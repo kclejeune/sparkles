@@ -4084,7 +4084,9 @@ sparkles settings set org memory.scratchBranches.notifyBefore=1d
 ```
 
 With the cap, `create_branch` fails with `scratch-branch-limit` once the caller has 20
-scratch branches in the dataset, kept ones included, until it merges or deletes one.
+scratch branches in the dataset, kept ones included. A merge leaves the branch and its
+mark in place, so the caller frees a place by deleting a branch, after merging it when
+its writes should stay, or an administrator frees one by clearing a mark.
 With the warning window, `list_branches`, the caller's `sparkles://org/branches`
 resource and the memory brief name the branches that expire within a day. On a server
 that expires branches, the `memory.review.pending` notification names those with

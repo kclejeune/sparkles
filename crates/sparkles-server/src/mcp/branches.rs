@@ -201,7 +201,7 @@ fn store_error(e: Error, request_id: &str) -> ToolError {
 
 impl McpServer {
     /// The datasets `p` may read on some branch, in name order.
-    fn visible_any_branch(&self, p: &Principal) -> Vec<Arc<Dataset>> {
+    pub(super) fn visible_any_branch(&self, p: &Principal) -> Vec<Arc<Dataset>> {
         let unbranched = p.clone().on_branch(None);
         self.state
             .datasets()
@@ -454,7 +454,7 @@ impl Tools<'_> {
                     "scratch-branch-limit",
                     409,
                     format!(
-                        "you have {mine} scratch branches in dataset {}, the most its memory.scratchBranches.maxPerPrincipal allows: merge or delete one first",
+                        "you have {mine} scratch branches in dataset {}, the most its memory.scratchBranches.maxPerPrincipal allows: delete one first, after merging it if its writes should stay, or ask an administrator to clear its scratch mark",
                         ds.name
                     ),
                 ));
@@ -899,6 +899,13 @@ pub(super) fn tool_defs(cfg: &McpConfig) -> Vec<ToolDef> {
 /// Held while `create_branch` counts a caller's scratch branches and creates one.
 static CREATING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// A test's step between the expiry's choice of a branch and its deletion.
+#[cfg(test)]
+pub(crate) type BeforeExpiry = Box<dyn Fn(&Dataset, &str) + Send>;
+#[cfg(test)]
+pub(crate) static BEFORE_EXPIRY: parking_lot::Mutex<Option<BeforeExpiry>> =
+    parking_lot::Mutex::new(None);
+
 /// Scratch branches the expiry deleted.
 static EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Whether this server expires scratch branches (the metric is exported then).
@@ -1081,8 +1088,9 @@ pub(crate) fn own_branches_json(
 const BRIEF_BRANCHES: usize = 5;
 
 /// The lines of the brief for the expiring branches of a branches resource `v`: one per
-/// branch, each beginning with `# scratch:`, with its name escaped.
-pub(crate) fn brief_lines(v: &Value) -> String {
+/// branch, each beginning with `# scratch:`, with its name escaped, as many whole lines
+/// as fit in `budget` characters.
+pub(crate) fn brief_lines(v: &Value, budget: usize) -> String {
     let soon: Vec<&Value> = v["branches"]
         .as_array()
         .into_iter()
@@ -1090,6 +1098,7 @@ pub(crate) fn brief_lines(v: &Value) -> String {
         .filter(|b| b["expiresSoon"] == true)
         .collect();
     let mut out = String::new();
+    let mut shown = 0;
     for b in soon.iter().take(BRIEF_BRANCHES) {
         let mut name = String::new();
         super::render::escape_into(&mut name, b["name"].as_str().unwrap_or(""));
@@ -1099,16 +1108,24 @@ pub(crate) fn brief_lines(v: &Value) -> String {
             1 => "1 commit not merged".to_string(),
             n => format!("{n} commits not merged"),
         };
-        out.push_str(&format!(
+        let line = format!(
             "# scratch: branch {name} expires at {} with {commits}\n",
             b["expires"].as_str().unwrap_or("")
-        ));
+        );
+        if out.chars().count() + line.chars().count() > budget {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
     }
-    if soon.len() > BRIEF_BRANCHES {
-        out.push_str(&format!(
+    if soon.len() > shown {
+        let line = format!(
             "# scratch: {} more scratch branches expire soon\n",
-            soon.len() - BRIEF_BRANCHES
-        ));
+            soon.len() - shown
+        );
+        if out.chars().count() + line.chars().count() <= budget {
+            out.push_str(&line);
+        }
     }
     out
 }
@@ -1120,15 +1137,22 @@ pub(crate) fn own_branches_state(
     ds: &Dataset,
     p: &Principal,
     default: Option<Duration>,
-) -> Vec<(String, Option<u64>, bool, Option<i64>, bool)> {
-    own_branches(st, ds, p, default, now_ms())
+) -> (
+    Option<String>,
+    Vec<(String, Option<u64>, u64, bool, Option<i64>, bool)>,
+) {
+    let notify_before = crate::assist::memory_settings(st, ds)
+        .scratch_branches
+        .and_then(|s| s.notify_before);
+    let branches = own_branches(st, ds, p, default, now_ms())
         .unwrap_or_default()
         .into_iter()
         .map(|(b, at, soon)| {
             let keep = b.scratch.as_ref().is_some_and(|s| s.keep);
-            (b.name, b.head.map(|h| h.seq), keep, at, soon)
+            (b.name, b.head.map(|h| h.seq), b.ahead, keep, at, soon)
         })
-        .collect()
+        .collect();
+    (notify_before, branches)
 }
 
 /// Delete the scratch branches of every dataset whose last change is older than the
@@ -1174,6 +1198,20 @@ pub(crate) fn sweep(
                 .unwrap_or(true);
             if pinned {
                 continue;
+            }
+            #[cfg(test)]
+            if let Some(f) = BEFORE_EXPIRY.lock().as_ref() {
+                f(ds, &b.name);
+            }
+            // the mark and the idle time again, under the lock that clearing a mark takes,
+            // so a branch an administrator kept after the listing above stays
+            let _marks = crate::assist::SCRATCH_MARKS.lock();
+            match ds.store.branch_info(&b.name) {
+                Ok(i)
+                    if i.scratch.as_ref().is_some_and(|s| !s.keep)
+                        && !i.broken
+                        && last_activity_ms(&i) < cutoff => {}
+                _ => continue,
             }
             match ds.dataset.delete_branch_with(
                 &b.name,

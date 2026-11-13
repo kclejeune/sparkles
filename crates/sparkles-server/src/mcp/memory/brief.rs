@@ -416,16 +416,40 @@ impl Tools<'_> {
         let mut review_lines = review
             .as_ref()
             .map_or(String::new(), super::pending::brief_lines);
-        // the caller's scratch branches that expire within the warning window (C17 §5.7)
-        let expiring = crate::mcp::branches::own_branches_json(
-            &self.server.state,
-            &ds,
-            &self.call.principal,
-            self.cfg().scratch_ttl,
-        )
-        .filter(|v| v["expiring"].as_array().is_some_and(|a| !a.is_empty()));
+        // the caller's scratch branches that expire within the warning window (C17 §5.7),
+        // read from the dataset's main, which owns the branch table, also when the brief
+        // reads a branch
+        let main = self
+            .server
+            .main_dataset(&self.call.principal.clone().on_branch(None), Some(&ds.name))
+            .ok();
+        let expiring = main
+            .and_then(|main| {
+                crate::mcp::branches::own_branches_json(
+                    &self.server.state,
+                    &main,
+                    &self.call.principal,
+                    self.cfg().scratch_ttl,
+                )
+            })
+            .filter(|v| v["expiring"].as_array().is_some_and(|a| !a.is_empty()));
         if let Some(v) = &expiring {
-            review_lines.push_str(&crate::mcp::branches::brief_lines(v));
+            // the lines take what `maxChars` leaves after the header and the review lines
+            let mut sc = String::new();
+            escape_into(&mut sc, &label);
+            let used = FIRST_LINE.chars().count()
+                + 1
+                + format!(
+                    "# dataset={} commit={commit} scope={sc} {status_word} facts={matched} shown=0\n",
+                    ds.name
+                )
+                .chars()
+                .count()
+                + review_lines.chars().count();
+            review_lines.push_str(&crate::mcp::branches::brief_lines(
+                v,
+                max_chars.saturating_sub(used),
+            ));
         }
         // C22 §2.5: the project scope adds the coarsest level's reports
         let mut communities = if scope == "project" {

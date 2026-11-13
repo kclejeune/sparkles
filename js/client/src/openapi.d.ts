@@ -5870,6 +5870,10 @@ export interface components {
                 [key: string]: unknown;
             }[];
             dataset: string;
+            /** @description The caller's scratch branches that expire within the dataset's `memory.scratchBranches.notifyBefore`. The `# scratch:` lines of `text` name as many of them as `maxChars` leaves room for, at most five. */
+            expiringBranches?: {
+                [key: string]: unknown;
+            }[];
             facts?: {
                 [key: string]: unknown;
             }[];

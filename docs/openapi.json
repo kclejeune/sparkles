@@ -4132,6 +4132,15 @@
           "dataset": {
             "type": "string"
           },
+          "expiringBranches": {
+            "description": "The caller's scratch branches that expire within the dataset's `memory.scratchBranches.notifyBefore`. The `# scratch:` lines of `text` name as many of them as `maxChars` leaves room for, at most five.",
+            "items": {
+              "additionalProperties": true,
+              "description": "A scratch branch with `name`, `head`, `created`, `lastChange`, `ahead`, `expires` and `expiresSoon`.",
+              "type": "object"
+            },
+            "type": "array"
+          },
           "facts": {
             "items": {
               "additionalProperties": true,

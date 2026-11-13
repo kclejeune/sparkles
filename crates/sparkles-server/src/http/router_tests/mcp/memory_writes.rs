@@ -872,6 +872,61 @@ async fn item435_kept_branches_and_the_warning_window() {
     assert!(ds.store.branch_info("k").unwrap().scratch.unwrap().keep);
 }
 
+/// Item 435, review round 1: the expiry rechecks the mark under the lock that clearing it
+/// takes, so a mark cleared after the expiry chose the branch keeps it, and the branches
+/// resource's state follows `ahead`.
+#[tokio::test(flavor = "multi_thread")]
+async fn item435_a_mark_cleared_during_expiry_keeps_the_branch() {
+    let s = mem_server(&["--mcp-allow-update", "--mcp-scratch-branch-ttl", "1h"]);
+    let ds = s.state.get("mem").unwrap();
+    for name in ["cleared-435", "expires-435"] {
+        let r = tool(&s.app, "create_branch", json!({ "name": name }), &[]).await;
+        assert_eq!(r["isError"], false, "{r}");
+    }
+    *crate::mcp::branches::BEFORE_EXPIRY.lock() = Some(Box::new(|ds, name| {
+        if name == "cleared-435" {
+            let _marks = crate::assist::SCRATCH_MARKS.lock();
+            ds.store.set_branch_scratch(name, None).unwrap();
+        }
+    }));
+    let gone = crate::mcp::branches::sweep(
+        &s.state,
+        Duration::from_secs(3600),
+        crate::mcp::branches::now_ms() + 2 * 3_600_000,
+    );
+    *crate::mcp::branches::BEFORE_EXPIRY.lock() = None;
+    assert_eq!(gone, ["mem@expires-435"]);
+    assert!(
+        ds.store
+            .branch_info("cleared-435")
+            .unwrap()
+            .scratch
+            .is_none()
+    );
+    // the resource's state changes when a merge changes `ahead` alone
+    let r = tool(&s.app, "create_branch", json!({"name": "ahead-435"}), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    ds.dataset
+        .branch("ahead-435")
+        .unwrap()
+        .update("INSERT DATA { <urn:a> <urn:p> 1 }")
+        .unwrap();
+    let p = crate::auth::Principal::local();
+    let state = || crate::mcp::branches::own_branches_state(&s.state, &ds, &p, None);
+    let before = state();
+    let r = tool(&s.app, "merge_branch", json!({"source": "ahead-435"}), &[]).await;
+    let expect = r["structuredContent"]["expect"].clone();
+    let r = tool(
+        &s.app,
+        "merge_branch",
+        json!({"source": "ahead-435", "dryRun": false, "expect": expect}),
+        &[],
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_ne!(before, state());
+}
+
 /// Item 435: `maxPerPrincipal` at its boundary, counted per creator with kept branches,
 /// a race-free count, and the admin route that clears a scratch mark.
 #[tokio::test(flavor = "multi_thread")]
@@ -939,12 +994,16 @@ async fn item435_limit_per_principal() {
     // concurrent calls at the limit: exactly one more fits after a deletion
     let r = tool(&s.app, "delete_branch", json!({"name": "d"}), &[]).await;
     assert_eq!(r["isError"], false, "{r}");
-    let calls = (0..4).map(|i| {
-        let app = s.app.clone();
-        tokio::spawn(async move {
-            tool(&app, "create_branch", json!({"name": format!("r{i}")}), &[]).await
+    let start = Arc::new(tokio::sync::Barrier::new(4));
+    let calls: Vec<_> = (0..4)
+        .map(|i| {
+            let (app, start) = (s.app.clone(), start.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                tool(&app, "create_branch", json!({"name": format!("r{i}")}), &[]).await
+            })
         })
-    });
+        .collect();
     let mut created = 0;
     for c in calls {
         if c.await.unwrap()["isError"] == false {
@@ -1110,11 +1169,21 @@ endpoints = ["query", "update", "gsp-rw", "info", "branches"]
 name = "reader"
 password = "{reader}"
 datasets = {{ mem = "read" }}
+
+[[users]]
+name = "sider"
+password = "{sider}"
+[[users.grants]]
+dataset = "mem"
+level = "write"
+branches = ["side*"]
+endpoints = ["query", "update", "gsp-rw", "info", "branches"]
 "#,
             owner = h("owner-pw"),
             agent = h("agent-7-pw"),
             tmpl = h("tmpl-pw"),
             reader = h("reader-pw"),
+            sider = h("sider-pw"),
         )
     }
 
@@ -1207,6 +1276,31 @@ datasets = {{ mem = "read" }}
         assert_eq!(r["isError"], true, "{r}");
         let r = call(&s, "agent-7", "create_branch", json!({"name": "scratch-b"})).await;
         assert_eq!(r["isError"], false, "{r}");
+        // a caller who reads only other branches than main has the resource too
+        let req = Request::post("/$/branches/mem")
+            .header("content-type", "application/json")
+            .header("authorization", b("owner"))
+            .body(Body::from(r#"{"name":"side-base"}"#))
+            .unwrap();
+        assert!(send(&s.app, req).await.status.is_success());
+        let r = call(
+            &s,
+            "sider",
+            "create_branch",
+            json!({"dataset": "mem", "name": "side-1", "from": "side-base"}),
+        )
+        .await;
+        assert_eq!(r["isError"], false, "{r}");
+        let r = modern(
+            &s.app,
+            "resources/list",
+            json!({}),
+            &[("authorization", &b("sider"))],
+        )
+        .await;
+        assert!(r.body.contains("sparkles://mem/branches"), "{}", r.body);
+        let v = read("sider").await;
+        assert_eq!(v["branches"][0]["name"], "side-1", "{v}");
     }
 
     /// A14 and the access rules of §5.7 and §6.

@@ -2131,6 +2131,7 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
                     "citations": array(any_object("One source of the facts.")),
                     "prefixes": any_object("The prefixes the compact terms use."),
                     "review": sref("ReviewCounts"),
+                    "expiringBranches": with_desc(array(any_object("A scratch branch with `name`, `head`, `created`, `lastChange`, `ahead`, `expires` and `expiresSoon`.")), "The caller's scratch branches that expire within the dataset's `memory.scratchBranches.notifyBefore`. The `# scratch:` lines of `text` name as many of them as `maxChars` leaves room for, at most five."),
                     "communities": with_desc(array(any_object("A report with `iri`, `community`, `title`, `summary`, `status` and `memberCount`.")), "In a project brief, the best rated reports of the coarsest level that the caller may read."),
                 }),
             ),

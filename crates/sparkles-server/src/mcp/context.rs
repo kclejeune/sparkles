@@ -170,7 +170,8 @@ impl McpServer {
             }
         }
         if self.allows(&call.principal, "create_branch") {
-            for ds in self.visible(&call.principal) {
+            // every dataset where the caller may read some branch, as create_branch takes
+            for ds in self.visible_any_branch(&call.principal.clone().on_branch(None)) {
                 out.push(Resource {
                     uri: format!("{SCHEME}{}/{}", ds.name, Kind::Branches.path()),
                     name: format!("{} scratch branches", ds.name),
@@ -220,7 +221,13 @@ impl McpServer {
     ) -> Result<(Kind, String), ContextError> {
         let unknown = || ContextError::InvalidParams(format!("unknown resource: {uri}"));
         let (name, kind, query) = parse_uri(uri).ok_or_else(unknown)?;
-        let ds = self.resource_dataset(&call, name)?;
+        let ds = if kind == Kind::Branches {
+            // the dataset's main, which a caller who reads only other branches may name
+            self.main_dataset(&call.principal.clone().on_branch(None), Some(name))
+                .map_err(|e| ContextError::InvalidParams(e.message))?
+        } else {
+            self.resource_dataset(&call, name)?
+        };
         match kind {
             Kind::Prefixes => Ok((kind, prefix_lines(&ds))),
             Kind::Query => {

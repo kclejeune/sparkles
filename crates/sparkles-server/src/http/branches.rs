@@ -943,6 +943,7 @@ pub(crate) async fn patch_branch(
             d.store.set_branch_note(&b, note)?;
         }
         if unscratch && b != sparkles::branch::MAIN {
+            let _marks = crate::assist::SCRATCH_MARKS.lock();
             d.store.set_branch_scratch(&b, None)?;
         }
         Ok(d.store.branch_info(&b)?)

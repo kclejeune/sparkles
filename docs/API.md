@@ -12086,12 +12086,14 @@ once no listed branch is kept. A caller with `admin` on a branch clears its scra
 with `PATCH /$/branches/{ds}/{name}` and the body `{"scratch": false}`. The branch then
 becomes an ordinary branch that never expires and that only grants without graph
 restrictions merge or delete. Clearing the mark of a branch that has none changes
-nothing.
+nothing, and the expiry never deletes a branch whose mark was cleared after it chose the
+branch.
 
 `memory.scratchBranches.maxPerPrincipal`, an integer from 1 to 65535, limits the scratch
 branches each principal has in the dataset, kept ones included. `create_branch` past the
 limit fails with `scratch-branch-limit` (409) and creates nothing. Branches made over
-HTTP and branches whose mark was cleared do not count. The count and the creation run
+HTTP and branches whose mark was cleared do not count. A merge keeps the source branch
+and its mark, so it frees no place, and deleting the branch does. The count and the creation run
 under one lock, so concurrent calls at the limit cannot both pass it.
 
 `memory.scratchBranches.notifyBefore`, a duration from `1m` to `3650d`, sets a warning
@@ -12644,9 +12646,10 @@ text from a file can start a line of the brief. An entity label that links to mo
 one entity is a `422` with code `ambiguous-entity` and the candidates.
 
 When the dataset sets `memory.scratchBranches.notifyBefore`, the brief also names the
-caller's scratch branches that expire within that window, at most five, each on a line
-`# scratch: branch NAME expires at TIME with N commits not merged`, and the answer lists
-them in `expiringBranches`.
+caller's scratch branches that expire within that window, at most five and only as many
+as `maxChars` leaves room for, each on a line
+`# scratch: branch NAME expires at TIME with N commits not merged`. The answer lists all
+of them in `expiringBranches`, and a brief that reads a branch names them as well.
 
 When the dataset has [GraphRAG](#graphrag) reports that the caller may read, the project
 scope also holds the five best rated reports of the coarsest level, reviewed ones only

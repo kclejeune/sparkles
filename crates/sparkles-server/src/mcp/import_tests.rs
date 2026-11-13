@@ -383,4 +383,58 @@ async fn brief_names_expiring_scratch_branches() {
     assert_eq!(list.len(), 1, "{v}");
     assert_eq!(list[0]["name"], "w-1");
     assert_eq!(list[0]["ahead"], 1);
+    // a brief that reads a branch, as the MCP `branch` argument selects, names them too
+    let call = Call {
+        arrived: std::time::Instant::now(),
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        request_id: "brief-on-branch".into(),
+        principal: crate::auth::Principal::local().on_branch(Some("w-1")),
+        headers: None,
+        held: None,
+        grant: None,
+    };
+    let args = json!({"dataset": "org", "scope": "project", "projectKey": "github.com/acme/shop"});
+    let out = tokio::task::block_in_place(|| {
+        server.run_now("memory_brief", args.as_object().unwrap().clone(), &call)
+    });
+    let v = match out {
+        Ok(Outcome::Structured(v)) => v,
+        Ok(Outcome::Text(t)) => panic!("{t}"),
+        Err(e) => panic!("{}", e.message),
+    };
+    assert!(
+        v["text"]
+            .as_str()
+            .unwrap()
+            .contains("# scratch: branch w-1 "),
+        "{v}"
+    );
+    // long names within the smallest maxChars: the lines fit or are left out
+    for i in 0..6 {
+        let name = format!("{}{i}", "x".repeat(63));
+        ds.dataset
+            .create_branch(&name, &Default::default())
+            .unwrap();
+        ds.store
+            .set_branch_scratch(
+                &name,
+                Some(sparkles::branch::Scratch {
+                    creator: "local".into(),
+                    keep: false,
+                }),
+            )
+            .unwrap();
+    }
+    let small = json!({"scope": "project", "projectKey": "github.com/acme/shop", "maxChars": 500})
+        .to_string();
+    let (s, v) = send(&app, "POST", "/org/memory/brief", &small).await;
+    assert_eq!(s, 200, "{v}");
+    let text = v["text"].as_str().unwrap();
+    assert!(
+        text.chars().count() <= 500,
+        "{} chars: {text}",
+        text.chars().count()
+    );
+    assert!(text.contains("# scratch:"), "{text}");
+    assert_eq!(v["expiringBranches"].as_array().unwrap().len(), 7, "{v}");
 }

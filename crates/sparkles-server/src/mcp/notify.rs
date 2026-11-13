@@ -71,7 +71,12 @@ impl McpServer {
     fn resource_state(&self, p: &Principal, uri: &str) -> Option<u64> {
         let rest = uri.strip_prefix(SCHEME)?;
         let (name, path) = rest.split_once('/')?;
-        let ds = self.dataset(p, Some(name)).ok()?;
+        let ds = if path == Kind::Branches.path() {
+            self.main_dataset(&p.clone().on_branch(None), Some(name))
+                .ok()?
+        } else {
+            self.dataset(p, Some(name)).ok()?
+        };
         // a dataset deleted and created again under its name is another one
         let instance = Arc::as_ptr(&ds) as usize;
         match path {

@@ -1490,13 +1490,16 @@ above is built, with these choices where it left the behaviour open.
   already takes. It needs `admin` on the branch, as `protected` does, and calls
   `Store::set_branch_scratch` with `None`. `scratch: true` is a `400`, since only
   `create_branch` makes scratch branches. Clearing a branch without a mark, or `main`,
-  changes nothing.
+  changes nothing. Clearing a mark and the expiry's deletion take one lock in the server,
+  and the expiry reads the mark and the idle time again under it, so it never deletes a
+  branch whose mark an administrator cleared after the expiry chose it.
 - **The limit.** `maxPerPrincipal` is an integer from 1 to 65535, the number of branch
   ordinals. `create_branch` counts the scratch branches of the dataset whose creator is
   the caller, kept ones included, and fails with `scratch-branch-limit` (409) at the
   limit, before it creates anything. The count and the creation run under one lock in
   the server, so concurrent calls at the limit cannot both pass it. Branches made over
-  HTTP and branches whose mark was cleared do not count.
+  HTTP and branches whose mark was cleared do not count. A merge keeps the source branch
+  and its mark, so only a deletion or a cleared mark frees a place.
 - **The window.** `notifyBefore` is a duration from `1m` to `3650d`, as `ttl` is. A
   scratch branch is in the window when it is not kept, the dataset's TTL applies to it,
   and its expiry is at most `notifyBefore` from now, the boundary included. The spec
@@ -1504,8 +1507,11 @@ above is built, with these choices where it left the behaviour open.
   resource `sparkles://{ds}/branches`. It shows the scratch branches the caller created
   with their expiry and names the ones in the window under `expiring`, and it is listed
   to callers who get `create_branch`, since only they can have scratch branches. The brief names the caller's own branches in the window
-  too, at most five, on `# scratch:` lines of statements, and lists them in
-  `expiringBranches`. `list_branches` marks each branch in the window `expiresSoon`.
+  too, at most five and as many as `maxChars` leaves room for, on `# scratch:` lines of
+  statements, and lists all of them in `expiringBranches`. A brief that reads a branch
+  reads the branch table from the dataset's main, so it names them as well. The
+  resource is listed for every dataset where the caller may read some branch, as
+  `create_branch` allows. `list_branches` marks each branch in the window `expiresSoon`.
 - **The event.** A branch "holds unreviewed proposals" when it has commits of its own
   that its upstream does not have. `memory.review.pending` names such branches in the
   window as a condition of its own, `memory.review.pending/{ds}/scratch`, apart from the
@@ -1526,10 +1532,14 @@ member and the stored format. In `router_tests::mcp::memory_writes`,
 `item435_kept_branches_and_the_warning_window` checks `keep`, `expiresSoon`, the
 resource, the boundary of the window and that the expiry keeps a kept branch, and
 `item435_limit_per_principal` checks the limit at its boundary, kept branches and HTTP
-branches in the count, the route that clears a mark and four concurrent calls at the
-limit. `auth::item435_limits_and_marks_per_principal` checks that each principal has its
-own count and resource and that only `admin` clears a mark.
-`mcp::import_tests::brief_names_expiring_scratch_branches` checks the brief, and
+branches in the count, the route that clears a mark and four concurrent calls released
+together at the limit. `auth::item435_limits_and_marks_per_principal` checks that each principal has its
+own count and resource, that a caller who reads only other branches than `main` gets
+the resource, and that only `admin` clears a mark.
+`item435_a_mark_cleared_during_expiry_keeps_the_branch` clears a mark between the
+expiry's choice and its deletion and checks that the resource's state follows a merge.
+`mcp::import_tests::brief_names_expiring_scratch_branches` checks the brief, a brief
+that reads a branch and the smallest `maxChars` with long branch names, and
 `notify::tests::expiring_scratch_branches_with_commits_notify` checks the event.
 
 ### Shared memory representation
