@@ -468,6 +468,28 @@ times the table size on disk.
 lag objectives, region-aware read routing and WAN write forwarding. F10 has no region
 concept. Phase 3 write forwarding is the nearest piece. It depends on item 66.
 
+## Formats added after the cutoff
+
+Item 933 adds the control keyspace of [C26 §7](../C26-durable-jobs-and-delivery.md#7-persistence-recovery-and-compatibility)
+to the first-release forms. It registers `control-log` version 1 for `control.log`,
+`control-checkpoint` version 1 for `control.bin`, `wal` version 3, which is version 2 with
+control records, and dataset reader 9 for the keyspace and the job ledger. Only a store
+with jobs enabled writes them, and its reader requirement keeps a build without them from
+opening it. Every reader refuses a version it does not know through `FileKind::refuse`,
+and the backup manifest requires the feature `control/1` for a backup that holds them.
+
+The write-ahead log keeps its record size and its commit framing. A control record sits
+inside an ordinary commit, and the readers that decode quads decode only insert and delete
+records and pass over configuration and control records, so the torn-tail rule, the commit
+index and the history readers are unchanged. A transition without quads is written to
+`control.log` and is not a commit. The control checkpoint is written under the writer
+before a compaction or a bulk commit switches `CURRENT`, so a generation switch never
+discards a control frame that no other file holds.
+
+A transaction that carries a control record drains the group and commits through the
+serial path. The group-of-one commit of item 833 must keep that rule, or carry control
+frames through the group's fence with the same durability order, which C26 §7.1 states.
+
 ## Decisions
 
 The maintainer took the recommended answer to each question below, and the roadmap
@@ -498,7 +520,8 @@ follows them.
    Phase 4 and record the choice in the load plan's table. Item 846 takes the bulk plan
    for a large `LOAD` with its own memory and lock measurement.
 5. **The import transport's reader.** The unwired import transport writes `minimumReader`
-   9 for an imported destination while the build reads up to 8. The recommendation is to
+   one above the build's `DATASET_READER` for an imported destination, which is 10 now
+   that reader 9 belongs to the job ledger. The recommendation is to
    leave it to the lane that wires the import, which raises `DATASET_READER` and the
    registry together once the capability has a contract, and not to widen the registry
    to make staged bytes open before then. Item 61, which wires the import, names the
