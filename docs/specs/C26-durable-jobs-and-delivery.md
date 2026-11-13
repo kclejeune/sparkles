@@ -179,7 +179,9 @@ A guard keeps a validation state of the head, made of its exact counts, its base
 the states of the commits it checked that are not yet published. Each state records the
 hidden graphs it was computed under. A check whose hidden graphs differ from those of its
 base state treats that state as unknown and validates in full, the state before the write
-included when the baseline policy compares them. The status and typing files are keyed by
+included when the baseline policy compares them. A registry change that hides new
+graphs also tells the store's own guard under its writer lock, so that guard forgets its
+state at once and its status shows the state as unknown. The status and typing files are keyed by
 the configuration's hash and the hidden graphs, so a state kept on disk under other
 hidden graphs is not trusted after a reopen. On a dataset without hidden graphs the key is
 the configuration's hash itself and the files do not change.

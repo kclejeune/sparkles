@@ -13577,6 +13577,9 @@ no guard with `404`, and a validation that names it as its data or shapes graph 
 `404`. A write-time guard leaves the ledger out of the data it validates when it is
 installed and on every write, and a guard configuration that names the ledger as a
 shapes, schema or data graph is refused with `404`, as for a graph that does not exist.
+Enabling jobs is refused with `409` while the write guard reads the ledger graph as a
+source or a listed data graph. A guard that still finds its shapes or schema in the
+ledger rejects every write with an error that names no graph.
 Materialization never reads it, whatever input graphs a request names, so no rule
 copies a ledger value into the inferred graph, and import fetching never follows an
 import the ledger names. A `SERVICE` call to this server and a resource header that

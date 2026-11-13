@@ -48,7 +48,8 @@ library query's graph view, and only the jobs inspection renders it. Statistics,
 the dataset listings, validation, materialization, reasoning diagnostics, merge previews,
 the library's schema, constraints, forms, explanation, analysis, ontology and GraphQL
 drafting handles, incremental queries, kept views, write-time guards and the MCP tools
-leave it out as well, a guard configuration cannot name it, merge results carry no commit
+leave it out as well, a guard configuration cannot name it, jobs are not enabled under a
+guard that reads it, merge results carry no commit
 counts on such a dataset, and the history routes leave out the counts that cover every
 graph while a dataset hides one. A lease deadline counts only once the commit
 that grants or extends it is the run's committed version, so a refused renewal never
