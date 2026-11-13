@@ -917,25 +917,28 @@ Three changes keep item 191's guarantee and repair the path.
   does not match, so `rdfs12cmp` no longer makes every property a container membership
   property. The abstraction remains an overestimate, so a relation it proves complete
   is complete, and a relation it cannot prove stays open as before.
-* **(b) The proof once per commit.** The proven relations depend on the rules, the
-  input graphs, the visible facts and the schema facts the session holds, so a session
-  stores them, as the IRIs of the closed predicates and classes, in a process-wide
-  cache under the schema table's view key, the rules digest and whether the session's
-  schema came from the schema table or a pass of its own. Later sessions of the same
-  view whose schema came the same way read them instead of scanning. The schema table
-  leaves out a generalized fact, such as one whose subject is a literal, so a proof
-  made over a pass that gave one is kept only for passes. The first session that reads
-  such a table then proves again over what the table holds, and later readers reuse
-  that proof. A session with facts of its own, such as a why-not hypothesis or
-  GeoSPARQL default geometries, neither reads nor keeps a proof, and nor does a session
-  whose rules read `now` or make blank nodes, since its schema pass can give other
-  facts than the pass of another session. A blank node's label follows the order the
-  session met its terms in, and a rule can test it. A session prepared again, as a
-  why-not search prepares its session for each step, holds the facts its earlier
-  derivations gave, so it neither reads nor keeps a proof and keeps no schema table. The cache holds at most 64 views and drops the oldest, and `nocache` does
-  not bypass it, like the schema table. A view that cannot be cached, such as a
-  transaction's snapshot, proves again in every session. The first query after a commit
-  still pays the two scans and the abstraction, which item 190 keeps for measurement.
+* **(b) The proof once per schema table.** The proof reads the rules and the session's
+  graph. A session that read the schema's table, and holds nothing else yet, holds the
+  view's facts and that table's facts, so every such session of the same table proves
+  the same relations. The first of them stores its proof, as the IRIs of the closed
+  predicates and classes, in a process-wide cache under the view key and the rules
+  digest together with the table it read, and later sessions that read the same table
+  use it instead of scanning. A table made again, after the cache dropped the old one,
+  gets a proof of its own. A session whose schema came from a pass of its own proves
+  again rather than share a proof, since two passes can differ and the table can lack a
+  fact its pass held. Rules that read `now` or test a made blank node's label give
+  each pass its own facts, an explanation's session keeps linear recursion and so
+  derives other intermediate facts, and the table leaves out a generalized fact, such
+  as one whose subject is a literal. A session prepared again, as a why-not search
+  prepares its session for each step, and a session with facts of its own, such as a
+  hypothesis or GeoSPARQL default geometries, hold more than the view's facts and the
+  table's, so they neither read nor keep a proof, and such a session keeps no schema
+  table either. The cache holds at most 64 views and drops the oldest, and `nocache`
+  does not bypass it, like the schema table. A view that cannot be cached, such as a
+  transaction's snapshot, proves again in every session. The first query after a
+  commit runs the pass and the proof, and the second, the first to read the table,
+  pays the two scans and the abstraction once more, which item 190 keeps for
+  measurement.
 * **(c) The axioms in the schema pass.** The schema pass reads instance facts as stored,
   so it missed schema facts that follow from an axiom about an instance. Under `owl-rl`,
   `rdf:nil rdf:type rdf:List` gives `rdf:List rdf:type rdfs:Class` and
