@@ -2071,9 +2071,9 @@ linked entities only, and its usage reports no schema terms or examples.
 | Local time per question, warm batch child | 0.42 s | 0.32 s |
 
 Part of the saving moves to the answered second ask. The first ask no longer warms the
-caches and pages that the second one reads, so the second ask's local time rose by a
-median of about 0.1 to 0.3 s. A person who abandons a clarification saves the whole
-cost.
+caches and pages that the second one reads, so the local time of the second ask rose by
+a paired median of 0.04 to 0.11 s in a fresh process and 0.015 s in a warm batch child.
+A person who abandons a clarification saves the whole cost.
 
 The paid check ran each model's questions in blocks, alternating the builds as base,
 candidate, candidate and base across blocks, with one child per ask and a page cache
