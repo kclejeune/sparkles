@@ -1054,21 +1054,34 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
   the read cost plus `DERIVE_BASE + facts × DERIVE_FACT`, or plus `READ_BASE + facts ×
   CACHED_FACT` for a table the cache holds, in the planner's unit of one scanned row,
   with the constants in `sparql::reasoning::cost`. The costs inform and do not decide,
-  as the next paragraph explains.
+  as the next paragraph explains. The derivation constants are provisional and are
+  measured once roadmap item 911 repairs the demand path.
 * **Why reading always wins.** §4.3 has the planner compare the two estimates per pattern
   and derive where deriving is cheaper. In this engine a derived pattern still reads the
   inferred graph, which stays in the query's default graph while the materialization
   answers, and its derived facts only join an overlay. Deriving therefore costs the read
   and the derivation, and is never the cheaper source. Leaving the inferred graph out per
   pattern would not change that, since a derivation of a pattern's facts costs at least
-  reading them from the store's indexes. The measurements agree. On LUBM at one
-  university, the reasoner-latency harness on stanley gives materialized reading from
-  0.06 to 1.7 ms per query with `owl-rl` and 0.14 to 1.7 ms with `rdfs`, and derivation on
-  demand at least 150 ms and 0.3 ms with the tables cached. The per-pattern comparison
-  with a derivation charged for its read, which always reads, also cost 1 to 8 ms per
-  query in reasoner setup and estimates, so `auto` reads by rule instead and keeps the
+  reading them from the store's indexes. The measurements below agree, and the
+  per-pattern comparison with a derivation charged for its read, which always reads,
+  also cost 1 to 8 ms per query in reasoner setup, cone estimates and seed queries at one
+  LUBM university, so `auto` reads by rule instead and keeps the
   estimates for EXPLAIN. Roadmap item 910 revisits a per-pattern choice once a separate
   derived layer (item 9, F16) makes reading inferences costlier than an index probe.
+* **Measurements.** `crates/sparkles/examples/auto_latency.rs` times the 14 LUBM
+  queries at 10 universities on persistent datasets, materialized with `rdfs` and with
+  `owl-rl`, one kept fresh and one made stale by a triple outside every query's cone.
+  The run used atlas (Intel), alone, at commit 2afc0e08, with 3 rounds of 2 timed runs
+  after one checked run, and each mode's answers equal the materialized ones. With a
+  fresh materialization `auto` starts no session and reads, and takes 0.04 to 8.2 ms
+  with `rdfs` and 0.37 to 9.2 ms with `owl-rl`. Materialized reasoning takes 0.23 to
+  8.9 ms and 0.07 to 8.2 ms. So `auto` is 0.1 to 0.7 ms faster than materialized with
+  `rdfs` and 0.2 to 1.0 ms slower with `owl-rl`, a difference that roadmap item 912
+  investigates. Over a stale materialization `auto` derives and takes what `demand` does,
+  45 to 149 ms with `rdfs` and 1.9 to 3.1 s with `owl-rl`. These derivation times come
+  from the demand path that roadmap item 911 repairs. Since item 191's schema
+  completeness, an `owl-rl` demand derives about the whole closure, 1,232,447 facts at
+  10 universities, for every query.
 
 * **The setting.** `crates/sparkles/src/reasoning/setting.rs` holds `default`, `profile`,
   `rules`, `inputs`, `budget` and `stale`, in `query-reasoning.json` with the version

@@ -20,6 +20,10 @@
 //! - `auto-fresh`: `auto` on the fresh dataset, which reads the inferred graph;
 //! - `auto-stale` and `auto-stale-cached`: `auto` on the stale dataset, which derives.
 //!
+//! With `AUTO_LATENCY_RAW` set, a `demand-raw` mode adds the query-time reasoner made
+//! without the dataset's record, as `crates/sparkles-reasoner/examples/
+//! reasoning_latency.rs` makes it, and each checked run prints its derivation counters.
+//!
 //! The result cache is off in every mode. Each mode's answer is checked against the
 //! materialized answer of its profile before anything is timed, and the harness checks
 //! that `auto-fresh` read every pattern and that `auto-stale` derived. Each mode and

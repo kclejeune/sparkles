@@ -196,8 +196,9 @@ pub trait ReasoningSession: Send {
 /// deriving them, in the planner's unit of one scanned row (spec F17 §4.3). EXPLAIN shows
 /// both, and they do not decide: a pattern that `auto` derives still reads the inferred
 /// graph, which stays in the query's default graph, so deriving costs the read and the
-/// derivation and is never the cheaper source ([`choose`]). The F17 Outcome records the
-/// measurements behind the constants. A derivation's fixed cost is the session's setup,
+/// derivation and is never the cheaper source ([`choose`]). The derivation constants
+/// are provisional: they are measured once roadmap item 911 repairs the demand path, as
+/// the F17 Outcome says. A derivation's fixed cost is the session's setup,
 /// the program made for the query and the merge of its facts into the query's view, and
 /// a table in the cache spares the program and the evaluation but not the merge.
 pub mod cost {
