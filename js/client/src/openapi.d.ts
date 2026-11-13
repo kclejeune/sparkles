@@ -10628,7 +10628,21 @@ export interface components {
             /** @enum {string} */
             default?: "auto" | "demand" | "materialized" | "false";
             /** @description The input graphs, as a reasoning request names them. */
-            inputs?: Record<string, never>;
+            inputs?: {
+                /** @description `default` or graph IRIs. */
+                dataGraphs?: string[];
+                /** @enum {string} */
+                imports?: "none" | "dataset" | "fetch";
+                locationMapping?: ({
+                    altName: string;
+                    name: string;
+                } | {
+                    altPrefix: string;
+                    prefix: string;
+                })[];
+                /** @description `default` or graph IRIs. */
+                ontologyGraphs?: string[];
+            };
             /** @enum {string} */
             profile?: "rdfs" | "rdfs-simple" | "owl-rl" | "rules";
             queryReasoningFormat?: number;
@@ -10637,7 +10651,9 @@ export interface components {
             /** @enum {string} */
             stale?: "derive" | "allow";
             /** @description The process-wide cache of derived tables, for callers with the metrics permission (responses only). */
-            tables?: Record<string, never>;
+            tables?: {
+                [key: string]: unknown;
+            };
         };
         /** @description One of the two members; 0 means unlimited. */
         QuotaRequest: {

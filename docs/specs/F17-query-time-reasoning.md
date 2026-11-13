@@ -1113,6 +1113,12 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
 5. Under `auto` with a readable materialization, a pattern reads unless a backward rule
    lies in its cone, rather than by the comparison of §4.3, for the reasons and
    measurements above.
+6. Reading a materialization beside derived facts is sound only when the materialization
+   holds a subset of the whole program's closure. With backward rules that holds when the
+   rest of the program is monotone and makes no terms, so `auto` does not read the
+   materialization of a rule file with backward rules and any builtin outside the pure
+   tests and functions of their arguments, a list action in a head, or a blank node or
+   functor in a head (`QueryReasoner::mixing_hazard`).
 
 **Acceptance.** A4 and A5 hold in `auto_reads_a_fresh_materialization_and_derives_over_a_stale_one`
 (`crates/sparkles/tests/auto_reasoning.rs`) and over HTTP in
@@ -1120,7 +1126,10 @@ commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in
 hold in `auto_derives_what_the_materialization_cannot_hold`, the setting in
 `the_query_setting_names_the_default_mode_and_the_stale_policy` and
 `the_setting_budget_bounds_a_derivation`, the rule in
-`auto_reads_what_the_materialization_holds` and the estimate in
+`auto_reads_what_the_materialization_holds`, decision 6 in
+`auto_does_not_mix_a_materialization_with_negation_over_backward_rules`,
+`auto_does_not_mix_fresh_witnesses` and `auto_does_not_mix_lists_that_backward_rules_extend`,
+and the estimate in
 `cone_estimates_follow_the_statistics_and_the_bound_positions`.
 
 ### Roadmap follow-ups
