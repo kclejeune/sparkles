@@ -651,6 +651,14 @@ An external agent asks in its own conversation. The server pipeline returns a
 A clarification is asked at most once per question. With no answer the pipeline takes
 the first choice and states the assumption.
 
+An ambiguous mention needs only the candidates of `link_entities`, so the server
+pipeline links the mentions before it reads the rest of step 1 and asks right away.
+The schema summary, the stored examples, the predicate use and the community reports
+are read on the answered request, where a draft uses them. With type hints the linker
+reads the schema's classes, so the schema summary is read first and the rest still
+waits. The `ground` event of a clarification therefore lists the linked entities and
+no schema terms or examples.
+
 ### 4.5 Explanation and the terms used
 
 The model's explanation is prose and can be wrong. Next to it the UI shows a

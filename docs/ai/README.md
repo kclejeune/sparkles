@@ -197,6 +197,8 @@ when the tool returns one. Each scoped completion also records a process-generat
 and the context-window size when selected. These remain in JSON logs without
 ancestor span lists. Standalone tool stages have no Ask identifier. These are diagnostic fields, not metric labels.
 The added fields contain no questions, labels, entity IRIs, prompts or error messages.
+An ask that stops at a clarification records only the linker and, with type hints,
+the two schema stages, because it asks before reading the rest of the context.
 
 Nested stages identify example-query and example-document embedding preparation and
 linker vector search. These include caches, admission and any local or remote model
