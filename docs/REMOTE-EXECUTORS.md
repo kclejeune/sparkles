@@ -248,8 +248,11 @@ heavy lock `~/gate/.lock`, adds a worktree, runs the check and removes the workt
 inside that unit. On a Boat worker the job's end is fixed before the start at
 `REMOTE_CI_RESERVE` seconds before the admitted end, 1200 by default. The worker computes
 the unit's runtime from that end immediately before the start and refuses with under
-`REMOTE_CI_MIN_SECONDS` left, 600 by default, so the closure watch finds the job closed. A
-job on an ssh host may run 6 hours. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
+`REMOTE_CI_MIN_SECONDS` left, 600 by default. Because the runtime counts from the unit's
+activation, the job also stops its own unit at that end and takes every wait from it, and the
+unit's shutdown is bounded at 60 seconds, so the closure watch finds the job closed. Starts on
+one host are serialized, and a job of the same name starts only after the earlier unit has
+fully stopped. A job on an ssh host may run 6 hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
 land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
 
 ## Source, results and cleanup
