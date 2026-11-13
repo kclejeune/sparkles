@@ -256,8 +256,8 @@ unit's shutdown is bounded at 60 seconds, so the closure watch finds the job clo
 one host are serialized, and a job of the same name starts only after the earlier unit has
 fully stopped. Under the heavy lock a job on a Boat worker needs `REMOTE_CI_MIN_FREE_GIB`
 free after the disk cleanup, 110 by default, and ends with exit 4 rather than start with
-less. The worker's disk timer stops any running job at 95% use, so a build that outgrows
-the disk ends before the stop's snapshot meets a full disk. A job on an ssh host may run 6
+less. The worker's disk timer stops any running job at 95% use, which is a recovery rather
+than a guarantee, since it checks once a minute and a build can fill the disk sooner. A job on an ssh host may run 6
 hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
 land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
 

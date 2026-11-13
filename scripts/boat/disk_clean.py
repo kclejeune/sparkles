@@ -22,8 +22,9 @@ With --stop-above PCT, which the worker's one-minute timer passes as 95, a disk 
 PCT% used first stops every active gate-* unit, the gate, lane CI and preparation units,
 because only a running job's own build can fill the disk that fast and no cleanup may take
 its files while it runs. The stop is logged in the record and in the job's progress.log,
-the job's results stay, and the cleanup then frees what the stopped jobs leave, so a stop's
-snapshot never meets a full disk.
+the job's results stay, and the cleanup then frees what the stopped jobs leave. This is a
+recovery at best, since a check comes once a minute and a shutdown takes time, so a disk can
+still fill between checks.
 
 With --need-free-gib N, which a lane CI job and a Boat gate start run as their admission
 check, the cleanup runs only when less than N GiB are free, and the program exits 3 when
@@ -176,13 +177,25 @@ def job_unit(unit):
     return unit.startswith('gate-') and unit.endswith(('.service', '.scope'))
 
 
-def stop_jobs(home, run, left, now):
-    """Stop every active gate-* unit and note the stop in each job's progress.log."""
-    units = active_units(lambda argv, e, cap: run(argv, e, left(cap)))
+def stop_jobs(home, run, left, now, wait_seconds=90, poll=time.sleep):
+    """Stop every active gate-* unit and note the stop in each job's progress.log.
+
+    Every stop request is queued at once with --no-block, so a slow shutdown of one job never
+    keeps another from its request, and the wait for the jobs to end shares one bound."""
+    listed = lambda: active_units(lambda argv, e, cap: run(argv, e, left(cap)))
+    units = listed()
+    jobs = sorted(u for u in (units or ()) if job_unit(u))
     stopped = []
-    for unit in sorted(u for u in (units or ()) if job_unit(u)):
-        code, _ = run(['systemctl', '--user', 'stop', unit], None, left(90))
-        stopped.append({'unit': unit, 'exit': code})
+    if jobs:
+        code, _ = run(['systemctl', '--user', 'stop', '--no-block', *jobs], None, left(30))
+        stopped = [{'unit': unit, 'exit': code} for unit in jobs]
+        wait = left(wait_seconds)
+        while wait > 0:
+            now_units = listed()
+            if now_units is not None and not any(u in now_units for u in jobs):
+                break
+            poll(2); wait -= 2
+    for unit in jobs:
         name = unit.rsplit('.', 1)[0][len('gate-'):]
         out = os.path.join(home, 'gate', 'out', name)
         if NAME.fullmatch(name) and plain_directory(out) and not os.path.islink(os.path.join(out, 'progress.log')):

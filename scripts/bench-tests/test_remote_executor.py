@@ -460,6 +460,11 @@ class Admission(unittest.TestCase):
         self.assertEqual(start[call+2].strip(),'exit 4')
         gate=(ROOT/'scripts/gate/gate.sh').read_text()
         self.assertIn('--executor boat --runtime $runtime --min-free-gib ${GATE_BOAT_MIN_FREE_GIB:-110}',gate)
+        self.assertIn('--setenv=GATE_MIN_FREE_GIB="${min_free:-110}"',(ROOT/'scripts/gate/remote/gate-start.sh').read_text())
+        # The check runs again under the heavy lock, before the build.
+        inner=(ROOT/'scripts/gate/remote/gate-inner.sh').read_text().splitlines()
+        lock=inner.index('flock 9');recheck=next(i for i,l in enumerate(inner) if '--need-free-gib "${GATE_MIN_FREE_GIB:-110}"' in l)
+        self.assertLess(lock,recheck);self.assertEqual(inner[recheck+2].strip(),'finish 4')
         self.assertLess(next(i for i,l in enumerate(start) if l.startswith('mkdir -p "$out"')),call)
         self.assertLess(call,next(i for i,l in enumerate(start) if 'worktree add' in l))
         # The start holds the cleanup's lock from before its worktree until its unit runs.

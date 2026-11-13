@@ -34,15 +34,16 @@ class FakeWorker:
     """systemctl, git and mbx on a worker, with the commands each call received."""
     def __init__(self, units=(), list_exit=0, disk=None, gc_frees=0, stop_frees=0):
         self.units = list(units); self.list_exit = list_exit; self.calls = []; self.disk = disk; self.gc_frees = gc_frees
-        self.stop_frees = stop_frees
+        self.stop_frees = stop_frees; self.stopping = []
 
     def run(self, argv, env=None, seconds=60):
         self.calls.append((argv, env, seconds))
-        if argv[:3] == ['systemctl', '--user', 'stop']:
-            self.units = [u for u in self.units if u != argv[3]]
-            if self.disk:
-                self.disk.used -= self.stop_frees * GIB
+        if argv[:4] == ['systemctl', '--user', 'stop', '--no-block']:
+            self.stopping = list(argv[4:])
             return 0, ''
+        if argv[:2] == ['systemctl', '--user'] and self.stopping:
+            # A queued stop ends one unit at each later list, as slow shutdowns would.
+            self.units.remove(self.stopping.pop(0))
         if argv[:2] == ['systemctl', '--user']:
             return self.list_exit, ''.join(u + ' loaded active running x\n' for u in self.units)
         if argv[:2] == ['rm', '-rf']:
@@ -228,15 +229,27 @@ class Clean(unittest.TestCase):
         (self.home / 'gate/out/live').mkdir(); (self.home / 'gate/out/live/progress.log').write_text('queued\n')
         units = ['gate-live.service', 'gate-prep-06ca04ef.scope', 'boat-owned-warm-qual-x.service', 'sparkles-disk-clean.service']
         worker = FakeWorker(units=units, disk=disk, gc_frees=30)
-        record = self.clean(worker, disk, stop_above=95)
-        stops = [c[0][3] for c in worker.calls if c[0][:3] == ['systemctl', '--user', 'stop']]
-        self.assertEqual(stops, ['gate-live.service', 'gate-prep-06ca04ef.scope'])
-        self.assertEqual([u['unit'] for u in record['stopped']], stops); self.assertTrue(record['stop_listed'])
+        with patch.object(disk_clean.time, 'sleep', lambda s: None):
+            record = self.clean(worker, disk, stop_above=95)
+        # Every stop is requested in one call before any wait.
+        stops = [c[0][4:] for c in worker.calls if c[0][:3] == ['systemctl', '--user', 'stop']]
+        self.assertEqual(stops, [['gate-live.service', 'gate-prep-06ca04ef.scope']])
+        self.assertEqual([u['unit'] for u in record['stopped']], stops[0]); self.assertTrue(record['stop_listed'])
         self.assertIn('stopped by the disk cleanup', (self.home / 'gate/out/live/progress.log').read_text())
         # The stops come before the unit list of the cleanup, which then takes the stopped jobs' worktrees.
         self.assertFalse(self.exists('gate/wt-live')); self.assertFalse(self.exists('gate/wt-06ca04ef'))
         self.assertTrue(self.exists('gate/out/live/progress.log')); self.assertEqual(record['after']['used_pct'], 66)
         self.assertIn('boat-owned-warm-qual-x.service', worker.units)
+
+    def test_many_slow_jobs_all_get_their_stop_within_the_bound(self):
+        disk = FakeDisk(97); units = ['gate-j%d.service' % i for i in range(5)]
+        worker = FakeWorker(units=list(units), disk=disk); t = [0.0]
+        def slow(s): t[0] += 60
+        with patch.object(disk_clean.time, 'sleep', slow):
+            record = self.clean(worker, disk, stop_above=95, deadline_seconds=240, clock=lambda: t[0])
+        stops = [c[0][4:] for c in worker.calls if c[0][:3] == ['systemctl', '--user', 'stop']]
+        self.assertEqual(stops, [units]); self.assertEqual(len(record['stopped']), 5)
+        self.assertLessEqual(t[0], 240)
 
     def test_under_the_hard_limit_nothing_stops(self):
         for used in [89, 92]:
@@ -264,7 +277,7 @@ class Clean(unittest.TestCase):
         def run(free_gib):
             disk = FakeDisk(100 - free_gib)
             with patch.object(disk_clean, 'clean', lambda *a, **k: real(*a, run=FakeWorker(disk=disk).run, statvfs=disk.statvfs, **k)), \
-                    contextlib.redirect_stdout(io.StringIO()):
+                    patch.object(disk_clean.signal, 'signal'), contextlib.redirect_stdout(io.StringIO()):
                 try:
                     disk_clean.main(['--home', str(self.home), '--need-free-gib', '40', '--log', str(log)])
                     return 0

@@ -70,6 +70,10 @@ log "lock acquired"
 # The admission check runs under the heavy lock, so no other job's build grows meanwhile. A
 # disk with under NEED_GIB free after the cleanup refuses the job rather than fill up.
 need=${NEED_GIB:-110}
+if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ] && [ ! -f "$G/bin/disk_clean.py" ]; then
+  log "no ~/gate/bin/disk_clean.py for the admission check; run scripts/gate/setup-host.sh"
+  finish 4
+fi
 if [ -f "$G/bin/disk_clean.py" ] &&
   ! python3 -I "$G/bin/disk_clean.py" --need-free-gib "$need" --deadline-seconds 240 --log "$G/disk-clean.jsonl" > "$out/disk-clean-admit.json" 2>&1; then
   log "under $need GiB free after the cleanup; not starting"

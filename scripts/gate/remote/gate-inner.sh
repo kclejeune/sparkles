@@ -68,6 +68,13 @@ test "$(git rev-parse HEAD)" = "$full" || {
   log abort
   finish 3
 }
+# On a Boat worker the start checked the free space before the gate queued, and another build
+# may have used it since, so the check runs again under the heavy lock before the build.
+if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ] &&
+  ! python3 -I "$(dirname "$0")/disk_clean.py" --need-free-gib "${GATE_MIN_FREE_GIB:-110}" --deadline-seconds 240 --log "$G/disk-clean.jsonl" > "$out/disk-clean-admit.json" 2>&1; then
+  log "under ${GATE_MIN_FREE_GIB:-110} GiB free after the cleanup; not starting"
+  finish 4
+fi
 
 export PATH="$G/py-venv/bin:$HOME/.local/bin:$PATH"
 export CARGO_BUILD_JOBS=${GATE_CARGO_JOBS:-4}

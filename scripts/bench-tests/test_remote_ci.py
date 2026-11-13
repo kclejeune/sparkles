@@ -60,6 +60,8 @@ class RemoteCI(unittest.TestCase):
         self.src = src
         home = t / 'home'; (home / 'gate/bin').mkdir(parents=True); (home / 'gate/out').mkdir()
         subprocess.run(['git', 'init', '-q', '--bare', str(home / 'gate/repo.git')], check=True)
+        # The worker's admission checker, which setup-host installs; it finds room by default.
+        (home / 'gate/bin/disk_clean.py').write_text('import sys\nopen(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))\nsys.exit(int(__import__("os").environ.get("FAKE_CLEAN_EXIT", "0")))\n')
         self.home = home
         fake = t / 'bin'; fake.mkdir()
         (fake / 'systemd-run').write_text(FAKE_SYSTEMD_RUN)
@@ -185,7 +187,6 @@ class RemoteCI(unittest.TestCase):
 
     def test_a_disk_without_room_for_the_build_refuses_the_job(self):
         clean = self.home / 'gate/bin/disk_clean.py'
-        clean.write_text('import sys\nopen(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))\nsys.exit(int(__import__("os").environ.get("FAKE_CLEAN_EXIT", "0")))\n')
         r = self.run_ci(FAKE_CLEAN_EXIT='3', REMOTE_CI_MIN_FREE_GIB='120')
         self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
         name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
@@ -194,6 +195,13 @@ class RemoteCI(unittest.TestCase):
         self.assertIn('--need-free-gib 120', Path(str(clean) + '.args').read_text())
         self.assertFalse((out / 'ci.log').exists()); self.assertFalse((self.home / 'gate' / ('wt-' + name)).exists())
         self.assertEqual(self.run_ci('--no-wait', REMOTE_CI_MIN_FREE_GIB='x').returncode, 2)
+
+    def test_a_boat_job_without_the_checker_refuses(self):
+        (self.home / 'gate/bin/disk_clean.py').unlink()
+        r = self.run_ci()
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertIn('no ~/gate/bin/disk_clean.py', (self.home / 'gate/out' / name / 'progress.log').read_text())
 
     def test_the_benchmark_host_never_runs_ci(self):
         for h in ['forge', 'user@forge.local']:

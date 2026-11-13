@@ -467,9 +467,9 @@ ends. A cleanup prints one record with the disk use before and after and appends
 `scripts/gate/setup-host.sh` installs the user timer `sparkles-disk-clean.timer`, which
 runs the cleanup every minute from ten minutes after boot and does nothing below 90% use.
 At 95% use the timer's cleanup first stops every active `gate-*` unit, the gate, lane CI
-and preparation units. A running build can grow faster than one check a minute and no
-cleanup may take its files, so only the stop keeps a full disk from reaching the stop's
-snapshot. The stop is written to the record and to the job's `progress.log`, and the job's
+and preparation units, because no cleanup may take a running build's files. This is a
+recovery at best, since the check runs once a minute and a build can fill the disk sooner,
+which is why a job also needs its room before it starts. The stop is written to the record and to the job's `progress.log`, and the job's
 results stay. The timer's unit files live in the home, so the snapshot keeps them and the
 timer runs again after a resume.
 

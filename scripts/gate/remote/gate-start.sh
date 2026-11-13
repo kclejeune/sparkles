@@ -197,6 +197,7 @@ systemd-run --user --unit "$unit" --collect -q "${forward[@]}" \
   --setenv=HOME="$HOME" --setenv=USER="$USER" --setenv=PATH="$PATH" \
   --setenv=MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" --setenv=SPARKLES_REMOTE_EXECUTOR="$executor" \
   --setenv=GATE_CARGO_JOBS="$cargo_jobs" --setenv=GATE_BASE="$base" --setenv=GATE_FULL="$all_checks" \
+  --setenv=GATE_MIN_FREE_GIB="${min_free:-110}" \
   timeout --signal=TERM --kill-after=30s "$runtime" "$bin/gate-inner.sh" "$full" "$name" "$part" "$jobs"
 [ "$executor" != boat ] || exec 7>&-
 echo "$unit"

@@ -196,5 +196,6 @@ done
 fetch "$name"
 code=$(cat "$root/.artifacts/remote-ci/$name/ci.exit")
 echo "gate-$name exit $code in $(($(date +%s) - start)) s"
-tail -n 30 "$root/.artifacts/remote-ci/$name/ci.log"
+[ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 30 "$root/.artifacts/remote-ci/$name/ci.log"
+[ -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 5 "$root/.artifacts/remote-ci/$name/progress.log"
 exit "$code"
