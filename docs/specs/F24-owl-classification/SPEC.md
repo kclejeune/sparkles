@@ -2053,29 +2053,29 @@ The merged terms are candidates of the at-most rule like any successor, through 
 transferred role literals, so a count that needs three terms in one element merges a
 merged term again.
 
-The completeness argument extends the proof of Theorem 9 in Appendix C. Its model fragment
-`R_t` from the ground clauses `N_t` of the context of a term `t` (C.2), the unfolding of
-the context structure into the rewrite system `R` (C.3) and Lemmas 13 to 28 rest on the
-forms of context clauses, on the order of Definition 3 and on the saturation under the
-Core, Eq, Ineq, Factor, Pred and Succ rules. The merged atoms are unary atoms over `x` and
-the merged symbols are function symbols of sort a, the order extends as above, and those
-rules are kept, so `R` is built as there and the lemmas hold, with the merged symbols in
-its Herbrand universe. The proof uses this productive interpretation and not an arbitrary
-model of the clauses, since in `R` every atom that is true in `R_t*` and whose terms `R`
-does not reduce is the maximal literal of a generative clause of `N_t` whose other
-literals are false (Lemma 16), and such a clause is an instance of a context clause that
-can be a premise of the rules. Lemma 29 shows from the saturation under the Hyper rule
-that `R*` satisfies each clause of the ontology, and its proof holds unchanged for every
-clause except the at-most clause of DL4 and item 728's lazy clauses, which have its form
-with atoms over `x` added to the head and whose Hyper conclusions are changed. For these
-clauses the same proof gives a weaker property. If the body atoms over `t` and `S_B(t,
-u_i)` hold in `R*` for `n + 1` different neighbours `u_i` of `t` that `R` does not reduce,
-then Lemma 27 makes each of these atoms true in `R_t*`, the rule applies to the context
-clauses behind their generative clauses, and its conclusion is in `N_t` up to redundancy
-and true in `R_t*` (Lemmas 18 and 22) while its premises' other literals are false. One of
-its head literals is therefore true. It is an atom over `t`, an equality of a `u_i` with
-the predecessor, which would reduce `u_i`, or a merged atom `M_{U_i ∪ U_j}(t)` of two of
-the successor terms, where `U_i` is the set of `u_i`.
+The completeness argument extends the proof of Theorem 9 in Appendix C. Appendix C.2
+builds the model fragment `R_t` from the ground clauses `N_t` of the context of a term
+`t`, and Appendix C.3 unfolds the context structure into the rewrite system `R`. Both
+constructions and Lemmas 13 to 28 rest on the forms of context clauses, on the order of
+Definition 3 and on the saturation under the Core, Eq, Ineq, Factor, Pred and Succ rules.
+The merged atoms are unary atoms over `x` and the merged symbols are function symbols of
+sort a, the order extends as above, and those rules are kept, so `R` is built as there and
+the lemmas hold, with the merged symbols in its Herbrand universe. The proof uses this
+productive interpretation and not an arbitrary model of the clauses, since in `R` every
+atom that is true in `R_t*` and whose terms `R` does not reduce is the maximal literal of
+a generative clause of `N_t` whose other literals Lemma 16 makes false, and such a clause
+is an instance of a context clause that can be a premise of the rules. Lemma 29 shows from
+the saturation under the Hyper rule that `R*` satisfies each clause of the ontology, and
+its proof holds unchanged for every clause except the at-most clause of DL4 and item 728's
+lazy clauses, which have its form with atoms over `x` added to the head and whose Hyper
+conclusions are changed. For these clauses the same proof gives a weaker property. If the
+body atoms over `t` and `S_B(t, u_i)` hold in `R*` for `n + 1` different neighbours `u_i`
+of `t` that `R` does not reduce, then Lemma 27 makes each of these atoms true in `R_t*`,
+the rule applies to the context clauses behind their generative clauses, and by Lemmas 18
+and 22 its conclusion is in `N_t` up to redundancy and true in `R_t*` while its premises'
+other literals are false. One of its head literals is therefore true. It is an atom over
+`t`, an equality of a `u_i` with the predecessor, which would reduce `u_i`, or a merged
+atom `M_{U_i ∪ U_j}(t)` of two of the successor terms, where `U_i` is the set of `u_i`.
 
 The qualification of a term by the counting qualifier `B` is the first clause of DL4 at
 that term, which Lemma 29 covers at a merged term as at any other term, whether its `B`
@@ -2087,9 +2087,9 @@ the weaker property reads it.
 The model is then the part of `R*` that the merged terms leave uncovered. A successor term
 `u` of `t` that `R` does not reduce, with the set `U`, is covered when `R*` makes `M_T(t)`
 true for a set `T` that strictly contains `U`, so the atom of a merged term never covers
-that term itself. For a covered term choose a largest such `T` by inclusion. Then `m_T(t)`
-is not covered, since a true atom of a strictly larger set would contradict the choice,
-and since the sets are finite every covered term has such a representative. The
+that term itself. For a covered term choose such a `T` that is maximal by inclusion. Then
+`m_T(t)` is not covered, since a true atom of a strictly larger set would contradict the
+choice, and since the sets are finite every covered term has such a representative. The
 interpretation `I` has as elements the terms that `R` does not reduce and that are reached
 from the constant `c` through successors that are not covered. Its atoms and role atoms
 are those of `R*` over these elements, and the value of a function symbol `f_e` at an
