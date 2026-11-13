@@ -533,7 +533,6 @@ impl Preparation<'_> {
             oxiri::Iri::parse(predicate.as_str())
                 .map_err(|_| Error::invalid("invalid scope predicate"))?;
             if predicate.starts_with("urn:x-sparkles:evidence:")
-                || predicate.starts_with(VALID_TIME)
                 || predicate.starts_with("http://www.w3.org/ns/prov#")
                 || [
                     "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
@@ -593,6 +592,13 @@ impl Preparation<'_> {
             super::Polarity::Uncertain => "uncertain",
         })?;
         self.node(&claim.attributed_author)?;
+        // A claim's validity enters only through its member (spec C27 §4.4). An
+        // assessment's scope keeps the profile's other terms, such as `vt:expiresAt`.
+        if claim.scope.keys().any(|p| p.starts_with(VALID_TIME)) {
+            return Err(Error::invalid(
+                "claim scope cannot name valid-time predicates; use the claim's validity",
+            ));
+        }
         self.scope(&claim.scope)?;
         self.facets(&claim.confidence)?;
         // Framed only when present, under a tag no other field uses, so that a claim

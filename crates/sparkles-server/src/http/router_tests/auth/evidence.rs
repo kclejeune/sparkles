@@ -547,11 +547,13 @@ async fn claim_validity_records_are_written_with_the_claim_over_http() {
         serde_json::json!({"urn:x-sparkles:valid-time:validDuring": ["<urn:period>"]});
     let r = propose(&s, &b("evw"), &scoped).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
-    assert_eq!(
-        ds.store.head_commit(),
-        head,
-        "nothing was written: {refused:?}"
+    refused.push(r.json()["code"].clone());
+    // every refusal carries the proposal API's code
+    assert!(
+        refused.iter().all(|c| c == "invalid-proposal"),
+        "{refused:?}"
     );
+    assert_eq!(ds.store.head_commit(), head, "nothing was written");
     // a valid record is written with the claim, its instants in UTC
     let mut body = revision_and_claim("c1");
     body["claims"][0]["validity"] = validity;

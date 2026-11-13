@@ -1013,4 +1013,12 @@ fn validity_records_are_framed_and_refused_like_the_v1_shapes() {
             "{predicate}"
         );
     }
+    // an assessment's scope still names valid-time terms, such as its freshness
+    // deadline
+    let mut input = sample();
+    input.assessments[0].scope.insert(
+        "urn:x-sparkles:valid-time:expiresAt".into(),
+        vec![timestamp("2026-06-01T00:00:00Z").into()],
+    );
+    prepare_input(&input, &Control::none()).unwrap();
 }

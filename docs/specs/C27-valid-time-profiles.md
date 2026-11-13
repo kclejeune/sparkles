@@ -291,7 +291,8 @@ each record carries its own copy rather than naming a shared run node that the w
 does not own.
 
 The writer refuses a validity record that the version 1 shapes would refuse, before
-the capability, the hold and the commit. An instant without an explicit offset, a
+the capability, the hold and the commit, and the HTTP and MCP surfaces answer
+`400 invalid-proposal`. An instant without an explicit offset, a
 reversed envelope, a known boundary without its precision or source value, an unknown
 or unbounded boundary with instants and a normalized status with a calendar other than
 `vt:Gregorian` are all refused. A fold choice without a timezone policy and a pinned
@@ -299,7 +300,8 @@ database version is refused too. When both boundaries are known, the latest star
 precede the earliest end, and an overlap is refused with `temporal-indeterminate-order`
 in its message. An importer that cannot order the endpoints records them as unknown
 under the `indeterminateOrder` status instead. Open claim scope refuses every predicate
-in the `vt:` namespace, so validity enters only through this member.
+in the `vt:` namespace, so validity enters only through this member. An assessment's
+scope keeps accepting them, as it accepted `vt:expiresAt` before.
 
 The record is immutable content of the claim. The record digest covers its triples,
 and the proposal's payload digest frames the member under its own tag only when it is

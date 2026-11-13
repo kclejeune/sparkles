@@ -395,6 +395,15 @@ fn confidence(field: &str, c: &ConfidenceJson) -> ApiResult<Confidence> {
     })
 }
 
+/// A malformed validity record: `400 invalid-proposal` with the field's path.
+fn invalid(field: String, why: impl std::fmt::Display) -> crate::http::ApiError {
+    crate::http::err_code(
+        StatusCode::BAD_REQUEST,
+        "invalid-proposal",
+        format!("{field}: {why}"),
+    )
+}
+
 fn validity(at: &str, v: &ValidityJson) -> ApiResult<sparkles::evidence::ValidityInput> {
     use sparkles::evidence::{FoldChoice, NormalizationInput, NormalizationStatus};
     let n = &v.normalization;
@@ -407,7 +416,7 @@ fn validity(at: &str, v: &ValidityJson) -> ApiResult<sparkles::evidence::Validit
         "indeterminateOrder" => NormalizationStatus::IndeterminateOrder,
         "nonexistentLocalTime" => NormalizationStatus::NonexistentLocalTime,
         _ => {
-            return Err(bad(
+            return Err(invalid(
                 format!("{at_n}.status"),
                 "status is normalized, unresolved, unsupportedCalendar, unsupportedPrecision, indeterminateOrder or nonexistentLocalTime",
             ));
@@ -418,7 +427,7 @@ fn validity(at: &str, v: &ValidityJson) -> ApiResult<sparkles::evidence::Validit
         Some("earlier") => Some(FoldChoice::Earlier),
         Some("later") => Some(FoldChoice::Later),
         Some(_) => {
-            return Err(bad(
+            return Err(invalid(
                 format!("{at_n}.foldChoice"),
                 "foldChoice is earlier or later",
             ));
@@ -447,7 +456,7 @@ fn boundary(at: &str, b: &BoundaryJson) -> ApiResult<sparkles::evidence::Boundar
             let (Some(earliest), Some(latest), Some(precision), Some(source_value)) =
                 (&b.earliest, &b.latest, &b.precision, &b.source_value)
             else {
-                return Err(bad(
+                return Err(invalid(
                     at.to_string(),
                     "a known boundary has earliest, latest, precision and sourceValue",
                 ));
@@ -460,7 +469,7 @@ fn boundary(at: &str, b: &BoundaryJson) -> ApiResult<sparkles::evidence::Boundar
             }
         }
         "unknown" | "unbounded" if finite => {
-            return Err(bad(
+            return Err(invalid(
                 at.to_string(),
                 "an unknown or unbounded boundary has no earliest, latest or precision",
             ));
@@ -472,7 +481,7 @@ fn boundary(at: &str, b: &BoundaryJson) -> ApiResult<sparkles::evidence::Boundar
             source_value: b.source_value.clone(),
         },
         _ => {
-            return Err(bad(
+            return Err(invalid(
                 format!("{at}.kind"),
                 "kind is known, unknown or unbounded",
             ));
@@ -996,6 +1005,8 @@ pub(super) fn propose_now(
             .or_insert_with(|| policy(&st, &p, ds, branch))
             .clone()
     };
+    // A batch that preparation refuses, such as a validity record the profile's shapes
+    // refuse, answers with the proposal API's code rather than a bare 400.
     let proposed = sparkles::evidence::propose(
         Some(&st.catalog),
         &main.dataset,
@@ -1004,7 +1015,13 @@ pub(super) fn propose_now(
         &options,
         &mut read,
         &control,
-    )?;
+    )
+    .map_err(|e| match e {
+        sparkles::Error::Invalid(m) => {
+            crate::http::err_code(StatusCode::BAD_REQUEST, "invalid-proposal", m)
+        }
+        e => e.into(),
+    })?;
     let mut out = json!({
         "operation": proposed.operation.as_str(),
         "committed": proposed.committed,
