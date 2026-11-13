@@ -550,8 +550,9 @@ The Sonnet sample is the 64 questions with the smallest SHA-256 of
 
 Replayed with the fake provider in the same way, the 2026-10-25 binary of the repeat
 above took 1.27 s for an initial clarification against 1.97 s for the 2026-10-24
-baseline, although the paid runs had measured 5.2 s against 3.6 s for Haiku. The higher
-median of that repeat came from the loaded host and its page cache, not from the code.
+baseline, although the paid runs had measured 5.2 s against 3.6 s for Haiku. The replay
+does not reproduce the higher median of that repeat, which points to the loaded host and
+its page cache rather than the code, although it cannot isolate the original cause.
 The [offline record](runs/2026-11-13-ask-latency-offline/record.json) and the
 [paid record](runs/2026-11-13-ask-latency-paid/record.json) give the stage profiles, the
 host load of every block and the per-question times, and

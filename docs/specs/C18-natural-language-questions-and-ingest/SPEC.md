@@ -653,8 +653,10 @@ the first choice and states the assumption.
 
 An ambiguous mention needs only the candidates of `link_entities`, so the server
 pipeline links the mentions before it reads the rest of step 1 and asks right away.
-The schema summary, the stored examples, the predicate use and the community reports
-are read on the answered request, where a draft uses them. With type hints the linker
+The schema summary, the stored examples, the predicate use and the communities of the
+linked entities are read on the answered request, where a draft uses them. The community
+reports that an automatic mode selects for a global answer are still read before the
+grounding. With type hints the linker
 reads the schema's classes, so the schema summary is read first and the rest still
 waits. The `ground` event of a clarification therefore lists the linked entities and
 no schema terms or examples.
@@ -3946,7 +3948,7 @@ provider's daily budget and cost estimates price cache writes and reads apart fr
 uncached input, and the `tool` level of the `anthropic` kind no longer forces its tool.
 Whether Ask's accuracy changes with the new order of the grounding is measured by the
 evaluation of §11, and the cache hit rate of real calls is checked from the
-`cacheReadInputTokens` of their records. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 263 and 318.
+`cacheReadInputTokens` of their records. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 263 and 914.
 
 Ask consumes recognized candidate evidence for full choice identities and conservative
 ordering of explicitly named kinds. Every ambiguous mention still requires a
@@ -3960,8 +3962,10 @@ to 77 and Sonnet 5.5 from 64 to 86 under the strict score, as the
 
 Bounded debug stage diagnostics distinguish local grounding, tool calls and nested
 embedding work with bounded process-generated request correlation and no change to
-usage accounting. Item 318 remains open for
-representative latency measurements and evidence-based reductions in avoidable work.
+usage accounting. An ambiguous mention is asked about before the rest of the grounding
+is read, which the [item 318 record](OUTCOME.md#ask-median-latency-item-318) measures.
+Item 914 follows the schema context that a fresh process computes before its first
+draft.
 
 See the [delivery record](OUTCOME.md#outcome) for implementation departures,
 validation, measurements and the detailed follow-ups. The [landing page](README.md)

@@ -2043,17 +2043,19 @@ calls no model, and its median rose from 3.6 to 5.2 s for Haiku and from 3.2 to 
 for Sonnet. Replayed with the fake provider on 2026-11-13, one child per ask as the paid
 runs did, the 2026-10-25 binary was not slower than the 2026-10-24 one. Its initial
 clarification took a median of 1.27 s against 1.97 s, and its local time per question
-2.4 s against 3.7 s. The paid runs had measured those clarifications at three to four
-times the replayed time, on a laptop that was running other work while it served a
-32 GB database from 30 GiB of memory. The retained difference therefore came from host
-load, the page cache and provider variation, not from the grounding change.
+2.4 s against 3.7 s. The paid repeat had measured those clarifications at about four
+times the replayed time, against 1.6 to 1.8 times for the baseline, on a laptop that was
+running other work while it served a 32 GB database from 30 GiB of memory. The replay
+does not reproduce the slowdown, so it gives no sign that the code caused it. Host load,
+the page cache and provider variation are the likely causes, although the replay ran
+under other conditions and cannot isolate the original one.
 
 Stage profiles of the current pipeline found one avoidable cost. Of the 107 QALD-9-plus
 questions, 84 begin with a clarification, and that first ask read both schema
-projections, the stored examples, the predicate use and the community reports before
-it asked, although the clarification uses only the linker's candidates. In a fresh
-process those reads took about 600 ms of a 1.0 to 1.2 s clarification, and in a warm
-batch child about 140 ms of 290 ms. Ask now links the mentions first when type hints
+projections, the stored examples, the predicate use and the communities of the linked
+entities before it asked, although the clarification uses only the linker's
+candidates. In a fresh process those reads took about 600 ms of a 1.0 to 1.2 s
+clarification, and in a warm batch child about 140 ms of 290 ms. Ask now links the mentions first when type hints
 are off, and an ambiguous mention returns the clarification before the rest of the
 grounding runs. With type hints the linker reads the schema's classes, so the schema is
 read first and only the examples, predicate use and recall are skipped. The context of a

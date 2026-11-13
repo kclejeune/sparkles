@@ -707,7 +707,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   with the usual error rather than exhausting memory. Model-dependent accuracy and
   contextual namesake resolution remain open. Roadmap item 263. Model calls take most of
   an answer's time. A fresh `sparkles ask` process also spends about half a second
-  computing the schema context that a running server keeps. Roadmap item 914. Local and
+  before its first draft computing the schema context that a running server keeps. Roadmap item 914. Local and
   OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from the full dump,
   and an evaluation of independent roles have not run. Roadmap item 6.
 * Prompt caching has not been measured against Anthropic. Neither the cache hit rate of

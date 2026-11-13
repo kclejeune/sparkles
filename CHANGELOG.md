@@ -15,8 +15,9 @@ the EL rules alone, and more on assertion-heavy files, which roadmap item 869 fo
 ### Ask latency
 
 An ask whose question names an ambiguous mention now asks which one is meant before it
-reads the schema, the stored examples, the predicate use and the community reports,
-which only a draft uses. With type hints the schema is still read first. A
+reads the schema, the stored examples, the predicate use and the communities of the
+linked entities, which only a draft uses. With type hints the schema is still read
+first. A
 clarification arrives in about 0.45 s instead of 1.0 to 1.2 s from a fresh
 `sparkles ask` process on DBpedia, and in 0.15 s instead of 0.29 s from a running one.
 Draft prompts are unchanged. The `ground` event of a clarification lists the linked
