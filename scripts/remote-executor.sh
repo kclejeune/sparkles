@@ -7,3 +7,4 @@ rx_admit() { python3 "$RX_DIR/remote-executor.py" admit "$@"; }
 # Seconds left from a saved admit observation on both original clocks, minus a reserve.
 rx_runtime() { python3 "$RX_DIR/remote-executor.py" runtime "$@"; }
 rx_bundle() { python3 "$RX_DIR/remote-executor.py" bundle "$@"; }
+rx_get() { python3 "$RX_DIR/remote-executor.py" get "$@"; }
