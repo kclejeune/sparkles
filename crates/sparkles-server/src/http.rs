@@ -2177,9 +2177,10 @@ pub(crate) async fn run_query(
     }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
     let resp = with_reasoning(resp, derived.as_deref());
-    // freshness is reported for the live state only
+    // freshness is reported for the live state only, and for a stale materialization
+    // that `auto` read at a historical commit
     let mut resp = match &resolved {
-        Some(r) if r.historical => resp,
+        Some(r) if r.historical => with_historical_stale_read(resp, derived.as_deref()),
         _ => with_inferences(
             resp,
             &ds,
@@ -5741,6 +5742,27 @@ fn with_inferences(mut r: Response, ds: &Dataset, included: bool, seq: u64) -> R
     if included && let Some(v) = crate::reasoning::inferences_header(ds, seq) {
         r.headers_mut()
             .insert(crate::reasoning::SPARKLES_INFERENCES, v);
+    }
+    r
+}
+
+/// Add `Sparkles-Inferences: stale` to a historical read whose `auto` reasoning read a
+/// stale materialization under the dataset's `"stale": "allow"` (spec F17 §4.2). The
+/// freshness of other historical reads is not reported.
+pub(crate) fn with_historical_stale_read(
+    mut r: Response,
+    applied: Option<&sparkles::sparql::reasoning::Applied>,
+) -> Response {
+    if applied.is_some_and(|a| {
+        matches!(
+            a.materialization,
+            sparkles::sparql::reasoning::Materialization::StaleRead { .. }
+        )
+    }) {
+        r.headers_mut().insert(
+            crate::reasoning::SPARKLES_INFERENCES,
+            header::HeaderValue::from_static("stale"),
+        );
     }
     r
 }

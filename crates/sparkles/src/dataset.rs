@@ -577,15 +577,21 @@ impl Dataset {
         if let Some(s) = &setting {
             s.validate()?;
         }
+        // one change at a time: the file and the setting in memory change together, and
+        // the file's temporary copy has one writer
+        let mut current = self.inner.query_reasoning.write();
         if let Some(root) = self.inner.store.root() {
             crate::reasoning::setting::write(root, setting.as_ref())?;
         }
-        *self.inner.query_reasoning.write() = setting;
+        *current = setting;
         Ok(())
     }
 
     /// The reasoning mode of a query that names none: the setting's default, else
     /// materialized reasoning, which reads the inferred graph while the dataset has one.
+    /// HTTP queries and `sparkles query` follow it. [`Dataset::query`] and the other
+    /// query methods read the materialized inferences as before, and a caller follows the
+    /// setting with `inference_view(default_reasoning_mode())`.
     pub fn default_reasoning_mode(&self) -> crate::reasoning::ReasoningMode {
         self.inner
             .query_reasoning

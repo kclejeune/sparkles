@@ -75,6 +75,10 @@ impl AutoReasoner {
                 "the materialization's input graphs differ from the query's".to_string(),
             );
         }
+        // backward rules beside negation or fresh terms: the two sources do not combine
+        if let Some(why) = self.inner.mixing_hazard() {
+            return derive(why);
+        }
         // a caller whose protections hide the inferences cannot read the graph (C12b)
         if let Some(readable) = &req.readable {
             let inferred = oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(

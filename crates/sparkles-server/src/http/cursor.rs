@@ -371,7 +371,7 @@ pub(super) async fn serve(
     let response = history::history_headers(response, resolved.as_ref(), &uri);
     let response = super::with_reasoning(response, derived.as_deref());
     let mut response = match &resolved {
-        Some(r) if r.historical => response,
+        Some(r) if r.historical => super::with_historical_stale_read(response, derived.as_deref()),
         _ => with_inferences(
             response,
             &ds,

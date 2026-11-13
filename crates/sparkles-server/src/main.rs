@@ -6159,7 +6159,8 @@ fn print_patterns(s: &sparkles::store::Snapshot) -> anyhow::Result<()> {
 }
 
 /// The options of `sparkles query` with its `--reasoning` (`materialized`, `demand`,
-/// `auto` or `false`), `--profile`, `--rules` and `--max-derived` (spec F17).
+/// `auto` or `false`, else the database's query-time default), `--profile`, `--rules`
+/// and `--max-derived` (spec F17).
 fn query_reasoning_options(
     ds: &sparkles::Dataset,
     qopts: QueryOptions,
@@ -6170,7 +6171,8 @@ fn query_reasoning_options(
 ) -> Result<QueryOptions> {
     use sparkles::reasoning::ReasoningMode;
     let mode = match reasoning {
-        None => ReasoningMode::Materialized,
+        // the database's query-time setting names the mode of a query that names none
+        None => ds.default_reasoning_mode(),
         Some(name) => match ReasoningMode::parse(name) {
             None => {
                 bail!("--reasoning must be materialized, demand, auto or false, not {name}")

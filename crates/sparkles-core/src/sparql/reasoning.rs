@@ -659,10 +659,8 @@ pub(crate) fn apply(
     // ---- under `auto`, a materialization that answers every pattern: the query reads
     // it as materialized reasoning does, and EXPLAIN alone starts a session to show the
     // estimates (spec F17 §4.3 as built)
-    if auto
-        && execute
-        && let Some(materialization) = provider.reads_all(&req)
-    {
+    let reads_all = if auto { provider.reads_all(&req) } else { None };
+    if execute && let Some(materialization) = reads_all.clone() {
         ctx.reasoning = Some(Arc::new(Applied {
             label: provider.label(),
             rdfs_skipped,
@@ -673,12 +671,13 @@ pub(crate) fn apply(
         }));
         return Ok(());
     }
-    // the derived facts go to the store's default graph, which the query must read
+    // the derived facts go to the store's default graph, which the query must read,
+    // unless the materialization answers every pattern and nothing is derived
     let reads_default = match &ctx.dataset.default {
         None => !ctx.dataset.union_default && !ctx.snap.union_default_graph,
         Some(l) => l.contains(&Id::DEFAULT_GRAPH),
     };
-    if !reads_default {
+    if !reads_default && reads_all.is_none() {
         return Err(Error::Unsupported(
             "query-time reasoning adds the derived facts to the store's default graph, \
              which this query does not read (its dataset names other graphs, or the default \

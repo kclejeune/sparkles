@@ -330,3 +330,137 @@ fn the_setting_budget_bounds_a_derivation() {
     }))
     .unwrap_err();
 }
+
+/// A dataset of `data` materialized with the Jena rules `rules`, and its answers to
+/// `query` under `auto` and under `demand`, sorted.
+fn auto_and_demand(data: &str, rules: &str, query: &str) -> (Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path().join("db")).unwrap();
+    ds.load_str(data, RdfFormat::Turtle).unwrap();
+    materialize(&ds, Profile::Rules(rules.to_string()));
+    let rows = |opts: &QueryOptions| {
+        let mut rows: Vec<String> = ds
+            .query_with(query, opts)
+            .unwrap()
+            .rows()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let demand = ds
+        .inference_view(ReasoningMode::Demand(Demand::default()))
+        .unwrap()
+        .query_options();
+    (rows(&auto(&ds, None)), rows(&demand))
+}
+
+/// A forward rule that walks a list which backward rules make reads a cone the
+/// materialization lacks, although none of its atoms names the list (review round 1).
+#[test]
+fn auto_follows_the_lists_a_builtin_reads_into_backward_rules() {
+    let rules = "@prefix ex: <http://ex.org/>.
+        [first: (?l rdf:first ?v) <- (?l ex:head ?v)]
+        [rest: (?l rdf:rest rdf:nil) <- (?l ex:head ?v)]
+        [member: (?s ex:items ?l), listMember(?l, ?m) -> (?s ex:member ?m)]";
+    let (auto, demand) = auto_and_demand(
+        "@prefix ex: <http://ex.org/> . ex:s ex:items ex:l . ex:l ex:head ex:a .",
+        rules,
+        "PREFIX ex: <http://ex.org/> SELECT ?m { ex:s ex:member ?m }",
+    );
+    assert_eq!(demand, ["<http://ex.org/a>"]);
+    assert_eq!(auto, demand);
+}
+
+/// A materialization that skips a backward rule can hold a conclusion that `noValue`
+/// draws from the rule's absence, which the whole program does not, so `auto` does not
+/// read it beside derived facts (review round 1).
+#[test]
+fn auto_does_not_mix_a_materialization_with_negation_over_backward_rules() {
+    let rules = "@prefix ex: <http://ex.org/>.
+        [blocked: (?x ex:q ?y) <- (?x ex:seed ?y)]
+        [eligible: (?x ex:seed ?y), noValue(?x, ex:q, ?y) -> (?x ex:r ?y)]";
+    let (auto, demand) = auto_and_demand(
+        "@prefix ex: <http://ex.org/> . ex:a ex:seed ex:b .",
+        rules,
+        "PREFIX ex: <http://ex.org/> SELECT ?p { ex:a ?p ex:b }",
+    );
+    assert!(
+        !demand.contains(&"<http://ex.org/r>".to_string()),
+        "{demand:?}"
+    );
+    assert_eq!(auto, demand);
+}
+
+/// `makeTemp` makes a new node on every run, so the materialization's node and a
+/// derivation's node would both answer (review round 1).
+#[test]
+fn auto_does_not_mix_fresh_witnesses() {
+    let rules = "@prefix ex: <http://ex.org/>.
+        [f: (?x ex:seed ?v), makeTemp(?n) -> (?x ex:node ?n)]
+        [b: (?x ex:answer ?n) <- (?x ex:node ?n)]";
+    let (auto, demand) = auto_and_demand(
+        "@prefix ex: <http://ex.org/> . ex:a ex:seed ex:b .",
+        rules,
+        "PREFIX ex: <http://ex.org/> SELECT ?n { ex:a ex:node ?n . ex:a ex:answer ?answer }",
+    );
+    assert_eq!(demand.len(), 1, "{demand:?}");
+    assert_eq!(auto.len(), demand.len(), "{auto:?}");
+}
+
+/// A query whose dataset leaves out the default graph reads a fresh materialization
+/// under `auto`, and EXPLAIN describes it as the query runs (review round 1).
+#[test]
+fn explain_agrees_with_a_read_that_derives_nothing() {
+    let (_dir, ds) = open();
+    materialize(&ds, Profile::Rdfs);
+    let opts = auto(&ds, None);
+    let q = "SELECT ?s FROM <urn:g> { ?s ?p ?o }";
+    ds.query_with(q, &opts).unwrap();
+    let (_, plan) = ds.explain(q, &opts).unwrap();
+    assert_eq!(plan.operator, "Reason", "{plan:?}");
+}
+
+/// Concurrent changes of the setting leave the setting in memory equal to the one a
+/// reopen reads (review round 1).
+#[test]
+fn concurrent_setting_changes_keep_memory_and_file_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let ds = Dataset::open(&path).unwrap();
+    std::thread::scope(|scope| {
+        for t in 0..4 {
+            let ds = ds.clone();
+            scope.spawn(move || {
+                for i in 0..50 {
+                    let setting = if (i + t) % 3 == 0 {
+                        None
+                    } else {
+                        Some(QuerySetting {
+                            default: Some(if (i + t) % 2 == 0 { "auto" } else { "demand" }.into()),
+                            budget: sparkles::reasoning::setting::Budget {
+                                max_derived: Some(1 + i * 10 + t),
+                                max_millis: None,
+                            },
+                            ..Default::default()
+                        })
+                    };
+                    ds.set_query_reasoning(setting).unwrap();
+                }
+            });
+        }
+    });
+    let live = ds.query_reasoning();
+    let mut on_disk = sparkles::reasoning::setting::read(&path);
+    // the file carries its format version, which the setting in memory leaves unset
+    if let Some(s) = on_disk.as_mut() {
+        s.query_reasoning_format = 0;
+    }
+    assert_eq!(live, on_disk);
+}

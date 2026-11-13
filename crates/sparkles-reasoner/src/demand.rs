@@ -210,9 +210,11 @@ pub(crate) fn intensional(rules: &[CRule], a: (Slot, Slot, Slot)) -> bool {
 }
 
 /// The rules whose facts a pattern may read, through the rules whose heads give facts of
-/// their body atoms: the dependency cone of a demand before its program is made, as the
-/// indices of the rules in the order the walk found them.
-pub(crate) fn cone_indices(rules: &[CRule], a: (Slot, Slot, Slot)) -> Vec<usize> {
+/// what their bodies read: the dependency cone of a demand before its program is made, as
+/// the indices of the rules in the order the walk found them. A body reads its atoms, the
+/// pattern a `noValue` tests, the lists that list builtins and head actions walk, and the
+/// facts a `listForAll` tests.
+pub(crate) fn cone_indices(rules: &[CRule], terms: &Terms, a: (Slot, Slot, Slot)) -> Vec<usize> {
     let mut seen = vec![false; rules.len()];
     let mut todo = vec![a];
     let mut out = Vec::new();
@@ -222,6 +224,22 @@ pub(crate) fn cone_indices(rules: &[CRule], a: (Slot, Slot, Slot)) -> Vec<usize>
                 seen[i] = true;
                 out.push(i);
                 todo.extend(r.atoms.iter().map(|b| (b.s, b.p, b.o)));
+                for b in &r.builtins {
+                    if b.kind == BuiltinKind::NoValue {
+                        let arg = |k: usize| b.args.get(k).copied().unwrap_or(Slot::Any);
+                        todo.push((arg(0), arg(1), arg(2)));
+                    }
+                    for read in list_reads(b.kind, &b.args, None) {
+                        if let Read::Facts(s, p) = read {
+                            todo.push((s, p, Slot::Any));
+                        }
+                    }
+                }
+                if reads_lists(r) {
+                    for p in [terms.rdf_first, terms.rdf_rest] {
+                        todo.push((Slot::Any, Slot::Const(p), Slot::Any));
+                    }
+                }
             }
         }
     }

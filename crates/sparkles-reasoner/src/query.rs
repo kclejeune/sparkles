@@ -146,6 +146,41 @@ impl QueryReasoner {
         self.shared.digest
     }
 
+    /// Why the facts of a materialization of these rules cannot be read beside facts
+    /// derived for a query, when the rules hold a top-level backward rule: a builtin whose
+    /// answer can change when the backward rules give more facts (`noValue`,
+    /// `listNotContains`, `listForAll`), so that the materialization can hold conclusions
+    /// the whole program does not, or a builtin that makes a new term on every run
+    /// (`makeTemp`, `now`), so that the two sources disagree on the terms (spec F17 §4.3 as
+    /// built). `None` when the two can be read together.
+    pub fn mixing_hazard(&self) -> Option<String> {
+        if !self.has_backward_rules() {
+            return None;
+        }
+        fn find(clauses: &[crate::parser::Clause]) -> Option<&str> {
+            clauses.iter().find_map(|c| match c {
+                crate::parser::Clause::Builtin(b) => matches!(
+                    b.name.as_str(),
+                    "noValue" | "listNotContains" | "listForAll" | "makeTemp" | "now"
+                )
+                .then_some(b.name.as_str()),
+                crate::parser::Clause::Rule(r) => find(&r.body).or_else(|| find(&r.head)),
+                crate::parser::Clause::Triple(_) => None,
+            })
+        }
+        self.shared
+            .rules
+            .iter()
+            .find_map(|r| find(&r.body).or_else(|| find(&r.head)).map(|b| (r, b)))
+            .map(|(r, b)| {
+                format!(
+                    "rule '{}' calls {b}, so the materialization, which skips the backward \
+                     rules, cannot be read beside derived facts",
+                    r.label()
+                )
+            })
+    }
+
     /// Whether the rules hold a top-level backward rule, whose facts a materialization
     /// lacks since the materializer skips such rules (spec F17 §5.1). The profiles
     /// `rdfs`, `rdfs-simple` and `owl-rl` hold none.
@@ -1592,7 +1627,7 @@ impl ReasoningSession for Session {
                     _ => Slot::Var(i),
                 };
                 let pattern = (slot(&d.s, 0), slot(&d.p, 1), slot(&d.o, 2));
-                let cone = demand::cone_indices(&self.rules, pattern);
+                let cone = demand::cone_indices(&self.rules, &self.terms, pattern);
                 // the materializer skips top-level backward rules (spec F17 §5.1), so a
                 // materialization lacks the facts of a cone that holds one
                 let materialized = !cone.iter().any(|&r| {
