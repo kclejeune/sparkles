@@ -189,6 +189,7 @@ fn claim(ds: &sparkles::Dataset) -> (NamedNode, Sha256Digest) {
             attributed_author: iri("urn:registry"),
             scope: Default::default(),
             confidence: Default::default(),
+            validity: None,
         }],
         ..Default::default()
     };
@@ -429,6 +430,7 @@ async fn a_supplied_query_reads_no_claims() {
                 attributed_author: iri("urn:other"),
                 scope: Default::default(),
                 confidence: Default::default(),
+                validity: None,
             }],
             ..Default::default()
         },

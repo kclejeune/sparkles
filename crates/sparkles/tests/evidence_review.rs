@@ -112,6 +112,7 @@ fn claim(occurrence: &str, polarity: Polarity, proposition: Triple) -> ClaimInpu
         attributed_author: iri("urn:publisher"),
         scope: Default::default(),
         confidence: Default::default(),
+        validity: None,
     }
 }
 

@@ -1,7 +1,9 @@
 use super::{
     AssessmentInput, BlankAnchor, ClaimInput, Confidence, ConfidenceFacets, EvidenceInput,
     EvidenceRefTarget, GraphIdentity, IdentityInput, IdentityRelation, MethodRef, RecordKind,
-    RecordRef, RenditionContent, Sha256Digest, SourceContent, canonical::FrameHash,
+    RecordRef, RenditionContent, Sha256Digest, SourceContent,
+    canonical::FrameHash,
+    model::{BoundaryInput, NormalizationInput, NormalizationStatus, ValidityInput},
     primitives::validate_iri,
 };
 use crate::{Error, Result, task::Control};
@@ -531,6 +533,7 @@ impl Preparation<'_> {
             oxiri::Iri::parse(predicate.as_str())
                 .map_err(|_| Error::invalid("invalid scope predicate"))?;
             if predicate.starts_with("urn:x-sparkles:evidence:")
+                || predicate.starts_with(VALID_TIME)
                 || predicate.starts_with("http://www.w3.org/ns/prov#")
                 || [
                     "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
@@ -591,7 +594,101 @@ impl Preparation<'_> {
         })?;
         self.node(&claim.attributed_author)?;
         self.scope(&claim.scope)?;
-        self.facets(&claim.confidence)
+        self.facets(&claim.confidence)?;
+        // Framed only when present, under a tag no other field uses, so that a claim
+        // without validity keeps the payload digest it had before validity existed.
+        match &claim.validity {
+            Some(validity) => self.validity(validity),
+            None => Ok(()),
+        }
+    }
+
+    /// A validity record, refused where the version 1 shapes would refuse it (spec C27
+    /// §4.4).
+    fn validity(&mut self, validity: &ValidityInput) -> Result<()> {
+        self.frame.field(40, &[1])?;
+        let start = self.boundary("start", &validity.start)?;
+        let end = self.boundary("end", &validity.end)?;
+        if let (Some((_, latest_start)), Some((earliest_end, _))) = (start, end)
+            && latest_start.partial_cmp(&earliest_end) != Some(std::cmp::Ordering::Less)
+        {
+            return Err(Error::invalid(
+                "validity: temporal-indeterminate-order: the latest start must precede the earliest end",
+            ));
+        }
+        self.normalization(&validity.normalization)
+    }
+
+    /// One boundary, and its parsed earliest and latest instants when it is known.
+    fn boundary(&mut self, name: &str, b: &BoundaryInput) -> Result<Option<(DateTime, DateTime)>> {
+        match b {
+            BoundaryInput::Known {
+                earliest,
+                latest,
+                precision,
+                source_value,
+            } => {
+                self.text("known")?;
+                self.frame.check_literal_capacity(earliest)?;
+                self.frame.literal(earliest)?;
+                self.frame.check_literal_capacity(latest)?;
+                self.frame.literal(latest)?;
+                self.node(precision)?;
+                self.text(source_value)?;
+                let e = validity_instant(name, earliest)?;
+                let l = validity_instant(name, latest)?;
+                if e.partial_cmp(&l) == Some(std::cmp::Ordering::Greater) {
+                    return Err(Error::invalid(format!(
+                        "validity.{name}: the earliest instant follows the latest"
+                    )));
+                }
+                Ok(Some((e, l)))
+            }
+            BoundaryInput::Unknown { source_value } => {
+                self.text("unknown")?;
+                self.optional_text(source_value.as_deref())?;
+                Ok(None)
+            }
+            BoundaryInput::Unbounded { source_value } => {
+                self.text("unbounded")?;
+                self.optional_text(source_value.as_deref())?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn normalization(&mut self, n: &NormalizationInput) -> Result<()> {
+        self.text(n.status.local())?;
+        self.node(&n.method)?;
+        self.text(&n.method_version)?;
+        self.node(&n.calendar)?;
+        self.optional_text(n.timezone_policy.as_deref())?;
+        self.optional_text(n.tzdb_version.as_deref())?;
+        self.optional_text(n.fold_choice.map(|f| f.as_str()))?;
+        for (field, value) in [
+            ("methodVersion", Some(n.method_version.as_str())),
+            ("timezonePolicy", n.timezone_policy.as_deref()),
+            ("tzdbVersion", n.tzdb_version.as_deref()),
+        ] {
+            if value.is_some_and(str::is_empty) {
+                return Err(Error::invalid(format!(
+                    "validity.normalization.{field} cannot be empty"
+                )));
+            }
+        }
+        if n.status == NormalizationStatus::Normalized
+            && n.calendar.as_str() != "urn:x-sparkles:valid-time:Gregorian"
+        {
+            return Err(Error::invalid(
+                "validity.normalization: normalized version 1 values require the Gregorian calendar",
+            ));
+        }
+        if n.fold_choice.is_some() && (n.timezone_policy.is_none() || n.tzdb_version.is_none()) {
+            return Err(Error::invalid(
+                "validity.normalization: a fold choice requires a timezone policy and a pinned database version",
+            ));
+        }
+        Ok(())
     }
 
     fn identity(&mut self, identity: &IdentityInput) -> Result<()> {
@@ -689,6 +786,38 @@ fn expected_digest_matches(expected: Option<Sha256Digest>, actual: Sha256Digest)
         ));
     }
     Ok(())
+}
+
+/// The C27 profile namespace, whose predicates only the validity member writes.
+const VALID_TIME: &str = "urn:x-sparkles:valid-time:";
+
+/// A validity instant: an `xsd:dateTime` with an explicit offset.
+fn validity_instant(name: &str, value: &Literal) -> Result<DateTime> {
+    if value.datatype() != xsd::DATE_TIME {
+        return Err(Error::invalid(format!(
+            "validity.{name}: an instant requires xsd:dateTime"
+        )));
+    }
+    let parsed: DateTime = value.value().parse().map_err(|_| {
+        Error::invalid(format!(
+            "validity.{name}: an instant is invalid or outside the supported range"
+        ))
+    })?;
+    if parsed.timezone_offset().is_none() {
+        return Err(Error::invalid(format!(
+            "validity.{name}: an instant requires an explicit offset"
+        )));
+    }
+    Ok(parsed)
+}
+
+/// The UTC form of a validity instant that preparation accepted.
+pub(super) fn validity_utc(value: &Literal) -> Result<Literal> {
+    let parsed = validity_instant("instant", value)?;
+    let utc = parsed
+        .adjust(Some(TimezoneOffset::UTC))
+        .ok_or_else(|| Error::invalid("validity: UTC conversion is outside the supported range"))?;
+    Ok(Literal::new_typed_literal(utc.to_string(), xsd::DATE_TIME))
 }
 
 fn normalize_time(value: &Literal) -> Result<NormalizedSourceTime> {

@@ -8566,7 +8566,7 @@
                     },
                     "type": "array"
                   },
-                  "description": "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
+                  "description": "Domain scope: predicate IRIs to N-Triples terms. Evidence profile, valid-time, PROV-O and structural predicates are refused.",
                   "type": "object"
                 },
                 "target": {
@@ -8801,7 +8801,142 @@
                     },
                     "type": "array"
                   },
-                  "description": "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
+                  "description": "Domain scope: predicate IRIs to N-Triples terms. Evidence profile, valid-time, PROV-O and structural predicates are refused.",
+                  "type": "object"
+                },
+                "validity": {
+                  "additionalProperties": false,
+                  "description": "The claim's C27 validity record, a half-open interval written with the claim and covered by its record digest. The latest start must precede the earliest end of two known boundaries.",
+                  "properties": {
+                    "end": {
+                      "additionalProperties": false,
+                      "description": "A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision.",
+                      "properties": {
+                        "earliest": {
+                          "description": "A known boundary's earliest possible instant, inclusive, with an explicit offset.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "kind": {
+                          "enum": [
+                            "known",
+                            "unknown",
+                            "unbounded"
+                          ],
+                          "type": "string"
+                        },
+                        "latest": {
+                          "description": "A known boundary's latest possible instant, inclusive, with an explicit offset.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "precision": {
+                          "description": "A known boundary's source precision, such as urn:x-sparkles:valid-time:Day.",
+                          "type": "string"
+                        },
+                        "sourceValue": {
+                          "description": "The source's original expression. A known boundary requires it.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "type": "object"
+                    },
+                    "normalization": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "calendar": {
+                          "description": "The calendar. Normalized values use urn:x-sparkles:valid-time:Gregorian.",
+                          "type": "string"
+                        },
+                        "foldChoice": {
+                          "description": "The choice for an ambiguous local time. It requires timezonePolicy and tzdbVersion.",
+                          "enum": [
+                            "earlier",
+                            "later"
+                          ],
+                          "type": "string"
+                        },
+                        "method": {
+                          "description": "The normalization method.",
+                          "type": "string"
+                        },
+                        "methodVersion": {
+                          "description": "The method's version. It cannot be empty.",
+                          "type": "string"
+                        },
+                        "status": {
+                          "enum": [
+                            "normalized",
+                            "unresolved",
+                            "unsupportedCalendar",
+                            "unsupportedPrecision",
+                            "indeterminateOrder",
+                            "nonexistentLocalTime"
+                          ],
+                          "type": "string"
+                        },
+                        "timezonePolicy": {
+                          "description": "The declared timezone policy. It cannot be empty.",
+                          "type": "string"
+                        },
+                        "tzdbVersion": {
+                          "description": "The pinned timezone database version. It cannot be empty.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "method",
+                        "methodVersion",
+                        "calendar"
+                      ],
+                      "type": "object"
+                    },
+                    "start": {
+                      "additionalProperties": false,
+                      "description": "A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision.",
+                      "properties": {
+                        "earliest": {
+                          "description": "A known boundary's earliest possible instant, inclusive, with an explicit offset.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "kind": {
+                          "enum": [
+                            "known",
+                            "unknown",
+                            "unbounded"
+                          ],
+                          "type": "string"
+                        },
+                        "latest": {
+                          "description": "A known boundary's latest possible instant, inclusive, with an explicit offset.",
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "precision": {
+                          "description": "A known boundary's source precision, such as urn:x-sparkles:valid-time:Day.",
+                          "type": "string"
+                        },
+                        "sourceValue": {
+                          "description": "The source's original expression. A known boundary requires it.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "start",
+                    "end",
+                    "normalization"
+                  ],
                   "type": "object"
                 }
               },

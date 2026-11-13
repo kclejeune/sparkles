@@ -219,6 +219,40 @@ struct ClaimJson {
     scope: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     confidence: FacetsJson,
+    /// The C27 validity record (spec C27 §4.4).
+    validity: Option<ValidityJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ValidityJson {
+    start: BoundaryJson,
+    end: BoundaryJson,
+    normalization: NormalizationJson,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BoundaryJson {
+    /// `known`, `unknown` or `unbounded`
+    kind: String,
+    earliest: Option<String>,
+    latest: Option<String>,
+    precision: Option<String>,
+    source_value: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NormalizationJson {
+    status: String,
+    method: String,
+    method_version: String,
+    calendar: String,
+    timezone_policy: Option<String>,
+    tzdb_version: Option<String>,
+    /// `earlier` or `later`
+    fold_choice: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -358,6 +392,91 @@ fn confidence(field: &str, c: &ConfidenceJson) -> ApiResult<Confidence> {
             .as_ref()
             .map(|m| method(&format!("{field}.method"), m))
             .transpose()?,
+    })
+}
+
+fn validity(at: &str, v: &ValidityJson) -> ApiResult<sparkles::evidence::ValidityInput> {
+    use sparkles::evidence::{FoldChoice, NormalizationInput, NormalizationStatus};
+    let n = &v.normalization;
+    let at_n = format!("{at}.normalization");
+    let status = match n.status.as_str() {
+        "normalized" => NormalizationStatus::Normalized,
+        "unresolved" => NormalizationStatus::Unresolved,
+        "unsupportedCalendar" => NormalizationStatus::UnsupportedCalendar,
+        "unsupportedPrecision" => NormalizationStatus::UnsupportedPrecision,
+        "indeterminateOrder" => NormalizationStatus::IndeterminateOrder,
+        "nonexistentLocalTime" => NormalizationStatus::NonexistentLocalTime,
+        _ => {
+            return Err(bad(
+                format!("{at_n}.status"),
+                "status is normalized, unresolved, unsupportedCalendar, unsupportedPrecision, indeterminateOrder or nonexistentLocalTime",
+            ));
+        }
+    };
+    let fold_choice = match n.fold_choice.as_deref() {
+        None => None,
+        Some("earlier") => Some(FoldChoice::Earlier),
+        Some("later") => Some(FoldChoice::Later),
+        Some(_) => {
+            return Err(bad(
+                format!("{at_n}.foldChoice"),
+                "foldChoice is earlier or later",
+            ));
+        }
+    };
+    Ok(sparkles::evidence::ValidityInput {
+        start: boundary(&format!("{at}.start"), &v.start)?,
+        end: boundary(&format!("{at}.end"), &v.end)?,
+        normalization: NormalizationInput {
+            status,
+            method: named(&format!("{at_n}.method"), &n.method)?,
+            method_version: n.method_version.clone(),
+            calendar: named(&format!("{at_n}.calendar"), &n.calendar)?,
+            timezone_policy: n.timezone_policy.clone(),
+            tzdb_version: n.tzdb_version.clone(),
+            fold_choice,
+        },
+    })
+}
+
+fn boundary(at: &str, b: &BoundaryJson) -> ApiResult<sparkles::evidence::BoundaryInput> {
+    use sparkles::evidence::BoundaryInput;
+    let finite = b.earliest.is_some() || b.latest.is_some() || b.precision.is_some();
+    Ok(match b.kind.as_str() {
+        "known" => {
+            let (Some(earliest), Some(latest), Some(precision), Some(source_value)) =
+                (&b.earliest, &b.latest, &b.precision, &b.source_value)
+            else {
+                return Err(bad(
+                    at.to_string(),
+                    "a known boundary has earliest, latest, precision and sourceValue",
+                ));
+            };
+            BoundaryInput::Known {
+                earliest: date_time(&format!("{at}.earliest"), earliest),
+                latest: date_time(&format!("{at}.latest"), latest),
+                precision: named(&format!("{at}.precision"), precision)?,
+                source_value: source_value.clone(),
+            }
+        }
+        "unknown" | "unbounded" if finite => {
+            return Err(bad(
+                at.to_string(),
+                "an unknown or unbounded boundary has no earliest, latest or precision",
+            ));
+        }
+        "unknown" => BoundaryInput::Unknown {
+            source_value: b.source_value.clone(),
+        },
+        "unbounded" => BoundaryInput::Unbounded {
+            source_value: b.source_value.clone(),
+        },
+        _ => {
+            return Err(bad(
+                format!("{at}.kind"),
+                "kind is known, unknown or unbounded",
+            ));
+        }
     })
 }
 
@@ -570,6 +689,11 @@ fn input_of(r: ClaimsRequest) -> ApiResult<(EvidenceInput, Request)> {
                 extraction: facet("extraction", &v.confidence.extraction)?,
                 analyst: facet("analyst", &v.confidence.analyst)?,
             },
+            validity: v
+                .validity
+                .as_ref()
+                .map(|validity_json| validity(&format!("{at}.validity"), validity_json))
+                .transpose()?,
         });
     }
     for (i, v) in r.links.iter().enumerate() {

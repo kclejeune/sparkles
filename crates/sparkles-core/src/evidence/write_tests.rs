@@ -45,6 +45,7 @@ fn input(occurrence: &str, object: &str) -> EvidenceInput {
             attributed_author: iri("urn:author"),
             scope: Default::default(),
             confidence: Default::default(),
+            validity: None,
         }],
         ..Default::default()
     }

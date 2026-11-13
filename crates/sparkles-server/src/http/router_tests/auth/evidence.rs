@@ -499,6 +499,86 @@ async fn authenticated_availability_is_server_owned_and_cannot_be_backdated() {
     );
 }
 
+/// A claim's validity record over HTTP (spec C27 §4.4): written with the claim, and
+/// refused before anything is written when malformed or sent through open scope.
+#[tokio::test]
+async fn claim_validity_records_are_written_with_the_claim_over_http() {
+    let s = proposal_server();
+    let ds = s.state.get("ev").unwrap();
+    let validity = serde_json::json!({
+        "start": {"kind": "known", "earliest": "2026-01-01T01:00:00+01:00",
+                  "latest": "2026-01-01T01:00:00+01:00",
+                  "precision": "urn:x-sparkles:valid-time:Day", "sourceValue": "1 January 2026"},
+        "end": {"kind": "unknown", "sourceValue": "until further notice"},
+        "normalization": {"status": "normalized", "method": "urn:method:dates",
+                          "methodVersion": "1", "calendar": "urn:x-sparkles:valid-time:Gregorian"},
+    });
+    let head = ds.store.head_commit();
+    let mut refused = Vec::new();
+    for (path, value) in [
+        ("/start/kind", serde_json::json!("sometimes")),
+        ("/start/precision", serde_json::Value::Null),
+        ("/end/earliest", serde_json::json!("2026-02-01T00:00:00Z")),
+        ("/normalization/status", serde_json::json!("guessed")),
+        ("/normalization/foldChoice", serde_json::json!("earlier")),
+        ("/start/earliest", serde_json::json!("2026-01-01T00:00:00")),
+        ("/extra", serde_json::json!(1)),
+    ] {
+        let mut v = validity.clone();
+        let (parent, leaf) = path.rsplit_once('/').unwrap();
+        let target = if parent.is_empty() {
+            &mut v
+        } else {
+            v.pointer_mut(parent).unwrap()
+        };
+        if value.is_null() {
+            target.as_object_mut().unwrap().remove(leaf);
+        } else {
+            target[leaf] = value;
+        }
+        let mut body = revision_and_claim("c1");
+        body["claims"][0]["validity"] = v;
+        let r = propose(&s, &b("evw"), &body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{path}: {}", r.text());
+        refused.push(r.json()["code"].clone());
+    }
+    let mut scoped = revision_and_claim("c1");
+    scoped["claims"][0]["scope"] =
+        serde_json::json!({"urn:x-sparkles:valid-time:validDuring": ["<urn:period>"]});
+    let r = propose(&s, &b("evw"), &scoped).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(
+        ds.store.head_commit(),
+        head,
+        "nothing was written: {refused:?}"
+    );
+    // a valid record is written with the claim, its instants in UTC
+    let mut body = revision_and_claim("c1");
+    body["claims"][0]["validity"] = validity;
+    let r = propose(&s, &b("evw"), &body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let claim = r.json()["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "claim")
+        .unwrap()["iri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        ds.dataset
+            .ask(&format!(
+                "PREFIX vt: <urn:x-sparkles:valid-time:>
+                 ASK {{ GRAPH <urn:ev:claims> {{
+                   <{claim}> vt:validDuring ?i . ?i a vt:Interval ; vt:normalization/vt:status vt:Normalized ;
+                     vt:start [ vt:kind vt:Known ; vt:earliest \"2026-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> ] ;
+                     vt:end [ vt:kind vt:Unknown ; vt:sourceValue \"until further notice\" ] }} }}"
+            ))
+            .unwrap()
+    );
+}
+
 /// A claims ingestion (spec C25, "Ingestion into claim proposals") needs `write` on the
 /// update endpoint and update grants on the evidence graphs it writes, and a caller
 /// without them is refused before any model call.

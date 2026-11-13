@@ -7143,7 +7143,7 @@ export interface components {
                 };
                 /** @description The assessment's key within its target. */
                 occurrenceKey: string;
-                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused. */
+                /** @description Domain scope: predicate IRIs to N-Triples terms. Evidence profile, valid-time, PROV-O and structural predicates are refused. */
                 scope?: {
                     [key: string]: string[];
                 };
@@ -7219,9 +7219,69 @@ export interface components {
                     /** @description A record of this batch, by its key. */
                     key?: string;
                 };
-                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused. */
+                /** @description Domain scope: predicate IRIs to N-Triples terms. Evidence profile, valid-time, PROV-O and structural predicates are refused. */
                 scope?: {
                     [key: string]: string[];
+                };
+                /** @description The claim's C27 validity record, a half-open interval written with the claim and covered by its record digest. The latest start must precede the earliest end of two known boundaries. */
+                validity?: {
+                    /** @description A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision. */
+                    end: {
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's earliest possible instant, inclusive, with an explicit offset.
+                         */
+                        earliest?: string;
+                        /** @enum {string} */
+                        kind: "known" | "unknown" | "unbounded";
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's latest possible instant, inclusive, with an explicit offset.
+                         */
+                        latest?: string;
+                        /** @description A known boundary's source precision, such as urn:x-sparkles:valid-time:Day. */
+                        precision?: string;
+                        /** @description The source's original expression. A known boundary requires it. */
+                        sourceValue?: string;
+                    };
+                    normalization: {
+                        /** @description The calendar. Normalized values use urn:x-sparkles:valid-time:Gregorian. */
+                        calendar: string;
+                        /**
+                         * @description The choice for an ambiguous local time. It requires timezonePolicy and tzdbVersion.
+                         * @enum {string}
+                         */
+                        foldChoice?: "earlier" | "later";
+                        /** @description The normalization method. */
+                        method: string;
+                        /** @description The method's version. It cannot be empty. */
+                        methodVersion: string;
+                        /** @enum {string} */
+                        status: "normalized" | "unresolved" | "unsupportedCalendar" | "unsupportedPrecision" | "indeterminateOrder" | "nonexistentLocalTime";
+                        /** @description The declared timezone policy. It cannot be empty. */
+                        timezonePolicy?: string;
+                        /** @description The pinned timezone database version. It cannot be empty. */
+                        tzdbVersion?: string;
+                    };
+                    /** @description A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision. */
+                    start: {
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's earliest possible instant, inclusive, with an explicit offset.
+                         */
+                        earliest?: string;
+                        /** @enum {string} */
+                        kind: "known" | "unknown" | "unbounded";
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's latest possible instant, inclusive, with an explicit offset.
+                         */
+                        latest?: string;
+                        /** @description A known boundary's source precision, such as urn:x-sparkles:valid-time:Day. */
+                        precision?: string;
+                        /** @description The source's original expression. A known boundary requires it. */
+                        sourceValue?: string;
+                    };
                 };
             }[];
             /** @description Check and preview the write without committing it or holding commits. */

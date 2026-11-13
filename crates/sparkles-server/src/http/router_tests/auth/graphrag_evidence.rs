@@ -330,6 +330,7 @@ fn propose(ds: &sparkles::Dataset, source: &str, t: Triple) -> (NamedNode, Sha25
             attributed_author: iri("urn:publisher"),
             scope: Default::default(),
             confidence: Default::default(),
+            validity: None,
         }],
         ..Default::default()
     };

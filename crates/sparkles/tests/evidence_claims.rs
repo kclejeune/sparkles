@@ -136,6 +136,7 @@ fn occurrence(source: &str, polarity: Polarity, proposition: Triple) -> Evidence
             attributed_author: iri("urn:publisher"),
             scope: Default::default(),
             confidence: Default::default(),
+            validity: None,
         }],
         ..Default::default()
     }
