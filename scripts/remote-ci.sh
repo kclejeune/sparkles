@@ -75,6 +75,12 @@ done
   echo "remote-ci.sh: no host; pass --host or set SPARKLES_REMOTE_CI_HOST" >&2
   exit 2
 }
+# shellcheck source=scripts/gate/config.sh
+. "$here/gate/config.sh"
+if is_bench "$host"; then
+  echo "remote-ci.sh: $host is the benchmark host (SPARKLES_BENCH_HOST) and never runs CI" >&2
+  exit 2
+fi
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
@@ -85,10 +91,7 @@ status() {
 fetch() {
   local dest=$root/.artifacts/remote-ci/$1
   mkdir -p "$dest"
-  case $host in
-    boat:*) rx_get "$host" "gate/out/$1" "$dest" ;;
-    *) rx_sync -- -a "$host:gate/out/$1/" "$dest/" ;;
-  esac
+  rx_sync -- -a "$host:gate/out/$1/" "$dest/"
   echo "results in $dest"
 }
 case $name in '' | *[!A-Za-z0-9._-]*) [ "$action" = start ] || {
@@ -132,10 +135,13 @@ case $host in
     ;;
 esac
 min=${REMOTE_CI_MIN_SECONDS:-600}
-# The job's script travels on stdin. The host checks that no job of that name runs, stores the
+# The job's script travels on stdin. Under the host's start lock, so that two starts of one
+# name cannot both pass the check, the host checks that no job of that name runs, stores the
 # script beside the job's results and starts the unit, whose runtime it takes from the end.
 # shellcheck disable=SC2016
 rx_exec "$host" "set -e; umask 022; G=\$HOME/gate; o=\$G/out/$name
+exec 8>> \$G/.remote-ci-start.lock
+flock -w 120 8 || { echo 'another remote-ci start holds the start lock' >&2; exit 4; }
 if systemctl --user is-active -q gate-$name; then echo 'gate-$name is already running' >&2; exit 1; fi
 systemctl --user reset-failed gate-$name 2> /dev/null || true
 if [ -d \"\$o\" ]; then mv \"\$o\" \"\$o.old-\$(date +%s)\"; fi
@@ -150,7 +156,7 @@ for n in MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE
 done
 p=\$PATH; [ ! -d \"\$G/py-venv/bin\" ] || p=\$G/py-venv/bin:\$p
 systemd-run --user --unit gate-$name --collect -q \"\${forward[@]}\" \\
-  -p MemoryMax=\${GATE_MEMORY_MAX:-13G} -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p UMask=0022 \\
+  -p MemoryMax=\${GATE_MEMORY_MAX:-13G} -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p TimeoutStopSec=60 -p UMask=0022 \\
   --setenv=HOME=\"\$HOME\" --setenv=USER=\"\$USER\" --setenv=PATH=\"\$p\" --setenv=SPARKLES_REMOTE_EXECUTOR=$executor \\
   --setenv=CARGO_BUILD_JOBS=6 --setenv=CARGO_INCREMENTAL=0 \\
   --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end \\

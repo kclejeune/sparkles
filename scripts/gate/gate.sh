@@ -58,9 +58,10 @@
 # the worker, which systemd ends with all its processes GATE_BOAT_PREP_SECONDS after it
 # begins, 900 by default, so the unit is activated within that bound or not at all. The
 # unit's runtime is computed just before the start to end GATE_BOAT_RESERVE seconds before
-# the admitted end, 1200 by default, plus that bound, so the gate ends GATE_BOAT_RESERVE
-# seconds before the admitted end however late it activates. That leaves the closure watch
-# its 900-second lead.
+# the admitted end, 1200 by default, plus that bound, so a late activation still ends
+# GATE_BOAT_RESERVE seconds before the admitted end and leaves the closure watch its
+# 900-second lead. The runtime is computed here, before the start is sent, so a slow
+# dispatch can still carry the gate past that lead, which roadmap item 803 tracks.
 #
 # These settings may also live in ~/.config/sparkles/gate.env (or $SPARKLES_GATE_CONFIG)
 # as KEY=VALUE lines, and the environment takes precedence.
@@ -290,9 +291,9 @@ start_on() {
   case $h in boat:*)
     local runtime
     # The runtime counts from the unit's activation, which the prep scope bounds, so the
-    # reserve here adds the scope's bound and the gate ends GATE_BOAT_RESERVE seconds
-    # before the admitted end. It is computed after the bundle and the install, so their
-    # time does not count against it.
+    # reserve here adds the scope's bound. It is computed after the bundle and the install,
+    # so their time does not count against it, but before the dispatch, whose delay still
+    # counts against the reserve (roadmap item 803).
     runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))") || return
     args+=" --executor boat --runtime $runtime"
     ;;
@@ -307,8 +308,10 @@ start_on() {
     boat:*)
       # The scope holds gate-start.sh and every process it starts, reparented or not, and
       # systemd ends them all when the scope's bound passes. The gate unit itself is a
-      # separate service, which gate-start.sh creates within that bound.
-      rx_exec "$h" "systemd-run --user --scope -q --unit gate-prep-$n -p RuntimeMaxSec=$prep \$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
+      # separate service, which gate-start.sh creates within that bound. A scope that its
+      # bound ended stays loaded as failed, so a retry of the same name resets it first, and
+      # --collect unloads the scope however it ends.
+      rx_exec "$h" "systemctl --user reset-failed gate-prep-$n 2> /dev/null; systemd-run --user --scope -q --collect --unit gate-prep-$n -p RuntimeMaxSec=$prep \$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
       ;;
     *) rx_exec "$h" "\$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")" ;;
   esac

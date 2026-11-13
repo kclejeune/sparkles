@@ -484,9 +484,11 @@ class Admission(unittest.TestCase):
         self.assertIn('--reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))"',body[runtime])
         # The runtime is computed after the bundle and the install, just before the start.
         self.assertLess(at('rx_bundle'),runtime);self.assertLess(at('bin=$(install_remote'),runtime)
-        start=at('systemd-run --user --scope -q --unit gate-prep-$n -p RuntimeMaxSec=$prep')
+        start=at('systemd-run --user --scope -q --collect --unit gate-prep-$n -p RuntimeMaxSec=$prep')
         self.assertLess(runtime,start);self.assertIn('\\$HOME/$bin/gate-start.sh $full $args',body[start])
-        self.assertEqual(body[start-4].strip(),'boat:*)')
+        self.assertEqual(body[start-6].strip(),'boat:*)')
+        # A retry first resets a scope that its bound ended.
+        self.assertIn('systemctl --user reset-failed gate-prep-$n 2> /dev/null;',body[start])
         # The closure watch counts the scope as a job unit, and gate.env may set the bound.
         self.assertIn("'gate-'",(ROOT/'scripts/boat/controller.py').read_text().split('JOB_UNIT_PREFIXES=',1)[1].splitlines()[0])
         self.assertIn('GATE_BOAT_PREP_SECONDS |',(ROOT/'scripts/gate/config.sh').read_text())
