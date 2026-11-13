@@ -565,18 +565,28 @@ fn a_large_json_ld_document_keeps_to_a_short_deadline() {
     );
 }
 
+/// With no deadline, linting expands the document once and then only as much as the
+/// probes' work budget lets it. Expansion is the costly step, so counting its bytes
+/// bounds the lint's work on any host, where a wall-clock bound fails on a loaded one.
 #[test]
 fn probes_without_a_deadline_stay_within_their_work_budget() {
     // as in the browser: no deadline, many queries, a large document
     let doc = big_shapes(2 << 20, 100);
     jsonld::PROBED.with(|p| p.set(0));
-    let start = std::time::Instant::now();
+    super::EXPANDED.with(|e| e.set(0));
     let d = diags(&doc);
-    let took = start.elapsed();
     let probed = jsonld::PROBED.with(std::cell::Cell::get);
+    let expanded = super::EXPANDED.with(std::cell::Cell::get);
     assert!(probed <= 4 * doc.len(), "{probed} of {}", doc.len());
     assert!(probed > 0);
-    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    // the document is expanded once, and every other expansion is a probe or fix check
+    // that the budget allowed
+    assert_eq!(
+        expanded,
+        doc.len() + probed,
+        "{expanded} expanded, {probed} probed, of {}",
+        doc.len()
+    );
     // the queries that were probed are linted, the rest are skipped
     let found = d.iter().filter(|d| d.rule == "undefined-prefix").count();
     assert!(found <= 100, "{found}");
