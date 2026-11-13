@@ -1629,7 +1629,8 @@ pub(crate) fn complete_schema(
 
 /// The abstract facts of [`refine_schema`] by predicate, and its types by class. A fact
 /// with a wildcard predicate is a candidate of every atom, and a type with a wildcard
-/// class of every type atom.
+/// class of every type atom. Those facts are listed once, beside the buckets, so that the
+/// index stays linear in the facts, within the workspace the refinement admits.
 struct AbstractIndex {
     by_pred: FxHashMap<u64, Vec<usize>>,
     by_class: FxHashMap<u64, Vec<usize>>,
@@ -1664,27 +1665,35 @@ impl AbstractIndex {
             }
         }
         // a wildcard predicate can be rdf:type with any class
-        for &i in &ix.any_pred {
-            ix.any_class.push(i);
-        }
-        for list in ix.by_pred.values_mut() {
-            list.extend(ix.any_pred.iter().copied());
-        }
-        for list in ix.by_class.values_mut() {
-            list.extend(ix.any_class.iter().copied());
-        }
+        ix.any_class.extend_from_slice(&ix.any_pred);
         ix
     }
 
-    /// The facts an atom of known predicate `p` and object `o` can match.
-    fn candidates(&self, p: Option<u64>, o: Option<u64>) -> &[usize] {
-        match (p, o) {
-            (Some(p), Some(c)) if p == self.rdf_type => {
-                self.by_class.get(&c).map_or(&self.any_class, |v| v)
-            }
-            (Some(p), _) => self.by_pred.get(&p).map_or(&self.any_pred, |v| v),
-            (None, _) => &self.all,
-        }
+    /// The facts an atom of known predicate `p` and object `o` can match: those of its
+    /// bucket and those with a wildcard in its place.
+    fn candidates(&self, p: Option<u64>, o: Option<u64>) -> impl Iterator<Item = usize> + '_ {
+        let (bucket, wild): (&[usize], &[usize]) = match (p, o) {
+            (Some(p), Some(c)) if p == self.rdf_type => (
+                self.by_class.get(&c).map_or(&[], |v| v.as_slice()),
+                &self.any_class,
+            ),
+            (Some(p), _) => (
+                self.by_pred.get(&p).map_or(&[], |v| v.as_slice()),
+                &self.any_pred,
+            ),
+            (None, _) => (&self.all, &[]),
+        };
+        bucket.iter().chain(wild).copied()
+    }
+
+    /// The entries the index holds, which stay within a small multiple of the facts.
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.by_pred.values().map(Vec::len).sum::<usize>()
+            + self.by_class.values().map(Vec::len).sum::<usize>()
+            + self.any_pred.len()
+            + self.any_class.len()
+            + self.all.len()
     }
 }
 
@@ -1705,7 +1714,7 @@ fn list_members(
             continue;
         }
         for p in [terms.rdf_first, terms.rdf_rest] {
-            for &i in index.candidates(Some(p), None) {
+            for i in index.candidates(Some(p), None) {
                 let f = facts[i];
                 if f[0] != Some(node) || f[1] != Some(p) {
                     continue;
@@ -1863,7 +1872,7 @@ pub(crate) fn refine_schema(
                         Slot::Var(v) => binding[v],
                         Slot::Any => None,
                     };
-                    for &i in index.candidates(known(a.p), known(a.o)) {
+                    for i in index.candidates(known(a.p), known(a.o)) {
                         let fact = &facts[i];
                         if cancel.load(Ordering::Relaxed) {
                             return Ok(());
@@ -2452,6 +2461,45 @@ pub(crate) enum TransformError {
 #[cfg(test)]
 mod schema_completeness_tests {
     use super::*;
+
+    /// The abstraction's index lists the facts with a wildcard predicate or class once,
+    /// not in every bucket, so that many buckets beside many wildcard facts stay linear
+    /// (spec F17, item 911), and an atom still meets every fact it can match.
+    #[test]
+    fn abstract_index_stays_linear_and_keeps_wildcard_candidates() {
+        let rdf_type = 7;
+        let n = 3000u64;
+        let mut facts: Vec<[Option<u64>; 3]> = Vec::new();
+        for i in 0..n {
+            facts.push([Some(10_000 + i), Some(20_000 + i), None]);
+            facts.push([Some(10_000 + i), None, Some(30_000)]);
+            facts.push([None, Some(rdf_type), Some(40_000 + i)]);
+        }
+        facts.push([None, Some(rdf_type), None]);
+        let ix = AbstractIndex::new(&facts, rdf_type);
+        assert!(
+            ix.entries() <= 4 * facts.len(),
+            "{} entries for {} facts",
+            ix.entries(),
+            facts.len()
+        );
+        let wild = facts.len() - 1;
+        let of = |p: Option<u64>, o: Option<u64>| ix.candidates(p, o).collect::<Vec<usize>>();
+        // a predicate's own fact and every wildcard predicate
+        let got = of(Some(20_005), None);
+        assert_eq!(got.len(), 1 + n as usize);
+        assert!(got.contains(&15) && got.contains(&16));
+        // a class's own type, the type of a wildcard class and every wildcard predicate
+        let got = of(Some(rdf_type), Some(40_005));
+        assert_eq!(got.len(), 2 + n as usize);
+        assert!(got.contains(&17) && got.contains(&wild) && got.contains(&1));
+        // an unknown class reads every type and every wildcard predicate
+        assert_eq!(of(Some(rdf_type), None).len(), 2 * n as usize + 1);
+        // an unknown predicate reads every fact
+        assert_eq!(of(None, None).len(), facts.len());
+        // a predicate without facts reads the wildcard predicates
+        assert_eq!(of(Some(99), None).len(), n as usize);
+    }
 
     fn rule(predicate: Slot, object: Slot, body: Vec<(u64, Slot)>) -> CRule {
         CRule {

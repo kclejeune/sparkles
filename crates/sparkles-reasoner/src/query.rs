@@ -1037,7 +1037,13 @@ impl Session {
         });
         let schema_from = self.graph.as_ref().expect("graph made").derived().len();
         let mut lower_end = schema_from;
+        // where the schema came from, which the completeness proof's cache tells apart:
+        // whether it came from the table, and whether a pass's table holds every schema
+        // fact the pass gave (spec F17, item 911)
+        let mut from_table = false;
+        let mut table_exact = false;
         if let Some(t) = key.as_ref().and_then(tables::get) {
+            from_table = true;
             let facts = self.remap(&t)?;
             let g = self.graph.as_mut().expect("graph made");
             g.try_add_batch(facts)
@@ -1074,16 +1080,29 @@ impl Session {
             // The axioms, the facts of rules without a body, join the facts the pass
             // reads as stored: a schema fact can follow from an axiom about an instance,
             // such as `rdf:nil rdf:type rdf:List`, which the pass would otherwise miss
-            // and the completeness proof would then leave open (spec F17, item 911).
+            // and the completeness proof would then leave open (spec F17, item 911). An
+            // axiom the input graphs hold is left out: a batch is deduplicated against
+            // the derived facts only, and a derived copy of a stored fact would reach
+            // the answer twice, since the overlay takes derived facts as absent from
+            // the store.
             let axioms = self
                 .rules
                 .iter()
                 .filter(|r| r.atoms.is_empty() && r.builtins.is_empty());
             let mut seeds = seeds;
+            let base = self.graph.as_ref().expect("graph made").base_arc();
             for r in axioms {
                 for h in &r.head {
                     if let CHead::Triple(Slot::Const(s), Slot::Const(p), Slot::Const(o)) = *h {
-                        seeds.push([s, p, o]);
+                        let stored = match &base {
+                            Some(b) => b
+                                .contains(&[s, p, o])
+                                .map_err(|e| component("reasoning-failed", format!("{e:#}")))?,
+                            None => false,
+                        };
+                        if !stored {
+                            seeds.push([s, p, o]);
+                        }
                     }
                 }
             }
@@ -1097,7 +1116,7 @@ impl Session {
                 // the schema facts the lower stages gave belong to the schema, and their
                 // instance facts are derived again by the sessions that read the table
                 let closed = crate::specialize::closed(&vocab, rdf_type);
-                self.cache_schema(key, schema_from, lower_end, &closed);
+                table_exact = self.cache_schema(key, schema_from, lower_end, &closed);
             }
         }
         let schema_to = self.graph.as_ref().expect("graph made").derived().len();
@@ -1113,20 +1132,36 @@ impl Session {
         // complete. Keep that vocabulary for exposure independently of closure.
         self.closed = Some(crate::specialize::closed(&vocab, rdf_type));
         let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"));
-        // The proof depends only on the rules and the view, so a later session of the
-        // same view reads it instead of scanning again (spec F17, item 911).
+        // The proof depends on the rules, the view and the schema the session holds,
+        // so a later session of the same view whose schema came the same way reads it
+        // instead of scanning again (spec F17, item 911). A session with facts of its
+        // own neither reads nor keeps a proof.
         let proof_key = self
             .schema_view
             .as_ref()
-            .map(|v| (v.clone(), self.shared.digest));
+            .filter(|_| !self.added_facts)
+            .map(|v| (v.clone(), self.shared.digest, from_table));
         // the analysis's admission lasts while its closure sets are in use
         let mut _admission = None;
+        // the session's own closure sets, made from a cached proof or copied from the
+        // analysis, are charged while they are in use
+        let set_bytes = |n: usize| n.saturating_mul(64).saturating_add(256);
+        let mut _sets = None;
         let closed_proof = match proof_key.as_ref().and_then(proofs::get) {
-            Some(proof) => demand::Closed {
-                preds: proof.preds.iter().map(|t| self.id_of(t)).collect(),
-                classes: proof.classes.iter().map(|t| self.id_of(t)).collect(),
-                rdf_type,
-            },
+            Some(proof) => {
+                _sets = Some(
+                    Held::try_new(
+                        &self.budget,
+                        set_bytes(proof.preds.len() + proof.classes.len()),
+                    )
+                    .map_err(|e| memory_error(e, "schema completeness"))?,
+                );
+                demand::Closed {
+                    preds: proof.preds.iter().map(|t| self.id_of(t)).collect(),
+                    classes: proof.classes.iter().map(|t| self.id_of(t)).collect(),
+                    rdf_type,
+                }
+            }
             None => {
                 let flag = AtomicBool::new(false);
                 let (complete, stopped) = watched(&self.stop, &flag, || {
@@ -1164,6 +1199,13 @@ impl Session {
                     Ok(e) => memory_error(e, "schema completeness"),
                     Err(e) => component("reasoning-failed", format!("{e:#}")),
                 })?;
+                _sets = Some(
+                    Held::try_new(
+                        &self.budget,
+                        set_bytes(complete.closed.preds.len() + complete.closed.classes.len()),
+                    )
+                    .map_err(|e| memory_error(e, "schema completeness"))?,
+                );
                 let closed = complete.closed.clone();
                 if let Some(key) = proof_key {
                     let terms = |ids: &FxHashSet<u64>| -> Option<Vec<Term>> {
@@ -1172,7 +1214,15 @@ impl Session {
                     if let (Some(preds), Some(classes)) =
                         (terms(&closed.preds), terms(&closed.classes))
                     {
-                        proofs::put(key, proofs::Proof { preds, classes });
+                        let proof = Arc::new(proofs::Proof { preds, classes });
+                        // A table that holds every schema fact of the pass gives the
+                        // sessions that read it the facts this proof read. A table
+                        // without a generalized fact, such as one whose subject is a
+                        // literal, does not, and those sessions prove again.
+                        if table_exact {
+                            proofs::put((key.0.clone(), key.1, true), proof.clone());
+                        }
+                        proofs::put(key, proof);
                     }
                 }
                 _admission = Some(complete);
@@ -1351,20 +1401,27 @@ impl Session {
     /// Keep the facts the schema pass derived from row `from` of the derived tier in the
     /// table cache, unless a rule made a blank node among them. Of the rows before
     /// `lower_end`, which its lower stages derived, only the schema facts `closed` names
-    /// are kept (Codex re-review F17-P1 #1).
+    /// are kept (Codex re-review F17-P1 #1). Returns whether a table was kept that holds
+    /// every fact the schema pass gave except the hidden ones, which a generalized fact,
+    /// such as one whose subject is a literal, prevents (spec F17, item 911).
     fn cache_schema(
         &self,
         key: tables::Key,
         from: usize,
         lower_end: usize,
         closed: &demand::Closed,
-    ) {
+    ) -> bool {
         let g = self.graph.as_ref().expect("graph made");
         let mut facts: Vec<[u64; 3]> = Vec::new();
         let mut keys: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut seen: FxHashSet<u64> = FxHashSet::default();
+        let mut exact = true;
         for (i, t) in g.derived()[from..].iter().enumerate() {
-            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+            if self.hidden.contains(&t[1]) {
+                continue;
+            }
+            if !self.terms.valid(t) {
+                exact = false;
                 continue;
             }
             let schema = || {
@@ -1381,7 +1438,7 @@ impl Session {
                 if Id(x).tag() == Tag::Local && seen.insert(x) {
                     match self.terms.local(x) {
                         Some(LocalTerm::Key(k)) => keys.push((x, k.clone())),
-                        _ => return,
+                        _ => return false,
                     }
                 }
             }
@@ -1394,6 +1451,7 @@ impl Session {
                 keys,
             }),
         );
+        exact
     }
 
     /// The facts of a cached table in this session's ids.
@@ -2510,7 +2568,9 @@ mod proofs {
         pub classes: Vec<Term>,
     }
 
-    type Key = (String, u64);
+    /// The view, the rules digest, and whether the session's schema came from the
+    /// schema's table rather than a pass of its own.
+    type Key = (String, u64, bool);
 
     static PROOFS: Mutex<VecDeque<(Key, Arc<Proof>)>> = Mutex::new(VecDeque::new());
 
@@ -2522,7 +2582,7 @@ mod proofs {
             .map(|(_, p)| p.clone())
     }
 
-    pub(super) fn put(key: Key, proof: Proof) {
+    pub(super) fn put(key: Key, proof: Arc<Proof>) {
         let mut proofs = PROOFS.lock().unwrap_or_else(|e| e.into_inner());
         if proofs.iter().any(|(k, _)| *k == key) {
             return;
@@ -2530,6 +2590,6 @@ mod proofs {
         if proofs.len() == VIEWS {
             proofs.pop_front();
         }
-        proofs.push_back((key, Arc::new(proof)));
+        proofs.push_back((key, proof));
     }
 }
