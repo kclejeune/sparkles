@@ -1088,7 +1088,11 @@ impl<'a> Eval<'a> {
     /// Match the atom of step `k` against derived facts, in ascending id order, which the
     /// order of first derivation of the heads follows.
     fn rows(&mut self, k: usize, atom: usize, b: &mut [u64], cands: Cands<'_>) {
-        if let Some(head) = self.probe_ahead(k, atom, b) {
+        // one candidate has no probe to overlap, and a later check that rejects it would
+        // leave its probe unused
+        if cands.len() > 1
+            && let Some(head) = self.probe_ahead(k, atom, b)
+        {
             self.rows_ahead(k, atom, b, cands, head);
             return;
         }
@@ -2602,6 +2606,86 @@ mod tests {
             kept.push(b);
         }
         assert_eq!(held.bytes(), 1_000 * slot);
+    }
+
+    /// The planner reads the distinct keys of the facts, not of the runs that hold them:
+    /// the same facts merged in one batch or in two plan the same join and give a list
+    /// link the same value. With per-run estimates, two runs of `P` counted 94 of its 100
+    /// subjects and the plan started at `Q`, which finds the other value first.
+    #[test]
+    fn statistics_follow_the_facts_not_the_runs() {
+        use sparkles_core::store::{Store, StoreOptions};
+        let t = Terms::new(Store::in_memory(StoreOptions::default()).snapshot());
+        let (p, q) = (1000, 1001);
+        let atom = |s, p, o| Atom { s, p, o };
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut got = Vec::new();
+                for split in [false, true] {
+                    let mut g = Graph::default();
+                    let ps: Vec<Triple> = (1..=100)
+                        .flat_map(|s| [[s, p, 10_000 + s * 10], [s, p, 10_001 + s * 10]])
+                        .collect();
+                    if split {
+                        g.add_batch(ps[..100].iter().copied());
+                        g.add_batch(ps[100..].iter().copied());
+                    } else {
+                        g.add_batch(ps);
+                    }
+                    g.add_batch(
+                        [[1, q, 10_011], [1, q, 10_010]]
+                            .into_iter()
+                            .chain(
+                                (2..=100).flat_map(|s| {
+                                    [[s, q, 10_000 + s * 10], [s, q, 10_001 + s * 10]]
+                                }),
+                            )
+                            .chain((2..=10).map(|s| [s, q, 999_999])),
+                    );
+                    g.add_batch([[999, t.rdf_rest, t.rdf_nil]]);
+                    let r = CRule {
+                        name: "list".into(),
+                        nvars: 1,
+                        builtins: vec![],
+                        atoms: vec![
+                            atom(Slot::Const(1), Slot::Const(p), Slot::Var(0)),
+                            atom(Slot::Const(1), Slot::Const(q), Slot::Var(0)),
+                        ],
+                        head: vec![CHead::Triple(
+                            Slot::Const(999),
+                            Slot::Const(t.rdf_first),
+                            Slot::Var(0),
+                        )],
+                    };
+                    assert_eq!(g.pstats(p), (100, 200), "split {split}");
+                    let lim = Limits {
+                        max_iterations: 10,
+                        max_inferred: 10_000,
+                        cancel: None,
+                        progress: None,
+                        budget: Budget::unlimited(),
+                        closures: false,
+                    };
+                    run(&mut g, &[r], &t, &lim, None).unwrap();
+                    let list = g
+                        .list(
+                            &mut Memo::default(),
+                            999,
+                            t.rdf_first,
+                            t.rdf_rest,
+                            t.rdf_nil,
+                            g.len(),
+                        )
+                        .unwrap();
+                    got.push(list[0]);
+                }
+                assert_eq!(got[0], got[1], "{threads} threads");
+            });
+        }
     }
 }
 

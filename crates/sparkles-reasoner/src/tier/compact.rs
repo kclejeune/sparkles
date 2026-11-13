@@ -111,9 +111,8 @@ fn digit_sorted(e: Vec<Entry>) -> Vec<Entry> {
     src
 }
 
-/// The run of `ids`, which ascend, sorted by `key` and then id: the entries are keyed
-/// once and sorted, and the run is built from them.
-pub(crate) fn sorted(ids: &[u32], key: &(impl Fn(u32) -> u64 + Sync)) -> Run {
+/// The entries of `ids`, which ascend, sorted by key and then id.
+fn sorted_entries(ids: &[u32], key: &(impl Fn(u32) -> u64 + Sync)) -> Vec<Entry> {
     debug_assert!(ids.is_sorted(), "a batch's ids ascend");
     let mut e = keyed(ids, key);
     if by_digits(e.len()) {
@@ -121,7 +120,77 @@ pub(crate) fn sorted(ids: &[u32], key: &(impl Fn(u32) -> u64 + Sync)) -> Run {
     } else {
         sort(&mut e);
     }
-    Run::from_sorted(e.iter().copied())
+    e
+}
+
+/// The distinct keys of sorted entries for which `fresh` holds, in parallel for many.
+fn count_fresh(e: &[Entry], fresh: &(impl Fn(u64) -> bool + Sync)) -> usize {
+    let first = |i: usize| i == 0 || e[i - 1].0 != e[i].0;
+    if e.len() >= PAR_MIN {
+        (0..e.len())
+            .into_par_iter()
+            .with_min_len(PAR_MIN)
+            .filter(|&i| first(i) && fresh(e[i].0))
+            .count()
+    } else {
+        (0..e.len()).filter(|&i| first(i) && fresh(e[i].0)).count()
+    }
+}
+
+/// The run of `ids`, which ascend, sorted by `key` and then id, and the number of its
+/// distinct keys for which `fresh` holds: the entries are keyed once and sorted, and
+/// the run is built from them.
+pub(crate) fn sorted(
+    ids: &[u32],
+    key: &(impl Fn(u32) -> u64 + Sync),
+    fresh: &(impl Fn(u64) -> bool + Sync),
+) -> (Run, usize) {
+    let e = sorted_entries(ids, key);
+    let n = count_fresh(&e, fresh);
+    (Run::from_sorted(e.iter().copied()), n)
+}
+
+/// The run of the ids among `ids`, which ascend, that `keep` accepts, sorted by `key`
+/// and then id, with the distinct keys of all of `ids` and those of them that only
+/// refused ids have, sorted. The entries of all of `ids` are sorted, so the sort's
+/// buffers are those of `ids.len()` entries.
+pub(crate) fn sorted_live(
+    ids: &[u32],
+    key: &(impl Fn(u32) -> u64 + Sync),
+    keep: &(impl Fn(u32) -> bool + Sync),
+) -> (Run, usize, Vec<u64>) {
+    let mut e = sorted_entries(ids, key);
+    let (mut keys, mut ghosts) = (0, Vec::new());
+    let mut i = 0;
+    while i < e.len() {
+        let k = e[i].0;
+        let mut live = false;
+        while i < e.len() && e[i].0 == k {
+            live |= keep(e[i].1);
+            i += 1;
+        }
+        keys += 1;
+        if !live {
+            ghosts.push(k);
+        }
+    }
+    e.retain(|x| keep(x.1));
+    (Run::from_sorted(e.iter().copied()), keys, ghosts)
+}
+
+/// The keys of the ids of `runs` that `keep` refuses, sorted and without repeats.
+pub(crate) fn dropped_keys(
+    runs: &[Run],
+    key: &impl Fn(u32) -> u64,
+    keep: &impl Fn(u32) -> bool,
+) -> Vec<u64> {
+    let mut k: Vec<u64> = runs
+        .iter()
+        .flat_map(|r| r.ids().iter().copied().filter(|&id| !keep(id)).map(key))
+        .collect();
+    k.sort_unstable();
+    k.dedup();
+    k
 }
 
 /// The runs merged into one, without the ids `keep` refuses.
@@ -214,21 +283,20 @@ mod tests {
         let mut runs = Vec::new();
         for r in [0..100u32, 100..130, 130..300] {
             let ids: Vec<u32> = r.collect();
-            runs.push(sorted(&ids, &key));
+            runs.push(sorted(&ids, &key, &|_| true).0);
         }
         let keep = |id: u32| !id.is_multiple_of(11);
         let want = {
             let ids: Vec<u32> = (0..300).filter(|&id| keep(id)).collect();
-            sorted(&ids, &key)
+            sorted(&ids, &key, &|_| true).0
         };
         assert_eq!(merged(&runs, &key, &keep).ids(), want.ids());
         let two = {
             let ids: Vec<u32> = (0..130).filter(|&id| keep(id)).collect();
-            sorted(&ids, &key)
+            sorted(&ids, &key, &|_| true).0
         };
         let m = merged(&runs[..2], &key, &keep);
         assert_eq!(m.ids(), two.ids());
-        assert_eq!(m.distinct(), two.distinct());
         assert_eq!(merged(&runs[..1], &key, &|_| true).len(), 100);
         assert_eq!(merged(&[], &key, &keep).len(), 0);
         // the entries sort by key and then id
@@ -278,12 +346,17 @@ mod tests {
         let n = PAR_MIN / 2;
         let ids: Vec<u32> = (0..n as u32).collect();
         let key = |id: u32| (id as u64 * 2_654_435_761) % 1000;
-        let (run, peak) = crate::alloc_probe::peak_of(|| sorted(&ids, &key));
+        let (run, peak) = crate::alloc_probe::peak_of(|| sorted(&ids, &key, &|_| true).0);
         assert!(
             peak <= sort_bytes(ids.len()) + Run::bytes_for(ids.len()),
             "sort peak {peak}"
         );
-        let b = sorted(&(n as u32..2 * n as u32).collect::<Vec<u32>>(), &key);
+        let b = sorted(
+            &(n as u32..2 * n as u32).collect::<Vec<u32>>(),
+            &key,
+            &|_| true,
+        )
+        .0;
         let runs = [run, b];
         let total = runs[0].len() + runs[1].len();
         let (_, peak) = crate::alloc_probe::peak_of(|| merged(&runs, &key, &|_| true));

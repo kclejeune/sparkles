@@ -657,22 +657,24 @@ impl Tier {
         let off = self.offset;
         let (rows, dead) = (&self.rows, &self.dead);
         let keep = |id: u32| alive_in(dead, (id - off) as usize);
-        // the live ids, the sort's buffers and the run, then the run's list
-        m.add(live * size_of::<u32>() + compact::sort_bytes(live) + Run::bytes_for(live))?;
-        let mut ids: Vec<u32> = Vec::with_capacity(live);
-        ids.extend((off..off + n as u32).filter(|&id| keep(id)));
-        let mut order = Order::default();
+        // the ids, the sort's buffers and the run of the live ones, then the run's list;
+        // the dead facts are sorted too, so that their keys count as the merges would
+        // have counted them
+        m.add(n * size_of::<u32>() + compact::sort_bytes(n) + Run::bytes_for(live))?;
+        let ids: Vec<u32> = (off..off + n as u32).collect();
+        let (run, keys, ghosts) = if subjects {
+            compact::sorted_live(&ids, &|id: u32| rows[(id - off) as usize].s, &keep)
+        } else {
+            compact::sorted_live(&ids, &|id: u32| rows[(id - off) as usize].o, &keep)
+        };
+        drop(ids);
+        m.sub(n * size_of::<u32>() + compact::sort_bytes(n));
+        let order = Order::built(run, keys, ghosts, m)?;
         if subjects {
-            let key = |id: u32| rows[(id - off) as usize].s;
-            order.push_charged(compact::sorted(&ids, &key), m)?;
             self.by_s = Some(order);
         } else {
-            let key = |id: u32| rows[(id - off) as usize].o;
-            order.push_charged(compact::sorted(&ids, &key), m)?;
             self.by_o = Some(order);
         }
-        drop(ids);
-        m.sub(live * size_of::<u32>() + compact::sort_bytes(live));
         Ok(())
     }
 
@@ -753,10 +755,11 @@ impl Tier {
                 rel.ids.extend_from_slice(new);
                 let scratch = compact::sort_bytes(new.len());
                 meter.add(scratch + 2 * Run::bytes_for(new.len()))?;
-                rel.subj
-                    .push_charged(compact::sorted(new, &key_s), &mut meter)?;
-                rel.obj
-                    .push_charged(compact::sorted(new, &key_o), &mut meter)?;
+                // the keys no fact of the relation has had are new
+                let (run, fresh) = compact::sorted(new, &key_s, &|k| !rel.subj.holds(k, &key_s));
+                rel.subj.push_charged(run, fresh, &mut meter)?;
+                let (run, fresh) = compact::sorted(new, &key_o, &|k| !rel.obj.holds(k, &key_o));
+                rel.obj.push_charged(run, fresh, &mut meter)?;
                 meter.sub(scratch);
             }
             Ok((meter.into_bytes(), rewrote))
@@ -801,11 +804,12 @@ impl Tier {
             }
             let scratch = compact::sort_bytes(n);
             m.add(scratch + Run::bytes_for(n))?;
-            if subjects {
-                order.push_charged(compact::sorted(&all, &key_s), m)?;
+            let (run, fresh) = if subjects {
+                compact::sorted(&all, &key_s, &|k| !order.holds(k, &key_s))
             } else {
-                order.push_charged(compact::sorted(&all, &key_o), m)?;
-            }
+                compact::sorted(&all, &key_o, &|k| !order.holds(k, &key_o))
+            };
+            order.push_charged(run, fresh, m)?;
             m.sub(scratch);
         }
         drop(all);
@@ -822,7 +826,8 @@ impl Tier {
 }
 
 /// Merge the runs the order's policy names below `floor`, or with `all` every run
-/// below it, without dead facts. Returns the dead facts dropped and the entries read.
+/// below it, without dead facts, keeping the keys left without a fact as ghosts. Returns
+/// the dead facts dropped and the entries read.
 fn compaction(
     order: &mut Order,
     floor: u32,
@@ -841,8 +846,18 @@ fn compaction(
     m.add(scratch + Run::bytes_for(total))?;
     let run = compact::merged(runs, key, keep);
     let dropped = total - run.len();
+    let gone = if dropped > 0 {
+        m.add(dropped * size_of::<u64>())?;
+        compact::dropped_keys(runs, key, keep)
+    } else {
+        Vec::new()
+    };
     order.replace(which, run);
     m.sub(scratch + old);
+    if dropped > 0 {
+        order.keep_ghosts(&gone, key, m)?;
+        m.sub(dropped * size_of::<u64>());
+    }
     Ok((dropped, total))
 }
 
