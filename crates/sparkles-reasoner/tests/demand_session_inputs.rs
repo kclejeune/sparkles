@@ -157,7 +157,9 @@ fn a_proof_of_a_session_prepared_again_is_not_reused() {
         o: DemandTerm::Var,
     };
     for round in 0..2 {
-        session.prepare(std::slice::from_ref(&value)).unwrap();
+        session
+            .prepare(std::slice::from_ref(&value), false)
+            .unwrap();
         session.derive(vec![(0, Vec::new())]).unwrap();
         assert!(session.report().derived > 0 || round > 0, "round {round}");
     }

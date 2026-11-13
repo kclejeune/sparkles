@@ -164,8 +164,8 @@ impl ReasoningSession for AutoSession {
         self.inner.intensional(s, p, o)
     }
 
-    fn prepare(&mut self, demands: &[Demand]) -> Result<Vec<DemandInfo>> {
-        self.inner.prepare(demands)
+    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
+        self.inner.prepare(demands, estimates)
     }
 
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> Result<Derived> {

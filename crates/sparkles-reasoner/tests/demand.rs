@@ -1732,3 +1732,22 @@ fn a_stored_axiom_is_answered_once() {
         }
     }
 }
+
+/// An executed demand query makes no estimate of its patterns' cones, which EXPLAIN shows
+/// and `auto` reads (spec F17 Phase 1 decision 5, item 911): the walk costs about as much
+/// as a narrow derivation.
+#[test]
+fn only_explain_estimates_a_demand() {
+    let s = store("ex:Student rdfs:subClassOf ex:Person . ex:tom a ex:Student .");
+    let qr = reasoner(&Profile::Rdfs);
+    let q = "SELECT ?x { ?x a ex:Person }";
+    let r = run(&s, q, &demand(&qr));
+    assert_eq!(rows(&r), vec!["<http://ex.org/tom>"]);
+    let a = r.ctx.reasoning.clone().unwrap();
+    let c = a.nodes[0].counters.as_ref().unwrap();
+    assert!(!c.contains_key("estimatedDerived"), "{c:?}");
+    let (_, plan) = explain(s.snapshot(), q, &demand(&qr)).unwrap();
+    assert_eq!(plan.children[0].operator, "Derive");
+    let c = plan.children[0].counters.as_ref().unwrap();
+    assert!(c.contains_key("estimatedDerived"), "{c:?}");
+}

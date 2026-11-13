@@ -1329,7 +1329,7 @@ impl Session {
 
     /// Derive every fact of `demands`, each with its constants alone.
     pub(crate) fn derive_all(&mut self, demands: &[Demand]) -> Result<()> {
-        self.prepare(demands)?;
+        self.prepare(demands, false)?;
         let seeds = (0..demands.len()).map(|d| (d, Vec::new())).collect();
         self.derive(seeds)?;
         Ok(())
@@ -1707,7 +1707,7 @@ impl ReasoningSession for Session {
         demand::intensional(&self.rules, (slot(s, 0), slot(p, 1), slot(o, 2)))
     }
 
-    fn prepare(&mut self, demands: &[Demand]) -> Result<Vec<DemandInfo>> {
+    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
         self.demands = demands.to_vec();
         self.keys.clear();
         self.consts.clear();
@@ -1775,7 +1775,13 @@ impl ReasoningSession for Session {
                     false,
                     matches!(d.o, DemandTerm::Seeded),
                 ];
-                let estimate = demand::estimate_cone(&self.rules, pattern, seeded, &stats);
+                // the estimate walks the cone against the statistics, which costs about
+                // as much as a narrow derivation, so it is made only when asked for
+                let estimate = if estimates {
+                    demand::estimate_cone(&self.rules, pattern, seeded, &stats)
+                } else {
+                    0.0
+                };
                 let cached = self.seeded[i] == Seeded::None
                     && self.table_key(i, &[]).is_some_and(|key| tables::peek(&key));
                 let mut rules: Vec<String> =
@@ -2213,7 +2219,7 @@ mod compact_tests {
             term("http://www.w3.org/1999/02/22-rdf-syntax-ns#List"),
         ];
         session
-            .prepare(&[crate::explain::demand_of(&target)])
+            .prepare(&[crate::explain::demand_of(&target)], false)
             .unwrap();
         session.ensure_program().unwrap();
         assert!(session.compact);
@@ -2275,7 +2281,7 @@ mod compact_tests {
                 )))
             });
             session
-                .prepare(&[crate::explain::demand_of(&target)])
+                .prepare(&[crate::explain::demand_of(&target)], false)
                 .unwrap();
             session.ensure_program().unwrap();
             assert!(

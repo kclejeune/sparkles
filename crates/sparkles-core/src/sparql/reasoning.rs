@@ -177,8 +177,10 @@ pub trait ReasoningSession: Send {
     /// Whether rules can give facts that match the pattern (`None` is a variable).
     fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> bool;
     /// Make the program for the demands the query can ask for. Demand `i` of later
-    /// calls is `demands[i]`.
-    fn prepare(&mut self, demands: &[Demand]) -> Result<Vec<DemandInfo>>;
+    /// calls is `demands[i]`. With `estimates` false the infos' estimates are left at
+    /// zero, for a caller that neither chooses by them nor shows them, since the
+    /// estimate walks the dependency cone against the statistics for every demand.
+    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>>;
     /// Derive the facts of the demands, each with the seeds of its seeded position (an
     /// empty list for a demand without one), and return the facts not returned before.
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> Result<Derived>;
@@ -827,10 +829,13 @@ pub(crate) fn apply(
             path_demands.push(add(d, &mut demands));
         }
     }
+    // EXPLAIN shows the estimates and `auto` chooses by them, so an executed query that
+    // reads no materialization leaves them out of its `Derive` nodes
+    let estimates = !execute || reads_inferred;
     let infos = if demands.is_empty() {
         Vec::new()
     } else {
-        session.prepare(&demands)?
+        session.prepare(&demands, estimates)?
     };
     // ---- under `auto` with a readable materialization, the patterns that read it
     // (spec F17 §4.3). A seeded pattern has the cone, and so the choice, of its plain
@@ -880,7 +885,9 @@ pub(crate) fn apply(
             serde_json::Value::Array(info.rules.iter().map(|r| r.clone().into()).collect()),
         );
         counters.insert("seeds".into(), how.into());
-        counters.insert("estimatedDerived".into(), info.estimate.into());
+        if estimates {
+            counters.insert("estimatedDerived".into(), info.estimate.into());
+        }
         if let Some(r) = report {
             counters.insert("derived".into(), r.derived.into());
             counters.insert("seedCount".into(), r.seeds.into());
