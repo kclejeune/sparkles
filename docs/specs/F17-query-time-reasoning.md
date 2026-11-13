@@ -1,12 +1,12 @@
 # F17: Query-time reasoning
 
-> **Status:** implemented in part, Phase 1.
+> **Status:** implemented in part, Phase 1 and the first part of Phase 2.
 >
 > **Phases:** Demand derivation, Jena backward rules, tables cached per snapshot and
-> view, budgets and EXPLAIN are available. Automatic cost selection, hybrid execution,
-> OWL 2 QL rewriting, additional settings and surfaces, and reuse across commits remain
-> planned in Phase 2. Incremental maintenance through F13 and later provenance remain
-> planned in Phase 3.
+> view, budgets and EXPLAIN are available, with `auto`, its cost model and the dataset
+> setting. Hybrid execution, OWL 2 QL rewriting, reuse across commits and the remaining
+> surfaces remain planned in Phase 2. Incremental maintenance through F13 and later
+> provenance remain planned in Phase 3.
 >
 > **User docs:** [Query-time reasoning](../API.md#query-time-reasoning) and
 > [features](../reasoning/README.md#reasoning-validation-and-schema).
@@ -1022,6 +1022,76 @@ rewriting remain in Phase 2 of this spec, roadmap item 19.
 ### Scope changes
 
 **OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 DL or EL reasoning. OWL 2 EL classification is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md). OWL 2 DL reasoning stays a non-goal of this spec.
+
+### Phase 2: automatic choice and the dataset setting
+
+**Built** for roadmap item 19. `reasoning=auto` (§2.1, §4) and the dataset setting (§2.2)
+are available. Hybrid Jena rules (§5.2), OWL 2 QL rewriting (§7), reuse of tables across
+commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in Phase 2.
+
+* **The choice.** `crates/sparkles/src/reasoning/auto.rs` wraps the dataset's query-time
+  reasoner. When a query starts, it decides for the snapshot the query reads whether the
+  materialized inferences can answer: the record's profile, rules digest and input graphs
+  equal the query-time program's, C08's freshness is fresh at the snapshot's commit, and
+  the caller can read the inferred graph. The engine (`sparql/reasoning.rs`) keeps the
+  inferred graph in the query's default graph while the materialization can answer and
+  takes it out otherwise. For each intensional pattern it then compares the estimated
+  cost of reading with the estimated cost of deriving, reads when reading is estimated no
+  more expensive, and derives the others into the overlay as under `demand`. Both sources
+  give facts of one closure, so the union answers as a fresh materialization does. A
+  pattern whose dependency cone holds a top-level backward rule derives, since the
+  materializer skips those rules although the rules digest covers them. A pattern with a
+  variable predicate reads. A seeded pattern is decided when its seeds are known, from the
+  join's fan-out per seed and the estimate per seed.
+* **The estimate.** `demand::estimate_cone` walks the dependency cone from the pattern
+  with its bound positions. For each rule whose head gives the pattern, the body is joined
+  in a greedy order, bound positions first, and each atom multiplies the join by the facts
+  it matches per binding from the generation's predicate statistics and the delta's. The
+  join's size counts as the rule's facts, a body atom that rules give is estimated in turn
+  with the positions the join has bound, once per rule and adornment, and the walk stops
+  at depth six. The free-adornment strata are the atoms the cone reaches with no position
+  bound. The costs are `READ_BASE + rows` and `DERIVE_BASE + facts × DERIVE_FACT`, or
+  `READ_BASE + facts × CACHED_FACT` for a table the cache holds, in the planner's unit of
+  one scanned row, with the constants in `sparql::reasoning::cost`.
+* **The setting.** `crates/sparkles/src/reasoning/setting.rs` holds `default`, `profile`,
+  `rules`, `inputs`, `budget` and `stale`, in `query-reasoning.json` with the version
+  member `queryReasoningFormat`. `PUT`, `GET` and `DELETE /$/reason/{ds}/query` change it,
+  `serve --query-reasoning NAME=PROFILE` and `sparkles infer --query-default MODE` set it
+  from the command line, and `Dataset::set_query_reasoning` from the library. A query
+  without a `reasoning` parameter takes the setting's default. `budget.maxMillis` wraps
+  the session's stop check and fails a longer derivation with `reasoning-budget`.
+* **Responses.** `Sparkles-Reasoning` begins with `auto;` and is present only when a
+  pattern was derived. `Sparkles-Inferences` is present only when a stale materialization
+  was read under `"stale": "allow"`. EXPLAIN's `Reason` node says whether the
+  materialization was fresh, stale or absent, and each `Derive` node carries `source`,
+  `readCost`, `deriveCost`, `estimatedDerived` and `reason`.
+
+**Decisions where this spec left the choice open.**
+
+1. The setting lives in `query-reasoning.json` rather than inside `reasoning.json`. The
+   record describes a materialization, and every reader treats its presence as one, so a
+   dataset with a query-time setting and no materialization could not have carried the
+   setting in the record without appearing materialized. "Next to the C08 record" in §2.2
+   is read as the directory.
+2. The header's first token under `auto` is `auto`, not `demand`, so that a client can
+   tell the mode that derived.
+3. A materialization of unknown freshness (an older record, or one of another dataset) is
+   treated as stale: it is not read unless the setting allows reading a stale one.
+4. The setting is not yet locked through C19's declared settings, whose kinds own their
+   files through the server's settings layer while the library owns this one. Roadmap
+   item 909 covers the lock.
+5. Under `auto` with a readable materialization, the per-pattern comparison decides a
+   seeded pattern only once its seeds are known, so EXPLAIN without a run shows the
+   comparison of its constants alone.
+
+**Acceptance.** A4 and A5 hold in `auto_reads_a_fresh_materialization_and_derives_over_a_stale_one`
+(`crates/sparkles/tests/auto_reasoning.rs`) and over HTTP in
+`auto_reasoning_and_the_query_setting_over_http`. The backward-rule and profile cases
+hold in `auto_derives_what_the_materialization_cannot_hold`, the setting in
+`the_query_setting_names_the_default_mode_and_the_stale_policy` and
+`the_setting_budget_bounds_a_derivation`, the cost rule in
+`auto_chooses_the_cheaper_source_within_the_rules` and the estimate in
+`cone_estimates_follow_the_statistics_and_the_bound_positions`.
 
 ### Roadmap follow-ups
 

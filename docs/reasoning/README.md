@@ -70,7 +70,10 @@ request or on every write, and the schema report counts what the data holds.
 * Query-time reasoning with `reasoning=demand` derives the facts a query's patterns need
   as it runs, from RDFS, RDFS simple, OWL 2 RL or a Jena rule file, without the inferred
   graph ([API.md](../API.md#query-time-reasoning), [F17](../specs/F17-query-time-reasoning.md#outcome)).
-  Jena backward rules answer this way. A demand transformation starts from the query's
+  Jena backward rules answer this way. `reasoning=auto` reads a fresh materialization
+  with the same profile and derives over a stale or absent one, choosing per pattern by
+  estimated cost, and the dataset's query-time setting makes it the default
+  ([API.md](../API.md#automatic-choice)). A demand transformation starts from the query's
   constants and bindings and specializes schema relations proven complete. Schema facts
   can follow from derived instance facts, including class and property declarations and
   equality between schema terms. Programs containing `makeTemp` run in one ordinary

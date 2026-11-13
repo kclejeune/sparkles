@@ -46,6 +46,17 @@ it.
 
 ### Added
 
+`reasoning=auto` chooses per pattern between the materialized inferences and derivation
+on demand (item 19, spec F17 Phase 2). A fresh materialization with the query-time
+profile, rules and inputs is read, a stale or absent one is derived around, a pattern
+whose rules include a Jena backward rule is derived, and the choice between the two
+sources follows estimated costs that EXPLAIN shows. `PUT /$/reason/{ds}/query` sets the
+dataset's query-time reasoning: the default mode of a query that names none, the profile
+and rules, the input graphs, a derivation budget and whether `auto` may read a stale
+materialization. `serve --query-reasoning NAME=PROFILE`, `sparkles infer --query-default
+MODE` and `sparkles query --reasoning auto` are the CLI's forms. The setting lives in
+`query-reasoning.json` with the version member `queryReasoningFormat`.
+
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
 settings, and a build or refresh then reads the policy's output graph with the projection's
