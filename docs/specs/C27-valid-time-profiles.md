@@ -201,6 +201,65 @@ Publication into a named graph is an F22 operation. This helper never asserts a
 proposition from a C25 proposed claim. Accepted projections must additionally enforce
 review and acceptance policy, source visibility and the selected temporal verdict.
 
+### 4.3 Local availability and backdating
+
+Local availability is assigned inside the commit that first makes a source revision
+visible. In a protected graph only the evidence owner's typed writer of
+[C25](C25-evidence-and-assessments.md#outcome) writes `ev:firstAvailableAt`. That writer
+serves `POST /{ds}/claims`, claims ingestion and the evidence MCP tools. It takes the
+managed-write capability, enters the branch writer and only then fixes the commit's stamp.
+The stamp names the sequence number after the held head and the later of the server
+clock and the head's time. The commit is never grouped with other commits and publishes
+with exactly that stamp. Each new source revision receives the stamp's time as
+`ev:firstAvailableAt`. Its receipt names the operation, whose description in the same
+graph records the same time, dataset, branch and commit. A revision already present with
+an equal record digest is reported as existing and keeps its first availability. A replay
+under the same idempotency key returns the first receipt without writing.
+
+Commit times never decrease along a branch. Recovery restores each commit's recorded
+time, so the first stamp after a restart is no earlier than the recovered head. F06
+resolves `at=time:T` to the last commit whose time is at most `T`. Suppose a revision
+first becomes visible at commit `c` with time `A`. When `A <= T`, the selected commit is
+`c` or a later one, so the revision is visible. When `A > T`, every commit from `c` on
+has a time of at least `A`, so the selected commit precedes `c` and the revision is
+absent. An as-known state therefore contains exactly the authenticated revisions whose
+availability is at most its cutoff, whatever their publication, validity or reported
+availability. A server clock that runs backward repeats the head's time and never stamps
+a commit earlier than one already visible. A clone starts a new lineage whose root time
+is no earlier than the commit it copies, so a cloned record cannot enter a state that
+precedes its availability. Its receipts keep naming the original dataset, branch and
+commit.
+
+A client cannot supply availability through the typed writer. The proposal request has
+no availability member, and an unknown member fails as `400 invalid-proposal` while the
+request is parsed. An open scope refuses evidence, PROV, `rdf:type` and `rdf:reifies`
+predicates while the input is prepared. Both refusals come before the capability, the
+source hold and the commit, so they leave nothing behind.
+
+Every other write path is refused before publication. Every commit point admits its
+candidate before it publishes, including SPARQL Update, Graph Store writes, uploads,
+bulk replacement, RDF Patch, merges, replays, cherry-picks and dry runs. A change to a
+source-record or proposal graph without the owner's capability answers
+`409 profile-managed-graph`, and the head, the write-ahead log and the graph stay
+unchanged. Merges of an owned graph are refused, so a record cannot reappear in another
+branch's history under another time.
+
+A client can still write `ev:firstAvailableAt` into an unowned graph as ordinary RDF.
+Such a record has no receipt that carries its graph's protection nonce, so resolution
+answers `origin-not-reproduced`. Its own commit also bounds the earliest state that can
+contain it. No template reads `ev:firstAvailableAt` as admission authority. An
+administrator who detaches a graph, edits it and protects it again gives the graph a
+new nonce, and the records written before then answer `origin-not-reproduced` until
+roadmap item 552's administered re-authentication.
+
+Availability, records, receipts and the operation description belong to one commit, so
+a crash publishes all of them or none. The C25 source hold is durable before the commit,
+and a hold whose operation never published is an orphan that reconciliation releases.
+After a restart the managed registry, its protection nonces and the commit catalog with
+each recorded time load before any write is admitted. The refusals and the ordering
+therefore hold across restarts without new state, and availability adds no on-disk
+record of its own.
+
 ## 5. Example
 
 An imported advisory revision says a product relationship was valid throughout an
