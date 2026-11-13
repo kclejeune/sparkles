@@ -2125,6 +2125,41 @@ fn admin(p: &mut Paths) {
     p.add(
         op(
             GET,
+            "/$/reason/{ds}/query",
+            "getQueryReasoning",
+            "Reasoning",
+            "The dataset's query-time reasoning setting",
+        )
+        .see("automatic-choice")
+        .json("200", "The setting.", "QueryReasoningSetting"),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/reason/{ds}/query",
+            "setQueryReasoning",
+            "Reasoning",
+            "Set the dataset's query-time reasoning",
+        )
+        .see("automatic-choice")
+        .json_body(true, "QueryReasoningSetting")
+        .json("200", "The setting.", "QueryReasoningSetting")
+        .errors(&[400]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/reason/{ds}/query",
+            "clearQueryReasoning",
+            "Reasoning",
+            "Remove the dataset's query-time reasoning setting",
+        )
+        .see("automatic-choice")
+        .json("200", "The setting, now empty.", "QueryReasoningSetting"),
+    );
+    p.add(
+        op(
+            GET,
             "/$/reason/{ds}/diagnostics",
             "reasoningDiagnostics",
             "Reasoning",

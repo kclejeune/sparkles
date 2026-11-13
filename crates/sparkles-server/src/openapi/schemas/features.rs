@@ -60,6 +60,32 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
             "reasoning-status-and-diagnostics",
         ),
     );
+    put(
+        "QueryReasoningSetting",
+        doc(
+            obj(
+                &[],
+                json!({
+                    "queryReasoningFormat": { "type": "integer", "minimum": 1 },
+                    "default": string_enum(&["auto", "demand", "materialized", "false"]),
+                    "profile": string_enum(&["rdfs", "rdfs-simple", "owl-rl", "rules"]),
+                    "rules": { "type": "string", "description": "The Jena rule text of the profile `rules`." },
+                    "inputs": { "type": "object", "description": "The input graphs, as a reasoning request names them." },
+                    "budget": {
+                        "type": "object",
+                        "properties": {
+                            "maxDerived": { "type": "integer", "minimum": 1 },
+                            "maxMillis": { "type": "integer", "minimum": 1 },
+                        },
+                    },
+                    "stale": string_enum(&["derive", "allow"]),
+                    "tables": { "type": "object", "description": "The process-wide cache of derived tables, for callers with the metrics permission (responses only)." },
+                }),
+            ),
+            "The dataset's query-time reasoning setting: the mode of a query that names none, the profile and rules that derive on demand, the input graphs, the budget of a derivation and the policy for a stale materialization.",
+            "automatic-choice",
+        ),
+    );
     let severity = string_enum(&["inconsistency", "warning"]);
     put(
         "DiagnosticsReport",

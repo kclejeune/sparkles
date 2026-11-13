@@ -1580,7 +1580,7 @@ async fn auto_reasoning_and_the_query_setting_over_http() {
     );
     // a query names its own mode regardless
     let (rows, _, _) = get("reasoning=false&").await;
-    assert_eq!(rows, [z.clone()]);
+    assert_eq!(rows, std::slice::from_ref(&z));
     let got = get_json(&app, "/$/reason/t/query").await;
     assert_eq!(got["default"], "auto", "{got}");
     assert_eq!(got["stale"], "allow", "{got}");
