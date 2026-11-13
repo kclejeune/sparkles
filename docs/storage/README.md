@@ -164,6 +164,15 @@ These read paths are tuned for queries over data that is not yet in memory
   metadata, so a commit record without it is damage: a torn tail when no later record
   proves the commit durable, and corruption otherwise. A header that a crash tore at the
   log's creation reads as an empty log, which the open creates again.
+* A dataset with durable jobs has a control keyspace beside its quads
+  ([C26 §7](../specs/C26-durable-jobs-and-delivery.md#7-persistence-recovery-and-compatibility)).
+  Its state is held in memory, checkpointed in `control.bin` and recovered at open. A
+  write that changes quads carries its control records in the same write-ahead log
+  record at log version 3, and a write without quads appends a frame to `control.log`
+  and creates no commit. One writer lock and one frame sequence order the two logs, so
+  the open refuses a gap, a repeated frame or a frame that follows a lost commit as an
+  integrity error. The control state costs memory in proportion to the job records it
+  holds, which the jobs settings bound at 256 MiB by default.
 * A data directory belongs on a local file system. Sparkles does not support NFS for a
   data directory, because the process lock is an advisory file lock and the index files
   are memory-mapped, and neither is reliable across clients of a network file system.

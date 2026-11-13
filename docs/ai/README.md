@@ -662,17 +662,25 @@ integration remain planned. Roadmap item 341.
 ### Durable jobs
 
 A durable job keeps accepted work inside the dataset, so a collector or an analysis
-worker resumes after a restart and its result reaches the data atomically. The ledger is
-the control graph `urn:x-sparkles:jobs:ledger`, which the jobs owner of the managed-graph
-registry protects from ordinary writes, and every transition is one commit of the
-dataset's main store. The design is in [C26](../specs/C26-durable-jobs-and-delivery.md).
+worker resumes after a restart and its result reaches the data atomically. The ledger
+lives in the control keyspace of the dataset's main store, which lies outside the RDF
+dataset, so no SPARQL update, Graph Store write, import or merge can change a record and
+no query, listing, statistic, index, export or history can read or count one. A
+transition that publishes quads writes its records in the same write-ahead log record as
+the quads, and a transition without quads is a frame of the store's `control.log`, which
+creates no commit. The design is in [C26](../specs/C26-durable-jobs-and-delivery.md).
 
 The settings in `jobs.json` register definitions. Each names a kind, the graphs its
 publications may change, the principals that may submit and claim it, and its retry and
 lease policy. The kind in this build is `quads`, whose typed result is bounded insert and
 delete quads in the definition's graphs with an opaque source checkpoint. The first
-configuration raises the dataset reader to 9, so a release that does not know the ledger
-refuses to open the dataset.
+configuration raises the dataset reader to 9, enables the control keyspace and upgrades
+the write-ahead log to version 3, so a release that does not know the ledger refuses to
+open the dataset. The control state is held in memory. `maxControlBytes`, 256 MiB by
+default, bounds it by refusing new submissions with `jobs-overloaded`, while the runs
+already admitted keep making progress. That memory is the price of keeping the ledger
+out of the indexes, and terminal records stay in it until roadmap item 934 adds their
+retention.
 
 A submission carries an idempotency key scoped to the dataset, the branch, the caller,
 the definition's name and revision and the operation kind. The same key with the same
@@ -695,22 +703,22 @@ horizon, a permanent one ends the run, cancellation fences the active attempt, a
 explicit retry makes a new run that links the old one.
 
 In Rust, `Dataset::jobs()` configures, submits, claims, renews, publishes, fails, cancels,
-retries and inspects. Over HTTP the routes are under `/$/jobs/{ds}`, described in
-[the API reference](../API.md#durable-jobs). The ledger graph leaves every caller's
-query, Graph Store, listing and history view, whatever the caller's grants say, and only
-the jobs inspection renders its records. Statistics, metrics, the dataset listings,
-validation, materialization, merge previews and the MCP tools leave it out as well, and
-so do the library's schema, validation, forms, explanation, analysis, ontology and
-GraphQL drafting handles. The history routes leave out the counts that cover every graph
-while a dataset hides one. The library's Graph Store,
-history, diff and dump handles subtract hidden graphs only from a view the caller gives,
-which roadmap item 902 covers, and a text, geo or vector index whose scope includes the
-ledger graph still indexes it, which item 904 covers. Once configured, the ledger stays protected and hidden while jobs are disabled,
-and a `managed.json` that cannot be read still hides it. A submitter's own grants must reach the definition's
-graphs, but a worker's publication is not intersected with the submitter's grants as they
-stand at publication, which item 903 covers. Delivery through an outbox, recurring
-definitions and recovery after a restore or clone are roadmap item 339, and the analysis
-and batch kinds are items 899 and 900.
+retries, inspects and resumes restored work. Over HTTP the routes are under
+`/$/jobs/{ds}`, described in [the API reference](../API.md#durable-jobs). Only the jobs
+inspection renders the ledger's records. A publication whose quads make no net change
+creates no commit and reports `committed: false` with the head it follows. A
+submitter's own grants must reach the definition's graphs, but a worker's publication
+is not intersected with the submitter's grants as they stand at publication, which
+roadmap item 903 covers.
+
+A backup holds the ledger as it was at the captured commit. A restored dataset pauses
+every restored run that had not ended before it admits any claim, and refuses
+transitions with `jobs-recovering` while it pauses them. An administrator then resumes
+selected runs with `POST /$/jobs/{ds}/recover` or `Jobs::resume`, after deciding which
+uncertain effects may happen again. A retry of a restored run waits paused in the same
+way. A clone starts with an empty ledger and the source's definitions. Delivery through
+an outbox and recurring definitions are roadmap item 339, and the analysis and batch
+kinds are items 899 and 900.
 
 ## Known gaps
 
@@ -719,11 +727,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### AI and agents
 
-* A durable job's publication writes quads only; an analysis publication with F22's
+* A durable job's publication writes quads only. An analysis publication with F22's
   freshness checks and a batch publication with C23's pinned iterator are roadmap items
-  899 and 900. The outbox, recurring definitions and recovery after a restore are item
-  339, and the ready-time index, cursor paging, per-principal bounds and shutdown fencing
-  of claims are item 902.
+  899 and 900. The outbox and recurring definitions are item 339, and the ready-time
+  index, cursor paging, per-principal bounds and shutdown fencing of claims are item 902.
+* Terminal job records stay in the control state, which is held in memory, until
+  roadmap item 934 adds their retention. A clone starts with an empty ledger, and item
+  936 copies records into a clone under new identities.
 * A question asked with a context chip reaches the model as the question followed by
   `(about <IRI>)`, as a typed suffix would. Grounding does not seed entity linking or
   predicate use from the structured `about` resource. Roadmap item 717.

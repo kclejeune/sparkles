@@ -13466,10 +13466,13 @@ record any of whose triples the caller's view hides is neither reported nor foll
 
 A dataset's durable jobs keep accepted work in a job ledger inside the dataset, so a
 collector or analysis worker resumes after a restart and a result reaches the data
-atomically. The ledger is the control graph `urn:x-sparkles:jobs:ledger`, which the jobs
-owner of the managed-graph registry protects from ordinary writes. Every transition is
-one commit of the dataset's main store, and a publication commits the worker's quads, the
-publication record, the source checkpoint and the run's completion together. The design
+atomically. The ledger lives in the control keyspace of the dataset's main store, which
+lies outside the RDF dataset, so no update, Graph Store write, import or merge can change
+a record and no query, listing, statistic, index, export, validation or history can read
+or count one. A publication commits the worker's quads, the publication record, the source
+checkpoint and the run's completion in one write-ahead log record. A transition without
+quads, such as a submission or a claim, is a frame of the store's `control.log` and
+creates no commit. The design
 is in [C26](specs/C26-durable-jobs-and-delivery.md), and its ordering argument against
 the log and the commit tail in
 [C26 §7.1](specs/C26-durable-jobs-and-delivery.md#71-ordering-against-the-write-ahead-log-and-the-commit-tail).
@@ -13479,8 +13482,9 @@ definitions, each with a kind, the graphs its publications may change, the princ
 that may submit and claim it, and its retry and lease policy. The only kind in this build
 is `quads`, whose typed result is bounded insert and delete quads in the definition's
 graphs with an opaque source checkpoint. The first configuration raises the dataset reader
-to 9 durably, so a release that does not know the ledger refuses to open the dataset, and
-marks the ledger graph hidden in the managed-graph registry.
+to 9 durably, enables the control keyspace and upgrades the write-ahead log to version 3,
+so a release that does not know the ledger refuses to open the dataset. The settings
+status reports `control: true` once the keyspace is enabled.
 
 ```json
 {
@@ -13503,11 +13507,14 @@ a run whose definition changed or was removed is not claimed until the definitio
 restored or the run is cancelled. An expired lease or a restart still judges such a run
 by the policy it was accepted with, never by a replacement's, so a run that has used its
 accepted attempts or passed its accepted horizon fails. Jobs cannot be disabled while runs are
-queued, leased or waiting to retry. A disabled configuration keeps the ledger graph
-protected and hidden under the same protection nonce, so a run admitted as jobs were being
-disabled waits until they are enabled again. `maxQueued` is at most 4096, and the
-definitions' `concurrency` adds up to at most 4096, so that dispatch counts waiting runs
-and leases exactly.
+queued, leased or waiting to retry, and a run admitted as jobs were being disabled waits
+until they are enabled again. `maxQueued` is at most 4096, and the definitions'
+`concurrency` adds up to at most 4096, so that dispatch counts waiting runs and leases
+exactly. The ledger is held in memory, and `maxControlBytes`, from 1 MiB to 16 GiB with a
+default of 256 MiB, bounds it. A submission that would pass the bound is `429
+jobs-overloaded`, while transitions of admitted runs are never refused for the ledger's
+size. Terminal records stay in the ledger until [roadmap](ROADMAP.md) item 934 adds their
+retention.
 
 `POST /$/jobs/{ds}` submits a run with `definition`, a JSON `payload`, an
 `idempotencyKey` of at most 256 bytes, an optional `checkpoint` and optional `inputs`,
@@ -13546,7 +13553,8 @@ publication names its `operation`, a UUID the worker keeps across retries, and i
 `checkpoint`. The same operation with the same quads and checkpoint answers the original
 receipt with `replayed: true`, even after the lease ended, and another result under the
 same operation is `409 publication-conflict`, so a retry after a lost response can never
-duplicate its effects. A failure is `transient`, which enters `retry-wait` with
+duplicate its effects. A publication whose quads make no net change creates no commit,
+and its receipt has `committed: false` and names the head it follows as its commit. A failure is `transient`, which enters `retry-wait` with
 exponential backoff and jitter and honors `retryAfterMs` within the definition's attempts
 and horizon, or permanent, which ends the run. A `retryAfterMs` that does not fit in the
 remaining horizon ends the run too.
@@ -13563,39 +13571,21 @@ carries a token or its verifier.
 
 A restart installs a new boot epoch before the process admits any claim, renewal or
 publication. Attempts of an earlier epoch are interrupted, their runs return to their
-retry policy, and their tokens fail from then on. The ledger graph is hidden: it leaves
-every caller's query, Graph Store, listing, history and diff view, whatever the caller's
-grants say, and a request for it answers as for a graph that does not exist. The surfaces
-that take no view follow the same exclusion. `/$/stats/{ds}` counts only the visible
-graphs, in its quad, base and delta totals, its graph list, its predicate counts and its
-class instances, while its vocabulary size and history figures describe the storage as a
-whole. Its distinct subjects and objects of a predicate leave out those that only the
-ledger gives it. The quad counts of `/$/datasets` and `/$/server` and the dataset and
-branch gauges of `/$/metrics` leave the ledger out. SHACL and ShEx validation never read
-it, also under `shapes=guard` and `schema=guard`, where a guard whose data graph is the
-ledger validates nothing, a guard whose shapes or schema are in the ledger is answered as
-no guard with `404`, and a validation that names it as its data or shapes graph gets
-`404`. A write-time guard leaves the ledger out of the data it validates when it is
-installed and on every write, and a guard configuration that names the ledger as a
-shapes, schema or data graph is refused with `404`, as for a graph that does not exist.
-Enabling jobs is refused with `409` while the write guard reads the ledger graph as a
-source or a listed data graph. A guard that still finds its shapes or schema in the
-ledger rejects every write with an error that names no graph.
-Materialization never reads it, whatever input graphs a request names, so no rule
-copies a ledger value into the inferred graph, and import fetching never follows an
-import the ledger names. A `SERVICE` call to this server and a resource header that
-select a dataset outside the request path leave that dataset's ledger out too. The MCP
-tools leave it out of every result, and so do incremental queries and kept views. A live
-query ends with a `forbidden` error when the dataset's hidden graphs change, such as when
-jobs are enabled. The counts a commit, a snapshot, a diff or a timeline
-bucket carries cover every graph, so the history routes leave them out while a dataset
-hides a graph, as they do for a caller whose grants cover only some graphs, and so do a
-created snapshot and the metadata of a `410` for a commit whose data is gone. A merge
-neither counts the ledger's changes nor its conflicts, resolved or not, and does not show
-them. A merge whose only unresolved conflicts are in the ledger is refused with
-`profile-managed-graph`. The commit of a merge's result, its MCP result and its task's
-detail carry no counts. Delivery through an outbox, recurring
-definitions and restore and clone recovery are [roadmap](ROADMAP.md) work.
+retry policy, and their tokens fail from then on.
+
+A backup holds the ledger as it was at the captured commit and requires the backup
+feature `control/1`. A restored dataset pauses every restored run that had not ended
+before it admits any claim, and while it pauses them every transition answers `409
+jobs-recovering`. A restart continues the pausing where it stopped. `POST
+/$/jobs/{ds}/recover` with `{"resume": [run ids]}` then resumes selected paused runs of
+the restored set, at most 256 per request, and needs `admin` on the dataset, since the
+operator decides which uncertain external effects may happen again. It answers the
+recovery, with the source dataset, the captured commit, its phase and the counts of
+paused and resumed runs, and the runs it resumed. An empty list reads the recovery, and
+the route is `409 jobs-recovering` while the pausing runs. A retry of a restored run
+creates its new run paused in the same set. A clone starts with an empty ledger and the
+source's definitions. Delivery through an outbox and recurring definitions are
+[roadmap](ROADMAP.md) work.
 
 ### Suggested examples
 

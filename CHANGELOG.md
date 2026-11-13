@@ -21,6 +21,16 @@ directory after it creates the log, so a crash after the first commits of a new 
 cannot lose it. The two pre-release fixtures stay in `testsuite/formats/` for their
 refusal tests, and a fixture written at the cutoff commit joins them.
 
+The control keyspace of item 933 adds `control.bin`, a checkpoint of the control state at
+version 1 that is replaced atomically, `control.log`, a log of control-only frames at
+version 1, and version 3 of the write-ahead log, which carries control records inside a
+transaction and is written by every store whose keyspace is enabled. Each file is listed
+in the format registry, and a reader refuses a version it does not know before it reads
+further. A version 3 log needs dataset reader 9, a `control.log` without `control.bin` is
+an integrity error, and a backup that holds `control.bin` or `jobs.json` requires the
+backup feature `control/1`. `sparkles check` has a `control` check of the two logs'
+ordering.
+
 ### OWL classification
 
 The Horn rules classify ontologies with individuals, functional data properties and top
@@ -65,27 +75,29 @@ it.
 
 ### Added
 
-Durable jobs (item 339, C26 Phase 1). A dataset keeps accepted work in a job ledger, the
-protected control graph `urn:x-sparkles:jobs:ledger`, with its definitions in `jobs.json`.
-`Dataset::jobs()` and the routes under `/$/jobs/{ds}` submit runs with an idempotency
-key, lease them to workers with a bearer token and a lease generation, and publish a
-worker's quads with the publication record, the source checkpoint and the run's completion
-in one commit, so a retry after a lost response or a crash never duplicates its effects.
-A restart fences every earlier lease by boot epoch before the process admits a claim.
-The ledger graph is the first hidden managed graph: it leaves every request's and every
-library query's graph view, and only the jobs inspection renders it. Statistics, metrics,
-the dataset listings, validation, materialization, reasoning diagnostics, merge previews,
-the library's schema, constraints, forms, explanation, analysis, ontology and GraphQL
-drafting handles, incremental queries, kept views, write-time guards and the MCP tools
-leave it out as well, a guard configuration cannot name it, jobs are not enabled under a
-guard that reads it, merge results carry no commit
-counts on such a dataset, and the history routes leave out the counts that cover every
-graph while a dataset hides one. A lease deadline counts only once the commit
-that grants or extends it is the run's committed version, so a refused renewal never
-extends a lease. A hidden graph no longer counts as a grant restriction, so
-branches, merges and source holds stay allowed on a dataset with jobs. Enabling jobs raises the dataset's `minimumReader` to 9, so older releases refuse to open
-such a dataset. The private import transport now names its destination reader as
-`IMPORTED_DESTINATION_READER`, one above `DATASET_READER`.
+Durable jobs (item 339, C26 Phase 1). A dataset keeps accepted work in a job ledger, with
+its definitions in `jobs.json`. `Dataset::jobs()` and the routes under `/$/jobs/{ds}`
+submit runs with an idempotency key, lease them to workers with a bearer token and a lease
+generation, and publish a worker's quads with the publication record, the source
+checkpoint and the run's completion in one commit, so a retry after a lost response or a
+crash never duplicates its effects. A restart fences every earlier lease by boot epoch
+before the process admits a claim. A lease deadline counts only once the transition that
+grants or extends it is the run's committed version, so a refused renewal never extends
+a lease. Enabling jobs raises the dataset's `minimumReader` to 9, so older releases
+refuse to open such a dataset. The private import transport now names its destination
+reader as `IMPORTED_DESTINATION_READER`, one above `DATASET_READER`.
+
+The job ledger lives in a control keyspace of the main store (item 933), outside the RDF
+dataset, so no query, listing, statistic, index, export, validation, merge or history
+reads or counts it and no read surface needs an exclusion of its own. A publication
+writes its records in the same write-ahead log record as its quads, and a transition
+without quads is a frame of `control.log` that creates no commit, so a publication whose
+quads make no net change reports `committed: false`. The settings' `maxControlBytes`, 256
+MiB by default, bounds the ledger held in memory by refusing new submissions. A backup
+captures the ledger at the captured commit, a restored dataset pauses its restored runs
+before it admits a claim and answers `jobs-recovering` while it does, and `POST
+/$/jobs/{ds}/recover` resumes selected paused runs. A clone starts with an empty ledger.
+The `hidden` visibility of the managed-graph registry stays reserved and refused.
 
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
