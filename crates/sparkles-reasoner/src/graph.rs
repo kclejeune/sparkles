@@ -26,6 +26,8 @@ use crate::budget::{
 use crate::facts::{Base, Memo, Probe, ProbeFilter};
 use crate::tier::{ROW, Tier};
 use hashbrown::HashTable;
+
+use crate::huge::{self, Huge};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::hash::BuildHasher;
@@ -89,17 +91,19 @@ fn shards<T: Default>() -> Vec<T> {
     (0..SHARDS).map(|_| T::default()).collect()
 }
 
-/// The heap of one shard of the triple index at capacity `cap`.
+/// The heap of one shard of the triple index at capacity `cap`, as its mapping makes it
+/// resident.
 fn index_bytes(cap: usize) -> usize {
-    table_bytes(cap, size_of::<Entry>())
+    huge::rounded(table_bytes(cap, size_of::<Entry>()))
 }
 
 pub(crate) struct Graph {
     base: Option<Arc<Base>>,
     /// the derived facts, from `offset` on
     tier: Tier,
-    /// the ids of the live derived triples, hashed by triple, by [`shard3`]
-    index: Vec<HashTable<Entry>>,
+    /// the ids of the live derived triples, hashed by triple, by [`shard3`], in tables
+    /// mapped for huge pages (see [`crate::huge`])
+    index: Vec<HashTable<Entry, Huge>>,
     /// facts a merge found in the base tier, by [`shard3`], so that evaluation does not
     /// emit them again: at most [`IN_BASE_SHARD`] per shard
     pub(crate) in_base: Vec<FxHashSet<Triple>>,
@@ -146,7 +150,7 @@ impl Graph {
         let mut g = Graph::default();
         g.tier.reserve_exact(n);
         for m in &mut g.index {
-            *m = HashTable::with_capacity(n / SHARDS);
+            *m = HashTable::with_capacity_in(n / SHARDS, Huge);
         }
         g.settle();
         g
@@ -211,7 +215,7 @@ impl Graph {
             .map(|s| table_bytes(s.capacity(), size_of::<Triple>()))
             .sum::<usize>();
         // the shard vectors themselves
-        n += SHARDS * (size_of::<HashTable<Entry>>() + size_of::<FxHashSet<Triple>>());
+        n += SHARDS * (size_of::<HashTable<Entry, Huge>>() + size_of::<FxHashSet<Triple>>());
         n
     }
 
