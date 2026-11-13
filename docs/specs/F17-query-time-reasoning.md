@@ -924,10 +924,12 @@ Three changes keep item 191's guarantee and repair the path.
   schema came from the schema table or a pass of its own. Later sessions of the same
   view whose schema came the same way read them instead of scanning. The schema table
   leaves out a generalized fact, such as one whose subject is a literal, so a proof
-  made over a pass that gave one is kept only for passes, and a session that reads the
-  table proves again over what the table holds. A session with facts of its own, such
-  as a why-not hypothesis or GeoSPARQL default geometries, neither reads nor keeps a
-  proof. The cache holds at most 64 views and drops the oldest, and `nocache` does
+  made over a pass that gave one is kept only for passes. The first session that reads
+  such a table then proves again over what the table holds, and later readers reuse
+  that proof. A session with facts of its own, such as a why-not hypothesis or
+  GeoSPARQL default geometries, neither reads nor keeps a proof, and nor does a session
+  whose rules read `now`, since its schema pass can give other facts than the pass of
+  another session. The cache holds at most 64 views and drops the oldest, and `nocache` does
   not bypass it, like the schema table. A view that cannot be cached, such as a
   transaction's snapshot, proves again in every session. The first query after a commit
   still pays the two scans and the abstraction, which item 190 keeps for measurement.
