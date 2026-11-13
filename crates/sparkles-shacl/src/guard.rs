@@ -38,7 +38,8 @@ pub use sparkles_core::guard::config::{
     Baseline, BaselinePolicy, CONFIG_FILE, CheckRecord, Counters, DataGraphSel, STATUS_FILE,
 };
 use sparkles_core::guard::config::{
-    CheckHistory, DecisionCounts, INFERRED_GRAPH as INFERRED, StatusFile, sha256_hex, write_atomic,
+    CheckHistory, DecisionCounts, INFERRED_GRAPH as INFERRED, StatusFile, sha256_hex, status_key,
+    write_atomic,
 };
 use sparkles_core::guard::{
     Candidate, Changes, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity,
@@ -166,13 +167,15 @@ impl ValidationConfig {
         self.shapes.graphs.as_deref().unwrap_or(&[])
     }
 
-    /// Validation options for this configuration over `snap`, or `None` when the data
-    /// graph is a list of graphs none of which exists (nothing to validate).
-    fn validate_options(&self, snap: &Snapshot) -> Option<ValidateOptions> {
+    /// Validation options for this configuration over `snap`, with the store's `hidden`
+    /// managed graphs never read, or `None` when the data graph is a list of graphs none
+    /// of which exists outside them (nothing to validate).
+    fn validate_options(&self, snap: &Snapshot, hidden: &[String]) -> Option<ValidateOptions> {
         let mut o = ValidateOptions {
             exclude_graphs: self.shapes_graphs().to_vec(),
             ..Default::default()
         };
+        o.exclude_graphs.extend(hidden.iter().cloned());
         if self.include_inferences {
             o.extra_graphs.push(INFERRED.into());
         } else {
@@ -182,7 +185,10 @@ impl ValidationConfig {
             DataGraphSel::Named(n) if n == "union" => o.data_graph = Some(UNION_GRAPH_IRI.into()),
             DataGraphSel::Named(_) => {}
             DataGraphSel::Graphs(gs) => {
-                let exists = |g: &str| g == DEFAULT_GRAPH_IRI || snap.lookup_iri(g).is_some();
+                let exists = |g: &str| {
+                    (g == DEFAULT_GRAPH_IRI || snap.lookup_iri(g).is_some())
+                        && !hidden.iter().any(|h| h == g)
+                };
                 let mut present = gs.iter().filter(|g| exists(g));
                 o.data_graph = Some(present.next()?.clone());
                 o.extra_graphs.extend(present.cloned());
@@ -191,8 +197,9 @@ impl ValidationConfig {
         Some(o)
     }
 
-    /// Whether a change to graph `g` can change the validation (data or shapes).
-    fn touches(&self, snap: &Snapshot, g: u64) -> (bool, bool) {
+    /// Whether a change to graph `g` can change the validation (data or shapes). A
+    /// hidden managed graph is never data.
+    fn touches(&self, snap: &Snapshot, g: u64, hidden: &[String]) -> (bool, bool) {
         let id = |iri: &str| {
             if iri == DEFAULT_GRAPH_IRI {
                 Some(Id::DEFAULT_GRAPH.0)
@@ -202,7 +209,7 @@ impl ValidationConfig {
         };
         let shapes = self.shapes_graphs().iter().any(|s| id(s) == Some(g));
         let inferred = id(INFERRED) == Some(g);
-        let data = if shapes {
+        let data = if shapes || hidden.iter().any(|h| id(h) == Some(g)) {
             false
         } else if inferred {
             self.include_inferences
@@ -323,6 +330,9 @@ pub struct ShaclGuard {
     /// the shapes file's triples, when the shapes are graphs and a file: they are merged
     /// with the graphs whenever a write changes them
     file_shapes: Option<Arc<oxrdf::Graph>>,
+    /// the store's hidden managed graphs when the guard was installed, which no
+    /// validation reads (spec C26 §2.3); a change of them installs a new guard
+    hidden: Vec<String>,
 }
 
 /// The data graph of one state, ready to validate.
@@ -346,7 +356,44 @@ impl ShaclGuard {
             history: CheckHistory::default(),
             persist,
             file_shapes: None,
+            hidden: Vec::new(),
         }
+    }
+
+    /// The directory and key that the state of each validated commit is kept under.
+    fn status_at(&self) -> Option<(&Path, String)> {
+        self.persist
+            .as_ref()
+            .map(|(root, hash)| (root.as_path(), status_key(hash, &self.hidden)))
+    }
+
+    /// The hidden managed graphs that no validation of this guard reads.
+    pub fn hidden(&self) -> &[String] {
+        &self.hidden
+    }
+
+    /// Install on `store` a guard with this configuration and these shapes that leaves
+    /// out the managed graphs `hidden`, replacing this one. The state of the head is
+    /// unknown to it, so its first validated write validates in full. The store's own
+    /// managed graphs call for it when the graphs it hides change.
+    pub fn rehidden(&self, store: &Store, mut hidden: Vec<String>) -> Arc<Self> {
+        hidden.sort_unstable();
+        hidden.dedup();
+        // no write commits between the switch and the next check
+        let txn = store.write_as(CommitKind::Transaction);
+        let mut g = Self::new(
+            self.cfg.clone(),
+            self.loaded.read().clone(),
+            self.persist.clone(),
+        );
+        g.file_shapes = self.file_shapes.clone();
+        g.hidden = hidden;
+        *g.tuning.write() = *self.tuning.read();
+        let g = Arc::new(g);
+        store.set_guard(Some(g.clone()));
+        store.set_guard_required(true);
+        drop(txn);
+        g
     }
 
     /// An independent guard for a memory branch, retaining only immutable schema data.
@@ -362,6 +409,7 @@ impl ShaclGuard {
         };
         let mut fork = Self::new(self.cfg.clone(), loaded, None);
         fork.file_shapes = self.file_shapes.clone();
+        fork.hidden = sorted(store.hidden_graphs());
         *fork.tuning.write() = *self.tuning.read();
         let fork = Arc::new(fork);
         store.set_guard(Some(fork.clone()));
@@ -383,7 +431,7 @@ impl ShaclGuard {
     /// validation options (no limits set): `None` when the configuration lists data
     /// graphs none of which exists in `snap`.
     pub fn data_graph_options(&self, snap: &Snapshot) -> Option<ValidateOptions> {
-        self.cfg.validate_options(snap)
+        self.cfg.validate_options(snap, &self.hidden)
     }
 
     /// The limits past which a write is validated in full.
@@ -506,7 +554,7 @@ impl ShaclGuard {
         shapes: &Shapes,
         o: &WriteOptions,
     ) -> sparkles_core::Result<Option<State>> {
-        let Some(mut vo) = self.cfg.validate_options(snap) else {
+        let Some(mut vo) = self.cfg.validate_options(snap, &self.hidden) else {
             return Ok(None);
         };
         vo.cancel = o.cancel.clone();
@@ -823,7 +871,7 @@ impl ShaclGuard {
         for (_, q) in log.iter() {
             let data = *graphs
                 .entry(q[3].0)
-                .or_insert_with(|| self.cfg.touches(&c.view, q[3].0).0);
+                .or_insert_with(|| self.cfg.touches(&c.view, q[3].0, &self.hidden).0);
             if data && seen.insert([q[0], q[1], q[2]]) {
                 changes.push([q[0], q[1], q[2]]);
             }
@@ -845,7 +893,7 @@ impl ShaclGuard {
             .filter(|(_, q)| {
                 *graphs
                     .entry(q[3].0)
-                    .or_insert_with(|| self.cfg.touches(&c.view, q[3].0).0)
+                    .or_insert_with(|| self.cfg.touches(&c.view, q[3].0, &self.hidden).0)
             })
             .map(|(_, q)| q[1])
             .collect();
@@ -1096,7 +1144,7 @@ impl CommitGuard for ShaclGuard {
         match c.changes.graphs() {
             Some(gs) => {
                 for g in gs {
-                    let (d, s) = self.cfg.touches(&c.view, g);
+                    let (d, s) = self.cfg.touches(&c.view, g, &self.hidden);
                     data |= d;
                     shapes_changed |= s;
                 }
@@ -1222,8 +1270,8 @@ impl CommitGuard for ShaclGuard {
                 *self.baseline.lock() = Some(p.baseline.clone());
                 *self.exact.lock() = p.exact.clone();
                 drop(pending);
-                if let (Some((root, hash)), Some(_)) = (&self.persist, &p.exact)
-                    && let Err(e) = StatusFile::of(&p.baseline, hash).write(root)
+                if let (Some((root, key)), Some(_)) = (self.status_at(), &p.exact)
+                    && let Err(e) = StatusFile::of(&p.baseline, &key).write(root)
                 {
                     tracing::warn!("cannot write {STATUS_FILE}: {e}");
                 }
@@ -1352,6 +1400,13 @@ pub fn configured_shapes(store: &Store) -> Result<Option<(ValidationConfig, Shap
     Ok(Some((cfg, shapes)))
 }
 
+/// `graphs` sorted, without duplicates.
+fn sorted(mut graphs: Vec<String>) -> Vec<String> {
+    graphs.sort_unstable();
+    graphs.dedup();
+    graphs
+}
+
 /// Install the guard of a persistent store from its `validation.json` (after
 /// [`Store::open`]). Without a configuration nothing happens. A configuration that
 /// cannot be loaded is an error, and the store keeps refusing writes (fail closed). The
@@ -1373,9 +1428,11 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShaclGuard>>> {
     let n = loaded.shapes.len();
     let mut g = ShaclGuard::new(cfg, loaded, Some((root.to_path_buf(), hash.clone())));
     g.file_shapes = file_shapes;
+    g.hidden = sorted(store.hidden_graphs());
+    let key = status_key(&hash, &g.hidden);
     let g = Arc::new(g);
     let head = store.head_commit().seq;
-    if let Some(b) = StatusFile::read(root, head, &hash) {
+    if let Some(b) = StatusFile::read(root, head, &key) {
         *g.exact.lock() = Some(Exact {
             commit: head,
             counts: b.by_severity,
@@ -1421,7 +1478,9 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     let head = txn.base().commit;
     let (shapes, file_shapes) = load_shapes(&cfg, root.as_deref(), &view)?;
     let loaded = Loaded::new(shapes);
-    let probe = ShaclGuard::new(cfg.clone(), loaded.clone(), None);
+    let hidden = sorted(store.hidden_graphs());
+    let mut probe = ShaclGuard::new(cfg.clone(), loaded.clone(), None);
+    probe.hidden = hidden.clone();
     let checked = probe.full(
         &view,
         &loaded,
@@ -1467,10 +1526,11 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     }
     let mut guard = ShaclGuard::new(cfg, loaded, persist);
     guard.file_shapes = file_shapes;
+    guard.hidden = hidden;
     let guard = Arc::new(guard);
     let baseline = baseline_of(&summary, head);
-    if let Some((r, hash)) = &guard.persist {
-        StatusFile::of(&baseline, hash).write(r)?;
+    if let Some((r, key)) = guard.status_at() {
+        StatusFile::of(&baseline, &key).write(r)?;
     }
     *guard.baseline.lock() = Some(baseline);
     *guard.exact.lock() = Some(checked.exact);

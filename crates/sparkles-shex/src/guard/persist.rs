@@ -380,9 +380,10 @@ impl ShexGuard {
     /// Read the typing of the head from its file (see the module documentation), and
     /// remember that the file is there.
     pub(super) fn restore_typing(&self, snap: &Snapshot, head: &CommitInfo) {
-        let Some((root, hash)) = self.persist.as_ref().filter(|_| self.persists_typing()) else {
+        let Some((root, key)) = self.status_at().filter(|_| self.persists_typing()) else {
             return;
         };
+        let hash = key.as_str();
         let model = self.model();
         if !model.keeps_typing() || snap.commit != head.seq {
             return;
@@ -410,9 +411,10 @@ impl ShexGuard {
     /// The clean close of the store: keep the typing of the head, unless the file
     /// already is it.
     pub(super) fn save_typing(&self, head: &CommitInfo, snap: &Snapshot) {
-        let Some((root, hash)) = self.persist.as_ref().filter(|_| self.persists_typing()) else {
+        let Some((root, key)) = self.status_at().filter(|_| self.persists_typing()) else {
             return;
         };
+        let hash = key.as_str();
         let typing = self.typing.lock();
         let Some(t) = typing
             .as_ref()

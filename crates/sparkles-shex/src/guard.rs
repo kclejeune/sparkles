@@ -57,7 +57,7 @@ use sparkles_core::commit::CommitKind;
 pub use sparkles_core::guard::config::BaselinePolicy;
 use sparkles_core::guard::config::{
     Baseline, CONFIG_FILE, CheckHistory, CheckRecord, Counters, DataGraphSel, DecisionCounts,
-    STATUS_FILE, StatusFile, sha256_hex, write_atomic,
+    STATUS_FILE, StatusFile, sha256_hex, status_key, write_atomic,
 };
 use sparkles_core::guard::{
     Candidate, Changes, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity,
@@ -372,6 +372,9 @@ pub struct ShexGuard {
     /// it in its directory)
     copy: Option<String>,
     history: CheckHistory,
+    /// the store's hidden managed graphs when the guard was installed, which no
+    /// validation reads (spec C26 §2.3); a change of them installs a new guard
+    hidden: Vec<String>,
 }
 
 impl ShexGuard {
@@ -396,7 +399,59 @@ impl ShexGuard {
             warnings: Mutex::new(Vec::new()),
             copy: None,
             history: CheckHistory::default(),
+            hidden: Vec::new(),
         }
+    }
+
+    /// The graphs no validation reads: the schema graphs and the hidden managed graphs.
+    fn excluded(&self) -> Vec<String> {
+        let mut x = self.cfg.schema_graphs().to_vec();
+        x.extend(self.hidden.iter().cloned());
+        x
+    }
+
+    /// The directory and key that the state of each validated commit is kept under.
+    pub(super) fn status_at(&self) -> Option<(&Path, String)> {
+        self.persist
+            .as_ref()
+            .map(|(root, hash)| (root.as_path(), status_key(hash, &self.hidden)))
+    }
+
+    /// The hidden managed graphs that no validation of this guard reads.
+    pub fn hidden(&self) -> &[String] {
+        &self.hidden
+    }
+
+    /// Install on `store` a guard with this configuration and this schema that leaves out
+    /// the managed graphs `hidden`, replacing this one. The state of the head is unknown
+    /// to it, so its first validated write validates in full. The store's own managed
+    /// graphs call for it when the graphs it hides change.
+    pub fn rehidden(&self, store: &Store, mut hidden: Vec<String>) -> Arc<Self> {
+        hidden.sort_unstable();
+        hidden.dedup();
+        // no write commits between the switch and the next check
+        let txn = store.write_as(CommitKind::Transaction);
+        let g = Arc::new(Self {
+            cfg: self.cfg.clone(),
+            model: parking_lot::RwLock::new(self.model()),
+            pending: Mutex::new(None),
+            baseline: Mutex::new(None),
+            exact: Mutex::new(None),
+            typing: Mutex::new(None),
+            saved: Mutex::new(None),
+            persist: self.persist.clone(),
+            counters: DecisionCounts::default(),
+            last_full: AtomicU64::new(u64::MAX),
+            associations: AtomicU64::new(u64::MAX),
+            warnings: Mutex::new(Vec::new()),
+            copy: self.copy.clone(),
+            history: CheckHistory::default(),
+            hidden,
+        });
+        store.set_guard(Some(g.clone()));
+        store.set_guard_required(true);
+        drop(txn);
+        g
     }
 
     /// An independent guard for a memory branch with its own validation state.
@@ -421,6 +476,7 @@ impl ShexGuard {
             warnings: Mutex::new(Vec::new()),
             copy: self.copy.clone(),
             history: CheckHistory::default(),
+            hidden: sorted(store.hidden_graphs()),
         });
         store.set_guard(Some(fork.clone()));
         store.set_guard_required(true);
@@ -447,7 +503,7 @@ impl ShexGuard {
         let opts = self
             .cfg
             .data_graph
-            .graphs(snap, self.cfg.include_inferences, self.cfg.schema_graphs())
+            .graphs(snap, self.cfg.include_inferences, &self.excluded())
             .map(|g| ValidateOptions {
                 data_graph: g.data_graph,
                 extra_graphs: g.extra_graphs,
@@ -574,11 +630,10 @@ impl ShexGuard {
         o: &WriteOptions,
         deadline: Instant,
     ) -> Option<ValidateOptions> {
-        let graphs = self.cfg.data_graph.graphs(
-            snap,
-            self.cfg.include_inferences,
-            self.cfg.schema_graphs(),
-        )?;
+        let graphs =
+            self.cfg
+                .data_graph
+                .graphs(snap, self.cfg.include_inferences, &self.excluded())?;
         Some(ValidateOptions {
             data_graph: graphs.data_graph,
             extra_graphs: graphs.extra_graphs,
@@ -842,14 +897,12 @@ impl ShexGuard {
         let mut graphs: FxHashMap<u64, bool> = FxHashMap::default();
         let mut seen: FxHashSet<[Id; 3]> = FxHashSet::default();
         let mut changes = Vec::new();
+        let excluded = self.excluded();
         for (_, q) in log.iter() {
             let data = *graphs.entry(q[3].0).or_insert_with(|| {
-                self.cfg.data_graph.touches(
-                    &c.view,
-                    q[3].0,
-                    self.cfg.include_inferences,
-                    self.cfg.schema_graphs(),
-                )
+                self.cfg
+                    .data_graph
+                    .touches(&c.view, q[3].0, self.cfg.include_inferences, &excluded)
             });
             if data && seen.insert([q[0], q[1], q[2]]) {
                 changes.push([q[0], q[1], q[2]]);
@@ -1043,6 +1096,7 @@ impl ShexGuard {
             .map(|ps| ps.iter().filter_map(|p| view.lookup_iri(p)).collect());
         let mut graphs: FxHashMap<u64, bool> = FxHashMap::default();
         let (mut data, mut schema) = (false, false);
+        let excluded = self.excluded();
         for q in log.iter().map(|(_, q)| q).chain(bulk) {
             let g = q[3].0;
             if schema_graphs.contains(&g) {
@@ -1053,12 +1107,9 @@ impl ShexGuard {
                 continue;
             }
             data |= *graphs.entry(g).or_insert_with(|| {
-                self.cfg.data_graph.touches(
-                    view,
-                    g,
-                    self.cfg.include_inferences,
-                    self.cfg.schema_graphs(),
-                )
+                self.cfg
+                    .data_graph
+                    .touches(view, g, self.cfg.include_inferences, &excluded)
             });
         }
         (data, schema)
@@ -1200,8 +1251,8 @@ impl CommitGuard for ShexGuard {
         let p = self.pending.lock().take();
         match p {
             Some(p) if p.seq == seq => {
-                if let (Some((root, hash)), Some(_)) = (&self.persist, &p.exact)
-                    && let Err(e) = StatusFile::of(&p.baseline, hash).write(root)
+                if let (Some((root, key)), Some(_)) = (self.status_at(), &p.exact)
+                    && let Err(e) = StatusFile::of(&p.baseline, &key).write(root)
                 {
                     tracing::warn!("cannot write {STATUS_FILE}: {e}");
                 }
@@ -1555,6 +1606,13 @@ fn read_config_hashed(root: &Path) -> Result<Option<(ShexValidationConfig, Strin
     Ok(Some((cfg, sha256_hex(&bytes))))
 }
 
+/// `graphs` sorted, without duplicates.
+fn sorted(mut graphs: Vec<String>) -> Vec<String> {
+    graphs.sort_unstable();
+    graphs.dedup();
+    graphs
+}
+
 /// Install the guard of a persistent store from its ShEx `validation.json` (after
 /// [`Store::open`]): the schema is read from its copy in the database, without
 /// resolving anything. Without a configuration nothing happens. A configuration that
@@ -1580,12 +1638,10 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         None => load_copy(&cfg, root)?,
     };
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
-    let g = Arc::new(ShexGuard::new(
-        cfg,
-        loaded,
-        map,
-        Some((root.to_path_buf(), hash.clone())),
-    ));
+    let mut g = ShexGuard::new(cfg, loaded, map, Some((root.to_path_buf(), hash.clone())));
+    g.hidden = sorted(store.hidden_graphs());
+    let key = status_key(&hash, &g.hidden);
+    let g = Arc::new(g);
     // the state of the head, when the status file records it for this configuration
     // The transaction already owns the writer. Read metadata for its exact
     // committed view without reentering Store::head_commit's writer lock.
@@ -1608,7 +1664,7 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         if model.keeps_typing() {
             *g.typing.lock() = Some(HeadTyping::new(head, snap.generation.uid, typing));
         }
-    } else if let Some(b) = StatusFile::read(root, head, &hash) {
+    } else if let Some(b) = StatusFile::read(root, head, &key) {
         *g.exact.lock() = Some(Exact {
             commit: head,
             nonconformant: b.blocking,
@@ -1724,6 +1780,7 @@ pub fn set_config(
     // the model keeps the text's digest, so the text stays in `loaded` until then
     let text = loaded.text.clone();
     let mut guard = ShexGuard::new(cfg, loaded, map, None);
+    guard.hidden = sorted(store.hidden_graphs());
     if root.is_none() && !in_graphs {
         guard.copy = Some(text.clone());
     }
@@ -1751,7 +1808,7 @@ pub fn set_config(
         let bytes = serde_json::to_vec_pretty(&guard.cfg)?;
         write_atomic(&r.join(CONFIG_FILE), &bytes)?;
         let hash = sha256_hex(&bytes);
-        StatusFile::of(&baseline, &hash).write(r)?;
+        StatusFile::of(&baseline, &status_key(&hash, &guard.hidden)).write(r)?;
         guard.persist = Some((r.clone(), hash));
     }
     *guard.exact.lock() = Some(Exact {
