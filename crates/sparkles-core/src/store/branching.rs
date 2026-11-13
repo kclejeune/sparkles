@@ -126,8 +126,9 @@ pub(crate) struct MainEntry {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TableFile {
-    /// 1, or 2 while the table lists retired branches, which an older build that reads
-    /// format 1 would remove
+    /// 1, 2 while the table lists retired branches, which an older build that reads
+    /// format 1 would remove, and 3 while a scratch branch is kept from expiry, which an
+    /// older build that reads format 2 would expire (see [`TableFile::stamped_format`])
     pub format: u32,
     pub dataset_id: uuid::Uuid,
     pub next_ordinal: u32,
@@ -149,6 +150,23 @@ pub(crate) struct TableFile {
 }
 
 impl TableFile {
+    /// The version the table is written as: the oldest that holds what it holds, so a
+    /// table without retired branches or kept scratch branches stays readable by older
+    /// releases.
+    pub(crate) fn stamped_format(&self) -> u32 {
+        let kept = self
+            .branches
+            .iter()
+            .any(|e| e.scratch.as_ref().is_some_and(|s| s.keep));
+        if kept {
+            3
+        } else if self.retired.is_empty() {
+            1
+        } else {
+            2
+        }
+    }
+
     fn new(dataset_id: uuid::Uuid) -> TableFile {
         TableFile {
             format: 1,
@@ -309,7 +327,7 @@ fn read_table(root: &Path) -> Result<Option<TableFile>> {
 fn write_table(root: &Path, t: &TableFile) -> Result<()> {
     commit::require_branch_reader(root)?;
     let mut t = t.clone();
-    t.format = if t.retired.is_empty() { 1 } else { 2 };
+    t.format = t.stamped_format();
     write_atomic(
         &root.join(BRANCHES_FILE),
         &serde_json::to_vec_pretty(&t).expect("the table serializes"),

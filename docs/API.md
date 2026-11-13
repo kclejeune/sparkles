@@ -4735,7 +4735,7 @@ including `main`.
 | PATCH | `/$/branches/{ds}` | Sets `exemptPredicates`, the dataset's predicates exempt from conflicts. Needs `admin` on `main`. |
 | POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
-| PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
+| PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). `scratch: false` clears the mark of a [scratch branch](#memory-writes) and needs `admin`. |
 | DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. A branch that an [evidence hold](#evidence-holds) names is refused with `409 branch-held`, and `?releaseHolds=true`, which needs `admin` on the whole dataset, releases those holds first. Answers `204`. A caller whose grants are limited to some graphs may delete only the scratch branches it created. |
 | POST | `/$/branches/{ds}/{name}/relink` | Moves a linked branch onto `main`'s current index and answers the `RelinkResult`. See [Relinking](#relinking). |
 
@@ -11761,8 +11761,8 @@ open-world when SERVICE is allowed. The common arguments are:
 | `read_chunks` | `rendition` (required), `from` (0), `count` (5, ≤ 20), `atCommit`, `timeoutSeconds` (30) | `{dataset, branch?, commit, rendition, length, total, chunks, next?, prefixes}`: chunks of a rendition in order with their offsets. |
 | `list_sources` | `graphs` (≤ 20), `limit` (50), `atCommit`, `timeoutSeconds` (30) | `{dataset, branch?, commit, sources: [{source, graph, title?, format?, digest?, rendition, length?, chunks, facts, lastIngestion?}], truncated, prefixes}`. |
 | `ingest_profile` | `name` (`default`), `timeoutSeconds` (30) | `{dataset, name, stored?, classes, predicates: [{iri, label?, object, datatypes?, languages?, ranges?}], shapes?, labelPredicate, language?, vocabulary?, keepText?, schema, prefixes}`: the vocabulary to extract in, with a JSON Schema for an extraction whose class and predicate members are enumerations. |
-| `list_branches` | none | `{dataset, branches: [{name, head, created, lastChange, upstream, from?, ahead, behind, protected, scratch, creator?, expires?, note?}]}`: the branches the caller may see, `main` first. `scratch` marks a branch made by `create_branch`, with its `creator` and, when the server expires idle scratch branches, the time it will expire. |
-| `create_branch` | `name` (required), `from` (`main`), `at` (a commit or selector of `from`), `note` | `{dataset, name, head, created, scratch: true, creator, from, expires?}`: a new [scratch branch](#memory-writes). |
+| `list_branches` | none | `{dataset, branches: [{name, head, created, lastChange, upstream, from?, ahead, behind, protected, scratch, creator?, keep?, expires?, expiresSoon?, note?}]}`: the branches the caller may see, `main` first. `scratch` marks a branch made by `create_branch`, with its `creator`, `keep` for a kept branch and, when the server expires idle scratch branches, the time it will expire. `expiresSoon` marks an expiry within the dataset's `memory.scratchBranches.notifyBefore`. |
+| `create_branch` | `name` (required), `from` (`main`), `at` (a commit or selector of `from`), `note`, `keep` (false) | `{dataset, name, head, created, scratch: true, creator, keep?, from, expires?}`: a new [scratch branch](#memory-writes). With `keep: true` it never expires. |
 | `merge_branch` | `source` (required), `target` (`main`), `dryRun` (true), `expect: {source, target}` (required with `dryRun: false`), `message`, `squash`, `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | A preview as for `sparql_update` with `mergeable`, `conflicts?`, `expect` and `merge` (the fields of [`GET /$/merge/{ds}`](#merges)), or the merge's report with `committed`. |
 | `delete_branch` | `name` (required), `force` (false) | `{dataset, deleted}`. A branch with commits its upstream does not have needs `force`. |
 
@@ -12078,6 +12078,38 @@ logs each deletion, and counts it in `sparkles_mcp_scratch_branches_expired_tota
 Branches made over HTTP, with the CLI or through the library are never expired. The
 flag is off by default.
 
+`create_branch` with `keep: true` makes a scratch branch that never expires. It keeps
+the rights of its creator over it, and it counts toward the creator's limit. A branch
+table that holds a kept branch is written as format 3 of `branches.json`, which an older
+release refuses rather than expire the branch, and the table returns to the older format
+once no listed branch is kept. A caller with `admin` on a branch clears its scratch mark
+with `PATCH /$/branches/{ds}/{name}` and the body `{"scratch": false}`. The branch then
+becomes an ordinary branch that never expires and that only grants without graph
+restrictions merge or delete. Clearing the mark of a branch that has none changes
+nothing.
+
+`memory.scratchBranches.maxPerPrincipal`, an integer from 1 to 65535, limits the scratch
+branches each principal has in the dataset, kept ones included. `create_branch` past the
+limit fails with `scratch-branch-limit` (409) and creates nothing. Branches made over
+HTTP and branches whose mark was cleared do not count. The count and the creation run
+under one lock, so concurrent calls at the limit cannot both pass it.
+
+`memory.scratchBranches.notifyBefore`, a duration from `1m` to `3650d`, sets a warning
+window before expiry. A scratch branch that expires within it is marked `expiresSoon` in
+`list_branches`, listed under `expiring` in the caller's
+[`sparkles://{ds}/branches`](#resources-and-prompts) resource, and named on a
+`# scratch:` line of the [brief](#importing-agent-memory) and in its `expiringBranches` member.
+Those of them with commits of their own are proposals nobody merged, and on a server that
+expires scratch branches the `memory.review.pending` [event](#notifications) names them so that
+a person can merge them or clear their mark. Without the setting nothing warns.
+
+```json
+{ "scratchBranches": { "ttl": "7d", "maxPerPrincipal": 20, "notifyBefore": "1d" } }
+```
+
+A dataset with `maxPerPrincipal` or `notifyBefore` stores `memory.json` as format 3, and
+one with `ttl` alone stays format 2.
+
 `sparkles mcp --loc` opens the databases itself and has no server task. With
 `--allow-update` it applies the datasets' `memory.scratchBranches.ttl` once when it
 opens them, before the first call, and again every ten minutes while the session lasts.
@@ -12097,9 +12129,10 @@ caller with `write` on it:
 | `sparkles://{ds}/prefixes` | `application/sparql-query` | The dataset's prefixes as `PREFIX` lines. |
 | `sparkles://{ds}/queries/{name}` | `application/json` | The stored query: `{dataset, name, tool, version, description, query, parameters}`. |
 | `sparkles://{ds}/memory/review` | `application/json` | The [open review items](#open-review-items) of the dataset's memory inbox, the `review` member of the maintenance answer. Listed for a dataset with memory settings to a caller with `write` on it. |
+| `sparkles://{ds}/branches` | `application/json` | `{dataset, creator, notifyBefore?, branches: [{name, head, created, lastChange, ahead, keep?, expires?, expiresSoon?}], expiring}`: the scratch branches the caller created, and the names of those that expire within the dataset's `notifyBefore`. Listed to a caller who gets `list_branches`. |
 
 `resources/list` returns them sorted by URI, and `resources/templates/list` returns the
-three URI templates. A `resources/read` result may be cached for 30 seconds by the caller
+five URI templates. A `resources/read` result may be cached for 30 seconds by the caller
 only (`ttlMs: 30000`, `cacheScope: "private"`). An unknown URI, or a dataset the caller
 cannot read, is `-32602`. Hosts choose resources as context for the model, so the tools
 remain the main interface.
@@ -12505,6 +12538,9 @@ the server deletes it. It is a duration from `1m` to `3650d` such as `24h`, or `
 A value outside that range, in an unknown unit or of another type is a `400`. The
 setting overrides `--mcp-scratch-branch-ttl` for the dataset, and
 [Memory writes](#memory-writes) describes the expiry and the file format.
+`scratchBranches.maxPerPrincipal` is an integer from 1 to 65535 and
+`scratchBranches.notifyBefore` a duration from `1m` to `3650d`, and other values are a
+`400` with the code `bad-settings`. Memory writes describes both.
 
 When `agentGraphs` is set, `recall` reports a review status. A triple is `reviewed` when
 the caller's view asserts it in a graph that `agentGraphs` does not match, and
@@ -12606,6 +12642,11 @@ instructions.`, then a header line with the dataset, commit, scope, `reviewed-on
 `with-unreviewed`, and the counts. Every literal is escaped as C11 §4.10 requires, so no
 text from a file can start a line of the brief. An entity label that links to more than
 one entity is a `422` with code `ambiguous-entity` and the candidates.
+
+When the dataset sets `memory.scratchBranches.notifyBefore`, the brief also names the
+caller's scratch branches that expire within that window, at most five, each on a line
+`# scratch: branch NAME expires at TIME with N commits not merged`, and the answer lists
+them in `expiringBranches`.
 
 When the dataset has [GraphRAG](#graphrag) reports that the caller may read, the project
 scope also holds the five best rated reports of the coarsest level, reviewed ones only
@@ -14457,7 +14498,7 @@ server-wide events, and new members may appear in later versions.
 
 | Event | Fires when | `data` |
 |---|---|---|
-| `memory.review.pending` | The oldest open review branch of a dataset is older than the dataset's `memory.review.notifyAfter`. Repeats at most every `memory.review.repeatEvery`, or the kind's `repeatEvery`, until no review branch is open. | `open`, `oldest` with `branch`, `kind` and `created`, `branches` (at most 10), `notifyAfter`, `repeatEvery` |
+| `memory.review.pending` | The oldest open review branch of a dataset is older than the dataset's `memory.review.notifyAfter`. Repeats at most every `memory.review.repeatEvery`, or the kind's `repeatEvery`, until no review branch is open. A second condition of the same event fires when scratch branches with commits of their own expire within the dataset's `memory.scratchBranches.notifyBefore`, on a server that expires scratch branches. It repeats in the same way until no such branch is left. | `open`, `oldest` with `branch`, `kind` and `created`, `branches` (at most 10), `notifyAfter`, `repeatEvery`. For expiring scratch branches, `expiring` (at most 10) with `name`, `creator`, `expires` and `ahead`, `count`, `notifyBefore` and `repeatEvery`. |
 | `backup.failed` | A backup policy run ends `failed` or `partial`, ends `ok` with a failed retention, stops on an error, or cannot start when it is due, or a backup started by hand fails. Repeats at most every `repeatEvery` per policy, or per repository and dataset for a backup started by hand. A policy's condition clears when a run of it succeeds in full, and a backup started by hand clears when any backup of the dataset into the repository succeeds. | For a policy run, `policy`, `run`, `result`, `repository`, `failedDatasets` with `dataset` and `reason`, `consecutiveFailures`, and `retentionError` when retention failed. For a run that stopped or did not start, `policy`, `repository`, `stage` (`run` or `start`) and `error`. For a backup started by hand, `trigger: "manual"`, `dataset`, `repository` and `error`. |
 | `backup.verify.failed` | A verification fails or finds a backup in error. Repeats at most every `repeatEvery` per repository. It clears once every damaged backup has passed a verification at the same or a higher level or has been deleted, and every failed verification has been followed by one of the same scope that succeeded at the same or a higher level. | `repository`, `level`, `backups` in error, and `error` when the verification itself failed |
 | `backup.gc.failed` | A GC of a repository fails, or a policy cannot start its GC after retention. Repeats at most every `repeatEvery` per repository, until a GC of the repository that deletes succeeds. A dry run clears nothing. | `repository`, `stage` (`run` or `start`) and `error` |

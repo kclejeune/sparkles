@@ -10,9 +10,9 @@
 > tools that list, create, merge and delete branches, scratch branches for graph-limited
 > grants and their optional expiry. The server model calls sketched as Phase 2 in §10
 > were superseded by [C18](C18-natural-language-questions-and-ingest/README.md). The
-> dataset setting for scratch expiry and expiry under stdio have shipped. The limit per
-> principal, the warnings before deletion and the `keep` option of scratch branches
-> remain under roadmap item 435, and the shared evidence profile under item 81.
+> dataset setting for scratch expiry, expiry under stdio, the limit per principal, the
+> warnings before deletion and the `keep` option of scratch branches have shipped. The
+> shared evidence profile remains under item 81.
 >
 > **User docs:** [API: MCP tools](../API.md#tools) ·
 > [API: Memory writes](../API.md#memory-writes) ·
@@ -1393,8 +1393,8 @@ of idle scratch branches was the `serve` flag `--mcp-scratch-branch-ttl`, read i
 `mcp/branches.rs`, which counts deletions in
 `sparkles_mcp_scratch_branches_expired_total`. The dataset setting of decision 4 (§13)
 and expiry under `sparkles mcp` over stdio were built for item 57, as the delivery
-record below describes. The design bullets follow, and the ones that are not built are
-tracked under item 435 of the [roadmap](../ROADMAP.md).
+record below describes. The design bullets follow. Item 435 built the ones that item 57
+left, as the second delivery record below describes.
 
 - **A dataset setting.** A `scratchBranches` object in the dataset's settings, a field
   of the C19 layers with its usual locks: `ttl` (a duration, or `null` for none),
@@ -1455,9 +1455,9 @@ it with the rest of the kind, and the OpenAPI document describes it under
   with the same checks for a running task and a named snapshot, and the same audit
   event. `--no-scratch-expiry` turns it off for a session. Without `--allow-update` the
   session never writes, so it never expires a branch.
-- **Not built.** `maxPerPrincipal`, `notifyBefore`, the `keep` argument of
-  `create_branch` and the `admin` route that clears a scratch mark remain as designed
-  above, under roadmap item 435.
+- **Left for item 435.** `maxPerPrincipal`, `notifyBefore`, the `keep` argument of
+  `create_branch` and the `admin` route that clears a scratch mark were built under item
+  435, as the record below describes.
 
 **Tests for item 57.** `mcp::expiry_tests` checks that a dataset value overrides the
 default in both directions, that `off` keeps branches, that an invalid stored value falls
@@ -1473,6 +1473,64 @@ validation, the sources and the format member of the file, and
 scratch branch was created in 2020, so the session deletes it before the first call, and
 checks that a read-only session, `--no-scratch-expiry`, a missing setting and `off` keep
 it.
+
+**Delivered for item 435: limits, warnings and kept branches.** The rest of the design
+above is built, with these choices where it left the behaviour open.
+
+- **Kept branches.** `create_branch` takes `keep` (false by default). A kept branch stays
+  a scratch branch, so its creator keeps the rights of §5.7 over it, but `sweep` skips
+  it and `list_branches` and `create_branch` report no `expires` for it.
+  `sparkles::branch::Scratch` gains `keep`, which is written only when it is true. An
+  older release would ignore the member and expire the branch, so a branch table that
+  lists a kept branch is format 3 of `branches.json`, through
+  `TableFile::stamped_format`, and the table returns to format 1 or 2 once no listed
+  branch is kept.
+- **Clearing a mark.** The `admin` route is `PATCH /$/branches/{ds}/{name}` with
+  `{"scratch": false}`, beside the `protected`, `note` and `name` members that the route
+  already takes. It needs `admin` on the branch, as `protected` does, and calls
+  `Store::set_branch_scratch` with `None`. `scratch: true` is a `400`, since only
+  `create_branch` makes scratch branches. Clearing a branch without a mark, or `main`,
+  changes nothing.
+- **The limit.** `maxPerPrincipal` is an integer from 1 to 65535, the number of branch
+  ordinals. `create_branch` counts the scratch branches of the dataset whose creator is
+  the caller, kept ones included, and fails with `scratch-branch-limit` (409) at the
+  limit, before it creates anything. The count and the creation run under one lock in
+  the server, so concurrent calls at the limit cannot both pass it. Branches made over
+  HTTP and branches whose mark was cleared do not count.
+- **The window.** `notifyBefore` is a duration from `1m` to `3650d`, as `ttl` is. A
+  scratch branch is in the window when it is not kept, the dataset's TTL applies to it,
+  and its expiry is at most `notifyBefore` from now, the boundary included. The spec
+  names "the MCP resource of a caller's branches", which did not exist. It is the new
+  resource `sparkles://{ds}/branches`, listed to callers who get `list_branches`, which
+  shows the scratch branches the caller created with their expiry and names the ones in
+  the window under `expiring`. The brief names the caller's own branches in the window
+  too, at most five, on `# scratch:` lines of statements, and lists them in
+  `expiringBranches`. `list_branches` marks each branch in the window `expiresSoon`.
+- **The event.** A branch "holds unreviewed proposals" when it has commits of its own
+  that its upstream does not have. `memory.review.pending` names such branches in the
+  window as a condition of its own, `memory.review.pending/{ds}/scratch`, apart from the
+  review branches of `notifyAfter`, so that neither suppresses the other. It repeats on
+  `memory.review.repeatEvery` or the kind's `repeatEvery`, clears when no such branch is
+  left, and fires only on a server that expires scratch branches, which is a writable
+  `serve --mcp` with `--mcp-allow-update`. A branch that enters the window while the
+  condition is suppressed is named at the next repeat.
+- **Format.** `memory.json` is format 3 while `scratchBranches` holds `maxPerPrincipal`
+  or `notifyBefore`, and format 2 with `ttl` alone, through `formats::stamp_settings`.
+
+**Tests for item 435.** `store::branch_tests::kept_scratch_marks_need_table_format_three`
+checks the format of the table with and without a kept branch, across a reopen.
+`formats::tests::memory_format_three_needs_scratch_limits_or_warnings` checks the stamp
+of `memory.json`. `settings::tests::scratch_branch_limits_are_layered_settings` checks
+the bounds of both members, a lock in the defaults layer, an override of the unlocked
+member and the stored format. In `router_tests::mcp::memory_writes`,
+`item435_kept_branches_and_the_warning_window` checks `keep`, `expiresSoon`, the
+resource, the boundary of the window and that the expiry keeps a kept branch, and
+`item435_limit_per_principal` checks the limit at its boundary, kept branches and HTTP
+branches in the count, the route that clears a mark and four concurrent calls at the
+limit. `auth::item435_limits_and_marks_per_principal` checks that each principal has its
+own count and resource and that only `admin` clears a mark.
+`mcp::import_tests::brief_names_expiring_scratch_branches` checks the brief, and
+`notify::tests::expiring_scratch_branches_with_commits_notify` checks the event.
 
 ### Shared memory representation
 

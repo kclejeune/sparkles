@@ -416,6 +416,17 @@ impl Tools<'_> {
         let mut review_lines = review
             .as_ref()
             .map_or(String::new(), super::pending::brief_lines);
+        // the caller's scratch branches that expire within the warning window (C17 §5.7)
+        let expiring = crate::mcp::branches::own_branches_json(
+            &self.server.state,
+            &ds,
+            &self.call.principal,
+            self.cfg().scratch_ttl,
+        )
+        .filter(|v| v["expiring"].as_array().is_some_and(|a| !a.is_empty()));
+        if let Some(v) = &expiring {
+            review_lines.push_str(&crate::mcp::branches::brief_lines(v));
+        }
         // C22 §2.5: the project scope adds the coarsest level's reports
         let mut communities = if scope == "project" {
             self.brief_reports(&ds, &r, !include_unreviewed)
@@ -559,6 +570,16 @@ impl Tools<'_> {
         });
         if let Some(r) = review {
             out["review"] = r;
+        }
+        if let Some(v) = expiring {
+            out["expiringBranches"] = v["branches"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|b| b["expiresSoon"] == true)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
         }
         if !communities.is_empty() {
             out["communities"] = communities

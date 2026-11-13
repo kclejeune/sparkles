@@ -2773,8 +2773,8 @@ fn branches(p: &mut Paths) {
         .errors(&[404]),
     );
     p.add(
-        op(PATCH, "/$/branches/{ds}/{name}", "updateBranch", "Branches", "Rename, protect or annotate a branch")
-            .doc("`name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only.")
+        op(PATCH, "/$/branches/{ds}/{name}", "updateBranch", "Branches", "Rename, protect, annotate or unmark a branch")
+            .doc("`name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only. `scratch: false` clears the scratch mark of a branch that the MCP tool `create_branch` made, so it no longer expires, and needs admin on the branch.")
             .see("branches-and-merges")
             .json_body(true, "BranchPatch")
             .json("200", "The branch.", "Branch")

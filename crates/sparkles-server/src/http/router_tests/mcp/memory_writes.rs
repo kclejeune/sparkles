@@ -760,6 +760,200 @@ async fn item57_dataset_ttl_sets_the_reported_expiry() {
     }
 }
 
+/// Item 435: `keep` on `create_branch`, the warning window of `notifyBefore` in
+/// `list_branches`, the `sparkles://{ds}/branches` resource and the expiry, with the
+/// window's boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn item435_kept_branches_and_the_warning_window() {
+    let s = mem_server(&["--mcp-allow-update", "--mcp-scratch-branch-ttl", "1h"]);
+    let ds = s.state.get("mem").unwrap();
+    crate::assist::write_file(
+        &s.state,
+        &ds,
+        "memory.json",
+        &json!({"scratchBranches": {"notifyBefore": "2h"}}),
+    )
+    .unwrap();
+    let r = tool(
+        &s.app,
+        "create_branch",
+        json!({"name": "k", "keep": true}),
+        &[],
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["keep"], true, "{r}");
+    assert!(r["structuredContent"].get("expires").is_none(), "{r}");
+    let r = tool(&s.app, "create_branch", json!({"name": "w"}), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(r["structuredContent"].get("keep").is_none(), "{r}");
+    assert!(r["structuredContent"]["expires"].is_string(), "{r}");
+    let r = tool(
+        &s.app,
+        "create_branch",
+        json!({"name": "x", "keep": 1}),
+        &[],
+    )
+    .await;
+    assert_eq!(r["isError"], true, "{r}");
+    // the TTL of one hour is inside the window of two
+    let r = tool(&s.app, "list_branches", json!({}), &[]).await;
+    let list = r["structuredContent"]["branches"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let b = |n: &str| list.iter().find(|b| b["name"] == n).cloned().unwrap();
+    assert_eq!(b("k")["keep"], true);
+    assert!(b("k").get("expires").is_none() && b("k").get("expiresSoon").is_none());
+    assert!(b("w")["expires"].is_string());
+    assert_eq!(b("w")["expiresSoon"], true);
+    // the resource lists the caller's scratch branches and those that expire soon
+    let uri = "sparkles://mem/branches";
+    let r = modern(&s.app, "resources/list", json!({}), &[]).await;
+    let uris: Vec<String> = r.rpc()["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap().to_string())
+        .collect();
+    assert!(uris.iter().any(|u| u == uri), "{uris:?}");
+    let r = modern(&s.app, "resources/read", json!({ "uri": uri }), &[]).await;
+    let text = r.rpc()["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v: J = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["creator"], "local", "{v}");
+    assert_eq!(v["notifyBefore"], "2h", "{v}");
+    assert_eq!(v["expiring"], json!(["w"]), "{v}");
+    let names: Vec<&str> = v["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["k", "w"], "{v}");
+    // the window's boundary: a branch that expires exactly `notifyBefore` from now is in
+    // it, one millisecond later is not
+    let w = ds.store.branch_info("w").unwrap();
+    let at = crate::mcp::branches::expires_ms(&w, Some(Duration::from_secs(3600))).unwrap();
+    let window = 2 * 3_600_000;
+    let ttl = Some(Duration::from_secs(3600));
+    let soon = crate::mcp::branches::expiring(&s.state, &ds, ttl, at - window);
+    assert_eq!(soon.len(), 1, "{soon:?}");
+    assert_eq!(soon[0].name, "w");
+    assert!(crate::mcp::branches::expiring(&s.state, &ds, ttl, at - window - 1).is_empty());
+    // without a TTL nothing expires, so nothing warns
+    crate::assist::write_file(
+        &s.state,
+        &ds,
+        "memory.json",
+        &json!({"scratchBranches": {"notifyBefore": "2h", "ttl": "off"}}),
+    )
+    .unwrap();
+    assert!(crate::mcp::branches::expiring(&s.state, &ds, ttl, at).is_empty());
+    let r = tool(&s.app, "list_branches", json!({}), &[]).await;
+    let list = r["structuredContent"]["branches"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        list.iter().all(|b| b.get("expiresSoon").is_none()),
+        "{list:?}"
+    );
+    // the expiry keeps the kept branch
+    crate::assist::write_file(&s.state, &ds, "memory.json", &json!({})).unwrap();
+    let gone = crate::mcp::branches::sweep(
+        &s.state,
+        Duration::from_secs(3600),
+        crate::mcp::branches::now_ms() + 2 * 3_600_000,
+    );
+    assert_eq!(gone, ["mem@w"]);
+    assert!(ds.store.branch_info("k").unwrap().scratch.unwrap().keep);
+}
+
+/// Item 435: `maxPerPrincipal` at its boundary, counted per creator with kept branches,
+/// a race-free count, and the admin route that clears a scratch mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn item435_limit_per_principal() {
+    let s = mem_server(&["--mcp-allow-update"]);
+    let ds = s.state.get("mem").unwrap();
+    crate::assist::write_file(
+        &s.state,
+        &ds,
+        "memory.json",
+        &json!({"scratchBranches": {"maxPerPrincipal": 2}}),
+    )
+    .unwrap();
+    for (name, keep) in [("a", false), ("b", true)] {
+        let r = tool(
+            &s.app,
+            "create_branch",
+            json!({"name": name, "keep": keep}),
+            &[],
+        )
+        .await;
+        assert_eq!(r["isError"], false, "{r}");
+    }
+    let r = tool(&s.app, "create_branch", json!({"name": "c"}), &[]).await;
+    assert_eq!(r["isError"], true, "{r}");
+    assert_eq!(
+        r["_meta"]["io.github.kclejeune.sparkles/error"]["code"], "scratch-branch-limit",
+        "{r}"
+    );
+    assert!(
+        ds.store.branch_info("c").is_err(),
+        "a refused call creates nothing"
+    );
+    // a branch made through HTTP is not a scratch branch and does not count
+    let req = Request::post("/$/branches/mem")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"name":"plain"}"#))
+        .unwrap();
+    assert!(send(&s.app, req).await.status.is_success());
+    // a deleted scratch branch frees its place
+    let r = tool(&s.app, "delete_branch", json!({"name": "a"}), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    let r = tool(&s.app, "create_branch", json!({"name": "c"}), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    // clearing a mark frees one too: the branch becomes ordinary
+    let patch = |name: &str, body: &str| {
+        Request::patch(format!("/$/branches/mem/{name}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let r = send(&s.app, patch("b", r#"{"scratch":true}"#)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = send(&s.app, patch("b", r#"{"scratch":false}"#)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.json()["scratch"].is_null(), "{}", r.text());
+    assert!(ds.store.branch_info("b").unwrap().scratch.is_none());
+    // clearing it again, or on main, changes nothing
+    let r = send(&s.app, patch("b", r#"{"scratch":false}"#)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(&s.app, patch("main", r#"{"scratch":false}"#)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = tool(&s.app, "create_branch", json!({"name": "d"}), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    // concurrent calls at the limit: exactly one more fits after a deletion
+    let r = tool(&s.app, "delete_branch", json!({"name": "d"}), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    let calls = (0..4).map(|i| {
+        let app = s.app.clone();
+        tokio::spawn(async move {
+            tool(&app, "create_branch", json!({"name": format!("r{i}")}), &[]).await
+        })
+    });
+    let mut created = 0;
+    for c in calls {
+        if c.await.unwrap()["isError"] == false {
+            created += 1;
+        }
+    }
+    assert_eq!(created, 1);
+}
+
 /// The `branch` argument of the read tools: a branch's data, an unknown branch, and an
 /// invalid name.
 #[tokio::test(flavor = "multi_thread")]
@@ -945,6 +1139,74 @@ datasets = {{ mem = "read" }}
 
     async fn call(s: &Server, user: &str, name: &str, args: J) -> J {
         tool(&s.app, name, args, &[("authorization", &b(user))]).await
+    }
+
+    /// Item 435: the limit counts each principal's own scratch branches, the branches
+    /// resource shows a caller only its own, and only `admin` clears a scratch mark.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn item435_limits_and_marks_per_principal() {
+        let s = authed();
+        let ds = s.state.get("mem").unwrap();
+        crate::assist::write_file(
+            &s.state,
+            &ds,
+            "memory.json",
+            &json!({"scratchBranches": {"maxPerPrincipal": 1}}),
+        )
+        .unwrap();
+        let r = call(&s, "agent-7", "create_branch", json!({"name": "scratch-a"})).await;
+        assert_eq!(r["isError"], false, "{r}");
+        let r = call(&s, "agent-7", "create_branch", json!({"name": "scratch-b"})).await;
+        assert_eq!(
+            r["_meta"]["io.github.kclejeune.sparkles/error"]["code"], "scratch-branch-limit",
+            "{r}"
+        );
+        // another principal has a place of its own
+        let r = call(&s, "owner", "create_branch", json!({"name": "scratch-o"})).await;
+        assert_eq!(r["isError"], false, "{r}");
+        // the resource of each caller lists its own branches only
+        let read = |user: &'static str| {
+            let app = s.app.clone();
+            async move {
+                let r = modern(
+                    &app,
+                    "resources/read",
+                    json!({"uri": "sparkles://mem/branches"}),
+                    &[("authorization", &b(user))],
+                )
+                .await;
+                let t = r.rpc()["result"]["contents"][0]["text"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{}", r.body))
+                    .to_string();
+                serde_json::from_str::<J>(&t).unwrap()
+            }
+        };
+        let v = read("agent-7").await;
+        assert_eq!(v["creator"], "user:agent-7");
+        assert_eq!(v["branches"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["branches"][0]["name"], "scratch-a");
+        let v = read("owner").await;
+        assert_eq!(v["branches"][0]["name"], "scratch-o", "{v}");
+        // clearing a mark needs admin
+        let patch = |user: &str| {
+            Request::patch("/$/branches/mem/scratch-a")
+                .header("content-type", "application/json")
+                .header("authorization", b(user))
+                .body(Body::from(r#"{"scratch":false}"#))
+                .unwrap()
+        };
+        let r = send(&s.app, patch("agent-7")).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+        assert!(ds.store.branch_info("scratch-a").unwrap().scratch.is_some());
+        let r = send(&s.app, patch("owner")).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert!(ds.store.branch_info("scratch-a").unwrap().scratch.is_none());
+        // an ordinary branch: agent-7 may no longer delete it, and has a free place
+        let r = call(&s, "agent-7", "delete_branch", json!({"name": "scratch-a"})).await;
+        assert_eq!(r["isError"], true, "{r}");
+        let r = call(&s, "agent-7", "create_branch", json!({"name": "scratch-b"})).await;
+        assert_eq!(r["isError"], false, "{r}");
     }
 
     /// A14 and the access rules of §5.7 and §6.

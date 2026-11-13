@@ -123,6 +123,10 @@ pub struct BranchInfo {
 pub struct Scratch {
     /// the principal that created the branch, as the server names it in its logs
     pub creator: String,
+    /// the branch never expires, as `create_branch` with `keep: true` asks; a table that
+    /// holds a kept branch is format 3 of `branches.json`
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep: bool,
 }
 
 /// Options of [`Store::create_branch`](crate::store::Store::create_branch).

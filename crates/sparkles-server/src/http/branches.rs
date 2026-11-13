@@ -630,7 +630,13 @@ pub(crate) fn branch_json(b: &BranchInfo) -> J {
             "generation": b.storage.generation,
         },
         "broken": b.broken,
-        "scratch": b.scratch.as_ref().map(|s| json!({ "creator": s.creator })),
+        "scratch": b.scratch.as_ref().map(|s| {
+            let mut j = json!({ "creator": s.creator });
+            if s.keep {
+                j["keep"] = true.into();
+            }
+            j
+        }),
     })
 }
 
@@ -844,7 +850,9 @@ async fn create_inner(
         .into_response())
 }
 
-/// `PATCH /$/branches/{ds}/{name}`: change `protected` or `note` (`null` removes it).
+/// `PATCH /$/branches/{ds}/{name}`: change `protected` or `note` (`null` removes it),
+/// rename the branch, or clear its scratch mark with `scratch: false` (C17 §5.7), which
+/// needs `admin` and turns a scratch branch into an ordinary one.
 pub(crate) async fn patch_branch(
     State(st): St,
     Path((name, branch)): Path<(String, String)>,
@@ -860,13 +868,23 @@ pub(crate) async fn patch_branch(
         .ok_or_else(|| invalid("invalid-branch", "the body is a JSON object"))?;
     if let Some(k) = obj
         .keys()
-        .find(|k| !matches!(k.as_str(), "protected" | "note" | "name"))
+        .find(|k| !matches!(k.as_str(), "protected" | "note" | "name" | "scratch"))
     {
         return Err(invalid(
             "invalid-branch",
-            format!("unknown field {k}: name, protected and note can change"),
+            format!("unknown field {k}: name, protected, note and scratch can change"),
         ));
     }
+    let unscratch = match obj.get("scratch") {
+        None => false,
+        Some(J::Bool(false)) => true,
+        Some(_) => {
+            return Err(invalid(
+                "invalid-branch",
+                "scratch: false, which clears the mark; the MCP tool create_branch makes scratch branches",
+            ));
+        }
+    };
     let rename = match obj.get("name") {
         None => None,
         Some(J::String(n)) if *n == branch => None,
@@ -884,7 +902,7 @@ pub(crate) async fn patch_branch(
         Some(J::String(s)) => Some(Some(s.clone())),
         Some(_) => return Err(invalid("invalid-branch", "note: a string or null")),
     };
-    if protected.is_some() {
+    if protected.is_some() || unscratch {
         check(&p, &name, &branch, Level::Admin, None)?;
     } else {
         check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
@@ -923,6 +941,9 @@ pub(crate) async fn patch_branch(
         }
         if let Some(note) = note {
             d.store.set_branch_note(&b, note)?;
+        }
+        if unscratch && b != sparkles::branch::MAIN {
+            d.store.set_branch_scratch(&b, None)?;
         }
         Ok(d.store.branch_info(&b)?)
     })

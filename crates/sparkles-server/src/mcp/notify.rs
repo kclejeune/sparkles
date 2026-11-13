@@ -80,6 +80,14 @@ impl McpServer {
                 let state = super::memory::pending::state(&self.state, &ds, p)?;
                 Some(hash(&(instance, state)))
             }
+            x if x == Kind::Branches.path() => {
+                if !self.allows(p, "list_branches") {
+                    return None;
+                }
+                let default = self.shared.cfg.scratch_ttl;
+                let state = super::branches::own_branches_state(&self.state, &ds, p, default);
+                Some(hash(&(instance, state)))
+            }
             x if x == Kind::Prefixes.path() => {
                 Some(hash(&(instance, super::tools::dataset_prefixes(&ds))))
             }

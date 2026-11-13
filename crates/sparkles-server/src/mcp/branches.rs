@@ -271,6 +271,7 @@ struct CreateArgs {
     from: Option<String>,
     at: Option<Value>,
     note: Option<String>,
+    keep: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -332,6 +333,8 @@ impl Tools<'_> {
             .branches()
             .map_err(|e| store_error(e, &self.call.request_id))?;
         let ttl = dataset_ttl(&self.server.state, &ds, self.cfg().scratch_ttl);
+        let window = notify_window(&self.server.state, &ds);
+        let now = now_ms();
         let list: Vec<Value> = infos
             .iter()
             .filter(|b| p.level(&on_branch(&ds.name, &b.name)).is_some())
@@ -352,11 +355,14 @@ impl Tools<'_> {
                 }
                 if let Some(s) = &b.scratch {
                     j["creator"] = s.creator.clone().into();
-                    if let Some(t) = ttl {
-                        j["expires"] = sparkles::commit::rfc3339_ms(
-                            last_activity_ms(b) + t.as_millis() as i64,
-                        )
-                        .into();
+                    if s.keep {
+                        j["keep"] = true.into();
+                    }
+                    if let Some(at) = expires_ms(b, ttl) {
+                        j["expires"] = sparkles::commit::rfc3339_ms(at).into();
+                        if window.is_some_and(|w| at - now <= w.as_millis() as i64) {
+                            j["expiresSoon"] = true.into();
+                        }
                     }
                 }
                 if let Some(n) = &b.note {
@@ -422,13 +428,49 @@ impl Tools<'_> {
             note: a.note,
         };
         let rid = &self.call.request_id;
+        let keep = a.keep.unwrap_or(false);
+        let max = crate::assist::memory_settings(&self.server.state, &ds)
+            .scratch_branches
+            .and_then(|s| s.max_per_principal);
+        // the count and the creation happen under one lock, so two calls at the limit
+        // cannot both pass it
+        let _creating = CREATING.lock();
+        if let Some(max) = max {
+            let mine = ds
+                .store
+                .branches()
+                .map_err(|e| store_error(e, rid))?
+                .iter()
+                .filter(|b| b.scratch.as_ref().is_some_and(|s| s.creator == p.id()))
+                .count();
+            if mine >= max as usize {
+                actor.failed_branch(
+                    "branch_created",
+                    Some(&ds.name),
+                    &name,
+                    "scratch-branch-limit",
+                );
+                return Err(ToolError::new(
+                    "scratch-branch-limit",
+                    409,
+                    format!(
+                        "you have {mine} scratch branches in dataset {}, the most its memory.scratchBranches.maxPerPrincipal allows: merge or delete one first",
+                        ds.name
+                    ),
+                ));
+            }
+        }
         ds.store.create_branch(&name, &o).map_err(|e| {
             actor.failed_branch("branch_created", Some(&ds.name), &name, e.code());
             store_error(e, rid)
         })?;
-        let marked = ds
-            .store
-            .set_branch_scratch(&name, Some(Scratch { creator: p.id() }));
+        let marked = ds.store.set_branch_scratch(
+            &name,
+            Some(Scratch {
+                creator: p.id(),
+                keep,
+            }),
+        );
         let info = match marked {
             Ok(i) => i,
             Err(e) => {
@@ -466,10 +508,15 @@ impl Tools<'_> {
             "scratch": true,
             "creator": p.id(),
         });
+        if keep {
+            j["keep"] = true.into();
+        }
         if let Some(f) = &info.from {
             j["from"] = json!({ "branch": f.branch, "commit": f.seq });
         }
-        if let Some(t) = dataset_ttl(&self.server.state, &ds, self.cfg().scratch_ttl) {
+        if let Some(t) = dataset_ttl(&self.server.state, &ds, self.cfg().scratch_ttl)
+            && !keep
+        {
             j["expires"] =
                 sparkles::commit::rfc3339_ms(info.created_ms + t.as_millis() as i64).into();
         }
@@ -756,12 +803,13 @@ pub(super) fn tool_defs(cfg: &McpConfig) -> Vec<ToolDef> {
         "from":{"type":"object","properties":{"branch":{"type":["string","null"]},"commit":{"type":"integer"}}},
         "ahead":{"type":"integer"},"behind":{"type":"integer"},
         "protected":{"type":"boolean"},"scratch":{"type":"boolean"},
-        "creator":{"type":"string"},"expires":{"type":"string"},"note":{"type":"string"}}});
+        "creator":{"type":"string"},"keep":{"type":"boolean"},"expires":{"type":"string"},
+        "expiresSoon":{"type":"boolean"},"note":{"type":"string"}}});
     vec![
         ToolDef {
             name: "list_branches",
             title: "List branches",
-            description: "List the branches of a dataset that you may see, main first: each with its head commit, its creation time and last change, how far it is ahead of and behind its upstream, whether it is protected, and whether it is a scratch branch made by create_branch, with its creator and, when the server expires idle scratch branches, when it will expire. Pass a branch name as `branch` to the other tools to read or write it.",
+            description: "List the branches of a dataset that you may see, main first: each with its head commit, its creation time and last change, how far it is ahead of and behind its upstream, whether it is protected, and whether it is a scratch branch made by create_branch, with its creator, whether it is kept and, when the server expires idle scratch branches, when it will expire and whether that falls within the dataset's warning window (`expiresSoon`). Pass a branch name as `branch` to the other tools to read or write it.",
             input: json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds()}}),
             output: Some(
@@ -776,17 +824,18 @@ pub(super) fn tool_defs(cfg: &McpConfig) -> Vec<ToolDef> {
         ToolDef {
             name: "create_branch",
             title: "Create a scratch branch",
-            description: "Create a scratch branch of a dataset for writes you are unsure of, so main stays unchanged: write there with assert_facts or sparql_update and `branch`, read it back with `branch`, then merge it with merge_branch or discard it with delete_branch. A branch costs a few kilobytes until it is compacted. The branch starts at the head of `from` (main by default) or at the commit `at` names.",
+            description: "Create a scratch branch of a dataset for writes you are unsure of, so main stays unchanged: write there with assert_facts or sparql_update and `branch`, read it back with `branch`, then merge it with merge_branch or discard it with delete_branch. A branch costs a few kilobytes until it is compacted. The branch starts at the head of `from` (main by default) or at the commit `at` names. With `keep: true` it never expires. A dataset may limit how many scratch branches each caller has.",
             input: json!({"type":"object","additionalProperties":false,"required":["name"],"properties":{
                 "dataset": ds(),
                 "name": {"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$","description":"The new branch's name"},
                 "from": {"type":"string","description":"The branch to start from (default main)"},
                 "at": super::schemas::at_sel(),
-                "note": {"type":"string","maxLength":1024,"description":"A note shown in branch listings"}}}),
+                "note": {"type":"string","maxLength":1024,"description":"A note shown in branch listings"},
+                "keep": {"type":"boolean","default":false,"description":"Keep the branch until it is merged or deleted, even when the server expires idle scratch branches"}}}),
             output: Some(
                 json!({"type":"object","required":["dataset","name","created","scratch","creator"],"properties":{
                 "dataset":{"type":"string"},"name":{"type":"string"},"head":{"type":["integer","null"]},
-                "created":{"type":"string"},"scratch":{"type":"boolean"},"creator":{"type":"string"},
+                "created":{"type":"string"},"scratch":{"type":"boolean"},"creator":{"type":"string"},"keep":{"type":"boolean"},
                 "from":{"type":"object"},"expires":{"type":"string"}}}),
             ),
             read_only: false,
@@ -847,6 +896,9 @@ pub(super) fn tool_defs(cfg: &McpConfig) -> Vec<ToolDef> {
 
 // ------------------------------------------------------------- scratch expiry ------
 
+/// Held while `create_branch` counts a caller's scratch branches and creates one.
+static CREATING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Scratch branches the expiry deleted.
 static EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// Whether this server expires scratch branches (the metric is exported then).
@@ -864,6 +916,219 @@ pub(crate) fn dataset_ttl(
         .scratch_branches
         .and_then(|s| s.choice())
         .unwrap_or(default)
+}
+
+/// The warning window of `ds`: its `memory.scratchBranches.notifyBefore`.
+pub(crate) fn notify_window(st: &AppState, ds: &Dataset) -> Option<Duration> {
+    crate::assist::memory_settings(st, ds)
+        .scratch_branches
+        .and_then(|s| s.window())
+}
+
+/// When scratch branch `b` expires under `ttl`, in milliseconds since the epoch: `None`
+/// for a branch that is not a scratch branch, is kept, or has no TTL.
+pub(crate) fn expires_ms(b: &BranchInfo, ttl: Option<Duration>) -> Option<i64> {
+    let s = b.scratch.as_ref()?;
+    if s.keep {
+        return None;
+    }
+    Some(last_activity_ms(b) + ttl?.as_millis() as i64)
+}
+
+/// A scratch branch that expires within its dataset's warning window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Expiring {
+    pub name: String,
+    pub creator: String,
+    pub expires_ms: i64,
+    /// its own commits that its upstream does not have
+    pub ahead: u64,
+}
+
+impl Expiring {
+    pub(crate) fn json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "creator": self.creator,
+            "expires": sparkles::commit::rfc3339_ms(self.expires_ms),
+            "ahead": self.ahead,
+        })
+    }
+}
+
+/// The scratch branches of `ds` that expire within its `notifyBefore` window at
+/// `now_ms`, soonest first, under the TTL that `default` and the dataset's setting give.
+/// Empty without a window or a TTL.
+pub(crate) fn expiring(
+    st: &AppState,
+    ds: &Dataset,
+    default: Option<Duration>,
+    now_ms: i64,
+) -> Vec<Expiring> {
+    let (Some(window), Some(ttl)) = (notify_window(st, ds), dataset_ttl(st, ds, default)) else {
+        return Vec::new();
+    };
+    let Ok(infos) = ds.store.branches() else {
+        return Vec::new();
+    };
+    let mut out: Vec<Expiring> = infos
+        .iter()
+        .filter(|b| !b.broken)
+        .filter_map(|b| {
+            let at = expires_ms(b, Some(ttl))?;
+            (at - now_ms <= window.as_millis() as i64).then(|| Expiring {
+                name: b.name.clone(),
+                creator: b
+                    .scratch
+                    .as_ref()
+                    .map(|s| s.creator.clone())
+                    .unwrap_or_default(),
+                expires_ms: at,
+                ahead: b.ahead,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.expires_ms
+            .cmp(&b.expires_ms)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
+/// The scratch branches of `ds` that `p` created and may see, with what the branches
+/// resource shows of each at `now_ms`.
+fn own_branches(
+    st: &AppState,
+    ds: &Dataset,
+    p: &Principal,
+    default: Option<Duration>,
+    now_ms: i64,
+) -> Option<Vec<(BranchInfo, Option<i64>, bool)>> {
+    let p = p.clone().on_branch(None);
+    let ttl = dataset_ttl(st, ds, default);
+    let window = notify_window(st, ds);
+    let me = p.id();
+    let infos = ds.store.branches().ok()?;
+    Some(
+        infos
+            .into_iter()
+            .filter(|b| b.scratch.as_ref().is_some_and(|s| s.creator == me))
+            .filter(|b| p.level(&on_branch(&ds.name, &b.name)).is_some())
+            .map(|b| {
+                let at = expires_ms(&b, ttl);
+                let soon = at
+                    .zip(window)
+                    .is_some_and(|(at, w)| at - now_ms <= w.as_millis() as i64);
+                (b, at, soon)
+            })
+            .collect(),
+    )
+}
+
+/// The `sparkles://{ds}/branches` resource for `p`: the scratch branches it created, each
+/// with its expiry, and the names of those that expire within the dataset's
+/// `notifyBefore` window.
+pub(crate) fn own_branches_json(
+    st: &AppState,
+    ds: &Dataset,
+    p: &Principal,
+    default: Option<Duration>,
+) -> Option<Value> {
+    let now = now_ms();
+    let own = own_branches(st, ds, p, default, now)?;
+    let mut expiring = Vec::new();
+    let branches: Vec<Value> = own
+        .iter()
+        .map(|(b, at, soon)| {
+            let mut j = json!({
+                "name": b.name,
+                "head": b.head.as_ref().map(|h| h.seq),
+                "created": sparkles::commit::rfc3339_ms(b.created_ms),
+                "lastChange": sparkles::commit::rfc3339_ms(last_activity_ms(b)),
+                "ahead": b.ahead,
+            });
+            if b.scratch.as_ref().is_some_and(|s| s.keep) {
+                j["keep"] = true.into();
+            }
+            if let Some(at) = at {
+                j["expires"] = sparkles::commit::rfc3339_ms(*at).into();
+            }
+            if *soon {
+                j["expiresSoon"] = true.into();
+                expiring.push(b.name.clone());
+            }
+            j
+        })
+        .collect();
+    let mut j = json!({
+        "dataset": ds.name,
+        "creator": p.id(),
+        "branches": branches,
+        "expiring": expiring,
+    });
+    if let Some(n) = crate::assist::memory_settings(st, ds)
+        .scratch_branches
+        .filter(|s| s.window().is_some())
+        .and_then(|s| s.notify_before)
+    {
+        j["notifyBefore"] = n.into();
+    }
+    Some(j)
+}
+
+/// The most expiring branches the brief names one by one.
+const BRIEF_BRANCHES: usize = 5;
+
+/// The lines of the brief for the expiring branches of a branches resource `v`: one per
+/// branch, each beginning with `# scratch:`, with its name escaped.
+pub(crate) fn brief_lines(v: &Value) -> String {
+    let soon: Vec<&Value> = v["branches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["expiresSoon"] == true)
+        .collect();
+    let mut out = String::new();
+    for b in soon.iter().take(BRIEF_BRANCHES) {
+        let mut name = String::new();
+        super::render::escape_into(&mut name, b["name"].as_str().unwrap_or(""));
+        let ahead = b["ahead"].as_u64().unwrap_or(0);
+        let commits = match ahead {
+            0 => "no commits of its own".to_string(),
+            1 => "1 commit not merged".to_string(),
+            n => format!("{n} commits not merged"),
+        };
+        out.push_str(&format!(
+            "# scratch: branch {name} expires at {} with {commits}\n",
+            b["expires"].as_str().unwrap_or("")
+        ));
+    }
+    if soon.len() > BRIEF_BRANCHES {
+        out.push_str(&format!(
+            "# scratch: {} more scratch branches expire soon\n",
+            soon.len() - BRIEF_BRANCHES
+        ));
+    }
+    out
+}
+
+/// The state of the branches resource for `p`, which changes when one of its scratch
+/// branches is created, deleted, written, kept or enters the warning window.
+pub(crate) fn own_branches_state(
+    st: &AppState,
+    ds: &Dataset,
+    p: &Principal,
+    default: Option<Duration>,
+) -> Vec<(String, Option<u64>, bool, Option<i64>, bool)> {
+    own_branches(st, ds, p, default, now_ms())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(b, at, soon)| {
+            let keep = b.scratch.as_ref().is_some_and(|s| s.keep);
+            (b.name, b.head.map(|h| h.seq), keep, at, soon)
+        })
+        .collect()
 }
 
 /// Delete the scratch branches of every dataset whose last change is older than the
@@ -888,7 +1153,10 @@ pub(crate) fn sweep(
             continue;
         };
         for b in infos {
-            if b.scratch.is_none() || b.broken || last_activity_ms(&b) >= cutoff {
+            if b.scratch.as_ref().is_none_or(|s| s.keep)
+                || b.broken
+                || last_activity_ms(&b) >= cutoff
+            {
                 continue;
             }
             let key = format!("{}@{}", ds.name, b.name);

@@ -40,6 +40,7 @@ pub fn check(st: &Arc<AppState>, now: DateTime<Utc>) {
     }
     for ds in st.datasets().values() {
         memory_review(st, &ds.name, now);
+        scratch_expiring(st, &ds.name, now);
     }
     model_budgets(st, now);
 }
@@ -154,6 +155,87 @@ pub fn memory_review(st: &Arc<AppState>, name: &str, now: DateTime<Utc>) -> Opti
         }),
         now,
     ))
+}
+
+/// The scratch-branch TTL a server expires branches under: `None` when it expires none,
+/// else its `--mcp-scratch-branch-ttl`, which a dataset's setting may override.
+#[cfg(feature = "mcp")]
+fn server_expiry(st: &AppState) -> Option<Option<Duration>> {
+    let m = st.mcp.as_ref()?;
+    (!st.read_only && m.cfg.allow_update).then_some(m.cfg.scratch_ttl)
+}
+
+/// Without the MCP server no scratch branches expire, so none warns.
+#[cfg(not(feature = "mcp"))]
+pub fn scratch_expiring(_: &Arc<AppState>, _: &str, _: DateTime<Utc>) -> Option<Raised> {
+    None
+}
+
+/// `memory.review.pending` for the scratch branches of dataset `name` that expire within
+/// its `memory.scratchBranches.notifyBefore` window and hold commits of their own, which
+/// are proposals nobody merged (C17 §5.7). It is a condition of its own, apart from the
+/// review branches, that repeats as they do and clears when no such branch is left.
+#[cfg(feature = "mcp")]
+pub fn scratch_expiring(st: &Arc<AppState>, name: &str, now: DateTime<Utc>) -> Option<Raised> {
+    let key = format!("memory.review.pending/{name}/scratch");
+    let ds = st.get(name)?;
+    let soon: Vec<crate::mcp::branches::Expiring> = match server_expiry(st) {
+        Some(default) => crate::mcp::branches::expiring(st, &ds, default, now.timestamp_millis())
+            .into_iter()
+            .filter(|b| b.ahead > 0)
+            .collect(),
+        None => Vec::new(),
+    };
+    if soon.is_empty() {
+        clear(st, &key);
+        return None;
+    }
+    {
+        let memory = crate::assist::memory_settings(st, &ds);
+        let cfg = settings(st);
+        let repeat = memory
+            .review
+            .as_ref()
+            .and_then(|r| r.repeat_every.as_deref())
+            .and_then(crate::assist::duration_days)
+            .map(delta)
+            .unwrap_or_else(|| cfg.repeat());
+        let notify_before = memory.scratch_branches.and_then(|s| s.notify_before);
+        let n = soon.len();
+        let first = &soon[0];
+        let enc = |s: &str| crate::settings_cmd::enc(s);
+        let ev = Event {
+            kind: "memory.review.pending",
+            dataset: Some(name.to_string()),
+            severity: Severity::Warning,
+            title: format!("Scratch branches expire soon in {name}"),
+            summary: format!(
+                "{n} scratch branch{} in {name} with unmerged commits expire{} within {}. The first, {} of {}, expires at {}. Merge it, or clear its scratch mark to keep it.",
+                if n == 1 { "" } else { "es" },
+                if n == 1 { "s" } else { "" },
+                notify_before.as_deref().unwrap_or("the warning window"),
+                first.name,
+                first.creator,
+                sparkles::commit::rfc3339_ms(first.expires_ms),
+            ),
+            link: Some(format!("/ui/datasets/{}", enc(name))),
+            data: json!({
+                "expiring": soon.iter().take(MAX_BRANCHES).map(|b| b.json()).collect::<Vec<_>>(),
+                "count": n,
+                "notifyBefore": notify_before,
+                "repeatEvery": memory.review.as_ref().and_then(|r| r.repeat_every.clone()).unwrap_or(cfg.repeat_every),
+            }),
+        };
+        Some(raise(
+            st,
+            ev,
+            Some(Condition {
+                key,
+                repeat: Some(repeat),
+            }),
+            now,
+        ))
+    }
 }
 
 /// `models.budget.exceeded` (§3.1): a provider's tokens counted today reach its daily
