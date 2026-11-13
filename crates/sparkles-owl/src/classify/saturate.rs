@@ -1744,8 +1744,15 @@ fn apply_rules<S: Sink, R: Rules>(
                 }
                 _ => {}
             }
+            let wait = if R::DISJ && matches!(h.node, Node::Fresh(_)) {
+                dl_rules::defer(ix, st, d)
+            } else {
+                None
+            };
             for &t in ix.told_of(h) {
-                out.me(Concl::Sub(t));
+                if Some(t) != wait {
+                    out.me(Concl::Sub(t));
+                }
             }
             for &(p, k) in ix.conj_of(h) {
                 if st.subs.contains(&p) {

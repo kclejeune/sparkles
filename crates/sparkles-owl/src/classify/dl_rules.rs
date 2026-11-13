@@ -103,6 +103,11 @@ pub struct DlIx {
     /// in a rooted run with counting, the existential restrictions of each minimum's
     /// holder, whose successor terms differ
     pub ne_of: FxHashMap<Ex, Vec<Ex>>,
+    /// for an at-least conjunction, the at-least conjunctions that entail it, as
+    /// [`super::dl_norm::DlAx::blockers`]
+    pub blockers: FxHashMap<Ex, Box<[Ex]>>,
+    /// for a minimum's name, the conjunction of its witnesses
+    pub witnesses: FxHashMap<Ex, Ex>,
 }
 
 impl DlIx {
@@ -234,6 +239,12 @@ impl DlIx {
             let q = qualified(&mut d, *s, *b);
             d.lazy.push((*k, q, head.clone().into_boxed_slice()));
         }
+        d.blockers = dl
+            .blockers
+            .iter()
+            .map(|(&h, v)| (h, v.clone().into_boxed_slice()))
+            .collect();
+        d.witnesses = dl.least.iter().copied().collect();
         d.low = vec![false; nodes];
         for &h in &dl.low {
             if let Some(x) = d.low.get_mut(h as usize) {
@@ -507,6 +518,9 @@ pub struct DlSt {
     choices: u32,
     /// in the root of a rooted run, its indexes by constant
     pub root: Option<Box<super::dl_root::RootSt>>,
+    /// the at-least conjunctions that hold and wait for the units before they make their
+    /// witnesses, since a conjunction that entails one of them makes its own
+    pending: Vec<Ex>,
 }
 
 impl DlSt {
@@ -831,6 +845,51 @@ pub fn promote() -> bool {
 pub fn low_h() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_LOW_H").is_some_and(|v| v == "1"))
+}
+
+/// Whether a run that counts without the root gives one name to a compound class
+/// expression that several axioms hold, so that a cardinality has one group of witnesses,
+/// one holder and one clause, which `SPARKLES_DL_SHARE=1` turns on. An experiment of item
+/// 894's second look, off by default.
+pub fn share() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_SHARE").is_some_and(|v| v == "1"))
+}
+
+/// Whether a run that counts without the root names the existential restrictions over
+/// simple roles in negative positions apart from the positive ones, which
+/// `SPARKLES_DL_SHADOW=1` turns on. An experiment of item 894's second look, off by default.
+pub fn shadow() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_SHADOW").is_some_and(|v| v == "1"))
+}
+
+/// Whether a run that counts without the root orders its number restrictions by
+/// entailment, which `SPARKLES_DL_LATTICE=1` turns on. An experiment of item 894's second
+/// look, off by default.
+pub fn lattice() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_LATTICE").is_some_and(|v| v == "1"))
+}
+
+/// For the unit `d`, the name of a minimum that another can entail, the conjunction of
+/// its witnesses, which then waits in the context until the units are taken, [`flush`]
+/// releasing it.
+pub fn defer(ix: &Index, st: &mut State, d: Ex) -> Option<Ex> {
+    let dx = ix.dl.as_deref()?;
+    if dx.blockers.is_empty() || !dx.blockers.contains_key(&d) {
+        return None;
+    }
+    let w = dx.witnesses.get(&d).copied()?;
+    ds(st).pending.push(d);
+    Some(w)
+}
+
+/// Whether the context holds an at-least conjunction that entails `d`.
+fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
+    dx.blockers
+        .get(&d)
+        .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
 }
 
 pub fn select_ground() -> bool {
@@ -1184,6 +1243,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
     body.retain(|l| !(l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom()))));
     // a literal that holds makes the clause redundant, and one that cannot leaves it
     let mut holds = false;
+    let cut = dx.root.is_none() && lattice();
     head.retain(|&l| match l.kind() {
         X | Y | F if l.atom() == BOTTOM => false,
         X | F if l.atom() == TOP => {
@@ -1193,6 +1253,15 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
         X if st.subs.contains(&l.atom()) => {
             holds = true;
             true
+        }
+        // an atom disjoint with a unit of the context cannot hold
+        X if cut
+            && ix
+                .disjoint_of(ix.head(l.atom()))
+                .iter()
+                .any(|set| st.disj.get(set).is_some_and(|&m| m != l.atom())) =>
+        {
+            false
         }
         F | RL if holds_succ(ix, dx, st, l) => {
             holds = true;
@@ -2415,6 +2484,26 @@ fn pred(
 /// of clauses processed.
 pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: usize) -> usize {
     let mut n = 0;
+    // the at-least conjunctions that waited for the units make their witnesses now, unless
+    // the context holds a conjunction that entails them
+    let waiting = st
+        .extra
+        .as_mut()
+        .and_then(|x| x.dl.as_deref_mut())
+        .map(|x| std::mem::take(&mut x.pending))
+        .unwrap_or_default();
+    for d in waiting {
+        if blocked(dix(ix), st, d) {
+            continue;
+        }
+        if let Some(&w) = dix(ix).witnesses.get(&d) {
+            out.me(Concl::Sub(w));
+            n += 1;
+        }
+    }
+    if n > 0 {
+        return n;
+    }
     let mut max: Vec<Lit> = Vec::new();
     while n < budget {
         if st.bottom {
@@ -2568,8 +2657,15 @@ fn process<S: Sink>(
                     _ => {}
                 }
                 found.rule = "told";
+                let skip = if blocked(dx, st, d) {
+                    dx.witnesses.get(&d).copied()
+                } else {
+                    None
+                };
                 for &t in ix.told_of(h) {
-                    found.push(with(&prem, Lit::x(t)));
+                    if Some(t) != skip {
+                        found.push(with(&prem, Lit::x(t)));
+                    }
                 }
                 found.rule = "conj";
                 for &(p, k) in ix.conj_of(h) {
