@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ================================================================== compile ====
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Slot {
     Var(usize),
     Const(u64),
