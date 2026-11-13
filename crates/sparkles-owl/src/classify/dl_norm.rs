@@ -1197,7 +1197,14 @@ pub fn normalize(
     } else {
         FxHashMap::default()
     };
-    unfold(it, ax, &all.clauses, &mut rb);
+    // the qualifiers of the number restrictions are in negative positions too
+    let quals: Vec<Ex> = all
+        .atmost
+        .iter()
+        .map(|&(_, _, _, b)| b)
+        .chain(all.lazy.iter().map(|&(_, _, b, _)| b))
+        .collect();
+    unfold(it, ax, &all.clauses, &quals, &mut rb);
     let mut dl = DlAx {
         clauses: all.clauses,
         atmost: all.atmost,
@@ -1328,12 +1335,19 @@ fn lattice(
 /// stand for, `∃s.F ⊑ e` being `F ⊑ ∀s⁻.e`. Each state of an automaton without
 /// ε-transitions is a fresh class: `B ⊑ X_start`, `X_p ⊑ ∀l.X_q` for each transition and
 /// `X_final ⊑ C`. The universal itself stays, which is sound on the direct links.
-fn unfold(it: &mut Interner, ax: &mut Axioms, clauses: &[(Vec<Ex>, Vec<Ex>)], rb: &mut RoleBox) {
+fn unfold(
+    it: &mut Interner,
+    ax: &mut Axioms,
+    clauses: &[(Vec<Ex>, Vec<Ex>)],
+    quals: &[Ex],
+    rb: &mut RoleBox,
+) {
     let inv = super::horn::inverses(it);
     // the expressions in positive and in negative positions
     let mut pos: Vec<Ex> = ax.subs.iter().map(|&(_, c)| c).collect();
     let mut neg: Vec<Ex> = ax.subs.iter().map(|&(a, _)| a).collect();
     neg.extend(ax.disjoint.iter().flatten().copied());
+    neg.extend(quals.iter().copied());
     for (b, h) in clauses {
         neg.extend(b.iter().copied());
         pos.extend(h.iter().copied());

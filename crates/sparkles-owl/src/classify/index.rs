@@ -1827,12 +1827,20 @@ impl Index {
                 b.negative(e, it);
             }
         }
-        // the clauses of Tier D read their body atoms as the left sides of inclusions
+        // the clauses of Tier D read their body atoms as the left sides of inclusions, and
+        // so do the at-most restrictions and item 728's clauses their qualifiers, which
+        // a neighbour must derive to be counted
         if let Some(d) = &ax.dl {
             for (body, _) in &d.clauses {
                 for &e in body {
                     b.negative(e, it);
                 }
+            }
+            for &(_, _, _, q) in &d.atmost {
+                b.negative(q, it);
+            }
+            for &(_, _, q, _) in &d.lazy {
+                b.negative(q, it);
             }
         }
         for &(r, w, x) in &b.neg_data {

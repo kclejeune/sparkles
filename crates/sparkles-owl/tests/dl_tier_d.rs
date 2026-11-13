@@ -2075,3 +2075,75 @@ fn a_qualification_reaches_an_equated_successor_through_the_other_ones_role() {
         &[("H", "F"), ("F", "A")],
     );
 }
+
+/// The qualifier of a number restriction is in a negative position: a neighbour counts
+/// once it derives the qualifier, so the rules that build an intersection from its
+/// operands and an existential restriction from its filler, over a simple role or a
+/// transitive one, are registered for it as for the left side of an inclusion. Each
+/// qualifier below occurs in no other axiom. A run that did not register them counted no
+/// neighbour and left each class satisfiable.
+#[test]
+fn a_compound_qualifier_of_a_number_restriction_is_built_where_it_holds() {
+    // a maximum over an intersection
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :C)) SubClassOf(:C :P) SubClassOf(:C :Q)
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectIntersectionOf(:P :Q))) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("C", "Nothing")],
+    );
+    // a maximum over an existential restriction on a simple role
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :C)))
+             SubClassOf(:X ObjectSomeValuesFrom(:s :D)) SubClassOf(:D :C) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing")],
+    );
+    // a maximum over an existential restriction on a transitive role
+    check(
+        &format!(
+            "TransitiveObjectProperty(:t)
+             SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:t :C)))
+             SubClassOf(:X ObjectSomeValuesFrom(:t :Y))
+             SubClassOf(:Y ObjectSomeValuesFrom(:t :C)) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing")],
+    );
+    // the same over a restriction that holds in each case of a disjunction, where the
+    // role's automaton carries the qualifier and not the EL rules' chains
+    check(
+        &format!(
+            "TransitiveObjectProperty(:t)
+             SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:t :C)))
+             SubClassOf(:X ObjectUnionOf(ObjectSomeValuesFrom(:t :Y1)
+               ObjectSomeValuesFrom(:t :Y2)))
+             SubClassOf(:Y1 ObjectSomeValuesFrom(:t :C))
+             SubClassOf(:Y2 ObjectSomeValuesFrom(:t :C)) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing")],
+    );
+    // a minimum and an exact cardinality in a negative position, item 728's clauses
+    check(
+        &format!(
+            "SubClassOf(ObjectMinCardinality(2 :r ObjectIntersectionOf(:P :Q)) :E)
+             SubClassOf(ObjectIntersectionOf(:K ObjectExactCardinality(2 :r
+               ObjectIntersectionOf(:P :Q))) :F)
+             DisjointClasses(:K1 :K2) SubClassOf(:C :P) SubClassOf(:C :Q)
+             SubClassOf(:B ObjectIntersectionOf(:K
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :K1))
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :K2))
+               ObjectMaxCardinality(2 :r :P)))
+             {UNION}"
+        ),
+        &[("B", "E"), ("B", "F")],
+        &[("B", "Nothing"), ("K", "E")],
+    );
+}
