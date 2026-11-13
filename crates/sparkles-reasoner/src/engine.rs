@@ -677,6 +677,11 @@ pub(crate) struct Eval<'a> {
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
     pub implicit: smallvec::SmallVec<[Triple; 2]>,
     stop: bool,
+    /// the head [`ahead`](Self::ahead) probed for the current candidate, and whether it
+    /// is known
+    probed: Option<(Triple, bool)>,
+    /// the heads probed by [`ahead`](Self::ahead) that an instance used
+    probes_used: u64,
     /// heads emitted so far ([`Mode::New`] and [`Mode::Existing`]), so that each goes
     /// out once
     seen: FxHashSet<Triple>,
@@ -771,6 +776,8 @@ impl<'a> Eval<'a> {
             trail: smallvec::SmallVec::new(),
             implicit: smallvec::SmallVec::new(),
             stop: false,
+            probed: None,
+            probes_used: 0,
             seen: FxHashSet::default(),
             err: None,
             visits: 0,
@@ -1081,17 +1088,190 @@ impl<'a> Eval<'a> {
     /// Match the atom of step `k` against derived facts, in ascending id order, which the
     /// order of first derivation of the heads follows.
     fn rows(&mut self, k: usize, atom: usize, b: &mut [u64], cands: Cands<'_>) {
-        cands.try_each(|row| {
-            if self.aborted() {
-                return false;
+        if let Some(head) = self.probe_ahead(k, atom, b) {
+            self.rows_ahead(k, atom, b, cands, head);
+            return;
+        }
+        cands.try_each(|row| self.row(k, atom, b, row));
+    }
+
+    /// One candidate of [`rows`](Self::rows); false when the evaluation stops.
+    #[inline(always)]
+    fn row(&mut self, k: usize, atom: usize, b: &mut [u64], row: u32) -> bool {
+        if self.aborted() {
+            return false;
+        }
+        self.stats[0] += 1;
+        if self.g.alive(row) {
+            let t = self.g.triple(row);
+            self.fact(k, atom, b, t);
+        }
+        true
+    }
+
+    /// The rule's head when the candidates of atom `atom`, step `k` of the plan, can probe
+    /// their heads ahead of the rest of the plan: forward chaining with no delta to admit
+    /// and no bindings to collect, one triple head, every variable of the head bound once
+    /// the atom matches a fact under the bindings `b`, at least one of them by the atom,
+    /// and the later steps atoms and builtins whose variables are all bound, which only
+    /// check the instance, such as `prp-symp`'s lookup of its symmetric property and its
+    /// `notLiteral` of the new subject. A later step that binds a
+    /// variable can join each candidate with many facts or with none, and a head probed
+    /// for a candidate it rejects is a probe the evaluation would not make. A probe only
+    /// reads the graph, which no evaluation changes, so its answer is the same whenever
+    /// it is asked.
+    fn probe_ahead(&self, k: usize, atom: usize, b: &[u64]) -> Option<[Slot; 3]> {
+        #[cfg(test)]
+        if AHEAD_OFF.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !matches!(self.mode, Mode::New)
+            || self.delta_since.is_some()
+            || self.collect_at.is_some()
+        {
+            return None;
+        }
+        let [CHead::Triple(s, p, o)] = self.rule.head.as_slice() else {
+            return None;
+        };
+        let a = &self.rule.atoms[atom];
+        let by_atom = |v: usize| [a.s, a.p, a.o].contains(&Slot::Var(v));
+        let bound = |x: Slot| !matches!(x, Slot::Var(v) if b[v] == 0 && !by_atom(v));
+        for step in &self.steps[k + 1..] {
+            let checks = match *step {
+                Step::Atom { atom, .. } => {
+                    let l = &self.rule.atoms[atom];
+                    [l.s, l.p, l.o].into_iter().all(bound)
+                }
+                Step::Builtin(j) => self.rule.builtins[j].args.iter().all(|&x| bound(x)),
+            };
+            if !checks {
+                return None;
             }
-            self.stats[0] += 1;
-            if self.g.alive(row) {
-                let t = self.g.triple(row);
-                self.fact(k, atom, b, t);
+        }
+        let head = [*s, *p, *o];
+        let mut new = false;
+        for x in head {
+            if let Slot::Var(v) = x
+                && b[v] == 0
+            {
+                if !by_atom(v) {
+                    return None;
+                }
+                new = true;
             }
-            true
+        }
+        new.then_some(head)
+    }
+
+    /// [`rows`](Self::rows) for an atom whose candidates [`probe_ahead`](Self::probe_ahead)
+    /// allows: they go in groups of [`AHEAD`].
+    fn rows_ahead(
+        &mut self,
+        k: usize,
+        atom: usize,
+        b: &mut [u64],
+        cands: Cands<'_>,
+        head: [Slot; 3],
+    ) {
+        let mut ids = [0u32; AHEAD];
+        let mut n = 0;
+        // one candidate at a time once a group's checks reject most of its probed heads,
+        // or its heads repeat so that few probes were made: the group then only adds work
+        let mut plain = false;
+        let go = cands.try_each(|row| {
+            if plain {
+                return self.row(k, atom, b, row);
+            }
+            ids[n] = row;
+            n += 1;
+            if n < AHEAD {
+                return true;
+            }
+            n = 0;
+            let used = self.probes_used;
+            let (go, matched, probes) = self.ahead(k, atom, b, &ids, head);
+            plain = 2 * self.probes_used.wrapping_sub(used) < u64::from(matched)
+                || 4 * probes < matched;
+            go
         });
+        if go && n > 0 {
+            self.ahead(k, atom, b, &ids[..n], head);
+        }
+    }
+
+    /// A group of candidates of [`rows`](Self::rows): the heads of the ones that match the
+    /// atom are formed and probed in the triple index one after another, so that the
+    /// cache misses of the probes overlap instead of each waiting for the evaluation of
+    /// the candidate before, and then every candidate is evaluated in order as `rows`
+    /// would, its head's probe answered from the group. Returns false when the evaluation
+    /// stops, the number of candidates that matched the atom and the number of probes.
+    fn ahead(
+        &mut self,
+        k: usize,
+        atom: usize,
+        b: &mut [u64],
+        ids: &[u32],
+        [hs, hp, ho]: [Slot; 3],
+    ) -> (bool, u32, u32) {
+        debug_assert!(ids.len() <= AHEAD);
+        #[cfg(test)]
+        AHEAD_GROUPS.fetch_add(1, Ordering::Relaxed);
+        let g = self.g;
+        let a = &self.rule.atoms[atom];
+        let mut heads = [[0u64; 3]; AHEAD];
+        // the candidates that match the atom, and of those the ones whose head is known
+        let (mut matched, mut known) = (0u32, 0u32);
+        for (i, &row) in ids.iter().enumerate() {
+            if !g.alive(row) {
+                continue;
+            }
+            let t = g.triple(row);
+            if !matches!(a.p, Slot::Const(_)) && g.is_hidden(t[1]) {
+                continue;
+            }
+            let mut newly = [usize::MAX; 3];
+            let mut n = 0;
+            if unify(a.s, t[0], b, &mut newly, &mut n)
+                && unify(a.p, t[1], b, &mut newly, &mut n)
+                && unify(a.o, t[2], b, &mut newly, &mut n)
+            {
+                heads[i] = [self.val(hs, b), self.val(hp, b), self.val(ho, b)];
+                matched |= 1 << i;
+            }
+            for &v in &newly[..n] {
+                b[v] = 0;
+            }
+        }
+        // a head equal to the one probed before it takes that answer: a scan whose heads
+        // repeat, such as `rdf1`'s, probes each run of them once
+        let mut last: Option<(Triple, bool)> = None;
+        let mut probes = 0;
+        for (i, t) in heads.iter().enumerate().take(ids.len()) {
+            if matched & (1 << i) == 0 {
+                continue;
+            }
+            let is = match last {
+                Some((h, is)) if h == *t => is,
+                _ => {
+                    probes += 1;
+                    g.known(t)
+                }
+            };
+            last = Some((*t, is));
+            if is {
+                known |= 1 << i;
+            }
+        }
+        for (i, &row) in ids.iter().enumerate() {
+            self.probed = (matched & (1 << i) != 0).then(|| (heads[i], known & (1 << i) != 0));
+            if !self.row(k, atom, b, row) {
+                self.probed = None;
+                return (false, matched.count_ones(), probes);
+            }
+        }
+        self.probed = None;
+        (true, matched.count_ones(), probes)
     }
 
     /// Match the atom of step `k` against the base tier, or a share of its scan.
@@ -1263,6 +1443,20 @@ impl<'a> Eval<'a> {
         })
     }
 
+    /// Whether head `t` is known: the answer of [`ahead`](Self::ahead)'s probe when it
+    /// probed this head for the current candidate, and a probe otherwise.
+    #[inline]
+    fn known_head(&mut self, t: &Triple) -> bool {
+        match self.probed {
+            Some((h, known)) if h == *t => {
+                self.stats[2] += 1;
+                self.probes_used = self.probes_used.wrapping_add(1);
+                known
+            }
+            _ => self.probe_known(t),
+        }
+    }
+
     /// [`Graph::known`], counted for the rule's trace line.
     #[inline]
     fn probe_known(&mut self, t: &Triple) -> bool {
@@ -1339,7 +1533,7 @@ impl<'a> Eval<'a> {
                                 Some(new) => new,
                                 None => return,
                             }
-                    } else if self.probe_known(&t) {
+                    } else if self.known_head(&t) {
                         false
                     } else {
                         match self.see(t) {
@@ -1456,6 +1650,21 @@ fn shares<'g>(
 /// The in-memory candidates a backward search reads before a long base-tier lookup (see
 /// [`Eval::rows_first`]).
 const ROWS_FIRST: usize = 64;
+
+/// Candidates per group of [`Eval::ahead`]: enough probes in flight to overlap their
+/// cache misses, few enough that the group's rows are still in the first-level cache
+/// when it is evaluated.
+const AHEAD: usize = 16;
+
+/// Tests turn [`Eval::probe_ahead`] off to compare its output with the evaluation one
+/// candidate at a time.
+#[cfg(test)]
+pub(crate) static AHEAD_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The groups [`Eval::ahead`] matched, for tests.
+#[cfg(test)]
+pub(crate) static AHEAD_GROUPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Bindings worked out up to plan step `d` before the work is split there.
 const MAX_SPLIT_BINDINGS: usize = 1 << 16;

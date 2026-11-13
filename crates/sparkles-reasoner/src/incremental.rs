@@ -2116,6 +2116,53 @@ pub(crate) mod tests {
         (incremental, fallbacks)
     }
 
+    /// A scan that probes its candidates' heads in groups derives the same facts with
+    /// the same ids as the evaluation one candidate at a time, for random
+    /// OWL RL and RDFS programs, with and without a limit of inferred facts that stops a
+    /// run partway through a group.
+    #[test]
+    fn grouped_head_probes_match_one_at_a_time() {
+        use std::sync::atomic::Ordering;
+        let run = |text: &str, base: &FxHashSet<Triple>, v: &Vocab, cap: usize, off: bool| {
+            let snap = set_default_graph(v, base);
+            let terms = Terms::new(snap.clone());
+            let rules = compiled(text, &terms);
+            let b = Base::new(snap, &[Id::DEFAULT_GRAPH]).unwrap();
+            let mut g = Graph::with_base(Arc::new(b));
+            let mut lim = limits();
+            lim.max_inferred = cap;
+            engine::AHEAD_OFF.store(off, Ordering::Relaxed);
+            let res = engine::run(&mut g, &rules, &terms, &lim, None);
+            engine::AHEAD_OFF.store(false, Ordering::Relaxed);
+            let facts: Vec<(Triple, bool)> = (g.offset()..g.len())
+                .map(|i| (g.triple(i), g.alive(i)))
+                .collect();
+            (
+                res.map(|o| o.iterations).map_err(|e| format!("{e:#}")),
+                facts,
+            )
+        };
+        let mut groups = 0;
+        for (text, owl) in [(crate::OWL_RL_RULES, true), (crate::RDFS_RULES, false)] {
+            for seed in 1..40u64 {
+                let v = Vocab::new();
+                let mut r = Rng(seed * 104_729 + 7);
+                let mut base: FxHashSet<Triple> = FxHashSet::default();
+                for _ in 0..60 {
+                    base.insert(v.triple(&mut r, owl));
+                }
+                for cap in [10_000_000, 1 + r.0 as usize % 200] {
+                    let before = engine::AHEAD_GROUPS.load(Ordering::Relaxed);
+                    let grouped = run(text, &base, &v, cap, false);
+                    groups += engine::AHEAD_GROUPS.load(Ordering::Relaxed) - before;
+                    let single = run(text, &base, &v, cap, true);
+                    assert_eq!(grouped, single, "seed {seed}, limit {cap}, owl {owl}");
+                }
+            }
+        }
+        assert!(groups > 1_000, "{groups}");
+    }
+
     #[test]
     fn rdfs_matches_full() {
         for seed in 1..25 {
