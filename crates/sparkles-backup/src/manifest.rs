@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn an_unknown_index_feature_is_incompatible() {
         let mut m = good();
-        m.index_format = 4;
+        m.index_format = sparkles_core::builder::FORMAT_VERSION;
         m.index_features = vec!["fsst-vocab".into()];
         validate(&m, PIECE, sparkles_core::formats::READABLE_INDEX_FORMATS).unwrap();
         m.index_features.push("zz-future".into());

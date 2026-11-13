@@ -106,11 +106,7 @@ impl Store {
         if let Some(end) = c.log_end {
             self.wal_end.store(end, Ordering::Release);
             if let Some(ix) = generation.wal_index.lock().as_mut() {
-                ix.note(wal::WalPoint {
-                    seq,
-                    offset: end,
-                    folding: false,
-                });
+                ix.note(wal::WalPoint { seq, offset: end });
             }
         }
         if let Some(change) = c.change

@@ -61,6 +61,14 @@ pub enum Concl {
     /// Tier H: an instance of this context has an instance of the target as an
     /// `r`-successor, which this context links to
     Succ(Role, Ex),
+    /// Tier H with individuals (roadmap item 692): the predecessor is real
+    RealBack(Ex),
+    /// Tier H with individuals: an at-most restriction of a singular successor counts
+    /// this context, so it has at most one instance
+    Singular,
+    /// Tier H with individuals: the context stands for the same element as this one,
+    /// and takes what this one holds and derives
+    Same(Ex),
     /// Tier D: the marker `A → A` of an atom that may hold of the context's instance
     Hyp(Ex),
     /// Tier D: the source context registers with this hypothetical successor by its
@@ -387,6 +395,15 @@ impl State {
                 .as_ref()
                 .and_then(|x| x.dl.as_ref())
                 .is_some_and(|d| d.has_hyp(a)),
+            Concl::RealBack(m) => self
+                .extra
+                .as_ref()
+                .is_some_and(|x| x.horn.real_preds.contains(&m)),
+            Concl::Singular => self.extra.as_ref().is_some_and(|x| x.horn.counted),
+            Concl::Same(k) => self
+                .extra
+                .as_ref()
+                .is_some_and(|x| x.horn.same.contains(&k)),
             Concl::SuccIn(..)
             | Concl::PredIn(..)
             | Concl::Succ(..)
@@ -683,8 +700,10 @@ pub fn saturate_counted(
         run.pending.fetch_add(q.len(), Ordering::SeqCst);
     }
     let threads = bounds.threads.max(1);
-    if run.horn {
+    if run.horn && run.plain {
         run.workers::<Horn>(threads);
+    } else if run.horn {
+        run.workers::<HornFull>(threads);
     } else if run.disj {
         run.workers::<Disj>(threads);
     } else if run.plain {
@@ -1014,12 +1033,37 @@ impl Dynamic {
         e
     }
 
+    /// The id of a conjunction the table holds, without creating one.
+    pub fn find(&self, core: &[Ex]) -> Option<Ex> {
+        use std::hash::BuildHasher;
+        let h = rustc_hash::FxBuildHasher.hash_one(core);
+        self.shards[(h >> 32) as usize % SHARDS]
+            .lock()
+            .get(core)
+            .copied()
+    }
+
+    /// The first id of the table's contexts.
+    pub fn base(&self) -> Ex {
+        self.base
+    }
+
+    /// Whether the id is one of the table's contexts.
+    pub fn holds(&self, e: Ex) -> bool {
+        e >= self.base && ((e - self.base) as usize) < self.len()
+    }
+
     pub fn core(&self, e: Ex) -> &[Ex] {
         self.slot(e).core.get().map_or(&[], |c| c)
     }
 
     pub fn ctx(&self, e: Ex) -> &Ctx {
         self.slot(e).ctx.get_or_init(Box::default)
+    }
+
+    /// The context of a conjunction, when the saturation has made one.
+    pub fn get_ctx(&self, e: Ex) -> Option<&Ctx> {
+        self.slot(e).ctx.get().map(|c| &**c)
     }
 
     /// The contexts created.
@@ -1407,14 +1451,7 @@ impl<'a> Run<'a> {
                 dl_rules::init_test(&mut st, core, &mut out);
             } else if R::HORN && me as usize >= self.ctx.len() {
                 let core = self.dynamic.expect("a run with the Horn rules").core(me);
-                st.init = true;
-                out.me(Concl::Sub(TOP));
-                for &m in core {
-                    out.me(Concl::Sub(m));
-                }
-                for &r in &self.ix.roles.reflexive {
-                    out.me(Concl::Loop(r));
-                }
+                init_conjunction(self.ix, core, &mut st, self.universal, &mut out);
             } else if R::DISJ && self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
                 dl_root::init(self.ix, &mut st, &mut out);
             } else {
@@ -1521,9 +1558,37 @@ fn individuals(ix: &Index, me: Ex, st: &State, mut f: impl FnMut(Ex)) {
     }
 }
 
-/// Applies the rules to one conclusion. The answer says whether it was new.
+/// Applies the rules to one conclusion, in a world: every rule of the EL calculus, with
+/// the Horn rules when the index has them. The answer says whether it was new.
 pub fn apply<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: Concl, out: &mut S) -> bool {
-    apply_rules::<S, Full>(ix, me, st, c, out)
+    if ix.horn.is_some() {
+        apply_rules::<S, HornFull>(ix, me, st, c, out)
+    } else {
+        apply_rules::<S, Full>(ix, me, st, c, out)
+    }
+}
+
+/// Initializes the context of a conjunction that the Horn rules created: it holds
+/// `owl:Thing`, each expression of its core, the reflexive loops and the facts of
+/// universal roles.
+pub fn init_conjunction<S: Sink>(
+    ix: &Index,
+    core: &[Ex],
+    st: &mut State,
+    universal: &[Ex],
+    out: &mut S,
+) {
+    st.init = true;
+    out.me(Concl::Sub(TOP));
+    for &m in core {
+        out.me(Concl::Sub(m));
+    }
+    for &r in &ix.roles.reflexive {
+        out.me(Concl::Loop(r));
+    }
+    for &x in universal {
+        out.me(Concl::Sub(x));
+    }
 }
 
 /// Whether the rules of individuals and functional data roles can apply to the index:
@@ -1560,6 +1625,16 @@ struct Horn;
 
 impl Rules for Horn {
     const FULL: bool = false;
+    const HORN: bool = true;
+}
+
+/// The rules of Tier H over an index with individuals, universal roles or functional
+/// data roles (roadmap item 692): every rule of the EL calculus with the Horn rules
+/// beside them.
+struct HornFull;
+
+impl Rules for HornFull {
+    const FULL: bool = true;
     const HORN: bool = true;
 }
 
@@ -1621,18 +1696,34 @@ fn apply_rules<S: Sink, R: Rules>(
                     }
                     if R::FULL && st.real {
                         out.send(succ, Concl::Real);
+                        if R::HORN {
+                            out.send(succ, Concl::RealBack(me));
+                        }
                     }
                     if R::HORN {
-                        horn_rules::succ(ix, me, st, r, succ, true, out);
+                        let new = horn_rules::succ(ix, me, st, r, succ, true, out);
+                        if R::FULL && new {
+                            horn_rules::succ_full(ix, me, st, r, succ, out);
+                        }
                     }
                 }
                 Node::Forall(s, a)
-                    if R::HORN && !ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::UNFOLDED)) =>
+                    if R::HORN
+                        && !ix
+                            .horn
+                            .as_ref()
+                            .is_some_and(|h| h.is(d, HornIx::UNFOLDED | HornIx::GLOBAL)) =>
                 {
                     horn_rules::forall(ix, me, st, s, a, out)
                 }
                 Node::AtMost1(s, b) if R::HORN => horn_rules::at_most(ix, me, st, s, b, out),
                 Node::SelfLoop(r) => out.me(Concl::Loop(r)),
+                Node::Nominal(_) if R::FULL && R::HORN => {
+                    if d != me {
+                        nominal(ix, me, st, d, out);
+                    }
+                    horn_rules::derived_nominal(ix, me, st, d, out);
+                }
                 Node::Nominal(_) if R::FULL && d != me => nominal(ix, me, st, d, out),
                 Node::DataSome(r, _) if R::FULL && !roles.functional(r).is_empty() => {
                     functional(ix, st, r, h.succ, out)
@@ -1671,6 +1762,9 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::FULL && st.extra.is_some() {
                 give(st, d, out);
+                if R::HORN {
+                    horn_rules::spread_sub(st, d, out);
+                }
             }
             if R::HORN && ix.horn.as_ref().is_some_and(|h| h.is(d, HornIx::FILLER)) && d != TOP {
                 horn_rules::fill(ix, me, st, d, out);
@@ -1703,6 +1797,9 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::HORN {
                 horn_rules::back(ix, me, st, e, r, out);
+                if R::FULL {
+                    horn_rules::back_full(ix, me, st, e, r, out);
+                }
             }
             if R::DISJ {
                 dl_rules::back(ix, me, st, e, r, out);
@@ -1750,19 +1847,47 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::HORN {
                 horn_rules::self_loop(ix, me, st, r, out);
+                if R::FULL {
+                    horn_rules::loop_full(ix, me, st, r, out);
+                }
             }
             true
         }
-        Concl::Nom(k) if R::FULL => apply_nom(me, st, k, out),
-        Concl::Real if R::FULL => apply_real(ix, st, out),
+        Concl::Nom(k) if R::FULL => apply_nom(ix, me, st, k, out),
+        Concl::Real if R::FULL => apply_real(ix, me, st, out),
         Concl::LinkTo(r, n) if R::FULL => apply_link_to(me, st, r, n, out),
         Concl::Nom(_) | Concl::Real | Concl::LinkTo(..) => {
             unreachable!("a conclusion of individuals in a saturation without them")
         }
         Concl::SuccIn(n, b) if R::HORN => horn_rules::succ_in(ix, me, st, n, b, out),
-        Concl::PredIn(m, b) if R::HORN => horn_rules::pred_in(ix, me, st, m, b, out),
-        Concl::Succ(r, n) if R::HORN => horn_rules::succ(ix, me, st, r, n, false, out),
-        Concl::SuccIn(..) | Concl::PredIn(..) | Concl::Succ(..) => {
+        Concl::PredIn(m, b) if R::HORN => {
+            let new = horn_rules::pred_in(ix, me, st, m, b, out);
+            if R::FULL && new {
+                horn_rules::spread(st, Concl::PredIn(m, b), true, false, out);
+                horn_rules::counted_full(ix, me, st, Some(m), out);
+            }
+            new
+        }
+        Concl::Succ(r, n) if R::HORN => {
+            let new = horn_rules::succ(ix, me, st, r, n, false, out);
+            if R::FULL && new {
+                horn_rules::succ_full(ix, me, st, r, n, out);
+            }
+            new
+        }
+        Concl::RealBack(m) if R::HORN && R::FULL => horn_rules::real_back(ix, me, st, m, out),
+        Concl::Singular if R::HORN && R::FULL => {
+            let new = !st.extra.as_ref().is_some_and(|x| x.horn.counted);
+            horn_rules::singular(ix, me, st, true, out);
+            new
+        }
+        Concl::Same(k) if R::HORN && R::FULL => horn_rules::same(ix, me, st, k, out),
+        Concl::SuccIn(..)
+        | Concl::PredIn(..)
+        | Concl::Succ(..)
+        | Concl::RealBack(_)
+        | Concl::Singular
+        | Concl::Same(_) => {
             unreachable!("a conclusion of the Horn rules in a saturation without them")
         }
         Concl::Hyp(a) if R::DISJ => dl_rules::hyp(st, a, out),
@@ -1787,7 +1912,7 @@ fn apply_rules<S: Sink, R: Rules>(
 /// A context registers as one that stands for its individual.
 #[cold]
 #[inline(never)]
-fn apply_nom<S: Sink>(me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
+fn apply_nom<S: Sink>(ix: &Index, me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
     if k == me || !st.extra().members.insert(k) {
         return false;
     }
@@ -1797,6 +1922,11 @@ fn apply_nom<S: Sink>(me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
         for &s in &st.subs {
             out.send(k, Concl::Sub(s));
         }
+        // a run with the Horn rules gives the member the loops and Horn successors
+        // too (roadmap item 692)
+        if ix.horn.is_some() {
+            horn_rules::send_own(st, k, out);
+        }
     }
     true
 }
@@ -1805,7 +1935,7 @@ fn apply_nom<S: Sink>(me: Ex, st: &mut State, k: Ex, out: &mut S) -> bool {
 /// knows.
 #[cold]
 #[inline(never)]
-fn apply_real<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
+fn apply_real<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
     if st.real {
         return false;
     }
@@ -1824,11 +1954,18 @@ fn apply_real<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
         }
     }
     if let Some(x) = &st.extra {
+        // the successors the Horn rules made (roadmap item 692)
+        for &(_, n) in &x.horn.succ.list {
+            out.send(n, Concl::Real);
+        }
         for &n in &x.noms {
             for &s in &st.subs {
                 out.send(n, Concl::Sub(s));
             }
         }
+    }
+    if ix.horn.is_some() {
+        horn_rules::became_real(me, st, out);
     }
     true
 }
@@ -2497,5 +2634,292 @@ mod numeric_resource_tests {
             sat.interner.ranges.ledger.as_ref().unwrap().bytes(),
             retained
         );
+    }
+}
+
+#[cfg(test)]
+mod horn_delivery_tests {
+    //! The delivery orders behind the review of roadmap item 692 (F24, "The Horn rules
+    //! with individuals"): a Horn successor made after its source became real, a member
+    //! registering after its individual has loops and Horn successors, and the filler of
+    //! a counted loop arriving last. A saturation's order of activation does not pin these
+    //! down, so each test delivers the conclusions to one context in a chosen order and
+    //! checks what the context sends, against the other orders of the same conclusions.
+    use super::*;
+    use crate::classify::horn;
+    use crate::classify::index::{self, Axioms, Interner, RoleName};
+    use crate::model::{AxiomKind, Class, ObjectProperty};
+
+    const EX: &str = "http://ex.org/delivery#";
+
+    struct Fixture {
+        ix: Index,
+        it: Interner,
+    }
+
+    impl Fixture {
+        /// The index of an ontology, through the EL normalization and then the Horn
+        /// normalization of what it left out, as the classifier builds it.
+        fn new(body: &str) -> Fixture {
+            let doc = crate::ofn_read::parse(&format!(
+                "Prefix(:=<{EX}>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n{body}\n)"
+            ))
+            .unwrap();
+            let mut it = Interner::new();
+            let mut ax = Axioms::default();
+            let mut outside: Vec<&AxiomKind> = Vec::new();
+            for a in &doc.axioms {
+                if index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+                    outside.push(&a.kind);
+                }
+            }
+            let taken = horn::normalize(&outside, &mut it, &mut ax, None, &|| false).unwrap();
+            assert!(taken.iter().all(|t| *t), "the Horn rules take every axiom");
+            ax.classes.extend(it.met_classes());
+            let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+            assert!(ix.horn.is_some(), "the index has the Horn rules");
+            Fixture { ix, it }
+        }
+
+        fn class(&self, name: &str) -> Ex {
+            self.it
+                .class_ex(&Class::new(format!("{EX}{name}")))
+                .unwrap()
+        }
+
+        fn role(&self, name: &str) -> Role {
+            self.it
+                .role_id(&RoleName::Object(ObjectProperty::new(format!(
+                    "{EX}{name}"
+                ))))
+                .unwrap()
+        }
+
+        /// The at-most restriction among the told subsumers of `e`, with its role and its
+        /// filler as the index holds them.
+        fn at_most_of(&self, e: Ex) -> (Ex, Role, Ex) {
+            let h = self.ix.head(e);
+            for &d in self.ix.told_of(h) {
+                if let Node::AtMost1(s, b) = self.ix.head(d).node {
+                    return (d, s, b);
+                }
+            }
+            panic!("no at-most restriction among the told subsumers");
+        }
+
+        fn nominal(&self) -> Ex {
+            let mut noms = self.it.nominals();
+            let n = noms.next().expect("one individual");
+            assert!(noms.next().is_none(), "one individual");
+            n
+        }
+    }
+
+    #[derive(Default)]
+    struct Recording {
+        sent: Vec<(Ex, Concl)>,
+        local: Vec<Concl>,
+    }
+
+    impl Sink for Recording {
+        fn send(&mut self, to: Ex, c: Concl) {
+            self.sent.push((to, c));
+        }
+        fn me(&mut self, c: Concl) {
+            self.local.push(c);
+        }
+        /// every context here stands for one named expression
+        fn core(&self, _ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+            out.push(e);
+        }
+    }
+
+    /// Delivers the conclusions to the context in order and returns what each one made the
+    /// context send.
+    fn deliver(f: &Fixture, me: Ex, seq: &[Concl]) -> Vec<Recording> {
+        let mut st = State::default();
+        seq.iter()
+            .map(|&c| {
+                let mut out = Recording::default();
+                apply_rules::<_, HornFull>(&f.ix, me, &mut st, c, &mut out);
+                out
+            })
+            .collect()
+    }
+
+    fn sent_to(outs: &[Recording], to: Ex, c: Concl) -> usize {
+        outs.iter()
+            .flat_map(|o| o.sent.iter())
+            .filter(|&&(t, d)| t == to && d == c)
+            .count()
+    }
+
+    fn local(outs: &[Recording], c: Concl) -> usize {
+        outs.iter()
+            .flat_map(|o| o.local.iter())
+            .filter(|&&d| d == c)
+            .count()
+    }
+
+    /// Finding 2 of the implementation review: a Horn successor that R3, R5 or R6 makes
+    /// after its source became real learns that the source is real, as a successor made
+    /// before does when the source becomes real.
+    #[test]
+    fn a_horn_successor_of_a_real_source_learns_the_source_is_real_in_either_order() {
+        let f = Fixture::new(
+            "SubClassOf(:M ObjectSomeValuesFrom(:r :N))
+             SubClassOf(:N ObjectAllValuesFrom(:s :N))
+             SubObjectPropertyOf(ObjectInverseOf(:r) :s)
+             ClassAssertion(:M :a)",
+        );
+        let (m, n, r) = (f.class("M"), f.class("N"), f.role("r"));
+        let real_first = [Concl::Real, Concl::Succ(r, n)];
+        let succ_first = [Concl::Succ(r, n), Concl::Real];
+        for (name, seq) in [
+            ("real first", &real_first),
+            ("successor first", &succ_first),
+        ] {
+            let outs = deliver(&f, m, seq);
+            assert_eq!(sent_to(&outs, n, Concl::Back(m, r)), 1, "{name}: the link");
+            assert_eq!(
+                sent_to(&outs, n, Concl::Real),
+                1,
+                "{name}: the successor is real"
+            );
+            assert_eq!(
+                sent_to(&outs, n, Concl::RealBack(m)),
+                1,
+                "{name}: the successor learns the source is real"
+            );
+            // the message comes with the step that completes the pair
+            assert_eq!(
+                sent_to(&outs[..1], n, Concl::RealBack(m)),
+                0,
+                "{name}: not before"
+            );
+        }
+    }
+
+    /// Finding 3 of the implementation review: a context that registers as a member of an
+    /// individual after the individual's context has loops and Horn successors takes
+    /// them, as a member registered before takes them as they come.
+    #[test]
+    fn a_member_that_registers_late_takes_the_loops_and_horn_successors() {
+        let f = Fixture::new(
+            "ClassAssertion(:C :a)
+             SubClassOf(:C ObjectHasSelf(:l))
+             SubClassOf(:C ObjectSomeValuesFrom(:r :N))
+             SubObjectPropertyOf(ObjectInverseOf(:r) :s)",
+        );
+        let (a, k, n) = (f.nominal(), f.class("C"), f.class("N"));
+        let (l, r) = (f.role("l"), f.role("r"));
+        let member_last = [Concl::Loop(l), Concl::Succ(r, n), Concl::Nom(k)];
+        let member_first = [Concl::Nom(k), Concl::Loop(l), Concl::Succ(r, n)];
+        for (name, seq) in [
+            ("member last", &member_last),
+            ("member first", &member_first),
+        ] {
+            let outs = deliver(&f, a, seq);
+            assert_eq!(sent_to(&outs, k, Concl::Loop(l)), 1, "{name}: the loop");
+            assert_eq!(
+                sent_to(&outs, k, Concl::Succ(r, n)),
+                1,
+                "{name}: the successor"
+            );
+        }
+        // the late member takes both in the step it registers
+        let outs = deliver(&f, a, &member_last);
+        assert_eq!(sent_to(&outs[..2], k, Concl::Loop(l)), 0);
+        assert_eq!(sent_to(&outs[..2], k, Concl::Succ(r, n)), 0);
+    }
+
+    /// Finding 4 of the implementation review: a loop that an at-most restriction of a
+    /// singular context counts, beside a real predecessor the restriction counts, makes R7
+    /// identify the predecessor with the context, whichever of the filler, the loop and
+    /// the restriction the context learns last. The filler last is the order the round-1
+    /// probe did not reach.
+    #[test]
+    fn r7_identifies_a_real_predecessor_with_a_counted_loop_whatever_comes_last() {
+        let f = Fixture::new(
+            "SubClassOf(:M ObjectMaxCardinality(1 :s :B))
+             SubClassOf(:M ObjectHasSelf(:l))
+             SubObjectPropertyOf(:l :s)
+             SubObjectPropertyOf(ObjectInverseOf(:r) :s)
+             SubClassOf(:P ObjectSomeValuesFrom(:r :M))
+             ClassAssertion(:B :a)",
+        );
+        let (m, p) = (f.class("M"), f.class("P"));
+        let (r, l) = (f.role("r"), f.role("l"));
+        let (at_most, _, b) = f.at_most_of(m);
+        assert!(
+            f.ix.horn.as_ref().unwrap().is(b, HornIx::FILLER),
+            "the filler is marked"
+        );
+        let filler_last = [
+            Concl::Singular,
+            Concl::Sub(at_most),
+            Concl::Back(p, r),
+            Concl::PredIn(p, b),
+            Concl::RealBack(p),
+            Concl::Loop(l),
+            Concl::Sub(b),
+        ];
+        let loop_last = [
+            Concl::Singular,
+            Concl::Sub(at_most),
+            Concl::Back(p, r),
+            Concl::PredIn(p, b),
+            Concl::RealBack(p),
+            Concl::Sub(b),
+            Concl::Loop(l),
+        ];
+        let restriction_last = [
+            Concl::Singular,
+            Concl::Back(p, r),
+            Concl::PredIn(p, b),
+            Concl::RealBack(p),
+            Concl::Loop(l),
+            Concl::Sub(b),
+            Concl::Sub(at_most),
+        ];
+        for (name, seq) in [
+            ("filler last", &filler_last),
+            ("loop last", &loop_last),
+            ("restriction last", &restriction_last),
+        ] {
+            let outs = deliver(&f, m, seq);
+            let before = &outs[..seq.len() - 1];
+            assert_eq!(
+                sent_to(before, p, Concl::Same(m)),
+                0,
+                "{name}: nothing before the last step"
+            );
+            assert_eq!(
+                local(before, Concl::Same(p)),
+                0,
+                "{name}: nothing before the last step"
+            );
+            assert_eq!(
+                sent_to(&outs, p, Concl::Same(m)),
+                1,
+                "{name}: the predecessor is told"
+            );
+            assert_eq!(
+                local(&outs, Concl::Same(p)),
+                1,
+                "{name}: the context is told"
+            );
+            // R6 also makes the predecessor the instance, with the loops
+            assert_eq!(
+                sent_to(&outs, p, Concl::Loop(l)),
+                1,
+                "{name}: R6 gives the loop"
+            );
+            assert_eq!(
+                sent_to(&outs, p, Concl::Sub(m)),
+                1,
+                "{name}: R6 gives the conjunction"
+            );
+        }
     }
 }

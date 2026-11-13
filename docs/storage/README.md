@@ -15,14 +15,14 @@ index is a set of QLever-style sorted and compressed permutations.
   `xsd:boolean`, `xsd:dateTime` and `xsd:date` values are stored inline when their
   lexical form is canonical.
 * The index holds 7 permutations (SPO, SOP, PSO, POS, OSP, OPS and GSPO) in compressed
-  blocks of 32k rows. Index format 3 splits each block column into frames of 2,048 rows
-  with a directory of their first keys, so a point lookup, a short range scan or an index
-  join decodes only the frames that can hold its rows. Stores in format 2 open as they
-  are and are rewritten at the next compaction.
+  blocks of 32k rows. Each block column is split into frames of 2,048 rows with a
+  directory of their first keys, so a point lookup, a short range scan or an index join
+  decodes only the frames that can hold its rows. Every generation records its index
+  format and the features its blocks use in `meta.json`.
 * The base vocabulary is sorted, front-coded and memory-mapped, and an append-only delta
   vocabulary holds the terms added since. With `--vocab-codec fsst`, a load or compaction
   also compresses each key's suffix with FSST, which shrinks `vocab.dat` by about 30% and
-  writes generation index format 4. FSST is off by default because it slows queries that
+  is recorded among the generation's features. FSST is off by default because it slows queries that
   decode many strings
   ([X11](../specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
 * A numeric column beside the base vocabulary, `vocab.num`, holds the exact value of
@@ -54,8 +54,7 @@ These read paths are tuned for queries over data that is not yet in memory
   repeat of a query makes no read hint.
 * Index joins decode the columns they need on a separate pool, and optional warmup
   observes cancellation and deadlines. Each step has its own `Optimizations` flag.
-* A point lookup in index format 3 decodes the frames of 2,048 rows that can hold its
-  keys. An index join whose keys in one block span more than a quarter of the block's
+* A point lookup decodes the frames of 2,048 rows that can hold its keys. An index join whose keys in one block span more than a quarter of the block's
   frames reads the block whole at its first cold frame, so a large join does not read
   frames one by one before it reads their block again.
 * `sparkles serve --prewarm` records, at shutdown and every `--prewarm-interval` seconds,
@@ -161,10 +160,10 @@ These read paths are tuned for queries over data that is not yet in memory
   15 to 21 MiB.
 * `/$/metrics` reports the synchronization time, the commits per fence, the wait, and why
   commits fell back or failed. `/$/stats/{ds}` says whether the dataset groups commits.
-* A WAL written before logs had a header record is framed strictly from the offset where
-  the current release first opened it for writing. The offset is recorded in the
-  generation's `commit.json` once the log, its vocabulary and its annotations are durable,
-  so a torn modern record after it is never read as a legacy one.
+* Every write-ahead log starts with a header record and every commit record carries
+  metadata, so a commit record without it is damage: a torn tail when no later record
+  proves the commit durable, and corruption otherwise. A header that a crash tore at the
+  log's creation reads as an empty log, which the open creates again.
 * A data directory belongs on a local file system. Sparkles does not support NFS for a
   data directory, because the process lock is an advisory file lock and the index files
   are memory-mapped, and neither is reliable across clients of a network file system.
@@ -354,6 +353,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 * The largest measured dataset is English DBpedia, 1.24 billion triples on one machine.
   Nothing larger, such as Wikidata, has been tried. Roadmap item 1.
+* Databases and backups written before the first release are refused with a message that
+  names `sparkles dump` from the release that wrote them and `sparkles load`. There is no
+  upgrade step for them, and `sparkles migrate --check` reports the files that are too
+  old ([X16](../specs/X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)).
 * FSST vocabulary compression is off by default. With it, a DBpedia export takes 1.05
   times as long as with front coding, and warm queries that decode many strings run 4% to
   12% slower. Single-term lookups are the follow-up. Roadmap item 160.
@@ -362,8 +365,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   each existing generation's recorded format. Roadmap item 343.
 * The first query that arrives about 2 s after a start is slower than one that arrives at
   once, because the server's idle threads and cores wake up for it. Roadmap item 572.
-* Cold `export-1m` at 1.01B takes 1,293 ms in index format 3, 4% above the earlier format 2
-  measurement, and 17 times as long with `SPARKLES_IO_HINTS=off`. Roadmap item 573.
+* Cold `export-1m` at 1.01B takes 1,293 ms with framed block columns, 4% above the
+  measurement of the earlier unframed layout, and 17 times as long with
+  `SPARKLES_IO_HINTS=off`. Roadmap item 573.
 * Warm point lookups run 1.6% to 2.5% more instructions per request for the index join's
   check of cold segments. Roadmap item 516.
 * The prewarm restores the block cache and the pages of the generation's files. It does

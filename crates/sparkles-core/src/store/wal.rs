@@ -17,29 +17,26 @@
 //!
 //! # Version
 //!
-//! A log created by this release starts with a header record: 33 bytes, like every
-//! record, so the records after it keep their alignment. Its first eight bytes are
-//! [`MAGIC`], whose first byte [`WAL_HEADER`] is no record type, then the log's version
-//! ([`crate::formats::WAL_VERSION`]) as a little-endian `u32`. The bytes after the version
-//! are zero in every version this build reads, and a newer version may use them, so a
-//! reader takes the version first and refuses an unknown one before it looks at the rest.
-//! A log without
-//! the header was written before it existed and is version 0. Its records are the same.
+//! Every log starts with a header record: 33 bytes, like every record, so the records
+//! after it keep their alignment. Its first eight bytes are [`MAGIC`], whose first byte
+//! [`WAL_HEADER`] is no record type, then the log's version as a little-endian `u32`,
+//! [`PLAIN_VERSION`] for a store without configuration history and
+//! [`crate::formats::WAL_VERSION`] for an activated one. The bytes after the version are
+//! zero in every version this build reads, and a newer version may use them, so a reader
+//! takes the version first and refuses an unknown one before it looks at the rest.
 //! Readers skip the header where a log starts, so a position of byte 0 still means "the
 //! generation's base, before any commit". A log whose version this build does not read
-//! is refused with [`Error::Unsupported`]. Existing logs are never rewritten to add the
-//! header: it arrives with the next generation, at a compaction or bulk load. The
-//! dataset requires reader [`HEADER_READER`] before a store writes one, so an older
-//! release refuses the dataset instead of reading the header as a damaged record.
+//! is refused with [`Error::Unsupported`], and so is the pre-release log without a
+//! header, [`HEADERLESS_VERSION`], with the dump-and-reload message. A header that a
+//! crash at the log's creation tore, fewer bytes than a record or a record of zeros with
+//! nothing after it, holds no committed record: the open reads it as an empty log and
+//! creates the log again with its header (see [`version_at_start`]). The dataset requires
+//! reader [`HEADER_READER`] from its creation, so a release before the header refuses
+//! the dataset instead of reading the header as a damaged record.
 //!
-//! A headerless log may hold commit records from a release that wrote no commit
-//! metadata, and such a record is byte-identical to a modern one whose metadata a crash
-//! tore away. The first write open of a headerless log by this release therefore records
-//! the log's logical end as `walStrictFrom` in the generation's `commit.json`, once and
-//! before it appends anything. It does so after replaying, truncating and syncing the log
-//! and syncing the vocabulary and annotations its commits name. Records after that offset
-//! follow the rules of a log with a header, and damage before it is corruption (see
-//! `store::Framing`).
+//! Every commit record after the header carries metadata, so a commit record without it
+//! is damage: a torn tail when no later record proves the commit durable, and corruption
+//! otherwise (see [`wal_torn_from`](super::wal_torn_from)).
 
 use super::*;
 
@@ -226,7 +223,7 @@ pub(crate) fn descriptor_version(file: &mut File, path: &Path) -> Result<u32> {
             }
             length += count;
         }
-        committed_version_of(&bytes[..length], path)
+        version_at_start(&bytes[..length], file.metadata()?.len(), path)
     })();
     let restored = file.seek(SeekFrom::Start(position));
     match result {
@@ -289,29 +286,62 @@ pub(crate) fn header_version(rec: &[u8], path: &Path) -> Result<u32> {
     Ok(v)
 }
 
-/// The version of the log whose first bytes are `buf` (0 without a header).
+/// The version of a log without a header record, the pre-release form that this build
+/// refuses with the dump-and-reload message (spec X16 Phase 1).
+pub(crate) const HEADERLESS_VERSION: u32 = 0;
+
+/// The version of a log whose first bytes are `first` and whose length is `total`. A
+/// log whose first record is not a header record is the pre-release headerless form,
+/// version 0, and is refused. A header that a crash at the log's creation tore before
+/// its bytes reached the disk, fewer bytes than a record or a record of zeros, holds no
+/// committed record and reads as an empty log of [`PLAIN_VERSION`], which the open
+/// creates again with its header. `wal::create` syncs the header before any record
+/// follows it, so a record of zeros followed by more bytes is not that case: it is
+/// damage, and refusing it keeps the records after it from being read as a torn tail.
+fn version_at_start(first: &[u8], total: u64, path: &Path) -> Result<u32> {
+    match first.first() {
+        None => Ok(PLAIN_VERSION),
+        Some(_) if first.len() < WAL_REC => Ok(PLAIN_VERSION),
+        Some(&WAL_HEADER) => header_version(first, path),
+        Some(_) if is_zero_record(&first[..WAL_REC]) => {
+            if total <= WAL_REC as u64 {
+                Ok(PLAIN_VERSION)
+            } else {
+                Err(Error::Corrupt(format!(
+                    "{}: the header record is zeros, but {total} bytes follow it",
+                    path.display()
+                )))
+            }
+        }
+        Some(_) => {
+            Err(crate::formats::WAL.refuse(&path.display().to_string(), HEADERLESS_VERSION, None))
+        }
+    }
+}
+
+/// The version of the log whose first bytes are `buf` (see [`version_at_start`]).
+#[cfg(test)]
 pub(crate) fn version_of(buf: &[u8], path: &Path) -> Result<u32> {
-    match buf.first() {
-        Some(&WAL_HEADER) => header_version(buf, path),
-        _ => Ok(0),
-    }
+    version_at_start(buf, buf.len() as u64, path)
 }
 
-/// The version of a log for replay, from its first complete record only. A
-/// header record cut short by a crash is a torn tail with no committed record,
-/// as it is to the record-by-record readers, so it reads as an empty log (0).
+/// The version of a log for replay, from the whole log `buf`. A header record cut short
+/// by a crash is a torn tail with no committed record, as it is to the record-by-record
+/// readers, so it reads as an empty log, and so does a log of zeros alone, whose length
+/// grew for its header before the bytes reached the disk.
 pub(crate) fn committed_version_of(buf: &[u8], path: &Path) -> Result<u32> {
-    match buf.get(..WAL_REC) {
-        Some(record) => version_of(record, path),
-        None => Ok(0),
+    if buf.first().is_some_and(|&b| b != WAL_HEADER) && buf.iter().all(|&b| b == 0) {
+        return Ok(PLAIN_VERSION);
     }
+    version_at_start(buf, buf.len() as u64, path)
 }
 
-/// The version of the log at `path` (0 for a missing or headerless log), for
-/// `sparkles migrate --check`.
+/// The version of the log at `path` ([`PLAIN_VERSION`] for a missing or empty log,
+/// [`HEADERLESS_VERSION`] for the pre-release headerless log, which the registry then
+/// refuses), for `sparkles migrate --check`.
 pub fn file_version(path: &Path) -> Result<u32> {
     let mut buf = [0u8; WAL_REC];
-    let n = match File::open(path) {
+    let (n, total) = match File::open(path) {
         Ok(mut f) => {
             let mut n = 0;
             while n < WAL_REC {
@@ -320,12 +350,15 @@ pub fn file_version(path: &Path) -> Result<u32> {
                     k => n += k,
                 }
             }
-            n
+            (n, f.metadata()?.len())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0),
         Err(e) => return Err(e.into()),
     };
-    version_of(&buf[..n], path)
+    if n == WAL_REC && buf[0] != WAL_HEADER && !is_zero_record(&buf) {
+        return Ok(HEADERLESS_VERSION);
+    }
+    version_at_start(&buf[..n], total, path)
 }
 
 /// The bytes a new log starts with: its header record.
@@ -669,8 +702,6 @@ pub(crate) struct WalPoint {
     pub seq: u64,
     /// the byte offset after the commit's last record
     pub offset: u64,
-    /// legacy transactions (without commit metadata) read from here fold into the base
-    pub folding: bool,
 }
 
 /// An index entry every this many commits.
@@ -691,11 +722,10 @@ pub(crate) struct WalIndex {
 
 impl WalIndex {
     /// The index of an empty log whose generation's base index holds commit `base`.
-    pub fn new(base: u64, fold_legacy: bool) -> WalIndex {
+    pub fn new(base: u64) -> WalIndex {
         let p = WalPoint {
             seq: base,
             offset: 0,
-            folding: fold_legacy,
         };
         WalIndex {
             points: vec![p],
@@ -706,17 +736,7 @@ impl WalIndex {
 
     /// Record the end of a complete transaction (in log order).
     pub fn note(&mut self, p: WalPoint) {
-        if p.seq < self.last.seq || p.offset < self.last.offset {
-            return;
-        }
-        if p.seq == self.last.seq {
-            // a legacy transaction folded into the base: the base's state ends later
-            self.last = p;
-            if let Some(l) = self.points.last_mut()
-                && l.seq == p.seq
-            {
-                *l = p;
-            }
+        if p.seq <= self.last.seq || p.offset < self.last.offset {
             return;
         }
         self.last = p;
@@ -754,8 +774,8 @@ impl WalIndex {
     /// one not indexed yet). It ends at a torn final transaction, and at damage: the
     /// index only says where to start reading, and the reader that reaches the damage
     /// reports it.
-    pub fn scan(path: &Path, base: u64, fold_legacy: bool) -> Result<WalIndex> {
-        let mut ix = WalIndex::new(base, fold_legacy);
+    pub fn scan(path: &Path, base: u64) -> Result<WalIndex> {
+        let mut ix = WalIndex::new(base);
         let file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ix),
@@ -943,7 +963,7 @@ impl WalCursor {
             ),
             None => commit::open_wal_commit(&rec, &self.txn),
         };
-        let (seq, folding) = match metadata {
+        let seq = match metadata {
             Some(Ok((seq, _, _, flags))) => {
                 self.configuration = configuration_records(&self.txn, self.version, flags)?;
                 if seq != prev + 1 {
@@ -952,7 +972,7 @@ impl WalCursor {
                         self.path.display()
                     )));
                 }
-                (seq, false)
+                seq
             }
             Some(Err(())) => {
                 return Err(Error::Corrupt(format!(
@@ -960,26 +980,16 @@ impl WalCursor {
                     self.path.display()
                 )));
             }
-            None if self.version >= 1 => {
-                return Err(Error::Corrupt(
-                    "framed WAL transaction has no commit metadata".into(),
-                ));
-            }
-            // legacy records before the first with metadata fold into the base
-            None if self.at.folding => {
-                configuration_records(&self.txn, self.version, 0)?;
-                (prev, true)
-            }
+            // every log this build reads has a header record, and every commit record
+            // after it carries metadata
             None => {
-                configuration_records(&self.txn, self.version, 0)?;
-                (prev + 1, false)
+                return Err(Error::Corrupt(format!(
+                    "{}: the transaction ending at byte {offset} has no commit metadata",
+                    self.path.display()
+                )));
             }
         };
-        self.at = WalPoint {
-            seq,
-            offset,
-            folding,
-        };
+        self.at = WalPoint { seq, offset };
         Ok(Some((seq, &self.txn, self.buffer_bytes())))
     }
 
@@ -1137,26 +1147,6 @@ pub(crate) fn apply_forward_limited(
     Ok(records)
 }
 
-/// Why a backward replay could not run.
-pub(crate) enum Backward {
-    /// a legacy transaction in the range: its number is not in the log, so replay
-    /// forward instead
-    Legacy,
-    Failed(Error),
-}
-
-impl From<Error> for Backward {
-    fn from(e: Error) -> Backward {
-        Backward::Failed(e)
-    }
-}
-
-impl From<std::io::Error> for Backward {
-    fn from(e: std::io::Error) -> Backward {
-        Backward::Failed(e.into())
-    }
-}
-
 /// Undo the transactions of a log range on `delta`, the state at the end of `hi`, so it
 /// becomes the state at the end of `lo`. The range is read from its end in chunks, and
 /// each transaction's checksum is verified before it is undone.
@@ -1168,9 +1158,9 @@ pub(crate) fn apply_backward(
     lo: WalPoint,
     hi: WalPoint,
     check: &mut dyn FnMut(&Delta) -> Result<()>,
-) -> std::result::Result<u64, Backward> {
+) -> Result<u64> {
     const CHUNK: u64 = (4 << 20) / WAL_REC as u64 * WAL_REC as u64;
-    let corrupt = |m: String| Backward::Failed(Error::Corrupt(format!("{}: {m}", path.display())));
+    let corrupt = |m: String| Error::Corrupt(format!("{}: {m}", path.display()));
     if hi.offset < lo.offset || !(hi.offset - lo.offset).is_multiple_of(WAL_REC as u64) {
         return Err(corrupt(format!(
             "no whole records between bytes {} and {}",
@@ -1190,14 +1180,14 @@ pub(crate) fn apply_backward(
                     data: &[[u8; WAL_REC]],
                     seq: &mut u64,
                     delta: &mut Delta|
-     -> std::result::Result<(), Backward> {
+     -> Result<()> {
         fwd.clear();
         for r in data.iter().rev() {
             fwd.extend_from_slice(r);
         }
         match commit::open_wal_commit(commit, &fwd) {
             Some(Ok((s, _, _, flags))) if s == *seq => {
-                configuration_records(&fwd, version, flags).map_err(Backward::Failed)?;
+                configuration_records(&fwd, version, flags)?;
             }
             Some(Ok((s, _, _, _))) => {
                 return Err(corrupt(format!("found commit {s} where {seq} ends")));
@@ -1207,7 +1197,11 @@ pub(crate) fn apply_backward(
                     "checksum mismatch in the transaction of commit {seq}"
                 )));
             }
-            None => return Err(Backward::Legacy),
+            None => {
+                return Err(corrupt(format!(
+                    "the transaction of commit {seq} has no commit metadata"
+                )));
+            }
         }
         for r in data {
             if r[0] == WAL_CONFIGURATION {
@@ -1273,10 +1267,10 @@ pub(crate) fn apply_backward_limited(
     lo: WalPoint,
     hi: WalPoint,
     limit: &crate::history::ReadLimit<'_>,
-) -> std::result::Result<u64, Backward> {
+) -> Result<u64> {
     const CHUNK: u64 = (64 << 10) / WAL_REC as u64 * WAL_REC as u64;
     limit.check(super::history_limited::preparation_delta_bytes(delta))?;
-    let corrupt = |m: String| Backward::Failed(Error::Corrupt(format!("{}: {m}", path.display())));
+    let corrupt = |m: String| Error::Corrupt(format!("{}: {m}", path.display()));
     if hi.offset < lo.offset || !(hi.offset - lo.offset).is_multiple_of(WAL_REC as u64) {
         return Err(corrupt(format!(
             "no whole records between bytes {} and {}",
@@ -1297,7 +1291,7 @@ pub(crate) fn apply_backward_limited(
                     seq: &mut u64,
                     delta: &mut Delta,
                     held_buffers: u64|
-     -> std::result::Result<(), Backward> {
+     -> Result<()> {
         fwd.clear();
         let need = data.len().saturating_mul(WAL_REC);
         if need > fwd.capacity() {
@@ -1330,7 +1324,7 @@ pub(crate) fn apply_backward_limited(
             )?,
         ) {
             Some(Ok((s, _, _, flags))) if s == *seq => {
-                configuration_records(&fwd, version, flags).map_err(Backward::Failed)?;
+                configuration_records(&fwd, version, flags)?;
             }
             Some(Ok((s, _, _, _))) => {
                 return Err(corrupt(format!("found commit {s} where {seq} ends")));
@@ -1340,7 +1334,11 @@ pub(crate) fn apply_backward_limited(
                     "checksum mismatch in the transaction of commit {seq}"
                 )));
             }
-            None => return Err(Backward::Legacy),
+            None => {
+                return Err(corrupt(format!(
+                    "the transaction of commit {seq} has no commit metadata"
+                )));
+            }
         }
         for r in data {
             if r[0] == WAL_CONFIGURATION {
@@ -1660,6 +1658,13 @@ mod tests {
                 fixture(version, &data, flags)
             };
             std::fs::write(&path, bytes).unwrap();
+            if version == 0 {
+                // the pre-release headerless log is refused before any record is read
+                let error = WalCursor::open(&path, p(0, 0)).err().expect("version 0");
+                assert!(matches!(error, Error::Unsupported(_)), "{error}");
+                assert!(error.to_string().contains("wal version 0"), "{error}");
+                continue;
+            }
             let mut cursor = WalCursor::open(&path, p(0, 0)).unwrap();
             let result = cursor.next().map(|r| r.map(|(seq, _)| seq));
             assert_eq!(
@@ -1684,11 +1689,7 @@ mod tests {
     }
 
     fn p(seq: u64, offset: u64) -> WalPoint {
-        WalPoint {
-            seq,
-            offset,
-            folding: false,
-        }
+        WalPoint { seq, offset }
     }
 
     fn crc_fixture(backward: bool) -> (tempfile::TempDir, Store, PathBuf, WalPoint, WalPoint) {
@@ -1895,62 +1896,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bounded_crc_headerless_legacy_keeps_forward_fallback() {
-        let (root, store, path, first, second) = crc_fixture(true);
-        let mut bytes = std::fs::read(&path).unwrap()[WAL_REC..second.offset as usize].to_vec();
-        for record in bytes.as_chunks_mut::<WAL_REC>().0 {
-            if record[0] == WAL_COMMIT {
-                record[9..].fill(0);
-            }
-        }
-        std::fs::write(&path, bytes).unwrap();
-        let snap = store.snapshot();
-        let first = p(1, first.offset - WAL_REC as u64);
-        let second = p(2, second.offset - WAL_REC as u64);
-        *snap.generation.wal_index.lock() = Some(WalIndex {
-            points: vec![p(0, 0), first, second],
-            last: second,
-            since: 0,
-        });
-        let before = durable_files(root.path());
-        let observer = std::sync::Arc::new(|_, _, _| panic!("legacy data has no modern CRC"));
-        let (bounded, _) = commit::with_wal_crc_observer(observer, || {
-            store.snapshot_at_limited(
-                &crate::history::At::Commit(1),
-                &Default::default(),
-                128 << 20,
-            )
-        })
-        .unwrap();
-        assert_eq!(bounded.len(), 6_000);
-        let mut history = store.history.as_ref().unwrap().lock();
-        history.cache.clear();
-        history.settle();
-        drop(history);
-        let (ordinary, _) = store
-            .snapshot_at(&crate::history::At::Commit(1), &Default::default())
-            .unwrap();
-        let mut bounded_quads = Vec::new();
-        bounded
-            .for_each_quad(|q| {
-                bounded_quads.push(*q);
-                Ok(())
-            })
-            .unwrap();
-        let mut ordinary_quads = Vec::new();
-        ordinary
-            .for_each_quad(|q| {
-                ordinary_quads.push(*q);
-                Ok(())
-            })
-            .unwrap();
-        bounded_quads.sort_unstable();
-        ordinary_quads.sort_unstable();
-        assert_eq!(bounded_quads, ordinary_quads);
-        assert_eq!(durable_files(root.path()), before);
-    }
-
     /// Direct writes, buffered writes in between, and block boundaries leave the file
     /// with exactly the bytes written, in order, and zeros after them.
     #[test]
@@ -1993,7 +1938,7 @@ mod tests {
 
     #[test]
     fn the_index_keeps_sparse_points() {
-        let mut ix = WalIndex::new(10, false);
+        let mut ix = WalIndex::new(10);
         for s in 11..=3000u64 {
             ix.note(p(s, (s - 10) * 66));
         }
@@ -2005,23 +1950,17 @@ mod tests {
         assert_eq!(ix.floor(2999), p(2058, 2048 * 66));
         assert_eq!(ix.floor(5000), p(3000, 2990 * 66));
         // large transactions: a point per MiB
-        let mut ix = WalIndex::new(0, false);
+        let mut ix = WalIndex::new(0);
         for s in 1..=10u64 {
             ix.note(p(s, s * (600 << 10)));
         }
         assert_eq!(ix.len(), 6);
-        // folded legacy transactions move the base's end
-        let mut ix = WalIndex::new(5, true);
-        ix.note(WalPoint {
-            seq: 5,
-            offset: 66,
-            folding: true,
-        });
+        // out-of-order notes are ignored, a repeated number included
+        let mut ix = WalIndex::new(5);
         ix.note(p(6, 132));
-        assert_eq!(ix.floor(5).offset, 66);
-        assert_eq!(ix.floor(6).offset, 132);
-        // out-of-order notes are ignored
         ix.note(p(4, 10));
+        ix.note(p(6, 200));
+        assert_eq!(ix.floor(5).offset, 0);
         assert_eq!(ix.last(), p(6, 132));
     }
 }

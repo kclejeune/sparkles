@@ -2690,10 +2690,11 @@ Query parameters beyond the standard protocol:
   every operator of the query has a cursor implementation. That covers counts over
   OPTIONAL and MINUS. Such groupings measured 0.50 to 0.91 times the eager time. On a
   server with spill on, a SELECT of cursor operators that eager execution would hold in
-  more than half its memory budget streams too, and an eager SELECT that exceeds its
-  memory budget runs once more as a cursor within the same deadline, unless it calls
-  SERVICE anywhere, inside an EXISTS included, a graph algorithm or an extension function.
-  The cursor plan then counts `eagerMemoryRetry`. A plan whose estimate exceeds the
+  more than half its memory budget streams too, an eager hash join whose table does not
+  fit the budget partitions its inputs to disk through the cursor's join, and an eager
+  SELECT that still exceeds its memory budget runs once more as a cursor within the same
+  deadline, unless it calls SERVICE anywhere, inside an EXISTS included, a graph
+  algorithm or an extension function. The cursor plan then counts `eagerMemoryRetry`. A plan whose estimate exceeds the
   request's row budgets (`max-rows` or `max-rows-produced`) runs eagerly, so that the
   budget fails it with a status before any output. Every other plan runs eagerly, with the
   same response as `execution=eager`. A query that ran in under 10 ms the last time also

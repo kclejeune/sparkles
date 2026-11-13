@@ -1148,7 +1148,6 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
     let from = super::wal::WalPoint {
         seq: head,
         offset: 0,
-        folding: physical.value.origin == "baseline",
     };
     let cursor_limit = budget.owned_limit()?;
     let mut cursor = super::wal::WalCursor::open_limited(&hot, from, &cursor_limit, 0)?;
@@ -1203,7 +1202,7 @@ fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparat
         )?;
         let directory = entry.path();
         let allowance = preparation.room();
-        let strict_from = {
+        {
             let _decode = preparation.reserve(allowance)?;
             let options = crate::history::HistoryOptions {
                 cancel: Some(preparation.control().cancel.flag()),
@@ -1223,8 +1222,7 @@ fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparat
                     "activation found a foreign or unpublished retained generation binding",
                 ));
             }
-            physical.and_then(|physical| physical.value.wal_strict_from)
-        };
+        }
         let path = directory.join("wal.log");
         let mut options = OpenOptions::new();
         options.read(true);
@@ -1235,9 +1233,7 @@ fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparat
         }
         let mut file = match options.open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && strict_from.is_none() => {
-                continue;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
         if !file.metadata()?.is_file() {

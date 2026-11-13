@@ -1,0 +1,2 @@
+PREFIX spk: <urn:x-sparkles:>
+PREFIX ex: <http://ex.org/> SELECT ?s WHERE { (?s ?score) spk:vectorSearch (ex:emb '[1, 0.1, 0]'^^spk:vector 1) }

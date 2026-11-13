@@ -28,12 +28,11 @@
 //! durable together with every chunk before it, so no durable chunk can follow one that
 //! did not reach the disk.
 //!
-//! Files written by releases before this one are *legacy* files: the entries alone,
-//! with no header. They are read as before, up to the first entry cut short or a tail
-//! of zero bytes. The first write to a legacy file rewrites it framed (a new file
-//! renamed over it). Before that, and before the first framed file of a dataset, the
-//! dataset's `dataset.json` is updated to require reader [`FRAMED_READER`], so a
-//! release that cannot read framed files refuses the dataset rather than misreading it.
+//! An empty file, or one whose first chunk a crash cut short before its bytes reached
+//! the disk, holds only zeros and no entries. The header is written with the first
+//! chunk. Pre-release files held the entries alone without a header, as version 1 of
+//! the format, and this build refuses one with the dump-and-reload message (spec X16
+//! Phase 1).
 //!
 //! # Writing
 //!
@@ -60,17 +59,19 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The first bytes of a framed delta vocabulary file. A legacy file starts with the
-/// length of its first key, which would have to be over a gigabyte to match.
+/// The first bytes of a framed delta vocabulary file. A pre-release file of version 1
+/// starts with the length of its first key, which would have to be over a gigabyte to
+/// match.
 pub const MAGIC: [u8; 8] = *b"\x89SDV\r\n\x1a\n";
-/// The version of the framed format in its header.
+/// The version of the framed format in its header, and the only version this build
+/// reads.
 pub const VERSION: u32 = 2;
+/// The version of a pre-release file without a header, which this build refuses.
+const UNFRAMED_VERSION: u32 = 1;
 /// Bytes of the file header.
 pub const HEADER: usize = 16;
 /// Bytes of a chunk header.
 pub const CHUNK_HEADER: usize = 24;
-/// The dataset reader (`minimumReader` of `dataset.json`) that reads framed files.
-pub const FRAMED_READER: u32 = 4;
 /// The most payload one chunk holds, unless a single entry is larger. A write of more
 /// entries, such as a group commit fence's terms, spans several chunks, since a chunk's
 /// header records its payload length in 32 bits.
@@ -78,42 +79,24 @@ const MAX_CHUNK: usize = 1 << 20;
 /// The most a delta vocabulary grows ahead of its chunks at once.
 pub const MAX_PREALLOC: u64 = 1 << 20;
 
-/// The format of a delta vocabulary file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeltaFormat {
-    /// written by a release before framed files, or empty
-    Legacy,
-    /// a header and checksummed chunks
-    Framed,
-}
-
-impl DeltaFormat {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DeltaFormat::Legacy => "legacy",
-            DeltaFormat::Framed => "framed",
-        }
-    }
-}
-
 /// The complete entries of a delta vocabulary file.
 pub struct ParsedDelta<'a> {
     pub keys: Vec<&'a [u8]>,
     /// where the complete entries end: past it lie zeros or a torn tail
     pub end: usize,
-    pub format: DeltaFormat,
-    /// chunks of a framed file
+    /// chunks of the file
     pub chunks: usize,
 }
 
-/// Read a delta vocabulary file's content (see the module documentation). A framed
-/// file of a later version is [`Error::Unsupported`], and a chunk whose checksum
-/// matches but whose entries do not fill it exactly is [`Error::Corrupt`].
+/// Read a delta vocabulary file's content (see the module documentation). A file of a
+/// later version, and a pre-release file without a header, are [`Error::Unsupported`],
+/// and a chunk whose checksum matches but whose entries do not fill it exactly is
+/// [`Error::Corrupt`].
 pub fn parse_delta(buf: &[u8]) -> Result<ParsedDelta<'_>> {
     parse_delta_with(buf, |_| {})
 }
 
-/// Where each chunk of a framed file ends, in order (none for a legacy file).
+/// Where each chunk of the file ends, in order.
 pub fn chunk_ends(buf: &[u8]) -> Result<Vec<usize>> {
     let mut ends = Vec::new();
     parse_delta_with(buf, |end| ends.push(end))?;
@@ -136,21 +119,20 @@ fn parse_delta_inner<'a>(
     mut on_chunk: impl FnMut(usize),
     mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
 ) -> Result<ParsedDelta<'a>> {
-    if buf.len() < MAGIC.len() || buf[..MAGIC.len()] != MAGIC {
-        let (keys, end) = legacy_entries(buf, budget.as_deref_mut())?;
-        return Ok(ParsedDelta {
-            keys,
-            end,
-            format: DeltaFormat::Legacy,
-            chunks: 0,
-        });
-    }
     let mut out = ParsedDelta {
         keys: Vec::new(),
         end: 0,
-        format: DeltaFormat::Framed,
         chunks: 0,
     };
+    if buf.len() < MAGIC.len() || buf[..MAGIC.len()] != MAGIC {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+        }
+        if !torn_first_chunk(buf) {
+            return Err(crate::formats::DELTA_VOCAB.refuse("delta.vocab", UNFRAMED_VERSION, None));
+        }
+        return Ok(out);
+    }
     // the header is written with the first chunk, so a torn one holds no entries
     let version = match buf.get(8..12) {
         Some(v) => u32::from_le_bytes(v.try_into().unwrap()),
@@ -216,49 +198,6 @@ fn parse_delta_inner<'a>(
     }
     out.end = pos;
     Ok(out)
-}
-
-/// The complete entries of a legacy file (`u32` length, key), and where they end. An
-/// entry cut short ends them, as does a tail of zero bytes: no key is empty, and a
-/// crash can leave zeros where the file's length reached the disk before its data (on
-/// file systems that do not order the two). Either is a torn tail.
-fn legacy_entries<'a>(
-    buf: &'a [u8],
-    mut budget: Option<&mut crate::store::cold::ColdBudget<'_>>,
-) -> Result<(Vec<&'a [u8]>, usize)> {
-    let mut pos = 0;
-    let mut keys = Vec::new();
-    while pos + 4 <= buf.len() {
-        if let Some(budget) = budget.as_deref_mut() {
-            budget.check()?;
-        }
-        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        if pos + 4 + len > buf.len() {
-            break;
-        }
-        if len == 0 {
-            let mut zero = true;
-            for chunk in buf[pos..].chunks(64 << 10) {
-                if let Some(budget) = budget.as_deref_mut() {
-                    budget.check()?;
-                }
-                if chunk.iter().any(|&byte| byte != 0) {
-                    zero = false;
-                    break;
-                }
-            }
-            if zero {
-                break;
-            }
-        }
-        if let Some(budget) = budget.as_deref_mut() {
-            let need = keys.len() + 1;
-            budget.reserve(&mut keys, need)?;
-        }
-        keys.push(&buf[pos + 4..pos + 4 + len]);
-        pos += 4 + len;
-    }
-    Ok((keys, pos))
 }
 
 fn chunk_crc(header: &[u8], payload: &[u8]) -> u32 {
@@ -331,8 +270,6 @@ pub struct VocabMark {
     /// the file's entries written to it, and where they end
     written: u64,
     end: u64,
-    /// the file was still a legacy one
-    legacy: bool,
 }
 
 impl VocabMark {
@@ -361,9 +298,6 @@ pub(crate) struct DeltaFile {
     /// entries of the vocabulary before the file's first (a linked generation's
     /// upstream prefix)
     base: u64,
-    format: DeltaFormat,
-    /// where the entries of a legacy file end once it was rewritten framed
-    converted_end: u64,
     /// the file's entries written to it
     written: u64,
     /// where they end: the file's logical end
@@ -404,40 +338,6 @@ impl DeltaFile {
         self.durable < self.end || self.base + self.written < self.vocab.read().len().min(upto)
     }
 
-    /// Make the file framed before its first write: require the reader that reads
-    /// framed files, then rewrite a legacy file's entries as chunks in a new file
-    /// renamed over it. An empty file gets its header with the first chunk.
-    fn ensure_framed(&mut self) -> Result<()> {
-        if self.format == DeltaFormat::Framed {
-            return Ok(());
-        }
-        require_framed_reader(&self.path)?;
-        if self.written == 0 {
-            // nothing to keep: the first chunk starts the file with the header
-            self.end = 0;
-            self.durable = 0;
-            self.converted_end = 0;
-            self.format = DeltaFormat::Framed;
-            return Ok(());
-        }
-        let keys: Vec<Arc<[u8]>> = {
-            let v = self.vocab.read();
-            let from = self.base as usize;
-            v.keys[from..from + self.written as usize].to_vec()
-        };
-        let bytes = replace_framed(&self.path, &keys)?;
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        self.end = bytes.len() as u64;
-        self.alloc = self.end;
-        self.durable = self.end;
-        self.converted_end = self.end;
-        // a handle of the replaced file must not take writes
-        self.direct = wal::Direct::Untried;
-        self.format = DeltaFormat::Framed;
-        tracing::info!(target: "sparkles::store", "rewrote {} as a framed delta vocabulary ({} terms)", self.path.display(), keys.len());
-        Ok(())
-    }
-
     /// Write the pending entries before entry `upto` as a chunk at the logical end, with a
     /// buffered write, growing the file by zero bytes when the chunk runs past its length.
     /// Not synced.
@@ -454,8 +354,8 @@ impl DeltaFile {
             )
             .into());
         }
-        self.ensure_framed()?;
         self.forget_direct_block();
+        // the header starts the file with its first chunk
         let chunk = encode_chunks(self.written, &keys, self.end == 0)?;
         if let Err(e) =
             wal::write_commit(&self.file, self.end, &mut self.alloc, &chunk, self.prealloc)
@@ -532,11 +432,7 @@ impl DeltaFile {
             }
             let keys = f.pending(upto);
             let mut attempt = None;
-            if f.format == DeltaFormat::Framed
-                && f.end >= HEADER as u64
-                && f.durable == f.end
-                && !keys.is_empty()
-            {
+            if f.end >= HEADER as u64 && f.durable == f.end && !keys.is_empty() {
                 let chunk = encode_chunks(f.written, &keys, false)?;
                 if DirectLog::fits(f.end, chunk.len(), f.alloc)
                     && f.direct.handle(Some(&f.path), &f.file).is_some()
@@ -607,34 +503,26 @@ impl DeltaFile {
     }
 }
 
-/// Write `keys` as a framed file in a new file renamed over `path`, synced with its
-/// directory, and return the file's bytes.
-fn replace_framed(path: &Path, keys: &[Arc<[u8]>]) -> Result<Vec<u8>> {
-    let bytes = encode_chunks(0, keys, true)?;
-    let tmp = path.with_file_name("delta.vocab.tmp");
-    crate::store::write_synced(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
-    crate::store::sync_dir(path.parent().unwrap_or(Path::new(".")))?;
-    Ok(bytes)
+/// Whether a file that does not start with the complete header is the first chunk a
+/// crash tore, which holds no entries: an empty file, or one whose header, written with
+/// the chunk, did not reach the disk, so that its first eight bytes are zeros, or a
+/// prefix of the magic followed by zeros, whatever later pages of the chunk hold. A
+/// pre-release file of the entries alone starts with the length of its first key, which
+/// is neither. The parser and [`file_version`] share this rule.
+fn torn_first_chunk(buf: &[u8]) -> bool {
+    let head = &buf[..buf.len().min(MAGIC.len())];
+    let magic = head
+        .iter()
+        .zip(MAGIC.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    head[magic..].iter().all(|&byte| byte == 0)
 }
 
-/// Rewrite the legacy delta vocabulary at `path` framed, as the first write to it would
-/// (for `sparkles migrate`, on a closed store). The dataset must already require
-/// [`FRAMED_READER`]. `Ok(false)` when the file is missing, already framed, or holds no
-/// entries.
-pub(crate) fn convert_legacy_file(path: &Path) -> Result<bool> {
-    let buf = read_file(path)?;
-    let parsed = parse_delta(&buf).map_err(|e| corrupt_in(path, e))?;
-    if parsed.format != DeltaFormat::Legacy || parsed.keys.is_empty() {
-        return Ok(false);
-    }
-    let keys: Vec<Arc<[u8]>> = parsed.keys.iter().map(|k| Arc::from(*k)).collect();
-    replace_framed(path, &keys)?;
-    Ok(true)
-}
-
-/// The version of the delta vocabulary at `path`: 1 for a legacy (or missing) file, the
-/// header's version for a framed one.
+/// The version of the delta vocabulary at `path`: the header's version, [`VERSION`]
+/// for a missing or empty file or a torn first chunk (see [`torn_first_chunk`]), which
+/// holds no entries yet, and 1 for a pre-release file of the entries alone, which this
+/// build refuses.
 pub fn file_version(path: &Path) -> Result<u32> {
     let buf = read_file(path)?;
     if buf.len() >= 12 && buf[..MAGIC.len()] == MAGIC {
@@ -643,25 +531,11 @@ pub fn file_version(path: &Path) -> Result<u32> {
             0 => VERSION,
             v => v,
         })
+    } else if torn_first_chunk(&buf) {
+        Ok(VERSION)
     } else {
-        Ok(1)
+        Ok(UNFRAMED_VERSION)
     }
-}
-
-/// Require the dataset reader that reads framed delta vocabularies in the store whose
-/// generation holds the file at `path`, and in its dataset when the store is a branch.
-/// A generation directory sits in its store's root.
-fn require_framed_reader(path: &Path) -> Result<()> {
-    let Some(root) = path.parent().and_then(Path::parent) else {
-        return Ok(());
-    };
-    crate::commit::require_reader(root, FRAMED_READER)?;
-    if root.join(crate::store::BRANCH_FILE_NAME).exists()
-        && let Some(ds) = root.parent().and_then(Path::parent)
-    {
-        crate::commit::require_reader(ds, FRAMED_READER)?;
-    }
-    Ok(())
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
@@ -798,7 +672,7 @@ impl DeltaVocab {
             }
         }
         let written = parsed.keys.len() as u64;
-        let (end, format) = (parsed.end as u64, parsed.format);
+        let end = parsed.end as u64;
         drop(buf);
         let file = OpenOptions::new()
             .read(true)
@@ -815,8 +689,6 @@ impl DeltaVocab {
                 file,
                 vocab: inner,
                 base,
-                format,
-                converted_end: 0,
                 written,
                 end,
                 alloc,
@@ -984,14 +856,12 @@ impl DeltaVocab {
                     entries: self.len(),
                     written: f.written,
                     end: f.end,
-                    legacy: f.format == DeltaFormat::Legacy,
                 }
             }
             None => VocabMark {
                 entries: self.len(),
                 written: 0,
                 end: 0,
-                legacy: false,
             },
         }
     }
@@ -1018,9 +888,7 @@ impl DeltaVocab {
         if f.base + f.written <= m.entries {
             return Ok(());
         }
-        // A mark from before the file was rewritten framed: the rewrite held exactly
-        // the entries written by then, which are the mark's.
-        let to = if m.legacy { f.converted_end } else { m.end };
+        let to = m.end;
         f.forget_direct_block();
         let zeros = vec![0u8; (f.end - to) as usize];
         let cut = wal::write_commit(&f.file, to, &mut f.alloc, &zeros, 0)
@@ -1125,11 +993,6 @@ impl DeltaVocab {
         self.file
             .as_ref()
             .is_some_and(|f| matches!(f.lock().direct, wal::Direct::Open(_)))
-    }
-
-    /// The file's format.
-    pub fn format(&self) -> Option<DeltaFormat> {
-        self.file.as_ref().map(|f| f.lock().format)
     }
 
     /// Make the file as the open found it the durable starting point of the writes to
@@ -1250,8 +1113,15 @@ fn extend_read_only_controlled(
 mod tests {
     use super::*;
 
+    /// One entry of a pre-release file of the entries alone, which this build refuses.
     fn entry(k: &[u8]) -> Vec<u8> {
         [&(k.len() as u32).to_le_bytes()[..], k].concat()
+    }
+
+    /// A framed file of `keys` in one chunk, as a write of them would leave it.
+    fn framed(keys: &[&[u8]]) -> Vec<u8> {
+        let keys: Vec<Arc<[u8]>> = keys.iter().map(|k| Arc::from(*k)).collect();
+        encode_chunks(0, &keys, true).unwrap()
     }
 
     /// The buffer of a write spanning many chunks is allocated once, at its size.
@@ -1357,25 +1227,32 @@ mod tests {
     }
 
     #[test]
-    fn controlled_parser_keeps_legacy_torn_and_unknown_version_semantics() {
+    fn controlled_parser_keeps_unframed_zero_and_unknown_version_semantics() {
         use crate::{
             history::{HistoryOptions, ReadLimit},
             store::cold::ColdBudget,
         };
         let options = HistoryOptions::default();
-        let mut source = entry(b"<urn:a>");
-        source.extend(entry(b"<urn:b>"));
-        source.extend([0; 64]);
         let mut budget = ColdBudget::new(ReadLimit {
             options: &options,
             memory: Some(1 << 20),
             held: 0,
         })
         .unwrap();
-        let controlled = parse_delta_controlled(&source, &mut budget).unwrap();
-        let legacy = parse_delta(&source).unwrap();
-        assert_eq!(controlled.keys, legacy.keys);
-        assert_eq!(controlled.end, legacy.end);
+        // a pre-release file of the entries alone is refused, as the plain parser does
+        let mut source = entry(b"<urn:a>");
+        source.extend(entry(b"<urn:b>"));
+        source.extend([0; 64]);
+        assert!(matches!(
+            parse_delta_controlled(&source, &mut budget),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(parse_delta(&source), Err(Error::Unsupported(_))));
+        assert_eq!(budget.used(), 0);
+        // a file of zeros holds no entries yet
+        let controlled = parse_delta_controlled(&[0; 64 << 10], &mut budget).unwrap();
+        assert!(controlled.keys.is_empty());
+        assert_eq!(controlled.end, 0);
         budget.drop_vec(controlled.keys);
         assert_eq!(budget.used(), 0);
         let mut unknown = Vec::from(MAGIC);
@@ -1407,7 +1284,6 @@ mod tests {
         let v = DeltaVocab::open(&path).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v.get(1).unwrap(), b"<http://x/b>");
-        assert_eq!(v.format(), Some(DeltaFormat::Framed));
     }
 
     /// Each sync writes one chunk after the header, and the file grows by zeros that a
@@ -1430,7 +1306,6 @@ mod tests {
         assert_eq!(buf.len() as u64, alloc);
         assert_eq!(&buf[..8], &MAGIC);
         let p = parse_delta(&buf).unwrap();
-        assert_eq!(p.format, DeltaFormat::Framed);
         assert_eq!(p.chunks, 2);
         assert_eq!(p.end as u64, end);
         assert_eq!(p.keys, vec![&b"<urn:a>"[..], b"<urn:b>", b"<urn:c>"]);
@@ -1454,34 +1329,82 @@ mod tests {
         assert_eq!(DeltaVocab::open(&path).unwrap().len(), 3);
     }
 
+    /// A pre-release file of the entries alone is refused with the dump-and-reload
+    /// message, and an empty file or one of zeros opens with no entries and takes its
+    /// header with the first chunk.
     #[test]
-    fn a_legacy_file_is_read_and_rewritten_framed_at_the_first_write() {
+    fn an_unframed_file_is_refused_and_a_file_of_zeros_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("delta.vocab");
-        let good = [entry(b"<http://x/a>"), entry(b"<http://x/b>")].concat();
-        // the length of a crash's appends reached the disk, their data did not
-        std::fs::write(&path, [&good[..], &[0u8; 23][..]].concat()).unwrap();
-        let v = DeltaVocab::open(&path).unwrap();
-        assert_eq!(v.len(), 2);
-        assert_eq!(v.format(), Some(DeltaFormat::Legacy));
-        assert!(!v.needs_sync());
-        // the open changes nothing
-        assert_eq!(std::fs::read(&path).unwrap().len(), good.len() + 23);
-        assert_eq!(v.insert(b"<http://x/c>").unwrap(), 2);
-        v.sync().unwrap();
-        assert_eq!(v.format(), Some(DeltaFormat::Framed));
-        drop(v);
-        let v = DeltaVocab::open(&path).unwrap();
-        assert_eq!(v.format(), Some(DeltaFormat::Framed));
-        assert_eq!(v.len(), 3);
-        assert_eq!(v.get(0).unwrap(), b"<http://x/a>");
-        assert_eq!(v.get(2).unwrap(), b"<http://x/c>");
-        // zeros followed by data are entries of a legacy file, as they always were read
-        let odd = [&good[..], &entry(b"")[..], &entry(b"<http://x/d>")[..]].concat();
-        std::fs::write(&path, &odd).unwrap();
-        assert_eq!(DeltaVocab::open_read_only(&path).unwrap().len(), 4);
-        assert_eq!(DeltaVocab::open(&path).unwrap().len(), 4);
-        assert_eq!(std::fs::read(&path).unwrap(), odd);
+        let unframed = [entry(b"<http://x/a>"), entry(b"<http://x/b>")].concat();
+        std::fs::write(&path, [&unframed[..], &[0u8; 23][..]].concat()).unwrap();
+        for result in [
+            DeltaVocab::open(&path).map(|_| ()),
+            DeltaVocab::open_read_only(&path).map(|_| ()),
+            file_version(&path).and_then(|v| crate::formats::DELTA_VOCAB.check("x", v, None)),
+        ] {
+            let error = result.expect_err("an unframed file is refused");
+            assert!(matches!(error, Error::Unsupported(_)), "{error}");
+            assert!(error.to_string().contains("sparkles dump"), "{error}");
+            assert!(error.to_string().contains("version 1"), "{error}");
+        }
+        // the refusal changes nothing
+        assert_eq!(std::fs::read(&path).unwrap().len(), unframed.len() + 23);
+        for bytes in [&[][..], &[0u8; 4096][..]] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(file_version(&path).unwrap(), VERSION);
+            let v = DeltaVocab::open(&path).unwrap();
+            assert_eq!(v.len(), 0);
+            assert_eq!(v.insert(b"<http://x/c>").unwrap(), 0);
+            v.sync().unwrap();
+            drop(v);
+            let buf = std::fs::read(&path).unwrap();
+            assert_eq!(&buf[..8], &MAGIC);
+            assert_eq!(parse_delta(&buf).unwrap().chunks, 1);
+            assert_eq!(DeltaVocab::open(&path).unwrap().len(), 1);
+        }
+    }
+
+    /// The first chunk a crash tore holds no entries, whether its first eight bytes are
+    /// zeros or a prefix of the magic followed by zeros, and whatever the later pages of
+    /// the chunk hold. The parser and `file_version` agree on each form, and so a
+    /// pre-release file is told apart by its first key's length alone.
+    #[test]
+    fn a_torn_first_chunk_with_a_prefix_of_the_magic_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.vocab");
+        let later_page = [&[0u8; 4096][..], b"<later page of the chunk>"].concat();
+        let mut torn: Vec<Vec<u8>> = Vec::new();
+        for prefix in 1..MAGIC.len() {
+            torn.push(MAGIC[..prefix].to_vec());
+            torn.push([&MAGIC[..prefix], &[0u8; 64][..]].concat());
+            torn.push([&MAGIC[..prefix], &later_page[prefix..]].concat());
+        }
+        torn.push(MAGIC.to_vec());
+        torn.push([&MAGIC[..], &[0u8; 3][..]].concat());
+        torn.push(later_page.clone());
+        for bytes in &torn {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(file_version(&path).unwrap(), VERSION, "{bytes:?}");
+            assert!(parse_delta(bytes).unwrap().keys.is_empty(), "{bytes:?}");
+            assert_eq!(DeltaVocab::open(&path).unwrap().len(), 0, "{bytes:?}");
+            assert_eq!(
+                DeltaVocab::open_read_only(&path).unwrap().len(),
+                0,
+                "{bytes:?}"
+            );
+        }
+        // a byte that is neither zero nor the next byte of the magic is a key length
+        for bytes in [
+            [&MAGIC[..3], &[7u8][..]].concat(),
+            [&MAGIC[..3], &[0u8, 7][..]].concat(),
+            [&[0u8; 7][..], &[1u8][..]].concat(),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(file_version(&path).unwrap(), UNFRAMED_VERSION, "{bytes:?}");
+            let error = DeltaVocab::open(&path).err().expect("refused");
+            assert!(matches!(error, Error::Unsupported(_)), "{error}");
+        }
     }
 
     /// A rollback past a written chunk cuts it back with zeros, and the entries before
@@ -1548,9 +1471,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let upstream = dir.path().join("source");
         let own = dir.path().join("own");
-        let first = entry(b"<urn:first>");
+        let first = framed(&[b"<urn:first>"]);
         let mut wire = first.clone();
-        wire.extend(entry(b"<urn:required-second>"));
+        wire.extend(encode_chunks(1, &[Arc::from(&b"<urn:required-second>"[..])], false).unwrap());
         std::fs::write(&upstream, &wire).unwrap();
         let fired = Cell::new(false);
         let observer = |stage: &str, _| {
@@ -1660,9 +1583,9 @@ mod tests {
         let upstream = dir.path().join("upstream");
         let middle = dir.path().join("middle");
         let own = dir.path().join("own");
-        let first = [entry(b"<urn:a>"), entry(b"<urn:b>"), entry(b"<urn:a>")].concat();
-        let second = [entry(b"<urn:c>"), entry(b"<urn:a>")].concat();
-        let last = entry(b"<urn:d>");
+        let first = framed(&[b"<urn:a>", b"<urn:b>", b"<urn:a>"]);
+        let second = framed(&[b"<urn:c>", b"<urn:a>"]);
+        let last = framed(&[b"<urn:d>"]);
         std::fs::write(&upstream, &first).unwrap();
         std::fs::write(&middle, &second).unwrap();
         std::fs::write(&own, &last).unwrap();

@@ -211,22 +211,18 @@ fn startup_rejects_a_lock_from_the_previous_root() {
     let store = Store::open(&root, StoreOptions::default()).unwrap();
     crate::sparql::update::update(
         &store,
-        "INSERT DATA { <urn:s> <urn:p> \"legacy term\" }",
+        "INSERT DATA { <urn:s> <urn:p> \"new term\" }",
         &Default::default(),
     )
     .unwrap();
-    let vocab = root
-        .join(&store.snapshot().generation.name)
-        .join("delta.vocab");
     drop(store);
-    let bytes = std::fs::read(&vocab).unwrap();
-    let parsed = crate::vocab::delta::parse_delta(&bytes).unwrap();
-    let mut legacy = Vec::new();
-    for key in parsed.keys {
-        legacy.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        legacy.extend_from_slice(key);
-    }
-    std::fs::write(vocab, legacy).unwrap();
+    // a pending migration, through the tests' synthetic step now that no release step
+    // exists
+    std::fs::write(
+        root.join(crate::migrate::tests::TEST_FILE),
+        br#"{"format": 1}"#,
+    )
+    .unwrap();
     let migrate_root = root.clone();
     AFTER_OPEN.with(|h| {
         *h.borrow_mut() = Some(Box::new(move || {

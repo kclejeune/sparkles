@@ -1,0 +1,38 @@
+# The axioms the lane leaves out on the 33 Horn files it classifies soundly but not completely, by rule and message, from EL_CLASSIFY_EXCLUDED=1 on four threads.
+ore_ont_14375	479	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_9761	6868	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_7195	11267	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_7251	14187	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_4662	16685	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_15733	23100	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_2624	12278	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_6478	77611	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_7858	16685	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_4527	1826	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_13755	315	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_8203	502	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_3529	4346	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_6817	2915	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_2456	279	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_6855	4	OWL 2 Profiles §2.2.1: the datatype <http://www.w3.org/2001/XMLSchema#boolean> is not allowed
+ore_ont_6855	3	OWL 2 Profiles §2.2.1: the datatype <http://www.w3.org/2001/XMLSchema#int> is not allowed
+ore_ont_6855	2	OWL 2 Profiles §2.2.3: DataMinCardinality is not allowed
+ore_ont_2775	166	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_7417	12	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_3775	1	OWL 2 Profiles §2.2.1: the datatype <http://www.w3.org/2001/XMLSchema#int> is not allowed
+ore_ont_3260	7	OWL 2 Profiles §2.2.1: the datatype <http://www.w3.org/2001/XMLSchema#int> is not allowed
+ore_ont_3260	13	OWL 2 Profiles §2.2.3: DataExactCardinality is not allowed
+ore_ont_3260	15	OWL 2 Profiles §2.2.3: DataMaxCardinality is not allowed
+ore_ont_580	3	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_7663	414	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_15231	537	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_12414	163237	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_12448	102961	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_1370	243972	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_4572	18029	OWL 2 Profiles §2.2.1: the datatype <http://www.w3.org/2001/XMLSchema#int> is not allowed
+ore_ont_4755	244174	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_11110	81045	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_4510	2505	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_12901	975	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_5481	457662	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed
+ore_ont_10073	457662	OWL 2 Profiles §2.2.1: anonymous individuals are not allowed

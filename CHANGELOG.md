@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Format
+
+The first-release format cutoff of item 479 implements X16 Phase 1. `dataset.json` is written
+as `format` 2 with `minimumReader` 5 or more, and a `format` 1 file or one that requires a
+reader below 5 is refused with the dump-and-reload message. The generation index is
+written and read as format 5, which is format 4 with the `features` list always present
+and `vocab.idx` required, and formats 2 to 4 are refused. The write-ahead log reads
+versions 1 and 2 and refuses a headerless log, version 0. The delta vocabulary reads the
+framed version 2 and refuses the pre-release file of the entries alone, and the
+`sparkles migrate` step that rewrote it is gone, so no step is registered. Backup key
+slots read format 2 alone. `sparkles vocab-index` no longer writes `vocab.idx`, which
+every generation has, and still adds the numeric column. The legacy framing of the
+write-ahead log, which told a pre-release commit record from a torn one through
+`walStrictFrom` in `commit.json`, is gone with the headerless reader, `sparkles check`
+reports every log and index form that open refuses, and the open syncs a generation's
+directory after it creates the log, so a crash after the first commits of a new log
+cannot lose it. The two pre-release fixtures stay in `testsuite/formats/` for their
+refusal tests, and a fixture written at the cutoff commit joins them.
+
+### OWL classification
+
+The Horn rules classify ontologies with individuals, functional data properties and top
+properties, in one saturation with the EL rules of individuals, with two rules over the
+predecessors of a context that stands for one element and a fact for a universal
+restriction on the top property. The disjunctive rules keep their condition. An at-least
+restriction above one beside individuals is left out and reported (roadmap item 692).
+On the development files with individuals the rules take 1.2 to 1.6 times the time of
+the EL rules alone, and more on assertion-heavy files, which roadmap item 869 follows.
+
 ### Compatibility
 
 The adopted HTTP, CLI and public library compatibility policy is documented.
@@ -74,6 +103,15 @@ refresh, and a new policy version rewrites every report. `GET /$/graphrag/{ds}/c
 finding's `claims` and `decisions`. The automatic refresh notices only the evidence
 changes that the principal's change feed lists, and roadmap item 652 adds a private check
 for the others.
+
+Roadmap item 825 gives the eager executor and the cursor one join-kernel library. The
+hash, keyed and merge kernels of `sparql/join` and one galloping search serve both
+modes, the `merge_left_join` switch selects the merge OPTIONAL without a condition in
+both and EXPLAIN names the algorithm that ran, a hash join's OPTIONAL condition is tested
+once per chunk of candidate pairs in both from the ids of the candidate rows without
+decoding their terms up front, and an eager hash join whose table does not
+fit the budget of a query that may spill partitions its inputs to disk through the
+cursor's join instead of failing.
 
 Roadmap item 791 adds Nemo 0.10.1 as the reference for the `owl-rl` materialization. The
 flake builds it from its checksum-pinned release binaries as `.#nemo`, and

@@ -429,13 +429,20 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 
 // ------------------------------------------------------------- dataset.json ------
 
-/// Dataset capabilities supported by this reader (1: legacy, 2: branches,
-/// 3: relinked generations with an immutable base overlay, 4: framed delta
-/// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
-/// see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
-/// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`],
-/// 8: configuration history, see [`crate::store::managed_history`], 9: the durable job
-/// ledger, see [`crate::jobs`]). [`crate::formats::DATASET`] lists them.
+/// The `format` of `dataset.json` this build writes and reads. Format 2 marks the
+/// first-release cutoff (spec X16 Phase 1). Format 1 is every pre-release form, which
+/// this build refuses with the dump-and-reload message, and a file without the member
+/// reads as format 1.
+pub const DATASET_FORMAT: u32 = 2;
+
+/// The dataset reader capabilities this build has (5: write-ahead logs with a header
+/// record, see [`crate::store::wal`], 6: protected managed graphs, `managed.json`, see
+/// [`crate::managed`], 7: durable source holds, `holds.json`, see [`crate::holds`], 8:
+/// configuration history, see [`crate::store::managed_history`], 9: the durable job
+/// ledger, see [`crate::jobs`]). Readers 1 to 4 named the pre-release forms, a dataset
+/// without branches, relinked generations, framed delta vocabularies or log headers, and
+/// [`OLDEST_DATASET_READER`] is the first one this build reads.
+/// [`crate::formats::DATASET`] lists them.
 pub const DATASET_READER: u32 = 9;
 
 /// The reader an imported destination of the private import transport
@@ -443,7 +450,14 @@ pub const DATASET_READER: u32 = 9;
 /// no build accepts an imported destination before the lane that wires the import
 /// (roadmap item 61) raises [`DATASET_READER`] and the registry together.
 pub(crate) const IMPORTED_DESTINATION_READER: u32 = DATASET_READER + 1;
-fn legacy_reader() -> u32 {
+
+/// The oldest dataset reader this build reads: every store of the first release writes
+/// a log with a header record, so a `format` 2 dataset requires at least this reader.
+pub const OLDEST_DATASET_READER: u32 = crate::store::wal::HEADER_READER;
+
+/// The reader of a `dataset.json` without a `minimumReader` member, which no release
+/// that writes `format` 2 produces.
+fn absent_reader() -> u32 {
     1
 }
 
@@ -476,21 +490,35 @@ pub(crate) fn check_dataset_value_as(v: &serde_json::Value, reader: u32) -> Resu
     };
     let format = member("format")?;
     let minimum_reader = member("minimumReader")?;
-    if format != 1 || minimum_reader > u64::from(reader) {
-        let by = v
-            .get("writtenBy")
-            .and_then(|w| w.as_str())
-            // A damaged header must not format an unbounded native string.
-            .filter(|value| value.len() <= 256)
-            .map(|v| format!(", written by Sparkles {v},"))
-            .unwrap_or_default();
+    let newer = format > u64::from(DATASET_FORMAT) || minimum_reader > u64::from(reader);
+    let older =
+        format < u64::from(DATASET_FORMAT) || minimum_reader < u64::from(OLDEST_DATASET_READER);
+    if !newer && !older {
+        return Ok(());
+    }
+    let written_by = v
+        .get("writtenBy")
+        .and_then(|w| w.as_str())
+        // A damaged header must not format an unbounded native string.
+        .filter(|value| value.len() <= 256);
+    let by = written_by
+        .map(|v| format!(", written by Sparkles {v}"))
+        .unwrap_or_default();
+    let head = format!(
+        "dataset.json{by} has format {format} and requires reader {minimum_reader}; Sparkles {} reads format {DATASET_FORMAT} with readers {OLDEST_DATASET_READER} to {reader}",
+        crate::formats::SPARKLES_VERSION,
+    );
+    // A file that is newer in one member and older in the other was written by no
+    // release, and the newer release is the one to ask about it.
+    if newer {
         return Err(Error::Unsupported(format!(
-            "dataset.json{by} has format {format} and requires reader {minimum_reader}; Sparkles {} reads format 1 up to reader {}. Open the database with a newer release",
-            crate::formats::SPARKLES_VERSION,
-            reader
+            "{head}. It was written by a newer release: open it with that release or a later one"
         )));
     }
-    Ok(())
+    Err(Error::Unsupported(format!(
+        "{head}. {}",
+        crate::formats::dump_and_reload(written_by)
+    )))
 }
 
 /// Decode the same identity and version contract without mutable Store startup.
@@ -596,19 +624,17 @@ pub fn read_written_by(root: &Path) -> Option<String> {
 }
 
 /// Record that this release opens the database at `root` for writing: `writtenBy`
-/// becomes this release, and `minimumReader` rises to the reader of the files this
-/// release creates (a log with a header record, [`crate::store::wal::HEADER_READER`]).
-/// `dataset.json` is rewritten only when either changes.
+/// becomes this release. `dataset.json` is rewritten only when it changes. Every
+/// dataset this build reads already requires the reader of the files a plain store
+/// creates, [`OLDEST_DATASET_READER`], so the reader stays.
 pub(crate) fn note_writer(root: &Path) -> Result<()> {
     let Some(mut ds) = read_dataset(root)? else {
         return Ok(());
     };
-    let reader = ds.minimum_reader.max(crate::store::wal::HEADER_READER);
     let version = crate::formats::SPARKLES_VERSION;
-    if ds.minimum_reader == reader && ds.written_by.as_deref() == Some(version) {
+    if ds.written_by.as_deref() == Some(version) {
         return Ok(());
     }
-    ds.minimum_reader = reader;
     ds.written_by = Some(version.to_string());
     write_dataset(root, &ds)
 }
@@ -616,11 +642,6 @@ pub(crate) fn note_writer(root: &Path) -> Result<()> {
 /// Check compatibility without changing any database files.
 pub fn check_dataset_compatibility(root: &Path) -> Result<()> {
     read_dataset(root).map(|_| ())
-}
-
-/// Publish the minimum reader needed by branches before publishing their table.
-pub(crate) fn require_branch_reader(root: &Path) -> Result<()> {
-    require_reader(root, 2)
 }
 
 /// The bytes of a `dataset.json` with its `minimumReader` raised to at least `reader`,
@@ -666,7 +687,7 @@ macro_rules! dataset_file {
 
 dataset_file! {
     format: u32 => "format",
-    #[serde(default = "legacy_reader")]
+    #[serde(default = "absent_reader")]
     minimum_reader: u32 => "minimumReader",
     #[serde(default, skip_serializing_if = "Option::is_none")]
     written_by: Option<String> => "writtenBy",
@@ -872,8 +893,8 @@ pub(crate) fn clone_dataset_file_bytes(
     from: ForkedFrom,
 ) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
-        format: 1,
-        minimum_reader: crate::store::wal::HEADER_READER,
+        format: DATASET_FORMAT,
+        minimum_reader: OLDEST_DATASET_READER,
         written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
@@ -906,8 +927,8 @@ pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
 
 pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
-        format: 1,
-        minimum_reader: crate::store::wal::HEADER_READER,
+        format: DATASET_FORMAT,
+        minimum_reader: OLDEST_DATASET_READER,
         written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
@@ -930,12 +951,9 @@ struct GenCommitFile {
     /// `create`, `baseline`, `bulk`, `compaction` or `clone`
     origin: String,
     commit: CommitJson,
-    /// Where strict framing starts in the generation's headerless (version 0) log, in
-    /// bytes. A release that writes commit metadata records the log's logical end here
-    /// once, at its first write open of the log, before it appends anything. Absent in
-    /// files written before the member existed, and for logs with a header record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    wal_strict_from: Option<u64>,
+    /// The configuration history binding of the generation's base
+    /// ([`crate::history::ConfigurationBinding`]). Absent in the files of a store
+    /// without configuration history, which reads as the legacy unbound binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     configuration_binding: Option<crate::history::ConfigurationBinding>,
     /// Members this build does not know, added by a later release under the additive
@@ -981,7 +999,6 @@ fn gen_commit_file(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> GenC
         dataset_id,
         base_seq: c.seq,
         origin: origin.to_string(),
-        wal_strict_from: None,
         configuration_binding: None,
         extra: Default::default(),
         commit: CommitJson {
@@ -1055,7 +1072,6 @@ pub(crate) struct RetainedGenerationCommit {
     pub(crate) dataset_id: uuid::Uuid,
     pub(crate) commit: CommitInfo,
     pub(crate) origin: String,
-    pub(crate) wal_strict_from: Option<u64>,
     pub(crate) configuration: crate::history::ConfigurationBinding,
 }
 
@@ -1079,7 +1095,6 @@ fn decode_gen_commit_file(f: GenCommitFile, path: &Path) -> Result<RetainedGener
             unvalidated: c.unvalidated,
         },
         origin: f.origin,
-        wal_strict_from: f.wal_strict_from,
         configuration: f.configuration_binding.unwrap_or_default(),
     })
 }
@@ -1288,28 +1303,6 @@ fn check_gen_commit_value(path: &Path, value: &serde_json::Value) -> Result<()> 
     }
 
     Ok(())
-}
-
-/// The strict-framing offset of a generation's headerless log (`walStrictFrom` of
-/// `gen-NNNN/commit.json`, see [`GenCommitFile`]): `None` when the file or the member is
-/// missing.
-pub(crate) fn wal_strict_from(dir: &Path) -> Result<Option<u64>> {
-    let path = dir.join("commit.json");
-    match std::fs::read(&path) {
-        Ok(b) => Ok(parse_gen_commit(&path, &b)?.wal_strict_from),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Record `at` as the strict-framing offset of the generation in `dir`, keeping every
-/// other member of its `commit.json`, durably (the file is replaced atomically and the
-/// directory synced) before the caller appends to the log.
-pub(crate) fn set_wal_strict_from(dir: &Path, at: u64) -> Result<()> {
-    let path = dir.join("commit.json");
-    let mut f = parse_gen_commit(&path, &std::fs::read(&path)?)?;
-    f.wal_strict_from = Some(at);
-    crate::store::write_atomic(&path, &serde_json::to_vec_pretty(&f).unwrap())
 }
 
 // ----------------------------------------------------------------- catalog ------
@@ -2223,7 +2216,6 @@ mod tests {
         let commit = sample_commit(42);
         let path = dir.path().join("commit.json");
         std::fs::write(&path, gen_commit_bytes(id, "compaction", &commit)).unwrap();
-        set_wal_strict_from(dir.path(), 33 * 8).unwrap();
         let before = std::fs::read(&path).unwrap();
         let options = HistoryOptions::default();
         let mut budget = ColdBudget::new(ReadLimit {
@@ -2244,7 +2236,6 @@ mod tests {
             ),
             (normal.0, normal.1, normal.2.as_str())
         );
-        assert_eq!(loaded.value.wal_strict_from, Some(33 * 8));
         assert_eq!(budget.used(), loaded.charge);
         drop(loaded.value);
         budget.release(loaded.charge);
@@ -2488,15 +2479,14 @@ mod tests {
     #[test]
     fn a_newer_dataset_json_with_other_members_is_unsupported() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("dataset.json"),
-            br#"{"format": 2, "minimumReader": 9, "id": 5}"#,
-        )
-        .unwrap();
+        let newer = format!(
+            r#"{{"format": 2, "minimumReader": {}, "id": 5}}"#,
+            DATASET_READER + 1
+        );
+        std::fs::write(dir.path().join("dataset.json"), &newer).unwrap();
         let e = read_dataset(dir.path()).expect_err("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
-        let e =
-            dataset_id_of(br#"{"format": 2, "minimumReader": 9, "id": 5}"#).expect_err("refused");
+        let e = dataset_id_of(newer.as_bytes()).expect_err("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 
@@ -2525,13 +2515,12 @@ mod tests {
         assert_eq!(v["writtenBy"], crate::formats::SPARKLES_VERSION);
         assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
         // a member that a later release added never shadows a known one
-        assert_eq!(v["format"], 1);
+        assert_eq!(v["format"], DATASET_FORMAT);
         assert_eq!(v["minimumReader"], 5);
         // raising the reader keeps it too
-        edit(&|v| v["minimumReader"] = 1.into());
-        require_reader(&root, 5).unwrap();
+        require_reader(&root, 6).unwrap();
         let v = read();
-        assert_eq!(v["minimumReader"], 5);
+        assert_eq!(v["minimumReader"], 6);
         assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
     }
     #[test]
@@ -2561,16 +2550,11 @@ mod tests {
             let mut file = gen_commit_file(old, "compaction", &commit);
             file.format = 2;
             file.configuration_binding = Some(binding);
-            file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 4);
             let raw = serde_json::to_vec_pretty(&file).unwrap();
             let before = raw.clone();
             let result = reidentified_generation_bytes(&raw, old, new, &preparation).unwrap();
             let decoded = parse_gen_commit(Path::new("diagnostic"), &result.value).unwrap();
             assert_eq!(decoded.dataset_id, new);
-            assert_eq!(
-                decoded.wal_strict_from,
-                Some(crate::store::WAL_REC as u64 * 4)
-            );
             assert_eq!(decoded.origin, "compaction");
             assert_eq!(
                 decode_gen_commit_file(decoded, Path::new("diagnostic"))
@@ -2601,7 +2585,6 @@ mod tests {
         let old = uuid::Uuid::new_v4();
         let new = uuid::Uuid::new_v4();
         let mut file = gen_commit_file(old, "baseline", &sample_commit(3));
-        file.wal_strict_from = Some(crate::store::WAL_REC as u64 * 32);
         file.extra
             .insert("laterRoot".to_owned(), serde_json::json!({"x":[1,2,3]}));
         file.commit
@@ -2614,10 +2597,6 @@ mod tests {
         let parsed = parse_gen_commit(Path::new("diagnostic"), &output.value).unwrap();
         assert_eq!(parsed.format, 1);
         assert_eq!(parsed.configuration_binding, None);
-        assert_eq!(
-            parsed.wal_strict_from,
-            Some(crate::store::WAL_REC as u64 * 32)
-        );
         assert_eq!(parsed.extra, file.extra);
         assert_eq!(parsed.commit.extra, file.commit.extra);
         assert_eq!(parsed.origin, file.origin);
@@ -2722,7 +2701,7 @@ mod tests {
             let found: DatasetFile = serde_json::from_slice(&output.value).unwrap();
             assert_eq!(found.id, destination);
             assert_eq!(found.minimum_reader, IMPORTED_DESTINATION_READER);
-            assert_eq!(found.format, 1);
+            assert_eq!(found.format, DATASET_FORMAT);
             assert_eq!(found.origin, "restore");
             assert_eq!(found.created, rfc3339_ms(2000));
             assert_eq!(found.forked_from, Some(ForkedFrom { id: old, seq: 42 }));
@@ -2753,21 +2732,35 @@ mod tests {
         assert!(
             reidentified_dataset_bytes(&raw, old, uuid::Uuid::nil(), 0, 0, &preparation).is_err()
         );
-        for future in [
-            serde_json::json!({"format":2,"id":false}),
-            serde_json::json!({"format":1,"minimumReader":u64::MAX,"id":false}),
+        // a newer format and a newer reader capability are refused as a newer release's
+        // before the malformed identity is decoded, and a pre-release form with the
+        // dump-and-reload message
+        for (unsupported, wording) in [
+            (
+                serde_json::json!({"format": DATASET_FORMAT + 1, "minimumReader": DATASET_READER, "id": false}),
+                "newer release",
+            ),
+            (
+                serde_json::json!({"format": DATASET_FORMAT, "minimumReader": DATASET_READER + 1, "id": false}),
+                "newer release",
+            ),
+            (
+                serde_json::json!({"format": 1, "minimumReader": 1, "id": false}),
+                "sparkles dump",
+            ),
         ] {
-            assert!(matches!(
-                reidentified_dataset_bytes(
-                    &serde_json::to_vec(&future).unwrap(),
-                    old,
-                    new,
-                    0,
-                    0,
-                    &preparation
-                ),
-                Err(Error::Unsupported(_))
-            ));
+            let Err(error) = reidentified_dataset_bytes(
+                &serde_json::to_vec(&unsupported).unwrap(),
+                old,
+                new,
+                0,
+                0,
+                &preparation,
+            ) else {
+                panic!("an unsupported dataset.json is refused: {unsupported}");
+            };
+            assert!(matches!(error, Error::Unsupported(_)), "{error}");
+            assert!(error.to_string().contains(wording), "{error}");
         }
         assert_eq!(preparation.room(), room);
         let control = Control::none();

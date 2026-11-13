@@ -108,8 +108,8 @@ dataset file gains `format` 2 and the index gains format 5.
 
 | Kind | Today | After the cutoff | How |
 |---|---|---|---|
-| `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 5. Format 5 is format 4 with the `features` list always present and `vocab.idx` required. | Drop the format 2 unsegmented layout from `PermIndex::open_format`, `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`. Add format 5 to `READABLE_INDEX_FORMATS` alone and move `builder::FORMAT_VERSION` to it, as decision 3 records. |
-| `vocab-index` | Every build writes `vocab.idx`, but a reader opens a generation without one, and `add_vocab_index` writes it for a generation an older build left bare. | Index format 5 requires it, and a format 5 generation without one is corrupt. | Make `Sparse` a required field of the vocabulary, delete `add_vocab_index`, and add a refusal test for a format 4 generation and a corruption test for a format 5 generation without the file. |
+| `index` | It reads 2, 3 and 4, and writes 3 without features and 4 with them. | It reads and writes 5. Format 5 is format 4 with the `features` list always present and `vocab.idx` required. | Drop the format 2 unsegmented layout from the open paths of `index.rs` and `cold.rs`, and `PLAIN_FORMAT_VERSION` from `builder.rs`. Add format 5 to `READABLE_INDEX_FORMATS` alone and move `builder::FORMAT_VERSION` to it. The tests keep the whole-column writer as a reference decoder for the segmented one, and item 847 removes the `Option` around `Segments`. |
+| `vocab-index` | Every build writes `vocab.idx`, but a reader opens a generation without one, and `add_vocab_index` writes it for a generation an older build left bare. | Index format 5 requires it, and a format 5 generation without one, or whose index does not describe its vocabulary's block offsets, is corrupt. The open compares the first and last offsets and `check` every entry's offset and key, and item 848 measures a full key check at open. | Require the file in `Vocab::open_codec` and `open_controlled`, delete `add_vocab_index`, and add a refusal test for a format 4 generation and a corruption test for a format 5 generation without the file. The `sparse` field stays optional for the empty vocabulary and the `SPARKLES_SPARSE_VOCAB` switch, and item 847 makes it and the permutations' `segs` required. |
 | `wal` | It reads 0, 1 and 2. A plain store writes 1 and an activated store writes 2. | It reads 1 and 2 and writes them as today. | Delete `Framing::Mixed`, `fold_legacy`, `walStrictFrom` in `commit.json`, the headerless branches of `WalCursor`, `WalIndex::scan`, `apply_backward`, `probe.rs`, `history_limited.rs`, `backup.rs` and `diff.rs`. |
 | `delta-vocab` | It reads 1 and 2, with a `migrate` step from 1. | It reads and writes 2. | Delete `convert_legacy_file`, the step and the legacy parser of `vocab/delta.rs`. |
 | `dataset` | It reads `format` 1 with readers 1 to 8. A new plain store writes reader 5 and an activated store reader 8. | It reads and writes `format` 2 with readers 5 to 8, and `minimumReader` keeps its meaning. | Write `format` 2 from both dataset writers, `dataset_file_bytes` and `clone_dataset_file_bytes`, which `Store::clone_to` uses, refuse `format` 1 with the dump-and-reload message in `check_dataset_value`, and delete the branches that handle readers below 5, which are a dataset without branches, relinked generations, framed deltas or log headers. The branches for `managed.json` and `holds.json` stay, since a plain store still lacks both. |
@@ -120,15 +120,16 @@ dataset file gains `format` 2 and the index gains format 5.
 The cutoff marker is therefore `format` 2 of `dataset.json`, which every store of the
 first release writes, and not `minimumReader`, because a plain store writes reader 5 and
 `managed_history::activation_recorded` reads a reader of 8 or more as a recorded
-activation, except reader 9 beside a `jobs.json`, which the durable job ledger explains. The reader stays what it is, a capability requirement that activation and
-the managed and held files raise. The private import transport of
+activation, except reader 9 beside a `jobs.json`, which the durable job ledger explains.
+The reader stays what it is, a capability requirement that activation, jobs and the
+managed and held files raise. The private import transport of
 `store/backup/transport.rs`, which no production path wires and whose staged destination
 has no store constructor, writes `minimumReader` one above the current `DATASET_READER`
 for an imported destination, through the named constant `IMPORTED_DESTINATION_READER`, and
 its test asserts that this build refuses those bytes. Reader 9 belongs to the durable job
 ledger of C26. The lane that wires the import takes the next reader number and raises
-`DATASET_READER` and the registry together, and the cutoff does not change it. The acceptance cases of the phase are a
-plain store created, written, reopened, branched, cloned and compacted, with the clone
+`DATASET_READER` and the registry together, and the cutoff does not change it. The
+acceptance cases of the phase are a plain store created, written, reopened, branched, cloned and compacted, with the clone
 reopened and carrying `format` 2 with its own reader requirement, an activated store doing
 the same apart from the clone, since `clone_to` refuses an activated source until item
 764 changes that, and a backup and restore of each, all writing `format` 2 and index format 5
@@ -559,6 +560,33 @@ HDT, RDF-3X dictionary split, QLever index builder, TriAD, Trinity.RDF, distribu
 No code from another project is copied.
 
 ## Outcome
+
+Phase 1, the first-release format cutoff of item 479, is built. `dataset.json` is
+written as `format` 2 with reader 5 or more, the generation index as format 5 with its
+feature list and a required `vocab.idx`, and every pre-release form is refused with the
+dump-and-reload message: a `format` 1 dataset or a reader below 5, index formats 2 to 4,
+the headerless write-ahead log, delta vocabulary version 1 and backup key slot format 1.
+A format 5 generation without `vocab.idx`, or with one that does not describe its
+vocabulary, is corrupt. No `migrate` step is registered, and the tests exercise the
+migration machinery through a synthetic step. The legacy framing of the log,
+`Framing::Mixed`, `fold_legacy`, `walStrictFrom` and the folding of legacy commits, is
+deleted. The replay, `sparkles check` and the read-only prefix prover refuse a first
+record that is neither a header record nor zeros, and read a record of zeros alone as a
+header that a crash tore at the log's creation, which the open reads as an empty log and
+creates again, with the generation directory synced before the writer starts. The open
+and `check` also read a log of zeros longer than one record as that torn creation, while
+the prover refuses it, a conservative difference for a read-only reader. The fixture
+`testsuite/formats/35e7cae4` was written at the cutoff commit, and the two pre-release
+fixtures stay for their refusal tests in the engine and through the command line. Items
+847, 848 and 849 record the follow-ups, a required `Segments` and `Sparse` without an
+`Option`, a full key check of `vocab.idx` at open, and allocation admission tests of the
+historical base lookup on the segmented layout, which replace the two whole-column tests
+that went with the refused layout. The gates were the format fixture tests,
+`tests/power_loss.rs`, `group_runs`, the `sparkles-core` lib tests, the `bench:insn`
+instruction screen and the review rounds recorded in the lane's audit directory. The
+screen compared the cutoff with its base on 17 metrics and flagged none, with the WAL
+replay and the open of 2000 commits within 0.1 percent of the base and every
+vocabulary case within 1 percent.
 
 Phase 2 is built. `wal::encode_txn` in `store/wal.rs` encodes a transaction's records for
 the serial, group and compaction writers, which pass their own flags and unfenced count

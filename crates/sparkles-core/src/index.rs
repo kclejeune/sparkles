@@ -10,9 +10,9 @@
 //! Since index format 3 a column is a run of independent LZ4 frames, one per segment of
 //! [`SEG_ROWS`] rows, and `<perm>.seg` holds each segment's first key and frame lengths
 //! (spec X07 §6.5). A reader of a few rows of a block decodes only the segments that can
-//! hold them, and a reader of whole blocks decodes every frame into one column as before.
-//! Format 2 generations, whose columns are one frame each and which have no `.seg` file,
-//! are read as before.
+//! hold them, and a reader of whole blocks decodes every frame into one column. The
+//! pre-release format 2, whose columns were one frame each without a `.seg` file, is no
+//! longer opened, and the tests keep its writer as a reference decoder.
 
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -949,8 +949,9 @@ impl PermWriter {
     }
 
     /// A writer of a segmented permutation or, with `segmented` false, of one in the
-    /// format 2 layout without segments (for tests and fixtures of that format).
-    pub(crate) fn create_format(dir: &Path, perm: Perm, segmented: bool) -> Result<PermWriter> {
+    /// whole-column layout of the pre-release format 2, which no store writes or opens
+    /// any more and the tests keep as a reference decoder for the segmented one.
+    fn create_format(dir: &Path, perm: Perm, segmented: bool) -> Result<PermWriter> {
         let seg = if segmented {
             let mut w = BufWriter::with_capacity(
                 64 << 10,
@@ -1309,7 +1310,9 @@ pub struct PermIndex {
     pub rows: u64,
     /// unique id of this permutation instance, used for cache keys
     pub uid: u64,
-    /// the segment directory, `None` for a format 2 permutation
+    /// the segment directory. `None` for an empty permutation ([`PermIndex::empty`])
+    /// and for the whole-column layout of the pre-release format 2, which only the tests
+    /// still write as a reference decoder.
     pub(crate) segs: Option<Arc<Segments>>,
 }
 
@@ -1336,36 +1339,31 @@ impl PermIndex {
         }
     }
 
-    /// Open the permutation in `dir`, segmented when its `.seg` file exists.
+    /// Open the permutation in `dir`. Every index format this build reads is segmented,
+    /// so the permutation needs its `.seg` file.
     pub fn open(dir: &Path, perm: Perm) -> Result<PermIndex> {
-        let segmented = dir.join(format!("{}.seg", perm.name())).exists();
-        Self::open_layout(dir, perm, segmented)
+        Self::open_layout_inner(dir, perm, true, None)
     }
 
-    /// Open the permutation of a generation in index format `format`: format 3 is
-    /// segmented and needs its `.seg` file, format 2 is not.
-    pub fn open_format(dir: &Path, perm: Perm, format: u32) -> Result<PermIndex> {
-        Self::open_layout(dir, perm, format >= 3)
+    /// Open a permutation in the whole-column layout of the pre-release format 2, which
+    /// the tests write as a reference decoder. No store opens one.
+    #[cfg(test)]
+    fn open_whole_columns(dir: &Path, perm: Perm) -> Result<PermIndex> {
+        Self::open_layout_inner(dir, perm, false, None)
     }
 
     pub(crate) fn open_controlled(
         dir: &Path,
         perm: Perm,
-        format: u32,
         budget: &mut crate::store::cold::ColdBudget<'_>,
     ) -> Result<crate::store::cold::Loaded<PermIndex>> {
         budget.check()?;
-        crate::formats::INDEX.check(&dir.display().to_string(), format, None)?;
         let start = budget.used();
-        let value = Self::open_layout_inner(dir, perm, format >= 3, Some(budget))?;
+        let value = Self::open_layout_inner(dir, perm, true, Some(budget))?;
         Ok(crate::store::cold::Loaded {
             value,
             charge: budget.used() - start,
         })
-    }
-
-    fn open_layout(dir: &Path, perm: Perm, segmented: bool) -> Result<PermIndex> {
-        Self::open_layout_inner(dir, perm, segmented, None)
     }
 
     fn open_layout_inner(
@@ -3038,9 +3036,10 @@ mod tests {
         assert!(est > 0);
     }
 
-    /// The same sorted keys written segmented (format 3) and not (format 2), in blocks of
-    /// irregular lengths: two full blocks, then a block ended early at a row that is not
-    /// a segment boundary, then a full one and a short tail.
+    /// The same sorted keys written segmented, as every generation is, and in the
+    /// whole-column layout of the pre-release format 2 as a reference decoder, in blocks
+    /// of irregular lengths: two full blocks, then a block ended early at a row that is
+    /// not a segment boundary, then a full one and a short tail.
     fn both_layouts(keys: &[Key]) -> (tempfile::TempDir, PermIndex, tempfile::TempDir, PermIndex) {
         let write = |segmented: bool| {
             let dir = tempfile::tempdir().unwrap();
@@ -3052,7 +3051,11 @@ mod tests {
                 }
             }
             w.finish(dir.path(), Perm::Spo).unwrap();
-            let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+            let idx = if segmented {
+                PermIndex::open(dir.path(), Perm::Spo).unwrap()
+            } else {
+                PermIndex::open_whole_columns(dir.path(), Perm::Spo).unwrap()
+            };
             (dir, idx)
         };
         let (d3, i3) = write(true);
@@ -3127,43 +3130,40 @@ mod tests {
     }
 
     #[test]
-    fn controlled_index_open_matches_both_layouts_and_retains_its_charge() {
+    fn controlled_index_open_matches_the_plain_open_and_retains_its_charge() {
         use crate::{
             history::{HistoryOptions, ReadLimit},
             store::cold::ColdBudget,
         };
         let options = HistoryOptions::default();
         let keys = run_keys();
-        let (dir3, normal3, dir2, normal2) = both_layouts(&keys);
-        for (directory, normal, format) in [(dir3.path(), &normal3, 3), (dir2.path(), &normal2, 2)]
-        {
-            let limit = ReadLimit {
-                options: &options,
-                memory: Some(1 << 20),
-                held: 0,
-            };
-            let mut budget = ColdBudget::new(limit).unwrap();
-            let loaded =
-                PermIndex::open_controlled(directory, Perm::Spo, format, &mut budget).unwrap();
-            assert_eq!(loaded.value.rows, normal.rows);
-            assert_eq!(loaded.value.blocks.len(), normal.blocks.len());
-            assert_eq!(loaded.value.segmented(), normal.segmented());
-            assert_eq!(budget.used(), loaded.charge);
-            let cache = BlockCache::new(1 << 20);
-            assert!(loaded.value.contains(&cache, &keys[12_345]).unwrap());
-            drop(loaded.value);
-            budget.release(loaded.charge);
-            assert_eq!(budget.used(), 0);
-            let mut low = ColdBudget::new(ReadLimit {
-                memory: Some(16),
-                ..limit
-            })
-            .unwrap();
-            assert!(matches!(
-                PermIndex::open_controlled(directory, Perm::Spo, format, &mut low),
-                Err(Error::BudgetExceeded(_))
-            ));
-        }
+        let (dir3, normal, _dir2, _normal2) = both_layouts(&keys);
+        let directory = dir3.path();
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(1 << 20),
+            held: 0,
+        };
+        let mut budget = ColdBudget::new(limit).unwrap();
+        let loaded = PermIndex::open_controlled(directory, Perm::Spo, &mut budget).unwrap();
+        assert_eq!(loaded.value.rows, normal.rows);
+        assert_eq!(loaded.value.blocks.len(), normal.blocks.len());
+        assert_eq!(loaded.value.segmented(), normal.segmented());
+        assert_eq!(budget.used(), loaded.charge);
+        let cache = BlockCache::new(1 << 20);
+        assert!(loaded.value.contains(&cache, &keys[12_345]).unwrap());
+        drop(loaded.value);
+        budget.release(loaded.charge);
+        assert_eq!(budget.used(), 0);
+        let mut low = ColdBudget::new(ReadLimit {
+            memory: Some(16),
+            ..limit
+        })
+        .unwrap();
+        assert!(matches!(
+            PermIndex::open_controlled(directory, Perm::Spo, &mut low),
+            Err(Error::BudgetExceeded(_))
+        ));
     }
 
     /// Keys of runs of 1 to 40 rows per subject, with large id gaps, over five blocks.
@@ -3461,9 +3461,9 @@ mod tests {
             std::fs::write(&seg, &bad).unwrap();
             assert!(PermIndex::open(d3.path(), Perm::Spo).is_err());
         }
-        // a missing directory refuses a format 3 open
+        // a missing directory refuses the open
         std::fs::remove_file(&seg).unwrap();
-        assert!(PermIndex::open_format(d3.path(), Perm::Spo, 3).is_err());
+        assert!(PermIndex::open(d3.path(), Perm::Spo).is_err());
         // a frame length that runs past its column is a decode error
         let mut bad = good.clone();
         bad[SEG_HEADER + 32..SEG_HEADER + 36].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -4565,12 +4565,9 @@ mod codec_probe {
             return;
         };
         let dir = std::path::Path::new(&dir);
-        let meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
-        let format = meta["format_version"].as_u64().unwrap() as u32;
         let mut grand = [0usize; 5];
         for &p in Perm::ALL.iter() {
-            let pi = PermIndex::open_format(dir, p, format).unwrap();
+            let pi = PermIndex::open(dir, p).unwrap();
             let on_disk = std::fs::metadata(dir.join(format!("{}.dat", p.name())))
                 .unwrap()
                 .len() as usize;

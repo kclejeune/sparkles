@@ -127,12 +127,7 @@ impl FileKind {
                 "{head}. Upgrade it with `sparkles migrate`, which keeps its history"
             ));
         }
-        let dump = written_by
-            .map(|v| format!("Sparkles {v}"))
-            .unwrap_or_else(|| "the release that wrote it".into());
-        Error::Unsupported(format!(
-            "{head}. It is older than this release reads: dump it with `sparkles dump` from {dump} and load the dump with `sparkles load`"
-        ))
+        Error::Unsupported(format!("{head}. {}", dump_and_reload(written_by)))
     }
 
     /// `Ok` when this build reads version `found`, else [`refuse`](Self::refuse).
@@ -143,6 +138,17 @@ impl FileKind {
             Err(self.refuse(what, found, written_by))
         }
     }
+}
+
+/// The sentence that tells how to carry a file this build no longer reads forward: dump
+/// it with the release that wrote it, `written_by` when known, and load the dump.
+pub(crate) fn dump_and_reload(written_by: Option<&str>) -> String {
+    let dump = written_by
+        .map(|v| format!("Sparkles {v}"))
+        .unwrap_or_else(|| "the release that wrote it".into());
+    format!(
+        "It is older than this release reads: dump it with `sparkles dump` from {dump} and load the dump with `sparkles load`"
+    )
 }
 
 fn list(v: &[u32]) -> String {
@@ -158,38 +164,46 @@ fn list(v: &[u32]) -> String {
 
 /// The generation index formats this build reads (`format_version` of `meta.json`).
 /// [`crate::builder::FORMAT_VERSION`] is the one it writes. A change that is read and
-/// rewritten at compaction adds the new format here and keeps the previous one.
-pub const READABLE_INDEX_FORMATS: &[u32] = &[2, 3, 4];
+/// rewritten at compaction adds the new format here and keeps the previous one. The
+/// first release reads one format, since the cutoff of spec X16 Phase 1 refuses the
+/// pre-release formats 2 to 4.
+pub const READABLE_INDEX_FORMATS: &[u32] = &[5];
 
-/// The write-ahead log version this build writes: a header record with the magic and
-/// this version starts every new `wal.log` (see [`crate::store::wal`]). Version 0 is a
-/// log without the header, written before it existed.
+/// The write-ahead log version this build writes for an activated store: a header
+/// record with the magic and this version starts every new `wal.log` (see
+/// [`crate::store::wal`]). A plain store writes version 1.
 pub const WAL_VERSION: u32 = 2;
 
-/// `dataset.json`: the dataset id and the reader capabilities a database needs.
+/// `dataset.json`: the dataset id and the reader capabilities a database needs. Its
+/// `format` is [`crate::commit::DATASET_FORMAT`], which marks the first-release cutoff,
+/// and `reads` lists the readers of that format. A `format` 1 file, or one that
+/// requires a reader below [`crate::commit::OLDEST_DATASET_READER`], is a pre-release
+/// form that [`crate::commit::check_dataset_compatibility`] refuses with the
+/// dump-and-reload message.
 pub const DATASET: FileKind = FileKind {
     id: "dataset",
     files: "dataset.json",
-    marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
+    marker: "`format` 2, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+    reads: &[5, 6, 7, 8, 9],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
-/// Format 4 is format 3 with a `features` list in meta.json (spec X11 §7.1), written
-/// only for a generation that uses a feature, such as `fsst-vocab`, that a reader of
-/// format 3 cannot read. A generation without one is written as format 3.
+/// Format 5 is the segmented layout of spec X07 §6.5 with the `features` list of spec
+/// X11 §7.1 always present in meta.json, empty for a generation without one, and the
+/// sparse vocabulary index `vocab.idx` required.
 pub const INDEX: FileKind = FileKind {
     id: "index",
     files: "gen-*/meta.json and the index files",
-    marker: "`format_version` of meta.json, and from format 4 its `features`, each of which the reader must know",
+    marker: "`format_version` of meta.json and its `features`, each of which the reader must know",
     class: Class::Primary,
     writes: crate::builder::FORMAT_VERSION,
     reads: READABLE_INDEX_FORMATS,
 };
 
-/// The sparse vocabulary index of a generation.
+/// The sparse vocabulary index of a generation, which index format 5 requires: a
+/// generation without one, or whose index does not describe its vocabulary, is corrupt.
 pub const VOCAB_INDEX: FileKind = FileKind {
     id: "vocab-index",
     files: "gen-*/vocab.idx",
@@ -246,24 +260,28 @@ pub const PLANNER_STATISTICS: FileKind = FileKind {
     reads: &[1],
 };
 
-/// The terms added since a generation was built.
+/// The terms added since a generation was built. Version 1, the pre-release file of the
+/// entries alone without a header, is refused with the dump-and-reload message.
 pub const DELTA_VOCAB: FileKind = FileKind {
     id: "delta-vocab",
     files: "gen-*/delta.vocab",
-    marker: "framed header `\\x89SDV` with its version; version 1 is the legacy file without a header",
+    marker: "framed header `\\x89SDV` with its version",
     class: Class::Primary,
     writes: crate::vocab::delta::VERSION,
-    reads: &[1, 2],
+    reads: &[2],
 };
 
-/// A generation's write-ahead log.
+/// A generation's write-ahead log. Version 1 is the log of a plain store and version 2,
+/// which seals a final configuration-reference record with commit flag 4, the log of an
+/// activated store, so both are current. Version 0, a log without the header record, is
+/// the pre-release form that the cutoff of spec X16 Phase 1 refuses.
 pub const WAL: FileKind = FileKind {
     id: "wal",
     files: "gen-*/wal.log",
-    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is headerless. Version 2 seals a final configuration-reference record with commit flag 4. Headerless strict framing starts at walStrictFrom",
+    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version). Version 2 seals a final configuration-reference record with commit flag 4",
     class: Class::Primary,
     writes: WAL_VERSION,
-    reads: &[0, 1, 2],
+    reads: &[1, 2],
 };
 
 /// Primary configuration binding of a generation's base data revision.
@@ -465,14 +483,16 @@ pub const BACKUP_BLOB: FileKind = FileKind {
     reads: &[1],
 };
 
-/// The key slots of an encrypted backup repository.
+/// The key slots of an encrypted backup repository. Format 2 binds the slot's metadata
+/// into its wrap. Format 1, which bound only the repository, epoch and slot id, is a
+/// pre-release form that follows the same window as databases.
 pub const BACKUP_SLOTS: FileKind = FileKind {
     id: "backup-slots",
     files: "key slots of an encrypted backup repository",
     marker: "`format` of each slot",
     class: Class::Archive,
     writes: 2,
-    reads: &[1, 2],
+    reads: &[2],
 };
 
 /// The manifest of a backup, which records the index format of the backed-up
@@ -1264,6 +1284,11 @@ mod tests {
             *DATASET.reads.last().unwrap(),
             crate::commit::DATASET_READER
         );
+        assert_eq!(
+            *DATASET.reads.first().unwrap(),
+            crate::commit::OLDEST_DATASET_READER
+        );
+        assert_eq!(crate::commit::DATASET_FORMAT, 2);
         assert_eq!(VECTOR.writes, crate::vector::config::FORMAT_VERSION);
         assert_eq!(GEO.writes, crate::geo::config::FORMAT_VERSION);
         assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
@@ -1326,18 +1351,18 @@ mod tests {
 
     #[test]
     fn refusals_say_what_to_do() {
-        let e = INDEX.refuse("gen-0003", 5, Some("0.4.0")).to_string();
+        let e = INDEX.refuse("gen-0003", 6, Some("0.4.0")).to_string();
         assert!(
-            e.contains("index version 5, written by Sparkles 0.4.0"),
+            e.contains("index version 6, written by Sparkles 0.4.0"),
             "{e}"
         );
         assert!(e.contains("newer release"), "{e}");
-        let e = INDEX.refuse("gen-0003", 1, Some("0.1.0")).to_string();
+        let e = INDEX.refuse("gen-0003", 4, Some("0.1.0")).to_string();
         assert!(
             e.contains("sparkles dump") && e.contains("Sparkles 0.1.0"),
             "{e}"
         );
-        assert_eq!(WAL.readable(), "0, 1 and 2");
+        assert_eq!(WAL.readable(), "1 and 2");
         assert_eq!(list(&[0, 1, 2]), "0, 1 and 2");
     }
 
