@@ -534,6 +534,31 @@ impl Store {
             (i, _, _) => i,
         };
         let (mut next, written) = change(installed)?;
+        // The write guard checks every commit under this writer lock with the hidden
+        // graphs of the registry it finds, so it never reads one it does not know is
+        // hidden. A change that would hide a graph the guard reads by name is refused
+        // (spec C26 §2.3).
+        let sorted = |mut g: Vec<String>| {
+            g.sort_unstable();
+            g.dedup();
+            g
+        };
+        let hidden_before = sorted(self.hidden_graphs());
+        let hidden_after = sorted(next.graphs.hidden_graphs());
+        let guard = (hidden_before != hidden_after)
+            .then(|| self.guard())
+            .flatten();
+        if let Some(g) = &guard {
+            let reads = g.reads_graphs();
+            if let Some(x) = hidden_after
+                .iter()
+                .find(|h| !hidden_before.contains(h) && reads.contains(h))
+            {
+                return Err(Error::Conflict(format!(
+                    "the write guard reads <{x}>, which this change would hide; configure the guard without it first"
+                )));
+            }
+        }
         for (owner, entry) in &next.graphs.owners {
             let matches = next
                 .settings
@@ -698,6 +723,9 @@ impl Store {
             .managed
             .store(Some(Arc::new(ManagedState::Installed(next))));
         fence.armed = false;
+        if let Some(g) = &guard {
+            g.hidden_changed(&hidden_after);
+        }
         drop(w);
         self.managed_barrier()?;
         Ok(graphs)

@@ -642,8 +642,10 @@ async fn shex_guard_validation_never_selects_a_ledger_focus() {
     assert!(!body.contains("urn:x-sparkles:jobs:run:"), "{body}");
 }
 
-/// A memory dataset `d` whose ledger graph held `quads` before jobs were enabled, as a
-/// guard configured with `guard` before then names it.
+/// A dataset `d` whose ledger graph held `quads` before jobs were enabled. With `guard`,
+/// the dataset is persistent and its guard configuration names the ledger. Neither the
+/// configuration route nor enablement admits that, so the file is written by hand
+/// before the server opens the dataset, as a damaged or edited directory would be.
 async fn ledger_written_before_jobs(
     quads: &str,
     guard: Option<J>,
@@ -652,23 +654,37 @@ async fn ledger_written_before_jobs(
     let state = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
     );
-    state.attach("d", DbType::Mem, None).unwrap();
     let ledger = sparkles::jobs::LEDGER_GRAPH;
-    state
-        .get("d")
-        .unwrap()
-        .dataset
-        .update(&format!(
-            "INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{ledger}> {{ {quads} }} }}"
-        ))
-        .unwrap();
-    let app = router(state.clone());
-    if let Some(cfg) = guard {
-        let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
-        assert_eq!(status, StatusCode::OK, "{j}");
+    let data =
+        format!("INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{ledger}> {{ {quads} }} }}");
+    let Some(mut cfg) = guard else {
+        state.attach("d", DbType::Mem, None).unwrap();
+        state.get("d").unwrap().dataset.update(&data).unwrap();
+        let app = router(state.clone());
+        let (s, j, _) = call(&app, "PUT", "/$/jobs/d/settings", None, Some(settings())).await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+        return (dir, state, app);
+    };
+    let db = dir.path().join("prepared-d");
+    {
+        let ds = sparkles::Dataset::open(&db).unwrap();
+        ds.update(&data).unwrap();
+        ds.jobs()
+            .configure(&serde_json::from_value(settings()).unwrap())
+            .unwrap();
     }
-    let (s, j, _) = call(&app, "PUT", "/$/jobs/d/settings", None, Some(settings())).await;
-    assert_eq!(s, StatusCode::OK, "{j}");
+    let shex = cfg["language"] == "shex";
+    cfg["format"] = json!(if shex { 3 } else { 2 });
+    if !shex {
+        cfg["language"] = json!("shacl");
+    }
+    std::fs::write(
+        db.join(sparkles::guard::config::CONFIG_FILE),
+        serde_json::to_vec(&cfg).unwrap(),
+    )
+    .unwrap();
+    state.attach("d", DbType::Persistent, Some(&db)).unwrap();
+    let app = router(state.clone());
     (dir, state, app)
 }
 
@@ -686,6 +702,38 @@ fn ledger_guard(language: &str, mode: &str) -> J {
         "shacl" => json!({"mode": mode, "dataGraph": "default", "shapes": {"graphs": [ledger]}}),
         _ => json!({"language": "shex", "mode": mode, "dataGraph": "default",
             "schema": {"graphs": [ledger]}, "shapeMap": "<urn:person>@<urn:S>"}),
+    }
+}
+
+#[cfg(all(feature = "shacl", feature = "shex"))]
+#[tokio::test]
+async fn jobs_are_not_enabled_under_a_guard_that_reads_the_ledger() {
+    for (language, quads) in [("shacl", LEDGER_SHAPES), ("shex", LEDGER_SCHEMA)] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        state.attach("d", DbType::Mem, None).unwrap();
+        let ledger = sparkles::jobs::LEDGER_GRAPH;
+        state
+            .get("d")
+            .unwrap()
+            .dataset
+            .update(&format!("INSERT DATA {{ GRAPH <{ledger}> {{ {quads} }} }}"))
+            .unwrap();
+        let app = router(state.clone());
+        let (status, j, _) = call(
+            &app,
+            "PUT",
+            "/$/validation/d",
+            None,
+            Some(ledger_guard(language, "warn")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{language}: {j}");
+        let (status, j, _) = call(&app, "PUT", "/$/jobs/d/settings", None, Some(settings())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{language}: {j}");
+        assert!(!j.to_string().contains("secret-path"), "{language}: {j}");
     }
 }
 

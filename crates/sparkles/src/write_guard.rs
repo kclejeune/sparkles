@@ -51,29 +51,6 @@ impl WriteGuard {
         }
     }
 
-    /// The hidden managed graphs that no validation of this guard reads (spec C26
-    /// §2.3), sorted.
-    pub fn hidden(&self) -> &[String] {
-        match *self {
-            #[cfg(feature = "shacl")]
-            WriteGuard::Shacl(ref g) => g.hidden(),
-            #[cfg(feature = "shex")]
-            WriteGuard::Shex(ref g) => g.hidden(),
-        }
-    }
-
-    /// Install on `store` the same validation leaving out the managed graphs `hidden`,
-    /// replacing this guard. Its first validated write validates in full.
-    pub(crate) fn rehidden(&self, store: &Store, hidden: Vec<String>) -> WriteGuard {
-        let _ = (store, &hidden);
-        match *self {
-            #[cfg(feature = "shacl")]
-            WriteGuard::Shacl(ref g) => WriteGuard::Shacl(g.rehidden(store, hidden)),
-            #[cfg(feature = "shex")]
-            WriteGuard::Shex(ref g) => WriteGuard::Shex(g.rehidden(store, hidden)),
-        }
-    }
-
     /// `{language, config, status}`, the configuration and the counts the server shows
     /// at `GET /$/validation/{ds}`.
     pub fn json(&self) -> J {

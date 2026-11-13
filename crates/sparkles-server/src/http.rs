@@ -6039,7 +6039,9 @@ async fn shacl(
             // without the dataset's hidden control graphs (spec C26 §2.3), and a hidden
             // data graph is one that does not exist
             let hidden = ds.dataset.store().hidden_graphs();
-            let Some(o) = g.data_graph_options(&snap).and_then(|mut o| {
+            // the hidden graphs are applied below, so that a hidden data graph answers
+            // as one that does not exist
+            let Some(o) = g.data_graph_options(&snap, &[]).and_then(|mut o| {
                 crate::validation_common::hide_graphs(
                     &mut o.data_graph,
                     &mut o.extra_graphs,

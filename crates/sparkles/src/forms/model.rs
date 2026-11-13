@@ -750,7 +750,8 @@ impl Forms {
         match settings.shapes {
             ShapesSource::Guard => match self.ds.write_guard() {
                 Some(crate::write_guard::WriteGuard::Shacl(g)) => {
-                    let Some(o) = g.data_graph_options(snap) else {
+                    let Some(o) = g.data_graph_options(snap, &self.ds.store().hidden_graphs())
+                    else {
                         return Ok((g.shapes(), vopts, None));
                     };
                     Ok((g.shapes(), o, None))

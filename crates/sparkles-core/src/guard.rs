@@ -57,6 +57,16 @@ pub trait CommitGuard: Send + Sync {
     fn language(&self) -> GuardLanguage {
         GuardLanguage::Shacl
     }
+    /// The graphs the guard reads by name: its shapes or schema graphs and the data
+    /// graphs its configuration lists. The store refuses a registry change that would
+    /// hide one of them (spec C26 §2.3).
+    fn reads_graphs(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Called under the writer lock, after a registry change of the store's family
+    /// published new hidden graphs (sorted), so that the guard forgets the state of the
+    /// head it validated with the old ones.
+    fn hidden_changed(&self, _hidden: &[String]) {}
 }
 
 /// Sees the outcome of every guard decision of a store (for metrics and logs): the
@@ -82,6 +92,9 @@ pub struct Candidate<'a> {
     pub kind: CommitKind,
     pub changes: Changes<'a>,
     pub opts: &'a WriteOptions,
+    /// The managed graphs the store's family hides (spec C26 §2.3), read under the
+    /// writer lock and sorted: no validation of the commit reads them.
+    pub hidden: &'a [String],
 }
 
 /// What a transaction changed.

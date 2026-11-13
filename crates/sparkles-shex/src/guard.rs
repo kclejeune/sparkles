@@ -267,6 +267,8 @@ struct Pending {
     typing: TypingUpdate,
     /// the schema a write to the schema graphs leaves
     model: Option<Arc<Model>>,
+    /// the hidden graphs the state was validated without
+    hidden: Vec<String>,
 }
 
 /// The schema a guard validates against, with what it reads: replaced when a write
@@ -372,9 +374,12 @@ pub struct ShexGuard {
     /// it in its directory)
     copy: Option<String>,
     history: CheckHistory,
-    /// the store's hidden managed graphs when the guard was installed, which no
-    /// validation reads (spec C26 §2.3); a change of them installs a new guard
-    hidden: Vec<String>,
+    /// the hidden managed graphs the published state was validated without (spec C26
+    /// §2.3); a check under other hidden graphs does not trust that state
+    hidden: Mutex<Vec<String>>,
+    /// the hidden managed graphs of the validation in progress, which it never reads;
+    /// checks run one at a time under the writer lock
+    reading: parking_lot::RwLock<Vec<String>>,
 }
 
 impl ShexGuard {
@@ -399,14 +404,22 @@ impl ShexGuard {
             warnings: Mutex::new(Vec::new()),
             copy: None,
             history: CheckHistory::default(),
-            hidden: Vec::new(),
+            hidden: Mutex::new(Vec::new()),
+            reading: parking_lot::RwLock::new(Vec::new()),
         }
     }
 
-    /// The graphs no validation reads: the schema graphs and the hidden managed graphs.
+    /// Validate as a store whose family hides `hidden` (sorted) does.
+    fn set_hidden(&mut self, hidden: Vec<String>) {
+        *self.reading.get_mut() = hidden.clone();
+        *self.hidden.get_mut() = hidden;
+    }
+
+    /// The graphs no validation reads: the schema graphs and the hidden managed graphs
+    /// of the validation in progress.
     fn excluded(&self) -> Vec<String> {
         let mut x = self.cfg.schema_graphs().to_vec();
-        x.extend(self.hidden.iter().cloned());
+        x.extend(self.reading.read().iter().cloned());
         x
     }
 
@@ -414,44 +427,38 @@ impl ShexGuard {
     pub(super) fn status_at(&self) -> Option<(&Path, String)> {
         self.persist
             .as_ref()
-            .map(|(root, hash)| (root.as_path(), status_key(hash, &self.hidden)))
+            .map(|(root, hash)| (root.as_path(), status_key(hash, &self.hidden.lock())))
     }
 
-    /// The hidden managed graphs that no validation of this guard reads.
-    pub fn hidden(&self) -> &[String] {
-        &self.hidden
+    /// A rejection of every write while the guard's schema is in a hidden graph. It
+    /// names no graph and reports none of the schema.
+    fn hidden_schema(&self, c: &Candidate<'_>, live: bool) -> Option<ValidationSummary> {
+        if !self
+            .cfg
+            .schema_graphs()
+            .iter()
+            .any(|g| c.hidden.contains(g))
+        {
+            return None;
+        }
+        let mut s =
+            ValidationSummary::empty(GuardStatus::Rejected, self.cfg.mode, Severity::Violation);
+        s.language = GuardLanguage::Shex;
+        s.limit = self.cfg.report_limit;
+        s.shapes_error = Some(
+            "the guard's schema is in a graph that is not readable; configure the guard again"
+                .into(),
+        );
+        if live {
+            self.counters.count(GuardStatus::Rejected);
+            self.history.record(c.kind, &s);
+        }
+        Some(s)
     }
 
-    /// Install on `store` a guard with this configuration and this schema that leaves out
-    /// the managed graphs `hidden`, replacing this one. The state of the head is unknown
-    /// to it, so its first validated write validates in full. The store's own managed
-    /// graphs call for it when the graphs it hides change.
-    pub fn rehidden(&self, store: &Store, mut hidden: Vec<String>) -> Arc<Self> {
-        hidden.sort_unstable();
-        hidden.dedup();
-        // no write commits between the switch and the next check
-        let txn = store.write_as(CommitKind::Transaction);
-        let g = Arc::new(Self {
-            cfg: self.cfg.clone(),
-            model: parking_lot::RwLock::new(self.model()),
-            pending: Mutex::new(None),
-            baseline: Mutex::new(None),
-            exact: Mutex::new(None),
-            typing: Mutex::new(None),
-            saved: Mutex::new(None),
-            persist: self.persist.clone(),
-            counters: DecisionCounts::default(),
-            last_full: AtomicU64::new(u64::MAX),
-            associations: AtomicU64::new(u64::MAX),
-            warnings: Mutex::new(Vec::new()),
-            copy: self.copy.clone(),
-            history: CheckHistory::default(),
-            hidden,
-        });
-        store.set_guard(Some(g.clone()));
-        store.set_guard_required(true);
-        drop(txn);
-        g
+    /// Whether the published state was validated without the hidden graphs of `c`.
+    fn same_hidden(&self, c: &Candidate<'_>) -> bool {
+        self.hidden.lock().as_slice() == c.hidden
     }
 
     /// An independent guard for a memory branch with its own validation state.
@@ -476,7 +483,8 @@ impl ShexGuard {
             warnings: Mutex::new(Vec::new()),
             copy: self.copy.clone(),
             history: CheckHistory::default(),
-            hidden: sorted(store.hidden_graphs()),
+            hidden: Mutex::new(sorted(store.hidden_graphs())),
+            reading: parking_lot::RwLock::new(sorted(store.hidden_graphs())),
         });
         store.set_guard(Some(fork.clone()));
         store.set_guard_required(true);
@@ -498,12 +506,15 @@ impl ShexGuard {
     pub fn validation_inputs(
         &self,
         snap: &Snapshot,
+        hidden: &[String],
     ) -> (Arc<CompiledSchema>, ShapeMap, Option<ValidateOptions>) {
         let m = self.model();
+        let mut excluded = self.cfg.schema_graphs().to_vec();
+        excluded.extend(hidden.iter().cloned());
         let opts = self
             .cfg
             .data_graph
-            .graphs(snap, self.cfg.include_inferences, &self.excluded())
+            .graphs(snap, self.cfg.include_inferences, &excluded)
             .map(|g| ValidateOptions {
                 data_graph: g.data_graph,
                 extra_graphs: g.extra_graphs,
@@ -887,7 +898,7 @@ impl ShexGuard {
             return self.full(m, m, c, "sparql");
         }
         let exact = *self.exact.lock();
-        let Some(exact) = exact.filter(|e| e.commit == c.base.commit) else {
+        let Some(exact) = exact.filter(|e| e.commit == c.base.commit && self.same_hidden(c)) else {
             return self.full(m, m, c, "baseline");
         };
         if self.cfg.mode == GuardMode::Reject && !self.grandfather() && exact.nonconformant > 0 {
@@ -1010,6 +1021,7 @@ impl ShexGuard {
                 exact: Some(exact),
                 typing,
                 model: Some(new),
+                hidden: c.hidden.to_vec(),
             });
         }
         Ok(summary)
@@ -1156,6 +1168,14 @@ impl CommitGuard for ShexGuard {
         // a dry run validates like a write and records nothing: no counters, no history,
         // no state for the next commit
         let live = c.opts.dry_run.is_none();
+        // the validation never reads the graphs the store hides (spec C26 §2.3)
+        *self.reading.write() = c.hidden.to_vec();
+        if let Some(s) = self.hidden_schema(c, live) {
+            return Ok(s);
+        }
+        // a published state validated with other graphs hidden is unknown, and this
+        // write validates in full
+        let same_hidden = self.same_hidden(c);
         // Replay predecessors are private transaction views. Their graph schema can
         // differ from the live cached model without any publication callback.
         // Rebuilt candidates can use a post-log base that already contains this write's
@@ -1195,7 +1215,7 @@ impl CommitGuard for ShexGuard {
         if schema_changed {
             return self.schema_write(c, &model, seq, live);
         }
-        if !relevant {
+        if !relevant && same_hidden {
             if !live {
                 let mut s = ValidationSummary::empty(
                     GuardStatus::Skipped,
@@ -1220,6 +1240,7 @@ impl CommitGuard for ShexGuard {
                     exact,
                     typing: TypingUpdate::Keep,
                     model: None,
+                    hidden: c.hidden.to_vec(),
                 });
             }
             let mut s =
@@ -1241,6 +1262,7 @@ impl CommitGuard for ShexGuard {
                 exact: Some(exact),
                 typing,
                 model: None,
+                hidden: c.hidden.to_vec(),
             });
         }
         Ok(summary)
@@ -1261,6 +1283,7 @@ impl CommitGuard for ShexGuard {
                 }
                 *self.baseline.lock() = Some(p.baseline);
                 *self.exact.lock() = p.exact;
+                *self.hidden.lock() = p.hidden;
                 let mut typing = self.typing.lock();
                 match p.typing {
                     TypingUpdate::Keep => match typing.as_mut() {
@@ -1294,6 +1317,24 @@ impl CommitGuard for ShexGuard {
 
     fn close(&self, head: &sparkles_core::commit::CommitInfo, snapshot: &Snapshot) {
         self.save_typing(head, snapshot);
+    }
+
+    fn reads_graphs(&self) -> Vec<String> {
+        let mut g = self.cfg.schema_graphs().to_vec();
+        if let DataGraphSel::Graphs(gs) = &self.cfg.data_graph {
+            g.extend(gs.iter().cloned());
+        }
+        g
+    }
+
+    fn hidden_changed(&self, hidden: &[String]) {
+        *self.pending.lock() = None;
+        *self.baseline.lock() = None;
+        *self.exact.lock() = None;
+        *self.typing.lock() = None;
+        self.forget_saved_typing();
+        *self.hidden.lock() = hidden.to_vec();
+        *self.reading.write() = hidden.to_vec();
     }
 
     fn rekey(&self, old: &Snapshot, new: &Snapshot) {
@@ -1639,8 +1680,9 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     };
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
     let mut g = ShexGuard::new(cfg, loaded, map, Some((root.to_path_buf(), hash.clone())));
-    g.hidden = sorted(store.hidden_graphs());
-    let key = status_key(&hash, &g.hidden);
+    let hidden = sorted(store.hidden_graphs());
+    let key = status_key(&hash, &hidden);
+    g.set_hidden(hidden);
     let g = Arc::new(g);
     // the state of the head, when the status file records it for this configuration
     // The transaction already owns the writer. Read metadata for its exact
@@ -1740,6 +1782,21 @@ pub fn set_config(
         return Ok(SetOutcome::Removed);
     };
     cfg.check()?;
+    // Under the writer lock the registry cannot change: a source it hides is refused
+    // as a graph that does not exist, before anything reads it (spec C26 §2.3).
+    let hidden = sorted(store.hidden_graphs());
+    let listed = match &cfg.data_graph {
+        DataGraphSel::Graphs(gs) => gs.as_slice(),
+        DataGraphSel::Named(_) => &[],
+    };
+    if let Some(g) = cfg
+        .schema_graphs()
+        .iter()
+        .chain(listed)
+        .find(|g| hidden.contains(g))
+    {
+        return Err(sparkles_core::Error::NotFound(format!("no such graph: <{g}>")).into());
+    }
     let view = Arc::new(txn.view());
     let in_graphs = cfg.schema.graphs.is_some();
     let loaded = match cfg.schema.inline.take() {
@@ -1780,7 +1837,7 @@ pub fn set_config(
     // the model keeps the text's digest, so the text stays in `loaded` until then
     let text = loaded.text.clone();
     let mut guard = ShexGuard::new(cfg, loaded, map, None);
-    guard.hidden = sorted(store.hidden_graphs());
+    guard.set_hidden(hidden);
     if root.is_none() && !in_graphs {
         guard.copy = Some(text.clone());
     }
@@ -1808,7 +1865,7 @@ pub fn set_config(
         let bytes = serde_json::to_vec_pretty(&guard.cfg)?;
         write_atomic(&r.join(CONFIG_FILE), &bytes)?;
         let hash = sha256_hex(&bytes);
-        StatusFile::of(&baseline, &status_key(&hash, &guard.hidden)).write(r)?;
+        StatusFile::of(&baseline, &status_key(&hash, &guard.hidden.lock())).write(r)?;
         guard.persist = Some((r.clone(), hash));
     }
     *guard.exact.lock() = Some(Exact {

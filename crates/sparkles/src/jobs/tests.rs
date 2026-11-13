@@ -2369,33 +2369,37 @@ fn an_ontology_opened_before_jobs_are_enabled_is_not_reused_after() {
     assert_eq!(after.summary().triples, 0, "cached: {}", after.cached);
 }
 
-/// Shapes in the ledger graph that a guard installed before jobs were enabled names. A
-/// guard configured once jobs are enabled cannot name a hidden graph.
+/// A dataset with jobs enabled whose guard names shapes kept in the ledger graph. Neither
+/// the guard configuration nor enablement admits that, so the configuration file is
+/// written by hand and the dataset opened again, as a damaged or edited directory would
+/// be.
 #[cfg(feature = "shacl")]
-fn ledger_shapes(ds: &Dataset) {
-    ds.update(&format!(
-        "PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{LEDGER_GRAPH}> {{ <urn:SecretShape> a sh:NodeShape ; sh:targetClass <urn:Public> ; sh:property <urn:SecretPropertyShape> . <urn:SecretPropertyShape> sh:path <urn:secret-path> ; sh:minCount 1 }} }}"
-    ))
-    .unwrap();
-    ds.validation()
-        .guard()
-        .set_shacl(
-            serde_json::from_value(serde_json::json!({
-                "mode": "warn",
-                "dataGraph": "default",
-                "shapes": {"graphs": [LEDGER_GRAPH]},
-            }))
-            .unwrap(),
-        )
+fn ledger_shapes() -> (tempfile::TempDir, Dataset) {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ds = Dataset::open(dir.path()).unwrap();
+        ds.update(&format!(
+            "PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{LEDGER_GRAPH}> {{ <urn:SecretShape> a sh:NodeShape ; sh:targetClass <urn:Public> ; sh:property <urn:SecretPropertyShape> . <urn:SecretPropertyShape> sh:path <urn:secret-path> ; sh:minCount 1 }} }}"
+        ))
         .unwrap();
-    configured(ds);
+        configured(&ds);
+    }
+    std::fs::write(
+        dir.path().join(crate::guard::config::CONFIG_FILE),
+        serde_json::to_vec(&serde_json::json!({"format": 2, "language": "shacl",
+            "mode": "warn", "dataGraph": "default", "shapes": {"graphs": [LEDGER_GRAPH]}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    assert!(ds.validation().guard().get().is_some());
+    (dir, ds)
 }
 
 #[cfg(feature = "shacl")]
 #[test]
 fn constraints_never_take_a_guard_whose_shapes_are_in_the_ledger() {
-    let ds = Dataset::memory();
-    ledger_shapes(&ds);
+    let (_dir, ds) = ledger_shapes();
     let mut req = crate::handles::ConstraintsRequest::default();
     req.shapes.guard = Some(true);
     let r = ds.schema().constraints(&req);
@@ -2409,8 +2413,7 @@ fn constraints_never_take_a_guard_whose_shapes_are_in_the_ledger() {
 #[cfg(all(feature = "graphql", feature = "shacl"))]
 #[test]
 fn a_graphql_draft_never_takes_guard_shapes_from_the_ledger() {
-    let ds = Dataset::memory();
-    ledger_shapes(&ds);
+    let (_dir, ds) = ledger_shapes();
     let r = ds.graphql().draft("d", Default::default());
     if let Ok((draft, _)) = r {
         let j = serde_json::to_string(&draft).unwrap();

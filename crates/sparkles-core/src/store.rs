@@ -5198,12 +5198,16 @@ impl Store {
         };
         let view = view();
         let t0 = std::time::Instant::now();
+        let mut hidden = self.hidden_graphs();
+        hidden.sort_unstable();
+        hidden.dedup();
         let checked = g.check(&crate::guard::Candidate {
             base,
             view,
             kind,
             changes,
             opts,
+            hidden: &hidden,
         });
         if let Some(o) = &observer
             && opts.dry_run.is_none()

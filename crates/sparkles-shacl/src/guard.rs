@@ -260,6 +260,8 @@ struct Pending {
     loaded: Option<Loaded>,
     baseline: Baseline,
     exact: Option<Exact>,
+    /// the hidden graphs the state was validated without
+    hidden: Vec<String>,
 }
 
 /// Which pre-state report can be used for grandfather comparison.
@@ -330,9 +332,12 @@ pub struct ShaclGuard {
     /// the shapes file's triples, when the shapes are graphs and a file: they are merged
     /// with the graphs whenever a write changes them
     file_shapes: Option<Arc<oxrdf::Graph>>,
-    /// the store's hidden managed graphs when the guard was installed, which no
-    /// validation reads (spec C26 §2.3); a change of them installs a new guard
-    hidden: Vec<String>,
+    /// the hidden managed graphs the published state was validated without (spec C26
+    /// §2.3); a check under other hidden graphs does not trust that state
+    hidden: Mutex<Vec<String>>,
+    /// the hidden managed graphs of the validation in progress, which it never reads;
+    /// checks run one at a time under the writer lock
+    reading: RwLock<Vec<String>>,
 }
 
 /// The data graph of one state, ready to validate.
@@ -356,44 +361,47 @@ impl ShaclGuard {
             history: CheckHistory::default(),
             persist,
             file_shapes: None,
-            hidden: Vec::new(),
+            hidden: Mutex::new(Vec::new()),
+            reading: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Validate as a store whose family hides `hidden` (sorted) does.
+    fn set_hidden(&mut self, hidden: Vec<String>) {
+        *self.reading.get_mut() = hidden.clone();
+        *self.hidden.get_mut() = hidden;
     }
 
     /// The directory and key that the state of each validated commit is kept under.
     fn status_at(&self) -> Option<(&Path, String)> {
         self.persist
             .as_ref()
-            .map(|(root, hash)| (root.as_path(), status_key(hash, &self.hidden)))
+            .map(|(root, hash)| (root.as_path(), status_key(hash, &self.hidden.lock())))
     }
 
-    /// The hidden managed graphs that no validation of this guard reads.
-    pub fn hidden(&self) -> &[String] {
-        &self.hidden
-    }
-
-    /// Install on `store` a guard with this configuration and these shapes that leaves
-    /// out the managed graphs `hidden`, replacing this one. The state of the head is
-    /// unknown to it, so its first validated write validates in full. The store's own
-    /// managed graphs call for it when the graphs it hides change.
-    pub fn rehidden(&self, store: &Store, mut hidden: Vec<String>) -> Arc<Self> {
-        hidden.sort_unstable();
-        hidden.dedup();
-        // no write commits between the switch and the next check
-        let txn = store.write_as(CommitKind::Transaction);
-        let mut g = Self::new(
-            self.cfg.clone(),
-            self.loaded.read().clone(),
-            self.persist.clone(),
+    /// A rejection of every write while the guard's shapes are in a hidden graph. It
+    /// names no graph and reports none of the shapes.
+    fn hidden_shapes(&self, c: &Candidate<'_>, live: bool) -> Option<ValidationSummary> {
+        if !self
+            .cfg
+            .shapes_graphs()
+            .iter()
+            .any(|g| c.hidden.contains(g))
+        {
+            return None;
+        }
+        let mut s =
+            ValidationSummary::empty(GuardStatus::Rejected, self.cfg.mode, self.cfg.threshold);
+        s.limit = self.cfg.report_limit;
+        s.shapes_error = Some(
+            "the guard's shapes are in a graph that is not readable; configure the guard again"
+                .into(),
         );
-        g.file_shapes = self.file_shapes.clone();
-        g.hidden = hidden;
-        *g.tuning.write() = *self.tuning.read();
-        let g = Arc::new(g);
-        store.set_guard(Some(g.clone()));
-        store.set_guard_required(true);
-        drop(txn);
-        g
+        if live {
+            self.count(GuardStatus::Rejected);
+            self.history.record(c.kind, &s);
+        }
+        Some(s)
     }
 
     /// An independent guard for a memory branch, retaining only immutable schema data.
@@ -409,7 +417,7 @@ impl ShaclGuard {
         };
         let mut fork = Self::new(self.cfg.clone(), loaded, None);
         fork.file_shapes = self.file_shapes.clone();
-        fork.hidden = sorted(store.hidden_graphs());
+        fork.set_hidden(sorted(store.hidden_graphs()));
         *fork.tuning.write() = *self.tuning.read();
         let fork = Arc::new(fork);
         store.set_guard(Some(fork.clone()));
@@ -428,10 +436,15 @@ impl ShaclGuard {
     }
 
     /// The data graph a validation of `snap` reads under this guard's configuration, as
-    /// validation options (no limits set): `None` when the configuration lists data
-    /// graphs none of which exists in `snap`.
-    pub fn data_graph_options(&self, snap: &Snapshot) -> Option<ValidateOptions> {
-        self.cfg.validate_options(snap, &self.hidden)
+    /// validation options (no limits set), with the store's `hidden` managed graphs left
+    /// out: `None` when the configuration lists data graphs none of which exists in
+    /// `snap` outside them.
+    pub fn data_graph_options(
+        &self,
+        snap: &Snapshot,
+        hidden: &[String],
+    ) -> Option<ValidateOptions> {
+        self.cfg.validate_options(snap, hidden)
     }
 
     /// The limits past which a write is validated in full.
@@ -498,7 +511,7 @@ impl ShaclGuard {
     /// baseline and exact counts when they are known. A commit of a group is checked
     /// while the commits before it wait for their fence, so the state comes from the
     /// commit in flight when there is one, and from the published state otherwise.
-    fn state_at(&self, base: u64) -> (Loaded, Option<Baseline>, Option<Exact>) {
+    fn state_at(&self, base: u64) -> (Loaded, Option<Baseline>, Option<Exact>, Vec<String>) {
         let pending = self.pending.lock();
         let loaded = pending
             .iter()
@@ -507,7 +520,12 @@ impl ShaclGuard {
             .find_map(|p| p.loaded.clone())
             .unwrap_or_else(|| self.loaded.read().clone());
         match pending.iter().find(|p| p.seq == base) {
-            Some(p) => (loaded, Some(p.baseline.clone()), p.exact.clone()),
+            Some(p) => (
+                loaded,
+                Some(p.baseline.clone()),
+                p.exact.clone(),
+                p.hidden.clone(),
+            ),
             // A baseline of another commit says nothing of this one: a write that bypassed
             // the guard sits between them (its mark is on the published baseline, and
             // the publication of an earlier commit may have put the old one back).
@@ -524,6 +542,7 @@ impl ShaclGuard {
                     }
                 }),
                 self.exact.lock().clone().filter(|e| e.commit == base),
+                self.hidden.lock().clone(),
             ),
         }
     }
@@ -554,7 +573,7 @@ impl ShaclGuard {
         shapes: &Shapes,
         o: &WriteOptions,
     ) -> sparkles_core::Result<Option<State>> {
-        let Some(mut vo) = self.cfg.validate_options(snap, &self.hidden) else {
+        let Some(mut vo) = self.cfg.validate_options(snap, &self.reading.read()) else {
             return Ok(None);
         };
         vo.cancel = o.cancel.clone();
@@ -807,6 +826,7 @@ impl ShaclGuard {
         live: bool,
         baseline: Option<Baseline>,
         exact: Option<Exact>,
+        hidden: &[String],
     ) -> ValidationSummary {
         if !live {
             let mut s =
@@ -823,6 +843,7 @@ impl ShaclGuard {
                 loaded: None,
                 baseline,
                 exact,
+                hidden: hidden.to_vec(),
             });
         }
         let mut s =
@@ -871,7 +892,7 @@ impl ShaclGuard {
         for (_, q) in log.iter() {
             let data = *graphs
                 .entry(q[3].0)
-                .or_insert_with(|| self.cfg.touches(&c.view, q[3].0, &self.hidden).0);
+                .or_insert_with(|| self.cfg.touches(&c.view, q[3].0, c.hidden).0);
             if data && seen.insert([q[0], q[1], q[2]]) {
                 changes.push([q[0], q[1], q[2]]);
             }
@@ -893,7 +914,7 @@ impl ShaclGuard {
             .filter(|(_, q)| {
                 *graphs
                     .entry(q[3].0)
-                    .or_insert_with(|| self.cfg.touches(&c.view, q[3].0, &self.hidden).0)
+                    .or_insert_with(|| self.cfg.touches(&c.view, q[3].0, c.hidden).0)
             })
             .map(|(_, q)| q[1])
             .collect();
@@ -1138,22 +1159,34 @@ impl CommitGuard for ShaclGuard {
         // a dry run validates like a write and records nothing: no counters, no history,
         // no state for the next commit
         let live = c.opts.dry_run.is_none();
+        // the validation never reads the graphs the store hides (spec C26 §2.3)
+        *self.reading.write() = c.hidden.to_vec();
+        if let Some(s) = self.hidden_shapes(c, live) {
+            return Ok(s);
+        }
         // relevance: a write that touches neither the data graph nor the shapes cannot
         // change the report
         let (mut data, mut shapes_changed) = (false, false);
         match c.changes.graphs() {
             Some(gs) => {
                 for g in gs {
-                    let (d, s) = self.cfg.touches(&c.view, g, &self.hidden);
+                    let (d, s) = self.cfg.touches(&c.view, g, c.hidden);
                     data |= d;
                     shapes_changed |= s;
                 }
             }
             None => (data, shapes_changed) = (true, !self.cfg.shapes_graphs().is_empty()),
         }
-        let (loaded, base_baseline, base_exact) = self.state_at(c.base.commit);
+        let (loaded, mut base_baseline, mut base_exact, base_hidden) = self.state_at(c.base.commit);
+        if base_hidden.as_slice() != c.hidden {
+            // the state of the base was validated with other graphs hidden: it is
+            // unknown, and this write validates in full
+            base_baseline = None;
+            base_exact = None;
+            data = true;
+        }
         if !data && !shapes_changed {
-            return Ok(self.skipped(seq, live, base_baseline, base_exact));
+            return Ok(self.skipped(seq, live, base_baseline, base_exact, c.hidden));
         }
         let unknown = base_baseline.as_ref().is_none_or(|b| b.conforms.is_none());
         let refresh = unknown && !self.cfg.shapes_graphs().is_empty();
@@ -1231,7 +1264,7 @@ impl CommitGuard for ShaclGuard {
         } else {
             // a write no shape can read: with the state of the head known, it carries over
             if base_exact.is_some() && !self.reads_changes(c, &loaded) {
-                return Ok(self.skipped(seq, live, base_baseline, base_exact));
+                return Ok(self.skipped(seq, live, base_baseline, base_exact, c.hidden));
             }
             (self.check_data(c, &loaded, base_exact)?, None)
         };
@@ -1247,6 +1280,7 @@ impl CommitGuard for ShaclGuard {
                 loaded: new_loaded,
                 baseline: baseline_of(&summary, seq),
                 exact: Some(checked.exact),
+                hidden: c.hidden.to_vec(),
             });
         }
         Ok(summary)
@@ -1267,6 +1301,7 @@ impl CommitGuard for ShaclGuard {
                 if let Some(l) = p.loaded.clone() {
                     *self.loaded.write() = l;
                 }
+                *self.hidden.lock() = p.hidden.clone();
                 *self.baseline.lock() = Some(p.baseline.clone());
                 *self.exact.lock() = p.exact.clone();
                 drop(pending);
@@ -1289,6 +1324,23 @@ impl CommitGuard for ShaclGuard {
 
     fn speculative(&self) -> bool {
         true
+    }
+
+    fn reads_graphs(&self) -> Vec<String> {
+        let mut g = self.cfg.shapes_graphs().to_vec();
+        if let DataGraphSel::Graphs(gs) = &self.cfg.data_graph {
+            g.extend(gs.iter().cloned());
+        }
+        g
+    }
+
+    fn hidden_changed(&self, hidden: &[String]) {
+        // the writer lock is held and the group commit drained: nothing is pending
+        self.pending.lock().clear();
+        *self.baseline.lock() = None;
+        *self.exact.lock() = None;
+        *self.hidden.lock() = hidden.to_vec();
+        *self.reading.write() = hidden.to_vec();
     }
 
     fn bypassed(&self, seq: u64) {
@@ -1400,6 +1452,24 @@ pub fn configured_shapes(store: &Store) -> Result<Option<(ValidationConfig, Shap
     Ok(Some((cfg, shapes)))
 }
 
+/// Refuse a configuration whose shapes graphs or listed data graphs include one of the
+/// store's `hidden` managed graphs, as for a graph that does not exist.
+fn refuse_hidden(cfg: &ValidationConfig, hidden: &[String]) -> Result<()> {
+    let listed = match &cfg.data_graph {
+        DataGraphSel::Graphs(gs) => gs.as_slice(),
+        DataGraphSel::Named(_) => &[],
+    };
+    match cfg
+        .shapes_graphs()
+        .iter()
+        .chain(listed)
+        .find(|g| hidden.contains(g))
+    {
+        Some(g) => Err(sparkles_core::Error::NotFound(format!("no such graph: <{g}>")).into()),
+        None => Ok(()),
+    }
+}
+
 /// `graphs` sorted, without duplicates.
 fn sorted(mut graphs: Vec<String>) -> Vec<String> {
     graphs.sort_unstable();
@@ -1428,8 +1498,9 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShaclGuard>>> {
     let n = loaded.shapes.len();
     let mut g = ShaclGuard::new(cfg, loaded, Some((root.to_path_buf(), hash.clone())));
     g.file_shapes = file_shapes;
-    g.hidden = sorted(store.hidden_graphs());
-    let key = status_key(&hash, &g.hidden);
+    let hidden = sorted(store.hidden_graphs());
+    let key = status_key(&hash, &hidden);
+    g.set_hidden(hidden);
     let g = Arc::new(g);
     let head = store.head_commit().seq;
     if let Some(b) = StatusFile::read(root, head, &key) {
@@ -1474,13 +1545,16 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         return Ok(SetOutcome::Removed);
     };
     cfg.check()?;
+    // Under the writer lock the registry cannot change: a source it hides is refused
+    // as a graph that does not exist, before anything reads it (spec C26 §2.3).
+    let hidden = sorted(store.hidden_graphs());
+    refuse_hidden(&cfg, &hidden)?;
     let view = Arc::new(txn.view());
     let head = txn.base().commit;
     let (shapes, file_shapes) = load_shapes(&cfg, root.as_deref(), &view)?;
     let loaded = Loaded::new(shapes);
-    let hidden = sorted(store.hidden_graphs());
     let mut probe = ShaclGuard::new(cfg.clone(), loaded.clone(), None);
-    probe.hidden = hidden.clone();
+    probe.set_hidden(hidden.clone());
     let checked = probe.full(
         &view,
         &loaded,
@@ -1526,7 +1600,7 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     }
     let mut guard = ShaclGuard::new(cfg, loaded, persist);
     guard.file_shapes = file_shapes;
-    guard.hidden = hidden;
+    guard.set_hidden(hidden);
     let guard = Arc::new(guard);
     let baseline = baseline_of(&summary, head);
     if let Some((r, key)) = guard.status_at() {
@@ -2194,6 +2268,7 @@ mod pending_tests {
             kind: CommitKind::Update,
             changes: Changes::Unknown,
             opts: &opts,
+            hidden: &[],
         });
         let err = checked.expect_err("a shapes read failure cannot validate");
         assert!(err.to_string().contains("cannot decode quad"), "{err}");

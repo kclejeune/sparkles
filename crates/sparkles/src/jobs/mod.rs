@@ -395,20 +395,18 @@ impl Jobs {
             store.require_dataset_reader(READER)?;
         }
         let graphs = settings.managed_graphs();
-        // The write guard leaves the ledger out before it can hold a record, and it
-        // follows the graphs the store hides once the registry is written, or not.
-        let mut hiding = store.hidden_graphs();
-        hiding.extend(graphs.iter().cloned());
-        ds.rehide_write_guard(hiding);
         let mut entry = OwnerEntry::for_settings(PROFILE, graphs, &canonical);
         // the ledger leaves every caller's read view (C26 §2.3)
         entry.visibility = crate::managed::Visibility::Hidden;
-        let enabled = store.enable_managed_at(OwnerKind::Jobs, entry, &canonical, revision);
-        ds.rehide_write_guard(store.hidden_graphs());
-        let graphs = enabled?;
-        // the hidden graphs changed without a commit of the data: the views' worker
-        // resolves their access again and ends the live queries
+        let graphs = store.enable_managed_at(OwnerKind::Jobs, entry, &canonical, revision)?;
+        // The hidden graphs changed without a commit of the data. The views' worker of
+        // main and of every open branch resolves its access again and ends its live
+        // queries (spec C26 §2.3).
         self.ds.state().views.kick();
+        let branches: Vec<Dataset> = self.ds.state().branches.lock().values().cloned().collect();
+        for b in branches {
+            b.state().views.kick();
+        }
         status_from(Some(&graphs), Some(&canonical))
     }
 

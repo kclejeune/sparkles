@@ -568,7 +568,9 @@ mod enabled {
     /// label keeps it.
     fn guard_validation(r: GuardRun<'_>) -> ApiResult {
         let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
-        let (schema, guard_map, opts) = r.guard.validation_inputs(&r.snap);
+        // the hidden graphs are applied below, so that a hidden data graph answers as one
+        // that does not exist
+        let (schema, guard_map, opts) = r.guard.validation_inputs(&r.snap, &[]);
         // the dataset's hidden control graphs (spec C26 §2.3) are never read, and a hidden
         // data graph is one that does not exist
         let hidden = r.ds.dataset.store().hidden_graphs();
