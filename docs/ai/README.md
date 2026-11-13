@@ -684,8 +684,9 @@ process that granted a lease has a boot epoch, so a token whose generation was s
 whose lease expired, whose process restarted or whose definition no longer admits the
 run or the worker fails with `lease-lost`, and a caller with no part in the run gets the
 answer of an unknown run. An expired lease follows the retry policy the run was accepted
-with before another worker takes the run over, and a run whose definition was edited or
-removed waits until it is restored. A publication
+with before another worker takes the run over. A run whose definition was edited or
+removed is not claimed until the definition is restored, and it keeps the policy it was
+accepted with, so it still fails once that policy's attempts or horizon run out. A publication
 commits the quads, the publication record, the checkpoint and the run's completion
 together, and a repeated publication operation returns the original receipt even after
 the lease ended, so a retry after a lost response never duplicates its effects. A
@@ -697,9 +698,11 @@ In Rust, `Dataset::jobs()` configures, submits, claims, renews, publishes, fails
 retries and inspects. Over HTTP the routes are under `/$/jobs/{ds}`, described in
 [the API reference](../API.md#durable-jobs). The ledger graph leaves every caller's
 query, Graph Store, listing and history view, whatever the caller's grants say, and only
-the jobs inspection renders its records. Statistics, the dataset listings, validation,
-materialization and the MCP tools leave it out as well, and the history routes leave out
-the counts that cover every graph while a dataset hides one. The library's Graph Store,
+the jobs inspection renders its records. Statistics, metrics, the dataset listings,
+validation, materialization, merge previews and the MCP tools leave it out as well, and
+so do the library's schema, validation, forms, explanation, analysis, ontology and
+GraphQL drafting handles. The history routes leave out the counts that cover every graph
+while a dataset hides one. The library's Graph Store,
 history, diff and dump handles subtract hidden graphs only from a view the caller gives,
 which roadmap item 902 covers, and a text, geo or vector index whose scope includes the
 ledger graph still indexes it, which item 904 covers. Once configured, the ledger stays protected and hidden while jobs are disabled,

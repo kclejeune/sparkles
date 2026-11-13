@@ -13498,8 +13498,10 @@ marks the ledger graph hidden in the managed-graph registry.
 `GET` and `PUT /$/jobs/{ds}/settings` read and record the settings and need `admin` on
 the dataset. A definition's revision is the digest of its canonical JSON. A run keeps the
 revision it was accepted under, with the attempts and retry horizon of that revision, and
-a run whose definition changed or was removed is not claimed, and not ended by an expired
-lease or a restart either, until the definition is restored or the run is cancelled. Jobs cannot be disabled while runs are
+a run whose definition changed or was removed is not claimed until the definition is
+restored or the run is cancelled. An expired lease or a restart still judges such a run
+by the policy it was accepted with, never by a replacement's, so a run that has used its
+accepted attempts or passed its accepted horizon fails. Jobs cannot be disabled while runs are
 queued, leased or waiting to retry. A disabled configuration keeps the ledger graph
 protected and hidden under the same protection nonce, so a run admitted as jobs were being
 disabled waits until they are enabled again. `maxQueued` is at most 4096, and the
@@ -13566,13 +13568,21 @@ grants say, and a request for it answers as for a graph that does not exist. The
 that take no view follow the same exclusion. `/$/stats/{ds}` counts only the visible
 graphs, in its quad, base and delta totals, its graph list, its predicate counts and its
 class instances, while its vocabulary size and history figures describe the storage as a
-whole. The quad counts of `/$/datasets` and `/$/server` leave the ledger out. SHACL and
-ShEx validation never read it, and a validation that names it as its data or shapes graph
-gets `404`. Materialization never reads it, whatever input graphs a request names, so no
-rule copies a ledger value into the inferred graph. The MCP tools leave it out of every
-result. The counts a commit, a snapshot, a diff or a timeline bucket carries cover every
-graph, so the history routes leave them out while a dataset hides a graph, as they do for
-a caller whose grants cover only some graphs. Delivery through an outbox, recurring
+whole. Its distinct subjects and objects of a predicate leave out those that only the
+ledger gives it. The quad counts of `/$/datasets` and `/$/server` and the dataset and
+branch gauges of `/$/metrics` leave the ledger out. SHACL and ShEx validation never read
+it, also under `shapes=guard` and `schema=guard`, where a guard whose data graph is the
+ledger validates nothing, and a validation that names it as its data or shapes graph gets
+`404`. Materialization never reads it, whatever input graphs a request names, so no rule
+copies a ledger value into the inferred graph, and import fetching never follows an
+import the ledger names. A `SERVICE` call to this server and a resource header that
+select a dataset outside the request path leave that dataset's ledger out too. The MCP
+tools leave it out of every result. The counts a commit, a snapshot, a diff or a timeline
+bucket carries cover every graph, so the history routes leave them out while a dataset
+hides a graph, as they do for a caller whose grants cover only some graphs, and so do a
+created snapshot and the metadata of a `410` for a commit whose data is gone. A merge
+preview neither counts the ledger's changes nor shows its conflicts, and a merge whose
+only conflicts are in the ledger is refused with `profile-managed-graph`. Delivery through an outbox, recurring
 definitions and restore and clone recovery are [roadmap](ROADMAP.md) work.
 
 ### Suggested examples

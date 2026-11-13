@@ -450,6 +450,22 @@ fail the epoch check before any new claim, whatever the wall clock says, which g
 Lease expiry is never derived from a record's UTC time within one process, so a backward
 clock change cannot lengthen a lease.
 
+The committed run version is the authority for which monotonic deadline applies. Every
+commit of a run writes the version after the one its base read, and transitions of one
+run serialize on the writer, so a version names exactly one committed state. A claim or
+renewal records its deadline in process memory under the version its commit will write,
+before the commit publishes, so that no later writer can read the new attempt without
+its deadline. A lease check under the writer admits only the deadline recorded under the
+version it reads in its base. A deadline whose commit was refused, unwound or lost
+belongs to a version that was never committed, so no check honours it, and the deadline
+of the committed version is never replaced or restored by another transaction's
+rollback. A transaction that does not commit removes only its own entry, and a commit
+that publishes drops the entries of older versions. A commit whose outcome is uncertain
+also removes its entry, so its lease counts as expired, which fences rather than
+extends it. Claim and renewal are the only transitions that keep a run leased under a
+new version, and each records its own deadline, so another transition never revives a
+recorded deadline of a version it wrote.
+
 Input commits are pinned by a source hold under the run's id before the submission
 commit, as the evidence profile pins its references. A crash between the hold and the
 commit leaves an orphan that the hold reconciliation releases after its grace period, and
@@ -590,8 +606,13 @@ registry lists the hidden graphs of its owners, and they leave every graph view 
 or a library query runs under: the server's authentication middleware subtracts them from
 the principal's view for every route of the dataset, and the library subtracts them from
 the view of every SPARQL query it runs, including a caller's explicit all-graphs view.
-Of the surfaces that take a view, only the typed inspection of the jobs handle reads the
-ledger. The surfaces that take no view follow the exclusion on their own: the statistics
+The server's shared options boundary subtracts them again for a dataset selected outside
+the request path, such as a local `SERVICE` target or a resource header. The library's
+schema, validation, forms, explanation, entailment analysis, ontology and GraphQL
+drafting handles subtract them from the view they are given. Of the dataset's ordinary
+surfaces, only the typed inspection of the jobs handle reads the ledger, and the raw
+`Store` remains a trusted interface whose callers supply the exclusion. The surfaces that
+take no view follow the exclusion on their own: the statistics
 count only the visible graphs, the dataset listings count only visible quads, SHACL and
 ShEx validation exclude the hidden graphs and answer a request that names one as for a
 graph that does not exist, materialization and reasoning diagnostics never read them
