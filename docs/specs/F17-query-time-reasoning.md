@@ -879,6 +879,76 @@ schema terms can expand the demand program far beyond the closure (roadmap items
 and 190).
 
 
+### Schema completeness at scale (item 911)
+
+Item 191 made schema facts that follow from derived instance facts complete under
+`demand`. A session proves which schema relations its preliminary schema pass already
+holds in full with two analyses. `complete_schema` reads the rules alone, and
+`refine_schema` evaluates a finite abstraction of the visible facts, in which every
+schema or program constant, every predicate and every type class stays concrete and
+every other instance position becomes a wildcard. Only proven relations are specialized
+into the query's program. An unproven relation stays in the ordinary demand program,
+which follows its derived premises.
+
+On LUBM the abstraction never finished. Its join enumerated every abstract fact for
+every binding, and a rule with a variable predicate passed the cap of 1,024 bindings,
+so the analysis fell back to the conservative answer and left every schema relation
+open. Measured on one university, `rdfs` closed none of its 4 schema predicates and 4
+meta classes and `owl-rl` none of its 19 and 12. The program was then about 780 rules
+over the unspecialized schema joins, and an `owl-rl` query derived about the whole type
+closure, 0.5 to 1.1 s for LUBM q1 at one university and 1.9 to 3.1 s at ten. The
+analysis also scanned the visible facts twice for every query, 23 to 50 ms of an `rdfs`
+q1 of 30 to 57 ms at one university.
+
+Three changes keep item 191's guarantee and repair the path.
+
+* **(a) An abstraction that scales.** The join indexes the abstract facts by predicate
+  and the abstract types by class, so an atom whose predicate or class is known visits
+  only the facts it can match, and a fact with a wildcard predicate or class stays a
+  candidate of every atom it can match. The caps rise to 16,384 abstract facts and
+  16,384 bindings per join step. LUBM's abstraction holds about 1,450 facts under
+  `owl-rl` and 750 under `rdfs`. The workspace admitted before the analysis grows with
+  the caps, from about 5 MB to about 40 MB for the shipped profiles. Two
+  overestimates that kept relations open on LUBM narrow without losing soundness.
+  `listMember` and `listEntry` follow the list from its head through `rdf:rest` when
+  every abstract list link has a concrete node, and take the members of every list
+  otherwise. A `regex` with a constant pattern rules out a binding whose known text it
+  does not match, so `rdfs12cmp` no longer makes every property a container membership
+  property. The abstraction remains an overestimate, so a relation it proves complete
+  is complete, and a relation it cannot prove stays open as before.
+* **(b) The proof once per commit.** The proven relations depend only on the rules,
+  the input graphs and the visible facts, so a session stores them, as the IRIs of the
+  closed predicates and classes, in a process-wide cache under the schema table's view
+  key and the rules digest, and later sessions of the same view read them instead of
+  scanning. The cache holds at most 64 views and drops the oldest, and `nocache` does
+  not bypass it, like the schema table. A view that cannot be cached, such as a
+  transaction's snapshot, proves again in every session. The first query after a commit
+  still pays the two scans and the abstraction, which item 190 keeps for measurement.
+* **(c) The axioms in the schema pass.** The schema pass reads instance facts as stored,
+  so it missed schema facts that follow from an axiom about an instance. Under `owl-rl`,
+  `rdf:nil rdf:type rdf:List` gives `rdf:List rdf:type rdfs:Class` and
+  `rdf:List rdfs:subClassOf rdf:List`, which the proof then rightly left open, and with
+  them all of `rdfs:subClassOf`. The facts of rules without a body now join the pass's
+  seeds, so the pass derives these schema facts and the proof closes the relation. The
+  axioms are entailed by every dataset, so they add no answer the rules do not give.
+
+Measured on one LUBM university on stanley, with the release build and `nocache`, the
+proof now closes all 4 schema predicates and 4 meta classes of `rdfs` and all 19 and 12
+of `owl-rl`. Once a view's proof is cached, LUBM q1 takes 1.5 to 1.6 ms under `rdfs` and
+3.4 to 3.7 ms under `owl-rl`, against 29 to 57 ms and 0.5 to 1.1 s before. q14 takes 1.2
+to 1.6 ms and 2.1 to 2.5 ms. The first query of a view pays the proof, 25 ms under `rdfs`
+and 230 ms under `owl-rl`, most of it the `owl-rl` abstraction's joins over rules with a
+variable predicate.
+
+Options that give up completeness were not taken. Trusting the preliminary schema pass,
+as before item 191, would again miss schema facts that only derived instance facts
+give. Bounding the proof by the relations a query's patterns reach would leave the
+program unspecialized for a query that reads the type closure, which is most of them.
+
+A regression test on the LUBM generator checks a bound on what a demand query derives
+and that the session proves the shipped profiles' schema relations, so an analysis that
+gives up again fails the test.
+
 ### Bounded positive feedback evaluation
 
 A cold demand session can evaluate the original rules over a temporary closure when
