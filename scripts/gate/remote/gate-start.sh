@@ -136,6 +136,10 @@ mkdir -p "$out"
 # keeps the store's live entries and every active job's files, and never stops the start.
 if [ "$executor" = boat ]; then
   python3 -I "$bin/disk_clean.py" --if-above 90 --log "$G/disk-clean.jsonl" > "$out/disk-clean-start.json" 2>&1 || true
+  # The worktree exists before its unit does, so the start holds the cleanup's lock until
+  # the unit runs, and a cleanup from the worker's timer cannot remove it meanwhile.
+  exec 7>> "$G/.disk-clean.lock"
+  flock -w 900 7
 fi
 git -C "$G/repo.git" cat-file -e "$full^{commit}"
 [ -z "$base" ] || git -C "$G/repo.git" cat-file -e "$base^{commit}"
@@ -179,4 +183,5 @@ systemd-run --user --unit "$unit" --collect -q "${forward[@]}" \
   --setenv=MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" --setenv=SPARKLES_REMOTE_EXECUTOR="$executor" \
   --setenv=GATE_CARGO_JOBS="$cargo_jobs" --setenv=GATE_BASE="$base" --setenv=GATE_FULL="$all_checks" \
   timeout --signal=TERM --kill-after=30s "$runtime" "$bin/gate-inner.sh" "$full" "$name" "$part" "$jobs"
+[ "$executor" != boat ] || exec 7>&-
 echo "$unit"

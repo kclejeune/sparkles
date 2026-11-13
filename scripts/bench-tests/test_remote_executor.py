@@ -459,6 +459,12 @@ class Admission(unittest.TestCase):
         self.assertIn('--if-above 90',start[call]);self.assertTrue(start[call].rstrip().endswith('|| true'))
         self.assertLess(next(i for i,l in enumerate(start) if l.startswith('mkdir -p "$out"')),call)
         self.assertLess(call,next(i for i,l in enumerate(start) if 'worktree add' in l))
+        # The start holds the cleanup's lock from before its worktree until its unit runs.
+        lock=next(i for i,l in enumerate(start) if l.strip()=='flock -w 900 7')
+        self.assertEqual(start[lock-1].strip(),'exec 7>> "$G/.disk-clean.lock"');self.assertLess(call,lock)
+        self.assertLess(lock,next(i for i,l in enumerate(start) if 'worktree add' in l))
+        self.assertEqual(start[-2:],['[ "$executor" != boat ] || exec 7>&-','echo "$unit"'])
+        self.assertLess(next(i for i,l in enumerate(start) if l.startswith('systemd-run --user --unit')),len(start)-2)
         inner=(ROOT/'scripts/gate/remote/gate-inner.sh').read_text().splitlines()
         call=next(i for i,l in enumerate(inner) if 'disk_clean.py' in l)
         self.assertEqual(inner[call-1].strip(),'if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ]; then')
