@@ -47,40 +47,40 @@ are reused. Restart does not make an old task ID a durable job identity.
 
 Jobs and their outbox entries are records in the dataset's control keyspace, a keyed
 space of the main store that holds no RDF. Each record is a versioned value under a key
-of the jobs owner. The keyspace belongs to the same store as the application quads and
-is changed only under the same writer lock. A typed publisher stages its business quads
-and its control records in one actual `WriteTxn`, and the store writes both into the
-same record of the write-ahead log, sealed by one checksum and synchronized once. There
-is no second queue database. A transition that changes no quad, such as a submission, a
-claim, a renewal, a failure or a cancellation, is written as one batch of the store's
-control log, which the writer orders with the write-ahead log as §7.1 describes. The two
-logs are not synchronized by a protocol of their own. One writer lock and one sequence of
-control batches order them.
+of the jobs owner. The keyspace belongs to the same store as the application quads and is
+changed only under the same writer lock. A typed publisher stages its business quads and
+its control records in one actual `WriteTxn`, and the store writes both into the same
+record of the write-ahead log, sealed by one checksum and synchronized once. There is no
+second queue database. A transition that changes no quad, such as a submission, a claim,
+a renewal, a failure or a cancellation, is written as one batch of the store's control
+log, which the writer orders with the write-ahead log as §7.1 describes. The two logs are
+not synchronized by a protocol of their own. One writer lock and one sequence of control
+batches order them.
 
 Phase 1 manages jobs on `main`. A branch can be an input, identified by its stable UUID,
-but publishing into it and updating a control record on `main` is refused. A branch
-store has no control keyspace, and branch creation, a merge and a branch's base never
-carry control records. Later branch jobs must keep their ledger and effects in that
-branch. A merge never copies active leases or causes a delivery. Preview analysis is
-inert until an explicit publication creates a job or result on the target branch.
+but publishing into it and updating a control record on `main` is refused. A branch store
+has no control keyspace, and branch creation, a merge and a branch's base never carry
+control records. Later branch jobs must keep their ledger and effects in that branch. A
+merge never copies active leases or causes a delivery. Preview analysis is inert until an
+explicit publication creates a job or result on the target branch.
 
 A transition that changes no quad is not a commit. It takes no commit number and appears
 in no history, change event, commit count or annotation, and it wakes no live query, kept
 view or change subscriber. A publication with a net change to the quads is one commit
-whose counts, changes and events are those of its business quads alone, and its commit metadata names no run, attempt or
-operation. Progress reports are process-local and coalesced, and a worker renews its
-lease infrequently rather than persisting every row. A rebuildable ready-time index
-avoids repeatedly scanning the whole ledger. The cost of the control log and its
-checkpoints must be measured before tuning checkpoint frequency or introducing a
-different authoritative format.
+whose counts, changes and events are those of its business quads alone, and its commit
+metadata names no run, attempt or operation. Progress reports are process-local and
+coalesced, and a worker renews its lease infrequently rather than persisting every row. A
+rebuildable ready-time index avoids repeatedly scanning the whole ledger. The cost of the
+control log and its checkpoints must be measured before tuning checkpoint frequency or
+introducing a different authoritative format.
 
 The dispatcher reads only committed ledger states. It cannot see an outbox entry before
-the transaction containing its business changes has durably committed. A transaction
-that carries both publishes its snapshot before its control state. A reader outside the
-writer that needs both loads the control state first and the snapshot second, and the
-snapshot is then at least as new as the business head that the control state records,
-so a publication record it sees names a commit the snapshot holds. The writer is never held across a
-network call, a model request or execution of an external worker.
+the transaction containing its business changes has durably committed. A transaction that
+carries both publishes its snapshot before its control state. A reader outside the writer
+that needs both loads the control state first and the snapshot second, and the snapshot
+is then at least as new as the business head that the control state records, so a
+publication record it sees names a commit the snapshot holds. The writer is never held
+across a network call, a model request or execution of an external worker.
 
 ### 2.2 Records
 
@@ -93,31 +93,31 @@ network call, a model request or execution of an external worker.
 | `job:Delivery` | A stable event UUID, destination reference, payload digest, evidence visibility footprint, delivery state, attempt count and next eligible time. |
 | `job:Recovery` | The source dataset identity, capture reference, paused state and recorded operator decision for resuming work or delivery. |
 
-Definitions stay in the `jobs.json` settings file. Every other record is a control
-record under a key that starts with `jobs/` and names its kind and identifier, such as
+Definitions stay in the `jobs.json` settings file. Every other record is a control record
+under a key that starts with `jobs/` and names its kind and identifier, such as
 `jobs/run/<uuid>` or `jobs/publication/<uuid>`. The value is a record version byte
 followed by the record's canonical JSON. A reader refuses a record whose version or
 members it does not know, and such a record stops dispatch for the dataset as an
 integrity failure. Index entries, such as `jobs/state/<state>/<run>` for the runs in one
 state and `jobs/operation/<id>` for a submission's operation id, are written in the same
-batch as the records they index. A scan by state therefore reads the index entries of
-one committed control state. A run's payload, input references and source checkpoint are
-kept under a key of their own that is written once at submission, so a transition
-rewrites only the run's small mutable record, and a transition over many runs, such as an
-epoch install or a restore pause, is written as several bounded frames. The `job:` names above are record kinds, not RDF classes,
-and no record is an RDF term, so no record enters the dataset's vocabulary, indexes or
-statistics.
+batch as the records they index. A scan by state therefore reads the index entries of one
+committed control state. A run's payload, input references and source checkpoint are kept
+under a key of their own that is written once at submission, so a transition rewrites
+only the run's small mutable record, and a transition over many runs, such as an epoch
+install or a restore pause, is written as several bounded frames. The `job:` names above
+are record kinds, not RDF classes, and no record is an RDF term, so no record enters the
+dataset's vocabulary, indexes or statistics.
 
 Publication records are immutable. A run and its current lease are mutable state with
 compare-and-set versions. Attempt and transition records form a bounded audit history.
 Job state, payload fields and destination configuration do not contain secret values.
 They hold references to the existing secret resolver and immutable external artifacts.
 
-Every input reference includes dataset UUID, branch UUID, commit selector and artifact
-or definition digest where applicable. A mutable name alone is insufficient. The
-consumer pins required input snapshots before accepting a run and releases them only
-after no retry can need them. If a referenced state cannot be retained, acceptance fails
-without claiming that the work is queued.
+Every input reference includes dataset UUID, branch UUID, commit selector and artifact or
+definition digest where applicable. A mutable name alone is insufficient. The consumer
+pins required input snapshots before accepting a run and releases them only after no
+retry can need them. If a referenced state cannot be retained, acceptance fails without
+claiming that the work is queued.
 
 ### 2.3 Protected control records
 
@@ -127,18 +127,18 @@ key, so no ordinary write can change a control record, whatever its grants. Quer
 listing, history, diff, dump, export, statistics, the text, spatial and vector indexes,
 reasoning, validation, forms, explanations, live queries and kept views read quads and
 commits, so none of them can read a control record or count one. The exclusion is a
-property of where the records live. No surface subtracts anything, and a new read
-surface needs no exclusion of its own.
+property of where the records live. No surface subtracts anything, and a new read surface
+needs no exclusion of its own.
 
 The core exposes the keyspace through two interfaces. An owner's control capability,
 which the store grants to the jobs handle, reads the committed control state and stages
 control records in a write transaction. The trusted capture of a backup and the offline
 integrity check read the control state whole. The typed inspection API renders redacted
-records from the control state. External workers never receive the capability or the
-raw control state. The library's raw `Store` is a trusted interface, and a caller that
-holds it can obtain the capability, as it can already write any quad. The server's job
-routes, and the MCP inspection that item 901 adds, read records only through the jobs
-handle, so neither needs a view of its own over the ledger.
+records from the control state. External workers never receive the capability or the raw
+control state. The library's raw `Store` is a trusted interface, and a caller that holds
+it can obtain the capability, as it can already write any quad. The server's job routes,
+and the MCP inspection that item 901 adds, read records only through the jobs handle, so
+neither needs a view of its own over the ledger.
 
 A write-time guard validates the business quads of a commit and never sees its control
 records. A transition that changes no quad runs no guard, since it changes no data the
@@ -154,15 +154,15 @@ registry stays reserved and refused, as it was before jobs.
 #### Alternatives to the control keyspace
 
 Three other designs were compared. The first kept the ledger in a reserved RDF graph and
-excluded it from each read surface. Every surface that read a snapshot, a cache or a guard
-source without the subtraction showed the ledger, and counts that cover every graph had
-to be redacted on their own, so the exclusion depended on each surface's code. The second
-masked the snapshot itself by returning the ledger's quads as delta deletions, the
+excluded it from each read surface. Every surface that read a snapshot, a cache or a
+guard source without the subtraction showed the ledger, and counts that cover every graph
+had to be redacted on their own, so the exclusion depended on each surface's code. The
+second masked the snapshot itself by returning the ledger's quads as delta deletions, the
 mechanism of triple-level access views. About 600 snapshot reads in the core would each
 have had to be classified as raw or public, a writer that took a masked base would commit
 the mask's deletions, every snapshot would cost work proportional to the ledger, and
-commit counts, the change log and history would still need their own redaction. The
-third paired a snapshot with the effective graph view at the library and server boundary.
+commit counts, the change log and history would still need their own redaction. The third
+paired a snapshot with the effective graph view at the library and server boundary.
 `Dataset::store` stays public, so raw library reads and counting surfaces would still
 depend on their callers. The control keyspace removes the ledger from every quad and
 commit surface at once, at the cost of new log, checkpoint, backup and reader formats,
@@ -241,39 +241,39 @@ according to their retry policy rather than assumed to have produced no external
 
 `POST /$/jobs/{ds}/{id}/publish` accepts the token, expected job version, publication
 operation UUID, staged typed result, optional source checkpoint and optional outbox
-events. Each registered kind defines exactly which results and transitions are legal.
-It cannot submit arbitrary protected graph mutations as part of its payload.
+events. Each registered kind defines exactly which results and transitions are legal. It
+cannot submit arbitrary protected graph mutations as part of its payload.
 
 The library publisher takes the dataset writer and rechecks the lease, cancellation,
-authorization and definition revision. Publication preconditions belong to the
-registered operation kind. A maintained analysis uses F22's unchanged-input and
-freshness checks. A C23 batch instead verifies its pinned iterator identity, fenced
-batch position, prior checkpoint and current write preconditions. It intentionally
-applies each batch to current data and must not reject a later batch merely because
-its own earlier effects changed the iterator's original query inputs.
+authorization and definition revision. Publication preconditions belong to the registered
+operation kind. A maintained analysis uses F22's unchanged-input and freshness checks. A
+C23 batch instead verifies its pinned iterator identity, fenced batch position, prior
+checkpoint and current write preconditions. It intentionally applies each batch to
+current data and must not reject a later batch merely because its own earlier effects
+changed the iterator's original query inputs.
 
 For an F22 publication, the check covers the declared read footprint, including
 visibility dependencies, inferred-input freshness and expiry. Job transitions do not
 advance the head, but other writers do, so the test cannot simply require the head to
 equal the original input commit. If a bounded check cannot establish freshness under the
-writer, an analysis publication refuses and requires a new run. A collector or batch
-uses its own typed checkpoint and publication contract rather than inheriting the
-analysis check accidentally. No estimate can substitute for any required precondition.
-It validates outputs and budgets, then stages business quads, immutable publication
-record, source checkpoint, completion state and outbox entries in one transaction.
-The actual sequence is assigned under that writer and is the publication's commit. A
-publication whose quads make no net change creates no commit. Its record names the
-business head it follows instead of a commit, its receipt says that no business commit
-was created, and a retry returns the same receipt.
-Validation refusal publishes none of these changes. A synchronization error is not a
-success acknowledgement and can leave the transaction outcome uncertain until recovery.
-Recovery retains either the complete transaction or none of it, and the publication
-operation ID resolves retries without assuming an error proved rollback.
+writer, an analysis publication refuses and requires a new run. A collector or batch uses
+its own typed checkpoint and publication contract rather than inheriting the analysis
+check accidentally. No estimate can substitute for any required precondition. It
+validates outputs and budgets, then stages business quads, immutable publication record,
+source checkpoint, completion state and outbox entries in one transaction. The actual
+sequence is assigned under that writer and is the publication's commit. A publication
+whose quads make no net change creates no commit. Its record names the business head it
+follows instead of a commit, its receipt says that no business commit was created, and a
+retry returns the same receipt. Validation refusal publishes none of these changes. A
+synchronization error is not a success acknowledgement and can leave the transaction
+outcome uncertain until recovery. Recovery retains either the complete transaction or
+none of it, and the publication operation ID resolves retries without assuming an error
+proved rollback.
 
 The publication operation UUID and digest are checked before lease rejection on an
 otherwise authorized retry. A completed publication with the same digest returns its
-original receipt, even if the old lease subsequently expired. A different digest is
-`409 publication-conflict`. This lookup does not permit new effects with a stale token.
+original receipt, even if the old lease subsequently expired. A different digest is `409
+publication-conflict`. This lookup does not permit new effects with a stale token.
 
 A retry interrupted after durable commit therefore cannot duplicate its database effects.
 For a source checkpoint, the input page's facts and its next cursor become visible
@@ -282,9 +282,9 @@ different checkpoint. No global feed transaction is implied.
 
 Large results can first be uploaded as a bounded immutable artifact with a digest and
 expiry. Uploading it is not publication. Publishing its RDF requires one permitted
-transaction or an explicitly declared C23 sequence. Such a sequence records each batch
-as its own idempotent publication and may leave completed batches after cancellation.
-It cannot advertise atomic replacement of the whole result.
+transaction or an explicitly declared C23 sequence. Such a sequence records each batch as
+its own idempotent publication and may leave completed batches after cancellation. It
+cannot advertise atomic replacement of the whole result.
 
 ### 4.4 Cancellation and failure
 
@@ -380,10 +380,11 @@ does not bypass a recovery or authorization hold.
 ## 7. Persistence, recovery and compatibility
 
 The control keyspace adds two files, a frame format that both of its logs share and a
-third version of the write-ahead log. Each has a version that a reader checks first, and a reader refuses a version it does
-not know through `FileKind::refuse` before it interprets anything after the version.
-The central format registry in `crates/sparkles-core/src/formats.rs` lists them, and
-X16 records them beside the first-release cutoff.
+third version of the write-ahead log. Each has a version that a reader checks first, and
+a reader refuses a version it does not know through `FileKind::refuse` before it
+interprets anything after the version. The central format registry in
+`crates/sparkles-core/src/formats.rs` lists them, and X16 records them beside the
+first-release cutoff.
 
 | Kind | Where | Version | Content |
 |---|---|---|---|
@@ -418,12 +419,11 @@ The control state is kept in memory as a persistent ordered map, so a transactio
 only the paths it changes and a reader holds one immutable state. An in-memory store
 keeps only that state, with the same transactions and no files, and its backup capture
 renders `control.bin` from it. The state's size is bounded by the jobs settings'
-`maxControlBytes`, and a submission that would exceed it is refused
-with the overload error of §4.1. The bound limits admission only. A transition of an
-admitted run is never refused for the size of the control state, so admitted work is
-never stranded by it. The memory of the control state is the price of
-leaving the ledger out of the indexes, and terminal records leave it only through the
-retention of §3.
+`maxControlBytes`, and a submission that would exceed it is refused with the overload
+error of §4.1. The bound limits admission only. A transition of an admitted run is never
+refused for the size of the control state, so admitted work is never stranded by it. The
+memory of the control state is the price of leaving the ledger out of the indexes, and
+terminal records leave it only through the retention of §3.
 
 Enabling jobs raises `dataset.json`'s `minimumReader` to 9 through the existing
 `commit::require_reader` gate. Under the writer it then writes an empty `control.bin` at
@@ -441,17 +441,17 @@ write reproduces the old header, writes and synchronizes the header record, and 
 writer's length and allocation as they were. A failure of the write or the
 synchronization poisons the writer, since the header's state is then unknown. A store
 with an enabled keyspace upgrades a current log that an interrupted enablement left at
-version 1 or 2 the same way before the first transaction that carries a control record.
-A generation switch installs a new log only when its version is the one the store writes
-at the switch, so a compaction that created its log before enablement is abandoned at
-the switch and runs again.
+version 1 or 2 the same way before the first transaction that carries a control record. A
+generation switch installs a new log only when its version is the one the store writes at
+the switch, so a compaction that created its log before enablement is abandoned at the
+switch and runs again.
 
 Supported older releases already check `minimumReader` before opening for mutation and
 therefore refuse this dataset. A new field checked only by the jobs API would not provide
 that protection. Releases predating that gate are outside the downgrade compatibility
-boundary and must not open an enabled dataset. There is no automatic downgrade while
-job records, required definitions or outbox entries remain. Supported readers also check
-the registered manifest, its profile and each record's version before dispatch or typed
+boundary and must not open an enabled dataset. There is no automatic downgrade while job
+records, required definitions or outbox entries remain. Supported readers also check the
+registered manifest, its profile and each record's version before dispatch or typed
 transitions. Unsupported versions are not ignored, truncated or interpreted as an empty
 queue. A dump and reload copies the quads and not the control keyspace, so it starts a
 dataset without a ledger.
@@ -464,16 +464,15 @@ compares it with committed ledger state.
 
 Startup first recovers the store, which replays the control keyspace as §7.2 describes,
 and checks the formats. It then pauses work restored from a capture as §7.3 requires,
-synchronizes a new boot epoch, expires old leases, rebuilds indexes and rechecks definitions
-and principals. Only then can it admit claims. A failure before this sequence completes
-leaves dispatch off. Server shutdown fences new claims and requests bounded cancellation.
-It does not wait indefinitely for an external worker.
+synchronizes a new boot epoch, expires old leases, rebuilds indexes and rechecks
+definitions and principals. Only then can it admit claims. A failure before this sequence
+completes leaves dispatch off. Server shutdown fences new claims and requests bounded
+cancellation. It does not wait indefinitely for an external worker.
 
-Control transitions are not commits, so application queries, analytical change
-consumers and history never see them. Explicit consumers can subscribe to typed job
-events. C23 trigger definitions may submit C26 jobs, with C23 recursion and ordering
-limits. They do not create another scheduler or imply atomic effects across trigger
-attempts.
+Control transitions are not commits, so application queries, analytical change consumers
+and history never see them. Explicit consumers can subscribe to typed job events. C23
+trigger definitions may submit C26 jobs, with C23 recursion and ordering limits. They do
+not create another scheduler or imply atomic effects across trigger attempts.
 
 ### 7.1 Ordering against the write-ahead log and the commit tail
 
@@ -490,32 +489,34 @@ go into the same write-ahead log record as its quads, before its commit record, 
 commit's checksum covers them. A transaction with a control record never joins a group
 commit and never takes the bulk rebuild path. It drains the group and commits through the
 serial path, which writes the record, synchronizes the log and only then publishes the
-snapshot and then the control state. A ledger record of a publication is therefore durable
-exactly when its commit is durable, and a reader sees it only after that commit is
-published.
+snapshot and then the control state. A ledger record of a publication is therefore
+durable exactly when its commit is durable, and a reader sees it only after that commit
+is published.
 
 A transaction with no net change to the quads is a control-only batch. It drains the
 group, so every commit up to the head is durable, then appends its frame to `control.log`
 with the head's commit number as the commit it follows, synchronizes the file and only
-then publishes the control state. It runs no write guard and publishes no snapshot. A
-dry run or preview that stages a control record is refused, since neither may write.
+then publishes the control state. It runs no write guard and publishes no snapshot. A dry
+run or preview that stages a control record is refused, since neither may write.
 
 The following properties hold, and the recovery of §7.2 relies on them.
 
-1. A frame is durable before the writer lock is released after it. The serial commit
-   path and the control log both synchronize before the lock is released. In a store
-   whose keyspace is enabled, a guard is armed before the first byte of any serial
-   transaction reaches either log, whether or not it carries a frame, and disarmed only
-   after the head and the log's length are recorded and the snapshot and the control
-   state are published. The group commit keeps the fence it already has for an unwind
-   of its coordinator. A failed write or synchronization, any other error in between, or an
-   unwind that drops the armed guard poisons the writer, which refuses every later write
-   until the store is opened again. An orderly close after the guard poisoned the writer
-   truncates neither log, since the bytes past the published length may hold a durable
-   frame or a commit that a frame follows. A control-only frame is written only when the
-   writer's head is the published snapshot's commit. No
-   frame is therefore ever written after one whose durability or publication is
-   unknown, and no sequence number is used twice.
+1. A frame is durable before the writer lock is released after it. The serial commit path
+   and the control log both synchronize before the lock is released. In a store whose
+   keyspace is enabled, a guard is armed before the first byte of any serial transaction
+   reaches either log, whether or not it carries a frame, and disarmed only after the
+   head and the log's length are recorded and the snapshot and the control state are
+   published. The same guard covers a bulk commit and a compaction from the moment
+   `CURRENT` may switch until the writer has adopted the new log and the snapshot of the
+   new generation is published. The group commit keeps the fence it already has for an
+   unwind of its coordinator. A failed write or synchronization, any other error in
+   between, or an unwind that drops the armed guard poisons the writer, which refuses
+   every later write until the store is opened again. An orderly close after the guard
+   poisoned the writer truncates neither log, since the bytes past the published length
+   may hold a durable frame or a commit that a frame follows. A control-only frame is
+   written only when the writer's head and generation are those of the published
+   snapshot. No frame is therefore ever written after one whose durability or publication
+   is unknown, and no sequence number is used twice.
 2. Durable frames therefore form a prefix of the sequence numbers. Frame n+1 is written
    only after frame n is durable, so a crash can lose only frames that were never
    acknowledged, and at most the last frame written can be partly on disk.
@@ -537,15 +538,14 @@ frame in its base and refuses. This gives A6 without a separate lock.
 
 The response is rendered after the transaction returns, so an acknowledged submission,
 claim or publication is in a synchronized frame. After a crash before synchronization
-succeeded, recovery keeps or drops the whole transaction, and nothing of it is visible
-in part. A crash after synchronization keeps the whole transaction even when the
-response was lost. This gives
-A2, A3 and A7, and the retry resolves the lost response from committed state. A
-submission is recorded under an operation id derived from the dataset, branch,
-principal, definition revision and idempotency key, and a publication under its
-operation UUID. A retry looks the id up in the published control state before taking
-the writer and again in the base of its own transaction, so no error is ever read as
-proof of rollback.
+succeeded, recovery keeps or drops the whole transaction, and nothing of it is visible in
+part. A crash after synchronization keeps the whole transaction even when the response
+was lost. This gives A2, A3 and A7, and the retry resolves the lost response from
+committed state. A submission is recorded under an operation id derived from the dataset,
+branch, principal, definition revision and idempotency key, and a publication under its
+operation UUID. A retry looks the id up in the published control state before taking the
+writer and again in the base of its own transaction, so no error is ever read as proof of
+rollback.
 
 The claim frame records the attempt's lease generation, the process's boot epoch and the
 SHA-256 verifier of the random bearer token. A renewal, publication or failure verifies
@@ -563,57 +563,62 @@ clock change cannot lengthen a lease.
 The committed run version is the authority for which monotonic deadline applies. Every
 transition of a run writes the version after the one its base read, and transitions of
 one run serialize on the writer, so a version names exactly one committed state. A claim
-or renewal records its deadline in process memory under the version its frame will
-write, before the control state publishes, so that no later writer can read the new
-attempt without its deadline. A lease check under the writer admits only the deadline
-recorded under the version it reads in its base. A deadline whose transaction was
-refused, unwound or lost belongs to a version that was never committed, so no check
-honours it, and the deadline of the committed version is never replaced or restored by
-another transaction's rollback. A transaction that does not commit removes only its own
-entry, and a transaction that publishes drops the entries of older versions. A
-transaction whose outcome is uncertain also removes its entry, so its lease counts as
-expired, which fences rather than extends it. Claim and renewal are the only transitions
-that keep a run leased under a new version, and each records its own deadline, so
-another transition never revives a recorded deadline of a version it wrote.
+or renewal records its deadline in process memory under the version its frame will write,
+before the control state publishes, so that no later writer can read the new attempt
+without its deadline. A lease check under the writer admits only the deadline recorded
+under the version it reads in its base. A deadline whose transaction was refused, unwound
+or lost belongs to a version that was never committed, so no check honours it, and the
+deadline of the committed version is never replaced or restored by another transaction's
+rollback. A transaction that does not commit removes only its own entry, and a
+transaction that publishes drops the entries of older versions. A transaction whose
+outcome is uncertain also removes its entry, so its lease counts as expired, which fences
+rather than extends it. Claim and renewal are the only transitions that keep a run leased
+under a new version, and each records its own deadline, so another transition never
+revives a recorded deadline of a version it wrote.
 
 Input commits are pinned by a source hold under the run's id before the submission frame
-is written, as the evidence profile pins its references. A crash between the hold and
-the frame leaves an orphan that the hold reconciliation releases after its grace period,
-and the hold is released when the run reaches a terminal state.
+is written, as the evidence profile pins its references. A crash between the hold and the
+frame leaves an orphan that the hold reconciliation releases after its grace period, and
+the hold is released when the run reaches a terminal state.
 
 A checkpoint writes the whole control state to `control.bin` under the writer lock, so no
 frame is written while it runs. It writes a temporary file, synchronizes it, renames it
 over `control.bin` and synchronizes the directory, and only then replaces `control.log`
 with an empty log of the same version through the same steps. A checkpoint runs before a
 compaction or a bulk commit switches `CURRENT` to a new generation, since the old
-generation's log may carry frames, and after the batch that takes `control.log` past
-both 64 MiB and the size of the last checkpoint, so a checkpoint never writes more than
-the log it replaces. Frames at or below the checkpoint's sequence number that remain in either
-log are skipped at recovery, so a crash between any two steps loses nothing. A failed
-checkpoint before the switch leaves the old generation current.
+generation's log may carry frames, and after the batch that takes `control.log` past both
+64 MiB and the size of the last checkpoint, so a checkpoint never writes more than the
+log it replaces. Frames at or below the checkpoint's sequence number that remain in
+either log are skipped at recovery, so a crash between any two steps loses nothing. A
+failed checkpoint before the switch leaves the old generation current.
 
 ### 7.2 Recovery at open
 
 A store has no control keyspace while neither `control.bin` nor `control.log` exists and
-no settings file or registry entry needs one. A `jobs.json`, a jobs entry in the
-registry or a `control.log` without a `control.bin` is an integrity error, so a lost
-checkpoint is never read as an empty ledger. A `control.bin` without a `control.log` is
-the state that enablement leaves after its checkpoint step, and the state of a restored
-backup, and a writable open creates the empty log durably before it admits a write. The
-open reads `control.bin` and never replaces it with an empty one. It replays the
-write-ahead log as before and collects the frames of the transactions it keeps. It reads `control.log` and
-collects its frames up to the first record that is incomplete or fails its checksum. It
-then merges the frames of both logs above the checkpoint's sequence number in sequence
-order and applies them. All of this happens before the open truncates either log.
+no settings file or registry entry needs one. A `jobs.json`, a jobs entry in the registry
+or a `control.log` without a `control.bin` is an integrity error, so a lost checkpoint is
+never read as an empty ledger. A `control.bin` without a `control.log` is accepted in two
+states only. One is an interrupted enablement, whose checkpoint is at sequence zero with
+no `jobs.json` and no jobs entry in the registry. The other is a restored backup, whose
+checkpoint carries a valid origin entry. A writable open then creates the empty log
+durably before it admits a write. In every other state a missing `control.log` is an
+integrity error, since checkpoints replace the log by a rename and never leave it
+missing, and acknowledged control-only frames could have been lost with it. The open
+reads `control.bin` and never replaces it with an empty one. It replays the write-ahead
+log as before and collects the frames of the transactions it keeps. It reads
+`control.log` and collects its frames up to the first record that is incomplete or fails
+its checksum. It then merges the frames of both logs above the checkpoint's sequence
+number in sequence order and applies them. All of this happens before the open truncates
+either log.
 
 The open refuses the store with an integrity error, and changes no file, when the
-checkpoint follows a commit above the recovered head, when the merged
-frames do not continue the checkpoint without a gap, when one sequence number appears
-twice, when a control-only frame follows a commit above the recovered head, when a frame
-in the write-ahead log does not name the commit that carries it, or when a damaged record
-of `control.log` has a complete record after it. Each of these contradicts property 1 or
-3 of §7.1. A gap explained by a commit that the replay would have dropped as a torn tail
-is refused the same way, since a later durable frame proves that commit was durable.
+checkpoint follows a commit above the recovered head, when the merged frames do not
+continue the checkpoint without a gap, when one sequence number appears twice, when a
+control-only frame follows a commit above the recovered head, when a frame in the
+write-ahead log does not name the commit that carries it, or when a damaged record of
+`control.log` has a complete record after it. Each of these contradicts property 1 or 3
+of §7.1. A gap explained by a commit that the replay would have dropped as a torn tail is
+refused the same way, since a later durable frame proves that commit was durable.
 Otherwise a damaged last record of `control.log` is a torn tail, which a writable open
 truncates as it truncates the write-ahead log. A process that stopped without
 synchronizing can leave bytes that only the page cache holds, so a writable open then
@@ -638,13 +643,16 @@ recovered state or admits a write. If that fails, the store does not open for wr
 
 A backup capture holds the writer lock only to record its file lengths. Under that lock
 it also takes the published control state, which holds every frame written before the
-lock, and after the lock it renders that state as
-the capture's `control.bin` with an origin entry that names the capture, the source
-dataset and the captured commit. The capture copies the write-ahead log up to the
-captured commit as before, and every frame in that prefix is at or below the rendered
-checkpoint's sequence number. It never copies `control.log`. The capture is therefore one
-consistent cut of quads and ledger. Definition manifests and immutable artifact
-references must also be captured or the backup explicitly reports them missing.
+lock, and after the lock it renders that state as the capture's `control.bin` with an
+origin entry that names the capture, the source dataset and the captured commit. The
+capture copies the write-ahead log up to the captured commit as before, and every frame
+in that prefix is at or below the rendered checkpoint's sequence number. It keeps the
+bytes of the log's header record that it read under the lock and serves them in place of
+the file's first record for the whole life of the capture, so a header upgrade by a later
+enablement never reaches a capture taken before it, and an incremental backup that reads
+the prefix twice reads the same bytes. It never copies `control.log`. The capture is
+therefore one consistent cut of quads and ledger. Definition manifests and immutable
+artifact references must also be captured or the backup explicitly reports them missing.
 
 A restored dataset opens with that checkpoint and its origin entry. The origin entry
 fences dispatch by itself. The first jobs recovery runs before it installs the process's
@@ -656,20 +664,28 @@ in bounded frames, each of which records how far it got, and a last frame moves 
 record to the `awaiting-decision` phase. A crash before the first frame leaves the origin
 entry, and a crash during the pausing leaves the `pausing` record, so the next recovery
 continues where it stopped. While an origin entry or a `pausing` record exists, a
-submission, a claim, a renewal, a publication, a failure under a lease and every
-delivery claim or send are refused under the writer, and a cancellation and a lookup of
-a recorded receipt are answered. The epoch is installed only after the record reaches
+submission, a claim, a renewal, a publication, a failure under a lease and every delivery
+claim or send are refused under the writer, and a cancellation and a lookup of a recorded
+receipt are answered. The epoch is installed only after the record reaches
 `awaiting-decision`, so no admission check passes before then.
 
 Once the record is `awaiting-decision`, runs and deliveries outside the restored set are
 dispatched as usual, and the paused ones wait. This holds whether the restore kept the
 dataset's UUID or minted a new one, including a retry of an older same-UUID backup. Old
-lease tokens fail the epoch check of the new process. An operator must map principals
-and secret references, confirm source continuity and choose whether previously
-uncertain external effects may be retried before resuming selected paused work through
-the recovery route of §6. That route refuses while the record is `pausing`, and it checks
-under the writer that each run or delivery it resumes is paused and belongs to the
-restored set. A paused run can be cancelled meanwhile.
+lease tokens fail the epoch check of the new process. An operator must map principals and
+secret references, confirm source continuity and choose whether previously uncertain
+external effects may be retried before resuming selected paused work through the recovery
+route of §6. That route refuses while the record is `pausing`, and it checks under the
+writer that each run or delivery it resumes is paused and belongs to the restored set. A
+paused run can be cancelled meanwhile.
+
+Membership in the restored set is decided from the record itself. The recovery record
+keeps the checkpoint's sequence number, and every run records the sequence number of the
+frame that submitted it, so a run at or below that number belongs to the set. An explicit
+retry of a member while its recovery awaits a decision, whether the member was paused and
+cancelled or was already terminal, creates its new run paused and records the same
+recovery on it, which makes the new run a member too. Only the recovery route then makes
+it eligible. A submission that is not a retry of a member is admitted as usual.
 
 The backup manifest lists `control.bin` and `jobs.json` as root files, and both are meta
 files that a later backup replaces whole and never extends as an appended prefix. A
@@ -677,22 +693,21 @@ restore checks the control closure before it reidentifies or publishes the datas
 whether or not an integrity check was asked for. The feature `control/1`, a `jobs.json`,
 a jobs entry in the captured registry and a captured log of version 3 each require a
 `control.bin`, and a `control.bin` requires the feature. A dataset reader of 9 alone does
-not, since an interrupted enablement may leave it. The
-checkpoint must carry an origin entry that names the backup's source dataset and
-captured commit, which must also be the checkpoint's business head. A backup that holds
-`control.log` is refused, and so is one that breaks any of these rules, such as one that
-keeps the feature and leaves out the checkpoint. The persistent,
-in-memory and materialized captures all render the checkpoint, and the extra files a
-backup creation may add or replace never include `control.bin`. A restore that the
-current release refuses, such as a new-identity restore of a dataset with configuration
-history, stays refused.
+not, since an interrupted enablement may leave it. The checkpoint must carry an origin
+entry that names the backup's source dataset and captured commit, which must also be the
+checkpoint's business head. A backup that holds `control.log` is refused, and so is one
+that breaks any of these rules, such as one that keeps the feature and leaves out the
+checkpoint. The persistent, in-memory and materialized captures all render the
+checkpoint, and the extra files a backup creation may add or replace never include
+`control.bin`. A restore that the current release refuses, such as a new-identity restore
+of a dataset with configuration history, stays refused.
 
 A clone is a new dataset whose copied `jobs.json` raises its reader to 9, and it starts
-with an empty control keyspace, an empty `control.bin` and an empty `control.log`. A clone
-of an activated store stays refused as it is now. A clone holds no run, lease or delivery
-identity of its source, so nothing in it can resume old work or reuse a delivery's deduplication
-identity. A later recovery feature may copy selected records into a clone under new
-identities with `origin` references.
+with an empty control keyspace, an empty `control.bin` and an empty `control.log`. A
+clone of an activated store stays refused as it is now. A clone holds no run, lease or
+delivery identity of its source, so nothing in it can resume old work or reuse a
+delivery's deduplication identity. A later recovery feature may copy selected records
+into a clone under new identities with `origin` references.
 
 Restoring an old backup cannot recover evidence that a remote receiver accepted after
 that capture. The recovery interface calls out that uncertainty. A provider with an
@@ -734,6 +749,10 @@ the current implementation.
 | A20. A reader loads the control state and a snapshot while a publication commits. | The snapshot holds every commit the control state names. An ordinary commit that unwinds before its snapshot publishes poisons the writer, so no control-only frame follows it. |
 | A21. A restore is interrupted, retried and recovered while workers and the operator act. | Nothing is claimed, sent or published before the restored set is paused, the recovery continues after a restart, and the recovery route refuses while pausing. |
 | A22. A backup keeps the control feature or settings without its checkpoint. | The restore refuses it before reidentification, also without an integrity check. |
+| A23. A bulk commit or a compaction unwinds after `CURRENT` switched. | The writer is poisoned, so no control-only frame follows a generation that is not published. |
+| A24. `control.log` is lost after a control-only submission that follows a generation switch. | The open refuses with an integrity error. |
+| A25. A restored run is cancelled and retried, or a terminal restored run is retried, before a decision. | The new run is paused and belongs to the restored set until the recovery route resumes it. |
+| A26. A backup is captured before enablement and written after it, also incrementally. | The backup holds the old header, has no control files and restores as a dataset without jobs. |
 
 Fault injection covers before and after vocabulary append, WAL append, control log
 append, synchronization, snapshot and control state publication, each step of a

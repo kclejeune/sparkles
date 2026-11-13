@@ -120,7 +120,9 @@ dataset file gains `format` 2 and the index gains format 5.
 The cutoff marker is therefore `format` 2 of `dataset.json`, which every store of the
 first release writes, and not `minimumReader`, because a plain store writes reader 5 and
 `managed_history::activation_recorded` reads a reader of 8 or more as a recorded
-activation, except reader 9 beside a `jobs.json`, which the durable job ledger explains.
+activation, except reader 9, which the durable job ledger explains and which an
+interrupted enablement of jobs can leave alone, so reader 9 never proves an activation
+and only the history directory and the registry do.
 The reader stays what it is, a capability requirement that activation, jobs and the
 managed and held files raise. The private import transport of
 `store/backup/transport.rs`, which no production path wires and whose staged destination
