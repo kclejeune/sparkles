@@ -46,8 +46,9 @@ A restart fences every earlier lease by boot epoch before the process admits a c
 The ledger graph is the first hidden managed graph: it leaves every request's and every
 library query's graph view, and only the jobs inspection renders it. Statistics, metrics,
 the dataset listings, validation, materialization, reasoning diagnostics, merge previews,
-the library's schema, forms, explanation, analysis, ontology and GraphQL drafting handles
-and the MCP tools leave it out as well, and the history routes leave out the counts that
+the library's schema, constraints, forms, explanation, analysis, ontology and GraphQL
+drafting handles, incremental queries, kept views and the MCP tools leave it out as well,
+merge results carry no commit counts on such a dataset, and the history routes leave out the counts that
 cover every graph while a dataset hides one. A lease deadline counts only once the commit
 that grants or extends it is the run's committed version, so a refused renewal never
 extends a lease. A hidden graph no longer counts as a grant restriction, so

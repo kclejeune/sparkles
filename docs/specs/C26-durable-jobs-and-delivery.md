@@ -108,8 +108,8 @@ Phase 1 enforces the exclusion per surface. The registry's owner entry names the
 graphs, the store answers them through `Store::hidden_graphs`, and every read surface
 subtracts them from the caller's graph view, through `Dataset::hide_owner_graphs`, the
 query defaults or the principal's per-dataset hidden graphs. Surfaces that report counts
-redact them under `Principal::partial_view`. Three review rounds each found surfaces that
-read a snapshot without this subtraction, so three structural alternatives were compared.
+redact them under `Principal::partial_view`. A surface that reads a snapshot without this
+subtraction shows the ledger, so three structural alternatives are compared here.
 
 The first alternative masks the snapshot itself. `Store::snapshot` and the historical
 and branch snapshot accessors would return the snapshot with the ledger's quads taken out
@@ -624,6 +624,17 @@ the counts that cover every graph leave the history responses as they do for a l
 grant. A registry this build cannot enforce still hides the graphs its file names as
 hidden, and one whose file does not read hides the graphs that every configured owner
 always hides.
+
+The per-surface exclusion was reviewed in several rounds, and each round found surfaces
+that read a snapshot, a cache or a guard's source without the subtraction. Those findings
+led to the comparison of structural alternatives in §2.3 and to item 905. Incremental
+queries and kept views now resolve their access with the hidden graphs subtracted, and a
+live subscription ends with a `forbidden` error when the hidden graphs of its dataset
+change. A write-time guard whose shapes or schema are in a hidden graph is answered as no
+guard by validation, constraints and GraphQL drafting. Merge reports count neither the
+changes nor the conflicts, resolved or not, of a hidden graph, and a merge receipt, an MCP
+merge result and a merge task's detail carry no commit counts on a dataset with hidden
+graphs.
 
 Several parts of the design wait for later items. The library's Graph Store, history,
 diff and dump handles apply a caller's view when one is given but do not subtract hidden

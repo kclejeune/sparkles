@@ -13572,17 +13572,22 @@ whole. Its distinct subjects and objects of a predicate leave out those that onl
 ledger gives it. The quad counts of `/$/datasets` and `/$/server` and the dataset and
 branch gauges of `/$/metrics` leave the ledger out. SHACL and ShEx validation never read
 it, also under `shapes=guard` and `schema=guard`, where a guard whose data graph is the
-ledger validates nothing, and a validation that names it as its data or shapes graph gets
+ledger validates nothing, a guard whose shapes or schema are in the ledger is answered as
+no guard with `404`, and a validation that names it as its data or shapes graph gets
 `404`. Materialization never reads it, whatever input graphs a request names, so no rule
 copies a ledger value into the inferred graph, and import fetching never follows an
 import the ledger names. A `SERVICE` call to this server and a resource header that
 select a dataset outside the request path leave that dataset's ledger out too. The MCP
-tools leave it out of every result. The counts a commit, a snapshot, a diff or a timeline
+tools leave it out of every result, and so do incremental queries and kept views. A live
+query ends with a `forbidden` error when the dataset's hidden graphs change, such as when
+jobs are enabled. The counts a commit, a snapshot, a diff or a timeline
 bucket carries cover every graph, so the history routes leave them out while a dataset
 hides a graph, as they do for a caller whose grants cover only some graphs, and so do a
 created snapshot and the metadata of a `410` for a commit whose data is gone. A merge
-preview neither counts the ledger's changes nor shows its conflicts, and a merge whose
-only conflicts are in the ledger is refused with `profile-managed-graph`. Delivery through an outbox, recurring
+neither counts the ledger's changes nor its conflicts, resolved or not, and does not show
+them. A merge whose only unresolved conflicts are in the ledger is refused with
+`profile-managed-graph`. The commit of a merge's result, its MCP result and its task's
+detail carry no counts. Delivery through an outbox, recurring
 definitions and restore and clone recovery are [roadmap](ROADMAP.md) work.
 
 ### Suggested examples
