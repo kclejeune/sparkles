@@ -59,9 +59,11 @@ worker's configured remote cache, and the job shell drops any inherited token se
 The provider's snapshot saves the worker home but not `~/.cache`, so MBX's default cache
 directory would be empty after every resume. Every job therefore sets `MBX_CACHE_DIR` to
 `~/.local/share/mbx-cache`, which holds the worker's single shared store with its managed
-targets and incremental state, and the normal stop's snapshot keeps it. Its 64 GiB budget
-holds two release builds and the workspace test builds, and its 45 GiB free-space floor
-keeps the disk headroom that qualification requires. `admit` asks the pinned `mbx` for
+targets and incremental state, and the normal stop's snapshot keeps it. Its 40 GiB budget
+leaves a cold workspace test build room on the large worker's 146 GiB disk, and its 45 GiB
+free-space floor keeps the disk headroom that qualification requires. A build directory
+that a running build uses stays whatever its size, so the budget does not bound a build
+in progress. `admit` asks the pinned `mbx` for
 these effective settings and refuses a remote URL, a token setting, another cache
 directory or another budget. Laptops, gate hosts and other ssh hosts keep their own MBX
 configuration.
@@ -70,9 +72,9 @@ A cold server build on the 8-vCPU worker takes about 29 minutes, and the store t
 about 5 GiB of objects and a 5 GiB managed target. After a normal stop and a
 resume onto a new machine, the store comes back unchanged, and a rebuild of the same
 commit at its stable path takes about 4 minutes with no misses and gives the same binary.
-The snapshot holds the store's files, so a full 64 GiB store takes most of the 111 GB of
-own files that the provider restores on a large worker, and roadmap item 858 covers
-keeping the saved files under that limit.
+The snapshot holds the store's files, so a full 40 GiB store takes more than a third of the
+111 GB of own files that the provider restores on a large worker, and roadmap item 858
+covers keeping the saved files under that limit.
 
 A resume runs on a new machine and downloads the snapshot's files in the background. A
 file whose content arrives while a build reads it changes under the compiler, and mbx
@@ -252,7 +254,11 @@ the unit's runtime from that end immediately before the start and refuses with u
 activation, the job also stops its own unit at that end and takes every wait from it, and the
 unit's shutdown is bounded at 60 seconds, so the closure watch finds the job closed. Starts on
 one host are serialized, and a job of the same name starts only after the earlier unit has
-fully stopped. A job on an ssh host may run 6 hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
+fully stopped. Under the heavy lock a job on a Boat worker needs `REMOTE_CI_MIN_FREE_GIB`
+free after the disk cleanup, 110 by default, and ends with exit 4 rather than start with
+less. The worker's disk timer stops any running job at 95% use, so a build that outgrows
+the disk ends before the stop's snapshot meets a full disk. A job on an ssh host may run 6
+hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
 land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
 
 ## Source, results and cleanup

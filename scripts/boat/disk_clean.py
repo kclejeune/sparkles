@@ -18,6 +18,18 @@ The remote build checkouts under ~/lanes/nsc-build-work are left alone. A build 
 sources there before its scope is listed, and their managed targets are in the store,
 which `mbx gc` bounds.
 
+With --stop-above PCT, which the worker's one-minute timer passes as 95, a disk at or above
+PCT% used first stops every active gate-* unit, the gate, lane CI and preparation units,
+because only a running job's own build can fill the disk that fast and no cleanup may take
+its files while it runs. The stop is logged in the record and in the job's progress.log,
+the job's results stay, and the cleanup then frees what the stopped jobs leave, so a stop's
+snapshot never meets a full disk.
+
+With --need-free-gib N, which a lane CI job and a Boat gate start run as their admission
+check, the cleanup runs only when less than N GiB are free, and the program exits 3 when
+less than N GiB are still free afterwards, so the job refuses to start rather than fill the
+disk.
+
 --deadline-seconds bounds the whole cleanup. Each command, the removals included, runs in
 its own process group, which is killed when the command's share of the deadline ends, and
 no step starts after the deadline. SIGTERM, SIGHUP or SIGINT kill the running command's
@@ -35,6 +47,7 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 # The module's docstring is not a docstring when the controller sends this file on stdin
@@ -159,14 +172,46 @@ def candidates(home, units):
     return found
 
 
+def job_unit(unit):
+    return unit.startswith('gate-') and unit.endswith(('.service', '.scope'))
+
+
+def stop_jobs(home, run, left, now):
+    """Stop every active gate-* unit and note the stop in each job's progress.log."""
+    units = active_units(lambda argv, e, cap: run(argv, e, left(cap)))
+    stopped = []
+    for unit in sorted(u for u in (units or ()) if job_unit(u)):
+        code, _ = run(['systemctl', '--user', 'stop', unit], None, left(90))
+        stopped.append({'unit': unit, 'exit': code})
+        name = unit.rsplit('.', 1)[0][len('gate-'):]
+        out = os.path.join(home, 'gate', 'out', name)
+        if NAME.fullmatch(name) and plain_directory(out) and not os.path.islink(os.path.join(out, 'progress.log')):
+            try:
+                with open(os.path.join(out, 'progress.log'), 'a') as f:
+                    f.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now()))
+                            + ' stopped by the disk cleanup: the disk reached its hard limit\n')
+            except OSError:
+                pass
+    return units is not None, stopped
+
+
 def clean(home, threshold=None, force=False, env=None, deadline_seconds=600, run=run_command,
-          statvfs=os.statvfs, now=time.time, clock=time.monotonic):
+          statvfs=os.statvfs, now=time.time, clock=time.monotonic, stop_above=None, need_free_bytes=None):
     end = clock() + deadline_seconds
     left = lambda cap: max(0, min(cap, end - clock()))
     before = usage(home, statvfs)
-    record = {'schema': 1, 'observed_unix': now(), 'home': home, 'mode': 'force' if force else 'if-above',
+    mode = 'force' if force else 'need-free' if need_free_bytes is not None else 'if-above'
+    record = {'schema': 1, 'observed_unix': now(), 'home': home, 'mode': mode,
               'threshold_pct': threshold, 'before': before, 'ran': False, 'removed': [], 'gc_exit': None}
-    if not force and before['used_pct'] < threshold:
+    if need_free_bytes is not None:
+        record['need_free_bytes'] = need_free_bytes
+        if before['avail_bytes'] >= need_free_bytes:
+            record['after'] = before; record['need_met'] = True
+            return record
+    elif stop_above is not None and before['used_pct'] >= stop_above:
+        record['stop_above_pct'] = stop_above
+        record['stop_listed'], record['stopped'] = stop_jobs(home, run, left, now)
+    elif not force and before['used_pct'] < threshold:
         record['after'] = before
         return record
     gate = os.path.join(home, 'gate')
@@ -178,6 +223,8 @@ def clean(home, threshold=None, force=False, env=None, deadline_seconds=600, run
         except BlockingIOError:
             record['after'] = before
             record['skipped'] = 'another cleanup holds the lock'
+            if need_free_bytes is not None:
+                record['need_met'] = False
             return record
         record['ran'] = True
         units = active_units(lambda argv, e, cap: run(argv, e, left(cap)))
@@ -197,6 +244,8 @@ def clean(home, threshold=None, force=False, env=None, deadline_seconds=600, run
     finally:
         os.close(lock)
     record['after'] = usage(home, statvfs)
+    if need_free_bytes is not None:
+        record['need_met'] = record['after']['avail_bytes'] >= need_free_bytes
     return record
 
 
@@ -206,12 +255,18 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--if-above', type=int, metavar='PCT')
     mode.add_argument('--force', action='store_true')
+    mode.add_argument('--need-free-gib', type=int, metavar='GIB')
+    parser.add_argument('--stop-above', type=int, metavar='PCT')
     parser.add_argument('--env', default='{}', help='a JSON object of environment settings for mbx gc')
     parser.add_argument('--deadline-seconds', type=int, default=600)
     parser.add_argument('--log')
     a = parser.parse_args(argv)
     if a.if_above is not None and not 1 <= a.if_above <= 100:
         parser.error('--if-above takes a percentage from 1 to 100')
+    if a.stop_above is not None and (a.if_above is None or not a.if_above <= a.stop_above <= 100):
+        parser.error('--stop-above takes a percentage from --if-above to 100, with --if-above')
+    if a.need_free_gib is not None and not 1 <= a.need_free_gib <= 10000:
+        parser.error('--need-free-gib takes 1 to 10000')
     env = json.loads(a.env)
     if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
         parser.error('--env takes a JSON object of strings')
@@ -219,12 +274,15 @@ def main(argv=None):
         parser.error('--deadline-seconds takes 1 to 3600')
     for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(signum, cancel)
-    record = clean(a.home, a.if_above, a.force, env, a.deadline_seconds)
+    need = None if a.need_free_gib is None else a.need_free_gib * 2**30
+    record = clean(a.home, a.if_above, a.force, env, a.deadline_seconds, stop_above=a.stop_above, need_free_bytes=need)
     line = json.dumps(record, sort_keys=True)
-    if a.log and record['ran']:
+    if a.log and (record['ran'] or record.get('stopped') or record.get('need_met') is False):
         with open(a.log, 'a') as f:
             f.write(line + '\n')
     print(line)
+    if record.get('need_met') is False:
+        sys.exit(3)
 
 
 if __name__ == '__main__':

@@ -295,7 +295,7 @@ start_on() {
     # so their time does not count against it, but before the dispatch, whose delay still
     # counts against the reserve, which roadmap item 803 tracks.
     runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))") || return
-    args+=" --executor boat --runtime $runtime"
+    args+=" --executor boat --runtime $runtime --min-free-gib ${GATE_BOAT_MIN_FREE_GIB:-110}"
     ;;
   esac
   cj=$(cargo_jobs_for "$h")

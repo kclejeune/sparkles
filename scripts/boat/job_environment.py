@@ -39,11 +39,12 @@ def pinned_mbx(profile):
 # so MBX's default cache directory is empty after every resume. Every job therefore
 # names one cache directory outside ~/.cache, which holds the worker's single shared
 # store with its managed targets and incremental state, and the normal stop's snapshot
-# keeps it for the next resume. Its shared budget holds two release builds and the
-# workspace test builds. The free-space floor keeps the 40 GiB that the metadata probe
-# requires at the next qualification on the large worker's disk.
+# keeps it for the next resume. Its shared budget is 40 GiB, so that with the system's
+# share the store leaves a cold workspace test build its peak on the large worker's 146 GiB
+# disk. The free-space floor keeps the 40 GiB that the metadata probe requires at the next
+# qualification.
 LOCAL_STORE_DIR = '.local/share/mbx-cache'
-LOCAL_STORE_TOTAL = '64GiB'
+LOCAL_STORE_TOTAL = '40GiB'
 LOCAL_STORE_MIN_FREE = '45GiB'
 
 

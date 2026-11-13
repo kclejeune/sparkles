@@ -56,7 +56,7 @@ case $host in boat:*)
       for n in PATH MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do
         [ -z "${!n+x}" ] || printf "Environment=\"%s=%s\"\n" "$n" "${!n}"
       done
-      echo "ExecStart=/usr/bin/python3 -I %h/gate/bin/disk_clean.py --if-above 90 --deadline-seconds 240 --log %h/gate/disk-clean.jsonl"
+      echo "ExecStart=/usr/bin/python3 -I %h/gate/bin/disk_clean.py --if-above 90 --stop-above 95 --deadline-seconds 240 --log %h/gate/disk-clean.jsonl"
     } > "$d/sparkles-disk-clean.service"
     printf "%s\n" "[Unit]" "Description=Check the disk use every minute" "[Timer]" "OnBootSec=10min" \
       "OnUnitInactiveSec=60s" "[Install]" "WantedBy=timers.target" > "$d/sparkles-disk-clean.timer"

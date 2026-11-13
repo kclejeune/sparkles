@@ -238,12 +238,13 @@ file whose content arrives during a build changes under the compiler, so mbx dis
 result and the build fails. `admit` therefore refuses a worker until `boat info` reports
 it `hydrated`.
 
-`MBX_GC_MAX_TOTAL_SIZE` is 64 GiB, which holds two release builds and the workspace test
-builds in one budget for the store, managed targets and incremental state.
+`MBX_GC_MAX_TOTAL_SIZE` is 40 GiB, one budget for the store, managed targets and incremental
+state that leaves a cold workspace test build room on the large worker's disk. A build
+directory in use stays whatever its size.
 `MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the 40 GiB of free disk that the metadata
 probe requires at the next qualification. The snapshot now holds the store, and the
 provider restores at most 111 GB of a large worker's own files, so a full store leaves
-about 40 GB for checkouts and build directories. Roadmap item 858 covers keeping the
+about 65 GB for checkouts and build directories. Roadmap item 858 covers keeping the
 saved files under that limit. `remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
 `cache_dir`, `gc.max_total_size` and `gc.min_free_size` through the job environment and
 refuses a remote URL, a token setting, another cache directory or another budget by
@@ -465,10 +466,19 @@ ends. A cleanup prints one record with the disk use before and after and appends
 
 `scripts/gate/setup-host.sh` installs the user timer `sparkles-disk-clean.timer`, which
 runs the cleanup every minute from ten minutes after boot and does nothing below 90% use.
-The timer's unit files live in the home, so the snapshot keeps them and the timer runs
-again after a resume. A Boat gate runs the cleanup at the same threshold before it
-creates its worktree and after its run, and keeps the records as `disk-clean-start.json`
-and `disk-clean-end.json` in its results.
+At 95% use the timer's cleanup first stops every active `gate-*` unit, the gate, lane CI
+and preparation units. A running build can grow faster than one check a minute and no
+cleanup may take its files, so only the stop keeps a full disk from reaching the stop's
+snapshot. The stop is written to the record and to the job's `progress.log`, and the job's
+results stay. The timer's unit files live in the home, so the snapshot keeps them and the
+timer runs again after a resume.
+
+A job also refuses to start without room for its build. With `--need-free-gib N` the
+cleanup runs only when less than N GiB are free and exits 3 when less is still free
+afterwards. A lane CI job runs it under the heavy lock with `REMOTE_CI_MIN_FREE_GIB`, and a
+Boat gate start runs it before it creates its worktree with `GATE_BOAT_MIN_FREE_GIB`, both
+110 by default. A Boat gate also cleans at 90% after its run, and keeps the records as
+`disk-clean-start.json` and `disk-clean-end.json` in its results.
 
 Every stop after a Root handoff needs a fresh job-closure receipt, so the forced cleanup
 runs before that receipt is taken. The closure watch runs it with `--force` for at most

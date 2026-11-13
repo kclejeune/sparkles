@@ -53,6 +53,9 @@ log "queued $MODE $FULL base ${BASE:-none} host $(hostname)"
   systemctl --user stop --no-block "gate-$NAME"
 ) &
 wd=$!
+# A stop of the unit, by its watchdog, the disk cleanup's hard limit or an operator, still
+# records an exit and removes the worktree.
+trap 'log "stopped by a signal"; finish 143' TERM
 if [ -x "$G/bin/disk_clean.py" ] || [ -f "$G/bin/disk_clean.py" ]; then
   python3 -I "$G/bin/disk_clean.py" --if-above 90 --deadline-seconds 240 --log "$G/disk-clean.jsonl" > "$out/disk-clean-start.json" 2>&1 || true
 fi
@@ -64,6 +67,14 @@ if [ "$w" -le 0 ] || ! flock -w "$w" 9; then
   finish 3
 fi
 log "lock acquired"
+# The admission check runs under the heavy lock, so no other job's build grows meanwhile. A
+# disk with under NEED_GIB free after the cleanup refuses the job rather than fill up.
+need=${NEED_GIB:-110}
+if [ -f "$G/bin/disk_clean.py" ] &&
+  ! python3 -I "$G/bin/disk_clean.py" --need-free-gib "$need" --deadline-seconds 240 --log "$G/disk-clean.jsonl" > "$out/disk-clean-admit.json" 2>&1; then
+  log "under $need GiB free after the cleanup; not starting"
+  finish 4
+fi
 date +%s > "$out/started_at"
 exec 7>> "$G/.disk-clean.lock"
 flock -w 300 7 || {

@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 printf 'prop %s\n' "${props[@]}" >> "$FAKE_LOG"
-env -i FAKE_LOG="$FAKE_LOG" FAKE_CI_EXIT="${FAKE_CI_EXIT:-0}" "${envs[@]}" "$@"
+env -i FAKE_LOG="$FAKE_LOG" FAKE_CI_EXIT="${FAKE_CI_EXIT:-0}" FAKE_CLEAN_EXIT="${FAKE_CLEAN_EXIT:-0}" "${envs[@]}" "$@"
 '''
 
 
@@ -182,6 +182,18 @@ class RemoteCI(unittest.TestCase):
                 self.assertEqual((out / 'progress.log').read_text(), 'live\n')
         self.assertEqual(sorted(p.name for p in (self.home / 'gate/out').iterdir()), [name])
         self.assertNotIn('unit gate-', self.log.read_text())
+
+    def test_a_disk_without_room_for_the_build_refuses_the_job(self):
+        clean = self.home / 'gate/bin/disk_clean.py'
+        clean.write_text('import sys\nopen(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))\nsys.exit(int(__import__("os").environ.get("FAKE_CLEAN_EXIT", "0")))\n')
+        r = self.run_ci(FAKE_CLEAN_EXIT='3', REMOTE_CI_MIN_FREE_GIB='120')
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        out = self.home / 'gate/out' / name
+        self.assertIn('under 120 GiB free', (out / 'progress.log').read_text())
+        self.assertIn('--need-free-gib 120', Path(str(clean) + '.args').read_text())
+        self.assertFalse((out / 'ci.log').exists()); self.assertFalse((self.home / 'gate' / ('wt-' + name)).exists())
+        self.assertEqual(self.run_ci('--no-wait', REMOTE_CI_MIN_FREE_GIB='x').returncode, 2)
 
     def test_the_benchmark_host_never_runs_ci(self):
         for h in ['forge', 'user@forge.local']:
