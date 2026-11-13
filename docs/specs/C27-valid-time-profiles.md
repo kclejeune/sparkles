@@ -2,11 +2,11 @@
 
 > **Status:** implemented in part
 >
-> **Phases:** Version 1 profile resources, shapes, fixtures and stored-query templates
-> are available. Phase 1 remains incomplete because A4's authenticated local availability
-> and backdating refusal need C25 Phase 2 and the shared protected-write boundary, or
-> a separately reviewed runtime helper. Phase 2's projection helper and event-time UI,
-> and Phase 3's expiry integration, remain planned. No temporal index is added.
+> **Phases:** Phase 1 is complete. Version 1 profile resources, shapes, fixtures and
+> stored-query templates are available, and authenticated claim proposals assign
+> server-owned local availability and refuse backdating. Validity intervals through the
+> authenticated writer are roadmap item 925. Phase 2's projection helper and event-time
+> UI, and Phase 3's expiry integration, remain planned. No temporal index is added.
 >
 > **User docs:** [Valid-time profile](../ai/README.md#valid-time-profile).
 >
@@ -448,16 +448,31 @@ Actual retained-commit tests exclude late imports from prior states, preserve th
 original revision and assessment after correction, and check that proposed matches
 remain unasserted. Existing F06 selection semantics are unchanged.
 
-Phase 1 is not complete. A4 includes an actual refusal of client backdating through
-server-owned availability receipts. Ordinary RDF and SHACL cannot authenticate that
-field, and the tests explicitly demonstrate that ordinary RDF accepts an arbitrary
-availability value. The retained-commit test proves snapshot selection only. Full A4
-requires the C25 Phase 2 runtime to assign dataset, branch, actual accepting commit and
-server timestamp atomically with ingestion through the shared protected-write boundary,
-or a separately reviewed C27 helper. Availability receipts remain readable under
-ordinary grants while raw writes must be denied. No template trusts publication or
-client-written availability as admission authority. This requirement remains under
-roadmap items 81 and 341.
+Phase 1 is complete. A4 passes through the C25 authenticated claim writer and the
+managed-graph boundary, as [§4.3](#43-local-availability-and-backdating) argues. No new
+format or API was needed. The `valid_time` availability tests propose a revision
+published in January through the typed writer at a March commit under a test clock.
+Its `ev:firstAvailableAt` equals that commit's time, and the claim is visible at the
+head while the as-known February state selected by time holds neither the revision nor
+the claim. SPARQL Update inserts and rewrites, a graph drop, RDF Patch, a load and an
+open-scope availability value are each refused, with the head and the stored value
+unchanged. An administrator's detach, rewrite and new protection leaves the record
+answering `origin-not-reproduced`, and an availability triple in an unowned graph never
+resolves. After a restart the commit time, the receipt and every refusal remain, and a
+server clock set back to January stamps the next import at the recovered head's time.
+A server test proposes as an authenticated user over HTTP and checks the principal on
+the receipt, the `400 invalid-proposal` answer to an availability member, the
+`?at=time:` exclusion and the `409 profile-managed-graph` answers of SPARQL Update and
+the Graph Store.
+
+Clones now stamp their root commit with the later of the store's clock and the copied
+commit's time on both the persistent and the in-memory path. Before this change a clock
+behind the copied commit gave the clone a root earlier than the writes it holds, which
+a failing-first clone test demonstrated.
+
+Claim proposals do not carry a validity interval, so the templates report authenticated
+claims with unknown validity. C25 §6 names validity records, and roadmap item 925 adds
+them to the claim input.
 
 The bounded projection helper, runtime configuration, event-time UI, expiry fencing
 and analysis invalidation remain unimplemented later phases. The existing U01 slider
