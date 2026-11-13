@@ -1428,123 +1428,14 @@ fn again(ix: &Index, st: &State, id: u32, c: &Clause, found: &mut Found) {
         .collect();
     keys.sort_unstable();
     keys.dedup();
-    let dx = dix(ix);
-    let filter = again_filter_on();
-    // a re-derivation of an equality clause `E` changes it only through a pair of
-    // certificates in disjoint classes of which the new one is a member, since the pairs of
-    // older ones were taken when `E` or the older certificate came: the new certificate
-    // must fit `E` as `known` reads it, its body in `E`'s and its other head literals in
-    // `E`'s head without the equality, and one of its classes must share a disjointness
-    // set with a class that the core or some certificate gives the other term; an
-    // equality clause that no literal passes is derived as it was, and the store drops it
-    let mut differ: FxHashMap<(Ex, Ex), bool> = FxHashMap::default();
-    let mut mine: Vec<Ex> = Vec::new();
     for k in keys {
         for &j in d.store.by_eq.get(&k).map_or(&[][..], |v| v.as_slice()) {
             let s = &d.store.clauses[j as usize];
-            if s.dead || j == id {
-                continue;
-            }
-            if filter && !c.body().iter().all(|m| s.c.body().binary_search(m).is_ok()) {
-                continue;
-            }
-            if filter {
-                let head = s.c.head();
-                let simplifies = head.iter().any(|&l| {
-                    if !matches!(l.kind(), EQ | NE) {
-                        return false;
-                    }
-                    let Term::Fun(t) = l.term() else { return false };
-                    let g = match (l.fun() == k, t == k) {
-                        (true, _) => t,
-                        (_, true) => l.fun(),
-                        _ => return false,
-                    };
-                    // the certificate literal that the new clause gives `k` under `E`
-                    let mut cert = None;
-                    for &m in c.head() {
-                        if m != l && head.binary_search(&m).is_ok() {
-                            continue;
-                        }
-                        if cert.is_none() && m.kind() == F && m.fun() == k {
-                            cert = Some(m.atom());
-                        } else {
-                            return false;
-                        }
-                    }
-                    let Some(a) = cert else { return false };
-                    *differ.entry((a, g)).or_insert_with(|| {
-                        mine.clear();
-                        certifying_parts(ix, a, &mut mine);
-                        may_differ(ix, dx, st, &d.store, &mine, g)
-                    })
-                });
-                if !simplifies {
-                    continue;
-                }
-            }
-            found.push((s.c.body().to_vec(), s.c.head().to_vec()));
-        }
-    }
-}
-
-/// Whether the `again` rule passes over the equality clauses that a new certificate cannot
-/// simplify, which `SPARKLES_DL_AGAIN_ALL=1` turns off while the filter is measured.
-fn again_filter_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_AGAIN_ALL").is_none_or(|v| v != "1"))
-}
-
-/// The classes of an atom that are in a disjointness set: the atom, or the parts of a
-/// conjunction.
-fn certifying_parts(ix: &Index, a: Ex, out: &mut Vec<Ex>) {
-    if matches!(ix.head(a).node, Node::Conj(..)) {
-        let mut parts = Vec::new();
-        flatten(ix, a, &mut parts);
-        out.extend(
-            parts
-                .into_iter()
-                .filter(|&p| !ix.disjoint_of(ix.head(p)).is_empty()),
-        );
-    } else if !ix.disjoint_of(ix.head(a)).is_empty() {
-        out.push(a);
-    }
-}
-
-/// Whether a class in `mine` and a class that the term `g` may be in share a disjointness
-/// set, the classes of `g` read from its core and from every certificate of it in the
-/// store whatever its body and head, so that the answer is false only when no derivation
-/// of an equality of the two terms finds them in disjoint classes through `mine`.
-fn may_differ(ix: &Index, dx: &DlIx, st: &State, store: &Store, mine: &[Ex], g: Ex) -> bool {
-    if mine.is_empty() {
-        return false;
-    }
-    let meets = |y: Ex| {
-        let sy = ix.disjoint_of(ix.head(y));
-        !sy.is_empty()
-            && mine
-                .iter()
-                .any(|&x| x != y && ix.disjoint_of(ix.head(x)).iter().any(|s| sy.contains(s)))
-    };
-    if st.subs.contains(&g)
-        && let Some(core) = dx.cores.get(&g)
-        && core.iter().any(|&a| meets(a))
-    {
-        return true;
-    }
-    let mut theirs = Vec::new();
-    for &i in store.by_cert.get(&g).map_or(&[][..], |v| v.as_slice()) {
-        for m in store.clauses[i as usize].c.head() {
-            if m.kind() == F && m.fun() == g {
-                theirs.clear();
-                certifying_parts(ix, m.atom(), &mut theirs);
-                if theirs.iter().any(|&y| meets(y)) {
-                    return true;
-                }
+            if !s.dead && j != id {
+                found.push((s.c.body().to_vec(), s.c.head().to_vec()));
             }
         }
     }
-    false
 }
 
 /// The clauses read that count as one derived conclusion for the work bound.
