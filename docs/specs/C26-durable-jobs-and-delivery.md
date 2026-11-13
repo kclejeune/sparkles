@@ -664,7 +664,9 @@ small frame that removes the origin entry and records a `job:Recovery` record in
 `pausing` phase. Under the same writer lock, before the lock is released and before the
 recovery goes on, the store writes a checkpoint that holds that frame, so `control.bin`
 no longer carries the origin before any later frame can be written or any transition
-acknowledged. The restored set is every run and delivery that the checkpoint holds.
+acknowledged. A failed checkpoint poisons the writer. An open that recovers the consuming
+frame from the log while `control.bin` still carries the origin writes that checkpoint
+before it admits any transition. The restored set is every run and delivery that the checkpoint holds.
 The recovery pauses the nonterminal runs and the pending or leased deliveries of that set
 in bounded frames, each of which records how far it got, and a last frame moves the
 record to the `awaiting-decision` phase. A crash before the first frame leaves the origin
