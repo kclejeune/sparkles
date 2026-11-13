@@ -246,13 +246,14 @@ hout=gate/out/$hname
 # The results directory names the host that ran ci. Older drivers always used -wally.
 dest=$root/.artifacts/gates/main-gate-$name-$primary
 
-# Installs scripts/gate/remote/ on a host under ~/gate/bin/v-<hash>/ and prints that path.
+# Installs scripts/gate/remote/ and scripts/boat/disk_clean.py on a host under
+# ~/gate/bin/v-<hash>/ and prints that path.
 # A content-addressed directory leaves running gates and older callers' scripts untouched.
 install_remote() {
   local h=$1 v
-  v=$(cat "$here/remote/gate-start.sh" "$here/remote/gate-inner.sh" | sha256sum | cut -c1-12)
+  v=$(cat "$here/remote/gate-start.sh" "$here/remote/gate-inner.sh" "$here/../boat/disk_clean.py" | sha256sum | cut -c1-12)
   # shellcheck disable=SC2029
-  tar -C "$here/remote" -cf - gate-start.sh gate-inner.sh | rx_exec "$h" "
+  tar -cf - -C "$here/remote" gate-start.sh gate-inner.sh -C "$here/../boat" disk_clean.py | rx_exec "$h" "
     d=\$HOME/gate/bin/v-$v
     if [ ! -x \"\$d/gate-start.sh\" ]; then
       t=\$(mktemp -d \"\$HOME/gate/bin/.v-$v.XXXXXX\")
@@ -283,7 +284,8 @@ start_on() {
     # The unit's runtime is computed here to end GATE_BOAT_RESERVE seconds before the
     # admitted end, so the closure watch, which checks the worker from 900 seconds before
     # the end, normally finds the gate closed. The runtime counts from the unit's
-    # activation, so a late activation can still carry it past the lead (item 803).
+    # activation, so a late activation can still carry it past the lead, which roadmap
+    # item 803 tracks.
     runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "${GATE_BOAT_RESERVE:-1200}") || return
     args+=" --executor boat --runtime $runtime"
     ;;

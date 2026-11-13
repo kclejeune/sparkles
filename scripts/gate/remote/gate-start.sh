@@ -131,6 +131,12 @@ fi
 systemctl --user reset-failed "$unit" 2> /dev/null || true
 if [ -d "$out" ]; then mv "$out" "$out.old-$(date +%s)"; fi
 mkdir -p "$out"
+# A Boat worker's provider warns the maintainer at 90% disk use, so a gate there first
+# frees finished work with scripts/boat/disk_clean.py when the disk is that full. The cleanup
+# keeps the store's live entries and every active job's files, and never stops the start.
+if [ "$executor" = boat ]; then
+  python3 -I "$bin/disk_clean.py" --if-above 90 --log "$G/disk-clean.jsonl" > "$out/disk-clean-start.json" 2>&1 || true
+fi
 git -C "$G/repo.git" cat-file -e "$full^{commit}"
 [ -z "$base" ] || git -C "$G/repo.git" cat-file -e "$base^{commit}"
 git -C "$G/repo.git" worktree prune

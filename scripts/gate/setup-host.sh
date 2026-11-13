@@ -7,6 +7,7 @@
 # It creates ~/gate/{bin,out}, the bare repository ~/gate/repo.git, the ~/gate/.lock
 # symlink to ~/lanes/.heavy.lock, ~/gate/suites copied from the source host (default
 # wally) through the laptop, ~/gate/conformance.env and the pytest venv ~/gate/py-venv.
+# On a Boat worker it also installs the disk cleanup timer sparkles-disk-clean.timer.
 # It then checks linger, mbx, mise and free disk. The mise tools themselves install in
 # each gate's first step. The benchmark host, SPARKLES_BENCH_HOST (default forge, read as
 # gate.sh reads it), is refused, so swapping roles means setting that first and then preparing the new gate host.
@@ -30,6 +31,40 @@ rx_exec "$host" '
   [ -d "$HOME/gate/repo.git" ] || git init -q --bare "$HOME/gate/repo.git"
   touch "$HOME/lanes/.heavy.lock"
   [ -L "$HOME/gate/.lock" ] || ln -s "$HOME/lanes/.heavy.lock" "$HOME/gate/.lock"'
+
+# A Boat worker frees finished work by itself when its disk reaches 90% use, the level at
+# which the provider warns the maintainer. The timer checks every minute from ten minutes
+# after boot, after a resume's qualification and admission, and runs
+# scripts/boat/disk_clean.py with the job environment's store settings. The unit files live
+# in the home, so the stop's snapshot keeps them and the timer runs again after a resume.
+case $host in boat:*)
+  # shellcheck disable=SC2016
+  rx_exec "$host" 'cat > "$HOME/gate/bin/disk_clean.py.new" && mv -f "$HOME/gate/bin/disk_clean.py.new" "$HOME/gate/bin/disk_clean.py"' < "$(dirname "$(readlink -f "$0")")/../boat/disk_clean.py"
+  # shellcheck disable=SC2016
+  rx_exec "$host" '
+    set -e
+    d=$HOME/.config/systemd/user
+    mkdir -p "$d"
+    {
+      echo "[Unit]"
+      echo "Description=Free finished work when the disk reaches 90% use"
+      echo "[Service]"
+      echo "Type=oneshot"
+      echo "Nice=10"
+      echo "TimeoutStartSec=900"
+      echo "UMask=0022"
+      for n in PATH MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do
+        [ -z "${!n+x}" ] || printf "Environment=\"%s=%s\"\n" "$n" "${!n}"
+      done
+      echo "ExecStart=/usr/bin/python3 -I %h/gate/bin/disk_clean.py --if-above 90 --log %h/gate/disk-clean.jsonl"
+    } > "$d/sparkles-disk-clean.service"
+    printf "%s\n" "[Unit]" "Description=Check the disk use every minute" "[Timer]" "OnBootSec=10min" \
+      "OnUnitInactiveSec=60s" "[Install]" "WantedBy=timers.target" > "$d/sparkles-disk-clean.timer"
+    systemctl --user daemon-reload
+    systemctl --user enable -q --now sparkles-disk-clean.timer
+    echo "disk clean timer: $(systemctl --user is-active sparkles-disk-clean.timer)"'
+  ;;
+esac
 
 if [ "$host" != "$src" ]; then
   stage=$(mktemp -d)

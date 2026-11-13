@@ -231,4 +231,8 @@ if [ $fail = 0 ]; then
 else
   log "worktree sources kept at $wt"
 fi
+# On a Boat worker the run leaves the disk below the provider's 90% warning when it can.
+if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ]; then
+  python3 -I "$(dirname "$0")/disk_clean.py" --if-above 90 --log "$G/disk-clean.jsonl" > "$out/disk-clean-end.json" 2>&1 || true
+fi
 finish $fail

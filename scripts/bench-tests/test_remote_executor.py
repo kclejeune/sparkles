@@ -451,6 +451,43 @@ class Admission(unittest.TestCase):
         drop=next(i for i,l in enumerate(lines) if l.strip()=='find "$stage" -type l -delete')
         self.assertLess(pull,drop);self.assertLess(drop,push)
 
+    def test_a_boat_gate_cleans_the_disk_at_its_start_and_end(self):
+        """A Boat gate frees finished work at 90% disk use before its worktree and after its run."""
+        start=(ROOT/'scripts/gate/remote/gate-start.sh').read_text().splitlines()
+        call=next(i for i,l in enumerate(start) if 'disk_clean.py' in l and 'python3' in l)
+        self.assertEqual(start[call-1].strip(),'if [ "$executor" = boat ]; then')
+        self.assertIn('--if-above 90',start[call]);self.assertTrue(start[call].rstrip().endswith('|| true'))
+        self.assertLess(next(i for i,l in enumerate(start) if l.startswith('mkdir -p "$out"')),call)
+        self.assertLess(call,next(i for i,l in enumerate(start) if 'worktree add' in l))
+        inner=(ROOT/'scripts/gate/remote/gate-inner.sh').read_text().splitlines()
+        call=next(i for i,l in enumerate(inner) if 'disk_clean.py' in l)
+        self.assertEqual(inner[call-1].strip(),'if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ]; then')
+        self.assertTrue(inner[call].rstrip().endswith('|| true'));self.assertEqual(inner[-1],'finish $fail')
+        gate=(ROOT/'scripts/gate/gate.sh').read_text()
+        self.assertIn('"$here/../boat/disk_clean.py" | sha256sum',gate)
+        self.assertIn('-C "$here/../boat" disk_clean.py | rx_exec "$h"',gate)
+
+    def test_setup_host_installs_a_disk_clean_timer_with_the_store_settings(self):
+        """The timer's service carries the job environment's store settings and never the token setting."""
+        import subprocess as sp
+        text=(ROOT/'scripts/gate/setup-host.sh').read_text()
+        begin=text.index("    set -e\n    d=$HOME/.config/systemd/user");end=text.index("'\n  ;;\nesac",begin)
+        script=text[begin:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp)/'home';home.mkdir();fake=Path(tmp)/'bin';fake.mkdir();calls=Path(tmp)/'calls'
+            (fake/'systemctl').write_text('#!/bin/sh\necho "$@" >> "%s"\necho active\n'%calls);(fake/'systemctl').chmod(0o755)
+            environ={'HOME':str(home),'PATH':str(fake)+':'+os.environ['PATH'],'MBX_REMOTE_URL':'','MBX_CACHE_DIR':str(home)+'/.local/share/mbx-cache',
+                     'MBX_GC_MAX_TOTAL_SIZE':'64GiB','MBX_GC_MIN_FREE_SIZE':'45GiB','MBX_REMOTE_TOKEN_FILE':'/run/secrets/x'}
+            out=sp.run(['bash','-c',script],env=environ,capture_output=True,text=True)
+            self.assertEqual(out.returncode,0,out.stderr);self.assertIn('disk clean timer: active',out.stdout)
+            unit=(home/'.config/systemd/user/sparkles-disk-clean.service').read_text().splitlines()
+            self.assertIn('Environment="MBX_REMOTE_URL="',unit);self.assertIn('Environment="MBX_CACHE_DIR=%s/.local/share/mbx-cache"'%home,unit)
+            self.assertIn('Environment="MBX_GC_MIN_FREE_SIZE=45GiB"',unit);self.assertFalse(any('TOKEN' in l for l in unit))
+            self.assertIn('ExecStart=/usr/bin/python3 -I %h/gate/bin/disk_clean.py --if-above 90 --log %h/gate/disk-clean.jsonl',unit)
+            timer=(home/'.config/systemd/user/sparkles-disk-clean.timer').read_text().splitlines()
+            self.assertIn('OnBootSec=10min',timer);self.assertIn('OnUnitInactiveSec=60s',timer);self.assertIn('WantedBy=timers.target',timer)
+            self.assertEqual(calls.read_text().splitlines()[:2],['--user daemon-reload','--user enable -q --now sparkles-disk-clean.timer'])
+
     def test_admit_renders_its_probe_and_names_a_missing_worker_tool(self):
         """The admit probe parses as shell, carries its formatted values, and checks every worker tool."""
         import subprocess as sp
