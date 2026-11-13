@@ -1196,47 +1196,11 @@ impl crate::guard::CommitGuard for RefuseWith {
     }
 }
 
-/// A subscriber that, on the thread it is installed on, holds a commit at the end of its
-/// span, after the writer was released and before the caller sees the outcome: it
-/// signals `ready` and waits for `resume`.
-struct PauseCommitExit {
-    ready: std::sync::mpsc::Sender<()>,
-    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-}
-
-impl tracing::Subscriber for PauseCommitExit {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
-        Some(tracing::metadata::LevelFilter::TRACE)
-    }
-    fn new_span(&self, a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(if a.metadata().name() == "commit" {
-            1
-        } else {
-            2
-        })
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, id: &tracing::span::Id) {
-        if id.into_u64() == 1 {
-            self.ready.send(()).unwrap();
-            let _ = self
-                .resume
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30));
-        }
-    }
-}
-
-/// `f` on a new thread whose commits pause at their end, with the channel that says a
-/// commit paused and the one that resumes it.
+/// `f` on a new thread, whose next renewal or failure of `ds` pauses after its commit
+/// returned, when the writer is released and before the runtime sees the outcome, with
+/// the channel that says it paused and the one that resumes it.
 fn paused<T: Send + 'static>(
+    ds: &Dataset,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> (
     std::sync::mpsc::Receiver<()>,
@@ -1244,15 +1208,12 @@ fn paused<T: Send + 'static>(
     std::thread::JoinHandle<T>,
 ) {
     let (ready, ready_rx) = std::sync::mpsc::channel();
-    let (resume_tx, resume) = std::sync::mpsc::channel();
-    let h = std::thread::spawn(move || {
-        let sub = PauseCommitExit {
-            ready,
-            resume: std::sync::Mutex::new(resume),
-        };
-        tracing::subscriber::with_default(sub, f)
-    });
-    (ready_rx, resume_tx, h)
+    let (resume_tx, resume) = std::sync::mpsc::channel::<()>();
+    *ds.jobs().runtime().after_commit.lock() = Some(Box::new(move || {
+        let _ = ready.send(());
+        let _ = resume.recv_timeout(Duration::from_secs(30));
+    }));
+    (ready_rx, resume_tx, std::thread::spawn(f))
 }
 
 fn lease_ms(ds: &Dataset, ms: u64) {
@@ -1270,7 +1231,7 @@ fn a_refused_renewal_paused_after_the_writer_does_not_extend_the_lease() {
     let c = claim(&ds, &worker("w"));
     ds.store().set_guard(Some(refuse_once()));
     let (d, run, token) = (ds.clone(), c.run, c.token.clone());
-    let (ready, resume, h) = paused(move || {
+    let (ready, resume, h) = paused(&ds, move || {
         d.jobs()
             .renew(run, &token, Some(60_000), None, &worker("w"))
     });
@@ -1302,7 +1263,7 @@ fn two_refused_renewals_do_not_revive_an_abandoned_deadline() {
     let c = claim(&ds, &worker("w"));
     let renew = |ds: &Dataset| {
         let (d, run, token) = (ds.clone(), c.run, c.token.clone());
-        paused(move || {
+        paused(ds, move || {
             d.jobs()
                 .renew(run, &token, Some(60_000), None, &worker("w"))
         })
@@ -2045,5 +2006,445 @@ mod crashes {
             "lease-lost"
         );
         ds.jobs().renew(c2.run, &c2.token, None, None, &w).unwrap();
+    }
+}
+
+#[test]
+fn a_failed_attempt_keeps_the_lease_of_the_claim_that_follows_it() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    let first = claim(&ds, &worker("w"));
+    let (d, token, run) = (ds.clone(), first.token.clone(), first.run);
+    // the failure stops after its commit has released the writer, before its cleanup
+    let (ready_rx, resume, h) = paused(&ds, move || {
+        d.jobs().fail(
+            run,
+            &token,
+            &Failure {
+                transient: true,
+                reason: "retry".into(),
+                retry_after_ms: None,
+            },
+            None,
+            &worker("w"),
+        )
+    });
+    if let Err(e) = ready_rx.recv_timeout(Duration::from_secs(30)) {
+        panic!("the failure did not commit ({e}): {:?}", h.join());
+    }
+    force_eligible(&ds, run);
+    let next = claim(&ds, &worker("w"));
+    assert_eq!((next.run, next.generation), (run, first.generation + 1));
+    resume.send(()).unwrap();
+    h.join().unwrap().unwrap();
+    let renewed = ds
+        .jobs()
+        .renew(next.run, &next.token, None, None, &worker("w"));
+    assert!(
+        renewed.is_ok(),
+        "the failed attempt's cleanup ended the later lease: {renewed:?}"
+    );
+}
+
+#[test]
+fn constraints_answer_the_ledger_as_a_graph_that_does_not_exist() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    for view in [None, Some(Arc::new(crate::access::GraphAccess::all()))] {
+        let req = crate::handles::ConstraintsRequest {
+            shapes: crate::handles::ShapesRequest {
+                guard: Some(false),
+                graphs: vec![LEDGER_GRAPH.into()],
+            },
+            graphs: view.clone(),
+            ..Default::default()
+        };
+        let r = ds.schema().constraints(&req);
+        assert!(matches!(r, Err(Error::NotFound(_))), "{view:?}: {r:?}");
+        let snap = ds.snapshot();
+        let r = ds
+            .schema()
+            .constraints_at(&snap, &req.shapes, view.as_deref());
+        assert!(matches!(r, Err(Error::NotFound(_))), "{view:?}: {r:?}");
+    }
+}
+
+/// A quad of the ledger graph written under the jobs capability, as an owner would.
+fn ledger_cell(value: &str) -> Quad {
+    Quad::new(
+        NamedNode::new_unchecked("urn:hidden-subject"),
+        NamedNode::new_unchecked("urn:cell"),
+        Literal::new_simple_literal(value),
+        GraphName::NamedNode(NamedNode::new_unchecked(LEDGER_GRAPH)),
+    )
+}
+
+fn set_ledger_cell(ds: &Dataset, old: Option<&str>, new: &str) {
+    let cap = ds
+        .store()
+        .managed_writer(OwnerKind::Jobs, Uuid::new_v4())
+        .unwrap();
+    let mut tx = ds.store().write();
+    tx.set_managed(cap).unwrap();
+    let mut labels = Default::default();
+    if let Some(v) = old {
+        let ids = tx.encode_quad(&ledger_cell(v), &mut labels).unwrap();
+        tx.delete(ids).unwrap();
+    }
+    let ids = tx.encode_quad(&ledger_cell(new), &mut labels).unwrap();
+    tx.insert(ids).unwrap();
+    tx.commit().unwrap();
+}
+
+/// A dataset with jobs whose ledger cell conflicts between `main` and branch `work`,
+/// with a public conflict too when `public`.
+fn conflicting(public: bool) -> Dataset {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    set_ledger_cell(&ds, None, "base");
+    if public {
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:base> }")
+            .unwrap();
+    }
+    ds.create_branch("work", &Default::default()).unwrap();
+    let work = ds.branch("work").unwrap();
+    set_ledger_cell(&ds, Some("base"), "ours");
+    set_ledger_cell(&work, Some("base"), "theirs");
+    if public {
+        ds.update("DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:ours> }")
+            .unwrap();
+        work.update("DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:theirs> }")
+            .unwrap();
+    }
+    ds
+}
+
+#[test]
+fn resolved_ledger_conflicts_leave_the_merge_counters() {
+    use crate::branch::{MergeOptions, Resolution, Take};
+    // a rule for every conflict
+    let o = MergeOptions {
+        on_conflict: Some(Take::Ours),
+        ..Default::default()
+    };
+    let r = conflicting(false)
+        .preview_merge("work", "main", &o)
+        .unwrap();
+    assert_eq!((r.conflicts_found, r.conflicts_resolved), (0, 0), "{r:?}");
+    let r = conflicting(true).preview_merge("work", "main", &o).unwrap();
+    assert_eq!((r.conflicts_found, r.conflicts_resolved), (1, 1), "{r:?}");
+    // an explicit resolution of the ledger cell
+    let o = MergeOptions {
+        resolutions: vec![Resolution {
+            graph: GraphName::NamedNode(NamedNode::new_unchecked(LEDGER_GRAPH)),
+            subject: Some(NamedNode::new_unchecked("urn:hidden-subject").into()),
+            predicate: Some(NamedNode::new_unchecked("urn:cell")),
+            take: Take::Ours,
+        }],
+        ..Default::default()
+    };
+    let r = conflicting(false)
+        .preview_merge("work", "main", &o)
+        .unwrap();
+    assert_eq!((r.conflicts_found, r.conflicts_resolved), (0, 0), "{r:?}");
+    // the public conflict remains and is shown, the resolved ledger one is not counted
+    let r = conflicting(true).preview_merge("work", "main", &o).unwrap();
+    assert_eq!((r.conflicts_found, r.conflicts_resolved), (1, 0), "{r:?}");
+    assert_eq!(r.conflicts.as_ref().map(|c| c.conflicts), Some(1), "{r:?}");
+}
+
+#[test]
+fn unresolved_ledger_only_conflicts_are_refused_as_managed() {
+    let ds = conflicting(false);
+    for r in [
+        ds.preview_merge("work", "main", &Default::default())
+            .map(|_| ()),
+        ds.merge("work", "main", &Default::default()).map(|_| ()),
+    ] {
+        assert_eq!(r.unwrap_err().code(), "profile-managed-graph");
+    }
+}
+
+#[test]
+fn merges_without_hidden_graphs_count_and_resolve_every_conflict() {
+    use crate::branch::{MergeOptions, Take};
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:s> <urn:p> <urn:base> }")
+        .unwrap();
+    ds.create_branch("work", &Default::default()).unwrap();
+    let work = ds.branch("work").unwrap();
+    ds.update(
+        "DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:ours> }",
+    )
+    .unwrap();
+    work.update(
+        "DELETE DATA { <urn:s> <urn:p> <urn:base> }; INSERT DATA { <urn:s> <urn:p> <urn:theirs> }",
+    )
+    .unwrap();
+    let r = ds
+        .preview_merge("work", "main", &Default::default())
+        .unwrap();
+    assert_eq!(r.conflicts_found, 1);
+    assert_eq!(r.conflicts.unwrap().conflicts, 1);
+    let o = MergeOptions {
+        on_conflict: Some(Take::Theirs),
+        ..Default::default()
+    };
+    let r = ds.preview_merge("work", "main", &o).unwrap();
+    assert_eq!(
+        (
+            r.inserted,
+            r.deleted,
+            r.conflicts_found,
+            r.conflicts_resolved
+        ),
+        (1, 1, 1, 1)
+    );
+    ds.merge("work", "main", &o).unwrap();
+    assert!(ds.ask("ASK { <urn:s> <urn:p> <urn:theirs> }").unwrap());
+}
+
+#[test]
+fn a_shared_schema_report_never_holds_the_ledger() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    ds.update("INSERT DATA { <urn:public> a <urn:Public> }")
+        .unwrap();
+    let mut req = crate::handles::ReportRequest::default();
+    req.options.graph = crate::schema::GraphSelection::Union;
+    let first = ds.schema().report(&req).unwrap();
+    let j = serde_json::to_string(first.report.as_ref()).unwrap();
+    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
+    let mut all = req.clone();
+    all.options.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
+    let second = ds.schema().report(&all).unwrap();
+    assert_eq!(second.computed, crate::handles::Computed::Cached);
+    assert!(Arc::ptr_eq(&first.report, &second.report));
+    claim(&ds, &admin());
+    let third = ds.schema().report(&req).unwrap();
+    let j = serde_json::to_string(third.report.as_ref()).unwrap();
+    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
+    assert_eq!(third.report.totals.triples, 1);
+}
+
+#[test]
+fn live_queries_never_read_the_ledger() {
+    for access in [None, Some(Arc::new(crate::access::GraphAccess::all()))] {
+        let ds = Dataset::memory();
+        configured(&ds);
+        submit(&ds, "k");
+        let q = format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
+        let live = ds.live_as(&q, access, &Default::default()).unwrap();
+        match live
+            .next_timeout(Duration::from_secs(10))
+            .expect("a first event")
+        {
+            crate::incr::LiveEvent::Snapshot { rows, .. } => {
+                assert!(
+                    rows.is_empty(),
+                    "{} ledger rows: {:?}",
+                    rows.len(),
+                    rows.first()
+                )
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_live_query_started_before_jobs_ends_when_they_are_enabled() {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:public> <urn:p> <urn:o> }")
+        .unwrap();
+    let live = ds
+        .live_as(
+            "SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }",
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        live.next_timeout(Duration::from_secs(10)),
+        Some(crate::incr::LiveEvent::Snapshot { .. })
+    ));
+    configured(&ds);
+    submit(&ds, "k");
+    // what its callers may read changed: the subscription ends instead of showing a
+    // change of the ledger
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let e = live.next_timeout(Duration::from_secs(10));
+        match e {
+            Some(crate::incr::LiveEvent::Error { code, .. }) => {
+                assert_eq!(code, "forbidden");
+                break;
+            }
+            Some(crate::incr::LiveEvent::Snapshot { rows, .. }) => {
+                let j = format!("{rows:?}");
+                assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
+            }
+            Some(other) => {
+                let j = format!("{other:?}");
+                assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
+            }
+            None => panic!("the subscription neither ended nor changed"),
+        }
+        assert!(Instant::now() < deadline, "the subscription did not end");
+    }
+}
+
+#[test]
+fn kept_views_never_read_the_ledger() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    let q = format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{LEDGER_GRAPH}> {{ ?s ?p ?o }} }}");
+    ds.views()
+        .put("ledger", crate::incr::ViewDef::table(q))
+        .unwrap();
+    ds.views()
+        .wait_built("ledger", Duration::from_secs(10))
+        .unwrap();
+    let rows = ds.views().read("ledger").unwrap();
+    assert!(rows.rows.is_empty(), "{:?}", rows.rows.first());
+}
+
+#[test]
+fn predicate_distinct_counts_leave_out_the_deleted_hidden_base_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    configured(&ds);
+    submit(&ds, "k");
+    ds.update("INSERT DATA { <urn:public> <urn:x-sparkles:jobs:version> 100 }")
+        .unwrap();
+    ds.compact().unwrap();
+    let counts = |ds: &Dataset| {
+        let s = ds.stats(&Default::default()).unwrap();
+        let p = s
+            .predicates
+            .iter()
+            .find(|p| p.iri == "urn:x-sparkles:jobs:version")
+            .unwrap()
+            .clone();
+        (p.count, p.distinct_subjects, p.distinct_objects)
+    };
+    assert_eq!(counts(&ds), (1, 1, 1));
+    // the claim replaces the run's version in the ledger's base
+    claim(&ds, &admin());
+    assert_eq!(counts(&ds), (1, 1, 1));
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn an_ontology_opened_before_jobs_are_enabled_is_not_reused_after() {
+    use crate::handles::ontology::OntologyRequest;
+    use crate::reasoning::reasoner::inputs::GraphRef;
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{LEDGER_GRAPH}> {{ <urn:SecretClass> a <http://www.w3.org/2002/07/owl#Class> }} }}"
+    ))
+    .unwrap();
+    let req = OntologyRequest {
+        graphs: vec![GraphRef::Named(LEDGER_GRAPH.into())],
+        ..Default::default()
+    };
+    let snap = ds.snapshot();
+    let first = ds
+        .ontology()
+        .open_at(&snap, &req, &Default::default())
+        .unwrap();
+    assert_eq!(first.summary().triples, 1);
+    configured(&ds);
+    // the configuration writes no RDF commit, so only the hidden graphs changed
+    assert_eq!(ds.snapshot().commit, snap.commit);
+    let after = ds
+        .ontology()
+        .open_at(&ds.snapshot(), &req, &Default::default())
+        .unwrap();
+    assert_eq!(after.summary().triples, 0, "cached: {}", after.cached);
+}
+
+/// Shapes in the ledger graph, written before jobs were enabled, that a guard names.
+#[cfg(feature = "shacl")]
+fn ledger_shapes(ds: &Dataset) {
+    ds.update(&format!(
+        "PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{LEDGER_GRAPH}> {{ <urn:SecretShape> a sh:NodeShape ; sh:targetClass <urn:Public> ; sh:property <urn:SecretPropertyShape> . <urn:SecretPropertyShape> sh:path <urn:secret-path> ; sh:minCount 1 }} }}"
+    ))
+    .unwrap();
+    configured(ds);
+    ds.validation()
+        .guard()
+        .set_shacl(
+            serde_json::from_value(serde_json::json!({
+                "mode": "warn",
+                "dataGraph": "default",
+                "shapes": {"graphs": [LEDGER_GRAPH]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn constraints_never_take_a_guard_whose_shapes_are_in_the_ledger() {
+    let ds = Dataset::memory();
+    ledger_shapes(&ds);
+    let mut req = crate::handles::ConstraintsRequest::default();
+    req.shapes.guard = Some(true);
+    let r = ds.schema().constraints(&req);
+    assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+    // without a required guard, the layer has no source
+    req.shapes.guard = None;
+    let layer = ds.schema().constraints(&req).unwrap();
+    assert!(!format!("{layer:?}").contains("secret-path"), "{layer:?}");
+}
+
+#[cfg(all(feature = "graphql", feature = "shacl"))]
+#[test]
+fn a_graphql_draft_never_takes_guard_shapes_from_the_ledger() {
+    let ds = Dataset::memory();
+    ledger_shapes(&ds);
+    let r = ds.graphql().draft("d", Default::default());
+    if let Ok((draft, _)) = r {
+        let j = serde_json::to_string(&draft).unwrap();
+        assert!(
+            !j.contains("urn:SecretShape") && !j.contains("urn:secret-path"),
+            "{j}"
+        );
+    }
+}
+
+#[test]
+fn a_public_kept_view_stays_readable_on_a_dataset_with_jobs() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    ds.update("INSERT DATA { <urn:public> <urn:p> <urn:o> }")
+        .unwrap();
+    ds.views()
+        .put(
+            "public",
+            crate::incr::ViewDef::table("SELECT ?s WHERE { ?s <urn:p> <urn:o> }"),
+        )
+        .unwrap();
+    ds.views()
+        .wait_built("public", Duration::from_secs(10))
+        .unwrap();
+    let q = "PREFIX view: <urn:x-sparkles:view#> SELECT ?s WHERE { SERVICE view:read { [] view:name \"public\" ; view:bind ?s } }";
+    // as a caller who reads every visible graph, and as one with no view of its own
+    for graphs in [None, Some(Arc::new(crate::access::GraphAccess::all()))] {
+        let opts = crate::sparql::QueryOptions {
+            graphs,
+            ..Default::default()
+        };
+        if let Err(e) = ds.query_with(q, &opts) {
+            panic!("{e}");
+        }
     }
 }

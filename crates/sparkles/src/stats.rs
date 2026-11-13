@@ -203,7 +203,7 @@ impl Dataset {
             .map(|&(p, count)| {
                 let ps = gen_.stats.predicate(p);
                 // less the subjects and objects only a hidden graph gives the predicate
-                let (hs, ho) = if hidden.predicate(p) > 0 {
+                let (hs, ho) = if hidden.counted(p) {
                     hidden.hidden_terms(snap, p)?
                 } else {
                     (0, 0)
@@ -360,6 +360,14 @@ impl Hidden {
                 }
                 Ok(true)
             })?;
+            // base quads the delta deletes are gone from the scan, but the build
+            // statistics still count their subjects and objects
+            for k in snap.delta.del[Perm::Gspo.index()]
+                .range([g, 0, 0, 0]..=[g, u64::MAX, u64::MAX, u64::MAX])
+            {
+                h.subjects.insert((k[2], k[1]));
+                h.objects.insert((k[2], k[3]));
+            }
             h.ids.push(g);
         }
         Ok(h)
@@ -375,6 +383,13 @@ impl Hidden {
 
     fn predicate(&self, p: u64) -> u64 {
         self.predicates.get(&p).copied().unwrap_or(0)
+    }
+
+    /// Whether a hidden graph's base gives predicate `p` subjects or objects that the
+    /// build statistics count, including base quads the delta has deleted.
+    fn counted(&self, p: u64) -> bool {
+        self.subjects.range((p, 0)..=(p, u64::MAX)).next().is_some()
+            || self.objects.range((p, 0)..=(p, u64::MAX)).next().is_some()
     }
 
     /// The distinct subjects and objects of predicate `p` that the build statistics count

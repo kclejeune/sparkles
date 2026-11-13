@@ -39,15 +39,38 @@ pub struct Views {
     pub(crate) ds: Dataset,
 }
 
-/// What the embedded library tells the runtime: every principal reads every quad,
-/// the dataset's prefixes apply and stored queries resolve from its catalog.
+/// What the embedded library tells the runtime: every principal reads every quad
+/// outside the dataset's hidden control graphs, the dataset's prefixes apply and stored
+/// queries resolve from its catalog.
 struct LibraryHost {
     state: crate::dataset::StateReference,
 }
 
+/// A number that changes when the hidden control graphs of `store` change (spec C26
+/// §2.3), so that the views resolve their access again.
+pub fn visibility_epoch(store: &crate::store::Store) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let hidden = store.hidden_graphs();
+    if hidden.is_empty() {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hidden.hash(&mut h);
+    h.finish() | 1
+}
+
 impl Host for LibraryHost {
     fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
-        Ok(None)
+        Ok(self
+            .state
+            .upgrade()
+            .and_then(|s| GraphAccess::hiding_graphs(None, &s.store.hidden_graphs())))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.state
+            .upgrade()
+            .map_or(0, |s| visibility_epoch(&s.store))
     }
 
     fn prefixes(&self) -> Vec<(String, String)> {
@@ -169,6 +192,8 @@ impl Dataset {
         o: &LiveOptions,
     ) -> Result<LiveQuery> {
         start(&self.inner, None);
+        // the dataset's hidden control graphs are never read (spec C26 §2.3)
+        let access = self.hide_owner_graphs(access);
         self.inner.views.live(&self.inner.store, query, access, o)
     }
 

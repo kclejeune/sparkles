@@ -671,14 +671,19 @@ fn constraints_layer(
     view: Option<&GraphAccess>,
 ) -> Result<Option<ConstraintsLayer>> {
     let view = view.filter(|v| !v.reads_all());
+    // a hidden control graph (spec C26 §2.3) is never a source of constraints, whoever
+    // asks: a guard that reads its shapes from one is answered as one this caller may not
+    // read, and a named one as a graph that does not exist
+    let hidden = ds.store().hidden_graphs();
     let readable = |g: &str| {
-        view.is_none_or(|v| {
-            if g == "default" {
-                v.read.default_graph()
-            } else {
-                v.read.allows_iri(g)
-            }
-        })
+        !hidden.iter().any(|h| h == g)
+            && view.is_none_or(|v| {
+                if g == "default" {
+                    v.read.default_graph()
+                } else {
+                    v.read.allows_iri(g)
+                }
+            })
     };
     let mut layer = ConstraintsLayer::default();
     if req.guard != Some(false) {

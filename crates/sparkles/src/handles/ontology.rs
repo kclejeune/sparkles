@@ -1251,7 +1251,13 @@ impl Ontologies {
         } else {
             None
         };
-        let key = req.key(snap.commit, record.is_some());
+        // the hidden graphs are part of the key: enabling an owner hides a graph without
+        // a new commit of the data
+        let key = format!(
+            "{}|{:?}",
+            req.key(snap.commit, record.is_some()),
+            self.ds.store().hidden_graphs()
+        );
         if keep {
             let mut cache = self.ds.state().ontology_cache.lock();
             if let Some(i) = cache.iter().position(|e| e.key == key) {

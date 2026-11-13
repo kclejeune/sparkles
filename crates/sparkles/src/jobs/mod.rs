@@ -59,6 +59,10 @@ pub struct Runtime {
     installing: parking_lot::Mutex<()>,
     leases: parking_lot::Mutex<HashMap<uuid::Uuid, Vec<Lease>>>,
     grants: std::sync::atomic::AtomicU64,
+    /// Run once by the next renewal or failure after its commit returns and before its
+    /// outcome reaches the runtime, so a test can order other operations there.
+    #[cfg(test)]
+    pub(crate) after_commit: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// One recorded deadline: the version of the run whose commit grants or extends the
@@ -79,6 +83,8 @@ impl Default for Runtime {
             installing: parking_lot::Mutex::new(()),
             leases: parking_lot::Mutex::new(HashMap::new()),
             grants: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            after_commit: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -176,9 +182,28 @@ impl Runtime {
         }
     }
 
-    /// Forget the deadline of `run`, after a commit ended its lease.
-    fn revoke(&self, run: uuid::Uuid) {
-        self.leases.lock().remove(&run);
+    /// The test hook of [`after_commit`](Self::after_commit), if one is set.
+    #[cfg(test)]
+    fn after_commit(&self) {
+        // taken before it runs, so that a test can set the next hook meanwhile
+        let hook = self.after_commit.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Forget the deadlines of `run` recorded under `version` or earlier, after the
+    /// commit that wrote `version` ended its lease. A deadline of a later version
+    /// belongs to a claim that committed after this transition and stays (spec C26
+    /// §7.1).
+    fn revoke_through(&self, run: uuid::Uuid, version: u64) {
+        let mut leases = self.leases.lock();
+        if let Some(v) = leases.get_mut(&run) {
+            v.retain(|l| l.version > version);
+            if v.is_empty() {
+                leases.remove(&run);
+            }
+        }
     }
 }
 

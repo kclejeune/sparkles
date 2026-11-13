@@ -162,6 +162,18 @@ pub fn guard_shapes(
         return None;
     };
     let cfg = g.config().clone();
+    // a guard that reads its shapes from a hidden control graph (spec C26 §2.3) is
+    // answered as no guard, so no draft or warning quotes a control record
+    let hidden = store.hidden_graphs();
+    if cfg
+        .shapes
+        .graphs
+        .iter()
+        .flatten()
+        .any(|g| hidden.contains(g))
+    {
+        return None;
+    }
     let mut graph = oxrdf::Graph::new();
     let snap = store.snapshot();
     for name in cfg.shapes.graphs.iter().flatten() {

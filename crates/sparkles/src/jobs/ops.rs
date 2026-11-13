@@ -543,7 +543,7 @@ impl Jobs {
             )?;
             let (state, next, reason) = after_failure(&run, now, true, None);
             self.transition(&mut ch, &mut l, &run, state, next, reason)?;
-            rt.revoke(run.id);
+            rt.revoke_through(run.id, run.version + 1);
             if state.terminal() {
                 ended.push(run.id);
             }
@@ -1026,7 +1026,7 @@ impl Jobs {
                             None => "the lease expired".into(),
                         });
                         self.transition(&mut ch, &mut l, &run, state, next, reason)?;
-                        rt.revoke(run.id);
+                        rt.revoke_through(run.id, run.version + 1);
                         if state.terminal() {
                             ended.push(run.id);
                         }
@@ -1281,7 +1281,10 @@ impl Jobs {
         // The new deadline counts only once this commit's version is the committed one,
         // and one that does not commit leaves the committed deadline as it was.
         let grant = self.runtime().grant(run.id, run.version + 1, extend);
-        t.commit()?;
+        let committed = t.commit();
+        #[cfg(test)]
+        self.runtime().after_commit();
+        committed?;
         grant.keep();
         Ok(Renewed {
             run: run.id,
@@ -1415,7 +1418,7 @@ impl Jobs {
         ds.store().failpoint("jobs-before-publish-commit");
         let receipt = t.commit()?;
         ds.store().failpoint("jobs-published");
-        self.runtime().revoke(run.id);
+        self.runtime().revoke_through(run.id, run.version + 1);
         if !run.inputs.is_empty() {
             self.maybe_release_hold(run.id);
         }
@@ -1530,7 +1533,9 @@ impl Jobs {
         drop(l);
         ch.apply(&mut t)?;
         t.commit()?;
-        self.runtime().revoke(run.id);
+        #[cfg(test)]
+        self.runtime().after_commit();
+        self.runtime().revoke_through(run.id, run.version + 1);
         if state.terminal() && !run.inputs.is_empty() {
             self.maybe_release_hold(run.id);
         }
@@ -1599,7 +1604,7 @@ impl Jobs {
         drop(l);
         ch.apply(&mut t)?;
         t.commit()?;
-        self.runtime().revoke(run.id);
+        self.runtime().revoke_through(run.id, run.version + 1);
         if !run.inputs.is_empty() {
             self.maybe_release_hold(run.id);
         }
