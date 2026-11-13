@@ -4696,7 +4696,13 @@ fn graph_writers_flush_after_their_first_batch() {
 /// execution, and both plans name the algorithm that ran.
 #[test]
 fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
-    let s = Store::in_memory(StoreOptions::default());
+    // The result cache admits every result here, as a slow host does when the join takes
+    // longer than the default admission time. A cached result would hide the join from the
+    // plan, so the queries that read the plan bypass the cache.
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..StoreOptions::default()
+    });
     let data = (0..200)
         .map(|i| {
             let mut t = format!("<urn:s:{i}> <urn:p> {i} .\n");
@@ -4720,6 +4726,7 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
                 merge_left_join: merge,
                 ..sparkles_core::sparql::Optimizations::ALL
             }),
+            no_cache: true,
             ..Default::default()
         };
         let eager = query(s.snapshot(), q, &opts).unwrap();
