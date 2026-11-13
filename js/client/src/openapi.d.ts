@@ -2788,6 +2788,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/reason/{ds}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The dataset's query-time reasoning setting */
+        get: operations["getQueryReasoning"];
+        /** Set the dataset's query-time reasoning */
+        put: operations["setQueryReasoning"];
+        post?: never;
+        /** Remove the dataset's query-time reasoning setting */
+        delete: operations["clearQueryReasoning"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/repositories": {
         parameters: {
             query?: never;
@@ -10599,6 +10618,26 @@ export interface components {
             dataset: string;
             promoted: number;
             target: string;
+        };
+        /** @description The dataset's query-time reasoning setting: the mode of a query that names none, the profile and rules that derive on demand, the input graphs, the budget of a derivation and the policy for a stale materialization. */
+        QueryReasoningSetting: {
+            budget?: {
+                maxDerived?: number;
+                maxMillis?: number;
+            };
+            /** @enum {string} */
+            default?: "auto" | "demand" | "materialized" | "false";
+            /** @description The input graphs, as a reasoning request names them. */
+            inputs?: Record<string, never>;
+            /** @enum {string} */
+            profile?: "rdfs" | "rdfs-simple" | "owl-rl" | "rules";
+            queryReasoningFormat?: number;
+            /** @description The Jena rule text of the profile `rules`. */
+            rules?: string;
+            /** @enum {string} */
+            stale?: "derive" | "allow";
+            /** @description The process-wide cache of derived tables, for callers with the metrics permission (responses only). */
+            tables?: Record<string, never>;
         };
         /** @description One of the two members; 0 means unlimited. */
         QuotaRequest: {
@@ -20838,6 +20877,92 @@ export interface operations {
             422: components["responses"]["Unprocessable"];
             501: components["responses"]["NotImplemented"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getQueryReasoning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The setting. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryReasoningSetting"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setQueryReasoning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryReasoningSetting"];
+            };
+        };
+        responses: {
+            /** @description The setting. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryReasoningSetting"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    clearQueryReasoning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The setting, now empty. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryReasoningSetting"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

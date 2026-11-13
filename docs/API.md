@@ -9241,7 +9241,9 @@ the input graphs, a budget and the policy for a stale materialization:
 ```
 
 Every member is optional. Without `default`, queries read the materialized inferences as
-before. Without `profile`, derivation uses the profile, rules and inputs of the last
+before. HTTP queries and `sparkles query` follow `default`, and library callers apply it
+with `Dataset::inference_view(Dataset::default_reasoning_mode())`, since
+`Dataset::query` reads the materialized inferences. Without `profile`, derivation uses the profile, rules and inputs of the last
 materialization, so `auto` compares like with like. `profile: "rules"` takes the Jena
 rule text in `rules`. `budget.maxDerived` applies when a query names no `maxDerived`,
 under the server's `--reason-max-derived`, and a derivation that runs longer than
