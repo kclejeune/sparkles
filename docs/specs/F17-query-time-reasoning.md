@@ -930,7 +930,9 @@ Three changes keep item 191's guarantee and repair the path.
   GeoSPARQL default geometries, neither reads nor keeps a proof, and nor does a session
   whose rules read `now` or make blank nodes, since its schema pass can give other
   facts than the pass of another session. A blank node's label follows the order the
-  session met its terms in, and a rule can test it. The cache holds at most 64 views and drops the oldest, and `nocache` does
+  session met its terms in, and a rule can test it. A session prepared again, as a
+  why-not search prepares its session for each step, holds the facts its earlier
+  derivations gave, so it neither reads nor keeps a proof and keeps no schema table. The cache holds at most 64 views and drops the oldest, and `nocache` does
   not bypass it, like the schema table. A view that cannot be cached, such as a
   transaction's snapshot, proves again in every session. The first query after a commit
   still pays the two scans and the abstraction, which item 190 keeps for measurement.
