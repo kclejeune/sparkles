@@ -108,7 +108,7 @@ pub struct DlIx {
     /// for a minimum's name, the names of the minimums that entail it, as
     /// [`super::dl_norm::DlAx::blockers`]
     pub blockers: FxHashMap<Ex, Box<[Ex]>>,
-    /// for a minimum's name, the conjunction of its witnesses
+    /// for a minimum's name that has witnesses of its own, their conjunction
     pub witnesses: FxHashMap<Ex, Ex>,
     /// by expression, whether it is a minimum's name, for the order of atoms
     least: Vec<bool>,
@@ -249,7 +249,11 @@ impl DlIx {
             .iter()
             .map(|(&h, v)| (h, v.clone().into_boxed_slice()))
             .collect();
-        d.witnesses = dl.least.iter().copied().collect();
+        d.witnesses = dl
+            .least
+            .iter()
+            .filter_map(|&(g, w)| w.map(|w| (g, w)))
+            .collect();
         if d.order {
             d.least = vec![false; nodes];
             for &(g, _) in &dl.least {

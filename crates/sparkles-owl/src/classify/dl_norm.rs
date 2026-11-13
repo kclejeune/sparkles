@@ -67,8 +67,9 @@ pub struct DlAx {
     /// without the root (F24, "The order between number restrictions")
     pub order: bool,
     /// with the order, the name of each minimum, a fresh class, with the conjunction of
-    /// its witnesses, its told subsumer
-    pub least: Vec<(Ex, Ex)>,
+    /// its witnesses, its told subsumer. A name that is told below an equivalent minimum's
+    /// name has none, since that minimum's witnesses are its own.
+    pub least: Vec<(Ex, Option<Ex>)>,
     /// with the order, for a minimum's name, the names of the minimums that entail it, a
     /// minimum at least as large over a role below its role and a filler below its
     /// filler: a context that holds one of them as a unit does not make the witnesses of
@@ -93,7 +94,7 @@ impl DlAx {
                 .iter()
                 .map(|(_, es)| es.capacity() * 4)
                 .sum::<usize>()
-            + self.least.capacity() * 8
+            + self.least.capacity() * std::mem::size_of::<(Ex, Option<Ex>)>()
             + super::saturate::table_bytes(
                 self.blockers.capacity(),
                 std::mem::size_of::<(Ex, Vec<Ex>)>(),
@@ -1238,10 +1239,10 @@ fn normalize_within(
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
     }
-    let blockers = if order {
+    let (blockers, spared) = if order {
         number_order(it, ax, &all.least, &all.atmost, relations, stop)?
     } else {
-        FxHashMap::default()
+        Default::default()
     };
     unfold(it, ax, &all.clauses, &mut rb);
     let mut dl = DlAx {
@@ -1254,7 +1255,11 @@ fn normalize_within(
         low: all.low,
         order,
         blockers,
-        least: all.least.iter().map(|l| (l.0, l.1)).collect(),
+        least: all
+            .least
+            .iter()
+            .map(|l| (l.0, (!spared.contains(&l.0)).then_some(l.1)))
+            .collect(),
         ..DlAx::default()
     };
     // the hypothetical successor of each existential restriction
@@ -1300,6 +1305,13 @@ const ORDER_RELATIONS: usize = 1 << 20;
 /// without a blocker makes its witnesses, so the rest are left out. A minimum that is told
 /// equivalent to its representative gets both inclusions and the blocker together or
 /// none of them.
+///
+/// A name that is told below one of its blockers, as a name is below its representative
+/// and the larger of two equivalent representatives below the smaller, loses its
+/// inclusion into its own witnesses: wherever it holds, under a clause or as a unit, the
+/// blocker holds and has witnesses, or a blocker of its own. The second answer lists
+/// these names.
+#[allow(clippy::type_complexity)]
 fn number_order(
     it: &Interner,
     ax: &mut Axioms,
@@ -1307,10 +1319,10 @@ fn number_order(
     atmost: &[(Ex, u32, Role, Ex)],
     bound: usize,
     stop: &dyn Fn() -> bool,
-) -> Result<FxHashMap<Ex, Vec<Ex>>, Halt> {
+) -> Result<(FxHashMap<Ex, Vec<Ex>>, FxHashSet<Ex>), Halt> {
     let mut out: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
     if least.is_empty() {
-        return Ok(out);
+        return Ok((out, FxHashSet::default()));
     }
     let mut steps = 0usize;
     let mut poll = |n: usize| -> Result<(), Halt> {
@@ -1467,11 +1479,26 @@ fn number_order(
         );
         out.clear();
     }
+    // the names told below a blocker, and their inclusions into their own witnesses
+    let told: FxHashSet<(Ex, Ex)> = subs.iter().copied().collect();
+    let spared: FxHashSet<Ex> = out
+        .iter()
+        .filter(|(g, hs)| hs.iter().any(|&h| told.contains(&(**g, h))))
+        .map(|(&g, _)| g)
+        .collect();
+    if !spared.is_empty() {
+        let own: FxHashSet<(Ex, Ex)> = least
+            .iter()
+            .filter(|l| spared.contains(&l.0))
+            .map(|l| (l.0, l.1))
+            .collect();
+        ax.subs.retain(|p| !own.contains(p));
+    }
     ax.subs.extend(subs);
     clash.sort_unstable();
     clash.dedup();
     ax.disjoint.extend(clash);
-    Ok(out)
+    Ok((out, spared))
 }
 
 /// Whether the relation from each key to its values has no cycle.
@@ -1752,12 +1779,25 @@ mod tests {
             .collect();
         let weaker = least_of(&d, &ax, &mut it, "D");
         let first = *names.iter().min().unwrap();
+        let witnesses = |g: Ex| d.least.iter().find(|l| l.0 == g).unwrap().1;
+        let told = |g: Ex| -> Vec<Ex> {
+            let mut v: Vec<Ex> = ax.subs.iter().filter(|p| p.0 == g).map(|p| p.1).collect();
+            v.sort_unstable();
+            v
+        };
         for &g in &names {
             if g == first {
                 assert!(!d.blockers.contains_key(&g));
+                // the representative keeps its witnesses beside the names it is told
+                // to be below
+                let w = witnesses(g).unwrap();
+                assert!(ax.subs.contains(&(g, w)));
             } else {
                 assert_eq!(d.blockers.get(&g), Some(&vec![first]));
                 assert!(ax.subs.contains(&(g, first)) && ax.subs.contains(&(first, g)));
+                // the representative's witnesses are its own, under a clause as well
+                assert_eq!(witnesses(g), None);
+                assert_eq!(told(g), vec![first]);
             }
         }
         // the weaker minimum is blocked by the representative alone
@@ -1820,6 +1860,7 @@ mod tests {
             .collect();
         assert_eq!(into.len(), 3);
         assert!(into.contains(&(c, b)));
+        assert!(d.least.iter().all(|l| l.1.is_some()));
     }
 
     /// Under any bound on its relations the order is a part of the whole one, with no
@@ -1851,12 +1892,26 @@ mod tests {
             let (taken, d, ax, _) = run_order_within(body, true, bound);
             assert!(taken.iter().all(|&t| t));
             assert_eq!(d.least.len(), 6);
-            let subs = ax
+            let subs: BTreeSet<(Ex, Ex)> = ax
                 .subs
                 .iter()
                 .copied()
                 .filter(|p| !base_subs.contains(p))
                 .collect();
+            // a name has witnesses of its own unless it is told below one of its blockers
+            for &(g, w) in &d.least {
+                let below = d
+                    .blockers
+                    .get(&g)
+                    .is_some_and(|hs| hs.iter().any(|&h| subs.contains(&(g, h))));
+                assert_eq!(w.is_none(), below, "bound {bound}");
+                let own = base_subs
+                    .iter()
+                    .filter(|p| p.0 == g)
+                    .filter(|p| ax.subs.contains(p))
+                    .count();
+                assert_eq!(own, usize::from(!below), "bound {bound}");
+            }
             let sets = ax
                 .disjoint
                 .iter()
@@ -1891,6 +1946,30 @@ mod tests {
         }
         let all = part(24);
         assert!(all.0 == whole.0 && all.1 == whole.1 && all.2 == whole.2);
+    }
+
+    /// Two minimums over equivalent roles entail each other. The one with the smaller
+    /// name blocks the other, which is told below it and so has no witnesses of its own.
+    #[test]
+    fn of_two_equivalent_minimums_the_larger_name_has_no_witnesses_of_its_own() {
+        let (d, ax, mut it) = run_order(
+            "EquivalentObjectProperties(:r :t)
+             SubClassOf(:A ObjectMinCardinality(2 :r :F))
+             SubClassOf(:B ObjectMinCardinality(2 :t :F))",
+            true,
+        );
+        let (a, b) = (
+            least_of(&d, &ax, &mut it, "A"),
+            least_of(&d, &ax, &mut it, "B"),
+        );
+        let (first, second) = (a.min(b), a.max(b));
+        assert!(ax.subs.contains(&(a, b)) && ax.subs.contains(&(b, a)));
+        assert_eq!(d.blockers.get(&second), Some(&vec![first]));
+        assert!(!d.blockers.contains_key(&first));
+        let witnesses = |g: Ex| d.least.iter().find(|l| l.0 == g).unwrap().1;
+        assert_eq!(witnesses(second), None);
+        let w = witnesses(first).unwrap();
+        assert!(ax.subs.contains(&(first, w)));
     }
 
     #[test]

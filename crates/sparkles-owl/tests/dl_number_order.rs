@@ -432,10 +432,10 @@ fn a_minimum_in_a_disjunction() {
 
 /// A minimum under a clause whose name is not the representative of its strength: `X`
 /// states the minimum first, so its name stands for the one in `A`'s union. In `A` neither
-/// holds as a unit, so nothing blocks the alternative, whose witnesses over the
-/// unsatisfiable filler refute it and leave `P`.
+/// holds as a unit. The alternative is told below its representative, whose witnesses over
+/// the unsatisfiable filler refute it and leave `P`.
 #[test]
-fn a_minimum_under_a_clause_makes_its_witnesses_without_its_representative() {
+fn a_minimum_under_a_clause_takes_the_witnesses_of_its_representative() {
     check(
         &format!(
             "SubClassOf(:X ObjectMinCardinality(2 :r :F))
@@ -446,6 +446,44 @@ fn a_minimum_under_a_clause_makes_its_witnesses_without_its_representative() {
         ),
         &[("A", "P"), ("X", "Nothing"), ("F", "Nothing")],
         &[("A", "Nothing"), ("P", "Nothing")],
+    );
+}
+
+/// A cardinality that two classes state, in a context that holds both classes only under
+/// a clause, as the hypothetical successor of the exact cardinality over `s` does here.
+/// No minimum is a unit there, so no unit blocks the second one. A name that made its own
+/// witnesses and those of its representative gave the context six successors over `s` for
+/// its maximum of three, and the run passed its bound where the run without the order
+/// derives 894 conclusions. The ontology is a generated one, `fz-0273` of the item's
+/// fuzzing, with HermiT's answer.
+#[test]
+fn a_cardinality_stated_twice_has_one_group_of_witnesses_under_a_clause() {
+    let (on, off) = check(
+        &format!(
+            "SubObjectPropertyOf(:r0 :r1)
+             EquivalentObjectProperties(:r0 :r2)
+             SubClassOf(:C0 ObjectExactCardinality(3 :s :C1))
+             SubClassOf(:C1 ObjectExactCardinality(3 :s :C1))
+             SubClassOf(:C2 ObjectExactCardinality(4 :r2 :C0))
+             SubClassOf(:C3 ObjectMaxCardinality(4 :r2 :C3))
+             SubClassOf(:C2 :C3)
+             SubClassOf(:C0 :C3)
+             EquivalentClasses(:C0 ObjectIntersectionOf(:C1
+               ObjectMaxCardinality(0 :r1 ObjectUnionOf(:C0 :C1))))
+             SubClassOf(:C0 ObjectAllValuesFrom(:r2 :C2))
+             DisjointClasses(:C3 :C1)
+             SubClassOf(:C1 ObjectExactCardinality(2 ObjectInverseOf(:s) :C3))
+             {UNION}"
+        ),
+        &[("C0", "Nothing"), ("C2", "Nothing")],
+        &[("C1", "Nothing"), ("C3", "Nothing")],
+    );
+    assert!(!off.stats.dl_over_budget);
+    assert!(
+        on.stats.dl_work <= off.stats.dl_work,
+        "the order added work: {} against {}",
+        on.stats.dl_work,
+        off.stats.dl_work
     );
 }
 
