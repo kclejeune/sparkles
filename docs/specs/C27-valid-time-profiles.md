@@ -260,6 +260,50 @@ each recorded time load before any write is admitted. The refusals and the order
 therefore hold across restarts without new state, and availability adds no on-disk
 record of its own.
 
+### 4.4 Validity records through the authenticated writer
+
+A claim occurrence proposed through the C25 writer can carry one validity record. The
+templates read a claim and its interval from one graph, and only the evidence owner
+writes the proposal graph, so the writer itself records the interval. The claim input
+has an optional `validity` member with a `start` boundary, an `end` boundary and a
+`normalization` description. A boundary has a `kind` of `known`, `unknown` or
+`unbounded`. A known boundary has `earliest` and `latest` instants, a `precision` IRI
+and a `sourceValue` string. An unknown or unbounded boundary has no instants and may
+keep a `sourceValue`. The normalization has a `status` of `normalized`, `unresolved`,
+`unsupportedCalendar`, `unsupportedPrecision`, `indeterminateOrder` or
+`nonexistentLocalTime`, a `method` IRI, a `methodVersion` string and a `calendar` IRI.
+It may add a `timezonePolicy`, a `tzdbVersion` and a `foldChoice` of `earlier` or
+`later`.
+
+The writer adds the record to the claim's own triples in the claim's graph. The claim
+receives `vt:validDuring` with the interval, and the interval, its two boundaries and
+its normalization use fragment IRIs of the claim, namely `#validity`,
+`#validity-start`, `#validity-end` and `#validity-normalization`. Each known instant is
+stored as its UTC value, and its source expression stays in `vt:sourceValue`. The
+normalization is a description of the run that interpreted this claim's source time, so
+each record carries its own copy rather than naming a shared run node that the writer
+does not own.
+
+The writer refuses a validity record that the version 1 shapes would refuse, before
+the capability, the hold and the commit. An instant without an explicit offset, a
+reversed envelope, a known boundary without its precision or source value, an unknown
+or unbounded boundary with instants and a normalized status with a calendar other than
+`vt:Gregorian` are all refused. A fold choice without a timezone policy and a pinned
+database version is refused too. When both boundaries are known, the latest start must
+precede the earliest end, and an overlap is refused with `temporal-indeterminate-order`
+in its message. An importer that cannot order the endpoints records them as unknown
+under the `indeterminateOrder` status instead. Open claim scope refuses every predicate
+in the `vt:` namespace, so validity enters only through this member.
+
+The record is immutable content of the claim. The record digest covers its triples,
+and the proposal's payload digest frames the member under its own tag only when it is
+present. A claim without validity therefore keeps its record digest, its payload digest
+and the outcome of an idempotent replay. The same occurrence key with other validity
+answers `409 immutable-record-conflict`, and a corrected interval is a new occurrence.
+Event occurrence windows are not a claim input, because an event is not a claim
+occurrence. This adds no storage format. It adds an optional member to the claim input
+of `POST /{ds}/claims`, the MCP tool `propose_claims` and `sparkles::evidence::propose`.
+
 ## 5. Example
 
 An imported advisory revision says a product relationship was valid throughout an
