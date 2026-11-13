@@ -173,37 +173,6 @@ struct Norm<'a> {
     /// whether the run has individuals, so that it is rooted: nominals become the
     /// singleton classes `N_u`, and what their rules leave out is refused
     rooted: bool,
-    /// the names already made for compound expressions, shared between the axioms when
-    /// [`super::dl_rules::share`] is on
-    memo: &'a mut Memo,
-}
-
-/// The names of the compound class expressions that the normalization has translated, by
-/// polarity, so that an expression that occurs in several axioms has one name, one set of
-/// clauses and, for a minimum, one group of witnesses. `journal` lists the entries of the
-/// axiom being normalized, which are removed when the axiom is refused, since its other
-/// outputs are dropped with it.
-#[derive(Default)]
-struct Memo {
-    on: bool,
-    pos: FxHashMap<ClassExpression, Ex>,
-    neg: FxHashMap<ClassExpression, Ex>,
-    journal: Vec<(bool, ClassExpression)>,
-}
-
-impl Memo {
-    fn commit(&mut self) {
-        self.journal.clear();
-    }
-    fn rollback(&mut self) {
-        for (pos, c) in self.journal.drain(..) {
-            if pos {
-                self.pos.remove(&c);
-            } else {
-                self.neg.remove(&c);
-            }
-        }
-    }
 }
 
 /// The largest minimum that becomes that many existential restrictions.
@@ -299,19 +268,6 @@ impl Norm<'_> {
 
     /// `x` with `x ⊑ c`.
     fn pos(&mut self, c: &ClassExpression, depth: usize) -> Result<Ex, Why> {
-        if !self.memo.on || self.rooted || matches!(c, ClassExpression::Class(_)) {
-            return self.pos_raw(c, depth);
-        }
-        if let Some(&e) = self.memo.pos.get(c) {
-            return Ok(e);
-        }
-        let e = self.pos_raw(c, depth)?;
-        self.memo.pos.insert(c.clone(), e);
-        self.memo.journal.push((true, c.clone()));
-        Ok(e)
-    }
-
-    fn pos_raw(&mut self, c: &ClassExpression, depth: usize) -> Result<Ex, Why> {
         use ClassExpression as C;
         if depth > 256 {
             return Err("class expressions nested too deeply");
@@ -534,19 +490,6 @@ impl Norm<'_> {
 
     /// `y` with `c ⊑ y`.
     fn neg(&mut self, c: &ClassExpression, depth: usize) -> Result<Ex, Why> {
-        if !self.memo.on || self.rooted || matches!(c, ClassExpression::Class(_)) {
-            return self.neg_raw(c, depth);
-        }
-        if let Some(&e) = self.memo.neg.get(c) {
-            return Ok(e);
-        }
-        let e = self.neg_raw(c, depth)?;
-        self.memo.neg.insert(c.clone(), e);
-        self.memo.journal.push((false, c.clone()));
-        Ok(e)
-    }
-
-    fn neg_raw(&mut self, c: &ClassExpression, depth: usize) -> Result<Ex, Why> {
         use ClassExpression as C;
         if depth > 256 {
             return Err("class expressions nested too deeply");
@@ -1134,10 +1077,6 @@ pub fn normalize(
         it.role(RoleName::Inverse(p));
     }
     let mut all = Out::default();
-    let mut memo = Memo {
-        on: counting && super::dl_rules::share(),
-        ..Memo::default()
-    };
     for (i, k) in axioms.iter().enumerate() {
         if !Norm::is_role_axiom(k) {
             continue;
@@ -1147,14 +1086,10 @@ pub fn normalize(
             out: Out::default(),
             counting,
             rooted,
-            memo: &mut memo,
         };
         if n.role_axiom(k).is_ok() {
             all.extend(n.out);
             taken[i] = true;
-            memo.commit();
-        } else {
-            memo.rollback();
         }
     }
     let mut disjunctive = 0;
@@ -1167,7 +1102,6 @@ pub fn normalize(
             out: Out::default(),
             counting,
             rooted,
-            memo: &mut memo,
         };
         if n.axiom(k).is_ok() {
             if !super::dl::shape(k).horn {
@@ -1175,9 +1109,6 @@ pub fn normalize(
             }
             all.extend(n.out);
             taken[i] = true;
-            memo.commit();
-        } else {
-            memo.rollback();
         }
     }
     if disjunctive == 0 {
@@ -1260,9 +1191,6 @@ pub fn normalize(
     for (r, c) in nonsimple_ranges {
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
-    }
-    if counting && !rooted && super::dl_rules::shadow() {
-        shadow(it, ax, &mut all.clauses, &rb, &inv);
     }
     let blockers = if counting && !rooted && super::dl_rules::lattice() {
         lattice(it, ax, &all.least, &all.atmost)
@@ -1393,82 +1321,6 @@ fn lattice(
     clash.dedup();
     ax.disjoint.extend(clash);
     out
-}
-
-/// Gives each existential restriction over a simple role in a negative position a name of
-/// its own, `N` with `F ⊑ ∀r⁻.N` for `∃r.F ⊑ N`, as the paper's normal form writes a
-/// negative existential restriction, so that the atom a neighbour derives is not the
-/// positive restriction, which makes a successor term. An experiment of item 894's second
-/// look, behind [`super::dl_rules::shadow`]. Without it the expression `∃r.F` is both: a
-/// context that learns from a neighbour that it has an `r`-neighbour in `F` then makes a
-/// further successor for it, a copy of that neighbour, which the at-most rule counts.
-fn shadow(
-    it: &mut Interner,
-    ax: &mut Axioms,
-    clauses: &mut [(Vec<Ex>, Vec<Ex>)],
-    rb: &RoleBox,
-    inv: &[Role],
-) {
-    struct Sh<'a> {
-        it: &'a mut Interner,
-        rb: &'a RoleBox,
-        inv: &'a [Role],
-        memo: FxHashMap<Ex, Ex>,
-        subs: Vec<(Ex, Ex)>,
-    }
-    impl Sh<'_> {
-        fn of(&mut self, e: Ex) -> Ex {
-            if let Some(&n) = self.memo.get(&e) {
-                return n;
-            }
-            let n = match self.it.nodes[e as usize] {
-                Node::Conj(a, b) => {
-                    let (a, b) = (self.of(a), self.of(b));
-                    self.it.conj(a, b)
-                }
-                Node::Exist(r, f) => {
-                    let g = self.of(f);
-                    match self.inv.get(r as usize) {
-                        Some(&i) if i != NO_ROLE && self.rb.simple(r) && self.rb.simple(i) => {
-                            let n = self.it.fresh_class();
-                            let all = self.it.node(Node::Forall(i, n));
-                            self.subs.push((g, all));
-                            n
-                        }
-                        _ => self.it.node(Node::Exist(r, g)),
-                    }
-                }
-                _ => e,
-            };
-            self.memo.insert(e, n);
-            n
-        }
-    }
-    let mut sh = Sh {
-        it,
-        rb,
-        inv,
-        memo: FxHashMap::default(),
-        subs: Vec::new(),
-    };
-    for (a, _) in ax.subs.iter_mut() {
-        *a = sh.of(*a);
-    }
-    for set in ax.disjoint.iter_mut() {
-        for e in set.iter_mut() {
-            *e = sh.of(*e);
-        }
-        set.sort_unstable();
-        set.dedup();
-    }
-    for (body, _) in clauses.iter_mut() {
-        for e in body.iter_mut() {
-            *e = sh.of(*e);
-        }
-        body.sort_unstable();
-        body.dedup();
-    }
-    ax.subs.extend(sh.subs);
 }
 
 /// The universals on roles that are not simple, unfolded by the roles' automata: those that

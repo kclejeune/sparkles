@@ -847,23 +847,6 @@ pub fn low_h() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_LOW_H").is_some_and(|v| v == "1"))
 }
 
-/// Whether a run that counts without the root gives one name to a compound class
-/// expression that several axioms hold, so that a cardinality has one group of witnesses,
-/// one holder and one clause, which `SPARKLES_DL_SHARE=1` turns on. An experiment of item
-/// 894's second look, off by default.
-pub fn share() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_SHARE").is_some_and(|v| v == "1"))
-}
-
-/// Whether a run that counts without the root names the existential restrictions over
-/// simple roles in negative positions apart from the positive ones, which
-/// `SPARKLES_DL_SHADOW=1` turns on. An experiment of item 894's second look, off by default.
-pub fn shadow() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_SHADOW").is_some_and(|v| v == "1"))
-}
-
 /// Whether a run that counts without the root orders its number restrictions by
 /// entailment, which `SPARKLES_DL_LATTICE=1` turns on. An experiment of item 894's second
 /// look, off by default.
