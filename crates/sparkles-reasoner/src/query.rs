@@ -1135,11 +1135,17 @@ impl Session {
         // The proof depends on the rules, the view and the schema the session holds,
         // so a later session of the same view whose schema came the same way reads it
         // instead of scanning again (spec F17, item 911). A session with facts of its
-        // own neither reads nor keeps a proof.
+        // own neither reads nor keeps a proof, and nor does a program that reads `now`,
+        // whose schema pass gives each session its own facts.
+        let now = self.rules.iter().any(|r| {
+            r.builtins
+                .iter()
+                .any(|b| b.kind == crate::builtins::BuiltinKind::Now)
+        });
         let proof_key = self
             .schema_view
             .as_ref()
-            .filter(|_| !self.added_facts)
+            .filter(|_| !self.added_facts && !now)
             .map(|v| (v.clone(), self.shared.digest, from_table));
         // the analysis's admission lasts while its closure sets are in use
         let mut _admission = None;
