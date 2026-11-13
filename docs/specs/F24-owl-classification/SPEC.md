@@ -2266,33 +2266,35 @@ does not establish how an exploration would charge such work against the present
 ore_ont_6485's attempt at the default bound derives 258,378 conclusions, 140,857 of them in
 the hypothetical successor of `∃r.HeteroAtom` over one of the bond roles, which 21
 predecessors share, and 29,424 in the hypothetical successor of a restriction over the same
-role whose filler is a name of the normalization, which 4 predecessors share. Neither
-context's cost is equality. In the first, 109,560 derivations are the disj rule's, which
-takes the cases of unions such as `HeteroAtom`, a union of four classes one of which is the
-union of five halogens. It processes 19,901 clauses whose bodies hold one to five of 21
-markers, the atoms over `x` that a predecessor can send, in 267 distinct sets. The second
-processes 4,843 clauses, 148 with one marker, 4,485 with two and 210 with three, out of 12
-markers in 36 distinct sets. The present calculus thus keeps one context and conditions its
-clauses on the sets of markers. The exploration instead makes a successor a conjunction of
-its filler and the facts that one branch of one predecessor sends, so each hypothetical
-successor becomes one conjunction for each set of markers that a predecessor's branch
-sends, each with branches of its own. In the processed clauses of the predecessors' contexts
-when the attempt stops, every marker is sent under a condition, 5 to 13 markers for each
-predecessor of the first successor and 10 for each predecessor of the second, so that
-snapshot allows up to 14,208 and 4,096 sets. A finished saturation could send more, and the
-conditions, inclusions and overlap between predecessors could make far fewer occur. The
-bond roles are symmetric, so a successor also counts its predecessor in its own exact
-cardinalities, and a conjunction must state whether the predecessor has each qualifier
-that counts it. The ontology's exact cardinalities over the bond roles have the seven
-qualifiers `OxygenAtom`, `BromineAtom`, `HalogenAtom`, `HydrogenAtom`, `CarbonAtom`,
-`Alkyl` and `OrganicGroup`. Under its told disjointness and inclusions, where `BromineAtom`
-is a halogen and `Alkyl` is a carbon atom and an organic group, they allow 13 combinations
-for a predecessor, and the cardinalities of the classes of oxygen and nitrogen, with the
-qualifiers `HydrogenAtom`, `CarbonAtom` and `Alkyl`, allow 4. For this snapshot the
-conjunctions of the two successors are therefore at most 14,208 × 4 = 56,832 and 4,096 ×
-13 = 53,248, against the 267 and 36 sets of markers that the calculus conditions on. The
-number that the predecessors' branches send in practice is known only from an
-implementation, so these figures show no pass and no failure.
+role whose filler is a name of the normalization, which 4 predecessors share. The first
+context spends its work on case analysis. The second's largest rule is paramodulation, with
+12,240 of its 29,424 derivations, over equalities of a successor term with the predecessor
+such as `y ≈ f(x)`, which the merge keeps. In the first, 109,560 derivations are the disj
+rule's, which takes the cases of unions such as `HeteroAtom`, a union of four classes one
+of which is the union of five halogens. It processes 19,901 clauses whose bodies hold one
+to five of 21 markers, the atoms over `x` that a predecessor can send, in 267 distinct
+sets. The second processes 4,843 clauses, 148 with one marker, 4,485 with two and 210 with
+three, out of 12 markers in 36 distinct sets. The present calculus thus keeps one context
+and conditions its clauses on the sets of markers. The exploration instead makes a
+successor a conjunction of its filler and the facts that one branch of one predecessor
+sends, so each hypothetical successor becomes one conjunction for each set of markers that
+a predecessor's branch sends, each with branches of its own. In the processed clauses of
+the predecessors' contexts when the attempt stops, every marker is sent under a condition,
+5 to 13 markers for each predecessor of the first successor and 10 for each predecessor of
+the second, so that snapshot allows up to 14,208 and 4,096 sets. A finished saturation
+could send more, and the conditions, inclusions and overlap between predecessors could make
+far fewer occur. The bond roles are symmetric, so a successor also counts its predecessor
+in its own exact cardinalities, and a conjunction must state whether the predecessor has
+each qualifier that counts it. The ontology's exact cardinalities over the bond roles have
+the seven qualifiers `OxygenAtom`, `BromineAtom`, `HalogenAtom`, `HydrogenAtom`,
+`CarbonAtom`, `Alkyl` and `OrganicGroup`. Under its told disjointness and inclusions, where
+`BromineAtom` is a halogen and `Alkyl` is a carbon atom and an organic group, they allow 13
+combinations for a predecessor, and the cardinalities of the classes of oxygen and
+nitrogen, with the qualifiers `HydrogenAtom`, `CarbonAtom` and `Alkyl`, allow 4. For this
+snapshot the conjunctions of the two successors are therefore at most 14,208 × 4 = 56,832
+and 4,096 × 13 = 53,248, against the 267 and 36 sets of markers that the calculus
+conditions on. The number that the predecessors' branches send in practice is known only
+from an implementation, so these figures show no pass and no failure.
 
 Counting inside a branch needs more than the published calculus, whose rules are for ALCHI
 without number restrictions or equality and whose implementation takes transitive roles
@@ -2319,46 +2321,52 @@ sources that this round reads gives that proof. The exploration also replaces th
 context clauses that the Pred rule, the hypothetical successors, item 728's lazy clauses
 and item 804's rooted run are built on, so it is a new Tier D beside the present one.
 
-The narrower repair keeps the merge and changes what its at-most rule counts. In the merge's
-traces, a merged term is a candidate beside the terms that its set covers, and the session
-that measured it proposed that a product never take two candidates one of whose sets
-strictly contains the other's. The member sets of the merged terms follow from the filler
-facts that the transfer moves into them, since each witness has its own filler. In the
-merge's hottest context of ore_ont_6952, 108,839 of its 168,148 at-most and lazy
-conclusions at the default bound take such a pair, which leaves 59,309, and in that of
-ore_ont_10140, 69,929 of the 211,345 conclusions whose merged terms are known take one,
-which leaves 141,416. The products that remain are those of merged terms whose sets are
-incomparable, such as the merged terms of one witness of each group, whose number grows
-with the matchings above, and the merge's attempt on ore_ont_6952 at the larger bound
-derived 1,170,975 at-most and lazy conclusions without finishing. The repair does not reach
-ore_ont_6485, whose cost in the reverted engine is not equality. Under the merge, that
-file's hottest context, the one of `AcylBromideGroup`, makes 219,761 at-most conclusions
-over maximums of one, and the attempt interns 15,284 merged terms. A maximum of one merges
-any two incomparable candidates, so the repair does not stop those unions. Its completeness argument looks
-provable. A merged term that is an element of the model has a true role literal, which
-the transfer derives only from a clause whose merged atom is then true, so it covers every
-term of a strictly smaller set. The elements of the model are thus pairwise incomparable,
-and the weaker property of Lemma 29 needs to hold only for `n + 1` neighbours with pairwise
-incomparable sets, which the restricted products still derive. The argument would state
-this restriction and check it against the lazy clauses.
+The narrower repair keeps the merge and changes what its at-most rule counts. In the
+merge's traces, a merged term is a candidate beside the terms that its set covers, and the
+session that measured it proposed that a product never take two candidates one of whose
+sets strictly contains the other's. The member sets of the merged terms follow from the
+filler facts that the transfer moves into them, since each witness has its own filler. In
+the merge's hottest context of ore_ont_6952, 108,839 of its 168,146 at-most and lazy
+conclusions at the default bound take such a pair, which leaves 59,307, and in that of
+ore_ont_10140, 69,929 of its 211,275 take one, which leaves 141,346. The products that
+remain are those of merged terms whose sets are incomparable, such as the merged terms of
+one witness of each group, whose number grows with the matchings above, and the merge's
+attempt on ore_ont_6952 at the larger bound derived 1,170,975 at-most and lazy conclusions
+without finishing. The repair has no demonstrated pass on ore_ont_6485. In the reverted
+engine, that file's hottest context spends its work on case analysis, which the merge does
+not change. Under the merge, that file's hottest context, the one of `AcylBromideGroup`,
+makes 219,761 at-most conclusions over maximums of one, and the attempt interns 15,284
+merged terms. A maximum of one merges any two incomparable candidates, so the repair does
+not stop those unions, while the share of comparable products that it removes there is not
+measured. Its completeness argument looks provable. Fix an element `t` of the model. A
+merged successor term of `t` that `R` does not reduce and that is reached through a true
+role literal has that literal from the transfer, which derives it only from a clause whose
+merged atom is then true, so the term covers every successor of `t` with a strictly smaller
+set. The successors of `t` that are elements, neither reduced nor covered, are thus
+pairwise incomparable, and the weaker property of Lemma 29 needs to hold only for `n + 1`
+such neighbours, which the restricted products still derive. A merged term that `R` reduces
+to the predecessor counts as the predecessor, as before, and a lazy clause keeps the atoms
+of its head, so the same contradiction applies when they are false. The argument would
+state this local restriction for each parent.
 
 The options rank as follows, with their expected cost. Closing item 894 at its measured
 outcome, with counting off by default and the axioms that need it left out and reported as
 they are now, costs a change to F24, the roadmap row and a follow-up item, and it leaves
-item 894's acceptance unmet, which is a scope decision for the maintainer. Item 603
-already names saturation with a tableau as the path where the calculus cannot finish, and
-the partitions and conjunction counts above are what a follow-up item for counting by
-search would start from. The merge with the restricted products comes next. It costs one to
-two sessions, since the merge's code is one revert away and the change to the proof is
-small, and it is a bounded experiment whose snapshot leaves 35 and 67 percent of the
-at-most and lazy conclusions in the hottest contexts. It cannot reach ore_ont_6485, so it cannot by itself
-let counting be on by default. A split that builds the exploration for the two versions of
-the Protein Ontology costs a new Tier D with the counting extension above and its proof,
-and since ore_ont_6485 would still fall back, counting would stay off by default after it.
-Exploration for all three files costs the same with no demonstrated path for ore_ont_6485,
-whose snapshot alone allows tens of thousands of conjunctions for two successors. The round
-recommends closing the item, and treats the restricted merge as an optional experiment for
-the record rather than a path to the item's acceptance.
+item 894's acceptance unmet, which is a scope decision for the maintainer. Item 603 already
+names saturation with a tableau as the path where the calculus cannot finish, and the
+partitions and conjunction counts above are what a follow-up item for counting by search
+would start from. The merge with the restricted products comes next. It costs one to two
+sessions, since the merge's code is one revert away and the change to the proof is small,
+and it is a bounded experiment whose snapshot leaves 35 and 67 percent of the at-most and
+lazy conclusions in the hottest contexts. It has no demonstrated pass on ore_ont_6485,
+where the reverted engine's hottest context spends its work on case analysis, so it is
+unlikely by itself to let counting be on by default. A split that builds the exploration
+for the two versions of the Protein Ontology costs a new Tier D with the counting extension
+above and its proof, and since ore_ont_6485 would still fall back, counting would stay off
+by default after it. Exploration for all three files costs the same with no demonstrated
+path for ore_ont_6485, whose snapshot alone allows tens of thousands of conjunctions for
+two successors. The round recommends closing the item, and treats the restricted merge as
+an optional experiment for the record rather than a path to the item's acceptance.
 
 ### Nominals in the disjunctive rules
 
