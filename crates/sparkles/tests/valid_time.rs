@@ -714,8 +714,9 @@ mod availability {
             ))
             .unwrap();
         r.rows()
+            .unwrap()
             .into_iter()
-            .map(|row| match row[0].as_ref().unwrap() {
+            .map(|row| match row.values()[0].as_ref().unwrap() {
                 Term::Literal(l) => l.value().to_string(),
                 t => panic!("{t}"),
             })

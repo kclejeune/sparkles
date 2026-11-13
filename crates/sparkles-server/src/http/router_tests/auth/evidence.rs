@@ -494,6 +494,7 @@ async fn authenticated_availability_is_server_owned_and_cannot_be_backdated() {
             ))
             .unwrap()
             .rows()
+            .unwrap()
             .len(),
         1
     );
