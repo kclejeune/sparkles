@@ -552,6 +552,20 @@ impl Dataset {
         self.inner.store.set_guard_missing_reason(None);
     }
 
+    /// Install the write guard again so that its validations leave out the managed
+    /// graphs `hidden` (spec C26 §2.3), when it does not already. A change of the
+    /// graphs the store hides calls for it, since no commit of data marks that change.
+    pub(crate) fn rehide_write_guard(&self, mut hidden: Vec<String>) {
+        hidden.sort_unstable();
+        hidden.dedup();
+        if let Some(g) = self.write_guard()
+            && g.hidden() != hidden.as_slice()
+        {
+            let g = g.rehidden(&self.inner.store, hidden);
+            *self.inner.validation.write() = Some(g);
+        }
+    }
+
     /// Why the write guard that the dataset's `validation.json` asks for could not be
     /// installed. While this is set, writes fail with [`Error::GuardMissing`].
     pub fn guard_error(&self) -> Option<String> {

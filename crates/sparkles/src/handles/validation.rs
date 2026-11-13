@@ -85,6 +85,31 @@ pub struct GuardSetting {
 }
 
 impl GuardSetting {
+    /// Refuse a configuration that names one of the dataset's hidden control graphs
+    /// (spec C26 §2.3) as a source of its shapes or schema, or as a data graph, as for a
+    /// graph that does not exist, so that installing it never reads one.
+    #[cfg(any(feature = "shacl", feature = "shex"))]
+    fn refuse_hidden(
+        &self,
+        sources: Option<&[String]>,
+        data: &crate::guard::config::DataGraphSel,
+    ) -> Result<()> {
+        let hidden = self.ds.store().hidden_graphs();
+        let named = match data {
+            crate::guard::config::DataGraphSel::Graphs(gs) => gs.as_slice(),
+            crate::guard::config::DataGraphSel::Named(_) => &[],
+        };
+        match sources
+            .into_iter()
+            .flatten()
+            .chain(named)
+            .find(|g| hidden.contains(g))
+        {
+            Some(g) => Err(crate::Error::NotFound(format!("no such graph: <{g}>"))),
+            None => Ok(()),
+        }
+    }
+
     /// The installed guard, whose `json()` is its configuration and status.
     pub fn get(&self) -> Option<WriteGuard> {
         self.ds.write_guard()
@@ -95,6 +120,7 @@ impl GuardSetting {
     #[cfg(feature = "shacl")]
     pub fn set_shacl(&self, cfg: sparkles_shacl::guard::ValidationConfig) -> Result<GuardOutcome> {
         use sparkles_shacl::guard::{SetOutcome, set_config};
+        self.refuse_hidden(cfg.shapes.graphs.as_deref(), &cfg.data_graph)?;
         Ok(
             match set_config(self.ds.store(), Some(cfg)).map_err(super::from_anyhow)? {
                 SetOutcome::Installed(g, s) => {
@@ -119,6 +145,7 @@ impl GuardSetting {
         resolver: &dyn sparkles_shex::Resolver,
     ) -> Result<GuardOutcome> {
         use sparkles_shex::guard::{SetOutcome, set_config};
+        self.refuse_hidden(cfg.schema.graphs.as_deref(), &cfg.data_graph)?;
         Ok(
             match set_config(self.ds.store(), Some(cfg), resolver).map_err(super::from_anyhow)? {
                 SetOutcome::Installed(g, s) => {

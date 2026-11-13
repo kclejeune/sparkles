@@ -2369,14 +2369,14 @@ fn an_ontology_opened_before_jobs_are_enabled_is_not_reused_after() {
     assert_eq!(after.summary().triples, 0, "cached: {}", after.cached);
 }
 
-/// Shapes in the ledger graph, written before jobs were enabled, that a guard names.
+/// Shapes in the ledger graph that a guard installed before jobs were enabled names. A
+/// guard configured once jobs are enabled cannot name a hidden graph.
 #[cfg(feature = "shacl")]
 fn ledger_shapes(ds: &Dataset) {
     ds.update(&format!(
         "PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{LEDGER_GRAPH}> {{ <urn:SecretShape> a sh:NodeShape ; sh:targetClass <urn:Public> ; sh:property <urn:SecretPropertyShape> . <urn:SecretPropertyShape> sh:path <urn:secret-path> ; sh:minCount 1 }} }}"
     ))
     .unwrap();
-    configured(ds);
     ds.validation()
         .guard()
         .set_shacl(
@@ -2388,6 +2388,7 @@ fn ledger_shapes(ds: &Dataset) {
             .unwrap(),
         )
         .unwrap();
+    configured(ds);
 }
 
 #[cfg(feature = "shacl")]

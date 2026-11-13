@@ -1237,7 +1237,13 @@ impl Ontologies {
         // the dataset's hidden control graphs leave every view (spec C26 §2.3); a caller
         // that reads every other graph still shares the kept ontology
         let shared = opts.graphs.is_none();
-        let opts = &*self.ds.without_owner_graphs(opts);
+        // one reading of the hidden graphs serves both the view and the cache key, so an
+        // ontology opened across an owner's enablement is kept under the visibility it
+        // was read with
+        let hidden = self.ds.store().hidden_graphs();
+        let mut hiding = opts.clone();
+        hiding.graphs = crate::access::GraphAccess::hiding_graphs(hiding.graphs.take(), &hidden);
+        let opts = &hiding;
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
             Some(a) => a.masked(snap)?,
@@ -1253,11 +1259,7 @@ impl Ontologies {
         };
         // the hidden graphs are part of the key: enabling an owner hides a graph without
         // a new commit of the data
-        let key = format!(
-            "{}|{:?}",
-            req.key(snap.commit, record.is_some()),
-            self.ds.store().hidden_graphs()
-        );
+        let key = format!("{}|{:?}", req.key(snap.commit, record.is_some()), hidden);
         if keep {
             let mut cache = self.ds.state().ontology_cache.lock();
             if let Some(i) = cache.iter().position(|e| e.key == key) {

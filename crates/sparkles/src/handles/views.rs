@@ -192,9 +192,23 @@ impl Dataset {
         o: &LiveOptions,
     ) -> Result<LiveQuery> {
         start(&self.inner, None);
-        // the dataset's hidden control graphs are never read (spec C26 §2.3)
-        let access = self.hide_owner_graphs(access);
-        self.inner.views.live(&self.inner.store, query, access, o)
+        // the dataset's hidden control graphs are never read (spec C26 §2.3). A
+        // subscription admitted while they changed may have missed the views' worker
+        // ending the others, so it is made again under the new ones.
+        let store = self.store();
+        for _ in 0..3 {
+            let hidden = store.hidden_graphs();
+            let a = GraphAccess::hiding_graphs(access.clone(), &hidden);
+            let live = self.inner.views.live(&self.inner.store, query, a, o)?;
+            if store.hidden_graphs() == hidden {
+                return Ok(live);
+            }
+            live.close();
+        }
+        Err(crate::incr::error(
+            "forbidden",
+            "what the dataset's callers may read kept changing; subscribe again",
+        ))
     }
 
     /// Attach an internal circuit for server code (spec F13 §3.6): a circuit that no
