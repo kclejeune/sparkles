@@ -154,6 +154,52 @@ Business effects still pass the worker run's current effective data grants, writ
 quotas and protected-branch checks. Internal access to job records cannot authorize a
 business quad. The proposed internal publisher is not a general write bypass.
 
+#### Write guards and the hidden graphs
+
+A write-time guard validates every commit that does not bypass it, and a job commit is
+such a commit. The guard therefore learns the hidden graphs where it decides, at the
+writer boundary, and keeps no copy of them that could outlive a registry change.
+
+The registry changes under the store's writer lock. `Store::change_managed` takes the
+writer, drains the group commit, publishes the new registry and then releases the writer.
+Every guard check runs under the writer lock of the store it validates, and the store
+passes the family's hidden graphs, read under that lock, in the candidate it checks. A
+registry change and a check of the same store are therefore ordered by the lock, and the
+check sees either the whole old registry or the whole new one. A job commit needs the
+jobs owner entry that enablement publishes, so it is checked after that publication and
+never meets a guard that reads the ledger as data.
+
+A branch store shares its family's registry but has its own writer lock. A branch check
+that reads the registry before main publishes a change is ordered before the change, and
+it validates the graphs that were visible at that point. A branch check that reads the
+registry afterwards leaves the new hidden graphs out. No branch commit is a job commit,
+since jobs run on main only.
+
+A guard keeps a validation state of the head, made of its exact counts, its baseline and
+the states of the commits it checked that are not yet published. Each state records the
+hidden graphs it was computed under. A check whose hidden graphs differ from those of its
+base state treats that state as unknown and validates in full, the state before the write
+included when the baseline policy compares them. The status and typing files are keyed by
+the configuration's hash and the hidden graphs, so a state kept on disk under other
+hidden graphs is not trusted after a reopen. On a dataset without hidden graphs the key is
+the configuration's hash itself and the files do not change.
+
+A guard reads its shapes or schema from its configured sources. Installing or replacing a
+guard configuration takes the writer lock before it reads the registry, and it refuses a
+source or a listed data graph that the registry hides, as for a graph that does not
+exist. A registry change that would hide a graph the store's guard reads as a source or a
+listed data graph is refused under the same lock, so jobs cannot be enabled under such a
+guard until it is reconfigured. A guard can still meet a hidden source, such as a branch
+guard forked from an older configuration. Its checks then reject every write with an
+error that names no graph, and the shapes of a hidden source are never reported. The
+guard does not fall back to validating without those shapes, since that would weaken
+validation without saying so.
+
+Enablement changes the hidden graphs without a commit of data. Once it has published the
+registry, it wakes the views runtime of main and of every open branch dataset. Each
+runtime compares its host's epoch at its next round and ends the live queries that were
+admitted under the old access.
+
 ## 3. Submission and idempotency
 
 `POST /$/jobs/{ds}` accepts a registered kind, typed payload, input selectors, optional
