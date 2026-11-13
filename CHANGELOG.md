@@ -23,6 +23,19 @@ stays off by default, since the three counting files of the ORE 2015 DL developm
 still pass its bound and classify again without it. This is roadmap item 728, and the
 calculus change that remains is item 894.
 
+`Limits::number_order`, off by default, adds the order between number restrictions to a
+counting run of the disjunctive rules without individuals. Each minimum cardinality in a
+positive position gets a name, the run tells itself that `≥m r.F` entails `≥n s.G` when
+`m ≥ n`, `r ⊑ s` and `F ⊑ G` are told and that it contradicts `≤k s.G` when `m > k`, and
+a context that holds a minimum makes no witnesses for a minimum that it entails. With it
+the two versions of the Protein Ontology in the ORE 2015 DL development set classify with
+counting and give HermiT's and Konclude's taxonomies, 6.3 and 6.5 times faster than
+Konclude 0.7.0 on four threads. ore_ont_6485 still passes the bound, and its failed
+attempt takes 3.1 times as long with the order, which roadmap item 896 follows. A counting
+run misses a maximum over a compound qualifier that no other axiom names, which is item
+897. Counting stays off by default. `el_classify` takes `--number-order`. This is roadmap
+item 894.
+
 ### Compatibility
 
 The adopted HTTP, CLI and public library compatibility policy is documented.

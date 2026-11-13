@@ -115,6 +115,20 @@ without counting, so counting stays off by default, and the calculus change for 
 equality reasoning over conditional successors that remains is item 894, which also takes
 the design's third part, the witnesses' shared context.
 
+Item 894 delivers [the order between number restrictions](#the-order-between-number-restrictions)
+as the option `Limits::number_order`, off by default. Its changes to the rules of the
+calculus, the cases of a union filler and the merge of successor terms, made no file
+classify and are not kept, and its exploration round stayed on paper. The order changes
+the clause set instead. A counting run without the root names each minimum, tells itself
+the entailments between minimums and their contradictions with maximums, and makes no
+witnesses for a minimum that a minimum of the context entails. With it ore_ont_6952 and
+ore_ont_10140 classify with counting on and give HermiT's and Konclude's taxonomies, 6.3
+and 6.5 times faster than Konclude 0.7.0 on four threads on `atlas` and 2.0 and 2.1 times
+on one. ore_ont_6485 still passes the bound, and its failed attempt takes 3.1 times as
+long with the order as without it. Item 896 follows that file and the default of
+counting. The item also found that a counting run misses a maximum over a compound
+qualifier that no other axiom names, which is item 897, so counting stays off by default.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -1178,12 +1192,15 @@ Counting is part of the same rules and is off by default. `Limits::counting` tur
 and `el_classify --counting` does the same. A run that does not count leaves the axioms
 that need counting out and reports them, and takes a minimum as the existential
 restriction it implies, so it costs what the classifier cost before counting. The reason
-is the cost on real ontologies, since no file of the ORE 2015 DL development set finishes
-with counting and the five that attempt it spend 2 to 30 times the time of the run
-without it before they give up where that run finishes. Item 728 replaced the clauses of
-every context and the hypothesis about the predecessor, as [its subsection](#item-728s-clauses-for-counting-over-definitions)
-records, and the three files still give up, so turning counting on is the work of item
-894, the calculus change for the equality reasoning that remains. A run that counts when asked takes a number restriction that the Horn rules
+is the cost on real ontologies. Five files of the ORE 2015 DL development set attempt
+counting. Without the order between number restrictions none of them finishes, and with
+it the two versions of the Protein Ontology finish, as [its subsection](#the-order-between-number-restrictions)
+records. The other three spend their attempt before they give up where the run without
+counting finishes. Item 728 replaced the clauses of every context and the hypothesis about
+the predecessor, as [its subsection](#item-728s-clauses-for-counting-over-definitions)
+records, item 894 added the order, and turning counting on is the work of item 896 for
+the cost that remains and of item 897 for a maximum over a compound qualifier, which a
+counting run misses. A run that counts when asked takes a number restriction that the Horn rules
 cannot take, a functional or inverse functional property, disjoint properties or an
 asymmetric property. The terms of a clause then include
 equalities of the successor terms and of a successor with the predecessor, and the order
@@ -1216,7 +1233,8 @@ with a bound of 4 million conclusions of its own, and sets `Stats::dl_counting_o
 as before. A run that does not count has no bound on its conclusions, only the memory
 budget. Of the 150 counting fixtures, all but three derive at most 190,000 conclusions on
 one thread, `shiq-046` derives 1.0 million and needs a raised `Limits::dl_work`, and
-`shq-041` and `shiq-028` pass any bound, item 729.
+`shiq-028` passes any bound, and `shq-041` passes any bound without the order between
+number restrictions and derives 17,844 conclusions with it, item 729.
 
 The bound has a limit that this section states plainly. Near it, the thread schedule can
 decide whether a run answers in full or falls back, since the clauses stored at the
@@ -2368,6 +2386,226 @@ path for ore_ont_6485, whose snapshot alone allows tens of thousands of conjunct
 two successors. The round recommends closing the item, and treats the restricted merge as
 an optional experiment for the record rather than a path to the item's acceptance.
 
+#### The order between number restrictions
+
+This subsection records what item 894 delivers. The rounds above changed rules of the
+calculus and left the three files past the bound. This one changes the clause set that the
+normalization gives the calculus in a run that counts without the root, and no inference
+rule. `Limits::number_order` asks for it. It is off by default and changes nothing without
+`Limits::counting`, in a rooted run, or in a run whose axioms need no counting. With it,
+ore_ont_6952 and ore_ont_10140 classify with counting on and give HermiT's and Konclude's
+taxonomies, and ore_ont_6485 still passes the bound, as the measurements below state.
+
+The traces of the earlier rounds show where the two versions of the Protein Ontology spend
+the bound. The normalization relates no two number restrictions. `PR_000026735` holds
+`=6 has_component.PR_P08034` and inherits `=6 has_component.PR_000007997`, with
+`PR_P08034 ⊑ PR_000007997` told, so its context makes twelve witnesses and the at-most rule
+searches their 720 matchings. `PR_000024883` holds `=3 has_component.MOD_00041`, and the
+definition of another class by `=2` over the same role and filler puts the alternative
+`≥3` with three witnesses of its own into the context's heads, which the context's maximum
+of three then matches with its own three. A minimum that the context already holds
+entails the second minimum in both cases, and the second group of witnesses adds nothing
+to any model.
+
+With the option, a minimum `≥n r.F` with `n ≥ 2` in a positive position becomes a fresh
+name `G` with the told inclusion `G ⊑ W`, where `W` is the conjunction of the `n`
+existential restrictions over fresh pairwise disjoint fillers below `F` that the
+normalization made before. The alternative `H` of item 728's clauses is such a minimum and
+gets a name in the same way. No rule builds `G` from the witnesses, so `G` holds only
+where an axiom or a clause states the minimum, and `G` ranks with `W` in the order of
+atoms. After the axioms are normalized, `dl_norm::number_order` closes the told role
+inclusions under reflexivity and transitivity, and closes the told class inclusions in the
+same way from each filler, with the operands of an intersection above it and `owl:Thing`
+and what the ontology tells of it above every filler. Each closure is a preorder of
+consequences of the ontology. A minimum `≥m r.F` then entails `≥n s.F'` when `m ≥ n`,
+`r ⊑ s` and `F ⊑ F'` are in the closures, and it contradicts a maximum `≤k s.B` when
+`m > k`, `r ⊑ s` and `F ⊑ B`. The normalization adds three kinds of relation from this.
+
+- The minimums of one bound, role and filler have a representative, the least name. Each
+  of the others is told equivalent to it and has it as its only blocker.
+- Between representatives, the name of a minimum is told to be below the name of each
+  minimum that it entails, and it is a blocker of that minimum. Two representatives that
+  entail each other, through equivalent roles or fillers, are told equivalent, and the
+  smaller name blocks the larger.
+- The name of a minimum and the holder `M` of a maximum that it contradicts are a
+  disjointness set, for the representative and for the names it stands for.
+
+A name that is told below one of its blockers keeps no inclusion into witnesses of its
+own. That is every name beside its representative and the larger name of two
+representatives that entail each other. Wherever such a name holds, as a unit or under a
+clause, the told inclusion gives the blocker under the same clause, and the blocker's
+witnesses are the name's.
+
+The blockers lie within a strict order, strict entailment and then the names, so they have
+no cycle. The normalization checks this, and a run would block nothing if a cycle showed.
+The relation is not transitive as stored, since a name that is not a representative has
+only its representative as a blocker. The relations are found through buckets of the
+minimums and the maximums by role and filler, so the cost is the size of the closures and
+not the square of the number of minimums. They number at most 1,048,576. Past that the
+rest are left out, which is sound and complete, since each is a consequence that the run
+can do without and a minimum without a blocker makes its witnesses. A name gets both
+inclusions to its representative and the blocker together or none of them. The closures
+poll the run's stop. The tables are charged to the estimates of `DlAx::bytes`,
+`DlIx::bytes` and `DlSt::bytes`. This memory buys the run's speed on ontologies with many
+related cardinalities, and on the two Protein Ontology files the peak resident memory with
+the order is 319 to 403 MiB against 267 to 343 MiB without counting.
+
+Two places in the engine read the tables. The first is blocking. A unit `G_2` that has
+blockers and witnesses of its own does not derive `W_2` with its other told subsumers.
+Its name waits in the context, in `DlSt::pending`, until the context has taken its units,
+which is when `dl_rules::flush` runs, and it then derives `W_2` unless the context holds
+as a unit a blocker of `G_2`. A clause `Γ → Δ ∨ G_2(x)` whose maximal literal is `G_2` skips the told
+step to `W_2` when the context holds such a unit, and takes it otherwise. A context with a
+waiting name is not idle, so a run that a deadline, a cancellation or the memory budget
+stops in that window reports the context's class incomplete. The second place is a cut.
+`dl_rules::derive` removes from the head of a derived clause an atom over `x` that is in a
+disjointness set with a unit of the context. The cut applies only in a run with the order,
+so a run without it derives what it derived before.
+
+The argument has a part for the clause set and a part for the two rules. Let `T` be the
+ontology after the structural transformation, with each positive minimum read as a
+minimum, and `O` the clause set of the run without the order, in which each such minimum
+is its conjunction of witnesses. `T` and `O` have the same consequences between the
+ontology's classes by Kazakov's Lemma 2, as before. Its argument does not extend an
+arbitrary model of `T`. It takes a model that refutes a subsumption, unravels it into a
+tree, and colours the neighbours of each element with the fresh fillers from the root
+down. An element's neighbours over a simple role are its predecessor and its successors,
+the predecessor carries at most one filler of a group when the element is reached, and
+the element is free in the fillers of its successors, so the colouring exists. Let `O⁺`
+be the clause set with the names, the inclusions `G ⊑ W` and the relations. Replacing each
+name by its conjunction in the clauses without the relations gives `O` back, so `O⁺`
+entails every consequence of `O`. In the other direction, the coloured tree model becomes
+a model of `O⁺` when each `G` is read as the set of elements with `n` neighbours over `r`
+in `F`. Every such element has its witnesses by the colouring, the told inclusions between
+names hold because the closures hold in the model, and a name and a maximum's holder that
+it contradicts share no element. So `O⁺` has the consequences of `T` between the
+ontology's classes and no others.
+
+For blocking, let `O'` be `O⁺` with each clause `G_2(x) → W_2(x)` replaced by
+`G_2(x) → W_2(x) ∨ ⋁ G_1(x)` over the blockers `G_1` of `G_2`. `O⁺` entails `O'`, so `O'`
+is sound. `O'` also entails every consequence of `T` between the ontology's classes. In a
+model of `O'`, by induction on the blockers, which is well founded since they have no
+cycle and are finitely many, an element of `G_2` has `n` neighbours over `s` in `F'`. It
+either satisfies `W_2`, or it is in a blocker `G_1` for a minimum `≥m r.F`, has `m`
+neighbours over `r` in `F` by the induction, and these are neighbours over `s` in `F'`
+because the told inclusions are clauses of `O'`. So every model of `O'` satisfies each
+axiom of `T` that states a minimum, and the other clauses of `T` are in `O'`. A context of
+the blocked run is saturated for `O'` up to redundancy. Where a blocker holds as a unit,
+the Hyper conclusion `Γ → Δ ∨ W_2 ∨ ⋁ G_1` contains that unit's atom and is redundant.
+Where none holds when the step is taken, the run derives `Γ → Δ ∨ W_2`, which subsumes the
+conclusion. A blocker that becomes a unit after `W_2` was derived leaves sound clauses
+behind, and a unit is never withdrawn. For a name `G_2` that is told below a blocker
+`G_1`, the clause `G_2(x) → W_2(x) ∨ ⋁ G_1(x)` of `O'` is subsumed by the told clause
+`G_2(x) → G_1(x)`, so `O'` without it is the same clause set up to redundancy, and the run
+leaves the name's witnesses out everywhere. Without this, a cardinality that two axioms
+state made two groups of witnesses in a context that holds both only under a clause, such
+as a hypothetical successor, where no minimum is a unit and nothing was blocked. The
+paper's Theorem 9 holds for any set of DL-clauses and therefore for `O'`, with the order of atoms unchanged apart from the rank
+of the names. The cut is the Hyper conclusion of the clause, the unit and the disjointness
+set. It is a consequence of the context's clauses and it subsumes the clause it replaces.
+In a hypothetical successor and in a test context the units it reads are conclusions of
+that context, relative to its core, and never the markers of a hypothesis.
+
+An earlier form of the design shared the first `n` witnesses of a larger minimum with a
+smaller one over the same role and filler. That is unsound with inverse roles. An element
+whose predecessor is the third witness of the predecessor's minimum cannot count it as the
+first or second witness of its own `≥2`, since the fillers are disjoint, so `≥2 r.F ⊓ ≤2 r.F`
+at that element would be unsatisfiable when the predecessor is one of its two neighbours.
+The order shares no filler. A blocked minimum makes no witnesses at all, and the model
+reads its neighbours from the blocker's. A regression holds this case.
+
+The measurements are of commit 35fb0f31 on `atlas`, with one process at a time in a 13 GiB
+scope, as medians of five classifications in one process, and for Konclude 0.7.0 of three
+processes. The whole run is the wall time of one process, with reading the file. The
+taxonomies with the order equal HermiT 1.4.5.519's and Konclude's on both versions of the
+Protein Ontology, where HermiT takes 392 and 228 s. Without counting each differs from
+them by four missing and four extra edges.
+
+| File | Threads | Without counting | Counting without the order | Counting with the order | Whole run with the order | Konclude, classification | Konclude, whole run |
+|---|---|---|---|---|---|---|---|
+| ore_ont_6952 | 1 | 875 ms | 1,039 ms, falls back | 1,154 ms | 1,313 ms | 2,336 ms | 3,169 ms |
+| ore_ont_6952 | 4 | 288 ms | 756 ms, falls back | 365 ms | 538 ms | 2,310 ms | 3,132 ms |
+| ore_ont_10140 | 1 | 913 ms | 1,107 ms, falls back | 1,178 ms | 1,404 ms | 2,510 ms | 3,694 ms |
+| ore_ont_10140 | 4 | 301 ms | 950 ms, falls back | 373 ms | 609 ms | 2,422 ms | 3,590 ms |
+| ore_ont_6485 | 1 | 7.0 ms | 184 ms, falls back | 576 ms, falls back | 609 ms | 40 ms | 55 ms |
+| ore_ont_6485 | 4 | 6.5 ms | 245 ms, falls back | 688 ms, falls back | 719 ms | 37 ms | 60 ms |
+
+On four threads the two Protein Ontology files classify 6.3 and 6.5 times faster than
+Konclude and their whole runs are 5.8 and 5.9 times faster. On one thread the
+classification is 2.0 and 2.1 times faster. The run with the order derives 23,282 and
+27,078 conclusions of the bound's 262,144 on one thread, and it costs 1.24 to 1.32 times
+the run without counting. On four threads it is also faster than the counting run
+without the order, which spends its attempt before it classifies again.
+
+The 207 development files of the ORE 2015 DL sample were classified with counting on
+four threads on `atlas`, without the order and with it, with 300 s and 13 GiB for each
+run. The reader refuses ore_ont_9881, and ore_ont_7192 passes the memory limit in both
+runs. The other 205 give a taxonomy in both runs, and the two taxonomies are the same
+bytes on 203 of them. The other two are ore_ont_6952 and ore_ont_10140, which fall back
+without the order and finish with it. Five files attempt counting, and ore_ont_6485,
+ore_ont_14817 and ore_ont_9663 pass the bound with the order as without it, in 646
+against 257 ms, 6.7 against 6.5 s and 3.8 against 4.1 s for the whole run. No run with
+the order passes its time where the run without it finishes. The runs are judged against
+HermiT's taxonomy for 67 files and against Konclude's for 135. Konclude cannot parse
+ore_ont_15516 and ore_ont_15993 and passes 300 s on ore_ont_7192, and the comparison
+passes its memory on ore_ont_10621, so those have no judgment. With the order 85 runs
+equal the reference and 117 leave axioms out and answer only entailed subsumptions,
+against 83 and 119 without it, and no run answers a subsumption that the reference does
+not entail.
+
+ore_ont_6485 remains a measured limitation. Its counting attempt still passes the bound
+with the order, and the failed attempt is dearer, 576 against 184 ms on one thread on
+`atlas`, 3.1 times, and 688 against 245 ms on four. The order removes the cheap
+derivations of the disjointness rule, which fall from 110,800 to 1,078, and the bound is
+then spent on the universal rule and the qualified roles, which rise from 30,563 and
+10,036 derivations to 118,258 and 68,900 and cost more each. What remains is the
+alternative `H` of a definition `=n r.F ⊓ … ⊑ C`. A context with `n` qualified neighbours
+derives `y ∨ H` with `H` maximal and makes `n + 1` hypothetical witnesses. The file has
+nine such restrictions over the symmetric bond roles, and a witness has a known neighbour,
+its predecessor, so it derives the same alternatives. Three hypothetical successors
+derive 69,109, 63,521 and 58,201 of the attempt's 281,121 conclusions. Two ideas are
+untried. A minimum could be blocked by a strictly stronger one that holds
+under the same clause and not only as a unit. A positive `∃r.F` whose negative name the context
+already holds could stay unexpanded, which needs a proof that the name is witnessed in the
+model. Both, and the default of counting, are item 896. Two other changes to the clause
+set were measured with the order and are not kept, one name per compound expression and
+a name of its own for a negative existential restriction, as
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md) records.
+
+A counting run has a gap that this item found and does not close. The qualifier of a
+maximum or of item 728's clauses is not registered as a negative occurrence, so a compound
+qualifier that no other axiom names is never derived at a neighbour, and the maximum
+counts no neighbour. `A ⊑ ≥2 r.C`, `C ⊑ P`, `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` leave `A`
+satisfiable in a run that reports itself complete, with the order or without it, and so
+does a maximum over `∃s.C`. A generated ontology of the item's fuzzing, inconsistent
+through a maximum over an intersection, is reported consistent. Registering the qualifier
+in the index and in the unfolding gives HermiT's answer on both, but the registered
+existential restriction is also the positive one, which makes a successor term at each
+neighbour, and the fixture `shq-015` then passes its bound on one thread and not on four.
+The repair is a name of the qualifier's own and is item 897. Counting stays off by
+default.
+
+The regressions are in `tests/dl_number_order.rs` and in the unit tests of `dl_norm.rs`
+and `dl_rules.rs`. Four hand cases pass the bound without the order and finish with it,
+the inherited cardinality over a wider filler, the cardinality stated twice, equivalent
+and wider roles, and recursive cardinalities over a symmetric role and an explicit
+inverse. The others cover the told contradiction with a maximum, fillers equivalent
+through `owl:Thing`, intersection and union qualifiers, unqualified minimums, unsatisfiable
+fillers, minimums under clauses, a refused axiom, every bound on the relations and the
+predecessor case above. The 206 fixtures of item 603 with a minimum or exact cardinality
+of two or more run with the order on one thread and on four with the eager strategy. Each
+answer is among HermiT's subsumptions, each case taken whole has exactly HermiT's, no case
+that stays in the bound without the order leaves it with the order, and 202 stay in it on
+one thread against 200. `shq-041` is one of the two gained, so of item 729's two fixtures
+`shiq-028` remains. A fuzz of 300 generated ontologies with related cardinalities, role
+hierarchies, an equivalent, an inverse and a symmetric role, judged against HermiT on the
+296 that HermiT finishes in 60 s, gives 264 equal and 31 sound answers with the order on
+one thread, 265 and 30 on four, and 238 equal and 57 sound without it. Every ontology
+that finishes without the order finishes with it. The one that differs, with the order
+and without it, is the ontology of the qualifier gap above. The fuzz also found the
+cardinality stated twice under a clause, which passed the bound with the order before a
+name beside its representative lost its own witnesses, and that ontology is a regression.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
@@ -2517,7 +2755,7 @@ The phase's gate is the `dl-o` stratum of the ORE 2015 DL development set, the n
 fixtures that need no counting and the hand cases. Of the six development files in `dl-o`,
 ore_ont_15803 and ore_ont_14924 have no data properties and both name the top object
 property. The other four use data properties and join the gate with item 768. The `dl-oiq`
-stratum needs counting and the Nom rule and joins the gate after item 894. The fixtures in
+stratum needs counting and the Nom rule and joins the gate after item 896. The fixtures in
 the gate are the 50 `shoi` cases, `sroiq-048` and the hand cases `nominal-disjunction`,
 `nominal-ripple`, `nominal-ripple-conditional`, `key-disjunction`, `top-forall` and
 `top-forall-conditional`, each on the rules that take it. Those hand cases that are Horn
