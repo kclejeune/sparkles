@@ -1071,6 +1071,22 @@ impl Session {
             // the patterns the schema rules' noValue reads are complete before stage zero
             // reads them (Codex review F17-P1 #3)
             self.run_lower(true, "the schema")?;
+            // The axioms, the facts of rules without a body, join the facts the pass
+            // reads as stored: a schema fact can follow from an axiom about an instance,
+            // such as `rdf:nil rdf:type rdf:List`, which the pass would otherwise miss
+            // and the completeness proof would then leave open (spec F17, item 911).
+            let axioms = self
+                .rules
+                .iter()
+                .filter(|r| r.atoms.is_empty() && r.builtins.is_empty());
+            let mut seeds = seeds;
+            for r in axioms {
+                for h in &r.head {
+                    if let CHead::Triple(Slot::Const(s), Slot::Const(p), Slot::Const(o)) = *h {
+                        seeds.push([s, p, o]);
+                    }
+                }
+            }
             let g = self.graph.as_mut().expect("graph made");
             lower_end = g.derived().len();
             let start = g.len();
@@ -1097,36 +1113,73 @@ impl Session {
         // complete. Keep that vocabulary for exposure independently of closure.
         self.closed = Some(crate::specialize::closed(&vocab, rdf_type));
         let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"));
-        let flag = AtomicBool::new(false);
-        let (complete, stopped) = watched(&self.stop, &flag, || {
-            demand::complete_schema(&self.rules, &vocab, rdf_type, same_as, &self.budget, &flag)
-        });
-        if let Some(error) = stopped {
-            return Err(error);
-        }
-        let mut complete = complete
-            .map_err(|e| memory_error(e, "schema completeness"))?
-            .expect("an unstopped completeness analysis returns its result");
-        let flag = AtomicBool::new(false);
-        let (refined, stopped) = watched(&self.stop, &flag, || {
-            demand::refine_schema(
-                &self.rules,
-                &vocab,
-                &self.terms,
-                self.graph.as_ref().expect("graph made"),
-                &mut complete.closed,
-                &self.budget,
-                &flag,
-            )
-        });
-        if let Some(error) = stopped {
-            return Err(error);
-        }
-        refined.map_err(|e| match e.downcast::<MemoryExceeded>() {
-            Ok(e) => memory_error(e, "schema completeness"),
-            Err(e) => component("reasoning-failed", format!("{e:#}")),
-        })?;
-        let closed = &complete.closed;
+        // The proof depends only on the rules and the view, so a later session of the
+        // same view reads it instead of scanning again (spec F17, item 911).
+        let proof_key = self
+            .schema_view
+            .as_ref()
+            .map(|v| (v.clone(), self.shared.digest));
+        // the analysis's admission lasts while its closure sets are in use
+        let mut _admission = None;
+        let closed_proof = match proof_key.as_ref().and_then(proofs::get) {
+            Some(proof) => demand::Closed {
+                preds: proof.preds.iter().map(|t| self.id_of(t)).collect(),
+                classes: proof.classes.iter().map(|t| self.id_of(t)).collect(),
+                rdf_type,
+            },
+            None => {
+                let flag = AtomicBool::new(false);
+                let (complete, stopped) = watched(&self.stop, &flag, || {
+                    demand::complete_schema(
+                        &self.rules,
+                        &vocab,
+                        rdf_type,
+                        same_as,
+                        &self.budget,
+                        &flag,
+                    )
+                });
+                if let Some(error) = stopped {
+                    return Err(error);
+                }
+                let mut complete = complete
+                    .map_err(|e| memory_error(e, "schema completeness"))?
+                    .expect("an unstopped completeness analysis returns its result");
+                let flag = AtomicBool::new(false);
+                let (refined, stopped) = watched(&self.stop, &flag, || {
+                    demand::refine_schema(
+                        &self.rules,
+                        &vocab,
+                        &self.terms,
+                        self.graph.as_ref().expect("graph made"),
+                        &mut complete.closed,
+                        &self.budget,
+                        &flag,
+                    )
+                });
+                if let Some(error) = stopped {
+                    return Err(error);
+                }
+                refined.map_err(|e| match e.downcast::<MemoryExceeded>() {
+                    Ok(e) => memory_error(e, "schema completeness"),
+                    Err(e) => component("reasoning-failed", format!("{e:#}")),
+                })?;
+                let closed = complete.closed.clone();
+                if let Some(key) = proof_key {
+                    let terms = |ids: &FxHashSet<u64>| -> Option<Vec<Term>> {
+                        ids.iter().map(|&x| self.terms.term(x)).collect()
+                    };
+                    if let (Some(preds), Some(classes)) =
+                        (terms(&closed.preds), terms(&closed.classes))
+                    {
+                        proofs::put(key, proofs::Proof { preds, classes });
+                    }
+                }
+                _admission = Some(complete);
+                closed
+            }
+        };
+        let closed = &closed_proof;
         // RDF lists are read as stored unless a rule gives their facts
         let lists: Vec<u64> = ["first", "rest"]
             .into_iter()
@@ -2438,5 +2491,45 @@ mod equality_workspace_tests {
             "allocated {peak} bytes at the peak, charged {}",
             held.bytes()
         );
+    }
+}
+
+/// The schema relations a session proved complete (spec F17, item 911), by view and rules
+/// digest, as the IRIs of the closed predicates and classes, since a session's ids of
+/// terms the store lacks are its own.
+mod proofs {
+    use oxrdf::Term;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// The views whose proofs are kept, the oldest dropped first.
+    const VIEWS: usize = 64;
+
+    pub(super) struct Proof {
+        pub preds: Vec<Term>,
+        pub classes: Vec<Term>,
+    }
+
+    type Key = (String, u64);
+
+    static PROOFS: Mutex<VecDeque<(Key, Arc<Proof>)>> = Mutex::new(VecDeque::new());
+
+    pub(super) fn get(key: &Key) -> Option<Arc<Proof>> {
+        let proofs = PROOFS.lock().unwrap_or_else(|e| e.into_inner());
+        proofs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, p)| p.clone())
+    }
+
+    pub(super) fn put(key: Key, proof: Proof) {
+        let mut proofs = PROOFS.lock().unwrap_or_else(|e| e.into_inner());
+        if proofs.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        if proofs.len() == VIEWS {
+            proofs.pop_front();
+        }
+        proofs.push_back((key, Arc::new(proof)));
     }
 }

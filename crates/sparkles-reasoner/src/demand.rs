@@ -1396,6 +1396,7 @@ impl CRule {
 
 /// Facts a pass before a demand program derived in full: the schema. Their atoms ask for nothing and the rules that only give them are left
 /// out of the program.
+#[derive(Clone)]
 pub(crate) struct Closed {
     pub preds: FxHashSet<u64>,
     /// the classes whose `rdf:type` facts are complete
@@ -1626,11 +1627,108 @@ pub(crate) fn complete_schema(
     }))
 }
 
+/// The abstract facts of [`refine_schema`] by predicate, and its types by class. A fact
+/// with a wildcard predicate is a candidate of every atom, and a type with a wildcard
+/// class of every type atom.
+struct AbstractIndex {
+    by_pred: FxHashMap<u64, Vec<usize>>,
+    by_class: FxHashMap<u64, Vec<usize>>,
+    any_pred: Vec<usize>,
+    any_class: Vec<usize>,
+    all: Vec<usize>,
+    rdf_type: u64,
+}
+
+impl AbstractIndex {
+    fn new(facts: &[[Option<u64>; 3]], rdf_type: u64) -> Self {
+        let mut ix = AbstractIndex {
+            by_pred: FxHashMap::default(),
+            by_class: FxHashMap::default(),
+            any_pred: Vec::new(),
+            any_class: Vec::new(),
+            all: (0..facts.len()).collect(),
+            rdf_type,
+        };
+        for (i, f) in facts.iter().enumerate() {
+            match f[1] {
+                None => ix.any_pred.push(i),
+                Some(p) => {
+                    ix.by_pred.entry(p).or_default().push(i);
+                    if p == rdf_type {
+                        match f[2] {
+                            Some(c) => ix.by_class.entry(c).or_default().push(i),
+                            None => ix.any_class.push(i),
+                        }
+                    }
+                }
+            }
+        }
+        // a wildcard predicate can be rdf:type with any class
+        for &i in &ix.any_pred {
+            ix.any_class.push(i);
+        }
+        for list in ix.by_pred.values_mut() {
+            list.extend(ix.any_pred.iter().copied());
+        }
+        for list in ix.by_class.values_mut() {
+            list.extend(ix.any_class.iter().copied());
+        }
+        ix
+    }
+
+    /// The facts an atom of known predicate `p` and object `o` can match.
+    fn candidates(&self, p: Option<u64>, o: Option<u64>) -> &[usize] {
+        match (p, o) {
+            (Some(p), Some(c)) if p == self.rdf_type => {
+                self.by_class.get(&c).map_or(&self.any_class, |v| v)
+            }
+            (Some(p), _) => self.by_pred.get(&p).map_or(&self.any_pred, |v| v),
+            (None, _) => &self.all,
+        }
+    }
+}
+
+/// The members of the abstract list whose head is `head`, followed through its
+/// `rdf:rest` links, or `None` when a link leads to a wildcard node, so that the caller
+/// takes the members of every list instead.
+fn list_members(
+    facts: &[[Option<u64>; 3]],
+    index: &AbstractIndex,
+    head: u64,
+    terms: &Terms,
+) -> Option<Vec<Option<u64>>> {
+    let mut members = Vec::new();
+    let mut seen = FxHashSet::default();
+    let mut nodes = vec![head];
+    while let Some(node) = nodes.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        for p in [terms.rdf_first, terms.rdf_rest] {
+            for &i in index.candidates(Some(p), None) {
+                let f = facts[i];
+                if f[0] != Some(node) || f[1] != Some(p) {
+                    continue;
+                }
+                if p == terms.rdf_first {
+                    members.push(f[2]);
+                } else {
+                    nodes.push(f[2]?);
+                }
+            }
+        }
+    }
+    Some(members)
+}
+
 /// The finite abstraction keeps every schema/program constant, every predicate and
 /// every type class. Other instance positions become `None` (any term). Concrete
-/// instance rows are never inferred here. Unsupported tests are ignored and their
-/// outputs remain wildcards, so the model can only overestimate rule consequences.
-/// If either workspace cap is reached, retain the conservative dependency answer.
+/// instance rows are never inferred here. `equal`, `notEqual` and a `regex` with a
+/// constant pattern rule out bindings their known values fail. Other tests are ignored
+/// and their outputs remain wildcards, and a list's members are followed from its head
+/// only while every list link has a concrete node, so the model can only overestimate
+/// rule consequences. If either workspace cap is reached, retain the conservative
+/// dependency answer (spec F17, item 911).
 pub(crate) fn refine_schema(
     rules: &[CRule],
     vocab: &Vocab,
@@ -1641,8 +1739,8 @@ pub(crate) fn refine_schema(
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
     let rdf_type = closed.rdf_type;
-    const FACTS: usize = 4096;
-    const BINDINGS: usize = 1024;
+    const FACTS: usize = 1 << 14;
+    const BINDINGS: usize = 1 << 14;
     type Abstract = [Option<u64>; 3];
     fn visit(
         graph: &crate::graph::Graph,
@@ -1740,6 +1838,17 @@ pub(crate) fn refine_schema(
     }
     loop {
         let before = facts.len();
+        // The facts by predicate, and the types by class, so that an atom whose predicate
+        // or class is known visits only the facts it can match. A fact with a wildcard
+        // predicate or class matches every such atom, so it is listed with all of them.
+        let index = AbstractIndex::new(&facts, rdf_type);
+        // whether every list link has a known node, so that a list's members can be
+        // followed from its head rather than taken from every list
+        let concrete_lists = facts.iter().all(|f| match f[1] {
+            None => false,
+            Some(p) if p == terms.rdf_first || p == terms.rdf_rest => f[0].is_some(),
+            Some(_) => true,
+        });
         for r in rules {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
@@ -1749,7 +1858,13 @@ pub(crate) fn refine_schema(
                 let mut next = Vec::new();
                 let mut unique = FxHashSet::default();
                 for binding in &bindings {
-                    for fact in &facts {
+                    let known = |s: Slot| match s {
+                        Slot::Const(c) => Some(c),
+                        Slot::Var(v) => binding[v],
+                        Slot::Any => None,
+                    };
+                    for &i in index.candidates(known(a.p), known(a.o)) {
+                        let fact = &facts[i];
                         if cancel.load(Ordering::Relaxed) {
                             return Ok(());
                         }
@@ -1800,12 +1915,27 @@ pub(crate) fn refine_schema(
                 let mut next = Vec::new();
                 let mut unique = FxHashSet::default();
                 for binding in &bindings {
-                    for fact in &facts {
+                    let head = match builtin.args.first() {
+                        Some(Slot::Const(c)) => Some(*c),
+                        Some(Slot::Var(v)) => binding[*v],
+                        _ => None,
+                    };
+                    let members = head
+                        .filter(|_| concrete_lists)
+                        .and_then(|h| list_members(&facts, &index, h, terms));
+                    let candidates: Box<dyn Iterator<Item = Option<u64>>> = match &members {
+                        Some(m) => Box::new(m.iter().copied()),
+                        None => Box::new(
+                            facts
+                                .iter()
+                                .filter(|f| f[1].is_none_or(|p| p == terms.rdf_first))
+                                .map(|f| f[2]),
+                        ),
+                    };
+                    for member in candidates {
+                        let fact = [None, Some(terms.rdf_first), member];
                         if cancel.load(Ordering::Relaxed) {
                             return Ok(());
-                        }
-                        if fact[1].is_some_and(|p| p != terms.rdf_first) {
-                            continue;
                         }
                         let slot = builtin.args[output];
                         let known = match slot {
@@ -1849,6 +1979,12 @@ pub(crate) fn refine_schema(
                         (BuiltinKind::Equal, [a, b]) => value(*a)
                             .zip(value(*b))
                             .is_some_and(|(a, b)| !crate::builtins::same_value(terms, a, b)),
+                        // a constant pattern that a known text does not match
+                        (BuiltinKind::Regex, [x, ..]) => b.regex.as_ref().is_some_and(|re| {
+                            value(*x)
+                                .and_then(|x| terms.lexical(x))
+                                .is_some_and(|text| !re.is_match(&text))
+                        }),
                         _ => false,
                     });
                 if impossible {
@@ -2522,7 +2658,8 @@ mod schema_completeness_tests {
     fn schema_completeness_abstract_caps_cancel_and_memory_leave_no_partial_proof() {
         let (terms, mut graph, mut closed) = abstract_fixture();
         closed.preds.insert(50);
-        graph.add_batch((1000..5100).map(|p| [9, p, 11]));
+        // more distinct predicates than the abstraction's cap of facts
+        graph.add_batch((1000..17_500).map(|p| [9, p, 11]));
         let budget = Budget::unlimited();
         refine_schema(
             &[],
