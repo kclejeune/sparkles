@@ -177,7 +177,7 @@ def job_unit(unit):
     return unit.startswith('gate-') and unit.endswith(('.service', '.scope'))
 
 
-def stop_jobs(home, run, left, now, wait_seconds=90, poll=time.sleep):
+def stop_jobs(home, run, left, now, clock=time.monotonic, wait_seconds=90, poll=None):
     """Stop every active gate-* unit and note the stop in each job's progress.log.
 
     Every stop request is queued at once with --no-block, so a slow shutdown of one job never
@@ -189,12 +189,17 @@ def stop_jobs(home, run, left, now, wait_seconds=90, poll=time.sleep):
     if jobs:
         code, _ = run(['systemctl', '--user', 'stop', '--no-block', *jobs], None, left(30))
         stopped = [{'unit': unit, 'exit': code} for unit in jobs]
-        wait = left(wait_seconds)
-        while wait > 0:
-            now_units = listed()
+        poll = poll or time.sleep
+        # One absolute bound for the wait, within the cleanup's own deadline, caps every
+        # list and every pause.
+        until = clock() + left(wait_seconds)
+        remaining = lambda: max(0, until - clock())
+        while remaining() > 0:
+            now_units = active_units(lambda argv, e, cap: run(argv, e, min(left(cap), remaining())))
             if now_units is not None and not any(u in now_units for u in jobs):
                 break
-            poll(2); wait -= 2
+            if remaining() > 0:
+                poll(min(2, remaining()))
     for unit in jobs:
         name = unit.rsplit('.', 1)[0][len('gate-'):]
         out = os.path.join(home, 'gate', 'out', name)
@@ -223,7 +228,7 @@ def clean(home, threshold=None, force=False, env=None, deadline_seconds=600, run
             return record
     elif stop_above is not None and before['used_pct'] >= stop_above:
         record['stop_above_pct'] = stop_above
-        record['stop_listed'], record['stopped'] = stop_jobs(home, run, left, now)
+        record['stop_listed'], record['stopped'] = stop_jobs(home, run, left, now, clock)
     elif not force and before['used_pct'] < threshold:
         record['after'] = before
         return record

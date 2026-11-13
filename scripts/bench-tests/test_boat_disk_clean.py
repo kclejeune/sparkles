@@ -242,13 +242,22 @@ class Clean(unittest.TestCase):
         self.assertIn('boat-owned-warm-qual-x.service', worker.units)
 
     def test_many_slow_jobs_all_get_their_stop_within_the_bound(self):
+        # Each unit list takes 20 seconds and each pause what it asks; no job ever ends.
         disk = FakeDisk(97); units = ['gate-j%d.service' % i for i in range(5)]
-        worker = FakeWorker(units=list(units), disk=disk); t = [0.0]
-        def slow(s): t[0] += 60
-        with patch.object(disk_clean.time, 'sleep', slow):
+        worker = FakeWorker(units=list(units), disk=disk); t = [0.0]; real = worker.run
+        def slow_run(argv, env=None, seconds=60):
+            if argv[:2] == ['systemctl', '--user'] and 'list-units' in argv:
+                t[0] += min(20, seconds); worker.stopping = []
+            return real(argv, env, seconds)
+        worker.run = slow_run
+        def pause(s): t[0] += s
+        with patch.object(disk_clean.time, 'sleep', pause):
             record = self.clean(worker, disk, stop_above=95, deadline_seconds=240, clock=lambda: t[0])
         stops = [c[0][4:] for c in worker.calls if c[0][:3] == ['systemctl', '--user', 'stop']]
         self.assertEqual(stops, [units]); self.assertEqual(len(record['stopped']), 5)
+        # The wait ended at its 90-second bound plus the first list, and the whole cleanup within its deadline.
+        waits = [c[2] for c in worker.calls if 'list-units' in c[0]]
+        self.assertTrue(all(w <= 90 for w in waits[1:]))
         self.assertLessEqual(t[0], 240)
 
     def test_under_the_hard_limit_nothing_stops(self):
