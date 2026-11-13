@@ -63,7 +63,7 @@ class RemoteCI(unittest.TestCase):
         self.home = home
         fake = t / 'bin'; fake.mkdir()
         (fake / 'systemd-run').write_text(FAKE_SYSTEMD_RUN)
-        (fake / 'systemctl').write_text('#!/bin/sh\necho "systemctl $*" >> "$FAKE_LOG"\n[ "$2" = is-active ] && { echo inactive; exit 3; }\nexit 0\n')
+        (fake / 'systemctl').write_text('#!/bin/sh\necho "systemctl $*" >> "$FAKE_LOG"\n[ "$2" = is-active ] && { echo inactive; exit 3; }\n[ "$2" = show ] && echo "${FAKE_STATE-inactive}"\nexit 0\n')
         (fake / 'mise').write_text('#!/bin/sh\nexit 0\n')
         (fake / 'flock').write_text('#!/bin/sh\necho "flock $*" >> "$FAKE_LOG"\n[ "$3" != "${FAKE_FLOCK_FAIL:-none}" ]\n')
         for f in fake.iterdir():
@@ -155,7 +155,8 @@ class RemoteCI(unittest.TestCase):
         r, out = self.run_job(int(time.time()) + 60)
         self.assertEqual(r.returncode, 3)
         self.assertEqual((out / 'ci.exit').read_text().strip(), '3')
-        self.assertFalse(self.log.exists() and 'flock' in self.log.read_text())
+        log = self.log.read_text() if self.log.exists() else ''
+        self.assertNotIn('flock', log); self.assertNotIn('stop --no-block', log)
 
     def test_a_heavy_lock_that_stays_held_ends_the_job_before_its_end(self):
         import time
@@ -170,6 +171,17 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         # Had the watchdog outlived the job, subprocess.run would have waited on its pipe.
         self.assertNotIn('stop --no-block', self.log.read_text())
+
+    def test_a_unit_still_shutting_down_keeps_its_results(self):
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        out = self.home / 'gate/out' / name; out.mkdir(parents=True); (out / 'progress.log').write_text('live\n')
+        for st in ['deactivating', 'active', 'activating', '']:
+            with self.subTest(state=st):
+                r = self.run_ci('--no-wait', FAKE_STATE=st)
+                self.assertEqual(r.returncode, 1, r.stderr); self.assertIn('must have stopped first', r.stderr)
+                self.assertEqual((out / 'progress.log').read_text(), 'live\n')
+        self.assertEqual(sorted(p.name for p in (self.home / 'gate/out').iterdir()), [name])
+        self.assertNotIn('unit gate-', self.log.read_text())
 
     def test_the_benchmark_host_never_runs_ci(self):
         for h in ['forge', 'user@forge.local']:

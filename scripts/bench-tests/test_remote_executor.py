@@ -488,7 +488,7 @@ class Admission(unittest.TestCase):
         self.assertLess(runtime,start);self.assertIn('\\$HOME/$bin/gate-start.sh $full $args',body[start])
         self.assertEqual(body[start-6].strip(),'boat:*)')
         # A retry first resets a scope that its bound ended.
-        self.assertIn('systemctl --user reset-failed gate-prep-$n 2> /dev/null;',body[start])
+        self.assertIn('systemctl --user reset-failed gate-prep-$n.scope 2> /dev/null;',body[start])
         # The closure watch counts the scope as a job unit, and gate.env may set the bound.
         self.assertIn("'gate-'",(ROOT/'scripts/boat/controller.py').read_text().split('JOB_UNIT_PREFIXES=',1)[1].splitlines()[0])
         self.assertIn('GATE_BOAT_PREP_SECONDS |',(ROOT/'scripts/gate/config.sh').read_text())

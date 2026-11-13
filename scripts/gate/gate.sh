@@ -293,7 +293,7 @@ start_on() {
     # The runtime counts from the unit's activation, which the prep scope bounds, so the
     # reserve here adds the scope's bound. It is computed after the bundle and the install,
     # so their time does not count against it, but before the dispatch, whose delay still
-    # counts against the reserve (roadmap item 803).
+    # counts against the reserve, which roadmap item 803 tracks.
     runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))") || return
     args+=" --executor boat --runtime $runtime"
     ;;
@@ -311,7 +311,7 @@ start_on() {
       # separate service, which gate-start.sh creates within that bound. A scope that its
       # bound ended stays loaded as failed, so a retry of the same name resets it first, and
       # --collect unloads the scope however it ends.
-      rx_exec "$h" "systemctl --user reset-failed gate-prep-$n 2> /dev/null; systemd-run --user --scope -q --collect --unit gate-prep-$n -p RuntimeMaxSec=$prep \$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
+      rx_exec "$h" "systemctl --user reset-failed gate-prep-$n.scope 2> /dev/null; systemd-run --user --scope -q --collect --unit gate-prep-$n -p RuntimeMaxSec=$prep \$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
       ;;
     *) rx_exec "$h" "\$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")" ;;
   esac

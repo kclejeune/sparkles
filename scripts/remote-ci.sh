@@ -136,13 +136,15 @@ case $host in
 esac
 min=${REMOTE_CI_MIN_SECONDS:-600}
 # The job's script travels on stdin. Under the host's start lock, so that two starts of one
-# name cannot both pass the check, the host checks that no job of that name runs, stores the
+# name cannot both pass the check, the host checks that the unit of that name has fully
+# stopped, rather than only left the active state, stores the
 # script beside the job's results and starts the unit, whose runtime it takes from the end.
 # shellcheck disable=SC2016
 rx_exec "$host" "set -e; umask 022; G=\$HOME/gate; o=\$G/out/$name
 exec 8>> \$G/.remote-ci-start.lock
 flock -w 120 8 || { echo 'another remote-ci start holds the start lock' >&2; exit 4; }
-if systemctl --user is-active -q gate-$name; then echo 'gate-$name is already running' >&2; exit 1; fi
+st=\$(systemctl --user show -p ActiveState --value gate-$name)
+case \$st in inactive | failed) ;; *) echo \"gate-$name is \$st; it must have stopped first\" >&2; exit 1 ;; esac
 systemctl --user reset-failed gate-$name 2> /dev/null || true
 if [ -d \"\$o\" ]; then mv \"\$o\" \"\$o.old-\$(date +%s)\"; fi
 mkdir -p \"\$o\"; cat > \"\$o/ci-job.sh\"

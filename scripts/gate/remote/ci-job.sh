@@ -20,22 +20,27 @@ G=$HOME/gate
 out=$G/out/$NAME
 wt=$G/wt-$NAME
 log() { echo "$(date -u +%FT%TZ) $*" >> "$out/progress.log"; }
+# The watchdog stays up through the cleanup, which is bounded too, and finish() ends it last.
 finish() {
-  [ -z "${wd:-}" ] || kill "$wd" 2> /dev/null
   echo "$1" > "$out/ci.exit"
   date +%s > "$out/done_at"
   log "end exit=$1"
-  cd "$G" || exit "$1"
-  rm -rf "$wt"
-  git -C "$G/repo.git" worktree prune
+  if cd "$G"; then
+    timeout --kill-after=10s 120 rm -rf "$wt"
+    timeout --kill-after=10s 60 git -C "$G/repo.git" worktree prune
+  fi
+  [ -z "${wd:-}" ] || kill "$wd" 2> /dev/null
   exit "$1"
 }
 until_end() { echo $((END - $(date +%s) - $1)); }
 mkdir -p "$out"
 log "queued $MODE $FULL base ${BASE:-none} host $(hostname)"
+# A job whose end has passed has created nothing yet, so it records its exit and stops.
 [ "$(until_end 120)" -gt 0 ] || {
   log "the job's end has passed"
-  finish 3
+  echo 3 > "$out/ci.exit"
+  date +%s > "$out/done_at"
+  exit 3
 }
 # The watchdog stops the unit at END whatever the job is doing. finish() ends it, and when
 # the job's main process exits systemd ends the rest of the unit's processes with it.
