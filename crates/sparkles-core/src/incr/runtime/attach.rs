@@ -159,11 +159,25 @@ impl Runtime {
         self.sync_inference(&mut reg, host.as_ref());
         let epoch = host.epoch();
         if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
-            // grants may have changed: resolve every view's principal again
+            // grants or the dataset's hidden graphs may have changed: resolve every
+            // view's principal again, and end the live queries, whose access was fixed
+            // when they subscribed
             for e in reg.views.values_mut() {
                 e.error = None;
                 if let Some(c) = e.cell.take() {
                     c.release_view();
+                }
+            }
+            for c in reg.cells.values() {
+                let mut st = c.state.lock();
+                for s in st.subs.drain(..) {
+                    if let Some(sh) = s.shared.upgrade() {
+                        sh.push(LiveEvent::Error {
+                            code: "forbidden".into(),
+                            message: "what the dataset's callers may read changed; subscribe again"
+                                .into(),
+                        });
+                    }
                 }
             }
         }

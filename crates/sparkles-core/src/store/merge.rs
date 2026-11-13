@@ -159,6 +159,10 @@ struct Plan {
     changes: FxHashMap<QuadKey, bool>,
     found: u64,
     resolved: u64,
+    /// of `found` and `resolved`, the conflicts in the graphs the plan was told to hide,
+    /// which a report leaves out (spec C26 §2.3)
+    hidden_found: u64,
+    hidden_resolved: u64,
     /// conflicting groups that remain, with the toggles of ours and theirs
     remaining: Vec<(GroupKey, Sides)>,
     excluded: Option<u64>,
@@ -250,7 +254,7 @@ impl Store {
             // With no resolutions and a fail-on-conflict rule, plan_merge never
             // reads `snap`: object replacement and dropped blank-node subgraphs
             // are impossible. It only compares the complete toggle groups.
-            let plan = plan_merge(snap, ours, theirs, &strict, &exempt)?;
+            let plan = plan_merge(snap, ours, theirs, &strict, &exempt, &[])?;
             if !plan.remaining.is_empty() {
                 let mut error = BranchError {
                     kind: BranchErrorKind::Conflict,
@@ -686,16 +690,17 @@ impl Store {
         let snap = tgt.snapshot();
         o.progress.report(0.5, "finding conflicts");
         let exempt = exempt_keys(set, o);
-        let mut plan = plan_merge(&snap, t_o, t_t, o, &exempt)?;
         // The report leaves the target's hidden control graphs out (spec C26 §2.3): their
-        // changes are not counted and their conflicts are not shown. A merge that would
-        // change one is refused at its commit by the managed-graph boundary, and one whose
-        // only conflicts are in such a graph is refused here.
+        // changes and conflicts, resolved or not, are not counted and their conflicts are
+        // not shown. A merge that would change one is refused at its commit by the
+        // managed-graph boundary, and one whose only unresolved conflicts are in such a
+        // graph is refused here.
         let hidden: Vec<Vec<u8>> = tgt
             .hidden_graphs()
             .iter()
             .map(|g| crate::id::iri_key(g))
             .collect();
+        let mut plan = plan_merge(&snap, t_o, t_t, o, &exempt, &hidden)?;
         let shown = |g: &[u8]| !hidden.iter().any(|h| h.as_slice() == g);
         let (mut ins, mut del) = (0u64, 0u64);
         for (k, i) in &plan.changes {
@@ -705,16 +710,15 @@ impl Store {
         }
         report.inserted = ins;
         report.deleted = del;
-        let mut found = plan.found;
+        let found = plan.found - plan.hidden_found;
+        let resolved = plan.resolved - plan.hidden_resolved;
         if !hidden.is_empty() {
-            let before = plan.remaining.len();
             let first_hidden = plan
                 .remaining
                 .iter()
                 .find(|(gk, _)| !shown(&gk.0))
                 .and_then(|(gk, _)| nt(&gk.0));
             plan.remaining.retain(|(gk, _)| shown(&gk.0));
-            found = found.saturating_sub((before - plan.remaining.len()) as u64);
             if plan.remaining.is_empty()
                 && let Some(g) = first_hidden
             {
@@ -723,7 +727,7 @@ impl Store {
             }
         }
         report.conflicts_found = found;
-        report.conflicts_resolved = plan.resolved;
+        report.conflicts_resolved = resolved;
         report.inferences_excluded = plan.excluded;
         if !plan.remaining.is_empty() {
             let c = conflict_report(&snap, &plan, o, &w.what, &report)?;
@@ -768,10 +772,7 @@ impl Store {
             return Ok(Step::Moved);
         }
         txn.force = w.force;
-        txn.merge = w.record.map(|r| MergeRec {
-            resolved: plan.resolved,
-            ..r
-        });
+        txn.merge = w.record.map(|r| MergeRec { resolved, ..r });
         let mut changes: Vec<(&QuadKey, &bool)> = plan.changes.iter().collect();
         // deletions first, each in key order, for a deterministic log
         changes.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
@@ -1030,6 +1031,7 @@ fn plan_merge(
     mut t_t: Toggles,
     o: &MergeOptions,
     exempt: &FxHashSet<Arc<[u8]>>,
+    hidden: &[Vec<u8>],
 ) -> Result<Plan> {
     let mut excluded = None;
     if !o.include_inferences {
@@ -1071,6 +1073,8 @@ fn plan_merge(
         changes: Default::default(),
         found: 0,
         resolved: 0,
+        hidden_found: 0,
+        hidden_resolved: 0,
         remaining: Vec::new(),
         excluded,
     };
@@ -1097,6 +1101,8 @@ fn plan_merge(
             continue;
         }
         plan.found += 1;
+        let is_hidden = hidden.iter().any(|h| h.as_slice() == &*gk.0);
+        plan.hidden_found += is_hidden as u64;
         let take =
             pick(&mut resolutions, &gk).or_else(|| o.on_conflict.clone().map(|t| (t, Vec::new())));
         let Some((take, objs)) = take else {
@@ -1104,6 +1110,7 @@ fn plan_merge(
             continue;
         };
         plan.resolved += 1;
+        plan.hidden_resolved += is_hidden as u64;
         let o_map: FxHashMap<&QuadKey, bool> = ours.iter().map(|(k, a)| (k, *a)).collect();
         let t_map: FxHashMap<&QuadKey, bool> = theirs.iter().map(|(k, a)| (k, *a)).collect();
         match take {
