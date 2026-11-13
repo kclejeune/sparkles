@@ -62,14 +62,19 @@ pub struct DlAx {
     /// the at-least conjunctions `H` that a cardinality in a negative position makes,
     /// which the order of a run without the root ranks below every class
     pub low: Vec<Ex>,
-    /// with [`super::dl_rules::lattice`], for an at-least conjunction, the at-least
-    /// conjunctions that entail it, a larger minimum over a role below its role and a
-    /// filler below its filler: a context that holds one of them does not make the
-    /// witnesses of this one
-    pub blockers: FxHashMap<Ex, Vec<Ex>>,
-    /// with [`super::dl_rules::lattice`], the name of each minimum, a fresh class, with
-    /// the conjunction of its witnesses, its told subsumer
+    /// whether the run orders its number restrictions by entailment, which
+    /// [`Limits::number_order`](super::Limits::number_order) asks of a run that counts
+    /// without the root (F24, "The order between number restrictions")
+    pub order: bool,
+    /// with the order, the name of each minimum, a fresh class, with the conjunction of
+    /// its witnesses, its told subsumer
     pub least: Vec<(Ex, Ex)>,
+    /// with the order, for a minimum's name, the names of the minimums that entail it, a
+    /// minimum at least as large over a role below its role and a filler below its
+    /// filler: a context that holds one of them as a unit does not make the witnesses of
+    /// this one. The relation is a strict order, two minimums that entail each other
+    /// being ordered by their names.
+    pub blockers: FxHashMap<Ex, Vec<Ex>>,
 }
 
 impl DlAx {
@@ -86,6 +91,16 @@ impl DlAx {
                 .ne
                 .iter()
                 .map(|(_, es)| es.capacity() * 4)
+                .sum::<usize>()
+            + self.least.capacity() * 8
+            + super::saturate::table_bytes(
+                self.blockers.capacity(),
+                std::mem::size_of::<(Ex, Vec<Ex>)>(),
+            )
+            + self
+                .blockers
+                .values()
+                .map(|v| v.capacity() * 4)
                 .sum::<usize>()
     }
 }
@@ -137,8 +152,8 @@ struct Out {
     lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
     /// the at-least conjunctions ranked lowest, as [`DlAx::low`]
     low: Vec<Ex>,
-    /// the minimums of a run without the root under [`super::dl_rules::lattice`]: the
-    /// name, the conjunction of the witnesses, the minimum, the role and the filler
+    /// the minimums of a run that orders its number restrictions: the name, the
+    /// conjunction of the witnesses, the minimum, the role and the filler
     least: Vec<(Ex, Ex, u32, Role, Ex)>,
     /// whether an inverse property occurs, which a symmetric or inverse functional
     /// property also makes
@@ -173,6 +188,9 @@ struct Norm<'a> {
     /// whether the run has individuals, so that it is rooted: nominals become the
     /// singleton classes `N_u`, and what their rules leave out is refused
     rooted: bool,
+    /// whether a minimum gets a name of its own, for [`number_order`]: a run that counts
+    /// without the root and was asked for the order
+    order: bool,
 }
 
 /// The largest minimum that becomes that many existential restrictions.
@@ -459,10 +477,11 @@ impl Norm<'_> {
         }
         self.out.disjoint.push(bs);
         let h = self.conj(es);
-        if !super::dl_rules::lattice() {
+        if !self.order {
             return Ok(h);
         }
-        // a name of the minimum's own, which no rule builds from the witnesses
+        // a name of the minimum's own, which no rule builds from the witnesses, so that
+        // it holds only where an axiom states the minimum
         let g = self.it.fresh_class();
         self.out.subs.push((g, h));
         self.out.least.push((g, h, n, r, fill));
@@ -1040,6 +1059,17 @@ impl Norm<'_> {
     }
 }
 
+/// What the caller lets the normalization of a Tier D run take.
+#[derive(Clone, Copy, Default)]
+pub struct Allowed {
+    /// number restrictions and the other axioms that need counting
+    pub counting: bool,
+    /// individuals and nominals, through the root of a rooted run
+    pub rooted: bool,
+    /// the order between the number restrictions of a run that counts without the root
+    pub order: bool,
+}
+
 /// The normalization of a Tier D run: the axioms outside OWL 2 EL that it takes, with the
 /// clauses of case analysis, after the EL axioms are in `ax`. `None` when it takes no axiom
 /// that needs case analysis, or when the role inclusions are not regular or their automata
@@ -1052,18 +1082,18 @@ pub fn normalize(
     ax: &mut Axioms,
     limit: Option<usize>,
     stop: &dyn Fn() -> bool,
-    counting_allowed: bool,
-    rooted_allowed: bool,
+    allowed: Allowed,
 ) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
     let mut taken = vec![false; axioms.len()];
     // individuals make the run rooted: those the EL part interned before the
     // normalization, and those the axioms outside it name
-    let rooted = rooted_allowed
+    let rooted = allowed.rooted
         && (!it.individuals.is_empty()
             || axioms
                 .iter()
                 .any(|k| crate::model::Signature::names_individual(k)));
-    let counting = counting_allowed && axioms.iter().any(|k| axiom_counts(k, rooted));
+    let counting = allowed.counting && axioms.iter().any(|k| axiom_counts(k, rooted));
+    let order = allowed.order && counting && !rooted;
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -1086,6 +1116,7 @@ pub fn normalize(
             out: Out::default(),
             counting,
             rooted,
+            order,
         };
         if n.role_axiom(k).is_ok() {
             all.extend(n.out);
@@ -1102,6 +1133,7 @@ pub fn normalize(
             out: Out::default(),
             counting,
             rooted,
+            order,
         };
         if n.axiom(k).is_ok() {
             if !super::dl::shape(k).horn {
@@ -1192,8 +1224,8 @@ pub fn normalize(
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
     }
-    let blockers = if counting && !rooted && super::dl_rules::lattice() {
-        lattice(it, ax, &all.least, &all.atmost)
+    let blockers = if order {
+        number_order(it, ax, &all.least, &all.atmost, stop)?
     } else {
         FxHashMap::default()
     };
@@ -1206,6 +1238,7 @@ pub fn normalize(
         ne: all.ne,
         lazy: all.lazy,
         low: all.low,
+        order,
         blockers,
         least: all.least.iter().map(|l| (l.0, l.1)).collect(),
         ..DlAx::default()
@@ -1228,50 +1261,78 @@ pub fn normalize(
     Ok(Some((taken, dl)))
 }
 
+/// The most told inclusions, disjointness sets and blockers that [`number_order`] adds.
+/// Each is a consequence of the ontology that the run can do without, so past the bound
+/// the rest are left out.
+const ORDER_RELATIONS: usize = 1 << 20;
+
 /// The order of entailment between the number restrictions of a run that counts without
-/// the root, an experiment of item 894's second look behind [`super::dl_rules::lattice`].
-/// `≥m r.F` entails `≥n s.G` when `m ≥ n`, `r ⊑ s` and `F ⊑ G`, and it contradicts
-/// `≤k s.G` when `m > k`. The inclusions are the told ones, closed, so each relation is a
-/// consequence of the ontology. The stronger minimum gets the weaker one as a told
-/// subsumer and the contradiction is a disjointness of the two names, and the answer lists for each
-/// conjunction those that entail it, with two of equal strength ordered by id.
-fn lattice(
+/// the root (F24, "The order between number restrictions"). `≥m r.F` entails `≥n s.G`
+/// when `m ≥ n`, `r ⊑ s` and `F ⊑ G`, and it contradicts `≤k s.G` when `m > k`. The
+/// inclusions are the told ones, closed under reflexivity and transitivity, with the
+/// operands of an intersection and `owl:Thing` above every filler, so each relation is a
+/// consequence of the ontology and entailment is a preorder.
+///
+/// The minimums with one bound, role and filler are equivalent, and the one with the
+/// least name stands for them: each of the others is told equivalent to it and has it as
+/// its only blocker. Between the representatives, the stronger minimum gets the weaker one
+/// as a told subsumer, and the answer lists for each name those that entail it, with two
+/// that entail each other ordered by name, so that the blockers are a strict order. A
+/// minimum and a maximum that it contradicts are a disjointness set.
+fn number_order(
     it: &Interner,
     ax: &mut Axioms,
     least: &[(Ex, Ex, u32, Role, Ex)],
     atmost: &[(Ex, u32, Role, Ex)],
-) -> FxHashMap<Ex, Vec<Ex>> {
-    let least: Vec<(Ex, u32, Role, Ex)> = least.iter().map(|l| (l.0, l.2, l.3, l.4)).collect();
-    let least = &least[..];
+    stop: &dyn Fn() -> bool,
+) -> Result<FxHashMap<Ex, Vec<Ex>>, Halt> {
     let mut out: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
     if least.is_empty() {
-        return out;
+        return Ok(out);
     }
-    // the told superroles of the minimums' roles and the told subsumers of their fillers
-    let mut role_up: FxHashMap<Role, FxHashSet<Role>> = FxHashMap::default();
-    for &(_, _, r, _) in least {
-        role_up.entry(r).or_insert_with(|| {
-            let mut seen: FxHashSet<Role> = std::iter::once(r).collect();
-            let mut todo = vec![r];
-            while let Some(a) = todo.pop() {
-                for &(x, y) in &ax.role_subs {
-                    if x == a && seen.insert(y) {
-                        todo.push(y);
-                    }
-                }
+    let mut steps = 0usize;
+    let mut poll = |n: usize| -> Result<(), Halt> {
+        steps += n;
+        if steps >= 1 << 16 {
+            steps = 0;
+            if stop() {
+                return Err(Halt::Stopped);
             }
-            seen
-        });
+        }
+        Ok(())
+    };
+    // the told superroles of the minimums' roles and the told subsumers of their fillers,
+    // sorted
+    let mut role_edges: FxHashMap<Role, Vec<Role>> = FxHashMap::default();
+    for &(x, y) in &ax.role_subs {
+        role_edges.entry(x).or_default().push(y);
     }
     let mut told: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
     for &(a, b) in &ax.subs {
         told.entry(a).or_default().push(b);
     }
-    let mut up: FxHashMap<Ex, FxHashSet<Ex>> = FxHashMap::default();
-    for &(_, _, _, f) in least {
-        up.entry(f).or_insert_with(|| {
+    let mut role_up: FxHashMap<Role, Vec<Role>> = FxHashMap::default();
+    let mut up: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    for &(_, _, _, r, f) in least {
+        if let std::collections::hash_map::Entry::Vacant(slot) = role_up.entry(r) {
+            let mut seen: FxHashSet<Role> = std::iter::once(r).collect();
+            let mut todo = vec![r];
+            while let Some(a) = todo.pop() {
+                for &y in role_edges.get(&a).map_or(&[][..], |v| v.as_slice()) {
+                    if seen.insert(y) {
+                        todo.push(y);
+                    }
+                }
+                poll(1)?;
+            }
+            let mut v: Vec<Role> = seen.into_iter().collect();
+            v.sort_unstable();
+            slot.insert(v);
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = up.entry(f) {
+            // `owl:Thing` is above every filler, and so is what the ontology tells of it
             let mut seen: FxHashSet<Ex> = [f, TOP].into_iter().collect();
-            let mut todo = vec![f];
+            let mut todo: Vec<Ex> = seen.iter().copied().collect();
             while let Some(a) = todo.pop() {
                 if let Node::Conj(x, y) = it.nodes[a as usize] {
                     for z in [x, y] {
@@ -1285,42 +1346,137 @@ fn lattice(
                         todo.push(b);
                     }
                 }
+                poll(1)?;
             }
-            seen
-        });
+            let mut v: Vec<Ex> = seen.into_iter().collect();
+            v.sort_unstable();
+            slot.insert(v);
+        }
     }
-    let mut hs: Vec<(Ex, u32, Role, Ex)> = least.to_vec();
+    // the representatives by role and filler, with their bounds, and the names each
+    // stands for; the maximums by role and filler
+    let mut hs: Vec<(Role, Ex, u32, Ex)> = least.iter().map(|l| (l.3, l.4, l.2, l.0)).collect();
     hs.sort_unstable();
     hs.dedup();
-    let entails = |a: &(Ex, u32, Role, Ex), n: u32, s: Role, g: Ex| {
-        a.1 >= n && role_up[&a.2].contains(&s) && up[&a.3].contains(&g)
-    };
-    // by role, so that the pairs are those of one role's hierarchy
+    let mut mins: FxHashMap<(Role, Ex), Vec<(u32, Ex)>> = FxHashMap::default();
+    let mut stands: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    let mut reps: Vec<(Role, Ex, u32, Ex)> = Vec::new();
     let mut subs: Vec<(Ex, Ex)> = Vec::new();
+    let mut relations = 0usize;
+    for &(r, f, n, g) in &hs {
+        match reps.last() {
+            Some(&(r0, f0, n0, g0)) if (r0, f0, n0) == (r, f, n) => {
+                if relations < ORDER_RELATIONS {
+                    relations += 3;
+                    subs.push((g, g0));
+                    subs.push((g0, g));
+                    out.insert(g, vec![g0]);
+                    stands.entry(g0).or_default().push(g);
+                }
+            }
+            _ => {
+                reps.push((r, f, n, g));
+                mins.entry((r, f)).or_default().push((n, g));
+            }
+        }
+    }
+    let mut maxs: FxHashMap<(Role, Ex), Vec<(u32, Ex)>> = FxHashMap::default();
+    for &(m, k, s, b) in atmost {
+        maxs.entry((s, b)).or_default().push((k, m));
+    }
+    let entails = |a: &(Role, Ex, u32, Ex), b: &(Role, Ex, u32, Ex)| {
+        a.2 >= b.2
+            && role_up[&a.0].binary_search(&b.0).is_ok()
+            && up[&a.1].binary_search(&b.1).is_ok()
+    };
     let mut clash: Vec<Vec<Ex>> = Vec::new();
-    for a in &hs {
-        for b in &hs {
-            if a.0 == b.0 || !entails(a, b.1, b.2, b.3) {
-                continue;
-            }
-            subs.push((a.0, b.0));
-            if !entails(b, a.1, a.2, a.3) || a.0 < b.0 {
-                out.entry(b.0).or_default().push(a.0);
+    'reps: for a in &reps {
+        for &s in &role_up[&a.0] {
+            for &g in &up[&a.1] {
+                poll(1)?;
+                for &(n, b) in mins.get(&(s, g)).map_or(&[][..], |v| v.as_slice()) {
+                    if b == a.3 || a.2 < n {
+                        continue;
+                    }
+                    if relations >= ORDER_RELATIONS {
+                        break 'reps;
+                    }
+                    relations += 1;
+                    subs.push((a.3, b));
+                    if !entails(&(s, g, n, b), a) || a.3 < b {
+                        relations += 1;
+                        out.entry(b).or_default().push(a.3);
+                    }
+                }
+                for &(k, m) in maxs.get(&(s, g)).map_or(&[][..], |v| v.as_slice()) {
+                    if a.2 <= k {
+                        continue;
+                    }
+                    for &h in std::iter::once(&a.3)
+                        .chain(stands.get(&a.3).map_or(&[][..], |v| v.as_slice()))
+                    {
+                        if relations >= ORDER_RELATIONS {
+                            break 'reps;
+                        }
+                        relations += 1;
+                        let mut set = vec![m, h];
+                        set.sort_unstable();
+                        clash.push(set);
+                    }
+                }
             }
         }
-        for &(m, k, s, g) in atmost {
-            if a.1 > k && role_up[&a.2].contains(&s) && up[&a.3].contains(&g) {
-                let mut set = vec![m, a.0];
-                set.sort_unstable();
-                clash.push(set);
-            }
-        }
+    }
+    for v in out.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    // entailment is a preorder, so the blockers have no cycle; a cycle would leave a
+    // minimum without witnesses, so the run blocks nothing if one shows
+    if !acyclic(&out) {
+        debug_assert!(
+            false,
+            "the blockers of the number restrictions have a cycle"
+        );
+        out.clear();
     }
     ax.subs.extend(subs);
     clash.sort_unstable();
     clash.dedup();
     ax.disjoint.extend(clash);
-    out
+    Ok(out)
+}
+
+/// Whether the relation from each key to its values has no cycle.
+fn acyclic(edges: &FxHashMap<Ex, Vec<Ex>>) -> bool {
+    // 1 while a node is on the path, 2 once its descendants are done
+    let mut state: FxHashMap<Ex, u8> = FxHashMap::default();
+    for &start in edges.keys() {
+        if state.contains_key(&start) {
+            continue;
+        }
+        state.insert(start, 1);
+        let mut path: Vec<(Ex, usize)> = vec![(start, 0)];
+        while let Some(&mut (e, ref mut at)) = path.last_mut() {
+            let next = edges.get(&e).and_then(|v| v.get(*at)).copied();
+            *at += 1;
+            match next {
+                None => {
+                    state.insert(e, 2);
+                    path.pop();
+                }
+                Some(b) => match state.get(&b) {
+                    Some(1) => return false,
+                    Some(_) => {}
+                    None => {
+                        state.insert(b, 1);
+                        path.push((b, 0));
+                    }
+                },
+            }
+        }
+    }
+    true
 }
 
 /// The universals on roles that are not simple, unfolded by the roles' automata: those that
@@ -1405,7 +1561,11 @@ mod tests {
         let mut it = Interner::new();
         let mut ax = Axioms::default();
         let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(&refs, &mut it, &mut ax, None, &|| false, true, false)
+        let allowed = Allowed {
+            counting: true,
+            ..Allowed::default()
+        };
+        normalize(&refs, &mut it, &mut ax, None, &|| false, allowed)
             .unwrap()
             .map(|(t, d)| (t, d, ax, it))
     }
@@ -1421,7 +1581,12 @@ mod tests {
         let mut it = Interner::new();
         let mut ax = Axioms::default();
         let refs: Vec<&AxiomKind> = axioms.iter().collect();
-        normalize(&refs, &mut it, &mut ax, None, &|| false, counting, true)
+        let allowed = Allowed {
+            counting,
+            rooted: true,
+            order: false,
+        };
+        normalize(&refs, &mut it, &mut ax, None, &|| false, allowed)
             .unwrap()
             .map(|(t, d)| (t, d, ax, it))
     }
@@ -1448,6 +1613,144 @@ mod tests {
 
     fn nominal(it: &Interner, e: Ex) -> bool {
         matches!(it.nodes[e as usize], Node::Nominal(_))
+    }
+
+    /// The normalization of a run that counts without the root, with the order between
+    /// its number restrictions or without it, from functional-style axioms over the prefix
+    /// `http://ex.org/`. A maximum over a role of its own makes the run count, which
+    /// minimums in positive positions alone do not, and a union makes it disjunctive.
+    fn run_order(body: &str, order: bool) -> (DlAx, Axioms, Interner) {
+        let doc = crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://ex.org/>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\n\
+             Ontology(\n{body}\nSubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+             SubClassOf(:Z ObjectMaxCardinality(5 :zq))\n)"
+        ))
+        .unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let allowed = Allowed {
+            counting: true,
+            rooted: false,
+            order,
+        };
+        let (taken, d) = normalize(&kinds, &mut it, &mut ax, None, &|| false, allowed)
+            .unwrap()
+            .unwrap();
+        assert!(taken.iter().all(|&t| t));
+        (d, ax, it)
+    }
+
+    /// The name of the minimum that `class` is told to be below.
+    fn least_of(d: &DlAx, ax: &Axioms, it: &mut Interner, class: &str) -> Ex {
+        let x = it.class(&Class::new(format!("http://ex.org/{class}")));
+        ax.subs
+            .iter()
+            .find(|&&(a, b)| a == x && d.least.iter().any(|&(g, _)| g == b))
+            .map(|&(_, b)| b)
+            .unwrap()
+    }
+
+    #[test]
+    fn without_the_order_a_minimum_has_no_name() {
+        let body = "SubClassOf(:A ObjectMinCardinality(3 :r :F))
+                    SubClassOf(:B ObjectMinCardinality(2 :r :F))
+                    SubClassOf(:C ObjectMaxCardinality(1 :r :F))";
+        let (d, _, _) = run_order(body, false);
+        assert!(!d.order && d.least.is_empty() && d.blockers.is_empty());
+        let (d, _, _) = run_order(body, true);
+        assert!(d.order);
+        assert_eq!(d.least.len(), 2);
+    }
+
+    #[test]
+    fn a_larger_minimum_blocks_a_smaller_one_and_contradicts_a_maximum_below_it() {
+        let (d, ax, mut it) = run_order(
+            "SubClassOf(:F :G) SubObjectPropertyOf(:r :s)
+             SubClassOf(:A ObjectMinCardinality(3 :r :F))
+             SubClassOf(:B ObjectMinCardinality(2 :s :G))
+             SubClassOf(:C ObjectMaxCardinality(2 :s :G))
+             SubClassOf(:D ObjectMaxCardinality(3 :s :G))",
+            true,
+        );
+        let (a, b) = (
+            least_of(&d, &ax, &mut it, "A"),
+            least_of(&d, &ax, &mut it, "B"),
+        );
+        assert_eq!(d.blockers.get(&b), Some(&vec![a]));
+        assert!(!d.blockers.contains_key(&a));
+        assert!(ax.subs.contains(&(a, b)) && !ax.subs.contains(&(b, a)));
+        // the maximum of two contradicts the minimum of three, and the maximum of three
+        // contradicts neither
+        let holders: Vec<Ex> = d.atmost.iter().map(|m| m.0).collect();
+        let clashes: Vec<&Vec<Ex>> = ax
+            .disjoint
+            .iter()
+            .filter(|set| set.len() == 2 && set.iter().any(|e| holders.contains(e)))
+            .collect();
+        assert_eq!(clashes.len(), 1);
+        assert!(clashes[0].contains(&a) && clashes[0].contains(&d.atmost[0].0));
+    }
+
+    #[test]
+    fn minimums_of_one_strength_have_one_representative() {
+        let (d, ax, mut it) = run_order(
+            "SubClassOf(:A ObjectMinCardinality(3 :r :F))
+             SubClassOf(:B ObjectMinCardinality(3 :r :F))
+             SubClassOf(:C ObjectMinCardinality(3 :r :F))
+             SubClassOf(:D ObjectMinCardinality(2 :r :F))",
+            true,
+        );
+        let names: Vec<Ex> = ["A", "B", "C"]
+            .iter()
+            .map(|n| least_of(&d, &ax, &mut it, n))
+            .collect();
+        let weaker = least_of(&d, &ax, &mut it, "D");
+        let first = *names.iter().min().unwrap();
+        for &g in &names {
+            if g == first {
+                assert!(!d.blockers.contains_key(&g));
+            } else {
+                assert_eq!(d.blockers.get(&g), Some(&vec![first]));
+                assert!(ax.subs.contains(&(g, first)) && ax.subs.contains(&(first, g)));
+            }
+        }
+        // the weaker minimum is blocked by the representative alone
+        assert_eq!(d.blockers.get(&weaker), Some(&vec![first]));
+        assert!(acyclic(&d.blockers));
+    }
+
+    /// What the ontology tells of `owl:Thing` is above every filler. A closure that
+    /// followed it only from `owl:Thing` itself gave a relation that is not transitive,
+    /// and the three minimums below blocked each other in a cycle.
+    #[test]
+    fn fillers_equivalent_through_owl_thing_are_ordered_by_name() {
+        let (d, ax, mut it) = run_order(
+            "SubClassOf(owl:Thing :B) SubClassOf(:B :A)
+             SubClassOf(:X0 ObjectMinCardinality(2 :r :A))
+             SubClassOf(:X1 ObjectMinCardinality(2 :r owl:Thing))
+             SubClassOf(:X2 ObjectMinCardinality(2 :r :B))",
+            true,
+        );
+        let mut names: Vec<Ex> = ["X0", "X1", "X2"]
+            .iter()
+            .map(|n| least_of(&d, &ax, &mut it, n))
+            .collect();
+        names.sort_unstable();
+        assert!(acyclic(&d.blockers));
+        assert!(!d.blockers.contains_key(&names[0]));
+        assert_eq!(d.blockers.get(&names[1]), Some(&vec![names[0]]));
+        assert_eq!(d.blockers.get(&names[2]), Some(&vec![names[0], names[1]]));
+    }
+
+    #[test]
+    fn a_cycle_of_blockers_is_found() {
+        let mut edges: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+        edges.insert(1, vec![2]);
+        edges.insert(2, vec![3, 4]);
+        assert!(acyclic(&edges));
+        edges.insert(4, vec![1]);
+        assert!(!acyclic(&edges));
     }
 
     #[test]

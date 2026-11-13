@@ -365,14 +365,7 @@ pub fn rank(ix: &Index, a: Ex) -> (u8, Ex) {
     }
     let r = match ix.head(a).node {
         // the name of a minimum ranks with the conjunction of its witnesses
-        Node::Fresh(_)
-            if ix
-                .dl
-                .as_deref()
-                .is_some_and(|d| d.witnesses.contains_key(&a)) =>
-        {
-            3
-        }
+        Node::Fresh(_) if ix.dl.as_deref().is_some_and(|d| d.is_least(a)) => 3,
         Node::Fresh(_) => 1,
         Node::Class(_) => 2,
         _ => 3,

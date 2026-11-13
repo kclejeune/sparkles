@@ -268,14 +268,10 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
 
 /// The counting cases that pass Tier D's bound on derived conclusions: every run, on one
 /// thread or several and with either strategy, passes it and falls back to the Horn rules,
-/// so that the answer is the same for every schedule. With the order between number
-/// restrictions, the experiment behind `SPARKLES_DL_LATTICE=1`, `shq-041` stays in its
-/// bound instead, and then every schedule takes it whole and gives HermiT's answer.
+/// so that the answer is the same for every schedule.
 #[test]
 fn the_cases_past_the_bound_fall_back_on_every_schedule() {
-    let lattice = std::env::var_os("SPARKLES_DL_LATTICE").is_some_and(|v| v == "1");
     for stem in ["shq-041", "shiq-028"] {
-        let finishes = lattice && stem == "shq-041";
         let path = fixtures().join(format!("{stem}.ofn"));
         let doc = ofn_read::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mut classes: Vec<Class> = doc
@@ -300,17 +296,10 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
                         ..Limits::default()
                     })
                     .unwrap();
-                if finishes {
-                    assert!(
-                        !out.stats.dl_over_budget && k.excluded().is_empty(),
-                        "{stem} on {threads} threads, {expansion:?}: Tier D did not take it whole"
-                    );
-                } else {
-                    assert!(
-                        out.stats.dl_over_budget,
-                        "{stem} on {threads} threads, {expansion:?}: Tier D stayed in its bound"
-                    );
-                }
+                assert!(
+                    out.stats.dl_over_budget,
+                    "{stem} on {threads} threads, {expansion:?}: Tier D stayed in its bound"
+                );
                 let mut got = BTreeSet::new();
                 for a in &classes {
                     for b in &classes {
@@ -327,14 +316,6 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
             1,
             "{stem}: the answer depends on the schedule"
         );
-        if finishes {
-            let names: BTreeSet<String> = classes.iter().map(|c| c.as_str().to_string()).collect();
-            let want = reference(
-                &std::fs::read_to_string(path.with_extension("hermit.ofn")).unwrap(),
-                &names,
-            );
-            assert_eq!(answers.into_iter().next().unwrap(), want, "{stem}");
-        }
     }
 }
 

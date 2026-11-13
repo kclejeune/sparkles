@@ -212,6 +212,16 @@ pub struct Limits {
     /// property, which take the default paths, and the option changes nothing for an
     /// ontology without individuals.
     pub rooted: bool,
+    /// whether a run that counts without the root orders its number restrictions by
+    /// entailment (F24, "The order between number restrictions"), which is off by default
+    /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
+    /// `≥n s.G` when `m ≥ n`, `r ⊑ s` and `F ⊑ G` are told, and contradicts `≤k s.G` when
+    /// `m > k`. The run tells itself these consequences of the ontology, and a context
+    /// that holds a minimum does not make the witnesses of a minimum that it entails. The
+    /// answers are those of a run without the order that finishes, and a run with it
+    /// finishes on ontologies with many related cardinalities, such as the Protein
+    /// Ontology, where the run without it passes [`dl_work`](Limits::dl_work).
+    pub number_order: bool,
 }
 
 /// Which context the Succ rule of Tier D (roadmap item 603) gives a successor. Both
@@ -1330,8 +1340,11 @@ impl Saturation {
                 &mut ax,
                 limits.max_memory,
                 &stop,
-                limits.counting && !self.no_counting,
-                rooted,
+                dl_norm::Allowed {
+                    counting: limits.counting && !self.no_counting,
+                    rooted,
+                    order: limits.number_order,
+                },
             )
             .map_err(halt)?
             {
