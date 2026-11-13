@@ -646,3 +646,54 @@ fn a_capture_from_before_enablement_keeps_the_old_header() {
     assert!(!r.control_enabled());
     assert_eq!(r.snapshot().len(), 1);
 }
+
+/// A16: an open that refuses the control keyspace changes no file, not even the torn
+/// tail of the write-ahead log or the commit catalog.
+#[test]
+fn a_refused_open_leaves_every_file_as_it_was() {
+    let (_dir, root, s) = setup();
+    transition(&s, &[("jobs/a", "1")], Some("a")).unwrap();
+    transition(&s, &[("jobs/b", "2")], None).unwrap();
+    let wal = s.snapshot().generation.dir.clone().unwrap().join("wal.log");
+    drop(s);
+    let mut torn = std::fs::read(&wal).unwrap();
+    torn.extend_from_slice(&[7; 5]);
+    std::fs::write(&wal, &torn).unwrap();
+    std::fs::remove_file(root.join(control::CHECKPOINT_FILE)).unwrap();
+    let files = |root: &Path| {
+        let mut out = Vec::new();
+        for e in walkdir(root) {
+            out.push((e.clone(), std::fs::read(&e).unwrap()));
+        }
+        out.sort();
+        out
+    };
+    let before = files(&root);
+    integrity(open(&root));
+    assert!(before == files(&root), "the refused open changed a file");
+}
+
+fn walkdir(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(root).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walkdir(&p));
+        } else if p.file_name().is_some_and(|n| n != "sparkles.lock") {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// A store whose log was upgraded for the keyspace needs it, so losing both control
+/// files is an integrity error even when no commit carries a frame.
+#[test]
+fn an_upgraded_log_needs_its_control_files() {
+    let (_dir, root, s) = setup();
+    transition(&s, &[("jobs/a", "1")], None).unwrap();
+    drop(s);
+    std::fs::remove_file(root.join(control::CHECKPOINT_FILE)).unwrap();
+    std::fs::remove_file(root.join(control::LOG_FILE)).unwrap();
+    integrity(open(&root));
+}

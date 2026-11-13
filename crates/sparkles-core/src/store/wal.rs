@@ -53,14 +53,22 @@ pub const HEADER_READER: u32 = 5;
 /// Structural refusal is evaluated only after the transaction checksum succeeds,
 /// preserving existing torn-tail treatment for an uncommitted damaged suffix.
 ///
-/// It also checks the placement of control records (spec C26 §7): they follow the
-/// quads, precede the configuration record, appear only in a log of version 3, and the
-/// commit's control flag is set exactly when they are present.
+/// It also checks the control records (spec C26 §7): they follow the quads, precede the
+/// configuration record, appear only in a log of version 3, and the commit's control
+/// flag is set exactly when they are present. The frame they carry has a version this
+/// build reads, declares a length that ends in their last record, and has zeros after
+/// it.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ConfigurationRecords {
     digest: Option<[u8; 32]>,
     control: bool,
     invalid: bool,
+    /// the bytes of control records seen
+    frame_seen: u64,
+    /// the frame's declared length
+    frame_len: u64,
+    /// the frame's version byte
+    frame_version: u8,
 }
 
 impl ConfigurationRecords {
@@ -76,7 +84,21 @@ impl ConfigurationRecords {
                 if self.digest.is_some() {
                     self.invalid = true;
                 }
+                let chunk = &record[1..];
+                if !self.control {
+                    self.frame_version = chunk[0];
+                    self.frame_len =
+                        u32::from_le_bytes(chunk[1..5].try_into().expect("four bytes")) as u64;
+                }
                 self.control = true;
+                // the bytes after the frame's declared end are zeros
+                let start = self.frame_seen;
+                for (i, b) in chunk.iter().enumerate() {
+                    if start + i as u64 >= self.frame_len && *b != 0 {
+                        self.invalid = true;
+                    }
+                }
+                self.frame_seen += chunk.len() as u64;
             }
             WAL_INSERT | WAL_DELETE => {
                 if self.digest.is_some() || self.control {
@@ -101,7 +123,24 @@ impl ConfigurationRecords {
         if version >= crate::formats::WAL_CONTROL_VERSION {
             allowed |= commit::WAL_FLAG_CONTROL;
         }
+        if self.control && self.frame_version != crate::control::FRAME_VERSION {
+            return Err(Error::Unsupported(format!(
+                "control frame version {}; Sparkles {} reads version {}",
+                self.frame_version,
+                crate::formats::SPARKLES_VERSION,
+                crate::control::FRAME_VERSION
+            )));
+        }
+        let chunk = (WAL_REC - 1) as u64;
+        // the frame ends in the last control record: it fits them, and no whole record
+        // after its end is padding
+        let frame_fits = !self.control
+            || (self.frame_len >= 5
+                && self.frame_len <= crate::control::MAX_FRAME as u64
+                && self.frame_len <= self.frame_seen
+                && self.frame_seen - self.frame_len < chunk);
         if self.invalid
+            || !frame_fits
             || required != self.digest.is_some()
             || control != self.control
             || (version < 2 && (required || self.digest.is_some()))
@@ -2034,5 +2073,58 @@ mod tests {
         ix.note(p(6, 200));
         assert_eq!(ix.floor(5).offset, 0);
         assert_eq!(ix.last(), p(6, 132));
+    }
+
+    /// Every parser checks the frame its control records carry: a version this build
+    /// reads, a declared length that ends in the last record, and zeros after it.
+    #[test]
+    fn control_records_carry_a_whole_frame() {
+        let frame = crate::control::Frame {
+            seq: 1,
+            follows: 1,
+            time_ms: 0,
+            ops: vec![crate::control::Op::Put(
+                b"jobs/a".to_vec().into(),
+                b"1".to_vec().into(),
+            )],
+        }
+        .encode()
+        .unwrap();
+        let records = |frame: &[u8]| {
+            let mut out = Vec::new();
+            for chunk in crate::control::chunks(frame) {
+                out.push(WAL_CONTROL);
+                out.extend_from_slice(&chunk);
+            }
+            out
+        };
+        let flags = commit::WAL_FLAG_CONTROL;
+        let v3 = crate::formats::WAL_CONTROL_VERSION;
+        configuration_records(&records(&frame), v3, flags).unwrap();
+        // not in a log before version 3, and only with the flag
+        assert!(configuration_records(&records(&frame), 2, flags).is_err());
+        assert!(configuration_records(&records(&frame), v3, 0).is_err());
+        // a byte after the frame's end
+        let mut padded = records(&frame);
+        let last = padded.len() - 1;
+        if frame.len() % (WAL_REC - 1) != 0 {
+            padded[last] = 1;
+            assert!(configuration_records(&padded, v3, flags).is_err());
+        }
+        // a declared length past the records, or one that leaves a whole record of padding
+        let mut long = frame.clone();
+        long[1..5].copy_from_slice(&((frame.len() + 64) as u32).to_le_bytes());
+        assert!(configuration_records(&records(&long), v3, flags).is_err());
+        let mut extra = records(&frame);
+        extra.push(WAL_CONTROL);
+        extra.extend_from_slice(&[0; WAL_REC - 1]);
+        assert!(configuration_records(&extra, v3, flags).is_err());
+        // an unknown frame version is refused as such
+        let mut newer = frame.clone();
+        newer[0] = crate::control::FRAME_VERSION + 1;
+        assert!(matches!(
+            configuration_records(&records(&newer), v3, flags),
+            Err(Error::Unsupported(_))
+        ));
     }
 }

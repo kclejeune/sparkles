@@ -85,12 +85,18 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// Whether the dataset at `root` has jobs configured, so that it needs a control
-/// keyspace: a `jobs.json`, or a jobs entry in the managed-graph registry.
-pub(super) fn jobs_configured(root: &Path, managed: Option<&crate::managed::ManagedState>) -> bool {
+/// Whether the dataset at `root` records that it needs a control keyspace: a
+/// `jobs.json`, a jobs entry in the managed-graph registry as its file records it,
+/// whether or not the registry can be enforced, or a write-ahead log of `wal_version` 3
+/// or later. A registry file that does not read records nothing here, and its own
+/// refusal stands.
+pub(crate) fn jobs_configured(root: &Path, wal_version: u32) -> bool {
     root.join(crate::jobs::FILE).exists()
-        || matches!(managed, Some(crate::managed::ManagedState::Installed(i))
-            if i.graphs.owners.contains_key(&crate::managed::OwnerKind::Jobs))
+        || wal_version >= crate::formats::WAL_CONTROL_VERSION
+        || std::fs::read(root.join(crate::managed::FILE))
+            .ok()
+            .and_then(|bytes| crate::managed::recorded_owners(&bytes).ok())
+            .is_some_and(|owners| owners.contains(&crate::managed::OwnerKind::Jobs))
 }
 
 /// Recover the control keyspace of the store at `root` from its checkpoint, the frames
@@ -496,6 +502,22 @@ impl WriteTxn<'_> {
     /// writer was taken.
     pub fn control_base(&self) -> Result<Arc<ControlState>> {
         Ok(self.control_txn()?.base.clone())
+    }
+
+    /// The bytes of the keys and values of the control state as this transaction would
+    /// leave it, which `maxControlBytes` bounds ([`ControlState::bytes`]).
+    pub fn control_bytes(&self) -> Result<u64> {
+        let c = self.control_txn()?;
+        let mut bytes = c.base.bytes();
+        for (k, v) in &c.changes {
+            if let Some(old) = c.base.get(k) {
+                bytes -= (k.len() + old.len()) as u64;
+            }
+            if let Some(v) = v {
+                bytes += (k.len() + v.len()) as u64;
+            }
+        }
+        Ok(bytes)
     }
 
     /// The value of `key` as this transaction sees it.

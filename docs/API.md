@@ -13581,9 +13581,12 @@ jobs-recovering`. A restart continues the pausing where it stopped. `POST
 the restored set, at most 256 per request, and needs `admin` on the dataset, since the
 operator decides which uncertain external effects may happen again. It answers the
 recovery, with the source dataset, the captured commit, its phase and the counts of
-paused and resumed runs, and the runs it resumed. An empty list reads the recovery, and
-the route is `409 jobs-recovering` while the pausing runs. A retry of a restored run
-creates its new run paused in the same set. A clone starts with an empty ledger and the
+paused and resumed runs, and the runs it resumed. An empty list reads the recovery. A
+request that arrives before every restored run is paused is `409 jobs-recovering`, and
+the server finishes the pausing before it answers, so the operator decides on a complete
+paused set with the next request. The recovery stays after its last paused run is
+resumed or cancelled, and a retry of a restored run creates its new run paused in the
+same set. A clone starts with an empty ledger and the
 source's definitions. Delivery through an outbox and recurring definitions are
 [roadmap](ROADMAP.md) work.
 

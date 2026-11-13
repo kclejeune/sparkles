@@ -26,6 +26,20 @@ use uuid::Uuid;
 /// The most runs one recovery frame pauses and one recovery request resumes.
 const PAUSE_BATCH: usize = 256;
 
+/// The bytes of run and attempt records that one recovery frame stages at most, half
+/// of the largest frame, so that long principal IRIs never make a recovery frame too
+/// large to write.
+const FRAME_BUDGET: usize = sparkles_core::control::MAX_FRAME / 2;
+
+/// The bytes run `run`'s record and attempt `attempt`'s record take in a frame.
+fn staged_bytes(ch: &mut Changes, run: &Run, attempt: Option<&Attempt>) -> usize {
+    let mut bytes = ledger::encode(ch.run(run)).len() + 64;
+    if let Some(a) = attempt {
+        bytes += ledger::encode(ch.attempt(a)).len() + 64;
+    }
+    bytes
+}
+
 /// The recovery of restored work, as [`Jobs::resume`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -547,58 +561,71 @@ impl Jobs {
         // Restored work is paused before the epoch is installed, so no admission check
         // passes before then (spec C26 §7.3).
         self.pause_restored()?;
-        let begun = self.begin(Uuid::new_v4(), None, Some("jobs: boot epoch".into()))?;
-        let Begun {
-            mut t,
-            settings: _,
-            base,
-        } = begun;
-        let mut l = Ledger::new(&base);
-        if l.epoch()? == Some(rt.epoch()) {
-            rt.mark_installed();
-            return Ok(Recovered {
-                epoch: rt.epoch(),
-                installed: false,
-                interrupted: Vec::new(),
-            });
-        }
         let now = now_ms();
-        let mut ch = Changes::default();
         let mut interrupted = Vec::new();
         let mut ended = Vec::new();
-        // A leased run beyond a cut scan keeps its old epoch, which every leased
-        // transition and the next claim refuse, so recovery stays possible.
-        for id in l.runs_in(State::Leased)?.ids {
-            let Some(run) = l.run_header(id)? else {
-                continue;
-            };
-            let Some(attempt) = run.current_attempt else {
-                continue;
-            };
-            let Some(attempt) = l.attempt(attempt)? else {
-                continue;
-            };
-            if attempt.epoch == rt.epoch() {
-                continue;
+        // The interrupted leases go into frames of at most FRAME_BUDGET bytes, and the
+        // epoch into the last one. A crash between them leaves the epoch of an earlier
+        // process, which this process's recovery replaces.
+        loop {
+            let Begun { mut t, base, .. } =
+                self.begin(Uuid::new_v4(), None, Some("jobs: boot epoch".into()))?;
+            let mut l = Ledger::new(&base);
+            if l.epoch()? == Some(rt.epoch()) {
+                rt.mark_installed();
+                return Ok(Recovered {
+                    epoch: rt.epoch(),
+                    installed: false,
+                    interrupted,
+                });
             }
-            let a = ch.attempt(&attempt);
-            a.state = AttemptState::Interrupted;
-            a.diagnostic = Some("interrupted by a restart of the dataset's process".into());
-            let (state, next, reason) = after_failure(&run, now, true, None);
-            self.transition(&mut ch, &run, state, next, reason);
-            rt.revoke_through(run.id, run.version + 1);
-            if state.terminal() {
-                ended.push(run.id);
+            let mut ch = Changes::default();
+            let mut bytes = 0;
+            let mut full = false;
+            // A leased run beyond a cut scan keeps its old epoch, which every leased
+            // transition and the next claim refuse, so recovery stays possible.
+            for id in l.runs_in(State::Leased)?.ids {
+                if bytes >= FRAME_BUDGET {
+                    full = true;
+                    break;
+                }
+                let Some(run) = l.run_header(id)? else {
+                    continue;
+                };
+                let Some(attempt) = run.current_attempt else {
+                    continue;
+                };
+                let Some(attempt) = l.attempt(attempt)? else {
+                    continue;
+                };
+                if attempt.epoch == rt.epoch() {
+                    continue;
+                }
+                let a = ch.attempt(&attempt);
+                a.state = AttemptState::Interrupted;
+                a.diagnostic = Some("interrupted by a restart of the dataset's process".into());
+                let (state, next, reason) = after_failure(&run, now, true, None);
+                self.transition(&mut ch, &run, state, next, reason);
+                bytes += staged_bytes(&mut ch, &run, Some(&attempt));
+                rt.revoke_through(run.id, run.version + 1);
+                if state.terminal() {
+                    ended.push(run.id);
+                }
+                interrupted.push(run.id);
             }
-            interrupted.push(run.id);
+            if !full {
+                ch.epoch(&Epoch {
+                    epoch: rt.epoch(),
+                    installed_ms: now,
+                });
+            }
+            drop(l);
+            ch.apply(&mut t)?;
+            t.commit()?;
+            if !full {
+                break;
+            }
         }
-        ch.epoch(&Epoch {
-            epoch: rt.epoch(),
-            installed_ms: now,
-        });
-        drop(l);
-        ch.apply(&mut t)?;
-        t.commit()?;
         rt.mark_installed();
         // A run that waits to retry still needs its pinned inputs.
         self.release_holds_of(&ended);
@@ -655,21 +682,42 @@ impl Jobs {
                 return Ok(());
             }
             let mut paused = 0;
-            'states: for st in [State::Queued, State::RetryWait, State::Leased] {
+            let mut bytes = 0;
+            let mut full = false;
+            'states: for st in [
+                State::Queued,
+                State::RetryWait,
+                State::Leased,
+                State::Paused,
+            ] {
                 for id in l.runs_in(st)?.ids {
-                    if paused == PAUSE_BATCH {
+                    if paused == PAUSE_BATCH || bytes >= FRAME_BUDGET {
+                        full = true;
                         break 'states;
                     }
                     let Some(run) = l.run_header(id)? else {
                         continue;
                     };
+                    // A run that an earlier recovery paused, captured while it awaited a
+                    // decision, joins this recovery's set.
+                    if st == State::Paused {
+                        if run.recovery == Some(rec.id) {
+                            continue;
+                        }
+                        ch.run(&run).recovery = Some(rec.id);
+                        bytes += staged_bytes(&mut ch, &run, None);
+                        paused += 1;
+                        continue;
+                    }
+                    let mut attempt = None;
                     if let Some(a) = run.current_attempt
                         && let Some(a) = l.attempt(a)?
                         && a.state == AttemptState::Active
                     {
-                        let a = ch.attempt(&a);
-                        a.state = AttemptState::Interrupted;
-                        a.diagnostic = Some("interrupted by a restore of the dataset".into());
+                        let staged = ch.attempt(&a);
+                        staged.state = AttemptState::Interrupted;
+                        staged.diagnostic = Some("interrupted by a restore of the dataset".into());
+                        attempt = Some(a);
                     }
                     self.transition(
                         &mut ch,
@@ -679,11 +727,12 @@ impl Jobs {
                         Some("paused by the recovery of a restored backup".into()),
                     );
                     ch.run(&run).recovery = Some(rec.id);
+                    bytes += staged_bytes(&mut ch, &run, attempt.as_ref());
                     paused += 1;
                 }
             }
             rec.paused += paused as u64;
-            if paused < PAUSE_BATCH {
+            if !full {
                 rec.phase = RecoveryPhase::AwaitingDecision;
             }
             ch.recovery(Some(&rec));
@@ -723,6 +772,21 @@ impl Jobs {
                 "a recovery request resumes at most {PAUSE_BATCH} runs"
             )));
         }
+        // A request that finds a restore's origin or a pausing recovery is refused, so
+        // the operator decides only once every restored run is paused. It drives the
+        // pausing to its end first, so that the next request can be admitted.
+        let published = self.published()?;
+        let pausing = published.origin()?.is_some()
+            || Ledger::new(&published)
+                .recovery()?
+                .is_some_and(|r| r.phase == RecoveryPhase::Pausing);
+        if pausing {
+            self.ensure_epoch()?;
+            return Err(managed(
+                ManagedErrorKind::JobsRecovering,
+                "the jobs recovery was pausing restored work when the request arrived; read the recovery and retry",
+            ));
+        }
         self.ensure_epoch()?;
         let Begun { mut t, base, .. } =
             self.begin(Uuid::new_v4(), None, Some("jobs: resume".into()))?;
@@ -760,11 +824,9 @@ impl Jobs {
         rec.resumed += resumed.len() as u64;
         let left = Self::paused_members(&mut l, &rec, &resumed)?;
         let status = RecoveryStatus::of(&rec, left, resumed);
-        if left == 0 {
-            ch.recovery(None);
-        } else {
-            ch.recovery(Some(&rec));
-        }
+        // the recovery stays once no run is paused, so that a retry of a restored run
+        // that ended still waits for a decision
+        ch.recovery(Some(&rec));
         drop(l);
         if !ch.is_empty() {
             ch.apply(&mut t)?;
@@ -1072,19 +1134,6 @@ impl Jobs {
             checkpoint: st.s.checkpoint.clone(),
             inputs: st.inputs.to_vec(),
         };
-        // Admission is bounded by the size of the control state, so that the memory it
-        // takes stays within the settings' bound. A transition of an admitted run is
-        // never refused for it (spec C26 §7).
-        let size = base.bytes() + ledger::encode(&input).len() as u64 + 2048;
-        if size > settings.max_control_bytes {
-            return Err(managed(
-                ManagedErrorKind::JobsOverloaded,
-                format!(
-                    "the job ledger would grow past the dataset's bound of {} bytes; no run was stored",
-                    settings.max_control_bytes
-                ),
-            ));
-        }
         // An explicit retry of a member of a restored set that awaits a decision joins
         // the set paused, so only the recovery route makes it eligible (spec C26 §7.3).
         let mut ch = Changes::default();
@@ -1151,6 +1200,18 @@ impl Jobs {
         );
         drop(l);
         ch.apply(&mut t)?;
+        // Admission is bounded by the size of the control state with every record the
+        // submission stages, so that the memory it takes stays within the settings'
+        // bound. A transition of an admitted run is never refused for it (spec C26 §7).
+        if t.control_bytes()? > settings.max_control_bytes {
+            return Err(managed(
+                ManagedErrorKind::JobsOverloaded,
+                format!(
+                    "the job ledger would grow past the dataset's bound of {} bytes; no run was stored",
+                    settings.max_control_bytes
+                ),
+            ));
+        }
         Ok(Staged::Ready(Box::new(t), state))
     }
 
@@ -1793,19 +1854,15 @@ impl Jobs {
                 format!("cancelled by {}", caller.principal.as_str())
             }),
         );
-        // a cancelled member of a restored set leaves the recovery's decision
+        // A cancelled member of a restored set leaves the paused runs, and the recovery
+        // stays, so that a retry of any member still waits for a decision (spec C26
+        // §7.3).
         if run.state == State::Paused
             && let Some(mut rec) = l.recovery()?
             && run.recovery == Some(rec.id)
         {
             rec.cancelled += 1;
-            if rec.phase == RecoveryPhase::AwaitingDecision
-                && Self::paused_members(&mut l, &rec, &[run.id])? == 0
-            {
-                ch.recovery(None);
-            } else {
-                ch.recovery(Some(&rec));
-            }
+            ch.recovery(Some(&rec));
         }
         drop(l);
         ch.apply(&mut t)?;

@@ -532,11 +532,12 @@ pub fn read_log(bytes: &[u8]) -> Result<LogRead> {
         let complete = len <= MAX_FRAME && end <= bytes.len();
         let valid = complete && len > 0 && crate::commit::crc32_of(&[&bytes[at + 8..end]]) == crc;
         if !valid {
-            // a record that runs past the end is the last one, and only zeros may follow
-            // a complete damaged one: every record is synchronized before the next is
-            // written, so damage before a later record is not a torn tail
+            // Every record is synchronized before the next is written, so damage before
+            // a later record is not a torn tail. Only zeros may follow a complete
+            // damaged record, and no complete record may follow one whose damaged
+            // length runs past the end.
             let after = if complete { end } else { bytes.len() };
-            if bytes[after..].iter().any(|b| *b != 0) {
+            if bytes[after..].iter().any(|b| *b != 0) || later_record(bytes, at + 1) {
                 return Err(corrupt(format!(
                     "{LOG_FILE} has a damaged record at byte {at} before later records"
                 )));
@@ -555,6 +556,29 @@ pub fn read_log(bytes: &[u8]) -> Result<LogRead> {
         good: at as u64,
         torn: false,
     })
+}
+
+/// Whether a complete, valid record of `control.log` starts at or after `from`: one whose
+/// frame starts with the frame version and declares the record's length, and whose
+/// checksum matches. The first two tests leave the checksum to few candidates.
+fn later_record(bytes: &[u8], from: usize) -> bool {
+    let mut p = from;
+    while p + 8 + 5 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        let end = p.saturating_add(8).saturating_add(len);
+        if len > 5
+            && len <= MAX_FRAME
+            && end <= bytes.len()
+            && bytes[p + 8] == FRAME_VERSION
+            && u32::from_le_bytes(bytes[p + 9..p + 13].try_into().unwrap()) as usize == len
+            && crate::commit::crc32_of(&[&bytes[p + 8..end]])
+                == u32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap())
+        {
+            return true;
+        }
+        p += 1;
+    }
+    false
 }
 
 // -------------------------------------------------------------------- recovery ------
@@ -801,6 +825,14 @@ mod tests {
         let mut mid = bytes.clone();
         mid[first_end - 1] ^= 1;
         assert!(matches!(read_log(&mid), Err(Error::Corrupt(_))));
+        // so is a damaged length that runs past the end over a later valid record
+        let h = LOG_HEADER_BYTES as usize;
+        let mut long = bytes.clone();
+        long[h..h + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(read_log(&long), Err(Error::Corrupt(_))));
+        let mut past = bytes.clone();
+        past[h..h + 4].copy_from_slice(&((bytes.len() - h) as u32).to_le_bytes());
+        assert!(matches!(read_log(&past), Err(Error::Corrupt(_))));
         // a newer version is refused
         let mut newer = bytes.clone();
         newer[8] = 2;

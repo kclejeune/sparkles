@@ -153,20 +153,20 @@ fn restored_work_waits_paused_for_the_recovery_route() {
     assert_eq!(state(&copy, leased_at_capture), State::Queued);
     let status = copy.jobs().resume(&[retried2.run], &admin()).unwrap();
     assert!(status.recovery.unwrap().ended);
-    assert!(
-        copy.jobs()
-            .resume(&[], &admin())
-            .unwrap()
-            .recovery
-            .is_none()
-    );
+    // the recovery stays once nothing is paused, so a later retry of a restored run
+    // that ended still waits for a decision
+    let rec = copy.jobs().resume(&[], &admin()).unwrap().recovery.unwrap();
+    assert_eq!((rec.paused, rec.ended), (0, true));
+    let late = copy.jobs().retry(cancelled, "again3", &admin()).unwrap();
+    assert_eq!(late.state, State::Paused);
+    copy.jobs().resume(&[late.run], &admin()).unwrap();
     // the resumed runs are claimed again
     let mut claimed = Vec::new();
     while let Some(c) = copy.jobs().claim(&[], &worker()).unwrap() {
         claimed.push(c.run);
     }
     claimed.sort();
-    let mut expected = vec![leased_at_capture, retried.run, retried2.run];
+    let mut expected = vec![leased_at_capture, retried.run, retried2.run, late.run];
     expected.sort();
     assert_eq!(claimed, expected);
 }
@@ -211,4 +211,55 @@ fn a_clone_starts_with_an_empty_ledger() {
             .is_empty()
     );
     assert!(clone.jobs().recover().unwrap().interrupted.is_empty());
+}
+
+/// A21: the recovery route refuses a request that finds the restored work still to be
+/// paused, and admits the next one once the pausing ended.
+#[test]
+fn the_recovery_route_refuses_until_the_restored_work_is_paused() {
+    let (_dir, _cat, _src, copy, runs, _) = restored();
+    assert_eq!(code(copy.jobs().resume(&[], &admin())), "jobs-recovering");
+    assert_eq!(state(&copy, runs[0]), State::Paused);
+    let rec = copy.jobs().resume(&[], &admin()).unwrap().recovery.unwrap();
+    assert_eq!(rec.phase, RecoveryPhase::AwaitingDecision);
+    copy.jobs().resume(&[runs[0]], &admin()).unwrap();
+    assert_eq!(state(&copy, runs[0]), State::Queued);
+}
+
+/// A backup of a restored dataset whose runs still await a decision restores with those
+/// runs in the new recovery, which resumes them.
+#[test]
+fn a_restore_of_a_restore_adopts_the_runs_it_holds_paused() {
+    let (_dir, cat, _src, copy, runs, _) = restored();
+    copy.jobs().recover().unwrap();
+    for run in [runs[0], runs[2]] {
+        assert_eq!(state(&copy, run), State::Paused);
+    }
+    let repo = cat.repositories().unwrap().open("local").unwrap();
+    copy.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "b2".into(),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let again = cat
+        .restore(
+            &repo,
+            "b2",
+            &RestoreRequest {
+                target: Some("again".into()),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    again.jobs().recover().unwrap();
+    let status = again.jobs().resume(&[runs[0], runs[2]], &admin()).unwrap();
+    assert_eq!(status.resumed.len(), 2);
+    for run in [runs[0], runs[2]] {
+        assert_eq!(state(&again, run), State::Queued);
+    }
 }

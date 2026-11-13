@@ -523,11 +523,11 @@ impl Checker<'_> {
     fn control_keyspace(&mut self) {
         let t = Instant::now();
         let mut run = Run::new("control");
-        let (frames, head) = match &self.wal {
-            Some(w) => (w.control.clone(), w.head),
-            None => (Vec::new(), self.base.map_or(0, |b| b.seq)),
+        let (frames, head, version) = match &self.wal {
+            Some(w) => (w.control.clone(), w.head, w.version),
+            None => (Vec::new(), self.base.map_or(0, |b| b.seq), 0),
         };
-        let configured = self.root.join(crate::jobs::FILE).exists();
+        let configured = crate::store::control_store::jobs_configured(self.root, version);
         let summary =
             match crate::store::control_store::recover_at_open(self.root, frames, head, configured)
             {
@@ -555,6 +555,8 @@ struct WalInfo {
     commits: Vec<(u64, i64, u8)>,
     /// the control frames of the commits replay would keep
     control: Vec<crate::control::WalFrame>,
+    /// the log's version
+    version: u32,
 }
 
 /// The vocabulary check, finished after the permutations report their id references.
@@ -1810,6 +1812,7 @@ impl Checker<'_> {
             head,
             commits,
             control,
+            version,
         });
         self.checks.push(run.done(summary));
     }

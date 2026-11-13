@@ -89,6 +89,73 @@ fn expire(ds: &Dataset, run: Uuid) {
     }
 }
 
+/// The epoch recovery of a restart writes the interrupted leases in as many frames as
+/// their records need, so long principal IRIs never make one frame too large.
+#[test]
+fn a_restart_interrupts_leases_whose_records_pass_one_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = |who: &str| {
+        NamedNode::new_unchecked(format!(
+            "urn:x-sparkles:principal:{who}-{}",
+            "p".repeat(500_000)
+        ))
+    };
+    let runs: Vec<Uuid> = {
+        let ds = Dataset::open(dir.path()).unwrap();
+        let mut s = settings();
+        s.definitions.get_mut("collect").unwrap().concurrency = 40;
+        ds.jobs().configure(&s).unwrap();
+        let submitter = Caller::admin(long("s"));
+        let w = Caller::admin(long("w"));
+        (0..40)
+            .map(|k| {
+                ds.jobs()
+                    .submit(
+                        &Submission::new(
+                            "collect",
+                            serde_json::json!({ "k": k }),
+                            &format!("k{k}"),
+                        ),
+                        &submitter,
+                    )
+                    .unwrap();
+                ds.jobs().claim(&[], &w).unwrap().unwrap().run
+            })
+            .collect()
+    };
+    let ds = Dataset::open(dir.path()).unwrap();
+    let r = ds.jobs().recover().unwrap();
+    assert!(r.installed);
+    assert_eq!(r.interrupted.len(), runs.len());
+    for run in runs {
+        assert_ne!(
+            ds.jobs().get(run, &admin()).unwrap().unwrap().state,
+            State::Leased
+        );
+    }
+}
+
+/// `maxControlBytes` counts every record a submission stages, so a principal's IRI
+/// that the run and its operation record both carry counts twice.
+#[test]
+fn the_control_bound_counts_every_staged_record() {
+    let ds = Dataset::memory();
+    let mut s = settings();
+    s.max_control_bytes = 1 << 20;
+    ds.jobs().configure(&s).unwrap();
+    let long = Caller::admin(NamedNode::new_unchecked(format!(
+        "urn:x-sparkles:principal:{}",
+        "p".repeat(600_000)
+    )));
+    let r = ds.jobs().submit(
+        &Submission::new("collect", serde_json::json!({"page": 1}), "k1"),
+        &long,
+    );
+    assert_eq!(code(r), "jobs-overloaded");
+    // an ordinary submission still fits
+    submit(&ds, "k2");
+}
+
 #[test]
 fn configuration_enables_the_control_keyspace() {
     let ds = Dataset::memory();

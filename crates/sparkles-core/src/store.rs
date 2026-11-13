@@ -2401,6 +2401,8 @@ impl Store {
         let annotated = crate::annotations::seqs_of(root, dataset_id);
         let mut truncated = false;
         let mut wal_control = Vec::new();
+        // the repair of the log's tail, made only once the control keyspace recovered
+        let mut wal_repair = None;
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -2420,20 +2422,8 @@ impl Store {
                 configuration_references.observation(observation)
             })?;
             wal_len = r.good as u64;
-            if r.good == 0 {
-                // No complete header record, so no committed record either: an empty
-                // file, or the header record a crash tore at the log's creation, whether
-                // it left zeros or a prefix of the header. The log holds nothing, so it
-                // is created again below with its header, and the writer starts after
-                // that header. A complete header counts as the log's first good part.
-                std::fs::remove_file(&wal_path)?;
-                sync_dir(&root.join(&name))?;
-            } else if r.good != buf.len() {
-                OpenOptions::new()
-                    .write(true)
-                    .open(&wal_path)?
-                    .set_len(r.good as u64)?;
-                truncated = true;
+            if r.good == 0 || r.good != buf.len() {
+                wal_repair = Some(r.good as u64);
             }
             wal_index = r.index;
             delta = r.delta;
@@ -2446,21 +2436,21 @@ impl Store {
         drop(configuration_references);
         drop(configuration_state);
         drop(configuration_preparation);
-        let catalog = Catalog::open(&catalog_path, dataset_id, base, &replayed)?;
-        // the catalog's record of the head: a commit that a compaction carried into this
-        // generation's log keeps the generation it was made in
-        let head = replayed
-            .last()
-            .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
-            .unwrap_or(base);
-        // The control keyspace of the main store, recovered before anything is written:
-        // an integrity error changes no file (spec C26 §7.2). A branch has none.
+        // The control keyspace of the main store, recovered before anything is written,
+        // the repair of the log's tail and the catalog's included: an integrity error
+        // changes no file (spec C26 §7.2). A branch has none.
+        let head_seq = replayed.last().map_or(base.seq, |c| c.seq);
+        let wal_version = if wal_path.exists() {
+            wal::file_version(&wal_path).unwrap_or(0)
+        } else {
+            0
+        };
         let control_opened = if ctx.is_none() {
             control_store::recover_at_open(
                 root,
                 std::mem::take(&mut wal_control),
-                head.seq,
-                control_store::jobs_configured(root, family.managed.load().as_deref()),
+                head_seq,
+                control_store::jobs_configured(root, wal_version),
             )?
         } else if !wal_control.is_empty() {
             return Err(Error::Corrupt(format!(
@@ -2470,6 +2460,32 @@ impl Store {
         } else {
             None
         };
+        match wal_repair {
+            // No complete header record, so no committed record either: an empty file,
+            // or the header record a crash tore at the log's creation, whether it left
+            // zeros or a prefix of the header. The log holds nothing, so it is created
+            // again below with its header, and the writer starts after that header. A
+            // complete header counts as the log's first good part.
+            Some(0) => {
+                std::fs::remove_file(&wal_path)?;
+                sync_dir(&root.join(&name))?;
+            }
+            Some(good) => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&wal_path)?
+                    .set_len(good)?;
+                truncated = true;
+            }
+            None => {}
+        }
+        let catalog = Catalog::open(&catalog_path, dataset_id, base, &replayed)?;
+        // the catalog's record of the head: a commit that a compaction carried into this
+        // generation's log keeps the generation it was made in
+        let head = replayed
+            .last()
+            .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
+            .unwrap_or(base);
         // The settings files were checked by the preflight after the lock, and every file
         // this open read is in a version this build reads. The release now writes the
         // database: record it in dataset.json, and require the reader of the
