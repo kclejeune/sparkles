@@ -197,6 +197,14 @@ It reports the questions whose prompt holds every gold term and the prompt size.
 `resourceNamespaces`, it also splits the gold terms into resources under those namespaces
 and schema terms, and reports each kind apart.
 
+`scripts/eval-ask --profile-stages`, or `"profileStages": true` in a run file, starts
+each child with `RUST_LOG=warn,sparkles::ask::profile=debug` and `--log-format json`, so
+the child's `stderr` holds one JSON line per completed Ask stage. These lines carry no
+question, label, IRI, prompt or error message, and
+[Ask stage diagnostics](../../docs/ai/README.md#ask-stage-diagnostics) describes their
+fields. A batch child numbers its asks in the order the runner sends them, which with
+`--jobs 1` is question order with each clarified case's second ask after its first.
+
 The self-test drives the real CLI through the proxy against a local fake API. It covers
 chunked and close-delimited replies, structured-output retries, a downgrade, a
 rate limit, an overload that clears and a cascade. `--dry-run` runs a whole run file
