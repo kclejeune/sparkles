@@ -940,6 +940,14 @@ to 1.6 ms and 2.1 to 2.5 ms. The first query of a view pays the proof, 25 ms und
 and 230 ms under `owl-rl`, most of it the `owl-rl` abstraction's joins over rules with a
 variable predicate.
 
+At ten universities on stanley, with two rounds of `reasoning_latency` for each build on
+the same host, LUBM q1 under `demand` takes 4.65 ms with `owl-rl` and 2.00 ms with
+`rdfs`, against 3,217 ms and 94.4 ms before these changes and 1.99 ms and 1.00 ms before
+item 191 (`6fae0eb2`). Every query's answers equal the materialized ones in all three
+builds. The narrow queries remain about twice as slow as before item 191, and the broad
+`owl-rl` queries q6, q8 and q9 take 2.9 to 3.0 s against 1.8 s. Item 911 stays open for
+that remainder.
+
 Options that give up completeness were not taken. Trusting the preliminary schema pass,
 as before item 191, would again miss schema facts that only derived instance facts
 give. Bounding the proof by the relations a query's patterns reach would leave the
