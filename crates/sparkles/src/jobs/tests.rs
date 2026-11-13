@@ -82,13 +82,11 @@ fn publication(op: Uuid, k: u32) -> Publication {
 
 /// Make the lease this process granted for `run` expire now.
 fn expire(ds: &Dataset, run: Uuid) {
-    ds.jobs().runtime().leases.lock().insert(
-        run,
-        Lease {
-            grant: 0,
-            deadline: Instant::now() - Duration::from_millis(1),
-        },
-    );
+    if let Some(v) = ds.jobs().runtime().leases.lock().get_mut(&run) {
+        for l in v {
+            l.deadline = Instant::now() - Duration::from_millis(1);
+        }
+    }
 }
 
 #[test]
@@ -267,6 +265,116 @@ fn materialization_never_reads_the_ledger() {
         .map(|i| i.to_string())
         .unwrap_or_default();
     assert!(!recorded.contains(LEDGER_GRAPH), "{record:?}");
+}
+
+#[test]
+fn predicate_distinct_counts_leave_the_hidden_subjects_and_objects_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    configured(&ds);
+    submit(&ds, "k");
+    ds.update("INSERT DATA { <urn:public> a <urn:Public> }")
+        .unwrap();
+    ds.compact().unwrap();
+    let stats = ds.stats(&Default::default()).unwrap();
+    let p = stats
+        .predicates
+        .iter()
+        .find(|p| p.iri == oxrdf::vocab::rdf::TYPE.as_str())
+        .unwrap();
+    assert_eq!(p.count, 1);
+    assert_eq!((p.distinct_subjects, p.distinct_objects), (1, 1), "{p:?}");
+}
+
+#[test]
+fn the_schema_facade_never_reads_the_ledger() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    let mut req = crate::handles::ReportRequest::default();
+    req.options.graph = crate::schema::GraphSelection::Union;
+    let report = ds.schema().report(&req).unwrap();
+    let j = serde_json::to_string(report.report.as_ref()).unwrap();
+    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
+    // an explicit all-graphs view, the report of an opened state and the profiles
+    let mut opts = req.options.clone();
+    opts.graphs = Some(Arc::new(crate::access::GraphAccess::all()));
+    let (r, _) = ds.schema().report_at(&ds.snapshot(), &opts).unwrap();
+    let j = serde_json::to_string(r.as_ref()).unwrap();
+    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
+    let profiles = ds
+        .schema()
+        .profiles(&crate::schema::profile::ProfileOptions {
+            schema: opts,
+            classes: Vec::new(),
+        })
+        .unwrap();
+    let j = format!("{profiles:?}");
+    assert!(!j.contains("urn:x-sparkles:jobs:"), "{j}");
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn library_validation_never_reads_the_ledger() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    submit(&ds, "k");
+    let shapes = sparkles_shacl::Shapes::parse(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetClass <urn:x-sparkles:jobs:Run> ; sh:property [ sh:path <urn:x-sparkles:jobs:state> ; sh:maxCount 0 ] .",
+        sparkles_shacl::ShapesSyntax::default(),
+        None,
+    )
+    .unwrap();
+    for data_graph in ["urn:x-arq:UnionGraph", LEDGER_GRAPH] {
+        let opts = sparkles_shacl::ValidateOptions {
+            data_graph: Some(data_graph.into()),
+            ..Default::default()
+        };
+        let report = ds.validation().shacl(&shapes, &opts).unwrap();
+        assert!(report.conforms, "{data_graph}: {report:?}");
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn library_forms_never_read_the_ledger() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let run = submit(&ds, "k").run;
+    ds.update("PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA { GRAPH <urn:shapes> { <urn:S> a sh:NodeShape ; sh:targetClass <urn:x-sparkles:jobs:Run> ; sh:property [ sh:path <urn:x-sparkles:jobs:state> ] } }")
+        .unwrap();
+    let settings = crate::forms::FormSettings {
+        shapes: crate::forms::ShapesSource::Graphs,
+        graphs: vec!["urn:shapes".into()],
+        ..Default::default()
+    };
+    let req = crate::forms::FormRequest::new(format!("urn:x-sparkles:jobs:run:{run}"), settings);
+    let model = ds.forms().model(&req, &Default::default()).unwrap();
+    let j = serde_json::to_string(&model).unwrap();
+    assert!(!j.contains("queued"), "{j}");
+}
+
+#[test]
+fn explanations_never_read_the_ledger() {
+    let ds = Dataset::memory();
+    configured(&ds);
+    let run = submit(&ds, "k").run;
+    ds.reasoning()
+        .rdfs()
+        .set(crate::reasoning::rdfs::NewSchema::Triples(vec![]))
+        .unwrap();
+    let term = |s: &str| oxrdf::Term::NamedNode(NamedNode::new(s).unwrap());
+    let req = crate::reasoning::explain::ExplainRequest::new([
+        term(&format!("urn:x-sparkles:jobs:run:{run}")),
+        term(oxrdf::vocab::rdf::TYPE.as_str()),
+        term("urn:x-sparkles:jobs:Run"),
+    ]);
+    let result = ds.reasoning().explain(&req).unwrap();
+    assert!(
+        matches!(result.explained, crate::explain::Explained::NotFound),
+        "{:?}",
+        result.explained
+    );
 }
 
 #[test]
@@ -1076,26 +1184,190 @@ fn refuse_once() -> Arc<dyn crate::guard::CommitGuard> {
     Arc::new(RefuseOnce(std::sync::atomic::AtomicBool::new(true)))
 }
 
+/// A commit guard that refuses every commit with the error `refusal` makes.
+struct RefuseWith(fn() -> Error);
+
+impl crate::guard::CommitGuard for RefuseWith {
+    fn check(&self, _: &crate::guard::Candidate<'_>) -> Result<crate::guard::ValidationSummary> {
+        Err((self.0)())
+    }
+    fn describe(&self) -> String {
+        "refuse with".into()
+    }
+}
+
+/// A subscriber that, on the thread it is installed on, holds a commit at the end of its
+/// span, after the writer was released and before the caller sees the outcome: it
+/// signals `ready` and waits for `resume`.
+struct PauseCommitExit {
+    ready: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl tracing::Subscriber for PauseCommitExit {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::TRACE)
+    }
+    fn new_span(&self, a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(if a.metadata().name() == "commit" {
+            1
+        } else {
+            2
+        })
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, id: &tracing::span::Id) {
+        if id.into_u64() == 1 {
+            self.ready.send(()).unwrap();
+            let _ = self
+                .resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+        }
+    }
+}
+
+/// `f` on a new thread whose commits pause at their end, with the channel that says a
+/// commit paused and the one that resumes it.
+fn paused<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<T>,
+) {
+    let (ready, ready_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        let sub = PauseCommitExit {
+            ready,
+            resume: std::sync::Mutex::new(resume),
+        };
+        tracing::subscriber::with_default(sub, f)
+    });
+    (ready_rx, resume_tx, h)
+}
+
+fn lease_ms(ds: &Dataset, ms: u64) {
+    let mut s = settings();
+    s.definitions.get_mut("collect").unwrap().lease_ms = ms;
+    ds.jobs().configure(&s).unwrap();
+}
+
+#[test]
+fn a_refused_renewal_paused_after_the_writer_does_not_extend_the_lease() {
+    let ds = Dataset::memory();
+    // long enough that a loaded machine reaches the renewal's commit within the lease
+    lease_ms(&ds, 1500);
+    submit(&ds, "k");
+    let c = claim(&ds, &worker("w"));
+    ds.store().set_guard(Some(refuse_once()));
+    let (d, run, token) = (ds.clone(), c.run, c.token.clone());
+    let (ready, resume, h) = paused(move || {
+        d.jobs()
+            .renew(run, &token, Some(60_000), None, &worker("w"))
+    });
+    if ready.recv_timeout(Duration::from_secs(30)).is_err() {
+        panic!("the renewal did not reach its commit: {:?}", h.join());
+    }
+    // past the committed deadline, while the refused renewal has not returned
+    std::thread::sleep(Duration::from_millis(1600));
+    let published = ds.jobs().publish(
+        c.run,
+        &c.token,
+        &publication(Uuid::new_v4(), 1),
+        &worker("w"),
+    );
+    resume.send(()).unwrap();
+    assert!(h.join().unwrap().is_err());
+    ds.store().set_guard(None);
+    assert!(
+        code(published).contains("lease-lost"),
+        "a refused renewal authorized a publication past the committed deadline"
+    );
+}
+
+#[test]
+fn two_refused_renewals_do_not_revive_an_abandoned_deadline() {
+    let ds = Dataset::memory();
+    lease_ms(&ds, 1500);
+    submit(&ds, "k");
+    let c = claim(&ds, &worker("w"));
+    let renew = |ds: &Dataset| {
+        let (d, run, token) = (ds.clone(), c.run, c.token.clone());
+        paused(move || {
+            d.jobs()
+                .renew(run, &token, Some(60_000), None, &worker("w"))
+        })
+    };
+    ds.store().set_guard(Some(refuse_once()));
+    let (a_ready, a_resume, a) = renew(&ds);
+    if a_ready.recv_timeout(Duration::from_secs(30)).is_err() {
+        panic!("renewal a did not reach its commit: {:?}", a.join());
+    }
+    ds.store().set_guard(Some(refuse_once()));
+    let (b_ready, b_resume, b) = renew(&ds);
+    if b_ready.recv_timeout(Duration::from_secs(30)).is_err() {
+        panic!("renewal b did not reach its commit: {:?}", b.join());
+    }
+    a_resume.send(()).unwrap();
+    assert!(a.join().unwrap().is_err());
+    b_resume.send(()).unwrap();
+    assert!(b.join().unwrap().is_err());
+    ds.store().set_guard(None);
+    std::thread::sleep(Duration::from_millis(1600));
+    assert!(
+        code(ds.jobs().renew(c.run, &c.token, None, None, &worker("w"))).contains("lease-lost"),
+        "two refused renewals left an extension of the expired lease"
+    );
+}
+
 #[test]
 fn a_refused_or_unwinding_lease_commit_leaves_the_deadlines_of_committed_leases() {
-    // the runtime by itself: a grant that is not kept puts back what it replaced, and
-    // only while the entry is still its own
+    // the runtime by itself: a deadline counts only at the version it was recorded
+    // under, a grant that is not kept removes only its own entry, and a kept one drops
+    // the older versions
     let rt = Runtime::default();
     let run = Uuid::new_v4();
-    let a = rt.grant(run, 60_000);
-    let b = rt.grant(run, 60_000);
-    b.keep();
-    drop(a);
-    assert!(!rt.lease_expired(run), "a's rollback left b's deadline");
-    let before = rt.leases.lock()[&run];
-    let c = rt.grant(run, 120_000);
-    drop(c);
-    assert_eq!(rt.leases.lock()[&run].deadline, before.deadline);
-    let d = rt.grant(Uuid::new_v4(), 60_000);
-    let other = d.run;
-    drop(d);
+    let a = rt.grant(run, 2, 60_000);
     assert!(
-        rt.lease_expired(other),
+        rt.lease_expired(run, 1),
+        "a deadline of an uncommitted version"
+    );
+    drop(a);
+    let b = rt.grant(run, 2, 60_000);
+    b.keep();
+    assert!(!rt.lease_expired(run, 2));
+    let c = rt.grant(run, 3, 120_000);
+    drop(c);
+    assert!(!rt.lease_expired(run, 2), "c's rollback left b's deadline");
+    assert!(rt.lease_expired(run, 3));
+    // two pending grants of one version: the later replaces the earlier, and neither
+    // rollback revives anything
+    let d = rt.grant(run, 3, 120_000);
+    let e = rt.grant(run, 3, 120_000);
+    drop(d);
+    drop(e);
+    assert!(rt.lease_expired(run, 3));
+    assert!(!rt.lease_expired(run, 2));
+    let f = rt.grant(run, 3, 60_000);
+    f.keep();
+    assert!(
+        rt.lease_expired(run, 2),
+        "a kept grant drops the older versions"
+    );
+    let g = rt.grant(Uuid::new_v4(), 1, 60_000);
+    let other = g.run;
+    drop(g);
+    assert!(
+        rt.lease_expired(other, 1),
         "a fresh grant that is not kept is gone"
     );
     // a claim whose commit is refused leaves no deadline, and the next claim takes
@@ -1232,6 +1504,39 @@ fn a_refused_submission_commit_releases_its_hold() {
     );
     let s = ds.jobs().submit(&sub, &admin()).unwrap();
     assert_eq!(ds.store().source_holds().unwrap()[0].id, s.run);
+}
+
+#[test]
+fn a_storage_or_managed_refusal_of_a_submission_releases_its_hold() {
+    let refusals: [fn() -> Error; 2] = [
+        || Error::StorageFull("the reserve would be exceeded".into()),
+        || {
+            crate::managed::ManagedError::error(
+                crate::managed::ManagedErrorKind::Protected,
+                "a managed graph",
+            )
+        },
+    ];
+    for (i, refusal) in refusals.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        ds.update("INSERT DATA { <urn:a> <urn:b> <urn:c> }")
+            .unwrap();
+        configured(&ds);
+        let mut sub = Submission::new("collect", serde_json::json!({}), "k1");
+        sub.inputs.push(crate::branch::CommitRef {
+            branch_id: ds.store().branch_id(),
+            seq: ds.store().head_commit().seq,
+        });
+        ds.store().set_guard(Some(Arc::new(RefuseWith(refusal))));
+        let r = ds.jobs().submit(&sub, &admin());
+        assert!(r.is_err(), "refusal {i}");
+        ds.store().set_guard(None);
+        assert!(
+            ds.store().source_holds().unwrap().is_empty(),
+            "refusal {i} left the hold of {r:?}"
+        );
+    }
 }
 
 #[test]

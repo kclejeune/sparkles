@@ -160,6 +160,11 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
     let max_depth = req.max_depth.min(MAX_DEPTH);
     let store = ds.store();
     let head = store.snapshot();
+    // the dataset's hidden control graphs are never explained from (spec C26 §2.3)
+    let req = &ExplainRequest {
+        access: ds.hide_owner_graphs(req.access.clone()),
+        ..req.clone()
+    };
     let access = req.access.as_ref();
     let generalized =
         matches!(req.triple[0], Term::Literal(_)) || !matches!(req.triple[1], Term::NamedNode(_));

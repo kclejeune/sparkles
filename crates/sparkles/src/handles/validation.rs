@@ -19,17 +19,31 @@ impl Validation {
         }
     }
 
-    /// Validate the current state against SHACL shapes.
+    /// Validate the current state against SHACL shapes. The dataset's hidden control
+    /// graphs (spec C26 §2.3) are never read, and a data graph that is one of them
+    /// conforms as a graph without quads does.
     #[cfg(feature = "shacl")]
     pub fn shacl(
         &self,
         shapes: &sparkles_shacl::Shapes,
         opts: &sparkles_shacl::ValidateOptions,
     ) -> Result<sparkles_shacl::ValidationReport> {
-        sparkles_shacl::validate(&self.ds.snapshot(), shapes, opts).map_err(super::from_anyhow)
+        let mut o = opts.clone();
+        if !self.ds.hide_validation_graphs(
+            &o.data_graph,
+            &mut o.extra_graphs,
+            &mut o.exclude_graphs,
+        ) {
+            return Ok(sparkles_shacl::ValidationReport {
+                conforms: true,
+                ..Default::default()
+            });
+        }
+        sparkles_shacl::validate(&self.ds.snapshot(), shapes, &o).map_err(super::from_anyhow)
     }
 
-    /// Validate the current state against a ShEx schema and shape map.
+    /// Validate the current state against a ShEx schema and shape map, without the
+    /// dataset's hidden control graphs, as [`shacl`](Self::shacl) does.
     #[cfg(feature = "shex")]
     pub fn shex(
         &self,
@@ -37,7 +51,18 @@ impl Validation {
         map: &sparkles_shex::ShapeMap,
         opts: &sparkles_shex::ValidateOptions,
     ) -> Result<sparkles_shex::ResultMap> {
-        sparkles_shex::validate(&self.ds.snapshot(), schema, map, opts).map_err(super::from_anyhow)
+        let mut o = opts.clone();
+        if !self.ds.hide_validation_graphs(
+            &o.data_graph,
+            &mut o.extra_graphs,
+            &mut o.exclude_graphs,
+        ) {
+            return Ok(sparkles_shex::ResultMap {
+                conforms: true,
+                ..Default::default()
+            });
+        }
+        sparkles_shex::validate(&self.ds.snapshot(), schema, map, &o).map_err(super::from_anyhow)
     }
 }
 

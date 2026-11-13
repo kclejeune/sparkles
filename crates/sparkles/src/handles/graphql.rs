@@ -133,7 +133,9 @@ impl GraphQl {
     /// A mapping schema drafted from SHACL shapes or from the data, with the commit it
     /// read. The data graph is the installed configuration's, and the shapes are those
     /// of `req.shapes_graph` or of the write guard.
-    pub fn draft(&self, name: &str, req: DraftRequest) -> Result<(draft::Draft, u64)> {
+    pub fn draft(&self, name: &str, mut req: DraftRequest) -> Result<(draft::Draft, u64)> {
+        // the dataset's hidden control graphs are never drafted from (spec C26 §2.3)
+        req.view = self.ds.hide_owner_graphs(req.view.take());
         let data_graph = self
             .get(None)
             .map(|s| s.config.data_graph)

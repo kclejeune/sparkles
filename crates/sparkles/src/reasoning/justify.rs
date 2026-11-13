@@ -613,6 +613,10 @@ impl InputsForProbe {
 }
 
 pub fn justify(dataset: &Dataset, request: &JustifyRequest) -> Result<JustificationReport> {
+    let request = &JustifyRequest {
+        analysis: super::analysis::hiding(dataset, &request.analysis),
+        ..request.clone()
+    };
     let control = AnalysisControl::new(&request.analysis)?;
     let snapshot = super::diff::resolve(dataset, &request.at, &control)?;
     let program = if matches!(request.target, JustifyTarget::Finding(_))
@@ -1031,7 +1035,7 @@ pub fn diagnose(
     analysis: &AnalysisOptions,
     max_checks: usize,
 ) -> Result<JustifiedDiagnostics> {
-    let mut analysis = analysis.clone();
+    let mut analysis = super::analysis::hiding(dataset, analysis);
     analysis.timeout = match (analysis.timeout, options.timeout) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),

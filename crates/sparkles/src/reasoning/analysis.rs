@@ -194,6 +194,14 @@ pub(crate) fn program(dataset: &Dataset, options: &AnalysisOptions) -> Result<An
     })
 }
 
+/// `options` with the dataset's hidden control graphs (spec C26 §2.3) out of its access,
+/// so that no analysis reads them, whatever access the caller supplied.
+pub(crate) fn hiding(dataset: &Dataset, options: &AnalysisOptions) -> AnalysisOptions {
+    let mut o = options.clone();
+    o.access = dataset.hide_owner_graphs(o.access.take());
+    o
+}
+
 pub(crate) fn view(snapshot: &Arc<Snapshot>, options: &AnalysisOptions) -> Result<Arc<Snapshot>> {
     match &options.access {
         Some(access) => access.bound(snapshot).masked(snapshot),

@@ -1234,12 +1234,16 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Opened> {
         req.validate()?;
+        // the dataset's hidden control graphs leave every view (spec C26 §2.3); a caller
+        // that reads every other graph still shares the kept ontology
+        let shared = opts.graphs.is_none();
+        let opts = &*self.ds.without_owner_graphs(opts);
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
             Some(a) => a.masked(snap)?,
             None => snap.clone(),
         };
-        let keep = access.is_none() && snap.cacheable;
+        let keep = shared && snap.cacheable;
         // an inferred view reads the inferred graph while the dataset records a
         // materialization; without one it reads the asserted axioms only (§7)
         let record = if req.inferences {
@@ -2482,7 +2486,13 @@ pub fn rl_warnings(
         },
         location_mapping: inputs.location_mapping.clone(),
     };
-    let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &|_| true);
+    // an import is followed only to a graph the view reads
+    let readable = |g: Id| {
+        opts.graphs
+            .as_ref()
+            .is_none_or(|a| a.bound(snap).readable_id(snap, g))
+    };
+    let resolved = sparkles_reasoner::inputs::resolve_readable(snap, &inputs, &readable);
     let graph_ids: Vec<Option<Id>> = resolved.graphs.iter().map(|g| g.id(snap)).collect();
     let requested = inputs.data_graphs.len();
     let (ontology, _) = read_store(snap, &graph_ids, requested, Mode::Lenient, opts)?;
@@ -2528,8 +2538,10 @@ pub fn rl_warnings(
 pub fn rl_inspector(
     store: &crate::store::Store,
     inputs: &Inputs,
-    opts: QueryOptions,
+    mut opts: QueryOptions,
 ) -> sparkles_reasoner::InspectFn {
+    // the store's hidden control graphs (spec C26 §2.3) are never inspected
+    opts.graphs = crate::access::GraphAccess::hiding_graphs(opts.graphs, &store.hidden_graphs());
     let prefixes = store.prefixes();
     let inputs = inputs.clone();
     Arc::new(move |snap| Ok(rl_warnings(snap, &prefixes, &inputs, &opts)?))

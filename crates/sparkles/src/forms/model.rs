@@ -359,6 +359,7 @@ impl Forms {
     /// The form model of a resource at `req.at` (the head when `None`), read under the
     /// view, deadline and cancellation of `opts`.
     pub fn model(&self, req: &FormRequest, opts: &QueryOptions) -> Result<FormModel> {
+        let opts = &*self.ds.without_owner_graphs(opts);
         let built = self.prepare_model(req, opts, None)?;
         built.model(
             req.writable && req.at.is_none(),
@@ -411,6 +412,7 @@ impl Forms {
     /// view that hides part of the data, no validation runs (`withheld`), as the
     /// validation routes refuse such callers.
     pub fn check(&self, change: &FormChange, opts: &QueryOptions) -> Result<FormCheck> {
+        let opts = &*self.ds.without_owner_graphs(opts);
         let mut controlled = opts.clone();
         controlled.deadline = deadline(opts);
         let opts = &controlled;
@@ -510,6 +512,7 @@ impl Forms {
     /// from: when another commit moved one between graphs, the save plans again on the
     /// new head, up to [`SAVE_ROUNDS`] times. The write guard runs as for any write.
     pub fn save(&self, change: &FormChange, opts: &QueryOptions) -> Result<FormSaved> {
+        let opts = &*self.ds.without_owner_graphs(opts);
         let store = self.ds.store();
         let limits = Limits::of(opts);
         let mut head = store.snapshot();

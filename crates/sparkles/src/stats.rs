@@ -202,14 +202,20 @@ impl Dataset {
             .take(TOP)
             .map(|&(p, count)| {
                 let ps = gen_.stats.predicate(p);
-                PredicateCount {
+                // less the subjects and objects only a hidden graph gives the predicate
+                let (hs, ho) = if hidden.predicate(p) > 0 {
+                    hidden.hidden_terms(snap, p)?
+                } else {
+                    (0, 0)
+                };
+                Ok(PredicateCount {
                     iri: term(p).unwrap_or_default(),
                     count,
-                    distinct_subjects: ps.map_or(0, |s| s.distinct_subjects),
-                    distinct_objects: ps.map_or(0, |s| s.distinct_objects),
-                }
+                    distinct_subjects: ps.map_or(0, |s| s.distinct_subjects).saturating_sub(hs),
+                    distinct_objects: ps.map_or(0, |s| s.distinct_objects).saturating_sub(ho),
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         // classes: distinct subjects typed with each class over every graph, as the
         // build statistics count them; after updates, from one ordered pass over
         // POS[rdf:type], where a subject typed in several graphs counts once
@@ -312,6 +318,10 @@ struct Hidden {
     deletes: usize,
     predicates: std::collections::BTreeMap<u64, u64>,
     typed: std::collections::BTreeSet<(u64, u64)>,
+    /// the (predicate, subject) and (predicate, object) pairs of their quads in the base,
+    /// which the build statistics count among the distinct subjects and objects
+    subjects: std::collections::BTreeSet<(u64, u64)>,
+    objects: std::collections::BTreeSet<(u64, u64)>,
 }
 
 impl Hidden {
@@ -332,10 +342,15 @@ impl Hidden {
             h.inserts += ins as usize;
             h.deletes += del as usize;
             // GSPO keys are [graph, subject, predicate, object]
+            let inserted = &snap.delta.ins[Perm::Gspo.index()];
             let mut visit = |k: &crate::index::Key| {
                 *h.predicates.entry(k[2]).or_default() += 1;
                 if Some(k[2]) == rdf_type {
                     h.typed.insert((k[3], k[1]));
+                }
+                if !inserted.contains(k) {
+                    h.subjects.insert((k[2], k[1]));
+                    h.objects.insert((k[2], k[3]));
                 }
             };
             snap.scan(Perm::Gspo, &[g], |c| {
@@ -360,6 +375,37 @@ impl Hidden {
 
     fn predicate(&self, p: u64) -> u64 {
         self.predicates.get(&p).copied().unwrap_or(0)
+    }
+
+    /// The distinct subjects and objects of predicate `p` that the build statistics count
+    /// and that only a hidden graph gives it: those of the base quads of the hidden
+    /// graphs that no visible quad of `p` shares.
+    fn hidden_terms(&self, snap: &Snapshot, p: u64) -> Result<(u64, u64)> {
+        let mut out = (0, 0);
+        // PSO keys are [predicate, subject, object, graph], POS keys
+        // [predicate, object, subject, graph]
+        for (pairs, perm, n) in [
+            (&self.subjects, Perm::Pso, &mut out.0),
+            (&self.objects, Perm::Pos, &mut out.1),
+        ] {
+            for &(_, t) in pairs.range((p, 0)..=(p, u64::MAX)) {
+                let mut visible = false;
+                snap.scan(perm, &[p, t], |c| {
+                    let in_visible = |k: &crate::index::Key| !self.graph(k[3]);
+                    visible = match c {
+                        crate::store::Chunk::Block(b, s, e) => {
+                            (s..e).any(|i| in_visible(&b.key(i)))
+                        }
+                        crate::store::Chunk::Row(k) => in_visible(&k),
+                    };
+                    Ok(!visible)
+                })?;
+                if !visible {
+                    *n += 1;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Take out of `classes`, which count the distinct subjects typed with each class

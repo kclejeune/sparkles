@@ -133,6 +133,7 @@ impl Forms {
     /// Refusal discards the whole result. Physical dictionary/segment decoding and
     /// source metadata preparation remain the separate controlled-reader boundary.
     pub fn nested_model(&self, req: &FormRequest, opts: &QueryOptions) -> Result<NestedFormModel> {
+        let opts = &*self.ds.without_owner_graphs(opts);
         let preparation = Preparation::of(opts);
         let built = self.prepare_model(req, opts, Some(preparation))?;
         let branch = self.ds.store().branch_name();

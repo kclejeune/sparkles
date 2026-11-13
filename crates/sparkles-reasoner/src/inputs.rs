@@ -741,7 +741,8 @@ pub fn fetch_imports(
         load(iri, &location, true, &mut out)?;
     }
     loop {
-        let r = resolve(&store.snapshot(), inputs);
+        // the store's hidden control graphs (spec C26 §2.3) name no import
+        let r = resolve_excluding(&store.snapshot(), inputs, &store.hidden_graphs());
         let mut tried = false;
         for i in r.imports.iter().filter(|i| i.graph.is_none()) {
             tried |= load(&i.iri, i.source(), false, &mut out)?;

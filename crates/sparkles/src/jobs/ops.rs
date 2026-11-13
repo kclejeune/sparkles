@@ -269,11 +269,15 @@ fn not_found(id: Uuid) -> Error {
 }
 
 /// Whether `e` is a refusal that wrote nothing, as opposed to an error after which the
-/// commit's outcome is uncertain.
+/// commit's outcome is uncertain. Every variant here is documented as raised before the
+/// log record is written. I/O, corruption and poisoned outcomes stay uncertain.
 fn refused(e: &Error) -> bool {
     matches!(
         e,
         Error::Conflict(_)
+            | Error::StorageFull(_)
+            | Error::Managed(_)
+            | Error::Branch(_)
             | Error::PreconditionFailed(_)
             | Error::NotPermitted(_)
             | Error::Invalid(_)
@@ -997,7 +1001,7 @@ impl Jobs {
                         }
                     }
                     State::Leased => {
-                        if !rt.lease_expired(run.id) {
+                        if !rt.lease_expired(run.id, run.version) {
                             *leased_by_definition
                                 .entry(run.definition.clone())
                                 .or_default() += 1;
@@ -1113,7 +1117,7 @@ impl Jobs {
         // The monotonic deadline exists before the commit publishes, while this
         // transaction still holds the writer, so no claim can read the new attempt
         // without its deadline and take it over as expired.
-        let grant = rt.grant(run.id, def.lease_ms);
+        let grant = rt.grant(run.id, run.version + 1, def.lease_ms);
         t.commit()?;
         grant.keep();
         ds.store().failpoint("jobs-claim-committed");
@@ -1192,7 +1196,7 @@ impl Jobs {
         if attempt.worker != caller.principal {
             return Err(lease_lost("the lease belongs to another worker"));
         }
-        if rt.lease_expired(run.id) {
+        if rt.lease_expired(run.id, run.version) {
             return Err(lease_lost("the lease expired"));
         }
         let Some(def) = settings.definitions.get(&run.definition) else {
@@ -1274,8 +1278,9 @@ impl Jobs {
         )?;
         drop(l);
         ch.apply(&mut t)?;
-        // A renewal that does not commit, or unwinds, puts the previous deadline back.
-        let grant = self.runtime().grant(run.id, extend);
+        // The new deadline counts only once this commit's version is the committed one,
+        // and one that does not commit leaves the committed deadline as it was.
+        let grant = self.runtime().grant(run.id, run.version + 1, extend);
         t.commit()?;
         grant.keep();
         Ok(Renewed {

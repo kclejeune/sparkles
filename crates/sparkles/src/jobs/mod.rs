@@ -57,14 +57,17 @@ pub struct Runtime {
     epoch: uuid::Uuid,
     installed: AtomicBool,
     installing: parking_lot::Mutex<()>,
-    leases: parking_lot::Mutex<HashMap<uuid::Uuid, Lease>>,
+    leases: parking_lot::Mutex<HashMap<uuid::Uuid, Vec<Lease>>>,
     grants: std::sync::atomic::AtomicU64,
 }
 
-/// One installed deadline, identified by the grant that installed it.
+/// One recorded deadline: the version of the run whose commit grants or extends the
+/// lease, and the grant that recorded it (spec C26 §7.1). A check honours it only once
+/// that version is the committed one.
 #[derive(Clone, Copy, Debug)]
 struct Lease {
     grant: u64,
+    version: u64,
     deadline: Instant,
 }
 
@@ -80,23 +83,27 @@ impl Default for Runtime {
     }
 }
 
-/// A deadline installed before its commit. Dropped without [`keep`](Grant::keep), as
-/// after a refused or unwinding commit, it puts back what the run had before, and only
-/// when the run's entry is still this grant's, so a claim that committed in the
-/// meantime keeps its deadline and an uncommitted extension does not survive.
+/// A deadline recorded before its commit, under the version the commit writes. Kept
+/// once the commit published, which drops the deadlines of older versions. Dropped
+/// without [`keep`](Grant::keep), as after a refused, unwinding or uncertain commit, it
+/// removes its own entry and nothing else: the deadline of the committed version was
+/// never replaced, so there is nothing to put back (spec C26 §7.1).
 #[must_use]
 pub(crate) struct Grant<'r> {
     rt: &'r Runtime,
     run: uuid::Uuid,
     id: u64,
-    previous: Option<Lease>,
+    version: u64,
     kept: bool,
 }
 
 impl Grant<'_> {
-    /// The commit published: the deadline stays.
+    /// The commit published: the deadline stays, and those of older versions go.
     fn keep(mut self) {
         self.kept = true;
+        if let Some(v) = self.rt.leases.lock().get_mut(&self.run) {
+            v.retain(|l| l.version >= self.version);
+        }
     }
 }
 
@@ -106,14 +113,10 @@ impl Drop for Grant<'_> {
             return;
         }
         let mut leases = self.rt.leases.lock();
-        if leases.get(&self.run).is_some_and(|l| l.grant == self.id) {
-            match self.previous {
-                Some(p) => {
-                    leases.insert(self.run, p);
-                }
-                None => {
-                    leases.remove(&self.run);
-                }
+        if let Some(v) = leases.get_mut(&self.run) {
+            v.retain(|l| l.grant != self.id);
+            if v.is_empty() {
+                leases.remove(&self.run);
             }
         }
     }
@@ -133,33 +136,42 @@ impl Runtime {
         self.installed.store(true, Ordering::Release);
     }
 
-    /// Whether the lease of `run` this process granted has expired on the monotonic
-    /// clock. A lease this process never granted is expired: its attempt belongs to
-    /// another epoch.
-    fn lease_expired(&self, run: uuid::Uuid) -> bool {
-        self.leases
-            .lock()
-            .get(&run)
-            .is_none_or(|l| l.deadline <= Instant::now())
+    /// Whether the lease of `run` at its committed version `version` has expired on the
+    /// monotonic clock. Only the deadline recorded under that version counts, so one
+    /// whose commit did not publish is never honoured (spec C26 §7.1). A lease this
+    /// process never granted is expired: its attempt belongs to another epoch.
+    fn lease_expired(&self, run: uuid::Uuid, version: u64) -> bool {
+        self.leases.lock().get(&run).is_none_or(|v| {
+            v.iter()
+                .find(|l| l.version == version)
+                .is_none_or(|l| l.deadline <= Instant::now())
+        })
     }
 
-    /// Install a deadline `ms` from now for `run`, before the commit that grants or
-    /// extends the lease publishes. The returned guard undoes it unless it is kept.
-    fn grant(&self, run: uuid::Uuid, ms: u64) -> Grant<'_> {
+    /// Record a deadline `ms` from now for `run` under `version`, the version the commit
+    /// that grants or extends the lease writes, before that commit publishes. A deadline
+    /// recorded earlier under the same version belongs to a commit that did not publish,
+    /// since only one commit writes each version, and is replaced. The returned guard
+    /// removes the entry unless it is kept.
+    fn grant(&self, run: uuid::Uuid, version: u64, ms: u64) -> Grant<'_> {
         let id = self
             .grants
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let lease = Lease {
             grant: id,
+            version,
             deadline: Instant::now() + std::time::Duration::from_millis(ms),
         };
-        let previous = self.leases.lock().insert(run, lease);
+        let mut leases = self.leases.lock();
+        let v = leases.entry(run).or_default();
+        v.retain(|l| l.version != version);
+        v.push(lease);
         Grant {
             rt: self,
             run,
             id,
-            previous,
+            version,
             kept: false,
         }
     }
