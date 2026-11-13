@@ -169,9 +169,12 @@ once per worker seed to copy public suites and prepare pytest. Boat jobs retain 
 tools without implicit reinstall. Screens/builds request at least 1800 remaining seconds
 and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. A gate unit's runtime is
 computed to end `GATE_BOAT_RESERVE` seconds before the admitted end, 1200 by default, which
-normally leaves the closure watch its 900-second lead. The runtime counts from the unit's
-activation, so a late activation or a slow shutdown can still carry a gate past that lead, and
-roadmap item 803 keeps the absolute expiry open. Partitions request
+leaves the closure watch its 900-second lead. The gate's start runs on the worker in the
+transient scope `gate-prep-NAME`, which systemd ends with all its processes
+`GATE_BOAT_PREP_SECONDS` after it begins, 900 by default, and the runtime adds that bound,
+so a late activation still ends in time. `gate.sh` computes the runtime before it sends the
+start, so a slow dispatch can still carry a gate past the lead, and roadmap item 803 keeps
+the absolute expiry open. Partitions request
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
 original qualification deadline. The legacy `--duration` screen option controls
 Namespace instance lifetime.
@@ -225,6 +228,29 @@ the pipes close even when closure stays unconfirmed. A transfer error stays the
 reported failure and carries the interrupt count. A command that would otherwise
 have returned is cancelled with `KeyboardInterrupt` once teardown ends. An
 unconfirmed closure after a zero exit is refused rather than reported as success.
+
+### Remote CI
+
+`scripts/remote-ci.sh` runs a lane's `scripts/ci.sh --fast --changed <base>` or a batch's
+`scripts/premerge.sh` on a gate host or an admitted Boat worker.
+
+```sh
+scripts/remote-ci.sh --host "$worker" --base origin/main HEAD
+scripts/remote-ci.sh --host "$worker" --premerge HEAD
+scripts/remote-ci.sh --host "$worker" --status ci-1234abcd-5678ef90
+scripts/remote-ci.sh --host "$worker" --fetch ci-1234abcd-5678ef90
+```
+
+The command bundles the commit and, for `--changed`, its merge base with the base, checks
+both on the host and starts the job as the user unit `gate-NAME`. The job script
+`scripts/gate/remote/ci-job.sh` runs the disk cleanup when the disk is 90% used, takes the
+heavy lock `~/gate/.lock`, adds a worktree, runs the check and removes the worktree, all
+inside that unit. On a Boat worker the job's end is fixed before the start at
+`REMOTE_CI_RESERVE` seconds before the admitted end, 1200 by default. The worker computes
+the unit's runtime from that end immediately before the start and refuses with under
+`REMOTE_CI_MIN_SECONDS` left, 600 by default, so the closure watch finds the job closed. A
+job on an ssh host may run 6 hours. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
+land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
 
 ## Source, results and cleanup
 
