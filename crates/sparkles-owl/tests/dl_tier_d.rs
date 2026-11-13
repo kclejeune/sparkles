@@ -1929,3 +1929,149 @@ fn source_and_independent_conditional_supports_of_two_cases_keep_the_product() {
     mixed_supports("X", "Y", "D", "C");
     mixed_supports("Y", "X", "C", "D");
 }
+
+#[test]
+fn a_count_that_needs_three_terms_in_one_element_merges_a_merged_term() {
+    // the one r-successor is the three witnesses at once: two merges make a merged term,
+    // which the third merges again (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B1)) SubClassOf(:A ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:A ObjectSomeValuesFrom(:r :B3)) SubClassOf(:A ObjectMaxCardinality(1 :r))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B2 :B3)))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B3)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B1)) SubClassOf(:H ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B3)) SubClassOf(:H ObjectMaxCardinality(2 :r))
+             {UNION}"
+        ),
+        &[("A", "F"), ("A", "G")],
+        &[("H", "F"), ("H", "G"), ("F", "A")],
+    );
+}
+
+#[test]
+fn a_merged_atom_that_certificates_refute_when_it_is_made_leaves_the_clause() {
+    // the two r-successors are in the disjoint C and D when the at-most rule and the lazy
+    // clause of ≥2 r ⊑ G would make them one: A is unsatisfiable and B is a G (item 894)
+    check(
+        &format!(
+            "DisjointClasses(:C :D)
+             SubClassOf(:A ObjectSomeValuesFrom(:r :C)) SubClassOf(:A ObjectSomeValuesFrom(:r :D))
+             SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:B ObjectSomeValuesFrom(:s :C)) SubClassOf(:B ObjectSomeValuesFrom(:s :D))
+             SubClassOf(ObjectMinCardinality(2 :s) :G)
+             SubClassOf(:K ObjectSomeValuesFrom(:s :C)) SubClassOf(:K ObjectSomeValuesFrom(:s :E))
+             SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "Nothing"), ("B", "G")],
+        &[("K", "G"), ("B", "Nothing")],
+    );
+}
+
+#[test]
+fn a_merged_atom_that_a_later_certificate_refutes_closes_through_the_merged_term() {
+    // the successors of P and Q are merged first, and the case analysis of A puts P's in C
+    // only later, which the transfer takes to the merged term, whose context meets Q's D:
+    // A is unsatisfiable under the at-most rule and a G under the lazy clause (item 894)
+    check(
+        &format!(
+            "DisjointClasses(:C :D) SubClassOf(:Q :D)
+             SubClassOf(:X ObjectAllValuesFrom(:r1 :C)) SubClassOf(:Y ObjectAllValuesFrom(:r1 :C))
+             SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r)
+             SubObjectPropertyOf(:r1 :s) SubObjectPropertyOf(:r2 :s)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:A ObjectUnionOf(:X :Y)) SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:B ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:B ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:B ObjectUnionOf(:X :Y)) SubClassOf(ObjectMinCardinality(2 :s) :G)
+             SubClassOf(:K ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:K ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:K ObjectUnionOf(:X :W)) {UNION}"
+        ),
+        &[("A", "Nothing"), ("B", "G")],
+        &[("K", "G"), ("B", "Nothing")],
+    );
+}
+
+#[test]
+fn two_overlapping_merged_terms_reach_the_element_of_their_union() {
+    // at most one r.Q makes the successors of B1 and B2 one, at most one r.R those of B2
+    // and B3, so all three are one element, which neither merge alone shows (item 894)
+    check(
+        &format!(
+            "SubClassOf(:B1 :Q) SubClassOf(:B2 :Q) SubClassOf(:B2 :R) SubClassOf(:B3 :R)
+             SubClassOf(:A ObjectSomeValuesFrom(:r :B1)) SubClassOf(:A ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:A ObjectSomeValuesFrom(:r :B3))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :Q)) SubClassOf(:A ObjectMaxCardinality(1 :r :R))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B3)))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B2)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B1)) SubClassOf(:H ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B3)) SubClassOf(:H ObjectMaxCardinality(1 :r :Q))
+             {UNION}"
+        ),
+        &[("A", "F"), ("A", "G"), ("H", "G")],
+        &[("H", "F"), ("F", "A")],
+    );
+}
+
+#[test]
+fn a_merged_term_equated_with_the_predecessor_gives_it_the_merged_facts() {
+    // K's s⁻-neighbours, its predecessor and the witnesses in B1 and B2, are one, so the
+    // predecessor is in B1 and B2 and in E, which their conjunction gives (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:s :K))
+             SubClassOf(:K ObjectSomeValuesFrom(ObjectInverseOf(:s) :B1))
+             SubClassOf(:K ObjectSomeValuesFrom(ObjectInverseOf(:s) :B2))
+             SubClassOf(:K ObjectMaxCardinality(1 ObjectInverseOf(:s)))
+             SubClassOf(ObjectIntersectionOf(:B1 :B2) :E)
+             SubClassOf(:L ObjectSomeValuesFrom(:s :K2))
+             SubClassOf(:K2 ObjectSomeValuesFrom(ObjectInverseOf(:s) :B1))
+             SubClassOf(:K2 ObjectSomeValuesFrom(ObjectInverseOf(:s) :B2))
+             SubClassOf(:K2 ObjectMaxCardinality(2 ObjectInverseOf(:s))) {UNION}"
+        ),
+        &[("A", "E"), ("A", "B1"), ("A", "B2")],
+        &[("L", "E"), ("L", "B1")],
+    );
+}
+
+#[test]
+fn a_merged_term_takes_a_conditional_fact_of_each_term() {
+    // the r1- and r2-successors are one, which is in C1 unless X and in C2 unless Y, so A
+    // is in X ⊔ Y ⊔ ∃r.E with E the conjunction of C1 and C2 (item 894)
+    check(
+        &format!(
+            "SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:A ObjectUnionOf(:X ObjectAllValuesFrom(:r1 :C1)))
+             SubClassOf(:A ObjectUnionOf(:Y ObjectAllValuesFrom(:r2 :C2)))
+             EquivalentClasses(:E ObjectIntersectionOf(:C1 :C2))
+             EquivalentClasses(:W ObjectUnionOf(:X :Y ObjectSomeValuesFrom(:r :E))) {UNION}"
+        ),
+        &[("A", "W")],
+        &[("A", "X"), ("A", "Y"), ("W", "A")],
+    );
+}
+
+#[test]
+fn a_qualification_reaches_a_merged_term_through_a_transferred_role() {
+    // at most one t makes the r1- and r2-successors one, and the r1 role literal that the
+    // merged term takes puts it in B by A's universal on r1, so at most one r.B makes it
+    // the r3-successor too: the one element is in Q and G (item 894)
+    check(
+        &format!(
+            "SubObjectPropertyOf(:r1 :t) SubObjectPropertyOf(:r2 :t)
+             SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r) SubObjectPropertyOf(:r3 :r)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:A ObjectSomeValuesFrom(:r3 ObjectIntersectionOf(:B :G)))
+             SubClassOf(:A ObjectMaxCardinality(1 :t)) SubClassOf(:A ObjectAllValuesFrom(:r1 :B))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :B))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:Q :G)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:H ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:H ObjectSomeValuesFrom(:r3 ObjectIntersectionOf(:B :G)))
+             SubClassOf(:H ObjectMaxCardinality(1 :t)) SubClassOf(:H ObjectMaxCardinality(1 :r :B))
+             {UNION}"
+        ),
+        &[("A", "F")],
+        &[("H", "F"), ("F", "A")],
+    );
+}

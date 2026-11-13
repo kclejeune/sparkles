@@ -37,7 +37,8 @@
 //! successors it registered with or to the predecessors it holds, as the EL rules do.
 
 use super::dl_clause::{
-    Clause, EQ, F, Lit, Lits, Made, NE, RL, RTerm, RY, Store, Table, Term, X, XL, Y,
+    Clause, EQ, F, Lit, Lits, Made, Merged, NE, RL, RTerm, RY, Store, Table, Term, X, XL, Y,
+    is_merged, merge_on,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, flatten, table_bytes};
@@ -417,6 +418,8 @@ pub struct DlRun {
     pub table: Table,
     /// the literals of a rooted run that the packed forms cannot hold
     pub lits: Lits,
+    /// the merged terms of item 894, with the tallies of the transfer rule
+    pub merged: Merged,
     /// whether the Succ rule takes the eager strategy instead of the cautious one
     pub eager: bool,
     stores: AtomicUsize,
@@ -433,13 +436,22 @@ pub struct DlRun {
 impl DlRun {
     pub fn new(eager: bool, worked: std::sync::Arc<std::sync::atomic::AtomicBool>) -> DlRun {
         DlRun {
+            table: Table::default(),
+            lits: Lits::default(),
+            merged: Merged::default(),
             eager,
+            stores: AtomicUsize::new(0),
+            empty: OnceLock::new(),
+            work: AtomicUsize::new(0),
+            work_limit: AtomicUsize::new(0),
             worked,
-            ..DlRun::default()
         }
     }
     pub fn bytes(&self) -> usize {
-        self.table.bytes() + self.lits.bytes() + self.stores.load(Ordering::Relaxed)
+        self.table.bytes()
+            + self.lits.bytes()
+            + self.merged.bytes()
+            + self.stores.load(Ordering::Relaxed)
     }
     pub(super) fn grow(&self, bytes: usize) {
         self.stores.fetch_add(bytes, Ordering::Relaxed);
@@ -470,6 +482,26 @@ impl DlRun {
         *self
             .empty
             .get_or_init(|| self.table.push(Clause::new(Vec::new(), Vec::new())))
+    }
+}
+
+impl Drop for DlRun {
+    /// With item 894's merge on, the run's tallies go to standard error as one line, for the
+    /// measurement of the merge behind its switch, whether the run finished or stopped.
+    fn drop(&mut self) {
+        if !merge_on() || self.work() == 0 {
+            return;
+        }
+        let m = &self.merged;
+        eprintln!(
+            "DLMERGE {{\"work\":{},\"attempts\":{},\"kept\":{},\"known\":{},\"terms\":{},\"contexts\":{}}}",
+            self.work(),
+            m.attempts.load(Ordering::Relaxed),
+            m.kept.load(Ordering::Relaxed),
+            m.known.load(Ordering::Relaxed),
+            m.len(),
+            m.contexts.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -507,6 +539,9 @@ pub struct DlSt {
     choices: u32,
     /// in the root of a rooted run, its indexes by constant
     pub root: Option<Box<super::dl_root::RootSt>>,
+    /// with item 894's merge, for each restriction e of the ontology, the merged terms
+    /// whose atoms the context processed with e in their sets, which take e's facts
+    msets: FxHashMap<Ex, Vec<Ex>>,
 }
 
 impl DlSt {
@@ -531,6 +566,8 @@ impl DlSt {
                 .map(|h| h.len() * std::mem::size_of::<Lit>())
                 .sum::<usize>()
             + self.root.as_ref().map_or(0, |r| r.bytes())
+            + table_bytes(self.msets.capacity(), 32)
+            + self.msets.values().map(|v| v.capacity() * 4).sum::<usize>()
     }
 
     /// Whether the context has no clause waiting for the rules.
@@ -547,6 +584,18 @@ impl DlSt {
 /// The bit that marks the class a test context's core denies.
 const NEG: Ex = 1 << 31;
 
+/// The bit that marks the merged term of item 894 whose successor context a core names,
+/// `[owl:Thing, m | MTAG]`: the context has the empty core, as a hypothetical successor
+/// has, and one for each merged term.
+pub(super) const MTAG: Ex = 1 << 30;
+
+/// Whether item 894's merge applies to the run: it is on, and the run counts without the
+/// root.
+#[inline]
+pub(super) fn merging(dx: &DlIx) -> bool {
+    dx.counting && dx.root.is_none() && merge_on()
+}
+
 /// The test context of whether `x` is below one of `bs`, sorted: its core is `x` and the
 /// complements of `bs`.
 pub fn test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> Ex {
@@ -561,6 +610,8 @@ pub fn init_test<S: Sink>(st: &mut State, core: &[Ex], out: &mut S) {
     for &m in core {
         if m & NEG != 0 {
             ds(st).neg.push(m & !NEG);
+        } else if m & MTAG != 0 {
+            // a merged term's context, whose core is empty
         } else {
             out.me(Concl::Sub(m));
         }
@@ -599,7 +650,7 @@ pub fn candidates(
             if s.dead || !s.c.body().is_empty() {
                 continue;
             }
-            s.c.maximal(ix, &mut max);
+            s.c.maximal(ix, None, &mut max);
             if let [m] = max.as_slice()
                 && m.kind() == X
             {
@@ -989,7 +1040,19 @@ pub(super) fn drain_with<S: Sink>(
                 tr(ix, lits, &c.1)
             );
         }
+        // the tallies of item 894's transfers: a transfer the store kept, or one it already
+        // held up to redundancy
+        let stored = (rule == "transfer").then(|| dl(st).map_or(0, |x| x.store.clauses.len()));
         derive(ix, st, c, out);
+        if let Some(before) = stored {
+            let m = &out.dl().merged;
+            m.attempts.fetch_add(1, Ordering::Relaxed);
+            if dl(st).map_or(0, |x| x.store.clauses.len()) > before {
+                m.kept.fetch_add(1, Ordering::Relaxed);
+            } else {
+                m.known.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let x = ds(st);
         x.choices += 1;
         if x.choices as usize >= PRODUCT_POLL {
@@ -1328,13 +1391,34 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
             return;
         }
     }
+    // item 894's merge: an equality of two successor terms, which only the at-most rule
+    // and item 728's lazy clauses write in these runs, is the merged atom of the union of
+    // their sets, once the certificates above have had their say on the pair
+    if merging(dx)
+        && head
+            .iter()
+            .any(|l| l.kind() == EQ && matches!(l.term(), Term::Fun(_)))
+    {
+        let m = &out.dl().merged;
+        for l in head.iter_mut() {
+            if l.kind() == EQ
+                && let Term::Fun(g) = l.term()
+                && let Some(u) = m.union(l.fun(), g)
+            {
+                *l = Lit::x(u);
+            }
+        }
+        head.sort_unstable();
+        head.dedup();
+    }
     if body.is_empty() {
         match head.as_slice() {
             [] => {
                 out.me(Concl::Sub(BOTTOM));
                 return;
             }
-            [l] if l.kind() == X => {
+            // a merged atom is no class of the EL rules and stays in the store
+            [l] if l.kind() == X && !is_merged(l.atom()) => {
                 out.me(Concl::Sub(l.atom()));
                 return;
             }
@@ -1788,6 +1872,67 @@ fn into_eq(ix: &Index, st: &State, me: Option<u32>, l2: Lit, prem: &Side, found:
     }
 }
 
+/// `l`, a class atom or a role literal over a successor term, over the merged term `m` in
+/// its place.
+fn moved(l: Lit, m: Ex) -> Option<Lit> {
+    match l.kind() {
+        F => Some(Lit::f(m, l.atom())),
+        RL => Some(Lit::rl(m, l.atom())),
+        _ => None,
+    }
+}
+
+/// The transfer rule of item 894 on a new premise `prem` whose maximal literal is the merged
+/// atom `M_T(x)`: each premise whose maximal literal is a class atom or a role literal over
+/// `f_e(x)`, for e in T, the unit's literals in place among them, gives the literal over
+/// `m_T(x)`.
+fn transfer_from_atom(
+    ix: &Index,
+    st: &State,
+    members: &[Ex],
+    t: Ex,
+    prem: &Side,
+    found: &mut Found,
+) {
+    found.rule = "transfer";
+    let dx = dix(ix);
+    let mut us = Vec::new();
+    for &e in members {
+        unit_lits(ix, dx, st, e, &mut us);
+        for &u in &us {
+            if let Some(l) = moved(u, t) {
+                found.push(with(prem, l));
+            }
+        }
+        if let Some(d) = dl(st) {
+            for (i, l2) in d.store.over(e) {
+                if let Some(l) = moved(l2, t) {
+                    let c2 = side(&d.store.clauses[i as usize].c, l2);
+                    found.push(with(&merge(prem, &c2), l));
+                }
+            }
+        }
+    }
+}
+
+/// The transfer rule of item 894 on a new premise `prem` whose maximal literal `l` is a class
+/// atom or a role literal over `f_e(x)`, e a restriction of the ontology: each premise of a
+/// merged atom `M_T(x)` with e in T gives `l` over `m_T(x)`.
+fn transfer_to_atoms(st: &State, l: Lit, prem: &Side, found: &mut Found) {
+    let Some(d) = dl(st) else { return };
+    let Some(ts) = d.msets.get(&l.fun()) else {
+        return;
+    };
+    found.rule = "transfer";
+    for &t in ts {
+        let Some(m) = moved(l, t) else { continue };
+        for i in d.store.with_x(t) {
+            let c1 = side(&d.store.clauses[i as usize].c, Lit::x(t));
+            found.push(with(&merge(&c1, prem), m));
+        }
+    }
+}
+
 /// A new unit `→ d(x)`, after the EL rules: Hyper with the clauses of case analysis and
 /// with the stored clauses, the universals over the successors and the predecessor, the
 /// universals over a new successor, the propagations to the registered predecessors, and
@@ -1897,6 +2042,9 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
             unit_lits(ix, dx, st, d, &mut us);
             for &l in &us {
                 into_eq(ix, st, None, l, &unit, &mut found);
+                if merging(dx) {
+                    transfer_to_atoms(st, l, &unit, &mut found);
+                }
             }
         }
     }
@@ -2191,17 +2339,21 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
         out.send(u, Concl::PredC(me, id));
         return true;
     }
-    let Some(r) = role_of(ix, e) else { return true };
+    // a merged term of item 894 has no role of its own, and its runs count
+    let r = role_of(ix, e);
+    if r.is_none() && !any {
+        return true;
+    }
     for k in 0..x.store.preds.len() {
         let i = x.store.preds[k];
         if let Some(cid) = pred_id(x, i, out)
-            && (any || meets(ix, &x.store.clauses[i as usize].c, r))
+            && (any || r.is_some_and(|r| meets(ix, &x.store.clauses[i as usize].c, r)))
         {
             out.send(u, Concl::PredC(me, cid));
         }
     }
     for (s, c) in props {
-        if any || ix.roles.sub(r, s) {
+        if any || r.is_some_and(|r| ix.roles.sub(r, s)) {
             let id = prop_id(x, s, c, out);
             out.send(u, Concl::PredC(me, id));
         }
@@ -2432,9 +2584,9 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
                 inv: &inv,
                 ground_total: super::dl_clause::ground_total(),
             };
-            x.store.next(ix, Some(&o), &mut max)
+            x.store.next(ix, Some(&o), None, &mut max)
         } else {
-            x.store.next(ix, None, &mut max)
+            x.store.next(ix, None, Some(&out.dl().merged), &mut max)
         };
         let Some(id) = id else {
             break;
@@ -2504,7 +2656,9 @@ fn process<S: Sink>(
         // a predecessor of a rooted run may reach the context over f_e(u) and finds the
         // role premises itself, with every role over f_e(u)
         for &(u, e) in &x.dpreds {
-            if rooted || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
+            // with counting every predecessor resolves the role atoms itself, a merged
+            // term's of item 894 among them
+            if rooted || dx.counting || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
                 out.send(u, Concl::PredC(me, cid));
             }
         }
@@ -2551,6 +2705,19 @@ fn process<S: Sink>(
                         }
                     }
                 }
+            }
+            X if is_merged(l.atom()) => {
+                // item 894's merged atom: the merged term takes the facts of its terms
+                let t = l.atom();
+                let members: Vec<Ex> = out.dl().merged.members(&t).to_vec();
+                let x = ds(st);
+                for &e in &members {
+                    let v = x.msets.entry(e).or_default();
+                    if !v.contains(&t) {
+                        v.push(t);
+                    }
+                }
+                transfer_from_atom(ix, st, &members, t, &prem, &mut found);
             }
             X => {
                 let d = l.atom();
@@ -2630,8 +2797,14 @@ fn process<S: Sink>(
                 // clauses with an equality or inequality of e(x) are derived again, which
                 // simplifies them whatever order they came in, and the shorter clause
                 // subsumes the old one
-                if dx.counting && l.kind() == F {
+                // with item 894's merge no clause holds an equality of two successor terms
+                if dx.counting && l.kind() == F && !merging(dx) {
                     again(ix, st, id, c, &mut found);
+                }
+                // item 894's transfer of a fact of a restriction's term to the merged terms
+                // whose atoms hold it
+                if matches!(l.kind(), F | RL) && !is_merged(e) && merging(dx) {
+                    transfer_to_atoms(st, l, &prem, &mut found);
                 }
                 // a rooted run has its own equality rules
                 if dx.counting && dx.root.is_none() {
@@ -2702,12 +2875,18 @@ pub(super) fn send_hyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, a: Ex, out: &
 /// context registers with takes the markers of the EL core's atoms it lacks.
 fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex {
     let dx = dix(ix);
-    let unit = st.subs.contains(&e);
-    let h = dx.hyp.get(&e).copied().unwrap_or(TOP);
-    let succ = ix.head(e).succ;
     if let Some(&(_, v)) = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == e)) {
         return v;
     }
+    // a merged term of item 894 is never a unit, and its successor with the empty core is
+    // a context of its own, as a hypothetical successor is a restriction's
+    let unit = !is_merged(e) && st.subs.contains(&e);
+    let h = if is_merged(e) {
+        out.intern(&[TOP, e | MTAG])
+    } else {
+        dx.hyp.get(&e).copied().unwrap_or(TOP)
+    };
+    let succ = ix.head(e).succ;
     let v = if out.dl().eager {
         let mut k1: Vec<Ex> = Vec::new();
         if unit {
@@ -2740,6 +2919,9 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
         }
         h
     };
+    if is_merged(e) && v == h {
+        out.dl().merged.context_made(e);
+    }
     ds(st).edges.push((e, v));
     out.send(v, Concl::DEdge(me, e));
     if dx.root.is_some() {
