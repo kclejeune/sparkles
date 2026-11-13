@@ -5708,8 +5708,21 @@ fn task_visible(st: &AppState, p: &Principal, t: &crate::state::Task) -> bool {
 /// A task as `p` sees it: without `server-admin`, absolute paths in its message and in
 /// the strings of its `detail` are cut to their last component (`backup written to
 /// …/wiki_2026-01-01.nq.zst`).
-fn task_for(p: &Principal, t: &crate::state::Task) -> crate::state::Task {
+fn task_for(st: &AppState, p: &Principal, t: &crate::state::Task) -> crate::state::Task {
     let mut t = t.clone();
+    // the commit of a merge's result carries figures that count every graph: left out
+    // for a reader who sees only some graphs and on a dataset that hides graphs, as the
+    // reader and the dataset are now, whenever the task ran (spec C26 §2.3)
+    if matches!(t.kind.as_str(), "merge" | "revert" | "cherry-pick")
+        && let Some(commit) = t.detail.as_mut().and_then(|d| d.get_mut("commit"))
+        && commit.is_object()
+        && (p.partial_view(&t.dataset)
+            || st
+                .get(&t.dataset)
+                .is_none_or(|d| !d.store.hidden_graphs().is_empty()))
+    {
+        redact_commit_json(commit);
+    }
     if !p.has(crate::auth::ServerPerm::ServerAdmin) {
         if let Some(m) = &t.message {
             t.message = Some(redact_paths(m));
@@ -5771,7 +5784,7 @@ async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J
         .lock()
         .iter()
         .filter(|t| task_visible(&st, &p, t))
-        .map(|t| task_for(&p, t))
+        .map(|t| task_for(&st, &p, t))
         .collect();
     Json(serde_json::to_value(tasks).unwrap())
 }
@@ -5785,7 +5798,7 @@ async fn get_task(
         .lock()
         .iter()
         .find(|t| t.id == id && task_visible(&st, &p, t))
-        .map(|t| Json(serde_json::to_value(task_for(&p, t)).unwrap()))
+        .map(|t| Json(serde_json::to_value(task_for(&st, &p, t)).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }
 
@@ -5828,7 +5841,7 @@ async fn cancel_task(
         return Ok(crate::auth::forbidden(&p, &msg));
     }
     match st.cancel_task(&id) {
-        Some(Ok(t)) => Ok((StatusCode::ACCEPTED, Json(task_for(&p, &t))).into_response()),
+        Some(Ok(t)) => Ok((StatusCode::ACCEPTED, Json(task_for(&st, &p, &t))).into_response()),
         Some(Err(t)) => {
             let why = if t.active() {
                 "does not accept cancellation"

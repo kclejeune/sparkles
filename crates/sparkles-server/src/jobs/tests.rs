@@ -643,8 +643,11 @@ async fn shex_guard_validation_never_selects_a_ledger_focus() {
 }
 
 /// A memory dataset `d` whose ledger graph held `quads` before jobs were enabled, as a
-/// guard may name it.
-async fn ledger_written_before_jobs(quads: &str) -> (tempfile::TempDir, Arc<AppState>, Router) {
+/// guard configured with `guard` before then names it.
+async fn ledger_written_before_jobs(
+    quads: &str,
+    guard: Option<J>,
+) -> (tempfile::TempDir, Arc<AppState>, Router) {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
@@ -660,20 +663,58 @@ async fn ledger_written_before_jobs(quads: &str) -> (tempfile::TempDir, Arc<AppS
         ))
         .unwrap();
     let app = router(state.clone());
+    if let Some(cfg) = guard {
+        let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+    }
     let (s, j, _) = call(&app, "PUT", "/$/jobs/d/settings", None, Some(settings())).await;
     assert_eq!(s, StatusCode::OK, "{j}");
     (dir, state, app)
 }
 
+#[allow(dead_code)]
+const LEDGER_SHAPES: &str = "<urn:SecretShape> a <http://www.w3.org/ns/shacl#NodeShape> ; <http://www.w3.org/ns/shacl#targetClass> <urn:Public> ; <http://www.w3.org/ns/shacl#property> <urn:SecretPropertyShape> . <urn:SecretPropertyShape> <http://www.w3.org/ns/shacl#path> <urn:secret-path> ; <http://www.w3.org/ns/shacl#minCount> 1";
+
+#[allow(dead_code)]
+const LEDGER_SCHEMA: &str = "<urn:schema> a <http://www.w3.org/ns/shex#Schema> ; <http://www.w3.org/ns/shex#shapes> <urn:S> . <urn:S> a <http://www.w3.org/ns/shex#Shape> ; <http://www.w3.org/ns/shex#expression> <urn:tc> . <urn:tc> a <http://www.w3.org/ns/shex#TripleConstraint> ; <http://www.w3.org/ns/shex#predicate> <urn:secret-path> ; <http://www.w3.org/ns/shex#min> 1 ; <http://www.w3.org/ns/shex#max> 1";
+
+/// A guard whose shapes or schema are the ledger graph's, in `mode`.
+#[allow(dead_code)]
+fn ledger_guard(language: &str, mode: &str) -> J {
+    let ledger = sparkles::jobs::LEDGER_GRAPH;
+    match language {
+        "shacl" => json!({"mode": mode, "dataGraph": "default", "shapes": {"graphs": [ledger]}}),
+        _ => json!({"language": "shex", "mode": mode, "dataGraph": "default",
+            "schema": {"graphs": [ledger]}, "shapeMap": "<urn:person>@<urn:S>"}),
+    }
+}
+
+#[cfg(all(feature = "shacl", feature = "shex"))]
+#[tokio::test]
+async fn a_guard_configuration_naming_the_ledger_is_answered_as_absent() {
+    for (language, quads) in [("shacl", LEDGER_SHAPES), ("shex", LEDGER_SCHEMA)] {
+        let (_dir, _state, app) = ledger_written_before_jobs(quads, None).await;
+        let (status, j, _) = call(
+            &app,
+            "PUT",
+            "/$/validation/d",
+            None,
+            Some(ledger_guard(language, "reject")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{language}: {j}");
+        assert!(
+            !j.to_string().contains("secret-path") && !j.to_string().contains("urn:S>"),
+            "{language}: {j}"
+        );
+    }
+}
+
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn a_guard_whose_shapes_are_in_the_ledger_is_answered_as_absent() {
-    let shapes = "<urn:SecretShape> a <http://www.w3.org/ns/shacl#NodeShape> ; <http://www.w3.org/ns/shacl#targetClass> <urn:Public> ; <http://www.w3.org/ns/shacl#property> <urn:SecretPropertyShape> . <urn:SecretPropertyShape> <http://www.w3.org/ns/shacl#path> <urn:secret-path> ; <http://www.w3.org/ns/shacl#minCount> 1";
-    let (_dir, _state, app) = ledger_written_before_jobs(shapes).await;
-    let cfg = json!({"mode": "warn", "dataGraph": "default",
-        "shapes": {"graphs": [sparkles::jobs::LEDGER_GRAPH]}});
-    let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
-    assert_eq!(status, StatusCode::OK, "{j}");
+    let (_dir, _state, app) =
+        ledger_written_before_jobs(LEDGER_SHAPES, Some(ledger_guard("shacl", "warn"))).await;
     let req = Request::post("/d/shacl?shapes=guard")
         .header("accept", "application/json")
         .body(Body::empty())
@@ -689,13 +730,8 @@ async fn a_guard_whose_shapes_are_in_the_ledger_is_answered_as_absent() {
 #[cfg(feature = "shex")]
 #[tokio::test]
 async fn a_guard_whose_schema_is_in_the_ledger_is_answered_as_absent() {
-    let schema = "<urn:schema> a <http://www.w3.org/ns/shex#Schema> ; <http://www.w3.org/ns/shex#shapes> <urn:S> . <urn:S> a <http://www.w3.org/ns/shex#Shape> ; <http://www.w3.org/ns/shex#expression> <urn:tc> . <urn:tc> a <http://www.w3.org/ns/shex#TripleConstraint> ; <http://www.w3.org/ns/shex#predicate> <urn:secret-path> ; <http://www.w3.org/ns/shex#min> 1 ; <http://www.w3.org/ns/shex#max> 1";
-    let (_dir, _state, app) = ledger_written_before_jobs(schema).await;
-    let cfg = json!({"language": "shex", "mode": "warn", "dataGraph": "default",
-        "schema": {"graphs": [sparkles::jobs::LEDGER_GRAPH]},
-        "shapeMap": "<urn:person>@<urn:S>"});
-    let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
-    assert_eq!(status, StatusCode::OK, "{j}");
+    let (_dir, _state, app) =
+        ledger_written_before_jobs(LEDGER_SCHEMA, Some(ledger_guard("shex", "warn"))).await;
     let req = Request::post(format!("/d/shex?schema=guard&node={}", enc("<urn:person>")))
         .header("content-type", "text/plain")
         .header("accept", "application/json")
@@ -824,4 +860,61 @@ async fn a_merge_task_detail_leaves_the_commit_counts_out() {
     let (status, j, _) = call(&app, "GET", &format!("/$/tasks/{id}"), None, None).await;
     assert_eq!(status, StatusCode::OK, "{j}");
     assert!(!j.to_string().contains("\"quads\""), "{j}");
+}
+
+#[tokio::test]
+async fn a_merge_task_finished_before_jobs_were_enabled_leaves_the_commit_counts_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Mem, None).unwrap();
+    let ds = state.get("d").unwrap();
+    let ledger = sparkles::jobs::LEDGER_GRAPH;
+    ds.dataset
+        .update(&format!(
+            "INSERT DATA {{ GRAPH <{ledger}> {{ <urn:secret> <urn:p> 1 }} }}"
+        ))
+        .unwrap();
+    ds.dataset
+        .create_branch("work", &Default::default())
+        .unwrap();
+    ds.dataset
+        .branch("work")
+        .unwrap()
+        .update("INSERT DATA { <urn:s> <urn:p> 2 }")
+        .unwrap();
+    let app = router(state.clone());
+    let req = Request::post("/$/merge/d")
+        .header("content-type", "application/json")
+        .header("prefer", "respond-async")
+        .body(Body::from(json!({"source": "work"}).to_string()))
+        .unwrap();
+    let (status, body) = text_of(&app, req).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let id = serde_json::from_str::<J>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let t0 = std::time::Instant::now();
+    while state
+        .tasks
+        .lock()
+        .iter()
+        .find(|t| t.id == id)
+        .is_some_and(|t| t.active())
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "the task did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (s, j, _) = call(&app, "PUT", "/$/jobs/d/settings", None, Some(settings())).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    for uri in [format!("/$/tasks/{id}"), "/$/tasks".to_string()] {
+        let (status, j, _) = call(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+        assert!(!j.to_string().contains("\"quads\""), "{uri}: {j}");
+    }
 }

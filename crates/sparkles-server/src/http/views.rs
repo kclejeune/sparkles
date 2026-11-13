@@ -103,7 +103,7 @@ impl Host for ServerHost {
             .map_or(0, |s| sparkles::handles::views::visibility_epoch(&s.store));
         #[cfg(feature = "auth")]
         if let Some(a) = &self.auth {
-            return a.epoch().rotate_left(32) ^ visibility;
+            return a.epoch() ^ visibility.rotate_left(32);
         }
         visibility
     }
