@@ -2595,3 +2595,48 @@ mod proofs {
         });
     }
 }
+
+#[cfg(test)]
+mod proof_cache_tests {
+    use super::Table;
+    use super::proofs::{Proof, get, put};
+    use std::sync::Arc;
+
+    fn table() -> Arc<Table> {
+        Arc::new(Table {
+            chunks: vec![Arc::new(vec![[1, 2, 3]])],
+            keys: Vec::new(),
+        })
+    }
+
+    fn proof() -> Proof {
+        Proof {
+            preds: Vec::new(),
+            classes: Vec::new(),
+        }
+    }
+
+    /// A proof answers the readers of the table it was made over and no other table of
+    /// its view, also after that table was dropped and another made in its place (spec
+    /// F17, item 911).
+    #[test]
+    fn a_proof_answers_only_the_readers_of_its_table() {
+        let key = ("proof-cache-test-view".to_string(), 7u64);
+        let first = table();
+        let other = table();
+        put(key.clone(), &first, proof());
+        assert!(get(&key, &first).is_some());
+        assert!(get(&key, &other).is_none());
+        assert!(get(&("another view".to_string(), 7), &first).is_none());
+        // the table made again after the cache dropped the first
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_none(), "the proof keeps no facts alive");
+        let again = table();
+        assert!(get(&key, &again).is_none());
+        // a proof over the new table takes the view's place
+        put(key.clone(), &again, proof());
+        assert!(get(&key, &again).is_some());
+        assert!(get(&key, &other).is_none());
+    }
+}
