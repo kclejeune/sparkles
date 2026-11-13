@@ -433,6 +433,8 @@ async fn snapshot_creation_and_history_gone_leave_the_commit_counts_out() {
 
     let ds = state.get("d").unwrap();
     let seq = ds.store.head_commit().seq;
+    // without its pin, the state of the snapshot is collected
+    ds.store.delete_snapshot("s1").unwrap();
     ds.store.set_retention(Default::default()).unwrap();
     ds.dataset
         .update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
@@ -449,8 +451,16 @@ async fn snapshot_creation_and_history_gone_leave_the_commit_counts_out() {
     .await;
     assert_eq!(status, StatusCode::GONE, "{j}");
     assert_eq!(j["metadata"]["seq"], seq, "{j}");
-    assert!(j["metadata"].get("inserted").is_none(), "{j}");
-    assert!(j["metadata"].get("quads").is_none(), "{j}");
+    for field in [
+        "inserted",
+        "deleted",
+        "quads",
+        "digest",
+        "exact",
+        "defaultGraph",
+    ] {
+        assert!(j["metadata"].get(field).is_none(), "{field}: {j}");
+    }
 }
 
 #[tokio::test]
@@ -625,5 +635,193 @@ async fn shex_guard_validation_never_selects_a_ledger_focus() {
     .unwrap();
     let (status, body) = text_of(&app, req).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(!body.contains("nonconformant"), "{body}");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["conforms"], true, "{j}");
+    assert_eq!(j["counts"]["nonconformant"], 0, "{j}");
+    assert_eq!(j["results"].as_array().map(Vec::len), Some(0), "{j}");
+    assert!(!body.contains("urn:x-sparkles:jobs:run:"), "{body}");
+}
+
+/// A memory dataset `d` whose ledger graph held `quads` before jobs were enabled, as a
+/// guard may name it.
+async fn ledger_written_before_jobs(quads: &str) -> (tempfile::TempDir, Arc<AppState>, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("d", DbType::Mem, None).unwrap();
+    let ledger = sparkles::jobs::LEDGER_GRAPH;
+    state
+        .get("d")
+        .unwrap()
+        .dataset
+        .update(&format!(
+            "INSERT DATA {{ <urn:person> a <urn:Public> . GRAPH <{ledger}> {{ {quads} }} }}"
+        ))
+        .unwrap();
+    let app = router(state.clone());
+    let (s, j, _) = call(&app, "PUT", "/$/jobs/d/settings", None, Some(settings())).await;
+    assert_eq!(s, StatusCode::OK, "{j}");
+    (dir, state, app)
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn a_guard_whose_shapes_are_in_the_ledger_is_answered_as_absent() {
+    let shapes = "<urn:SecretShape> a <http://www.w3.org/ns/shacl#NodeShape> ; <http://www.w3.org/ns/shacl#targetClass> <urn:Public> ; <http://www.w3.org/ns/shacl#property> <urn:SecretPropertyShape> . <urn:SecretPropertyShape> <http://www.w3.org/ns/shacl#path> <urn:secret-path> ; <http://www.w3.org/ns/shacl#minCount> 1";
+    let (_dir, _state, app) = ledger_written_before_jobs(shapes).await;
+    let cfg = json!({"mode": "warn", "dataGraph": "default",
+        "shapes": {"graphs": [sparkles::jobs::LEDGER_GRAPH]}});
+    let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let req = Request::post("/d/shacl?shapes=guard")
+        .header("accept", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = text_of(&app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        !body.contains("secret-path") && !body.contains("SecretPropertyShape"),
+        "{body}"
+    );
+}
+
+#[cfg(feature = "shex")]
+#[tokio::test]
+async fn a_guard_whose_schema_is_in_the_ledger_is_answered_as_absent() {
+    let schema = "<urn:schema> a <http://www.w3.org/ns/shex#Schema> ; <http://www.w3.org/ns/shex#shapes> <urn:S> . <urn:S> a <http://www.w3.org/ns/shex#Shape> ; <http://www.w3.org/ns/shex#expression> <urn:tc> . <urn:tc> a <http://www.w3.org/ns/shex#TripleConstraint> ; <http://www.w3.org/ns/shex#predicate> <urn:secret-path> ; <http://www.w3.org/ns/shex#min> 1 ; <http://www.w3.org/ns/shex#max> 1";
+    let (_dir, _state, app) = ledger_written_before_jobs(schema).await;
+    let cfg = json!({"language": "shex", "mode": "warn", "dataGraph": "default",
+        "schema": {"graphs": [sparkles::jobs::LEDGER_GRAPH]},
+        "shapeMap": "<urn:person>@<urn:S>"});
+    let (status, j, _) = call(&app, "PUT", "/$/validation/d", None, Some(cfg)).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let req = Request::post(format!("/d/shex?schema=guard&node={}", enc("<urn:person>")))
+        .header("content-type", "text/plain")
+        .header("accept", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = text_of(&app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(!body.contains("secret-path"), "{body}");
+}
+
+#[tokio::test]
+async fn a_public_kept_view_stays_readable_on_a_dataset_with_jobs() {
+    let (_dir, state, app) = seeded().await;
+    let ds = state.get("d").unwrap();
+    ds.dataset
+        .update("INSERT DATA { <urn:public> <urn:p> <urn:o> }")
+        .unwrap();
+    ds.dataset
+        .views()
+        .put(
+            "public",
+            sparkles::incr::ViewDef::table("SELECT ?s WHERE { ?s <urn:p> <urn:o> }"),
+        )
+        .unwrap();
+    ds.dataset
+        .views()
+        .wait_built("public", Duration::from_secs(10))
+        .unwrap();
+    let q = "PREFIX view: <urn:x-sparkles:view#> SELECT ?s WHERE { SERVICE view:read { [] view:name \"public\" ; view:bind ?s } }";
+    let (status, j, _) = call(
+        &app,
+        "GET",
+        &format!("/d/query?query={}", enc(q)),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(
+        j["results"]["bindings"].as_array().map(Vec::len),
+        Some(1),
+        "{j}"
+    );
+}
+
+/// `seeded` with a branch `work` that holds one public quad more than `main`.
+async fn with_a_branch_to_merge() -> (tempfile::TempDir, Arc<AppState>, Router) {
+    let (dir, state, app) = seeded().await;
+    let ds = state.get("d").unwrap();
+    ds.dataset
+        .create_branch("work", &Default::default())
+        .unwrap();
+    ds.dataset
+        .branch("work")
+        .unwrap()
+        .update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+        .unwrap();
+    (dir, state, app)
+}
+
+#[tokio::test]
+async fn a_merge_receipt_leaves_the_commit_counts_out() {
+    let (_dir, _state, app) = with_a_branch_to_merge().await;
+    let body = json!({"source": "work", "target": "main"});
+    let (status, j, _) = call(&app, "POST", "/$/merge/d", None, Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["changes"]["inserted"], 1, "{j}");
+    assert!(j["commit"]["seq"].is_u64(), "{j}");
+    for field in [
+        "inserted",
+        "deleted",
+        "quads",
+        "digest",
+        "exact",
+        "defaultGraph",
+    ] {
+        assert!(j["commit"].get(field).is_none(), "{field}: {j}");
+    }
+}
+
+#[tokio::test]
+async fn a_merge_task_detail_leaves_the_commit_counts_out() {
+    let (_dir, state, app) = with_a_branch_to_merge().await;
+    let req = Request::post("/$/merge/d")
+        .header("content-type", "application/json")
+        .header("prefer", "respond-async")
+        .body(Body::from(json!({"source": "work"}).to_string()))
+        .unwrap();
+    let (status, body) = text_of(&app, req).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let id = serde_json::from_str::<J>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let t0 = std::time::Instant::now();
+    let task = loop {
+        let t = state
+            .tasks
+            .lock()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .unwrap();
+        if !t.active() {
+            break t;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "the task did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(task.state, "done", "{:?}", task.message);
+    let d = task.detail.unwrap();
+    assert!(d["commit"]["seq"].is_u64(), "{d}");
+    for field in [
+        "inserted",
+        "deleted",
+        "quads",
+        "digest",
+        "exact",
+        "defaultGraph",
+    ] {
+        assert!(d["commit"].get(field).is_none(), "{field}: {d}");
+    }
+    let (status, j, _) = call(&app, "GET", &format!("/$/tasks/{id}"), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert!(!j.to_string().contains("\"quads\""), "{j}");
 }

@@ -1221,7 +1221,17 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
     })
 }
 
-pub(crate) fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
+/// Whether a merge's result shown to `p` leaves out the figures that count every graph of
+/// the dataset, such as the quads of its commit: when `p` reads only some graphs, or the
+/// dataset hides control graphs from every caller (spec C26 §2.3). Who may merge is
+/// still decided by the grants alone.
+pub(crate) fn redacts(p: &Principal, name: &str, ds: &Dataset) -> bool {
+    p.partial_view(name) || !ds.store.hidden_graphs().is_empty()
+}
+
+/// The JSON of a merge's report. With `partial`, its commit carries no figure that counts
+/// every graph (see [`redacts`]).
+pub(crate) fn merge_json(r: &MergeReport, stale: Option<bool>, partial: bool) -> J {
     let side = |c: &NamedCommitRef| json!({ "branch": c.branch, "seq": c.seq });
     let commit = r.commit.as_ref().filter(|rc| rc.committed).map(|rc| {
         let mut j = json!(sparkles::commit::AnnotatedCommit {
@@ -1233,6 +1243,9 @@ pub(crate) fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
         // a merge that records its second parent
         if rc.commit.kind == sparkles::commit::CommitKind::Merge && !r.squashed {
             j["mergedFrom"] = commit_ref(&r.source);
+        }
+        if partial {
+            crate::http::redact_commit_json(&mut j);
         }
         j
     });
@@ -1349,8 +1362,8 @@ impl Op {
     }
 
     /// The result's JSON: the merge fields, and what a revert undid.
-    fn json(&self, r: &MergeReport, stale: Option<bool>) -> J {
-        let mut j = merge_json(r, stale);
+    fn json(&self, r: &MergeReport, stale: Option<bool>, partial: bool) -> J {
+        let mut j = merge_json(r, stale, partial);
         if let Op::Revert { branch, commit } = self {
             j["reverted"] = json!({ "branch": branch, "seq": commit });
         }
@@ -1427,10 +1440,11 @@ async fn run_preview(
 ) -> ApiResult {
     op.access(p, name)?;
     let owner = ds.store.owner_dataset_id();
+    let partial = redacts(p, name, &ds);
     let op2 = op.clone();
     let r = blocking(move || Ok(op2.preview(&ds.store, &o)?)).await?;
     Ok(with_report(
-        Json(op.json(&r, None)).into_response(),
+        Json(op.json(&r, None, partial)).into_response(),
         owner,
         &r,
         r.target.seq,
@@ -1450,6 +1464,7 @@ async fn preview_entailments(
     headers: &HeaderMap,
 ) -> ApiResult {
     op.access(p, name)?;
+    let partial = redacts(p, name, &ds);
     let target = st.branch_dataset(&ds, op.target())?;
     let mut parameters = Params(params.0.clone());
     parameters.0.push(("dryRun".into(), "true".into()));
@@ -1477,7 +1492,7 @@ async fn preview_entailments(
                 Error::PreconditionFailed("the preview target identity changed".into()).into(),
             );
         }
-        let mut doc = op2.json(&report, None);
+        let mut doc = op2.json(&report, None, partial);
         if report.conflicts.is_some() && report.conflicts_found > report.conflicts_resolved {
             doc["entailments"] = J::Null;
             doc["entailmentsUnavailable"] =
@@ -1698,6 +1713,7 @@ async fn execute(
     dry_run: bool,
 ) -> ApiResult {
     op.access(p, name)?;
+    let partial = redacts(p, name, &ds);
     if let Some(a) = p.log_name() {
         o.write.author = Some(a.into());
     }
@@ -1733,7 +1749,7 @@ async fn execute(
     o.write.dry_run = dr.clone();
     let tds = st.branch_dataset(&ds, op.target())?;
     if dr.is_none() && respond_async(headers) {
-        return start_task(st, name, ds, op, o);
+        return start_task(st, name, ds, op, o, partial);
     }
     let response = dr
         .as_ref()
@@ -1788,7 +1804,7 @@ async fn execute(
             let op2 = op.clone();
             let fields = blocking(move || Ok(op2.preview(&d.store, &po)?)).await?;
             if let Some(obj) = doc.as_object_mut() {
-                obj.insert("merge".into(), op.json(&fields, None));
+                obj.insert("merge".into(), op.json(&fields, None, partial));
             }
             Ok(with_report(
                 Json(doc).into_response(),
@@ -1802,7 +1818,7 @@ async fn execute(
             serde_json::to_value(c.as_ref()).unwrap_or_default(),
         )),
         Ok(MergeOutcome::UpToDate(r)) => {
-            let mut doc = op.json(&r, None);
+            let mut doc = op.json(&r, None, partial);
             if requested {
                 if r.target.branch_id != tds.store.branch_id() {
                     return Err(Error::PreconditionFailed(
@@ -1829,7 +1845,7 @@ async fn execute(
             crate::mcp::memory::pending::touch(st, name);
             let stale = reasoned && (r.inserted + r.deleted) > 0;
             let seq = r.commit.as_ref().map_or(r.target.seq, |c| c.commit.seq);
-            let resp = Json(op.json(&r, Some(stale))).into_response();
+            let resp = Json(op.json(&r, Some(stale), partial)).into_response();
             Ok(with_report(resp, ds.store.owner_dataset_id(), &r, seq))
         }
     }
@@ -1855,6 +1871,7 @@ fn start_task(
     ds: Arc<Dataset>,
     op: Op,
     o: MergeOptions,
+    partial: bool,
 ) -> ApiResult {
     task_start_check(st, None, name)?;
     let kind = match &op {
@@ -1885,11 +1902,11 @@ fn start_task(
                         Err(anyhow::anyhow!("{}", c.error))
                     }
                     MergeOutcome::UpToDate(r) => {
-                        h.set_detail(op.json(&r, None));
+                        h.set_detail(op.json(&r, None, partial));
                         Ok("up to date: nothing to change".into())
                     }
                     MergeOutcome::Merged(r) => {
-                        h.set_detail(op.json(&r, None));
+                        h.set_detail(op.json(&r, None, partial));
                         Ok(match r.commit.as_ref() {
                             Some(c) => format!(
                                 "commit {} on {}: +{} -{}",

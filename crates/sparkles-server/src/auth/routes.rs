@@ -1253,7 +1253,6 @@ pub(crate) fn protected_resource(
     ))
 }
 
-/// The `{ds}` segment of the request path.
 /// `p` with the hidden managed graphs of the request's dataset (spec C26 §2.3), such as
 /// the job ledger, left out of its read and write views on top of the graphs its grants
 /// and the server's configuration hide. A request that names no dataset, or one the
@@ -1265,15 +1264,12 @@ fn hiding_owner_graphs(st: &AppState, route: &str, uri: &Uri, p: Principal) -> P
     let Some(dataset) = st.get(&ds) else {
         return p;
     };
-    let hidden = dataset.dataset.store().hidden_graphs();
-    if hidden.is_empty() {
-        return p;
-    }
-    let mut patterns: Vec<String> = p.hidden_patterns().to_vec();
-    patterns.extend(hidden);
-    p.hiding_graphs(&patterns)
+    // by name in this dataset, as every other boundary subtracts them, so that the view
+    // a request reads under is the one a kept view of the dataset resolves to
+    p.hiding_graphs_in(&ds, dataset.dataset.store().hidden_graphs())
 }
 
+/// The `{ds}` segment of the request path.
 fn ds_of(route: &str, uri: &Uri) -> Option<String> {
     let pos = route.split('/').position(|s| s == "{ds}")?;
     let seg = uri.path().split('/').nth(pos)?;

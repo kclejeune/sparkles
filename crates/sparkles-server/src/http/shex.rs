@@ -360,6 +360,17 @@ mod enabled {
         let at = super::super::history::at_param(&query)?;
         let guard = if p.guard {
             match ds.validation.read().clone() {
+                Some(crate::write_validation::Validation::Shex(g))
+                    if crate::validation_common::source_hidden(
+                        g.config().schema.graphs.as_ref(),
+                        &ds.dataset.store().hidden_graphs(),
+                    ) =>
+                {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!("/{} has no write-time validation", ds.name),
+                    ));
+                }
                 Some(crate::write_validation::Validation::Shex(g)) => Some(g),
                 #[cfg(feature = "shacl")]
                 Some(crate::write_validation::Validation::Shacl(_)) => {

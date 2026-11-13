@@ -5919,6 +5919,17 @@ async fn shacl(
                 ));
             }
             match ds.validation.read().clone() {
+                Some(crate::write_validation::Validation::Shacl(g))
+                    if crate::validation_common::source_hidden(
+                        g.config().shapes.graphs.as_ref(),
+                        &ds.dataset.store().hidden_graphs(),
+                    ) =>
+                {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!("/{} has no write-time validation", ds.name),
+                    ));
+                }
                 Some(crate::write_validation::Validation::Shacl(g)) => Some(g),
                 #[cfg(feature = "shex")]
                 Some(crate::write_validation::Validation::Shex(_)) => {

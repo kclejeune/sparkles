@@ -126,6 +126,14 @@ pub fn hide_graphs(
     true
 }
 
+/// Whether a write-time guard reads its shapes or schema from one of the graphs `hidden`
+/// names, a dataset's hidden control graphs (spec C26 §2.3). A validation answers such a
+/// guard as one the dataset does not have, so no report quotes a control record as a
+/// shape or a schema.
+pub fn source_hidden(sources: Option<&Vec<String>>, hidden: &[String]) -> bool {
+    sources.into_iter().flatten().any(|g| hidden.contains(g))
+}
+
 /// Does the named graph exist (hold at least one quad)?
 pub fn graph_exists(snap: &Snapshot, iri: &str) -> bool {
     snap.lookup_iri(iri)
