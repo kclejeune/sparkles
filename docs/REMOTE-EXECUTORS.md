@@ -43,9 +43,11 @@ exposes no `memory.stat` is refused.
 `admit` resolves `mbx` and `rustc` through the same environment that jobs receive. That
 environment puts the pinned mise MBX install on PATH, selects the pinned Rust toolchain
 with `RUSTUP_TOOLCHAIN` and turns off automatic toolchain installation. A missing `mbx`,
-an `mbx` found elsewhere or at another version, and a `rustc` at a version other than
-the pin each refuse admission with the reason named, rather than running with the
-rustup default.
+an `mbx` found elsewhere or at another version, a `rustc` at a version other than the pin,
+and a missing `rustdoc` or one at another version each refuse admission with the reason
+named, rather than running with the rustup default. The worker image keeps rustup's
+`rustdoc` proxy only in `/usr/local/cargo/bin`, so the job PATH includes it after
+`/usr/local/bin` for the doctests.
 
 Development credentials stay on the owned development worker. They are excluded from
 source packets, result manifests and reusable snapshot seeds. GitHub Actions retains

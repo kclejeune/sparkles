@@ -41,9 +41,9 @@
       "sha256": "b26f69930360afa4f7fd27f813684c7154efeed8c2507375c904f7d1677f0be8"
     },
     "job_environment.py": {
-      "bytes": 12480,
+      "bytes": 12676,
       "mode": 420,
-      "sha256": "34cf81d97d1dc96466ec989a9a69953a9fd4789ac80174780f720c717f701e99"
+      "sha256": "a34e1ffb257def8afd3fdb23be3c931875ea4daa8440dd61fca61fcfcf87ff4c"
     },
     "metadata-probe.py": {
       "bytes": 27098,

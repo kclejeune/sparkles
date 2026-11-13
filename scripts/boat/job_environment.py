@@ -56,9 +56,11 @@ def local_store(profile):
 def environment(profile):
     # Jobs resolve the pinned MBX install directly and select the pinned Rust
     # toolchain by name, so neither a missing shim nor the rustup default is used.
+    # The worker image has rustup's rustdoc proxy only in /usr/local/cargo/bin, which follows
+    # /usr/local/bin, so doctests find it and rustc still resolves as before.
     home = profile['worker_home']
     return {'PATH': ':'.join([home+'/.local/share/mbx/bin', pinned_mbx(profile).removesuffix('/mbx'), home+'/.local/bin',
-                             home+'/.cargo/bin', '/usr/local/bin', '/usr/bin', '/bin']),
+                             home+'/.cargo/bin', '/usr/local/bin', '/usr/local/cargo/bin', '/usr/bin', '/bin']),
             'RUSTUP_TOOLCHAIN': profile['tool_versions']['rust'],
             'RUSTUP_AUTO_INSTALL': '0',
             'MBX_REMOTE_URL': '',

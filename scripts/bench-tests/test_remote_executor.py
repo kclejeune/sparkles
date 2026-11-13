@@ -319,13 +319,16 @@ class Admission(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertNotIn('["expires_at"]-time.time()',text);self.assertIn('rx_runtime',text)
 
-    def fake_worker(self,mbx_version='1.29.1',rustc_version='1.99.1',install_mbx=True):
+    def fake_worker(self,mbx_version='1.29.1',rustc_version='1.99.1',install_mbx=True,install_rustdoc=True):
         """A fake worker home whose tools are tiny scripts, with the job environment's PATH."""
         profile=dict(self.fixtures['profile'],worker_home=str(self.root/'home'))
         home=Path(profile['worker_home']);cargo=home/'.cargo/bin';cargo.mkdir(parents=True)
         # rustup's proxy reports the pinned toolchain only when RUSTUP_TOOLCHAIN selects it.
         (cargo/'rustc').write_text('#!/bin/sh\nif [ "$RUSTUP_TOOLCHAIN" = 1.99.1 ]; then echo "rustc '+rustc_version+' (fixture)"; else echo "rustc 1.97.1 (fixture default)"; fi\n')
         (cargo/'rustc').chmod(0o755)
+        if install_rustdoc:
+            (cargo/'rustdoc').write_text('#!/bin/sh\nif [ "$RUSTUP_TOOLCHAIN" = 1.99.1 ]; then echo "rustdoc '+rustc_version+' (fixture)"; else echo "rustdoc 1.97.1 (fixture default)"; fi\n')
+            (cargo/'rustdoc').chmod(0o755)
         if install_mbx:
             pinned=home/'.local/share/mise/installs/mr-boxington/1.29.1';pinned.mkdir(parents=True)
             # The fake answers `settings get` the way mbx does: an environment variable
@@ -357,7 +360,8 @@ class Admission(unittest.TestCase):
     def test_admit_tool_check_refuses_missing_mbx_and_wrong_rustc_clearly(self):
         cases=[({'install_mbx':False},'mbx is not on the job PATH'),
                ({'mbx_version':'1.28.0'},'mbx reports 1.28.0, pinned 1.29.1'),
-               ({'rustc_version':'1.97.1'},'rustc reports 1.97.1, pinned 1.99.1')]
+               ({'rustc_version':'1.97.1'},'rustc reports 1.97.1, pinned 1.99.1'),
+               ({'install_rustdoc':False},'rustdoc is not on the job PATH')]
         for kwargs,reason in cases:
             with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
                 self.root=Path(tmp);profile,env=self.fake_worker(**kwargs)
