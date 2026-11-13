@@ -478,13 +478,20 @@ with jobs enabled writes them, and its reader requirement keeps a build without 
 opening it. Every reader refuses a version it does not know through `FileKind::refuse`,
 and the backup manifest requires the feature `control/1` for a backup that holds them.
 
-The write-ahead log keeps its record size and its commit framing. A control record sits
-inside an ordinary commit, and the readers that decode quads decode only insert and delete
-records and pass over configuration and control records, so the torn-tail rule, the commit
-index and the history readers are unchanged. A transition without quads is written to
-`control.log` and is not a commit. The control checkpoint is written under the writer
-before a compaction or a bulk commit switches `CURRENT`, so a generation switch never
-discards a control frame that no other file holds.
+The write-ahead log keeps its record size, its transaction boundaries, its commit
+numbering and its durability rules. A control record sits inside an ordinary commit.
+Every parser that frames transactions, checks a seal or looks for a later commit as proof
+of durability, including `wal_torn_from`, the probes, `WalCursor`, the reverse readers,
+`wal_end` and the integrity check, includes control records in the transaction and its
+checksum and checks their placement, frame length, padding and commit flag in a log of
+version 3. Every reader that decodes quads, including forward and reverse replay, the
+branch metadata replay, diffs, the change log and the full-text recovery, decodes only
+insert and delete records, since several of them read every record that is not a
+configuration record as a quad today. Branch overlays stay quad-only. A transition
+without quads is written to `control.log` and is not a commit. The control checkpoint is
+written under the writer before a compaction or a bulk commit switches `CURRENT`, so a
+generation switch never discards a control frame that no other file holds, and a switch
+installs a new log only at the version the store writes at that moment.
 
 A transaction that carries a control record drains the group and commits through the
 serial path. The group-of-one commit of item 833 must keep that rule, or carry control
