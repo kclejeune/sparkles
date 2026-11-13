@@ -1319,6 +1319,7 @@ class Finish(unittest.TestCase):
                 def mono(self):return self.t
                 def read(self,n):return self.records[n]
                 def exists(self,n):return n in self.records
+                def record(self,n,v):self.records[n]=v
                 def trigger(self):self.triggered+=1
                 def wait(self,n):self.t+=1;self.records['closed.json']=closed
                 def show(self,u):return {'Id':u,'InvocationID':'a'*32,'ActiveState':'inactive','MainPID':'0','ExecMainStatus':'0','ControlGroup':''}
@@ -1326,6 +1327,9 @@ class Finish(unittest.TestCase):
             with patch.object(controller,'RealIO',return_value=io):
                 result=controller.finish_operation(f['operation'],seconds=3)
             self.assertTrue(result['stopped_confirmed']);self.assertTrue(result['guard_closed']);self.assertEqual(io.triggered,1)
+            # Without the lifetime records the finish cannot bound a disk cleanup, so it
+            # records that and still stops.
+            self.assertEqual({k:io.records['finish-disk-clean.json'][k] for k in ('cleaned','reason_code')},{'cleaned':False,'reason_code':'disk_clean_no_time'})
             io=IO();io.records['guard-loaded.json']['boot_id']='replaced-boot'
             with patch.object(controller,'RealIO',return_value=io),self.assertRaises(controller.Refusal):
                 controller.finish_operation(f['operation'],seconds=3)

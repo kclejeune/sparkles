@@ -32,6 +32,11 @@ WATCH_FLOOR=60
 WATCH_CHECKS=400
 WATCH_ACCEPT=15
 WATCH_DECISION=90
+# Before it stops a worker, the watch or a finish runs disk_clean.py --force on it for
+# at most DISK_CLEAN_SECONDS, so the stop's snapshot does not carry finished jobs'
+# worktrees or a store over its budget into the next resume. The cleanup is best effort
+# and never holds off a stop.
+DISK_CLEAN_SECONDS=240
 # A remote phase's reason code is kept only in one of these forms. A refusal
 # code must name one of the packet's own literal refusal reasons.
 FIXED_REASONS=frozenset({'startup_unobserved','startup_busy:unallowed_processes','startup_busy:bootstrap_lock_held','startup_busy:lock_or_manifest_absent','startup_busy:bootstrap_lock_replaced','startup_busy:state_restore_in_progress','existing_phase_pending','unreported'})
@@ -345,6 +350,15 @@ class RealIO:
                 local[unit]=x.get('ActiveState') in ('inactive','failed') and x.get('MainPID')=='0'
         need(self.mono()<=end,'job closure bound exhausted')
         return {'list_exit':b.get('list_exit'),'units':b.get('units'),'unit_count':b.get('unit_count'),'processes':b.get('processes'),'process_count':b.get('process_count'),'boot_id':b.get('boot_id'),'local_units_closed':local}
+    def disk_clean(self,seconds):
+        """Run disk_clean.py --force on the worker within ``seconds`` and return its record."""
+        import job_environment
+        home=profile()['worker_home'];teardown=owned_group.WINDOW+1;need(seconds-teardown>=30,'disk clean bound exhausted')
+        args=['--home',home,'--force','--env',json.dumps(job_environment.environment(profile()),sort_keys=True),
+              '--gc-seconds',str(int(seconds-teardown-15)),'--log',home+'/gate/disk-clean.jsonl']
+        r=self.remote_python((ROOT/'disk_clean.py').read_text(),args,seconds-teardown)
+        need(r['exit']==0 and isinstance(r['body'],dict),'worker disk clean failed')
+        b=r['body'];return {k:b.get(k) for k in ('observed_unix','before','after','ran','removed','gc_exit','units_listed','skipped')}
     def stop_status(self,operation):
         r=self.boat(['stop',worker_id(),'--status',operation],15)
         need(r['exit']==0 and isinstance(r['body'],dict) and r['body'].get('id')==worker_id(),'stop status unavailable')
@@ -1012,6 +1026,10 @@ def _finish(r,io,job_closure,seconds):
             if io.exists('root-job-closed.json'):need(io.read('root-job-closed.json')==closed,'closure replacement refused')
             else:io.record('root-job-closed.json',closed)
         matching_root_job_closed(r,io,io.read('root-job-closed.json'))
+        if not io.exists('stop-trigger.json'):
+            try:wall,boot,_=watch_ends(r,io);budget=min(wall-io.wall(),boot-io.mono())-WATCH_FLOOR-60
+            except Exception:budget=0
+            clean_before_stop(io,'finish-disk-clean.json',budget)
     if not io.exists('closed.json'):io.trigger()
     return await_stop(r,io,seconds)
 
@@ -1081,6 +1099,18 @@ def job_closed(r,io,check):
     return (check.get('list_exit')==0 and check.get('units')==[] and check.get('unit_count')==0 and check.get('processes')==[] and check.get('process_count')==0
             and isinstance(check.get('boot_id'),str) and check['boot_id']==q.get('worker_boot_id') and all(v is True for v in check['local_units_closed'].values()))
 
+def clean_before_stop(io,name,seconds):
+    """Clean the worker's disk once before a stop, recording the result in ``name``.
+
+    A failure or a short bound is recorded and never prevents the stop."""
+    if io.exists(name):return
+    seconds=min(DISK_CLEAN_SECONDS,int(seconds))
+    if seconds<60:
+        io.record(name,{'worker':worker_id(),'cleaned':False,'reason_code':'disk_clean_no_time','observed_wall':io.wall()});return
+    try:row={'worker':worker_id(),'cleaned':True}|io.disk_clean(seconds)
+    except Exception as error:row={'worker':worker_id(),'cleaned':False,'reason_code':reason_code(error),'observed_wall':io.wall()}
+    io.record(name,row)
+
 def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=await_stop):
     """Close a warm worker's operation before its deadline, once its jobs have ended.
 
@@ -1132,6 +1162,13 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
         if checks>=WATCH_CHECKS:return unresolved('closure_check_bound')
         check=check_jobs(60)
         if check is None or not check['closed']:pause(io,poll);continue
+        # The jobs have ended. The cleanup runs under the exclusive job lock, so no command
+        # can launch a job whose files it would remove, and the check under the locks
+        # below runs after it and sees no cleanup process left.
+        if not io.exists('closure-watch-disk-clean.json'):
+            if not io.lock_jobs():last='job_command_live';pause(io,poll);continue
+            try:clean_before_stop(io,'closure-watch-disk-clean.json',left-WATCH_FLOOR-WATCH_DECISION-60)
+            finally:io.unlock_jobs()
         if not io.freeze_extensions():
             last='extension_act_running';pause(io,1);continue
         published=False

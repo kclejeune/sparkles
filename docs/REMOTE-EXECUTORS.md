@@ -180,6 +180,12 @@ closure shortly before the guard's present end and finishes the operation, so th
 guard's stop does not depend on the provider TTL. The
 [scheduled closure](../scripts/boat/README.md#scheduled-closure) section describes it.
 
+A worker frees finished work when its root disk reaches 90% use, the level at which the
+provider warns the maintainer, and before every stop that the closure watch or `finish`
+makes. The cleanup removes finished gate worktrees and build checkouts and runs `mbx gc`,
+and keeps the store's live entries and every active job's files. The
+[disk cleanup](../scripts/boat/README.md#disk-cleanup) section describes where it runs.
+
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a
 host with a newer glibc do not run there. The executor does not choose the build host,
 so the screen names the worker as its build host and passes two revisions rather than
