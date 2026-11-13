@@ -332,7 +332,13 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
     let terms = || {
         with_desc(
             json!({ "type": "object", "additionalProperties": array(string()) }),
-            "Domain scope: predicate IRIs to N-Triples terms. Evidence profile, valid-time, PROV-O and structural predicates are refused.",
+            "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
+        )
+    };
+    let claim_terms = || {
+        with_desc(
+            json!({ "type": "object", "additionalProperties": array(string()) }),
+            "Domain scope: predicate IRIs to N-Triples terms. Profile, valid-time, PROV-O and structural predicates are refused. A claim's validity uses its validity member.",
         )
     };
     let date_time = |d: &str| with_desc(json!({ "type": "string", "format": "date-time" }), d);
@@ -473,7 +479,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "kind": string_enum(&["reported", "observation", "hypothesis", "preference"]),
                             "polarity": string_enum(&["positive", "negative", "uncertain"]),
                             "author": iri("The attributed source author, not the authenticated caller."),
-                            "scope": terms(),
+                            "scope": claim_terms(),
                             "confidence": closed(
                                 &[],
                                 json!({ "source": confidence(), "extraction": confidence(), "analyst": confidence() }),

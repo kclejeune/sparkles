@@ -7143,7 +7143,7 @@ export interface components {
                 };
                 /** @description The assessment's key within its target. */
                 occurrenceKey: string;
-                /** @description Domain scope: predicate IRIs to N-Triples terms. Evidence profile, valid-time, PROV-O and structural predicates are refused. */
+                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused. */
                 scope?: {
                     [key: string]: string[];
                 };
@@ -7219,7 +7219,7 @@ export interface components {
                     /** @description A record of this batch, by its key. */
                     key?: string;
                 };
-                /** @description Domain scope: predicate IRIs to N-Triples terms. Evidence profile, valid-time, PROV-O and structural predicates are refused. */
+                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, valid-time, PROV-O and structural predicates are refused. A claim's validity uses its validity member. */
                 scope?: {
                     [key: string]: string[];
                 };
