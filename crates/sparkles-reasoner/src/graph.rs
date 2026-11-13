@@ -26,8 +26,6 @@ use crate::budget::{
 use crate::facts::{Base, Memo, Probe, ProbeFilter};
 use crate::tier::{ROW, Tier};
 use hashbrown::HashTable;
-
-use crate::huge::{self, Huge};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::hash::BuildHasher;
@@ -45,34 +43,9 @@ const PAR_MIN: usize = 1 << 14;
 /// merge's probe.
 pub(crate) const IN_BASE_SHARD: usize = 128;
 
-/// An entry of the triple index: a fact's id and the 32 bits of its triple's hash that
-/// the table's hash is made of, so that a rehash rebuilds the hash from the entry
-/// without reading the row, and a probe compares the bits before it reads a row, which
-/// a probe of an absent triple then never does.
-#[derive(Clone, Copy)]
-struct Entry {
-    id: u32,
-    h: u32,
-}
-
-/// The 32 bits of a triple's hash that the index keeps.
-#[inline]
-fn fp3(t: &Triple) -> u32 {
-    let h = rustc_hash::FxBuildHasher.hash_one(t);
-    (h ^ (h >> 32)) as u32
-}
-
-/// The table's hash from the kept bits: the low bits pick the bucket and the top bits
-/// the control byte, both from the same 32 bits.
-#[inline]
-fn widen(h: u32) -> u64 {
-    u64::from(h) | (u64::from(h) << 32)
-}
-
-/// The table's hash of a triple.
 #[inline]
 fn hash3(t: &Triple) -> u64 {
-    widen(fp3(t))
+    rustc_hash::FxBuildHasher.hash_one(t)
 }
 
 #[inline]
@@ -91,19 +64,12 @@ fn shards<T: Default>() -> Vec<T> {
     (0..SHARDS).map(|_| T::default()).collect()
 }
 
-/// The heap of one shard of the triple index at capacity `cap`, as its mapping makes it
-/// resident.
-fn index_bytes(cap: usize) -> usize {
-    huge::rounded(table_bytes(cap, size_of::<Entry>()))
-}
-
 pub(crate) struct Graph {
     base: Option<Arc<Base>>,
     /// the derived facts, from `offset` on
     tier: Tier,
-    /// the ids of the live derived triples, hashed by triple, by [`shard3`], in tables
-    /// mapped for huge pages (see [`crate::huge`])
-    index: Vec<HashTable<Entry, Huge>>,
+    /// the ids of the live derived triples, hashed by triple, by [`shard3`]
+    index: Vec<HashTable<u32>>,
     /// facts a merge found in the base tier, by [`shard3`], so that evaluation does not
     /// emit them again: at most [`IN_BASE_SHARD`] per shard
     pub(crate) in_base: Vec<FxHashSet<Triple>>,
@@ -150,7 +116,7 @@ impl Graph {
         let mut g = Graph::default();
         g.tier.reserve_exact(n);
         for m in &mut g.index {
-            *m = HashTable::with_capacity_in(n / SHARDS, Huge);
+            *m = HashTable::with_capacity(n / SHARDS);
         }
         g.settle();
         g
@@ -158,7 +124,7 @@ impl Graph {
 
     /// [`with_capacity`](Self::with_capacity), charged to `budget` before it allocates.
     pub fn try_with_capacity(n: usize, budget: &Arc<Budget>) -> Result<Graph, MemoryExceeded> {
-        let bytes = n * ROW + SHARDS * index_bytes(table_capacity(n / SHARDS));
+        let bytes = n * ROW + SHARDS * table_bytes(table_capacity(n / SHARDS), 4);
         let mut held = Held::try_new(budget, bytes)?;
         let mut g = Graph::with_capacity(n);
         // strict: the estimate above may fall short of the heap, and settling must not
@@ -207,7 +173,7 @@ impl Graph {
         n += self
             .index
             .iter()
-            .map(|t| index_bytes(t.capacity()))
+            .map(|t| table_bytes(t.capacity(), size_of::<u32>()))
             .sum::<usize>();
         n += self
             .in_base
@@ -215,7 +181,7 @@ impl Graph {
             .map(|s| table_bytes(s.capacity(), size_of::<Triple>()))
             .sum::<usize>();
         // the shard vectors themselves
-        n += SHARDS * (size_of::<HashTable<Entry, Huge>>() + size_of::<FxHashSet<Triple>>());
+        n += SHARDS * (size_of::<HashTable<u32>>() + size_of::<FxHashSet<Triple>>());
         n
     }
 
@@ -240,9 +206,10 @@ impl Graph {
             }
             let (old, len) = (t.capacity(), t.len());
             let to = table_grown(old, len, want.max(min));
-            self.held.try_grow(index_bytes(to))?;
-            self.index[s].reserve(to - len, |e| widen(e.h));
-            self.held.shrink(index_bytes(old));
+            self.held.try_grow(table_bytes(to, size_of::<u32>()))?;
+            let tier = &self.tier;
+            self.index[s].reserve(to - len, |&r| hash3(&tier.triple(r)));
+            self.held.shrink(table_bytes(old, size_of::<u32>()));
         }
         self.try_settle()
     }
@@ -407,10 +374,9 @@ impl Graph {
         let r = (|| {
             let Graph { index, tier, .. } = &mut *self;
             for t in ts {
-                let fp = fp3(&t);
-                let h = widen(fp);
+                let h = hash3(&t);
                 let tbl = &mut index[shard3(&t)];
-                if tbl.find(h, |e| e.h == fp && tier.eq(e.id, &t)).is_none() {
+                if tbl.find(h, |&r| tier.eq(r, &t)).is_none() {
                     m.add(tier.rel_growth(t[1]))?;
                     if tier.count() == tier.capacity() {
                         // the new buffers, while the old ones are alive
@@ -421,14 +387,17 @@ impl Graph {
                         m.sub(old * ROW);
                     }
                     if tbl.len() == tbl.capacity() {
-                        let old = index_bytes(tbl.capacity());
-                        m.add(index_bytes(table_grown(tbl.capacity(), tbl.len(), 1)))?;
-                        tbl.reserve(1, |e| widen(e.h));
+                        let old = table_bytes(tbl.capacity(), size_of::<u32>());
+                        m.add(table_bytes(
+                            table_grown(tbl.capacity(), tbl.len(), 1),
+                            size_of::<u32>(),
+                        ))?;
+                        tbl.reserve(1, |&r| hash3(&tier.triple(r)));
                         m.sub(old);
                     }
                     let id = tier.len();
                     tier.push(t);
-                    tbl.insert_unique(h, Entry { id, h: fp }, |e| widen(e.h));
+                    tbl.insert_unique(h, id, |&r| hash3(&tier.triple(r)));
                 }
             }
             Ok(())
@@ -600,9 +569,8 @@ impl Graph {
                         if !known.is_empty() && known.contains(&t) {
                             continue;
                         }
-                        let fp = fp3(&t);
-                        let hash = widen(fp);
-                        if tbl.find(hash, |e| e.h == fp && tier.eq(e.id, &t)).is_some() {
+                        let hash = hash3(&t);
+                        if tbl.find(hash, |&r| tier.eq(r, &t)).is_some() {
                             continue;
                         }
                         if let hashbrown::hash_table::Entry::Vacant(v) =
@@ -778,7 +746,10 @@ impl Graph {
         }
         for (tbl, ks) in self.index.iter().zip(&kept) {
             if tbl.len() + ks.len() > tbl.capacity() {
-                grow += index_bytes(table_grown(tbl.capacity(), tbl.len(), ks.len()));
+                grow += table_bytes(
+                    table_grown(tbl.capacity(), tbl.len(), ks.len()),
+                    size_of::<u32>(),
+                );
             }
         }
         work.try_grow(grow)?;
@@ -809,14 +780,14 @@ impl Graph {
             .par_iter_mut()
             .zip(kept.par_iter())
             .for_each(|(tbl, ks)| {
-                tbl.reserve(ks.len(), |e| widen(e.h));
+                let hasher = |&r: &u32| hash3(&tier.triple(r));
+                tbl.reserve(ks.len(), hasher);
                 for &h in ks {
                     let p = gpos(h);
                     let (w, b) = (p / 64, p % 64);
                     let r =
                         first_id + before_ref[w] + (bits_ref[w] & ((1u64 << b) - 1)).count_ones();
-                    let fp = fp3(&tier.triple(r));
-                    tbl.insert_unique(widen(fp), Entry { id: r, h: fp }, |e| widen(e.h));
+                    tbl.insert_unique(hasher(&r), r, hasher);
                 }
             });
         let t_rows = std::time::Instant::now();
@@ -874,10 +845,9 @@ impl Graph {
     /// The id of a live derived triple.
     #[inline]
     pub fn position(&self, t: &Triple) -> Option<u32> {
-        let fp = fp3(t);
         self.index[shard3(t)]
-            .find(widen(fp), |e| e.h == fp && self.tier.eq(e.id, t))
-            .map(|e| e.id)
+            .find(hash3(t), |&r| self.tier.eq(r, t))
+            .copied()
     }
 
     /// Whether a triple is a fact of either tier.
@@ -905,12 +875,10 @@ impl Graph {
     /// Mark a live derived triple dead; returns false if the triple is not live.
     pub fn kill(&mut self, t: &Triple) -> bool {
         let tier = &self.tier;
-        let fp = fp3(t);
-        let Ok(e) = self.index[shard3(t)].find_entry(widen(fp), |e| e.h == fp && tier.eq(e.id, t))
-        else {
+        let Ok(e) = self.index[shard3(t)].find_entry(hash3(t), |&r| tier.eq(r, t)) else {
             return false;
         };
-        let (Entry { id: i, .. }, _) = e.remove();
+        let (i, _) = e.remove();
         // a few bits per fact, charged as they grow
         let (grow, old) = self.tier.dead_growth(i);
         self.held.grow(grow);
@@ -973,11 +941,8 @@ impl Graph {
         }
         if let (Some(s), Some(p), Some(o)) = (s, p, o) {
             let t = [s, p, o];
-            let fp = fp3(&t);
-            return match self.index[shard3(&t)]
-                .find(widen(fp), |e| e.h == fp && self.tier.eq(e.id, &t))
-            {
-                Some(e) if e.id >= lo && e.id < hi => Cands::ids(std::slice::from_ref(&e.id)),
+            return match self.index[shard3(&t)].find(hash3(&t), |&r| self.tier.eq(r, &t)) {
+                Some(i) if *i >= lo && *i < hi => Cands::ids(std::slice::from_ref(i)),
                 _ => Cands::empty(),
             };
         }

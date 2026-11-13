@@ -6064,10 +6064,8 @@ dependencies = [
 name = "sparkles-reasoner"
 version = "0.1.0"
 dependencies = [
- "allocator-api2",
  "anyhow",
  "hashbrown 0.16.1",
- "libc",
  "oxrdf",
  "oxsdatatypes",
  "oxttl",
