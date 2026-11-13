@@ -664,10 +664,12 @@ resolves as an authenticated record. A clone's root commit is never earlier than
 commit it copies. The [ordering argument](../specs/C27-valid-time-profiles.md#43-local-availability-and-backdating)
 gives the details.
 
-Claim proposals do not carry a validity interval, so the templates report
-authenticated claims with unknown validity, and roadmap item 925 adds that input. The
-projection helper, event-time UI and expiry integration remain planned under roadmap
-item 341.
+A claim proposal can carry the claim's validity record, which the writer stores with
+the claim in the proposal graph and covers by the claim's record digest, so the
+templates evaluate authenticated claims directly. The writer refuses an interval that
+the version 1 shapes refuse, and claim scope cannot name valid-time predicates. The
+[claims API](../API.md) describes the `validity` member. The projection helper,
+event-time UI and expiry integration remain planned under roadmap item 341.
 
 ## Known gaps
 
@@ -760,9 +762,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   reasoner and view maintenance does not provide that application lifecycle. Roadmap
   item 340.
 * The [valid-time profile](#valid-time-profile) supplies static resources, temporal
-  queries and server-owned availability. Authenticated claim proposals cannot carry a
-  validity interval, which roadmap item 925 adds. The runtime projection helper,
-  event-time control and expiry integration remain planned. Roadmap item 341.
+  queries, validity records on authenticated claims and server-owned availability. The
+  runtime projection helper, event-time control and expiry integration remain planned.
+  Roadmap item 341.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
   have reports built from their own view. Roadmap item 100. Global answering is evaluated
   on one generated question set on the demo graph, compared with BM25 rather than vector

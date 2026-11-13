@@ -10,8 +10,14 @@ publishes it, and an as-known read with `at=time:` excludes revisions imported a
 its cutoff whatever their publication dates. Attempts to backdate availability through
 the proposal body, SPARQL Update, the Graph Store, RDF Patch or a load are refused
 before anything is written. A clone's root commit is no longer earlier than the commit
-it copies when the server clock runs behind. Validity intervals through the
-authenticated writer are roadmap item 925.
+it copies when the server clock runs behind.
+
+A claim proposal can carry the claim's validity record through `validity` on
+`POST /{ds}/claims`, the MCP tool `propose_claims` and `sparkles::evidence::propose`
+(roadmap item 925). The server stores it with the claim and refuses intervals that the
+valid-time shapes refuse, and claim scope no longer accepts valid-time predicates.
+Claims without validity keep their record and payload digests. `ClaimInput` has a new
+`validity` field, so Rust code that builds it field by field adds `validity: None`.
 
 ### OWL classification
 
