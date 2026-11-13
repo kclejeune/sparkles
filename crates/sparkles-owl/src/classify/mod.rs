@@ -1332,6 +1332,7 @@ impl Saturation {
                 &stop,
                 limits.counting && !self.no_counting,
                 rooted,
+                dl_norm::cases_on(),
             )
             .map_err(halt)?
             {

@@ -1740,3 +1740,197 @@ fn a_short_product_with_wide_conclusions_is_charged_before_its_record_is_dropped
         ),
     }
 }
+
+/// `U ⊑ C ⊔ D`, the told union that item 894 distributes a restriction over U into cases of.
+const TOLD_UNION: &str = "SubClassOf(:U ObjectUnionOf(:C :D))";
+
+#[test]
+fn a_union_filler_whose_cases_overlap_keeps_the_identity() {
+    // the cases C and D are not disjoint, so A's one successor may be in both, which the
+    // distribution must not decide: it is in E and need not be in C ⊓ D; H's successors
+    // are one, in C and D (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r)))
+             {TOLD_UNION} SubClassOf(:C :E) SubClassOf(:D :E)
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r :E))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :D)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :C)) SubClassOf(:H ObjectSomeValuesFrom(:r :D))
+             SubClassOf(:H ObjectMaxCardinality(1 :r)) {UNION}"
+        ),
+        &[("A", "F"), ("H", "G"), ("H", "F")],
+        &[("A", "G"), ("F", "A")],
+    );
+}
+
+#[test]
+fn two_witnesses_below_a_union_take_different_cases() {
+    // at most one r-successor in C and at most one in D, so the two witnesses of
+    // ≥2 r.U are one in C and one in D (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :U)) {TOLD_UNION} DisjointClasses(:C :D)
+             SubClassOf(:A ObjectMaxCardinality(1 :r :C)) SubClassOf(:A ObjectMaxCardinality(1 :r :D))
+             EquivalentClasses(:F ObjectIntersectionOf(ObjectSomeValuesFrom(:r :C) ObjectSomeValuesFrom(:r :D)))
+             SubClassOf(:B ObjectMinCardinality(2 :r :U)) SubClassOf(:B ObjectMaxCardinality(1 :r :C))
+             SubClassOf(:B ObjectAllValuesFrom(:r :C)) SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "F"), ("B", "E")],
+        &[("F", "A"), ("A", "E")],
+    );
+}
+
+#[test]
+fn two_cases_a_context_supports_independently_keep_their_equality() {
+    // A holds both cases of ∃r.U as units and at most one r-successor, so the two case
+    // terms are equal and in the disjoint C and D: the lemma does not cover them and A
+    // is unsatisfiable (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :C)))
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :D)))
+             SubClassOf(:A ObjectMaxCardinality(1 :r)) {TOLD_UNION} DisjointClasses(:C :D)
+             SubClassOf(:B ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r)))
+             SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "Nothing"), ("A", "E")],
+        &[("B", "E")],
+    );
+}
+
+#[test]
+fn two_cases_of_two_restrictions_whose_classes_overlap_are_equated() {
+    // the one successor is in C ⊔ D and in C ⊔ E with D and E disjoint, so it is in C,
+    // which needs the equality of case terms of two different restrictions (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectUnionOf(:C :D)))
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectUnionOf(:C :E)))
+             SubClassOf(:A ObjectMaxCardinality(1 :r)) DisjointClasses(:D :E)
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r :C)) {UNION}"
+        ),
+        &[("A", "F")],
+        &[("F", "A")],
+    );
+}
+
+#[test]
+fn a_conditional_inequality_certificate_holds_after_the_distribution() {
+    // ≥2 r.U is conditional in A, its witnesses are distributed over U's cases, and at
+    // most one r-successor equates them, which their disjoint fillers refute: A is E
+    // (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectUnionOf(ObjectMinCardinality(2 :r :U) :E))
+             SubClassOf(:A ObjectMaxCardinality(1 :r)) {TOLD_UNION}
+             SubClassOf(:B ObjectUnionOf(ObjectMinCardinality(2 :r :U) :E))
+             SubClassOf(:B ObjectMaxCardinality(2 :r)) {UNION}"
+        ),
+        &[("A", "E")],
+        &[("B", "E")],
+    );
+}
+
+#[test]
+fn a_qualification_by_a_case_reaches_the_predecessor() {
+    // the case successor of ∃r.U is a B through its case, which Pred reports to A, where
+    // at most one r.B equates it with the B-successor in G: the successor is in U and G
+    // (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r :B)))
+             {TOLD_UNION} SubClassOf(:C :B) SubClassOf(:D :B)
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :G)))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :B))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :G))) {UNION}"
+        ),
+        &[("A", "F")],
+        &[("F", "A")],
+    );
+}
+
+#[test]
+fn a_transitive_property_unfolds_under_a_case() {
+    // each case of the t-successor has a t-successor in E, and t is transitive, so A has
+    // one too; the maximum on s turns counting on (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:t :U) ObjectMaxCardinality(1 :s)))
+             {TOLD_UNION} TransitiveObjectProperty(:t)
+             SubClassOf(:C ObjectSomeValuesFrom(:t :E)) SubClassOf(:D ObjectSomeValuesFrom(:t :E))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:t :E))
+             SubClassOf(:A ObjectMaxCardinality(1 :s)) {UNION}"
+        ),
+        &[("A", "F")],
+        &[("F", "A")],
+    );
+}
+
+#[test]
+fn a_case_context_takes_another_case_and_an_exclusion_from_its_predecessors() {
+    // A and B share the conditional cases of ∃r.U, so their case contexts are
+    // hypothetical: A's universal puts its successor in D, so A's C case closes, and B's
+    // universal puts its successor outside C (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectUnionOf(ObjectSomeValuesFrom(:r :U) :Q))
+             SubClassOf(:B ObjectUnionOf(ObjectSomeValuesFrom(:r :U) :Q))
+             {TOLD_UNION} DisjointClasses(:C :D) DisjointClasses(:C :X)
+             SubClassOf(:A ObjectAllValuesFrom(:r :D)) SubClassOf(:B ObjectAllValuesFrom(:r :X))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r :D))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r :C))
+             EquivalentClasses(:FQ ObjectUnionOf(:F :Q))
+             SubClassOf(:H ObjectMaxCardinality(1 :r)) {UNION}"
+        ),
+        &[("A", "FQ"), ("B", "FQ")],
+        &[("A", "F"), ("B", "F"), ("A", "G"), ("B", "G")],
+    );
+}
+
+#[test]
+fn disjoint_subroles_with_one_counted_successor_are_unsatisfiable() {
+    // the K-successors by r1 and r2 are one r-successor, which both disjoint roles then
+    // reach: the equality must carry both role edges (item 894, the merge's regression)
+    check(
+        &format!(
+            "SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r) DisjointObjectProperties(:r1 :r2)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :K)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :K))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :K))
+             SubClassOf(:B ObjectSomeValuesFrom(:r1 :K)) SubClassOf(:B ObjectSomeValuesFrom(:r2 :K))
+             SubClassOf(:B ObjectMaxCardinality(2 :r :K)) SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "Nothing"), ("A", "E")],
+        &[("B", "E")],
+    );
+}
+
+/// The mixed supports of design round 2: A's cases of ∃r.U have the support from the
+/// cases' clause, which only the larger case's term gets since only the maximal literal
+/// unfolds, and the conditional supports `X ⊔ ∃r.(U ⊓ c₁)` and `Y ⊔ ∃r.(U ⊓ c₂)` of their
+/// own, which the told chain from A to P3 derives after the cases' clause. A source support
+/// with an independent one is redundant, and the two independent ones give
+/// `X ⊔ Y ⊔ f₁ ≈ f₂`, so that the disjoint cases put A in `X ⊔ Y`.
+fn mixed_supports(x: &str, y: &str, c1: &str, c2: &str) {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r)))
+             {TOLD_UNION} DisjointClasses(:C :D)
+             SubClassOf(:A :P1) SubClassOf(:P1 :P2) SubClassOf(:P2 :P3)
+             SubClassOf(:P3 ObjectUnionOf(:{x} ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :{c1}))))
+             SubClassOf(:P3 ObjectUnionOf(:{y} ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :{c2}))))
+             EquivalentClasses(:W ObjectUnionOf(:{x} :{y})) {UNION}"
+        ),
+        &[("A", "W")],
+        &[("A", x), ("A", y), ("W", "A")],
+    );
+}
+
+#[test]
+fn source_and_independent_conditional_supports_of_two_cases_keep_the_product() {
+    // a subset is skipped only when every pair of its supports is redundant, so a
+    // candidate with a source and an independent support keeps the product of the
+    // independent ones; the two orders of the names give the two orders of arrival, and
+    // a skip on one redundant pair fails both (item 894)
+    mixed_supports("X", "Y", "D", "C");
+    mixed_supports("Y", "X", "C", "D");
+}

@@ -103,6 +103,10 @@ pub struct DlIx {
     /// in a rooted run with counting, the existential restrictions of each minimum's
     /// holder, whose successor terms differ
     pub ne_of: FxHashMap<Ex, Vec<Ex>>,
+    /// item 894's case restrictions, each with the group of the distributed restriction it
+    /// is a case of, so that the at-most rule skips the subsets whose products two cases of
+    /// one group make redundant
+    case_group: FxHashMap<Ex, u32>,
 }
 
 impl DlIx {
@@ -114,6 +118,12 @@ impl DlIx {
             counting: dl.counting,
             root: dl.root,
             ne_of: dl.ne.iter().cloned().collect(),
+            case_group: dl
+                .cases
+                .iter()
+                .enumerate()
+                .flat_map(|(g, es)| es.iter().map(move |&e| (e, g as u32)))
+                .collect(),
             ..DlIx::default()
         };
         for (b, h) in &dl.clauses {
@@ -1291,8 +1301,8 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
                 continue;
             }
             let rest: Vec<Lit> = head.iter().copied().filter(|&m| m != l).collect();
-            let read = known(dx, st, &body, &rest, l.fun(), &mut a)
-                + known(dx, st, &body, &rest, g, &mut b);
+            let read = known(ix, dx, st, &body, &rest, l.fun(), &mut a)
+                + known(ix, dx, st, &body, &rest, g, &mut b);
             out.dl()
                 .work
                 .fetch_add(read / WORK_READS, Ordering::Relaxed);
@@ -1352,6 +1362,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
 /// are in `head`. Each class comes with the clause that gives it, `u32::MAX` for the core.
 /// The answer is the number of clauses it read, which the work bound counts.
 fn known(
+    ix: &Index,
     dx: &DlIx,
     st: &State,
     body: &[Lit],
@@ -1388,7 +1399,15 @@ fn known(
                 }
             }
             if let (true, Some(m)) = (fits, cert) {
-                out.push((m.atom(), i));
+                // the atom may be a conjunction, whose parts certify, item 894
+                let a = m.atom();
+                if matches!(ix.head(a).node, Node::Conj(..)) {
+                    let mut parts = Vec::new();
+                    flatten(ix, a, &mut parts);
+                    out.extend(parts.into_iter().map(|p| (p, i)));
+                } else {
+                    out.push((a, i));
+                }
             }
         }
     }
@@ -1404,7 +1423,7 @@ fn again(ix: &Index, st: &State, id: u32, c: &Clause, found: &mut Found) {
     let mut keys: Vec<Ex> = c
         .head()
         .iter()
-        .filter(|m| m.kind() == F && !ix.disjoint_of(ix.head(m.atom())).is_empty())
+        .filter(|m| m.kind() == F && super::dl_clause::certifies(ix, m.atom()))
         .map(|m| m.fun())
         .collect();
     keys.sort_unstable();
@@ -1541,19 +1560,56 @@ fn at_most(
     if cands.len() < k {
         return;
     }
+    let m = cands.len();
     // the subsets, with the fixed candidate when there is one, made one product each
-    let subsets = match must {
-        Some(_) => choose(cands.len() - 1, k - 1),
-        None => choose(cands.len(), k),
+    let mut subsets = match must {
+        Some(_) => choose(m - 1, k - 1),
+        None => choose(m, k),
     };
+    // item 894: two candidates that are cases of one distributed restriction, every pair
+    // of whose supports merges into a clause that a live clause of the store subsumes,
+    // make only redundant products, so a subset that holds both is skipped before the
+    // bounds count it
+    let redundant = redundant_pairs(ix, st, &cands);
+    let chosen = |pick: &[usize]| {
+        must.is_none_or(|m| pick.contains(&m))
+            && !redundant
+                .iter()
+                .any(|&(i, j)| pick.contains(&i) && pick.contains(&j))
+    };
+    let mut skipped = 0usize;
+    if !redundant.is_empty() {
+        if subsets > CASES_COUNT_CAP {
+            found.over = true;
+            return;
+        }
+        let mut kept = 0usize;
+        let mut pick: Vec<usize> = (0..k).collect();
+        loop {
+            if chosen(&pick) {
+                kept += 1;
+            } else if must.is_none_or(|m| pick.contains(&m)) {
+                skipped += 1;
+            }
+            if !next_subset(&mut pick, m) {
+                break;
+            }
+        }
+        subsets = kept;
+        if tracing() && skipped > 0 {
+            eprintln!(
+                "TR SKIP {} q={q} k={k} cands={m} skipped={skipped} subsets={subsets}",
+                tr_ctx(st, false)
+            );
+        }
+    }
     // each subset's product holds its premise lists and the equalities of every pair
     let payload = subsets.saturating_mul(k * (k - 1) / 2 + k + 1);
     if k > AT_MOST_WIDEST || subsets > AT_MOST_SUBSETS || payload > AT_MOST_PAYLOAD {
         if tracing() {
             eprintln!(
-                "TR OVER {} q={q} k={k} cands={} subsets={subsets} payload={payload}",
-                tr_ctx(st, false),
-                cands.len()
+                "TR OVER {} q={q} k={k} cands={m} subsets={subsets} payload={payload}",
+                tr_ctx(st, false)
             );
         }
         found.over = true;
@@ -1562,7 +1618,7 @@ fn at_most(
     // each subset of k candidates, with the fixed one when there is one
     let mut pick: Vec<usize> = (0..k).collect();
     loop {
-        if must.is_none_or(|m| pick.contains(&m)) {
+        if chosen(&pick) {
             let mut lists: Vec<Vec<Side>> = vec![holder.clone()];
             let mut eqs: Vec<Lit> = extra.iter().map(|&a| Lit::x(a)).collect();
             for (a, &i) in pick.iter().enumerate() {
@@ -1575,23 +1631,70 @@ fn at_most(
             }
             found.products(lists, (Vec::new(), eqs));
         }
-        // the next subset in lexicographic order
-        let m = cands.len();
-        let mut i = k;
-        loop {
-            if i == 0 {
-                return;
+        if !next_subset(&mut pick, m) {
+            return;
+        }
+    }
+}
+
+/// Advances `pick`, a sorted subset of `0..m`, to the next subset of its size in
+/// lexicographic order; false after the last.
+fn next_subset(pick: &mut [usize], m: usize) -> bool {
+    let k = pick.len();
+    let mut i = k;
+    loop {
+        if i == 0 {
+            return false;
+        }
+        i -= 1;
+        if pick[i] < m - k + i {
+            pick[i] += 1;
+            for j in i + 1..k {
+                pick[j] = pick[j - 1] + 1;
             }
-            i -= 1;
-            if pick[i] < m - k + i {
-                pick[i] += 1;
-                for j in i + 1..k {
-                    pick[j] = pick[j - 1] + 1;
-                }
-                break;
+            return true;
+        }
+    }
+}
+
+/// The most subsets the at-most rule enumerates to count those it skips, item 894; past it
+/// the rule passes the run's bound on derived conclusions instead.
+const CASES_COUNT_CAP: usize = 1 << 20;
+
+/// The pairs of candidates of the at-most rule whose products are all redundant, item 894:
+/// two case restrictions of one distributed restriction such that every pair of their
+/// supports, merged, is subsumed by a live clause of the store, which the occurrence of the
+/// cases' clause with the alternatives not yet taken provides. A product over the pair
+/// holds the merge, so the Elim rule would drop it on arrival.
+fn redundant_pairs(ix: &Index, st: &State, cands: &[(Term, Vec<Side>)]) -> Vec<(usize, usize)> {
+    let dx = dix(ix);
+    let mut out = Vec::new();
+    if dx.case_group.is_empty() {
+        return out;
+    }
+    let Some(d) = dl(st) else { return out };
+    let group = |t: Term| match t {
+        Term::Fun(f) => dx.case_group.get(&f).copied(),
+        _ => None,
+    };
+    for i in 0..cands.len() {
+        let Some(g) = group(cands[i].0) else { continue };
+        for j in i + 1..cands.len() {
+            if group(cands[j].0) != Some(g) {
+                continue;
+            }
+            let covered = cands[i].1.iter().all(|p| {
+                cands[j].1.iter().all(|q| {
+                    let s = merge(p, q);
+                    d.store.is_subsumed(&Clause::new(s.0, s.1))
+                })
+            });
+            if covered {
+                out.push((i, j));
             }
         }
     }
+    out
 }
 
 /// The most subsets one application of the at-most rule makes before the run passes its

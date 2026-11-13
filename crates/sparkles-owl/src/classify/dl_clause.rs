@@ -371,6 +371,22 @@ pub fn rank(ix: &Index, a: Ex) -> (u8, Ex) {
     (r, a)
 }
 
+/// Whether an atom over a successor term certifies that the term is in a class of a
+/// disjointness set: the atom is in one, or it is a conjunction one of whose parts is,
+/// item 894's case fillers among them.
+pub fn certifies(ix: &Index, a: Ex) -> bool {
+    match ix.head(a).node {
+        Node::Conj(..) => {
+            let mut parts = Vec::new();
+            super::saturate::flatten(ix, a, &mut parts);
+            parts
+                .iter()
+                .any(|&p| !ix.disjoint_of(ix.head(p)).is_empty())
+        }
+        _ => !ix.disjoint_of(ix.head(a)).is_empty(),
+    }
+}
+
 /// A context clause: its body, then its head, each sorted.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Clause {
@@ -928,6 +944,11 @@ impl Store {
             .any(|l| self.by_last.get(l).is_some_and(|ids| check(ids)))
     }
 
+    /// Whether a clause of the store that is not dead subsumes `c`.
+    pub fn is_subsumed(&self, c: &Clause) -> bool {
+        self.subsumed(c, c.sig())
+    }
+
     /// Adds a clause that is not subsumed, marks dead those it subsumes, and queues it.
     /// The answer is the number of bytes it added, or `None` when it was subsumed.
     pub fn add(&mut self, c: Clause) -> Option<usize> {
@@ -1064,7 +1085,7 @@ impl Store {
                 }
             }
             if let Some(l) = self.max_of(id, |l| l.kind() == F)
-                && !ix.disjoint_of(ix.head(l.atom())).is_empty()
+                && certifies(ix, l.atom())
             {
                 self.by_cert.entry(l.fun()).or_default().push(id);
             }
