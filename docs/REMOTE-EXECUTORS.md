@@ -160,6 +160,7 @@ mise run bench:jena-remote --executor "$worker" --no-build -- --arm sparkles=spa
 mise run test:partitioned --hosts "$worker" --no-local
 scripts/gate/setup-host.sh "$worker" wally
 scripts/gate/gate.sh --host "$worker" --helper none HEAD
+python3 scripts/remote-executor.py exec "$worker" 'python3 -I ~/gate/bin/disk_clean.py --force --log ~/gate/disk-clean.jsonl'
 mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
 
@@ -181,9 +182,10 @@ guard's stop does not depend on the provider TTL. The
 [scheduled closure](../scripts/boat/README.md#scheduled-closure) section describes it.
 
 A worker frees finished work when its root disk reaches 90% use, the level at which the
-provider warns the maintainer, and before every stop that the closure watch or `finish`
-makes. The cleanup removes finished gate worktrees and build checkouts and runs `mbx gc`,
-and keeps the store's live entries and every active job's files. The
+provider warns the maintainer, and before the job-closure receipt of every stop, which the
+closure watch runs itself and the owner runs before `finish`. The cleanup removes finished
+gate worktrees and runs `mbx gc`, and keeps the store's live entries and every active
+job's files. The
 [disk cleanup](../scripts/boat/README.md#disk-cleanup) section describes where it runs.
 
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a

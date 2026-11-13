@@ -286,6 +286,7 @@ mise run bench:remote-writes --executor "$worker" base=path/to/baseline head=pat
 mise run test:partitioned --hosts "$worker" --no-local
 scripts/gate/setup-host.sh "$worker" wally
 scripts/gate/gate.sh --host "$worker" --helper none HEAD
+python3 scripts/remote-executor.py exec "$worker" 'python3 -I ~/gate/bin/disk_clean.py --force --log ~/gate/disk-clean.jsonl'
 mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
 
@@ -432,32 +433,6 @@ as `finish` does. If no check finds the jobs closed by 60 seconds before the end
 watch records `closure-watch-unresolved.json` with the last reason code and leaves the
 guard's own deadline stop in place. One watch runs per operation.
 
-### Disk cleanup
-
-The provider emails the maintainer when a worker's root disk reaches 90% use, and a stop
-saves whatever the disk holds into the snapshot of the next resume. `disk_clean.py` runs
-on the worker and frees finished work. It removes each gate or lane CI worktree
-`~/gate/wt-NAME` whose unit `gate-NAME` is not active and the remote build checkouts under
-`~/lanes/nsc-build-work` when no `nsc-build-*` unit is active. It then runs `mbx gc` with
-the job environment's store settings, which keeps the targets and entries that running
-commands use. It never follows a link, never removes a path whose unit it cannot show
-inactive and never deletes store files itself. A cleanup prints one record with the disk
-use before and after and appends it to `~/gate/disk-clean.jsonl`.
-
-The cleanup runs in four places. `scripts/gate/setup-host.sh` installs the user timer
-`sparkles-disk-clean.timer`, which runs it every minute from ten minutes after boot and
-does nothing below 90% use. The timer's unit files live in the home, so the snapshot keeps
-them and the timer runs again after a resume. A Boat gate runs it at the same threshold
-before it creates its worktree and after its run, and keeps the records as
-`disk-clean-start.json` and `disk-clean-end.json` in its results. Before a stop, the
-closure watch and `finish` run it with `--force` for at most 240 seconds. The watch runs
-it after a check finds the jobs closed and while it holds `jobs.lock` exclusively, so no
-command can launch a job whose files it would remove, and the check under the locks
-follows it. The watch keeps the result as `closure-watch-disk-clean.json` and `finish`
-as `finish-disk-clean.json`. A failed cleanup, or one with less than a minute to spare,
-is recorded and never holds off the stop. The guard's own deadline stop, which follows
-when no closure was established, runs no cleanup, and the timer is then the only one.
-
 `finish` waits up to 180 seconds for the same operation's verified completed/nonforced
 stop, current stopped/snapshot proof and clean local guard exit. systemd unloads the guard's
 transient unit once it is inactive without a failure, so a finish can find it already
@@ -470,3 +445,46 @@ unknown or unresolved stop fails and retains reconciliation ownership. It never 
 resumes, retries stop or selects another worker. `request-stop --operation OPERATION`
 remains available to submit the trigger without claiming completion. Recovery uses the
 operation's protected original profile snapshot and source seal.
+
+## Disk cleanup
+
+The provider emails the maintainer when a worker's root disk reaches 90% use, and a stop
+saves whatever the disk holds into the snapshot of the next resume. `disk_clean.py` runs
+on the worker and frees finished work. It removes each gate or lane CI worktree
+`~/gate/wt-NAME` whose unit `gate-NAME` is not active, and then runs `mbx gc` with the job
+environment's store settings, which keeps the targets and entries that running commands
+use. It never follows a link, never removes a path whose unit it cannot show inactive and
+never deletes store files itself. It leaves the remote build checkouts under
+`~/lanes/nsc-build-work`, because a build moves its sources there before its scope is
+listed, and `mbx gc` bounds their managed targets in the store. One cleanup runs at a time
+under `~/gate/.disk-clean.lock`, and a gate start holds that lock from before it creates
+its worktree until its unit runs. `--deadline-seconds` bounds the whole cleanup. Each
+command runs in its own process group, which is killed when its share of the deadline
+ends. A cleanup prints one record with the disk use before and after and appends it to
+`~/gate/disk-clean.jsonl`.
+
+`scripts/gate/setup-host.sh` installs the user timer `sparkles-disk-clean.timer`, which
+runs the cleanup every minute from ten minutes after boot and does nothing below 90% use.
+The timer's unit files live in the home, so the snapshot keeps them and the timer runs
+again after a resume. A Boat gate runs the cleanup at the same threshold before it
+creates its worktree and after its run, and keeps the records as `disk-clean-start.json`
+and `disk-clean-end.json` in its results.
+
+Every stop after a Root handoff needs a fresh job-closure receipt, so the forced cleanup
+runs before that receipt is taken. The closure watch runs it with `--force` for at most
+240 seconds after a check finds the jobs closed. It holds `jobs.lock` exclusively
+meanwhile, so no command can launch a job whose files it would remove, and its bound
+leaves the floor, the guard's wait for the extension lock, the decision and one more check.
+The check under the locks follows the cleanup, so a cleanup process that is still running
+holds off the publication. The watch keeps the result as
+`closure-watch-disk-clean.json`. A failed cleanup, or one with less than a minute to
+spare, is recorded and never holds off the stop. Before `finish` or `request-stop`, the
+owner runs the cleanup and then takes the job-closure receipt.
+
+```sh
+python3 scripts/remote-executor.py exec "$worker" 'python3 -I ~/gate/bin/disk_clean.py --force --log ~/gate/disk-clean.jsonl'
+```
+
+A stop before the handoff follows a qualification that ran no job, so it saves the disk
+that the previous cleaned stop left. The guard's deadline path stops only with the
+closure receipt that the watch or the owner published after the cleanup.

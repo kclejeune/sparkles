@@ -7,11 +7,20 @@ With --if-above PCT it does nothing while the disk holding --home is below PCT% 
 --force it always cleans, as the closure watch and a finish do before a stop.
 
 A cleanup removes the finished gate and lane CI worktrees ~/gate/wt-NAME, whose unit
-gate-NAME is not active, and the remote build checkouts under ~/lanes/nsc-build-work when
-no nsc-build- unit is active. It then runs `mbx gc` with the job environment's store
-settings, which keeps the targets and store entries that running commands use. It never
-removes a path whose unit it cannot show is inactive, never follows a link and never
-touches the store directly. One cleanup runs at a time under ~/gate/.disk-clean.lock.
+gate-NAME is not active, and then runs `mbx gc` with the job environment's store settings,
+which keeps the targets and store entries that running commands use. It never removes a
+path whose unit it cannot show is inactive, never follows a link and never touches the
+store directly. One cleanup runs at a time under ~/gate/.disk-clean.lock, and a gate start
+holds that lock from before it creates its worktree until its unit runs, so the unit list
+that a cleanup reads stays true until it has removed what it chose.
+
+The remote build checkouts under ~/lanes/nsc-build-work are left alone. A build moves its
+sources there before its scope is listed, and their managed targets are in the store,
+which `mbx gc` bounds.
+
+--deadline-seconds bounds the whole cleanup. Each command runs in its own process group,
+which is killed when the command's share of the deadline ends, and no step starts after
+the deadline, so no process of the cleanup outlives it by more than a few seconds.
 
 It prints one JSON record with the disk use before and after, and --log appends the same
 record to a file.
@@ -22,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import time
@@ -44,14 +54,24 @@ def usage(path, statvfs=os.statvfs):
 
 
 def run_command(argv, env=None, seconds=60):
+    """Run argv in a new process group for at most seconds, and kill the group after that."""
+    if seconds <= 0:
+        return 'no_time', ''
     try:
-        r = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=seconds)
-        return r.returncode, r.stdout.decode(errors='replace')
-    except subprocess.TimeoutExpired:
-        return 'timeout', ''
+        p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         return 'unavailable', ''
+    try:
+        out, _ = p.communicate(timeout=seconds)
+        return p.returncode, out.decode(errors='replace')
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.communicate()
+        return 'timeout', ''
 
 
 def active_units(run):
@@ -88,17 +108,13 @@ def candidates(home, units):
             if entry.startswith('wt-') and NAME.fullmatch(name) and plain_directory(path):
                 if not any(u in units for u in ('gate-' + name + '.service', 'gate-' + name + '.scope')):
                     found.append(('gate-worktree', path))
-    work = os.path.join(home, 'lanes', 'nsc-build-work')
-    if plain_directory(work) and not any(u.startswith('nsc-build-') for u in units):
-        for entry in sorted(os.listdir(work)):
-            path = os.path.join(work, entry)
-            if NAME.fullmatch(entry) and plain_directory(path):
-                found.append(('build-checkout', path))
     return found
 
 
-def clean(home, threshold=None, force=False, env=None, gc_seconds=600, run=run_command,
-          statvfs=os.statvfs, now=time.time):
+def clean(home, threshold=None, force=False, env=None, deadline_seconds=600, run=run_command,
+          statvfs=os.statvfs, now=time.time, clock=time.monotonic):
+    end = clock() + deadline_seconds
+    left = lambda cap: max(0, min(cap, end - clock()))
     before = usage(home, statvfs)
     record = {'schema': 1, 'observed_unix': now(), 'home': home, 'mode': 'force' if force else 'if-above',
               'threshold_pct': threshold, 'before': before, 'ran': False, 'removed': [], 'gc_exit': None}
@@ -116,19 +132,20 @@ def clean(home, threshold=None, force=False, env=None, gc_seconds=600, run=run_c
             record['skipped'] = 'another cleanup holds the lock'
             return record
         record['ran'] = True
-        units = active_units(run)
+        units = active_units(lambda argv, e, cap: run(argv, e, left(cap)))
         record['units_listed'] = units is not None
         repo = os.path.join(gate, 'repo.git')
         for kind, path in candidates(home, units):
-            if kind == 'gate-worktree' and plain_directory(repo):
-                run(['git', '-C', repo, 'worktree', 'remove', '--force', path], None, 120)
+            if left(1) <= 0:
+                record['deadline_reached'] = True
+                break
             if remove_tree(path):
                 record['removed'].append({'kind': kind, 'path': path})
         if plain_directory(repo):
-            run(['git', '-C', repo, 'worktree', 'prune'], None, 60)
+            run(['git', '-C', repo, 'worktree', 'prune'], None, left(60))
         gc_env = dict(os.environ)
         gc_env.update(env or {})
-        record['gc_exit'], _ = run(['mbx', 'gc'], gc_env, gc_seconds)
+        record['gc_exit'], _ = run(['mbx', 'gc'], gc_env, left(deadline_seconds))
     finally:
         os.close(lock)
     record['after'] = usage(home, statvfs)
@@ -142,7 +159,7 @@ def main(argv=None):
     mode.add_argument('--if-above', type=int, metavar='PCT')
     mode.add_argument('--force', action='store_true')
     parser.add_argument('--env', default='{}', help='a JSON object of environment settings for mbx gc')
-    parser.add_argument('--gc-seconds', type=int, default=600)
+    parser.add_argument('--deadline-seconds', type=int, default=600)
     parser.add_argument('--log')
     a = parser.parse_args(argv)
     if a.if_above is not None and not 1 <= a.if_above <= 100:
@@ -150,7 +167,9 @@ def main(argv=None):
     env = json.loads(a.env)
     if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
         parser.error('--env takes a JSON object of strings')
-    record = clean(a.home, a.if_above, a.force, env, a.gc_seconds)
+    if not 1 <= a.deadline_seconds <= 3600:
+        parser.error('--deadline-seconds takes 1 to 3600')
+    record = clean(a.home, a.if_above, a.force, env, a.deadline_seconds)
     line = json.dumps(record, sort_keys=True)
     if a.log and record['ran']:
         with open(a.log, 'a') as f:

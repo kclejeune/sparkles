@@ -32,8 +32,8 @@ WATCH_FLOOR=60
 WATCH_CHECKS=400
 WATCH_ACCEPT=15
 WATCH_DECISION=90
-# Before it stops a worker, the watch or a finish runs disk_clean.py --force on it for
-# at most DISK_CLEAN_SECONDS, so the stop's snapshot does not carry finished jobs'
+# Before it closes a warm worker's jobs, the closure watch runs disk_clean.py --force on
+# it for at most DISK_CLEAN_SECONDS, so the stop's snapshot does not carry finished jobs'
 # worktrees or a store over its budget into the next resume. The cleanup is best effort
 # and never holds off a stop.
 DISK_CLEAN_SECONDS=240
@@ -354,11 +354,13 @@ class RealIO:
         """Run disk_clean.py --force on the worker within ``seconds`` and return its record."""
         import job_environment
         home=profile()['worker_home'];teardown=owned_group.WINDOW+1;need(seconds-teardown>=30,'disk clean bound exhausted')
+        # The worker's program ends by its own deadline, 15 seconds before this call's, so
+        # no cleanup process outlives the call and the next closure check can pass.
         args=['--home',home,'--force','--env',json.dumps(job_environment.environment(profile()),sort_keys=True),
-              '--gc-seconds',str(int(seconds-teardown-15)),'--log',home+'/gate/disk-clean.jsonl']
+              '--deadline-seconds',str(int(seconds-teardown-15)),'--log',home+'/gate/disk-clean.jsonl']
         r=self.remote_python((ROOT/'disk_clean.py').read_text(),args,seconds-teardown)
         need(r['exit']==0 and isinstance(r['body'],dict),'worker disk clean failed')
-        b=r['body'];return {k:b.get(k) for k in ('observed_unix','before','after','ran','removed','gc_exit','units_listed','skipped')}
+        b=r['body'];return {k:b.get(k) for k in ('observed_unix','before','after','ran','removed','gc_exit','units_listed','skipped','deadline_reached')}
     def stop_status(self,operation):
         r=self.boat(['stop',worker_id(),'--status',operation],15)
         need(r['exit']==0 and isinstance(r['body'],dict) and r['body'].get('id')==worker_id(),'stop status unavailable')
@@ -1026,10 +1028,6 @@ def _finish(r,io,job_closure,seconds):
             if io.exists('root-job-closed.json'):need(io.read('root-job-closed.json')==closed,'closure replacement refused')
             else:io.record('root-job-closed.json',closed)
         matching_root_job_closed(r,io,io.read('root-job-closed.json'))
-        if not io.exists('stop-trigger.json'):
-            try:wall,boot,_=watch_ends(r,io);budget=min(wall-io.wall(),boot-io.mono())-WATCH_FLOOR-60
-            except Exception:budget=0
-            clean_before_stop(io,'finish-disk-clean.json',budget)
     if not io.exists('closed.json'):io.trigger()
     return await_stop(r,io,seconds)
 
@@ -1163,11 +1161,17 @@ def closure_watch(r,io,lead=WATCH_LEAD,local_units=(),poll=WATCH_POLL,observe=aw
         check=check_jobs(60)
         if check is None or not check['closed']:pause(io,poll);continue
         # The jobs have ended. The cleanup runs under the exclusive job lock, so no command
-        # can launch a job whose files it would remove, and the check under the locks
-        # below runs after it and sees no cleanup process left.
+        # can launch a job whose files it would remove. The check under the locks below
+        # runs after it, so a cleanup process still running holds off the publication.
         if not io.exists('closure-watch-disk-clean.json'):
             if not io.lock_jobs():last='job_command_live';pause(io,poll);continue
-            try:clean_before_stop(io,'closure-watch-disk-clean.json',left-WATCH_FLOOR-WATCH_DECISION-60)
+            # The bound is what is left after this check less the floor, the guard's wait
+            # for the extension lock, the decision and one more check.
+            try:
+                wall,boot,_=watch_ends(r,io)
+                budget=min(wall-io.wall(),boot-io.mono())-WATCH_FLOOR-FREEZE_WAIT-WATCH_DECISION-60
+            except Exception:budget=0
+            try:clean_before_stop(io,'closure-watch-disk-clean.json',budget)
             finally:io.unlock_jobs()
         if not io.freeze_extensions():
             last='extension_act_running';pause(io,1);continue

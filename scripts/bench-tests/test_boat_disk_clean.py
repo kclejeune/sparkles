@@ -75,7 +75,10 @@ class Clean(unittest.TestCase):
         record = self.clean(worker, disk, env={'MBX_CACHE_DIR': str(self.home / '.local/share/mbx-cache')})
         self.assertTrue(record['ran']); self.assertEqual(record['before']['used_pct'], 90); self.assertEqual(record['after']['used_pct'], 70)
         removed = {(r['kind'], Path(r['path']).name) for r in record['removed']}
-        self.assertEqual(removed, {('gate-worktree', 'wt-06ca04ef'), ('gate-worktree', 'wt-ci-1234abcd'), ('build-checkout', 'aaaa')})
+        self.assertEqual(removed, {('gate-worktree', 'wt-06ca04ef'), ('gate-worktree', 'wt-ci-1234abcd')})
+        # A build moves its sources into its checkout before its scope is listed, so build
+        # checkouts always stay.
+        self.assertTrue(self.exists('lanes/nsc-build-work/aaaa/src'))
         self.assertFalse(self.exists('gate/wt-06ca04ef')); self.assertTrue(self.exists('gate/wt-live/src'))
         # Results, the bare repository, the store and anything behind a link stay.
         self.assertTrue(self.exists('gate/out/06ca04ef')); self.assertTrue(self.exists('gate/repo.git'))
@@ -86,11 +89,41 @@ class Clean(unittest.TestCase):
         # gc runs after the removals, so it can collect their managed targets.
         self.assertEqual(worker.calls[-1][0], ['mbx', 'gc'])
 
-    def test_a_running_build_keeps_every_build_checkout(self):
-        disk = FakeDisk(95); worker = FakeWorker(units=['nsc-build-a1.scope'], disk=disk)
-        record = self.clean(worker, disk)
-        self.assertTrue(self.exists('lanes/nsc-build-work/aaaa/src'))
-        self.assertNotIn('build-checkout', {r['kind'] for r in record['removed']})
+    def test_the_deadline_bounds_every_command_and_stops_the_removals(self):
+        disk = FakeDisk(95); t = [0.0]; worker = FakeWorker(disk=disk)
+        real = worker.run
+        def slow(argv, env=None, seconds=60):
+            t[0] += 4; return real(argv, env, seconds)
+        worker.run = slow
+        removals = []
+        def remove(path):
+            removals.append(path); t[0] += 3; return disk_clean.shutil.rmtree(path) or True
+        with patch.object(disk_clean, 'remove_tree', remove):
+            record = self.clean(worker, disk, deadline_seconds=10, clock=lambda: t[0])
+        # The unit list took 4 seconds and one removal 3, so the second removal and the
+        # later commands found too little time.
+        self.assertEqual(len(removals), 2); self.assertTrue(all(c[2] <= 10 for c in worker.calls))
+        self.assertEqual([c[0][:2] for c in worker.calls][0], ['systemctl', '--user'])
+        self.assertLessEqual(worker.calls[-1][2], 0 + 10 - 4 - 6)
+        record = self.clean(FakeWorker(disk=disk), disk, deadline_seconds=1, clock=lambda: 5.0)
+        self.assertTrue(record['ran'])
+
+    def test_a_command_past_its_share_is_killed_with_its_children(self):
+        import time
+        start = time.monotonic()
+        with tempfile.NamedTemporaryFile() as pidfile:
+            code, _ = disk_clean.run_command(['sh', '-c', 'sleep 30 & echo $! > %s; wait' % pidfile.name], None, 1)
+            child = int(Path(pidfile.name).read_text())
+        self.assertEqual(code, 'timeout'); self.assertLess(time.monotonic() - start, 10)
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail('the background child outlived its process group')
+        self.assertEqual(disk_clean.run_command(['true'], None, 0)[0], 'no_time')
 
     def test_a_gate_scope_or_service_keeps_its_worktree(self):
         for unit in ['gate-06ca04ef.service', 'gate-06ca04ef.scope']:
@@ -102,7 +135,7 @@ class Clean(unittest.TestCase):
         disk = FakeDisk(95); worker = FakeWorker(list_exit=1, disk=disk)
         record = self.clean(worker, disk)
         self.assertEqual(record['removed'], []); self.assertFalse(record['units_listed'])
-        self.assertTrue(self.exists('gate/wt-06ca04ef/src')); self.assertTrue(self.exists('lanes/nsc-build-work/aaaa/src'))
+        self.assertTrue(self.exists('gate/wt-06ca04ef/src'))
         self.assertIn(['mbx', 'gc'], [c[0] for c in worker.calls])
 
     def test_force_cleans_below_the_threshold(self):
@@ -123,15 +156,22 @@ class Clean(unittest.TestCase):
         args = ['--home', str(self.home), '--if-above', '90', '--env', '{"MBX_CACHE_DIR":"/c"}', '--log', str(log)]
         source = "import sys\nsys.argv=['remote']+" + repr(args) + '\n' + (Path(disk_clean.__file__)).read_text()
         out = io.StringIO()
-        with patch('os.statvfs', disk.statvfs), patch('subprocess.run') as run, contextlib.redirect_stdout(out):
-            run.return_value = SimpleNamespace(returncode=0, stdout=b'')
+        started = []
+        class Popen:
+            def __init__(self, argv, env=None, **kw):
+                started.append((argv, env, kw)); self.returncode = 0; self.pid = 0
+            def communicate(self, timeout=None):
+                return b'', None
+        with patch('os.statvfs', disk.statvfs), patch('subprocess.Popen', Popen), contextlib.redirect_stdout(out):
             exec(compile(source, 'remote', 'exec'), {'__name__': '__main__'})
         record = json.loads(out.getvalue())
         self.assertTrue(record['ran']); self.assertEqual(json.loads(log.read_text()), record)
-        self.assertEqual(run.call_args_list[-1].args[0], ['mbx', 'gc']); self.assertEqual(run.call_args_list[-1].kwargs['env']['MBX_CACHE_DIR'], '/c')
+        argv, gc_env, kw = started[-1]
+        self.assertEqual(argv, ['mbx', 'gc']); self.assertEqual(gc_env['MBX_CACHE_DIR'], '/c'); self.assertTrue(kw['start_new_session'])
 
     def test_the_command_line_refuses_bad_values(self):
-        for argv in [[], ['--if-above', '0'], ['--if-above', '101'], ['--force', '--env', '["x"]'], ['--force', '--if-above', '90']]:
+        for argv in [[], ['--if-above', '0'], ['--if-above', '101'], ['--force', '--env', '["x"]'], ['--force', '--if-above', '90'],
+                     ['--force', '--deadline-seconds', '0']]:
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 disk_clean.main(['--home', str(self.home)] + argv)
 
@@ -170,6 +210,20 @@ class StopPaths(unittest.TestCase):
         row = self.read('closure-watch-disk-clean.json'); self.assertFalse(row['cleaned']); self.assertIn('reason_code', row)
         self.assertTrue(io.exists('root-job-closed.json'))
 
+    def test_the_bound_counts_from_after_the_check_and_leaves_the_freeze_wait(self):
+        for spent, expect in [(400, 'clean'), (600, 'no_time')]:
+            with self.subTest(spent=spent):
+                self.setUp(); io = WatchIO(self.f); seen = []
+                io.on_check = lambda n, io=io, spent=spent: io.wait(spent) if n == 1 else None
+                io.disk_clean = lambda seconds, seen=seen: seen.append(seconds) or {'ran': True}
+                self.assertEqual(self.watch(io), 'FINISHED')
+                row = self.read('closure-watch-disk-clean.json')
+                if expect == 'clean':
+                    self.assertEqual(len(seen), 1)
+                    self.assertLessEqual(seen[0] + controller.WATCH_FLOOR + controller.FREEZE_WAIT + controller.WATCH_DECISION, 900 - spent)
+                else:
+                    self.assertEqual(seen, []); self.assertEqual(row['reason_code'], 'disk_clean_no_time')
+
     def test_a_live_command_defers_the_cleanup(self):
         io = WatchIO(self.f, checks=['closed'] * 400); calls = []
         io.disk_clean = lambda seconds: calls.append(seconds) or {}
@@ -189,7 +243,7 @@ class StopPaths(unittest.TestCase):
         self.assertEqual(args[:3], ['--home', home, '--force'])
         self.assertEqual(json.loads(args[args.index('--env') + 1]), env.environment(controller.profile()))
         self.assertEqual(args[args.index('--log') + 1], home + '/gate/disk-clean.jsonl')
-        self.assertLess(int(args[args.index('--gc-seconds') + 1]), seconds); self.assertLess(seconds, 240)
+        self.assertLess(int(args[args.index('--deadline-seconds') + 1]) + 15, seconds + 1); self.assertLess(seconds, 240)
         with self.assertRaisesRegex(Exception, 'disk clean bound exhausted'):
             io.disk_clean(20)
 
