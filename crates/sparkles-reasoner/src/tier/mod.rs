@@ -309,6 +309,10 @@ pub(crate) struct Tier {
     /// the facts by id, each with the index of its relation in `rels`
     rows: Vec<Row>,
     rels: Vec<Rel>,
+    /// the predicate of each relation, by its index in `rels`: a dense copy of `Rel::p`,
+    /// so that reading a fact's triple reads eight bytes of one small array and not a
+    /// field of the relation's large record
+    preds: Vec<u64>,
     rel_of: FxHashMap<u64, u32>,
     /// by subject and by object over the whole tier, built on demand
     by_s: Option<Order>,
@@ -329,6 +333,7 @@ impl Tier {
             offset,
             rows: Vec::new(),
             rels: Vec::new(),
+            preds: Vec::new(),
             rel_of: FxHashMap::default(),
             by_s: None,
             by_o: None,
@@ -391,15 +396,17 @@ impl Tier {
     #[inline]
     pub fn triple(&self, id: u32) -> Triple {
         let r = &self.rows[self.at(id)];
-        [r.s, self.rels[r.ri as usize].p, r.o]
+        [r.s, self.preds[r.ri as usize], r.o]
     }
 
-    /// Whether fact `id` is the triple `t`: one read of the row, and of the relation's
-    /// predicate when its subject and object match.
+    /// Whether fact `id` is the triple `t`: one read of the row and of its relation's
+    /// predicate.
     #[inline]
     pub fn eq(&self, id: u32, t: &Triple) -> bool {
         let r = &self.rows[self.at(id)];
-        r.s == t[0] && r.o == t[2] && self.rels[r.ri as usize].p == t[1]
+        // one test of the three, without a branch on each component read from the row,
+        // which the processor would otherwise follow before it issues the next probe
+        (r.s == t[0]) & (r.o == t[2]) & (self.preds[r.ri as usize] == t[1])
     }
 
     /// The facts in id order, dead ones included.
@@ -411,7 +418,7 @@ impl Tier {
     pub fn facts_range(&self, a: usize, b: usize) -> impl Iterator<Item = Triple> + '_ {
         self.rows[a..b]
             .iter()
-            .map(|r| [r.s, self.rels[r.ri as usize].p, r.o])
+            .map(|r| [r.s, self.preds[r.ri as usize], r.o])
     }
 
     /// The bytes the relations and their table grow by when a fact with predicate `p`
@@ -424,6 +431,9 @@ impl Tier {
         let mut n = 0;
         if self.rels.len() == self.rels.capacity() {
             n += self.rels.capacity().max(4) * size_of::<Rel>();
+        }
+        if self.preds.len() == self.preds.capacity() {
+            n += self.preds.capacity().max(4) * size_of::<u64>();
         }
         if self.rel_of.len() == self.rel_of.capacity() {
             n += table_bytes(
@@ -449,6 +459,7 @@ impl Tier {
                     obj: Order::default(),
                     dead: 0,
                 });
+                self.preds.push(t[1]);
                 self.rel_of.insert(t[1], i);
                 i
             }
@@ -617,6 +628,7 @@ impl Tier {
     pub fn heap_bytes(&self) -> usize {
         let mut n = self.rows.capacity() * ROW;
         n += self.rels.capacity() * size_of::<Rel>();
+        n += self.preds.capacity() * size_of::<u64>();
         n += self
             .rels
             .iter()
