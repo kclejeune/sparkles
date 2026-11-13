@@ -54,11 +54,13 @@
 # (scripts/gate/remote/gate-start.sh).
 #
 # A gate on a Boat worker needs SPARKLES_REMOTE_MIN_LIFETIME seconds of admitted lifetime,
-# 7200 by default. GATE_BOAT_RESERVE sets how many seconds before the admitted end the
-# unit's runtime is computed to end, 1200 by default, which normally leaves the closure
-# watch its 900-second lead. The runtime counts from the unit's activation, so a late
-# activation or a slow shutdown can still carry the unit past that lead, which roadmap
-# item 803 tracks.
+# 7200 by default. Its start, gate-start.sh, runs in the transient scope gate-prep-NAME on
+# the worker, which systemd ends with all its processes GATE_BOAT_PREP_SECONDS after it
+# begins, 900 by default, so the unit is activated within that bound or not at all. The
+# unit's runtime is computed just before the start to end GATE_BOAT_RESERVE seconds before
+# the admitted end, 1200 by default, plus that bound, so the gate ends GATE_BOAT_RESERVE
+# seconds before the admitted end however late it activates. That leaves the closure watch
+# its 900-second lead.
 #
 # These settings may also live in ~/.config/sparkles/gate.env (or $SPARKLES_GATE_CONFIG)
 # as KEY=VALUE lines, and the environment takes precedence.
@@ -279,14 +281,19 @@ start_on() {
   esac
   bin=$(install_remote "$h")
   args="--name $n --part $p --jobs $jobs"
+  local prep=${GATE_BOAT_PREP_SECONDS:-900}
+  case $prep in '' | *[!0-9]* | 0)
+    echo "GATE_BOAT_PREP_SECONDS must be a positive number of seconds" >&2
+    return 2
+    ;;
+  esac
   case $h in boat:*)
     local runtime
-    # The unit's runtime is computed here to end GATE_BOAT_RESERVE seconds before the
-    # admitted end, so the closure watch, which checks the worker from 900 seconds before
-    # the end, normally finds the gate closed. The runtime counts from the unit's
-    # activation, so a late activation can still carry it past the lead, which roadmap
-    # item 803 tracks.
-    runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "${GATE_BOAT_RESERVE:-1200}") || return
+    # The runtime counts from the unit's activation, which the prep scope bounds, so the
+    # reserve here adds the scope's bound and the gate ends GATE_BOAT_RESERVE seconds
+    # before the admitted end. It is computed after the bundle and the install, so their
+    # time does not count against it.
+    runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))") || return
     args+=" --executor boat --runtime $runtime"
     ;;
   esac
@@ -296,7 +303,15 @@ start_on() {
   [ $all_checks = 0 ] || args+=" --full"
   # shellcheck disable=SC2029
   printf 'phase=start-requested\n' >> "$statedir/start-intent-$n"
-  rx_exec "$h" "\$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
+  case $h in
+    boat:*)
+      # The scope holds gate-start.sh and every process it starts, reparented or not, and
+      # systemd ends them all when the scope's bound passes. The gate unit itself is a
+      # separate service, which gate-start.sh creates within that bound.
+      rx_exec "$h" "systemd-run --user --scope -q --unit gate-prep-$n -p RuntimeMaxSec=$prep \$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")"
+      ;;
+    *) rx_exec "$h" "\$HOME/$bin/gate-start.sh $full $args --note $(printf '%q' "$note")" ;;
+  esac
 }
 
 # 0 when the run NAME on HOST has finished: it wrote its exit file or its unit stopped.

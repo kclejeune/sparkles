@@ -460,7 +460,7 @@ class Admission(unittest.TestCase):
         self.assertLess(next(i for i,l in enumerate(start) if l.startswith('mkdir -p "$out"')),call)
         self.assertLess(call,next(i for i,l in enumerate(start) if 'worktree add' in l))
         # The start holds the cleanup's lock from before its worktree until its unit runs.
-        lock=next(i for i,l in enumerate(start) if l.strip()=='flock -w 900 7')
+        lock=next(i for i,l in enumerate(start) if l.strip()=='flock -w 300 7')
         self.assertEqual(start[lock-1].strip(),'exec 7>> "$G/.disk-clean.lock"');self.assertLess(call,lock)
         self.assertLess(lock,next(i for i,l in enumerate(start) if 'worktree add' in l))
         self.assertEqual(start[-2:],['[ "$executor" != boat ] || exec 7>&-','echo "$unit"'])
@@ -472,6 +472,24 @@ class Admission(unittest.TestCase):
         gate=(ROOT/'scripts/gate/gate.sh').read_text()
         self.assertIn('"$here/../boat/disk_clean.py" | sha256sum',gate)
         self.assertIn('-C "$here/../boat" disk_clean.py | rx_exec "$h"',gate)
+
+    def test_a_boat_gate_start_runs_in_a_bounded_scope_and_its_runtime_counts_the_bound(self):
+        """Item 803: the unit activates within the prep scope's bound, so the reserve adds it."""
+        lines=(ROOT/'scripts/gate/gate.sh').read_text().splitlines()
+        body=lines[next(i for i,l in enumerate(lines) if l.startswith('start_on() {')):]
+        body=body[:next(i for i,l in enumerate(body) if l=='}')+1]
+        at=lambda text:next(i for i,l in enumerate(body) if text in l)
+        self.assertIn('local prep=${GATE_BOAT_PREP_SECONDS:-900}',body[at('local prep=')])
+        runtime=at('runtime=$(rx_runtime')
+        self.assertIn('--reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))"',body[runtime])
+        # The runtime is computed after the bundle and the install, just before the start.
+        self.assertLess(at('rx_bundle'),runtime);self.assertLess(at('bin=$(install_remote'),runtime)
+        start=at('systemd-run --user --scope -q --unit gate-prep-$n -p RuntimeMaxSec=$prep')
+        self.assertLess(runtime,start);self.assertIn('\\$HOME/$bin/gate-start.sh $full $args',body[start])
+        self.assertEqual(body[start-4].strip(),'boat:*)')
+        # The closure watch counts the scope as a job unit, and gate.env may set the bound.
+        self.assertIn("'gate-'",(ROOT/'scripts/boat/controller.py').read_text().split('JOB_UNIT_PREFIXES=',1)[1].splitlines()[0])
+        self.assertIn('GATE_BOAT_PREP_SECONDS |',(ROOT/'scripts/gate/config.sh').read_text())
 
     def test_setup_host_installs_a_disk_clean_timer_with_the_store_settings(self):
         """The timer's service carries the job environment's store settings and never the token setting."""
@@ -489,7 +507,7 @@ class Admission(unittest.TestCase):
             unit=(home/'.config/systemd/user/sparkles-disk-clean.service').read_text().splitlines()
             self.assertIn('Environment="MBX_REMOTE_URL="',unit);self.assertIn('Environment="MBX_CACHE_DIR=%s/.local/share/mbx-cache"'%home,unit)
             self.assertIn('Environment="MBX_GC_MIN_FREE_SIZE=45GiB"',unit);self.assertFalse(any('TOKEN' in l for l in unit))
-            self.assertIn('ExecStart=/usr/bin/python3 -I %h/gate/bin/disk_clean.py --if-above 90 --log %h/gate/disk-clean.jsonl',unit)
+            self.assertIn('ExecStart=/usr/bin/python3 -I %h/gate/bin/disk_clean.py --if-above 90 --deadline-seconds 240 --log %h/gate/disk-clean.jsonl',unit)
             timer=(home/'.config/systemd/user/sparkles-disk-clean.timer').read_text().splitlines()
             self.assertIn('OnBootSec=10min',timer);self.assertIn('OnUnitInactiveSec=60s',timer);self.assertIn('WantedBy=timers.target',timer)
             self.assertEqual(calls.read_text().splitlines()[:2],['--user daemon-reload','--user enable -q --now sparkles-disk-clean.timer'])

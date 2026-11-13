@@ -135,11 +135,11 @@ mkdir -p "$out"
 # frees finished work with scripts/boat/disk_clean.py when the disk is that full. The cleanup
 # keeps the store's live entries and every active job's files, and never stops the start.
 if [ "$executor" = boat ]; then
-  python3 -I "$bin/disk_clean.py" --if-above 90 --log "$G/disk-clean.jsonl" > "$out/disk-clean-start.json" 2>&1 || true
+  python3 -I "$bin/disk_clean.py" --if-above 90 --deadline-seconds 300 --log "$G/disk-clean.jsonl" > "$out/disk-clean-start.json" 2>&1 || true
   # The worktree exists before its unit does, so the start holds the cleanup's lock until
   # the unit runs, and a cleanup from the worker's timer cannot remove it meanwhile.
   exec 7>> "$G/.disk-clean.lock"
-  flock -w 900 7
+  flock -w 300 7
 fi
 git -C "$G/repo.git" cat-file -e "$full^{commit}"
 [ -z "$base" ] || git -C "$G/repo.git" cat-file -e "$base^{commit}"
