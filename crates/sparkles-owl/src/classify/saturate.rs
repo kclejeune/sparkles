@@ -1224,6 +1224,13 @@ impl<'a> Run<'a> {
     }
 
     fn halt(&self, why: u8) {
+        if super::dl_rules::tracing() {
+            eprintln!(
+                "TR HALT why={why} peak={} memory={}",
+                self.peak.load(Ordering::Relaxed),
+                self.memory.load(Ordering::Relaxed)
+            );
+        }
         let _ = self
             .stop
             .compare_exchange(STOP_NONE, why, Ordering::SeqCst, Ordering::SeqCst);
