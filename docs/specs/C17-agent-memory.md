@@ -1501,9 +1501,9 @@ above is built, with these choices where it left the behaviour open.
   scratch branch is in the window when it is not kept, the dataset's TTL applies to it,
   and its expiry is at most `notifyBefore` from now, the boundary included. The spec
   names "the MCP resource of a caller's branches", which did not exist. It is the new
-  resource `sparkles://{ds}/branches`, listed to callers who get `list_branches`, which
-  shows the scratch branches the caller created with their expiry and names the ones in
-  the window under `expiring`. The brief names the caller's own branches in the window
+  resource `sparkles://{ds}/branches`. It shows the scratch branches the caller created
+  with their expiry and names the ones in the window under `expiring`, and it is listed
+  to callers who get `create_branch`, since only they can have scratch branches. The brief names the caller's own branches in the window
   too, at most five, on `# scratch:` lines of statements, and lists them in
   `expiringBranches`. `list_branches` marks each branch in the window `expiresSoon`.
 - **The event.** A branch "holds unreviewed proposals" when it has commits of its own

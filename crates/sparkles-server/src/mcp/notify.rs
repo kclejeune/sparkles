@@ -81,7 +81,7 @@ impl McpServer {
                 Some(hash(&(instance, state)))
             }
             x if x == Kind::Branches.path() => {
-                if !self.allows(p, "list_branches") {
+                if !self.allows(p, "create_branch") {
                     return None;
                 }
                 let default = self.shared.cfg.scratch_ttl;

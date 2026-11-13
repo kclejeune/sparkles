@@ -12129,7 +12129,7 @@ caller with `write` on it:
 | `sparkles://{ds}/prefixes` | `application/sparql-query` | The dataset's prefixes as `PREFIX` lines. |
 | `sparkles://{ds}/queries/{name}` | `application/json` | The stored query: `{dataset, name, tool, version, description, query, parameters}`. |
 | `sparkles://{ds}/memory/review` | `application/json` | The [open review items](#open-review-items) of the dataset's memory inbox, the `review` member of the maintenance answer. Listed for a dataset with memory settings to a caller with `write` on it. |
-| `sparkles://{ds}/branches` | `application/json` | `{dataset, creator, notifyBefore?, branches: [{name, head, created, lastChange, ahead, keep?, expires?, expiresSoon?}], expiring}`: the scratch branches the caller created, and the names of those that expire within the dataset's `notifyBefore`. Listed to a caller who gets `list_branches`. |
+| `sparkles://{ds}/branches` | `application/json` | `{dataset, creator, notifyBefore?, branches: [{name, head, created, lastChange, ahead, keep?, expires?, expiresSoon?}], expiring}`: the scratch branches the caller created, and the names of those that expire within the dataset's `notifyBefore`. Listed to a caller who gets `create_branch`, which needs `--mcp-allow-update`. |
 
 `resources/list` returns them sorted by URI, and `resources/templates/list` returns the
 five URI templates. A `resources/read` result may be cached for 30 seconds by the caller

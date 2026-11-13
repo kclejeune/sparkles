@@ -688,8 +688,8 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Rename, protect or annotate a branch
-         * @description `name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only.
+         * Rename, protect, annotate or unmark a branch
+         * @description `name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only. `scratch: false` clears the scratch mark of a branch that the MCP tool `create_branch` made, so it no longer expires, and needs admin on the branch.
          */
         patch: operations["updateBranch"];
         trace?: never;
@@ -5663,9 +5663,10 @@ export interface components {
             note?: string | null;
             ordinal?: number;
             protected: boolean;
-            /** @description Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it. */
+            /** @description Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it, and `keep` when the branch never expires. */
             scratch?: {
                 creator?: string;
+                keep?: boolean;
             } | null;
             storage: {
                 generation?: string;
@@ -5696,6 +5697,11 @@ export interface components {
             name?: string;
             note?: string | null;
             protected?: boolean;
+            /**
+             * @description `false` clears the scratch mark, so the branch becomes an ordinary branch that never expires and that only grants without graph restrictions merge or delete. Needs `admin` on the branch.
+             * @enum {boolean}
+             */
+            scratch?: false;
         };
         /** @description What a review branch proposes and retracts, its new entities and the text of the sources it cites. */
         BranchReview: {
@@ -8996,8 +9002,12 @@ export interface components {
                 /** @description Delete only graphs whose facts a reviewed graph asserts too (true by default). */
                 requireConsolidated?: boolean;
             };
-            /** @description When idle scratch branches expire. Written as `format` 2 of `memory.json`. */
+            /** @description Limits, warnings and expiry of the scratch branches that MCP agents create. Written as `format` 2 of `memory.json` with `ttl` only, and as `format` 3 with `maxPerPrincipal` or `notifyBefore`. */
             scratchBranches?: {
+                /** @description The most scratch branches one principal may have in the dataset, from 1 to 65535. Kept branches count. `create_branch` past it is refused with `409 scratch-branch-limit`. Without it, only the dataset's branch limit applies. */
+                maxPerPrincipal?: number;
+                /** @description How long before a scratch branch expires the brief, the `sparkles://{ds}/branches` resource and `list_branches` name it, from `1m` to `3650d`, such as `6h`. `memory.review.pending` names those of them with commits of their own. Without it, nothing warns. */
+                notifyBefore?: string;
                 /** @description How long a scratch branch may sit idle before the server deletes it, from `1m` to `3650d`, such as `24h`. `off` keeps the dataset's scratch branches even when the server's `--mcp-scratch-branch-ttl` sets a duration. Without it, the server flag decides. A dataset with this member needs a release that reads `memory.json` format 2. */
                 ttl?: string;
             };

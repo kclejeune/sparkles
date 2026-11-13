@@ -3,7 +3,7 @@
 //! the caller may run as a tool (`sparkles://{ds}/queries/{name}`), the open items of
 //! the memory review inbox of each dataset with memory settings whose inbox the caller
 //! may review (`sparkles://{ds}/memory/review`), the caller's scratch branches of each
-//! dataset where it may list branches (`sparkles://{ds}/branches`), and eight prompts
+//! dataset where it may create them (`sparkles://{ds}/branches`), and eight prompts
 //! (`explore_dataset`, `answer_question`, `run_stored_query`, `ask_graph`,
 //! `explain_term`, `agent_memory`, `ingest_document`, `consolidate_memory`). Each lists
 //! and reads only the datasets the caller may read. Prompt text is static apart from the
@@ -169,7 +169,7 @@ impl McpServer {
                 });
             }
         }
-        if self.allows(&call.principal, "list_branches") {
+        if self.allows(&call.principal, "create_branch") {
             for ds in self.visible(&call.principal) {
                 out.push(Resource {
                     uri: format!("{SCHEME}{}/{}", ds.name, Kind::Branches.path()),
@@ -252,7 +252,7 @@ impl McpServer {
                 }
             }
             Kind::Branches => {
-                if !self.allows(&call.principal, "list_branches") {
+                if !self.allows(&call.principal, "create_branch") {
                     return Err(unknown());
                 }
                 let (st, p) = (self.state.clone(), call.principal.clone());
