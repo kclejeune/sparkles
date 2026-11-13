@@ -905,8 +905,9 @@ Three changes keep item 191's guarantee and repair the path.
 * **(a) An abstraction that scales.** The join indexes the abstract facts by predicate
   and the abstract types by class, so an atom whose predicate or class is known visits
   only the facts it can match, and a fact with a wildcard predicate or class stays a
-  candidate of every atom it can match. The caps rise to 16,384 abstract facts and
-  16,384 bindings per join step. LUBM's abstraction holds about 1,450 facts under
+  candidate of every atom it can match. Those facts are listed once beside the buckets,
+  so the index stays linear in the abstract facts and within the admitted workspace.
+  The caps rise to 16,384 abstract facts and 16,384 bindings per join step. LUBM's abstraction holds about 1,450 facts under
   `owl-rl` and 750 under `rdfs`. The workspace admitted before the analysis grows with
   the caps, from about 5 MB to about 40 MB for the shipped profiles. Two
   overestimates that kept relations open on LUBM narrow without losing soundness.
@@ -916,11 +917,17 @@ Three changes keep item 191's guarantee and repair the path.
   does not match, so `rdfs12cmp` no longer makes every property a container membership
   property. The abstraction remains an overestimate, so a relation it proves complete
   is complete, and a relation it cannot prove stays open as before.
-* **(b) The proof once per commit.** The proven relations depend only on the rules,
-  the input graphs and the visible facts, so a session stores them, as the IRIs of the
-  closed predicates and classes, in a process-wide cache under the schema table's view
-  key and the rules digest, and later sessions of the same view read them instead of
-  scanning. The cache holds at most 64 views and drops the oldest, and `nocache` does
+* **(b) The proof once per commit.** The proven relations depend on the rules, the
+  input graphs, the visible facts and the schema facts the session holds, so a session
+  stores them, as the IRIs of the closed predicates and classes, in a process-wide
+  cache under the schema table's view key, the rules digest and whether the session's
+  schema came from the schema table or a pass of its own. Later sessions of the same
+  view whose schema came the same way read them instead of scanning. The schema table
+  leaves out a generalized fact, such as one whose subject is a literal, so a proof
+  made over a pass that gave one is kept only for passes, and a session that reads the
+  table proves again over what the table holds. A session with facts of its own, such
+  as a why-not hypothesis or GeoSPARQL default geometries, neither reads nor keeps a
+  proof. The cache holds at most 64 views and drops the oldest, and `nocache` does
   not bypass it, like the schema table. A view that cannot be cached, such as a
   transaction's snapshot, proves again in every session. The first query after a commit
   still pays the two scans and the abstraction, which item 190 keeps for measurement.
@@ -931,6 +938,8 @@ Three changes keep item 191's guarantee and repair the path.
   them all of `rdfs:subClassOf`. The facts of rules without a body now join the pass's
   seeds, so the pass derives these schema facts and the proof closes the relation. The
   axioms are entailed by every dataset, so they add no answer the rules do not give.
+  An axiom the input graphs already hold is not seeded, since a derived copy of a
+  stored fact would reach the answer twice.
 
 Measured on one LUBM university on stanley, with the release build and `nocache`, the
 proof now closes all 4 schema predicates and 4 meta classes of `rdfs` and all 19 and 12
@@ -953,9 +962,9 @@ as before item 191, would again miss schema facts that only derived instance fac
 give. Bounding the proof by the relations a query's patterns reach would leave the
 program unspecialized for a query that reads the type closure, which is most of them.
 
-A regression test on the LUBM generator checks a bound on what a demand query derives
-and that the session proves the shipped profiles' schema relations, so an analysis that
-gives up again fails the test.
+A regression test on the LUBM generator checks the answers and a bound on what a
+demand query derives under the shipped profiles, so an analysis that gives up again,
+and leaves the type closure to derive, fails the test.
 
 ### Bounded positive feedback evaluation
 
