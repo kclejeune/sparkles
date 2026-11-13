@@ -13574,7 +13574,10 @@ branch gauges of `/$/metrics` leave the ledger out. SHACL and ShEx validation ne
 it, also under `shapes=guard` and `schema=guard`, where a guard whose data graph is the
 ledger validates nothing, a guard whose shapes or schema are in the ledger is answered as
 no guard with `404`, and a validation that names it as its data or shapes graph gets
-`404`. Materialization never reads it, whatever input graphs a request names, so no rule
+`404`. A write-time guard leaves the ledger out of the data it validates when it is
+installed and on every write, and a guard configuration that names the ledger as a
+shapes, schema or data graph is refused with `404`, as for a graph that does not exist.
+Materialization never reads it, whatever input graphs a request names, so no rule
 copies a ledger value into the inferred graph, and import fetching never follows an
 import the ledger names. A `SERVICE` call to this server and a resource header that
 select a dataset outside the request path leave that dataset's ledger out too. The MCP

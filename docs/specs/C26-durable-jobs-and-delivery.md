@@ -630,11 +630,17 @@ that read a snapshot, a cache or a guard's source without the subtraction. Those
 led to the comparison of structural alternatives in §2.3 and to item 905. Incremental
 queries and kept views now resolve their access with the hidden graphs subtracted, and a
 live subscription ends with a `forbidden` error when the hidden graphs of its dataset
-change. A write-time guard whose shapes or schema are in a hidden graph is answered as no
-guard by validation, constraints and GraphQL drafting. Merge reports count neither the
+change, including one admitted while they change. A write-time guard whose shapes or
+schema are in a hidden graph is answered as no guard by validation, constraints and
+GraphQL drafting. A write-time guard leaves the hidden graphs out of the data it
+validates, enabling jobs installs the guard again with the ledger left out before the
+ledger can hold a record, and the guard's kept state of the head is keyed by the hidden
+graphs as well as its configuration, so a state kept before they changed is validated
+again. A guard configuration that names a hidden graph as a source or a data graph is
+refused as for a graph that does not exist. Merge reports count neither the
 changes nor the conflicts, resolved or not, of a hidden graph, and a merge receipt, an MCP
 merge result and a merge task's detail carry no commit counts on a dataset with hidden
-graphs.
+graphs, also for a task that finished before the dataset hid them.
 
 Several parts of the design wait for later items. The library's Graph Store, history,
 diff and dump handles apply a caller's view when one is given but do not subtract hidden
