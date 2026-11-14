@@ -4670,6 +4670,18 @@ fn run() -> Result<()> {
                                 .with_context(|| format!("reading {}", f.display()))?,
                         );
                     } else if let Some(p) = &profile {
+                        // a shacl-af profile runs only in a materialization, so a query
+                        // could never derive with it
+                        if matches!(
+                            p.parse::<sparkles_reasoner::Profile>(),
+                            Ok(sparkles_reasoner::Profile::ShaclAf(_))
+                        ) {
+                            eprintln!(
+                                "error: --query-only cannot take the shacl-af profile, whose \
+                                 rules run only in a materialization"
+                            );
+                            std::process::exit(2);
+                        }
                         s.profile = Some(p.clone());
                         s.rules = None;
                     }

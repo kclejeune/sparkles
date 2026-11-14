@@ -418,4 +418,22 @@ fn query_only_records_the_rules_without_a_run() {
         "--query-only",
     ];
     expect(&fetch, 2);
+    // and takes no shacl-af profile, whose rules run only in a materialization
+    let o = expect(
+        &[
+            "infer",
+            "--loc",
+            dbs,
+            "--profile",
+            "shacl-af",
+            "--query-default",
+            "demand",
+            "--query-only",
+        ],
+        2,
+    );
+    assert!(stderr(&o).contains("shacl-af"), "{}", stderr(&o));
+    let setting: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(db.join("query-reasoning.json")).unwrap()).unwrap();
+    assert_eq!(setting["profile"], "rules", "{setting}");
 }
