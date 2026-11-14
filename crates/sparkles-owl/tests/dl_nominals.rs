@@ -456,3 +456,35 @@ fn a_rooted_run_that_counts_falls_back_twice_past_a_tiny_bound() {
     assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
     assert!(!out.stats.dl_over_budget);
 }
+
+/// A rooted run that counts gives a compound qualifier of a maximum a name, as a run
+/// without the root does (roadmap item 897). `a` has two different r-successors, each in
+/// `P` and `Q` and each with an s-successor in `C`, and at most one r-successor in the
+/// intersection or with such a successor, which makes the ontology inconsistent. With one
+/// of the two outside the qualifier it is consistent.
+#[test]
+fn a_rooted_run_counts_the_neighbours_in_a_compound_qualifier() {
+    let facts = "ClassAssertion(:A :a) ObjectPropertyAssertion(:r :a :b)
+                 ObjectPropertyAssertion(:r :a :c) DifferentIndividuals(:b :c)
+                 ClassAssertion(:P :b) ClassAssertion(:Q :b) ClassAssertion(:P :c)
+                 ObjectPropertyAssertion(:s :b :d) ClassAssertion(:C :d)
+                 SubClassOf(:D ObjectUnionOf(:D1 :D2))";
+    for (more, qualifier, consistency) in [
+        (
+            "ClassAssertion(:Q :c)",
+            "ObjectIntersectionOf(:P :Q)",
+            Consistency::Inconsistent,
+        ),
+        ("", "ObjectIntersectionOf(:P :Q)", Consistency::Consistent),
+        (
+            "ObjectPropertyAssertion(:s :c :d)",
+            "ObjectSomeValuesFrom(:s :C)",
+            Consistency::Inconsistent,
+        ),
+        ("", "ObjectSomeValuesFrom(:s :C)", Consistency::Consistent),
+    ] {
+        let body = format!("{facts} {more} SubClassOf(:A ObjectMaxCardinality(1 :r {qualifier}))");
+        let out = rooted(&body, true, &[]);
+        assert_eq!(out.consistency, consistency, "{qualifier} with {more:?}");
+    }
+}

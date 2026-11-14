@@ -136,9 +136,9 @@ const ROOTED_WORK_BOUND: usize = 1 << 19;
 /// either finishes in a few thousand conclusions or runs on past millions, so the bound
 /// is the time a run spends before it gives up counting, about 0.2 s on one thread for a
 /// small ontology. Of the 150 counting fixtures, with the order between number
-/// restrictions, 146 derive at most 63,000 conclusions on one thread and one derives
-/// 247,000. Two derive 392,000 and 1.3 million, which [`Limits::dl_work`] lets a caller
-/// allow, and one passes 8 million.
+/// restrictions, 146 derive at most 103,000 conclusions on one thread. Three derive
+/// 393,000, 877,000 and 1.3 million, which [`Limits::dl_work`] lets a caller allow, and
+/// one passes 8 million.
 const DL_WORK_BOUND: usize = 1 << 18;
 
 /// The bound on the conclusions of the run that starts again without counting once the run
