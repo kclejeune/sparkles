@@ -22,14 +22,28 @@ const AHEAD_ROWS: usize = 256;
 /// what a cursor holds there at about this much and one row.
 const AHEAD_BYTES: usize = 1 << 20;
 
-/// About how many bytes of text a term holds, for [`AHEAD_BYTES`].
+/// The bytes a decoded term owns, for [`AHEAD_BYTES`]: its own storage and every text it
+/// holds, with a triple term's parts counted in turn. A datatype is counted in full,
+/// though the standard ones own no text, so the count is never too low.
 fn term_bytes(term: &oxrdf::Term) -> usize {
     64 + match term {
         oxrdf::Term::NamedNode(n) => n.as_str().len(),
         oxrdf::Term::BlankNode(b) => b.as_str().len(),
-        oxrdf::Term::Literal(l) => l.value().len(),
-        oxrdf::Term::Triple(_) => 256,
+        oxrdf::Term::Literal(l) => {
+            l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+        }
+        oxrdf::Term::Triple(t) => {
+            128 + t.subject.to_string().len() + t.predicate.as_str().len() + term_bytes(&t.object)
+        }
     }
+}
+
+/// [`term_bytes`] for every field of a quad.
+fn quad_bytes(quad: &oxrdf::Quad) -> usize {
+    192 + quad.subject.to_string().len()
+        + quad.predicate.as_str().len()
+        + term_bytes(&quad.object)
+        + quad.graph_name.to_string().len()
 }
 
 struct State {
@@ -84,7 +98,11 @@ impl State {
             let Some(Ok(row)) = self.batch.as_ref().map(|batch| batch.row(self.row)) else {
                 break;
             };
-            bytes += row.iter().flatten().map(term_bytes).sum::<usize>();
+            // an unbound cell still takes its place in the row
+            bytes += row
+                .iter()
+                .map(|cell| cell.as_ref().map_or(64, term_bytes))
+                .sum::<usize>();
             self.row += 1;
             self.ahead.push_back(row);
         }
@@ -561,7 +579,7 @@ impl GraphState {
             else {
                 break;
             };
-            bytes += 192 + term_bytes(&quad.object);
+            bytes += quad_bytes(&quad);
             self.row += 1;
             self.ahead.push_back(quad);
         }

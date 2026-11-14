@@ -207,3 +207,23 @@ def test_cursor_decoding_ahead_raises_a_budget_error_at_its_row():
     assert len(rows) == 40
     assert cursor.status == "failed"
     assert cursor.stats()["emittedRows"] == 40
+
+
+def test_cursor_decoding_ahead_counts_datatypes_and_triple_terms():
+    ds = Dataset()
+    datatype = "urn:dt:" + "d" * 65_536
+    data = " ".join(f'<urn:s{i}> <urn:p> "x"^^<{datatype}> .' for i in range(300))
+    data += " ".join(f" <urn:t{i}> <urn:q> <<( <urn:a{i}> <urn:b> <urn:c> )>> ." for i in range(300))
+    ds.load(data, "ttl")
+    for q in (
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+        "SELECT ?s ?o WHERE { ?s <urn:q> ?o }",
+    ):
+        expected = sorted(tuple(map(str, row)) for row in ds.select(q))
+        assert len(expected) == 300
+        # a refill stops at one mebibyte of owned text, which 16 of the typed rows fill
+        cursor = ds.select_cursor(q)
+        assert sorted(tuple(map(str, row)) for row in cursor) == expected
+        assert cursor.stats()["emittedRows"] == 300
+    quads = ds.graph_cursor("CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }")
+    assert len(list(quads)) == 300
