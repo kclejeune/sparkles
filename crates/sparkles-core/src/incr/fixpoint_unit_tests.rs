@@ -111,6 +111,11 @@ struct Count<const X: bool> {
     ends: usize,
     /// claim to saturate by itself
     own: bool,
+    /// list each record's premise this many times
+    fan_in: u32,
+    /// fail in `annotate` at this call
+    annotate_fails_at: Option<u64>,
+    annotated: u64,
     /// the facts below this are broken at every pass
     broken: u32,
     /// the scratch the program holds, which grows by `scratch_step` at each call of
@@ -130,6 +135,9 @@ impl<const X: bool> Count<X> {
             end_fails: false,
             ends: 0,
             own: false,
+            fan_in: 1,
+            annotate_fails_at: None,
+            annotated: 0,
             broken: 0,
             scratch: 0,
             scratch_step: 0,
@@ -157,7 +165,9 @@ impl<const X: bool> Program for Count<X> {
         out: &mut Sink<'_, u32, Oops>,
     ) -> std::result::Result<(), Oops> {
         if *r != AXIOM {
-            out.push(*r)?;
+            for _ in 0..self.fan_in {
+                out.push(*r)?;
+            }
         }
         Ok(())
     }
@@ -247,6 +257,10 @@ impl<const X: bool> Program for Count<X> {
         r: &u32,
         premises: &[&Ann],
     ) -> std::result::Result<Ann, Oops> {
+        self.annotated += 1;
+        if self.annotate_fails_at == Some(self.annotated) {
+            return Err(Oops::Mine);
+        }
         let mut atoms: Vec<Atom> = premises.iter().flat_map(|a| atoms_of(a)).collect();
         if *r == AXIOM {
             atoms.push(Atom::Fact(FactKey::of_keys(
@@ -477,6 +491,7 @@ fn buffers_past_the_budget_are_refused() {
         fp.build(&mut (), None),
         Err(Oops::Core(Error::BudgetExceeded(_)))
     ));
+    assert_eq!(fp.program.ticks, 0, "refused before the chase");
     assert_eq!(fp.store().reserved.get(), 0);
     assert_eq!(fp.program.ends, 1);
 }
@@ -518,6 +533,44 @@ fn scratch_grown_during_production_counts_with_the_sink() {
         fp.build(&mut (), Some(end + 64)),
         Err(Oops::Core(Error::BudgetExceeded(_)))
     ));
+    assert_eq!(fp.store().reserved.get(), 0);
+    // state and scratch past `u64::MAX` refuse the top limit, with an empty sink too
+    let mut p = Count::<false>::new(1, 0);
+    p.scratch_step = u64::MAX;
+    let mut fp = FixedPoint::new(p);
+    assert!(matches!(
+        fp.build(&mut (), Some(u64::MAX)),
+        Err(Oops::Core(Error::BudgetExceeded(_)))
+    ));
+}
+
+/// The annotation walk charges the premises a program lists: a record with many
+/// premises is refused while they are listed, and an error of `annotate` returns every
+/// reservation too.
+#[test]
+fn the_annotation_walk_is_charged() {
+    let mut p = Count::<false>::new(1, 3);
+    p.fan_in = 100_000;
+    p.cap = Some(256 << 10);
+    let mut fp = FixedPoint::new(p);
+    fp.set_provenance(Provenance::why());
+    assert!(matches!(
+        fp.build(&mut (), None),
+        Err(Oops::Core(Error::BudgetExceeded(_)))
+    ));
+    assert!(
+        fp.program.annotated <= 1,
+        "refused at the first record with premises"
+    );
+    assert_eq!(fp.store().reserved.get(), 0);
+
+    let mut p = Count::<false>::new(1, 30);
+    p.annotate_fails_at = Some(10);
+    let mut fp = FixedPoint::new(p);
+    fp.set_provenance(Provenance::why());
+    assert!(matches!(fp.build(&mut (), None), Err(Oops::Mine)));
+    assert_eq!(fp.store().reserved.get(), 0);
+    assert_eq!(fp.program.ends, 1);
 }
 
 /// A limit of `u64::MAX` refuses a count that would overflow it.

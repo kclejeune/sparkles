@@ -779,9 +779,17 @@ impl<P: Program> FixedPoint<P> {
     }
 
     /// What counts against `max_bytes` beside a producer's sink: the state and the
-    /// program's scratch.
+    /// program's scratch, or `None` past `u64::MAX`.
+    fn used_checked(&self) -> Option<u64> {
+        self.store
+            .bytes()
+            .checked_add(self.ann_bytes)?
+            .checked_add(self.ann.len() as u64 * 16)?
+            .checked_add(self.program.scratch_bytes())
+    }
+
     fn used(&self) -> u64 {
-        self.bytes().saturating_add(self.program.scratch_bytes())
+        self.used_checked().unwrap_or(u64::MAX)
     }
 
     /// Check the budget every 4096 facts.
@@ -798,7 +806,7 @@ impl<P: Program> FixedPoint<P> {
         let Some(m) = max else {
             return Ok(());
         };
-        let used = self.used().checked_add(pending);
+        let used = self.used_checked().and_then(|u| u.checked_add(pending));
         if used.is_none_or(|u| u > m) {
             return Err(over(m, used.unwrap_or(u64::MAX)).into());
         }
