@@ -2259,8 +2259,22 @@ impl<'a> Run<'a> {
         // witnesses it released, and whether it gave way
         let mut clauses = 0usize;
         let mut gave_way = false;
+        // the batch taken from the to-do list, applied in the order it arrived from its
+        // own buffer, and the place of its next conclusion. The conclusions the rules
+        // give the context itself come first, as they did when the batch went onto
+        // `local` reversed (roadmap item 889).
+        let mut taken: Vec<Concl> = Vec::new();
+        let mut at = 0;
         'outer: loop {
-            while let Some(c) = out.local.pop() {
+            loop {
+                let c = match out.local.pop() {
+                    Some(c) => c,
+                    None if at < taken.len() => {
+                        at += 1;
+                        taken[at - 1]
+                    }
+                    None => break,
+                };
                 if apply_rules::<_, R>(self.ix, me, &mut st, c, &mut out) {
                     tally.stored += 1;
                 }
@@ -2339,7 +2353,7 @@ impl<'a> Run<'a> {
                     Some(std::mem::take(&mut *t))
                 }
             };
-            let Some(mut batch) = batch else {
+            let Some(batch) = batch else {
                 // the products of the links and propagations this activation found go out
                 // once its own conclusions are applied, and those for the context itself
                 // come back as conclusions of its own
@@ -2378,9 +2392,8 @@ impl<'a> Run<'a> {
                 break;
             };
             tally.queued -= batch.len() as isize;
-            // apply the batch in the order it arrived
-            batch.reverse();
-            out.local.append(&mut batch);
+            taken = batch;
+            at = 0;
         }
         // A run that answers in part when it stops gives back the conclusions it did not
         // apply, so that the context shows as not closed, and sends the products of the
@@ -2389,8 +2402,12 @@ impl<'a> Run<'a> {
             self.flush_links(&st, &mut out, tally);
         }
         tally.queued += out.sent as isize;
-        if self.bounds.partial && !out.local.is_empty() {
-            ctx.todo.lock().append(out.local);
+        if self.bounds.partial && (at < taken.len() || !out.local.is_empty()) {
+            // the rest of the batch in the order the reversed batch left it on `local`,
+            // below what the rules gave the context
+            let mut t = ctx.todo.lock();
+            t.extend(taken[at..].iter().rev());
+            t.append(out.local);
         }
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
@@ -3666,6 +3683,42 @@ mod horn_accounting_tests {
         );
         assert!(sent(&outbox).contains(&(f.targets[0], Concl::Back(e1, f.t))));
         assert!(!root.todo.lock().is_empty());
+    }
+
+    /// A run that answers in part and stops inside an activation gives back the rest
+    /// of the batch it took, last first, below the conclusions the rules gave the
+    /// context, as it did when the batch went onto the context's own list reversed
+    /// (roadmap item 889).
+    #[test]
+    fn a_stopped_partial_activation_gives_back_the_rest_of_its_batch() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let root = ctx[f.root as usize].get_or_init(Box::default);
+        let [e1, x1, x2] = [1, 2, 3].map(|i| f.targets[i]);
+        let bounds = bounds(true);
+        let run = run(&f.ix, &ctx, &bounds);
+        run.batch.store(true, Ordering::Relaxed);
+        run.stop.store(STOP_CANCEL, Ordering::SeqCst);
+        {
+            let mut t = root.todo.lock();
+            t.push(Concl::Back(e1, f.s));
+            t.extend(std::iter::repeat_n(Concl::Sub(TOP), CHECK_EVERY + 4));
+            t.push(Concl::Sub(x1));
+            t.push(Concl::Sub(x2));
+        }
+        run.process::<Horn>(
+            f.root,
+            &mut VecDeque::new(),
+            &mut Tally::default(),
+            &mut Vec::new(),
+            &mut Outbox::default(),
+            &mut Marks::default(),
+        );
+        // the check after CHECK_EVERY conclusions found the run stopped, with the last
+        // repeats and the two subsumers not applied
+        let mut want = vec![Concl::Sub(x2), Concl::Sub(x1)];
+        want.extend(std::iter::repeat_n(Concl::Sub(TOP), 9));
+        assert_eq!(*root.todo.lock(), want);
     }
 
     #[test]
