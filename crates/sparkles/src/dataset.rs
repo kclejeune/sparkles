@@ -1050,11 +1050,21 @@ impl Dataset {
     }
 
     pub fn contains(&self, quad: QuadRef<'_>) -> Result<bool> {
+        crate::embed::contains_quad_in(&self.inner.store.snapshot(), quad)
+    }
+
+    /// Whether each quad is in the dataset, in the order given. Every answer is read
+    /// from one snapshot, so the answers describe one state of the dataset, and a
+    /// binding crosses into the engine once for the whole batch.
+    pub fn contains_all<'a>(
+        &self,
+        quads: impl IntoIterator<Item = QuadRef<'a>>,
+    ) -> Result<Vec<bool>> {
         let snap = self.inner.store.snapshot();
-        match quad_ids(&snap, quad) {
-            Some(ids) => snap.contains(&ids),
-            None => Ok(false),
-        }
+        quads
+            .into_iter()
+            .map(|q| crate::embed::contains_quad_in(&snap, q))
+            .collect()
     }
 
     /// Number of quads in the dataset.
