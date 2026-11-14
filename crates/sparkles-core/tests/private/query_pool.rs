@@ -216,10 +216,12 @@ fn algorithm_warmed_public_cursor_preserves_cache_policy_and_admission_handoff()
     .unwrap();
     let retained = cursor.next_batch().unwrap().unwrap();
     set_projection_observer(None);
+    // A cursor keeps the query's result cache policy, as eager execution does (item
+    // 827), so the warm entry serves it and its admission handoff is checked below.
     assert_eq!(
         s.result_cache().hits(),
-        hits,
-        "public cursor preserves its existing no-result-cache policy"
+        hits + 1,
+        "public cursor keeps the query's result cache policy"
     );
     assert_eq!(retained.len(), 2);
     drop(cursor);
