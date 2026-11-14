@@ -341,8 +341,10 @@ async fn a_quick_budgeted_ask_keeps_automatic_admission_on_repeated_http_request
         assert!(crate::http::QUICK.is_quick(key));
     }
     assert_eq!(crate::http::inline::ran_by_key(key), 4);
-    // Keeping Auto is a hint for automatic requests, not a forced execution mode.
-    let eager = budgeted_ask(&s.app, name, "execution=eager&max-rows=1024").await;
+    // Keeping Auto is a hint for automatic requests, not a forced execution mode. An
+    // eager ASK pulls its keyed join as an automatic one does (item 827), so a row
+    // limit below the join's first reads refuses it.
+    let eager = budgeted_ask(&s.app, name, "execution=eager&max-rows=1").await;
     assert_eq!(eager.status, StatusCode::INSUFFICIENT_STORAGE);
     assert_eq!(eager.json()["budget"], "rows");
     assert!(!crate::http::QUICK.is_quick(key));

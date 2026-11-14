@@ -2034,6 +2034,70 @@ fn streaming_ask_stops_after_a_qualifying_solution() {
     );
 }
 
+/// Automatic and eager execution pull every ASK through cursor operators as a
+/// streaming request does (item 827). Automatic execution reports the cursor's plan, and
+/// an ASK with initial bindings, which runs eagerly, still stops at its first solution.
+#[test]
+fn every_mode_pulls_an_ask_through_the_cursor() {
+    use sparkles_core::sparql::{ExecutionMode, QueryExecution, query_execution};
+    let s = store(10000);
+    for (q, expected) in [
+        ("ASK { ?s <urn:p> ?o }", true),
+        ("ASK { ?s <urn:absent> ?o }", false),
+        ("ASK { ?s <urn:p> ?o . ?t <urn:p> ?o }", true),
+    ] {
+        for mode in [
+            ExecutionMode::Eager,
+            ExecutionMode::Auto,
+            ExecutionMode::Streaming,
+        ] {
+            let execution = query_execution(
+                s.snapshot(),
+                q,
+                &Default::default(),
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap();
+            let plan = execution.plan_json().unwrap();
+            if expected {
+                // the scans stop at the first solution in every mode
+                assert!(plan.contains("\"stoppedEarly\":true"), "{q}: {plan}");
+            }
+            let (QueryExecution::Ask(result) | QueryExecution::Eager(result)) = &execution else {
+                panic!("{q}: an ASK completes")
+            };
+            assert_eq!(result.value(), expected, "{q} under {mode:?}");
+            assert!(result.result().rows_produced < 20, "{q} under {mode:?}");
+            // an absent pattern has no rows, so the planner runs it whole and
+            // automatic execution keeps it eager
+            if mode == ExecutionMode::Auto {
+                assert_eq!(matches!(execution, QueryExecution::Ask(_)), expected, "{q}");
+            }
+        }
+    }
+    let bound = QueryOptions {
+        initial_bindings: vec![(
+            "s".into(),
+            Term::NamedNode(oxrdf::NamedNode::new_unchecked("urn:s:1")),
+        )],
+        ..Default::default()
+    };
+    let execution = query_execution(
+        s.snapshot(),
+        "ASK { ?s <urn:p> ?o }",
+        &bound,
+        &CursorOptions::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let (QueryExecution::Ask(result) | QueryExecution::Eager(result)) = &execution else {
+        panic!("an ASK completes")
+    };
+    assert!(result.value());
+    assert!(result.result().rows_produced < 20);
+}
+
 #[test]
 fn native_graph_document_and_jena_writers_stream_and_fuse_failures() {
     use sparkles_core::sparql::{QueryExecution, graph_cursor, query_cursor, results};
@@ -2137,7 +2201,6 @@ fn automatic_execution_keeps_small_and_stateful_queries_eager() {
     for q in [
         "SELECT * {?s ?p ?o}",
         "SELECT (COUNT(*) AS ?n) {?s ?p ?o}",
-        "ASK {?s ?p ?o}",
         "CONSTRUCT {?s ?p ?o} WHERE {?s ?p ?o}",
     ] {
         let execution = query_execution(
@@ -2156,6 +2219,23 @@ fn automatic_execution_keeps_small_and_stateful_queries_eager() {
         assert_eq!(result.result().len(), expected.len());
         assert_eq!(result.result().boolean, expected.boolean);
     }
+    // An ASK over an input that the planner runs whole, because it is small, stays
+    // eager too (item 827).
+    let q = "ASK {?s ?p ?o}";
+    let execution = query_execution(
+        s.snapshot(),
+        q,
+        &Default::default(),
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Eager(answer) = execution else {
+        panic!("a small ASK must remain eager")
+    };
+    let expected = query(s.snapshot(), q, &Default::default()).unwrap();
+    assert!(expected.boolean);
+    assert_eq!(answer.result().boolean, expected.boolean);
 }
 
 #[test]

@@ -24,6 +24,32 @@ of 64 took 0.31 µs on the JVM against 0.97 µs for a single call, and 0.31 µs 
 Node against 0.84 µs. In Python a batch saves about a tenth, since the lookup is most
 of an `in`.
 
+### One plan in every execution mode
+
+A query has one plan whatever its execution mode (roadmap item 827), and EXPLAIN shows
+it. `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in
+every mode, and a spilling DISTINCT over an ORDER BY deduplicates below the sort in every
+mode. Every ASK and every LIMIT without ORDER BY pulls its input through cursor operators
+that stop at the rows it needs, in eager and automatic execution as in streaming, so a
+filter or a join under a LIMIT reads its input once rather than in growing prefixes. The
+planner runs a small input whole instead, when exact index counts bound each of its
+operators to a cursor batch, it evaluates no expression and its estimated cost past the
+first rows is below the cost of building cursor operators, and an EXISTS pattern
+evaluated per row does the same. A whole run that a row or memory budget refuses pulls
+the input instead. An ASK or a `LIMIT 1` over a keyed join reads both inputs alternately
+and keys each row once. A cursor FILTER without effects reads larger batches while its
+rows do not pass. A LIMIT of no rows over a pattern scan reads no pattern. A UNION under
+a LIMIT or an ASK reads its cheapest branch first in every mode. Automatic execution
+streams every ASK without initial bindings whose input does not run whole. A pattern
+scan's reader charges the patterns it decodes as they grow, and the decoded rows of a
+pulled result charge their terms in steps. A pulled limit takes the query's memory
+ledger, which a small eager LIMIT over anything but a scan or a table of values did not
+take before. A cursor cross product holds its smaller input and streams the larger one. A
+LIMIT over an inner hash join builds the index of one whole input, which takes more
+memory than the eager limited join it replaces when both inputs are large, and roadmap
+item 947 follows it up. Some pulled first rows still take 1.05 to 1.37 times as long as
+the eager path did, and roadmap item 952 follows them up.
+
 ### Valid time
 
 C27 Phase 1 is complete (roadmap item 341). An authenticated claim proposal records each
@@ -116,12 +142,43 @@ the generated fixture `shiq-038` now passes the default bound of the counting ru
 DL development set keeps its taxonomies, and no change of its times was observed. This is roadmap item 897.
 
 A context of the disjunctive rules that has processed 256 of its clauses in one activation
-gives way to the contexts its worker woke. On one thread a context that equated its
+gives way to the contexts its worker woke, after it has sent the products of the links
+and propagations of that activation. On one thread a context that equated its
 successors under a maximum otherwise finished that work before a successor without a model
 could close it. A generated ontology of item 897 derives 29,625 conclusions on one thread
 where it derived 2,122,545, and seven of 750 generated ontologies come within the default
 bound of the counting run on one thread, with none leaving it. The fixture `shq-041`
-finishes without the order between number restrictions, where it passed any bound.
+finishes without the order between number restrictions, where it passed any bound. The
+ORE 2015 DL development set keeps its taxonomies with and without the order, and the
+failed counting attempt of ore_ont_6485 is cheaper. Its classification with counting
+requested takes 157 ms on one thread with the order against 123 ms without it, 1.28
+times as long, where it took 576 against 184 ms.
+
+A run of the disjunctive rules that has a bound on its derived conclusions now proceeds
+in steps. Such a run is one that counts, the run without counting that follows it past
+the bound, or a rooted run. A step activates the waiting contexts on the workers and
+delivers their messages at its end in a fixed order, and the bound is compared between
+steps. The run then derives the same conclusions and answers in full or falls back in the
+same way on every number of threads, and it does not repeat on one thread an attempt that
+passed the bound. `Limits::dl_steps` controls the steps and is on by default, and
+`el_classify` takes `--no-dl-steps`. A run without the bound keeps the driver without
+steps, so a classification under the default limits runs as before. A rooted run and a
+run with the eager strategy that counts take one thread for their saturations with the
+option, which is roadmap item 951. An
+inference too wide to make now marks the run past its bound with a flag. Four of them
+between two checks wrapped the count before, and the run ended as complete without those
+inferences. A worker of a saturation that panics, in a caller's callback for example, now
+stops the run, and the panic reaches the caller. The other workers waited for it without
+end before, with either driver. On `atlas` on four threads the two versions of the
+Protein Ontology classify 4.0 and 4.9% slower in steps, and the three files of the ORE
+2015 DL sample whose counting attempt fails classify 1.3 to 2.6 times faster, since a run
+in steps does not repeat the attempt on one thread. On one thread the fallback of
+ore_ont_14817 takes 10 s in steps against 132 s without them, and 222 s before a context
+gave way to the contexts it woke. In steps the classification of ore_ont_6485 with
+counting requested takes 213 ms with the order between number restrictions against 188
+ms without it on one thread, where the entry above gives the times without steps. The counting fixtures that take less
+than 10 ms take 9% longer in steps on one thread in sum and 4% longer on four, which
+roadmap item 950 follows. This is roadmap item 727.
 
 ### Ask latency
 
@@ -2104,6 +2161,16 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+A classifier that keeps its state between runs no longer misses a subsumption that only
+Tier D finds after a change. The run chose its tier over an interner that still held the
+expressions of removed axioms, of added axioms outside OWL 2 EL and of an earlier run's
+normalization outside OWL 2 EL. A removed self restriction, a removed use of the top
+object property or a self restriction in an axiom outside OWL 2 EL thus kept Tier D from
+the disjunctions in the ontology. With `A ⊑ ∃r.Self`, `B ⊑ C ⊔ D`, `C ⊑ E` and `D ⊑ E`,
+removing the first axiom lost `B ⊑ E`. A run with axioms outside OWL 2 EL now starts again
+with a new interner once the interner holds such an expression that the choice of tier
+reads and a fresh run would not. Changes to plain class axioms keep the state.
 
 Query-time reasoning with `reasoning=demand` no longer derives about the whole OWL RL type
 closure for every query (roadmap item 911). The schema completeness proof gave up on

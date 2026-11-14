@@ -466,6 +466,9 @@ pub struct DlRun {
     work_limit: AtomicUsize,
     /// set once the run passes its bound on derived conclusions
     worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// set once an inference was too wide to make, which passes the bound whatever the
+    /// count is
+    exhausted: std::sync::atomic::AtomicBool,
 }
 
 impl DlRun {
@@ -487,18 +490,40 @@ impl DlRun {
     pub fn set_work_limit(&self, n: usize) {
         self.work_limit.store(n, Ordering::Relaxed);
     }
+    /// Whether the run has a bound on the conclusions it derives.
+    pub fn bounded(&self) -> bool {
+        self.work_limit.load(Ordering::Relaxed) != 0
+    }
+    /// Counts `n` derived conclusions.
+    pub(super) fn count(&self, n: usize) {
+        self.work.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Whether `n` conclusions alone are more than the run's bound, and marks the run
+    /// past its bound when they are.
+    pub(super) fn past(&self, n: usize) -> bool {
+        let l = self.work_limit.load(Ordering::Relaxed);
+        let past = l != 0 && n > l;
+        if past {
+            self.exhaust();
+        }
+        past
+    }
     /// The conclusions derived so far.
     pub fn work(&self) -> usize {
         self.work.load(Ordering::Relaxed)
     }
     /// Passes the bound on derived conclusions at once, for an inference too wide to make.
+    /// The mark stays, where a sum would wrap once four inferences added a quarter of
+    /// the range each before a check read it, and the run would then end as complete
+    /// without them.
     fn exhaust(&self) {
-        self.work.fetch_add(usize::MAX / 4, Ordering::Relaxed);
+        self.exhausted.store(true, Ordering::Relaxed);
     }
     /// Whether the run derived more conclusions than its bound.
     pub fn over_work(&self) -> bool {
         let l = self.work_limit.load(Ordering::Relaxed);
-        let over = l != 0 && self.work.load(Ordering::Relaxed) > l;
+        let over = l != 0
+            && (self.exhausted.load(Ordering::Relaxed) || self.work.load(Ordering::Relaxed) > l);
         if over {
             self.worked.store(true, Ordering::Relaxed);
         }
@@ -1236,7 +1261,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
     if st.bottom {
         return;
     }
-    out.dl().work.fetch_add(1, Ordering::Relaxed);
+    out.worked(1);
     let dx = dix(ix);
     // a test context's denied class leaves the head
     if let Some(x) = dl(st)
@@ -1369,9 +1394,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
             let rest: Vec<Lit> = head.iter().copied().filter(|&m| m != l).collect();
             let read = known(dx, st, &body, &rest, l.fun(), &mut a)
                 + known(dx, st, &body, &rest, g, &mut b);
-            out.dl()
-                .work
-                .fetch_add(read / WORK_READS, Ordering::Relaxed);
+            out.worked(read / WORK_READS);
             let Some((i, j)) = disjoint(ix, &a, &b) else {
                 k += 1;
                 continue;
@@ -2551,8 +2574,9 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, me, st, id, &c, &max, out);
-        // the units go to the EL rules first, and a stopped run leaves the rest queued
-        if out.busy() || out.stopped() {
+        // the units go to the EL rules first, and a stopped run leaves the rest queued,
+        // as an activation of a run in steps does once it derived its share
+        if out.busy() || out.stopped() || out.pause() {
             break;
         }
     }
@@ -2986,5 +3010,22 @@ mod tests {
         assert!(!st.is_idle());
         st.pending.clear();
         assert!(st.is_idle());
+    }
+
+    /// Four inferences too wide to make, between two checks of the bound, leave the run
+    /// past its bound. Each added a quarter of the count's range before, so that four of
+    /// them after four or more conclusions wrapped the count to a small number, and the
+    /// run ended as complete without those inferences.
+    #[test]
+    fn four_inferences_too_wide_leave_the_run_past_its_bound() {
+        let run = DlRun::default();
+        run.set_work_limit(1000);
+        run.work.fetch_add(100, Ordering::Relaxed);
+        assert!(!run.over_work());
+        for _ in 0..4 {
+            run.exhaust();
+        }
+        assert!(run.over_work());
+        assert_eq!(run.work(), 100);
     }
 }

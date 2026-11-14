@@ -11,345 +11,6 @@ const MAX_TRIPLES: usize = 8;
 const MAX_BRANCHES: usize = 8;
 const MAX_SCREEN_NODES: usize = MAX_TRIPLES * MAX_BRANCHES * 4;
 
-/// A bounded UNION whose branch order and excess demand have no external effects.
-fn pure_union(ctx: &super::ctx::Ctx, node: &Node) -> bool {
-    use super::expr::Expr;
-
-    fn expression(expr: &Expr, remaining: &mut usize) -> bool {
-        if *remaining == 0 {
-            return false;
-        }
-        *remaining -= 1;
-        match expr {
-            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
-            Expr::Eq(a, b) | Expr::SameTerm(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
-                expression(a, remaining) && expression(b, remaining)
-            }
-            Expr::Not(a) => expression(a, remaining),
-            _ => false,
-        }
-    }
-
-    fn plain(node: &Node, remaining: &mut usize, expressions: &mut usize) -> bool {
-        if *remaining == 0 {
-            return false;
-        }
-        *remaining -= 1;
-        let shape = match &node.kind {
-            Kind::Scan(_) | Kind::Values(_) | Kind::Empty => node.children.is_empty(),
-            Kind::Join { .. } => node.children.len() == 2,
-            Kind::Union => (2..=MAX_BRANCHES).contains(&node.children.len()),
-            Kind::Project(_) | Kind::Sort(_) => node.children.len() == 1,
-            Kind::Extend(_, expr) => node.children.len() == 1 && expr.const_id().is_some(),
-            Kind::Filter(exprs) => {
-                node.children.len() == 1 && exprs.iter().all(|e| expression(e, expressions))
-            }
-            Kind::IndexJoin(spec) => {
-                node.children.len() == 1
-                    && spec
-                        .probes
-                        .iter()
-                        .all(|p| p.filter.iter().all(|e| expression(e, expressions)))
-            }
-            _ => false,
-        };
-        shape
-            && node
-                .children
-                .iter()
-                .all(|c| plain(c, remaining, expressions))
-    }
-
-    !ctx.calls_extensions
-        && matches!(node.kind, Kind::Union)
-        && (2..=MAX_BRANCHES).contains(&node.children.len())
-        && node
-            .children
-            .iter()
-            .all(|c| c.cost.is_finite() && c.cost >= 0.0)
-        && plain(node, &mut 128, &mut 256)
-}
-
-/// Only a wholly admitted pure ASK may reduce input demand. Subtree purity
-/// alone cannot rule out an effectful consumer outside that subtree.
-pub(super) fn limited_input(ctx: &super::ctx::Ctx, node: &Node) -> bool {
-    // A limited join builds one side in full on entry. An outer operator that
-    // retries smaller prefixes would rebuild that side each time. Keep the
-    // ordinary prefix for those inputs rather than multiplying their startup.
-    fn restarts_build(node: &Node, remaining: &mut usize) -> bool {
-        if *remaining == 0 {
-            return true;
-        }
-        *remaining -= 1;
-        match &node.kind {
-            Kind::Join { .. } | Kind::KeyedJoin { .. } => true,
-            // These either stream directly or finish in one call regardless of
-            // prefix. In particular VALUES and sorting do not trigger retries.
-            Kind::Scan(_) | Kind::Values(_) | Kind::Empty | Kind::Sort(_) => false,
-            _ => node.children.iter().any(|c| restarts_build(c, remaining)),
-        }
-    }
-
-    let retried = match &node.kind {
-        Kind::Filter(_) | Kind::IndexJoin(_) => node.children.first(),
-        Kind::Join { .. } if node.children.len() == 2 => {
-            // Match the limited executor's choice of the streamed input. Its
-            // other input is built once outside the retry loop.
-            let limited = if node.children[0].est >= node.children[1].est {
-                0
-            } else {
-                1
-            };
-            Some(&node.children[limited])
-        }
-        // Projection and constant BIND preserve rows, so a one-row child prefix
-        // already satisfies their demand. They must not drain more UNION arms.
-        _ => None,
-    };
-
-    !ctx.streams()
-        && matches!(
-            node.kind,
-            Kind::Project(_)
-                | Kind::Filter(_)
-                | Kind::Extend(..)
-                | Kind::IndexJoin(_)
-                | Kind::Join { .. }
-        )
-        && ctx
-            .eager_union_demand
-            .load(std::sync::atomic::Ordering::Relaxed)
-        // Widening can itself exceed a tight output or memory budget. Reuse the
-        // conservative whole-subtree bounds before keeping the larger prefix.
-        && !retried.is_some_and(|c| restarts_build(c, &mut 128) && ordering_fits(ctx, node))
-}
-
-/// A prefix's live rows cannot exceed its covering base blocks and inserted keys.
-/// Unlike the planner's graph discount and midpoint estimate, this is an upper bound.
-fn scan_upper(ctx: &super::ctx::Ctx, scan: &ScanSpec) -> u64 {
-    if let Some(count) = ctx.snap.predicate_count(scan.perm, &scan.prefix) {
-        return count;
-    }
-    let index = ctx.snap.perm(scan.perm);
-    let (lo, hi) = index.block_range(&scan.prefix);
-    let base = if lo < hi {
-        index.blocks[hi - 1].row_start + u64::from(index.blocks[hi - 1].rows)
-            - index.blocks[lo].row_start
-    } else {
-        0
-    };
-    base.saturating_add(crate::store::Delta::count_prefix(
-        &ctx.snap.delta.ins[scan.perm.index()],
-        &scan.prefix,
-    ))
-}
-
-fn full_work(ctx: &super::ctx::Ctx, node: &Node, left: &mut usize) -> Option<f64> {
-    if *left == 0 || !node.cost.is_finite() || node.cost < 0.0 {
-        return None;
-    }
-    *left -= 1;
-    let own = match &node.kind {
-        Kind::Scan(scan) => node.cost.max(scan_upper(ctx, scan) as f64),
-        Kind::Values(table) => node.cost.max(table.len() as f64),
-        _ => node.cost,
-    };
-    let mut children = 0.0;
-    for child in &node.children {
-        children += full_work(ctx, child, left)?;
-    }
-    let work = own.max(children);
-    work.is_finite().then_some(work)
-}
-
-/// Work before the first limited result. A filtered or blocking input may have
-/// to run to completion, so keep its full cost rather than amortizing it over
-/// output rows. Eager joins also build their estimated smaller input in full.
-fn first_work(
-    ctx: &super::ctx::Ctx,
-    node: &Node,
-    want: usize,
-    remaining: &mut usize,
-) -> Option<f64> {
-    use super::plan::GraphFilter;
-    if *remaining == 0
-        || !node.cost.is_finite()
-        || node.cost < 0.0
-        || !node.est.is_finite()
-        || node.est < 0.0
-    {
-        return None;
-    }
-    *remaining -= 1;
-    let prefix = |n: f64| (want as f64 / n.max(1.0)).min(1.0);
-    let work = match &node.kind {
-        Kind::Scan(spec) => {
-            let all = spec.eqs.is_empty()
-                && !spec.dedup
-                && (matches!(spec.graph, GraphFilter::All)
-                    || spec
-                        .prefix
-                        .get(spec.graph_col)
-                        .is_some_and(|g| spec.graph.accepts(*g))
-                    || (ctx.snap.delta.is_empty()
-                        && ctx.snap.generation.stats.graphs.len() == 1
-                        && spec.graph.accepts(ctx.snap.generation.stats.graphs[0].0)));
-            if all {
-                node.cost * prefix(node.est)
-            } else {
-                node.cost.max(scan_upper(ctx, spec) as f64)
-            }
-        }
-        Kind::Values(table) => node.cost.max(table.len() as f64),
-        Kind::Empty => 0.0,
-        Kind::Project(_) => first_work(ctx, &node.children[0], want, remaining)?,
-        Kind::Extend(..) => {
-            first_work(ctx, &node.children[0], want, remaining)?
-                + (node.cost - node.children[0].cost).max(0.0)
-                    * (want as f64 / node.est.max(1.0)).min(1.0)
-        }
-        Kind::Join { .. } => {
-            if node
-                .children
-                .iter()
-                .any(|c| !c.est.is_finite() || c.est < 0.0)
-            {
-                return None;
-            }
-            let lim = usize::from(node.children[0].est < node.children[1].est);
-            let part = &node.children[lim];
-            let other = &node.children[1 - lim];
-            if !other.cost.is_finite()
-                || other.cost < 0.0
-                || !part.est.is_finite()
-                || part.est < 0.0
-            {
-                return None;
-            }
-            full_work(ctx, other, remaining)?
-                + first_work(ctx, part, want, remaining)?
-                + (node.cost - part.cost - other.cost).max(0.0)
-                    * (want as f64 / part.est.max(1.0)).min(1.0)
-        }
-        Kind::Union => {
-            let mut cost = 0.0;
-            let mut need = want as f64;
-            for child in &node.children {
-                cost += first_work(ctx, child, need.ceil() as usize, remaining)?;
-                need = (need - child.est).max(0.0);
-                if need == 0.0 {
-                    break;
-                }
-            }
-            cost
-        }
-        Kind::Filter(_) | Kind::IndexJoin(_) | Kind::Sort(_) => {
-            // This node was counted above; the full walk counts it once itself.
-            *remaining += 1;
-            full_work(ctx, node, remaining)?
-        }
-        _ => return None,
-    };
-    (work.is_finite() && work >= 0.0).then_some(work)
-}
-
-/// A new order must fit conservative output bounds, including compatible-key
-/// products. Cardinality estimates do not bound a join whose inputs contain UNDEF.
-fn ordering_fits(ctx: &super::ctx::Ctx, root: &Node) -> bool {
-    // Geometric prefix retries can produce more than one full scan. Keep the
-    // original order under a finite total-work cap instead of certifying a sum.
-    if ctx.max_rows_produced != u64::MAX || !ctx.snap.delta.is_empty() {
-        return false;
-    }
-    fn visit(ctx: &super::ctx::Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Option<u64> {
-        if *left == 0 || node.children.len() > MAX_BRANCHES {
-            return None;
-        }
-        *left -= 1;
-        let mut children = [0u64; MAX_BRANCHES];
-        for (i, child) in node.children.iter().enumerate() {
-            children[i] = visit(ctx, child, left, bytes)?;
-        }
-        let count = match &node.kind {
-            Kind::Values(table) => table.len() as u64,
-            Kind::Scan(scan) => scan_upper(ctx, scan),
-            Kind::Empty => 0,
-            Kind::Join { .. } => children[0].checked_mul(children[1])?,
-            Kind::Union => children[..node.children.len()]
-                .iter()
-                .try_fold(0u64, |sum, n| sum.checked_add(*n))?,
-            Kind::Project(_) | Kind::Filter(_) | Kind::Extend(..) | Kind::Sort(_) => children[0],
-            Kind::Slice { offset, limit } => children[0]
-                .saturating_sub(*offset as u64)
-                .min(limit.map_or(u64::MAX, |n| n as u64)),
-            // Probe fanout and duplicate input keys have no cheap output upper
-            // bound. Keep their original order rather than certify an estimate.
-            Kind::IndexJoin(_) => return None,
-            _ => return None,
-        };
-        if count > ctx.max_rows as u64 {
-            return None;
-        }
-        // Include room for pair indexes and capacity growth as well as columns.
-        let width = (node.vars.len() as u64).checked_mul(16)?.checked_add(64)?;
-        *bytes = bytes.checked_add(count.checked_mul(width)?.checked_add(128)?)?;
-        (*bytes <= ctx.memory_room()).then_some(count)
-    }
-    let mut bytes = 0;
-    let mut left = MAX_SCREEN_NODES;
-    visit(ctx, root, &mut left, &mut bytes).is_some()
-}
-
-/// An eager ASK needs one solution, so visit a cheaper pure UNION operand first.
-/// Cursor execution and SELECT retain their existing order.
-pub(super) fn order_ask(ctx: &super::ctx::Ctx, node: &mut Node) {
-    if !matches!(
-        node.kind,
-        Kind::Slice {
-            offset: 0,
-            limit: Some(1)
-        }
-    ) || node.children.len() != 1
-    {
-        return;
-    }
-    let mut union = &mut node.children[0];
-    for _ in 0..8 {
-        if !matches!(union.kind, Kind::Project(_)) || union.children.len() != 1 {
-            break;
-        }
-        union = &mut union.children[0];
-    }
-    if ctx.max_rows_produced != u64::MAX || !ctx.snap.delta.is_empty() || !pure_union(ctx, union) {
-        return;
-    }
-    ctx.eager_union_demand
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    if !ordering_fits(ctx, node) {
-        return;
-    }
-    let mut union = &mut node.children[0];
-    for _ in 0..8 {
-        if !matches!(union.kind, Kind::Project(_)) || union.children.len() != 1 {
-            break;
-        }
-        union = &mut union.children[0];
-    }
-    let Some(mut work) = first_work(ctx, &union.children[0], 1, &mut 128) else {
-        return;
-    };
-    let mut cheapest = 0;
-    for i in 1..union.children.len() {
-        let Some(candidate) = first_work(ctx, &union.children[i], 1, &mut 128) else {
-            return;
-        };
-        if candidate < work {
-            cheapest = i;
-            work = candidate;
-        }
-    }
-    union.children.swap(0, cheapest);
-}
 /// Do not duplicate broad anchor reads merely because they have a constant object.
 pub(super) const MAX_ANCHOR_ROWS: f64 = 32.0;
 
@@ -688,8 +349,8 @@ mod tests {
                 find(capped.plan(), "IndexScan", "urn:p")
                     .unwrap()
                     .actual_rows,
-                64,
-                "a finite produced-row cap keeps the original prefix: {pattern}"
+                1,
+                "a finite produced-row cap takes the same demand: {pattern}"
             );
         }
         assert!(
@@ -717,8 +378,8 @@ mod tests {
             find(changed.plan(), "IndexScan", "urn:p")
                 .unwrap()
                 .actual_rows,
-            64,
-            "an unmerged snapshot keeps the original prefix"
+            1,
+            "a snapshot with a delta takes the same demand"
         );
     }
 
@@ -837,7 +498,7 @@ mod tests {
         )
         .unwrap();
         assert!(result.boolean);
-        assert_eq!(result.rows_produced, 3001);
+        assert!(result.rows_produced < 3001, "{}", result.rows_produced);
     }
 
     #[test]
@@ -892,10 +553,8 @@ mod tests {
             let mut todo = vec![result.plan()];
             while let Some(p) = todo.pop() {
                 if p.operator == "Values" {
-                    assert_eq!(
-                        p.actual_rows, -1,
-                        "the eager VALUES that cannot fit the budget must stay skipped"
-                    );
+                    // the cursor copies only the rows the ASK asks for (item 827)
+                    assert!(p.actual_rows <= 1, "{}", p.actual_rows);
                 }
                 todo.extend(p.children.iter());
             }
@@ -1072,11 +731,8 @@ mod tests {
             }
             todo.extend(p.children.iter());
         }
-        assert_eq!(
-            rows,
-            Some(127),
-            "the pure subtree must not reduce its effectful consumer's127correlated evaluations"
-        );
+        // the BIND evaluates its EXISTS for the rows the ASK pulls (item 827)
+        assert_eq!(rows, Some(1));
     }
 
     #[test]
@@ -1087,7 +743,9 @@ mod tests {
 
         let store = Store::in_memory(StoreOptions::default());
         let mut data = String::from("<urn:yes> <urn:cheap> 1 .\n");
-        for i in 0..128 {
+        // more rows than a cursor batch, so that the ASK pulls its input rather than
+        // running it whole
+        for i in 0..5000 {
             data.push_str(&format!(
                 "<urn:s{i}> <urn:wide> {i}; <urn:extra> {} .\n",
                 i + 1
@@ -1125,8 +783,9 @@ mod tests {
             &QueryOptions::default(),
         )
         .unwrap();
+        // a LIMIT takes the cheap branch first too (item 827)
         assert!(
-            selected.test_application_rows()[0]
+            !selected.test_application_rows()[0]
                 .iter()
                 .any(|v| v.as_ref().is_some_and(|v| v.to_string().contains("urn:s")))
         );
@@ -1148,10 +807,7 @@ mod tests {
             }
             plans.extend(p.children.iter());
         }
-        assert!(
-            read_wide,
-            "forced streaming retains its original operand order"
-        );
+        assert!(!read_wide, "streaming takes the cheap branch first as well");
     }
 
     #[test]
@@ -1216,12 +872,14 @@ mod tests {
                 )
                 .unwrap();
                 let result = match result {
+                    // automatic execution pulls an ASK through a cursor, unless the
+                    // planner runs its small input whole (item 827)
                     QueryExecution::Eager(result) => {
                         assert_ne!(mode, ExecutionMode::Streaming);
                         result
                     }
                     QueryExecution::Ask(result) => {
-                        assert_eq!(mode, ExecutionMode::Streaming);
+                        assert_ne!(mode, ExecutionMode::Eager);
                         result
                     }
                     _ => panic!("ASK must produce a completed boolean"),
@@ -1229,27 +887,6 @@ mod tests {
                 assert_eq!(result.result().boolean, expected, "{text}, {mode:?}");
             }
         }
-        let parsed = crate::sparql::parse_query(
-            "ASK { { ?s <urn:p> ?v } UNION { <urn:t> <urn:q> ?v } }",
-            None,
-            &[],
-        )
-        .unwrap();
-        let mut prepared =
-            super::super::prepare_query(store.snapshot(), &parsed, &Default::default(), None, None)
-                .unwrap();
-        assert!(!limited_input(&prepared.ctx, &prepared.node.children[0]));
-        order_ask(&prepared.ctx, &mut prepared.node);
-        assert!(limited_input(&prepared.ctx, &prepared.node.children[0]));
-        prepared.ctx.detach_owner_for_tests();
-        std::sync::Arc::get_mut(&mut prepared.ctx)
-            .unwrap()
-            .enable_cursor_accounting()
-            .unwrap();
-        assert!(
-            !limited_input(&prepared.ctx, &prepared.node.children[0]),
-            "a cursor fallback must retain its original eager prefix policy too"
-        );
     }
 
     #[test]
@@ -1301,10 +938,12 @@ mod tests {
         )
         .unwrap();
         assert!(result.boolean);
-        assert_eq!(
-            count.load(Ordering::Relaxed),
-            64,
-            "the effectful path retains its original demand and callback count"
+        // the branches keep their order, and pull demand evaluates the callback for
+        // the rows the ASK reads
+        assert!(
+            (1..64).contains(&count.load(Ordering::Relaxed)),
+            "{}",
+            count.load(Ordering::Relaxed)
         );
     }
 
@@ -1400,8 +1039,8 @@ mod tests {
                     ..Default::default()
                 }
             )
-            .is_err(),
-            "the total-work-capped filtered path still refuses its physical64-row input work"
+            .is_ok_and(|r| r.boolean),
+            "pull demand reads the rows the ASK needs within a one-row budget"
         );
         let optimized = query(
             store.snapshot(),

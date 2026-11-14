@@ -55,7 +55,6 @@ use super::dl_rules::{
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::atomic::Ordering;
 
 /// What a context of a rooted run keeps for the rules at the constants and over `f_e(u)`.
 /// Every context keeps its processed clauses by constant and its edges over `f_e(u)`. The
@@ -724,7 +723,7 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
     if st.bottom {
         return;
     }
-    out.dl().work.fetch_add(1, Ordering::Relaxed);
+    out.worked(1);
     let inv = inv_of(ix, dix(ix));
     let lits = &out.dl().lits;
     body.retain(|&l| !matches!(lits.view(l, inv), XLit::Atom(TOP, _)));
@@ -1494,6 +1493,7 @@ mod tests {
             dynamic: None,
             dl: Some(&run),
             partial: false,
+            steps: false,
         };
         let seeds = seed(&ix, &mut s.it);
         if !seeds.is_empty() {

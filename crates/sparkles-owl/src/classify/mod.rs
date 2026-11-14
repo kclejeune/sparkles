@@ -225,9 +225,26 @@ pub struct Limits {
     /// Ontology, where the run without it passes [`dl_work`](Limits::dl_work). A run
     /// that passes the bound either way can spend longer before it does: the
     /// classification of ore_ont_6485 of the ORE 2015 DL sample with counting, the
-    /// attempt and the run without counting together, takes 576 ms with the order and
-    /// 184 ms without it on one thread. False turns the order off.
+    /// attempt and the run without counting together, takes 213 ms with the order and
+    /// 188 ms without it on one thread. False turns the order off.
     pub number_order: bool,
+    /// Makes the saturations of a run of Tier D that has a bound on its derived
+    /// conclusions proceed in steps, so that the run derives the same conclusions, passes
+    /// or keeps its bound on them, and so answers in full or falls back, in the same way
+    /// on every number of threads and every schedule (roadmap item 727). On by default.
+    /// The runs with such a bound are a run that counts, the run that starts again
+    /// without counting after it, and a rooted run. A step activates the waiting
+    /// contexts in parallel and delivers their messages at its end in a fixed order.
+    /// The run does not repeat on one thread an attempt that passed its bound. A rooted
+    /// run and a run with [`Expansion::Eager`] that has the bound run their saturations
+    /// on one thread with the option. A run without the bound has no outcome that a
+    /// schedule decides, so the option changes nothing for it. The memory budget, the
+    /// deadline and a cancellation still stop a run when they are reached. False takes
+    /// the driver whose threads deliver their messages during the saturation, with no
+    /// step between them. With it a run near its bound can answer in full on one
+    /// schedule and fall back on another, and an attempt that passed the bound on
+    /// several threads is repeated on one.
+    pub dl_steps: bool,
 }
 
 impl Default for Limits {
@@ -245,6 +262,7 @@ impl Default for Limits {
             counting: false,
             rooted: false,
             number_order: true,
+            dl_steps: true,
         }
     }
 }
@@ -481,6 +499,12 @@ pub struct Saturation {
     /// the invalidation does not follow: a context merged with an individual, a world, a
     /// key or a fact of a universal role
     entangled: bool,
+    /// whether the interner may hold expressions that are not [`tier_neutral`] of a
+    /// removed axiom or of an added axiom outside OWL 2 EL, or what a normalization
+    /// outside OWL 2 EL interned that [`TierMark::passed`] finds, which a run that
+    /// decides its tier over the interner would read as present, so a run with axioms
+    /// outside OWL 2 EL starts again
+    stale_tier: bool,
     /// whether the last run whose saturation ended found the ontology consistent
     consistent: bool,
     /// the contexts of conjunctions that the last run's Horn rules created
@@ -544,6 +568,87 @@ fn needs_full_run(ax: &AxiomKind) -> bool {
             Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
         )
     })
+}
+
+/// Whether the expressions of the axiom, once it is removed or when a change interns an
+/// added axiom outside OWL 2 EL as a premise, leave nothing in a kept interner that a
+/// run's choice of tier reads. That choice looks for self restrictions,
+/// at-most restrictions, nominals, data and the top and bottom object properties among
+/// every expression the interner holds, so a removed axiom with any of them could keep
+/// Tier D from the axioms that remain. Class axioms and domains built from classes,
+/// intersections, unions, complements and existentials over other properties are
+/// neutral, and so are declarations and annotations.
+fn tier_neutral(ax: &AxiomKind) -> bool {
+    use ClassExpression as C;
+    fn plain(c: &ClassExpression) -> bool {
+        match c {
+            C::Class(_) => true,
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().all(plain),
+            C::ObjectComplementOf(c) => plain(c),
+            C::ObjectSomeValuesFrom(p, c) => {
+                let p = p.named();
+                *p != ObjectProperty::top() && *p != ObjectProperty::bottom() && plain(c)
+            }
+            _ => false,
+        }
+    }
+    match ax {
+        _ if !logical(ax) => true,
+        AxiomKind::Declaration(e) => !matches!(
+            e,
+            Entity::ObjectProperty(p) if *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
+        ),
+        AxiomKind::SubClassOf(a, b) => plain(a) && plain(b),
+        AxiomKind::EquivalentClasses(cs) | AxiomKind::DisjointClasses(cs) => cs.iter().all(plain),
+        AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
+        AxiomKind::ObjectPropertyDomain(p, c) => {
+            let p = p.named();
+            *p != ObjectProperty::top() && *p != ObjectProperty::bottom() && plain(c)
+        }
+        _ => false,
+    }
+}
+
+/// How far the interner's tables reached at one point of a run, to tell whether what
+/// was interned since holds anything that a run's choice of tier reads.
+struct TierMark {
+    nodes: usize,
+    roles: usize,
+    individuals: usize,
+    vals: usize,
+}
+
+impl TierMark {
+    fn of(it: &Interner) -> TierMark {
+        TierMark {
+            nodes: it.nodes.len(),
+            roles: it.roles.len(),
+            individuals: it.individuals.len(),
+            vals: it.vals.len(),
+        }
+    }
+
+    /// Whether the interner has gained, since the mark, an individual, a data value, a
+    /// data role, the top or bottom object property, or a nominal, self, data or
+    /// at-most-one restriction, which [`dl_norm::eligible`] and
+    /// [`Saturation::disj_allowed`] read.
+    fn passed(&self, it: &Interner) -> bool {
+        it.individuals.len() > self.individuals
+            || it.vals.len() > self.vals
+            || it.roles[self.roles..].iter().any(|r| match r {
+                index::RoleName::Data(_) => true,
+                index::RoleName::Object(p) => {
+                    *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
+                }
+                _ => false,
+            })
+            || it.nodes[self.nodes..].iter().any(|n| {
+                matches!(
+                    n,
+                    Node::Nominal(_) | Node::SelfLoop(_) | Node::DataSome(..) | Node::AtMost1(..)
+                )
+            })
+    }
 }
 
 /// Whether a change to the axiom affects the role table, which a run builds once.
@@ -843,6 +948,7 @@ impl Saturation {
             dirty: true,
             worlds: FxHashMap::default(),
             entangled: false,
+            stale_tier: false,
             consistent: true,
             dynamic: None,
             horn_tried: false,
@@ -932,6 +1038,7 @@ impl Saturation {
         if let Err(Error::Memory { .. }) = r
             && self.dl_tried
             && limits.threads != 1
+            && !limits.dl_steps
             && !limits.el_only
             && !self.partial_over
             && !self.numeric_halt
@@ -941,8 +1048,8 @@ impl Saturation {
             // depends on the order in which the threads delivered the contexts'
             // conclusions: the run starts again on one thread, whose order is fixed, before
             // it falls back to the Horn rules. A schedule that stays within the bound where
-            // one thread does not still answers in full, which the roadmap's item on a
-            // deterministic bound covers. Its charges draw first on what the pool admitted
+            // one thread does not still answers in full. A run in steps
+            // (`Limits::dl_steps`) derives the same on every schedule and does not repeat. Its charges draw first on what the pool admitted
             // for the first run.
             self.reset();
             self.dl_worked.store(false, Ordering::Relaxed);
@@ -1135,6 +1242,7 @@ impl Saturation {
     fn reset(&mut self) {
         self.index = None;
         self.interner = Interner::new();
+        self.stale_tier = false;
         self.ctx = Vec::new();
         self.dynamic = None;
     }
@@ -1337,6 +1445,9 @@ impl Saturation {
                 outside_el.add(dl::shape(k));
             }
         }
+        // what the interner holds before the normalizations outside OWL 2 EL, which
+        // intern into it whether or not they take their axioms
+        let mark = TierMark::of(&self.interner);
         // The Horn rules take what they can of these (items 603 and 692).
         let mut taken: FxHashSet<&AxiomKind> = FxHashSet::default();
         let stop = || poll(limits).is_err();
@@ -1404,6 +1515,10 @@ impl Saturation {
             );
         }
         self.interner.ranges.check()?;
+        // A fresh run decides its tier before these normalizations, so what they intern
+        // that the decision reads would keep a later run over this interner from Tier D.
+        // A run whose rules take it starts again anyway, as `entangled` says.
+        self.stale_tier |= mark.passed(&self.interner);
         ax.classes.extend(self.interner.met_classes());
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
@@ -1504,29 +1619,6 @@ impl Saturation {
         self.dl_tried = false;
         self.partial_over = false;
         self.numeric_halt = false;
-        let changes = changes.filter(|_| !again);
-        let full = self.entangled
-            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
-        self.worlds.clear();
-        if full {
-            self.interner = Interner::new();
-            self.ctx = Vec::new();
-        }
-        // the premises of the changed axioms, read from the interner before the index of
-        // the new axioms is built
-        let premises = match changes {
-            Some(c) if !full => {
-                let mut scratch = Axioms::default();
-                for &k in c.added.iter().chain(c.removed) {
-                    index::normalize(k, &mut self.interner, &mut scratch);
-                }
-                Some(scratch)
-            }
-            _ => None,
-        };
-        // The old index is no longer read. Drop its handles before constructing the
-        // replacement, while cached contexts retain their shared numeric ledger.
-        self.index = None;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
@@ -1544,6 +1636,43 @@ impl Saturation {
             .flatten()
             .collect();
         poll(limits)?;
+        let changes = changes.filter(|_| !again);
+        // The run decides its tier over the interner, which keeps the expressions of
+        // removed axioms and those that the premises below intern for added axioms
+        // outside OWL 2 EL, which a fresh run leaves to the rules outside it. One of
+        // them that the decision reads, such as a self restriction or the top property,
+        // could keep Tier D from the axioms outside OWL 2 EL, so such a run starts again.
+        let stale = self.stale_tier
+            || changes.is_some_and(|c| {
+                c.removed.iter().any(|k| !tier_neutral(k))
+                    || c.added.iter().any(|k| {
+                        !tier_neutral(k) && profiles::el_axiom(k).into_iter().next().is_some()
+                    })
+            });
+        let full = self.entangled
+            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)))
+            || stale && !outside.is_empty() && !limits.el_only;
+        self.worlds.clear();
+        if full {
+            self.interner = Interner::new();
+            self.ctx = Vec::new();
+        }
+        self.stale_tier = stale && !full;
+        // the premises of the changed axioms, read from the interner before the index of
+        // the new axioms is built
+        let premises = match changes {
+            Some(c) if !full => {
+                let mut scratch = Axioms::default();
+                for &k in c.added.iter().chain(c.removed) {
+                    index::normalize(k, &mut self.interner, &mut scratch);
+                }
+                Some(scratch)
+            }
+            _ => None,
+        };
+        // The old index is no longer read. Drop its handles before constructing the
+        // replacement, while cached contexts retain their shared numeric ledger.
+        self.index = None;
         let (ax, mut ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
@@ -1663,8 +1792,17 @@ impl Saturation {
         } else {
             limits.max_memory
         };
+        // With `Limits::dl_steps` every saturation of a run of Tier D that has a bound on
+        // its derived conclusions runs in steps. A run without the bound gives the same
+        // answer on every schedule and keeps the driver without steps. The ids of a rooted
+        // run's literals and of the eager strategy's contexts follow the order in which
+        // the threads make them, so those runs take one thread instead, whose order is
+        // fixed. The worlds and the taxonomy keep the caller's threads.
+        let fixed = limits.dl_steps && disj && dl_run.as_ref().is_some_and(|d| d.bounded());
+        let steps = fixed && rooted.is_none() && limits.expansion == Expansion::Cautious;
+        let saturation_threads = if fixed && !steps { 1 } else { threads };
         let bounds = Bounds {
-            threads,
+            threads: saturation_threads,
             deadline: limits.deadline,
             max_memory,
             cancelled: cancel_fn,
@@ -1674,6 +1812,7 @@ impl Saturation {
             dynamic: dynamic.as_ref(),
             dl: dl_run.as_ref(),
             partial: limits.partial && disj && with_taxonomy,
+            steps,
         };
         // the pool has been charged for the peak of a parallel normalization
         let more = base.saturating_sub(normalized_peak);
@@ -1714,6 +1853,10 @@ impl Saturation {
             (_, Some(s)) => {
                 self.dl_worked
                     .store(matches!(s, Stop::Work { .. }), Ordering::Relaxed);
+                #[cfg(test)]
+                if matches!(s, Stop::Work { .. }) {
+                    PASSED_AT.with(|p| p.set(dl_run.as_ref().map_or(0, |d| d.work())));
+                }
                 return Err(stopped(s));
             }
         };
@@ -1815,6 +1958,10 @@ impl Saturation {
         // fallback chain of `run_with` takes to the run that starts again, with counting
         // or the rooted rules left out, and the caller gets that run's answer.
         self.dl_worked.store(over_work, Ordering::Relaxed);
+        #[cfg(test)]
+        if over_work {
+            PASSED_AT.with(|p| p.set(dl_run.as_ref().map_or(0, |d| d.work())));
+        }
         if (!partial || over_work)
             && let Some(h) = halted.take()
         {
@@ -2586,6 +2733,13 @@ impl WorldBudget<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The conclusions that the last run of Tier D on this thread had derived when it
+    /// stopped at its bound on them, so that a test sees how far past the bound it went.
+    static PASSED_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn poll(limits: &Limits) -> Result<(), Error> {
     if limits.deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Error::Timeout);
@@ -2661,6 +2815,321 @@ mod tests {
                 answered,
                 "{threads} threads: no poll reached the saturation"
             );
+        }
+    }
+
+    /// An ontology whose saturation with counting takes more contexts than two steps of a
+    /// run in steps. Each `C` has two successors that a maximum merges, a union on the
+    /// merged successor gives `P`, every seventh `C` has disjoint fillers, and a filler
+    /// reaches the next `C` in one case of a union.
+    fn many_contexts(n: usize) -> Vec<Axiom> {
+        let mut text = String::from("Prefix(:=<http://ex.org/>)\nOntology(\n");
+        for i in 0..n {
+            text += &format!(
+                "SubClassOf(:C{i} ObjectSomeValuesFrom(:r :D{i}))
+                 SubClassOf(:C{i} ObjectSomeValuesFrom(:r :E{i}))
+                 SubClassOf(:C{i} ObjectMaxCardinality(1 :r))
+                 SubClassOf(:D{i} ObjectUnionOf(:F{i} :G{i}))
+                 SubClassOf(ObjectIntersectionOf(:F{i} :E{i}) :H{i})
+                 SubClassOf(:G{i} :H{i})
+                 SubClassOf(ObjectSomeValuesFrom(:r :H{i}) :P{i})
+                 SubClassOf(:E{i} ObjectUnionOf(:Q{i} ObjectSomeValuesFrom(:r :C{})))\n",
+                (i + 1) % n
+            );
+            if i % 7 == 0 {
+                text += &format!("DisjointClasses(:D{i} :E{i})\n");
+            }
+        }
+        text += ")";
+        crate::ofn_read::parse(&text).unwrap().axioms
+    }
+
+    /// Roadmap item 727: a run in steps over more contexts than one step takes, where
+    /// under test the workers share every step of two contexts and every delivery, derives
+    /// the same conclusions and the same answer on one, three and eight threads, and the
+    /// answer is that of a run without steps. A run that a cancellation stops fails or answers in
+    /// part, and the next run of that classifier gives the outcome of a new one.
+    #[test]
+    fn a_run_in_steps_over_many_steps_derives_the_same_on_every_number_of_threads() {
+        let n = 700;
+        let axioms = many_contexts(n);
+        let class = |s: String| Class::new(format!("http://ex.org/{s}"));
+        let limits = |threads: usize, dl_steps: bool| Limits {
+            threads,
+            counting: true,
+            dl_steps,
+            ..Limits::default()
+        };
+        // the answer on the classes the test reads, and what Tier D derived
+        let outcome = |out: &Classification| {
+            let mut got = Vec::new();
+            for i in 0..n {
+                got.push((
+                    out.taxonomy
+                        .is_subclass(&class(format!("C{i}")), &class(format!("P{i}"))),
+                    out.taxonomy
+                        .is_subclass(&class(format!("C{i}")), &Class::nothing()),
+                    out.taxonomy
+                        .is_subclass(&class(format!("D{i}")), &class(format!("H{i}"))),
+                ));
+            }
+            (
+                got,
+                out.stats.dl_work,
+                out.stats.dl_stored,
+                out.stats.dl_over_budget,
+            )
+        };
+        let first = {
+            let out = Classifier::of(&axioms).classify(&limits(1, true)).unwrap();
+            assert!(out.complete && !out.stats.dl_over_budget);
+            assert!(out.stats.contexts > 2 * saturate::STEP_CONTEXTS);
+            outcome(&out)
+        };
+        for (i, &(p, unsat, h)) in first.0.iter().enumerate() {
+            assert_eq!((p, unsat, h), (true, i % 7 == 0, false), "C{i}");
+        }
+        for threads in [3, 8] {
+            let out = Classifier::of(&axioms)
+                .classify(&limits(threads, true))
+                .unwrap();
+            assert_eq!(outcome(&out), first, "{threads} threads");
+        }
+        let default = Classifier::of(&axioms).classify(&limits(4, false)).unwrap();
+        assert_eq!(outcome(&default).0, first.0);
+        // a cancellation at its n-th poll, then the same classifier again
+        for threads in [1, 8] {
+            for at in [0, 3, 10, 30, 100, 300] {
+                let mut k = Classifier::of(&axioms);
+                let polls = Arc::new(AtomicUsize::new(0));
+                let p = polls.clone();
+                let stopped = k.classify(&Limits {
+                    partial: true,
+                    cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= at)),
+                    ..limits(threads, true)
+                });
+                match stopped {
+                    Err(Error::Cancelled) => {}
+                    Err(e) => panic!("{threads} threads, poll {at}: {e:?}"),
+                    Ok(out) if out.complete => assert_eq!(outcome(&out), first),
+                    Ok(out) => {
+                        for (i, &(p, unsat, h)) in outcome(&out).0.iter().enumerate() {
+                            assert!(p <= first.0[i].0 && unsat <= first.0[i].1 && !h);
+                        }
+                    }
+                }
+                let out = k.classify(&limits(threads, true)).unwrap();
+                assert_eq!(outcome(&out), first, "{threads} threads after poll {at}");
+            }
+        }
+    }
+
+    /// Roadmap item 727: a run that counts, which has a bound on its derived conclusions,
+    /// proceeds in steps by default, and `dl_steps: false` gives it the driver without
+    /// steps. A run without counting or the root has no bound and takes the driver
+    /// without steps whatever the option says. The poll of a cancellation sees which
+    /// driver calls it. Both drivers give a run that counts the same answer.
+    #[test]
+    fn a_run_with_a_bound_proceeds_in_steps_by_default_and_false_turns_them_off() {
+        use std::cell::Cell;
+        assert!(Limits::default().dl_steps);
+        let n = 700;
+        let axioms = many_contexts(n);
+        let class = |s: String| Class::new(format!("http://ex.org/{s}"));
+        // the drivers whose workers polled, as (in steps, without steps), and the answer
+        let run = |limits: Limits| {
+            let seen = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+            let s = seen.clone();
+            let out = Classifier::of(&axioms)
+                .classify(&Limits {
+                    threads: 4,
+                    cancelled: Some(Arc::new(move || {
+                        match saturate::WORKER.with(Cell::get) {
+                            saturate::STEP_CALLER | saturate::STEP_HELPER => {
+                                s[0].store(true, Ordering::Relaxed);
+                            }
+                            saturate::FIRST_WORKER | saturate::HELPER => {
+                                s[1].store(true, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                        false
+                    })),
+                    ..limits
+                })
+                .unwrap();
+            assert!(out.complete && !out.stats.dl_over_budget);
+            let answer: Vec<bool> = (0..n)
+                .map(|i| {
+                    out.taxonomy
+                        .is_subclass(&class(format!("C{i}")), &class(format!("P{i}")))
+                })
+                .collect();
+            (
+                seen[0].load(Ordering::Relaxed),
+                seen[1].load(Ordering::Relaxed),
+                answer,
+            )
+        };
+        let counting = Limits {
+            counting: true,
+            ..Limits::default()
+        };
+        let (steps, without, by_default) = run(counting.clone());
+        assert!(steps && !without);
+        assert!(by_default.iter().all(|&p| p));
+        let (steps, without, off) = run(Limits {
+            dl_steps: false,
+            ..counting
+        });
+        assert!(!steps && without);
+        assert_eq!(off, by_default);
+        // without counting the maximum is left out, so no `C` is below its `P`
+        for dl_steps in [true, false] {
+            let (steps, without, answer) = run(Limits {
+                dl_steps,
+                ..Limits::default()
+            });
+            assert!(!steps && without, "steps {dl_steps}");
+            assert!(answer.iter().all(|&p| !p), "steps {dl_steps}");
+        }
+    }
+
+    /// An inference of a run in steps that derives more conclusions than the run's bound
+    /// ends at its next look at the bounds, also when every conclusion is new and the
+    /// inference reserves memory for its record of them. `Z` holds 60 clauses with `A`,
+    /// 60 with `B` and three with `C`, which it processes in that order, so that each
+    /// of the three makes 3,600 new conclusions in one inference with
+    /// `A ⊓ B ⊓ C ⊑ D ⊔ E`. The maximum makes the run one that counts, which has the
+    /// bound. The reservation asked only the memory budget, so the activation derived
+    /// the 3,600 of the first inference before it looked at its count.
+    #[test]
+    fn a_wide_inference_of_a_run_in_steps_ends_once_it_passes_the_bound() {
+        let k = 60;
+        // The other classes of the unions come first, in an axiom that derives nothing,
+        // so that `A`, `B` and `C` are the maximal literals of their clauses.
+        let unions = |a: &str, p: &str, n: usize| {
+            let us: Vec<String> = (0..n)
+                .map(|i| format!("ObjectUnionOf(:{a} :{p}{i})"))
+                .collect();
+            us.join(" ")
+        };
+        let others: Vec<String> = (0..k)
+            .map(|i| format!(":P{i}"))
+            .chain((0..k).map(|i| format!(":Q{i}")))
+            .chain((0..3).map(|i| format!(":R{i}")))
+            .collect();
+        let text = format!(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+             SubClassOf(ObjectIntersectionOf({}) :W)
+             SubClassOf(:X ObjectMaxCardinality(1 :r))
+             SubClassOf(:Z ObjectIntersectionOf({} {} {}))
+             SubClassOf(ObjectIntersectionOf(:A :B :C) ObjectUnionOf(:D :E))
+             )",
+            others.join(" "),
+            unions("A", "P", k),
+            unions("B", "Q", k),
+            unions("C", "R", 3),
+        );
+        let doc = crate::ofn_read::parse(&text).unwrap();
+        // in the order of the document, which the order of the classes follows
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let limits = |threads: usize, dl_work: usize| Limits {
+            threads,
+            counting: true,
+            dl_steps: true,
+            dl_work: Some(dl_work),
+            ..Limits::default()
+        };
+        // the whole run derives each product
+        let whole = Saturation::new()
+            .classify(&axioms, None, &limits(1, 1 << 20))
+            .unwrap();
+        assert!(!whole.stats.dl_counting_over);
+        assert!(whole.stats.dl_work > 3 * k * k, "{}", whole.stats.dl_work);
+        for threads in [1, 4] {
+            PASSED_AT.with(|p| p.set(0));
+            let out = Saturation::new()
+                .classify(&axioms, None, &limits(threads, 300))
+                .unwrap();
+            assert!(out.stats.dl_counting_over);
+            let at = PASSED_AT.with(std::cell::Cell::get);
+            // the bound, the conclusions before the inference and those between two
+            // looks at the bounds
+            assert!(at > 300 && at < 1000, "{threads} threads: {at}");
+        }
+    }
+
+    /// A panic in a worker of a saturation ends the run with the panic, in a helper and
+    /// in the calling thread, in a run in steps and in a run without them. A helper that is
+    /// not to panic stays in the callback for a while, and the calling thread panics
+    /// only while a helper is there, so that it panics while a helper works in the same
+    /// saturation. The other workers waited for the one that panicked without end: those
+    /// of a run in steps at the barrier between the phases, and those of a run without steps
+    /// for a count of busy workers that never reached zero.
+    #[test]
+    fn a_panic_in_a_worker_ends_the_saturation_with_the_panic() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let axioms = many_contexts(700);
+        for dl_steps in [true, false] {
+            for in_helper in [true, false] {
+                let (first, helper) = if dl_steps {
+                    (saturate::STEP_CALLER, saturate::STEP_HELPER)
+                } else {
+                    (saturate::FIRST_WORKER, saturate::HELPER)
+                };
+                let (tx, rx) = std::sync::mpsc::channel();
+                let axioms = axioms.clone();
+                std::thread::spawn(move || {
+                    // the helpers that are in the callback now
+                    let waiting = Arc::new(AtomicUsize::new(0));
+                    // whether the callback panicked where the case wants it
+                    let fired = Arc::new(AtomicBool::new(false));
+                    let hit = fired.clone();
+                    let cancelled = move || {
+                        let at = saturate::WORKER.with(Cell::get);
+                        if at == helper && in_helper {
+                            hit.store(true, Ordering::Relaxed);
+                            panic!("the poll panics in a helper");
+                        } else if at == helper {
+                            // long enough for the calling thread's next poll, and
+                            // short enough for a saturation in which it has none left
+                            waiting.fetch_add(1, Ordering::SeqCst);
+                            let since = Instant::now();
+                            while !hit.load(Ordering::Relaxed)
+                                && since.elapsed() < Duration::from_millis(200)
+                            {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            waiting.fetch_sub(1, Ordering::SeqCst);
+                        } else if at == first && !in_helper && waiting.load(Ordering::SeqCst) > 0 {
+                            hit.store(true, Ordering::Relaxed);
+                            panic!("the poll panics in the calling thread");
+                        }
+                        false
+                    };
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Classifier::of(&axioms)
+                            .classify(&Limits {
+                                threads: 8,
+                                counting: true,
+                                dl_steps,
+                                cancelled: Some(Arc::new(cancelled)),
+                                ..Limits::default()
+                            })
+                            .is_ok()
+                    }));
+                    let _ = tx.send((run.is_err(), fired.load(Ordering::Relaxed)));
+                });
+                // the run ended with a panic, and the panic was the callback's
+                assert_eq!(
+                    rx.recv_timeout(Duration::from_secs(120)),
+                    Ok((true, true)),
+                    "steps {dl_steps}, in a helper {in_helper}"
+                );
+            }
         }
     }
 

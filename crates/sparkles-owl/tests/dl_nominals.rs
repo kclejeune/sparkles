@@ -417,6 +417,7 @@ fn a_rooted_run_past_its_bound_falls_back_though_it_may_answer_in_part() {
 
 /// A rooted run that counts keeps the counting bound: past it the run starts again
 /// without counting, with the rooted bound, and past that one without the rooted rules.
+/// It does so with `Limits::dl_steps` as without it (roadmap item 727).
 #[test]
 fn a_rooted_run_that_counts_falls_back_twice_past_a_tiny_bound() {
     let body = "ClassAssertion(ObjectUnionOf(:B :C) :a)
@@ -426,30 +427,28 @@ fn a_rooted_run_that_counts_falls_back_twice_past_a_tiny_bound() {
                 SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
     let ax = axioms(body);
     for (threads, partial) in [(1, false), (4, false), (1, true), (4, true)] {
-        let mut k = Classifier::of(&ax);
-        let out = k
-            .classify(&Limits {
-                threads,
-                rooted: true,
-                counting: true,
-                partial,
-                dl_work: Some(1),
-                ..Limits::default()
-            })
-            .unwrap();
-        assert!(
-            out.stats.dl_counting_over,
-            "{threads} threads, partial {partial}"
-        );
-        assert!(
-            out.stats.dl_rooted_over,
-            "{threads} threads, partial {partial}"
-        );
-        assert!(out.stats.dl_over_budget);
-        assert!(out.complete);
-        assert_eq!(out.consistency, Consistency::Consistent);
-        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
-        assert!(!k.excluded().is_empty());
+        for dl_steps in [false, true] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    rooted: true,
+                    counting: true,
+                    partial,
+                    dl_steps,
+                    dl_work: Some(1),
+                    ..Limits::default()
+                })
+                .unwrap();
+            let run = format!("{threads} threads, partial {partial}, steps {dl_steps}");
+            assert!(out.stats.dl_counting_over, "{run}");
+            assert!(out.stats.dl_rooted_over, "{run}");
+            assert!(out.stats.dl_over_budget, "{run}");
+            assert!(out.complete, "{run}");
+            assert_eq!(out.consistency, Consistency::Consistent);
+            assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+            assert!(!k.excluded().is_empty());
+        }
     }
     // with a bound the run finishes within, it answers in full with counting
     let out = rooted(body, true, &[("A", "D")]);
