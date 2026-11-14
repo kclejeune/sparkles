@@ -102,10 +102,12 @@ fn dataset(dir: &std::path::Path, universities: usize, profile: &Profile, stale:
 fn answer(r: &QueryResult) -> (usize, u64) {
     let mut rows: Vec<String> = r
         .rows()
+        .expect("the answer decodes")
         .into_iter()
         .map(|row| {
-            row.into_iter()
-                .map(|t| t.map_or("UNDEF".into(), |t| t.to_string()))
+            row.values()
+                .iter()
+                .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -306,7 +308,7 @@ fn main() {
                 }
                 _ => {}
             }
-            if let Some(applied) = &r.ctx.reasoning {
+            if let Some(applied) = r.reasoning() {
                 let d = format!(
                     "read={} derived={} tables={} cached={}",
                     applied.read,

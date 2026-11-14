@@ -160,7 +160,7 @@ impl ReasoningSession for AutoSession {
         s: Option<&oxrdf::Term>,
         p: Option<&oxrdf::Term>,
         o: Option<&oxrdf::Term>,
-    ) -> bool {
+    ) -> Result<bool> {
         self.inner.intensional(s, p, o)
     }
 

@@ -48,10 +48,11 @@ fn answers(ds: &Dataset, opts: &QueryOptions) -> (Vec<String>, Option<String>, b
     let r = ds.query_with(Q, opts).unwrap();
     let rows: Vec<String> = r
         .rows()
+        .unwrap()
         .into_iter()
-        .map(|row| row[0].as_ref().unwrap().to_string())
+        .map(|row| row.values()[0].as_ref().unwrap().to_string())
         .collect();
-    let applied = r.ctx.reasoning.clone().expect("auto applies");
+    let applied = r.reasoning().cloned().expect("auto applies");
     (rows, applied.header(), applied.reads_inferred())
 }
 
@@ -94,9 +95,8 @@ fn auto_reads_a_fresh_materialization_and_derives_over_a_stale_one() {
     let applied = ds
         .query_with(Q, &opts)
         .unwrap()
-        .ctx
-        .reasoning
-        .clone()
+        .reasoning()
+        .cloned()
         .unwrap();
     assert!(
         applied.nodes.is_empty() && applied.report.tables == 0,
@@ -192,7 +192,7 @@ fn auto_derives_what_the_materialization_cannot_hold() {
         "PREFIX ex: <http://ex.org/> SELECT ?x ?y { ?x a ex:B . ?x ex:knows ?y } ORDER BY ?x ?y";
     let r = ds.query_with(both, &opts).unwrap();
     assert_eq!(r.len(), 4, "every pair of B instances knows each other");
-    let applied = r.ctx.reasoning.clone().unwrap();
+    let applied = r.reasoning().cloned().unwrap();
     assert_eq!(applied.read, 1, "the type pattern reads");
     assert_eq!(applied.report.tables, 1, "the knows pattern derives");
     let (_, plan) = ds.explain(both, &opts).unwrap();
@@ -272,9 +272,8 @@ fn the_query_setting_names_the_default_mode_and_the_stale_policy() {
     let applied = ds
         .query_with(Q, &opts)
         .unwrap()
-        .ctx
-        .reasoning
-        .clone()
+        .reasoning()
+        .cloned()
         .unwrap();
     assert!(applied.reads_inferred());
 
@@ -343,9 +342,11 @@ fn auto_and_demand(data: &str, rules: &str, query: &str) -> (Vec<String>, Vec<St
             .query_with(query, opts)
             .unwrap()
             .rows()
+            .unwrap()
             .into_iter()
             .map(|row| {
-                row.iter()
+                row.values()
+                    .iter()
                     .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
                     .collect::<Vec<_>>()
                     .join(" ")

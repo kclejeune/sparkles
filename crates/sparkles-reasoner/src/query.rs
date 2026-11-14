@@ -1101,7 +1101,8 @@ impl Session {
             // the answer twice, since the overlay takes derived facts as absent from
             // the store.
             let axioms = self
-                .rules
+                .compiled
+                .rules()
                 .iter()
                 .filter(|r| r.atoms.is_empty() && r.builtins.is_empty());
             let mut seeds = seeds;

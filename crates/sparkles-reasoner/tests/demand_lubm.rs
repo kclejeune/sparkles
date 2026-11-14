@@ -53,8 +53,8 @@ fn demand(s: &Store, profile: Profile, name: &str) -> (usize, u64) {
         ..Default::default()
     };
     let result = query(s.snapshot(), &lubm_query(name), &opts).unwrap();
-    let derived = result.ctx.reasoning.as_ref().unwrap().report.derived;
-    (result.rows().len(), derived)
+    let derived = result.reasoning().unwrap().report.derived;
+    (result.rows().unwrap().len(), derived)
 }
 
 #[test]
