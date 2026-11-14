@@ -2873,12 +2873,16 @@ mod tests {
 
     /// A panic in a worker of a saturation ends the run with the panic, in a helper and
     /// in the calling thread, in a run in steps and in the default run. The callback
-    /// panics once the helpers have started. The other workers waited for the one that
-    /// panicked without end: those of a run in steps at the barrier between the phases,
-    /// and those of the default run for a count of busy workers that never reached zero.
+    /// panics once the helpers have started, and a helper that is not to panic stays in
+    /// the callback until the calling thread has, so that the calling thread panics
+    /// while a helper works in the same saturation. The other workers waited for the one
+    /// that panicked without end: those of a run in steps at the barrier between the
+    /// phases, and those of the default run for a count of busy workers that never
+    /// reached zero.
     #[test]
     fn a_panic_in_a_worker_ends_the_saturation_with_the_panic() {
         use std::cell::Cell;
+        use std::time::Duration;
         let axioms = many_contexts(700);
         for dl_steps in [true, false] {
             for in_helper in [true, false] {
@@ -2891,14 +2895,25 @@ mod tests {
                 let axioms = axioms.clone();
                 std::thread::spawn(move || {
                     let started = Arc::new(AtomicBool::new(false));
+                    // whether the callback panicked where the case wants it
+                    let fired = Arc::new(AtomicBool::new(false));
+                    let hit = fired.clone();
                     let cancelled = move || {
                         let at = saturate::WORKER.with(Cell::get);
                         if at == helper {
                             started.store(true, Ordering::Relaxed);
                             if in_helper {
+                                hit.store(true, Ordering::Relaxed);
                                 panic!("the poll panics in a helper");
                             }
+                            let since = Instant::now();
+                            while !hit.load(Ordering::Relaxed)
+                                && since.elapsed() < Duration::from_secs(30)
+                            {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
                         } else if at == first && !in_helper && started.load(Ordering::Relaxed) {
+                            hit.store(true, Ordering::Relaxed);
                             panic!("the poll panics in the calling thread");
                         }
                         false
@@ -2914,11 +2929,12 @@ mod tests {
                             })
                             .is_ok()
                     }));
-                    let _ = tx.send(run.is_err());
+                    let _ = tx.send((run.is_err(), fired.load(Ordering::Relaxed)));
                 });
+                // the run ended with a panic, and the panic was the callback's
                 assert_eq!(
-                    rx.recv_timeout(std::time::Duration::from_secs(120)),
-                    Ok(true),
+                    rx.recv_timeout(Duration::from_secs(120)),
+                    Ok((true, true)),
                     "steps {dl_steps}, in a helper {in_helper}"
                 );
             }
