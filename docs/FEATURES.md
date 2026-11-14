@@ -130,7 +130,8 @@ preset's model, answers 101 of 150 held-out QALD-9-plus questions at $0.0019 eac
 within the noise of GPT-6.1 Sol, while Opus 5.5 answers 114.
 
 [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
-and execution timings while the remaining accuracy and latency work stays open.
+and execution timings. An ambiguous mention is asked about before the rest of the
+grounding is read, so a clarification arrives in about half the time.
 Anthropic providers use [prompt caching](ai/README.md#questions-in-plain-language) for
 the stable start of each prompt, and budgets price cache writes and reads apart.
 

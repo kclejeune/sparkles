@@ -2,7 +2,7 @@
 
 > **Status:** implemented in part (Phases 1, 2, 2b, 3, 3m-a, 3m-b, 4 and 5)
 
-Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 90, 263 and 318.
+Ask, query explanations, document ingestion and agent-memory workflows are available. The remaining evaluation, ingestion, verified-rewrite, grounding and latency work is tracked under items 6, 15, 27, 77, 81, 90, 263 and 914.
 
 ## Documents
 

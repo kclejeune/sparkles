@@ -199,6 +199,10 @@ when the tool returns one. Each scoped completion also records a process-generat
 and the context-window size when selected. These remain in JSON logs without
 ancestor span lists. Standalone tool stages have no Ask identifier. These are diagnostic fields, not metric labels.
 The added fields contain no questions, labels, entity IRIs, prompts or error messages.
+An initial ask that stops because a mention links ambiguously records the total
+grounding stage, the linker with any nested vector search and, with type hints, the two
+schema stages, because it asks before reading the rest of the context. A clarification
+that the draft model asks for comes after the whole grounding.
 
 Nested stages identify example-query and example-document embedding preparation and
 linker vector search. These include caches, admission and any local or remote model
@@ -796,10 +800,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   answers, and wrong query shape most of the rest. Property path evaluation runs within
   Ask's query memory budget and timeout, so a generated query with a property path fails
   with the usual error rather than exhausting memory. Model-dependent accuracy and
-  contextual namesake resolution remain open. Roadmap item 263. The median end-to-end
-  latency is also higher. Roadmap item 318. Local and OpenAI-compatible models, LC-QuAD
-  2.0, which needs a Wikidata load from the full dump, and an evaluation of independent
-  roles have not run. Roadmap item 6.
+  contextual namesake resolution remain open. Roadmap item 263. Model calls take most of
+  an answer's time. A fresh `sparkles ask` process also spends about half a second
+  before its first draft computing the schema context that a running server keeps. Roadmap item 914. Local and
+  OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from the full dump,
+  and an evaluation of independent roles have not run. Roadmap item 6.
 * Prompt caching has not been measured against Anthropic. Neither the cache hit rate of
   real calls nor Ask's accuracy with its grounding reordered for the cache has run.
   Roadmap item 503.
@@ -870,7 +875,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 318](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item 503](../ROADMAP.md).
+The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item 503](../ROADMAP.md), [item 914](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

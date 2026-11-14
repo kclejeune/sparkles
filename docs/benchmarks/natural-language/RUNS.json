@@ -298,6 +298,61 @@
           "schema": 1
         }
       }
+    },
+    {
+      "run_id": "sha256-c55e10015b5f0cff33829b238be21bceb01589c9b976789f1366a8465ab21edd",
+      "path": "runs/2026-11-13-ask-latency-paid/record.json",
+      "sha256": "c55e10015b5f0cff33829b238be21bceb01589c9b976789f1366a8465ab21edd",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "effort": "medium",
+          "contextTokens": 200000,
+          "askDeadlineSecs": 300,
+          "queryTimeoutSecs": 60,
+          "askTokenBudget": 100000,
+          "clarifications": "answer",
+          "batch": false,
+          "jobs": 1,
+          "maxOutputTokens": {
+            "anthropic": 4096,
+            "openai": 16384
+          }
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "stanley, a 16-thread laptop with 30 GiB of RAM running other lanes' builds and tests",
+          "kind": "paid interleaved A/B, one child per ask",
+          "schema": 1
+        }
+      }
+    },
+    {
+      "run_id": "sha256-c913fafa0678312eff34e695a11e1bd6a9179c904d16cfeee455eb028bb80156",
+      "path": "runs/2026-11-13-ask-latency-offline/record.json",
+      "sha256": "c913fafa0678312eff34e695a11e1bd6a9179c904d16cfeee455eb028bb80156",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": null,
+        "scale": null,
+        "manifest": null,
+        "settings": {
+          "contextTokens": 200000,
+          "clarifications": "answer",
+          "jobs": 1,
+          "profileStages": true,
+          "pageCache": "warm, the runs follow one another with the database already read by earlier runs"
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": "stanley, a 16-thread laptop with 30 GiB of RAM running other lanes' builds and tests",
+          "kind": "offline fake-provider stage profiles, no provider call",
+          "schema": 1
+        }
+      }
     }
   ]
 }

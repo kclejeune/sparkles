@@ -101,6 +101,19 @@ where it derived 2,122,545, and seven of 750 generated ontologies come within th
 bound of the counting run on one thread, with none leaving it. The fixture `shq-041`
 finishes without the order between number restrictions, where it passed any bound.
 
+### Ask latency
+
+An ask whose question names an ambiguous mention now asks which one is meant before it
+reads the schema, the stored examples, the predicate use and the communities of the
+linked entities, which only a draft uses. With type hints the schema is still read
+first. A
+clarification arrives in about 0.45 s instead of 1.0 to 1.2 s from a fresh
+`sparkles ask` process on DBpedia, and in 0.15 s instead of 0.29 s from a running one.
+Draft prompts are unchanged. The `ground` event of a clarification lists the linked
+entities only, and its `usage.grounding` reports no schema terms or examples (roadmap
+item 318). `scripts/eval-ask --profile-stages` records the Ask stage diagnostics of
+each evaluation child.
+
 ### Compatibility
 
 The experimental Rust memory-admission API uses an opaque `ParentHandle` in place

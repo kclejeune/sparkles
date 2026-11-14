@@ -1,0 +1,13 @@
+[
+ {
+  "day": "2026-11-13",
+  "model": "gpt-6-luna",
+  "providerUsd": 0.4624,
+  "requests": 986,
+  "input": 1425562,
+  "cache_read": 5971579,
+  "output": 454628,
+  "ledgerUsd": 0.4904,
+  "diffUsd": 0.028
+ }
+]

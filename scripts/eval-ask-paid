@@ -48,6 +48,7 @@ FIELDS = {
     "clarifications",
     "contextTokens",
     "askOptions",
+    "profileStages",
 }
 
 
@@ -89,6 +90,8 @@ def load_run(path):
     context = run.get("contextTokens")
     if context is not None and (type(context) is not int or not 0 < context <= 10**7):
         raise Invalid("contextTokens is a positive integer")
+    if type(run.get("profileStages", False)) is not bool:
+        raise Invalid("profileStages is true or false")
     if run.get("clarifications", "answer") not in mod_clarifications():
         raise Invalid("unknown clarification policy")
     for set_ in run["sets"]:
@@ -286,6 +289,7 @@ def main():
         "clarifications": run.get("clarifications", "answer"),
         "contextTokens": run.get("contextTokens"),
         "askOptions": run.get("askOptions", []),
+        "profileStages": run.get("profileStages") is True,
         "jobs": args.jobs,
         "batch": not args.no_batch,
         "sets": {},
@@ -339,6 +343,8 @@ def main():
             argv += ["--clarifications", run.get("clarifications", "answer")]
             for flag in run.get("askOptions", []):
                 argv += ["--ask-option=" + flag]
+            if run.get("profileStages") is True:
+                argv.append("--profile-stages")
             argv += ["--jobs", str(args.jobs)]
             if not args.no_batch:
                 argv.append("--batch")
