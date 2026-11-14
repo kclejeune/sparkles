@@ -485,8 +485,9 @@ no permit.
 
   `DatasetGraphSparkles.containsAll` is the batched call. It encodes a batch of quads
   into one request, in which a shared term is sent once, and one native call returns a
-  byte for each quad. The native side looks the id of each distinct term up once and
-  probes the index by ids. In batches of 64 probes inside one read transaction, a probe
+  byte for each quad. For a quad whose four terms are given, the native side looks the
+  id of each distinct term up once and probes the index by ids. A pattern with a
+  wildcard is answered as `contains` answers it. In batches of 64 probes inside one read transaction, a probe
   took about 0.30 µs against 0.81 µs for `Graph.contains` in a transaction of its own,
   at a load of 7. TIM answered the same batch one by one in 0.15 µs each in one
   transaction, and a single probe in its own transaction in 0.42 µs. A profile of the
