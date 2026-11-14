@@ -674,10 +674,26 @@ fn cursors_run_pattern_plans_without_materializing() {
         let (slow, _) = rows(q, Optimizations::NONE, FallbackPolicy::AllowMaterialization);
         assert_eq!(fast, slow, "{q}");
     }
+    // the pairs stream from the patterns a batch at a time, corrected for the delta
+    let q = "SELECT ?s ?p WHERE { ?s spk:hasPredicate ?p }";
+    let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::RejectMaterialization);
+    assert!(plan.contains("PatternScan"), "{plan}");
+    let (slow, _) = rows(q, Optimizations::NONE, FallbackPolicy::AllowMaterialization);
+    assert_eq!(fast, slow);
+    // and a LIMIT stops the scan at the rows it asks for
     let q = "SELECT ?s ?p WHERE { ?s spk:hasPredicate ?p } LIMIT 5";
-    let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::AllowMaterialization);
-    assert!(!plan.contains("PatternScan"), "{plan}");
+    let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::RejectMaterialization);
     assert_eq!(fast.len(), 5);
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    fn find<'a>(p: &'a serde_json::Value, op: &str) -> Option<&'a serde_json::Value> {
+        if p["operator"]["operator"] == op {
+            return Some(p);
+        }
+        p["children"].as_array()?.iter().find_map(|c| find(c, op))
+    }
+    let scan = find(&plan, "PatternScan").unwrap_or_else(|| panic!("{plan}"));
+    assert_eq!(scan["operator"]["actualRows"], 5, "{plan}");
+    assert_eq!(scan["materializes"], false, "{plan}");
 }
 
 /// A partial compaction with patterns turned off writes none.
@@ -789,4 +805,168 @@ fn a_limited_scan_checks_its_final_rows() {
     // and within the limit it answers as the generic plan does
     let r = same(&s, &text, Some(true));
     assert_eq!(r.len(), 1000);
+}
+
+/// A constant subject's predicates come at most a batch at a time, so a LIMIT reads one
+/// of a subject's three hundred predicates in every mode, within a row budget of two.
+#[test]
+fn constant_subject_scans_follow_their_demand() {
+    use crate::sparql::cursor::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let s = Store::in_memory(StoreOptions::default());
+    let data: String = (0..300)
+        .map(|i| format!("<urn:s> <urn:p{i}> 1 .\n"))
+        .collect();
+    load(&s, &data, RdfFormat::Turtle);
+    let text = format!("{SPK}SELECT ?p WHERE {{ <urn:s> spk:hasPredicate ?p }}");
+    let limited = format!("{text} LIMIT 1");
+    let tight = QueryOptions {
+        max_rows: Some(2),
+        ..opts(Optimizations::ALL)
+    };
+    for mode in [
+        ExecutionMode::Eager,
+        ExecutionMode::Streaming,
+        ExecutionMode::Auto,
+    ] {
+        let execution = query_execution(
+            s.snapshot(),
+            &limited,
+            &tight,
+            &CursorOptions::default(),
+            mode,
+        )
+        .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        let plan = execution.plan_json().unwrap();
+        assert!(plan.contains("PatternScan"), "{plan}");
+        let rows = match execution {
+            QueryExecution::Select(mut c) => {
+                let mut n = 0;
+                while let Some(b) = c.next_batch().unwrap() {
+                    n += b.len();
+                }
+                n
+            }
+            QueryExecution::Eager(r) => r.result().len(),
+            _ => unreachable!("a SELECT"),
+        };
+        assert_eq!(rows, 1, "{mode:?}");
+    }
+    // a cursor of one row a batch hands out every predicate, one at a time
+    let c = CursorOptions {
+        batch_rows: 1,
+        ..Default::default()
+    };
+    let mut cur =
+        crate::sparql::select_cursor(s.snapshot(), &text, &opts(Optimizations::ALL), &c).unwrap();
+    let mut n = 0;
+    while let Some(b) = cur.next_batch().unwrap() {
+        assert!(b.len() <= 1);
+        n += b.len();
+    }
+    assert_eq!(n, 300);
+}
+
+/// A cursor's pattern scan charges the block of subjects it decodes and keeps between
+/// pulls, and releases it once the scan ends.
+#[test]
+fn pattern_scan_cursors_charge_their_decoded_block() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s, &films(), RdfFormat::TriG);
+    let text = format!("{PREFIXES}{SPK}SELECT ?s ?p WHERE {{ ?s spk:hasPredicate ?p }}");
+    let c = crate::sparql::cursor::CursorOptions {
+        batch_rows: 1,
+        ..Default::default()
+    };
+    let mut cur =
+        crate::sparql::select_cursor(s.snapshot(), &text, &opts(Optimizations::ALL), &c).unwrap();
+    let before = cur.stats().mem_peak_bytes;
+    assert_eq!(cur.next_batch().unwrap().map(|b| b.len()), Some(1));
+    // the decoded block of subjects alone is BLOCK_SUBJECTS pairs of 16 bytes
+    let grown = cur.stats().mem_peak_bytes - before;
+    assert!(
+        grown >= crate::patterns::BLOCK_SUBJECTS as u64 * 16,
+        "the first pull raised the peak by {grown} bytes"
+    );
+    while cur.next_batch().unwrap().is_some() {}
+}
+
+/// An eager pattern scan charges the patterns its reader keeps decoded while it reads,
+/// although it drops them once it has read every pair (review round 2).
+#[test]
+fn eager_pattern_scans_charge_their_kept_patterns() {
+    let peak = |distinct: bool| {
+        let s = Store::in_memory(StoreOptions::default());
+        let data: String = (0..6000)
+            .map(|i| {
+                let p = if distinct { i } else { 0 };
+                format!("<urn:s{i}> <urn:p{p}> 1 .\n")
+            })
+            .collect();
+        load(&s, &data, RdfFormat::Turtle);
+        let text = format!("{SPK}SELECT ?s ?p WHERE {{ ?s spk:hasPredicate ?p }}");
+        let r = query(s.snapshot(), &text, &opts(Optimizations::ALL)).unwrap();
+        assert!(has_op(r.plan(), "PatternScan"));
+        assert_eq!(r.len(), 6000);
+        r.mem_peak_bytes
+    };
+    let (one, many) = (peak(false), peak(true));
+    // the reader keeps the first KEPT_PATTERNS patterns, each a slot of 24 bytes and a
+    // list of its predicates, where one pattern keeps one
+    assert!(
+        many >= one + 4096 * 24,
+        "one pattern peaked at {one} bytes and 6,000 at {many}"
+    );
+}
+
+/// A constant subject's scan charges its predicate list once and decodes no block of
+/// subjects, so its pulls charge no block (review round 2).
+#[test]
+fn constant_subject_pulls_charge_no_subject_block() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data: String = (0..3000)
+        .map(|i| format!("<urn:s> <urn:p{i}> 1 .\n"))
+        .collect();
+    load(&s, &data, RdfFormat::Turtle);
+    let text = format!("{SPK}SELECT ?p WHERE {{ <urn:s> spk:hasPredicate ?p }}");
+    let c = crate::sparql::cursor::CursorOptions {
+        batch_rows: 1,
+        ..Default::default()
+    };
+    let mut cur =
+        crate::sparql::select_cursor(s.snapshot(), &text, &opts(Optimizations::ALL), &c).unwrap();
+    let before = cur.stats().mem_peak_bytes;
+    let mut n = 0;
+    while let Some(b) = cur.next_batch().unwrap() {
+        n += b.len();
+    }
+    assert_eq!(n, 3000);
+    // The list of 3,000 predicates, with the reader's allowance for growth, and a
+    // batch raised the peak by 41,336 bytes, and by 49,316 when every pull charged a
+    // block of subjects as well.
+    let grown = cur.stats().mem_peak_bytes - before;
+    assert!(grown < 45_000, "the pulls raised the peak by {grown} bytes");
+}
+
+/// A LIMIT of no rows over a pattern scan reads no pattern, so it charges no predicate
+/// list however many predicates its subject has (review round 5).
+#[test]
+fn a_limit_of_no_rows_reads_no_pattern() {
+    let peak = |predicates: usize| {
+        let s = Store::in_memory(StoreOptions::default());
+        let data: String = (0..predicates)
+            .map(|i| format!("<urn:s> <urn:p{i}> 1 .\n"))
+            .collect();
+        load(&s, &data, RdfFormat::Turtle);
+        let text = format!("{SPK}SELECT ?p WHERE {{ <urn:s> spk:hasPredicate ?p }} LIMIT 0");
+        let r = query(s.snapshot(), &text, &opts(Optimizations::ALL)).unwrap();
+        assert!(has_op(r.plan(), "PatternScan"));
+        assert_eq!(r.len(), 0);
+        r.mem_peak_bytes
+    };
+    let (one, many) = (peak(1), peak(3000));
+    // the list of 3,000 predicates alone is 24,000 bytes
+    assert!(
+        many < one + 8_000,
+        "one predicate peaked at {one} bytes and 3,000 at {many}"
+    );
 }

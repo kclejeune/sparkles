@@ -1156,8 +1156,10 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
+    // An ASK pulls one row through the cursor, which stops at it, unless the planner
+    // found its input small enough to run whole (item 827).
     if kind == QueryKind::Ask {
-        return filtered_ask_admitted(ctx, node);
+        return !super::demand::whole_slice(node);
     }
     // A plan expected to pass the row budgets stays eager, so that it fails before the
     // first byte of output with an error status rather than partway through a stream.
@@ -1203,218 +1205,6 @@ fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions) -> u64 {
         .saturating_add((cap as u64).saturating_mul(row_bytes))
         .saturating_add((ctx.nvars() as u64).saturating_mul(16))
         .saturating_add(4096)
-}
-
-/// An ASK with a pure equality filter can stop at its first matching pair instead
-/// of materializing an over-budget Cartesian candidate table. Keep the ordinary
-/// path for cheap queries and restrict this policy to the measured native shape.
-fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
-    use super::plan::JoinAlgo;
-
-    if !ctx.snap.delta.is_empty() || ctx.calls_extensions {
-        return false;
-    }
-    let Kind::Slice {
-        offset: 0,
-        limit: Some(1),
-    } = node.kind
-    else {
-        return false;
-    };
-    let Some(mut filtered) = node.children.first() else {
-        return false;
-    };
-    // The planner may project the ASK pattern's in-scope variables. Bound this
-    // transparent wrapper walk before doing any expression or subtree inspection.
-    for _ in 0..8 {
-        if !matches!(filtered.kind, Kind::Project(_)) || filtered.children.len() != 1 {
-            break;
-        }
-        filtered = &filtered.children[0];
-    }
-    // A large keyed ASK can avoid reading either input whole. When the smaller
-    // input and a prefix of the larger one fit, limited eager execution is cheaper
-    // for estimated-small inputs, especially a selective filter that proves empty.
-    if let Kind::KeyedJoin { .. } = filtered.kind {
-        let [a, b] = filtered.children.as_slice() else {
-            return false;
-        };
-        if !a.est.is_finite() || !b.est.is_finite() || a.est < 0.0 || b.est < 0.0 {
-            return false;
-        }
-        let (small, large) = if a.est <= b.est { (a, b) } else { (b, a) };
-        let prefix = large.est.min(64.0);
-        let candidates = small.est * prefix;
-        let held =
-            small.est * (small.vars.len() * 8) as f64 + prefix * (large.vars.len() * 8) as f64;
-        let bytes = candidates * ((filtered.vars.len() + 1) * 8) as f64 + held;
-        let bounded = candidates <= ctx.max_rows as f64
-            && bytes <= ctx.memory_remaining() as f64
-            && exact_scan(ctx, a)
-            && exact_scan(ctx, b);
-        return (small.est >= AUTO_SCAN_ROWS || !bounded) && native(filtered);
-    }
-    let Kind::Filter(expressions) = &filtered.kind else {
-        return false;
-    };
-    let [Expr::Eq(left, right)] = expressions.as_slice() else {
-        return false;
-    };
-    let (Expr::Var(left), Expr::Var(right)) = (&**left, &**right) else {
-        return false;
-    };
-    let [product] = filtered.children.as_slice() else {
-        return false;
-    };
-    let Kind::Join {
-        algo: JoinAlgo::Cross,
-        ..
-    } = product.kind
-    else {
-        return false;
-    };
-    let [a, b] = product.children.as_slice() else {
-        return false;
-    };
-    if !((a.certain.contains(left) && b.certain.contains(right))
-        || (a.certain.contains(right) && b.certain.contains(left)))
-    {
-        return false;
-    }
-    if !a.est.is_finite() || !b.est.is_finite() || a.est < 0.0 || b.est < 0.0 {
-        return false;
-    }
-    let rows = product.est;
-    let bytes = rows * (product.vars.len().max(1) * 8) as f64;
-    if !rows.is_finite()
-        || rows <= 0.0
-        || !bytes.is_finite()
-        || (rows <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64)
-    {
-        return false;
-    }
-    // Only exact scan counts prove that run_limited's first 64-row prefix is
-    // cheap. Repeated-variable and graph/dedup estimates can undercount its work.
-    fn exact_scan(ctx: &Ctx, node: &Node) -> bool {
-        let Kind::Scan(scan) = &node.kind else {
-            return false;
-        };
-        scan.eqs.is_empty()
-            && !scan.dedup
-            && (matches!(scan.graph, super::plan::GraphFilter::All)
-                || scan
-                    .prefix
-                    .get(scan.graph_col)
-                    .is_some_and(|g| scan.graph.accepts(*g))
-                || (ctx.snap.generation.stats.graphs.len() == 1
-                    && scan.graph.accepts(ctx.snap.generation.stats.graphs[0].0)))
-    }
-    if exact_scan(ctx, a) && exact_scan(ctx, b) {
-        let (small, large) = if a.est <= b.est { (a, b) } else { (b, a) };
-        let prefix = large.est.min(64.0);
-        let candidates = small.est * prefix;
-        let held =
-            small.est * (small.vars.len() * 8) as f64 + prefix * (large.vars.len() * 8) as f64;
-        let bytes = candidates * ((product.vars.len() + 1) * 8) as f64 + held;
-        if candidates <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64 {
-            return false;
-        }
-    }
-    // No effects, expressions or eager fallbacks are hidden below the equality.
-    // The count also bounds recursion and work on large rejected plans.
-    fn plain(node: &Node, remaining: &mut usize) -> bool {
-        if *remaining == 0 {
-            return false;
-        }
-        *remaining -= 1;
-        let shape = match &node.kind {
-            Kind::Scan(_) | Kind::Values(_) | Kind::Empty => node.children.is_empty(),
-            Kind::Join { .. } => node.children.len() == 2,
-            Kind::Project(_) | Kind::Sort(_) => node.children.len() == 1,
-            _ => false,
-        };
-        shape && node.children.iter().all(|child| plain(child, remaining))
-    }
-    plain(product, &mut 64) && native(product)
-}
-
-/// Only an admitted pure ASK product is oriented: build the same smaller input
-/// that eager limited execution collects, while streaming the larger one. Other
-/// cursor and eager plans retain their original children and variable order.
-/// Any other shape, which a future cursor admission might pass here, is left alone.
-fn orient_filtered_ask(node: &mut Node, ctx: &Ctx, options: &CursorOptions) {
-    use super::plan::JoinAlgo;
-
-    let Some(mut filtered) = node.children.first_mut() else {
-        return;
-    };
-    for _ in 0..8 {
-        if !matches!(filtered.kind, Kind::Project(_)) || filtered.children.len() != 1 {
-            break;
-        }
-        filtered = &mut filtered.children[0];
-    }
-    if let Kind::KeyedJoin { ripple, .. } = &mut filtered.kind {
-        // the first matching pair answers the ASK
-        *ripple = filtered.children.len() == 2;
-        for input in &mut filtered.children {
-            first_rows(input, ctx, options.batch_rows);
-        }
-        return;
-    }
-    if !matches!(filtered.kind, Kind::Filter(_)) {
-        return;
-    }
-    let Some(product) = filtered.children.first_mut() else {
-        return;
-    };
-    if matches!(
-        product.kind,
-        Kind::Join {
-            algo: JoinAlgo::Cross,
-            ..
-        }
-    ) && product.children.len() == 2
-        && product.children[0].est < product.children[1].est
-    {
-        product.children.swap(0, 1);
-    }
-}
-
-/// A ripple join reads its inputs a few rows at a time, so a hash join below it that
-/// reads one input whole before its first row costs more than probing the index of a
-/// pattern for each row it needs. Each hash join with a triple pattern as one input
-/// becomes an index join from its other input into that pattern, when that input
-/// always binds the pattern's key and the index join keeps the order the hash join
-/// promised.
-fn first_rows(node: &mut Node, ctx: &Ctx, batch_rows: usize) {
-    use super::plan::JoinAlgo;
-    for child in &mut node.children {
-        first_rows(child, ctx, batch_rows);
-    }
-    if !matches!(
-        node.kind,
-        Kind::Join {
-            algo: JoinAlgo::Hash,
-            ..
-        }
-    ) || node.children.len() != 2
-    {
-        return;
-    }
-    for drive in [0, 1] {
-        if let Some(joined) = super::indexjoin::index_join_for_first_rows(
-            &node.children[drive],
-            &node.children[1 - drive],
-            ctx,
-            batch_rows,
-        ) && joined.sorted.starts_with(&node.sorted)
-            && joined.vars.len() == node.vars.len()
-        {
-            *node = joined;
-            return;
-        }
-    }
 }
 
 /// The estimated input rows from which automatic execution streams a grouping. The
@@ -1644,27 +1434,12 @@ fn largest_output_bytes(node: &Node) -> f64 {
         .fold(own, f64::max)
 }
 
-/// Whether every operator of `node` has a cursor implementation, so that a cursor
-/// over it runs no eager subtree. An operator that evaluates EXISTS counts as not
-/// native here, since whether its patterns stream is known only once they are built.
-pub(super) fn native(node: &Node) -> bool {
-    !own_exprs(&node.kind).iter().any(|e| e.has_exists())
-        && (supported(&node.kind)
-            || binary::eligible(node)
-            || group::eligible(node)
-            || expand::eligible(node)
-            || walk::eligible(node)
-            || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
-                && node.children.len() == 1))
-        && node.children.iter().all(native)
-}
-
 /// How deep automatic admission follows EXISTS patterns nested in EXISTS patterns. A
 /// deeper nesting keeps the plan eager.
 const AUTO_EXISTS_DEPTH: usize = 4;
 
-/// Whether every operator of `node` has a cursor implementation, as [`native`] asks,
-/// where a FILTER conjunct or a BIND expression that is `EXISTS { P }` or
+/// Whether every operator of `node` has a cursor implementation, so that a cursor over
+/// it runs no eager subtree, where a FILTER conjunct or a BIND expression that is `EXISTS { P }` or
 /// `NOT EXISTS { P }` also counts when the cursor can answer it from a key set and the
 /// plan of `P` counts in turn. The key set is filled by a child cursor under the query's
 /// charges. An EXISTS inside a larger expression, such as IF or OR, is evaluated once
@@ -1862,7 +1637,7 @@ pub fn query_execution_with_plan(
                 return Err(Error::invalid("cursor batch rows and bytes must be positive").into());
             }
             let planning = Instant::now();
-            let mut prepared =
+            let prepared =
                 super::prepare_query(snapshot, &parsed, options, Some(started), Some(cursor))?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let kind = prepared.kind;
@@ -1879,9 +1654,6 @@ pub fn query_execution_with_plan(
                 && retryable(&prepared.node)
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.streams() {
-                if kind == QueryKind::Ask {
-                    orient_filtered_ask(&mut prepared.node, &prepared.ctx, cursor);
-                }
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
                     kind,
@@ -2493,6 +2265,151 @@ pub(super) fn spilled_join(ctx: &Arc<Ctx>, node: Node, out: &mut Table) -> Resul
     Ok(())
 }
 
+/// Run `node` as cursor operators until they have produced `want` rows or ended, for an
+/// eager LIMIT without ORDER BY or an ASK, which any `want` of its solutions answer
+/// (item 827). The operators read their inputs a batch at a time and stop when their
+/// consumer stops asking, so a scan reads the blocks the rows come from and a UNION
+/// reads its branches in order until it has the rows. Returns the rows, the plan of
+/// what ran, with the nodes that stopped before their end marked, and whether the
+/// input ended. The rows keep the order the plan claims for `node`, which an eager
+/// operator above may rely on. A context that was never shared, as some unit tests
+/// build, runs `node` whole.
+pub(super) fn pull<'ctx>(
+    ctx: &'ctx Ctx,
+    node: &Node,
+    want: usize,
+) -> Result<(super::table::Materialized<'ctx>, PlanInfo, bool)> {
+    pull_planned(ctx, node, want, true)
+}
+
+/// Whether `node` has a solution, pulled through cursor operators as [`pull`] pulls
+/// it, without its plan, for the per-row evaluation of an EXISTS pattern.
+pub(super) fn has_solution(ctx: &Ctx, node: &Node) -> Result<bool> {
+    let (rows, _, _) = pull_planned(ctx, node, 1, false)?;
+    Ok(!rows.table.is_empty())
+}
+
+fn pull_planned<'ctx>(
+    ctx: &'ctx Ctx,
+    node: &Node,
+    want: usize,
+    planned: bool,
+) -> Result<(super::table::Materialized<'ctx>, PlanInfo, bool)> {
+    let Some(shared) = ctx.shared() else {
+        let (rows, info) = exec::execute_materialized(ctx, node)?;
+        return Ok((rows, info, true));
+    };
+    let options = CursorOptions::default();
+    // The operators keep a copy of the plan, such as its tables of values, until they
+    // drop, which they do before this charge.
+    let _plan = OwnedCharge::new(&shared, plan_bytes(node))?;
+    let mut root = Operator::build(&shared, node.clone(), FallbackPolicy::AllowMaterialization)?;
+    let mut out = Buffer::new(&shared, &root.vars, 0)?;
+    let ran = (|| {
+        while out.table.len < want {
+            match root.next(&shared, &options, want - out.table.len)? {
+                Some(batch) => {
+                    let rows = out.table.len + batch.table.len;
+                    ctx.check_output(rows, out.table.width())?;
+                    merge::append(&shared, &mut out, &batch.table, 0..batch.table.len)?;
+                }
+                None => break,
+            }
+        }
+        Ok(())
+    })();
+    let ended = root.done;
+    if !planned {
+        ran?;
+        return Ok((
+            super::table::Materialized::with_owned(out.table, out.charge)?,
+            PlanInfo::default(),
+            ended,
+        ));
+    }
+    let mut plan = root.describe(ctx);
+    root.update_plan(&mut plan);
+    // the plan of what ran, moved out of the cursor's plan rather than copied
+    fn info(plan: CursorPlan, stopped: bool, failed: bool) -> PlanInfo {
+        let CursorPlan {
+            operator: mut out,
+            children,
+            complete,
+            ..
+        } = plan;
+        out.children = children
+            .into_iter()
+            .map(|c| info(c, stopped, failed))
+            .collect();
+        if !complete && out.fidelity().skipped.is_none() {
+            if failed {
+                out.fidelity_mut().incomplete = true;
+            } else if stopped && out.actual_rows == 0 && out.time_ms == 0.0 {
+                // nothing pulled it before the consumer had its rows
+                return out.skip("the limit was met before it ran");
+            } else if stopped && out.actual_rows >= 0 {
+                out.description = format!("{} [stopped early]", out.description);
+                out.fidelity_mut().stopped_early = true;
+            }
+        }
+        out
+    }
+    if let Err(error) = ran {
+        // the rows the operators gave were not delivered, even when they all ran
+        let mut failed = info(plan, false, true);
+        failed.fidelity_mut().incomplete = true;
+        ctx.set_failed(node, failed);
+        return Err(error);
+    }
+    let mut info = info(plan, !ended, false);
+    // a filter's EXISTS notes and counters, as the eager filter reports them
+    fn annotate(ctx: &Ctx, node: &Node, info: &mut PlanInfo) {
+        if let Kind::Filter(exprs) = &node.kind
+            && info.operator == "Filter"
+            && exprs.iter().any(|e| e.has_exists())
+        {
+            let (note, counters) = super::exists::explain(ctx, exprs);
+            if let Some(note) = note {
+                info.description = format!("{} {note}", info.description);
+            }
+            if counters.is_some() {
+                info.counters = counters;
+            }
+        }
+        if node.children.len() == info.children.len() {
+            for (child, info) in node.children.iter().zip(&mut info.children) {
+                annotate(ctx, child, info);
+            }
+        }
+    }
+    annotate(ctx, node, &mut info);
+    let kept = std::mem::take(&mut root.order);
+    drop(root);
+    let finished = (|| {
+        if !kept.starts_with(&node.sorted) && !out.table.sorted.starts_with(&node.sorted) {
+            // Row indices and the reordered copy coexist with the pulled rows.
+            out.charge.resize(
+                capacity_bytes(&out.table)
+                    .saturating_mul(2)
+                    .saturating_add(out.table.len as u64 * 8),
+            )?;
+            out.table.sort_by_vars(&node.sorted);
+            ctx.check()?;
+            out.reconcile()?;
+        }
+        out.set_order(&node.sorted)?;
+        out.reconcile()
+    })();
+    if let Err(error) = finished {
+        // the subtree ran, and the rows it gave were not delivered
+        info.fidelity_mut().incomplete = true;
+        ctx.set_failed(node, info);
+        return Err(error);
+    }
+    let rows = super::table::Materialized::with_owned(out.table, out.charge)?;
+    Ok((rows, info, ended))
+}
+
 fn plan_bytes(node: &Node) -> u64 {
     let values = match &node.kind {
         Kind::Values(t) => capacity_bytes(t),
@@ -2525,6 +2442,13 @@ enum State {
     Expand(Box<expand::Expand>),
     Walk(Box<walk::Walk>),
     Scan(Scan),
+    /// `spk:hasPredicate` read from the predicate patterns, a block of subjects at a time.
+    PatternScan {
+        spec: Box<super::patternplan::PatternScanSpec>,
+        reader: crate::patterns::PairCursor,
+        /// The reader's decoded storage, which it keeps between pulls.
+        charge: OwnedCharge,
+    },
     Values {
         table: Table,
         at: usize,
@@ -2584,6 +2508,33 @@ struct Operator {
     /// The order key of the last row produced, to check the order across batches.
     #[cfg(debug_assertions)]
     last: Option<Vec<Id>>,
+    /// A FILTER that may read ahead of its consumer's demand (see [`Ahead`]).
+    ahead: Option<Box<Ahead>>,
+}
+
+/// The read-ahead of a FILTER without effects: while its batches come back empty, it
+/// asks its input for four times as many rows each time, up to [`AHEAD_BATCHES`]
+/// cursor batches, and it holds the rows past its consumer's demand for the next pulls.
+#[derive(Default)]
+struct Ahead {
+    /// The rows of the next read, or 0 for the consumer's demand.
+    demand: usize,
+    pending: Option<Buffer>,
+    at: usize,
+}
+
+/// The most cursor batches a FILTER that reads ahead asks its input for at once.
+const AHEAD_BATCHES: usize = 8;
+
+/// Whether a FILTER may ask its input `child` for `rows` rows ahead of its demand: the
+/// read-ahead is on, the query has no budget of produced rows, and the rows fit the row
+/// limit and the memory headroom.
+fn ahead_fits(ctx: &Ctx, child: &Operator, rows: usize) -> bool {
+    let row_bytes = (child.vars.len() as u64 * 16).saturating_add(192);
+    ctx.opt.grow_input
+        && ctx.max_rows_produced == u64::MAX
+        && ctx.max_rows.saturating_sub(child.rows) >= rows
+        && ctx.memory_remaining() >= (rows as u64).saturating_mul(row_bytes).saturating_add(8192)
 }
 
 fn supported(kind: &Kind) -> bool {
@@ -2604,6 +2555,7 @@ fn supported(kind: &Kind) -> bool {
             | Kind::Filter(_)
             | Kind::Extend(..)
             | Kind::CountFilterScan { .. }
+            | Kind::PatternScan(_)
     )
 }
 
@@ -2784,6 +2736,8 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
                 spec.cols.iter().map(|&(_, v)| v).collect()
             }
             Kind::Values(table) => table.sorted.clone(),
+            // pairs come in subject order and each subject's predicates in order
+            Kind::PatternScan(_) => node.sorted.clone(),
             Kind::Path {
                 bound_from_left: false,
                 ..
@@ -2818,63 +2772,6 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
         .collect()
 }
 
-/// `SELECT DISTINCT … ORDER BY` deduplicates below its sort when the query may spill
-/// (item 85), so that the DISTINCT can pass rows to later passes: the DISTINCT of a
-/// projection of an ORDER BY becomes a projection of an ORDER BY of a numbered DISTINCT
-/// of the projection. Equal projected rows have equal sort keys when every key is a pure
-/// expression of projected variables without EXISTS, and the numbered DISTINCT keeps
-/// each row's first input number, on which the sort orders ties, so the rows and their
-/// order are those that sorting first gives. Other shapes keep the DISTINCT above the
-/// sort.
-fn distinct_below_order(ctx: &Ctx, node: Node) -> Node {
-    let rewrites = matches!(node.kind, Kind::Distinct)
-        && node.children.len() == 1
-        && matches!(&node.children[0].kind, Kind::Project(vars) if *vars == node.vars && !vars.is_empty())
-        && node.children[0].children.len() == 1
-        && match &node.children[0].children[0].kind {
-            Kind::OrderBy { keys, limit: None } => keys.iter().all(|(key, _)| {
-                !key.has_exists()
-                    && crate::sparql::exprcache::impurity(key).is_none()
-                    && key.var_set().iter().all(|v| node.vars.contains(v))
-            }),
-            _ => false,
-        };
-    if !rewrites {
-        return node;
-    }
-    let mut distinct = node;
-    let mut project = distinct.children.pop().expect("a projection");
-    let mut order = project.children.pop().expect("an ORDER BY");
-    let input = order.children.pop().expect("the sorted input");
-    let Kind::OrderBy { mut keys, .. } = order.kind else {
-        unreachable!("an ORDER BY")
-    };
-    let vars = distinct.vars.clone();
-    let number = ctx.var("\u{1}distinct number");
-    let below = super::plan::project(input, vars.clone(), ctx);
-    let mut numbered = Node::leaf(
-        Kind::Distinct,
-        [vars.clone(), vec![number]].concat(),
-        below.est,
-        "below the ORDER BY, so that it may spill".into(),
-    );
-    numbered.certain = [below.certain.clone(), vec![number]].concat();
-    numbered.cost = below.cost;
-    numbered.children = vec![below];
-    keys.push((Expr::Var(number), true));
-    let mut sort = Node::leaf(
-        Kind::OrderBy { keys, limit: None },
-        numbered.vars.clone(),
-        numbered.est,
-        format!("{} then the first input row", order.desc),
-    );
-    sort.certain = numbered.certain.clone();
-    sort.cost = numbered.cost + numbered.est * numbered.est.max(2.0).log2() * 0.5;
-    sort.children = vec![numbered];
-    project.children.clear();
-    super::plan::project(sort, vars, ctx)
-}
-
 impl Operator {
     fn build(ctx: &Arc<Ctx>, node: Node, fallback: FallbackPolicy) -> Result<Self> {
         Self::build_for(ctx, node, fallback, true)
@@ -2891,11 +2788,7 @@ impl Operator {
         needed: bool,
     ) -> Result<Self> {
         ctx.check()?;
-        let mut node = if ctx.spill.is_some() {
-            distinct_below_order(ctx, node)
-        } else {
-            node
-        };
+        let mut node = node;
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
@@ -2936,6 +2829,10 @@ impl Operator {
             )));
         }
         let mut info = exec::describe_node(ctx, &node);
+        if let Kind::PatternScan(spec) = &node.kind {
+            // the table the scan reads, as the eager plan names it
+            info.description = format!("{} {}", info.description, spec.uses.note());
+        }
         if ctx.graphs.is_some() {
             info.redact();
         }
@@ -2951,11 +2848,7 @@ impl Operator {
         let value_ordered_input =
             matches!(node.kind, Kind::Distinct) && node.children.first().is_some_and(value_ordered);
         // A DISTINCT that numbers its input rows has one variable more than its input.
-        let numbered_distinct = matches!(node.kind, Kind::Distinct)
-            && node.children.first().is_some_and(|child| {
-                child.vars.len() + 1 == node.vars.len()
-                    && node.vars.last().is_some_and(|v| !child.vars.contains(v))
-            });
+        let numbered_distinct = super::demand::numbered_distinct(&node);
         // A hash join that spills keeps its probe input's order when that input comes in
         // an order a caller observes.
         let probe_value_ordered = needed
@@ -2980,7 +2873,7 @@ impl Operator {
             };
         let needs: Vec<bool> = (0..node.children.len())
             .map(|i| match node.kind {
-                Kind::Slice { offset, limit } if offset > 0 || limit.is_some() => true,
+                Kind::Slice { offset, limit, .. } if offset > 0 || limit.is_some() => true,
                 Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } | Kind::Filter(_) => {
                     needed
                 }
@@ -2989,6 +2882,8 @@ impl Operator {
                 _ => true,
             })
             .collect();
+        // Read before the children below become shells.
+        let reads_ahead = super::demand::reads_ahead(ctx, &node);
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes
@@ -3213,6 +3108,11 @@ impl Operator {
             match &node.kind {
                 Kind::Scan(spec) => State::Scan(Scan::new(spec.clone(), None)),
                 Kind::RangeScan(spec, range) => State::Scan(Scan::new(spec.clone(), Some(range))),
+                Kind::PatternScan(spec) => State::PatternScan {
+                    reader: super::patternplan::scan_reader(spec),
+                    spec: spec.clone(),
+                    charge: OwnedCharge::new(ctx, 0)?,
+                },
                 Kind::Values(_) => {
                     let Kind::Values(table) = node.kind else {
                         unreachable!()
@@ -3236,7 +3136,7 @@ impl Operator {
                     value_ordered_input,
                     numbered_distinct,
                 )?),
-                Kind::Slice { offset, limit } => State::Slice {
+                Kind::Slice { offset, limit, .. } => State::Slice {
                     offset: *offset,
                     remaining: *limit,
                 },
@@ -3249,6 +3149,7 @@ impl Operator {
         {
             order.clear();
         }
+        let ahead = (reads_ahead && matches!(state, State::Unary(_))).then(Box::default);
         Ok(Self {
             state,
             children,
@@ -3265,6 +3166,7 @@ impl Operator {
             order,
             #[cfg(debug_assertions)]
             last: None,
+            ahead,
         })
     }
 
@@ -3314,6 +3216,7 @@ impl Operator {
             order,
             #[cfg(debug_assertions)]
             last: None,
+            ahead: None,
         })
     }
 
@@ -3335,6 +3238,10 @@ impl Operator {
             State::Binary(binary) => binary.release_working_sets(),
             State::Ripple(ripple) => ripple.release_working_sets(),
             _ => {}
+        }
+        if let Some(ahead) = &mut self.ahead {
+            ahead.pending = None;
+            ahead.at = 0;
         }
         for child in &mut self.children {
             child.release_finished();
@@ -3817,6 +3724,23 @@ impl Operator {
                     self.done = scan.done();
                     b
                 }
+                State::PatternScan {
+                    spec,
+                    reader,
+                    charge,
+                } => {
+                    let mut b = Buffer::new(ctx, &self.vars, cap)?;
+                    self.done = super::patternplan::fill_scan(
+                        ctx,
+                        spec,
+                        reader,
+                        &mut b.table,
+                        cap,
+                        &mut |bytes| charge.resize(bytes),
+                    )?;
+                    b.reconcile()?;
+                    Some(b)
+                }
                 State::TopK(topk) => {
                     let b = topk.next(ctx, &mut self.children[0], options, cap)?;
                     self.done = topk.done();
@@ -3985,8 +3909,48 @@ impl Operator {
                     self.done = *at == table.len;
                     b
                 }
+                State::Unary(_)
+                    if self
+                        .ahead
+                        .as_ref()
+                        .is_some_and(|ahead| ahead.pending.is_some()) =>
+                {
+                    let ahead = self.ahead.as_mut().expect("a read-ahead");
+                    let pending = ahead.pending.as_ref().expect("rows read ahead");
+                    let batch = copy_rows(ctx, &pending.table, ahead.at, cap)?;
+                    ahead.at += batch.as_ref().map_or(0, |b| b.table.len);
+                    if ahead.at >= pending.table.len {
+                        ahead.pending = None;
+                        ahead.at = 0;
+                    }
+                    self.done = ahead.pending.is_none() && self.children[0].done;
+                    batch
+                }
                 State::Unary(node) => {
-                    let Some(mut b) = self.children[0].next(ctx, options, cap)? else {
+                    // A grown demand is checked against the limits before every read, as
+                    // the child's rows and the free memory change between reads.
+                    let child = &self.children[0];
+                    let demand = match &mut self.ahead {
+                        Some(ahead) if ahead.demand > cap => {
+                            if ahead_fits(ctx, child, ahead.demand) {
+                                ahead.demand
+                            } else {
+                                ahead.demand = 0;
+                                cap
+                            }
+                        }
+                        _ => cap,
+                    };
+                    let grown;
+                    let input_options = if demand > cap {
+                        let mut wider = options.clone();
+                        wider.batch_rows = demand.max(options.batch_rows);
+                        grown = wider;
+                        &grown
+                    } else {
+                        options
+                    };
+                    let Some(mut b) = self.children[0].next(ctx, input_options, demand)? else {
                         return Ok(None);
                     };
                     if let Kind::Project(vars) = &node.kind {
@@ -4022,7 +3986,31 @@ impl Operator {
                     b.reconcile()?;
                     drop(scratch);
                     self.done = self.children[0].done;
-                    Some(b)
+                    let mut out = Some(b);
+                    if let Some(ahead) = &mut self.ahead {
+                        let b = out.as_ref().expect("a filtered batch");
+                        if b.table.is_empty() {
+                            // Ask for four times as many rows next, when the query has
+                            // no budget of produced rows and the rows fit its limits.
+                            let next = demand
+                                .saturating_mul(4)
+                                .min(options.batch_rows.saturating_mul(AHEAD_BATCHES));
+                            if ahead_fits(ctx, &self.children[0], next) {
+                                ahead.demand = next;
+                            }
+                        } else {
+                            ahead.demand = 0;
+                            if b.table.len > cap {
+                                // The rows past the demand wait for the next pulls.
+                                let first = copy_rows(ctx, &b.table, 0, cap)?;
+                                ahead.at = cap;
+                                ahead.pending = out.take();
+                                self.done = false;
+                                out = first;
+                            }
+                        }
+                    }
+                    out
                 }
                 State::Slice { offset, remaining } => {
                     if *remaining == Some(0) {
@@ -4129,7 +4117,6 @@ struct BaseScan {
     block: Option<crate::index::Block>,
     row: usize,
     row_end: usize,
-    passes: bool,
     _charge: Arc<OwnedCharge>,
 }
 
@@ -4202,7 +4189,6 @@ impl Scan {
                 block: None,
                 row: 0,
                 row_end: 0,
-                passes: false,
                 _charge: Arc::new(charge),
             });
             self.base_checked = true;
@@ -4264,7 +4250,6 @@ impl Scan {
                     block.key_range(&lo, &hi)
                 };
                 base.next += 1;
-                base.passes = exec::block_passes(&self.spec, &block, base.row, base.row_end);
                 base.block = Some(block);
             }
             if base.row == base.row_end {
@@ -4272,12 +4257,14 @@ impl Scan {
                 continue;
             }
             let block = base.block.as_ref().expect("loaded immutable block");
-            if !base.passes {
-                // No row was consumed: the owned path can resume this block.
+            // Only the rows of this batch are checked, so a small demand does not read
+            // the graph column of the whole block.
+            let end = base.row_end.min(base.row.saturating_add(cap));
+            if !exec::block_passes(&self.spec, block, base.row, end) {
+                // No row of the batch was consumed: the owned path resumes from it.
                 return Ok(SharedAttempt::Unsupported);
             }
             let charge = OwnedCharge::new(ctx, 512)?;
-            let end = base.row_end.min(base.row.saturating_add(cap));
             let batch = SharedBatch {
                 block: block.clone(),
                 columns,
@@ -4408,12 +4395,11 @@ impl Scan {
                     block.key_range(&lo, &hi)
                 };
                 base.next += 1;
-                base.passes = exec::block_passes(&self.spec, &block, base.row, base.row_end);
                 base.block = Some(block);
             }
             let block = base.block.as_ref().unwrap();
-            if !self.spec.dedup && base.passes {
-                let end = base.row_end.min(base.row + cap - out.table.len);
+            let end = base.row_end.min(base.row + cap - out.table.len);
+            if !self.spec.dedup && exec::block_passes(&self.spec, block, base.row, end) {
                 for (column, &source) in out.table.cols.iter_mut().zip(&columns) {
                     column.extend(block.cols[source][base.row..end].iter().copied().map(Id));
                 }
@@ -4464,7 +4450,6 @@ impl Scan {
                     block: None,
                     row: 0,
                     row_end: 0,
-                    passes: false,
                     _charge: Arc::new(charge),
                 });
             }
@@ -4606,6 +4591,96 @@ mod tests {
         drop(plan);
         drop(info);
         (ctx, output, pool, value)
+    }
+
+    /// A pulled input whose operators do not keep the planner's order is sorted into it,
+    /// and the sorted copy and its order list stay within the output's owned credit.
+    #[test]
+    fn pulled_rows_sorted_into_the_planned_order_keep_their_credit() {
+        use crate::store::{Store, StoreOptions};
+        for rows in [1usize, 3] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 4 << 20;
+            let ctx = Arc::new(ctx);
+            ctx.attach_owner();
+            let a = ctx.var("a");
+            let b = ctx.var("b");
+            let mut table = Table::new(vec![a, b]);
+            for i in 0..rows {
+                let v = Id::from_i64((rows - i) as i64).unwrap();
+                table.push_row(&[v, v]);
+            }
+            // the rows hold no order, which the planner's node claims
+            table.sorted.clear();
+            let mut node = Node::leaf(
+                Kind::Values(table),
+                vec![a, b],
+                rows as f64,
+                "unordered values".into(),
+            );
+            node.sorted = vec![a, b];
+            let (out, _, ended) = pull(&ctx, &node, 10).unwrap();
+            assert!(ended);
+            assert_eq!(out.table.len, rows);
+            assert_eq!(out.table.sorted, vec![a, b]);
+            let first = Id::from_i64(1).unwrap();
+            assert_eq!(out.table.get(0, 0), first);
+        }
+    }
+
+    /// A pull whose sort into the planned order is refused after its operators ran
+    /// keeps the plan as far as it ran, as a failure while they run does.
+    #[test]
+    fn a_pull_refused_after_its_input_ran_keeps_its_plan() {
+        use crate::store::{Store, StoreOptions};
+        const ROWS: usize = 20_000;
+        let store = Store::in_memory(StoreOptions::default());
+        // a context of `limit` KiB and unordered values, which the node claims are
+        // ordered when `ordered`
+        let setup = |limit: u64, ordered: bool| {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit << 10;
+            let ctx = Arc::new(ctx);
+            ctx.attach_owner();
+            let a = ctx.var("a");
+            let b = ctx.var("b");
+            let mut table = Table::new(vec![a, b]);
+            for i in 0..ROWS {
+                let v = Id::from_i64((ROWS - i) as i64).unwrap();
+                table.push_row(&[v, v]);
+            }
+            table.sorted.clear();
+            let mut node = Node::leaf(
+                Kind::Values(table),
+                vec![a, b],
+                ROWS as f64,
+                "unordered values".into(),
+            );
+            if ordered {
+                node.sorted = vec![a, b];
+            }
+            (ctx, node)
+        };
+        let mut sort_refused = 0;
+        for limit in (64..4096).step_by(16) {
+            let (ctx, node) = setup(limit, false);
+            if pull(&ctx, &node, ROWS).is_err() {
+                continue;
+            }
+            // the input runs within this budget, and only the sort can refuse
+            let (ctx, node) = setup(limit, true);
+            if pull(&ctx, &node, ROWS).is_ok() {
+                break;
+            }
+            let failed = ctx
+                .take_failed(&node)
+                .expect("a pull refused after its input ran keeps its plan");
+            assert_eq!(failed.actual_rows, ROWS as i64);
+            assert!(failed.fidelity().incomplete);
+            sort_refused += 1;
+        }
+        assert!(sort_refused > 0, "no budget refused the sort alone");
     }
 
     #[test]
@@ -5031,93 +5106,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn orienting_leaves_other_ask_shapes_alone() {
-        use crate::store::{Store, StoreOptions};
-        let store = Store::in_memory(StoreOptions::default());
-        for text in ["ASK {?s ?p ?o}", "ASK {?s ?p ?o FILTER(?s = ?o)}", "ASK {}"] {
-            let query = super::super::parse_query(text, None, &[]).unwrap();
-            let options = QueryOptions {
-                no_cache: true,
-                ..Default::default()
-            };
-            let mut p = super::super::prepare_query(store.snapshot(), &query, &options, None, None)
-                .unwrap();
-            fn shape(node: &Node) -> String {
-                let children: Vec<String> = node.children.iter().map(shape).collect();
-                format!("{:?}/{}[{}]", node.vars, node.est, children.join(","))
-            }
-            let before = shape(&p.node);
-            orient_filtered_ask(&mut p.node, &p.ctx, &Default::default());
-            assert_eq!(shape(&p.node), before, "{text}");
-        }
-    }
-
-    #[test]
-    fn filtered_ask_admission_keeps_small_effectful_and_mutable_plans_ordinary() {
-        use crate::io::Source;
-        use crate::store::{Store, StoreOptions};
-        let store = Store::in_memory(StoreOptions::default());
-        let mut data = String::new();
-        for i in 0..64 {
-            data.push_str(&format!("<urn:left:{i}> <urn:left> {i} .\n"));
-            data.push_str(&format!("<urn:right:{i}> <urn:right> {i} .\n"));
-        }
-        store
-            .load(&[Source::from_bytes(
-                data.into_bytes(),
-                oxrdfio::RdfFormat::Turtle,
-                None,
-            )])
-            .unwrap();
-        let text = "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y)}";
-        let prepare = |text: &str, max_rows| {
-            let query = super::super::parse_query(text, None, &[]).unwrap();
-            let options = QueryOptions {
-                max_rows: Some(max_rows),
-                no_cache: true,
-                // This decision table describes the legacy filtered-product path.
-                optimizations: Some(super::super::Optimizations {
-                    keyed_join: false,
-                    ..super::super::Optimizations::ALL
-                }),
-                ..Default::default()
-            };
-            super::super::prepare_query(store.snapshot(), &query, &options, None, None).unwrap()
-        };
-        let p = prepare(text, 1024);
-        assert!(filtered_ask_admitted(&p.ctx, &p.node));
-        let small = prepare(text, 8192);
-        assert!(!filtered_ask_admitted(&small.ctx, &small.node));
-        for text in [
-            "ASK {?a <urn:left> ?x}",
-            "SELECT * {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y)}",
-            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y && RAND() < 1)}",
-            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = UUID())}",
-            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?a)}",
-            "ASK {?a <urn:left> ?x OPTIONAL {?b <urn:right> ?y} FILTER(?x = ?y)}",
-            "ASK {VALUES ?x {UNDEF 1} VALUES ?y {UNDEF 1} FILTER(?x = ?y)}",
-        ] {
-            let p = prepare(text, 1);
-            assert!(!filtered_ask_admitted(&p.ctx, &p.node), "{text}");
-        }
-        let mut effects = prepare(text, 1024);
-        effects.ctx.detach_owner_for_tests();
-        Arc::get_mut(&mut effects.ctx).unwrap().calls_extensions = true;
-        assert!(!filtered_ask_admitted(&effects.ctx, &effects.node));
-        // A retained immutable context stays eligible; a new delta keeps the
-        // conservative ordinary policy until it has an immutable generation.
-        super::super::update::update(
-            &store,
-            "INSERT DATA {<urn:new> <urn:left> 0}",
-            &Default::default(),
-        )
-        .unwrap();
-        let changed = prepare(text, 1024);
-        assert!(!filtered_ask_admitted(&changed.ctx, &changed.node));
-        assert!(filtered_ask_admitted(&p.ctx, &p.node));
     }
 
     #[test]

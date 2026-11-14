@@ -294,31 +294,7 @@ fn first_rows_fit(
         }
     }
     let rows = scan_rows(ctx, scan);
-    let mut fanout = rows;
-    let order = scan.perm.order();
-    let stats = &ctx.snap.generation.stats;
-    if ctx.snap.delta.is_empty()
-        && let Some(pcol) = order
-            .iter()
-            .position(|c| *c == P)
-            .filter(|c| *c < scan.prefix.len())
-        && ctx
-            .snap
-            .predicate_count(Perm::Pso, &[scan.prefix[pcol]])
-            .is_some()
-        && let Some(stat) = stats.predicate(scan.prefix[pcol])
-        && let Some((col, _)) = scan.cols.iter().find(|(_, v)| *v == key)
-    {
-        let distinct = match order[*col] {
-            S => stat.distinct_subjects,
-            O => stat.distinct_objects,
-            _ => 0,
-        };
-        if distinct > 0 && distinct <= stat.count {
-            // Every other distinct key accounts for at least one row.
-            fanout = fanout.min(stat.count - distinct + 1);
-        }
-    }
+    let fanout = rows.min(key_fanout(ctx, scan, key).unwrap_or(u64::MAX));
     let input = match &drive.kind {
         Kind::Values(table) => (table.len() as u64).min(batch_rows.max(1) as u64),
         _ => batch_rows.max(1) as u64,
@@ -362,6 +338,35 @@ fn first_rows_fit(
             n.checked_add(crate::index::BLOCK_ROWS as u64 * 32 + ctx.nvars() as u64 * 96 + 8192)
         });
     bytes.is_some_and(|n| n <= ctx.memory_room())
+}
+
+/// The most rows `scan` has for any one value of its variable `key`, from the exact
+/// statistics of a constant predicate: every other distinct subject or object of the
+/// predicate accounts for at least one of its rows. `None` when the scan has no
+/// constant predicate, `key` is not its subject or object, the delta is not empty or
+/// the statistics do not describe the base.
+pub(super) fn key_fanout(ctx: &Ctx, scan: &ScanSpec, key: VarId) -> Option<u64> {
+    let order = scan.perm.order();
+    let pcol = order
+        .iter()
+        .position(|c| *c == P)
+        .filter(|c| *c < scan.prefix.len())?;
+    if !ctx.snap.delta.is_empty()
+        || ctx
+            .snap
+            .predicate_count(Perm::Pso, &[scan.prefix[pcol]])
+            .is_none()
+    {
+        return None;
+    }
+    let stat = ctx.snap.generation.stats.predicate(scan.prefix[pcol])?;
+    let (col, _) = scan.cols.iter().find(|(_, v)| *v == key)?;
+    let distinct = match order[*col] {
+        S => stat.distinct_subjects,
+        O => stat.distinct_objects,
+        _ => return None,
+    };
+    (distinct > 0 && distinct <= stat.count).then(|| stat.count - distinct + 1)
 }
 
 #[cfg(test)]

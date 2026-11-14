@@ -342,8 +342,8 @@ pub struct Optimizations {
     /// a streamed result writer decodes the terms of the next batch on the Rayon pool
     /// while it writes the current one
     pub decode_ahead: bool,
-    /// cursor operators that read their whole input before output, and filters over a
-    /// scan, read larger inputs as a long input goes on
+    /// cursor operators that read their whole input before output, and filters without
+    /// effects whose rows do not pass, read larger inputs as a long input goes on
     pub grow_input: bool,
     /// the predicates of a set of subjects, with the subjects having each, and
     /// `spk:hasPredicate` are read from the generation's predicate patterns
@@ -683,9 +683,6 @@ pub struct Ctx {
     /// the planner met a `SERVICE` of the graph-algorithm namespace (see
     /// [`Ctx::calls_algorithm`])
     algorithmic: AtomicBool,
-    /// The whole eager ASK was admitted as a bounded pure UNION. Only that
-    /// consumer may reduce pure input demand below the ordinary prefix policy.
-    pub(super) eager_union_demand: AtomicBool,
     /// The plan of the operator that failed, as far as it ran, keyed by the address of
     /// its node, until its parent takes it (see [`Ctx::take_failed`]). Execution state:
     /// a plan shared between executions must not keep it.
@@ -1199,7 +1196,6 @@ impl Ctx {
             geo: Default::default(),
             warnings: Default::default(),
             algorithmic: AtomicBool::new(false),
-            eager_union_demand: AtomicBool::new(false),
             failed: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),
@@ -1387,6 +1383,12 @@ impl Ctx {
     }
 
     /// The plan of the failed node `node`, when the failure came from it.
+    /// Forget the plan of a failure that the executor recovered from, such as a LIMIT's
+    /// whole run that a budget refused before the LIMIT pulled its input instead.
+    pub(super) fn clear_failed(&self) {
+        *self.failed.lock() = None;
+    }
+
     pub(super) fn take_failed(&self, node: &super::plan::Node) -> Option<super::exec::PlanInfo> {
         let mut f = self.failed.lock();
         match &*f {
@@ -1499,10 +1501,9 @@ impl Ctx {
         // cursor keeps them.
         self.memory().cursor_mode()?;
         self.streams = true;
-        // The result cache and sampled filters are planning choices that stage 6 of
-        // item 453 makes independent of the execution mode.
-        self.use_cache = false;
-        self.opt.sampled_filters = false;
+        // The result cache and sampled filters stay as the query set them, so that a
+        // query plans alike in every mode (item 827). The cache serves the subtrees a
+        // cursor runs whole, and sampled filters take their samples once per plan.
         Ok(())
     }
 
@@ -1538,13 +1539,6 @@ impl Ctx {
         if first {
             self.regex.clear();
         }
-    }
-
-    /// Drop the context's weak reference to itself, which lets a test take the prepared
-    /// context back with `Arc::get_mut`.
-    #[cfg(test)]
-    pub(super) fn detach_owner_for_tests(&self) {
-        *self.owner.lock() = Weak::new();
     }
 
     /// The shared context, for an eager join that runs the cursor's partitioned join
@@ -1612,8 +1606,11 @@ impl Ctx {
             Some(id) => self.memory().release(id, bytes),
             None => {
                 debug_assert_eq!(bytes, 0);
-                // Only cursor accounting trims, and it always has a ledger.
-                if let Some(ledger) = self.memory.get() {
+                // Only cursor accounting trims, and it always has a ledger. An eager
+                // query that a pulled LIMIT gave a ledger does not take its lock here.
+                if self.streams
+                    && let Some(ledger) = self.memory.get()
+                {
                     ledger.trim_zero(self.grant.as_ref());
                 }
             }
@@ -2304,9 +2301,9 @@ impl Ctx {
     /// pages and single terms use this route, so a simple literal takes over its
     /// reconstructed vocabulary key's allocation. The streaming writer reuses one
     /// scratch row through [`Ctx::output_term_into`] instead.
-    pub(super) fn output_term(&self, id: Id, row: &Charge<'_>) -> Result<Option<Term>> {
+    pub(super) fn output_term(&self, id: Id, row: &dyn TermCredit) -> Result<Option<Term>> {
         assert!(
-            std::ptr::eq(self, row.ctx),
+            std::ptr::eq(self, row.ctx()),
             "output credit belongs to its query"
         );
         self.check_memory_failure()?;
@@ -2477,7 +2474,7 @@ impl Ctx {
     /// A vocabulary key and its final simple literal share one physical allocation.
     /// Every capacity change stays on the actual output account, including realloc
     /// overlap. Other key kinds keep the admitted copy path while scratch is alive.
-    fn output_vocab_term(&self, id: u64, row: &Charge<'_>) -> Result<Option<Term>> {
+    fn output_vocab_term(&self, id: u64, row: &dyn TermCredit) -> Result<Option<Term>> {
         let base = row.bytes();
         let total = |old: usize, new: usize| {
             base.checked_add(old as u64)
@@ -2493,7 +2490,7 @@ impl Ctx {
         )
     }
 
-    fn output_owned_key(&self, mut key: Vec<u8>, row: &Charge<'_>) -> Result<Term> {
+    fn output_owned_key(&self, mut key: Vec<u8>, row: &dyn TermCredit) -> Result<Term> {
         self.check()?;
         let capacity = key.capacity() as u64;
         #[cfg(test)]
@@ -2549,8 +2546,8 @@ impl Ctx {
 
     /// The sorted bulk decoder already borrows a reconstructed key. Admit its
     /// actual owned representation before copying, under the same real context.
-    pub(super) fn output_key(&self, key: &[u8], storage: &Charge<'_>) -> Result<Term> {
-        if !std::ptr::eq(self, storage.ctx) {
+    pub(super) fn output_key(&self, key: &[u8], storage: &dyn TermCredit) -> Result<Term> {
+        if !std::ptr::eq(self, storage.ctx()) {
             return Err(Error::invalid(
                 "bulk output belongs to another query account",
             ));
@@ -3131,6 +3128,41 @@ pub struct Charge<'a> {
     bytes: std::cell::Cell<u64>,
     owner: std::cell::Cell<Option<u64>>,
 }
+/// What [`Ctx::output_term`] admits a decoded term's bytes on before it allocates them.
+/// It counts what the terms use, which [`TermCredit::resize`] sets, as a reused key
+/// buffer comes and goes.
+pub(super) trait TermCredit {
+    fn ctx(&self) -> &Ctx;
+    fn add(&self, bytes: u64) -> Result<()>;
+    /// What the terms use.
+    fn bytes(&self) -> u64;
+    /// Set what the terms use, admitting growth before it is allocated.
+    fn resize(&self, bytes: u64) -> Result<()>;
+}
+
+impl TermCredit for Charge<'_> {
+    fn ctx(&self) -> &Ctx {
+        self.ctx
+    }
+    fn add(&self, bytes: u64) -> Result<()> {
+        Charge::add(self, bytes)
+    }
+    fn bytes(&self) -> u64 {
+        Charge::bytes(self)
+    }
+    fn resize(&self, bytes: u64) -> Result<()> {
+        Charge::resize(self, bytes)
+    }
+}
+
+impl Ctx {
+    /// Whether the query keeps its memory on the shared ledger, whose every charge
+    /// takes a lock, rather than on its fast account.
+    pub(super) fn has_ledger(&self) -> bool {
+        self.memory.get().is_some()
+    }
+}
+
 impl Charge<'_> {
     pub(super) fn bytes(&self) -> u64 {
         self.bytes.get()
@@ -3852,9 +3884,11 @@ mod charge_tests {
     }
 
     /// The executors read the accounting mode in at most this many places outside tests.
-    /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, to the planning and
-    /// routing sites that stage 6 removes, so that new twins do not come back.
-    const MODE_CHECKS: usize = 6;
+    /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, and item 827 took
+    /// the planning reads out, so that a query plans alike in every mode. The routing of
+    /// `query_execution_with_plan`, the EXISTS key set, the decoding envelope and
+    /// `string_order_mask` remain.
+    const MODE_CHECKS: usize = 4;
 
     /// Counts the calls of `streams()` in the non-test sources of the SPARQL engine,
     /// and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453).

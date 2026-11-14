@@ -384,7 +384,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   keep their contexts in the same way. After an edit of class axioms the next run clears
   the contexts that hold an expression whose rules changed, with the contexts that reach
   them, and its answer is that of a classification that starts again. A change to the
-  property hierarchy, chains, reflexivity or ranges, a domain, a property declaration, an
+  property hierarchy, chains, reflexivity or ranges, a domain, an
   axiom with an individual, a data property, a datatype, a key or a self restriction, and
   a change that moves the ontology to other rules, saturates everything again. So does
   any change to a Horn ontology with individuals, to a counting or a rooted run, and to a

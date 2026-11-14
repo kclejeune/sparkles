@@ -11,6 +11,7 @@ pub mod charsets;
 mod constkeys;
 pub mod ctx;
 pub mod cursor;
+mod demand;
 pub mod depth;
 pub mod describe;
 pub mod enhancer;
@@ -1659,7 +1660,7 @@ fn execute_prepared_parts(
 ) -> std::result::Result<ResultParts, Box<Failed>> {
     let PreparedQuery {
         ctx,
-        mut node,
+        node,
         pattern,
         bound,
         kind,
@@ -1687,9 +1688,6 @@ fn execute_prepared_parts(
         _ => None,
     };
     let t2 = Instant::now();
-    if kind == QueryKind::Ask {
-        unionpush::order_ask(&ctx, &mut node);
-    }
     // the plan of a failed query as far as it ran, under the root of a graph query
     let failed = |error: Error, plan: Option<PlanInfo>, stage: Option<Instant>| {
         let mut plan = plan.or_else(|| ctx.failed_plan());

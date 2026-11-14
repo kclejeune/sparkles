@@ -162,7 +162,8 @@ rt=\$(($end - \$(date +%s)))
 if [ \"\$rt\" -lt $min ]; then echo \"only \$rt s left before the job's end; not starting\" >&2; exit 3; fi
 forward=()
 for n in MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL; do
-  [ -z \"\${!n+x}\" ] || forward+=(\"--setenv=\$n=\${!n}\")
+  eval \"s=\\\${\$n+x} v=\\\${\$n-}\"
+  [ -z \"\$s\" ] || forward+=(\"--setenv=\$n=\$v\")
 done
 p=\$PATH; [ ! -d \"\$G/py-venv/bin\" ] || p=\$G/py-venv/bin:\$p
 systemd-run --user --unit gate-$name --collect -q \"\${forward[@]}\" \\
