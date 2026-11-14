@@ -876,34 +876,111 @@ pub(crate) fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Resul
     Ok(rules)
 }
 
-/// The rule sets that [`incremental_rules`] keeps.
+/// The most rule sets that [`incremental_rules`] keeps.
 const KEPT_RULE_SETS: usize = 8;
 
-/// A rule set of [`incremental_rules`]: its digest, its rules, and why they cannot be
-/// maintained incrementally, if they cannot.
-type KeptRules = (u64, Arc<Vec<Rule>>, Option<String>);
+/// The most bytes of parsed rules, as [`rules_bytes`] estimates them, that the kept rule
+/// sets hold in all. A larger rule set is not kept, and its runs parse it every time.
+const KEPT_RULE_BYTES: usize = 4 << 20;
 
-/// The rule sets of the incremental runs made last, by their digest ([`rules_digest`]).
-static INCREMENTAL_RULES: std::sync::Mutex<Vec<KeptRules>> = std::sync::Mutex::new(Vec::new());
+/// The parsed rule sets of the incremental runs made last, oldest first, by their digest
+/// ([`rules_digest`]). They stay with the process and no run's budget counts them, so
+/// their number and their size are bounded.
+struct KeptRuleSets {
+    sets: Vec<KeptRules>,
+    /// the bytes of `sets`
+    bytes: usize,
+}
+
+/// A kept rule set: its digest, the estimate of its bytes, its rules, and why they cannot
+/// be maintained incrementally, if they cannot.
+struct KeptRules {
+    digest: u64,
+    bytes: usize,
+    rules: Arc<Vec<Rule>>,
+    blocker: Option<String>,
+}
+
+impl KeptRuleSets {
+    const fn new() -> KeptRuleSets {
+        KeptRuleSets {
+            sets: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&self, digest: u64) -> Option<(Arc<Vec<Rule>>, Option<String>)> {
+        self.sets
+            .iter()
+            .find(|k| k.digest == digest)
+            .map(|k| (k.rules.clone(), k.blocker.clone()))
+    }
+
+    /// Keep `set` within `max_sets` sets and `max_bytes` bytes in all, in place of the
+    /// oldest sets. A set over `max_bytes` by itself is not kept.
+    fn keep(&mut self, set: KeptRules, max_sets: usize, max_bytes: usize) {
+        if set.bytes > max_bytes || max_sets == 0 || self.get(set.digest).is_some() {
+            return;
+        }
+        while self.sets.len() == max_sets || self.bytes + set.bytes > max_bytes {
+            self.bytes -= self.sets.remove(0).bytes;
+        }
+        self.bytes += set.bytes;
+        self.sets.push(set);
+    }
+}
+
+static INCREMENTAL_RULES: std::sync::Mutex<KeptRuleSets> =
+    std::sync::Mutex::new(KeptRuleSets::new());
+
+/// An estimate of the memory of parsed rules: their clauses and nodes with the text of
+/// their names, variables and constants. A rule that an `@include` or a prefix expands
+/// counts at its parsed size, which the length of the rule text does not bound.
+fn rules_bytes(rules: &[Rule]) -> usize {
+    fn node(n: &Node) -> usize {
+        size_of::<Node>()
+            + match n {
+                Node::Var(v) => v.len(),
+                Node::Const(t) => t.to_string().len(),
+                Node::Any => 0,
+                Node::Functor(name, args) => name.len() + args.iter().map(node).sum::<usize>(),
+            }
+    }
+    fn clause(c: &Clause) -> usize {
+        size_of::<Clause>()
+            + match c {
+                Clause::Triple(t) => node(&t.subject) + node(&t.predicate) + node(&t.object),
+                Clause::Builtin(b) => b.name.len() + b.args.iter().map(node).sum::<usize>(),
+                Clause::Rule(r) => rule(r),
+            }
+    }
+    fn rule(r: &Rule) -> usize {
+        size_of::<Rule>()
+            + r.name.as_ref().map_or(0, |n| n.len())
+            + r.body.iter().chain(&r.head).map(clause).sum::<usize>()
+    }
+    rules.iter().map(rule).sum()
+}
 
 /// The parsed rules of a profile and its extras for an incremental run, and why they
 /// keep a materialization from being maintained incrementally, if they do
 /// ([`engine::incremental_blocker`]). Both follow from the rule text alone, which the
 /// digest covers, so they are kept for the next runs with the same digest: a run after
 /// each small write would otherwise parse the profile and compile it for the check
-/// every time, about a tenth of the time of a change of 100 triples.
+/// every time, about a tenth of the time of a change of 100 triples. The kept sets cost
+/// memory that outlives the runs, at most [`KEPT_RULE_SETS`] sets of
+/// [`KEPT_RULE_BYTES`] bytes in all.
 fn incremental_rules(
     profile: &Profile,
     extras: &Extras,
     digest: u64,
     snap: &Arc<Snapshot>,
 ) -> anyhow::Result<(Arc<Vec<Rule>>, Option<String>)> {
-    let kept = |sets: &Vec<KeptRules>| {
-        sets.iter()
-            .find(|k| k.0 == digest)
-            .map(|k| (k.1.clone(), k.2.clone()))
-    };
-    if let Some(found) = kept(&INCREMENTAL_RULES.lock().unwrap_or_else(|e| e.into_inner())) {
+    let kept = INCREMENTAL_RULES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(digest);
+    if let Some(found) = kept {
         return Ok(found);
     }
     let rules = Arc::new(profile_rules(profile, extras)?);
@@ -911,13 +988,16 @@ fn incremental_rules(
     let blocker = engine::compile(&rules, &terms, &mut Vec::new())
         .iter()
         .find_map(|r| engine::incremental_blocker(r, &terms));
-    let mut sets = INCREMENTAL_RULES.lock().unwrap_or_else(|e| e.into_inner());
-    if kept(&sets).is_none() {
-        if sets.len() == KEPT_RULE_SETS {
-            sets.remove(0);
-        }
-        sets.push((digest, rules.clone(), blocker.clone()));
-    }
+    let set = KeptRules {
+        digest,
+        bytes: rules_bytes(&rules),
+        rules: rules.clone(),
+        blocker: blocker.clone(),
+    };
+    INCREMENTAL_RULES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keep(set, KEPT_RULE_SETS, KEPT_RULE_BYTES);
     Ok((rules, blocker))
 }
 
@@ -2023,6 +2103,64 @@ pub fn bench_derive(
         seq = maintain::fnv(&h.to_le_bytes(), seq);
     }
     Ok((d.closure_len(), d.iterations, set, seq))
+}
+
+#[cfg(test)]
+mod kept_rule_sets_tests {
+    use super::*;
+
+    fn set(digest: u64, bytes: usize) -> KeptRules {
+        KeptRules {
+            digest,
+            bytes,
+            rules: Arc::new(Vec::new()),
+            blocker: None,
+        }
+    }
+
+    fn digests(k: &KeptRuleSets) -> Vec<u64> {
+        k.sets.iter().map(|s| s.digest).collect()
+    }
+
+    #[test]
+    fn kept_rule_sets_are_bounded_by_number_and_bytes() {
+        let mut k = KeptRuleSets::new();
+        // a set over the bound by itself is not kept and evicts nothing
+        k.keep(set(1, 40), 3, 100);
+        k.keep(set(2, 101), 3, 100);
+        assert_eq!(digests(&k), [1]);
+        assert!(k.get(2).is_none());
+        // the oldest sets leave until the new one fits
+        k.keep(set(3, 40), 3, 100);
+        k.keep(set(4, 70), 3, 100);
+        assert_eq!(digests(&k), [4]);
+        assert_eq!(k.bytes, 70);
+        // a set that is kept already stays as it is
+        k.keep(set(4, 10), 3, 100);
+        assert_eq!(k.bytes, 70);
+        // the number of sets
+        for d in 5..9 {
+            k.keep(set(d, 1), 3, 100);
+        }
+        assert_eq!(digests(&k), [6, 7, 8]);
+        assert_eq!(k.bytes, 3);
+        assert!(k.get(7).is_some() && k.get(4).is_none());
+    }
+
+    #[test]
+    fn rules_bytes_count_what_includes_and_prefixes_expand() {
+        let own = parse_rules("[r: (?a <urn:p> ?b) -> (?b <urn:q> ?a)]").unwrap();
+        let included = parse_rules("@include <owl-rl> .").unwrap();
+        let prefixed = parse_rules(&format!(
+            "@prefix ex: <urn:{}> .\n[r: (?a ex:p ?b) -> (?b ex:q ?a)]",
+            "x".repeat(1000)
+        ))
+        .unwrap();
+        let small = rules_bytes(&own);
+        assert!(small >= size_of::<Rule>() + 6 * size_of::<Node>());
+        assert!(rules_bytes(&included) > OWL_RL_RULES.len());
+        assert!(rules_bytes(&prefixed) >= small + 2000);
+    }
 }
 
 #[cfg(test)]
