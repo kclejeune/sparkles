@@ -1355,7 +1355,18 @@ forward rules into it in `sparkles-reasoner/src/fixpoint.rs`.
   and `added`. `FixedPoint` keeps every derived fact with a record, the one instance that
   derived it first. Records are well founded, since an instance is recorded only over
   facts that held before it, so following them from any fact ends at base facts and no
-  fact in a cycle supports itself.
+  fact in a cycle supports itself. The program chooses the `FactStore` that holds its
+  facts, and its methods return its own error type. Producers write into a `Sink`, which
+  reserves each growth through the store before it happens, so a fact with a large
+  fan-out fails while it produces. Every other buffer of a pass is reserved through the
+  store for the allocation it holds, and the reservations are released when the pass
+  ends. Against a pass's `max_bytes` count the state, the program's scratch and the sink
+  being filled. A program can take its facts in batches of `batch_len` through
+  `consequences_batch` and `prove_batch`. In exact mode a program keeps no records, its
+  `prove` decides provability exactly, and a pass runs in rounds that delete the facts
+  without a proof and then insert the added facts and their consequences, so a fact
+  deleted and derived again appears twice in the change, which `consolidate` cancels.
+  Exact mode keeps no annotations.
 - **Maintenance.** A pass deletes by backward and forward rederivation. The facts whose
   recorded instance read a removed base fact are broken, and they and the facts whose
   records depend on them are the candidates. Each candidate is first checked backward for
@@ -1386,9 +1397,13 @@ forward rules into it in `sparkles-reasoner/src/fixpoint.rs`.
   Constants that the store lacks, in bodies and heads, are kept as local terms, so a
   rule matches the triples another rule derives with them, and a pass that first meets
   one in the store builds the program again. `RuleProgram::encode` and `decode`
-  checkpoint a fixed point with those terms. The reasoner's own maintenance is
-  unchanged. Moving it onto the operator is item 456's shared maintenance core, after item
-  547 measures the plug-in on LUBM.
+  checkpoint a fixed point with those terms. Item 547 measured it against the reasoner's
+  own maintenance on LUBM with one and ten universities. Its changes and undos of 100 and
+  1,000 triples took 4 to 1,600 times as long, and it kept about 1,000 bytes per derived
+  fact against the derived tier's 57 to 82, since it also holds the explicit triples
+  ([results](../benchmarks/reasoning/RESULTS.md#the-rule-plug-in-against-the-reasoners-maintenance)).
+  Item 837 therefore moves the reasoner onto the operator as an exact program over its
+  derived tier, and `RuleProgram` remains a test of the interface.
 - **Provenance.** With a provenance setting a fact counts one derivation, its recorded
   one, and its support is the union of the instances' supports along its record chain,
   so the witness it reports is real. A fact whose record changes, and the facts recorded

@@ -279,6 +279,14 @@ record-free search and the plug-in's about 144 bytes per fact, its key, record, 
 three index entries, against the tier's. It is routine, and it runs beside the first
 phase.
 
+The [reasoning results](../../benchmarks/reasoning/RESULTS.md#the-rule-plug-in-against-the-reasoners-maintenance)
+record item 547's measurement, made on a development host with the change sets of
+`examples/lubm.rs`, since the differences it found are far larger than a host's. On
+LUBM(1) and LUBM(10) the plug-in's changes and undos of 100 and 1,000 triples took 4 to
+1,600 times as long as the reasoner's, and it kept about 1,000 bytes per derived fact
+against the tier's 57 to 82, because it holds the explicit triples too. Phase 4 therefore
+builds the reasoner's program on the tier's own evaluation.
+
 Item 791's published numbers come from `bench:rl-reference lubm 100` and
 `owl2bench 1` to `5` on atlas and then forge, published in the reasoning results, so
 every later phase has a baseline per scale. It is routine.

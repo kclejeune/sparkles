@@ -1,0 +1,46 @@
+plugin reasoner full_us=156929 inferred=339224
+plugin reasoner kept_facts=339224 kept_closure_mib=25.9 bytes_per_fact=80.2
+plugin operator build_us=1172136 facts=1630298 state_mib=367.9 bytes_per_fact=236.6 counted_mib=252.0
+plugin settle explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=0 step=change reasoner_us=9277 method=incremental operator_us=6755280
+plugin change explicit=1291074 operator_derived=339803 reasoner_inferred=339803
+plugin round=0 step=revert reasoner_us=10390 method=incremental operator_us=14414169
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=1 step=change reasoner_us=10972 method=incremental operator_us=7235482
+plugin change explicit=1291074 operator_derived=339829 reasoner_inferred=339829
+plugin round=1 step=revert reasoner_us=8709 method=incremental operator_us=13705441
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=2 step=change reasoner_us=10363 method=incremental operator_us=7549348
+plugin change explicit=1291074 operator_derived=339773 reasoner_inferred=339773
+plugin round=2 step=revert reasoner_us=9383 method=incremental operator_us=15366405
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=3 step=change reasoner_us=19179 method=incremental operator_us=7051345
+plugin change explicit=1291074 operator_derived=339777 reasoner_inferred=339777
+plugin round=3 step=revert reasoner_us=15391 method=incremental operator_us=16894520
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=4 step=change reasoner_us=12958 method=incremental operator_us=8129713
+plugin change explicit=1291074 operator_derived=339761 reasoner_inferred=339761
+plugin round=4 step=revert reasoner_us=9526 method=incremental operator_us=14738300
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=5 step=change reasoner_us=10852 method=incremental operator_us=6773983
+plugin change explicit=1291074 operator_derived=339813 reasoner_inferred=339813
+plugin round=5 step=revert reasoner_us=9141 method=incremental operator_us=14517828
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=6 step=change reasoner_us=9732 method=incremental operator_us=6779817
+plugin change explicit=1291074 operator_derived=339796 reasoner_inferred=339796
+plugin round=6 step=revert reasoner_us=9266 method=incremental operator_us=14154389
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=7 step=change reasoner_us=10297 method=incremental operator_us=7136066
+plugin change explicit=1291074 operator_derived=339820 reasoner_inferred=339820
+plugin round=7 step=revert reasoner_us=9598 method=incremental operator_us=15063431
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=8 step=change reasoner_us=9049 method=incremental operator_us=6650193
+plugin change explicit=1291074 operator_derived=339823 reasoner_inferred=339823
+plugin round=8 step=revert reasoner_us=56255 method=incremental operator_us=16557185
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin round=9 step=change reasoner_us=16576 method=incremental operator_us=8135897
+plugin change explicit=1291074 operator_derived=339801 reasoner_inferred=339801
+plugin round=9 step=revert reasoner_us=73287 method=incremental operator_us=16290574
+plugin revert explicit=1291074 operator_derived=339224 reasoner_inferred=339224
+plugin k=1000 rounds=10 change reasoner_median_us=10852 operator_median_us=7136066
+plugin k=1000 rounds=10 revert reasoner_median_us=9598 operator_median_us=15063431

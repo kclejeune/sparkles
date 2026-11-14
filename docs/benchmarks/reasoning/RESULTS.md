@@ -263,6 +263,37 @@ as long at one thread, which is item 942. The
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.
 
+### The rule plug-in against the reasoner's maintenance
+
+`plugin` of `examples/lubm.rs` runs the RDFS rules without axioms or builtins two ways over
+the same dataset, through the reasoner with a kept closure and through `RuleProgram` on the
+fixed-point operator, which keeps a record for every fact and deletes by its one-step
+backward check. Each round removes `K` triples of a university and adds `K` new ones, then
+undoes the change. The reasoner's time includes the commit of its inferred graph, and the
+operator's includes the read of the change. Both closures had the same size after every
+step. The table gives the medians over the rounds.
+
+| Data | Change, reasoner | Change, operator | Undo, reasoner | Undo, operator |
+|---|---:|---:|---:|---:|
+| LUBM(1), 100 triples, 6 rounds | 31.8 ms | 133 ms | 23.0 ms | 347 ms |
+| LUBM(1), 1,000 triples, 6 rounds | 11.3 ms | 677 ms | 14.4 ms | 1,526 ms |
+| LUBM(10), 100 triples, 10 rounds | 4.7 ms | 705 ms | 4.6 ms | 1,325 ms |
+| LUBM(10), 1,000 triples, 10 rounds | 10.9 ms | 7,136 ms | 9.6 ms | 15,063 ms |
+
+*Measured on stanley, a development laptop shared with other builds, on 2026-11-14 at
+commit 4a5bcac9. The reasoner's small runs vary by several times between processes on
+this host.*
+
+The operator is 4 to 1,600 times slower, and the undo, which deletes the added triples'
+consequences through records, costs it about twice its change. The reasoner keeps 57 to
+82 bytes per derived fact. The operator holds the explicit triples beside the derived
+ones, 1.63 million facts for 339,224 derived on LUBM(10), at 206 to 266 bytes per fact,
+or about 1,000 bytes per derived fact. The reasoner's maintenance therefore moves onto
+the operator as an exact program over its own derived tier and evaluation, not through
+`RuleProgram`. The [run directory](runs/2026-11-14-item-547-stanley/run.sh.txt) holds the
+commands, the [host and build](runs/2026-11-14-item-547-stanley/env.txt) and each run's
+output, such as [LUBM(10) with 1,000 triples](runs/2026-11-14-item-547-stanley/l10-k1000.txt).
+
 ### Reasoner witnesses
 
 The witnesses of item 416 are off by default
