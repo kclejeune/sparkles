@@ -248,40 +248,37 @@ fn inspect_generation(
 ) -> Result<()> {
     let start = budget.used();
     let result = (|| {
-        let (base, binding, folding, strict, branch) =
-            match commit::read_gen_commit_controlled(directory, budget)? {
-                Some(identity) => {
-                    if family.is_none() {
-                        return Err(managed_history::unavailable(
-                            "copied generation metadata has no actual family identity",
-                        ));
-                    }
-                    if branch.is_some_and(|branch| identity.value.dataset_id != branch) {
-                        return Err(managed_history::unavailable(
-                            "copied generation identity differs",
-                        ));
-                    }
-                    let result = (
-                        identity.value.commit.seq,
-                        identity.value.configuration,
-                        identity.value.origin == "baseline",
-                        identity.value.wal_strict_from,
-                        Some(identity.value.dataset_id),
-                    );
-                    drop(identity.value);
-                    budget.release(identity.charge);
-                    result
-                }
-                // First-identity migration folds genuinely pre-metadata records into
-                // baseline0. Still prove the WAL: deleting both small identity files
-                // must not hide a surviving accepted configuration seal.
-                None if legacy => (0, ConfigurationBinding::LegacyUnbound, true, None, branch),
-                None => {
+        let (base, binding, branch) = match commit::read_gen_commit_controlled(directory, budget)? {
+            Some(identity) => {
+                if family.is_none() {
                     return Err(managed_history::unavailable(
-                        "copied generation identity is missing",
+                        "copied generation metadata has no actual family identity",
                     ));
                 }
-            };
+                if branch.is_some_and(|branch| identity.value.dataset_id != branch) {
+                    return Err(managed_history::unavailable(
+                        "copied generation identity differs",
+                    ));
+                }
+                let result = (
+                    identity.value.commit.seq,
+                    identity.value.configuration,
+                    Some(identity.value.dataset_id),
+                );
+                drop(identity.value);
+                budget.release(identity.charge);
+                result
+            }
+            // A generation without commit.json has no identity to bind. Still prove
+            // the WAL: deleting both small identity files must not hide a surviving
+            // accepted configuration seal.
+            None if legacy => (0, ConfigurationBinding::LegacyUnbound, branch),
+            None => {
+                return Err(managed_history::unavailable(
+                    "copied generation identity is missing",
+                ));
+            }
+        };
         let mut primary = match family {
             Some(family) => {
                 let temporary = metadata_preparation(budget)?;
@@ -309,9 +306,7 @@ fn inspect_generation(
         let path = directory.join("wal.log");
         let loaded = match budget.buffered(&path) {
             Ok(loaded) => loaded,
-            Err(Error::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound && strict.is_none() =>
-            {
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -324,8 +319,6 @@ fn inspect_generation(
             extent,
             base,
             u64::MAX,
-            folding,
-            strict,
             terms,
             annotations.value.as_deref(),
             &path,

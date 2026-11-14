@@ -82,7 +82,9 @@ pub const MAX_SETTINGS_BYTES: usize = 16 << 20;
 pub enum OwnerKind {
     /// The evidence profile (spec C25), whose settings are `evidence.json`.
     Evidence,
-    /// A second owner for the engine's own tests.
+    /// The durable job ledger (spec C26), whose settings are `jobs.json`.
+    Jobs,
+    /// A further owner for the engine's own tests.
     #[cfg(test)]
     Test,
 }
@@ -90,14 +92,15 @@ pub enum OwnerKind {
 impl OwnerKind {
     /// Every owner this build knows.
     #[cfg(not(test))]
-    pub const ALL: [OwnerKind; 1] = [OwnerKind::Evidence];
+    pub const ALL: [OwnerKind; 2] = [OwnerKind::Evidence, OwnerKind::Jobs];
     #[cfg(test)]
-    pub const ALL: [OwnerKind; 2] = [OwnerKind::Evidence, OwnerKind::Test];
+    pub const ALL: [OwnerKind; 3] = [OwnerKind::Evidence, OwnerKind::Jobs, OwnerKind::Test];
 
     /// The owner's name in `managed.json`.
     pub fn as_str(self) -> &'static str {
         match self {
             OwnerKind::Evidence => "evidence",
+            OwnerKind::Jobs => "jobs",
             #[cfg(test)]
             OwnerKind::Test => "test",
         }
@@ -112,6 +115,7 @@ impl OwnerKind {
     pub fn settings_file(self) -> &'static str {
         match self {
             OwnerKind::Evidence => "evidence.json",
+            OwnerKind::Jobs => crate::jobs::FILE,
             #[cfg(test)]
             OwnerKind::Test => "managed-test.json",
         }
@@ -141,6 +145,7 @@ impl OwnerKind {
                     )),
                 }
             }
+            OwnerKind::Jobs => crate::jobs::check_settings(bytes, profile),
             #[cfg(test)]
             OwnerKind::Test => None,
         }
@@ -150,6 +155,7 @@ impl OwnerKind {
     pub fn supports_profile(self, profile: u32) -> bool {
         match self {
             OwnerKind::Evidence => profile == 1,
+            OwnerKind::Jobs => profile == crate::jobs::PROFILE,
             #[cfg(test)]
             OwnerKind::Test => profile == 1,
         }
@@ -339,11 +345,21 @@ pub enum ManagedErrorKind {
     /// A read that needs historical evidence configuration found a store whose
     /// configuration history is not activated.
     ConfigurationHistoryInactive,
+    /// A job lease token is stale: its generation was superseded, its lease expired, its
+    /// process epoch is gone or its run was cancelled (spec C26 §4.2).
+    LeaseLost,
+    /// A publication operation id was completed before with another digest.
+    PublicationConflict,
+    /// The dataset's bound on queued runs is reached, so no run was stored.
+    JobsOverloaded,
+    /// The dataset was restored and its jobs recovery is pausing the restored work, so
+    /// the transition was refused (spec C26 §7.3).
+    JobsRecovering,
 }
 
 impl ManagedErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ManagedErrorKind; 23] = [
+    pub const ALL: [ManagedErrorKind; 27] = [
         ManagedErrorKind::Protected,
         ManagedErrorKind::Unavailable,
         ManagedErrorKind::UnsupportedProfile,
@@ -367,6 +383,10 @@ impl ManagedErrorKind {
         ManagedErrorKind::ProjectionUnavailable,
         ManagedErrorKind::IdentityConflict,
         ManagedErrorKind::ConfigurationHistoryInactive,
+        ManagedErrorKind::LeaseLost,
+        ManagedErrorKind::PublicationConflict,
+        ManagedErrorKind::JobsOverloaded,
+        ManagedErrorKind::JobsRecovering,
     ];
 
     /// The stable code of the kind.
@@ -395,6 +415,10 @@ impl ManagedErrorKind {
             ManagedErrorKind::ProjectionUnavailable => "projection-unavailable",
             ManagedErrorKind::IdentityConflict => "identity-conflict",
             ManagedErrorKind::ConfigurationHistoryInactive => "configuration-history-inactive",
+            ManagedErrorKind::LeaseLost => "lease-lost",
+            ManagedErrorKind::PublicationConflict => "publication-conflict",
+            ManagedErrorKind::JobsOverloaded => "jobs-overloaded",
+            ManagedErrorKind::JobsRecovering => "jobs-recovering",
         }
     }
 
@@ -425,9 +449,10 @@ pub struct ManagedError {
     /// `immutable-record-conflict`, and the typed-write codes `head-changed`,
     /// `idempotency-conflict` and `authority-changed`, and the review codes
     /// `policy-changed`, `target-changed`, `decision-superseded`, `target-withdrawn`,
-    /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`, and
+    /// `evidence-conflict`, `projection-unavailable` and `identity-conflict`,
     /// `configuration-history-inactive` for a historical evidence read of a store
-    /// without activated configuration history
+    /// without activated configuration history, and the job codes `lease-lost`,
+    /// `publication-conflict`, `jobs-overloaded` and `jobs-recovering`
     pub code: &'static str,
     pub message: String,
 }
@@ -466,7 +491,11 @@ impl ManagedError {
             | ManagedErrorKind::TargetWithdrawn
             | ManagedErrorKind::EvidenceConflict
             | ManagedErrorKind::IdentityConflict
-            | ManagedErrorKind::ConfigurationHistoryInactive => 409,
+            | ManagedErrorKind::ConfigurationHistoryInactive
+            | ManagedErrorKind::LeaseLost
+            | ManagedErrorKind::PublicationConflict
+            | ManagedErrorKind::JobsRecovering => 409,
+            ManagedErrorKind::JobsOverloaded => 429,
             ManagedErrorKind::AuthorityChanged | ManagedErrorKind::ProjectionUnavailable => 503,
         }
     }
@@ -1080,7 +1109,7 @@ mod tests {
         v["format"] = 3.into();
         let newer = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
-        v["owners"]["jobs"] = v["owners"]["evidence"].clone();
+        v["owners"]["widgets"] = v["owners"]["evidence"].clone();
         let unknown_owner = serde_json::to_vec(&v).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&good).unwrap();
         v["owners"]["evidence"]["profile"] = 2.into();

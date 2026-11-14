@@ -290,6 +290,15 @@ fn activation_is_recorded_by_the_reader_or_the_history_directory() {
         check_activated_registry(root, None).unwrap_err().code(),
         "evidence-unavailable"
     );
+    // reader 9 is the job ledger's, with or without its settings file, since an
+    // interrupted enablement leaves the reader raised and must stay resumable
+    dataset(crate::jobs::READER);
+    std::fs::write(root.join(crate::jobs::FILE), b"{}").unwrap();
+    assert!(!activation_recorded(root).unwrap());
+    check_activated_registry(root, None).unwrap();
+    std::fs::remove_file(root.join(crate::jobs::FILE)).unwrap();
+    assert!(!activation_recorded(root).unwrap());
+    check_activated_registry(root, None).unwrap();
     // the history directory alone records activation too
     dataset(crate::store::wal::HEADER_READER);
     std::fs::create_dir(root.join(DIRECTORY)).unwrap();

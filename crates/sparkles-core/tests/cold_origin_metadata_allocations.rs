@@ -12,7 +12,8 @@ const PAYLOAD: usize = (1 << 20) - 4096;
 fn malformed(field: &str) -> (tempfile::TempDir, Vec<u8>) {
     let root = tempfile::tempdir().unwrap();
     let mut value = serde_json::json!({
-        "format": 1, "minimumReader": 1,
+        "format": sparkles_core::commit::DATASET_FORMAT,
+        "minimumReader": sparkles_core::commit::DATASET_READER,
         "id": uuid::Uuid::new_v4(), "created": "2020-01-01T00:00:00Z", "origin": "create"
     });
     value[field] = if field == "forkedFrom" {

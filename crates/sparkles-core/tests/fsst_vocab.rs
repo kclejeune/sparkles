@@ -3,7 +3,7 @@
 //! compactions, changes it when asked, and is refused by name when its meta lists a
 //! feature this build does not read.
 
-use sparkles_core::builder::{BuildOptions, FEATURE_FSST_VOCAB, VocabCodec};
+use sparkles_core::builder::{BuildOptions, FEATURE_FSST_VOCAB, FORMAT_VERSION, VocabCodec};
 use sparkles_core::check::{CheckOptions, Status, check};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::QueryOptions;
@@ -117,11 +117,11 @@ fn an_fsst_vocabulary_answers_as_front_coding_does() {
     let fsst = load(&fs, Some(VocabCodec::Fsst));
     let g = &fsst.snapshot().generation;
     assert!(g.vocab.is_fsst());
-    assert_eq!(g.meta.format_version, 4);
+    assert_eq!(g.meta.format_version, FORMAT_VERSION);
     assert_eq!(g.meta.features, [FEATURE_FSST_VOCAB]);
     let fg = &front.snapshot().generation;
     assert!(!fg.vocab.is_fsst());
-    assert_eq!(fg.meta.format_version, 3);
+    assert_eq!(fg.meta.format_version, FORMAT_VERSION);
     assert!(fg.meta.features.is_empty());
     let size = |s: &Store| {
         std::fs::metadata(gen_dir(s).join("vocab.dat"))
@@ -157,7 +157,7 @@ fn an_fsst_vocabulary_answers_as_front_coding_does() {
         .unwrap();
     assert_eq!(r.mode, "partial", "{r:?}");
     assert!(s.snapshot().generation.vocab.is_fsst());
-    assert_eq!(s.snapshot().generation.meta.format_version, 4);
+    assert_eq!(s.snapshot().generation.meta.format_version, FORMAT_VERSION);
     // a full compaction with no codec named keeps it too
     update(
         &s,
@@ -193,7 +193,7 @@ fn an_fsst_vocabulary_answers_as_front_coding_does() {
     assert!(r.full_reason.unwrap().contains("vocabulary codec"));
     let g = &s.snapshot().generation;
     assert!(!g.vocab.is_fsst());
-    assert_eq!(g.meta.format_version, 3);
+    assert_eq!(g.meta.format_version, FORMAT_VERSION);
     assert!(!gen_dir(&s).join("vocab.fsst").exists());
     drop(s);
     assert_clean(&fs);
@@ -248,21 +248,26 @@ fn unknown_features_and_damaged_tables_are_refused() {
     assert!(Store::open(&root, StoreOptions::default()).is_ok());
 }
 
-/// A release that reads index formats 2 and 3 refuses an FSST generation as newer, by
-/// the version in its meta.json.
+/// A release that read index formats 2 and 3 refuses a generation of this release's
+/// format as newer, by the version in its meta.json, and this release reads only its
+/// own format.
 #[test]
-fn a_format_3_reader_refuses_format_4() {
+fn a_format_3_reader_refuses_the_current_format() {
     let old = sparkles_core::formats::FileKind {
         reads: &[2, 3],
         writes: 3,
         ..sparkles_core::formats::INDEX
     };
-    let e = old.check("gen-0002", 4, None).unwrap_err().to_string();
+    let e = old
+        .check("gen-0002", FORMAT_VERSION, None)
+        .unwrap_err()
+        .to_string();
     assert!(
-        e.contains("index version 4") && e.contains("newer release"),
+        e.contains("index version 5") && e.contains("newer release"),
         "{e}"
     );
-    assert!(sparkles_core::formats::INDEX.reads(4));
+    assert!(sparkles_core::formats::INDEX.reads(FORMAT_VERSION));
+    assert!(!sparkles_core::formats::INDEX.reads(4));
 }
 
 /// `sparkles migrate --check` refuses what opening the store refuses: an unknown index

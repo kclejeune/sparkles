@@ -13,6 +13,433 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     maintenance(put);
     graphrag(put);
     evidence(put);
+    jobs(put);
+}
+
+pub(super) fn jobs(put: &mut dyn FnMut(&str, J)) {
+    let ms = |d: &str| with_desc(int(), d);
+    let uuid = |d: &str| with_desc(json!({ "type": "string", "format": "uuid" }), d);
+    let state = string_enum(&[
+        "queued",
+        "leased",
+        "retry-wait",
+        "paused",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ]);
+    put(
+        "JobsSettings",
+        doc(
+            closed(
+                &["format", "profile", "enabled"],
+                json!({
+                    "format": { "const": 1 },
+                    "profile": { "const": 1 },
+                    "enabled": boolean(),
+                    "maxQueued": with_desc(int(), "The most runs waiting in `queued` or `retry-wait` at once. Default 1024."),
+                    "maxControlBytes": with_desc(int(), "The size of the dataset's control state past which a submission is refused with `jobs-overloaded`. It bounds admission only. Default 256 MiB."),
+                    "definitions": {
+                        "type": "object",
+                        "maxProperties": 256,
+                        "description": "The registered definitions by name.",
+                        "additionalProperties": closed(
+                            &["kind"],
+                            json!({
+                                "kind": with_desc(string_enum(&["quads"]), "The registered kind. `quads` publishes bounded insert and delete quads into the definition's graphs."),
+                                "version": with_desc(int(), "The kind's version. Default 1."),
+                                "enabled": with_desc(boolean(), "A disabled definition takes no claims. Default true."),
+                                "graphs": with_desc(strings(), "The named graphs a publication may change."),
+                                "workers": with_desc(strings(), "The principal IRIs that may claim runs. Empty admits every principal with `write`."),
+                                "submitters": with_desc(strings(), "The principal IRIs that may submit runs. Empty admits every principal with `write`."),
+                                "attempts": with_desc(int(), "Default 8."),
+                                "retryHorizonMs": ms("Default one day."),
+                                "leaseMs": ms("Default 60000."),
+                                "maxLeaseExtensionMs": ms("Default 300000."),
+                                "maxInputBytes": with_desc(int(), "The largest canonical payload. Default 1 MiB."),
+                                "maxOutputQuads": with_desc(int(), "The most quads one publication holds. Default 100000."),
+                                "concurrency": with_desc(int(), "The most runs of the definition leased at once. Default 1."),
+                            }),
+                        ),
+                    },
+                }),
+            ),
+            "The jobs settings of a dataset, as `jobs.json` format 1 holds them.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobsSettingsStatus",
+        doc(
+            closed(
+                &["settings", "revision", "control", "revisions"],
+                json!({
+                    "settings": sref("JobsSettings"),
+                    "digest": or_null(with_desc(string(), "The SHA-256 digest of the recorded `jobs.json`, or null before the first configuration.")),
+                    "revision": with_desc(int(), "The revision of the dataset's managed-graph registry."),
+                    "control": with_desc(boolean(), "Whether the dataset's control keyspace, which holds the job ledger outside the RDF dataset, is enabled."),
+                    "revisions": with_desc(json!({ "type": "object", "additionalProperties": string() }), "The revision digest of each definition."),
+                }),
+            ),
+            "The settings and the state of the ledger's control keyspace.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobSubmission",
+        doc(
+            closed(
+                &["definition", "idempotencyKey"],
+                json!({
+                    "format": { "const": 1 },
+                    "definition": with_desc(string(), "A registered definition's name."),
+                    "payload": any_object("The typed payload the worker receives at its claim. It must hold no secret."),
+                    "idempotencyKey": with_desc(json!({ "type": "string", "maxLength": 256 }), "Scoped to the dataset, the branch, the caller and the definition revision."),
+                    "checkpoint": with_desc(string(), "The source checkpoint the run starts from."),
+                    "inputs": with_desc(array(closed(&["branchId", "seq"], json!({ "branchId": uuid("The branch by id."), "seq": int() }))), "Commits the run reads, pinned by a source hold until the run is terminal."),
+                    "message": with_desc(string(), "A message for the submission. A submission makes no commit, so it is not recorded."),
+                }),
+            ),
+            "A run to submit.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobSubmitted",
+        doc(
+            closed(
+                &["run", "version", "commit", "replayed", "state"],
+                json!({
+                    "run": uuid("The run's id."),
+                    "version": int(),
+                    "commit": with_desc(int(), "The head of the dataset that the submission's ledger record follows. A submission makes no commit."),
+                    "replayed": with_desc(boolean(), "Whether the key was known with the same payload."),
+                    "state": state.clone(),
+                }),
+            ),
+            "The durable receipt of a submission.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobAttempt",
+        doc(
+            closed(
+                &[
+                    "id",
+                    "worker",
+                    "number",
+                    "generation",
+                    "epoch",
+                    "state",
+                    "claimedMs",
+                    "leaseExpiresMs",
+                ],
+                json!({
+                    "id": uuid("The attempt's id."),
+                    "worker": with_desc(string(), "The worker's principal IRI."),
+                    "number": int(),
+                    "generation": with_desc(int(), "The lease generation, raised by every claim."),
+                    "epoch": uuid("The boot epoch of the process that granted the lease."),
+                    "state": string_enum(&["active", "published", "failed", "interrupted", "expired", "cancelled"]),
+                    "claimedMs": ms("Milliseconds since the epoch in UTC."),
+                    "leaseExpiresMs": ms("Milliseconds since the epoch in UTC, for reporting."),
+                    "diagnostic": with_desc(string(), "The worker's redacted diagnostic, at most 512 characters."),
+                }),
+            ),
+            "An attempt of a run. It never carries the lease token or its verifier.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobPublication",
+        doc(
+            closed(
+                &[
+                    "id",
+                    "attempt",
+                    "digest",
+                    "commit",
+                    "committed",
+                    "inserted",
+                    "deleted",
+                    "publishedMs",
+                ],
+                json!({
+                    "id": uuid("The publication operation id."),
+                    "attempt": uuid("The attempt that published."),
+                    "digest": with_desc(string(), "The digest of the published result."),
+                    "commit": with_desc(int(), "The commit that holds the quads, the record and the state, or the head the publication followed when it made no commit."),
+                    "committed": with_desc(boolean(), "Whether the publication made a commit. One whose result changed no quad makes none."),
+                    "inserted": int(),
+                    "deleted": int(),
+                    "checkpoint": string(),
+                    "publishedMs": ms("Milliseconds since the epoch in UTC."),
+                }),
+            ),
+            "A committed publication.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRun",
+        doc(
+            closed(
+                &[
+                    "id",
+                    "definition",
+                    "revision",
+                    "kind",
+                    "kindVersion",
+                    "principal",
+                    "state",
+                    "version",
+                    "attempts",
+                    "generation",
+                    "submittedMs",
+                    "submittedCommit",
+                    "payloadDigest",
+                    "operation",
+                    "inputs",
+                ],
+                json!({
+                    "id": uuid("The run's id."),
+                    "definition": string(),
+                    "revision": with_desc(string(), "The definition revision the run was accepted under."),
+                    "kind": string(),
+                    "kindVersion": int(),
+                    "principal": with_desc(string(), "The submitter's principal IRI."),
+                    "state": state,
+                    "version": with_desc(int(), "Raised by every transition, for `expectedVersion`."),
+                    "attempts": int(),
+                    "generation": int(),
+                    "submittedMs": ms("Milliseconds since the epoch in UTC."),
+                    "submittedCommit": int(),
+                    "payloadDigest": string(),
+                    "operation": uuid("The submission operation, derived from the idempotency key's scope."),
+                    "checkpoint": string(),
+                    "inputs": array(closed(&["branchId", "seq"], json!({ "branchId": uuid("The branch by id."), "seq": int() }))),
+                    "nextEligibleMs": ms("When a `retry-wait` run may be claimed again."),
+                    "reason": with_desc(string(), "Why the run failed or was cancelled, redacted."),
+                    "retryOf": uuid("The terminal run this one retries."),
+                    "attempt": sref("JobAttempt"),
+                    "publication": sref("JobPublication"),
+                }),
+            ),
+            "The redacted state of a run.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRuns",
+        doc(
+            closed(&["runs"], json!({ "runs": array(sref("JobRun")) })),
+            "The visible runs, newest first.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobClaim",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "format": { "const": 1 },
+                    "definitions": with_desc(strings(), "Restrict the claim to these definitions. Empty claims any permitted definition."),
+                }),
+            ),
+            "A claim request.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobClaimed",
+        doc(
+            closed(
+                &[
+                    "run",
+                    "attempt",
+                    "number",
+                    "generation",
+                    "version",
+                    "token",
+                    "leaseExpiresMs",
+                    "definition",
+                    "kind",
+                    "kindVersion",
+                    "payload",
+                    "inputs",
+                    "graphs",
+                ],
+                json!({
+                    "run": uuid("The run's id."),
+                    "attempt": uuid("The attempt's id."),
+                    "number": int(),
+                    "generation": int(),
+                    "version": int(),
+                    "token": with_desc(string(), "The bearer lease token for `Sparkles-Job-Lease`. It is returned once and never recorded."),
+                    "leaseExpiresMs": ms("Milliseconds since the epoch in UTC."),
+                    "definition": string(),
+                    "kind": string(),
+                    "kindVersion": int(),
+                    "payload": any_object("The submitted payload."),
+                    "checkpoint": string(),
+                    "inputs": array(closed(&["branchId", "seq"], json!({ "branchId": uuid("The branch by id."), "seq": int() }))),
+                    "graphs": with_desc(strings(), "The graphs the publication may change."),
+                }),
+            ),
+            "A claimed run and its lease.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRenew",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "format": { "const": 1 },
+                    "extendMs": ms("The extension, at most the definition's largest. Default the lease length."),
+                    "expectedVersion": with_desc(int(), "Refused with `412` when the run is at another version."),
+                }),
+            ),
+            "A lease renewal.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRenewed",
+        doc(
+            closed(
+                &["run", "version", "leaseExpiresMs"],
+                json!({ "run": uuid("The run's id."), "version": int(), "leaseExpiresMs": ms("Milliseconds since the epoch in UTC.") }),
+            ),
+            "A renewed lease.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobPublish",
+        doc(
+            closed(
+                &["operation"],
+                json!({
+                    "format": { "const": 1 },
+                    "operation": uuid("The publication operation id, chosen by the worker and kept across retries."),
+                    "expectedVersion": int(),
+                    "insert": with_desc(strings(), "N-Quads lines, one quad each, in the definition's graphs."),
+                    "delete": with_desc(strings(), "N-Quads lines, one quad each, in the definition's graphs."),
+                    "checkpoint": with_desc(string(), "The source checkpoint that becomes visible with the quads."),
+                    "message": with_desc(string(), "The commit message."),
+                }),
+            ),
+            "The typed result of a `quads` run.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobPublished",
+        doc(
+            closed(
+                &[
+                    "run",
+                    "publication",
+                    "commit",
+                    "committed",
+                    "version",
+                    "inserted",
+                    "deleted",
+                    "replayed",
+                ],
+                json!({
+                    "run": uuid("The run's id."),
+                    "publication": uuid("The publication operation id."),
+                    "commit": with_desc(int(), "The commit the publication made, or the head it followed when its result changed no quad."),
+                    "committed": with_desc(boolean(), "Whether the publication made a commit."),
+                    "version": int(),
+                    "inserted": int(),
+                    "deleted": int(),
+                    "replayed": with_desc(boolean(), "Whether this is the original receipt of an operation completed before."),
+                }),
+            ),
+            "The receipt of a publication.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobFailure",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "format": { "const": 1 },
+                    "transient": with_desc(boolean(), "Whether another attempt may succeed. Default false, which ends the run."),
+                    "reason": with_desc(string(), "A diagnostic the worker has redacted. Cut to 512 characters."),
+                    "retryAfterMs": ms("The least delay before the next attempt."),
+                    "expectedVersion": int(),
+                }),
+            ),
+            "A typed failure of an attempt.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRetry",
+        doc(
+            closed(
+                &["idempotencyKey"],
+                json!({
+                    "format": { "const": 1 },
+                    "idempotencyKey": with_desc(json!({ "type": "string", "maxLength": 256 }), "The new run's key."),
+                }),
+            ),
+            "An explicit retry of a failed or cancelled run.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRecover",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "format": { "const": 1 },
+                    "resume": with_desc(array(uuid("A paused run of the restored set.")), "The paused runs to resume, at most 256. Empty reports the recovery."),
+                }),
+            ),
+            "A request of the recovery route.",
+            "durable-jobs",
+        ),
+    );
+    put(
+        "JobRecovery",
+        doc(
+            closed(
+                &["recovery", "resumed"],
+                json!({
+                    "recovery": or_null(closed(
+                        &["id", "sourceDataset", "captureCommit", "captureMs", "phase", "startedMs", "paused", "resumed", "cancelled", "ended"],
+                        json!({
+                            "id": uuid("The recovery's id."),
+                            "sourceDataset": uuid("The dataset the restored backup was taken of."),
+                            "captureCommit": with_desc(int(), "The commit the backup captured."),
+                            "captureLabel": string(),
+                            "captureMs": ms("When the backup was captured."),
+                            "phase": string_enum(&["pausing", "awaiting-decision"]),
+                            "startedMs": ms("When the recovery started."),
+                            "paused": with_desc(int(), "The restored runs still paused."),
+                            "resumed": with_desc(int(), "The runs resumed so far."),
+                            "cancelled": with_desc(int(), "The paused runs cancelled so far."),
+                            "ended": with_desc(boolean(), "Whether no paused run is left, which ends the recovery."),
+                        }),
+                    )),
+                    "resumed": with_desc(array(uuid("A resumed run.")), "The runs this request resumed."),
+                }),
+            ),
+            "The recovery of a restored dataset's jobs.",
+            "durable-jobs",
+        ),
+    );
 }
 
 pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {

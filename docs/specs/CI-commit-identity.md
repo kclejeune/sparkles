@@ -521,29 +521,16 @@ last one.
   interrupted create left one. Build `gen-0001`, then write `gen-0001/commit.json` with
   `baseSeq 0`, kind `create` and quads 0. Write `commits.bin` with record 0. Write
   `CURRENT` last.
-* **Pre-existing database** (`CURRENT` present, no `dataset.json`). Open and replay as
-  today, treating version-0 commit records as legacy. Then write the baseline root commit.
-  It has `seq 0`, kind `baseline`, `inserted = quads` (everything present), `deleted 0`
-  and the current time as its timestamp. Write it to `gen-NNNN/commit.json` (`baseSeq 0`,
-  origin `baseline`), then to `commits.bin`, and write `dataset.json` last. Once
-  `dataset.json` exists the migration is complete, so an interrupted migration is redone.
-  Legacy records *before* the first version-2 record are folded into `baseSeq`
-  (commit 0).
-* **Legacy records after a version-2 record.** These appear when an older binary appends
-  to an upgraded database. Each gets `seq = prev + 1`, kind `unknown`, the parent's
-  timestamp and the `reconstructed` flag. The rule is deterministic, so every replay
-  assigns the same ids. Downgrading is still unsupported, but it corrupts nothing.
-* **Strict framing of a headerless log.** A torn version-2 commit record can be
-  byte-identical to a legacy one. The first write open of a headerless log by a release
-  with [X09](X09-group-commit-by-default.md) Phase 3 records the log's logical end as
-  `walStrictFrom` in the generation's `commit.json`. It does so after replay, truncation,
-  the log's sync and the syncs of `delta.vocab` and `annotations.bin`, so the terms and
-  annotations of the commits before the offset are durable with them. A log cut to nothing
-  records 0, and a recorded offset whose log is missing is corruption.
-  Records before it keep the rules above. Records after it follow the rules of a log with
-  a header record, so a commit record without metadata there is damage, and damage before
-  the offset is corruption. Legacy records that a downgraded binary appends after the
-  offset are therefore treated as damage.
+* **Pre-existing database** (`CURRENT` present, no `dataset.json`). The first-release
+  format cutoff of [X16 Phase 1](X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)
+  refuses it with the dump-and-reload message, together with a log without a header record
+  and a `dataset.json` of `format` 1. The baseline migration, the folding of legacy
+  commit records into commit 0, the reconstruction of legacy records after a version-2
+  record and the `walStrictFrom` member of `commit.json` that told a legacy record from a
+  torn one are gone with the headerless reader. Every log this release reads starts with
+  a header record, and every commit record after it carries metadata, so a commit record
+  without metadata is damage: a torn tail when no later record proves the commit durable,
+  and corruption otherwise. `dataset.json` is written as `format` 2.
 
 ### 5.7 Server plumbing
 

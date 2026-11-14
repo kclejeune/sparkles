@@ -13,6 +13,35 @@ before anything is written. A clone's root commit is no longer earlier than the 
 it copies when the server clock runs behind. Validity intervals through the
 authenticated writer are roadmap item 925.
 
+### Format
+
+The first-release format cutoff of item 479 implements X16 Phase 1. `dataset.json` is written
+as `format` 2 with `minimumReader` 5 or more, and a `format` 1 file or one that requires a
+reader below 5 is refused with the dump-and-reload message. The generation index is
+written and read as format 5, which is format 4 with the `features` list always present
+and `vocab.idx` required, and formats 2 to 4 are refused. The write-ahead log reads
+versions 1 and 2 and refuses a headerless log, version 0. The delta vocabulary reads the
+framed version 2 and refuses the pre-release file of the entries alone, and the
+`sparkles migrate` step that rewrote it is gone, so no step is registered. Backup key
+slots read format 2 alone. `sparkles vocab-index` no longer writes `vocab.idx`, which
+every generation has, and still adds the numeric column. The legacy framing of the
+write-ahead log, which told a pre-release commit record from a torn one through
+`walStrictFrom` in `commit.json`, is gone with the headerless reader, `sparkles check`
+reports every log and index form that open refuses, and the open syncs a generation's
+directory after it creates the log, so a crash after the first commits of a new log
+cannot lose it. The two pre-release fixtures stay in `testsuite/formats/` for their
+refusal tests, and a fixture written at the cutoff commit joins them.
+
+The control keyspace of item 933 adds `control.bin`, a checkpoint of the control state at
+version 1 that is replaced atomically, `control.log`, a log of control-only frames at
+version 1, and version 3 of the write-ahead log, which carries control records inside a
+transaction and is written by every store whose keyspace is enabled. Each file is listed
+in the format registry, and a reader refuses a version it does not know before it reads
+further. A version 3 log needs dataset reader 9, a `control.log` without `control.bin` is
+an integrity error, and a backup that holds `control.bin` or `jobs.json` requires the
+backup feature `control/1`. `sparkles check` has a `control` check of the two logs'
+ordering.
+
 ### OWL classification
 
 The Horn rules classify ontologies with individuals, functional data properties and top
@@ -86,6 +115,30 @@ and a correlated `EXISTS` is evaluated by the query engine for the rows a commit
 changed. A view's `GROUP_CONCAT` lists a group's values in their `ORDER BY` order. View
 checkpoints written by earlier releases for queries with these operators are refused by
 their compiler fingerprint and the views are built again.
+
+Durable jobs (item 339, C26 Phase 1). A dataset keeps accepted work in a job ledger, with
+its definitions in `jobs.json`. `Dataset::jobs()` and the routes under `/$/jobs/{ds}`
+submit runs with an idempotency key, lease them to workers with a bearer token and a lease
+generation, and publish a worker's quads with the publication record, the source
+checkpoint and the run's completion in one commit, so a retry after a lost response or a
+crash never duplicates its effects. A restart fences every earlier lease by boot epoch
+before the process admits a claim. A lease deadline counts only once the transition that
+grants or extends it is the run's committed version, so a refused renewal never extends
+a lease. Enabling jobs raises the dataset's `minimumReader` to 9, so older releases
+refuse to open such a dataset. The private import transport now names its destination
+reader as `IMPORTED_DESTINATION_READER`, one above `DATASET_READER`.
+
+The job ledger lives in a control keyspace of the main store (item 933), outside the RDF
+dataset, so no query, listing, statistic, index, export, validation, merge or history
+reads or counts it and no read surface needs an exclusion of its own. A publication
+writes its records in the same write-ahead log record as its quads, and a transition
+without quads is a frame of `control.log` that creates no commit, so a publication whose
+quads make no net change reports `committed: false`. The settings' `maxControlBytes`, 256
+MiB by default, bounds the ledger held in memory by refusing new submissions. A backup
+captures the ledger at the captured commit, a restored dataset pauses its restored runs
+before it admits a claim and answers `jobs-recovering` while it does, and `POST
+/$/jobs/{ds}/recover` resumes selected paused runs. A clone starts with an empty ledger.
+The `hidden` visibility of the managed-graph registry stays reserved and refused.
 
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence

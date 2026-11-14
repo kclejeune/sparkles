@@ -110,8 +110,6 @@ pub(super) struct Pending {
     base: CommitInfo,
     base_configuration: ConfigurationBinding,
     base_origin: Sha256Digest,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
     _held: Reservation,
 }
 
@@ -134,8 +132,6 @@ pub(super) struct Retained {
     base: CommitInfo,
     base_configuration: ConfigurationBinding,
     base_origin: Sha256Digest,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
     _held: Reservation,
 }
 
@@ -167,8 +163,6 @@ impl Retained {
             || actual.configuration != self.base_configuration
             || Sha256Digest::of_bytes(actual.origin.as_bytes(), preparation.control())?
                 != self.base_origin
-            || (actual.origin == "baseline") != self.fold_legacy
-            || actual.wal_strict_from != self.strict_from
             || actual.dataset_id != self.sources.origin.value.dataset_id
         {
             return Err(managed_history::unavailable(
@@ -377,8 +371,6 @@ impl Pending {
             base: actual.commit,
             base_configuration: actual.configuration,
             base_origin: Sha256Digest::of_bytes(actual.origin.as_bytes(), preparation.control())?,
-            fold_legacy: actual.origin == "baseline",
-            strict_from: actual.wal_strict_from,
             _held: held,
         }))
     }
@@ -423,8 +415,6 @@ impl Pending {
         preparation.check()?;
         if !Arc::ptr_eq(from.generation, &self.generation)
             || from.base != self.base
-            || from.fold_legacy != self.fold_legacy
-            || from.strict_from != self.strict_from
             || from.path != self.root.join(&self.generation.name).join("wal.log")
         {
             return Err(managed_history::unavailable(
@@ -487,8 +477,6 @@ impl Pending {
             bytes.len() as u64,
             self.base.seq,
             u64::MAX,
-            self.fold_legacy,
-            self.strict_from,
             self.generation.dvocab.len(),
             from.annotated.map(|_| membership.as_slice()),
             from.path,
@@ -545,8 +533,6 @@ impl Pending {
             base: self.base,
             base_configuration: self.base_configuration,
             base_origin: self.base_origin,
-            fold_legacy: self.fold_legacy,
-            strict_from: self.strict_from,
             _held: self._held,
         };
         // Local opening actors die here. The transferred map owns no Arc back
@@ -574,7 +560,6 @@ fn same_base(
     if original.meta != generation.meta
         || original.physical.commit != actual.commit
         || original.physical.origin != actual.origin
-        || original.physical.wal_strict_from != actual.wal_strict_from
         || (actual.configuration != binding && actual.configuration != retag(binding))
     {
         return Err(managed_history::unavailable(

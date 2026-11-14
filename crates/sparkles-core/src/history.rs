@@ -786,8 +786,7 @@ pub(crate) struct GenEntry {
     pub base: CommitInfo,
     /// the last commit in its WAL (for the current generation: kept at the head)
     pub end: u64,
-    /// legacy WAL commits before the first one with metadata fold into the base
-    pub fold_legacy: bool,
+    /// the size of its directory, 0 for the current generation
     pub bytes: u64,
 }
 
@@ -1286,7 +1285,7 @@ fn fully_covered(lo: u64, hi: u64, covered: &[(u64, u64)]) -> bool {
 pub(crate) fn scan_generations(
     root: &Path,
     dataset_id: uuid::Uuid,
-) -> Result<Vec<(u32, String, CommitInfo, bool)>> {
+) -> Result<Vec<(u32, String, CommitInfo)>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(root)? {
         let e = e?;
@@ -1299,9 +1298,7 @@ pub(crate) fn scan_generations(
         }
         let no = commit::generation_number(&name);
         match commit::read_gen_commit(&e.path()) {
-            Ok(Some((id, c, origin))) if id == dataset_id => {
-                out.push((no, name, c, origin == "baseline"))
-            }
+            Ok(Some((id, c, _))) if id == dataset_id => out.push((no, name, c)),
             _ => tracing::warn!(
                 target: "sparkles::history",
                 "{}: not a generation of this dataset; left alone",
@@ -1336,7 +1333,7 @@ pub fn retained_offline(
         .unwrap_or_default();
     let head = recs.last().map_or(0, |c| c.seq);
     let mut h = HistoryState::new(pins, retention);
-    for (no, name, base, fold_legacy) in scan_generations(root, dataset_id)? {
+    for (no, name, base) in scan_generations(root, dataset_id)? {
         if no > current {
             continue;
         }
@@ -1348,7 +1345,7 @@ pub fn retained_offline(
                 .rev()
                 .find(|c| c.generation == no)
                 .map(|c| c.seq.max(base.seq))
-                .unwrap_or_else(|| crate::store::wal_end(&dir, &base, fold_legacy))
+                .unwrap_or_else(|| crate::store::wal_end(&dir, &base))
         };
         h.gens.insert(
             no,
@@ -1357,7 +1354,6 @@ pub fn retained_offline(
                 dir,
                 base,
                 end,
-                fold_legacy,
                 bytes: 0,
             },
         );
@@ -1418,7 +1414,7 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
         .unwrap_or_default();
     let head = recs.last().map_or(0, |c| c.seq);
     let mut h = HistoryState::new(BTreeMap::new(), Retention::default());
-    for (no, name, base, fold_legacy) in scan_generations(root, dataset_id)? {
+    for (no, name, base) in scan_generations(root, dataset_id)? {
         if no > current {
             continue;
         }
@@ -1429,7 +1425,7 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
             .rev()
             .find(|c| c.generation == no)
             .map(|c| c.seq.max(base.seq))
-            .unwrap_or_else(|| crate::store::wal_end(&dir, &base, fold_legacy));
+            .unwrap_or_else(|| crate::store::wal_end(&dir, &base));
         h.gens.insert(
             no,
             GenEntry {
@@ -1437,7 +1433,6 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
                 name,
                 base,
                 end,
-                fold_legacy,
                 bytes: 0,
             },
         );
@@ -1502,8 +1497,8 @@ fn unfinished(
         Err(e) => Err(format!("its commit.json cannot be read: {e}")),
         Ok(b) if blank(&b) => Ok(()),
         Ok(_) => match commit::read_gen_commit(dir) {
-            Ok(Some((id, c, origin))) if id == dataset_id => {
-                let end = crate::store::wal_end(dir, &c, origin == "baseline");
+            Ok(Some((id, c, _))) if id == dataset_id => {
+                let end = crate::store::wal_end(dir, &c);
                 if c.seq <= head && end <= head {
                     Ok(())
                 } else {
@@ -1685,7 +1680,6 @@ mod tests {
                     dir: PathBuf::new(),
                     base: c(b),
                     end: e,
-                    fold_legacy: false,
                     bytes: 0,
                 },
             );

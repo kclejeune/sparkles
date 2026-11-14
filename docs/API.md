@@ -13467,6 +13467,134 @@ record any of whose triples the caller's view hides is neither reported nor foll
 
 `GET /$/server` lists the route in `capabilities.claims.dependents`.
 
+### Durable jobs
+
+A dataset's durable jobs keep accepted work in a job ledger inside the dataset, so a
+collector or analysis worker resumes after a restart and a result reaches the data
+atomically. The ledger lives in the control keyspace of the dataset's main store, which
+lies outside the RDF dataset, so no update, Graph Store write, import or merge can change
+a record and no query, listing, statistic, index, export, validation or history can read
+or count one. A publication commits the worker's quads, the publication record, the source
+checkpoint and the run's completion in one write-ahead log record. A transition without
+quads, such as a submission or a claim, is a frame of the store's `control.log` and
+creates no commit. The design
+is in [C26](specs/C26-durable-jobs-and-delivery.md), and its ordering argument against
+the log and the commit tail in
+[C26 §7.1](specs/C26-durable-jobs-and-delivery.md#71-ordering-against-the-write-ahead-log-and-the-commit-tail).
+
+The settings are kept in `<db>/jobs.json` as format 1 and profile 1. They register the
+definitions, each with a kind, the graphs its publications may change, the principals
+that may submit and claim it, and its retry and lease policy. The only kind in this build
+is `quads`, whose typed result is bounded insert and delete quads in the definition's
+graphs with an opaque source checkpoint. The first configuration raises the dataset reader
+to 9 durably, enables the control keyspace and upgrades the write-ahead log to version 3,
+so a release that does not know the ledger refuses to open the dataset. The settings
+status reports `control: true` once the keyspace is enabled.
+
+```json
+{
+  "format": 1, "profile": 1, "enabled": true, "maxQueued": 1024,
+  "definitions": {
+    "collect-advisories": {
+      "kind": "quads", "version": 1, "graphs": ["https://example.org/advisories"],
+      "workers": ["urn:x-sparkles:principal:collector"],
+      "attempts": 8, "retryHorizonMs": 86400000, "leaseMs": 60000,
+      "maxLeaseExtensionMs": 300000, "maxOutputQuads": 100000, "concurrency": 1
+    }
+  }
+}
+```
+
+`GET` and `PUT /$/jobs/{ds}/settings` read and record the settings and need `admin` on
+the dataset. A definition's revision is the digest of its canonical JSON. A run keeps the
+revision it was accepted under, with the attempts and retry horizon of that revision, and
+a run whose definition changed or was removed is not claimed until the definition is
+restored or the run is cancelled. An expired lease or a restart still judges such a run
+by the policy it was accepted with, never by a replacement's, so a run that has used its
+accepted attempts or passed its accepted horizon fails. Jobs cannot be disabled while runs are
+queued, leased or waiting to retry, and a run admitted as jobs were being disabled waits
+until they are enabled again. `maxQueued` is at most 4096, and the definitions'
+`concurrency` adds up to at most 4096, so that dispatch counts waiting runs and leases
+exactly. The ledger is held in memory, and `maxControlBytes`, from 1 MiB to 16 GiB with a
+default of 256 MiB, bounds it. A submission that would pass the bound is `429
+jobs-overloaded`, while transitions of admitted runs are never refused for the ledger's
+size. Terminal records stay in the ledger until [roadmap](ROADMAP.md) item 934 adds their
+retention.
+
+`POST /$/jobs/{ds}` submits a run with `definition`, a JSON `payload`, an
+`idempotencyKey` of at most 256 bytes, an optional `checkpoint` and optional `inputs`,
+commits that a source hold pins until the run is terminal, at most 4096 of them. It needs
+`write` on the dataset through the update endpoint, and the caller's own grants must reach
+every graph of the definition. The server answers `202` with the run's `Location` once the
+submission's commit is durable. The key is scoped to the dataset, the branch, the caller,
+the definition's name and revision and the operation kind, a submission or a retry. The
+same key with the same payload, checkpoint, input set and retried run answers `200` with
+the existing run and `replayed: true`, while another request under the key is `409
+idempotency-conflict`. JSON whitespace, member order and the order of the inputs do not
+change the request's digest. A definition that changes between the check of the request
+and the commit is `409`, and nothing is stored.
+A dataset whose bound on waiting runs is reached answers `429 jobs-overloaded` and stores
+nothing.
+
+`POST /$/jobs/{ds}/claim` leases the first submitted eligible run of the caller's
+permitted definitions, optionally restricted by `definitions`, and answers its payload,
+inputs, checkpoint, graphs and a bearer lease token. The token is returned once and never
+recorded, since the ledger keeps only its SHA-256 verifier. Nothing eligible is `204`. A
+lease has a generation that every claim raises, and the process that granted it has a
+boot epoch. A run whose lease expired is scheduled under its retry policy, as an
+interrupted attempt is, and is taken over with a later generation once it is due. A
+waiting run whose horizon passed, or whose attempts ran out, ends as `failed` instead.
+
+`POST /$/jobs/{ds}/{id}/renew`, `publish` and `fail` carry the token in the
+`Sparkles-Job-Lease` header, which no log records, and may carry `expectedVersion`, which
+refuses another version with `412`. A token whose generation was superseded, whose lease
+expired, whose process restarted or whose run is no longer leased is `409 lease-lost`, and
+so is a lease whose definition was removed, disabled or edited since the claim or no
+longer lists the worker. A caller that is neither an administrator, the submitter nor a
+worker of one of the run's attempts gets the `404` of an unknown run instead. A renewal extends the lease by `extendMs`, at most the
+definition's largest extension. A
+publication names its `operation`, a UUID the worker keeps across retries, and its
+`insert` and `delete` quads as N-Quads lines in the definition's graphs, with an optional
+`checkpoint`. The same operation with the same quads and checkpoint answers the original
+receipt with `replayed: true`, even after the lease ended, and another result under the
+same operation is `409 publication-conflict`, so a retry after a lost response can never
+duplicate its effects. A publication whose quads make no net change creates no commit,
+and its receipt has `committed: false` and names the head it follows as its commit. A failure is `transient`, which enters `retry-wait` with
+exponential backoff and jitter and honors `retryAfterMs` within the definition's attempts
+and horizon, or permanent, which ends the run. A `retryAfterMs` that does not fit in the
+remaining horizon ends the run too.
+
+`POST /$/jobs/{ds}/{id}/cancel` durably ends a run and fences its active attempt. Work
+already committed stays committed, and the reason records that an external request
+already sent may still take effect. `POST /$/jobs/{ds}/{id}/retry` creates a new run from
+a failed or cancelled one under a new key and links it to the old run, which stays as
+evidence. `GET /$/jobs/{ds}` and `GET /$/jobs/{ds}/{id}` inspect the runs the caller may
+see, every run for an administrator and the runs another caller submitted or works on,
+with `state`, `definition` and `limit` filters. An unknown run and an invisible run share
+the same `404`. The claim response returns the token once, and no inspection response
+carries a token or its verifier.
+
+A restart installs a new boot epoch before the process admits any claim, renewal or
+publication. Attempts of an earlier epoch are interrupted, their runs return to their
+retry policy, and their tokens fail from then on.
+
+A backup holds the ledger as it was at the captured commit and requires the backup
+feature `control/1`. A restored dataset pauses every restored run that had not ended
+before it admits any claim, and while it pauses them every transition answers `409
+jobs-recovering`. A restart continues the pausing where it stopped. `POST
+/$/jobs/{ds}/recover` with `{"resume": [run ids]}` then resumes selected paused runs of
+the restored set, at most 256 per request, and needs `admin` on the dataset, since the
+operator decides which uncertain external effects may happen again. It answers the
+recovery, with the source dataset, the captured commit, its phase and the counts of
+paused and resumed runs, and the runs it resumed. An empty list reads the recovery. A
+request that arrives before every restored run is paused is `409 jobs-recovering`, and
+the server finishes the pausing before it answers, so the operator decides on a complete
+paused set with the next request. The recovery stays after its last paused run is
+resumed or cancelled, and a retry of a restored run creates its new run paused in the
+same set. A clone starts with an empty ledger and the
+source's definitions. Delivery through an outbox and recurring definitions are
+[roadmap](ROADMAP.md) work.
+
 ### Suggested examples
 
 A reader who finds a good question and query can suggest it as an example, and a

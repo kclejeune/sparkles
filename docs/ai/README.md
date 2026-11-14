@@ -673,6 +673,67 @@ authenticated claims with unknown validity, and roadmap item 925 adds that input
 projection helper, event-time UI and expiry integration remain planned under roadmap
 item 341.
 
+### Durable jobs
+
+A durable job keeps accepted work inside the dataset, so a collector or an analysis
+worker resumes after a restart and its result reaches the data atomically. The ledger
+lives in the control keyspace of the dataset's main store, which lies outside the RDF
+dataset, so no SPARQL update, Graph Store write, import or merge can change a record and
+no query, listing, statistic, index, export or history can read or count one. A
+transition that publishes quads writes its records in the same write-ahead log record as
+the quads, and a transition without quads is a frame of the store's `control.log`, which
+creates no commit. The design is in [C26](../specs/C26-durable-jobs-and-delivery.md).
+
+The settings in `jobs.json` register definitions. Each names a kind, the graphs its
+publications may change, the principals that may submit and claim it, and its retry and
+lease policy. The kind in this build is `quads`, whose typed result is bounded insert and
+delete quads in the definition's graphs with an opaque source checkpoint. The first
+configuration raises the dataset reader to 9, enables the control keyspace and upgrades
+the write-ahead log to version 3, so a release that does not know the ledger refuses to
+open the dataset. The control state is held in memory. `maxControlBytes`, 256 MiB by
+default, bounds it by refusing new submissions with `jobs-overloaded`, while the runs
+already admitted keep making progress. That memory is the price of keeping the ledger
+out of the indexes, and terminal records stay in it until roadmap item 934 adds their
+retention.
+
+A submission carries an idempotency key scoped to the dataset, the branch, the caller,
+the definition's name and revision and the operation kind. The same key with the same
+payload, checkpoint, input set and retried run returns the existing run, and another
+request under the key is a conflict. A worker claims the first submitted eligible run of its
+permitted definitions and receives a bearer lease token, which the ledger never records
+beyond its SHA-256 verifier. Every claim raises the run's lease generation, and the
+process that granted a lease has a boot epoch, so a token whose generation was superseded,
+whose lease expired, whose process restarted or whose definition no longer admits the
+run or the worker fails with `lease-lost`, and a caller with no part in the run gets the
+answer of an unknown run. An expired lease follows the retry policy the run was accepted
+with before another worker takes the run over. A run whose definition was edited or
+removed is not claimed until the definition is restored, and it keeps the policy it was
+accepted with, so it still fails once that policy's attempts or horizon run out. A publication
+commits the quads, the publication record, the checkpoint and the run's completion
+together, and a repeated publication operation returns the original receipt even after
+the lease ended, so a retry after a lost response never duplicates its effects. A
+transient failure retries with exponential backoff within the definition's attempts and
+horizon, a permanent one ends the run, cancellation fences the active attempt, and an
+explicit retry makes a new run that links the old one.
+
+In Rust, `Dataset::jobs()` configures, submits, claims, renews, publishes, fails, cancels,
+retries, inspects and resumes restored work. Over HTTP the routes are under
+`/$/jobs/{ds}`, described in [the API reference](../API.md#durable-jobs). Only the jobs
+inspection renders the ledger's records. A publication whose quads make no net change
+creates no commit and reports `committed: false` with the head it follows. A
+submitter's own grants must reach the definition's graphs, but a worker's publication
+is not intersected with the submitter's grants as they stand at publication, which
+roadmap item 903 covers.
+
+A backup holds the ledger as it was at the captured commit. A restored dataset pauses
+every restored run that had not ended before it admits any claim, and refuses
+transitions with `jobs-recovering` while it pauses them. An administrator then resumes
+selected runs with `POST /$/jobs/{ds}/recover` or `Jobs::resume`, after deciding which
+uncertain effects may happen again. A retry of a restored run waits paused in the same
+way. A clone starts with an empty ledger and the source's definitions. Delivery through
+an outbox and recurring definitions are roadmap item 339, and the analysis and batch
+kinds are items 899 and 900.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
@@ -680,6 +741,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### AI and agents
 
+* A durable job's publication writes quads only. An analysis publication with F22's
+  freshness checks and a batch publication with C23's pinned iterator are roadmap items
+  899 and 900. The outbox and recurring definitions are item 339, and the ready-time
+  index, cursor paging, per-principal bounds and shutdown fencing of claims are item 902.
+* Terminal job records stay in the control state, which is held in memory, until
+  roadmap item 934 adds their retention. A clone starts with an empty ledger, and item
+  936 copies records into a clone under new identities.
 * A question asked with a context chip reaches the model as the question followed by
   `(about <IRI>)`, as a typed suffix would. Grounding does not seed entity linking or
   predicate use from the structured `about` resource. Roadmap item 717.

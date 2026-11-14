@@ -3882,6 +3882,110 @@ fn assist(p: &mut Paths) {
         .errors(&[400, 404, 503]),
     );
     p.add(
+        op(GET, "/$/jobs/{ds}/settings", "getJobsSettings", "Datasets", "Get the jobs settings")
+            .doc("Needs `admin` on the dataset. Answers the disabled defaults before the first configuration.")
+            .see("durable-jobs")
+            .json("200", "The settings and their protection.", "JobsSettingsStatus")
+            .errors(&[503]),
+    );
+    p.add(
+        op(PUT, "/$/jobs/{ds}/settings", "putJobsSettings", "Datasets", "Set the jobs settings")
+            .doc("Needs `admin` on the dataset. Records complete settings, and on the first configuration raises the dataset reader to 9 durably and enables the dataset's control keyspace, which holds the job ledger outside the RDF dataset. Editing a definition changes its revision, and a run accepted under an older revision keeps that revision's attempts and retry horizon and is not claimed, and not ended by an expiry or a restart, until the definition is restored. Disabling jobs while runs are queued, leased or waiting to retry is a `409` that writes nothing, as is a configuration that races with another change of the registry. A disabled configuration keeps the control keyspace, so a run that was admitted as jobs were disabled waits, untouched, until they are enabled. `maxQueued` is at most 4096, the definitions' `concurrency` adds up to at most 4096, and `maxControlBytes`, the size of the control state past which a submission is refused, is between 1 MiB and 16 GiB with a default of 256 MiB.")
+            .see("durable-jobs")
+            .json_body(true, "JobsSettings")
+            .json("200", "The settings and their protection.", "JobsSettingsStatus")
+            .errors(&[400, 409, 503]),
+    );
+    p.add(
+        op(GET, "/$/jobs/{ds}", "listJobs", "Datasets", "List the visible runs")
+            .doc("Needs `read` on the dataset through the query endpoint. An administrator sees every run, and another caller the runs it submitted or currently works on. Newest first, at most `limit`.")
+            .see("durable-jobs")
+            .query("state", str_enum(&["queued", "leased", "retry-wait", "paused", "succeeded", "failed", "cancelled"]), "Only runs in this state.")
+            .query("definition", s(), "Only runs of this definition.")
+            .query("limit", int(), "At most this many runs, up to 1000. Default 100.")
+            .json("200", "The visible runs.", "JobRuns")
+            .errors(&[400, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}", "submitJob", "Datasets", "Submit a run")
+            .doc("Needs `write` on the dataset through the update endpoint, and to be among the definition's submitters when it names any. Records the run in the dataset's job ledger, which is no commit of the dataset, and answers `202` with its `Location` once the record is durable. The key is scoped to the dataset, the branch, the caller, the definition's name and revision and the operation kind. The same `idempotencyKey` with the same payload, `checkpoint`, `inputs` and retried run answers `200` with the existing run and `replayed`; JSON whitespace, member order and the order of `inputs` do not change the request's digest. Refusals write nothing: `400` for a malformed submission or more than 4096 `inputs`, `403` when the caller's own grants do not reach a graph of the definition, `404` for an unknown definition, `409 idempotency-conflict` for a known key with another request, `409` for a disabled definition or one that changed while the submission was prepared, `409 jobs-recovering` while the jobs recovery of a restored dataset pauses its restored work, and `429 jobs-overloaded` when the dataset's bound on waiting runs or on the size of its control state is reached.")
+            .see("durable-jobs")
+            .json_body(true, "JobSubmission")
+            .resp_h("202", "The durable receipt.", Some(json!({ "application/json": { "schema": sref("JobSubmitted") } })), json!({
+                "Location": { "description": "The run's route.", "schema": s() },
+            }))
+            .json("200", "The existing run of a replayed key.", "JobSubmitted")
+            .errors(&[400, 403, 404, 409, 429, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}/claim", "claimJob", "Datasets", "Claim one eligible run")
+            .doc("Needs `write` on the dataset through the update endpoint, and to be among a definition's workers when it names any. Leases the first submitted eligible run of the caller's permitted definitions, raising its lease generation, and answers the payload with a bearer lease token that is returned once and never recorded. A run whose lease expired is scheduled under its retry policy, as an interrupted attempt is, and is claimed with a later generation once it is due, from which point the earlier worker's token fails; a run whose horizon passed or whose attempts ran out ends as `failed` instead. `204` when nothing is eligible.")
+            .see("durable-jobs")
+            .json_body(false, "JobClaim")
+            .json("200", "The claimed run and its lease.", "JobClaimed")
+            .no_content("Nothing is eligible.")
+            .errors(&[400, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}/recover", "recoverJobs", "Datasets", "Resume restored work")
+            .doc("Needs `admin` on the dataset. A restored dataset's jobs recovery pauses every run its backup held before any claim, and those runs wait for this route. It resumes the paused runs listed in `resume`, each of which must belong to the restored set, and the recovery ends once none of them is left paused. An operator resumes work only after mapping principals and secret references and deciding whether uncertain external effects may happen again. With an empty `resume` it reports the recovery. `409 jobs-recovering` while the recovery is still pausing, and `409` for a run that the recovery did not pause.")
+            .see("durable-jobs")
+            .json_body(false, "JobRecover")
+            .json("200", "The recovery and the runs resumed.", "JobRecovery")
+            .errors(&[400, 403, 409, 503]),
+    );
+    p.add(
+        op(GET, "/$/jobs/{ds}/{id}", "getJob", "Datasets", "Inspect a run")
+            .doc("Needs `read` on the dataset through the query endpoint. An unknown run and a run the caller may not see share the same `404`. The response never carries a lease token or its verifier.")
+            .see("durable-jobs")
+            .json("200", "The redacted state of the run.", "JobRun")
+            .errors(&[404, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}/{id}/renew", "renewJobLease", "Datasets", "Renew a lease")
+            .doc("Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. Extends the lease by `extendMs`, at most the definition's largest extension. `409 lease-lost` for a token whose generation was superseded, whose lease expired, whose process restarted, whose run is no longer leased or whose definition was removed, disabled, edited or no longer lists the worker, `404` for a caller that is neither an administrator, the submitter nor a worker of the run, `412 precondition-failed` for another `expectedVersion`, and `401 lease-missing` without the header.")
+            .see("durable-jobs")
+            .header_req("Sparkles-Job-Lease", s(), "The bearer lease token the claim returned.")
+            .json_body(false, "JobRenew")
+            .json("200", "The renewed lease.", "JobRenewed")
+            .errors(&[400, 401, 409, 412, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}/{id}/publish", "publishJob", "Datasets", "Publish a run's result")
+            .doc("Needs `write` through the update endpoint, update grants on every graph the result writes and the lease token in `Sparkles-Job-Lease`. Commits the result's quads, the publication record, the checkpoint and the run's completion in one commit of the dataset, so a crash leaves all of them or none. A result that changes no quad makes no commit: its receipt names the head it follows with `committed` false. A repeated `operation` with the same quads and checkpoint answers the original receipt with `replayed`, even after the lease ended, and another result under the same `operation` is `409 publication-conflict`. Refusals write nothing: `400` for malformed quads or more quads than the definition allows, `403` for a graph outside the definition's graphs or the caller's grants, `409 profile-managed-graph` for a managed graph, `409 lease-lost`, `412 precondition-failed` and `401 lease-missing`.")
+            .see("durable-jobs")
+            .header_req("Sparkles-Job-Lease", s(), "The bearer lease token the claim returned.")
+            .json_body(true, "JobPublish")
+            .json("200", "The receipt of the publication.", "JobPublished")
+            .errors(&[400, 401, 403, 409, 412, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}/{id}/fail", "failJob", "Datasets", "Record a failure")
+            .doc("Needs `write` through the update endpoint and the lease token in `Sparkles-Job-Lease`. A transient failure enters `retry-wait` with exponential backoff and jitter, honoring `retryAfterMs`, within the definition's attempts and retry horizon; any other failure, an exhausted policy or a `retryAfterMs` that does not fit in the remaining horizon ends the run as `failed` with the redacted reason. `409 lease-lost`, `412 precondition-failed` and `401 lease-missing` as for a renewal.")
+            .see("durable-jobs")
+            .header_req("Sparkles-Job-Lease", s(), "The bearer lease token the claim returned.")
+            .json_body(true, "JobFailure")
+            .json("200", "The run after the failure.", "JobRun")
+            .errors(&[400, 401, 409, 412, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}/{id}/cancel", "cancelJob", "Datasets", "Cancel a run")
+            .doc("Needs `write` through the update endpoint, as the submitter or an administrator. Durably ends the run and fences its active attempt, whose token fails from then on. Work already committed stays committed, and the reason records that an external request already sent may still take effect. A terminal run is `409`.")
+            .see("durable-jobs")
+            .json("200", "The cancelled run.", "JobRun")
+            .errors(&[404, 409, 503]),
+    );
+    p.add(
+        op(POST, "/$/jobs/{ds}/{id}/retry", "retryJob", "Datasets", "Retry a terminal run")
+            .doc("Needs `write` through the update endpoint. Creates a new run from a failed or cancelled one, with its payload, checkpoint and inputs, under the new `idempotencyKey`, and links it to the old run, which stays as evidence. A run in any other state is `409`.")
+            .see("durable-jobs")
+            .json_body(true, "JobRetry")
+            .resp_h("202", "The new run's receipt.", Some(json!({ "application/json": { "schema": sref("JobSubmitted") } })), json!({
+                "Location": { "description": "The new run's route.", "schema": s() },
+            }))
+            .errors(&[400, 404, 409, 429, 503]),
+    );
+    p.add(
         op(
             GET,
             "/$/memory/{ds}/inbox",

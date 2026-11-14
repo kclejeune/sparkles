@@ -474,7 +474,7 @@ fn an_unenforceable_registry_refuses_writes_and_keeps_reads() {
         (
             "managed.json",
             "unknown owner",
-            |v| v["owners"]["jobs"] = v["owners"]["evidence"].clone(),
+            |v| v["owners"]["widgets"] = v["owners"]["evidence"].clone(),
             false,
         ),
         (
@@ -906,9 +906,9 @@ fn copies_of_unknown_owners_are_refused() {
         match name {
             "unknown owner" => {
                 edit(&root, "managed.json", |v| {
-                    v["owners"]["jobs"] = v["owners"]["evidence"].clone()
+                    v["owners"]["widgets"] = v["owners"]["evidence"].clone()
                 });
-                std::fs::write(root.join("jobs.json"), b"{}").unwrap();
+                std::fs::write(root.join("widgets.json"), b"{}").unwrap();
             }
             "newer format" => edit(&root, "managed.json", |v| v["format"] = 3.into()),
             _ => edit(&root, "managed.json", |v| {

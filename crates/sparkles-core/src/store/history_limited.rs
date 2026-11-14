@@ -384,7 +384,6 @@ impl Store {
         let base = wal::WalPoint {
             seq: entry.base.seq,
             offset: 0,
-            folding: entry.fold_legacy,
         };
         let base_delta = generation.link.as_ref().map(|l| &l.base_delta);
         let mut best = (
@@ -438,23 +437,7 @@ impl Store {
             limit,
         ) {
             Ok(_) => Ok((delta, target)),
-            Err(wal::Backward::Failed(error)) => Err(error),
-            Err(wal::Backward::Legacy) => {
-                // Release the failed backward working state before preparing its replacement.
-                drop(delta);
-                limit.check(base_delta.map_or(0, preparation_delta_bytes))?;
-                let mut delta = base_delta.cloned().unwrap_or_default();
-                wal::apply_forward_limited(
-                    &path,
-                    generation,
-                    &self.cache,
-                    &mut delta,
-                    base,
-                    target,
-                    limit,
-                )?;
-                Ok((delta, target))
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -726,16 +709,15 @@ fn wal_point_limited(
         .unwrap_or(wal::WalPoint {
             seq: entry.base.seq,
             offset: 0,
-            folding: entry.fold_legacy,
         });
     limit.check(0)?;
-    if floor.seq == seq && !floor.folding {
+    if floor.seq == seq {
         return Ok(floor);
     }
     let mut cursor = wal::WalCursor::open_limited(&path, floor, limit, 0)?;
     loop {
         let before = cursor.position();
-        if before.seq == seq && !before.folding {
+        if before.seq == seq {
             limit.check(0)?;
             return Ok(before);
         }

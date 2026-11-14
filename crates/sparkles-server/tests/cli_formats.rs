@@ -17,7 +17,18 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");
 
-fn fixtures() -> Vec<PathBuf> {
+/// The `format` of the dataset's `dataset.json` that a fixture's `facts.txt` records,
+/// absent in the pre-release fixtures, whose datasets are format 1.
+fn dataset_format(fixture: &Path) -> u32 {
+    std::fs::read_to_string(fixture.join("facts.txt"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("dataset-format "))
+        .map_or(1, |v| v.trim().parse().unwrap())
+}
+
+/// Every fixture, in label order, with whether this build reads its dataset format.
+fn all_fixtures() -> Vec<(PathBuf, bool)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/formats");
     let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
@@ -27,6 +38,31 @@ fn fixtures() -> Vec<PathBuf> {
         .collect();
     out.sort();
     assert!(!out.is_empty(), "no fixtures in {}", dir.display());
+    out.into_iter()
+        .map(|p| {
+            let inside = dataset_format(&p) == sparkles::commit::DATASET_FORMAT;
+            (p, inside)
+        })
+        .collect()
+}
+
+/// The fixtures inside the window, which open and answer as recorded.
+fn fixtures() -> Vec<PathBuf> {
+    let out: Vec<PathBuf> = all_fixtures()
+        .into_iter()
+        .filter_map(|(p, inside)| inside.then_some(p))
+        .collect();
+    assert!(!out.is_empty(), "no fixture inside the window");
+    out
+}
+
+/// The pre-release fixtures, outside the window, whose refusal the tests check.
+fn refused_fixtures() -> Vec<PathBuf> {
+    let out: Vec<PathBuf> = all_fixtures()
+        .into_iter()
+        .filter_map(|(p, inside)| (!inside).then_some(p))
+        .collect();
+    assert!(!out.is_empty(), "no fixture outside the window");
     out
 }
 
@@ -250,6 +286,37 @@ fn every_fixture_opens_answers_writes_and_restores() {
                 .any(|f| f["kind"] == "wal" && f["version"] == 1),
             "{d}"
         );
+    }
+}
+
+/// A pre-release fixture is refused by the command line with the dump-and-reload
+/// message: `migrate --check` puts it outside the window with no step, and `query`
+/// refuses to open it. The refusal changes no file.
+#[test]
+fn every_pre_release_fixture_is_refused_by_the_cli() {
+    for fixture in refused_fixtures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        unpack(&fixture, h);
+        let data = h.join("data");
+        let db = data.join("databases/books");
+        let before = std::fs::read(db.join("dataset.json")).unwrap();
+        let o = sparkles(h, &["migrate", "--data", data.to_str().unwrap(), "--check"]);
+        assert_eq!(o.status.code(), Some(1), "{}", fixture.display());
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            out.contains("has format 1") && out.contains("sparkles dump"),
+            "{out}"
+        );
+        assert!(!out.contains("`sparkles migrate`"), "{out}");
+        let o = sparkles(h, &["query", "--loc", db.to_str().unwrap(), "ASK {}"]);
+        assert!(!o.status.success());
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("has format 1") && err.contains("sparkles dump"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(db.join("dataset.json")).unwrap(), before);
     }
 }
 

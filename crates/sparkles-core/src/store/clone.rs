@@ -276,6 +276,20 @@ impl Store {
         // the managed definitions come along paused: the clone is a new dataset, whose
         // views run only once an operator has checked their principals and inputs
         super::definitions::write_all(dir, &cap.definitions, Some("cloned"))?;
+        // A clone starts with an empty control keyspace: its copied `jobs.json` needs
+        // one, and it holds no run, lease or delivery identity of its source (spec C26
+        // §7.3). The reader rises first, and the checkpoint precedes the log.
+        if self.control_enabled() {
+            commit::require_reader(dir, crate::jobs::READER)?;
+            write_atomic(
+                &dir.join(crate::control::CHECKPOINT_FILE),
+                &crate::control::encode_checkpoint(&Default::default()),
+            )?;
+            write_atomic(
+                &dir.join(crate::control::LOG_FILE),
+                &crate::control::log_header(),
+            )?;
+        }
         // the managed graphs stay protected: the registry needs its reader first
         if !cap.managed.is_empty() {
             commit::require_reader(dir, crate::managed::READER)?;
@@ -354,6 +368,9 @@ impl Store {
             id,
             Some(forked_from),
         );
+        if self.control_enabled() {
+            store.enable_control()?;
+        }
         store.install_managed_files(&cap.managed);
         report(opts, 0.95, "configuring indexes");
         self.configure_indexes(&store)?;

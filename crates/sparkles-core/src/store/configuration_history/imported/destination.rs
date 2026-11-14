@@ -259,7 +259,6 @@ mod tests {
             commit,
             configuration,
             origin: "compaction".to_owned(),
-            wal_strict_from: Some(0),
         };
         assert_eq!(
             publication

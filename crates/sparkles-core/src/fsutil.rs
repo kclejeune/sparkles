@@ -25,10 +25,35 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
             dir
         };
         File::open(dir)?.sync_all()?;
+        #[cfg(test)]
+        DIR_SYNCS.with(|s| {
+            let names = std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            s.borrow_mut().push((dir.to_path_buf(), names));
+        });
     }
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The directories this thread synced, each with the names it held at the time, for
+    /// tests of what a sync made durable. [`take_dir_syncs`] drains it.
+    pub static DIR_SYNCS: std::cell::RefCell<Vec<(std::path::PathBuf, Vec<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The directory syncs of this thread since the last call, oldest first.
+#[cfg(test)]
+pub fn take_dir_syncs() -> Vec<(std::path::PathBuf, Vec<String>)> {
+    DIR_SYNCS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 /// Replace `path` durably through the temporary file `tmp`, which must be in the same

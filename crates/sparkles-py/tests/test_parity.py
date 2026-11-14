@@ -62,6 +62,18 @@ DEFERRED = {
     "evidence.review",
     "evidence.settings",
     "evidence.withdraw",
+    "jobs.cancel",
+    "jobs.claim",
+    "jobs.configure",
+    "jobs.fail",
+    "jobs.get",
+    "jobs.list",
+    "jobs.publish",
+    "jobs.renew",
+    "jobs.resume",
+    "jobs.retry",
+    "jobs.settings",
+    "jobs.submit",
 }
 
 
