@@ -160,8 +160,14 @@ struct Table<T> {
 }
 
 impl<T: Key> Table<T> {
+    /// A table with room for `n` members.
     fn with_capacity(n: usize) -> Table<T> {
-        let cap = (n * 4 / 3 + 1).next_power_of_two().max(8);
+        Table::with_slots((n * 4 / 3 + 1).next_power_of_two())
+    }
+
+    /// An empty table of `cap` slots, a power of two.
+    fn with_slots(cap: usize) -> Table<T> {
+        let cap = cap.max(8);
         Table {
             slots: vec![T::EMPTY; cap].into_boxed_slice(),
             len: 0,
@@ -198,9 +204,6 @@ impl<T: Key> Table<T> {
             self.len += new as usize;
             return new;
         }
-        if (self.len + 1) * 4 > self.slots.len() * 3 {
-            self.grow();
-        }
         let mask = self.slots.len() - 1;
         let mut i = (x.mix() >> self.shift) as usize;
         loop {
@@ -209,17 +212,23 @@ impl<T: Key> Table<T> {
                 return false;
             }
             if s == T::EMPTY {
-                self.slots[i] = x;
-                self.len += 1;
-                return true;
+                break;
             }
             i = (i + 1) & mask;
         }
+        // a new member, which the table makes room for first when it is full
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
+            self.grow();
+            return self.insert(x);
+        }
+        self.slots[i] = x;
+        self.len += 1;
+        true
     }
 
     #[cold]
     fn grow(&mut self) {
-        let mut t = Table::with_capacity(2 * self.slots.len());
+        let mut t = Table::with_slots(2 * self.slots.len());
         t.extend(self.slots.iter().copied().filter(|&s| s != T::EMPTY));
         t.empty = self.empty;
         t.len += self.empty as usize;
@@ -3174,6 +3183,30 @@ mod small_tests {
         assert_eq!(small.contains(&T::EMPTY), want.contains(&T::EMPTY));
     }
 
+    /// A member added again leaves the table as it was, at the load that a new member
+    /// would grow it by, and a new member there doubles its slots once.
+    #[test]
+    fn a_repeated_member_does_not_grow_the_table() {
+        let mut small: Small<u32> = Small::default();
+        let mut n = 0;
+        // fill the table to the load at which the next new member grows it
+        loop {
+            let set = small.set.as_ref();
+            if set.is_some_and(|t| (t.len + 1) * 4 > t.slots.len() * 3) {
+                break;
+            }
+            assert!(small.insert(n));
+            n += 1;
+        }
+        let (slots, bytes) = (small.set.as_ref().unwrap().slots.len(), small.bytes());
+        assert!(!small.insert(0));
+        assert_eq!(small.set.as_ref().unwrap().slots.len(), slots);
+        assert_eq!(small.bytes(), bytes);
+        assert!(small.insert(n));
+        assert_eq!(small.set.as_ref().unwrap().slots.len(), 2 * slots);
+        assert!((0..=n).all(|x| small.contains(&x)));
+    }
+
     #[test]
     fn a_small_set_answers_as_a_hash_set() {
         check(|v| v as u32);
@@ -3625,9 +3658,10 @@ mod horn_accounting_tests {
             Concl::Back(f.root, f.t),
             Concl::Back(e2, f.t),
         ];
-        for batch in [true, false] {
+        for (batch, steps) in [(true, false), (false, false), (true, true)] {
             let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
-            let run = run(&f.ix, &ctx, &bounds);
+            let mut run = run(&f.ix, &ctx, &bounds);
+            run.steps = steps;
             run.batch.store(batch, Ordering::Relaxed);
             let (mut local, mut woke, mut outbox, mut marks) = (
                 Vec::new(),
@@ -3656,7 +3690,16 @@ mod horn_accounting_tests {
                 (f1, backs.to_vec()),
                 (f2, backs.to_vec()),
             ];
-            if batch {
+            if steps {
+                // a run in steps keeps a message for each destination, in the order the
+                // destinations took them one at a time
+                let each: Vec<(Ex, Concl)> = want
+                    .iter()
+                    .flat_map(|(to, msgs)| msgs.iter().map(move |&c| (*to, c)))
+                    .collect();
+                assert_eq!(outbox.steps, each);
+                assert!(outbox.msgs.is_empty());
+            } else if batch {
                 // one copy of the products and one of the backward links
                 assert_eq!(outbox.msgs.len(), products.len() + backs.len());
                 let mut by: Vec<(Ex, Vec<Concl>)> = Vec::new();
@@ -3696,9 +3739,11 @@ mod horn_accounting_tests {
         for &e in ids.iter().step_by(2) {
             st.back_by(f.s).insert(e);
         }
-        for &e in ids.iter().step_by(3) {
+        // a hash table of forward links by r
+        for &e in ids.iter().skip(1).step_by(2) {
             st.fwd.insert((f.r, e));
         }
+        assert!(st.fwd.set.is_some() && st.back[1].1.set.is_some());
         for &e in &ids[..7] {
             st.subs.insert(e);
         }
