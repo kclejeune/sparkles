@@ -2214,11 +2214,11 @@ pub(crate) async fn run_query(
         );
     }
     let resp = history::history_headers(resp, resolved.as_ref(), &uri);
-    let resp = with_reasoning(resp, derived.as_deref());
+    let resp = with_reasoning(resp, derived);
     // freshness is reported for the live state only, and for a stale materialization
     // that `auto` read at a historical commit
     let mut resp = match &resolved {
-        Some(r) if r.historical => with_historical_stale_read(resp, derived.as_deref()),
+        Some(r) if r.historical => with_historical_stale_read(resp, derived),
         _ => with_inferences(
             resp,
             &ds,
