@@ -341,3 +341,81 @@ fn infer_warns_about_axioms_outside_owl_rl() {
     let o = expect(&["infer", "--loc", &db, "--profile", "rdfs"], 0);
     assert!(!stderr(&o).contains("OWL 2 RL"), "{}", stderr(&o));
 }
+
+/// `infer --query-default MODE --query-only` records the rules and input graphs as the
+/// dataset's query-time reasoning and materializes nothing, so a query derives with them
+/// on demand (spec F17 §5.3, the backward mode of G08 §5.5).
+#[test]
+fn query_only_records_the_rules_without_a_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.ttl");
+    std::fs::write(
+        &data,
+        "<http://ex.org/a> <http://ex.org/p> <http://ex.org/b> .",
+    )
+    .unwrap();
+    let rules = dir.path().join("r.rules");
+    std::fs::write(
+        &rules,
+        "[sym: (?b <http://ex.org/p> ?a) <- (?a <http://ex.org/p> ?b)]",
+    )
+    .unwrap();
+    let db = dir.path().join("db");
+    let dbs = db.to_str().unwrap();
+    expect(&["load", "--loc", dbs, data.to_str().unwrap()], 0);
+    expect(
+        &[
+            "infer",
+            "--loc",
+            dbs,
+            "--rules",
+            rules.to_str().unwrap(),
+            "--data-graph",
+            "default",
+            "--imports",
+            "none",
+            "--query-default",
+            "demand",
+            "--query-only",
+        ],
+        0,
+    );
+    let setting: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(db.join("query-reasoning.json")).unwrap()).unwrap();
+    assert_eq!(setting["default"], "demand", "{setting}");
+    assert_eq!(setting["profile"], "rules", "{setting}");
+    assert!(
+        setting["rules"].as_str().unwrap().contains("sym"),
+        "{setting}"
+    );
+    assert_eq!(setting["inputs"]["dataGraphs"][0], "default", "{setting}");
+    assert_eq!(setting["inputs"]["imports"], "none", "{setting}");
+    assert!(!db.join("reasoning.json").exists());
+    // the default mode derives the backward rule's fact
+    let o = expect(
+        &[
+            "query",
+            "--loc",
+            dbs,
+            "ASK { <http://ex.org/b> <http://ex.org/p> <http://ex.org/a> }",
+        ],
+        0,
+    );
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "yes", "{o:?}");
+    // --query-only needs --query-default
+    expect(&["infer", "--loc", dbs, "--query-only"], 2);
+    // and fetches no imports, which only a materialization records
+    let fetch = [
+        "infer",
+        "--loc",
+        dbs,
+        "--profile",
+        "rdfs",
+        "--imports",
+        "fetch",
+        "--query-default",
+        "demand",
+        "--query-only",
+    ];
+    expect(&fetch, 2);
+}

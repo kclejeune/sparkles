@@ -1051,3 +1051,119 @@ async fn review_adapters_entailment_diff_honors_the_effective_mcp_memory_ceiling
     assert_eq!(result["isError"], true, "{result}");
     assert_eq!(dataset.store.snapshot().commit, head);
 }
+
+/// `sparql_query` and `explain_query` take the query-time reasoning modes of the SPARQL
+/// endpoints, with their profile and fact limit, and say what a query derived (spec F17
+/// §2.1, §2.3).
+#[cfg(feature = "reasoning")]
+#[tokio::test(flavor = "multi_thread")]
+async fn query_tools_take_query_time_reasoning() {
+    const DATA: &str = r#"@prefix ex: <http://ex.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat .
+"#;
+    let srv = server_with(&[("t", &[DATA])], McpConfig::default());
+    let dataset = srv.state.get("t").unwrap();
+    let mut c = Client::start(srv);
+    let q = "SELECT ?x { ?x a ex:Animal }";
+    let t = c
+        .text(
+            "sparql_query",
+            json!({"query": q, "reasoning": "demand", "reasoningProfile": "rdfs"}),
+        )
+        .await;
+    assert!(t.contains("ex:tom"), "{t}");
+    assert!(t.starts_with("# reasoning: demand; derived="), "{t}");
+    let j = c
+        .text(
+            "sparql_query",
+            json!({"query": q, "reasoning": "demand", "reasoningProfile": "rdfs", "format": "json"}),
+        )
+        .await;
+    let j: Value = serde_json::from_str(&j).unwrap();
+    assert!(
+        j["reasoning"].as_str().unwrap().starts_with("demand;"),
+        "{j}"
+    );
+    assert_eq!(j["rows"].as_array().unwrap().len(), 1, "{j}");
+    // the asserted data alone has no animal, and says nothing of reasoning
+    let t = c
+        .text("sparql_query", json!({"query": q, "reasoning": false}))
+        .await;
+    assert!(!t.contains("ex:tom") && !t.contains("# reasoning"), "{t}");
+    let (t, _) = c
+        .error(
+            "sparql_query",
+            json!({"query": q, "reasoning": "sometimes"}),
+        )
+        .await;
+    assert!(t.contains("reasoning must be"), "{t}");
+    let (t, _) = c
+        .error(
+            "sparql_query",
+            json!({"query": q, "reasoning": "demand", "reasoningProfile": "rdfs", "maxDerived": 0}),
+        )
+        .await;
+    assert!(t.contains("maxDerived"), "{t}");
+    let (t, _) = c
+        .error(
+            "sparql_query",
+            json!({"query": q, "reasoning": false, "reasoningProfile": "rdfs"}),
+        )
+        .await;
+    assert!(t.contains("reasoningProfile"), "{t}");
+    let (t, _) = c
+        .error(
+            "sparql_query",
+            json!({"query": q, "reasoning": "demand", "reasoningProfile": "no-such"}),
+        )
+        .await;
+    assert!(t.contains("profile"), "{t}");
+    let e = c
+        .structured(
+            "explain_query",
+            json!({"query": q, "reasoning": "demand", "reasoningProfile": "rdfs"}),
+        )
+        .await;
+    assert!(e["plan"].as_str().unwrap().contains("Derive"), "{e}");
+    // over a fresh materialization `auto` reads it and derives nothing
+    dataset
+        .dataset
+        .reasoning()
+        .run(&sparkles::reasoning::ReasonRequest::default())
+        .unwrap();
+    let t = c
+        .text("sparql_query", json!({"query": q, "reasoning": "auto"}))
+        .await;
+    assert!(t.contains("ex:tom") && !t.contains("# reasoning"), "{t}");
+}
+
+/// The line that says what query-time reasoning derived counts toward `maxBytes`.
+#[cfg(feature = "reasoning")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reasoning_line_fits_max_bytes() {
+    let mut data = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:Cat rdfs:subClassOf ex:Animal .\n",
+    );
+    for i in 0..400 {
+        data.push_str(&format!("ex:cat{i} a ex:Cat .\n"));
+    }
+    let srv = server_with(&[("t", &[data.as_str()])], McpConfig::default());
+    let mut c = Client::start(srv);
+    for (format, query) in [
+        ("table", "SELECT ?x { ?x a ex:Animal }"),
+        ("table", "ASK { ex:cat1 a ex:Animal }"),
+        ("json", "SELECT ?x { ?x a ex:Animal }"),
+    ] {
+        let t = c
+            .text(
+                "sparql_query",
+                json!({"query": query, "reasoning": "demand", "reasoningProfile": "rdfs",
+                       "maxRows": 1000, "maxBytes": 1024, "format": format}),
+            )
+            .await;
+        assert!(t.len() <= 1024, "{format} {query}: {} bytes", t.len());
+        assert!(t.contains("demand; derived="), "{t}");
+    }
+}

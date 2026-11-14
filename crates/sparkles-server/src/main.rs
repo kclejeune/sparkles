@@ -2080,6 +2080,11 @@ enum Cmd {
         /// materialized or false. Alone, it materializes nothing
         #[arg(long, value_name = "MODE", conflicts_with_all = ["clear", "status", "diff"])]
         query_default: Option<String>,
+        /// With --query-default: record --profile or --rules and the input graph options
+        /// as the dataset's query-time reasoning and materialize nothing, as a Jena rule
+        /// set in backward mode answers every query on demand (spec F17 §5.3)
+        #[arg(long, requires = "query_default", conflicts_with = "check")]
+        query_only: bool,
         /// Timeout of the checks, or of --why, in seconds
         #[arg(long)]
         timeout: Option<f64>,
@@ -2598,6 +2603,44 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
         std::process::exit(3);
     }
     e
+}
+
+/// The input graphs that `sparkles infer` was given, or `None` when it was given none of
+/// the input options and the recorded inputs apply.
+fn cli_inputs(
+    data_graphs: &[String],
+    ontology_graphs: &[String],
+    imports: Option<&str>,
+    location_mapping: Option<&std::path::Path>,
+) -> Result<Option<sparkles_reasoner::Inputs>> {
+    if data_graphs.is_empty()
+        && ontology_graphs.is_empty()
+        && imports.is_none()
+        && location_mapping.is_none()
+    {
+        return Ok(None);
+    }
+    let graphs = |v: &[String]| {
+        v.iter()
+            .map(|g| sparkles_reasoner::GraphRef::parse(g))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!(e))
+    };
+    let mut i = sparkles_reasoner::Inputs::default();
+    if !data_graphs.is_empty() {
+        i.data_graphs = graphs(data_graphs)?;
+    }
+    i.ontology_graphs = graphs(ontology_graphs)?;
+    if let Some(m) = imports {
+        i.imports = m.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    }
+    if let Some(f) = location_mapping {
+        let (format, _) = sparkles::io::format_for_path(f)
+            .with_context(|| format!("{}: unknown RDF format", f.display()))?;
+        i.location_mapping =
+            sparkles_reasoner::LocationMapping::from_jena(&std::fs::read(f)?, format)?;
+    }
+    Ok(Some(i))
 }
 
 /// ` · validation passed in 14 ms`: the write-time validation of a CLI write, for its
@@ -4528,6 +4571,7 @@ fn run() -> Result<()> {
             closure,
             format,
             query_default,
+            query_only,
             timeout,
             data_graphs,
             ontology_graphs,
@@ -4618,10 +4662,42 @@ fn run() -> Result<()> {
                 use sparkles::reasoning::setting;
                 let mut s = setting::read(&loc).unwrap_or_default();
                 s.default = Some(mode.clone());
+                if query_only {
+                    if let Some(f) = &rules {
+                        s.profile = Some("rules".into());
+                        s.rules = Some(
+                            std::fs::read_to_string(f)
+                                .with_context(|| format!("reading {}", f.display()))?,
+                        );
+                    } else if let Some(p) = &profile {
+                        s.profile = Some(p.clone());
+                        s.rules = None;
+                    }
+                    // a fetch loads graphs into the store and records them with a
+                    // materialization, which a query-only setting does not have
+                    if refresh_imports || imports.as_deref() == Some("fetch") {
+                        eprintln!(
+                            "error: --query-only takes --imports none or dataset, and no \
+                             --refresh-imports; fetch the imports with a materialization"
+                        );
+                        std::process::exit(2);
+                    }
+                    if let Some(i) = cli_inputs(
+                        &data_graphs,
+                        &ontology_graphs,
+                        imports.as_deref(),
+                        location_mapping.as_deref(),
+                    )? {
+                        i.validate()?;
+                        s.inputs = Some(serde_json::to_value(&i)?);
+                    }
+                }
                 s.validate()?;
                 setting::write(&loc, Some(&s))?;
                 eprintln!("query-time reasoning default set to {mode}");
-                if profile.is_none() && rules.is_none() && !check && extras.is_empty() {
+                if query_only
+                    || (profile.is_none() && rules.is_none() && !check && extras.is_empty())
+                {
                     return Ok(());
                 }
             }
@@ -4651,39 +4727,17 @@ fn run() -> Result<()> {
                     reasoning::incremental_since(previous.as_ref(), &store)
                 };
                 // the input graphs: as given, else as recorded
-                let given = !data_graphs.is_empty()
-                    || !ontology_graphs.is_empty()
-                    || imports.is_some()
-                    || location_mapping.is_some();
-                let inputs = if given {
-                    let graphs = |v: &[String]| {
-                        v.iter()
-                            .map(|g| sparkles_reasoner::GraphRef::parse(g))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|e| anyhow::anyhow!(e))
-                    };
-                    let mut i = sparkles_reasoner::Inputs::default();
-                    if !data_graphs.is_empty() {
-                        i.data_graphs = graphs(&data_graphs)?;
-                    }
-                    i.ontology_graphs = graphs(&ontology_graphs)?;
-                    if let Some(m) = &imports {
-                        i.imports = m.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                    }
-                    if let Some(f) = &location_mapping {
-                        let (format, _) = sparkles::io::format_for_path(f)
-                            .with_context(|| format!("{}: unknown RDF format", f.display()))?;
-                        i.location_mapping = sparkles_reasoner::LocationMapping::from_jena(
-                            &std::fs::read(f)?,
-                            format,
-                        )?;
-                    }
-                    i
-                } else {
-                    match &previous {
+                let inputs = match cli_inputs(
+                    &data_graphs,
+                    &ontology_graphs,
+                    imports.as_deref(),
+                    location_mapping.as_deref(),
+                )? {
+                    Some(i) => i,
+                    None => match &previous {
                         Some(p) => p.run_inputs()?,
                         None => Default::default(),
-                    }
+                    },
                 };
                 inputs.validate()?;
                 let fetched_before: Vec<String> = previous

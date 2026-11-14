@@ -1,0 +1,4 @@
+mbx build --release -p sparkles-reasoner --example table_reuse   # on stanley, in each tree
+flock ~/lanes/.heavy.lock sh -c 'for arm in base tip tip base; do
+  systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue \
+    ./table_reuse-<arm> 10 5 > runN-<arm>.log; done'   # on atlas

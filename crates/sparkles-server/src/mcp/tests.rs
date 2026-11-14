@@ -338,7 +338,8 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
         ),
         (
             "sparql_query",
-            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+            super::schemas::rq(
+                json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds,
                 "query": {"type":"string","minLength":1,"maxLength":65536},
                 "format": {"enum":["table","json"],"default":"table","description":"table: tab-separated rows (compact); json: structured object"},
@@ -348,19 +349,21 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "offset": {"type":"integer","minimum":0,"default":0},
                 "exactTotal": {"type":"boolean","default":true,"description":"false: stop after offset+maxRows+1 solutions (faster; total becomes null)"},
                 "timeoutSeconds": to,
-                "reasoning": rs,
                 "atCommit": at, "at": sel}}),
+            ),
         ),
         (
             "explain_query",
-            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+            super::schemas::rq(
+                json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds, "query": {"type":"string","minLength":1,"maxLength":65536},
                 "includeAlgebra": {"type":"boolean","default":false},
                 "profile": {"enum":["estimate","run"],"default":"estimate","description":"estimate plans without running; run runs the query read-only under timeoutSeconds and explains the executed plan"},
                 "notes": {"type":"boolean","default":false,"description":"Add nodes, notes and asks (the explanation of C18 §6.6), and start each plan line with its node id"},
                 "timeoutSeconds": {"type":"number","exclusiveMinimum":0,"maximum":60,"default":30,"description":"The deadline of a run"},
                 "useServerModel": {"type":"boolean","default":false,"description":"Have the server's explain model rewrite asks and notes as prose. Needs the serverModels permission, and its tokens count against your budget. You can write the prose yourself from notes and asks instead."},
-                "reasoning": rs, "atCommit": at, "at": sel}}),
+                "atCommit": at, "at": sel}}),
+            ),
         ),
         (
             "describe_resource",

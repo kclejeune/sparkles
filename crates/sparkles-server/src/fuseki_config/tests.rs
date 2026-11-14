@@ -790,3 +790,75 @@ fn shacl_rules_reasoner() {
     assert_eq!(c.shapes, vec![g.to_string()]);
     assert!(c.one_pass);
 }
+
+/// The GenericRuleReasoner's `jr:ruleMode`, read from the `ja:InfModel` as Jena's
+/// assembler passes it, chooses the dataset's query-time default (spec F17 §5.3, G08
+/// §5.5): hybrid, Jena's default, reads the materialization under `auto`, backward
+/// answers every query on demand and materializes nothing, and forward materializes as
+/// before.
+#[test]
+fn rule_modes_choose_the_query_time_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = |mode: Option<&str>| {
+        let mode = mode
+            .map(|m| format!("jr:ruleMode \"{m}\" ;"))
+            .unwrap_or_default();
+        format!(
+            r#"PREFIX :       <#>
+PREFIX fuseki: <http://jena.apache.org/fuseki#>
+PREFIX ja:     <http://jena.hpl.hp.com/2005/11/Assembler#>
+PREFIX jr:     <http://jena.hpl.hp.com/2003/RuleReasoner#>
+[] a fuseki:Server ; fuseki:services ( :service ) .
+:service a fuseki:Service ; fuseki:name "ds" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ;
+    fuseki:dataset :dataset .
+:dataset a ja:RDFDataset ; ja:defaultGraph :inf .
+:inf a ja:InfModel ; {mode}
+    ja:baseModel [ a ja:MemoryModel ; ja:content [ ja:externalContent <file:data.ttl> ] ] ;
+    ja:reasoner [ ja:reasonerURL <http://jena.hpl.hp.com/2003/GenericRuleReasoner> ;
+                  ja:rule "[r1: (?a <http://ex.org/p> ?b) -> (?b <http://ex.org/p> ?a)]" ] .
+"#
+        )
+    };
+    std::fs::write(dir.path().join("data.ttl"), "").unwrap();
+    let plan_of = |mode: Option<&str>| {
+        let path = dir
+            .path()
+            .join(format!("config-{}.ttl", mode.unwrap_or("none")));
+        std::fs::write(&path, config(mode)).unwrap();
+        plan_for(&[path], &UserSource::default(), Mode::Files).unwrap()
+    };
+    for (mode, default, demand_only) in [
+        (None, Some("auto"), false),
+        (Some("hybrid"), Some("auto"), false),
+        (Some("backward"), Some("demand"), true),
+        (Some("forward"), None, false),
+        (Some("forwardRETE"), None, false),
+    ] {
+        let p = plan_of(mode);
+        assert!(!p.report.has_unsupported(), "{mode:?}: {}", p.report.text());
+        // the rule mode is a setting the converter knows
+        assert!(!has(&p, Kind::Ignored, "ruleMode"), "{}", p.report.text());
+        let r = p.datasets[0].reasoning.as_ref().unwrap();
+        assert_eq!(r.query_default, default, "{mode:?}");
+        assert_eq!(r.demand_only, demand_only, "{mode:?}");
+        let load = write::load_script_text(&p);
+        let infer = load
+            .lines()
+            .find(|l| l.contains(" infer "))
+            .unwrap_or_else(|| panic!("{mode:?}: {load}"));
+        match default {
+            Some(d) => assert!(infer.contains(&format!("--query-default {d}")), "{infer}"),
+            None => assert!(!infer.contains("--query-default"), "{infer}"),
+        }
+        assert_eq!(infer.contains("--query-only"), demand_only, "{infer}");
+        // only a materialization is run again after writes
+        assert_eq!(p.server.auto_reason, !demand_only, "{mode:?}");
+    }
+    let p = plan_of(Some("sideways"));
+    assert!(
+        has(&p, Kind::Unsupported, "sideways"),
+        "{}",
+        p.report.text()
+    );
+}

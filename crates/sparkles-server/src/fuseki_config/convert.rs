@@ -63,6 +63,13 @@ pub struct Reasoning {
     /// GeoSPARQL's schema and RDFS inference
     pub geo_vocab: bool,
     pub default_geometry: bool,
+    /// The dataset's query-time reasoning default (spec F17 §5.3, G08 §5.5): `auto` for
+    /// the GenericRuleReasoner's hybrid mode, `demand` for its backward mode, `None`
+    /// to leave queries reading the materialization.
+    pub query_default: Option<&'static str>,
+    /// The backward mode answers every query on demand, so nothing is materialized and
+    /// the query-time setting carries the rules.
+    pub demand_only: bool,
 }
 
 /// The graph the files of a reasoner's `ja:schema` are loaded into.
@@ -254,7 +261,9 @@ impl Converter<'_> {
             &mut self.report,
             &mut plan_server,
         );
-        plan_server.auto_reason = datasets.iter().any(|d| d.reasoning.is_some());
+        plan_server.auto_reason = datasets
+            .iter()
+            .any(|d| d.reasoning.as_ref().is_some_and(|r| !r.demand_only));
         if plan_server.auto_reason {
             self.report.approximated(
                 "server",

@@ -264,6 +264,21 @@ it.
 
 ### Added
 
+Query-time reasoning keeps its derived tables across commits that change nothing the
+rules read or give (roadmap item 19, F17 §6.2). The schema, its completeness proof, the
+equality stage table and each demand's table of the commit before answer the next
+commit when no quad that differs between them in the input graphs is a schema, RDF list
+or `owl:sameAs` fact, unifies with an atom, builtin read or head of the specialized rules,
+or holds a rule constant the store has gained. The check walks the differing quads with
+the new `Delta::changes_since`, which passes over the key-set leaves two snapshots share.
+A view's anchor keeps a clone of its commit's delta, which trades the key-set nodes that
+later writes replace for the time of deriving again. The MCP tools `sparql_query` and
+`explain_query` take `reasoning` as a mode, `materialized`, `demand` or `auto`, with
+`reasoningProfile` and `maxDerived`, and say what a query derived. The Fuseki converter
+reads `jr:ruleMode` from a `ja:InfModel` and makes the hybrid mode, Jena's default, `auto`
+over the materialization, the backward mode `demand` with nothing materialized through the
+new `sparkles infer --query-default MODE --query-only`, and the forward modes materialized.
+
 Incremental views and live queries maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`,
 `HAVING` over them and correlated `EXISTS` instead of evaluating the query again at each
 commit (item 418). The group operator keeps each group's values as an ordered multiset,

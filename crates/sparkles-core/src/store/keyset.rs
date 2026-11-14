@@ -640,6 +640,89 @@ impl KeySet {
     pub fn first(&self) -> Option<&Key> {
         self.iter().next()
     }
+
+    /// The leaves of the set in key order.
+    fn leaves(&self) -> Vec<&Arc<Node>> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&Arc<Node>> = self.root.iter().collect();
+        while let Some(n) = stack.pop() {
+            match &**n {
+                Node::Leaf(_) => out.push(n),
+                Node::Branch(b) => stack.extend(b.children.iter().rev()),
+            }
+        }
+        out
+    }
+
+    /// Call `f` with each key that one of `self` and `other` holds and the other does
+    /// not, in key order, until `f` returns false, and say whether `f` saw them all. A leaf
+    /// that both sets share, as a set and a clone of it share the leaves no write copied,
+    /// is passed over without reading its keys when both walks reach it at once. So two
+    /// versions of one set compare in a step per leaf and a step per key of the leaves
+    /// that writes copied, and sets that share nothing compare key by key.
+    pub fn symmetric_difference(&self, other: &KeySet, mut f: impl FnMut(&Key) -> bool) -> bool {
+        if self.same(other) {
+            return true;
+        }
+        let (a, b) = (self.leaves(), other.leaves());
+        fn leaf(n: &Arc<Node>) -> &[Key] {
+            match &**n {
+                Node::Leaf(k) => k,
+                Node::Branch(_) => &[],
+            }
+        }
+        let (mut la, mut ka, mut lb, mut kb) = (0, 0, 0, 0);
+        loop {
+            while ka == 0 && kb == 0 && la < a.len() && lb < b.len() && Arc::ptr_eq(a[la], b[lb]) {
+                la += 1;
+                lb += 1;
+            }
+            let x = (la < a.len()).then(|| &leaf(a[la])[ka]);
+            let y = (lb < b.len()).then(|| &leaf(b[lb])[kb]);
+            let (step_a, step_b) = match (x, y) {
+                (None, None) => return true,
+                (Some(x), None) => {
+                    if !f(x) {
+                        return false;
+                    }
+                    (true, false)
+                }
+                (None, Some(y)) => {
+                    if !f(y) {
+                        return false;
+                    }
+                    (false, true)
+                }
+                (Some(x), Some(y)) => match x.cmp(y) {
+                    std::cmp::Ordering::Equal => (true, true),
+                    std::cmp::Ordering::Less => {
+                        if !f(x) {
+                            return false;
+                        }
+                        (true, false)
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if !f(y) {
+                            return false;
+                        }
+                        (false, true)
+                    }
+                },
+            };
+            if step_a {
+                ka += 1;
+                if ka == leaf(a[la]).len() {
+                    (la, ka) = (la + 1, 0);
+                }
+            }
+            if step_b {
+                kb += 1;
+                if kb == leaf(b[lb]).len() {
+                    (lb, kb) = (lb + 1, 0);
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for KeySet {
@@ -778,6 +861,68 @@ impl<'a> Iterator for Iter<'a> {
         }
         self.pos += 1;
         Some(k)
+    }
+}
+
+#[cfg(test)]
+mod difference_tests {
+    use super::*;
+
+    fn key(i: u64) -> Key {
+        [i / 7, i % 7, i, 0]
+    }
+
+    fn naive(a: &KeySet, b: &KeySet) -> Vec<Key> {
+        let (x, y): (
+            std::collections::BTreeSet<Key>,
+            std::collections::BTreeSet<Key>,
+        ) = (a.iter().copied().collect(), b.iter().copied().collect());
+        x.symmetric_difference(&y).copied().collect()
+    }
+
+    fn walked(a: &KeySet, b: &KeySet) -> Vec<Key> {
+        let mut out = Vec::new();
+        assert!(a.symmetric_difference(b, |k| {
+            out.push(*k);
+            true
+        }));
+        out
+    }
+
+    #[test]
+    fn the_difference_of_versions_is_the_difference_of_their_keys() {
+        let base: KeySet = (0..5_000).map(|i| key(i * 3)).collect();
+        // writes on a clone copy the leaves they touch and share the others
+        let mut changed = base.clone();
+        for i in [0u64, 1, 2, 3_000, 7_501, 14_997, 20_000] {
+            changed.insert(key(i));
+        }
+        for i in [9u64, 3_003, 6_000, 14_994] {
+            changed.remove(&key(i));
+        }
+        assert_eq!(walked(&base, &changed), naive(&base, &changed));
+        assert_eq!(walked(&changed, &base), naive(&base, &changed));
+        assert!(walked(&base, &base.clone()).is_empty());
+        // many writes split leaves, and the walks still meet again at shared leaves
+        let mut grown = base.clone();
+        for i in 0..3_000 {
+            grown.insert(key(i * 3 + 1));
+        }
+        assert_eq!(walked(&base, &grown), naive(&base, &grown));
+        // sets that share nothing compare key by key
+        let other: KeySet = (0..4_000).map(|i| key(i * 2)).collect();
+        assert_eq!(walked(&base, &other), naive(&base, &other));
+        assert_eq!(
+            walked(&KeySet::new(), &other),
+            naive(&KeySet::new(), &other)
+        );
+        // a false answer stops the walk
+        let mut n = 0;
+        assert!(!base.symmetric_difference(&other, |_| {
+            n += 1;
+            n < 3
+        }));
+        assert_eq!(n, 3);
     }
 }
 

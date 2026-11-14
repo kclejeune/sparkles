@@ -411,3 +411,46 @@ the answer fingerprints, the settings, the compilers and the build configuration
 [log](runs/2026-11-01-reasoning-latency-forge-53220ef6/output.log) and the
 [commands](runs/2026-11-01-reasoning-latency-forge-53220ef6/run.sh.txt). Item 190's
 equality-stage fixtures are not part of this benchmark, and item 533 adds them.
+
+### Reuse of tables across commits
+
+The `table_reuse` example of the reasoner measures the first `reasoning=demand` query
+after a commit, with and without the reuse of tables across commits that spec F17 §6.2
+describes. It ran on atlas, which has the benchmark host's hardware, with nothing else
+running and 20 Rayon threads. The data was 10 LUBM-style universities. Before each timed
+query the example commits one triple, either a literal of a predicate the rules do not
+read, the unrelated kind, or the type of a new graduate student, the relevant kind. Every
+answer matched the same state read through a view that no cache serves. The build before
+reuse is commit 65c570db and the build with it is 84dc3c11. Four runs of five rounds
+alternated the builds, the earlier build first and last. Each figure is the mean of the
+two runs' medians for a build, in milliseconds, for the `owl-rl` profile.
+
+| Query | unrelated, before | unrelated, reuse | tables read | relevant, before | relevant, reuse |
+|---|--:|--:|--:|--:|--:|
+| q1 | 229 | 64.9 | 2 of 10 | 226 | 225 |
+| q2 | 391 | 146 | 6 of 30 | 374 | 386 |
+| q3 | 243 | 2.63 | 2 of 10 | 249 | 248 |
+| q4 | 240 | 10.5 | 5 of 25 | 250 | 258 |
+| q5 | 327 | 52.8 | 2 of 10 | 306 | 321 |
+| q6 | 2,259 | 1,785 | 1 of 5 | 2,263 | 2,199 |
+| q7 | 233 | 9.71 | 4 of 20 | 232 | 226 |
+| q8 | 2,318 | 731 | 9 of 25 | 2,325 | 2,327 |
+| q9 | 1,052 | 755 | 6 of 30 | 1,040 | 1,038 |
+| q10 | 226 | 6.07 | 6 of 10 | 237 | 234 |
+| q11 | 265 | 2.23 | 6 of 10 | 257 | 257 |
+| q12 | 333 | 87.7 | 12 of 20 | 366 | 343 |
+| q13 | 253 | 25.2 | 2 of 10 | 254 | 260 |
+| q14 | 240 | 0.63 | 5 of 5 | 250 | 236 |
+
+After an unrelated commit, the session reads the schema's table and the completeness
+proof of the anchor's commit, and the query's own tables where the anchor's view already
+holds them, which the tables column counts over the five rounds. That takes most queries
+from about 250 ms to between 0.6 and 90 ms. Queries 2, 6, 8 and 9, whose own derivations
+dominate, gain less. After a relevant commit every table is derived again, and each query
+took between 6% less and 5% more time than before reuse. A build that timed the reuse
+steps put the anchor lookup and the walk over the differing quads at 8 µs on average per
+session, specialization's extra work below a millisecond and anchoring below 0.1 ms. The
+`rdfs` profile reads every fact through `rdfs4`, so it never reuses, and its queries were
+within 6% of the earlier build except `q10`, whose times spread from 47 to 77 ms in both
+builds. The [run record](runs/2026-11-14-item-19-table-reuse-atlas/env.txt) holds the
+four logs, the build identities and the commands.

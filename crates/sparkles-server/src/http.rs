@@ -1517,14 +1517,49 @@ fn query_reasoning(
     params: &Params,
     opts: &mut QueryOptions,
 ) -> ApiResult<()> {
-    use sparkles::reasoning::ReasoningMode;
     let mode = reasoning_mode(ds, params);
     if mode.demand().is_none() {
         return Ok(());
     }
+    let max = match params.get("maxDerived") {
+        None => None,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "maxDerived must be a positive integer",
+                ));
+            }
+        },
+    };
+    let view = demand_view(st, ds, mode, params.get("reasoningProfile"), max)?;
+    if let Some(view) = view {
+        view.apply(opts);
+    }
+    Ok(())
+}
+
+/// The inferred data of a demand or auto `mode` (spec F17 §2.1), which the SPARQL
+/// endpoints and the MCP query tools share: the reasoner of the dataset, with the
+/// profile `profile` names, else the dataset's query-time setting's or the last
+/// materialization's, and at most `max_derived` derived facts, else the setting's
+/// budget, never more than the server's `--reason-max-derived`. `None` for the other
+/// modes, which the caller's options already read.
+pub(crate) fn demand_view(
+    st: &AppState,
+    ds: &Dataset,
+    mode: sparkles::reasoning::ReasoningMode,
+    profile: Option<&str>,
+    max_derived: Option<usize>,
+) -> ApiResult<Option<sparkles::reasoning::InferenceView>> {
+    use sparkles::reasoning::ReasoningMode;
+    if mode.demand().is_none() {
+        return Ok(None);
+    }
     #[cfg(feature = "reasoning")]
     {
-        let profile = match params.get("reasoningProfile") {
+        let profile = match profile {
             None => None,
             Some(p) => Some(p.parse::<sparkles_reasoner::Profile>().map_err(|e| {
                 err_code(StatusCode::BAD_REQUEST, "reasoning-profile", e.to_string())
@@ -1534,17 +1569,9 @@ fn query_reasoning(
             .dataset
             .query_reasoning()
             .and_then(|s| s.budget.max_derived);
-        let max = match params.get("maxDerived") {
+        let max = match max_derived {
             None => setting_max.map_or(st.reason_max_derived, |n| n.min(st.reason_max_derived)),
-            Some(v) => match v.parse::<usize>() {
-                Ok(n) if n > 0 => n.min(st.reason_max_derived),
-                _ => {
-                    return Err(err(
-                        StatusCode::BAD_REQUEST,
-                        "maxDerived must be a positive integer",
-                    ));
-                }
-            },
+            Some(n) => n.min(st.reason_max_derived),
         };
         let demand = sparkles::reasoning::Demand {
             profile,
@@ -1554,12 +1581,11 @@ fn query_reasoning(
             ReasoningMode::Auto(_) => ReasoningMode::Auto(demand),
             _ => ReasoningMode::Demand(demand),
         };
-        ds.dataset.inference_view(mode)?.apply(opts);
-        Ok(())
+        Ok(Some(ds.dataset.inference_view(mode)?))
     }
     #[cfg(not(feature = "reasoning"))]
     {
-        let _ = (st, ds, opts);
+        let _ = (st, ds, profile, max_derived);
         Err(err(
             StatusCode::NOT_IMPLEMENTED,
             "built without the `reasoning` feature",

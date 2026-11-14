@@ -83,6 +83,26 @@ impl ToolError {
     }
 }
 
+impl ToolError {
+    /// The tool error of an HTTP route's error: its `code`, else a code for its status,
+    /// with its message.
+    pub(crate) fn from_api(e: crate::http::ApiError) -> ToolError {
+        let (status, body) = e.into_parts();
+        let message = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the request failed")
+            .to_string();
+        let code = match body.get("code").and_then(Value::as_str) {
+            Some(c) => c.to_string(),
+            None if status.as_u16() == 400 => "bad-argument".to_string(),
+            None if status.as_u16() == 501 => "unsupported".to_string(),
+            None => "failed".to_string(),
+        };
+        ToolError::new(code, status.as_u16(), message)
+    }
+}
+
 /// What an engine error means for the call that got it.
 pub struct ErrorContext<'a> {
     /// the call's timeout, in seconds

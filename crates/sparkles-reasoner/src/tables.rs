@@ -161,6 +161,10 @@ impl Cache {
 /// Set the cache's capacity in bytes (0 turns it off and empties it).
 pub fn set_capacity(bytes: u64) {
     CACHE.set_capacity(bytes);
+    // no table outlives a disabled cache, so neither does an anchor and its delta
+    if bytes == 0 {
+        crate::reuse::clear();
+    }
 }
 
 /// The cache's capacity in bytes.
@@ -181,9 +185,12 @@ pub fn snapshot() -> CacheStats {
 
 /// Empty the cache.
 pub fn clear() {
-    let mut inner = CACHE.inner.lock();
-    inner.map.clear();
-    inner.bytes = 0;
+    {
+        let mut inner = CACHE.inner.lock();
+        inner.map.clear();
+        inner.bytes = 0;
+    }
+    crate::reuse::clear();
 }
 
 fn evict(inner: &mut Inner, cap: u64) {

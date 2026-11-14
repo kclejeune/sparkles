@@ -17,9 +17,11 @@
 //! `owl:intersectionOf` list. A rule whose schema join has more than [`MAX_BINDINGS`]
 //! bindings is kept as it is, and so is every rule after the program reaches
 //! [`MAX_RULES`] specialized rules. Its schema atoms still read the schema the pass
-//! derived.
+//! derived. The rules left out, which the reuse of tables across commits reads, are kept
+//! up to [`MAX_RULES`] instances, past which a rule as written stands for its instances,
+//! and the budget is charged for them.
 
-use crate::budget::{Budget, BudgetFailure};
+use crate::budget::{Budget, BudgetFailure, Held};
 use crate::builtins::BuiltinKind;
 use crate::demand::{Closed, Vocab, clone_builtin};
 use crate::engine::{self, Atom, CBuiltin, CHead, CRule, Eval, Mode, Slot};
@@ -192,6 +194,14 @@ fn rest(r: &CRule, atoms: &[usize], builtins: &[usize], vals: &[Option<u64>]) ->
 /// [`specialize`].
 pub(crate) struct Specialized {
     pub rules: Vec<CRule>,
+    /// the rules left out because their every head gives only facts `closed` says are
+    /// complete, as written or once specialized to a binding of their schema join. A
+    /// change their atoms read can change the schema, so the reuse of tables across
+    /// commits reads them too (spec F17 §6.2).
+    pub left_out: Vec<CRule>,
+    /// the budget's charge for `left_out`, which holds at most [`MAX_RULES`] instances
+    /// and the rules as written that stand for the instances past that bound
+    pub held: Held,
 }
 
 /// The rules of a demand program over the schema that `g` holds in full: each rule
@@ -209,6 +219,10 @@ pub(crate) fn specialize(
 ) -> Result<Specialized, BudgetFailure> {
     let abort = AtomicBool::new(false);
     let mut out: Vec<CRule> = Vec::new();
+    let mut dropped: Vec<CRule> = Vec::new();
+    let mut held = Held::new(budget);
+    let mut dropped_made = 0usize;
+    let mut seen_out: FxHashSet<RuleKey> = FxHashSet::default();
     let mut made = 0usize;
     let left_out = |r: &CRule| {
         r.head
@@ -220,6 +234,8 @@ pub(crate) fn specialize(
             break;
         }
         if left_out(r) {
+            held.try_grow(rule_bytes(r))?;
+            dropped.push(r.clone_shallow());
             continue;
         }
         let Some((atoms, builtins, bound)) = prefix(r, closed, lists) else {
@@ -267,10 +283,34 @@ pub(crate) fn specialize(
             continue;
         }
         let mut seen: FxHashSet<RuleKey> = FxHashSet::default();
+        // past the bound on the instances left out, the rule as written stands for the
+        // rest of them, since its atoms are more general
+        let mut written = false;
         for c in collected {
             let vals: Vec<Option<u64>> = (0..r.nvars).map(|v| bound[v].then_some(c[v])).collect();
             let s = expand_lists(rest(r, &atoms, &builtins, &vals), g, terms);
             if left_out(&s) {
+                if written {
+                    continue;
+                }
+                if dropped_made >= MAX_RULES {
+                    held.try_grow(rule_bytes(r))?;
+                    dropped.push(r.clone_shallow());
+                    written = true;
+                } else {
+                    let mut s = s;
+                    // list expansion can leave spare room, which a kept rule need not hold
+                    s.atoms.shrink_to_fit();
+                    s.builtins.shrink_to_fit();
+                    s.head.shrink_to_fit();
+                    let key = rule_key(&s);
+                    if !seen_out.contains(&key) {
+                        held.try_grow(rule_bytes(&s))?;
+                        seen_out.insert(key);
+                        dropped_made += 1;
+                        dropped.push(s);
+                    }
+                }
                 continue;
             }
             // the same rule from another binding, its atoms in another order
@@ -280,7 +320,53 @@ pub(crate) fn specialize(
             }
         }
     }
-    Ok(Specialized { rules: out })
+    Ok(Specialized {
+        rules: out,
+        left_out: dropped,
+        held,
+    })
+}
+
+/// The bytes a compiled rule and the key that dedupes it hold, with every nested buffer
+/// at its capacity. A builtin's pattern is shared, so it is not counted.
+fn rule_bytes(r: &CRule) -> usize {
+    use std::mem::size_of;
+    let slots = |n: usize| n * size_of::<Slot>();
+    let builtins: usize = r
+        .builtins
+        .iter()
+        .map(|b| {
+            slots(b.args.capacity())
+                + (b.inputs.capacity() + b.outputs.capacity()) * size_of::<usize>()
+                // the key's copy of the arguments
+                + size_of::<(BuiltinKind, Vec<Slot>)>()
+                + slots(b.args.len())
+        })
+        .sum();
+    let heads: usize = r
+        .head
+        .iter()
+        .map(|h| {
+            let args = match h {
+                CHead::Triple(..) => 3,
+                CHead::Action(_, args) => args.capacity(),
+            };
+            slots(args)
+                + size_of::<(Option<crate::builtins::HeadAction>, Vec<Slot>)>()
+                + slots(args)
+        })
+        .sum();
+    size_of::<CRule>()
+        + size_of::<RuleKey>()
+        + r.name.capacity()
+        + r.atoms.capacity() * size_of::<Atom>()
+        + r.atoms.len() * size_of::<[Slot; 3]>()
+        + r.builtins.capacity() * size_of::<CBuiltin>()
+        + builtins
+        + r.head.capacity() * size_of::<CHead>()
+        + heads
+        // the key set's entry and hash
+        + 16
 }
 
 /// A specialized rule as its atoms in a canonical order, its builtins and its head, so
@@ -378,4 +464,201 @@ pub(crate) fn without_equality(rules: Vec<CRule>, same_as: u64, g: &Graph) -> Ve
         return rules;
     }
     rules.into_iter().filter(|r| !reads(r)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rule whose head predicate a schema atom binds, to a relation the proof closed,
+    /// is left out once specialized, and [`Specialized::left_out`] holds that instance
+    /// with its other atoms, which the reuse of tables across commits reads (Codex review
+    /// qtr-step2, round 2).
+    #[test]
+    fn a_rule_closed_once_specialized_is_kept_as_left_out() {
+        let store =
+            sparkles_core::store::Store::in_memory(sparkles_core::store::StoreOptions::default());
+        let terms = Terms::new(store.snapshot());
+        let mut graph = Graph::with_capacity(0);
+        // `8 6 7`: the schema atom `(?p 6 7)` binds ?p to 8, a closed relation
+        graph.add_batch([[8, 6, 7]]);
+        let closed = Closed {
+            preds: [6, 8].into_iter().collect(),
+            classes: FxHashSet::default(),
+            rdf_type: 1,
+        };
+        let rule = CRule {
+            name: "schema producer".into(),
+            nvars: 1,
+            atoms: vec![
+                Atom {
+                    s: Slot::Var(0),
+                    p: Slot::Const(6),
+                    o: Slot::Const(7),
+                },
+                Atom {
+                    s: Slot::Const(20),
+                    p: Slot::Const(21),
+                    o: Slot::Const(22),
+                },
+            ],
+            builtins: vec![],
+            head: vec![CHead::Triple(
+                Slot::Const(30),
+                Slot::Var(0),
+                Slot::Const(31),
+            )],
+        };
+        let s = specialize(
+            &[rule],
+            &closed,
+            &[],
+            &graph,
+            &terms,
+            &Budget::unlimited(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(s.rules.is_empty());
+        assert_eq!(s.left_out.len(), 1);
+        let a = &s.left_out[0].atoms;
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            (a[0].s, a[0].p, a[0].o),
+            (Slot::Const(20), Slot::Const(21), Slot::Const(22))
+        );
+    }
+
+    /// Past [`MAX_RULES`] instances left out, a rule as written stands for the rest of
+    /// its instances, so the list stays bounded and the reuse check reads atoms that are
+    /// only more general (Codex review qtr-step2, round 3).
+    #[test]
+    fn instances_left_out_stop_at_the_bound() {
+        let store =
+            sparkles_core::store::Store::in_memory(sparkles_core::store::StoreOptions::default());
+        let terms = Terms::new(store.snapshot());
+        let mut graph = Graph::with_capacity(0);
+        let subjects: Vec<u64> = (1000..1000 + MAX_BINDINGS as u64).collect();
+        graph.add_batch(subjects.iter().map(|&p| [p, 6, 7]));
+        let closed = Closed {
+            preds: subjects.iter().copied().chain([6]).collect(),
+            classes: FxHashSet::default(),
+            rdf_type: 1,
+        };
+        let rule = |k: u64| CRule {
+            name: format!("producer {k}"),
+            nvars: 1,
+            atoms: vec![
+                Atom {
+                    s: Slot::Var(0),
+                    p: Slot::Const(6),
+                    o: Slot::Const(7),
+                },
+                Atom {
+                    s: Slot::Const(20 + k),
+                    p: Slot::Const(21),
+                    o: Slot::Const(22),
+                },
+            ],
+            builtins: vec![],
+            head: vec![CHead::Triple(
+                Slot::Const(30),
+                Slot::Var(0),
+                Slot::Const(31),
+            )],
+        };
+        let n = MAX_RULES / MAX_BINDINGS + 2;
+        let rules: Vec<CRule> = (0..n as u64).map(rule).collect();
+        let budget = Budget::unlimited();
+        let s = specialize(
+            &rules,
+            &closed,
+            &[],
+            &graph,
+            &terms,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(s.rules.is_empty());
+        let written = s.left_out.iter().filter(|r| r.atoms.len() == 2).count();
+        assert_eq!(s.left_out.len() - written, MAX_RULES);
+        assert_eq!(written, 2);
+        assert!(budget.used() > 0);
+        drop(s);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// The charge for the instances left out counts each builtin's arguments, so a wide
+    /// builtin runs out of a small budget, and the charge is given back (Codex review
+    /// qtr-step2, round 4).
+    #[test]
+    fn a_wide_builtin_left_out_is_charged() {
+        let store =
+            sparkles_core::store::Store::in_memory(sparkles_core::store::StoreOptions::default());
+        let terms = Terms::new(store.snapshot());
+        let mut graph = Graph::with_capacity(0);
+        let subjects: Vec<u64> = (1000..1000 + MAX_BINDINGS as u64).collect();
+        graph.add_batch(subjects.iter().map(|&p| [p, 6, 7]));
+        let closed = Closed {
+            preds: subjects.iter().copied().chain([6]).collect(),
+            classes: FxHashSet::default(),
+            rdf_type: 1,
+        };
+        let mut args: Vec<Slot> = (0..1000).map(|i| Slot::Const(5000 + i)).collect();
+        args.push(Slot::Var(1));
+        let rule = CRule {
+            name: "wide producer".into(),
+            nvars: 2,
+            atoms: vec![Atom {
+                s: Slot::Var(0),
+                p: Slot::Const(6),
+                o: Slot::Const(7),
+            }],
+            builtins: vec![CBuiltin {
+                origin: 0,
+                kind: BuiltinKind::StrConcat,
+                args,
+                inputs: vec![],
+                outputs: vec![1],
+                regex: None,
+            }],
+            head: vec![CHead::Triple(
+                Slot::Const(30),
+                Slot::Var(0),
+                Slot::Const(31),
+            )],
+        };
+        // each instance holds two copies of 1,001 arguments, so 4,096 of them hold
+        // over 100 MiB
+        let budget = Budget::new(Some(16 << 20));
+        let r = specialize(
+            &[rule],
+            &closed,
+            &[],
+            &graph,
+            &terms,
+            &budget,
+            &AtomicBool::new(false),
+        );
+        assert!(r.is_err());
+        drop(r);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// The charge counts the room a rule's lists hold beyond their elements, such as the
+    /// builtins that list expansion removed (Codex review qtr-step2, round 5).
+    #[test]
+    fn spare_room_is_charged() {
+        let rule = |builtins: Vec<CBuiltin>| CRule {
+            name: String::new(),
+            nvars: 0,
+            atoms: vec![],
+            builtins,
+            head: vec![],
+        };
+        let empty = rule_bytes(&rule(Vec::new()));
+        let spare = rule_bytes(&rule(Vec::with_capacity(1000)));
+        assert!(spare - empty >= 1000 * std::mem::size_of::<CBuiltin>());
+    }
 }

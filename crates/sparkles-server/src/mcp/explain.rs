@@ -211,7 +211,7 @@ pub(crate) fn sparql_explain(
     let ea = ExplainArgs {
         dataset: b.dataset,
         query: b.query.clone(),
-        reasoning: b.reasoning,
+        reasoning: b.reasoning.map(super::tools::ReasoningArg::Flag),
         at_commit: if profile == "given" { b.commit } else { None },
         at: if profile == "given" { None } else { b.at },
         profile: Some(profile.into()),

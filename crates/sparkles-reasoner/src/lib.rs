@@ -40,6 +40,7 @@ mod maintain;
 pub mod parser;
 mod pool;
 pub mod query;
+mod reuse;
 pub mod shacl_af;
 mod specialize;
 pub mod tables;
