@@ -64,7 +64,12 @@ fn pairs(s: &Store, op: &str, decoded: bool) -> Vec<(usize, usize)> {
         Some(oxrdf::Term::NamedNode(n)) => n.as_str()["urn:s:".len()..].parse().unwrap(),
         other => panic!("{other:?}"),
     };
-    let mut out: Vec<(usize, usize)> = r.rows().iter().map(|r| (num(&r[0]), num(&r[1]))).collect();
+    let mut out: Vec<(usize, usize)> = r
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|r| (num(&r.values()[0]), num(&r.values()[1])))
+        .collect();
     out.sort();
     out
 }
@@ -170,8 +175,12 @@ fn large_tables_order_stored_strings_through_their_vocabulary_floors() {
             },
             other => panic!("{other:?}"),
         };
-        let mut got: Vec<(usize, usize)> =
-            r.rows().iter().map(|r| (num(&r[0]), num(&r[1]))).collect();
+        let mut got: Vec<(usize, usize)> = r
+            .rows()
+            .unwrap()
+            .iter()
+            .map(|r| (num(&r.values()[0]), num(&r.values()[1])))
+            .collect();
         got.sort();
         let mut expected = Vec::new();
         for i in 0..total {

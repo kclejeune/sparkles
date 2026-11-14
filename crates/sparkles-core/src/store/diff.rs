@@ -457,7 +457,7 @@ fn walk_wal(
         };
         if seq > after && seq <= through {
             for d in txn.as_chunks::<WAL_REC>().0 {
-                if d[0] == WAL_CONFIGURATION {
+                if !wal_is_quad(d[0]) {
                     continue;
                 }
                 f(d[0], super::wal::record_quad(d))?;
@@ -995,11 +995,7 @@ impl Store {
         let from = {
             let mut ix = generation.wal_index.lock();
             if ix.is_none() {
-                *ix = Some(super::wal::WalIndex::scan(
-                    &path,
-                    entry.base.seq,
-                    entry.fold_legacy,
-                )?);
+                *ix = Some(super::wal::WalIndex::scan(&path, entry.base.seq)?);
             }
             ix.as_ref().map(|ix| ix.floor(after)).expect("built above")
         };

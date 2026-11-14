@@ -595,10 +595,12 @@ fn content(s: &Store) -> Content {
     .unwrap();
     let mut rows: Vec<String> = r
         .rows()
+        .unwrap()
         .into_iter()
         .map(|row| {
-            row.into_iter()
-                .map(|t| t.map_or("-".into(), |t| t.to_string()))
+            row.values()
+                .iter()
+                .map(|t| t.as_ref().map_or("-".into(), |t| t.to_string()))
                 .collect::<Vec<_>>()
                 .join(" ")
         })

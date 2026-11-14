@@ -326,7 +326,11 @@ impl Repository {
             });
         }
         for (path, content) in &o.extra {
-            if !layout::ROOT_FILES.contains(&path.as_str()) {
+            // the control checkpoint is rendered by the capture alone (spec C26 §7.3)
+            if !layout::ROOT_FILES.contains(&path.as_str())
+                || path == sparkles_core::control::CHECKPOINT_FILE
+                || path == sparkles_core::jobs::FILE
+            {
                 return Err(BackupError::new(
                     Code::InvalidRequest,
                     format!("{path:?} cannot be added to a backup"),
@@ -511,6 +515,14 @@ impl Repository {
             .any(|entry| layout::configuration_history_path(&entry.path))
         {
             requires.push("evidence-configuration-history/1".to_string());
+        }
+        // a backup that holds the control checkpoint or the jobs settings needs a reader
+        // that restores the control keyspace (spec C26 §7.3)
+        if entries.iter().any(|entry| {
+            entry.path == sparkles_core::control::CHECKPOINT_FILE
+                || entry.path == sparkles_core::jobs::FILE
+        }) {
+            requires.push("control/1".to_string());
         }
         let manifest = Manifest {
             format: layout::FORMAT,

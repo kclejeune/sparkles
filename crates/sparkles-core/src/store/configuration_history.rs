@@ -289,7 +289,6 @@ impl Store {
                     let from = wal::WalPoint {
                         seq: entry.base.seq,
                         offset: 0,
-                        folding: entry.fold_legacy,
                     };
                     let cursor_limit = budget.owned_limit()?;
                     let mut cursor = wal::WalCursor::open_limited(

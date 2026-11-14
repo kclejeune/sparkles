@@ -2454,7 +2454,7 @@ fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report()
         )])
         .unwrap();
     let summary = |principal| {
-        let call = Call {
+        let mut call = Call {
             arrived: Instant::now(),
             cancel: Arc::new(AtomicBool::new(false)),
             request_id: "schema-ranking".into(),
@@ -2462,10 +2462,16 @@ fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report()
             headers: None,
             held: None,
             grant: None,
+
+            preparation: None,
         };
         let args = json!({"dataset":"t","graph":"union","query":"secret predicate","limit":1});
         match server
-            .run_now("describe_schema", args.as_object().unwrap().clone(), &call)
+            .run_now(
+                "describe_schema",
+                args.as_object().unwrap().clone(),
+                &mut call,
+            )
             .unwrap()
         {
             Outcome::Structured(value) => value,
@@ -2481,4 +2487,127 @@ fn question_schema_ranking_cannot_reveal_a_hidden_predicate_from_cached_report()
         "{restricted}"
     );
     assert_eq!(summary(Principal::local()), visible);
+}
+
+#[test]
+fn real_request_preparation_survives_branch_continuation_and_aggregate_refusal() {
+    use sparkles::{
+        BudgetKind, Error,
+        sparql::{output::NativeBudget, pool::QueryPool},
+    };
+    use std::sync::atomic::Ordering;
+    let server = server_with(
+        &[("t", &[FIXTURE])],
+        McpConfig {
+            query_memory_bytes: Some(128 << 10),
+            ..Default::default()
+        },
+    );
+    let pool = QueryPool::new(4 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut call = Call {
+        arrived: Instant::now(),
+        cancel: cancel.clone(),
+        request_id: "same request".into(),
+        principal: Principal::local(),
+        headers: None,
+        held: None,
+        grant: Some(grant.clone()),
+        preparation: None,
+    };
+    server.prepare_call(&mut call).unwrap();
+    // The request root charges the layouts it allocates.
+    let root = grant.used();
+    assert!(root > 0 && root < 1024, "{root}");
+    let mut args = serde_json::json!({"branch":"review"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let mut branch = super::branches::branch_call(&server, "sparql_query", &mut args, &call)
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(branch.grant.as_ref().unwrap(), &grant));
+    server.prepare_call(&mut branch).unwrap();
+    assert_eq!(
+        grant.used(),
+        root,
+        "continuation initialization allocates no second root"
+    );
+    let one = NativeBudget::from_preparation(call.preparation.as_ref().unwrap()).unwrap();
+    let two = NativeBudget::from_preparation(branch.preparation.as_ref().unwrap()).unwrap();
+    let output = one.text(&"x".repeat(64 << 10)).unwrap();
+    let live = grant.used();
+    assert!(
+        matches!(two.text(&"y".repeat(64 << 10)), Err(Error::BudgetExceeded(b))
+        if b.kind == BudgetKind::Memory && b.limit == 128 << 10)
+    );
+    assert_eq!(grant.used(), live);
+    cancel.store(true, Ordering::SeqCst);
+    assert!(matches!(one.check(), Err(Error::Cancelled)));
+    assert!(matches!(two.check(), Err(Error::Cancelled)));
+    drop(one);
+    drop(two);
+    drop(call);
+    drop(branch);
+    assert!(grant.used() >= output.len() as u64);
+    assert_eq!(output.len(), 64 << 10);
+    drop(output);
+    assert_eq!(grant.used(), 0);
+    drop(grant);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// A jobs-enabled dataset with one submitted run: the ledger holds control records that
+/// no MCP tool may render (spec C26 §2.3).
+fn server_with_a_ledger() -> McpServer {
+    let server = server_with(&[("d", &[FIXTURE])], McpConfig::default());
+    let ds = server.state.get("d").unwrap();
+    let mut s = sparkles::jobs::Settings {
+        enabled: true,
+        ..Default::default()
+    };
+    s.definitions.insert(
+        "collect".into(),
+        sparkles::jobs::Definition::quads(vec!["urn:g".into()]),
+    );
+    ds.dataset.jobs().configure(&s).unwrap();
+    ds.dataset
+        .jobs()
+        .submit(
+            &sparkles::jobs::Submission::new("collect", json!({"page": 1}), "k1"),
+            &sparkles::jobs::Caller::admin(oxrdf::NamedNode::new("urn:s").unwrap()),
+        )
+        .unwrap();
+    server
+}
+
+#[tokio::test]
+async fn no_mcp_tool_reaches_the_ledger() {
+    let server = server_with_a_ledger();
+    let ds = server.state.get("d").unwrap();
+    let ledger = "urn:x-sparkles:jobs:ledger";
+    // the ledger is in the control keyspace, so the snapshot holds none of its terms
+    let snap = ds.dataset.snapshot();
+    assert!(snap.lookup_iri(ledger).is_none());
+    assert!(ds.dataset.store().control_enabled());
+    let mut c = Client::start(server);
+    let r = c
+        .text(
+            "sparql_query",
+            json!({"format": "json", "dataset": "d",
+                   "query": "SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } FILTER(CONTAINS(STR(?o), 'collect') || STRSTARTS(STR(?g), 'urn:x-sparkles:jobs')) }"}),
+        )
+        .await;
+    assert!(!r.contains("urn:x-sparkles:jobs:"), "{r}");
+    let s = c.structured("list_changes", json!({"dataset": "d"})).await;
+    assert!(!s.to_string().contains("urn:x-sparkles:jobs:"), "{s}");
+    let s = c.structured("list_datasets", json!({})).await;
+    let d = s["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "d")
+        .unwrap();
+    assert_eq!(d["quads"], snap.len(), "{d}");
 }

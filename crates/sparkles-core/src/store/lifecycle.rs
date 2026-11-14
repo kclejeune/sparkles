@@ -757,7 +757,7 @@ mod tests {
         assert_eq!(reopened.snapshot().len(), 1);
     }
     #[test]
-    fn existing_unknown_identity_preserves_the_supported_legacy_metadata_upgrade() {
+    fn existing_unknown_identity_refuses_a_pre_release_database() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("legacy");
         let store = Store::open(&root, Default::default()).unwrap();
@@ -770,9 +770,8 @@ mod tests {
             .unwrap();
         let previous_id = store.dataset_id();
         drop(store);
-        // Match the genuine legacy transformation exercised by
-        // tests/commits.rs::databases_from_older_versions_get_a_baseline_commit.
-        // Removing only the header from a modern UUID-stamped catalog is corrupt.
+        // The pre-release form: a headerless log of commit records without metadata
+        // and no commit.json, commits.bin or dataset.json. Every open refuses it.
         let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
         let generation = root.join(current.trim());
         let wal = generation.join("wal.log");
@@ -786,12 +785,13 @@ mod tests {
                 record[9..].fill(0);
             }
         }
-        std::fs::write(wal, bytes).unwrap();
+        std::fs::write(&wal, &bytes).unwrap();
         std::fs::remove_file(generation.join("commit.json")).unwrap();
         std::fs::remove_file(root.join("commits.bin")).unwrap();
         std::fs::remove_file(root.join("dataset.json")).unwrap();
         assert!(Store::open_existing(&root, Default::default(), Some(previous_id)).is_err());
         assert!(!root.join("dataset.json").exists());
+        assert_eq!(std::fs::read(&wal).unwrap(), bytes);
         fn copy_fixture(from: &std::path::Path, to: &std::path::Path) {
             std::fs::create_dir(to).unwrap();
             for entry in std::fs::read_dir(from).unwrap() {
@@ -806,13 +806,15 @@ mod tests {
         }
         let ordinary = dir.path().join("ordinary-control");
         copy_fixture(&root, &ordinary);
-        let control = Store::open(&ordinary, Default::default()).unwrap();
-        assert_eq!(control.snapshot().len(), 1);
-        assert!(!control.dataset_id().is_nil());
-        drop(control);
-        let store = Store::open_existing(&root, Default::default(), None).unwrap();
-        assert_eq!(store.snapshot().len(), 1);
-        assert!(!store.dataset_id().is_nil());
-        assert!(root.join("dataset.json").is_file());
+        let e = Store::open(&ordinary, Default::default()).err().unwrap();
+        assert!(matches!(e, Error::Unsupported(_)), "{e}");
+        assert!(e.to_string().contains("sparkles dump"), "{e}");
+        assert!(!ordinary.join("dataset.json").exists());
+        let e = Store::open_existing(&root, Default::default(), None)
+            .err()
+            .unwrap();
+        assert!(matches!(e, Error::Unsupported(_)), "{e}");
+        assert!(!root.join("dataset.json").exists());
+        assert_eq!(std::fs::read(&wal).unwrap(), bytes);
     }
 }

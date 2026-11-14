@@ -40,7 +40,7 @@ fn cfg() -> GeoConfig {
 fn features(snap: Arc<Snapshot>, q: &str) -> BTreeSet<String> {
     let r = crate::sparql::query(snap, &format!("{P}{q}"), &Default::default())
         .unwrap_or_else(|e| panic!("{q}: {e}"));
-    r.rows()
+    r.test_application_rows()
         .into_iter()
         .map(|row| match row.into_iter().next().flatten() {
             Some(oxrdf::Term::NamedNode(n)) => n.as_str().rsplit('/').next().unwrap().into(),

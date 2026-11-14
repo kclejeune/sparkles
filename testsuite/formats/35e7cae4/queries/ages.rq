@@ -1,0 +1,1 @@
+PREFIX ex: <http://ex.org/> SELECT ?p ?age WHERE { ?p ex:age ?age } ORDER BY ?p

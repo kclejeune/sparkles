@@ -34,7 +34,11 @@ fn answers(ds: &Store) -> Vec<Vec<String>> {
             let r = ds
                 .query(&format!("{P}{q}"))
                 .unwrap_or_else(|e| panic!("{q}: {e}"));
-            let mut v: Vec<String> = r.rows().iter().map(|row| format!("{row:?}")).collect();
+            let mut v: Vec<String> = r
+                .test_application_rows()
+                .iter()
+                .map(|row| format!("{row:?}"))
+                .collect();
             v.sort();
             v
         })

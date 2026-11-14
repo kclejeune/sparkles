@@ -287,7 +287,7 @@ impl Store {
                             ddo.check()?;
                             local.clear();
                             for d in txn.as_chunks::<WAL_REC>().0 {
-                                if d[0] == WAL_CONFIGURATION {
+                                if !wal_is_quad(d[0]) {
                                     continue;
                                 }
                                 match local.entry(wal::record_quad(d)) {

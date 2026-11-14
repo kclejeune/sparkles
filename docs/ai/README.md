@@ -632,6 +632,10 @@ count examples define no operational health policy or connector.
   the report's activity names every claim, decision and child report it read with
   `prov:used`, and a withdrawn, reversed or superseded claim rewrites the reports that
   read it ([C25](../specs/C25-evidence-and-assessments.md#reports-on-accepted-evidence)).
+  With `refresh.mode: auto`, a change of the policy's evidence, of the evidence
+  configuration or of the access policy starts a private check, a refresh's plan with no
+  model call or commit, and a refresh follows only when a report's input changed, including
+  through a decision the principal cannot see.
 * Ask answers questions about the whole dataset from the reports by map-reduce, and falls
   back to a query for callers who may not read them. The MCP tool `community_reports`,
   `recall` with `communities`, the brief, `sparkles graphrag` and the UI's Communities tab
@@ -652,12 +656,83 @@ and normalization status. A temporal match does not assert the claim's propositi
 or establish its acceptance. Recorded history still selects an actual retained commit;
 valid-time parameters do not change the meaning of `at`.
 
-C27 Phase 1 remains incomplete. The resources cannot authenticate local availability
-or refuse client backdating of an ordinary RDF timestamp. That A4 acceptance requirement
-needs C25's planned server-owned receipts and the shared protected-write boundary, or
-a separately reviewed runtime helper. Publication dates and arbitrary receipt triples
-do not establish a knowledge cutoff. The projection helper, event-time UI and expiry
-integration remain planned. Roadmap item 341.
+Local availability comes from the server. An authenticated claim proposal writes each
+new source revision's `ev:firstAvailableAt` as the time of the commit that publishes it,
+and commit times never decrease along a branch, including after a restart. An as-known
+read with `at=time:T` therefore contains exactly the authenticated revisions available
+by `T`, whatever their publication or validity dates. A proposal has no availability
+field and answers `400 invalid-proposal` to one. SPARQL Update, Graph Store writes, RDF
+Patch and loads that touch the evidence graphs answer `409 profile-managed-graph` and
+write nothing. Availability written into another graph is ordinary data that never
+resolves as an authenticated record. A clone's root commit is never earlier than the
+commit it copies. The [ordering argument](../specs/C27-valid-time-profiles.md#43-local-availability-and-backdating)
+gives the details.
+
+Claim proposals do not carry a validity interval, so the templates report
+authenticated claims with unknown validity, and roadmap item 925 adds that input. The
+projection helper, event-time UI and expiry integration remain planned under roadmap
+item 341.
+
+### Durable jobs
+
+A durable job keeps accepted work inside the dataset, so a collector or an analysis
+worker resumes after a restart and its result reaches the data atomically. The ledger
+lives in the control keyspace of the dataset's main store, which lies outside the RDF
+dataset, so no SPARQL update, Graph Store write, import or merge can change a record and
+no query, listing, statistic, index, export or history can read or count one. A
+transition that publishes quads writes its records in the same write-ahead log record as
+the quads, and a transition without quads is a frame of the store's `control.log`, which
+creates no commit. The design is in [C26](../specs/C26-durable-jobs-and-delivery.md).
+
+The settings in `jobs.json` register definitions. Each names a kind, the graphs its
+publications may change, the principals that may submit and claim it, and its retry and
+lease policy. The kind in this build is `quads`, whose typed result is bounded insert and
+delete quads in the definition's graphs with an opaque source checkpoint. The first
+configuration raises the dataset reader to 9, enables the control keyspace and upgrades
+the write-ahead log to version 3, so a release that does not know the ledger refuses to
+open the dataset. The control state is held in memory. `maxControlBytes`, 256 MiB by
+default, bounds it by refusing new submissions with `jobs-overloaded`, while the runs
+already admitted keep making progress. That memory is the price of keeping the ledger
+out of the indexes, and terminal records stay in it until roadmap item 934 adds their
+retention.
+
+A submission carries an idempotency key scoped to the dataset, the branch, the caller,
+the definition's name and revision and the operation kind. The same key with the same
+payload, checkpoint, input set and retried run returns the existing run, and another
+request under the key is a conflict. A worker claims the first submitted eligible run of its
+permitted definitions and receives a bearer lease token, which the ledger never records
+beyond its SHA-256 verifier. Every claim raises the run's lease generation, and the
+process that granted a lease has a boot epoch, so a token whose generation was superseded,
+whose lease expired, whose process restarted or whose definition no longer admits the
+run or the worker fails with `lease-lost`, and a caller with no part in the run gets the
+answer of an unknown run. An expired lease follows the retry policy the run was accepted
+with before another worker takes the run over. A run whose definition was edited or
+removed is not claimed until the definition is restored, and it keeps the policy it was
+accepted with, so it still fails once that policy's attempts or horizon run out. A publication
+commits the quads, the publication record, the checkpoint and the run's completion
+together, and a repeated publication operation returns the original receipt even after
+the lease ended, so a retry after a lost response never duplicates its effects. A
+transient failure retries with exponential backoff within the definition's attempts and
+horizon, a permanent one ends the run, cancellation fences the active attempt, and an
+explicit retry makes a new run that links the old one.
+
+In Rust, `Dataset::jobs()` configures, submits, claims, renews, publishes, fails, cancels,
+retries, inspects and resumes restored work. Over HTTP the routes are under
+`/$/jobs/{ds}`, described in [the API reference](../API.md#durable-jobs). Only the jobs
+inspection renders the ledger's records. A publication whose quads make no net change
+creates no commit and reports `committed: false` with the head it follows. A
+submitter's own grants must reach the definition's graphs, but a worker's publication
+is not intersected with the submitter's grants as they stand at publication, which
+roadmap item 903 covers.
+
+A backup holds the ledger as it was at the captured commit. A restored dataset pauses
+every restored run that had not ended before it admits any claim, and refuses
+transitions with `jobs-recovering` while it pauses them. An administrator then resumes
+selected runs with `POST /$/jobs/{ds}/recover` or `Jobs::resume`, after deciding which
+uncertain effects may happen again. A retry of a restored run waits paused in the same
+way. A clone starts with an empty ledger and the source's definitions. Delivery through
+an outbox and recurring definitions are roadmap item 339, and the analysis and batch
+kinds are items 899 and 900.
 
 ## Known gaps
 
@@ -666,6 +741,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### AI and agents
 
+* A durable job's publication writes quads only. An analysis publication with F22's
+  freshness checks and a batch publication with C23's pinned iterator are roadmap items
+  899 and 900. The outbox and recurring definitions are item 339, and the ready-time
+  index, cursor paging, per-principal bounds and shutdown fencing of claims are item 902.
+* Terminal job records stay in the control state, which is held in memory, until
+  roadmap item 934 adds their retention. A clone starts with an empty ledger, and item
+  936 copies records into a clone under new identities.
 * A question asked with a context chip reaches the model as the question followed by
   `(about <IRI>)`, as a typed suffix would. Grounding does not seed entity linking or
   predicate use from the structured `about` resource. Roadmap item 717.
@@ -725,11 +807,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Maintained analyses remain planned in [C25](../specs/C25-evidence-and-assessments.md).
   Ordinary RDF shape validation does not establish the runtime guarantees of the typed
   evidence operations. Roadmap item 340.
-* The automatic refresh of reports read under a review policy notices only the changes
-  of the policy's evidence that the principal's change feed lists. A hidden decision,
-  support or withdrawal, a settings-only change of the evidence configuration, a reload
-  of the access policy and a state left behind by a crash wait for the next visible
-  change or a manual refresh. Roadmap item 652.
 * A report waiting for a rewrite after its claim was withdrawn keeps its earlier
   citations while the daily budget holds the rewrite back, without a `stale` mark.
   Roadmap item 809.
@@ -749,10 +826,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   result publication are planned in [F22](../specs/F22-analysis-lifecycle.md). Existing
   reasoner and view maintenance does not provide that application lifecycle. Roadmap
   item 340.
-* The [valid-time profile](#valid-time-profile) supplies static resources and temporal
-  queries. C27 Phase 1 remains incomplete until server-owned availability and backdating
-  refusal pass A4, dependent on C25 Phase 2 and protected writes. The runtime projection
-  helper, event-time control and expiry integration remain planned. Roadmap item 341.
+* The [valid-time profile](#valid-time-profile) supplies static resources, temporal
+  queries and server-owned availability. Authenticated claim proposals cannot carry a
+  validity interval, which roadmap item 925 adds. The runtime projection helper,
+  event-time control and expiry integration remain planned. Roadmap item 341.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
   have reports built from their own view. Roadmap item 100. Global answering is evaluated
   on one generated question set on the demo graph, compared with BM25 rather than vector

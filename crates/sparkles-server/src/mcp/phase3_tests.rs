@@ -1029,8 +1029,9 @@ async fn entailment_diff_reads_branch_states_without_writing() {
 #[cfg(feature = "reasoning")]
 #[tokio::test(flavor = "multi_thread")]
 async fn review_adapters_entailment_diff_honors_the_effective_mcp_memory_ceiling() {
+    // The request root fits under the MCP ceiling, and the diff does not.
     let cfg = McpConfig {
-        query_memory_bytes: Some(1),
+        query_memory_bytes: Some(512),
         ..Default::default()
     };
     let mut state = AppState::standalone(StoreOptions::default(), cfg.max_timeout);

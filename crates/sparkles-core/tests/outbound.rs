@@ -899,9 +899,12 @@ fn service_blank_nodes_are_the_endpoints_own() {
     let one = |q: &str| {
         let q = q.replace("URL", &s.url("/sparql"));
         let r = sparkles_core::sparql::query(store.snapshot(), &q, &opts).unwrap();
-        let rows = r.rows();
+        let rows = r.rows().unwrap();
         assert_eq!(rows.len(), 1, "{q}");
-        rows[0][0].as_ref().unwrap().to_string()
+        rows.row(0).unwrap().values()[0]
+            .as_ref()
+            .unwrap()
+            .to_string()
     };
     assert_eq!(one("SELECT ?s { ?s <urn:p> ?v }"), "_:b0");
     assert_eq!(

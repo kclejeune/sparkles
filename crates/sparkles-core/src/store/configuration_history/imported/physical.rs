@@ -185,8 +185,6 @@ pub(super) fn prove_prefix<R: Read + Seek>(
     extent: u64,
     base: u64,
     target: u64,
-    fold_legacy: bool,
-    strict_from: Option<u64>,
     dvocab_len: u64,
     annotated: Option<&[u64]>,
     path: &Path,
@@ -210,8 +208,6 @@ pub(super) fn prove_prefix<R: Read + Seek>(
             extent,
             base,
             target,
-            fold_legacy,
-            strict_from,
             dvocab_len,
             annotated,
             path,
@@ -407,8 +403,6 @@ mod tests {
             wire.len() as u64,
             0,
             2,
-            false,
-            None,
             u64::MAX,
             Some(&[]),
             Path::new("annotation-lookahead"),
@@ -433,8 +427,6 @@ mod tests {
             wire.len() as u64,
             0,
             2,
-            false,
-            None,
             u64::MAX,
             Some(&[]),
             Path::new("annotation-lookahead"),
@@ -500,8 +492,6 @@ mod tests {
             wire.len() as u64,
             0,
             4,
-            false,
-            None,
             u64::MAX,
             None,
             Path::new("disjoint-imports"),
@@ -527,8 +517,6 @@ mod tests {
             changed.len() as u64,
             0,
             4,
-            false,
-            None,
             u64::MAX,
             None,
             Path::new("disjoint-imports"),
@@ -544,8 +532,6 @@ mod tests {
                 changed.len() as u64,
                 0,
                 4,
-                false,
-                None,
                 u64::MAX,
                 None,
                 Path::new("disjoint-imports"),
@@ -578,8 +564,6 @@ mod tests {
                 wire.len() as u64,
                 0,
                 2,
-                false,
-                None,
                 u64::MAX,
                 None,
                 Path::new("split-import"),
@@ -595,8 +579,6 @@ mod tests {
             truncated.len() as u64,
             0,
             0,
-            false,
-            None,
             u64::MAX,
             Some(&[]),
             Path::new("missing-durability"),
@@ -613,8 +595,6 @@ mod tests {
                 truncated.len() as u64,
                 0,
                 0,
-                false,
-                None,
                 u64::MAX,
                 Some(&[]),
                 Path::new("missing-durability"),
@@ -655,8 +635,6 @@ mod tests {
                 wire.len() as u64,
                 0,
                 2,
-                false,
-                None,
                 u64::MAX,
                 None,
                 Path::new("buffer-pressure"),
@@ -679,8 +657,6 @@ mod tests {
             wire.len() as u64,
             0,
             2,
-            false,
-            None,
             u64::MAX,
             None,
             Path::new("callback-refusal"),
@@ -776,11 +752,7 @@ mod tests {
     fn observation(start: u64, end: u64, seq: u64) -> wal::probe::WalCommitObservation {
         wal::probe::WalCommitObservation {
             start_offset: start,
-            point: wal::WalPoint {
-                seq,
-                offset: end,
-                folding: false,
-            },
+            point: wal::WalPoint { seq, offset: end },
             metadata: None,
             configuration: None,
         }
@@ -810,68 +782,52 @@ mod tests {
     }
 
     #[test]
-    fn imported_stream_and_framing_use_the_actual_probe_for_headers_and_folded_commits() {
-        for (headed, folded) in [(true, false), (false, true)] {
-            let mut wire = if headed {
-                wal::header_record().to_vec()
-            } else {
-                Vec::new()
-            };
-            let mut data = [0; WAL_REC];
-            data[0] = WAL_INSERT;
-            for seq in [11, 12] {
-                wire.extend_from_slice(&data);
-                let mut record = [0; WAL_REC];
-                record[0] = WAL_COMMIT;
-                if !folded {
-                    commit::seal_wal_commit_unfenced(
-                        &mut record,
-                        seq,
-                        100,
-                        CommitKind::Update,
-                        0,
-                        0,
-                        &data,
-                    );
-                }
-                wire.extend_from_slice(&record);
-            }
-            let spans = [span(
-                &wire,
+    fn imported_stream_and_framing_use_the_actual_probe() {
+        let mut wire = wal::header_record().to_vec();
+        let mut data = [0; WAL_REC];
+        data[0] = WAL_INSERT;
+        for seq in [11, 12] {
+            wire.extend_from_slice(&data);
+            let mut record = [0; WAL_REC];
+            record[0] = WAL_COMMIT;
+            commit::seal_wal_commit_unfenced(
+                &mut record,
+                seq,
+                100,
+                CommitKind::Update,
                 0,
-                wire.len(),
-                if folded { 10 } else { 11 },
-                if folded { 10 } else { 12 },
-            )];
-            let options = HistoryOptions::default();
-            let budget = ColdBudget::new(ReadLimit {
-                options: &options,
-                memory: Some(4096),
-                held: 0,
-            })
-            .unwrap();
-            let mut reader = BufReader::with_capacity(
-                17,
-                SpanReader::new(Cursor::new(&wire), &spans, wire.len() as u64).unwrap(),
+                0,
+                &data,
             );
-            let mut frames = FrameProof::new(&spans, wire.len() as u64).unwrap();
-            let proof = wal::probe::prove_prefix_with(
-                &mut reader,
-                wire.len() as u64,
-                10,
-                u64::MAX,
-                folded,
-                None,
-                u64::MAX,
-                None,
-                Path::new("private-import-proof"),
-                &budget,
-                &mut |observation| frames.observe(observation),
-            )
-            .unwrap();
-            assert_eq!(proof.head.offset, wire.len() as u64);
-            frames.finish().unwrap();
-            reader.into_inner().finish().unwrap();
+            wire.extend_from_slice(&record);
         }
+        let spans = [span(&wire, 0, wire.len(), 11, 12)];
+        let options = HistoryOptions::default();
+        let budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        let mut reader = BufReader::with_capacity(
+            17,
+            SpanReader::new(Cursor::new(&wire), &spans, wire.len() as u64).unwrap(),
+        );
+        let mut frames = FrameProof::new(&spans, wire.len() as u64).unwrap();
+        let proof = wal::probe::prove_prefix_with(
+            &mut reader,
+            wire.len() as u64,
+            10,
+            u64::MAX,
+            u64::MAX,
+            None,
+            Path::new("private-import-proof"),
+            &budget,
+            &mut |observation| frames.observe(observation),
+        )
+        .unwrap();
+        assert_eq!(proof.head.offset, wire.len() as u64);
+        frames.finish().unwrap();
+        reader.into_inner().finish().unwrap();
     }
 }

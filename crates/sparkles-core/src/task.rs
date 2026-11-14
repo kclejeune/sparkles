@@ -84,6 +84,10 @@ impl std::fmt::Debug for Cancel {
 pub struct Cancellation(Arc<[Arc<AtomicBool>]>);
 
 impl Cancellation {
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn from_flags(flags: impl IntoIterator<Item = Arc<AtomicBool>>) -> Self {
         let mut unique = Vec::new();
         for flag in flags {

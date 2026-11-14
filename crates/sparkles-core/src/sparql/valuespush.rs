@@ -528,7 +528,11 @@ mod tests {
             ..Default::default()
         };
         let r = crate::sparql::query(s.snapshot(), q, &opts)?;
-        let mut v: Vec<String> = r.rows().into_iter().map(|row| format!("{row:?}")).collect();
+        let mut v: Vec<String> = r
+            .test_application_rows()
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect();
         v.sort();
         Ok(v)
     }

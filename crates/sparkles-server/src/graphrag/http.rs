@@ -108,7 +108,9 @@ fn proven(ds: &Dataset, p: &Principal, graph: &str) -> bool {
 
 fn rows(ds: &Dataset, opts: &QueryOptions, q: &str) -> ApiResult<Vec<Vec<Option<Term>>>> {
     sparql::query(ds.store.snapshot(), q, opts)
-        .map(|r| r.rows())
+        .and_then(|r| r.rows())
+        // An application copy, as before the retained row owners.
+        .map(|rows| rows.iter().map(|row| row.values().to_vec()).collect())
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 

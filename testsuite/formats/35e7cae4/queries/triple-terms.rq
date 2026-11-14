@@ -1,0 +1,2 @@
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?r ?s ?o WHERE { ?r rdf:reifies ?t BIND(SUBJECT(?t) AS ?s) BIND(OBJECT(?t) AS ?o) } ORDER BY ?r

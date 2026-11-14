@@ -21,7 +21,7 @@
 //! and joins its solutions with the group's rows.
 
 use super::ctx::Ctx;
-use super::exec::{execute, join_tables};
+use super::exec::{execute_materialized, join_tables};
 use super::plan::{ActiveGraph, Kind, Node, Planner, collect_pattern_vars, join_est};
 use super::table::{Table, VarId};
 use crate::error::Result;
@@ -312,17 +312,18 @@ pub(super) fn run(
             g => g.clone(),
         };
         let node = p.plan(&spec.pattern, &graph, Vec::new())?;
-        let (r, _) = execute(ctx, &node)?;
+        let (input, _) = execute_materialized(ctx, &node)?;
+        let r = input.as_table();
         solutions += r.len();
         let rows = l.take_rows(&groups[key]);
         let joined = match &spec.optional {
             Some(expr) => {
                 let expr = expr.as_ref().map(|e| p.compile(e, &graph));
                 let mut note = None;
-                super::exec::left_join(ctx, &rows, &r, expr.as_ref(), &mut note)?
+                super::exec::left_join(ctx, &rows, r, expr.as_ref(), &mut note)?
             }
             None if r.is_empty() => continue,
-            None => join_tables(ctx, &rows, &r, &[], false)?,
+            None => join_tables(ctx, &rows, r, &[], false)?,
         };
         ctx.check_output(out.len() + joined.len(), vars.len())?;
         out.append(joined.project(vars));

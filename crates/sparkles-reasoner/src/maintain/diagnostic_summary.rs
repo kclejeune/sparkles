@@ -69,10 +69,10 @@ pub fn literal_typings_controlled(
             .ok()
             .is_some_and(|meta| meta.len() > limit)
     {
-        return Err(MemoryExceeded {
-            limit: limit.try_into().unwrap_or(usize::MAX),
-            context: " while reading generalized diagnostic metadata".into(),
-        }
+        return Err(BudgetFailure::local(
+            limit.try_into().unwrap_or(usize::MAX),
+            " while reading generalized diagnostic metadata".into(),
+        )
         .into());
     }
     let Some(meta) = saved_meta(root, store.dataset_id(), commit) else {

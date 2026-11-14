@@ -49,16 +49,17 @@ fn run(s: &Store, q: &str, opts: &QueryOptions) -> (Vec<BTreeMap<String, String>
         query(s.snapshot(), &format!("{PREFIXES}{q}"), opts).unwrap_or_else(|e| panic!("{q}: {e}"));
     let rows = r
         .rows()
+        .unwrap()
         .iter()
         .map(|row| {
-            r.vars
+            r.variables()
                 .iter()
-                .zip(row)
+                .zip(row.values())
                 .map(|(v, t)| (v.clone(), short(t)))
                 .collect()
         })
         .collect();
-    (rows, r.plan)
+    (rows, r.plan().clone())
 }
 
 fn rows(s: &Store, q: &str) -> Vec<BTreeMap<String, String>> {

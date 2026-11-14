@@ -8,13 +8,16 @@ mod caller_allocations;
 fn cold_index_nodes_and_collision_vectors_are_admitted_before_growth() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("delta.vocab");
-    let mut wire = Vec::new();
-    for id in 0..10_000 {
-        let key = format!("<urn:key:{id:08}>");
-        wire.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        wire.extend_from_slice(key.as_bytes());
+    {
+        let vocab = DeltaVocab::open(&path).unwrap();
+        for id in 0..10_000 {
+            vocab
+                .insert(format!("<urn:key:{id:08}>").as_bytes())
+                .unwrap();
+        }
+        vocab.sync().unwrap();
     }
-    std::fs::write(&path, &wire).unwrap();
+    let wire = std::fs::read(&path).unwrap();
     let cap = 1 << 20;
     let (result, counts) = caller_allocations::measure(|| {
         DeltaVocab::open_read_only_limited_for_test(&path, &HistoryOptions::default(), cap)

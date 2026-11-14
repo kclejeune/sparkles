@@ -179,9 +179,9 @@ fn rows(
     snap: &Arc<Snapshot>,
     q: &str,
     opts: &QueryOptions,
-) -> Result<Vec<Vec<Option<Term>>>, RunError> {
+) -> Result<sparql::output::OwnedRows, RunError> {
     sparql::query(snap.clone(), q, opts)
-        .map(|r| r.rows())
+        .and_then(|r| r.rows())
         .map_err(|e| match e {
             sparkles::Error::Cancelled => RunError::Cancelled,
             e => failed(e),
@@ -262,6 +262,70 @@ enum Plan {
     Keep(String),
     /// write a new report, replacing the current one if any
     Write,
+}
+
+/// Why a run decided a community's plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// a community without a report of the previous build to keep
+    New,
+    /// a report the state names that the graph no longer links
+    Unmatched,
+    /// pending, failed, stale or never written, which C22's own retry covers
+    Retry,
+    /// an entity joined or left
+    Members,
+    /// rewritten whatever the fraction
+    Forced,
+    /// its facts or children changed past the fraction
+    Changed,
+    Kept,
+}
+
+impl Why {
+    /// Whether the plan rewrites the report because its input changed.
+    fn input(self) -> bool {
+        matches!(
+            self,
+            Why::New | Why::Unmatched | Why::Members | Why::Forced | Why::Changed
+        )
+    }
+}
+
+/// Why a plan needs a refresh for a change of a report's input: a report it rewrites
+/// because its input changed, or a community it adds, removes or gives other members or
+/// another parent, including a hierarchy that is now empty.
+fn input_change(prep: &Prepared, b: &BuildRecord, why: &[Why]) -> Option<String> {
+    let old: HashMap<&str, &StoredCommunity> =
+        b.communities.iter().map(|c| (c.iri.as_str(), c)).collect();
+    let mut inherited: HashSet<&str> = HashSet::new();
+    for (i, n) in prep.nodes.iter().enumerate() {
+        let Some(o) = n.inherited.as_deref().and_then(|p| old.get(p)) else {
+            return Some("a new community".into());
+        };
+        inherited.insert(o.iri.as_str());
+        if n.members != o.members {
+            return Some(format!("the members of <{}> changed", n.iri));
+        }
+        let parent = n.parent.map(|p| prep.nodes[p].iri.as_str());
+        if parent != o.parent.as_deref() {
+            return Some(format!("<{}> has another parent", n.iri));
+        }
+        if why[i].input() {
+            return Some(format!("the input of <{}> changed", n.iri));
+        }
+    }
+    if let Some(o) = b
+        .communities
+        .iter()
+        .find(|c| !inherited.contains(c.iri.as_str()))
+    {
+        return Some(format!("<{}> is gone", o.iri));
+    }
+    if let Some(g) = prep.gone.first() {
+        return Some(format!("<{g}> is no longer a community"));
+    }
+    None
 }
 
 /// The inputs a run reads before it calls a model.
@@ -732,6 +796,7 @@ impl Run<'_> {
             // each label or type triple, with whether only the output graph holds it
             let mut lines: BTreeMap<(String, String), (Term, bool, bool)> = BTreeMap::new();
             for r in rows(&snap, &q, &opts)? {
+                let r = r.values();
                 let Some(e) = nt(&r[0]) else { continue };
                 let value = match (&r[1], &r[2]) {
                     (Some(l @ Term::Literal(_)), _) => l.clone(),
@@ -890,6 +955,7 @@ impl Run<'_> {
                 values.join(" ")
             );
             for r in rows(snap, &q, opts)? {
+                let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     found.insert((s, p, o));
                 }
@@ -920,6 +986,7 @@ impl Run<'_> {
         );
         let mut out: HashMap<String, Revision> = HashMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             let Some(Term::NamedNode(rep)) = &r[0] else {
                 continue;
             };
@@ -990,6 +1057,7 @@ impl Run<'_> {
                 store::RDF_TYPE
             );
             for r in rows(snap, &q, opts)? {
+                let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     let flag = |i: usize| matches!(r.get(i), Some(Some(Term::Literal(l))) if l.value() == "1");
                     let origin = Origin {
@@ -1028,6 +1096,7 @@ impl Run<'_> {
         );
         let mut all: BTreeMap<String, Existing> = BTreeMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             let Some(Term::NamedNode(c)) = &r[0] else {
                 continue;
             };
@@ -1058,6 +1127,7 @@ impl Run<'_> {
         let mut summary = String::new();
         let mut findings: BTreeMap<u64, ChildFinding> = BTreeMap::new();
         for r in rows(snap, &q, &QueryOptions::default())? {
+            let r = r.values();
             if let Some(Term::Literal(l)) = &r[0] {
                 title = l.value().to_string();
             }
@@ -1090,6 +1160,11 @@ impl Run<'_> {
 
     /// Decide what to do with each community.
     fn plan(&self, prep: &Prepared, previous: &BuildState) -> Vec<Plan> {
+        self.plan_why(prep, previous).0
+    }
+
+    /// The plan of each community, with why it was decided.
+    fn plan_why(&self, prep: &Prepared, previous: &BuildState) -> (Vec<Plan>, Vec<Why>) {
         let old: HashMap<&str, &StoredCommunity> = previous
             .last_build
             .iter()
@@ -1097,10 +1172,12 @@ impl Run<'_> {
             .map(|c| (c.iri.as_str(), c))
             .collect();
         let mut plans: Vec<Plan> = vec![Plan::Write; prep.nodes.len()];
+        let mut why: Vec<Why> = vec![Why::New; prep.nodes.len()];
         if self.mode == Mode::Build {
-            return plans;
+            return (plans, why);
         }
         let frac = self.settings.refresh.min_changed_fraction;
+        let keeps = |changed: f64| changed < frac || (changed == 0.0 && frac == 0.0);
         let policy = prep.evidence.as_ref().map(|e| &e.policy);
         let same = policy.is_some_and(|p| {
             same_policy(
@@ -1128,17 +1205,30 @@ impl Run<'_> {
                 continue;
             };
             if pending.contains(inherited.as_str()) {
+                why[i] = Why::Retry;
                 continue;
             }
+            // a report the state names and the graph no longer links does not match
+            let unlinked = if o.report.is_some() {
+                Why::Unmatched
+            } else {
+                Why::Retry
+            };
             let Some(e) = prep.existing.get(&n.iri) else {
+                why[i] = unlinked;
                 continue;
             };
-            let Some(report) = &e.report else { continue };
+            let Some(report) = &e.report else {
+                why[i] = unlinked;
+                continue;
+            };
             if matches!(e.status, None | Some(Status::Failed) | Some(Status::Stale)) {
+                why[i] = Why::Retry;
                 continue;
             }
             // an entity joined or left
             if o.members != n.members {
+                why[i] = Why::Members;
                 continue;
             }
             // the policy the linked report records, whatever the state says
@@ -1159,6 +1249,7 @@ impl Run<'_> {
             };
             if force || n.children.iter().any(|&c| forced[c]) {
                 forced[i] = true;
+                why[i] = Why::Forced;
                 continue;
             }
             // the share of the facts the report was written from that changed: a leaf's
@@ -1170,21 +1261,55 @@ impl Run<'_> {
             } else {
                 before.symmetric_difference(&after).count() as f64 / before.len().max(1) as f64
             };
-            let changed = if n.leaf() {
-                facts_changed
+            // a parent also counts its rewritten children, and apart from them the
+            // children rewritten because their inputs changed
+            let (changed, by_input) = if n.leaf() {
+                (facts_changed, facts_changed)
             } else {
-                let rewritten = n
-                    .children
-                    .iter()
-                    .filter(|&&c| matches!(plans[c], Plan::Write))
-                    .count();
-                facts_changed.max(rewritten as f64 / n.children.len().max(1) as f64)
+                let share = |f: &dyn Fn(usize) -> bool| {
+                    n.children.iter().filter(|&&c| f(c)).count() as f64
+                        / n.children.len().max(1) as f64
+                };
+                let rewritten = share(&|c| matches!(plans[c], Plan::Write));
+                let input = share(&|c| matches!(plans[c], Plan::Write) && why[c].input());
+                (facts_changed.max(rewritten), facts_changed.max(input))
             };
-            if changed < frac || (changed == 0.0 && frac == 0.0) {
+            if keeps(changed) {
                 plans[i] = Plan::Keep(report.clone());
+                why[i] = Why::Kept;
+            } else if keeps(by_input) {
+                why[i] = Why::Retry;
+            } else {
+                why[i] = Why::Changed;
             }
         }
-        plans
+        (plans, why)
+    }
+
+    /// The private check of the automatic refresh under a review policy (spec C25,
+    /// "Refresh"): a refresh's preparation and plan, read as the principal at the Head
+    /// evidence view, with no estimate, model call, commit, state change or task. It
+    /// answers why the dataset needs a refresh for a change of a report's input, and
+    /// `None` when it does not. Pending, failed and stale reports are not such a reason.
+    pub(crate) fn private_check(&self) -> Result<Option<String>, RunError> {
+        // the check calls no model, so it needs no provider: a refresh it starts without
+        // one fails as a visible task, as one the principal's feed starts does
+        if !self.settings.enabled {
+            return Ok(None);
+        }
+        self.settings.check().map_err(RunError::Refused)?;
+        let principal = authorized_principal(self.st, &self.ds, &self.settings.principal)
+            .map_err(RunError::Refused)?;
+        let previous = self.load_state()?;
+        let Some(b) = &previous.last_build else {
+            return Ok(None);
+        };
+        if b.branch != sparkles::branch::MAIN {
+            return Ok(None);
+        }
+        let prep = self.prepare(&principal, &previous)?;
+        let (_, why) = self.plan_why(&prep, &previous);
+        Ok(input_change(&prep, b, &why))
     }
 
     /// The input of a community, with its children's current reports.

@@ -708,7 +708,7 @@ fn run_admin(
                 probe.finish(&result)?;
             }
             let text = result?;
-            serde_json::from_str::<Value>(&text).map_err(|e| EngineError::invalid(e.to_string()))?
+            serde_json::from_str::<Value>(text.as_str()).map_err(|e| EngineError::invalid(e.to_string()))?
         }
         "algo.runWrite" => value(ds.algorithms().run_write(
             &sparkles::sparql::algorun::AlgoRequest::from_json(a["request"].clone())?,

@@ -1,0 +1,4719 @@
+{
+ "settings": {
+  "store": "synth-71d11ad0.db",
+  "rounds": 6,
+  "reps": 30,
+  "threads": "12",
+  "server_cpu": "0-11",
+  "client_cpu": "12",
+  "arms": [
+   [
+    "base",
+    "./sparkles-71d11ad0",
+    ""
+   ],
+   [
+    "main",
+    "./sparkles-321508fe",
+    ""
+   ],
+   [
+    "tip",
+    "./sparkles-ce993ece",
+    ""
+   ]
+  ],
+  "phases": {
+   "basic": [
+    "instructions:u",
+    "cycles:u",
+    "cache-misses:u",
+    "branch-misses:u",
+    "cpu_core/mem_load_retired.l3_miss/u",
+    "cpu_core/baclears.any/u"
+   ],
+   "front": [
+    "instructions:u",
+    "cycles:u",
+    "cpu_core/idq.dsb_uops/u",
+    "cpu_core/idq.mite_uops/u",
+    "cpu_core/frontend_retired.any_dsb_miss/u",
+    "cpu_core/dsb2mite_switches.penalty_cycles/u"
+   ],
+   "icache": [
+    "instructions:u",
+    "cycles:u",
+    "cpu_core/icache_data.stalls/u",
+    "cpu_core/icache_tag.stalls/u",
+    "L1-icache-load-misses:u",
+    "iTLB-load-misses:u"
+   ]
+  }
+ },
+ "results": {
+  "f-regex-iri-join": {
+   "base": [
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.11608349999999999,
+      "execMs": 8.619885499999999,
+      "per_req": {
+       "instructions": 67334769.06666666,
+       "cycles": 31060584.133333333,
+       "cache-misses": 62047.8,
+       "branch-misses": 78919.96666666666,
+       "mem_load_retired.l3_miss": 1674.1333333333334,
+       "baclears.any": 14895.0
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09429349999999999,
+      "execMs": 7.3429745,
+      "per_req": {
+       "instructions": 67079001.06666667,
+       "cycles": 30276715.933333334,
+       "idq.dsb_uops": 55616738.6,
+       "idq.mite_uops": 5559131.933333334,
+       "frontend_retired.any_dsb_miss": 826362.8666666667,
+       "dsb2mite_switches.penalty_cycles": 885445.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0968605,
+      "execMs": 7.518175,
+      "per_req": {
+       "instructions": 67046844.5,
+       "cycles": 29983722.533333335,
+       "icache_data.stalls": 551221.0666666667,
+       "icache_tag.stalls": 377771.9,
+       "L1-icache-load-misses": 203534.06666666668,
+       "iTLB-load-misses": 2112.4
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.11763399999999999,
+      "execMs": 7.832392499999999,
+      "per_req": {
+       "instructions": 67217359.66666667,
+       "cycles": 30485036.133333333,
+       "cache-misses": 50567.433333333334,
+       "branch-misses": 78709.56666666667,
+       "mem_load_retired.l3_miss": 1529.9666666666667,
+       "baclears.any": 14110.033333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.122776,
+      "execMs": 8.249281,
+      "per_req": {
+       "instructions": 67099523.733333334,
+       "cycles": 30457273.833333332,
+       "idq.dsb_uops": 55621370.5,
+       "idq.mite_uops": 5591527.333333333,
+       "frontend_retired.any_dsb_miss": 833196.8333333334,
+       "dsb2mite_switches.penalty_cycles": 892241.5
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.11913499999999999,
+      "execMs": 7.7320575,
+      "per_req": {
+       "instructions": 67090142.8,
+       "cycles": 30386450.8,
+       "icache_data.stalls": 672361.3333333334,
+       "icache_tag.stalls": 457955.5,
+       "L1-icache-load-misses": 199264.56666666668,
+       "iTLB-load-misses": 2236.4666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.13020099999999998,
+      "execMs": 8.41116,
+      "per_req": {
+       "instructions": 67329959.06666666,
+       "cycles": 31051305.133333333,
+       "cache-misses": 64604.46666666667,
+       "branch-misses": 79301.1,
+       "mem_load_retired.l3_miss": 1652.4666666666667,
+       "baclears.any": 13968.033333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1331615,
+      "execMs": 8.5621145,
+      "per_req": {
+       "instructions": 67271676.9,
+       "cycles": 31214790.833333332,
+       "idq.dsb_uops": 55779583.03333333,
+       "idq.mite_uops": 5604542.666666667,
+       "frontend_retired.any_dsb_miss": 836259.4666666667,
+       "dsb2mite_switches.penalty_cycles": 898702.1333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.127388,
+      "execMs": 7.6078125,
+      "per_req": {
+       "instructions": 67091696.233333334,
+       "cycles": 30543924.466666665,
+       "icache_data.stalls": 740219.7666666667,
+       "icache_tag.stalls": 514993.3333333333,
+       "L1-icache-load-misses": 200955.06666666668,
+       "iTLB-load-misses": 2176.9666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1248475,
+      "execMs": 8.744688,
+      "per_req": {
+       "instructions": 67274330.7,
+       "cycles": 30939715.6,
+       "cache-misses": 67120.73333333334,
+       "branch-misses": 78019.43333333333,
+       "mem_load_retired.l3_miss": 1997.5666666666666,
+       "baclears.any": 13058.733333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.12649349999999998,
+      "execMs": 9.197612,
+      "per_req": {
+       "instructions": 67328153.86666666,
+       "cycles": 30806294.266666666,
+       "idq.dsb_uops": 55854664.5,
+       "idq.mite_uops": 5618505.633333334,
+       "frontend_retired.any_dsb_miss": 836180.9,
+       "dsb2mite_switches.penalty_cycles": 889021.7
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.13275199999999998,
+      "execMs": 8.4229965,
+      "per_req": {
+       "instructions": 67205850.7,
+       "cycles": 31306425.866666667,
+       "icache_data.stalls": 974429.4333333333,
+       "icache_tag.stalls": 736486.9333333333,
+       "L1-icache-load-misses": 202901.0,
+       "iTLB-load-misses": 2149.5666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.120702,
+      "execMs": 8.312028999999999,
+      "per_req": {
+       "instructions": 67226022.76666667,
+       "cycles": 30729934.166666668,
+       "cache-misses": 59487.3,
+       "branch-misses": 78783.3,
+       "mem_load_retired.l3_miss": 1771.8,
+       "baclears.any": 13879.433333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.12133050000000001,
+      "execMs": 8.309832,
+      "per_req": {
+       "instructions": 67140564.93333334,
+       "cycles": 30649566.633333333,
+       "idq.dsb_uops": 55837192.86666667,
+       "idq.mite_uops": 5520753.466666667,
+       "frontend_retired.any_dsb_miss": 819669.2666666667,
+       "dsb2mite_switches.penalty_cycles": 873301.3666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1283355,
+      "execMs": 7.529199,
+      "per_req": {
+       "instructions": 67109513.3,
+       "cycles": 30742440.966666665,
+       "icache_data.stalls": 746422.2666666667,
+       "icache_tag.stalls": 526666.4,
+       "L1-icache-load-misses": 204933.9,
+       "iTLB-load-misses": 2211.0333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.099683,
+      "execMs": 7.6715685,
+      "per_req": {
+       "instructions": 67171749.86666666,
+       "cycles": 30038593.3,
+       "cache-misses": 27084.4,
+       "branch-misses": 78833.7,
+       "mem_load_retired.l3_miss": 801.7,
+       "baclears.any": 14475.233333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.10036149999999999,
+      "execMs": 7.379158,
+      "per_req": {
+       "instructions": 67077572.4,
+       "cycles": 29680533.766666666,
+       "idq.dsb_uops": 55553860.0,
+       "idq.mite_uops": 5603097.766666667,
+       "frontend_retired.any_dsb_miss": 833337.7666666667,
+       "dsb2mite_switches.penalty_cycles": 896862.0666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.099418,
+      "execMs": 7.5720115,
+      "per_req": {
+       "instructions": 67124190.96666667,
+       "cycles": 29809750.3,
+       "icache_data.stalls": 419963.1666666667,
+       "icache_tag.stalls": 318139.13333333336,
+       "L1-icache-load-misses": 199348.76666666666,
+       "iTLB-load-misses": 2167.5
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.10310249999999999,
+      "execMs": 8.471809499999999,
+      "per_req": {
+       "instructions": 67240396.46666667,
+       "cycles": 30110242.466666665,
+       "cache-misses": 25389.966666666667,
+       "branch-misses": 79111.73333333334,
+       "mem_load_retired.l3_miss": 783.5,
+       "baclears.any": 14342.266666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1000665,
+      "execMs": 7.484492,
+      "per_req": {
+       "instructions": 67064195.36666667,
+       "cycles": 29728680.9,
+       "idq.dsb_uops": 55551739.5,
+       "idq.mite_uops": 5581545.633333334,
+       "frontend_retired.any_dsb_miss": 831486.5,
+       "dsb2mite_switches.penalty_cycles": 883116.0333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.100469,
+      "execMs": 7.574135500000001,
+      "per_req": {
+       "instructions": 67087987.5,
+       "cycles": 29826285.533333335,
+       "icache_data.stalls": 452745.43333333335,
+       "icache_tag.stalls": 332311.76666666666,
+       "L1-icache-load-misses": 202059.3,
+       "iTLB-load-misses": 2132.733333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.099828,
+      "execMs": 7.581587,
+      "per_req": {
+       "instructions": 67216917.26666667,
+       "cycles": 29887102.866666667,
+       "cache-misses": 16472.0,
+       "branch-misses": 79414.46666666666,
+       "mem_load_retired.l3_miss": 477.4,
+       "baclears.any": 14582.3
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09805249999999999,
+      "execMs": 7.582202499999999,
+      "per_req": {
+       "instructions": 67103687.1,
+       "cycles": 29639529.433333334,
+       "idq.dsb_uops": 55618566.46666667,
+       "idq.mite_uops": 5545827.466666667,
+       "frontend_retired.any_dsb_miss": 825658.9333333333,
+       "dsb2mite_switches.penalty_cycles": 875288.2666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.09939300000000001,
+      "execMs": 7.376697,
+      "per_req": {
+       "instructions": 67049178.96666667,
+       "cycles": 29627077.933333334,
+       "icache_data.stalls": 427692.3,
+       "icache_tag.stalls": 325790.8333333333,
+       "L1-icache-load-misses": 202480.5,
+       "iTLB-load-misses": 2154.9666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0976165,
+      "execMs": 7.480803,
+      "per_req": {
+       "instructions": 67173691.96666667,
+       "cycles": 29933353.566666666,
+       "cache-misses": 17986.733333333334,
+       "branch-misses": 78686.13333333333,
+       "mem_load_retired.l3_miss": 538.5666666666667,
+       "baclears.any": 14076.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.099333,
+      "execMs": 7.467468,
+      "per_req": {
+       "instructions": 67029699.8,
+       "cycles": 29808595.033333335,
+       "idq.dsb_uops": 55765424.6,
+       "idq.mite_uops": 5426740.5,
+       "frontend_retired.any_dsb_miss": 807414.5333333333,
+       "dsb2mite_switches.penalty_cycles": 852135.7333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.098214,
+      "execMs": 6.9792895,
+      "per_req": {
+       "instructions": 67000036.96666667,
+       "cycles": 29783306.9,
+       "icache_data.stalls": 428612.3,
+       "icache_tag.stalls": 317272.5,
+       "L1-icache-load-misses": 201079.16666666666,
+       "iTLB-load-misses": 2048.866666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.09830900000000001,
+      "execMs": 7.5515025,
+      "per_req": {
+       "instructions": 67204098.83333333,
+       "cycles": 29958089.5,
+       "cache-misses": 19195.233333333334,
+       "branch-misses": 78750.9,
+       "mem_load_retired.l3_miss": 565.1666666666666,
+       "baclears.any": 14675.8
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09992899999999999,
+      "execMs": 7.7285515,
+      "per_req": {
+       "instructions": 67143466.7,
+       "cycles": 29823452.366666667,
+       "idq.dsb_uops": 55632079.2,
+       "idq.mite_uops": 5579053.633333334,
+       "frontend_retired.any_dsb_miss": 832377.1,
+       "dsb2mite_switches.penalty_cycles": 884944.2666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0959845,
+      "execMs": 7.996646,
+      "per_req": {
+       "instructions": 67078170.6,
+       "cycles": 29715880.5,
+       "icache_data.stalls": 421443.13333333336,
+       "icache_tag.stalls": 314141.73333333334,
+       "L1-icache-load-misses": 198988.33333333334,
+       "iTLB-load-misses": 2166.133333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.099588,
+      "execMs": 7.159313,
+      "per_req": {
+       "instructions": 67065258.46666667,
+       "cycles": 29753148.966666665,
+       "cache-misses": 20410.0,
+       "branch-misses": 78127.26666666666,
+       "mem_load_retired.l3_miss": 718.7666666666667,
+       "baclears.any": 14582.566666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.098417,
+      "execMs": 7.388009,
+      "per_req": {
+       "instructions": 67032216.1,
+       "cycles": 29725554.933333334,
+       "idq.dsb_uops": 55254809.6,
+       "idq.mite_uops": 5767532.5,
+       "frontend_retired.any_dsb_miss": 859722.6,
+       "dsb2mite_switches.penalty_cycles": 932504.2
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.098765,
+      "execMs": 7.582634499999999,
+      "per_req": {
+       "instructions": 67176748.33333333,
+       "cycles": 29891810.566666666,
+       "icache_data.stalls": 445599.93333333335,
+       "icache_tag.stalls": 339462.73333333334,
+       "L1-icache-load-misses": 205964.03333333333,
+       "iTLB-load-misses": 2319.0
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.097387,
+      "execMs": 7.7556815,
+      "per_req": {
+       "instructions": 67180296.0,
+       "cycles": 29905708.166666668,
+       "cache-misses": 14409.133333333333,
+       "branch-misses": 78839.86666666667,
+       "mem_load_retired.l3_miss": 471.8333333333333,
+       "baclears.any": 14397.033333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.098591,
+      "execMs": 6.9366105000000005,
+      "per_req": {
+       "instructions": 67073818.43333333,
+       "cycles": 29612613.166666668,
+       "idq.dsb_uops": 55401838.5,
+       "idq.mite_uops": 5679261.7,
+       "frontend_retired.any_dsb_miss": 845203.5666666667,
+       "dsb2mite_switches.penalty_cycles": 912604.3666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.100388,
+      "execMs": 7.2783305,
+      "per_req": {
+       "instructions": 67057172.13333333,
+       "cycles": 29834378.233333334,
+       "icache_data.stalls": 450383.63333333336,
+       "icache_tag.stalls": 337798.9,
+       "L1-icache-load-misses": 201263.36666666667,
+       "iTLB-load-misses": 2161.4333333333334
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "main": [
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.116788,
+      "execMs": 8.258663,
+      "per_req": {
+       "instructions": 67152169.46666667,
+       "cycles": 30362641.2,
+       "cache-misses": 64090.2,
+       "branch-misses": 78782.7,
+       "mem_load_retired.l3_miss": 1796.3333333333333,
+       "baclears.any": 17165.2
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.12555150000000004,
+      "execMs": 9.3071315,
+      "per_req": {
+       "instructions": 67321144.26666667,
+       "cycles": 31011376.133333333,
+       "idq.dsb_uops": 56193278.266666666,
+       "idq.mite_uops": 5565852.833333333,
+       "frontend_retired.any_dsb_miss": 810003.8,
+       "dsb2mite_switches.penalty_cycles": 830053.3
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.118271,
+      "execMs": 8.116223000000002,
+      "per_req": {
+       "instructions": 67199459.6,
+       "cycles": 30510068.5,
+       "icache_data.stalls": 837523.6666666666,
+       "icache_tag.stalls": 607750.8666666667,
+       "L1-icache-load-misses": 186368.93333333332,
+       "iTLB-load-misses": 2161.733333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.134026,
+      "execMs": 8.8190365,
+      "per_req": {
+       "instructions": 67325733.23333333,
+       "cycles": 30510429.7,
+       "cache-misses": 71160.6,
+       "branch-misses": 79288.26666666666,
+       "mem_load_retired.l3_miss": 2012.8333333333333,
+       "baclears.any": 16444.233333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1170025,
+      "execMs": 7.4454005,
+      "per_req": {
+       "instructions": 67117092.83333333,
+       "cycles": 29757674.466666665,
+       "idq.dsb_uops": 55906040.666666664,
+       "idq.mite_uops": 5529164.8,
+       "frontend_retired.any_dsb_miss": 798807.4333333333,
+       "dsb2mite_switches.penalty_cycles": 816479.8
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.12778899999999999,
+      "execMs": 8.197179000000002,
+      "per_req": {
+       "instructions": 67173983.5,
+       "cycles": 30394009.8,
+       "icache_data.stalls": 849918.1333333333,
+       "icache_tag.stalls": 643192.1333333333,
+       "L1-icache-load-misses": 183417.46666666667,
+       "iTLB-load-misses": 2145.3
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1189875,
+      "execMs": 7.445443,
+      "per_req": {
+       "instructions": 67191635.9,
+       "cycles": 30659591.666666668,
+       "cache-misses": 58023.7,
+       "branch-misses": 78735.06666666667,
+       "mem_load_retired.l3_miss": 1831.3,
+       "baclears.any": 17269.2
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.12194250000000001,
+      "execMs": 7.549346,
+      "per_req": {
+       "instructions": 67143991.93333334,
+       "cycles": 29910519.2,
+       "idq.dsb_uops": 55817563.13333333,
+       "idq.mite_uops": 5636270.033333333,
+       "frontend_retired.any_dsb_miss": 814944.8333333334,
+       "dsb2mite_switches.penalty_cycles": 838689.8
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.12123799999999998,
+      "execMs": 7.341861,
+      "per_req": {
+       "instructions": 67041457.233333334,
+       "cycles": 30169503.7,
+       "icache_data.stalls": 700851.7333333333,
+       "icache_tag.stalls": 503206.6666666667,
+       "L1-icache-load-misses": 183048.86666666667,
+       "iTLB-load-misses": 2116.1
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1156015,
+      "execMs": 8.1898485,
+      "per_req": {
+       "instructions": 67197035.43333334,
+       "cycles": 29982037.133333333,
+       "cache-misses": 50232.066666666666,
+       "branch-misses": 79378.23333333334,
+       "mem_load_retired.l3_miss": 1328.5666666666666,
+       "baclears.any": 16604.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1188405,
+      "execMs": 7.6903334999999995,
+      "per_req": {
+       "instructions": 67134690.06666666,
+       "cycles": 29794333.066666666,
+       "idq.dsb_uops": 56095121.666666664,
+       "idq.mite_uops": 5491295.266666667,
+       "frontend_retired.any_dsb_miss": 796514.0333333333,
+       "dsb2mite_switches.penalty_cycles": 809056.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.118615,
+      "execMs": 7.5287405,
+      "per_req": {
+       "instructions": 67059426.63333333,
+       "cycles": 29828184.6,
+       "icache_data.stalls": 637674.5,
+       "icache_tag.stalls": 452912.3333333333,
+       "L1-icache-load-misses": 184447.36666666667,
+       "iTLB-load-misses": 2164.766666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.117713,
+      "execMs": 8.760832,
+      "per_req": {
+       "instructions": 67276609.9,
+       "cycles": 29797423.433333334,
+       "cache-misses": 44265.066666666666,
+       "branch-misses": 79239.56666666667,
+       "mem_load_retired.l3_miss": 1294.6333333333334,
+       "baclears.any": 17086.766666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.11891249999999999,
+      "execMs": 8.5053135,
+      "per_req": {
+       "instructions": 67227035.2,
+       "cycles": 29776692.366666667,
+       "idq.dsb_uops": 55958974.63333333,
+       "idq.mite_uops": 5645288.6,
+       "frontend_retired.any_dsb_miss": 819679.6,
+       "dsb2mite_switches.penalty_cycles": 829416.3666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1252505,
+      "execMs": 7.868442999999999,
+      "per_req": {
+       "instructions": 67140057.4,
+       "cycles": 30018132.2,
+       "icache_data.stalls": 728796.8,
+       "icache_tag.stalls": 524571.9666666667,
+       "L1-icache-load-misses": 183572.73333333334,
+       "iTLB-load-misses": 2209.9333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.126909,
+      "execMs": 7.5451915,
+      "per_req": {
+       "instructions": 67238192.9,
+       "cycles": 30224126.3,
+       "cache-misses": 61725.666666666664,
+       "branch-misses": 79147.53333333334,
+       "mem_load_retired.l3_miss": 1642.4333333333334,
+       "baclears.any": 16283.5
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.12497799999999999,
+      "execMs": 8.321907500000002,
+      "per_req": {
+       "instructions": 67227758.6,
+       "cycles": 30566566.0,
+       "idq.dsb_uops": 55029541.766666666,
+       "idq.mite_uops": 6286807.9,
+       "frontend_retired.any_dsb_miss": 913462.4333333333,
+       "dsb2mite_switches.penalty_cycles": 1018082.7
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.126975,
+      "execMs": 8.6007895,
+      "per_req": {
+       "instructions": 67236541.46666667,
+       "cycles": 30468380.4,
+       "icache_data.stalls": 844150.8,
+       "icache_tag.stalls": 631867.0,
+       "L1-icache-load-misses": 187631.13333333333,
+       "iTLB-load-misses": 2286.233333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0989825,
+      "execMs": 9.3443005,
+      "per_req": {
+       "instructions": 67310711.3,
+       "cycles": 29418853.966666665,
+       "cache-misses": 15418.033333333333,
+       "branch-misses": 79124.5,
+       "mem_load_retired.l3_miss": 461.6666666666667,
+       "baclears.any": 16477.233333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09805549999999999,
+      "execMs": 7.594429,
+      "per_req": {
+       "instructions": 67162572.26666667,
+       "cycles": 29332091.3,
+       "idq.dsb_uops": 55954227.4,
+       "idq.mite_uops": 5518289.033333333,
+       "frontend_retired.any_dsb_miss": 801315.8333333334,
+       "dsb2mite_switches.penalty_cycles": 815655.5666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.097157,
+      "execMs": 7.329458,
+      "per_req": {
+       "instructions": 67065541.86666667,
+       "cycles": 29073295.866666667,
+       "icache_data.stalls": 394490.6666666667,
+       "icache_tag.stalls": 307380.1666666667,
+       "L1-icache-load-misses": 181815.4,
+       "iTLB-load-misses": 2068.366666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0970945,
+      "execMs": 7.422074,
+      "per_req": {
+       "instructions": 67094022.86666667,
+       "cycles": 29207384.5,
+       "cache-misses": 15657.166666666666,
+       "branch-misses": 77865.83333333333,
+       "mem_load_retired.l3_miss": 479.43333333333334,
+       "baclears.any": 16222.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.096522,
+      "execMs": 7.400031500000001,
+      "per_req": {
+       "instructions": 67094098.6,
+       "cycles": 29228797.366666667,
+       "idq.dsb_uops": 55428100.833333336,
+       "idq.mite_uops": 5804974.133333334,
+       "frontend_retired.any_dsb_miss": 840151.3666666667,
+       "dsb2mite_switches.penalty_cycles": 891106.9666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.098106,
+      "execMs": 7.3754805,
+      "per_req": {
+       "instructions": 67036771.6,
+       "cycles": 29122888.9,
+       "icache_data.stalls": 419550.6,
+       "icache_tag.stalls": 310630.2,
+       "L1-icache-load-misses": 183479.86666666667,
+       "iTLB-load-misses": 2024.6
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.0986655,
+      "execMs": 7.378959999999999,
+      "per_req": {
+       "instructions": 67151874.93333334,
+       "cycles": 29407661.3,
+       "cache-misses": 20647.933333333334,
+       "branch-misses": 79155.13333333333,
+       "mem_load_retired.l3_miss": 658.7333333333333,
+       "baclears.any": 17023.7
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0992575,
+      "execMs": 7.5462855,
+      "per_req": {
+       "instructions": 67149208.6,
+       "cycles": 29330828.233333334,
+       "idq.dsb_uops": 55759294.53333333,
+       "idq.mite_uops": 5622777.4,
+       "frontend_retired.any_dsb_miss": 815038.4,
+       "dsb2mite_switches.penalty_cycles": 838591.9333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.099855,
+      "execMs": 7.5768225000000005,
+      "per_req": {
+       "instructions": 67045107.36666667,
+       "cycles": 29193317.6,
+       "icache_data.stalls": 407973.4666666667,
+       "icache_tag.stalls": 320144.0,
+       "L1-icache-load-misses": 185226.13333333333,
+       "iTLB-load-misses": 2172.766666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.101412,
+      "execMs": 7.367812000000001,
+      "per_req": {
+       "instructions": 67096221.86666667,
+       "cycles": 29397101.5,
+       "cache-misses": 24833.666666666668,
+       "branch-misses": 77938.73333333334,
+       "mem_load_retired.l3_miss": 963.5333333333333,
+       "baclears.any": 16165.2
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09871650000000001,
+      "execMs": 7.099701,
+      "per_req": {
+       "instructions": 67032967.36666667,
+       "cycles": 29134918.633333333,
+       "idq.dsb_uops": 55479564.7,
+       "idq.mite_uops": 5674883.666666667,
+       "frontend_retired.any_dsb_miss": 821781.9666666667,
+       "dsb2mite_switches.penalty_cycles": 858122.8666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10052,
+      "execMs": 7.4053629999999995,
+      "per_req": {
+       "instructions": 67037563.43333333,
+       "cycles": 29694152.866666667,
+       "icache_data.stalls": 414976.0333333333,
+       "icache_tag.stalls": 318050.9666666667,
+       "L1-icache-load-misses": 182634.26666666666,
+       "iTLB-load-misses": 2145.9
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.098165,
+      "execMs": 7.1248325,
+      "per_req": {
+       "instructions": 67151417.53333333,
+       "cycles": 29366716.8,
+       "cache-misses": 16542.466666666667,
+       "branch-misses": 78533.86666666667,
+       "mem_load_retired.l3_miss": 449.9,
+       "baclears.any": 17169.966666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.098211,
+      "execMs": 7.344189,
+      "per_req": {
+       "instructions": 67077278.8,
+       "cycles": 29203200.666666668,
+       "idq.dsb_uops": 55364666.06666667,
+       "idq.mite_uops": 5847572.233333333,
+       "frontend_retired.any_dsb_miss": 849778.6,
+       "dsb2mite_switches.penalty_cycles": 893960.2666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1002255,
+      "execMs": 7.4798919999999995,
+      "per_req": {
+       "instructions": 67035670.166666664,
+       "cycles": 29339307.166666668,
+       "icache_data.stalls": 408959.1666666667,
+       "icache_tag.stalls": 314638.1666666667,
+       "L1-icache-load-misses": 183156.73333333334,
+       "iTLB-load-misses": 2085.3333333333335
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.098366,
+      "execMs": 7.389357,
+      "per_req": {
+       "instructions": 67144091.46666667,
+       "cycles": 29393857.4,
+       "cache-misses": 19904.433333333334,
+       "branch-misses": 78698.9,
+       "mem_load_retired.l3_miss": 632.6666666666666,
+       "baclears.any": 16743.7
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.100301,
+      "execMs": 7.503431,
+      "per_req": {
+       "instructions": 67119281.63333334,
+       "cycles": 29425239.4,
+       "idq.dsb_uops": 55452730.5,
+       "idq.mite_uops": 5885401.0,
+       "frontend_retired.any_dsb_miss": 852907.2,
+       "dsb2mite_switches.penalty_cycles": 913932.6666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1004845,
+      "execMs": 7.497432,
+      "per_req": {
+       "instructions": 67077516.43333333,
+       "cycles": 29334723.7,
+       "icache_data.stalls": 412040.36666666664,
+       "icache_tag.stalls": 325827.1,
+       "L1-icache-load-misses": 185034.5,
+       "iTLB-load-misses": 2221.9333333333334
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "tip": [
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1105415,
+      "execMs": 8.001363999999999,
+      "per_req": {
+       "instructions": 67236799.7,
+       "cycles": 30482121.533333335,
+       "cache-misses": 63773.13333333333,
+       "branch-misses": 79830.76666666666,
+       "mem_load_retired.l3_miss": 1961.7333333333333,
+       "baclears.any": 14862.133333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.114222,
+      "execMs": 8.402439000000001,
+      "per_req": {
+       "instructions": 67212330.26666667,
+       "cycles": 30303158.366666667,
+       "idq.dsb_uops": 55359967.86666667,
+       "idq.mite_uops": 6183797.5,
+       "frontend_retired.any_dsb_miss": 894715.6333333333,
+       "dsb2mite_switches.penalty_cycles": 906997.6333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.122224,
+      "execMs": 8.650801999999999,
+      "per_req": {
+       "instructions": 67217618.2,
+       "cycles": 31013788.6,
+       "icache_data.stalls": 869456.0333333333,
+       "icache_tag.stalls": 622293.3666666667,
+       "L1-icache-load-misses": 190837.93333333332,
+       "iTLB-load-misses": 2260.3
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1155735,
+      "execMs": 8.2826525,
+      "per_req": {
+       "instructions": 67221327.53333333,
+       "cycles": 29741289.8,
+       "cache-misses": 46238.166666666664,
+       "branch-misses": 79358.96666666666,
+       "mem_load_retired.l3_miss": 1214.1333333333334,
+       "baclears.any": 15354.566666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.12489350000000002,
+      "execMs": 8.404991500000001,
+      "per_req": {
+       "instructions": 67163109.56666666,
+       "cycles": 29833522.7,
+       "idq.dsb_uops": 55328841.03333333,
+       "idq.mite_uops": 6144790.066666666,
+       "frontend_retired.any_dsb_miss": 888187.4333333333,
+       "dsb2mite_switches.penalty_cycles": 896339.8333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.130129,
+      "execMs": 8.163263,
+      "per_req": {
+       "instructions": 67114090.26666667,
+       "cycles": 30015853.1,
+       "icache_data.stalls": 792662.3333333334,
+       "icache_tag.stalls": 554942.2666666667,
+       "L1-icache-load-misses": 192696.8,
+       "iTLB-load-misses": 2205.4
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1154,
+      "execMs": 7.618866,
+      "per_req": {
+       "instructions": 67170003.53333333,
+       "cycles": 29764014.533333335,
+       "cache-misses": 43620.066666666666,
+       "branch-misses": 79534.46666666666,
+       "mem_load_retired.l3_miss": 1221.0,
+       "baclears.any": 15318.133333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.117725,
+      "execMs": 7.554536499999999,
+      "per_req": {
+       "instructions": 67185870.56666666,
+       "cycles": 29727161.733333334,
+       "idq.dsb_uops": 55177281.96666667,
+       "idq.mite_uops": 6225763.3,
+       "frontend_retired.any_dsb_miss": 899315.2,
+       "dsb2mite_switches.penalty_cycles": 905086.8666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1245485,
+      "execMs": 7.5550844999999995,
+      "per_req": {
+       "instructions": 67047887.5,
+       "cycles": 29902931.533333335,
+       "icache_data.stalls": 695988.7,
+       "icache_tag.stalls": 475357.93333333335,
+       "L1-icache-load-misses": 192579.2,
+       "iTLB-load-misses": 2142.3
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.12318600000000002,
+      "execMs": 8.241323,
+      "per_req": {
+       "instructions": 67164982.3,
+       "cycles": 29993689.0,
+       "cache-misses": 59842.96666666667,
+       "branch-misses": 79341.36666666667,
+       "mem_load_retired.l3_miss": 1668.0333333333333,
+       "baclears.any": 14786.766666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.125971,
+      "execMs": 8.8404235,
+      "per_req": {
+       "instructions": 67286531.73333333,
+       "cycles": 30051853.266666666,
+       "idq.dsb_uops": 55360422.03333333,
+       "idq.mite_uops": 6218886.7,
+       "frontend_retired.any_dsb_miss": 897773.6,
+       "dsb2mite_switches.penalty_cycles": 900360.7
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.126017,
+      "execMs": 7.5248675,
+      "per_req": {
+       "instructions": 67086909.96666667,
+       "cycles": 30228884.566666666,
+       "icache_data.stalls": 778903.8333333334,
+       "icache_tag.stalls": 569610.0,
+       "L1-icache-load-misses": 191043.43333333332,
+       "iTLB-load-misses": 2165.0333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1255555,
+      "execMs": 7.5166129999999995,
+      "per_req": {
+       "instructions": 67066971.06666667,
+       "cycles": 30009696.266666666,
+       "cache-misses": 67535.93333333333,
+       "branch-misses": 79214.16666666667,
+       "mem_load_retired.l3_miss": 2235.633333333333,
+       "baclears.any": 15256.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1268985,
+      "execMs": 8.623167,
+      "per_req": {
+       "instructions": 67257496.86666666,
+       "cycles": 30210484.833333332,
+       "idq.dsb_uops": 55278066.8,
+       "idq.mite_uops": 6244369.066666666,
+       "frontend_retired.any_dsb_miss": 903825.4333333333,
+       "dsb2mite_switches.penalty_cycles": 915038.7333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.131392,
+      "execMs": 8.541193499999999,
+      "per_req": {
+       "instructions": 67180454.4,
+       "cycles": 30467002.9,
+       "icache_data.stalls": 840478.3666666667,
+       "icache_tag.stalls": 644368.5666666667,
+       "L1-icache-load-misses": 190907.43333333332,
+       "iTLB-load-misses": 2267.866666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.118734,
+      "execMs": 8.055826499999998,
+      "per_req": {
+       "instructions": 67183898.06666666,
+       "cycles": 29726360.9,
+       "cache-misses": 48619.4,
+       "branch-misses": 80123.2,
+       "mem_load_retired.l3_miss": 1293.9666666666667,
+       "baclears.any": 15033.8
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.123826,
+      "execMs": 8.5629145,
+      "per_req": {
+       "instructions": 67186736.9,
+       "cycles": 29816110.933333334,
+       "idq.dsb_uops": 55380131.7,
+       "idq.mite_uops": 6111903.033333333,
+       "frontend_retired.any_dsb_miss": 877916.9333333333,
+       "dsb2mite_switches.penalty_cycles": 877126.2666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.11977850000000001,
+      "execMs": 7.4928535,
+      "per_req": {
+       "instructions": 67077497.8,
+       "cycles": 29675094.1,
+       "icache_data.stalls": 659504.9,
+       "icache_tag.stalls": 465999.86666666664,
+       "L1-icache-load-misses": 190591.43333333332,
+       "iTLB-load-misses": 2187.266666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.10136300000000001,
+      "execMs": 7.5700065,
+      "per_req": {
+       "instructions": 67180434.26666667,
+       "cycles": 29538947.566666666,
+       "cache-misses": 24292.333333333332,
+       "branch-misses": 79095.66666666667,
+       "mem_load_retired.l3_miss": 700.0666666666667,
+       "baclears.any": 15048.5
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09978500000000001,
+      "execMs": 7.36177,
+      "per_req": {
+       "instructions": 67098519.43333333,
+       "cycles": 29293986.866666667,
+       "idq.dsb_uops": 55398128.7,
+       "idq.mite_uops": 6047506.733333333,
+       "frontend_retired.any_dsb_miss": 867412.6,
+       "dsb2mite_switches.penalty_cycles": 871385.8666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.100147,
+      "execMs": 7.289232500000001,
+      "per_req": {
+       "instructions": 66969516.03333333,
+       "cycles": 29230919.9,
+       "icache_data.stalls": 391946.43333333335,
+       "icache_tag.stalls": 308021.43333333335,
+       "L1-icache-load-misses": 189429.23333333334,
+       "iTLB-load-misses": 2121.6
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.09993350000000001,
+      "execMs": 7.399944,
+      "per_req": {
+       "instructions": 67157672.23333333,
+       "cycles": 29278646.0,
+       "cache-misses": 18116.133333333335,
+       "branch-misses": 78904.83333333333,
+       "mem_load_retired.l3_miss": 536.3,
+       "baclears.any": 14805.766666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.100272,
+      "execMs": 7.517341500000001,
+      "per_req": {
+       "instructions": 67068551.233333334,
+       "cycles": 29153865.533333335,
+       "idq.dsb_uops": 55018173.266666666,
+       "idq.mite_uops": 6246356.433333334,
+       "frontend_retired.any_dsb_miss": 904736.5666666667,
+       "dsb2mite_switches.penalty_cycles": 899541.6333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1019365,
+      "execMs": 7.585989,
+      "per_req": {
+       "instructions": 67099990.6,
+       "cycles": 29320726.566666666,
+       "icache_data.stalls": 462327.1666666667,
+       "icache_tag.stalls": 361256.13333333336,
+       "L1-icache-load-misses": 191155.2,
+       "iTLB-load-misses": 2214.233333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.09961300000000001,
+      "execMs": 7.567006,
+      "per_req": {
+       "instructions": 67064138.733333334,
+       "cycles": 29160748.466666665,
+       "cache-misses": 17038.1,
+       "branch-misses": 79467.5,
+       "mem_load_retired.l3_miss": 575.5666666666667,
+       "baclears.any": 15358.666666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.099553,
+      "execMs": 6.599458,
+      "per_req": {
+       "instructions": 66943527.5,
+       "cycles": 28999240.066666666,
+       "idq.dsb_uops": 54943957.9,
+       "idq.mite_uops": 6131557.5,
+       "frontend_retired.any_dsb_miss": 887718.6666666666,
+       "dsb2mite_switches.penalty_cycles": 887379.0333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1004675,
+      "execMs": 7.5694195,
+      "per_req": {
+       "instructions": 67043860.166666664,
+       "cycles": 29092016.933333334,
+       "icache_data.stalls": 420687.9666666667,
+       "icache_tag.stalls": 322587.56666666665,
+       "L1-icache-load-misses": 189686.93333333332,
+       "iTLB-load-misses": 2166.366666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.099419,
+      "execMs": 7.407373,
+      "per_req": {
+       "instructions": 67173215.66666667,
+       "cycles": 29415243.466666665,
+       "cache-misses": 20577.7,
+       "branch-misses": 79468.23333333334,
+       "mem_load_retired.l3_miss": 589.4333333333333,
+       "baclears.any": 15136.3
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0989045,
+      "execMs": 7.3890305,
+      "per_req": {
+       "instructions": 67042393.166666664,
+       "cycles": 29083709.766666666,
+       "idq.dsb_uops": 55182961.8,
+       "idq.mite_uops": 6089280.3,
+       "frontend_retired.any_dsb_miss": 880471.1666666666,
+       "dsb2mite_switches.penalty_cycles": 878104.1333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.09969449999999999,
+      "execMs": 7.3909205,
+      "per_req": {
+       "instructions": 66994231.766666666,
+       "cycles": 29013647.0,
+       "icache_data.stalls": 396368.9,
+       "icache_tag.stalls": 319368.5,
+       "L1-icache-load-misses": 187284.4,
+       "iTLB-load-misses": 2108.4333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1013795,
+      "execMs": 7.579972,
+      "per_req": {
+       "instructions": 67131781.76666667,
+       "cycles": 29422713.866666667,
+       "cache-misses": 22930.9,
+       "branch-misses": 79163.8,
+       "mem_load_retired.l3_miss": 703.9333333333333,
+       "baclears.any": 14944.333333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.10035150000000001,
+      "execMs": 7.286557999999999,
+      "per_req": {
+       "instructions": 67026006.166666664,
+       "cycles": 29160440.833333332,
+       "idq.dsb_uops": 54967202.06666667,
+       "idq.mite_uops": 6236054.866666666,
+       "frontend_retired.any_dsb_miss": 905289.7666666667,
+       "dsb2mite_switches.penalty_cycles": 904744.6
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.09930749999999999,
+      "execMs": 7.580586500000001,
+      "per_req": {
+       "instructions": 67110879.93333334,
+       "cycles": 29182370.366666667,
+       "icache_data.stalls": 405283.5333333333,
+       "icache_tag.stalls": 334019.4666666667,
+       "L1-icache-load-misses": 186973.1,
+       "iTLB-load-misses": 2228.3333333333335
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "189a4018bbf0",
+     "idle_per_s": {},
+     "basic": {
+      "planMs": 0.1001685,
+      "execMs": 7.260934499999999,
+      "per_req": {
+       "instructions": 67133242.86666666,
+       "cycles": 29268112.366666667,
+       "cache-misses": 18009.333333333332,
+       "branch-misses": 79348.1,
+       "mem_load_retired.l3_miss": 588.7666666666667,
+       "baclears.any": 14959.066666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.098011,
+      "execMs": 7.5785425,
+      "per_req": {
+       "instructions": 67052405.13333333,
+       "cycles": 29110383.533333335,
+       "idq.dsb_uops": 55239840.833333336,
+       "idq.mite_uops": 6081319.466666667,
+       "frontend_retired.any_dsb_miss": 877705.8,
+       "dsb2mite_switches.penalty_cycles": 876708.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0979805,
+      "execMs": 6.8452885000000006,
+      "per_req": {
+       "instructions": 67040821.93333333,
+       "cycles": 29102860.9,
+       "icache_data.stalls": 408725.23333333334,
+       "icache_tag.stalls": 313328.9,
+       "L1-icache-load-misses": 188056.66666666666,
+       "iTLB-load-misses": 2127.266666666667
+      },
+      "pct_min": 100.0
+     }
+    }
+   ]
+  },
+  "f-expr-range-join": {
+   "base": [
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.127763,
+      "execMs": 3.2555924999999997,
+      "per_req": {
+       "instructions": 39014102.333333336,
+       "cycles": 23438268.566666666,
+       "cache-misses": 131782.93333333332,
+       "branch-misses": 64067.46666666667,
+       "mem_load_retired.l3_miss": 10218.4,
+       "baclears.any": 12639.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1312855,
+      "execMs": 3.1359679999999996,
+      "per_req": {
+       "instructions": 39006995.53333333,
+       "cycles": 23494425.933333334,
+       "idq.dsb_uops": 21761914.9,
+       "idq.mite_uops": 11871975.566666666,
+       "frontend_retired.any_dsb_miss": 2053899.4666666666,
+       "dsb2mite_switches.penalty_cycles": 2095380.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.13315500000000002,
+      "execMs": 2.2801155,
+      "per_req": {
+       "instructions": 38943462.2,
+       "cycles": 23620464.833333332,
+       "icache_data.stalls": 1184249.9666666666,
+       "icache_tag.stalls": 778936.3,
+       "L1-icache-load-misses": 328412.13333333336,
+       "iTLB-load-misses": 1840.9
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.14579999999999999,
+      "execMs": 1.754538,
+      "per_req": {
+       "instructions": 38858802.0,
+       "cycles": 23320487.833333332,
+       "cache-misses": 145475.06666666668,
+       "branch-misses": 64037.96666666667,
+       "mem_load_retired.l3_miss": 11372.833333333334,
+       "baclears.any": 12575.5
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.146734,
+      "execMs": 3.3425700000000003,
+      "per_req": {
+       "instructions": 39020643.46666667,
+       "cycles": 23439061.566666666,
+       "idq.dsb_uops": 21823098.3,
+       "idq.mite_uops": 11846460.266666668,
+       "frontend_retired.any_dsb_miss": 2039236.2,
+       "dsb2mite_switches.penalty_cycles": 2066264.3
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1443665,
+      "execMs": 2.879321,
+      "per_req": {
+       "instructions": 38951535.2,
+       "cycles": 23449588.366666667,
+       "icache_data.stalls": 1135159.1333333333,
+       "icache_tag.stalls": 744572.2333333333,
+       "L1-icache-load-misses": 330779.6,
+       "iTLB-load-misses": 1990.3333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.147871,
+      "execMs": 2.8497174999999997,
+      "per_req": {
+       "instructions": 38982044.43333333,
+       "cycles": 23537045.2,
+       "cache-misses": 145026.56666666668,
+       "branch-misses": 64319.333333333336,
+       "mem_load_retired.l3_miss": 11469.333333333334,
+       "baclears.any": 12424.766666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.16421249999999998,
+      "execMs": 2.1617625,
+      "per_req": {
+       "instructions": 39017582.43333333,
+       "cycles": 24587979.1,
+       "idq.dsb_uops": 21670625.6,
+       "idq.mite_uops": 12024781.466666667,
+       "frontend_retired.any_dsb_miss": 2076031.6333333333,
+       "dsb2mite_switches.penalty_cycles": 2100871.466666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.123652,
+      "execMs": 2.3177250000000003,
+      "per_req": {
+       "instructions": 38883158.93333333,
+       "cycles": 22793142.566666666,
+       "icache_data.stalls": 932909.9,
+       "icache_tag.stalls": 571678.4,
+       "L1-icache-load-misses": 328513.93333333335,
+       "iTLB-load-misses": 1905.1333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.14607599999999998,
+      "execMs": 1.897504,
+      "per_req": {
+       "instructions": 38960410.63333333,
+       "cycles": 23529004.966666665,
+       "cache-misses": 148240.23333333334,
+       "branch-misses": 64150.26666666667,
+       "mem_load_retired.l3_miss": 11908.833333333334,
+       "baclears.any": 12430.133333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1664565,
+      "execMs": 2.3695925,
+      "per_req": {
+       "instructions": 38979933.1,
+       "cycles": 24392647.8,
+       "idq.dsb_uops": 21823617.4,
+       "idq.mite_uops": 11833105.966666667,
+       "frontend_retired.any_dsb_miss": 2036246.3,
+       "dsb2mite_switches.penalty_cycles": 2073240.9333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.133902,
+      "execMs": 3.1164595,
+      "per_req": {
+       "instructions": 38922536.9,
+       "cycles": 23293032.166666668,
+       "icache_data.stalls": 1082887.7333333334,
+       "icache_tag.stalls": 700471.0333333333,
+       "L1-icache-load-misses": 329429.4666666667,
+       "iTLB-load-misses": 1899.3
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.147483,
+      "execMs": 3.1143985,
+      "per_req": {
+       "instructions": 38992334.96666667,
+       "cycles": 23488898.133333333,
+       "cache-misses": 144414.1,
+       "branch-misses": 63900.1,
+       "mem_load_retired.l3_miss": 11674.833333333334,
+       "baclears.any": 12541.066666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1445005,
+      "execMs": 2.2412725,
+      "per_req": {
+       "instructions": 38903337.3,
+       "cycles": 23352817.9,
+       "idq.dsb_uops": 21678541.8,
+       "idq.mite_uops": 11899901.733333332,
+       "frontend_retired.any_dsb_miss": 2051162.3666666667,
+       "dsb2mite_switches.penalty_cycles": 2075446.8333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.14083400000000001,
+      "execMs": 2.681862,
+      "per_req": {
+       "instructions": 39019710.333333336,
+       "cycles": 23425030.7,
+       "icache_data.stalls": 1101566.1333333333,
+       "icache_tag.stalls": 712192.3,
+       "L1-icache-load-misses": 331092.1,
+       "iTLB-load-misses": 1954.6666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1100045,
+      "execMs": 1.8792285,
+      "per_req": {
+       "instructions": 38896422.8,
+       "cycles": 22397575.333333332,
+       "cache-misses": 92294.86666666667,
+       "branch-misses": 64270.2,
+       "mem_load_retired.l3_miss": 6846.266666666666,
+       "baclears.any": 13107.366666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.109904,
+      "execMs": 2.993206,
+      "per_req": {
+       "instructions": 38951816.06666667,
+       "cycles": 22337913.2,
+       "idq.dsb_uops": 21827871.0,
+       "idq.mite_uops": 11781544.966666667,
+       "frontend_retired.any_dsb_miss": 2030670.4666666666,
+       "dsb2mite_switches.penalty_cycles": 2058182.3666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1075055,
+      "execMs": 1.835041,
+      "per_req": {
+       "instructions": 38891756.233333334,
+       "cycles": 22187628.7,
+       "icache_data.stalls": 737132.5333333333,
+       "icache_tag.stalls": 382104.3,
+       "L1-icache-load-misses": 325862.63333333336,
+       "iTLB-load-misses": 1835.7333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1091935,
+      "execMs": 3.0252865,
+      "per_req": {
+       "instructions": 39027826.96666667,
+       "cycles": 22438744.833333332,
+       "cache-misses": 86984.23333333334,
+       "branch-misses": 64519.066666666666,
+       "mem_load_retired.l3_miss": 7142.3,
+       "baclears.any": 12779.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.108454,
+      "execMs": 2.6907565,
+      "per_req": {
+       "instructions": 38957040.56666667,
+       "cycles": 22177419.233333334,
+       "idq.dsb_uops": 21865493.333333332,
+       "idq.mite_uops": 11744460.933333334,
+       "frontend_retired.any_dsb_miss": 2023944.7333333334,
+       "dsb2mite_switches.penalty_cycles": 2067182.2333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1086915,
+      "execMs": 2.232358,
+      "per_req": {
+       "instructions": 38888631.166666664,
+       "cycles": 22175305.533333335,
+       "icache_data.stalls": 738277.9,
+       "icache_tag.stalls": 386029.93333333335,
+       "L1-icache-load-misses": 327542.7,
+       "iTLB-load-misses": 1909.6
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.107436,
+      "execMs": 2.915915,
+      "per_req": {
+       "instructions": 38956239.2,
+       "cycles": 22372652.133333333,
+       "cache-misses": 84299.3,
+       "branch-misses": 63818.066666666666,
+       "mem_load_retired.l3_miss": 7640.3,
+       "baclears.any": 12671.1
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.106511,
+      "execMs": 2.9176254999999998,
+      "per_req": {
+       "instructions": 38973069.4,
+       "cycles": 22231816.533333335,
+       "idq.dsb_uops": 21762368.833333332,
+       "idq.mite_uops": 11856915.766666668,
+       "frontend_retired.any_dsb_miss": 2044965.1333333333,
+       "dsb2mite_switches.penalty_cycles": 2076550.7666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10754649999999999,
+      "execMs": 3.2555905,
+      "per_req": {
+       "instructions": 39017129.766666666,
+       "cycles": 22214572.866666667,
+       "icache_data.stalls": 753110.7333333333,
+       "icache_tag.stalls": 395016.1666666667,
+       "L1-icache-load-misses": 327589.6,
+       "iTLB-load-misses": 1989.7666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1055625,
+      "execMs": 3.0472725,
+      "per_req": {
+       "instructions": 39005344.06666667,
+       "cycles": 22354285.866666667,
+       "cache-misses": 80699.66666666667,
+       "branch-misses": 64263.6,
+       "mem_load_retired.l3_miss": 7297.7,
+       "baclears.any": 12837.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.10860349999999999,
+      "execMs": 2.8963185,
+      "per_req": {
+       "instructions": 38960073.46666667,
+       "cycles": 22385188.366666667,
+       "idq.dsb_uops": 21720680.633333333,
+       "idq.mite_uops": 11872009.433333334,
+       "frontend_retired.any_dsb_miss": 2052544.9,
+       "dsb2mite_switches.penalty_cycles": 2088321.6
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10872000000000001,
+      "execMs": 3.214413,
+      "per_req": {
+       "instructions": 39010340.733333334,
+       "cycles": 22436124.9,
+       "icache_data.stalls": 785811.5,
+       "icache_tag.stalls": 437566.93333333335,
+       "L1-icache-load-misses": 329038.4666666667,
+       "iTLB-load-misses": 1939.6666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1089565,
+      "execMs": 3.0405195,
+      "per_req": {
+       "instructions": 38987337.6,
+       "cycles": 22527108.366666667,
+       "cache-misses": 89653.1,
+       "branch-misses": 64473.666666666664,
+       "mem_load_retired.l3_miss": 7638.7,
+       "baclears.any": 13117.3
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1063955,
+      "execMs": 3.7255934999999996,
+      "per_req": {
+       "instructions": 39039961.8,
+       "cycles": 22318698.633333333,
+       "idq.dsb_uops": 21808358.0,
+       "idq.mite_uops": 11870760.466666667,
+       "frontend_retired.any_dsb_miss": 2048884.2666666666,
+       "dsb2mite_switches.penalty_cycles": 2072730.1666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1066195,
+      "execMs": 2.6663185,
+      "per_req": {
+       "instructions": 38920595.1,
+       "cycles": 22323576.8,
+       "icache_data.stalls": 755182.1,
+       "icache_tag.stalls": 397551.1,
+       "L1-icache-load-misses": 328886.5333333333,
+       "iTLB-load-misses": 1894.4
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.10782900000000001,
+      "execMs": 3.1587855,
+      "per_req": {
+       "instructions": 39028845.3,
+       "cycles": 22286086.533333335,
+       "cache-misses": 78156.5,
+       "branch-misses": 64029.73333333333,
+       "mem_load_retired.l3_miss": 6697.833333333333,
+       "baclears.any": 12278.6
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1063595,
+      "execMs": 2.3527515,
+      "per_req": {
+       "instructions": 38956009.666666664,
+       "cycles": 22203716.6,
+       "idq.dsb_uops": 21859993.233333334,
+       "idq.mite_uops": 11747906.166666666,
+       "frontend_retired.any_dsb_miss": 2022918.5,
+       "dsb2mite_switches.penalty_cycles": 2051996.1333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1073505,
+      "execMs": 3.772265,
+      "per_req": {
+       "instructions": 38977958.666666664,
+       "cycles": 22181399.2,
+       "icache_data.stalls": 750275.8666666667,
+       "icache_tag.stalls": 392381.36666666664,
+       "L1-icache-load-misses": 326660.9666666667,
+       "iTLB-load-misses": 2012.5
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.108701,
+      "execMs": 3.8422595,
+      "per_req": {
+       "instructions": 39020277.8,
+       "cycles": 22324443.6,
+       "cache-misses": 82208.36666666667,
+       "branch-misses": 63875.76666666667,
+       "mem_load_retired.l3_miss": 6932.766666666666,
+       "baclears.any": 12657.6
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1101015,
+      "execMs": 3.0089035,
+      "per_req": {
+       "instructions": 38932617.86666667,
+       "cycles": 22284657.7,
+       "idq.dsb_uops": 21887665.166666668,
+       "idq.mite_uops": 11733222.1,
+       "frontend_retired.any_dsb_miss": 2022123.2666666666,
+       "dsb2mite_switches.penalty_cycles": 2054300.1
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.106862,
+      "execMs": 2.5972355,
+      "per_req": {
+       "instructions": 38893684.233333334,
+       "cycles": 22241789.666666668,
+       "icache_data.stalls": 749113.1,
+       "icache_tag.stalls": 401132.0,
+       "L1-icache-load-misses": 327539.26666666666,
+       "iTLB-load-misses": 1828.5333333333333
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "main": [
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.139357,
+      "execMs": 3.1386075,
+      "per_req": {
+       "instructions": 39024505.766666666,
+       "cycles": 23019450.533333335,
+       "cache-misses": 155007.3,
+       "branch-misses": 57575.933333333334,
+       "mem_load_retired.l3_miss": 12070.4,
+       "baclears.any": 13462.666666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.13732100000000003,
+      "execMs": 3.5325100000000003,
+      "per_req": {
+       "instructions": 39032649.86666667,
+       "cycles": 22717674.433333334,
+       "idq.dsb_uops": 23779257.9,
+       "idq.mite_uops": 10718308.9,
+       "frontend_retired.any_dsb_miss": 1709424.7666666666,
+       "dsb2mite_switches.penalty_cycles": 1757451.9333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1516445,
+      "execMs": 3.045413,
+      "per_req": {
+       "instructions": 39122001.06666667,
+       "cycles": 23948455.9,
+       "icache_data.stalls": 1595071.2,
+       "icache_tag.stalls": 1178483.0,
+       "L1-icache-load-misses": 296150.06666666665,
+       "iTLB-load-misses": 1917.4333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1384975,
+      "execMs": 3.4705760000000003,
+      "per_req": {
+       "instructions": 38970987.43333333,
+       "cycles": 21595162.933333334,
+       "cache-misses": 133884.9,
+       "branch-misses": 57453.666666666664,
+       "mem_load_retired.l3_miss": 10203.833333333334,
+       "baclears.any": 13732.833333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1390005,
+      "execMs": 1.8717305,
+      "per_req": {
+       "instructions": 38913310.8,
+       "cycles": 21585287.6,
+       "idq.dsb_uops": 24642827.466666665,
+       "idq.mite_uops": 9823423.6,
+       "frontend_retired.any_dsb_miss": 1547448.1333333333,
+       "dsb2mite_switches.penalty_cycles": 1619693.8
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.14497949999999998,
+      "execMs": 1.912169,
+      "per_req": {
+       "instructions": 38986036.266666666,
+       "cycles": 21826615.0,
+       "icache_data.stalls": 1123760.6666666667,
+       "icache_tag.stalls": 746380.7333333333,
+       "L1-icache-load-misses": 289142.56666666665,
+       "iTLB-load-misses": 1924.9666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.146821,
+      "execMs": 2.8371115,
+      "per_req": {
+       "instructions": 38952564.3,
+       "cycles": 21787971.8,
+       "cache-misses": 145538.13333333333,
+       "branch-misses": 56793.6,
+       "mem_load_retired.l3_miss": 11355.633333333333,
+       "baclears.any": 13401.466666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.14177099999999998,
+      "execMs": 2.0802375,
+      "per_req": {
+       "instructions": 38915017.233333334,
+       "cycles": 21810880.2,
+       "idq.dsb_uops": 24596360.0,
+       "idq.mite_uops": 9865123.733333332,
+       "frontend_retired.any_dsb_miss": 1558519.3,
+       "dsb2mite_switches.penalty_cycles": 1641385.2
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.14243,
+      "execMs": 3.055973,
+      "per_req": {
+       "instructions": 38945886.56666667,
+       "cycles": 21764183.566666666,
+       "icache_data.stalls": 1089766.7333333334,
+       "icache_tag.stalls": 711787.5333333333,
+       "L1-icache-load-misses": 288244.5333333333,
+       "iTLB-load-misses": 1898.4333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1397565,
+      "execMs": 3.0982849999999997,
+      "per_req": {
+       "instructions": 39018716.766666666,
+       "cycles": 21969079.933333334,
+       "cache-misses": 138399.7,
+       "branch-misses": 57235.666666666664,
+       "mem_load_retired.l3_miss": 10921.633333333333,
+       "baclears.any": 13306.8
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1425555,
+      "execMs": 3.0038025,
+      "per_req": {
+       "instructions": 38991011.666666664,
+       "cycles": 21988674.9,
+       "idq.dsb_uops": 24125522.966666665,
+       "idq.mite_uops": 10358592.733333332,
+       "frontend_retired.any_dsb_miss": 1645830.6666666667,
+       "dsb2mite_switches.penalty_cycles": 1711387.6
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.142538,
+      "execMs": 2.874141,
+      "per_req": {
+       "instructions": 38964634.4,
+       "cycles": 21964119.966666665,
+       "icache_data.stalls": 1108565.1666666667,
+       "icache_tag.stalls": 739112.5,
+       "L1-icache-load-misses": 291052.63333333336,
+       "iTLB-load-misses": 1943.5333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1433855,
+      "execMs": 3.1373135000000003,
+      "per_req": {
+       "instructions": 38973179.0,
+       "cycles": 21891153.833333332,
+       "cache-misses": 144260.73333333334,
+       "branch-misses": 56799.2,
+       "mem_load_retired.l3_miss": 10818.166666666666,
+       "baclears.any": 12033.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.14472800000000002,
+      "execMs": 2.8403045000000002,
+      "per_req": {
+       "instructions": 38972983.266666666,
+       "cycles": 21978232.2,
+       "idq.dsb_uops": 24490307.733333334,
+       "idq.mite_uops": 9998182.833333334,
+       "frontend_retired.any_dsb_miss": 1575427.3,
+       "dsb2mite_switches.penalty_cycles": 1670992.8333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.14095600000000003,
+      "execMs": 2.9610995,
+      "per_req": {
+       "instructions": 38998252.43333333,
+       "cycles": 21841493.2,
+       "icache_data.stalls": 1128114.2333333334,
+       "icache_tag.stalls": 716338.9,
+       "L1-icache-load-misses": 285568.76666666666,
+       "iTLB-load-misses": 1799.9
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1449485,
+      "execMs": 2.1134195,
+      "per_req": {
+       "instructions": 38926765.36666667,
+       "cycles": 22092745.466666665,
+       "cache-misses": 147517.7,
+       "branch-misses": 57144.26666666667,
+       "mem_load_retired.l3_miss": 11617.533333333333,
+       "baclears.any": 13118.633333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.166053,
+      "execMs": 3.0417215,
+      "per_req": {
+       "instructions": 39084875.06666667,
+       "cycles": 23233914.166666668,
+       "idq.dsb_uops": 24046089.566666666,
+       "idq.mite_uops": 10516686.633333333,
+       "frontend_retired.any_dsb_miss": 1670085.6,
+       "dsb2mite_switches.penalty_cycles": 1730839.5
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1084415,
+      "execMs": 3.2400305,
+      "per_req": {
+       "instructions": 39081747.93333333,
+       "cycles": 21037348.266666666,
+       "icache_data.stalls": 762913.8,
+       "icache_tag.stalls": 416288.1666666667,
+       "L1-icache-load-misses": 287927.6,
+       "iTLB-load-misses": 2024.4
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1075845,
+      "execMs": 1.74138,
+      "per_req": {
+       "instructions": 38980086.1,
+       "cycles": 20691096.333333332,
+       "cache-misses": 77982.73333333334,
+       "branch-misses": 58022.03333333333,
+       "mem_load_retired.l3_miss": 6511.533333333334,
+       "baclears.any": 13053.033333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1072975,
+      "execMs": 3.34179,
+      "per_req": {
+       "instructions": 38991696.0,
+       "cycles": 20686346.566666666,
+       "idq.dsb_uops": 24785127.6,
+       "idq.mite_uops": 9682412.866666667,
+       "frontend_retired.any_dsb_miss": 1519764.3,
+       "dsb2mite_switches.penalty_cycles": 1629259.3666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1082475,
+      "execMs": 2.8311415,
+      "per_req": {
+       "instructions": 38931926.266666666,
+       "cycles": 20657677.266666666,
+       "icache_data.stalls": 753567.1333333333,
+       "icache_tag.stalls": 409430.26666666666,
+       "L1-icache-load-misses": 284254.0,
+       "iTLB-load-misses": 1838.6333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.106109,
+      "execMs": 2.5852554999999997,
+      "per_req": {
+       "instructions": 38953079.9,
+       "cycles": 20649632.366666667,
+       "cache-misses": 75510.73333333334,
+       "branch-misses": 57933.333333333336,
+       "mem_load_retired.l3_miss": 6152.0,
+       "baclears.any": 13637.433333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.10755999999999999,
+      "execMs": 2.9162285,
+      "per_req": {
+       "instructions": 38963206.6,
+       "cycles": 20708667.433333334,
+       "idq.dsb_uops": 24937137.866666667,
+       "idq.mite_uops": 9597477.166666666,
+       "frontend_retired.any_dsb_miss": 1513771.7333333334,
+       "dsb2mite_switches.penalty_cycles": 1589347.3666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1051145,
+      "execMs": 1.9017565,
+      "per_req": {
+       "instructions": 38898251.13333333,
+       "cycles": 20560798.833333332,
+       "icache_data.stalls": 728305.0333333333,
+       "icache_tag.stalls": 372592.36666666664,
+       "L1-icache-load-misses": 282437.8,
+       "iTLB-load-misses": 1842.1
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.107875,
+      "execMs": 3.740052,
+      "per_req": {
+       "instructions": 38995244.46666667,
+       "cycles": 20804216.9,
+       "cache-misses": 85690.53333333334,
+       "branch-misses": 57209.26666666667,
+       "mem_load_retired.l3_miss": 6895.766666666666,
+       "baclears.any": 12478.233333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.107332,
+      "execMs": 3.1637079999999997,
+      "per_req": {
+       "instructions": 38986793.266666666,
+       "cycles": 20667397.066666666,
+       "idq.dsb_uops": 24836963.2,
+       "idq.mite_uops": 9713683.966666667,
+       "frontend_retired.any_dsb_miss": 1539922.7,
+       "dsb2mite_switches.penalty_cycles": 1607654.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.107093,
+      "execMs": 2.9572265,
+      "per_req": {
+       "instructions": 39003753.233333334,
+       "cycles": 20717281.433333334,
+       "icache_data.stalls": 761226.8,
+       "icache_tag.stalls": 406359.26666666666,
+       "L1-icache-load-misses": 283690.4,
+       "iTLB-load-misses": 1896.2666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.107989,
+      "execMs": 2.3093205,
+      "per_req": {
+       "instructions": 38923501.1,
+       "cycles": 20717140.6,
+       "cache-misses": 85028.83333333333,
+       "branch-misses": 57500.03333333333,
+       "mem_load_retired.l3_miss": 6831.5,
+       "baclears.any": 12884.8
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1066675,
+      "execMs": 2.8873145,
+      "per_req": {
+       "instructions": 38971229.166666664,
+       "cycles": 20593957.833333332,
+       "idq.dsb_uops": 24846561.666666668,
+       "idq.mite_uops": 9712444.133333333,
+       "frontend_retired.any_dsb_miss": 1544385.1,
+       "dsb2mite_switches.penalty_cycles": 1610520.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.106151,
+      "execMs": 2.0472615,
+      "per_req": {
+       "instructions": 38967553.833333336,
+       "cycles": 20614707.766666666,
+       "icache_data.stalls": 724762.6666666666,
+       "icache_tag.stalls": 388741.1666666667,
+       "L1-icache-load-misses": 285055.93333333335,
+       "iTLB-load-misses": 1919.4333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.10593,
+      "execMs": 1.8058195,
+      "per_req": {
+       "instructions": 38938167.03333333,
+       "cycles": 20637489.9,
+       "cache-misses": 78797.76666666666,
+       "branch-misses": 57575.066666666666,
+       "mem_load_retired.l3_miss": 6748.033333333334,
+       "baclears.any": 13139.433333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.10821050000000002,
+      "execMs": 3.326194,
+      "per_req": {
+       "instructions": 39011941.2,
+       "cycles": 20631389.8,
+       "idq.dsb_uops": 24828870.266666666,
+       "idq.mite_uops": 9648763.7,
+       "frontend_retired.any_dsb_miss": 1515760.5333333334,
+       "dsb2mite_switches.penalty_cycles": 1601937.8
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.108186,
+      "execMs": 2.8410219999999997,
+      "per_req": {
+       "instructions": 38960490.8,
+       "cycles": 20626142.0,
+       "icache_data.stalls": 769172.1333333333,
+       "icache_tag.stalls": 414077.9666666667,
+       "L1-icache-load-misses": 281550.76666666666,
+       "iTLB-load-misses": 1947.2
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.106954,
+      "execMs": 2.698503,
+      "per_req": {
+       "instructions": 38970281.86666667,
+       "cycles": 20857561.666666668,
+       "cache-misses": 82699.53333333334,
+       "branch-misses": 57747.73333333333,
+       "mem_load_retired.l3_miss": 6684.833333333333,
+       "baclears.any": 13536.266666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1069235,
+      "execMs": 2.982504,
+      "per_req": {
+       "instructions": 38969677.266666666,
+       "cycles": 20697633.6,
+       "idq.dsb_uops": 24436604.1,
+       "idq.mite_uops": 9998759.0,
+       "frontend_retired.any_dsb_miss": 1576853.9666666666,
+       "dsb2mite_switches.penalty_cycles": 1662555.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10614399999999999,
+      "execMs": 1.8553405,
+      "per_req": {
+       "instructions": 38924065.1,
+       "cycles": 20821852.833333332,
+       "icache_data.stalls": 726244.9,
+       "icache_tag.stalls": 393177.06666666665,
+       "L1-icache-load-misses": 287336.1666666667,
+       "iTLB-load-misses": 1864.7333333333333
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "tip": [
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.141631,
+      "execMs": 2.002522,
+      "per_req": {
+       "instructions": 38971466.93333333,
+       "cycles": 22527425.633333333,
+       "cache-misses": 147253.7,
+       "branch-misses": 58104.2,
+       "mem_load_retired.l3_miss": 11322.133333333333,
+       "baclears.any": 13032.666666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.139757,
+      "execMs": 3.807928,
+      "per_req": {
+       "instructions": 39020450.03333333,
+       "cycles": 22661254.866666667,
+       "idq.dsb_uops": 24691316.166666668,
+       "idq.mite_uops": 9749628.033333333,
+       "frontend_retired.any_dsb_miss": 1586259.4666666666,
+       "dsb2mite_switches.penalty_cycles": 1819070.8666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.14181749999999999,
+      "execMs": 2.723293,
+      "per_req": {
+       "instructions": 38958748.3,
+       "cycles": 22032695.166666668,
+       "icache_data.stalls": 1114280.9666666666,
+       "icache_tag.stalls": 729216.6,
+       "L1-icache-load-misses": 261499.8,
+       "iTLB-load-misses": 1887.2333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.146058,
+      "execMs": 2.8863065,
+      "per_req": {
+       "instructions": 38965661.43333333,
+       "cycles": 22013836.733333334,
+       "cache-misses": 143544.0,
+       "branch-misses": 57595.3,
+       "mem_load_retired.l3_miss": 11128.266666666666,
+       "baclears.any": 12837.566666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.14748,
+      "execMs": 1.7315710000000002,
+      "per_req": {
+       "instructions": 38894334.233333334,
+       "cycles": 22002019.1,
+       "idq.dsb_uops": 24931519.366666667,
+       "idq.mite_uops": 9428026.1,
+       "frontend_retired.any_dsb_miss": 1516252.0,
+       "dsb2mite_switches.penalty_cycles": 1722145.5666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1514665,
+      "execMs": 2.322407,
+      "per_req": {
+       "instructions": 38919738.43333333,
+       "cycles": 22116295.366666667,
+       "icache_data.stalls": 1121071.5,
+       "icache_tag.stalls": 765346.6333333333,
+       "L1-icache-load-misses": 260735.86666666667,
+       "iTLB-load-misses": 1912.5666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.143739,
+      "execMs": 2.4712810000000003,
+      "per_req": {
+       "instructions": 38935376.3,
+       "cycles": 21949006.666666668,
+       "cache-misses": 143101.86666666667,
+       "branch-misses": 57487.9,
+       "mem_load_retired.l3_miss": 10888.8,
+       "baclears.any": 12803.833333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.14343,
+      "execMs": 1.7996085000000002,
+      "per_req": {
+       "instructions": 38871863.4,
+       "cycles": 21897918.133333333,
+       "idq.dsb_uops": 24698739.166666668,
+       "idq.mite_uops": 9640646.1,
+       "frontend_retired.any_dsb_miss": 1568319.4333333333,
+       "dsb2mite_switches.penalty_cycles": 1772837.7333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1498225,
+      "execMs": 1.8524495,
+      "per_req": {
+       "instructions": 38926972.4,
+       "cycles": 22049133.533333335,
+       "icache_data.stalls": 1104707.0333333334,
+       "icache_tag.stalls": 733187.0333333333,
+       "L1-icache-load-misses": 259335.26666666666,
+       "iTLB-load-misses": 1814.0666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.13794499999999998,
+      "execMs": 1.782932,
+      "per_req": {
+       "instructions": 38939031.8,
+       "cycles": 21617635.5,
+       "cache-misses": 127692.23333333334,
+       "branch-misses": 57730.36666666667,
+       "mem_load_retired.l3_miss": 10570.266666666666,
+       "baclears.any": 12589.233333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.142431,
+      "execMs": 3.607778,
+      "per_req": {
+       "instructions": 39006004.56666667,
+       "cycles": 21928862.1,
+       "idq.dsb_uops": 24996434.833333332,
+       "idq.mite_uops": 9552566.366666667,
+       "frontend_retired.any_dsb_miss": 1535093.6666666667,
+       "dsb2mite_switches.penalty_cycles": 1747228.3666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.14322200000000002,
+      "execMs": 2.662642,
+      "per_req": {
+       "instructions": 38977081.5,
+       "cycles": 21835516.2,
+       "icache_data.stalls": 1092988.9,
+       "icache_tag.stalls": 709740.9666666667,
+       "L1-icache-load-misses": 259101.63333333333,
+       "iTLB-load-misses": 1954.7666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1395595,
+      "execMs": 1.9003925,
+      "per_req": {
+       "instructions": 38954828.63333333,
+       "cycles": 21658243.766666666,
+       "cache-misses": 125991.1,
+       "branch-misses": 57265.933333333334,
+       "mem_load_retired.l3_miss": 10081.233333333334,
+       "baclears.any": 12410.933333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1431705,
+      "execMs": 2.55789,
+      "per_req": {
+       "instructions": 38976027.2,
+       "cycles": 21801221.933333334,
+       "idq.dsb_uops": 25133762.333333332,
+       "idq.mite_uops": 9347755.4,
+       "frontend_retired.any_dsb_miss": 1497354.3666666667,
+       "dsb2mite_switches.penalty_cycles": 1703351.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.147185,
+      "execMs": 3.230113,
+      "per_req": {
+       "instructions": 39039956.1,
+       "cycles": 21935618.2,
+       "icache_data.stalls": 1113131.1,
+       "icache_tag.stalls": 729444.1666666666,
+       "L1-icache-load-misses": 260599.63333333333,
+       "iTLB-load-misses": 2010.9
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1462755,
+      "execMs": 2.049798,
+      "per_req": {
+       "instructions": 38931048.96666667,
+       "cycles": 21886616.233333334,
+       "cache-misses": 142111.33333333334,
+       "branch-misses": 58061.333333333336,
+       "mem_load_retired.l3_miss": 10966.166666666666,
+       "baclears.any": 12761.1
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.148484,
+      "execMs": 1.8299785000000002,
+      "per_req": {
+       "instructions": 38899840.666666664,
+       "cycles": 21860937.8,
+       "idq.dsb_uops": 25044484.366666667,
+       "idq.mite_uops": 9380785.933333334,
+       "frontend_retired.any_dsb_miss": 1510650.2,
+       "dsb2mite_switches.penalty_cycles": 1728723.0333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.14744849999999998,
+      "execMs": 2.1492009999999997,
+      "per_req": {
+       "instructions": 38961296.1,
+       "cycles": 21934078.166666668,
+       "icache_data.stalls": 1130914.6333333333,
+       "icache_tag.stalls": 752909.9,
+       "L1-icache-load-misses": 259280.46666666667,
+       "iTLB-load-misses": 1974.0
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1106855,
+      "execMs": 1.7976565,
+      "per_req": {
+       "instructions": 38923402.06666667,
+       "cycles": 20904807.7,
+       "cache-misses": 85021.9,
+       "branch-misses": 58064.566666666666,
+       "mem_load_retired.l3_miss": 6617.166666666667,
+       "baclears.any": 13016.4
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.110806,
+      "execMs": 1.9582674999999998,
+      "per_req": {
+       "instructions": 38878946.6,
+       "cycles": 20894560.133333333,
+       "idq.dsb_uops": 24791301.766666666,
+       "idq.mite_uops": 9482769.4,
+       "frontend_retired.any_dsb_miss": 1540100.0,
+       "dsb2mite_switches.penalty_cycles": 1757582.9333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10996349999999999,
+      "execMs": 2.8059944999999997,
+      "per_req": {
+       "instructions": 38955176.36666667,
+       "cycles": 20843989.866666667,
+       "icache_data.stalls": 727603.9666666667,
+       "icache_tag.stalls": 398808.7,
+       "L1-icache-load-misses": 253891.36666666667,
+       "iTLB-load-misses": 1918.1
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.1103635,
+      "execMs": 3.0447665,
+      "per_req": {
+       "instructions": 38971161.1,
+       "cycles": 20798434.233333334,
+       "cache-misses": 81503.1,
+       "branch-misses": 57834.86666666667,
+       "mem_load_retired.l3_miss": 6916.133333333333,
+       "baclears.any": 12961.466666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1093185,
+      "execMs": 2.0648855,
+      "per_req": {
+       "instructions": 38946404.53333333,
+       "cycles": 20821369.266666666,
+       "idq.dsb_uops": 24938669.866666667,
+       "idq.mite_uops": 9416356.133333333,
+       "frontend_retired.any_dsb_miss": 1516870.2,
+       "dsb2mite_switches.penalty_cycles": 1734873.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1086645,
+      "execMs": 2.755477,
+      "per_req": {
+       "instructions": 38956455.13333333,
+       "cycles": 20790153.1,
+       "icache_data.stalls": 708181.9666666667,
+       "icache_tag.stalls": 383462.4666666667,
+       "L1-icache-load-misses": 256057.3,
+       "iTLB-load-misses": 1850.9
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.109194,
+      "execMs": 1.7300045,
+      "per_req": {
+       "instructions": 38922594.46666667,
+       "cycles": 21031815.766666666,
+       "cache-misses": 84799.33333333333,
+       "branch-misses": 58206.63333333333,
+       "mem_load_retired.l3_miss": 6838.6,
+       "baclears.any": 13201.4
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1092495,
+      "execMs": 2.218611,
+      "per_req": {
+       "instructions": 38930017.5,
+       "cycles": 21011997.5,
+       "idq.dsb_uops": 24550697.833333332,
+       "idq.mite_uops": 9758653.666666666,
+       "frontend_retired.any_dsb_miss": 1611568.5333333334,
+       "dsb2mite_switches.penalty_cycles": 1877239.6
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10773450000000001,
+      "execMs": 1.8018505,
+      "per_req": {
+       "instructions": 38877791.56666667,
+       "cycles": 20926918.9,
+       "icache_data.stalls": 742319.0,
+       "icache_tag.stalls": 400394.63333333336,
+       "L1-icache-load-misses": 255299.93333333332,
+       "iTLB-load-misses": 1874.2333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.10899,
+      "execMs": 3.312467,
+      "per_req": {
+       "instructions": 39012846.96666667,
+       "cycles": 20869338.733333334,
+       "cache-misses": 77291.86666666667,
+       "branch-misses": 57560.63333333333,
+       "mem_load_retired.l3_miss": 7203.366666666667,
+       "baclears.any": 13122.066666666668
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1085035,
+      "execMs": 2.8227745,
+      "per_req": {
+       "instructions": 38961521.06666667,
+       "cycles": 20855397.233333334,
+       "idq.dsb_uops": 24995971.766666666,
+       "idq.mite_uops": 9356024.533333333,
+       "frontend_retired.any_dsb_miss": 1501741.3333333333,
+       "dsb2mite_switches.penalty_cycles": 1711177.9
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10919699999999999,
+      "execMs": 1.9519860000000002,
+      "per_req": {
+       "instructions": 38989787.53333333,
+       "cycles": 20736168.466666665,
+       "icache_data.stalls": 721109.8333333334,
+       "icache_tag.stalls": 393584.3333333333,
+       "L1-icache-load-misses": 253757.96666666667,
+       "iTLB-load-misses": 1934.1
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.10976949999999999,
+      "execMs": 3.0408340000000003,
+      "per_req": {
+       "instructions": 38927705.0,
+       "cycles": 20839210.333333332,
+       "cache-misses": 81198.6,
+       "branch-misses": 57422.433333333334,
+       "mem_load_retired.l3_miss": 6601.8,
+       "baclears.any": 12707.933333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.10945450000000001,
+      "execMs": 3.153281,
+      "per_req": {
+       "instructions": 38962438.96666667,
+       "cycles": 20839513.766666666,
+       "idq.dsb_uops": 25018519.366666667,
+       "idq.mite_uops": 9327131.833333334,
+       "frontend_retired.any_dsb_miss": 1499676.0666666667,
+       "dsb2mite_switches.penalty_cycles": 1726197.6666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1092595,
+      "execMs": 3.2465384999999998,
+      "per_req": {
+       "instructions": 39000848.8,
+       "cycles": 20787879.866666667,
+       "icache_data.stalls": 722790.5,
+       "icache_tag.stalls": 387098.0,
+       "L1-icache-load-misses": 254814.6,
+       "iTLB-load-misses": 1901.2
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "caecaaba77b4",
+     "basic": {
+      "planMs": 0.109102,
+      "execMs": 3.1073845,
+      "per_req": {
+       "instructions": 38987973.43333333,
+       "cycles": 20938181.133333333,
+       "cache-misses": 81732.23333333334,
+       "branch-misses": 58034.46666666667,
+       "mem_load_retired.l3_miss": 7074.8,
+       "baclears.any": 13132.1
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.109376,
+      "execMs": 2.8640685,
+      "per_req": {
+       "instructions": 38920889.46666667,
+       "cycles": 20777925.066666666,
+       "idq.dsb_uops": 25032950.7,
+       "idq.mite_uops": 9336811.666666666,
+       "frontend_retired.any_dsb_miss": 1502208.4333333333,
+       "dsb2mite_switches.penalty_cycles": 1716126.0333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.10921700000000001,
+      "execMs": 2.900939,
+      "per_req": {
+       "instructions": 38907352.96666667,
+       "cycles": 20708091.466666665,
+       "icache_data.stalls": 746768.5,
+       "icache_tag.stalls": 415880.06666666665,
+       "L1-icache-load-misses": 252461.73333333334,
+       "iTLB-load-misses": 1913.4666666666667
+      },
+      "pct_min": 100.0
+     }
+    }
+   ]
+  },
+  "two-hop-count": {
+   "base": [
+    {
+     "plan": "6c37dff01996",
+     "basic": {
+      "planMs": 0.107081,
+      "execMs": 6.757885,
+      "per_req": {
+       "instructions": 16209868.733333332,
+       "cycles": 18750089.066666666,
+       "cache-misses": 154400.83333333334,
+       "branch-misses": 233707.4,
+       "mem_load_retired.l3_miss": 2444.233333333333,
+       "baclears.any": 22918.466666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1092255,
+      "execMs": 7.249005500000001,
+      "per_req": {
+       "instructions": 16218159.866666667,
+       "cycles": 18685564.833333332,
+       "idq.dsb_uops": 20235617.3,
+       "idq.mite_uops": 1974526.9,
+       "frontend_retired.any_dsb_miss": 240492.33333333334,
+       "dsb2mite_switches.penalty_cycles": 472529.6
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.108609,
+      "execMs": 6.3670425,
+      "per_req": {
+       "instructions": 16116603.5,
+       "cycles": 18682424.066666666,
+       "icache_data.stalls": 756109.6333333333,
+       "icache_tag.stalls": 601668.8,
+       "L1-icache-load-misses": 61561.13333333333,
+       "iTLB-load-misses": 1889.5
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "f4078d6413d0",
+     "basic": {
+      "planMs": 0.114702,
+      "execMs": 7.4004045000000005,
+      "per_req": {
+       "instructions": 16351797.266666668,
+       "cycles": 18216886.466666665,
+       "cache-misses": 146615.33333333334,
+       "branch-misses": 233762.73333333334,
+       "mem_load_retired.l3_miss": 2278.1,
+       "baclears.any": 15592.633333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1172525,
+      "execMs": 7.401054,
+      "per_req": {
+       "instructions": 16313430.066666666,
+       "cycles": 18343293.866666667,
+       "idq.dsb_uops": 21311219.9,
+       "idq.mite_uops": 1665513.7,
+       "frontend_retired.any_dsb_miss": 205011.93333333332,
+       "dsb2mite_switches.penalty_cycles": 343773.4666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.11649,
+      "execMs": 7.386216,
+      "per_req": {
+       "instructions": 16300090.533333333,
+       "cycles": 18329335.033333335,
+       "icache_data.stalls": 695760.6,
+       "icache_tag.stalls": 564028.3333333334,
+       "L1-icache-load-misses": 63845.166666666664,
+       "iTLB-load-misses": 1989.5333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "9272883ee0ad",
+     "basic": {
+      "planMs": 0.0908,
+      "execMs": 7.4451195,
+      "per_req": {
+       "instructions": 16248533.9,
+       "cycles": 17300875.9,
+       "cache-misses": 77549.2,
+       "branch-misses": 234773.46666666667,
+       "mem_load_retired.l3_miss": 1231.4333333333334,
+       "baclears.any": 23199.5
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09219549999999999,
+      "execMs": 6.443346999999999,
+      "per_req": {
+       "instructions": 16165291.3,
+       "cycles": 17181212.4,
+       "idq.dsb_uops": 20588427.166666668,
+       "idq.mite_uops": 1754807.4,
+       "frontend_retired.any_dsb_miss": 212714.46666666667,
+       "dsb2mite_switches.penalty_cycles": 388376.56666666665
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.097161,
+      "execMs": 7.2704785,
+      "per_req": {
+       "instructions": 16312744.833333334,
+       "cycles": 18381347.266666666,
+       "icache_data.stalls": 609936.1,
+       "icache_tag.stalls": 518773.86666666664,
+       "L1-icache-load-misses": 63176.566666666666,
+       "iTLB-load-misses": 2054.633333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "c768cd17952b",
+     "basic": {
+      "planMs": 0.09060499999999999,
+      "execMs": 6.4583125,
+      "per_req": {
+       "instructions": 16213337.0,
+       "cycles": 17269501.966666665,
+       "cache-misses": 76023.23333333334,
+       "branch-misses": 235720.4,
+       "mem_load_retired.l3_miss": 1412.0666666666666,
+       "baclears.any": 24322.066666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.09074099999999999,
+      "execMs": 7.326072999999999,
+      "per_req": {
+       "instructions": 16208690.766666668,
+       "cycles": 17277648.0,
+       "idq.dsb_uops": 19849106.566666666,
+       "idq.mite_uops": 1986232.9666666666,
+       "frontend_retired.any_dsb_miss": 239674.76666666666,
+       "dsb2mite_switches.penalty_cycles": 476686.7
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08980949999999999,
+      "execMs": 6.452169,
+      "per_req": {
+       "instructions": 16214296.333333334,
+       "cycles": 17214174.866666667,
+       "icache_data.stalls": 394528.4666666667,
+       "icache_tag.stalls": 335645.6,
+       "L1-icache-load-misses": 60776.333333333336,
+       "iTLB-load-misses": 1889.8666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "a4a679705ac9",
+     "basic": {
+      "planMs": 0.1011195,
+      "execMs": 7.4242729999999995,
+      "per_req": {
+       "instructions": 16341025.633333333,
+       "cycles": 17902946.833333332,
+       "cache-misses": 118647.56666666667,
+       "branch-misses": 235111.8,
+       "mem_load_retired.l3_miss": 1818.1,
+       "baclears.any": 20469.033333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1108185,
+      "execMs": 7.2015519999999995,
+      "per_req": {
+       "instructions": 16246544.466666667,
+       "cycles": 18134569.966666665,
+       "idq.dsb_uops": 20989103.433333334,
+       "idq.mite_uops": 1687856.5333333334,
+       "frontend_retired.any_dsb_miss": 205571.26666666666,
+       "dsb2mite_switches.penalty_cycles": 361340.1
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.111948,
+      "execMs": 7.4068705,
+      "per_req": {
+       "instructions": 16335969.666666666,
+       "cycles": 18350501.4,
+       "icache_data.stalls": 631218.0666666667,
+       "icache_tag.stalls": 517503.2,
+       "L1-icache-load-misses": 62566.36666666667,
+       "iTLB-load-misses": 2001.0
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "8c63b40d0ec4",
+     "basic": {
+      "planMs": 0.08412149999999999,
+      "execMs": 6.462038,
+      "per_req": {
+       "instructions": 16231793.566666666,
+       "cycles": 17082975.433333334,
+       "cache-misses": 54432.96666666667,
+       "branch-misses": 235783.23333333334,
+       "mem_load_retired.l3_miss": 1027.6,
+       "baclears.any": 20427.3
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0848825,
+      "execMs": 7.424426,
+      "per_req": {
+       "instructions": 16189638.833333334,
+       "cycles": 17133613.3,
+       "idq.dsb_uops": 20342377.133333333,
+       "idq.mite_uops": 1861289.9333333333,
+       "frontend_retired.any_dsb_miss": 224118.4,
+       "dsb2mite_switches.penalty_cycles": 436912.26666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08467,
+      "execMs": 7.447447,
+      "per_req": {
+       "instructions": 16265495.8,
+       "cycles": 17032474.8,
+       "icache_data.stalls": 358699.3,
+       "icache_tag.stalls": 307345.56666666665,
+       "L1-icache-load-misses": 62551.666666666664,
+       "iTLB-load-misses": 1912.8
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "66e3b3da1abc",
+     "basic": {
+      "planMs": 0.086568,
+      "execMs": 6.480336,
+      "per_req": {
+       "instructions": 16201778.3,
+       "cycles": 17268798.6,
+       "cache-misses": 61139.8,
+       "branch-misses": 235559.73333333334,
+       "mem_load_retired.l3_miss": 1246.2666666666667,
+       "baclears.any": 25518.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08684049999999999,
+      "execMs": 6.8664775,
+      "per_req": {
+       "instructions": 16160704.9,
+       "cycles": 17224662.3,
+       "idq.dsb_uops": 20538123.366666667,
+       "idq.mite_uops": 1845078.8333333333,
+       "frontend_retired.any_dsb_miss": 222058.13333333333,
+       "dsb2mite_switches.penalty_cycles": 427420.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.086173,
+      "execMs": 6.480646,
+      "per_req": {
+       "instructions": 16169386.466666667,
+       "cycles": 17331635.733333334,
+       "icache_data.stalls": 375287.5333333333,
+       "icache_tag.stalls": 324485.6,
+       "L1-icache-load-misses": 61392.73333333333,
+       "iTLB-load-misses": 1997.1666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "c84cd8fadfc6",
+     "basic": {
+      "planMs": 0.08565999999999999,
+      "execMs": 6.886084,
+      "per_req": {
+       "instructions": 16256496.866666667,
+       "cycles": 17215935.5,
+       "cache-misses": 61184.96666666667,
+       "branch-misses": 234865.86666666667,
+       "mem_load_retired.l3_miss": 1144.1,
+       "baclears.any": 19827.433333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0871695,
+      "execMs": 7.443744499999999,
+      "per_req": {
+       "instructions": 16222276.266666668,
+       "cycles": 17118662.533333335,
+       "idq.dsb_uops": 20981762.766666666,
+       "idq.mite_uops": 1673792.6,
+       "frontend_retired.any_dsb_miss": 202616.43333333332,
+       "dsb2mite_switches.penalty_cycles": 351598.7
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08499399999999999,
+      "execMs": 6.460884,
+      "per_req": {
+       "instructions": 16166663.433333334,
+       "cycles": 16982318.133333333,
+       "icache_data.stalls": 358642.76666666666,
+       "icache_tag.stalls": 307406.4,
+       "L1-icache-load-misses": 60388.4,
+       "iTLB-load-misses": 1821.7666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "96652fef4430",
+     "basic": {
+      "planMs": 0.084762,
+      "execMs": 7.4371825000000005,
+      "per_req": {
+       "instructions": 16284559.366666667,
+       "cycles": 17322668.566666666,
+       "cache-misses": 55206.333333333336,
+       "branch-misses": 236502.76666666666,
+       "mem_load_retired.l3_miss": 1048.5,
+       "baclears.any": 23669.466666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.083622,
+      "execMs": 6.451166,
+      "per_req": {
+       "instructions": 16193208.433333334,
+       "cycles": 17254499.333333332,
+       "idq.dsb_uops": 20651626.833333332,
+       "idq.mite_uops": 1775651.7333333334,
+       "frontend_retired.any_dsb_miss": 213576.16666666666,
+       "dsb2mite_switches.penalty_cycles": 397664.13333333336
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0842465,
+      "execMs": 6.443403,
+      "per_req": {
+       "instructions": 16141223.933333334,
+       "cycles": 17132408.466666665,
+       "icache_data.stalls": 358043.56666666665,
+       "icache_tag.stalls": 316334.3333333333,
+       "L1-icache-load-misses": 60496.666666666664,
+       "iTLB-load-misses": 1896.1666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "d23b5dee7ed8",
+     "basic": {
+      "planMs": 0.0846035,
+      "execMs": 7.4469899999999996,
+      "per_req": {
+       "instructions": 16268662.766666668,
+       "cycles": 17305839.5,
+       "cache-misses": 62699.333333333336,
+       "branch-misses": 234970.53333333333,
+       "mem_load_retired.l3_miss": 1245.8666666666666,
+       "baclears.any": 23562.766666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0852985,
+      "execMs": 7.4424565,
+      "per_req": {
+       "instructions": 16248210.666666666,
+       "cycles": 17290331.3,
+       "idq.dsb_uops": 20809037.833333332,
+       "idq.mite_uops": 1770152.0666666667,
+       "frontend_retired.any_dsb_miss": 216124.96666666667,
+       "dsb2mite_switches.penalty_cycles": 393417.3
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0852595,
+      "execMs": 7.203601,
+      "per_req": {
+       "instructions": 16184086.566666666,
+       "cycles": 17140129.7,
+       "icache_data.stalls": 371181.43333333335,
+       "icache_tag.stalls": 313660.5333333333,
+       "L1-icache-load-misses": 61564.166666666664,
+       "iTLB-load-misses": 1883.1666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "5b087c37a37c",
+     "basic": {
+      "planMs": 0.086164,
+      "execMs": 6.4540565,
+      "per_req": {
+       "instructions": 16158744.266666668,
+       "cycles": 17212097.033333335,
+       "cache-misses": 67006.36666666667,
+       "branch-misses": 236327.46666666667,
+       "mem_load_retired.l3_miss": 1211.8,
+       "baclears.any": 21105.2
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.086889,
+      "execMs": 6.461392999999999,
+      "per_req": {
+       "instructions": 16166316.266666668,
+       "cycles": 17231483.0,
+       "idq.dsb_uops": 20367255.166666668,
+       "idq.mite_uops": 1780835.4,
+       "frontend_retired.any_dsb_miss": 215397.2,
+       "dsb2mite_switches.penalty_cycles": 408739.86666666664
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.084155,
+      "execMs": 7.4351895,
+      "per_req": {
+       "instructions": 16294859.266666668,
+       "cycles": 17235292.533333335,
+       "icache_data.stalls": 371558.5333333333,
+       "icache_tag.stalls": 352276.8,
+       "L1-icache-load-misses": 62163.9,
+       "iTLB-load-misses": 2158.5666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "319d86bcb515",
+     "basic": {
+      "planMs": 0.085482,
+      "execMs": 6.8775605,
+      "per_req": {
+       "instructions": 16186124.733333332,
+       "cycles": 17238113.866666667,
+       "cache-misses": 65153.63333333333,
+       "branch-misses": 234993.0,
+       "mem_load_retired.l3_miss": 1179.7666666666667,
+       "baclears.any": 28382.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0841055,
+      "execMs": 6.4921925,
+      "per_req": {
+       "instructions": 16237614.766666668,
+       "cycles": 17312501.233333334,
+       "idq.dsb_uops": 19770037.233333334,
+       "idq.mite_uops": 2062591.3666666667,
+       "frontend_retired.any_dsb_miss": 249649.43333333332,
+       "dsb2mite_switches.penalty_cycles": 512320.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.082757,
+      "execMs": 6.4771754999999995,
+      "per_req": {
+       "instructions": 16200190.3,
+       "cycles": 17147166.733333334,
+       "icache_data.stalls": 367137.1666666667,
+       "icache_tag.stalls": 310504.1666666667,
+       "L1-icache-load-misses": 61030.433333333334,
+       "iTLB-load-misses": 1847.1666666666667
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "main": [
+    {
+     "plan": "65080377066d",
+     "basic": {
+      "planMs": 0.08365,
+      "execMs": 6.3791365,
+      "per_req": {
+       "instructions": 16138549.733333332,
+       "cycles": 18414843.566666666,
+       "cache-misses": 114568.26666666666,
+       "branch-misses": 231501.66666666666,
+       "mem_load_retired.l3_miss": 1882.5666666666666,
+       "baclears.any": 30778.333333333332
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0830395,
+      "execMs": 6.3697775,
+      "per_req": {
+       "instructions": 16141150.466666667,
+       "cycles": 17581107.7,
+       "idq.dsb_uops": 19501027.1,
+       "idq.mite_uops": 2166472.8,
+       "frontend_retired.any_dsb_miss": 264363.5,
+       "dsb2mite_switches.penalty_cycles": 510348.06666666665
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0829235,
+      "execMs": 7.29576,
+      "per_req": {
+       "instructions": 16210247.1,
+       "cycles": 17565817.033333335,
+       "icache_data.stalls": 430450.0,
+       "icache_tag.stalls": 349869.8333333333,
+       "L1-icache-load-misses": 63446.23333333333,
+       "iTLB-load-misses": 1866.4
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "aca780edd75a",
+     "basic": {
+      "planMs": 0.10978399999999999,
+      "execMs": 6.4028355,
+      "per_req": {
+       "instructions": 16265891.466666667,
+       "cycles": 18499300.9,
+       "cache-misses": 133853.43333333332,
+       "branch-misses": 232689.26666666666,
+       "mem_load_retired.l3_miss": 1959.0666666666666,
+       "baclears.any": 53243.53333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.11239550000000001,
+      "execMs": 6.5412085,
+      "per_req": {
+       "instructions": 16264751.933333334,
+       "cycles": 18845285.833333332,
+       "idq.dsb_uops": 19218804.533333335,
+       "idq.mite_uops": 2353923.2,
+       "frontend_retired.any_dsb_miss": 293031.2,
+       "dsb2mite_switches.penalty_cycles": 580459.1
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.090319,
+      "execMs": 7.322711,
+      "per_req": {
+       "instructions": 16293435.333333334,
+       "cycles": 17837772.233333334,
+       "icache_data.stalls": 437473.86666666664,
+       "icache_tag.stalls": 378376.56666666665,
+       "L1-icache-load-misses": 65105.73333333333,
+       "iTLB-load-misses": 1974.3333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "3f480db69eae",
+     "basic": {
+      "planMs": 0.10057750000000001,
+      "execMs": 6.45714,
+      "per_req": {
+       "instructions": 16272846.633333333,
+       "cycles": 17842253.8,
+       "cache-misses": 110078.0,
+       "branch-misses": 231717.2,
+       "mem_load_retired.l3_miss": 1702.9333333333334,
+       "baclears.any": 35578.76666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.110232,
+      "execMs": 7.362672,
+      "per_req": {
+       "instructions": 16255185.2,
+       "cycles": 18285158.666666668,
+       "idq.dsb_uops": 19348767.5,
+       "idq.mite_uops": 2205518.8,
+       "frontend_retired.any_dsb_miss": 272115.26666666666,
+       "dsb2mite_switches.penalty_cycles": 512613.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1118875,
+      "execMs": 6.4169730000000005,
+      "per_req": {
+       "instructions": 16268184.333333334,
+       "cycles": 18324874.333333332,
+       "icache_data.stalls": 612997.0,
+       "icache_tag.stalls": 498498.5333333333,
+       "L1-icache-load-misses": 64616.9,
+       "iTLB-load-misses": 1920.4666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "930066ad8d6a",
+     "basic": {
+      "planMs": 0.11848900000000001,
+      "execMs": 7.053238,
+      "per_req": {
+       "instructions": 16342042.9,
+       "cycles": 18608070.966666665,
+       "cache-misses": 147753.33333333334,
+       "branch-misses": 231644.73333333334,
+       "mem_load_retired.l3_miss": 2328.4,
+       "baclears.any": 36360.433333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1170435,
+      "execMs": 7.383196,
+      "per_req": {
+       "instructions": 16344224.3,
+       "cycles": 18522607.166666668,
+       "idq.dsb_uops": 20144880.0,
+       "idq.mite_uops": 1929475.9666666666,
+       "frontend_retired.any_dsb_miss": 240393.86666666667,
+       "dsb2mite_switches.penalty_cycles": 415267.6
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1178955,
+      "execMs": 7.374616,
+      "per_req": {
+       "instructions": 16325169.3,
+       "cycles": 18584107.2,
+       "icache_data.stalls": 713183.7,
+       "icache_tag.stalls": 573702.0666666667,
+       "L1-icache-load-misses": 64541.76666666667,
+       "iTLB-load-misses": 1957.6666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "d79866cfbaf1",
+     "basic": {
+      "planMs": 0.095943,
+      "execMs": 7.4156355000000005,
+      "per_req": {
+       "instructions": 16280249.266666668,
+       "cycles": 17778490.033333335,
+       "cache-misses": 89494.63333333333,
+       "branch-misses": 231581.66666666666,
+       "mem_load_retired.l3_miss": 1542.3666666666666,
+       "baclears.any": 44487.933333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.11358399999999999,
+      "execMs": 6.4140675,
+      "per_req": {
+       "instructions": 16316247.566666666,
+       "cycles": 18218986.4,
+       "idq.dsb_uops": 19243498.033333335,
+       "idq.mite_uops": 2310433.6666666665,
+       "frontend_retired.any_dsb_miss": 281891.93333333335,
+       "dsb2mite_switches.penalty_cycles": 562693.9666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.114514,
+      "execMs": 7.217551,
+      "per_req": {
+       "instructions": 16306778.666666666,
+       "cycles": 18529752.033333335,
+       "icache_data.stalls": 643690.4666666667,
+       "icache_tag.stalls": 524567.7333333333,
+       "L1-icache-load-misses": 63277.46666666667,
+       "iTLB-load-misses": 2018.2666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "df5d5015a01e",
+     "basic": {
+      "planMs": 0.08655850000000001,
+      "execMs": 6.4503655,
+      "per_req": {
+       "instructions": 16159087.433333334,
+       "cycles": 17085346.566666666,
+       "cache-misses": 59536.3,
+       "branch-misses": 228828.23333333334,
+       "mem_load_retired.l3_miss": 1136.3,
+       "baclears.any": 30522.8
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08588199999999999,
+      "execMs": 7.4435445,
+      "per_req": {
+       "instructions": 16298024.666666666,
+       "cycles": 17351403.733333334,
+       "idq.dsb_uops": 19589607.633333333,
+       "idq.mite_uops": 2201044.4,
+       "frontend_retired.any_dsb_miss": 271192.06666666665,
+       "dsb2mite_switches.penalty_cycles": 515271.56666666665
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08687900000000001,
+      "execMs": 6.4321155,
+      "per_req": {
+       "instructions": 16173408.333333334,
+       "cycles": 17394457.5,
+       "icache_data.stalls": 377840.6666666667,
+       "icache_tag.stalls": 326735.0,
+       "L1-icache-load-misses": 63399.63333333333,
+       "iTLB-load-misses": 1896.1333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "ac6b8c666b16",
+     "basic": {
+      "planMs": 0.0854815,
+      "execMs": 6.460733,
+      "per_req": {
+       "instructions": 16248856.533333333,
+       "cycles": 17433347.033333335,
+       "cache-misses": 61159.63333333333,
+       "branch-misses": 231146.13333333333,
+       "mem_load_retired.l3_miss": 1095.4,
+       "baclears.any": 53381.166666666664
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08405750000000001,
+      "execMs": 7.463153500000001,
+      "per_req": {
+       "instructions": 16244968.933333334,
+       "cycles": 17538184.466666665,
+       "idq.dsb_uops": 18893268.133333333,
+       "idq.mite_uops": 2516099.7,
+       "frontend_retired.any_dsb_miss": 306862.6,
+       "dsb2mite_switches.penalty_cycles": 632177.6666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0841885,
+      "execMs": 6.439023,
+      "per_req": {
+       "instructions": 16121937.1,
+       "cycles": 17342700.433333334,
+       "icache_data.stalls": 359101.73333333334,
+       "icache_tag.stalls": 306605.73333333334,
+       "L1-icache-load-misses": 62121.3,
+       "iTLB-load-misses": 1811.9666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "052ee17245b2",
+     "basic": {
+      "planMs": 0.08483550000000001,
+      "execMs": 6.426042,
+      "per_req": {
+       "instructions": 16132801.1,
+       "cycles": 17294371.5,
+       "cache-misses": 58568.46666666667,
+       "branch-misses": 230621.6,
+       "mem_load_retired.l3_miss": 1181.9333333333334,
+       "baclears.any": 44644.53333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08504700000000001,
+      "execMs": 7.3351985,
+      "per_req": {
+       "instructions": 16279020.866666667,
+       "cycles": 18617349.166666668,
+       "idq.dsb_uops": 19170765.9,
+       "idq.mite_uops": 2393643.7333333334,
+       "frontend_retired.any_dsb_miss": 292981.0333333333,
+       "dsb2mite_switches.penalty_cycles": 582948.5
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08510000000000001,
+      "execMs": 7.361412,
+      "per_req": {
+       "instructions": 16334639.5,
+       "cycles": 17471342.6,
+       "icache_data.stalls": 368190.93333333335,
+       "icache_tag.stalls": 313477.13333333336,
+       "L1-icache-load-misses": 62582.2,
+       "iTLB-load-misses": 1885.5666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "017ffaec4bdc",
+     "basic": {
+      "planMs": 0.08409649999999999,
+      "execMs": 6.8561735,
+      "per_req": {
+       "instructions": 16239323.266666668,
+       "cycles": 17434077.6,
+       "cache-misses": 59685.13333333333,
+       "branch-misses": 233508.3,
+       "mem_load_retired.l3_miss": 1196.5333333333333,
+       "baclears.any": 42427.833333333336
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08405850000000001,
+      "execMs": 7.42582,
+      "per_req": {
+       "instructions": 16262934.166666666,
+       "cycles": 17516243.966666665,
+       "idq.dsb_uops": 19179870.166666668,
+       "idq.mite_uops": 2288259.1333333333,
+       "frontend_retired.any_dsb_miss": 284525.43333333335,
+       "dsb2mite_switches.penalty_cycles": 564948.1666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.085106,
+      "execMs": 7.394527,
+      "per_req": {
+       "instructions": 16284054.066666666,
+       "cycles": 17522199.733333334,
+       "icache_data.stalls": 378912.76666666666,
+       "icache_tag.stalls": 325133.6,
+       "L1-icache-load-misses": 62018.7,
+       "iTLB-load-misses": 1786.3666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "f944925d965c",
+     "basic": {
+      "planMs": 0.08556699999999999,
+      "execMs": 6.4217915,
+      "per_req": {
+       "instructions": 16194394.766666668,
+       "cycles": 17245734.033333335,
+       "cache-misses": 54681.566666666666,
+       "branch-misses": 229807.83333333334,
+       "mem_load_retired.l3_miss": 1087.1,
+       "baclears.any": 41995.0
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0858845,
+      "execMs": 7.4350545,
+      "per_req": {
+       "instructions": 16249294.366666667,
+       "cycles": 17345881.433333334,
+       "idq.dsb_uops": 19448834.7,
+       "idq.mite_uops": 2169806.7,
+       "frontend_retired.any_dsb_miss": 267229.26666666666,
+       "dsb2mite_switches.penalty_cycles": 502367.8333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0849355,
+      "execMs": 6.845959499999999,
+      "per_req": {
+       "instructions": 16235891.666666666,
+       "cycles": 17286787.733333334,
+       "icache_data.stalls": 353615.86666666664,
+       "icache_tag.stalls": 309238.6666666667,
+       "L1-icache-load-misses": 63046.63333333333,
+       "iTLB-load-misses": 1912.3333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "5989e4c7434c",
+     "basic": {
+      "planMs": 0.0856465,
+      "execMs": 7.252794,
+      "per_req": {
+       "instructions": 16248246.6,
+       "cycles": 17222983.233333334,
+       "cache-misses": 60758.9,
+       "branch-misses": 228931.46666666667,
+       "mem_load_retired.l3_miss": 1039.6,
+       "baclears.any": 38605.433333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.085535,
+      "execMs": 7.359329499999999,
+      "per_req": {
+       "instructions": 16278823.166666666,
+       "cycles": 17421184.766666666,
+       "idq.dsb_uops": 19419693.1,
+       "idq.mite_uops": 2182732.5,
+       "frontend_retired.any_dsb_miss": 269089.36666666664,
+       "dsb2mite_switches.penalty_cycles": 508350.93333333335
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.085536,
+      "execMs": 6.4386925,
+      "per_req": {
+       "instructions": 16178467.066666666,
+       "cycles": 17448621.8,
+       "icache_data.stalls": 369037.6666666667,
+       "icache_tag.stalls": 312837.36666666664,
+       "L1-icache-load-misses": 62127.9,
+       "iTLB-load-misses": 1909.1666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "8550c0d7d8e3",
+     "basic": {
+      "planMs": 0.084099,
+      "execMs": 6.831439,
+      "per_req": {
+       "instructions": 16200158.866666667,
+       "cycles": 17237259.933333334,
+       "cache-misses": 54753.166666666664,
+       "branch-misses": 230710.86666666667,
+       "mem_load_retired.l3_miss": 1098.4666666666667,
+       "baclears.any": 37579.76666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08449400000000001,
+      "execMs": 6.729058500000001,
+      "per_req": {
+       "instructions": 16220132.533333333,
+       "cycles": 17229831.5,
+       "idq.dsb_uops": 19424746.533333335,
+       "idq.mite_uops": 2132571.6666666665,
+       "frontend_retired.any_dsb_miss": 267166.4666666667,
+       "dsb2mite_switches.penalty_cycles": 497327.76666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0851025,
+      "execMs": 7.4290045,
+      "per_req": {
+       "instructions": 16233452.833333334,
+       "cycles": 17407253.266666666,
+       "icache_data.stalls": 376644.9,
+       "icache_tag.stalls": 324598.76666666666,
+       "L1-icache-load-misses": 63502.46666666667,
+       "iTLB-load-misses": 1893.5666666666666
+      },
+      "pct_min": 100.0
+     }
+    }
+   ],
+   "tip": [
+    {
+     "plan": "ff1587a8f29b",
+     "basic": {
+      "planMs": 0.11286099999999999,
+      "execMs": 6.429853,
+      "per_req": {
+       "instructions": 16346625.066666666,
+       "cycles": 18350831.733333334,
+       "cache-misses": 134489.1,
+       "branch-misses": 231046.23333333334,
+       "mem_load_retired.l3_miss": 2119.366666666667,
+       "baclears.any": 16945.033333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.11143249999999999,
+      "execMs": 7.310330499999999,
+      "per_req": {
+       "instructions": 16212098.733333332,
+       "cycles": 18435922.3,
+       "idq.dsb_uops": 19532780.733333334,
+       "idq.mite_uops": 1872369.0333333334,
+       "frontend_retired.any_dsb_miss": 243163.83333333334,
+       "dsb2mite_switches.penalty_cycles": 433989.43333333335
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1094455,
+      "execMs": 7.410697000000001,
+      "per_req": {
+       "instructions": 16303346.2,
+       "cycles": 18255265.133333333,
+       "icache_data.stalls": 582458.3,
+       "icache_tag.stalls": 481466.9,
+       "L1-icache-load-misses": 66721.33333333333,
+       "iTLB-load-misses": 2039.3666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "b20402a11146",
+     "basic": {
+      "planMs": 0.10427149999999999,
+      "execMs": 7.3749395,
+      "per_req": {
+       "instructions": 16336720.066666666,
+       "cycles": 17892318.366666667,
+       "cache-misses": 108565.83333333333,
+       "branch-misses": 229306.9,
+       "mem_load_retired.l3_miss": 1725.2666666666667,
+       "baclears.any": 28316.966666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1100025,
+      "execMs": 7.3874525,
+      "per_req": {
+       "instructions": 16244788.8,
+       "cycles": 17916864.666666668,
+       "idq.dsb_uops": 19551697.966666665,
+       "idq.mite_uops": 1863383.2333333334,
+       "frontend_retired.any_dsb_miss": 243656.0,
+       "dsb2mite_switches.penalty_cycles": 439745.23333333334
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.1146185,
+      "execMs": 7.233712000000001,
+      "per_req": {
+       "instructions": 16280150.6,
+       "cycles": 18093599.666666668,
+       "icache_data.stalls": 658308.0333333333,
+       "icache_tag.stalls": 518393.56666666665,
+       "L1-icache-load-misses": 64714.03333333333,
+       "iTLB-load-misses": 1945.5333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "a08d116c0a2f",
+     "basic": {
+      "planMs": 0.0926775,
+      "execMs": 6.438449,
+      "per_req": {
+       "instructions": 16141788.4,
+       "cycles": 17447843.466666665,
+       "cache-misses": 80518.8,
+       "branch-misses": 229294.06666666668,
+       "mem_load_retired.l3_miss": 1493.0333333333333,
+       "baclears.any": 22944.533333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.111729,
+      "execMs": 7.3804675,
+      "per_req": {
+       "instructions": 16236273.9,
+       "cycles": 18054108.533333335,
+       "idq.dsb_uops": 19765741.0,
+       "idq.mite_uops": 1778280.5333333334,
+       "frontend_retired.any_dsb_miss": 229915.13333333333,
+       "dsb2mite_switches.penalty_cycles": 409482.9666666667
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.112482,
+      "execMs": 7.239516,
+      "per_req": {
+       "instructions": 16199920.5,
+       "cycles": 18122343.433333334,
+       "icache_data.stalls": 634090.2333333333,
+       "icache_tag.stalls": 490951.2,
+       "L1-icache-load-misses": 64445.23333333333,
+       "iTLB-load-misses": 1861.6333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "95d6fa7cc1d2",
+     "basic": {
+      "planMs": 0.110225,
+      "execMs": 7.1942075,
+      "per_req": {
+       "instructions": 16265356.966666667,
+       "cycles": 18195413.366666667,
+       "cache-misses": 126427.03333333334,
+       "branch-misses": 229183.23333333334,
+       "mem_load_retired.l3_miss": 2053.766666666667,
+       "baclears.any": 25613.233333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1091685,
+      "execMs": 6.8121685,
+      "per_req": {
+       "instructions": 16328965.7,
+       "cycles": 18170934.466666665,
+       "idq.dsb_uops": 19222250.233333334,
+       "idq.mite_uops": 2006488.9666666666,
+       "frontend_retired.any_dsb_miss": 263087.8,
+       "dsb2mite_switches.penalty_cycles": 491042.3333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.110892,
+      "execMs": 6.408063,
+      "per_req": {
+       "instructions": 16138574.866666667,
+       "cycles": 18347822.833333332,
+       "icache_data.stalls": 603044.3666666667,
+       "icache_tag.stalls": 495239.93333333335,
+       "L1-icache-load-misses": 63920.0,
+       "iTLB-load-misses": 1942.8
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "2c3cd4a7a7a4",
+     "basic": {
+      "planMs": 0.11192150000000001,
+      "execMs": 7.3890895,
+      "per_req": {
+       "instructions": 16315536.2,
+       "cycles": 18359647.366666667,
+       "cache-misses": 120060.6,
+       "branch-misses": 227999.1,
+       "mem_load_retired.l3_miss": 1977.8333333333333,
+       "baclears.any": 43461.73333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.1134795,
+      "execMs": 7.3530655,
+      "per_req": {
+       "instructions": 16261549.0,
+       "cycles": 18807999.833333332,
+       "idq.dsb_uops": 18560809.166666668,
+       "idq.mite_uops": 2232858.9,
+       "frontend_retired.any_dsb_miss": 292396.7,
+       "dsb2mite_switches.penalty_cycles": 578130.1666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.090345,
+      "execMs": 7.4462735,
+      "per_req": {
+       "instructions": 16305434.766666668,
+       "cycles": 17459915.0,
+       "icache_data.stalls": 394658.9,
+       "icache_tag.stalls": 331776.86666666664,
+       "L1-icache-load-misses": 63807.666666666664,
+       "iTLB-load-misses": 1844.4666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "a06b94e14b63",
+     "basic": {
+      "planMs": 0.118852,
+      "execMs": 6.73511,
+      "per_req": {
+       "instructions": 16192165.933333334,
+       "cycles": 18413628.4,
+       "cache-misses": 146939.5,
+       "branch-misses": 228414.73333333334,
+       "mem_load_retired.l3_miss": 2431.1666666666665,
+       "baclears.any": 29611.566666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.11965400000000001,
+      "execMs": 7.3884865,
+      "per_req": {
+       "instructions": 16311213.4,
+       "cycles": 18620767.9,
+       "idq.dsb_uops": 19272679.366666667,
+       "idq.mite_uops": 2089180.6333333333,
+       "frontend_retired.any_dsb_miss": 269222.43333333335,
+       "dsb2mite_switches.penalty_cycles": 505142.0
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.11912600000000001,
+      "execMs": 7.389097,
+      "per_req": {
+       "instructions": 16279603.133333333,
+       "cycles": 18627734.766666666,
+       "icache_data.stalls": 712293.3,
+       "icache_tag.stalls": 559823.8,
+       "L1-icache-load-misses": 64029.46666666667,
+       "iTLB-load-misses": 1932.8666666666666
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "edbb7424c4ef",
+     "basic": {
+      "planMs": 0.0873245,
+      "execMs": 6.433425,
+      "per_req": {
+       "instructions": 16152148.9,
+       "cycles": 17303295.5,
+       "cache-misses": 56961.8,
+       "branch-misses": 229341.56666666668,
+       "mem_load_retired.l3_miss": 1124.8666666666666,
+       "baclears.any": 36567.76666666667
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0879865,
+      "execMs": 7.341479,
+      "per_req": {
+       "instructions": 16276936.366666667,
+       "cycles": 17430441.6,
+       "idq.dsb_uops": 18888534.066666666,
+       "idq.mite_uops": 2055650.1666666667,
+       "frontend_retired.any_dsb_miss": 267727.1666666667,
+       "dsb2mite_switches.penalty_cycles": 503409.76666666666
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08820800000000001,
+      "execMs": 7.3238455,
+      "per_req": {
+       "instructions": 16213566.866666667,
+       "cycles": 17612688.5,
+       "icache_data.stalls": 411650.8,
+       "icache_tag.stalls": 345230.0,
+       "L1-icache-load-misses": 64107.166666666664,
+       "iTLB-load-misses": 1946.6333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "0e7c836cc6a4",
+     "basic": {
+      "planMs": 0.085979,
+      "execMs": 7.4076985,
+      "per_req": {
+       "instructions": 16333274.833333334,
+       "cycles": 17512786.0,
+       "cache-misses": 65882.2,
+       "branch-misses": 229165.66666666666,
+       "mem_load_retired.l3_miss": 1170.2333333333333,
+       "baclears.any": 48502.933333333334
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08440349999999999,
+      "execMs": 6.441847,
+      "per_req": {
+       "instructions": 16234513.033333333,
+       "cycles": 17384075.3,
+       "idq.dsb_uops": 18633490.2,
+       "idq.mite_uops": 2221374.5,
+       "frontend_retired.any_dsb_miss": 294996.5,
+       "dsb2mite_switches.penalty_cycles": 574934.2333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.084656,
+      "execMs": 7.333817,
+      "per_req": {
+       "instructions": 16147254.9,
+       "cycles": 17299481.1,
+       "icache_data.stalls": 367043.0333333333,
+       "icache_tag.stalls": 309397.23333333334,
+       "L1-icache-load-misses": 61493.13333333333,
+       "iTLB-load-misses": 1794.6333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "13cf1a68ad60",
+     "basic": {
+      "planMs": 0.08629700000000001,
+      "execMs": 6.438829,
+      "per_req": {
+       "instructions": 16240568.666666666,
+       "cycles": 17245710.033333335,
+       "cache-misses": 57921.2,
+       "branch-misses": 230149.66666666666,
+       "mem_load_retired.l3_miss": 1055.3,
+       "baclears.any": 23540.766666666666
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08673449999999999,
+      "execMs": 7.229169499999999,
+      "per_req": {
+       "instructions": 16207069.3,
+       "cycles": 17240331.166666668,
+       "idq.dsb_uops": 19261227.766666666,
+       "idq.mite_uops": 1918385.3,
+       "frontend_retired.any_dsb_miss": 252899.13333333333,
+       "dsb2mite_switches.penalty_cycles": 461685.5
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0849795,
+      "execMs": 7.3157265,
+      "per_req": {
+       "instructions": 16226758.066666666,
+       "cycles": 17259713.766666666,
+       "icache_data.stalls": 374884.63333333336,
+       "icache_tag.stalls": 312693.76666666666,
+       "L1-icache-load-misses": 63866.0,
+       "iTLB-load-misses": 1897.1333333333334
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "bef795c33986",
+     "basic": {
+      "planMs": 0.086116,
+      "execMs": 7.4229675,
+      "per_req": {
+       "instructions": 16207306.6,
+       "cycles": 17251642.933333334,
+       "cache-misses": 53929.13333333333,
+       "branch-misses": 230377.2,
+       "mem_load_retired.l3_miss": 1041.2,
+       "baclears.any": 27885.2
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.08607000000000001,
+      "execMs": 7.4154634999999995,
+      "per_req": {
+       "instructions": 16271927.433333334,
+       "cycles": 17298465.966666665,
+       "idq.dsb_uops": 19943056.166666668,
+       "idq.mite_uops": 1707373.3,
+       "frontend_retired.any_dsb_miss": 222774.0,
+       "dsb2mite_switches.penalty_cycles": 375984.4
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08660999999999999,
+      "execMs": 7.259352,
+      "per_req": {
+       "instructions": 16275903.666666666,
+       "cycles": 17281945.366666667,
+       "icache_data.stalls": 375484.0,
+       "icache_tag.stalls": 330213.73333333334,
+       "L1-icache-load-misses": 64373.13333333333,
+       "iTLB-load-misses": 1947.7333333333333
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "86d4dbe366f0",
+     "basic": {
+      "planMs": 0.08632399999999998,
+      "execMs": 7.4116785,
+      "per_req": {
+       "instructions": 16280919.166666666,
+       "cycles": 17292189.833333332,
+       "cache-misses": 59587.0,
+       "branch-misses": 229649.86666666667,
+       "mem_load_retired.l3_miss": 1196.4666666666667,
+       "baclears.any": 28255.9
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.0879655,
+      "execMs": 7.426859,
+      "per_req": {
+       "instructions": 16250226.433333334,
+       "cycles": 17407569.366666667,
+       "idq.dsb_uops": 18757056.0,
+       "idq.mite_uops": 2095605.5333333334,
+       "frontend_retired.any_dsb_miss": 273798.6666666667,
+       "dsb2mite_switches.penalty_cycles": 518548.63333333336
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.08669550000000001,
+      "execMs": 6.437903,
+      "per_req": {
+       "instructions": 16184032.166666666,
+       "cycles": 17358191.166666668,
+       "icache_data.stalls": 381964.56666666665,
+       "icache_tag.stalls": 330491.3,
+       "L1-icache-load-misses": 64627.1,
+       "iTLB-load-misses": 1881.2666666666667
+      },
+      "pct_min": 100.0
+     }
+    },
+    {
+     "plan": "6a7d1ec8d7a9",
+     "basic": {
+      "planMs": 0.08642849999999999,
+      "execMs": 7.440846,
+      "per_req": {
+       "instructions": 16284761.533333333,
+       "cycles": 17433622.2,
+       "cache-misses": 57516.066666666666,
+       "branch-misses": 229679.66666666666,
+       "mem_load_retired.l3_miss": 1137.0,
+       "baclears.any": 38712.13333333333
+      },
+      "pct_min": 100.0
+     },
+     "front": {
+      "planMs": 0.087342,
+      "execMs": 6.834218,
+      "per_req": {
+       "instructions": 16280144.133333333,
+       "cycles": 17419222.166666668,
+       "idq.dsb_uops": 18534400.366666667,
+       "idq.mite_uops": 2166789.0,
+       "frontend_retired.any_dsb_miss": 280504.73333333334,
+       "dsb2mite_switches.penalty_cycles": 537706.6333333333
+      },
+      "pct_min": 100.0
+     },
+     "icache": {
+      "planMs": 0.0890475,
+      "execMs": 8.1560475,
+      "per_req": {
+       "instructions": 16371262.333333334,
+       "cycles": 17564806.0,
+       "icache_data.stalls": 403484.1666666667,
+       "icache_tag.stalls": 344311.0333333333,
+       "L1-icache-load-misses": 66076.8,
+       "iTLB-load-misses": 1991.5333333333333
+      },
+      "pct_min": 100.0
+     }
+    }
+   ]
+  }
+ },
+ "plans": {
+  "f-regex-iri-join": {
+   "base": {
+    "189a4018bbf0": "Project est=17 cost=192352 ?p ?a\n  IndexJoin est=17 cost=192352 on ?p | PSO ?p <http://xmlns.com/foaf/0.1/age> ?a | REGEX(STR(?p), \"person/1[0-9]{3}$\") [709 keys, 1 seeks, 1 blocks, 709 rows read]\n    Filter est=1077 cost=140046 REGEX(STR(?p), \"person/1[0-9]{3}$\") [selectivity 0.0154 of 130 sampled rows] [runs of ?p: 70023 values tested on vocabulary keys, 709 passed]\n      IndexScan est=70023 cost=70023 PSO ?p <http://example.org/worksFor> ?o"
+   },
+   "main": {
+    "189a4018bbf0": "Project est=17 cost=192352 ?p ?a\n  IndexJoin est=17 cost=192352 on ?p | PSO ?p <http://xmlns.com/foaf/0.1/age> ?a | REGEX(STR(?p), \"person/1[0-9]{3}$\") [709 keys, 1 seeks, 1 blocks, 709 rows read]\n    Filter est=1077 cost=140046 REGEX(STR(?p), \"person/1[0-9]{3}$\") [selectivity 0.0154 of 130 sampled rows] [runs of ?p: 70023 values tested on vocabulary keys, 709 passed]\n      IndexScan est=70023 cost=70023 PSO ?p <http://example.org/worksFor> ?o"
+   },
+   "tip": {
+    "189a4018bbf0": "Project est=17 cost=192352 ?p ?a\n  IndexJoin est=17 cost=192352 on ?p | PSO ?p <http://xmlns.com/foaf/0.1/age> ?a | REGEX(STR(?p), \"person/1[0-9]{3}$\") [709 keys, 1 seeks, 1 blocks, 709 rows read]\n    Filter est=1077 cost=140046 REGEX(STR(?p), \"person/1[0-9]{3}$\") [selectivity 0.0154 of 130 sampled rows] [runs of ?p: 70023 values tested on vocabulary keys, 709 passed]\n      IndexScan est=70023 cost=70023 PSO ?p <http://example.org/worksFor> ?o"
+   }
+  },
+  "f-expr-range-join": {
+   "base": {
+    "caecaaba77b4": "Project est=5039 cost=434609 ?p ?a ?n\n  MergeJoin est=5039 cost=434609 on ?p\n    Sort est=5039 cost=220532 \n      Filter est=5039 cost=200000 (ABS((?a - \"49\"^^<http://www.w3.org/2001/XMLSchema#integer>)) < \"2\"^^<http://www.w3.org/2001/XMLSchema#integer>) [selectivity 0.0504 of 258 sampled rows] [runs of ?a: 63 values tested, 3 passed]\n        IndexScan est=100000 cost=100000 POS ?p <http://xmlns.com/foaf/0.1/age> ?a\n    IndexScan est=102000 cost=102000 PSO ?p <http://xmlns.com/foaf/0.1/name> ?n [decodes SOG]"
+   },
+   "main": {
+    "caecaaba77b4": "Project est=5039 cost=434609 ?p ?a ?n\n  MergeJoin est=5039 cost=434609 on ?p\n    Sort est=5039 cost=220532 \n      Filter est=5039 cost=200000 (ABS((?a - \"49\"^^<http://www.w3.org/2001/XMLSchema#integer>)) < \"2\"^^<http://www.w3.org/2001/XMLSchema#integer>) [selectivity 0.0504 of 258 sampled rows] [runs of ?a: 63 values tested, 3 passed]\n        IndexScan est=100000 cost=100000 POS ?p <http://xmlns.com/foaf/0.1/age> ?a\n    IndexScan est=102000 cost=102000 PSO ?p <http://xmlns.com/foaf/0.1/name> ?n [decodes SOG]"
+   },
+   "tip": {
+    "caecaaba77b4": "Project est=5039 cost=434609 ?p ?a ?n\n  MergeJoin est=5039 cost=434609 on ?p\n    Sort est=5039 cost=220532 \n      Filter est=5039 cost=200000 (ABS((?a - \"49\"^^<http://www.w3.org/2001/XMLSchema#integer>)) < \"2\"^^<http://www.w3.org/2001/XMLSchema#integer>) [selectivity 0.0504 of 258 sampled rows] [runs of ?a: 63 values tested, 3 passed]\n        IndexScan est=100000 cost=100000 POS ?p <http://xmlns.com/foaf/0.1/age> ?a\n    IndexScan est=102000 cost=102000 PSO ?p <http://xmlns.com/foaf/0.1/name> ?n [decodes SOG]"
+   }
+  },
+  "two-hop-count": {
+   "base": {
+    "6c37dff01996": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?480e655d836c26cb4e0cc17847b071a\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "f4078d6413d0": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?23401745aeeeb79368fba57d9dd4b6cd\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "9272883ee0ad": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?3ad078283ae9e32c5e30e0c052c97754\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "c768cd17952b": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?48a9666e3bb1c5d60b5a729114730044\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "a4a679705ac9": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?9e4710d8ea0d40f146bfa496329d02d7\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "8c63b40d0ec4": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?9d05371a64d0f4ac3d1321e07debb77e\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "66e3b3da1abc": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?408afb57cc02e80c181849e92e400b5c\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "c84cd8fadfc6": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?cd8f6bfa1f2a8928dd97939402199fff\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "96652fef4430": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?f80c2e53b6dd2f122d926812452764f0\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "d23b5dee7ed8": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?58d6156b98dd303696d4ce26ba0491a9\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "5b087c37a37c": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?d4a6e5abe28859cff8aa177fcf64135\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "319d86bcb515": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?8e3a8dacc8e4372d10aa10a784e9977f\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]"
+   },
+   "main": {
+    "65080377066d": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?32bbda98ed36dcd2c788f97b8c60b880\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "aca780edd75a": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?48f06d26bce972d21825a2fb3bb07c70\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "3f480db69eae": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?415c472fc5eaef36f81ad1e42df10ac6\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "930066ad8d6a": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?3388b054332ed688755e9d2b0630208e\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "d79866cfbaf1": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?6d07b6df360825a2b3b4fb15bc25385\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "df5d5015a01e": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?1684226d5af9e432a867cf601e340a3b\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "ac6b8c666b16": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?3b74c98f0be19df4fbeac73ab2ac18d7\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "052ee17245b2": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?1fe863cff5b79cfcb209b6790fd82273\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "017ffaec4bdc": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?bc397cf6ad6ecaf33ba2eed4bc889271\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "f944925d965c": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?91937a9ed897769504ec9dce317e746e\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "5989e4c7434c": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?50e2c05bc04830ba58f0c06be878acfa\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "8550c0d7d8e3": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?2dd61fc4b1b94426624622833c4496b1\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]"
+   },
+   "tip": {
+    "ff1587a8f29b": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?102e274d3a8cdb50643a15272318ada9\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "b20402a11146": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?16357768f7c911ce254cc0a6c07c24d7\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "a08d116c0a2f": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?fdef15e50f6734e832a8a04e8bf89ea2\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "95d6fa7cc1d2": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?80e1e662df570d46986b916033d348b9\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "2c3cd4a7a7a4": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?5ceeddd310575c169808f515235436cb\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "a06b94e14b63": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?1b5175c0399836f5a4c76d837d6000f5\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "edbb7424c4ef": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?c7a41772d39ed93076f978d514b3a5f0\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "0e7c836cc6a4": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?ca7ccad834bdc6bf0d3fbba6050aee4\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "13cf1a68ad60": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?a5665ec8f367dae3dfb7ecccaf90870b\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "bef795c33986": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?16abe8ea15abfffcea72c750ff4055b8\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "86d4dbe366f0": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?9588d10391df8db5a32448b3c5d6c21f\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]",
+    "6a7d1ec8d7a9": "Project est=1 cost=499737 ?n\n  Bind est=1 cost=499737 ?n := ?fe8b0df6b5069116040613d01b010229\n    CountJoinFromRuns est=1 cost=499736 on ?b\n      IndexScan est=249868 cost=249868 POS ?a <http://xmlns.com/foaf/0.1/knows> ?b [runs of ?b]\n      IndexScan est=249868 cost=249868 PSO ?b <http://xmlns.com/foaf/0.1/knows> ?c [runs of ?b]"
+   }
+  }
+ }
+}

@@ -107,10 +107,6 @@ fn open_link_vocabulary(
                 "a linked segment disagrees with its physical generation".into(),
             ));
         }
-        crate::store::check_strict_from(
-            &source.value.join("wal.log"),
-            identity.value.wal_strict_from,
-        )?;
         drop(identity.value);
         budget.release(identity.charge);
         let need = prefix.len() + 1;
@@ -221,12 +217,10 @@ impl Generation {
                 wal::WalPoint {
                     seq: segment.base_seq,
                     offset: 0,
-                    folding: false,
                 },
                 wal::WalPoint {
                     seq: segment.end_seq,
                     offset: segment.wal_end,
-                    folding: false,
                 },
                 &limit,
             )?;

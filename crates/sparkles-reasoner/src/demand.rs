@@ -43,7 +43,7 @@
 //! magic predicates of its own, evaluated to its fixpoint first. A program whose stages
 //! do not end is not stratified and is refused.
 
-use crate::budget::{Budget, Held, MemoryExceeded};
+use crate::budget::{Budget, BudgetFailure, Held};
 use crate::builtins::{BuiltinKind, HeadAction};
 use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step};
 use crate::graph::Triple;
@@ -321,7 +321,7 @@ pub(crate) struct Program {
 
 /// Root labels for a compact evaluation of the original positive rules. The
 /// labels remain hidden, but no adorned rule copies need to consume them.
-pub(crate) fn compact_roots(terms: &Terms, roots: &[Key]) -> Result<Program, MemoryExceeded> {
+pub(crate) fn compact_roots(terms: &Terms, roots: &[Key]) -> Result<Program, BudgetFailure> {
     let bytes = roots
         .len()
         .saturating_mul(4 * (std::mem::size_of::<Key>() + std::mem::size_of::<u64>() + 16))
@@ -1274,7 +1274,7 @@ pub(crate) fn complete_schema(
     same_as: u64,
     budget: &Arc<Budget>,
     cancel: &AtomicBool,
-) -> Result<Option<CompleteSchema>, MemoryExceeded> {
+) -> Result<Option<CompleteSchema>, BudgetFailure> {
     if cancel.load(Ordering::Relaxed) {
         return Ok(None);
     }
@@ -2105,8 +2105,8 @@ pub(crate) enum TransformError {
     NotStratified,
     #[error("the demand program has {0} rules, more than the {MAX_RULES} allowed")]
     TooLarge(usize),
-    #[error(transparent)]
-    Memory(MemoryExceeded),
+    #[error("{0}")]
+    Memory(BudgetFailure),
 }
 
 #[cfg(test)]
@@ -2281,14 +2281,18 @@ mod schema_completeness_tests {
     #[test]
     fn schema_completeness_abstract_equal_uses_literal_values() {
         let (terms, graph, mut closed) = abstract_fixture();
-        let integer = terms.id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
-            "1",
-            oxrdf::vocab::xsd::INTEGER,
-        )));
-        let decimal = terms.id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
-            "1.0",
-            oxrdf::vocab::xsd::DECIMAL,
-        )));
+        let integer = terms
+            .id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+                "1",
+                oxrdf::vocab::xsd::INTEGER,
+            )))
+            .unwrap();
+        let decimal = terms
+            .id_for(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+                "1.0",
+                oxrdf::vocab::xsd::DECIMAL,
+            )))
+            .unwrap();
         assert_ne!(integer, decimal);
         assert!(crate::builtins::same_value(&terms, integer, decimal));
         let mut producer = rule(Slot::Const(50), Slot::Const(21), vec![]);

@@ -1,0 +1,67 @@
+"""Report of perfstat.py output: perfratio703.py PS.json [NUM DEN ...]
+
+Per query and arm, the median over server processes of execMs, instructions and cycles per
+request, IPC, and the frontend and cache counts, then the per-process execMs and instruction
+medians in process order (odd rounds run the arms forward, even rounds in reverse), so that
+modes across processes show. With NUM DEN pairs it prints the ratio of the medians for
+execMs, instructions, cycles, DSB misses and L3 misses."""
+import json
+import math
+import statistics
+import sys
+
+d = json.load(open(sys.argv[1]))
+pairs = list(zip(sys.argv[2::2], sys.argv[3::2]))
+res, plans, st = d["results"], d["plans"], d["settings"]
+print(f"store={st['store']} threads={st['threads']} server_cpu={st['server_cpu']} rounds={st['rounds']} reps={st['reps']}")
+
+
+def vals(recs, phase, key):
+    return [r[phase]["per_req"].get(key, 0.0) for r in recs]
+
+
+def med(recs, phase, key):
+    return statistics.median(vals(recs, phase, key))
+
+
+def execs(recs, phase="basic"):
+    return [r[phase]["execMs"] for r in recs]
+
+
+for qn, byarm in res.items():
+    print(f"\n== {qn}")
+    print(f"{'arm':6} {'exec ms':>8} {'min':>8} {'max':>8} {'instr/req':>11} {'spread':>6} {'cycles/req':>11} "
+          f"{'IPC':>5} {'L3miss':>7} {'cachemiss':>9} {'brmiss':>7} {'dsb%':>6} {'dsbmiss':>8} {'mite2dsb':>8} "
+          f"{'icd.stall':>9} {'ict.stall':>9} {'L1i.miss':>8} {'iTLB':>6} {'pct':>4} plans")
+    for arm in byarm:
+        recs = byarm[arm]
+        es = execs(recs)
+        ins = vals(recs, "basic", "instructions")
+        cyc = med(recs, "basic", "cycles")
+        dsb, mite = med(recs, "front", "idq.dsb_uops"), med(recs, "front", "idq.mite_uops")
+        pct = min(min(r[p]["pct_min"] for p in ("basic", "front", "icache")) for r in recs)
+        print(f"{arm:6} {statistics.median(es):8.4f} {min(es):8.4f} {max(es):8.4f} {statistics.median(ins):11.0f} "
+              f"{(max(ins) - min(ins)) / statistics.median(ins) * 100:5.1f}% {cyc:11.0f} "
+              f"{statistics.median(ins) / cyc if cyc else 0:5.2f} {med(recs, 'basic', 'mem_load_retired.l3_miss'):7.0f} "
+              f"{med(recs, 'basic', 'cache-misses'):9.0f} {med(recs, 'basic', 'branch-misses'):7.0f} "
+              f"{dsb / (dsb + mite) * 100 if dsb + mite else 0:5.1f}% "
+              f"{med(recs, 'front', 'frontend_retired.any_dsb_miss'):8.0f} "
+              f"{med(recs, 'front', 'dsb2mite_switches.penalty_cycles'):8.0f} "
+              f"{med(recs, 'icache', 'icache_data.stalls'):9.0f} {med(recs, 'icache', 'icache_tag.stalls'):9.0f} "
+              f"{med(recs, 'icache', 'L1-icache-load-misses'):8.0f} {med(recs, 'icache', 'iTLB-load-misses'):6.0f} "
+              f"{pct:4.0f} {','.join(sorted({r['plan'] for r in recs}))}")
+    for arm in byarm:
+        recs = byarm[arm]
+        print(f"  {arm:6} exec by process: " + " ".join(f"{e:.3f}" for e in execs(recs)))
+        print(f"  {arm:6} Minstr by process: " + " ".join(f"{i / 1e6:.3f}" for i in vals(recs, 'basic', 'instructions')))
+        print(f"  {arm:6} Mcycles by process: " + " ".join(f"{i / 1e6:.3f}" for i in vals(recs, 'basic', 'cycles')))
+    for n, dn in pairs:
+        a, b = byarm[n], byarm[dn]
+        r = lambda f: f(a) / f(b) if f(b) else float("nan")
+        print(f"  {n}/{dn}: exec {r(lambda x: statistics.median(execs(x))):.3f}  instr {r(lambda x: med(x, 'basic', 'instructions')):.4f}  "
+              f"cycles {r(lambda x: med(x, 'basic', 'cycles')):.3f}  dsbmiss {r(lambda x: med(x, 'front', 'frontend_retired.any_dsb_miss')):.3f}  "
+              f"L3miss {r(lambda x: med(x, 'basic', 'mem_load_retired.l3_miss')):.3f}  "
+              f"icd.stall {r(lambda x: med(x, 'icache', 'icache_data.stalls')):.3f}")
+    shapes = {arm: set(plans[qn][arm]) for arm in byarm}
+    allfp = set().union(*shapes.values())
+    print(f"  plan shapes: {len(allfp)} distinct over arms " + ("(identical)" if len(allfp) == 1 else str({a: sorted(s) for a, s in shapes.items()})))

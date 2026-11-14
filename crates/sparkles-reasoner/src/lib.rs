@@ -29,6 +29,8 @@ pub mod extras;
 mod facts;
 pub mod fixpoint;
 mod graph;
+#[cfg(test)]
+mod hierarchy_tests;
 mod incremental;
 pub mod inputs;
 mod lookups;
@@ -55,7 +57,7 @@ pub use parser::{
 };
 
 use anyhow::Context as _;
-use budget::{Budget, Held};
+use budget::{Budget, Held, WorkingWarnings};
 use incremental::Fallback;
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -346,7 +348,7 @@ struct Derivation {
     terms: Terms,
     rules: usize,
     iterations: usize,
-    warnings: Vec<String>,
+    warnings: WorkingWarnings,
     /// the run's memory: the graph and the local terms stay charged to it
     budget: Arc<Budget>,
     /// the GeoSPARQL default geometries the run added as facts, sorted, and their charge
@@ -417,8 +419,8 @@ fn derive_here(
         g.try_add_batch(d.0.iter().copied())?;
         defaults = Some(d);
     }
-    let mut warnings = Vec::new();
-    let compiled = engine::compile(&rules, &terms, &mut warnings);
+    let mut warnings = WorkingWarnings::new(&budget);
+    let compiled = engine::compile(&rules, &terms, &mut warnings)?;
     if let Some(context) = &opts.analysis {
         context.check()?;
     }
@@ -466,13 +468,13 @@ fn derive_here(
 const GEO: &str = "http://www.opengis.net/ont/geosparql#";
 
 /// The ids of `geo:hasGeometry` and `geo:hasDefaultGeometry`.
-fn geo_ids(terms: &Terms) -> (u64, u64) {
+fn geo_ids(terms: &Terms) -> Result<(u64, u64), budget::BudgetFailure> {
     let iri = |l: &str| {
         terms.id_for(&Term::NamedNode(NamedNode::new_unchecked(format!(
             "{GEO}{l}"
         ))))
     };
-    (iri("hasGeometry"), iri("hasDefaultGeometry"))
+    Ok((iri("hasGeometry")?, iri("hasDefaultGeometry")?))
 }
 
 /// Room in `held` for one more key of a table of capacity `cap` with `len` keys of
@@ -483,7 +485,7 @@ fn room_for_key(
     cap: usize,
     len: usize,
     elem: usize,
-) -> Result<(), budget::MemoryExceeded> {
+) -> Result<(), budget::BudgetFailure> {
     let to = budget::table_grown(cap, len, 1);
     if to != cap {
         held.try_grow(budget::table_bytes(to, elem))?;
@@ -540,7 +542,7 @@ fn default_geometries_controlled(
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
     check()?;
-    let (has, default) = geo_ids(terms);
+    let (has, default) = geo_ids(terms)?;
     let mut held = Held::new(budget);
     let mut refused = None;
     let mut stopped = None;
@@ -648,7 +650,7 @@ fn default_geometry_changes(
     ch: &mut maintain::Changes,
     budget: &Arc<Budget>,
 ) -> anyhow::Result<Vec<[u64; 3]>> {
-    let (has, default) = geo_ids(&closure.terms);
+    let (has, default) = geo_ids(&closure.terms)?;
     let geo = |t: &&[u64; 3]| t[1] == has || t[1] == default;
     let mut changed: Vec<u64> = ch
         .base_added
@@ -727,7 +729,7 @@ fn default_geometry_changes(
         defaults.of.insert(d[0], d[2]);
     }
     closure.defaults = Some(defaults);
-    closure.settle();
+    closure.settle()?;
     budget.check()?;
     let touched: Vec<[u64; 3]> = gone.iter().chain(&new).copied().collect();
     // a default geometry that is also stated, or no longer stated, does not change. It
@@ -739,7 +741,7 @@ fn default_geometry_changes(
                 ch.base_added.swap_remove(i);
                 if let Some(r) = closure.graph.position(&d) {
                     closure.set_flag(r, false);
-                    closure.graph.kill(&d);
+                    closure.graph.kill(&d)?;
                 }
             }
             None => ch.base_removed.push(d),
@@ -759,7 +761,7 @@ fn default_geometry_changes(
             None => ch.base_added.push(d),
         }
     }
-    closure.settle();
+    closure.settle()?;
     Ok(touched)
 }
 
@@ -794,7 +796,7 @@ impl Derivation {
         }
         let mut c = incremental::Closure::new(graph, terms)?;
         if let Some((d, _held)) = defaults {
-            let (_, pred) = geo_ids(&c.terms);
+            let (_, pred) = geo_ids(&c.terms)?;
             let d = incremental::Defaults {
                 pred,
                 of: d.iter().map(|t| (t[0], t[2])).collect(),
@@ -948,7 +950,7 @@ fn materialize_admitted(
             exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw, opts,
         ) {
             Ok(mut done) => {
-                done.warnings.extend(inspected);
+                done.warnings.extend_borrowed(&inspected)?;
                 return finish(
                     store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
                 );
@@ -969,14 +971,14 @@ fn materialize_admitted(
         opts,
     )?;
     progress(opts, 0.8, "writing inferred graph");
-    let mut warnings = d.warnings.clone();
-    warnings.extend(inspected);
+    let mut warnings = WorkingWarnings::try_clone_from(d.warnings.as_slice(), &d.budget)?;
+    warnings.extend_borrowed(&inspected)?;
     let w = write_full(&mut txn, &snap, &d, opts)?;
     if w.generalized > 0 {
-        warnings.push(format!(
+        warnings.push_fmt(format_args!(
             "{} derived generalized triples (literal subjects or non-IRI predicates) were not written",
             w.generalized
-        ));
+        ))?;
     }
     let generalized: FxHashSet<[u64; 3]> = d
         .derived()
@@ -1137,7 +1139,8 @@ fn build_witnesses(
     opts: &ReasonOptions,
 ) -> anyhow::Result<witness::Witnesses> {
     let rules = profile_rules(profile, extras)?;
-    let compiled = engine::compile(&rules, &c.terms, &mut Vec::new());
+    let mut warnings = WorkingWarnings::new(budget);
+    let compiled = engine::compile(&rules, &c.terms, &mut warnings)?;
     witness::Witnesses::build(c, &compiled, max, &witness_limits(budget, opts))
 }
 
@@ -1157,7 +1160,7 @@ struct Done {
     written: Written,
     rules: usize,
     iterations: usize,
-    warnings: Vec<String>,
+    warnings: WorkingWarnings,
     method: Method,
     fallback: Option<String>,
     changes: Option<Changes>,
@@ -1209,10 +1212,13 @@ fn finish(
             anyhow::bail!("analysis closure was unavailable before diagnostics capture");
         }
     }
+    // Required report storage must be admitted while the transaction can still
+    // roll back. Keep the complete warning owner alive through commit/transfer.
+    let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
+    warnings.extend_borrowed(done.warnings.as_slice())?;
+    done.budget.check_peak()?;
     let receipt = txn.commit()?;
     progress(opts, 1.0, "done");
-    let mut warnings = resolved.warnings.clone();
-    warnings.extend(done.warnings);
     let graphs = resolved.graph_set();
     let mut kept = false;
     let witness_report = done.witnesses.as_ref().map(|w| w.report.clone());
@@ -1262,7 +1268,7 @@ fn finish(
         iterations: done.iterations,
         inferred: done.written.inferred,
         millis: t0.elapsed().as_millis() as u64,
-        warnings,
+        warnings: warnings.into_legacy_report(),
         receipt: Some(receipt),
         method: done.method,
         fallback: done.fallback,
@@ -1428,9 +1434,10 @@ fn update_closure(
     let rules = profile_rules(profile, extras)?;
     {
         let terms = Terms::new(snap.clone());
-        let mut w = Vec::new();
-        for r in engine::compile(&rules, &terms, &mut w) {
-            if let Some(why) = engine::incremental_blocker(&r, &terms) {
+        let mut w = WorkingWarnings::new(&terms.budget());
+        let compiled = engine::compile(&rules, &terms, &mut w)?;
+        for r in compiled.iter() {
+            if let Some(why) = engine::incremental_blocker(r, &terms) {
                 return Err(Fallback(why).into());
             }
         }
@@ -1474,8 +1481,8 @@ fn update_closure(
     } else {
         Vec::new()
     };
-    let mut warnings = Vec::new();
-    let compiled = engine::compile(&rules, &closure.terms, &mut warnings);
+    let mut warnings = WorkingWarnings::new(&budget);
+    let compiled = engine::compile(&rules, &closure.terms, &mut warnings)?;
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
@@ -1598,10 +1605,10 @@ fn update_closure(
         "incremental update"
     );
     if !generalized.is_empty() {
-        warnings.push(format!(
+        warnings.push_fmt(format_args!(
             "{} derived generalized triples (literal subjects or non-IRI predicates) were not written",
             generalized.len()
-        ));
+        ))?;
     }
     Ok(Done {
         budget,
@@ -1808,22 +1815,22 @@ pub fn dred_overdeletion(
             &opts,
         )
     })?;
-    let mut warnings = Vec::new();
+    let mut warnings = WorkingWarnings::new(&d.budget);
     let rules = engine::compile(
         &profile_rules(profile, &Extras::default())?,
         &d.terms,
         &mut warnings,
-    );
+    )?;
     let removed: Vec<[u64; 3]> = removed
         .iter()
         .map(|t| {
-            [
-                d.terms.id_for(&t.subject.clone().into()),
-                d.terms.id_for(&t.predicate.clone().into()),
-                d.terms.id_for(&t.object),
-            ]
+            Ok([
+                d.terms.id_for(&t.subject.clone().into())?,
+                d.terms.id_for(&t.predicate.clone().into())?,
+                d.terms.id_for(&t.object)?,
+            ])
         })
-        .collect();
+        .collect::<Result<Vec<_>, budget::BudgetFailure>>()?;
     let limits = engine::Limits {
         max_iterations: usize::MAX,
         max_inferred: usize::MAX,
@@ -1833,9 +1840,7 @@ pub fn dred_overdeletion(
         closures: false,
     };
     let mut c = d.into_closure()?;
-    Ok(incremental::dred_overdeletion(
-        &mut c, &rules, &limits, &removed,
-    ))
+    incremental::dred_overdeletion(&mut c, &rules, &limits, &removed)
 }
 
 /// Run the rules over a snapshot's input graphs ([`ReasonOptions::inputs`]) and return
@@ -1876,7 +1881,7 @@ pub fn infer(
         iterations: d.iterations,
         inferred: out.len() as u64,
         millis: t0.elapsed().as_millis() as u64,
-        warnings: d.warnings,
+        warnings: d.warnings.into_legacy_report(),
         receipt: None,
         inputs: Some(resolved),
         peak_bytes: d.budget.peak() as u64,
@@ -1964,3 +1969,6 @@ mod geometry_analysis_control_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod finish_warning_tests;

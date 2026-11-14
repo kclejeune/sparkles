@@ -149,6 +149,8 @@ impl Tools<'_> {
             headers: self.call.headers.clone(),
             held: self.call.held.clone(),
             grant: self.call.grant.clone(),
+
+            preparation: self.call.preparation.clone(),
         })
     }
 

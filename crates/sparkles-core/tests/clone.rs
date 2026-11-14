@@ -29,8 +29,15 @@ fn dump(s: &Store) -> Vec<String> {
 fn select(s: &Store, q: &str) -> Vec<String> {
     let r = query(s.snapshot(), q, &QueryOptions::default()).unwrap();
     r.rows()
+        .unwrap()
         .into_iter()
-        .map(|row| row.into_iter().flatten().map(|t| t.to_string()).collect())
+        .map(|row| {
+            row.values()
+                .iter()
+                .flatten()
+                .map(|t| t.to_string())
+                .collect()
+        })
         .collect()
 }
 
@@ -343,7 +350,7 @@ fn a_shared_generation_with_a_newer_meta_is_unsupported() {
         .join(current.trim())
         .join("meta.json");
     let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
-    v["format_version"] = 5.into();
+    v["format_version"] = (sparkles_core::builder::FORMAT_VERSION + 1).into();
     v.as_object_mut().unwrap().remove("created");
     std::fs::write(&meta, serde_json::to_vec(&v).unwrap()).unwrap();
     match s.clone_to(&dir.path().join("dst"), &CloneOptions::default()) {

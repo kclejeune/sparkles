@@ -41,6 +41,10 @@ fn rows(s: &Store, q: &str) -> Vec<String> {
     let r = query(s.snapshot(), &format!("{P}{q}"), &QueryOptions::default())
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -423,7 +427,8 @@ fn queries_bound_by_the_group() {
         &QueryOptions::default(),
     )
     .unwrap()
-    .plan;
+    .plan()
+    .clone();
     fn has(p: &sparkles_core::sparql::PlanInfo, needle: &str) -> bool {
         p.description.contains(needle) || p.children.iter().any(|c| has(c, needle))
     }

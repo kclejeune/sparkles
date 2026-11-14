@@ -119,6 +119,33 @@ impl Compiled {
         ))
     }
 
+    /// Compile with a query-backed capability check. A refusal is preserved as an
+    /// engine error and no provisional mapping or warning result can escape.
+    pub fn new_checked(
+        config: Config,
+        version: u64,
+        backing: &dyn Fn(&str, &str, bool) -> sparkles_core::Result<bool>,
+    ) -> Result<(Compiled, Vec<String>), PutError> {
+        let first = std::cell::RefCell::new(None);
+        let callback = |class: &str, path: &str, inverse: bool| {
+            if first.borrow().is_some() {
+                return false;
+            }
+            match backing(class, path, inverse) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    *first.borrow_mut() = Some(error);
+                    false
+                }
+            }
+        };
+        let result = Self::new(config, version, &callback);
+        match first.into_inner() {
+            Some(error) => Err(PutError::Engine(error)),
+            None => result,
+        }
+    }
+
     /// Plan a document without running it: the groups' paths and kinds (tests, tools).
     pub fn parse_document(
         &self,
@@ -491,3 +518,57 @@ fn run(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod checked_backing_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn config() -> Config {
+        Config::new(
+            "extend schema @rdf(vocab: \"urn:test:\")\ntype T { name: String! age: Int! }\n",
+        )
+    }
+    #[test]
+    fn first_backing_refusal_is_typed_and_no_configuration_is_published() {
+        let catalog = Catalog::open(None).unwrap();
+        let calls = Cell::new(0usize);
+        let error = catalog.put_checked(config(), Change::default(), &|_, _, _| {
+            calls.set(calls.get() + 1);
+            Err(sparkles_core::Error::BudgetExceeded(
+                sparkles_core::Budget {
+                    kind: sparkles_core::BudgetKind::Memory,
+                    limit: 8192,
+                    requested: 16384,
+                },
+            ))
+        });
+        assert!(
+            matches!(error,Err(PutError::Engine(sparkles_core::Error::BudgetExceeded(b))) if b.kind==sparkles_core::BudgetKind::Memory && b.limit==8192 && b.requested==16384)
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(catalog.get(None).is_none());
+        assert!(catalog.versions().is_empty());
+        assert!(catalog.compiled().unwrap().is_none());
+    }
+    #[test]
+    fn legitimate_false_remains_a_warning_and_success_can_publish() {
+        let catalog = Catalog::open(None).unwrap();
+        let (saved, warnings) = catalog
+            .put_checked(config(), Change::default(), &|_, _, _| Ok(false))
+            .unwrap();
+        assert!(saved.changed);
+        assert_eq!(catalog.versions().len(), 1);
+        assert!(!warnings.is_empty());
+        let before = catalog.get(None).unwrap().version.digest;
+        let refused = catalog.put_checked(config(), Change::default(), &|_, _, _| {
+            Err(sparkles_core::Error::Cancelled)
+        });
+        assert!(matches!(
+            refused,
+            Err(PutError::Engine(sparkles_core::Error::Cancelled))
+        ));
+        assert_eq!(catalog.get(None).unwrap().version.digest, before);
+        assert_eq!(catalog.versions().len(), 1);
+    }
+}

@@ -167,16 +167,18 @@ fn answer(s: &Store, q: &str, opts: &QueryOptions) -> Vec<String> {
     let mut out: Vec<String> = match r.kind {
         QueryKind::Select => r
             .rows()
+            .unwrap()
             .into_iter()
             .map(|row| {
-                row.iter()
+                row.values()
+                    .iter()
                     .map(|t| t.as_ref().map_or("-".to_string(), |t| t.to_string()))
                     .collect::<Vec<_>>()
                     .join(" ")
             })
             .collect(),
         QueryKind::Ask => vec![r.boolean.to_string()],
-        _ => r.triples.iter().map(|t| t.to_string()).collect(),
+        _ => r.triples().iter().map(|t| t.to_string()).collect(),
     };
     out.sort();
     out
@@ -476,9 +478,9 @@ fn plans_of_a_view_carry_no_statistics_of_hidden_graphs() {
         assert!(!text.contains("graphs not read"), "{text}");
         assert_eq!(plan.estimated_rows, -1.0);
         let r = query(full.snapshot(), &q, &opts).unwrap();
-        let text = serde_json::to_string(&r.plan).unwrap();
+        let text = serde_json::to_string(r.plan()).unwrap();
         assert!(!text.contains("graphs not read"), "{text}");
-        assert_eq!(r.plan.estimated_rows, -1.0);
+        assert_eq!(r.plan().estimated_rows, -1.0);
     }
 }
 

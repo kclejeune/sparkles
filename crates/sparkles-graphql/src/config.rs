@@ -314,6 +314,33 @@ impl Catalog {
         change: Change,
         backing: crate::mapping::Backing,
     ) -> std::result::Result<(Saved, Vec<String>), crate::PutError> {
+        self.put_with(config, change, |config, version| {
+            Compiled::new(config, version, backing)
+        })
+    }
+
+    /// Install using a fallible capability check. Its first engine refusal wins
+    /// before any configuration or compiled cache entry is published.
+    pub fn put_checked(
+        &self,
+        config: Config,
+        change: Change,
+        backing: &dyn Fn(&str, &str, bool) -> sparkles_core::Result<bool>,
+    ) -> std::result::Result<(Saved, Vec<String>), crate::PutError> {
+        self.put_with(config, change, |config, version| {
+            Compiled::new_checked(config, version, backing)
+        })
+    }
+
+    fn put_with(
+        &self,
+        config: Config,
+        change: Change,
+        compile: impl FnOnce(
+            Config,
+            u64,
+        ) -> std::result::Result<(Compiled, Vec<String>), crate::PutError>,
+    ) -> std::result::Result<(Saved, Vec<String>), crate::PutError> {
         self.writable().map_err(crate::PutError::Engine)?;
         config.check().map_err(crate::PutError::Engine)?;
         let mut doc = self.doc.write();
@@ -331,7 +358,7 @@ impl Catalog {
         } else {
             have + 1
         };
-        let (compiled, warnings) = Compiled::new(config.clone(), next_version, backing)?;
+        let (compiled, warnings) = compile(config.clone(), next_version)?;
         let compiled = Arc::new(compiled);
         if let Some(c) = &current
             && c.config == config

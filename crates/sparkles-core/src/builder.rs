@@ -202,10 +202,11 @@ pub struct IndexMeta {
     /// the member ignore it, and the file next to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patterns: Option<crate::patterns::PatternInfo>,
-    /// The features of the generation that a reader of format 3 cannot read (spec X11
-    /// §7.1), such as [`FEATURE_FSST_VOCAB`]. A generation with any is format 4, and a
-    /// reader refuses one whose features it does not all know.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The features of the generation that every reader of its format does not read
+    /// (spec X11 §7.1), such as [`FEATURE_FSST_VOCAB`]. The list is always present from
+    /// format 5, empty for a generation without one, and a reader refuses a generation
+    /// whose features it does not all know.
+    #[serde(default)]
     pub features: Vec<String>,
 }
 
@@ -215,15 +216,12 @@ impl IndexMeta {
     }
 }
 
-/// The newest index format this build writes. Format 3 stores each column as one frame
-/// per segment with a `.seg` directory (spec X07 §6.5), and format 2 as one frame per
-/// column. Format 4 is format 3 with the `features` of [`IndexMeta`], and a build writes
-/// it only for a generation that has a feature ([`format_for`]).
-pub const FORMAT_VERSION: u32 = 4;
-
-/// The format of a generation without features, which releases that read only format 3
-/// still open.
-pub const PLAIN_FORMAT_VERSION: u32 = 3;
+/// The index format this build writes and the only one it reads (spec X16 Phase 1).
+/// Each column is one frame per segment with a `.seg` directory (spec X07 §6.5), the
+/// `features` of [`IndexMeta`] are always listed, and the sparse vocabulary index
+/// `vocab.idx` is required. The pre-release formats 2 to 4 are refused with the
+/// dump-and-reload message.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The vocabulary's suffixes are FSST-coded, with the tables in `vocab.fsst` (spec X11
 /// §4.1).
@@ -231,15 +229,6 @@ pub const FEATURE_FSST_VOCAB: &str = "fsst-vocab";
 
 /// The features this build reads.
 pub const KNOWN_FEATURES: &[&str] = &[FEATURE_FSST_VOCAB];
-
-/// The format of a generation with `features`.
-pub fn format_for(features: &[String]) -> u32 {
-    if features.is_empty() {
-        PLAIN_FORMAT_VERSION
-    } else {
-        FORMAT_VERSION
-    }
-}
 
 /// How the base vocabulary stores the suffixes of its front-coded keys (spec X11 §4.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -302,10 +291,24 @@ pub fn read_index_meta(dir: &Path, written_by: Option<&str>) -> Result<IndexMeta
         .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
     let version = meta_version_of(&v, "meta.json")?;
     crate::formats::INDEX.check(&dir.display().to_string(), version, written_by)?;
+    check_features_listed(&v, "meta.json")?;
     let meta: IndexMeta =
         serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
     check_features(&dir.display().to_string(), &meta.features, written_by)?;
     Ok(meta)
+}
+
+/// A `meta.json` of a format this build reads lists its `features`, empty or not. One
+/// without the member was not written by a release of that format and is
+/// [`Error::Corrupt`].
+pub(crate) fn check_features_listed(v: &serde_json::Value, what: &str) -> Result<()> {
+    match v.get("features") {
+        Some(serde_json::Value::Array(_)) => Ok(()),
+        Some(_) => Err(Error::Corrupt(format!("{what}: features is not a list"))),
+        None => Err(Error::Corrupt(format!(
+            "{what}: features is missing, which every generation of index format {FORMAT_VERSION} lists"
+        ))),
+    }
 }
 
 /// Refuse a generation (`what`) that lists a feature this build does not read, naming it.
@@ -781,7 +784,7 @@ impl Builder {
             VocabCodec::Fsst => vec![FEATURE_FSST_VOCAB.into()],
         };
         let meta = IndexMeta {
-            format_version: format_for(&features),
+            format_version: FORMAT_VERSION,
             features,
             quads: rows,
             terms,

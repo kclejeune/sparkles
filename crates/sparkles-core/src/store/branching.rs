@@ -307,7 +307,6 @@ fn read_table(root: &Path) -> Result<Option<TableFile>> {
 }
 
 fn write_table(root: &Path, t: &TableFile) -> Result<()> {
-    commit::require_branch_reader(root)?;
     let mut t = t.clone();
     t.format = if t.retired.is_empty() { 1 } else { 2 };
     write_atomic(
@@ -598,7 +597,7 @@ fn link_holds_on_disk(root: &Path, id: uuid::Uuid) -> Option<Vec<GenHold>> {
     let current = std::fs::read_to_string(root.join("CURRENT")).ok()?;
     let current = commit::generation_number(current.trim());
     let mut holds = Vec::new();
-    for (no, name, _, _) in crate::history::scan_generations(root, id).ok()? {
+    for (no, name, _) in crate::history::scan_generations(root, id).ok()? {
         if no > current {
             continue;
         }

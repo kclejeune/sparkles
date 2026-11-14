@@ -211,7 +211,7 @@ impl Store {
         let snap = &cap.snap;
         // a new lineage: its own id and root commit, forked from the snapshot
         let id = uuid::Uuid::new_v4();
-        let now = commit::now_ms();
+        let now = self.clone_root_time(snap);
         let root = root_commit(now, built.meta.quads, 1);
         let forked_from = ForkedFrom {
             id: self.dataset_id,
@@ -276,6 +276,20 @@ impl Store {
         // the managed definitions come along paused: the clone is a new dataset, whose
         // views run only once an operator has checked their principals and inputs
         super::definitions::write_all(dir, &cap.definitions, Some("cloned"))?;
+        // A clone starts with an empty control keyspace: its copied `jobs.json` needs
+        // one, and it holds no run, lease or delivery identity of its source (spec C26
+        // §7.3). The reader rises first, and the checkpoint precedes the log.
+        if self.control_enabled() {
+            commit::require_reader(dir, crate::jobs::READER)?;
+            write_atomic(
+                &dir.join(crate::control::CHECKPOINT_FILE),
+                &crate::control::encode_checkpoint(&Default::default()),
+            )?;
+            write_atomic(
+                &dir.join(crate::control::LOG_FILE),
+                &crate::control::log_header(),
+            )?;
+        }
         // the managed graphs stay protected: the registry needs its reader first
         if !cap.managed.is_empty() {
             commit::require_reader(dir, crate::managed::READER)?;
@@ -343,7 +357,7 @@ impl Store {
             id: self.dataset_id,
             seq: snap.commit,
         };
-        let root = root_commit(commit::now_ms(), built.meta.quads, 0);
+        let root = root_commit(self.clone_root_time(snap), built.meta.quads, 0);
         let next_bnode = built.meta.next_bnode.max(cap.next_bnode);
         let store = Store::in_memory_from(
             store_opts,
@@ -354,6 +368,9 @@ impl Store {
             id,
             Some(forked_from),
         );
+        if self.control_enabled() {
+            store.enable_control()?;
+        }
         store.install_managed_files(&cap.managed);
         report(opts, 0.95, "configuring indexes");
         self.configure_indexes(&store)?;
@@ -377,6 +394,18 @@ impl Store {
     /// Take the snapshot to clone, with the blank-node counter and the prefixes, under
     /// the writer lock (no commit falls in between), and lease its generation when its
     /// files may be shared.
+    /// The time of a clone's root commit: the store's clock, never before the commit
+    /// the clone copies. A cloned write therefore never enters a state of the clone
+    /// that precedes the write's own commit, even when the clock runs behind (spec C27
+    /// §4.3). A copied commit the catalog no longer lists is bounded by the head.
+    fn clone_root_time(&self, snap: &Snapshot) -> i64 {
+        let copied = self
+            .commit(snap.commit)
+            .unwrap_or_else(|| self.head_commit())
+            .timestamp_ms;
+        self.now_ms().max(copied)
+    }
+
     fn clone_capture(&self, opts: &CloneOptions) -> Result<Capture> {
         self.failpoint("clone-admitting");
         let share = opts.mode != CloneMode::Rebuild && opts.at.is_none();

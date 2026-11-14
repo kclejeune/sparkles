@@ -121,11 +121,12 @@ fn check_with(name: &str, ok: bool, detail: String, fingerprint: Option<String>)
 /// Rows as sorted strings, each repeated by its multiplicity. A row of negative weight,
 /// which a correct maintained result never holds, is kept as a marked row so that the
 /// answer cannot match a query's.
-fn rows_of(rows: &[(Vec<Option<oxrdf::Term>>, i64)]) -> Vec<String> {
+fn rows_of<R: AsRef<[Option<oxrdf::Term>]>>(rows: &[(R, i64)]) -> Vec<String> {
     let mut out: Vec<String> = rows
         .iter()
         .flat_map(|(r, w)| {
             let s = r
+                .as_ref()
                 .iter()
                 .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
                 .collect::<Vec<_>>()
@@ -168,20 +169,26 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
         },
     )
     .unwrap();
-    let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
+    let decoded = fresh.rows().unwrap();
+    let want = rows_of(
+        &(0..decoded.len())
+            .map(|row| (decoded.row(row).unwrap().values(), 1))
+            .collect::<Vec<_>>(),
+    );
     // the evaluated answer's variables and rows, which stay the same across builds, so that
     // a change that breaks the view and its query alike still differs from the baseline
-    let fingerprint = answer_fingerprint(&fresh.vars, &want);
+    let fingerprint = answer_fingerprint(fresh.variables(), &want);
     let (ok, detail) = match read {
         Ok(r) if r.commit != snap.commit => (
             false,
             format!("the view is at commit {} of {}", r.commit, snap.commit),
         ),
-        Ok(r) if r.columns != fresh.vars => (
+        Ok(r) if r.columns != fresh.variables() => (
             false,
             format!(
                 "the view's columns are {:?}, the query's {:?}",
-                r.columns, fresh.vars
+                r.columns,
+                fresh.variables()
             ),
         ),
         Ok(r) => {
@@ -613,12 +620,11 @@ fn commit_path_without_views() {
     )
     .unwrap();
     let added = s.snapshot().len() - quads;
-    let vars = written.vars.clone();
+    let vars = written.variables().to_vec();
+    let decoded = written.rows().unwrap();
     let rows = rows_of(
-        &written
-            .rows()
-            .into_iter()
-            .map(|r| (r, 1))
+        &(0..decoded.len())
+            .map(|row| (decoded.row(row).unwrap().values(), 1))
             .collect::<Vec<_>>(),
     );
     // the i-th commit of a round gave its subject the team t(i % 50) and the age i % 60
@@ -696,19 +702,24 @@ fn pass_breakdown() {
             },
         )
         .unwrap();
-        let want = rows_of(&fresh.rows().into_iter().map(|r| (r, 1)).collect::<Vec<_>>());
+        let decoded = fresh.rows().unwrap();
+        let want = rows_of(
+            &(0..decoded.len())
+                .map(|row| (decoded.row(row).unwrap().values(), 1))
+                .collect::<Vec<_>>(),
+        );
         let got = rows_of(&c.rows());
         check_with(
             &format!("breakdown/{name}/answer"),
-            c.columns() == fresh.vars && got == want,
+            c.columns() == fresh.variables() && got == want,
             format!(
                 "columns {:?} against {:?}, {} rows against {}",
                 c.columns(),
-                fresh.vars,
+                fresh.variables(),
                 got.len(),
                 want.len()
             ),
-            Some(answer_fingerprint(&fresh.vars, &want)),
+            Some(answer_fingerprint(fresh.variables(), &want)),
         );
         let (r, o, a) = (pct(&mut read, 0.5), pct(&mut old, 0.5), pct(&mut adv, 0.5));
         println!("| {name} | {r:.1} | {o:.1} | {a:.1} |");
@@ -1031,6 +1042,123 @@ fn path_pass_against_recompute() {
         metric(&format!("paths/{name}/pass-median"), pm, "ms", "lower");
         metric(&format!("paths/{name}/pass-p95"), p95, "ms", "lower");
         metric(&format!("paths/{name}/state"), state, "MiB", "lower");
+        rt.delete(name).unwrap();
+        rt.round(&s);
+    }
+}
+
+/// The views of item 418: the aggregates of spec F13 §4.2, `HAVING` and a correlated
+/// `EXISTS`, over the people data. Each has one answer per snapshot: every team has at
+/// most one label, so its `GROUP_CONCAT` and `SAMPLE` do not depend on the order of its
+/// rows.
+const AGG_VIEWS: &[(&str, &str)] = &[
+    (
+        "team-age-range",
+        "SELECT ?t (MIN(?a) AS ?lo) (MAX(?a) AS ?hi) WHERE { ?p :memberOf ?t . ?p :age ?a } GROUP BY ?t",
+    ),
+    (
+        "full-teams",
+        "SELECT ?t (COUNT(?p) AS ?n) WHERE { ?p :memberOf ?t } GROUP BY ?t HAVING (COUNT(?p) >= 200)",
+    ),
+    (
+        "team-labels",
+        "SELECT ?t (GROUP_CONCAT(?l; SEPARATOR=\", \") AS ?ls) (SAMPLE(?l) AS ?one) WHERE { ?p :memberOf ?t OPTIONAL { ?t rdfs:label ?l } } GROUP BY ?t",
+    ),
+    (
+        "knows-older",
+        "SELECT ?p ?a WHERE { ?p :age ?a FILTER EXISTS { ?p :knows ?q . ?q :age ?b FILTER(?b > ?a) } }",
+    ),
+];
+
+const AGG_WORKLOAD: &str = "incr_bench aggregates v1";
+
+/// §4.2: a one- or two-quad commit's pass of the item 418 views against evaluating the
+/// query again, through the commit mix of `pass_against_recompute`. An age insert
+/// touches the `?q :age ?b` pattern of `knows-older`, which names no outer variable,
+/// so that commit evaluates the condition again for every row, and the p95 shows it.
+#[test]
+#[ignore]
+fn aggregate_pass_against_recompute() {
+    let n = people();
+    let t0 = Instant::now();
+    let s = store(n, None);
+    eprintln!("loaded {n} people in {:.1?}", t0.elapsed());
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let views: Vec<&str> = AGG_VIEWS.iter().flat_map(|(n, q)| [*n, *q]).collect();
+    for p in [data(n).as_str(), &views.join("\n"), AGG_WORKLOAD] {
+        for b in p.bytes().chain([0]) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    check_with(
+        "aggregates/workload",
+        true,
+        format!("{n} people"),
+        Some(format!("{h:016x}")),
+    );
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    println!(
+        "| view | build ms | query ms | pass median ms | pass p95 ms | query / pass | state MiB |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    for (name, q) in AGG_VIEWS {
+        let text = format!("{PREFIX}{q}");
+        let t = Instant::now();
+        let mut def = ViewDef::table(text.clone());
+        def.memory_bytes = 4 << 30;
+        rt.put(&s, name, def).unwrap();
+        rt.round(&s);
+        let build = t.elapsed().as_secs_f64() * 1e3;
+        let mut query = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = sparql::query(
+                s.snapshot(),
+                &text,
+                &QueryOptions {
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            std::hint::black_box(r.len());
+            query.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut passes = Vec::new();
+        for i in 0..200 {
+            mix(&s, i, n);
+            let t = Instant::now();
+            rt.round(&s);
+            passes.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        check_view(
+            &rt,
+            &s,
+            &format!("aggregates/{name}"),
+            name,
+            &text,
+            QueryOptions::default(),
+        );
+        let info = rt.get(&s, name).unwrap();
+        assert!(
+            !info.plan.as_ref().is_some_and(|p| p.has_recompute()),
+            "{name} has a recompute node: {:#?}",
+            info.plan
+        );
+        let qm = pct(&mut query, 0.5);
+        let pm = pct(&mut passes, 0.5);
+        let p95 = pct(&mut passes, 0.95);
+        let state = info.state_bytes as f64 / (1 << 20) as f64;
+        println!(
+            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {:.0} | {state:.1} |",
+            qm / pm,
+        );
+        metric(&format!("aggregates/{name}/build"), build, "ms", "lower");
+        metric(&format!("aggregates/{name}/query"), qm, "ms", "lower");
+        metric(&format!("aggregates/{name}/pass-median"), pm, "ms", "lower");
+        metric(&format!("aggregates/{name}/pass-p95"), p95, "ms", "lower");
+        metric(&format!("aggregates/{name}/state"), state, "MiB", "lower");
         rt.delete(name).unwrap();
         rt.round(&s);
     }

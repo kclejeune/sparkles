@@ -28,7 +28,7 @@
 //! relation. The operator then gives the rule back to the ordinary evaluator for the rest
 //! of the run, with one full evaluation, so the result stays the rules' fixpoint.
 
-use crate::budget::{Budget, Held, MemoryExceeded, table_bytes};
+use crate::budget::{Budget, BudgetFailure, Held, table_bytes};
 use crate::builtins::{BuiltinKind, same_value};
 use crate::engine::{Atom, CHead, CRule, Slot, incremental_blocker, reads_lists};
 use crate::facts::Memo;
@@ -285,24 +285,30 @@ impl Closures {
     /// The operators of `rules`, or `None` when no rule has one or the program has a rule
     /// whose result depends on the order of derivation. `start` is the row before which
     /// the facts are closed under the rules, as for [`crate::engine::run`].
-    pub(crate) fn detect(rules: &[CRule], terms: &Terms, start: Option<u32>) -> Option<Closures> {
+    pub(crate) fn detect(
+        rules: &[CRule],
+        terms: &Terms,
+        start: Option<u32>,
+    ) -> Result<Option<Closures>, BudgetFailure> {
         if rules
             .iter()
             .any(|r| incremental_blocker(r, terms).is_some())
         {
-            return None;
+            return Ok(None);
         }
         // what a list builtin reads depends on when derived list facts appear, and the
         // operators derive their pairs earlier than joins do: a program that reads lists
         // and builds them in a rule head runs without operators, and one whose rules
         // derive list facts through a variable predicate starts again without them
         // (see `Restart`)
-        let lists = rules.iter().any(reads_lists).then(|| {
-            [
-                terms.id_for(&Term::NamedNode(rdf::FIRST.into_owned())),
-                terms.id_for(&Term::NamedNode(rdf::REST.into_owned())),
-            ]
-        });
+        let lists = if rules.iter().any(reads_lists) {
+            Some([
+                terms.id_for(&Term::NamedNode(rdf::FIRST.into_owned()))?,
+                terms.id_for(&Term::NamedNode(rdf::REST.into_owned()))?,
+            ])
+        } else {
+            None
+        };
         if let Some(ids) = lists
             && rules.iter().any(|r| {
                 r.head
@@ -310,7 +316,7 @@ impl Closures {
                     .any(|h| matches!(h, CHead::Triple(_, Slot::Const(p), _) if ids.contains(p)))
             })
         {
-            return None;
+            return Ok(None);
         }
         let syms: Vec<(usize, u64)> = rules
             .iter()
@@ -345,7 +351,7 @@ impl Closures {
             op.rules.retain(|&r| taken.insert(r));
         }
         ops.retain(|op| !op.rules.is_empty());
-        (!ops.is_empty()).then_some(Closures { ops, start, lists })
+        Ok((!ops.is_empty()).then_some(Closures { ops, start, lists }))
     }
 
     /// Whether rule `ri` is evaluated by an operator now.
@@ -603,14 +609,14 @@ impl Builder {
             + self.pairs.capacity() * size_of::<(u32, u32)>()
     }
 
-    fn charge(&mut self) -> Result<(), MemoryExceeded> {
+    fn charge(&mut self) -> Result<(), BudgetFailure> {
         let b = self.bytes();
         self.held.try_set(b)
     }
 
     /// Reserve room for `nodes` more nodes and one more pair, charging the growth of
     /// each buffer before it is reserved.
-    fn room(&mut self, nodes: usize) -> Result<(), MemoryExceeded> {
+    fn room(&mut self, nodes: usize) -> Result<(), BudgetFailure> {
         let ids = self.ids.len() + nodes > self.ids.capacity();
         let at = self.at.len() + nodes > self.at.capacity();
         let pairs = self.pairs.len() == self.pairs.capacity();
@@ -649,7 +655,7 @@ impl Builder {
     }
 
     #[inline]
-    fn node(&mut self, id: u64) -> Result<(u32, bool), MemoryExceeded> {
+    fn node(&mut self, id: u64) -> Result<(u32, bool), BudgetFailure> {
         if let Some(&n) = self.at.get(&id) {
             return Ok((n, false));
         }
@@ -661,7 +667,7 @@ impl Builder {
     }
 
     #[inline]
-    fn edge(&mut self, s: u64, o: u64) -> Result<(), MemoryExceeded> {
+    fn edge(&mut self, s: u64, o: u64) -> Result<(), BudgetFailure> {
         let (a, _) = self.node(s)?;
         let (b, _) = self.node(o)?;
         self.room(0)?;
@@ -670,7 +676,7 @@ impl Builder {
     }
 
     /// The compressed adjacency of the pairs, sorted and without duplicates.
-    fn finish(mut self, emit: Vec<bool>) -> Result<Local, MemoryExceeded> {
+    fn finish(mut self, emit: Vec<bool>) -> Result<Local, BudgetFailure> {
         self.charge()?;
         let n = self.ids.len();
         let mut pairs = std::mem::take(&mut self.pairs);

@@ -13,7 +13,9 @@
 # repositories `repo/` and `repo-encrypted/` with its key files in `keys/`), the queries
 # in queries/, the cases in cases.txt and each case's answer, as BIN printed it, in
 # expected/. A case line is `NAME QUERY [FLAGS...]`: the answer of queries/QUERY.rq run
-# with `sparkles query --loc data/databases/books --results json FLAGS...`.
+# with `sparkles query --loc data/databases/books --results json FLAGS...`. facts.txt
+# records the label, the release, the head commit and the `format` of the dataset's
+# dataset.json, by which the tests tell a fixture inside the window from one outside it.
 #
 # The dataset `books` has two generations (a bulk load, then a compaction), commits in
 # the log of the second with new terms in its delta vocabulary, named graphs, blank
@@ -143,6 +145,7 @@ s queries run --loc "$DB" adults --set minAge=40 > "$OUT/expected/stored-adults.
   echo "label $LABEL"
   echo "written-by $("$BIN" --version)"
   echo "head $(s log --loc "$DB" --limit 1 | sed -n "s/.*  head \([0-9]*\).*/\1/p")"
+  echo "dataset-format $(sed -n 's/^ *"format": *\([0-9]*\).*/\1/p' "$DB/dataset.json")"
 } > "$OUT/facts.txt"
 cp "$W/log.txt" "$OUT/log.txt"
 

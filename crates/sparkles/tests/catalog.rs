@@ -251,7 +251,7 @@ fn catalog_clones_search_text_at_once() {
     let r = cloned
         .query("SELECT ?s { ?s <http://jena.apache.org/text#query> \"fox\" }")
         .unwrap();
-    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.len(), 1);
 }
 
 #[test]

@@ -43,8 +43,9 @@ fn subjects(s: &Store, q: &str) -> Result<Vec<String>, String> {
     .map_err(|e| e.to_string())?;
     let mut v: Vec<String> = r
         .rows()
-        .into_iter()
-        .map(|row| match row[0].clone() {
+        .unwrap()
+        .iter()
+        .map(|row| match row.values()[0].clone() {
             Some(oxrdf::Term::NamedNode(n)) => n.as_str().rsplit('/').next().unwrap().to_string(),
             t => format!("{t:?}"),
         })

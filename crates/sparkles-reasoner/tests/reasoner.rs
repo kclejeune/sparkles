@@ -65,6 +65,10 @@ fn select(s: &Store, q: &str, reasoning: bool) -> Vec<String> {
     let r = query(s.snapshot(), q, &qopts(reasoning)).unwrap_or_else(|e| panic!("{q}: {e}"));
     let mut v: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()

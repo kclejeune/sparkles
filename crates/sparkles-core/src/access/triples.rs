@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(super) mod controlled;
+pub(crate) mod controlled;
 
 pub use crate::INFERRED_GRAPH;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -431,15 +431,15 @@ pub(crate) fn passes(
         }
         e => e,
     })?;
-    if r.table.len() as u64 > limits.max_pattern_rows {
+    if r.table().len() as u64 > limits.max_pattern_rows {
         return Err(Error::BudgetExceeded(Budget {
             kind: BudgetKind::Rows,
             limit: limits.max_pattern_rows,
-            requested: r.table.len() as u64,
+            requested: r.table().len() as u64,
         }));
     }
     if !cols.iter().any(|c| *c) {
-        return Ok(if r.table.is_empty() {
+        return Ok(if r.table().is_empty() {
             Passes::None
         } else {
             Passes::All
@@ -447,12 +447,12 @@ pub(crate) fn passes(
     }
     let mut set = FxHashSet::default();
     let n = cols.iter().filter(|c| **c).count();
-    for i in 0..r.table.len() {
+    for i in 0..r.table().len() {
         let mut k = [0u64; 3];
         let mut c = 0;
         for (j, on) in cols.iter().enumerate() {
             if *on {
-                k[j] = r.table.cols[c][i].0;
+                k[j] = r.table().get(i, c)?.0;
                 c += 1;
             }
         }

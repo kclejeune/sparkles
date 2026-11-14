@@ -353,35 +353,81 @@ pub struct HistoryOptions {
     pub deadline: Option<std::time::Instant>,
 }
 
+// A prepared scan must poll the complete same-root control view, including
+// composed query cancellation, inside decoders and their lock waits. Ordinary
+// historical readers keep the existing HistoryOptions behavior unchanged.
+pub(crate) trait ReadControl: Send + Sync {
+    fn check_read(&self) -> Result<()>;
+    fn no_wait(&self) -> bool {
+        false
+    }
+    /// A synchronous temporary preparation with this read's complete controls
+    /// and its own allowance, for a cold check that needs a Preparation.
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation>;
+}
+
+impl ReadControl for HistoryOptions {
+    fn check_read(&self) -> Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
+
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+        crate::access::Preparation::new(
+            crate::task::Control {
+                cancel: self
+                    .cancel
+                    .clone()
+                    .map(crate::task::Cancel::from_flag)
+                    .unwrap_or_default(),
+                deadline: self.deadline,
+                ..Default::default()
+            },
+            memory_bytes,
+        )
+    }
+}
+
+impl ReadControl for crate::access::Preparation {
+    fn check_read(&self) -> Result<()> {
+        self.check()
+    }
+
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+        self.temporary_with_controls(memory_bytes)
+    }
+
+    fn no_wait(&self) -> bool {
+        self.refuses_wait()
+    }
+}
+
 /// Fixed selector/result/error metadata, including bounded snapshot names.
 pub(crate) const READ_METADATA_BYTES: u64 = 1024;
 
 /// One read's preparation limit. This does not resize the shared history cache.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadLimit<'a> {
-    pub(crate) options: &'a HistoryOptions,
+    pub(crate) options: &'a dyn ReadControl,
     pub(crate) memory: Option<u64>,
     pub(crate) held: u64,
 }
 
 impl ReadLimit<'_> {
     pub(crate) fn check(&self, bytes: u64) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        if self
-            .options
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed))
-        {
-            return Err(Error::Cancelled);
-        }
-        if self
-            .options
-            .deadline
-            .is_some_and(|t| std::time::Instant::now() >= t)
-        {
-            return Err(Error::Timeout);
-        }
+        self.options.check_read()?;
         if let Some(limit) = self.memory
             && bytes.saturating_add(self.held) > limit
         {
@@ -411,6 +457,14 @@ impl ReadLimit<'_> {
         &self,
         lock: &'m parking_lot::RwLock<T>,
     ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        if self.options.no_wait() {
+            self.check(0)?;
+            let held = lock.try_read().ok_or_else(|| {
+                Error::invalid("controlled view preparation would wait (no_wait)")
+            })?;
+            self.check(0)?;
+            return Ok(held);
+        }
         crate::task::read_lock(lock, || self.check(0))
     }
 
@@ -420,6 +474,13 @@ impl ReadLimit<'_> {
     ) -> Result<parking_lot::MutexGuard<'m, T>> {
         loop {
             self.check(0)?;
+            if self.options.no_wait() {
+                let held = mutex.try_lock().ok_or_else(|| {
+                    Error::invalid("controlled view preparation would wait (no_wait)")
+                })?;
+                self.check(0)?;
+                return Ok(held);
+            }
             if let Some(guard) = mutex.try_lock_for(std::time::Duration::from_millis(10)) {
                 self.check(0)?;
                 return Ok(guard);
@@ -480,17 +541,39 @@ pub(crate) struct HistoryConfig {
     pub catalog: CatalogHorizon,
 }
 
+fn read_bytes(root: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(root.join("history.json")) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
-/// file is missing).
+/// file is missing), checked against the selected store's actual identity.
 pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
-    let bytes = match std::fs::read(root.join("history.json")) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(HistoryConfig::default());
-        }
-        Err(e) => return Err(e.into()),
+    let Some(bytes) = read_bytes(root)? else {
+        return Ok(HistoryConfig::default());
     };
     decode_file(&bytes, dataset_id, None)
+}
+
+/// Validate current history metadata without startup writers or recovery cleanup.
+/// A legacy directory without history needs no recorded identity. A present
+/// identity-bearing history requires its own dataset.json, never a fabricated ID.
+pub(crate) fn preflight_file(root: &Path) -> Result<()> {
+    let Some(bytes) = read_bytes(root)? else {
+        return Ok(());
+    };
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    crate::formats::check_settings("history.json", &v)?;
+    let f: HistoryFile =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    let dataset_id = commit::read_dataset_file(root)?.ok_or_else(|| {
+        Error::Corrupt("history.json requires its recorded dataset.json identity".into())
+    })?;
+    checked_document(&f, &bytes, dataset_id, &|| Ok(()))
 }
 
 // The capture reader uses the same legacy semantics and format2 validation as
@@ -703,8 +786,7 @@ pub(crate) struct GenEntry {
     pub base: CommitInfo,
     /// the last commit in its WAL (for the current generation: kept at the head)
     pub end: u64,
-    /// legacy WAL commits before the first one with metadata fold into the base
-    pub fold_legacy: bool,
+    /// the size of its directory, 0 for the current generation
     pub bytes: u64,
 }
 
@@ -1203,7 +1285,7 @@ fn fully_covered(lo: u64, hi: u64, covered: &[(u64, u64)]) -> bool {
 pub(crate) fn scan_generations(
     root: &Path,
     dataset_id: uuid::Uuid,
-) -> Result<Vec<(u32, String, CommitInfo, bool)>> {
+) -> Result<Vec<(u32, String, CommitInfo)>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(root)? {
         let e = e?;
@@ -1216,9 +1298,7 @@ pub(crate) fn scan_generations(
         }
         let no = commit::generation_number(&name);
         match commit::read_gen_commit(&e.path()) {
-            Ok(Some((id, c, origin))) if id == dataset_id => {
-                out.push((no, name, c, origin == "baseline"))
-            }
+            Ok(Some((id, c, _))) if id == dataset_id => out.push((no, name, c)),
             _ => tracing::warn!(
                 target: "sparkles::history",
                 "{}: not a generation of this dataset; left alone",
@@ -1253,7 +1333,7 @@ pub fn retained_offline(
         .unwrap_or_default();
     let head = recs.last().map_or(0, |c| c.seq);
     let mut h = HistoryState::new(pins, retention);
-    for (no, name, base, fold_legacy) in scan_generations(root, dataset_id)? {
+    for (no, name, base) in scan_generations(root, dataset_id)? {
         if no > current {
             continue;
         }
@@ -1265,7 +1345,7 @@ pub fn retained_offline(
                 .rev()
                 .find(|c| c.generation == no)
                 .map(|c| c.seq.max(base.seq))
-                .unwrap_or_else(|| crate::store::wal_end(&dir, &base, fold_legacy))
+                .unwrap_or_else(|| crate::store::wal_end(&dir, &base))
         };
         h.gens.insert(
             no,
@@ -1274,7 +1354,6 @@ pub fn retained_offline(
                 dir,
                 base,
                 end,
-                fold_legacy,
                 bytes: 0,
             },
         );
@@ -1335,7 +1414,7 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
         .unwrap_or_default();
     let head = recs.last().map_or(0, |c| c.seq);
     let mut h = HistoryState::new(BTreeMap::new(), Retention::default());
-    for (no, name, base, fold_legacy) in scan_generations(root, dataset_id)? {
+    for (no, name, base) in scan_generations(root, dataset_id)? {
         if no > current {
             continue;
         }
@@ -1346,7 +1425,7 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
             .rev()
             .find(|c| c.generation == no)
             .map(|c| c.seq.max(base.seq))
-            .unwrap_or_else(|| crate::store::wal_end(&dir, &base, fold_legacy));
+            .unwrap_or_else(|| crate::store::wal_end(&dir, &base));
         h.gens.insert(
             no,
             GenEntry {
@@ -1354,7 +1433,6 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
                 name,
                 base,
                 end,
-                fold_legacy,
                 bytes: 0,
             },
         );
@@ -1419,8 +1497,8 @@ fn unfinished(
         Err(e) => Err(format!("its commit.json cannot be read: {e}")),
         Ok(b) if blank(&b) => Ok(()),
         Ok(_) => match commit::read_gen_commit(dir) {
-            Ok(Some((id, c, origin))) if id == dataset_id => {
-                let end = crate::store::wal_end(dir, &c, origin == "baseline");
+            Ok(Some((id, c, _))) if id == dataset_id => {
+                let end = crate::store::wal_end(dir, &c);
                 if c.seq <= head && end <= head {
                     Ok(())
                 } else {
@@ -1602,7 +1680,6 @@ mod tests {
                     dir: PathBuf::new(),
                     base: c(b),
                     end: e,
-                    fold_legacy: false,
                     bytes: 0,
                 },
             );

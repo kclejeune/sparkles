@@ -25,6 +25,10 @@ fn values(snapshot: Arc<sparkles_core::store::Snapshot>) -> Vec<Vec<Option<oxrdf
     )
     .unwrap()
     .rows()
+    .unwrap()
+    .iter()
+    .map(|row| row.values().to_vec())
+    .collect()
 }
 
 #[test]

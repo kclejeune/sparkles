@@ -1,6 +1,6 @@
 //! Request-scoped historical view preparation. No write or authority is granted here.
 use super::*;
-use crate::history::{At, HistoryOptions, ReadLimit, Resolved};
+use crate::history::{At, HistoryOptions, ReadControl, ReadLimit, Resolved};
 
 /// Where a pinned read starts: an open store, or a branch read without opening it.
 enum PinnedSource<'a> {
@@ -384,7 +384,6 @@ impl Store {
         let base = wal::WalPoint {
             seq: entry.base.seq,
             offset: 0,
-            folding: entry.fold_legacy,
         };
         let base_delta = generation.link.as_ref().map(|l| &l.base_delta);
         let mut best = (
@@ -438,23 +437,7 @@ impl Store {
             limit,
         ) {
             Ok(_) => Ok((delta, target)),
-            Err(wal::Backward::Failed(error)) => Err(error),
-            Err(wal::Backward::Legacy) => {
-                // Release the failed backward working state before preparing its replacement.
-                drop(delta);
-                limit.check(base_delta.map_or(0, preparation_delta_bytes))?;
-                let mut delta = base_delta.cloned().unwrap_or_default();
-                wal::apply_forward_limited(
-                    &path,
-                    generation,
-                    &self.cache,
-                    &mut delta,
-                    base,
-                    target,
-                    limit,
-                )?;
-                Ok((delta, target))
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -523,6 +506,24 @@ impl Store {
         self.snapshot_pinned_limited(store, at, options, max_memory_bytes)
     }
 
+    pub(super) fn snapshot_at_prepared(
+        &self,
+        logical: &Store,
+        at: &At,
+        preparation: &crate::access::Preparation,
+        memory: u64,
+    ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
+        if self.is_branch()
+            || self.owner_dataset_id() != logical.owner_dataset_id()
+            || !Arc::ptr_eq(&self.family, &logical.family)
+        {
+            return Err(Error::invalid(
+                "physical selection requires the actual owning main Store",
+            ));
+        }
+        self.snapshot_pinned_limited(logical, at, preparation, memory)
+    }
+
     /// The state of the branch whose identity is `branch` at `at`, within
     /// `max_memory_bytes`, through this dataset's main store. `branch` is the dataset
     /// id for `main` or the id of a listed branch, so a renamed branch keeps resolving
@@ -572,7 +573,7 @@ impl Store {
         &self,
         store: &Store,
         at: &At,
-        options: &HistoryOptions,
+        options: &dyn ReadControl,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
         self.snapshot_from_limited(
@@ -587,7 +588,7 @@ impl Store {
         &self,
         start: PinnedSource<'_>,
         at: &At,
-        options: &HistoryOptions,
+        options: &dyn ReadControl,
         memory: u64,
     ) -> Result<(Arc<Snapshot>, Resolved, uuid::Uuid)> {
         use PinnedSource as Source;
@@ -620,7 +621,7 @@ impl Store {
                 Source::Resident(store) => (
                     store.branch_id(),
                     store
-                        .snapshot_at_limited(requested, options, memory)
+                        .snapshot_at_inner(requested, options, Some(memory))
                         .map(|(snapshot, resolved)| OriginRead::View(snapshot, resolved)),
                 ),
                 Source::Cold(id) => (
@@ -708,16 +709,15 @@ fn wal_point_limited(
         .unwrap_or(wal::WalPoint {
             seq: entry.base.seq,
             offset: 0,
-            folding: entry.fold_legacy,
         });
     limit.check(0)?;
-    if floor.seq == seq && !floor.folding {
+    if floor.seq == seq {
         return Ok(floor);
     }
     let mut cursor = wal::WalCursor::open_limited(&path, floor, limit, 0)?;
     loop {
         let before = cursor.position();
-        if before.seq == seq && !before.folding {
+        if before.seq == seq {
             limit.check(0)?;
             return Ok(before);
         }

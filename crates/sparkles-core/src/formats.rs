@@ -127,12 +127,7 @@ impl FileKind {
                 "{head}. Upgrade it with `sparkles migrate`, which keeps its history"
             ));
         }
-        let dump = written_by
-            .map(|v| format!("Sparkles {v}"))
-            .unwrap_or_else(|| "the release that wrote it".into());
-        Error::Unsupported(format!(
-            "{head}. It is older than this release reads: dump it with `sparkles dump` from {dump} and load the dump with `sparkles load`"
-        ))
+        Error::Unsupported(format!("{head}. {}", dump_and_reload(written_by)))
     }
 
     /// `Ok` when this build reads version `found`, else [`refuse`](Self::refuse).
@@ -143,6 +138,17 @@ impl FileKind {
             Err(self.refuse(what, found, written_by))
         }
     }
+}
+
+/// The sentence that tells how to carry a file this build no longer reads forward: dump
+/// it with the release that wrote it, `written_by` when known, and load the dump.
+pub(crate) fn dump_and_reload(written_by: Option<&str>) -> String {
+    let dump = written_by
+        .map(|v| format!("Sparkles {v}"))
+        .unwrap_or_else(|| "the release that wrote it".into());
+    format!(
+        "It is older than this release reads: dump it with `sparkles dump` from {dump} and load the dump with `sparkles load`"
+    )
 }
 
 fn list(v: &[u32]) -> String {
@@ -158,38 +164,46 @@ fn list(v: &[u32]) -> String {
 
 /// The generation index formats this build reads (`format_version` of `meta.json`).
 /// [`crate::builder::FORMAT_VERSION`] is the one it writes. A change that is read and
-/// rewritten at compaction adds the new format here and keeps the previous one.
-pub const READABLE_INDEX_FORMATS: &[u32] = &[2, 3, 4];
+/// rewritten at compaction adds the new format here and keeps the previous one. The
+/// first release reads one format, since the cutoff of spec X16 Phase 1 refuses the
+/// pre-release formats 2 to 4.
+pub const READABLE_INDEX_FORMATS: &[u32] = &[5];
 
-/// The write-ahead log version this build writes: a header record with the magic and
-/// this version starts every new `wal.log` (see [`crate::store::wal`]). Version 0 is a
-/// log without the header, written before it existed.
+/// The write-ahead log version this build writes for an activated store: a header
+/// record with the magic and this version starts every new `wal.log` (see
+/// [`crate::store::wal`]). A plain store writes version 1.
 pub const WAL_VERSION: u32 = 2;
 
-/// `dataset.json`: the dataset id and the reader capabilities a database needs.
+/// `dataset.json`: the dataset id and the reader capabilities a database needs. Its
+/// `format` is [`crate::commit::DATASET_FORMAT`], which marks the first-release cutoff,
+/// and `reads` lists the readers of that format. A `format` 1 file, or one that
+/// requires a reader below [`crate::commit::OLDEST_DATASET_READER`], is a pre-release
+/// form that [`crate::commit::check_dataset_compatibility`] refuses with the
+/// dump-and-reload message.
 pub const DATASET: FileKind = FileKind {
     id: "dataset",
     files: "dataset.json",
-    marker: "`format` 1, `minimumReader` (the reader capability the database needs) and `writtenBy`",
+    marker: "`format` 2, `minimumReader` (the reader capability the database needs) and `writtenBy`",
     class: Class::Primary,
     writes: crate::commit::DATASET_READER,
-    reads: &[1, 2, 3, 4, 5, 6, 7, 8],
+    reads: &[5, 6, 7, 8, 9],
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
-/// Format 4 is format 3 with a `features` list in meta.json (spec X11 §7.1), written
-/// only for a generation that uses a feature, such as `fsst-vocab`, that a reader of
-/// format 3 cannot read. A generation without one is written as format 3.
+/// Format 5 is the segmented layout of spec X07 §6.5 with the `features` list of spec
+/// X11 §7.1 always present in meta.json, empty for a generation without one, and the
+/// sparse vocabulary index `vocab.idx` required.
 pub const INDEX: FileKind = FileKind {
     id: "index",
     files: "gen-*/meta.json and the index files",
-    marker: "`format_version` of meta.json, and from format 4 its `features`, each of which the reader must know",
+    marker: "`format_version` of meta.json and its `features`, each of which the reader must know",
     class: Class::Primary,
     writes: crate::builder::FORMAT_VERSION,
     reads: READABLE_INDEX_FORMATS,
 };
 
-/// The sparse vocabulary index of a generation.
+/// The sparse vocabulary index of a generation, which index format 5 requires: a
+/// generation without one, or whose index does not describe its vocabulary, is corrupt.
 pub const VOCAB_INDEX: FileKind = FileKind {
     id: "vocab-index",
     files: "gen-*/vocab.idx",
@@ -246,24 +260,52 @@ pub const PLANNER_STATISTICS: FileKind = FileKind {
     reads: &[1],
 };
 
-/// The terms added since a generation was built.
+/// The terms added since a generation was built. Version 1, the pre-release file of the
+/// entries alone without a header, is refused with the dump-and-reload message.
 pub const DELTA_VOCAB: FileKind = FileKind {
     id: "delta-vocab",
     files: "gen-*/delta.vocab",
-    marker: "framed header `\\x89SDV` with its version; version 1 is the legacy file without a header",
+    marker: "framed header `\\x89SDV` with its version",
     class: Class::Primary,
     writes: crate::vocab::delta::VERSION,
-    reads: &[1, 2],
+    reads: &[2],
 };
 
-/// A generation's write-ahead log.
+/// A generation's write-ahead log. Version 1 is the log of a plain store and version 2,
+/// which seals a final configuration-reference record with commit flag 4, the log of an
+/// activated store, so both are current. Version 0, a log without the header record, is
+/// the pre-release form that the cutoff of spec X16 Phase 1 refuses.
 pub const WAL: FileKind = FileKind {
     id: "wal",
     files: "gen-*/wal.log",
-    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is headerless. Version 2 seals a final configuration-reference record with commit flag 4. Headerless strict framing starts at walStrictFrom",
+    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version). Version 2 seals a final configuration-reference record with commit flag 4, and version 3 also carries control records with commit flag 8",
     class: Class::Primary,
-    writes: WAL_VERSION,
-    reads: &[0, 1, 2],
+    writes: WAL_CONTROL_VERSION,
+    reads: &[1, 2, 3],
+};
+
+/// The write-ahead log version a store with a control keyspace writes, activated or
+/// not: version 2 with `WAL_CONTROL` records (spec C26 §7).
+pub const WAL_CONTROL_VERSION: u32 = 3;
+
+/// The control log at the dataset root (spec C26 §7, [`crate::control`]).
+pub const CONTROL_LOG: FileKind = FileKind {
+    id: "control-log",
+    files: "control.log",
+    marker: "a 16-byte header (magic `\\x89SPKCTL\\n` and the version), then frames with their length and CRC-32",
+    class: Class::Primary,
+    writes: crate::control::LOG_VERSION,
+    reads: &[1],
+};
+
+/// The control checkpoint at the dataset root (spec C26 §7, [`crate::control`]).
+pub const CONTROL_CHECKPOINT: FileKind = FileKind {
+    id: "control-checkpoint",
+    files: "control.bin",
+    marker: "magic `\\x89SPKCKP\\n` and the version, the entries in key order and a SHA-256 trailer",
+    class: Class::Primary,
+    writes: crate::control::CHECKPOINT_VERSION,
+    reads: &[1],
 };
 
 /// Primary configuration binding of a generation's base data revision.
@@ -465,14 +507,16 @@ pub const BACKUP_BLOB: FileKind = FileKind {
     reads: &[1],
 };
 
-/// The key slots of an encrypted backup repository.
+/// The key slots of an encrypted backup repository. Format 2 binds the slot's metadata
+/// into its wrap. Format 1, which bound only the repository, epoch and slot id, is a
+/// pre-release form that follows the same window as databases.
 pub const BACKUP_SLOTS: FileKind = FileKind {
     id: "backup-slots",
     files: "key slots of an encrypted backup repository",
     marker: "`format` of each slot",
     class: Class::Archive,
     writes: 2,
-    reads: &[1, 2],
+    reads: &[2],
 };
 
 /// The manifest of a backup, which records the index format of the backed-up
@@ -502,7 +546,11 @@ pub const BACKUP_DEFINITION: FileKind = FileKind {
 
 /// The features a backup manifest may require in `requires`, which this build reads.
 /// A manifest that requires another feature is refused before anything is written.
-pub const BACKUP_MANIFEST_FEATURES: &[&str] = &["definitions", "evidence-configuration-history/1"];
+pub const BACKUP_MANIFEST_FEATURES: &[&str] = &[
+    "definitions",
+    "evidence-configuration-history/1",
+    "control/1",
+];
 
 /// A kind of dataset-managed definition that backups and clones carry beside the data,
 /// at `DIR/NAME/FILE` under the dataset root. The file is the registered settings file
@@ -636,6 +684,8 @@ pub const KINDS: &[&FileKind] = &[
     &PLANNER_STATISTICS,
     &DELTA_VOCAB,
     &WAL,
+    &CONTROL_LOG,
+    &CONTROL_CHECKPOINT,
     &GENERATION_COMMIT,
     &CONFIGURATION_GENERATION,
     &CONFIGURATION_COVERAGE,
@@ -761,6 +811,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     // the managed-graph registry and its owners' settings (see `crate::managed`)
     ds("managed.json", 3),
     ds("evidence.json", 1),
+    ds("jobs.json", crate::jobs::FORMAT),
     // durable source holds (see `crate::holds`)
     ds("holds.json", 1),
     // a view's definition, `views/NAME/view.json`: format 2 is a paused one
@@ -800,7 +851,7 @@ pub fn informational(name: &str) -> bool {
 /// managed-graph registry and its owners' settings. A registry this build cannot
 /// enforce keeps the dataset readable and refuses every write instead (see
 /// [`crate::managed`]).
-pub const WRITE_FENCED_SETTINGS: &[&str] = &["managed.json", "evidence.json"];
+pub const WRITE_FENCED_SETTINGS: &[&str] = &["managed.json", "evidence.json", "jobs.json"];
 
 /// Dataset settings files that refuse the open only when they are of a newer version.
 /// Any other damage keeps the dataset open and makes the file's owner fail closed:
@@ -855,11 +906,13 @@ pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
 
 /// Every reason this build refuses the dataset directory `dir` because of a settings
 /// file (the registered files of [`Scope::Dataset`] other than the informational ones).
-/// A file that does not exist is skipped. One that is not JSON is skipped too, since its
-/// own reader reports the damage. A file with a version this build does not read
-/// gives an error that names the directory and keeps its variant.
+/// A file that does not exist is skipped. History also uses its full typed reader so
+/// that supported corruption refuses before startup writers. Other files that are not
+/// JSON are left to their own readers. An unreadable version names the directory and
+/// keeps its error variant.
 pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
     let mut out = Vec::new();
+    let mut history_refused = false;
     for s in SETTINGS.iter().filter(|s| {
         s.scope == Scope::Dataset
             && !informational(s.name)
@@ -885,6 +938,7 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
+        let refused = out.len();
         let checked = check_settings(s.name, &v).and_then(|found| {
             if matches!(s.name, "history.json" | "branch.json")
                 && found >= 2
@@ -906,6 +960,20 @@ pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
             Err(Error::Corrupt(m)) => out.push(Error::Corrupt(format!("{}: {m}", dir.display()))),
             Err(e) => out.push(e),
         }
+        history_refused |= s.name == "history.json" && out.len() > refused;
+    }
+    // History also goes through its full pure typed reader, so that supported
+    // corruption refuses before startup writers. The version and its admission
+    // against the recorded reader are checked above first, and a refusal there
+    // stands alone.
+    if !history_refused && let Err(error) = crate::history::preflight_file(dir) {
+        out.push(match error {
+            Error::Unsupported(message) => {
+                Error::Unsupported(format!("{}: {message}", dir.display()))
+            }
+            Error::Corrupt(message) => Error::Corrupt(format!("{}: {message}", dir.display())),
+            error => error,
+        });
     }
     out
 }
@@ -1019,6 +1087,20 @@ pub(crate) fn admit_configuration_version(
     Ok(())
 }
 
+/// Refuse `version` of `what`, a format only a store with a control keyspace writes (log
+/// version 3), in a dataset that records a reader below the one that enabling the
+/// keyspace raises it to (spec C26 §7).
+pub(crate) fn admit_control_version(recorded_reader: u32, what: &str, version: u32) -> Result<()> {
+    let reader = crate::jobs::READER;
+    if recorded_reader < reader {
+        return Err(Error::Unsupported(format!(
+            "{what} has version {version}, which a dataset records only with a control \
+             keyspace (reader {reader}); this dataset records reader {recorded_reader}"
+        )));
+    }
+    Ok(())
+}
+
 /// The reader that the dataset in `dir` records, when it has a `dataset.json`.
 fn recorded_reader(dir: &std::path::Path) -> Option<u32> {
     crate::commit::read_dataset_versions(dir)
@@ -1077,7 +1159,9 @@ pub(crate) fn check_configuration_versions(dir: &std::path::Path) -> Result<()> 
                 }
                 if read == header.len() && header[..8] == crate::store::wal::MAGIC {
                     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-                    if version > crate::store::wal::PLAIN_VERSION {
+                    if version == WAL_CONTROL_VERSION {
+                        admit_control_version(reader, &wal.display().to_string(), version)?;
+                    } else if version > crate::store::wal::PLAIN_VERSION {
                         admit_configuration_version(reader, &wal.display().to_string(), version)?;
                     }
                 }
@@ -1263,6 +1347,11 @@ mod tests {
             *DATASET.reads.last().unwrap(),
             crate::commit::DATASET_READER
         );
+        assert_eq!(
+            *DATASET.reads.first().unwrap(),
+            crate::commit::OLDEST_DATASET_READER
+        );
+        assert_eq!(crate::commit::DATASET_FORMAT, 2);
         assert_eq!(VECTOR.writes, crate::vector::config::FORMAT_VERSION);
         assert_eq!(GEO.writes, crate::geo::config::FORMAT_VERSION);
         assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
@@ -1325,18 +1414,18 @@ mod tests {
 
     #[test]
     fn refusals_say_what_to_do() {
-        let e = INDEX.refuse("gen-0003", 5, Some("0.4.0")).to_string();
+        let e = INDEX.refuse("gen-0003", 6, Some("0.4.0")).to_string();
         assert!(
-            e.contains("index version 5, written by Sparkles 0.4.0"),
+            e.contains("index version 6, written by Sparkles 0.4.0"),
             "{e}"
         );
         assert!(e.contains("newer release"), "{e}");
-        let e = INDEX.refuse("gen-0003", 1, Some("0.1.0")).to_string();
+        let e = INDEX.refuse("gen-0003", 4, Some("0.1.0")).to_string();
         assert!(
             e.contains("sparkles dump") && e.contains("Sparkles 0.1.0"),
             "{e}"
         );
-        assert_eq!(WAL.readable(), "0, 1 and 2");
+        assert_eq!(WAL.readable(), "1, 2 and 3");
         assert_eq!(list(&[0, 1, 2]), "0, 1 and 2");
     }
 
@@ -1442,5 +1531,314 @@ mod algo_catalog_registry_tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["writes"], 2);
+    }
+}
+
+#[cfg(test)]
+mod history_refusal_nonmutation_tests {
+    use crate::{
+        Error,
+        store::{Store, StoreOptions},
+    };
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
+
+    fn metadata_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                let path = entry.path();
+                if kind.is_dir() {
+                    visit(root, &path, out);
+                } else {
+                    assert!(kind.is_file(), "fixture contains an unexpected non-file");
+                    if entry.file_name() != "sparkles.lock" {
+                        out.insert(
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            std::fs::read(path).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    /// Activate configuration history on a closed persistent store. Only an
+    /// activated dataset admits `history.json` format 2 (C25, "The newer file
+    /// versions are written only after activation").
+    fn activate(root: &Path) {
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 64 << 20).unwrap();
+        crate::migrate::activate_configuration_history(root, false, &preparation).unwrap();
+    }
+
+    /// Remove `writtenBy`, so that a write-open by this build would rewrite
+    /// `dataset.json` and a refusal can show that nothing was written.
+    fn unstamp_writer(root: &Path) {
+        let path = root.join("dataset.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("writtenBy");
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn refused_without_writes(root: &Path) -> Error {
+        let before = metadata_files(root);
+        let error = match Store::open(root, StoreOptions::default()) {
+            Err(error) => error,
+            Ok(_) => panic!("the open must refuse"),
+        };
+        assert_eq!(
+            metadata_files(root),
+            before,
+            "a refused open must not mutate any metadata file"
+        );
+        error
+    }
+
+    #[test]
+    fn supported_corrupt_history_refuses_before_any_metadata_writer() {
+        assert_eq!(super::settings_file("history.json").unwrap().writes, 2);
+        // An activated dataset admits format 2, so a malformed one is corruption.
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        activate(&root);
+        let original_id = crate::commit::read_dataset_file(&root).unwrap().unwrap();
+        unstamp_writer(&root);
+        std::fs::write(root.join("history.json"), br#"{"format":2}"#).unwrap();
+        let error = refused_without_writes(&root);
+        assert!(
+            matches!(error, Error::Corrupt(_)),
+            "current malformed history is corruption: {error}"
+        );
+        assert_eq!(
+            crate::commit::read_dataset_file(&root).unwrap(),
+            Some(original_id),
+            "real dataset identity is unchanged"
+        );
+    }
+
+    #[test]
+    fn format_two_history_in_an_older_reader_dataset_is_a_newer_file() {
+        // C25: "One of these versions in a dataset that records an older reader
+        // is refused as a newer release's file."
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        old_stamp(&root);
+        std::fs::write(root.join("history.json"), br#"{"format":2}"#).unwrap();
+        let error = refused_without_writes(&root);
+        assert!(matches!(error, Error::Unsupported(_)), "{error}");
+    }
+
+    fn write_valid_history(root: &Path, identity: uuid::Uuid, current: bool) {
+        let mut pins = BTreeMap::new();
+        if current {
+            pins.insert(
+                "kept".into(),
+                crate::history::Pin {
+                    seq: 0,
+                    created_ms: 0,
+                    note: None,
+                    expires_ms: None,
+                    warm: false,
+                    configuration: Some(crate::history::PinnedConfiguration::legacy()),
+                },
+            );
+        }
+        crate::history::write_file(
+            root,
+            identity,
+            &pins,
+            Default::default(),
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+    }
+
+    fn old_stamp(root: &Path) {
+        let path = root.join("dataset.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["minimumReader"] = 1.into();
+        value.as_object_mut().unwrap().remove("writtenBy");
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn corrupt_current_history_in_root_active_and_retained_branches_is_read_only() {
+        for place in ["root", "active", "retained"] {
+            for fault in ["foreign-identity", "noncanonical"] {
+                let directory = tempfile::tempdir().unwrap();
+                let root = directory.path().join("db");
+                let store = Store::open(&root, StoreOptions::default()).unwrap();
+                let target = if place == "root" {
+                    root.clone()
+                } else {
+                    let info = store.create_branch("bad", &Default::default()).unwrap();
+                    if place == "retained" {
+                        store
+                            .create_branch(
+                                "child",
+                                &crate::branch::BranchOptions {
+                                    from: "bad".into(),
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                        store
+                            .delete_branch_with(
+                                "bad",
+                                &crate::branch::DeleteOptions {
+                                    force: true,
+                                    reparent: true,
+                                    release_holds: false,
+                                },
+                            )
+                            .unwrap();
+                    }
+                    root.join("branches").join(info.id.to_string())
+                };
+                drop(store);
+                assert!(
+                    target.is_dir(),
+                    "real active/retained physical branch must survive"
+                );
+                activate(&root);
+                let identity = crate::commit::read_dataset_file(&target).unwrap().unwrap();
+                write_valid_history(
+                    &target,
+                    if fault == "foreign-identity" {
+                        uuid::Uuid::new_v4()
+                    } else {
+                        identity
+                    },
+                    true,
+                );
+                if fault == "noncanonical" {
+                    let path = target.join("history.json");
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes.push(b' ');
+                    std::fs::write(path, bytes).unwrap();
+                }
+                unstamp_writer(&root);
+                let before = metadata_files(&root);
+                let plan = crate::migrate::plan(&root).unwrap();
+                assert!(
+                    !plan.refused.is_empty(),
+                    "migration must refuse {place}/{fault}"
+                );
+                assert_eq!(
+                    metadata_files(&root),
+                    before,
+                    "read-only planner changed metadata"
+                );
+                let error = Store::open(&root, StoreOptions::default())
+                    .err()
+                    .expect("supported history corruption must refuse");
+                assert!(
+                    matches!(error, Error::Corrupt(_)),
+                    "{place}/{fault}: {error}"
+                );
+                assert_eq!(
+                    metadata_files(&root),
+                    before,
+                    "{place}/{fault}: refusal mutated metadata"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn future_history_refuses_before_required_fields_or_recorded_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(
+            root.join("history.json"),
+            br#"{"format":3,"futureShape":true}"#,
+        )
+        .unwrap();
+        let before = metadata_files(root);
+        assert!(matches!(
+            crate::history::preflight_file(root),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            super::check_dataset_dir(root),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(!crate::migrate::plan(root).unwrap().refused.is_empty());
+        assert_eq!(metadata_files(root), before);
+    }
+
+    #[test]
+    fn absent_history_keeps_the_new_path_and_refuses_the_pre_release_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("db");
+        std::fs::create_dir(&root).unwrap();
+        crate::history::preflight_file(&root).unwrap();
+        let store = Store::open(&root, StoreOptions::default()).unwrap();
+        assert!(store.snapshot().is_empty());
+        drop(store);
+        assert!(!root.join("history.json").exists());
+        let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+        std::fs::remove_file(root.join(current.trim()).join("commit.json")).unwrap();
+        std::fs::remove_file(root.join("dataset.json")).unwrap();
+        std::fs::remove_file(root.join("commits.bin")).unwrap();
+        crate::history::preflight_file(&root).unwrap();
+        // The first-release format cutoff (item 479) refuses a database without
+        // dataset.json instead of upgrading it, and the refusal writes nothing.
+        let before = metadata_files(&root);
+        match Store::open(&root, StoreOptions::default()) {
+            Err(Error::Unsupported(message)) => {
+                assert!(message.contains("dataset.json is missing"), "{message}")
+            }
+            Err(other) => panic!("expected the pre-release refusal, got {other}"),
+            Ok(_) => panic!("a database without dataset.json opened"),
+        }
+        assert_eq!(metadata_files(&root), before);
+        assert!(!root.join("dataset.json").exists());
+    }
+
+    #[test]
+    fn valid_current_history_uses_its_actual_identity_without_preflight_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        activate(&root);
+        let identity = crate::commit::read_dataset_file(&root).unwrap().unwrap();
+        write_valid_history(&root, identity, true);
+        let before = metadata_files(&root);
+        crate::history::preflight_file(&root).unwrap();
+        super::check_dataset_tree(&root).unwrap();
+        assert!(crate::migrate::plan(&root).unwrap().refused.is_empty());
+        assert_eq!(metadata_files(&root), before);
+        let opened = Store::open(&root, StoreOptions::default()).unwrap();
+        assert!(opened.snapshot().is_empty());
+    }
+
+    #[test]
+    fn supported_history_requires_real_identity_without_inventing_legacy_uuid() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let identity = crate::commit::read_dataset_file(&root).unwrap().unwrap();
+        write_valid_history(&root, identity, false);
+        std::fs::remove_file(root.join("dataset.json")).unwrap();
+        let before = metadata_files(&root);
+        assert!(matches!(
+            crate::history::preflight_file(&root),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(!crate::migrate::plan(&root).unwrap().refused.is_empty());
+        assert_eq!(metadata_files(&root), before);
     }
 }

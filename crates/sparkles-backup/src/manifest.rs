@@ -291,6 +291,20 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
             "configuration history needs its primary closure and managed.json".into(),
         );
     }
+    // The control closure (spec C26 §7.3): the feature and the jobs settings each need
+    // the checkpoint, and the checkpoint needs the feature. Its content is checked
+    // against the dataset before the restore reidentifies or publishes it.
+    let control_required = m.requires.iter().any(|feature| feature == "control/1");
+    let checkpoint = seen.contains(sparkles_core::control::CHECKPOINT_FILE);
+    if (control_required || seen.contains(sparkles_core::jobs::FILE)) && !checkpoint {
+        return bad(
+            "files",
+            "the control feature and the jobs settings need control.bin".into(),
+        );
+    }
+    if checkpoint && !control_required {
+        return bad("requires", "control.bin needs the feature control/1".into());
+    }
     Ok(())
 }
 
@@ -562,6 +576,29 @@ mod tests {
         validate(&m, PIECE, &[2]).unwrap();
     }
 
+    /// A22: the control feature and the jobs settings need the checkpoint, and the
+    /// checkpoint needs the feature (spec C26 §7.3).
+    #[test]
+    fn the_control_closure_needs_the_checkpoint_and_the_feature() {
+        let with = |paths: &[&str], feature: bool| {
+            let mut m = good();
+            for (i, p) in paths.iter().enumerate() {
+                m.files.push(file(p, &[40 + i as u64]));
+            }
+            if feature {
+                m.requires.push("control/1".into());
+            }
+            validate(&m, PIECE, &[2])
+        };
+        with(&["control.bin", "jobs.json"], true).unwrap();
+        with(&["control.bin"], true).unwrap();
+        assert!(with(&["jobs.json"], true).is_err());
+        assert!(with(&["jobs.json"], false).is_err());
+        assert!(with(&[], true).is_err());
+        assert!(with(&["control.bin"], false).is_err());
+        assert!(with(&["control.log", "control.bin"], true).is_err());
+    }
+
     #[test]
     fn configuration_history_requires_immutable_digest_named_primary_files() {
         let lineage = "0b6e5c1a-0000-4000-8000-000000000001";
@@ -721,7 +758,7 @@ mod tests {
     #[test]
     fn an_unknown_index_feature_is_incompatible() {
         let mut m = good();
-        m.index_format = 4;
+        m.index_format = sparkles_core::builder::FORMAT_VERSION;
         m.index_features = vec!["fsst-vocab".into()];
         validate(&m, PIECE, sparkles_core::formats::READABLE_INDEX_FORMATS).unwrap();
         m.index_features.push("zz-future".into());

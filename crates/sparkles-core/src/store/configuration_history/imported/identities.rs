@@ -176,7 +176,7 @@ impl Identities {
         let logical = store.dataset_id;
         let family_dataset = managed_history::encode(
             &CapturedFamily {
-                format: 1,
+                format: crate::commit::DATASET_FORMAT,
                 minimum_reader: managed_history::READER,
                 written_by: crate::formats::SPARKLES_VERSION,
                 id: family,

@@ -278,7 +278,7 @@ answers and instruction counts, and the limits of attributing them to layout.
 | [History, snapshots and branches](storage/README.md#versioning-and-history) | Partially complete. | Retained commits, diffs, branches and merge review are available. Capped Store snapshots and trusted Dataset history handles preserve retained origins. Historical full-text search and further branch administration remain. |
 | [Join estimation](internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations) | Partially complete. | Stars, object joins, chains and joins on several keys are estimated from characteristic sets with a remainder and from key probes. Characteristic pairs, sampling of large inputs and the other X15 phases remain under item 454. |
 | [Streaming execution and disk spill](querying/README.md#sparql-queries-and-updates) | Partially complete. | Eligible plans stream automatically, with explicit cursors and disk spill on by default. Both modes join through one kernel library, an eager join whose hash table does not fit spills, and finite HTTP bodies have independent idle and optional total transfer deadlines. Eager fallbacks and some ordered spill costs remain. |
-| [Incremental views and live queries](querying/README.md#sparql-queries-and-updates) | Partially complete. | Table views and live query updates are available, including maintained property paths. Graph views, commit-time maintenance, branch views and provenance on views remain planned. |
+| [Incremental views and live queries](querying/README.md#sparql-queries-and-updates) | Partially complete. | Table views and live query updates are available, including maintained property paths, the aggregates `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`, `HAVING` and correlated `EXISTS`. Graph views, commit-time maintenance, branch views and provenance on views remain planned. |
 
 ### Search and graph analysis
 
@@ -329,11 +329,11 @@ answers and instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reviewed, reversible identity resolution maps, assessment inputs and the dependents of changed records are available through Rust, HTTP and caller-scoped MCP tools with protected records and retained source holds. `recall` and Ask cite claim occurrences with their review state under a named policy. Document ingestion can write extracted facts as claim proposals with their source registration in one commit. Community reports can read a review policy's accepted projection and cite the claims and decisions behind their facts. Maintained analyses are planned under item 340. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reviewed, reversible identity resolution maps, assessment inputs and the dependents of changed records are available through Rust, HTTP and caller-scoped MCP tools with protected records and retained source holds. `recall` and Ask cite claim occurrences with their review state under a named policy. Document ingestion can write extracted facts as claim proposals with their source registration in one commit. Community reports can read a review policy's accepted projection, cite the claims and decisions behind their facts, and refresh automatically when a reviewed input changes. Maintained analyses are planned under item 340. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
-| [Durable jobs and delivery](specs/C26-durable-jobs-and-delivery.md) | Planned. | Item 339 specifies checkpointed jobs, fenced workers and a transactional outbox. Current tasks and notifications do not provide that recovery contract. |
+| [Durable jobs and delivery](ai/README.md#durable-jobs) | Partially complete. | Idempotent submission, fenced worker leases, atomic publication of quads with a source checkpoint, restart fencing and the recovery of restored work are available through Rust and HTTP for the `quads` kind. The ledger lives in the store's control keyspace, which no query, listing, index or history reads. The outbox and recurring definitions remain under item 339. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |
-| [Valid-time queries and event history](ai/README.md#valid-time-profile) | Partially complete. | Versioned RDF resources, SHACL shapes and temporal stored-query templates are available. Phase 1 still requires authenticated availability and backdating refusal. The projection helper, event-time UI and expiry integration remain planned. |
+| [Valid-time queries and event history](ai/README.md#valid-time-profile) | Partially complete. | Versioned RDF resources, SHACL shapes, temporal stored-query templates and server-owned availability that refuses backdating are available. Validity intervals through the authenticated writer, the projection helper, event-time UI and expiry integration remain planned. |
 | [Reports for distinct audiences](specs/C22b-report-configurations.md) | Planned. | Item 100 specifies multiple guarded GraphRAG configurations and shared budget enforcement. |
 | [ChatGPT-plan model access](specs/C28-chatgpt-model-access.md) | Planned. | Item 344 specifies personal sign-in, protected connections and Responses streaming. Existing OpenAI-compatible providers use API keys. |
 | [Batched updates and triggers](specs/C23-batched-updates-and-triggers.md) | Planned. | Item 36 specifies batched work, commit-trigger authoring and the writer that graph algorithms use. |
@@ -350,10 +350,10 @@ roadmap item as unfinished or promise another implementation.
   predicate. Queries that count triples use the ordinary permutations. Encoded IRIs and
   alternative block codecs are not available because their measured savings did not
   meet the adoption gates in [X11](specs/X11-index-compression-and-predicate-patterns.md#phases-not-built).
-* A headerless WAL that has never been opened for writing by the current format keeps
-  its legacy interpretation. A torn record left by an older build can therefore be
-  read as a legacy commit or refused, as [X09](specs/X09-group-commit-by-default.md#phase-3)
-  describes.
+* Databases and backups written before the first release are refused with a message
+  that names `sparkles dump` from the release that wrote them and `sparkles load`, as
+  [X16](specs/X16-storage-consolidation/SPEC.md#phase-1-first-release-format-cutoff-item-479)
+  describes. There is no upgrade step for them.
 * ShEx 2.2 does not support `RESTRICTS` or `EXACTLY` reference syntax. SHACL 1.2 reifier
   constraints, `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`,
   `sh:singleLine` and SHACL 1.2 custom functions are outside the supported scope. The

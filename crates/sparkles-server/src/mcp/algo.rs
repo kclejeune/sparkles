@@ -54,7 +54,7 @@ fn cell(t: &Option<Term>, terms: &mut Terms) -> Value {
             ) =>
         {
             l.value().parse::<f64>().map_or_else(
-                |_| json!(terms.term(&Term::Literal(l.clone()))),
+                |_| json!(terms.term(t.as_ref().expect("matched literal"))),
                 super::number,
             )
         }
@@ -146,23 +146,24 @@ impl Tools<'_> {
             )
             .map_err(|e| ctx.engine(e))?;
         let result = sparql::query(snap.clone(), &query, &opts).map_err(|e| ctx.engine(e))?;
-        let mut columns = result.vars.clone();
+        let mut columns = result.variables().to_vec();
         let summary_at = columns.iter().position(|v| v == "summary");
         if let Some(i) = summary_at {
             columns.remove(i);
         }
-        let rows = result.rows();
+        let rows = result.rows().map_err(|e| ctx.engine(e))?;
         let mut terms = Terms::new(&prefixes, 200);
         let mut summary = Value::Null;
         let mut table: Vec<Value> = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for row in rows.iter() {
             if summary.is_null()
                 && let Some(i) = summary_at
-                && let Some(Some(Term::Literal(l))) = row.get(i)
+                && let Some(Some(Term::Literal(l))) = row.values().get(i)
             {
                 summary = serde_json::from_str(l.value()).unwrap_or(Value::Null);
             }
             let cells = row
+                .values()
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| Some(*i) != summary_at)

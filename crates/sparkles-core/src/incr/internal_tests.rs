@@ -114,7 +114,7 @@ fn rows_at_head(s: &Store, query: &str) -> BTreeMap<Vec<String>, i64> {
     )
     .expect("oracle");
     let mut out = BTreeMap::new();
-    for row in r.rows() {
+    for row in r.test_application_rows() {
         *out.entry(row.iter().map(name).collect::<Vec<_>>())
             .or_insert(0) += 1;
     }

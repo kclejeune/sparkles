@@ -75,7 +75,7 @@ fn answer(snap: &Arc<crate::store::Snapshot>, q: &str, opt: Optimizations) -> Ve
     let r = query(snap.clone(), &format!("{PREFIXES}{q}"), &opts(opt))
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     let mut rows: Vec<String> = r
-        .rows()
+        .test_application_rows()
         .into_iter()
         .map(|row| {
             row.into_iter()

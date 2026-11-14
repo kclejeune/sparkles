@@ -33,7 +33,7 @@ use crate::index::{
     read_varint_checked, supported_segment_rows,
 };
 use crate::store::{
-    Framing, WAL_COMMIT, WAL_CONFIGURATION, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC,
+    WAL_COMMIT, WAL_CONFIGURATION, WAL_CONTROL, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC,
 };
 use crate::vocab::{FC_BLOCK, parse_delta};
 use rayon::prelude::*;
@@ -394,6 +394,7 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         let text = crate::text::probe(root, c.full);
         let text_ms = t_text.elapsed().as_secs_f64() * 1000.0;
         c.wal_check(&dir, &gen_name);
+        c.control_keyspace();
         c.catalog(catalog);
         c.text(text);
         if let Some(t) = c.checks.iter_mut().find(|x| x.name == "text") {
@@ -516,11 +517,46 @@ mod text_probe_tests {
 }
 
 /// What the WAL holds, as replay would see it.
+impl Checker<'_> {
+    /// The control keyspace (spec C26 §7.2): the checkpoint, the control log and the
+    /// frames the write-ahead log's kept commits carry recover as an open would.
+    fn control_keyspace(&mut self) {
+        let t = Instant::now();
+        let mut run = Run::new("control");
+        let (frames, head, version) = match &self.wal {
+            Some(w) => (w.control.clone(), w.head, w.version),
+            None => (Vec::new(), self.base.map_or(0, |b| b.seq), 0),
+        };
+        let configured = crate::store::control_store::jobs_configured(self.root, version);
+        let summary =
+            match crate::store::control_store::recover_at_open(self.root, frames, head, configured)
+            {
+                Ok(None) => "no control keyspace".to_string(),
+                Ok(Some(opened)) => format!(
+                    "{} entries after control frame {}",
+                    opened.state.len(),
+                    opened.state.seq
+                ),
+                Err(e) => {
+                    run.add(Issue::error(e.to_string()));
+                    "the control keyspace does not recover".to_string()
+                }
+            };
+        let mut done = run.done(summary);
+        done.millis = t.elapsed().as_secs_f64() * 1000.0;
+        self.checks.push(done);
+    }
+}
+
 struct WalInfo {
     /// the last commit replay would keep
     head: u64,
     /// (seq, timestamp, kind code) of the commits replay would keep, in order
     commits: Vec<(u64, i64, u8)>,
+    /// the control frames of the commits replay would keep
+    control: Vec<crate::control::WalFrame>,
+    /// the log's version
+    version: u32,
 }
 
 /// The vocabulary check, finished after the permutations report their id references.
@@ -658,12 +694,16 @@ impl Checker<'_> {
         }
         match commit::read_dataset_file(root) {
             Ok(Some(id)) => self.dataset_id = Some(id),
-            Ok(None) => run.add(
-                Issue::warning(
-                    "dataset.json is missing: a database from an older version, which gets a dataset id and a baseline commit when opened",
-                )
+            // only a database written before the first release lacks the file, and
+            // open refuses it instead of giving it a baseline commit
+            Ok(None) if self.current.is_some() => run.add(
+                Issue::error(format!(
+                    "dataset.json is missing, which only a database written before the first release lacks: open refuses the database. {}",
+                    crate::formats::dump_and_reload(None)
+                ))
                 .file("dataset.json"),
             ),
+            Ok(None) => {}
             Err(e) => run.add(Issue::error(e.to_string()).file("dataset.json")),
         }
         if let Some(name) = &self.current {
@@ -683,11 +723,13 @@ impl Checker<'_> {
                     self.base = Some(c);
                     self.origin = Some(origin);
                 }
-                Ok(None) if self.dataset_id.is_some() => run.add(
-                    Issue::warning("missing: open records the generation as a baseline commit")
-                        .file(&file),
+                Ok(None) => run.add(
+                    Issue::error(format!(
+                        "missing, which only a generation written before the first release lacks: open refuses the database. {}",
+                        crate::formats::dump_and_reload(commit::read_written_by(root).as_deref())
+                    ))
+                    .file(&file),
                 ),
-                Ok(None) => {}
                 Err(e) => run.add(Issue::error(e.to_string()).file(&file)),
             }
         }
@@ -788,12 +830,14 @@ impl Checker<'_> {
             // the version first: a newer meta may have another shape
             Ok(b) => match crate::builder::index_meta_version(&b, "meta.json").and_then(|v| {
                 let written_by = dir.parent().and_then(crate::commit::read_written_by);
-                crate::formats::INDEX.check(name, v, written_by.as_deref())
+                crate::formats::INDEX.check(name, v, written_by.as_deref())?;
+                // a readable format lists its features, as open requires
+                let value: serde_json::Value = serde_json::from_slice(&b)
+                    .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
+                crate::builder::check_features_listed(&value, "meta.json")
             }) {
-                Err(e @ Error::Unsupported(_)) => {
-                    run.add(Issue::error(e.to_string()).file(&meta_file))
-                }
-                _ => match serde_json::from_slice::<IndexMeta>(&b) {
+                Err(e) => run.add(Issue::error(e.to_string()).file(&meta_file)),
+                Ok(()) => match serde_json::from_slice::<IndexMeta>(&b) {
                     Err(e) => {
                         run.add(Issue::error(format!("does not parse: {e}")).file(&meta_file))
                     }
@@ -1150,18 +1194,10 @@ impl Checker<'_> {
             summary.push_str(", block first keys checked for order");
         }
         match crate::vocab::verify_sparse_index(dir, &offsets, data) {
-            None => {}
-            Some(Ok(n)) => summary.push_str(&format!(", sparse index of {n} keys")),
-            // the server does without an index it cannot read, but would use one that
-            // reads well and names other keys
-            Some(Err((error, m))) => run.add(
-                if error {
-                    Issue::error(m)
-                } else {
-                    Issue::warning(m)
-                }
-                .file(format!("{name}/vocab.idx")),
-            ),
+            Ok(n) => summary.push_str(&format!(", sparse index of {n} keys")),
+            // index format 5 requires the sparse index, so a missing one or one that
+            // does not describe this vocabulary is an error, as the open refuses it
+            Err(m) => run.add(Issue::error(m).file(format!("{name}/vocab.idx"))),
         }
         match crate::vocab::verify_numeric_column(dir, self.full) {
             None => {}
@@ -1277,11 +1313,7 @@ impl Checker<'_> {
             }
         }
         self.dvocab_len = Some(keys.len() as u64);
-        let mut summary = format!(
-            "{} terms added by updates; {} format",
-            keys.len(),
-            parsed.format.as_str()
-        );
+        let mut summary = format!("{} terms added by updates", keys.len());
         if parsed.chunks > 0 {
             summary.push_str(&format!(", {} chunks", parsed.chunks));
         }
@@ -1297,15 +1329,10 @@ impl Checker<'_> {
         let full = self.full;
         let quads = self.meta.as_ref().map(|m| m.quads);
         let vocab_len = self.vocab_len;
-        // format 3 generations are segmented (spec X07 §6.5); without a readable meta.json
-        // the `.seg` files say
-        let segmented = |p: Perm| match self.meta.as_ref() {
-            Some(m) => m.format_version >= 3,
-            None => dir.join(format!("{}.seg", p.name())).exists(),
-        };
+        // every generation this build reads is segmented (spec X07 §6.5)
         let scans: Vec<PermScan> = Perm::ALL
             .par_iter()
-            .map(|&p| scan_perm(dir, name, p, quads, vocab_len, full, segmented(p)))
+            .map(|&p| scan_perm(dir, name, p, quads, vocab_len, full))
             .collect();
         let t0 = Instant::now();
         let mut refs = IdRefs::default();
@@ -1395,21 +1422,10 @@ impl Checker<'_> {
     fn wal_check(&mut self, dir: &Path, name: &str) {
         let mut run = Run::new("wal");
         let file = format!("{name}/wal.log");
-        let mut missing = false;
         let buf = match std::fs::read(dir.join("wal.log")) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                missing = true;
-                // a recorded strict-framing offset proves the log existed
-                match commit::wal_strict_from(dir) {
-                    Ok(Some(m)) => run.add(
-                        Issue::error(format!(
-                            "missing, but commit.json records walStrictFrom {m}: the log was lost, and open refuses the database"
-                        ))
-                        .file(&file),
-                    ),
-                    _ => run.add(Issue::warning("missing: created on open").file(&file)),
-                }
+                run.add(Issue::warning("missing: created on open").file(&file));
                 Vec::new()
             }
             Err(e) => {
@@ -1451,13 +1467,21 @@ impl Checker<'_> {
             std::thread::sleep(std::time::Duration::from_millis(25));
             dvocab_len = terms();
         }
-        // the commit the base holds; a generation without commit.json starts a baseline
+        // the commit the base holds
         let base_seq = self.base.map(|b| b.seq);
         let base_ts = self.base.map_or(i64::MIN, |b| b.timestamp_ms);
-        let fold_legacy = match (&self.origin, self.dataset_id) {
-            (Some(o), Some(_)) => o == "baseline",
-            _ => true,
-        };
+        // The first record by the open's rule, on the whole file: a header record, or
+        // the zeros of a header torn at the log's creation. The pre-release headerless
+        // log and a record of zeros with bytes after it are refused as open refuses them.
+        if let Err(e) = crate::store::wal::committed_version_of(&buf, &dir.join("wal.log")) {
+            run.add(
+                Issue::error(format!("{e}: open refuses the database"))
+                    .file(&file)
+                    .offset(0),
+            );
+            self.checks.push(run.done("refused"));
+            return;
+        }
         // zero bytes after the last record are space preallocated for the next commits
         let zero = |r: &[u8]| r.iter().all(|&b| b == 0);
         let logical = buf
@@ -1469,25 +1493,8 @@ impl Checker<'_> {
         let recs = buf.as_chunks::<WAL_REC>().0;
         // whether damage at record `i` is a torn tail that open truncates, by the rule
         // open uses
-        let torn_at = |i: usize, prev_seq: Option<u64>, framing: Framing| {
-            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1), framing)
-        };
-        // Where a headerless log's strict framing starts. It is read after the log: it is
-        // recorded once, before anything is appended past it, so every byte read above
-        // that a writer appended lies after the offset read here.
-        let strict_from = match commit::wal_strict_from(dir) {
-            Ok(m) => m,
-            Err(e) => {
-                run.add(Issue::error(e.to_string()).file(format!("{name}/commit.json")));
-                None
-            }
-        };
-        let strict_from = match crate::store::check_strict_from(&dir.join("wal.log"), strict_from) {
-            Ok(()) => strict_from,
-            Err(e) => {
-                run.add(Issue::error(e.to_string()).file(format!("{name}/commit.json")));
-                None
-            }
+        let torn_at = |i: usize, prev_seq: Option<u64>| {
+            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1))
         };
         // the commits that have an annotation, to find a commit of a group that reached
         // the disk without the one it asked for (see `commit::WAL_FLAG_ANNOTATED`)
@@ -1496,11 +1503,11 @@ impl Checker<'_> {
             .and_then(|id| crate::annotations::seqs_of(self.root, id));
         let (mut prev_seq, mut prev_ts) = (base_seq, base_ts);
         let mut commits: Vec<(u64, i64, u8)> = Vec::new();
-        let (mut folded, mut data_recs) = (0usize, 0usize);
+        let mut control: Vec<crate::control::WalFrame> = Vec::new();
+        let mut txn_control: Vec<u8> = Vec::new();
+        let mut data_recs = 0usize;
         let mut txn_start = 0usize;
         let mut good = 0usize;
-        let mut seen_v2 = false;
-        let mut framing = Framing::of(strict_from);
         let mut torn = false;
         // the log's version: 0 without a header record
         let mut version = 0u32;
@@ -1520,20 +1527,7 @@ impl Checker<'_> {
                 // the header record of a log written by a release with log versions
                 WAL_HEADER if i == 0 => {
                     match crate::store::wal::header_version(rec, &dir.join("wal.log")) {
-                        Ok(v) => {
-                            version = v;
-                            if strict_from.is_some() {
-                                run.add(
-                                    Issue::warning(
-                                        "commit.json records walStrictFrom for a log with a header record, which ignores it",
-                                    )
-                                    .file(format!("{name}/commit.json")),
-                                );
-                            }
-                            if v >= 1 {
-                                framing = Framing::Strict { from: 1 };
-                            }
-                        }
+                        Ok(v) => version = v,
                         Err(e) => {
                             run.add(Issue::error(e.to_string()).file(&file).offset(0));
                             torn = true;
@@ -1561,13 +1555,14 @@ impl Checker<'_> {
                     }
                 }
                 WAL_CONFIGURATION => {}
+                WAL_CONTROL => txn_control.extend_from_slice(&rec[1..]),
                 WAL_COMMIT => {
                     let data = &buf[txn_start * WAL_REC..i * WAL_REC];
                     let n = i - txn_start;
                     let n = format!("{n} transaction record{}", if n == 1 { "" } else { "s" });
                     let meta = commit::open_wal_commit(rec, data);
-                    if meta.is_none() && framing.strict_at(i) {
-                        let suffix_torn = torn_at(i, prev_seq, framing);
+                    if meta.is_none() {
+                        let suffix_torn = torn_at(i, prev_seq);
                         let message = if suffix_torn {
                             format!(
                                 "the transaction ({n} from offset {}) has lost its modern commit metadata, and no later commit shows it was durable: it is treated as torn and truncated on open",
@@ -1613,7 +1608,7 @@ impl Checker<'_> {
                     // damage that no later commit record shows was durable is a torn tail
                     let torn_here = (matches!(meta, Some(Err(())))
                         || (missing_terms && matches!(meta, Some(Ok(_)))))
-                        && torn_at(i, prev_seq, framing);
+                        && torn_at(i, prev_seq);
                     if torn_here && missing_terms && matches!(meta, Some(Ok(_))) {
                         run.add(
                             Issue::warning(format!(
@@ -1631,7 +1626,7 @@ impl Checker<'_> {
                         && flags & commit::WAL_FLAG_ANNOTATED != 0
                         && !set.contains(seq)
                     {
-                        if torn_at(i, prev_seq, framing) {
+                        if torn_at(i, prev_seq) {
                             run.add(
                                 Issue::warning(format!(
                                     "the annotation of commit {seq} is missing from annotations.bin, and no later commit shows it was durable: it did not reach the disk before a crash, so the commit is treated as torn and truncated on open"
@@ -1689,7 +1684,6 @@ impl Checker<'_> {
                             commits.push((seq, prev_ts, 255));
                         }
                         Some(Ok((seq, ts, kind, _))) => {
-                            seen_v2 = true;
                             let expect = prev_seq.map_or(0, |s| s + 1);
                             if seq != expect {
                                 run.add(
@@ -1715,20 +1709,28 @@ impl Checker<'_> {
                             prev_seq = Some(seq);
                             prev_ts = prev_ts.max(ts);
                             commits.push((seq, ts, kind.code()));
+                            if !txn_control.is_empty() {
+                                match crate::control::Frame::from_chunks(&txn_control) {
+                                    Ok(frame) => control
+                                        .push(crate::control::WalFrame { commit: seq, frame }),
+                                    Err(e) => run.add(
+                                        Issue::error(format!("commit {seq}: {e}"))
+                                            .file(&file)
+                                            .offset(at)
+                                            .seq(seq),
+                                    ),
+                                }
+                            }
                         }
-                        // a record from an older version: part of the baseline, or the next
-                        _ if fold_legacy && !seen_v2 => folded += 1,
-                        _ => {
-                            let seq = prev_seq.map_or(0, |s| s + 1);
-                            prev_seq = Some(seq);
-                            commits.push((seq, prev_ts, 255));
-                        }
+                        // a record without metadata ended the scan above
+                        None => {}
                     }
                     good = (i + 1) * WAL_REC;
                     txn_start = i + 1;
+                    txn_control.clear();
                 }
                 op => {
-                    if !torn_at(i, prev_seq, framing) {
+                    if !torn_at(i, prev_seq) {
                         run.add(
                             Issue::error(format!(
                                 "record {i} has unknown type {op}, and a later commit record shows its transaction was durable: open refuses the database"
@@ -1784,19 +1786,6 @@ impl Checker<'_> {
                 .offset(good as u64),
             );
         }
-        if let Some(m) = strict_from
-            && !missing
-            && version == 0
-            && (good as u64) < m
-        {
-            run.add(
-                Issue::error(format!(
-                    "the log's complete transactions end at byte {good}, before byte {m}, which commit.json records as durable: open refuses the database"
-                ))
-                .file(&file)
-                .offset(good as u64),
-            );
-        }
         let partial = buf.len() % WAL_REC;
         if partial != 0 {
             run.add(
@@ -1812,11 +1801,6 @@ impl Checker<'_> {
         if let (Some(f), Some(l)) = (commits.first(), commits.last()) {
             summary.push_str(&format!(" ({}..{})", f.0, l.0));
         }
-        if folded > 0 {
-            summary.push_str(&format!(
-                " and {folded} older-version commits that open folds into a baseline"
-            ));
-        }
         summary.push_str(&format!("; head {head}; version {version}"));
         if preallocated > 0 {
             summary.push_str(&format!("; {preallocated} bytes preallocated"));
@@ -1824,7 +1808,12 @@ impl Checker<'_> {
         if self.full || data_recs > 0 {
             summary.push_str(&format!("; {ids_checked} ids checked"));
         }
-        self.wal = Some(WalInfo { head, commits });
+        self.wal = Some(WalInfo {
+            head,
+            commits,
+            control,
+            version,
+        });
         self.checks.push(run.done(summary));
     }
 
@@ -2443,7 +2432,6 @@ fn scan_perm(
     quads: Option<u64>,
     vocab_len: Option<u64>,
     full: bool,
-    segmented: bool,
 ) -> PermScan {
     let name = perm.name();
     let mut run = Run::new(format!("perm.{name}"));
@@ -2570,16 +2558,12 @@ fn scan_perm(
         );
     }
     // the segment directory: its header, and one entry per segment of every block
-    let seg_bytes = if segmented {
-        match std::fs::read(dir.join(format!("{name}.seg"))) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                run.add(Issue::error(format!("{e}: a format 3 index needs it")).file(&seg_file));
-                None
-            }
+    let seg_bytes = match std::fs::read(dir.join(format!("{name}.seg"))) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            run.add(Issue::error(format!("{e}: a segmented index needs it")).file(&seg_file));
+            None
         }
-    } else {
-        None
     };
     // (segment size, the index of each block's first entry)
     let mut directory: Option<(usize, Vec<usize>)> = None;
@@ -2646,7 +2630,7 @@ fn scan_perm(
                     )),
                     _ => None,
                 };
-                if segmented && segs.is_none() {
+                if segs.is_none() {
                     return BlockScan {
                         issues: Vec::new(),
                         id_issues: Vec::new(),

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# konclude818.sh: Konclude 0.7.0-1138 on ore_ont_8737 on atlas on 4, 12 and 1 workers, one process each,
+# in a 13 GiB scope, under the heavy lock, into the latest slot directory.
+set -uo pipefail
+cd ~/lanes/el-threads-818
+exec 8> ~/lanes/.heavy.lock
+flock 8
+O=$(ls -d slot-* | tail -1)/konclude; mkdir -p "$O"
+K=/nix/store/wdpc7cr8as4kscxmaxlf7wh9rhayd0r6-konclude-0.7.0-1138/bin/Konclude
+echo "$(date -u +%FT%TZ) start load=$(cut -d" " -f1-3 /proc/loadavg)" >> "$O/log.txt"
+for t in 4 12 1; do
+  systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    timeout 900 python3 scripts/konclude.py run --konclude "$K" --threads $t --taxonomy "$O/tax.t$t.txt" data/dev/ore_ont_8737.owl > "$O/konclude.t$t.json" 2> "$O/konclude.t$t.err"
+  echo "$(date -u +%FT%TZ) konclude t$t rc=$?" >> "$O/log.txt"
+done
+echo "$(date -u +%FT%TZ) KONCLUDE-DONE" >> "$O/log.txt"

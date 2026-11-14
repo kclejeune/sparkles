@@ -23,6 +23,10 @@ fn rows(snapshot: Arc<Snapshot>) -> Vec<Vec<Option<oxrdf::Term>>> {
     )
     .unwrap()
     .rows()
+    .unwrap()
+    .iter()
+    .map(|row| row.values().to_vec())
+    .collect()
 }
 fn durable_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut pending = vec![root.to_owned()];
@@ -320,13 +324,12 @@ fn cold_wal_torn_and_preallocated_suffixes_preserve_the_proven_prefix() {
 }
 
 #[test]
-fn cold_origin_refuses_foreign_future_and_missing_durable_metadata_without_writes() {
+fn cold_origin_refuses_foreign_and_future_metadata_without_writes() {
     for mode in [
         "foreign-catalog",
         "future-catalog",
         "future-dataset",
         "future-generation",
-        "strict-wal",
     ] {
         let family = ColdFamily::new(false);
         // Open only the supported child first. Ordinary family opening itself
@@ -364,15 +367,6 @@ fn cold_origin_refuses_foreign_future_and_missing_durable_metadata_without_write
                 // A newer format may change the shape of its supported payload.
                 file["commit"] = false.into();
                 std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
-            }
-            "strict-wal" => {
-                let current = family.current();
-                let path = current.join("commit.json");
-                let mut file: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                file["walStrictFrom"] = 0.into();
-                std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
-                std::fs::remove_file(current.join("wal.log")).unwrap();
             }
             _ => unreachable!(),
         }

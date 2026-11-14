@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# slot818.sh: item 818 measurement on atlas, sides base (321508fe), a (181e9c95, the filter of
+# every held kind) and b (fb894c98, the lane: a plus the link products sent in runs). Holds the
+# heavy lock for the whole run. One run of ore_ont_8737 per side on 4, 12 and 1 threads in a 13
+# GiB scope, then six interleaved rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482 on 1,
+# 4 and 12 threads through ab.sh. Ends log.txt with SLOT-DONE.
+set -uo pipefail
+D=$HOME/lanes/el-threads-818
+cd "$D"
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+O=$D/slot-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$O"; cd "$O"
+ln -s ../bin bin; ln -s ../data data
+log() { echo "$(date -u +%FT%TZ) $*" >> "$O/log.txt"; }
+log "start host=$(hostname) load=$(cut -d' ' -f1-3 /proc/loadavg)"
+{ free -g; vmstat 1 5; } > "$O/host-before.txt" 2>&1
+vmstat 10 > "$O/vmstat.txt" 2>&1 &
+VM=$!
+SIDES=${SIDES:-base a b}
+for b in $SIDES; do log "sha $b $(sha256sum bin/$b | cut -c1-16)"; done
+mkdir -p mem
+for t in 4 12 1; do for s in $SIDES; do
+  TAX=$(mktemp)
+  systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    /usr/bin/env time -f 'wall=%e rss_kib=%M' -o "mem/$s.t$t.time" \
+    timeout 900 "bin/$s" --threads "$t" --taxonomy "$TAX" data/dev/ore_ont_8737.owl > "mem/$s.t$t.json" 2> "mem/$s.t$t.err"
+  log "mem $s t$t rc=$? tax=$(sort "$TAX" | sha256sum | cut -c1-16) $(cat "mem/$s.t$t.time")"
+  rm -f "$TAX"
+done; done
+log "mem done"
+THREADS="1 4 12" PIN1=4 PINN=0-11 REPEAT=5 bash ../scripts/ab.sh "$O" 6 "go.ofn chebi_lite.ofn ore-el/ore_ont_3836.owl ore-el/ore_ont_13482.owl" "$SIDES" >> "$O/log.txt" 2>&1
+log "ab done"
+kill $VM
+{ free -g; vmstat 1 5; } > "$O/host-after.txt" 2>&1
+log "SLOT-DONE"

@@ -99,6 +99,8 @@ binding-deps = [
   "crates/sparkles/resources/**",
   "crates/sparkles-alloc/*.toml",
   "crates/sparkles-alloc/src/**",
+  "crates/sparkles-budget/*.toml",
+  "crates/sparkles-budget/src/**",
   "crates/sparkles-backup/*.toml",
   "crates/sparkles-backup/src/**",
   "crates/sparkles-core/*.toml",

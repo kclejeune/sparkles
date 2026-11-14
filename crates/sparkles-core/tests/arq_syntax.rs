@@ -53,8 +53,9 @@ fn rows(s: &Store, q: &str) -> Vec<String> {
         query(s.snapshot(), &text, &QueryOptions::default()).unwrap_or_else(|e| panic!("{q}: {e}"));
     let mut out: Vec<String> = r
         .rows()
+        .unwrap()
         .iter()
-        .map(|row| row.iter().map(short).collect::<Vec<_>>().join(" "))
+        .map(|row| row.values().iter().map(short).collect::<Vec<_>>().join(" "))
         .collect();
     out.sort();
     out
@@ -504,10 +505,10 @@ fn construct_quads() {
     };
     let r = run("CONSTRUCT { GRAPH ?g { ?s :p ?o } ?s :in ?g } WHERE { GRAPH ?g { ?s :p ?o } }");
     assert_eq!(r.kind, QueryKind::Construct);
-    assert_eq!(r.triples.len(), 3);
-    assert_eq!(r.quads.len(), 3);
+    assert_eq!(r.triples().len(), 3);
+    assert_eq!(r.quads().len(), 3);
     assert_eq!(r.len(), 6);
-    let mut graphs: Vec<String> = r.quads.iter().map(|q| q.graph_name.to_string()).collect();
+    let mut graphs: Vec<String> = r.quads().iter().map(|q| q.graph_name.to_string()).collect();
     graphs.sort();
     assert_eq!(
         graphs,
@@ -521,12 +522,12 @@ fn construct_quads() {
     let r = run(
         "CONSTRUCT { GRAPH <urn:x-arq:DefaultGraphNode> { ?s :p ?o } GRAPH ?none { ?s :q ?o } GRAPH _:b { ?s :r ?o } } WHERE { ?s :p ?o }",
     );
-    assert_eq!(r.triples.len(), 1);
-    assert_eq!(r.quads.len(), 1);
-    assert!(r.quads[0].graph_name.is_blank_node());
+    assert_eq!(r.triples().len(), 1);
+    assert_eq!(r.quads().len(), 1);
+    assert!(r.quads()[0].graph_name.is_blank_node());
     // CONSTRUCT WHERE with a GRAPH block
     let r = run("CONSTRUCT WHERE { GRAPH ?g { ?s :p ?o } }");
-    assert_eq!((r.triples.len(), r.quads.len()), (0, 3));
+    assert_eq!((r.triples().len(), r.quads().len()), (0, 3));
     // N-Quads carries the quads, Turtle the default graph only (as Fuseki)
     let r = run("CONSTRUCT { ?s :p ?o GRAPH ?g { ?s :p ?o } } WHERE { GRAPH ?g { ?s :p ?o } }");
     let write = |f: RdfFormat| {

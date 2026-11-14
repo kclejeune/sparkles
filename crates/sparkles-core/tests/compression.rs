@@ -188,7 +188,7 @@ fn text_doc_store_uses_zstd_and_lz4_on_request() {
     let hits = |s: &Store| {
         let q = "SELECT ?s { ?s <http://jena.apache.org/text#query> \"two\" }";
         let r = sparkles_core::sparql::query(s.snapshot(), q, &Default::default()).unwrap();
-        format!("{:?}", r.rows())
+        format!("{:?}", r.rows().unwrap())
     };
     let meta = |root: &Path| std::fs::read_to_string(root.join("text/meta.json")).unwrap();
     store.enable_text(TextConfig::default()).unwrap();

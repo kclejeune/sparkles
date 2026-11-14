@@ -37,9 +37,11 @@ fn rows(s: &Store, q: &str) -> Vec<String> {
     let r = query(s.snapshot(), &format!("{P}{q}"), &QueryOptions::default())
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
-        .into_iter()
+        .unwrap()
+        .iter()
         .map(|row| {
-            row.into_iter()
+            row.values()
+                .iter()
                 .map(|t| match t {
                     None => "-".to_string(),
                     Some(oxrdf::Term::NamedNode(n)) => {
@@ -407,8 +409,20 @@ fn same_both_ways(s: &Store, q: &str) -> sparkles_core::sparql::PlanInfo {
             .unwrap_or_else(|e| panic!("{q}: {e}"))
     };
     let (on, off) = (run(true), run(false));
-    assert_eq!(on.rows(), off.rows(), "{q}");
-    on.plan
+    let on_rows = on.rows().unwrap();
+    let off_rows = off.rows().unwrap();
+    assert_eq!(
+        on_rows
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        off_rows
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        "{q}"
+    );
+    on.plan().clone()
 }
 
 #[test]

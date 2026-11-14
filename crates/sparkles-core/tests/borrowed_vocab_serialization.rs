@@ -33,7 +33,8 @@ fn borrowed_base_terms_preserve_json_tsv_and_other_id_branches() {
         Some(Term::Literal(Literal::from(42)))
     );
     let result = query(snap, "SELECT ?s ?o ?missing WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:missing> ?missing } } ORDER BY ?s", &QueryOptions::default()).unwrap();
-    let rich = sparkles_json(&result, None);
+    let rich: serde_json::Value =
+        serde_json::from_str(sparkles_json(&result, None).unwrap().as_str()).unwrap();
     for (i, term) in terms.iter().enumerate() {
         assert_eq!(rich["rows"][i][1], term_json(term));
         assert!(rich["rows"][i][2].is_null());
@@ -57,7 +58,10 @@ fn borrowed_base_terms_preserve_json_tsv_and_other_id_branches() {
         }
     }
     assert_eq!(
-        sparkles_json(&result, Some(1))["rows"]
+        serde_json::from_str::<serde_json::Value>(
+            sparkles_json(&result, Some(1)).unwrap().as_str()
+        )
+        .unwrap()["rows"]
             .as_array()
             .unwrap()
             .len(),
@@ -87,7 +91,8 @@ fn borrowed_base_terms_preserve_json_tsv_and_other_id_branches() {
     )
     .unwrap();
     assert_eq!(
-        sparkles_json(&local, None)["rows"][0][0]["value"],
+        serde_json::from_str::<serde_json::Value>(sparkles_json(&local, None).unwrap().as_str())
+            .unwrap()["rows"][0][0]["value"],
         "computed value"
     );
 }
@@ -119,7 +124,8 @@ fn sorted_vocabulary_contains_count_preserves_exact_result() {
     )
     .unwrap();
     assert_eq!(result.len(), 1);
-    let value = sparkles_json(&result, None);
+    let value: serde_json::Value =
+        serde_json::from_str(sparkles_json(&result, None).unwrap().as_str()).unwrap();
     assert_eq!(value["rows"][0][0]["value"], ((n + 2) / 3).to_string());
     let mut tsv = Vec::new();
     write_solutions(&result, SolutionsFormat::Tsv, &mut tsv, None).unwrap();

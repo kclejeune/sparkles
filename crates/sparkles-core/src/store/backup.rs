@@ -58,6 +58,24 @@ pub enum FileSource {
     File(std::fs::File),
     /// content rendered at capture time (`prefixes.json`) or read whole after it
     Bytes(Arc<[u8]>),
+    /// a read handle as [`File`](Self::File), whose first bytes are served from `head`
+    /// instead: the header record of a write-ahead log as it was read under the writer
+    /// lock, so that a header upgraded by a later enablement never reaches the capture
+    /// (spec C26 §7.3)
+    Patched {
+        file: std::fs::File,
+        head: Arc<[u8]>,
+    },
+}
+
+impl FileSource {
+    /// The read handle of a file source, if it has one.
+    pub fn descriptor(&self) -> Option<&std::fs::File> {
+        match self {
+            FileSource::File(f) | FileSource::Patched { file: f, .. } => Some(f),
+            FileSource::Bytes(_) => None,
+        }
+    }
 }
 
 /// One file of a capture.
@@ -81,29 +99,38 @@ impl CapturedFile {
         if offset >= self.len {
             return Ok(0);
         }
-        let n = buf.len().min((self.len - offset) as usize);
-        match &self.src {
+        let mut n = buf.len().min((self.len - offset) as usize);
+        let f = match &self.src {
+            FileSource::Patched { file, head } => {
+                if offset < head.len() as u64 {
+                    let start = offset as usize;
+                    let avail = (head.len() - start).min(n);
+                    buf[..avail].copy_from_slice(&head[start..start + avail]);
+                    return Ok(avail);
+                }
+                file
+            }
+            FileSource::File(f) => f,
             FileSource::Bytes(b) => {
                 let start = offset as usize;
                 let avail = b.len().saturating_sub(start).min(n);
                 buf[..avail].copy_from_slice(&b[start..start + avail]);
-                Ok(avail)
+                return Ok(avail);
             }
-            FileSource::File(f) => {
-                #[cfg(unix)]
-                {
-                    std::os::unix::fs::FileExt::read_at(f, &mut buf[..n], offset)
-                }
-                #[cfg(windows)]
-                {
-                    std::os::windows::fs::FileExt::seek_read(f, &mut buf[..n], offset)
-                }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    let _ = f;
-                    Err(std::io::Error::other("positioned reads are not supported"))
-                }
-            }
+        };
+        n = n.min(buf.len());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(f, &mut buf[..n], offset)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(f, &mut buf[..n], offset)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (f, n);
+            Err(std::io::Error::other("positioned reads are not supported"))
         }
     }
 
@@ -675,7 +702,7 @@ impl ConfigurationCapture {
         let metadata_pin = self.check_metadata_basis(basis.metadata, preparation)?;
         // This ephemeral loan admits the input, JSON scratch and decoded origin.
         // No publication callback can run while it holds the remaining allowance.
-        let (base_binding, strict_from, commit_pin) = {
+        let (base_binding, commit_pin) = {
             let allowance = preparation.room();
             let _loan = preparation.reserve(allowance)?;
             let options = crate::history::HistoryOptions {
@@ -706,11 +733,7 @@ impl ConfigurationCapture {
                 bytes: extent,
                 sha256: crate::evidence::Sha256Digest::of_bytes(&bytes, preparation.control())?,
             };
-            (
-                decoded.value.configuration,
-                decoded.value.wal_strict_from,
-                pin,
-            )
+            (decoded.value.configuration, pin)
         };
         let family = self.original.identities.family();
         let coverage = {
@@ -766,8 +789,6 @@ impl ConfigurationCapture {
             extent,
             basis.base.seq,
             self.data.commit.seq,
-            basis.fold_legacy,
-            strict_from,
             basis.dvocab_len,
             Some(membership.seqs.as_deref().unwrap_or(&[])),
             Path::new("captured-primary/wal.log"),
@@ -948,7 +969,7 @@ impl CapturedReader<'_> {
             return Ok(0);
         }
         let file = &self.capture.data.files[self.index];
-        if !independent_file_cursor && matches!(&file.src, FileSource::File(_)) {
+        if !independent_file_cursor && file.src.descriptor().is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "this platform has no independent captured-file cursor backend",
@@ -1016,7 +1037,6 @@ struct CapturedBasis {
     base: CommitInfo,
     physical_owner: uuid::Uuid,
     dvocab_len: u64,
-    fold_legacy: bool,
     metadata: crate::evidence::Sha256Digest,
 }
 
@@ -1166,7 +1186,6 @@ impl CapturedOriginal {
                     base: entry.base,
                     physical_owner: store.dataset_id,
                     dvocab_len: snapshot.dvocab_len,
-                    fold_legacy: entry.fold_legacy,
                     metadata: metadata_fingerprint(&snapshot.generation.meta, preparation)?,
                 })
             } else {
@@ -1536,6 +1555,7 @@ impl Store {
         };
         control.check()?;
         let t0 = Instant::now();
+        let control_state;
         let (
             snap,
             next_bnode,
@@ -1552,6 +1572,7 @@ impl Store {
             if w.poisoned {
                 return Err(Error::Poisoned);
             }
+            control_state = self.control_state();
             let state = self.managed_state_shared();
             let history = matches!(state.as_deref(), Some(crate::managed::ManagedState::Installed(installed)) if installed.configuration_history.is_some());
             let managed = if history {
@@ -1677,7 +1698,6 @@ impl Store {
                 base: commit,
                 physical_owner: self.dataset_id,
                 dvocab_len: 0,
-                fold_legacy: false,
                 metadata: metadata_fingerprint(&meta, preparation)?,
             });
         }
@@ -1691,7 +1711,10 @@ impl Store {
                 binding,
             ),
         )?;
-        super::wal::create(&gdir.join("wal.log"), super::wal::version_for(activated))?;
+        super::wal::create(
+            &gdir.join("wal.log"),
+            super::wal::version_with(activated, control_state.is_some()),
+        )?;
         super::sync_dir(&gdir)?;
         crate::commit::Catalog::create(&dir.join("commits.bin"), self.dataset_id, commit)?;
         let mut files = Vec::new();
@@ -1743,9 +1766,18 @@ impl Store {
         if activated {
             dataset = crate::commit::with_reader(&dataset, super::managed_history::READER)?;
         }
+        if control_state.is_some() {
+            dataset = crate::commit::with_reader(&dataset, crate::jobs::READER)?;
+        }
         files.push(meta_file("dataset.json", dataset));
         for (name, bytes) in managed {
             files.push(meta_file(name, bytes));
+        }
+        if let Some(state) = &control_state {
+            files.push(meta_file(
+                crate::control::CHECKPOINT_FILE,
+                super::control_store::capture_checkpoint(state, self.dataset_id, head.seq, label)?,
+            ));
         }
         files.extend(history_files);
         files.push(meta_file(
@@ -1892,6 +1924,18 @@ impl Store {
             Some(_) => w.wal_len,
             None => 0,
         };
+        // The control state holds every frame written before the lock, and the log's
+        // header record as it is now is served for the capture's whole life (spec C26
+        // §7.3).
+        let control_state = self.control_state();
+        let wal_head = match (&snap.generation.dir, wal_len >= super::WAL_REC as u64) {
+            (Some(dir), true) => {
+                let mut head = vec![0u8; super::WAL_REC];
+                std::io::Read::read_exact(&mut File::open(dir.join("wal.log"))?, &mut head)?;
+                Some(Arc::<[u8]>::from(head))
+            }
+            _ => None,
+        };
         // the vocabulary's own handle: a first write can rewrite a legacy file under a
         // new inode after the lock, and the captured length is of this one
         let mut dvocab = snap.generation.dvocab.capture()?;
@@ -1962,6 +2006,7 @@ impl Store {
             };
             gen_files.push((name, f, len));
         }
+        let mut wal_head = wal_head;
         self.failpoint("backup-capture-unlocked");
         check_preparation()?;
 
@@ -2002,11 +2047,15 @@ impl Store {
             } else {
                 FileKind::Immutable
             };
+            let src = match wal_head.take_if(|_| name == "wal.log") {
+                Some(head) => FileSource::Patched { file: f, head },
+                None => FileSource::File(f),
+            };
             files.push(CapturedFile {
                 path: format!("{generation}/{name}"),
                 kind,
                 len,
-                src: FileSource::File(f),
+                src,
             });
         }
         let wal = files.iter().find(|f| f.path.ends_with("/wal.log"));
@@ -2044,9 +2093,19 @@ impl Store {
             // an activated store's files need the configuration-history reader
             crate::commit::with_reader(&dataset, super::managed_history::READER)?
         };
+        let dataset = match &control_state {
+            Some(_) => crate::commit::with_reader(&dataset, crate::jobs::READER)?,
+            None => dataset,
+        };
         files.push(meta("dataset.json", dataset));
         for (name, bytes) in managed {
             files.push(meta(name, bytes));
+        }
+        if let Some(state) = &control_state {
+            files.push(meta(
+                crate::control::CHECKPOINT_FILE,
+                super::control_store::capture_checkpoint(state, self.dataset_id, head.seq, label)?,
+            ));
         }
         files.extend(history_files);
         files.push(meta(
@@ -2750,8 +2809,9 @@ mod tests {
         let path = root.join(&snapshot.generation.name).join("meta.json");
         let original = std::fs::read(&path).unwrap();
         let actual = serde_json::to_value(&snapshot.generation.meta).unwrap();
+        // format_version is not in the list: this build reads one index format, so any
+        // other value is refused by its version before the metadata is fingerprinted
         for field in [
-            "format_version",
             "quads",
             "terms",
             "next_bnode",
@@ -2762,13 +2822,6 @@ mod tests {
         ] {
             let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
             match field {
-                "format_version" => {
-                    changed[field] = if snapshot.generation.meta.format_version == 3 {
-                        4.into()
-                    } else {
-                        3.into()
-                    }
-                }
                 "quads" | "terms" | "next_bnode" => {
                     changed[field] = changed[field]
                         .as_u64()
@@ -3920,7 +3973,7 @@ mod tests {
             .unwrap();
         let mut first = captured.primary_reader(CapturedPrimary::Wal).unwrap();
         let file = &captured.data.files[first.index];
-        let FileSource::File(raw) = &file.src else {
+        let Some(raw) = file.src.descriptor() else {
             panic!("genuine WAL must retain its descriptor")
         };
         let mut raw = raw;
@@ -3967,7 +4020,7 @@ mod tests {
             .configuration_capture("unsupported-cursor", &Default::default(), &preparation)
             .unwrap();
         let reader = captured.primary_reader(CapturedPrimary::Wal).unwrap();
-        let FileSource::File(raw) = &captured.data.files[reader.index].src else {
+        let Some(raw) = captured.data.files[reader.index].src.descriptor() else {
             panic!("genuine retained file")
         };
         let mut raw = raw;
@@ -4924,7 +4977,7 @@ mod tests {
         let c = s.backup_capture("b1").unwrap();
         assert_eq!(c.commit.seq, 3);
         assert_eq!(c.generation, "gen-0001");
-        assert_eq!(c.index_format, crate::builder::PLAIN_FORMAT_VERSION);
+        assert_eq!(c.index_format, crate::builder::FORMAT_VERSION);
         assert_eq!(c.lease.generation(), 1);
         assert_eq!(c.lease.label(), "b1");
         let paths: Vec<&str> = c.files.iter().map(|f| f.path.as_str()).collect();

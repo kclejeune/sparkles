@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Valid time
+
+C27 Phase 1 is complete (roadmap item 341). An authenticated claim proposal records each
+new source revision's first availability as the server time of the commit that
+publishes it, and an as-known read with `at=time:` excludes revisions imported after
+its cutoff whatever their publication dates. Attempts to backdate availability through
+the proposal body, SPARQL Update, the Graph Store, RDF Patch or a load are refused
+before anything is written. A clone's root commit is no longer earlier than the commit
+it copies when the server clock runs behind. Validity intervals through the
+authenticated writer are roadmap item 925.
+
+### Format
+
+The first-release format cutoff of item 479 implements X16 Phase 1. `dataset.json` is written
+as `format` 2 with `minimumReader` 5 or more, and a `format` 1 file or one that requires a
+reader below 5 is refused with the dump-and-reload message. The generation index is
+written and read as format 5, which is format 4 with the `features` list always present
+and `vocab.idx` required, and formats 2 to 4 are refused. The write-ahead log reads
+versions 1 and 2 and refuses a headerless log, version 0. The delta vocabulary reads the
+framed version 2 and refuses the pre-release file of the entries alone, and the
+`sparkles migrate` step that rewrote it is gone, so no step is registered. Backup key
+slots read format 2 alone. `sparkles vocab-index` no longer writes `vocab.idx`, which
+every generation has, and still adds the numeric column. The legacy framing of the
+write-ahead log, which told a pre-release commit record from a torn one through
+`walStrictFrom` in `commit.json`, is gone with the headerless reader, `sparkles check`
+reports every log and index form that open refuses, and the open syncs a generation's
+directory after it creates the log, so a crash after the first commits of a new log
+cannot lose it. The two pre-release fixtures stay in `testsuite/formats/` for their
+refusal tests, and a fixture written at the cutoff commit joins them.
+
+The control keyspace of item 933 adds `control.bin`, a checkpoint of the control state at
+version 1 that is replaced atomically, `control.log`, a log of control-only frames at
+version 1, and version 3 of the write-ahead log, which carries control records inside a
+transaction and is written by every store whose keyspace is enabled. Each file is listed
+in the format registry, and a reader refuses a version it does not know before it reads
+further. A version 3 log needs dataset reader 9, a `control.log` without `control.bin` is
+an integrity error, and a backup that holds `control.bin` or `jobs.json` requires the
+backup feature `control/1`. `sparkles check` has a `control` check of the two logs'
+ordering.
+
 ### OWL classification
 
 The Horn rules classify ontologies with individuals, functional data properties and top
@@ -83,6 +123,17 @@ roadmap item 950 follows. This is roadmap item 727.
 
 ### Compatibility
 
+The experimental Rust memory-admission API uses an opaque `ParentHandle` in place
+of `Arc<dyn MemoryParent>`. Parent leases, live credit, query contexts and reasoner
+budgets accept that same handle. Consumers share it with `clone()` and compare
+parents with `same_parent()`; raw Arc and Weak conversion is unavailable. A paid
+backend uses `MemoryDomain::parent_with_header`, whose release callback borrows
+the live handle for reentrant admission. The compatibility `parent` constructor
+retains its two callback arguments but does not certify admission of separate
+captured allocations. This is an unreleased Rust source API change; HTTP and CLI
+wire contracts are unchanged.
+
+
 The adopted HTTP, CLI and public library compatibility policy is documented.
 HTTP descriptions and the standard CLI command tree have compatibility guards against
 a commit-labeled development baseline. No published release baseline exists.
@@ -115,6 +166,38 @@ it.
 
 ### Added
 
+Incremental views and live queries maintain `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`,
+`HAVING` over them and correlated `EXISTS` instead of evaluating the query again at each
+commit (item 418). The group operator keeps each group's values as an ordered multiset,
+and a correlated `EXISTS` is evaluated by the query engine for the rows a commit can have
+changed. A view's `GROUP_CONCAT` lists a group's values in their `ORDER BY` order. View
+checkpoints written by earlier releases for queries with these operators are refused by
+their compiler fingerprint and the views are built again.
+
+Durable jobs (item 339, C26 Phase 1). A dataset keeps accepted work in a job ledger, with
+its definitions in `jobs.json`. `Dataset::jobs()` and the routes under `/$/jobs/{ds}`
+submit runs with an idempotency key, lease them to workers with a bearer token and a lease
+generation, and publish a worker's quads with the publication record, the source
+checkpoint and the run's completion in one commit, so a retry after a lost response or a
+crash never duplicates its effects. A restart fences every earlier lease by boot epoch
+before the process admits a claim. A lease deadline counts only once the transition that
+grants or extends it is the run's committed version, so a refused renewal never extends
+a lease. Enabling jobs raises the dataset's `minimumReader` to 9, so older releases
+refuse to open such a dataset. The private import transport now names its destination
+reader as `IMPORTED_DESTINATION_READER`, one above `DATASET_READER`.
+
+The job ledger lives in a control keyspace of the main store (item 933), outside the RDF
+dataset, so no query, listing, statistic, index, export, validation, merge or history
+reads or counts it and no read surface needs an exclusion of its own. A publication
+writes its records in the same write-ahead log record as its quads, and a transition
+without quads is a frame of `control.log` that creates no commit, so a publication whose
+quads make no net change reports `committed: false`. The settings' `maxControlBytes`, 256
+MiB by default, bounds the ledger held in memory by refusing new submissions. A backup
+captures the ledger at the captured commit, a restored dataset pauses its restored runs
+before it admits a claim and answers `jobs-recovering` while it does, and `POST
+/$/jobs/{ds}/recover` resumes selected paused runs. A clone starts with an empty ledger.
+The `hidden` visibility of the managed-graph registry stays reserved and refused.
+
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
 settings, and a build or refresh then reads the policy's output graph with the projection's
@@ -128,9 +211,16 @@ decisions and supports graphs and the readable proposal graphs. A withdrawal, re
 superseding decision rewrites the reports that read it and their ancestors at the next
 refresh, and a new policy version rewrites every report. `GET /$/graphrag/{ds}/community`,
 `community_reports` and a global answer's `reports` carry `reviewPolicy` and each
-finding's `claims` and `decisions`. The automatic refresh notices only the evidence
-changes that the principal's change feed lists, and roadmap item 652 adds a private check
-for the others.
+finding's `claims` and `decisions`.
+
+The automatic refresh of reports read under a review policy runs a private check (item
+652). A change of the policy's decisions or supports graph, a withdrawal in a proposal
+graph, read from the change feed without the principal's view, another evidence
+configuration, a reload of the access policy and a server start each make a check due,
+and so does a principal's feed that cannot count the changes. The check runs a refresh's
+preparation and plan with no model call, commit, state change or task, and starts a
+refresh only when a report's input or the hierarchy changed. The principal's feed no
+longer starts a refresh by itself for a decision, support or withdrawal it lists.
 
 Roadmap item 825 gives the eager executor and the cursor one join-kernel library. The
 hash, keyed and merge kernels of `sparql/join` and one galloping search serve both
@@ -717,6 +807,18 @@ with the same taxonomy. Its time on four threads, 28 s against Konclude's 11 s, 
 818. The one-thread times of five larger files move by up to 2% with the code's layout,
 and the new build is 0.6% faster to 0.9% slower than the one before on them, item
 722.
+
+A context of the EL saturation sends the products of its backward links with its forward
+links and propagations once its to-do list is empty, in one run per source or target, and
+the outbox sorts these runs rather than its messages, while a congested delivery drops every
+kind of conclusion the context holds, forward links included, for roadmap item 818. On atlas
+the saturation of `ore_ont_8737`, a transitive closure of 2.5 million existential
+restrictions, takes 13.5 s on four threads instead of 25.2 s, 9.0 s on twelve instead of
+18.5 s and 45.0 s on one instead of 83.0 s, and peaks at 5.1 instead of 6.9 GiB on four
+threads, with the same taxonomies on 300 files. Konclude 0.7.0 classifies it on atlas in 9.5 to 9.7 s at 6.7 GiB with any number
+of workers. GO and ore_ont_3836 are unchanged, ChEBI lite is 1.9% slower on one thread
+and slower in half of its twelve-thread rounds, and ore_ont_13482 3% slower on one and
+four threads, item 890.
 
 A congested EL saturation drops the subsumptions and backward links it delivers to a
 context that already holds them (roadmap item 695). The peak resident set of

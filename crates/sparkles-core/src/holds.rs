@@ -504,7 +504,8 @@ mod tests {
         };
         let c = |s: u64| format!(r#"{{"branchId":"{ds}","seq":{s}}}"#);
         assert!(decode(hold("evidence", &format!("[{}]", c(1))).as_bytes(), ds).is_ok());
-        assert!(decode(hold("jobs", &format!("[{}]", c(1))).as_bytes(), ds).is_err());
+        assert!(decode(hold("jobs", &format!("[{}]", c(1))).as_bytes(), ds).is_ok());
+        assert!(decode(hold("unknown", &format!("[{}]", c(1))).as_bytes(), ds).is_err());
         assert!(decode(hold("evidence", "[]").as_bytes(), ds).is_err());
         assert!(
             decode(

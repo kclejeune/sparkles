@@ -308,7 +308,7 @@ async fn run(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let call = Call {
+    let mut call = Call {
         arrived: Instant::now(),
         cancel: Arc::new(AtomicBool::new(false)),
         request_id,
@@ -316,12 +316,14 @@ async fn run(
         headers: Some(headers),
         held: None,
         grant: crate::server_memory::current_grant(),
+
+        preparation: None,
     };
     let server = McpServer::new(st.clone(), config(&st, mode));
     let out = if mode == Mode::Internal {
         let name = tool.to_string();
         let request_id = call.request_id.clone();
-        tokio::task::spawn_blocking(move || server.run_now(&name, args, &call))
+        tokio::task::spawn_blocking(move || server.run_now(&name, args, &mut call))
             .await
             .map_err(|e| {
                 tracing::error!(request_id, "{tool} panicked: {e}");

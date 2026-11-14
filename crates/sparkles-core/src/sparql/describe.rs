@@ -19,7 +19,7 @@
 //! (`?r rdf:subject s ; rdf:predicate p ; rdf:object o`). Options add the labels of the
 //! IRIs the description links to, and bound its depth and its size.
 
-use super::ctx::{Charge, Ctx, PlanWarning, RetainedCharge, TermKind};
+use super::ctx::{Charge, Ctx, OutputCredit, PlanWarning, RetainedCharge, TermKind};
 use super::plan::GraphFilter;
 use super::table::Table;
 use crate::error::{Error, Result};
@@ -29,6 +29,7 @@ use crate::store::Chunk;
 use oxrdf::{Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
@@ -237,9 +238,75 @@ impl<'a> DescriptionCharge<'a> {
 
 /// The triples of a DESCRIBE, and whether [`DescribeOptions::max_triples`] cut them short.
 pub(super) struct Described<'a> {
-    pub triples: Vec<Triple>,
+    triples: Vec<Triple>,
     pub truncated: bool,
-    _charge: DescriptionCharge<'a>,
+    _charge: Option<DescriptionCharge<'a>>,
+}
+
+impl Described<'_> {
+    /// Reconcile only downward while the physical graph still has its original
+    /// admission. No allocation or reserve is permitted at this boundary.
+    pub(super) fn into_output(mut self, ctx: &Arc<Ctx>) -> Result<(Vec<Triple>, OutputCredit)> {
+        ctx.check()?;
+        let charge = self._charge.as_mut().expect("live description credit");
+        let same = match &charge.inner {
+            DescriptionChargeKind::Eager(held) => held.belongs_to(ctx),
+            DescriptionChargeKind::Cursor(held) => {
+                held.owner().is_some_and(|owner| Arc::ptr_eq(&owner, ctx))
+            }
+        };
+        if !same {
+            return Err(Error::invalid(
+                "description belongs to another query account",
+            ));
+        }
+        let mut bytes = (self.triples.capacity() as u64)
+            .checked_mul(std::mem::size_of::<Triple>() as u64)
+            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        for triple in &self.triples {
+            ctx.check()?;
+            // The outer Triple slots are already included above. This envelope
+            // conservatively includes each owned lexical allocation and nested box.
+            let subject = match &triple.subject {
+                oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+            };
+            let payload = super::output::term_bytes(&triple.object)
+                .and_then(|n| n.checked_add(subject as u64))
+                .and_then(|n| n.checked_add(triple.predicate.as_str().len() as u64))
+                .and_then(|n| n.checked_add(256))
+                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+            bytes = bytes
+                .checked_add(payload)
+                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+        }
+        if bytes > charge.bytes {
+            return Err(Error::invalid("description exceeds its original admission"));
+        }
+        match &mut charge.inner {
+            DescriptionChargeKind::Eager(held) => held.resize(bytes)?,
+            DescriptionChargeKind::Cursor(held) => held.resize(bytes)?,
+        }
+        charge.bytes = bytes;
+        ctx.check()?;
+        let charge = self._charge.take().expect("validated description credit");
+        let credit = match charge.inner {
+            DescriptionChargeKind::Eager(held) => held.into_output(ctx),
+            DescriptionChargeKind::Cursor(held) => held.into_output(ctx),
+        };
+        Ok((std::mem::take(&mut self.triples), credit))
+    }
+}
+impl Drop for Described<'_> {
+    fn drop(&mut self) {
+        let depth = self
+            .triples
+            .iter()
+            .map(|t| super::output::term_depth(&t.object))
+            .max()
+            .unwrap_or(0);
+        super::depth::with_stack(depth, || self.triples.clear());
+    }
 }
 
 /// A graph a description reads: the query's default graph, or one named graph.
@@ -562,7 +629,7 @@ pub(super) fn describe<'a>(
     Ok(Described {
         triples: d.out,
         truncated: d.truncated,
-        _charge: d.charge,
+        _charge: Some(d.charge),
     })
 }
 
@@ -837,5 +904,61 @@ impl<'a> Describer<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retained_output_tests {
+    use super::*;
+    use crate::sparql::{QueryOptions, query};
+    use crate::store::{Store, StoreOptions};
+
+    fn context() -> Arc<Ctx> {
+        let store = Store::in_memory(StoreOptions::default());
+        query(store.snapshot(), "ASK {}", &QueryOptions::default())
+            .unwrap()
+            .test_context()
+            .clone()
+    }
+    fn graph(ctx: &Ctx) -> Described<'_> {
+        let charge = DescriptionCharge::new(ctx, 128 << 10).unwrap();
+        let triple = Triple::new(
+            oxrdf::NamedNode::new_unchecked("urn:s"),
+            oxrdf::NamedNode::new_unchecked("urn:p"),
+            oxrdf::Literal::new_simple_literal("x".repeat(64 << 10)),
+        );
+        Described {
+            triples: vec![triple],
+            truncated: false,
+            _charge: Some(charge),
+        }
+    }
+    #[test]
+    fn original_credit_transfers_without_returning_the_payload_admission() {
+        let ctx = context();
+        let baseline = ctx.live_bytes();
+        let described = graph(&ctx);
+        assert_eq!(ctx.live_bytes(), baseline + (128 << 10));
+        let (triples, credit) = described.into_output(&ctx).unwrap();
+        assert_eq!(triples.len(), 1);
+        assert!(ctx.live_bytes() >= baseline + (64 << 10));
+        assert!(ctx.live_bytes() < baseline + (128 << 10));
+        drop(triples);
+        assert!(ctx.live_bytes() >= baseline + (64 << 10));
+        drop(credit);
+        assert_eq!(ctx.live_bytes(), baseline);
+    }
+    #[test]
+    fn foreign_context_refuses_and_returns_only_the_original_owner_credit() {
+        let ctx = context();
+        let foreign = context();
+        let baseline = ctx.live_bytes();
+        let other = foreign.live_bytes();
+        assert!(matches!(
+            graph(&ctx).into_output(&foreign),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(ctx.live_bytes(), baseline);
+        assert_eq!(foreign.live_bytes(), other);
     }
 }

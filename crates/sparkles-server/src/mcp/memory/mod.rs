@@ -84,7 +84,13 @@ impl Reader {
         let mut opts = self.opts.clone();
         opts.timeout = Some(remaining(self.deadline)?);
         opts.initial_bindings = bindings;
-        Ok(sparql::query(self.snap.clone(), q, &opts)?.rows())
+        // An application copy, as before the retained row owners. Retaining these
+        // MCP consumer rows under their query credit is a separate migration.
+        Ok(sparql::query(self.snap.clone(), q, &opts)?
+            .rows()?
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect())
     }
 
     /// An ASK query with `bindings` substituted.

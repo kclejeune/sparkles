@@ -1206,7 +1206,7 @@ fn link_evidence_counts_and_details_remain_in_the_query_view() {
         RdfFormat::Turtle, Some(oxrdf::NamedNode::new("urn:hiddenGraph").unwrap()),
     )]).unwrap();
     let read = |principal| {
-        let call = Call {
+        let mut call = Call {
             arrived: Instant::now(),
             cancel: Arc::new(AtomicBool::new(false)),
             request_id: "link-evidence".into(),
@@ -1214,10 +1214,16 @@ fn link_evidence_counts_and_details_remain_in_the_query_view() {
             headers: None,
             held: None,
             grant: None,
+
+            preparation: None,
         };
         let args = json!({"dataset":"t","mentions":[{"text":"Berlin"}],"evidence":true});
         match server
-            .run_now("link_entities", args.as_object().unwrap().clone(), &call)
+            .run_now(
+                "link_entities",
+                args.as_object().unwrap().clone(),
+                &mut call,
+            )
             .unwrap()
         {
             Outcome::Structured(value) => value,
@@ -1394,7 +1400,7 @@ fn link_evidence_limits_large_term_construction_across_repeated_mentions() {
             ..Default::default()
         },
     );
-    let call = Call {
+    let mut call = Call {
         arrived: Instant::now(),
         cancel: Arc::new(AtomicBool::new(false)),
         request_id: "evidence-construction".into(),
@@ -1402,10 +1408,16 @@ fn link_evidence_limits_large_term_construction_across_repeated_mentions() {
         headers: None,
         held: None,
         grant: None,
+
+        preparation: None,
     };
     let args = json!({"dataset":"t","mentions":vec![json!({"text":"Berlin"}); MENTIONS],"evidence":true,"timeoutSeconds":600});
     let (result, observation) = crate::mcp::memory::evidence_probe::measure(|| {
-        server.run_now("link_entities", args.as_object().unwrap().clone(), &call)
+        server.run_now(
+            "link_entities",
+            args.as_object().unwrap().clone(),
+            &mut call,
+        )
     });
     eprintln!("evidence construction capacities {}", json!(observation));
     let error = match result {
@@ -1443,7 +1455,7 @@ fn link_evidence_escaped_terms_keep_identity_and_exact_byte_acceptance() {
     );
     let server = server_with(&[("t", &[&ttl])], McpConfig::default());
     let read = |server: &McpServer, evidence| {
-        let call = Call {
+        let mut call = Call {
             arrived: Instant::now(),
             cancel: Arc::new(AtomicBool::new(false)),
             request_id: "escaped-evidence".into(),
@@ -1451,10 +1463,16 @@ fn link_evidence_escaped_terms_keep_identity_and_exact_byte_acceptance() {
             headers: None,
             held: None,
             grant: None,
+
+            preparation: None,
         };
         let args = json!({"dataset":"t","mentions":[{"text":"Berlin"}],"evidence":evidence});
         server
-            .run_now("link_entities", args.as_object().unwrap().clone(), &call)
+            .run_now(
+                "link_entities",
+                args.as_object().unwrap().clone(),
+                &mut call,
+            )
             .map(|outcome| match outcome {
                 Outcome::Structured(value) => value,
                 Outcome::Text(_) => panic!("expected structured evidence"),

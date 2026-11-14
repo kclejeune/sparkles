@@ -391,7 +391,7 @@ pub fn shex(
             Py::new(
                 py,
                 PyShexResult {
-                    node: r.node,
+                    node: r.node.as_term().clone(),
                     shape: match r.shape {
                         ShapeLabel::Iri(i) => i,
                         ShapeLabel::BNode(b) => format!("_:{b}"),

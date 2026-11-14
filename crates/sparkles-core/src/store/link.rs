@@ -192,12 +192,10 @@ impl Generation {
             let from = wal::WalPoint {
                 seq: s.base_seq,
                 offset: 0,
-                folding: false,
             };
             let to = wal::WalPoint {
                 seq: s.end_seq,
                 offset: s.wal_end,
-                folding: false,
             };
             wal::apply_forward(&path, &g, cache, &mut delta, from, to, &mut |_| Ok(()))?;
         }

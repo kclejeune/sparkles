@@ -23,9 +23,7 @@ pub(crate) const FORMAT: u32 = 1;
 /// root with either record is therefore activated, and a registry that is
 /// missing or names no history root must refuse rather than read as legacy.
 pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
-    let reader = crate::commit::read_dataset_versions(root)?
-        .is_some_and(|versions| versions.minimum_reader >= READER);
-    if reader {
+    if reader_records_activation(root)? {
         return Ok(true);
     }
     match std::fs::symlink_metadata(root.join(DIRECTORY)) {
@@ -33,6 +31,20 @@ pub(crate) fn activation_recorded(root: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Whether the dataset reader at `root` records an activation: a reader of
+/// [`READER`] or more that nothing else explains. Reader 9 belongs to the durable job
+/// ledger ([`crate::jobs::READER`]), and an interrupted enablement of jobs leaves that
+/// reader with no `jobs.json`, which C26 §7 says is safe to resume, so reader 9 never
+/// records an activation by itself and only the history directory does. A reader this
+/// build does not know still refuses as activated.
+fn reader_records_activation(root: &Path) -> Result<bool> {
+    let Some(versions) = crate::commit::read_dataset_versions(root)? else {
+        return Ok(false);
+    };
+    let reader = versions.minimum_reader;
+    Ok(reader >= READER && reader != crate::jobs::READER)
 }
 
 /// Refuse an activated root whose registry no longer names its history root.
@@ -77,9 +89,9 @@ pub(crate) fn activated(
         Some(crate::managed::ManagedState::Installed(installed)) => {
             installed.configuration_history.is_some()
         }
-        Some(crate::managed::ManagedState::Unavailable { .. }) => family_root
-            .and_then(|root| crate::commit::read_dataset_versions(root).ok().flatten())
-            .is_some_and(|versions| versions.minimum_reader >= READER),
+        Some(crate::managed::ManagedState::Unavailable { .. }) => {
+            family_root.is_some_and(|root| reader_records_activation(root).unwrap_or(false))
+        }
         None => false,
     }
 }
@@ -1136,7 +1148,6 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
     let from = super::wal::WalPoint {
         seq: head,
         offset: 0,
-        folding: physical.value.origin == "baseline",
     };
     let cursor_limit = budget.owned_limit()?;
     let mut cursor = super::wal::WalCursor::open_limited(&hot, from, &cursor_limit, 0)?;
@@ -1191,7 +1202,7 @@ fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparat
         )?;
         let directory = entry.path();
         let allowance = preparation.room();
-        let strict_from = {
+        {
             let _decode = preparation.reserve(allowance)?;
             let options = crate::history::HistoryOptions {
                 cancel: Some(preparation.control().cancel.flag()),
@@ -1211,8 +1222,7 @@ fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparat
                     "activation found a foreign or unpublished retained generation binding",
                 ));
             }
-            physical.and_then(|physical| physical.value.wal_strict_from)
-        };
+        }
         let path = directory.join("wal.log");
         let mut options = OpenOptions::new();
         options.read(true);
@@ -1223,9 +1233,7 @@ fn activation_retained_generations(root: &Path, id: Uuid, preparation: &Preparat
         }
         let mut file = match options.open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && strict_from.is_none() => {
-                continue;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
         if !file.metadata()?.is_file() {
@@ -1383,7 +1391,10 @@ pub(crate) fn activate_copy(
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&super::wal::configuration_header_record())?;
             file.sync_all()?;
-        } else if version != crate::formats::WAL_VERSION {
+        } else if version != crate::formats::WAL_VERSION
+            && version != crate::formats::WAL_CONTROL_VERSION
+        {
+            // version 3 already carries configuration records (spec C26 §7)
             return Err(unavailable("activation WAL version changed"));
         }
     }

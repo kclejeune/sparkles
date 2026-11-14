@@ -54,7 +54,9 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 /// A commit of some branch: the branch id and the seq.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitRef {
     pub branch_id: uuid::Uuid,

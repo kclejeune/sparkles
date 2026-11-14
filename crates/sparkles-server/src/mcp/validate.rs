@@ -416,7 +416,7 @@ fn shex_failure(f: &sparkles_shex::ShexFailure, terms: &mut Terms) -> Value {
         _ => None,
     };
     if let Some(t) = value {
-        v["value"] = terms.term(t).into();
+        v["value"] = terms.term(t.as_term()).into();
     }
     if let Some(p) = v
         .get("predicate")
@@ -431,7 +431,7 @@ fn shex_failure(f: &sparkles_shex::ShexFailure, terms: &mut Terms) -> Value {
 #[cfg(feature = "shex")]
 fn shex_result(r: &sparkles_shex::ShapeResult, terms: &mut Terms) -> Value {
     let mut o = json!({
-        "node": terms.term(&r.node),
+        "node": terms.term(r.node.as_term()),
         "shape": shape_label(&r.shape, terms),
         "status": match r.status {
             sparkles_shex::Status::Conformant => "conformant",

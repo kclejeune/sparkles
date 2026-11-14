@@ -23,6 +23,7 @@ pub mod evidence;
 pub mod fmt;
 pub mod forms;
 pub mod handles;
+pub mod jobs;
 pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;
@@ -41,7 +42,10 @@ pub mod write_guard;
 pub use sparkles_owl as owl;
 
 pub use catalog::{Catalog, CatalogOptions};
-pub use dataset::{Dataset, DatasetOptions, GraphView, QuadIter, Solution, Solutions, Transaction};
+pub use dataset::{
+    ConstructedDataset, ConstructedGraph, ConstructedQuadIter, Dataset, DatasetOptions, GraphView,
+    QuadIter, Solution, Solutions, SolutionsIter, Transaction,
+};
 pub use request::{Budgets, QueryRequest};
 pub use sparkles_core::{Budget, BudgetKind, Error, Result};
 pub use syntax::RdfSyntax;

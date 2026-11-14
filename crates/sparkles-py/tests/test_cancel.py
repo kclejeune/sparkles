@@ -187,3 +187,13 @@ def test_budgets(big: Dataset) -> None:
         "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex.org/p> ?o }", max_rows=10_000, max_memory_bytes=1 << 20
     )
     assert row["n"] == Literal(1500)
+
+
+def test_an_exhausted_iterator_stays_exhausted_after_cancellation() -> None:
+    ds = Dataset()
+    ds.extend(Triple(ex(f"s{i}"), ex("p"), Literal(i)) for i in range(3))
+    token = CancelToken()
+    rows = iter(ds.query("SELECT * WHERE { ?s ?p ?o }", cancel=token))
+    assert len(list(rows)) == 3
+    token.cancel()
+    assert next(rows, None) is None

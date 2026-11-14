@@ -458,7 +458,7 @@ pub(crate) fn write(
     // the vocabulary is copied, and with it its features
     let features = g.meta.features.clone();
     let meta = IndexMeta {
-        format_version: crate::builder::format_for(&features),
+        format_version: crate::builder::FORMAT_VERSION,
         features,
         quads,
         terms: g.meta.terms,

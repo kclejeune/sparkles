@@ -27,11 +27,12 @@ use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{G, O, S};
 use crate::sparql::ctx::Ctx;
-use crate::sparql::exec::{PlanInfo, execute};
+use crate::sparql::exec::{PlanInfo, execute_materialized};
 use crate::sparql::expr::{Row, eval};
 use crate::sparql::geojoin::SpatialKnnSpec;
 use crate::sparql::geopf::{ScanShape, number};
 use crate::sparql::plan::{Kind, Node, PathEnd};
+use crate::sparql::table::Materialized;
 use crate::sparql::table::{Table, VarId};
 use crate::store::Chunk;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -59,12 +60,12 @@ impl Ord for Key {
 }
 
 /// Runs of the template over batches of the scan's rows.
-struct Runner<'a> {
-    ctx: &'a Ctx,
-    spec: &'a SpatialKnnSpec,
-    template: &'a Node,
-    vars: &'a [VarId],
-    out: Table,
+struct Runner<'ctx, 'plan> {
+    ctx: &'ctx Ctx,
+    spec: &'plan SpatialKnnSpec,
+    template: &'plan Node,
+    vars: &'plan [VarId],
+    out: Materialized<'ctx>,
     runs: Vec<PlanInfo>,
     batches: u64,
     empty_batches: u64,
@@ -72,7 +73,7 @@ struct Runner<'a> {
     keyed: u64,
 }
 
-impl Runner<'_> {
+impl Runner<'_, '_> {
     /// Run the template over the scan's rows `(s, o, g)`; returns the ordering key of
     /// each of its rows (`None`: an error).
     fn run(&mut self, rows: &[[Id; 3]]) -> Result<Vec<Option<f64>>> {
@@ -111,7 +112,8 @@ impl Runner<'_> {
         }
         leaf.est = rows.len() as f64;
         leaf.kind = Kind::Values(batch);
-        let (res, info) = execute(self.ctx, &t)?;
+        let (input, info) = execute_materialized(self.ctx, &t)?;
+        let res = input.as_table();
         self.batches += 1;
         self.empty_batches += u64::from(res.is_empty());
         if self.runs.len() < RUNS_SHOWN {
@@ -121,7 +123,7 @@ impl Runner<'_> {
         let keys = (0..res.len())
             .map(|i| {
                 let row = Row {
-                    table: &res,
+                    table: res,
                     i,
                     map: &map,
                     dec: None,
@@ -134,8 +136,8 @@ impl Runner<'_> {
             })
             .collect::<Vec<_>>();
         self.keyed += keys.len() as u64;
-        self.out.append(res.project(self.vars));
-        self.ctx.check_output(self.out.len(), self.out.width())?;
+        let projected = input.project(self.ctx, self.vars)?;
+        self.out.append_copy(self.ctx, &projected)?;
         Ok(keys)
     }
 }
@@ -148,6 +150,18 @@ pub fn spatial_knn(
     template: &Node,
     vars: &[VarId],
 ) -> Result<(Table, Counters, Vec<PlanInfo>)> {
+    // Explicitly raw low-level application API. The engine uses the protected
+    // materialized entry and transfers its actual output credit into its result.
+    let (output, counters, plans) = spatial_knn_materialized(ctx, spec, template, vars)?;
+    Ok((output.into_application_table(), counters, plans))
+}
+
+pub(crate) fn spatial_knn_materialized<'ctx>(
+    ctx: &'ctx Ctx,
+    spec: &SpatialKnnSpec,
+    template: &Node,
+    vars: &[VarId],
+) -> Result<(Materialized<'ctx>, Counters, Vec<PlanInfo>)> {
     let shape = ScanShape::of(&spec.scan)
         .ok_or_else(|| Error::invalid("nearest-neighbour search of an unexpected pattern"))?;
     let subj = match shape.subj {
@@ -159,7 +173,7 @@ pub fn spatial_knn(
         spec,
         template,
         vars,
-        out: Table::new(vars.to_vec()),
+        out: Materialized::empty_fast(ctx, vars, &[])?,
         runs: Vec::new(),
         batches: 0,
         empty_batches: 0,
@@ -231,7 +245,7 @@ pub fn spatial_knn(
     let mut c = Counters::new();
     c.insert("candidates".into(), st.candidates.into());
     c.insert("refined".into(), run.keyed.into());
-    c.insert("matched".into(), (run.out.len() as u64).into());
+    c.insert("matched".into(), (run.out.as_table().len() as u64).into());
     c.insert("treeNodesVisited".into(), st.nodes.into());
     c.insert("rechecked".into(), st.rechecked.into());
     c.insert("batches".into(), run.batches.into());

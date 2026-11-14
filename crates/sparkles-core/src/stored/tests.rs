@@ -39,7 +39,7 @@ fn names(s: &Store, d: &Definition, g: Value) -> Vec<String> {
         ..Default::default()
     };
     let r = query(s.snapshot(), &d.query, &opts).unwrap();
-    r.rows()
+    r.test_application_rows()
         .into_iter()
         .map(|row| match &row[0] {
             Some(Term::Literal(l)) => l.value().to_string(),

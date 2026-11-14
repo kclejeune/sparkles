@@ -550,6 +550,7 @@ impl super::Generation {
                 Error::Corrupt("meta.json: format_version is missing or not a u32".into())
             })?;
         crate::formats::INDEX.check("historical generation", number, written_by)?;
+        builder::check_features_listed(&version.value, "meta.json")?;
         drop(version.value);
         budget.release(version.charge);
         let meta: Loaded<builder::IndexMeta> = budget.json(&bytes)?;
@@ -581,10 +582,7 @@ impl super::Generation {
         budget.reserve(&mut perms, Perm::ALL.len())?;
         for perm in Perm::ALL {
             budget.check()?;
-            perms.push(
-                crate::index::PermIndex::open_controlled(dir, perm, meta.format_version, budget)?
-                    .value,
-            );
+            perms.push(crate::index::PermIndex::open_controlled(dir, perm, budget)?.value);
         }
         // Pattern opening maps immutable data and decodes at most two fixed table
         // descriptors. Bound its wrappers and optional diagnostic before opening.

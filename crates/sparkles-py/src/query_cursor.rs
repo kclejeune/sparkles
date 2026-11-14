@@ -282,7 +282,8 @@ impl PyQueryCursor {
                 let Some(batch) = &state.batch else {
                     return Ok(None);
                 };
-                let values = batch.row(state.row)?;
+                // The Python solution keeps its own terms.
+                let values = batch.row(state.row)?.values().to_vec();
                 state.row += 1;
                 state.emitted += 1;
                 Ok(Some(values))

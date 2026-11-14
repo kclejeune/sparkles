@@ -142,13 +142,10 @@ fn answer(
         ("500 Internal Server Error", b"no".to_vec())
     } else {
         match query(data.snapshot(), &q, &QueryOptions::default()) {
-            Ok(mut r) => {
+            Ok(r) => {
                 let n = limit.load(Ordering::SeqCst);
-                if r.table.len() > n {
-                    r.table.truncate(n);
-                }
                 let mut out = Vec::new();
-                write_solutions(&r, SolutionsFormat::Json, &mut out, None).unwrap();
+                write_solutions(&r, SolutionsFormat::Json, &mut out, Some(n)).unwrap();
                 ("200 OK", out)
             }
             Err(e) => ("400 Bad Request", e.to_string().into_bytes()),
@@ -185,9 +182,9 @@ fn short(t: &Option<Term>) -> String {
 fn run(local: &Store, q: &str, o: &QueryOptions) -> sparkles_core::Result<Vec<String>> {
     let r = query(local.snapshot(), q, o)?;
     let mut rows: Vec<String> = r
-        .rows()
+        .rows()?
         .iter()
-        .map(|row| row.iter().map(short).collect::<Vec<_>>().join(" "))
+        .map(|row| row.values().iter().map(short).collect::<Vec<_>>().join(" "))
         .collect();
     rows.sort();
     Ok(rows)
@@ -518,7 +515,7 @@ fn measure_bulk_and_cache() {
             let t = Instant::now();
             let r = query(local.snapshot(), q, &opts()).unwrap();
             best = best.min(t.elapsed().as_secs_f64() * 1000.0);
-            rows = r.table.len();
+            rows = r.len();
             reqs = ep.take().len();
         }
         println!("{name:<40} {rows:>7} rows {reqs:>6} requests {best:>9.1} ms");
@@ -577,7 +574,7 @@ fn a_limit_reaches_the_remote_query() {
                 }
                 n
             }
-            QueryExecution::Eager(r) => r.into_result().rows().len(),
+            QueryExecution::Eager(r) => r.into_result().len(),
             _ => unreachable!("a SELECT"),
         }
     };

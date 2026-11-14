@@ -11,7 +11,8 @@
 use super::ids::{GroupId, Key, Level, MAX_DEPTH, MAX_ID, Step, canonical_term};
 use super::{By, GroupsRequest, Within};
 use crate::error::{Error, Result};
-use crate::sparql::QueryOptions;
+use crate::sparql::output::OwnedRows;
+use crate::sparql::{QueryOptions, QueryResult};
 use crate::store::Snapshot;
 use oxrdf::Term;
 use serde_json::{Value as J, json};
@@ -55,13 +56,58 @@ pub(super) struct Run<'a> {
 
 /// The solutions of one query, with their variables.
 pub(super) struct Rows {
-    pub(super) vars: Vec<String>,
-    pub(super) rows: Vec<Vec<Option<Term>>>,
+    result: QueryResult,
+    pub(super) rows: RowValues,
+}
+
+/// Borrowing adapter over actual decoded rows, never an uncredited model copy.
+pub(super) struct RowValues(OwnedRows);
+impl RowValues {
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub(super) fn first(&self) -> Option<&[Option<Term>]> {
+        self.0.row(0).ok().map(|r| r.values())
+    }
+    pub(super) fn iter(&self) -> RowValuesIter<'_> {
+        RowValuesIter {
+            rows: &self.0,
+            index: 0,
+        }
+    }
+}
+pub(super) struct RowValuesIter<'a> {
+    rows: &'a OwnedRows,
+    index: usize,
+}
+impl<'a> Iterator for RowValuesIter<'a> {
+    type Item = &'a [Option<Term>];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.rows.len() {
+            return None;
+        }
+        let row = self.rows.row(self.index).expect("checked row");
+        self.index += 1;
+        Some(row.values())
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.rows.len() - self.index;
+        (n, Some(n))
+    }
+}
+impl ExactSizeIterator for RowValuesIter<'_> {}
+impl<'a> IntoIterator for &'a RowValues {
+    type Item = &'a [Option<Term>];
+    type IntoIter = RowValuesIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
 }
 
 impl Rows {
     pub(super) fn col(&self, name: &str) -> usize {
-        self.vars
+        self.result
+            .variables()
             .iter()
             .position(|v| v == name)
             .unwrap_or(usize::MAX)
@@ -355,8 +401,8 @@ impl Run<'_> {
         let r =
             crate::sparql::query_with_plan(self.snap.clone(), q, self.opts).map_err(|f| f.error)?;
         Ok(Rows {
-            rows: r.rows(),
-            vars: r.vars,
+            rows: RowValues(r.rows()?),
+            result: r,
         })
     }
 

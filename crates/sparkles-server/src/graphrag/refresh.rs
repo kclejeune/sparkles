@@ -15,9 +15,20 @@
 //! The loop never starts a first build, never runs on a branch other than main, and
 //! leaves a dataset alone while one of its GraphRAG tasks is queued or running. A run
 //! that the budget stopped with pending communities is retried once a day.
+//!
+//! Under a review policy, a report's input can change without any change that the
+//! principal's feed lists (spec C25, "Refresh"). The loop then runs a private check in
+//! place of a refresh: when a commit changes the policy's decisions or supports graph or
+//! adds a withdrawal to a proposal graph, which it reads from the feed without the
+//! principal's view, when the selected evidence configuration or the access policy's
+//! generation differs from the one it last checked, when it first sees the dataset, and
+//! when the principal's feed cannot list the changes. The check is a refresh's
+//! preparation and plan with no model call, commit, state change or task, and it starts
+//! a refresh only for a change of a report's input. It keeps its own backoff, so a check
+//! that fails never holds back what the principal's feed starts.
 
 use super::build::{self, Mode};
-use super::settings::{GraphragSettings, RefreshMode, is_guarded};
+use super::settings::{GraphragSettings, RefreshMode};
 use super::state::BuildState;
 use crate::auth::Endpoint;
 use crate::state::{AppState, Dataset, task_state};
@@ -68,9 +79,84 @@ pub struct Watch {
     /// commit, and whether the last build read under one
     policy_checked: Option<Instant>,
     had_policy: bool,
+    /// the private check under a review policy: whether one is due, the head through
+    /// which the evidence graphs' changes were read, the evidence configuration and the
+    /// access policy's generation it last saw, and its own backoff
+    private: Private,
+}
+
+/// What the loop remembers for the private check of one dataset.
+#[derive(Debug, Default)]
+pub(crate) struct Private {
+    pub(crate) due: bool,
+    evidence_seen: Option<u64>,
+    configuration: Option<String>,
+    access: Option<u64>,
+    /// the head that the last check which found nothing read at least
+    covered: Option<u64>,
+    failures: u32,
+    retry_at: Option<Instant>,
+    /// the checks run, for tests
+    pub(crate) runs: u64,
+}
+
+impl Private {
+    /// Whether a due check may run at `now`, after its own backoff.
+    fn ready(&self, now: Instant) -> bool {
+        self.due && self.retry_at.is_none_or(|t| now >= t)
+    }
+
+    fn failed(&mut self, now: Instant, debounce: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + debounce * (1u32 << self.failures.min(6)));
+    }
+
+    fn done(&mut self) {
+        self.due = false;
+        self.failures = 0;
+        self.retry_at = None;
+    }
+
+    /// The principal's feed cannot count the changes up to `head`: a check is due unless
+    /// one already covered that head, so an idle dataset is not checked on every pass.
+    fn uncounted(&mut self, head: u64) {
+        if self.covered != Some(head) {
+            self.due = true;
+        }
+    }
 }
 
 impl Watch {
+    /// The private check's record, for tests.
+    pub(crate) fn private(&self) -> &Private {
+        &self.private
+    }
+
+    /// Follow the refresh this loop started, whose task is in `state`: whether it is
+    /// still queued or running. A failure backs off. Only a refresh that ended well
+    /// read everything a due private check would have read, so a cancelled or missing
+    /// task leaves the check due.
+    fn follow(&mut self, state: Option<&str>, head: u64, now: Instant, debounce: Duration) -> bool {
+        match state {
+            Some(task_state::QUEUED | task_state::RUNNING) => {
+                self.due(head, now, debounce);
+                return true;
+            }
+            Some(task_state::FAILED) => {
+                self.failed(now, debounce);
+                // the failed run used no daily retry of pending communities
+                self.retried_day = None;
+            }
+            Some(task_state::DONE) => {
+                self.failures = 0;
+                self.private.done();
+            }
+            _ => self.failures = 0,
+        }
+        self.task = None;
+        false
+    }
+
     /// Note the head at `now`; whether a check is due.
     fn due(&mut self, head: u64, now: Instant, debounce: Duration) -> bool {
         match self.seen {
@@ -172,19 +258,9 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
                 .iter()
                 .find(|t| &t.id == id)
                 .map(|t| t.state.clone());
-            match state.as_deref() {
-                Some(task_state::QUEUED | task_state::RUNNING) => {
-                    w.due(head, now, debounce);
-                    continue;
-                }
-                Some(task_state::FAILED) => {
-                    w.failed(now, debounce);
-                    // the failed run used no daily retry of pending communities
-                    w.retried_day = None;
-                }
-                _ => w.failures = 0,
+            if w.follow(state.as_deref(), head, now, debounce) {
+                continue;
             }
-            w.task = None;
         }
         // a review policy that changed, or a new version of it, makes the dataset due
         // without a commit, so it is compared once a debounce period
@@ -192,7 +268,12 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             && w.retry_at.is_none_or(|t| now >= t)
             && w.policy_checked
                 .is_none_or(|t| now.duration_since(t) >= debounce);
-        if !w.wants_check(head, now, debounce, build::today()) && !policy_due {
+        // a private check that failed is retried after its own backoff, which an
+        // outstanding backoff of the loop holds back as well
+        let private_retry = settings.review_policy.is_some()
+            && w.private.ready(now)
+            && w.retry_at.is_none_or(|t| now >= t);
+        if !w.wants_check(head, now, debounce, build::today()) && !policy_due && !private_retry {
             continue;
         }
         // a running or queued build or refresh goes first, and the check waits for it
@@ -209,6 +290,12 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
                 continue;
             }
         };
+        let reason = match reason {
+            Some(r) => Some(r),
+            None => private_check(st, &ds, &settings, w, now, debounce),
+        };
+        // the failures in a row end only when no refresh is needed, so the refreshes
+        // that private checks start back off as the others do
         let Some(reason) = reason else {
             w.failures = 0;
             continue;
@@ -220,6 +307,139 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             Err(_) => w.retry_at = Some(now + debounce),
         }
     }
+}
+
+/// The reason a refresh starts after a private check finds a changed input. It names no
+/// record and no trigger, since the change may be one the principal cannot see.
+pub const CHECK_REASON: &str = "a check under the review policy found reports whose input changed";
+
+/// Run the private check when one is due and its backoff has passed. `Some` when it
+/// found a change of a report's input; nothing else the check does is visible.
+fn private_check(
+    st: &Arc<AppState>,
+    ds: &Arc<Dataset>,
+    settings: &GraphragSettings,
+    w: &mut Watch,
+    now: Instant,
+    debounce: Duration,
+) -> Option<String> {
+    if settings.review_policy.is_none() || !w.private.ready(now) {
+        return None;
+    }
+    w.private.runs += 1;
+    let head = ds.store.head_commit().seq;
+    let r = build::Run {
+        st,
+        ds: ds.clone(),
+        settings: settings.clone(),
+        mode: Mode::Refresh,
+        confirmed: true,
+        task: None,
+        task_id: String::new(),
+        cancel: Default::default(),
+        limits: Default::default(),
+    };
+    match r.private_check() {
+        Ok(None) => {
+            w.private.done();
+            w.private.covered = Some(head);
+            None
+        }
+        Ok(Some(why)) => {
+            // the refresh it starts clears the check once it ends well
+            tracing::debug!(target: "sparkles::graphrag", dataset = %ds.name, "automatic refresh check: {why}");
+            Some(CHECK_REASON.into())
+        }
+        Err(e) => {
+            tracing::warn!(target: "sparkles::graphrag", dataset = %ds.name, "automatic refresh check: {e}");
+            w.private.failed(now, debounce);
+            None
+        }
+    }
+}
+
+/// Note what makes a private check due under the review policy `e`: the dataset seen
+/// for the first time, as when the server starts, another evidence configuration or
+/// access policy generation, and a commit since the last look that changed the
+/// policy's decisions or supports graph or added a withdrawal to a proposal graph, read
+/// from the feed without the principal's view.
+fn note_private(st: &AppState, ds: &Dataset, e: &super::evidence::Evidence, w: &mut Watch) {
+    let p = &mut w.private;
+    if p.configuration.as_deref() != Some(e.policy.configuration.as_str()) {
+        p.configuration = Some(e.policy.configuration.clone());
+        p.due = true;
+    }
+    let access = st.auth.as_ref().map_or(0, |a| a.epoch());
+    if p.access != Some(access) {
+        p.access = Some(access);
+        p.due = true;
+    }
+    let head = ds.store.head_commit().seq;
+    let Some(after) = p.evidence_seen else {
+        p.evidence_seen = Some(head);
+        p.due = true;
+        return;
+    };
+    if after >= head {
+        return;
+    }
+    p.evidence_seen = Some(head);
+    if !p.due && evidence_changed(ds, e, after, head) {
+        p.due = true;
+    }
+}
+
+/// Whether a commit in `after..=head` changed the decisions or supports graph of `e`'s
+/// policy or added a withdrawal to a proposal graph, or may have when the feed cannot
+/// list it.
+fn evidence_changed(ds: &Dataset, e: &super::evidence::Evidence, after: u64, head: u64) -> bool {
+    use sparkles::access::{GraphAccess, GraphRule, Graphs};
+    let mut names: Vec<&str> = vec![&e.policy.decisions, &e.policy.supports];
+    names.extend(e.proposals.iter().map(String::as_str));
+    let o = ChangesOptions {
+        max_commits: PAGE_COMMITS,
+        max_quads: PAGE_QUADS,
+        cancel: None,
+        deadline: Some(Instant::now() + FEED_DEADLINE),
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new(names, &[])),
+            Graphs::none(),
+        ))),
+    };
+    let mut after = after;
+    while after < head {
+        let Ok(page) = ds.store.changes(after, &o) else {
+            return true;
+        };
+        for c in &page.commits {
+            if c.commit.seq > head {
+                return false;
+            }
+            if !c.complete() {
+                return true;
+            }
+            for (_, q) in c.iter() {
+                let GraphName::NamedNode(g) = &q.graph_name else {
+                    continue;
+                };
+                let g = g.as_str();
+                if g == e.policy.decisions || g == e.policy.supports {
+                    return true;
+                }
+                if q.predicate.as_str() == super::store::RDF_TYPE
+                    && matches!(&q.object, Term::NamedNode(o) if o.as_str() == WITHDRAWAL)
+                {
+                    return true;
+                }
+            }
+        }
+        let next = page.next();
+        if page.commits.is_empty() || next >= head.min(page.head.seq) {
+            break;
+        }
+        after = next;
+    }
+    false
 }
 
 /// Why the dataset needs a refresh now, if it does.
@@ -254,6 +474,9 @@ pub(crate) fn due_reason(
         ),
         None => None,
     };
+    if let Some(e) = &evidence {
+        note_private(st, ds, e, w);
+    }
     match (&evidence, &b.policy) {
         (None, None) => {}
         (None, Some(_)) => {
@@ -306,6 +529,11 @@ pub(crate) fn due_reason(
                 | sparkles::Error::NotPermitted(_)
                 | sparkles::Error::NotFound(_)),
             ) => {
+                // under a review policy, the private check decides
+                if evidence.is_some() {
+                    w.private.uncounted(ds.store.head_commit().seq);
+                    return Ok(None);
+                }
                 return Ok(Some(format!(
                     "the change feed cannot list the changes: {e}"
                 )));
@@ -317,6 +545,10 @@ pub(crate) fn due_reason(
                 continue;
             }
             if !c.complete() {
+                if evidence.is_some() {
+                    w.private.uncounted(ds.store.head_commit().seq);
+                    return Ok(None);
+                }
                 return Ok(Some(format!(
                     "commit {} changed too many facts to count",
                     c.commit.seq
@@ -326,28 +558,15 @@ pub(crate) fn due_reason(
                 let GraphName::NamedNode(g) = &q.graph_name else {
                     continue;
                 };
-                // a decision or support the principal can see, or a withdrawal, can end
-                // what a report read without changing the output graph
-                if let Some(e) = &evidence {
-                    let g = g.as_str();
-                    if g == e.policy.decisions || g == e.policy.supports {
-                        return Ok(Some(format!(
-                            "commit {} changed the decisions or supports of review policy {}",
-                            c.commit.seq, e.policy.name
-                        )));
-                    }
-                    if e.proposals.iter().any(|p| p == g)
-                        && q.predicate.as_str() == super::store::RDF_TYPE
-                        && matches!(&q.object, Term::NamedNode(o) if o.as_str() == WITHDRAWAL)
-                    {
-                        return Ok(Some(format!("commit {} withdrew a claim", c.commit.seq)));
-                    }
-                }
-                let output = evidence.as_ref().map(|e| e.policy.output.as_str());
-                if is_guarded(g.as_str())
-                    || !(super::projection::named(settings, g.as_str())
-                        || output == Some(g.as_str()))
-                {
+                // a decision, support or withdrawal, seen or not, is the private
+                // check's to weigh (`note_private`)
+                // the graphs the preparation reads: the projection's and the output
+                // graph, without the other graphs of an evidence role
+                let extra = super::projection::Extra {
+                    output: evidence.as_ref().map(|e| e.policy.output.as_str()),
+                    excluded: evidence.as_ref().map(|e| &e.excluded),
+                };
+                if !extra.reads(settings, g.as_str()) {
                     continue;
                 }
                 if let Some(r) = counter.change(&q.subject, &q.predicate.to_string(), &q.object) {
@@ -469,6 +688,7 @@ impl<'a> Counter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graphrag::settings::is_guarded;
     use crate::graphrag::state::{BuildRecord, StoredCommunity};
 
     fn state() -> BuildState {
@@ -740,6 +960,79 @@ mod tests {
             w.failed(t0, d);
         }
         assert_eq!(w.retry_at, Some(t0 + d * 64));
+    }
+
+    /// A private check that fails backs off on its own, and never holds back the loop's
+    /// other triggers.
+    #[test]
+    fn private_checks_back_off_on_their_own() {
+        let d = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        assert!(!w.private.ready(t0));
+        w.private.due = true;
+        assert!(w.private.ready(t0));
+        w.private.failed(t0, d);
+        assert!(!w.private.ready(t0 + d));
+        assert!(w.private.ready(t0 + d * 2));
+        assert_eq!(w.retry_at, None, "the loop's own backoff is untouched");
+        assert!(!w.wants_check(5, t0, d, 100));
+        assert!(w.wants_check(5, t0 + d, d, 100));
+        w.private.failed(t0, d);
+        assert!(!w.private.ready(t0 + d * 3));
+        assert!(w.private.ready(t0 + d * 4));
+        w.private.done();
+        assert!(!w.private.ready(t0 + d * 4));
+        assert_eq!(w.private.failures, 0);
+    }
+
+    /// Only a refresh that ended well clears a due private check, and refreshes that
+    /// keep failing back off further each time.
+    #[test]
+    fn a_due_check_waits_for_a_refresh_that_ends_well() {
+        let d = Duration::from_secs(10);
+        let t0 = Instant::now();
+        for (state, cleared) in [
+            (Some(task_state::DONE), true),
+            (Some(task_state::CANCELLED), false),
+            (Some(task_state::FAILED), false),
+            (None, false),
+        ] {
+            let mut w = Watch {
+                task: Some("t".into()),
+                ..Default::default()
+            };
+            w.private.due = true;
+            assert!(!w.follow(state, 5, t0, d), "{state:?}");
+            assert_eq!(w.private.due, !cleared, "{state:?}");
+            assert_eq!(w.task, None);
+        }
+        let mut w = Watch {
+            task: Some("t".into()),
+            ..Default::default()
+        };
+        assert!(w.follow(Some(task_state::RUNNING), 5, t0, d));
+        assert!(w.task.is_some());
+        // consecutive failures, with no reset between them, double the backoff
+        let mut w = Watch::default();
+        w.follow(Some(task_state::FAILED), 5, t0, d);
+        assert_eq!(w.retry_at, Some(t0 + d * 2));
+        w.follow(Some(task_state::FAILED), 5, t0, d);
+        assert_eq!(w.retry_at, Some(t0 + d * 4));
+    }
+
+    /// A feed that cannot count the changes makes a check due once per head.
+    #[test]
+    fn an_uncountable_feed_is_checked_once_per_head() {
+        let mut p = Private::default();
+        p.uncounted(7);
+        assert!(p.due);
+        p.done();
+        p.covered = Some(7);
+        p.uncounted(7);
+        assert!(!p.due, "the check already covered head 7");
+        p.uncounted(8);
+        assert!(p.due);
     }
 
     #[test]

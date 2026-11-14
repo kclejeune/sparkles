@@ -465,7 +465,7 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         let text = format!("{PREFIXES}SELECT ?r {{ {pattern} BIND({expr} AS ?r) }}");
         let r = query(s.snapshot(), &text, &QueryOptions::default())
             .unwrap_or_else(|e| panic!("{text}: {e}"));
-        let mut rows = r.rows();
+        let mut rows = r.test_application_rows();
         assert_eq!(rows.len(), 1, "{text}");
         rows.pop().unwrap().pop().unwrap()
     }
@@ -622,7 +622,7 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         let run = |expr: &str| {
             let text = format!("{PREFIXES}SELECT ?r {{ BIND({expr} AS ?r) }}");
             let r = query(s.snapshot(), &text, &QueryOptions::default()).unwrap();
-            r.plan.warnings
+            r.plan().warnings.clone()
         };
         let bng = "\"<http://www.opengis.net/def/crs/EPSG/0/27700> POINT(538985 177334)\"^^geo:wktLiteral";
         let ws = run(&format!(

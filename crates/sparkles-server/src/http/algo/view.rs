@@ -542,25 +542,32 @@ fn compute(
         .or_else(|| opts.timeout.map(|t| Instant::now() + t));
     let r = sparkles::sparql::query(snap, q, opts)?;
     let control = || controlled(opts, deadline);
-    let mut vars = r.vars.clone();
+    let mut vars = r.variables().to_vec();
     // the summary is the last column, the same literal in every row: decoded once
     let summary_col = (vars.last().map(String::as_str) == Some("summary")).then(|| {
         vars.pop();
         vars.len()
     });
-    let n = r.table.len();
+    let n = r.table().len();
     let width = vars.len();
     let mut summary = None;
     if let Some(c) = summary_col
         && n > 0
-        && let Some(Term::Literal(l)) = r.term(r.table.cols[c][0])
+        && let Some(term) = r.term(r.table().get(0, c)?)?
+        && let Term::Literal(l) = term.as_term()
     {
         summary = Some(serde_json::from_str(l.value()).unwrap_or(J::from(l.value())));
     }
     let mut rows: Vec<Vec<Option<Term>>> = Vec::new();
     let mut pending = 0u64;
     for i in 0..n {
-        let row: Vec<Option<Term>> = r.table.cols[..width].iter().map(|c| r.term(c[i])).collect();
+        // The kept view owns independent copies, charged to `held` below.
+        let row = r
+            .table()
+            .columns()
+            .take(width)
+            .map(|c| Ok(r.term(c[i])?.map(|t| t.as_term().clone())))
+            .collect::<sparkles::Result<Vec<Option<Term>>>>()?;
         pending += row_bytes(&row) + row_index_bytes(&row);
         rows.push(row);
         if rows.len().is_multiple_of(CHARGE_EVERY) {

@@ -225,6 +225,10 @@ budget. These remain estimated heap charges rather than process RSS limits.
 
 Hierarchical ownership of public results, native buffers, reasoner work and views, and
 strict decoding throughout their callers remain part of item 675.
+One follow-up of item 675 is MCP native frame ownership. MCP tool results are still
+application copies of their rendered text. A retained renderer would keep each response
+frame under its query's credit until the transport writes it. That needs an rmcp
+transport qualified for retained results, including session replay and tasks.
 
 ### Dead compaction arm and one generation switch
 

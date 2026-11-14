@@ -1888,7 +1888,7 @@ impl Store {
                                 .as_chunks::<WAL_REC>()
                                 .0
                                 .iter()
-                                .filter(|record| record[0] != WAL_CONFIGURATION)
+                                .filter(|record| wal_is_quad(record[0]))
                                 .map(|d| (d[0], super::wal::record_quad(d)))
                                 .collect();
                             log.push(Pending {

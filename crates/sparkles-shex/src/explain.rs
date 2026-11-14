@@ -101,16 +101,11 @@ impl Explainer<'_, '_, '_> {
                 let shape = self.label(*k);
                 self.push(ShexFailure::Reference {
                     shape,
-                    value: env.term(node),
+                    value: env.term(node)?,
                 });
             }
             Se::Nc(n) => {
-                let f = match env.absent.get(node.payload() as usize) {
-                    Some(t) if node.tag() == sparkles_core::id::Tag::Local => {
-                        env.nc.explain_term(*n, t)?
-                    }
-                    _ => env.nc.explain(*n, node)?,
-                };
+                let f = env.nc.explain_owned_term(*n, env.term(node)?)?;
                 if let Some(f) = f {
                     self.push(f);
                 }
@@ -140,8 +135,8 @@ impl Explainer<'_, '_, '_> {
         let before = self.out.len();
         if let Some((p, o)) = neigh.closed_violation {
             self.push(ShexFailure::Closed {
-                predicate: iri_of(&env.term(p)),
-                value: env.term(o),
+                predicate: iri_of(env.term(p)?.as_term()),
+                value: env.term(o)?,
             });
         }
         let error = RefCell::new(None);
@@ -166,7 +161,7 @@ impl Explainer<'_, '_, '_> {
                                 let shape = self.label(k);
                                 self.push(ShexFailure::Reference {
                                     shape,
-                                    value: env.term(v),
+                                    value: env.term(v)?,
                                 });
                             }
                             _ => {}
@@ -174,7 +169,7 @@ impl Explainer<'_, '_, '_> {
                     } else {
                         self.push(ShexFailure::Extra {
                             predicate: pred.clone(),
-                            value: env.term(v),
+                            value: env.term(v)?,
                         });
                     }
                 }
@@ -246,7 +241,7 @@ pub fn reason(node: &Term, f: &ShexFailure, prefixes: &PrefixMap) -> String {
         | ShexFailure::Datatype { value, constraint }
         | ShexFailure::Facet { value, constraint }
         | ShexFailure::ValueSet { value, constraint } => {
-            format!("{} fails {constraint}", term(value))
+            format!("{} fails {constraint}", term(value.as_term()))
         }
         ShexFailure::Cardinality {
             predicate,
@@ -263,16 +258,20 @@ pub fn reason(node: &Term, f: &ShexFailure, prefixes: &PrefixMap) -> String {
             )
         }
         ShexFailure::Closed { predicate, value } => {
-            format!("CLOSED shape forbids {} {}", iri(predicate), term(value))
+            format!(
+                "CLOSED shape forbids {} {}",
+                iri(predicate),
+                term(value.as_term())
+            )
         }
         ShexFailure::Extra { predicate, value } => format!(
             "{} {} matches no triple constraint",
             iri(predicate),
-            term(value)
+            term(value.as_term())
         ),
         ShexFailure::NoMatch { detail } => detail.clone(),
         ShexFailure::Reference { shape, value } => {
-            format!("{} does not conform to {shape}", term(value))
+            format!("{} does not conform to {shape}", term(value.as_term()))
         }
         ShexFailure::Not { shape } => format!("conforms to {shape} under NOT"),
         ShexFailure::SemAct { extension, message } => {
