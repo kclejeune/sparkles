@@ -2113,10 +2113,12 @@ impl Index {
 
     /// The bytes that [`Index::changed`] allocates for the comparison with `old`,
     /// roughly: a mark for each expression, the members of the disjointness sets of
-    /// both indexes with their numbers, and the keys of the clauses of Tier D.
+    /// both indexes with their lists, their entries in the table that numbers them and
+    /// their numbers, which for sets of two members is 48 bytes a member, and the keys
+    /// of the clauses of Tier D.
     pub fn changed_scratch(&self, old: &Index) -> usize {
         old.heads.len()
-            + (old.disjoint.len() + self.disjoint.len()) * 12
+            + (old.disjoint.len() + self.disjoint.len()) * 48
             + match (&old.dl, &self.dl) {
                 (Some(a), Some(b)) => b.changed_scratch(a),
                 _ => 0,

@@ -384,11 +384,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   keep their contexts in the same way. After an edit of class axioms the next run clears
   the contexts that hold an expression whose rules changed, with the contexts that reach
   them, and its answer is that of a classification that starts again. A change to the
-  property hierarchy, chains, reflexivity or ranges, a domain, an
+  property hierarchy, chains, reflexivity or ranges, an
   axiom with an individual, a data property, a datatype, a key or a self restriction, and
   a change that moves the ontology to other rules, saturates everything again. So does
   any change to a Horn ontology with individuals, to a counting or a rooted run, and to a
-  run with the eager strategy. Roadmap items 753 and 953. A kept classification holds
+  disjunctive run with the eager strategy. Roadmap items 753 and 953. A kept classification holds
   the last index beside the new one while it compares them, and starts again once it
   keeps more than twice the expressions of its last full run. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
@@ -870,7 +870,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A Horn classification of an ontology with individuals, keys or data restrictions
   rebuilds after every axiom insertion and deletion. Roadmap
   [item 753](../ROADMAP.md) under item 603.
-* A classification that counts, a rooted one and one with the eager strategy rebuild
+* A classification that counts, a rooted one and a disjunctive one with the eager strategy rebuild
   after every edit, since the bound on their derived conclusions depends on the order
   of the derivations. Roadmap [item 953](../ROADMAP.md).
 * A classification that keeps its contexts after an edit still normalizes every axiom
