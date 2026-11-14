@@ -149,6 +149,42 @@ fn a_change_beside_an_unfolded_universal_keeps_its_holders() {
     }
 }
 
+/// A universal over the result of a chain whose unfolding makes the universal `∀s.B`,
+/// which no axiom names, with an instance of the chain into `s` under M.
+const MADE_UNIVERSAL: &str = "SubObjectPropertyOf(ObjectPropertyChain(:u :v) :s)
+     SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+     SubClassOf(:A ObjectAllValuesFrom(:t :B))
+     SubClassOf(:M ObjectSomeValuesFrom(:u :C))
+     SubClassOf(:C ObjectSomeValuesFrom(:v :D))
+     DisjointClasses(:B :D)";
+
+#[test]
+fn an_axiom_that_names_a_universal_an_automaton_made_has_it_unfolded() {
+    for threads in [1, 4] {
+        let (mut k, mut held) = started(MADE_UNIVERSAL, threads);
+        let out = k.classify(&limits(threads)).unwrap();
+        assert_eq!(out.taxonomy.unsatisfiable().count(), 0);
+        // the axiom's universal is the one the automaton of t made, and a run that
+        // starts again unfolds it by the chain into s: D, two steps from M, is in B
+        let named = "SubClassOf(:M ObjectAllValuesFrom(:s :B))";
+        add(&mut k, &mut held, named);
+        let out = same_as_fresh(&mut k, &held, threads, "after M named the universal");
+        assert!(out.taxonomy.unsatisfiable().any(|x| *x == c("M")));
+        let a = "SubClassOf(:A ObjectAllValuesFrom(:t :B))";
+        remove(&mut k, &mut held, a);
+        let out = same_as_fresh(&mut k, &held, threads, "after A's universal left");
+        assert!(out.taxonomy.unsatisfiable().any(|x| *x == c("M")));
+        add(&mut k, &mut held, a);
+        same_as_fresh(&mut k, &held, threads, "after A's universal came back");
+        remove(&mut k, &mut held, named);
+        let out = same_as_fresh(&mut k, &held, threads, "after M's universal left");
+        assert_eq!(out.taxonomy.unsatisfiable().count(), 0);
+        add(&mut k, &mut held, named);
+        let out = same_as_fresh(&mut k, &held, threads, "after M's universal came back");
+        assert!(out.taxonomy.unsatisfiable().any(|x| *x == c("M")));
+    }
+}
+
 /// Two negative existential restrictions with one filler over two transitive
 /// properties, each unfolded by the automaton of its property's inverse. The inverse
 /// restrictions on X and Y make the Horn rules take the ontology.

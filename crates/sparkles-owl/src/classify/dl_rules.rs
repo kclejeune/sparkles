@@ -309,6 +309,18 @@ impl DlIx {
     /// keys other rules here than in `old`: one in the body of a clause that only one of
     /// the two has, one with another hypothetical successor or successor core, and one
     /// that the order of atoms ranks differently.
+    /// The bytes that [`DlIx::changed`] allocates for the comparison with `old`,
+    /// roughly: a key for each clause of both, with a copy of its head.
+    pub fn changed_scratch(&self, old: &DlIx) -> usize {
+        let keys = |d: &DlIx| {
+            d.clauses
+                .iter()
+                .map(|(_, h)| 56 + h.len() * 4)
+                .sum::<usize>()
+        };
+        keys(old) + keys(self)
+    }
+
     pub fn changed(&self, old: &DlIx, changed: &mut [bool]) {
         type Key<'a> = (&'a [Ex], Vec<Ex>);
         fn keys(d: &DlIx) -> FxHashSet<Key<'_>> {

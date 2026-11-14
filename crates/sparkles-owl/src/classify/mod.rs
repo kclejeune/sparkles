@@ -1936,7 +1936,21 @@ impl Saturation {
                 });
             }
             normalized_peak = normalized_peak.max(held);
-            stats.cleared = self.invalidate_changed(&ix.changed(&old), &ix, d);
+            // the stop the comparison saw, which a cancellation polled once does not
+            // repeat
+            let stopped = std::cell::RefCell::new(None);
+            let changed = ix.changed(&old, &|| {
+                let r = poll(limits);
+                let stop = r.is_err();
+                if let Err(e) = r {
+                    *stopped.borrow_mut() = Some(e);
+                }
+                stop
+            });
+            let Some(changed) = changed else {
+                return Err(stopped.into_inner().unwrap_or(Error::Cancelled));
+            };
+            stats.cleared = self.invalidate_changed(&changed, &ix, d);
             drop(old);
             poll(limits)?;
         }

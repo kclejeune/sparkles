@@ -308,6 +308,9 @@ pub enum Scope {
 /// The estimated bytes of a scope's entry, its classes aside.
 const SCOPE_BYTES: usize = 48;
 
+/// The expressions that [`Index::changed`] compares between two polls of its stop.
+const POLL_CHANGED: usize = 4096;
+
 struct ValueInsertionPlan {
     vector_capacity: usize,
     bytes: usize,
@@ -375,9 +378,8 @@ impl Interner {
             + self.roles.capacity() * 48
             + self.ands.len() * 80
             + self.and_ops * 4
-            + self.scope_bytes
+            + self.scope_bytes()
             + self.prefix_roles.capacity() * 16
-            + self.made_universals.capacity() * 5
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
@@ -808,9 +810,10 @@ impl Interner {
         self.node(Node::Fresh(self.fresh_classes))
     }
 
-    /// The estimated bytes of the scopes of fresh classes and their axioms.
+    /// The estimated bytes of the scopes of fresh classes and their axioms, and of the
+    /// marks of the universals that automata made.
     pub fn scope_bytes(&self) -> usize {
-        self.scope_bytes
+        self.scope_bytes + self.made_universals.capacity() * 5
     }
 
     /// Starts a run's normalization: the scopes it opens are those the run keeps.
@@ -2020,7 +2023,9 @@ impl Index {
     /// disjointness sets, as sets, or other flags of the Horn rules, on the expression
     /// or, for a universal restriction, on its filler, and in a run of Tier D other
     /// clauses with the expression in their body or another hypothetical successor.
-    pub fn changed(&self, old: &Index) -> Vec<bool> {
+    /// `stop` is asked before each [`POLL_CHANGED`] expressions, and the answer is `None`
+    /// once it says to stop.
+    pub fn changed(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<Vec<bool>> {
         let n = old.heads.len();
         debug_assert!(self.heads.len() >= n);
         // the disjointness sets of each index by their members, which name them in both
@@ -2069,6 +2074,9 @@ impl Index {
         }
         let mut changed = vec![false; n];
         for (e, changed) in changed.iter_mut().enumerate() {
+            if e % POLL_CHANGED == 0 && stop() {
+                return None;
+            }
             let (a, b) = (&old.heads[e], &self.heads[e]);
             debug_assert_eq!(a.node, b.node);
             let sets = |ix: &Index, h: &Head, sets: &[u32]| -> Vec<u32> {
@@ -2094,17 +2102,25 @@ impl Index {
                 || (a.disj.len != 0 || b.disj.len != 0)
                     && sets(old, a, &old_sets) != sets(self, b, &new_sets);
         }
+        if stop() {
+            return None;
+        }
         if let (Some(a), Some(b)) = (&old.dl, &self.dl) {
             b.changed(a, &mut changed);
         }
-        changed
+        Some(changed)
     }
 
     /// The bytes that [`Index::changed`] allocates for the comparison with `old`,
-    /// roughly: a mark for each expression, and the members of the disjointness sets of
-    /// both indexes with their numbers.
+    /// roughly: a mark for each expression, the members of the disjointness sets of
+    /// both indexes with their numbers, and the keys of the clauses of Tier D.
     pub fn changed_scratch(&self, old: &Index) -> usize {
-        old.heads.len() + (old.disjoint.len() + self.disjoint.len()) * 12
+        old.heads.len()
+            + (old.disjoint.len() + self.disjoint.len()) * 12
+            + match (&old.dl, &self.dl) {
+                (Some(a), Some(b)) => b.changed_scratch(a),
+                _ => 0,
+            }
     }
 
     /// The bytes the index takes, roughly, the role table included.
