@@ -30,7 +30,9 @@
 //! its undo, the change again and a second undo, which leaves the dataset as it was. It
 //! reports the time of each incremental run in microseconds, with the commit, and the
 //! quartiles of each step over the rounds. The first round is the first change after the
-//! closure is kept, and each later round changes data that no earlier round read.
+//! closure is kept, and each later round changes data that no earlier round read. `K` and
+//! `ROUNDS` can be lists such as `100,1000,10000` and `40,20,6`, which run one size after
+//! another over the same kept closure.
 //! `LUBM_PERF_CONTROL` names a control FIFO of `perf record --control`, to which `churn`
 //! writes `enable` before the rounds and `disable` after them, so that a record started
 //! with `--delay=-1` holds the rounds without the full run. With `LUBM_POOL=1` the runs
@@ -392,9 +394,13 @@ fn main() {
         "churn" => {
             let db = PathBuf::from(&args[2]);
             let profile: Profile = args[3].parse().expect("profile");
-            let k: usize = args[4].parse().expect("triples");
+            let list = |a: &str, what: &str| -> Vec<usize> {
+                a.split(',').map(|x| x.parse().expect(what)).collect()
+            };
+            let sizes = list(&args[4], "triples");
             let universities: usize = args[5].parse().expect("universities");
-            let rounds: usize = args[6].parse().expect("rounds");
+            let batches = list(&args[6], "rounds");
+            assert_eq!(sizes.len(), batches.len(), "a number of rounds for each K");
             let store = Store::open(&db, StoreOptions::default()).unwrap();
             let threads = rayon::current_num_threads();
             let cache = Cache::new(usize::MAX);
@@ -424,9 +430,6 @@ fn main() {
             let mut since = r.receipt.unwrap().commit.seq;
             let (r, _) = run(Some(since));
             since = r.receipt.unwrap().commit.seq;
-            let sets: Vec<(Vec<Triple>, Vec<Triple>)> = (0..universities.min(rounds))
-                .map(|u| change_sets(u, k))
-                .collect();
             // a profiler started with its events off records the rounds only
             let control = |word: &str| {
                 if let Ok(path) = std::env::var("LUBM_PERF_CONTROL") {
@@ -434,51 +437,59 @@ fn main() {
                     writeln!(f, "{word}").unwrap();
                 }
             };
-            control("enable");
             let steps = ["change", "revert", "change-again", "revert-again"];
-            let mut times: Vec<Vec<u128>> = vec![Vec::new(); steps.len()];
-            for round in 0..rounds {
-                let (del, add) = &sets[round % universities];
-                let mut line = format!(
-                    "churn {} threads={threads} k={k} round={round}",
-                    profile.name()
-                );
-                for (i, step) in steps.iter().enumerate() {
-                    if i % 2 == 0 {
-                        change(&store, add, del);
-                    } else {
-                        change(&store, del, add);
-                    }
-                    let (r, us) = run(Some(since));
-                    since = r.receipt.unwrap().commit.seq;
-                    let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
-                    assert!(
-                        r.method.as_str() == "incremental" && source == "memory",
-                        "round {round} {step}: method={} source={source}",
-                        r.method.as_str()
+            // each round of each size changes the next university
+            let mut next = 0;
+            for (&k, &rounds) in sizes.iter().zip(&batches) {
+                let sets: Vec<(Vec<Triple>, Vec<Triple>)> = (0..universities.min(rounds))
+                    .map(|u| change_sets((next + u) % universities, k))
+                    .collect();
+                next += sets.len();
+                control("enable");
+                let mut times: Vec<Vec<u128>> = vec![Vec::new(); steps.len()];
+                for round in 0..rounds {
+                    let (del, add) = &sets[round % sets.len()];
+                    let mut line = format!(
+                        "churn {} threads={threads} k={k} round={round}",
+                        profile.name()
                     );
-                    times[i].push(us);
-                    line.push_str(&format!(" {step}_us={us}"));
-                    if i == 3 {
-                        line.push_str(&format!(" inferred={}", r.inferred));
+                    for (i, step) in steps.iter().enumerate() {
+                        if i % 2 == 0 {
+                            change(&store, add, del);
+                        } else {
+                            change(&store, del, add);
+                        }
+                        let (r, us) = run(Some(since));
+                        since = r.receipt.unwrap().commit.seq;
+                        let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
+                        assert!(
+                            r.method.as_str() == "incremental" && source == "memory",
+                            "round {round} {step}: method={} source={source}",
+                            r.method.as_str()
+                        );
+                        times[i].push(us);
+                        line.push_str(&format!(" {step}_us={us}"));
+                        if i == 3 {
+                            line.push_str(&format!(" inferred={}", r.inferred));
+                        }
                     }
+                    println!("{line}");
                 }
-                println!("{line}");
-            }
-            control("disable");
-            for (step, t) in steps.iter().zip(&mut times) {
-                let first = t.first().copied().unwrap_or(0);
-                t.sort_unstable();
-                let q = |f: f64| t[((t.len() - 1) as f64 * f).round() as usize];
-                println!(
-                    "churn {} threads={threads} k={k} rounds={rounds} {step} first_us={first} min_us={} p25_us={} median_us={} p75_us={} max_us={}",
-                    profile.name(),
-                    q(0.0),
-                    q(0.25),
-                    q(0.5),
-                    q(0.75),
-                    q(1.0)
-                );
+                control("disable");
+                for (step, t) in steps.iter().zip(&mut times) {
+                    let first = t.first().copied().unwrap_or(0);
+                    t.sort_unstable();
+                    let q = |f: f64| t[((t.len() - 1) as f64 * f).round() as usize];
+                    println!(
+                        "churn {} threads={threads} k={k} rounds={rounds} {step} first_us={first} min_us={} p25_us={} median_us={} p75_us={} max_us={}",
+                        profile.name(),
+                        q(0.0),
+                        q(0.25),
+                        q(0.5),
+                        q(0.75),
+                        q(1.0)
+                    );
+                }
             }
         }
         "diag" => {
