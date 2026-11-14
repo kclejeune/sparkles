@@ -1017,16 +1017,18 @@ fn pull(
                     close_requested,
                     cancel,
                 )?;
+                table.next_query_batch();
             }
             let Some(batch) = &state.batch else {
                 drained = true;
                 break;
             };
-            // A term is decoded when its key is new to this batch's table. That decode
-            // asks the query's memory budget for the term, as every cell's did, and a
-            // refusal fails the batch. A cell that repeats a key of the batch asks
-            // nothing: the reservation ends with the decode, so the repeat would ask the
-            // same budget for the same term again.
+            // The first cell of a key in each batch of the query decodes its term, which
+            // asks the query's memory budget for it as every cell's decode did, and a
+            // refusal fails the wire batch. A later cell of the same key in the same
+            // query batch asks nothing: the reservation ends with the decode and the
+            // query does not run in between, so it would ask the same budget for the
+            // same term again.
             width = batch.width();
             for column in 0..width {
                 cells.push(match batch.key(state.row, column)? {

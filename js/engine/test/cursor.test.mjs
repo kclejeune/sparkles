@@ -459,3 +459,27 @@ test(
     }
   },
 );
+
+test(
+  'a term that repeats across the batches of a streamed query is read by every row',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      let data = '';
+      for (let i = 0; i < 500; i++) data += `<urn:s${i}> <urn:p> "shared" ; <urn:q> ${i} . `;
+      await ds.load(data, { format: 'ttl' });
+      const q = 'SELECT ?s ?o ?n WHERE { ?s <urn:p> ?o ; <urn:q> ?n }';
+      // small query batches inside one wire batch, and one wire batch per query batch
+      for (const options of [{ batchSize: 4096 }, { batchSize: 7 }]) {
+        const rows = [];
+        for await (const row of await ds.select(q, { execution: 'streaming', ...options }))
+          rows.push([row.get('s').value, row.get('o').value, row.get('n').value]);
+        assert.equal(rows.length, 500);
+        assert.ok(rows.every(([s, o, n]) => o === 'shared' && s === `urn:s${n}`));
+      }
+    } finally {
+      await ds.close();
+    }
+  },
+);

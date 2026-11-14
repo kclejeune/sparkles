@@ -186,8 +186,12 @@ pub struct TermTable {
     ascii: bool,
     entries: Vec<u32>,
     index: FxHashMap<Cell, u32>,
-    /// the entries of the engine ids that `quad_ids` and `keyed` decoded
+    /// the entries of the engine ids that `quad_ids` decoded
     ids: FxHashMap<u64, u32>,
+    /// the entries of the keys that `keyed` decoded, each with the round of the query
+    /// batch that last asked the memory budget for it
+    keys: FxHashMap<u64, (u32, u32)>,
+    round: u32,
     /// the entries of the datatype IRIs, which few batches have more than a handful of
     datatypes: Vec<(String, u32)>,
 }
@@ -206,6 +210,8 @@ impl TermTable {
             entries,
             index: FxHashMap::default(),
             ids: FxHashMap::default(),
+            keys: FxHashMap::default(),
+            round: 0,
             datatypes: Vec::new(),
         }
     }
@@ -311,24 +317,37 @@ impl TermTable {
         Some(out)
     }
 
-    /// The entry of the term that a query batch knows by `key`, decoded once per batch
-    /// with `decode`; 0 when the key has no term. A failed decode, such as a term that
-    /// the query's memory budget refuses, is returned and not remembered. Two keys can
-    /// name equal terms, which then have an entry each.
+    /// Start the cells of another batch of the query. Its first cell of each key asks the
+    /// query's memory budget again, since what the query holds can differ from one of its
+    /// batches to the next.
+    pub fn next_query_batch(&mut self) {
+        self.round += 1;
+    }
+
+    /// The entry of the term that a query batch knows by `key`; 0 when the key has no
+    /// term. `decode` runs for the first cell of the key in each batch of the query: it
+    /// asks the query's memory budget for the term, and its error, such as a refusal, is
+    /// returned. The term's text is written once per wire batch. Two keys can name equal
+    /// terms, which then have an entry each.
     pub fn keyed(
         &mut self,
         key: u64,
         decode: impl FnOnce() -> sparkles::Result<Option<Term>>,
     ) -> sparkles::Result<u32> {
-        if let Some(e) = self.ids.get(&key) {
-            return Ok(*e);
+        let round = self.round;
+        if let Some((entry, asked)) = self.keys.get_mut(&key) {
+            if *asked != round {
+                decode()?;
+                *asked = round;
+            }
+            return Ok(*entry);
         }
-        let e = match decode()? {
+        let entry = match decode()? {
             Some(t) => self.term(&t),
             None => 0,
         };
-        self.ids.insert(key, e);
-        Ok(e)
+        self.keys.insert(key, (entry, round));
+        Ok(entry)
     }
 
     fn datatype(&mut self, iri: &str) -> u32 {
