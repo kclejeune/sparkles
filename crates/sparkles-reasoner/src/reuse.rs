@@ -353,7 +353,7 @@ fn answers(
     let whole = snap.delta.changes_since(&a.delta, |q| {
         // every differing quad counts toward the walk's bound, in the input graphs or not
         n += 1;
-        if n > MAX_CHANGES || (n % 4096 == 0 && stop().is_err()) {
+        if n > MAX_CHANGES || (n.is_multiple_of(4096) && stop().is_err()) {
             relevant = true;
             return false;
         }
