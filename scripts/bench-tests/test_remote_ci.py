@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FAKE_RX = r'''
 RX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # The fake host is this machine with HOME set to the fake worker's home.
-rx_exec() { shift; HOME=$FAKE_HOME PATH=$FAKE_BIN:$PATH bash -c "$1"; }
+# FAKE_SHELL stands in for the login shell an ssh host runs the command in.
+rx_exec() { shift; HOME=$FAKE_HOME PATH=$FAKE_BIN:$PATH ${FAKE_SHELL:-bash} -c "$1"; }
 rx_admit() { echo "admit $*" >> "$FAKE_LOG"; echo '{}'; }
 rx_runtime() { echo "runtime $*" >> "$FAKE_LOG"; echo "${FAKE_RUNTIME:-5000}"; }
 rx_bundle() { echo "bundle $*" >> "$FAKE_LOG"; git -C "$FAKE_HOME/gate/repo.git" fetch -q "$FAKE_SRC" "$2"; }
@@ -107,6 +108,15 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual(len(w), 1); self.assertLessEqual(int(w[0].split()[2]), 5000 - 120)
         # The job removed its worktree and kept its results.
         self.assertFalse((self.home / 'gate' / ('wt-' + name)).exists())
+
+    @unittest.skipUnless(shutil.which('zsh'), 'zsh is not installed')
+    def test_a_host_whose_login_shell_is_zsh_starts_the_job_and_forwards_its_settings(self):
+        # An ssh host runs the start command in its login shell, which is zsh on wally.
+        r = self.run_ci('--base', 'origin/main', FAKE_SHELL='zsh', MBX_REMOTE_URL='', RUSTUP_TOOLCHAIN='x y')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('started gate-', r.stdout)
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        self.assertEqual((self.home / 'gate/out' / name / 'ci.exit').read_text().strip(), '0')
 
     def test_a_base_that_moved_on_uses_the_merge_base_the_tip_carries(self):
         g = ['git', '-C', str(self.src), '-c', 'user.name=t', '-c', 'user.email=t@t']
