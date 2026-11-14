@@ -2508,7 +2508,23 @@ struct Operator {
     /// The order key of the last row produced, to check the order across batches.
     #[cfg(debug_assertions)]
     last: Option<Vec<Id>>,
+    /// A FILTER that may read ahead of its consumer's demand (see [`Ahead`]).
+    ahead: Option<Box<Ahead>>,
 }
+
+/// The read-ahead of a FILTER without effects: while its batches come back empty, it
+/// asks its input for four times as many rows each time, up to [`AHEAD_BATCHES`]
+/// cursor batches, and it holds the rows past its consumer's demand for the next pulls.
+#[derive(Default)]
+struct Ahead {
+    /// The rows of the next read, or 0 for the consumer's demand.
+    demand: usize,
+    pending: Option<Buffer>,
+    at: usize,
+}
+
+/// The most cursor batches a FILTER that reads ahead asks its input for at once.
+const AHEAD_BATCHES: usize = 8;
 
 fn supported(kind: &Kind) -> bool {
     matches!(
@@ -2855,6 +2871,8 @@ impl Operator {
                 _ => true,
             })
             .collect();
+        // Read before the children below become shells.
+        let reads_ahead = super::demand::reads_ahead(ctx, &node);
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes
@@ -3120,6 +3138,7 @@ impl Operator {
         {
             order.clear();
         }
+        let ahead = (reads_ahead && matches!(state, State::Unary(_))).then(Box::default);
         Ok(Self {
             state,
             children,
@@ -3136,6 +3155,7 @@ impl Operator {
             order,
             #[cfg(debug_assertions)]
             last: None,
+            ahead,
         })
     }
 
@@ -3185,6 +3205,7 @@ impl Operator {
             order,
             #[cfg(debug_assertions)]
             last: None,
+            ahead: None,
         })
     }
 
@@ -3873,8 +3894,38 @@ impl Operator {
                     self.done = *at == table.len;
                     b
                 }
+                State::Unary(_)
+                    if self
+                        .ahead
+                        .as_ref()
+                        .is_some_and(|ahead| ahead.pending.is_some()) =>
+                {
+                    let ahead = self.ahead.as_mut().expect("a read-ahead");
+                    let pending = ahead.pending.as_ref().expect("rows read ahead");
+                    let batch = copy_rows(ctx, &pending.table, ahead.at, cap)?;
+                    ahead.at += batch.as_ref().map_or(0, |b| b.table.len);
+                    if ahead.at >= pending.table.len {
+                        ahead.pending = None;
+                        ahead.at = 0;
+                    }
+                    self.done = ahead.pending.is_none() && self.children[0].done;
+                    batch
+                }
                 State::Unary(node) => {
-                    let Some(mut b) = self.children[0].next(ctx, options, cap)? else {
+                    let demand = self
+                        .ahead
+                        .as_ref()
+                        .map_or(cap, |ahead| ahead.demand.max(cap));
+                    let grown;
+                    let input_options = if demand > cap {
+                        let mut wider = options.clone();
+                        wider.batch_rows = demand.max(options.batch_rows);
+                        grown = wider;
+                        &grown
+                    } else {
+                        options
+                    };
+                    let Some(mut b) = self.children[0].next(ctx, input_options, demand)? else {
                         return Ok(None);
                     };
                     if let Kind::Project(vars) = &node.kind {
@@ -3910,7 +3961,38 @@ impl Operator {
                     b.reconcile()?;
                     drop(scratch);
                     self.done = self.children[0].done;
-                    Some(b)
+                    let mut out = Some(b);
+                    if let Some(ahead) = &mut self.ahead {
+                        let b = out.as_ref().expect("a filtered batch");
+                        if b.table.is_empty() {
+                            // Ask for four times as many rows next, when the query has
+                            // no budget of produced rows and the rows fit its limits.
+                            let child = &self.children[0];
+                            let next = demand
+                                .saturating_mul(4)
+                                .min(options.batch_rows.saturating_mul(AHEAD_BATCHES));
+                            let row_bytes = (child.vars.len() as u64 * 16).saturating_add(192);
+                            if ctx.opt.grow_input
+                                && ctx.max_rows_produced == u64::MAX
+                                && ctx.max_rows.saturating_sub(child.rows) >= next
+                                && ctx.memory_remaining()
+                                    >= (next as u64).saturating_mul(row_bytes).saturating_add(8192)
+                            {
+                                ahead.demand = next;
+                            }
+                        } else {
+                            ahead.demand = 0;
+                            if b.table.len > cap {
+                                // The rows past the demand wait for the next pulls.
+                                let first = copy_rows(ctx, &b.table, 0, cap)?;
+                                ahead.at = cap;
+                                ahead.pending = out.take();
+                                self.done = false;
+                                out = first;
+                            }
+                        }
+                    }
+                    out
                 }
                 State::Slice { offset, remaining } => {
                     if *remaining == Some(0) {

@@ -355,6 +355,17 @@ fn key_rows(ctx: &Ctx, node: &Node, key: super::table::VarId, left: &mut usize) 
     }
 }
 
+/// Whether a FILTER `node` may read more rows of its input than its consumer asks for,
+/// because neither its expressions nor its input have effects that the extra rows could
+/// observe. A filter whose rows do not pass then reads larger batches, as the eager
+/// executor's growing prefixes did, instead of one batch of its consumer's demand at a
+/// time.
+pub(super) fn reads_ahead(ctx: &Ctx, node: &Node) -> bool {
+    matches!(node.kind, Kind::Filter(_))
+        && !ctx.calls_extensions
+        && plain(node, &mut MAX_NODES.clone())
+}
+
 /// Whether a branch holds only operators whose order of evaluation nothing observes:
 /// scans, joins, projections and the like, whose expressions are [`effect_free`].
 fn plain(node: &Node, left: &mut usize) -> bool {

@@ -1213,6 +1213,43 @@ mod tests {
         // a charge per term took about 4,000 operations
         assert!(ops < 100, "{ops} ledger operations");
     }
+
+    /// A FILTER over a product without a key, under an ASK, reads its input in batches
+    /// that grow while no row passes, rather than one pair at a time with the ledger
+    /// operations of a batch each.
+    #[test]
+    fn a_filter_whose_batches_come_back_empty_reads_larger_ones() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{QueryOptions, query};
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..300 {
+            data.push_str(&format!("ex:p{i} ex:age {} .\n", i % 90));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            no_cache: true,
+            ..Default::default()
+        };
+        let before = LEDGER_OPS.with(|n| n.get());
+        let r = query(
+            store.snapshot(),
+            "ASK { ?a ex:age ?x . ?b ex:age ?y FILTER(?x + ?y > 1000) }",
+            &opts,
+        )
+        .unwrap();
+        let ops = LEDGER_OPS.with(|n| n.get()) - before;
+        assert!(!r.boolean);
+        // one pair at a time took several operations for each of the 90,000 pairs
+        assert!(ops < 5_000, "{ops} ledger operations");
+    }
     /// A grant set after the first charge would leave that charge on the old grant,
     /// which debug builds refuse.
     #[test]
