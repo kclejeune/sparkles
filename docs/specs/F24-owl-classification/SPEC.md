@@ -116,7 +116,8 @@ equality reasoning over conditional successors that remains is item 894, which a
 the design's third part, the witnesses' shared context.
 
 Item 894 delivers [the order between number restrictions](#the-order-between-number-restrictions)
-as the option `Limits::number_order`, off by default. Its changes to the rules of the
+as the option `Limits::number_order`, which is on by default and applies to a run that
+counts. Its changes to the rules of the
 calculus, the cases of a union filler and the merge of successor terms, made no file
 classify and are not kept, and its exploration round stayed on paper. The order changes
 the clause set instead. A counting run without the root names each minimum, tells itself
@@ -125,8 +126,8 @@ witnesses for a minimum that a minimum of the context entails. With it ore_ont_6
 ore_ont_10140 classify with counting on and give HermiT's and Konclude's taxonomies, 6.3
 and 6.5 times faster than Konclude 0.7.0 on four threads on `atlas` and 2.0 and 2.1 times
 on one. ore_ont_6485 still passes the bound, and its failed attempt takes 3.1 times as
-long with the order as without it. Item 896 follows that file and the default of
-counting. The item also found that a counting run misses a maximum over a compound
+long with the order as without it, 576 ms against 184 ms on one thread. The default
+accepts that cost, and item 896 follows that file and the default of counting. The item also found that a counting run misses a maximum over a compound
 qualifier that no other axiom names, which is item 897, so counting stays off by default.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
@@ -2391,10 +2392,12 @@ an optional experiment for the record rather than a path to the item's acceptanc
 This subsection records what item 894 delivers. The rounds above changed rules of the
 calculus and left the three files past the bound. This one changes the clause set that the
 normalization gives the calculus in a run that counts without the root, and no inference
-rule. `Limits::number_order` asks for it. It is off by default and changes nothing without
-`Limits::counting`, in a rooted run, or in a run whose axioms need no counting. With it,
-ore_ont_6952 and ore_ont_10140 classify with counting on and give HermiT's and Konclude's
-taxonomies, and ore_ont_6485 still passes the bound, as the measurements below state.
+rule. `Limits::number_order` controls it. It is on by default, and false turns it off. It
+changes nothing without `Limits::counting`, in a rooted run, or in a run whose axioms need
+no counting, so a run with the default limits, which does not count, is unchanged. With
+it, ore_ont_6952 and ore_ont_10140 classify with counting on and give HermiT's and
+Konclude's taxonomies, and ore_ont_6485 still passes the bound, as the measurements below
+state.
 
 The traces of the earlier rounds show where the two versions of the Protein Ontology spend
 the bound. The normalization relates no two number restrictions. `PR_000026735` holds
@@ -2554,9 +2557,15 @@ equal the reference and 117 leave axioms out and answer only entailed subsumptio
 against 83 and 119 without it, and no run answers a subsumption that the reference does
 not entail.
 
+The order is on by default for a run that counts because of these measurements. Two more
+files of the sample, two more of the 206 fixtures and 26 more of the 296 generated
+ontologies below finish with it, none that finishes without it stops finishing, and no
+answer differs from a finished run without it. Its one measured cost is ore_ont_6485.
+
 ore_ont_6485 remains a measured limitation. Its counting attempt still passes the bound
 with the order, and the failed attempt is dearer, 576 against 184 ms on one thread on
-`atlas`, 3.1 times, and 688 against 245 ms on four. The order removes the cheap
+`atlas`, 3.1 times, and 688 against 245 ms on four. A caller for whom that attempt
+matters sets `Limits::number_order` to false. The order removes the cheap
 derivations of the disjointness rule, which fall from 110,800 to 1,078, and the bound is
 then spent on the universal rule and the qualified roles, which rise from 30,563 and
 10,036 derivations to 118,258 and 68,900 and cost more each. What remains is the
@@ -2593,7 +2602,9 @@ and wider roles, and recursive cardinalities over a symmetric role and an explic
 inverse. The others cover the told contradiction with a maximum, fillers equivalent
 through `owl:Thing`, intersection and union qualifiers, unqualified minimums, unsatisfiable
 fillers, minimums under clauses, a refused axiom, every bound on the relations and the
-predecessor case above. The 206 fixtures of item 603 with a minimum or exact cardinality
+predecessor case above. One case runs with the default limits and counting, where it
+finishes, with the field set to false, where it passes the bound, and without counting,
+where the field changes nothing. The 206 fixtures of item 603 with a minimum or exact cardinality
 of two or more run with the order on one thread and on four with the eager strategy. Each
 answer is among HermiT's subsumptions, each case taken whole has exactly HermiT's, no case
 that stays in the bound without the order leaves it with the order, and two more stay in
