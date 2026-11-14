@@ -1563,8 +1563,8 @@ nodes, would also make the stack independent of the count of the walk.
 ### Bounded filtered ASK admission (2026-10-22)
 
 Item 827 of [X14](X14-unified-executor/SPEC.md#outcome) replaced this admission. Every
-ASK now pulls its input through the cursor in every mode, and the planner orients the
-shapes this section describes. The section records the admission as it was.
+ASK now pulls its input through the cursor in every mode unless the planner runs a small
+input whole, and the planner orients the shapes this section describes. The section records the admission as it was.
 
 Automatic execution also admits an immutable native ASK whose single variable
 equality FILTER sits over an independent Cartesian product when the ordinary

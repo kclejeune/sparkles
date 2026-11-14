@@ -234,13 +234,27 @@ from each branch's cost and estimated rows, when no branch calls an application
 function, a SERVICE or another operator with effects. `run_limited`, `execute_limited`,
 the first-work estimator, `limited_input`, `filtered_ask_admitted`, `order_ask` and
 `Dataset::ask_streaming_with` are gone, and the accounting mode is read in four places.
+The planner marks a LIMIT or an ASK to run its input whole, as a SELECT does, when exact
+index counts bound every operator of the input to a cursor batch of 4,096 rows and its
+estimated cost past the first rows, with sixteen cost units for each row an expression is
+evaluated for, is below the 4,096 units that building cursor operators costs
+(`demand::runs_whole`). A join is bounded by the product of its inputs or, where an input
+that always binds a key meets a pattern with a constant predicate, by that input's rows
+times the pattern's most rows for one key, which the predicate's statistics bound. The
+eager LIMIT runs such an input whole, automatic execution keeps such an ASK eager, and
+the per-row test of an EXISTS pattern applies the same choice. The choice depends on the
+plan and the snapshot, never on the mode.
 `scan_limited` remains for the planner's two-row probe and the direct reads. A pulled
 limit charges its operators' batches and its copy of the plan to the query's ledger,
 which an eager query of a few rows did not take before, and the cursor's scan charges one
 decoded block. A path walk grows its charge a reservation step at a time and checks its
 output each time it doubles, and an eager query's empty charges do not take the ledger to
-trim its grant, so a pulled `LIMIT 500` over walks of 300 levels takes 585 ledger
-operations rather than 3,233. A small pulled LIMIT over a join still takes 50 to 100, one
+trim its grant. A pulled `LIMIT 500` over the paths of 300 people who know one other
+person each therefore takes 585 ledger operations rather than 3,233 in a release
+measurement, and the unit test's single cycle of 300 people takes fewer than 300 where it
+took 3,054. The decoded rows of a pulled result charge their terms a reservation step at a
+time, so `QueryResult::rows` over 500 rows of two columns takes fewer than 100 operations
+rather than about 4,000. A small pulled LIMIT over a join still takes 50 to 100, one
 group per batch and operator, as a streaming query does. A `PatternScan` of a constant
 subject hands out its predicates a batch at a time, and the cursor charges the pattern
 reader's decoded block. A cursor cross product now holds its smaller estimated input and

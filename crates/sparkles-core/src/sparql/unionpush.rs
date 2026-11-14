@@ -743,7 +743,9 @@ mod tests {
 
         let store = Store::in_memory(StoreOptions::default());
         let mut data = String::from("<urn:yes> <urn:cheap> 1 .\n");
-        for i in 0..128 {
+        // more rows than a cursor batch, so that the ASK pulls its input rather than
+        // running it whole
+        for i in 0..5000 {
             data.push_str(&format!(
                 "<urn:s{i}> <urn:wide> {i}; <urn:extra> {} .\n",
                 i + 1
@@ -870,9 +872,10 @@ mod tests {
                 )
                 .unwrap();
                 let result = match result {
-                    // automatic execution pulls every ASK through a cursor (item 827)
+                    // automatic execution pulls an ASK through a cursor, unless the
+                    // planner runs its small input whole (item 827)
                     QueryExecution::Eager(result) => {
-                        assert_eq!(mode, ExecutionMode::Eager);
+                        assert_ne!(mode, ExecutionMode::Streaming);
                         result
                     }
                     QueryExecution::Ask(result) => {

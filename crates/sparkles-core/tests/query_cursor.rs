@@ -2069,8 +2069,10 @@ fn every_mode_pulls_an_ask_through_the_cursor() {
             };
             assert_eq!(result.value(), expected, "{q} under {mode:?}");
             assert!(result.result().rows_produced < 20, "{q} under {mode:?}");
+            // an absent pattern has no rows, so the planner runs it whole and
+            // automatic execution keeps it eager
             if mode == ExecutionMode::Auto {
-                assert!(matches!(execution, QueryExecution::Ask(_)), "{q}");
+                assert_eq!(matches!(execution, QueryExecution::Ask(_)), expected, "{q}");
             }
         }
     }
@@ -2217,8 +2219,8 @@ fn automatic_execution_keeps_small_and_stateful_queries_eager() {
         assert_eq!(result.result().len(), expected.len());
         assert_eq!(result.result().boolean, expected.boolean);
     }
-    // An ASK needs one solution at any size, so automatic execution pulls it through
-    // the cursor, with the eager answer (item 827).
+    // An ASK over an input that the planner runs whole, because it is small, stays
+    // eager too (item 827).
     let q = "ASK {?s ?p ?o}";
     let execution = query_execution(
         s.snapshot(),
@@ -2228,8 +2230,8 @@ fn automatic_execution_keeps_small_and_stateful_queries_eager() {
         ExecutionMode::Auto,
     )
     .unwrap();
-    let QueryExecution::Ask(answer) = execution else {
-        panic!("automatic execution streams every ASK")
+    let QueryExecution::Eager(answer) = execution else {
+        panic!("a small ASK must remain eager")
     };
     let expected = query(s.snapshot(), q, &Default::default()).unwrap();
     assert!(expected.boolean);

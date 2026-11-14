@@ -1404,12 +1404,18 @@ fn run_node<'ctx>(
         Kind::Slice {
             offset,
             limit: Some(limit),
+            whole,
         } if !super::demand::ordered_input(&n.children[0]) => {
             // LIMIT without ORDER BY: any `offset + limit` solutions will do, so the
-            // input runs as cursor operators that stop when they have them (item 827)
+            // input runs as cursor operators that stop when they have them (item 827),
+            // or whole when the planner found it small
             let want = offset.saturating_add(*limit);
             let (mut t, info, _) = match leaf_rows(ctx, &n.children[0], want)? {
                 Some(rows) => rows,
+                None if *whole => {
+                    let (t, info) = execute_materialized(ctx, &n.children[0])?;
+                    (t, info, true)
+                }
                 None => super::cursor::pull(ctx, &n.children[0], want)?,
             };
             infos.push(info);
@@ -1421,7 +1427,7 @@ fn run_node<'ctx>(
             }
             t.table
         }
-        Kind::Slice { offset, limit } => {
+        Kind::Slice { offset, limit, .. } => {
             let input = child(0, infos)?;
             match last_input.get() {
                 InputCredit::Plain => input.slice(*offset, *limit),
@@ -9442,6 +9448,7 @@ mod paid_eager_producer_tests {
                 Kind::Slice {
                     offset: 1,
                     limit: Some(1),
+                    whole: false,
                 },
                 vec![0],
                 1.0,
@@ -9484,6 +9491,7 @@ mod paid_eager_producer_tests {
             Kind::Slice {
                 offset: 0,
                 limit: Some(1),
+                whole: false,
             },
             vec![0],
             1.0,

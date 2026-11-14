@@ -416,6 +416,10 @@ pub enum Kind {
     Slice {
         offset: usize,
         limit: Option<usize>,
+        /// The input runs whole, as the planner chose for a LIMIT without ORDER BY whose
+        /// input is small ([`super::demand::runs_whole`]), rather than as cursor
+        /// operators that stop at the rows the LIMIT takes. A cursor pulls it either way.
+        whole: bool,
     },
     Group {
         keys: Vec<VarId>,
@@ -5202,10 +5206,14 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
         "offset {start} limit {}",
         length.map_or("∞".to_string(), |l| l.to_string())
     );
+    let whole = length.is_some()
+        && !super::demand::ordered_input(&child)
+        && super::demand::runs_whole(ctx, &child, start.saturating_add(length.unwrap_or(0)));
     let mut n = Node::unary(
         Kind::Slice {
             offset: start,
             limit: length,
+            whole,
         },
         child,
         desc,
@@ -6197,9 +6205,14 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
     };
     let node = p.plan(&spec.pattern, &graph, Vec::new())?;
     // A substituted pattern of one triple or a table of values reads its first row
-    // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger pattern pulls
-    // its first solution through cursor operators, as a LIMIT does.
+    // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
+    // pattern pulls its first solution through cursor operators, as a LIMIT does, or
+    // runs whole when it is small enough that a LIMIT would.
     if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
+        return Ok(!rows.table.is_empty());
+    }
+    if super::demand::runs_whole(ctx, &node, 1) {
+        let (rows, _) = super::exec::execute_materialized(ctx, &node)?;
         return Ok(!rows.table.is_empty());
     }
     super::cursor::has_solution(ctx, &node)

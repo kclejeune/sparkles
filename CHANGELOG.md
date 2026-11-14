@@ -9,9 +9,14 @@ it. `spk:hasPredicate` reads the predicate patterns a block of subjects at a tim
 every mode, and a spilling DISTINCT over an ORDER BY deduplicates below the sort in every
 mode. Every ASK and every LIMIT without ORDER BY pulls its input through cursor operators
 that stop at the rows it needs, in eager and automatic execution as in streaming, so a
-filter or a join under a LIMIT reads its input once rather than in growing prefixes. A
+filter or a join under a LIMIT reads its input once rather than in growing prefixes. The
+planner runs a small input whole instead, when exact index counts bound each of its
+operators to a cursor batch and its estimated cost past the first rows is below the cost
+of building cursor operators, and an EXISTS pattern evaluated per row does the same. A
 UNION under a LIMIT or an ASK reads its cheapest branch first in every mode. Automatic
-execution streams every ASK without initial bindings. A pulled limit takes the query's
+execution streams every ASK without initial bindings whose input does not run whole. A
+pattern scan's reader charges the patterns it decodes as they grow, and the decoded rows
+of a pulled result charge their terms in steps. A pulled limit takes the query's
 memory ledger, which a small eager LIMIT over anything but a scan or a table of values did
 not take before. A cursor cross product holds its smaller input and streams the larger
 one. A LIMIT over an inner hash join builds the index of one whole input, which takes

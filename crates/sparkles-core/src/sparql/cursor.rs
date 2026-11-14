@@ -1156,9 +1156,10 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
-    // An ASK pulls one row through the cursor, which stops at it (item 827).
+    // An ASK pulls one row through the cursor, which stops at it, unless the planner
+    // found its input small enough to run whole (item 827).
     if kind == QueryKind::Ask {
-        return true;
+        return !super::demand::whole_slice(node);
     }
     // A plan expected to pass the row budgets stays eager, so that it fails before the
     // first byte of output with an error status rather than partway through a stream.
@@ -2328,14 +2329,19 @@ fn pull_planned<'ctx>(
     }
     let mut plan = root.describe(ctx);
     root.update_plan(&mut plan);
-    fn info(plan: &CursorPlan, stopped: bool, failed: bool) -> PlanInfo {
-        let mut out = plan.operator.clone();
-        out.children = plan
-            .children
-            .iter()
+    // the plan of what ran, moved out of the cursor's plan rather than copied
+    fn info(plan: CursorPlan, stopped: bool, failed: bool) -> PlanInfo {
+        let CursorPlan {
+            operator: mut out,
+            children,
+            complete,
+            ..
+        } = plan;
+        out.children = children
+            .into_iter()
             .map(|c| info(c, stopped, failed))
             .collect();
-        if !plan.complete && out.fidelity().skipped.is_none() {
+        if !complete && out.fidelity().skipped.is_none() {
             if failed {
                 out.fidelity_mut().incomplete = true;
             } else if stopped && out.actual_rows == 0 && out.time_ms == 0.0 {
@@ -2350,12 +2356,12 @@ fn pull_planned<'ctx>(
     }
     if let Err(error) = ran {
         // the rows the operators gave were not delivered, even when they all ran
-        let mut failed = info(&plan, false, true);
+        let mut failed = info(plan, false, true);
         failed.fidelity_mut().incomplete = true;
         ctx.set_failed(node, failed);
         return Err(error);
     }
-    let mut info = info(&plan, !ended, false);
+    let mut info = info(plan, !ended, false);
     // a filter's EXISTS notes and counters, as the eager filter reports them
     fn annotate(ctx: &Ctx, node: &Node, info: &mut PlanInfo) {
         if let Kind::Filter(exprs) = &node.kind
@@ -2840,7 +2846,7 @@ impl Operator {
             };
         let needs: Vec<bool> = (0..node.children.len())
             .map(|i| match node.kind {
-                Kind::Slice { offset, limit } if offset > 0 || limit.is_some() => true,
+                Kind::Slice { offset, limit, .. } if offset > 0 || limit.is_some() => true,
                 Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } | Kind::Filter(_) => {
                     needed
                 }
@@ -3101,7 +3107,7 @@ impl Operator {
                     value_ordered_input,
                     numbered_distinct,
                 )?),
-                Kind::Slice { offset, limit } => State::Slice {
+                Kind::Slice { offset, limit, .. } => State::Slice {
                     offset: *offset,
                     remaining: *limit,
                 },
