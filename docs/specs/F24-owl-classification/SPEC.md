@@ -167,27 +167,28 @@ property hierarchy of the Horn rules is closed under inverses and every chain ho
 mirror image, so a symmetric transitive property, which is its own inverse, also had the
 transitivity of its inverse. The composition table then listed the property and its
 inverse for every pair of links, each composed link was derived by both, and both were
-composed again. A path of 60 classes by such a property derives 548,060 conclusions
-without the reduction and 72,284 with it, as many as the same path beside an unrelated
-pair of inverse properties. A link by a property counts for each of its superproperties in
-every rule, the table lists every pair of properties under a chain's operands, and a
-property that clashes with itself is empty, so the least properties lose no conclusion. Of
-equivalent properties the one with the smallest id stays, and the reduction reads each
-result's superproperty list once and polls the run's stop as it goes. Item 692 let the
-Horn rules take ore_ont_8737 and ore_ont_16744, whose inclusions under the top property
-had made the rules refuse both files, and both have one such property. On `atlas` on four
-threads ore_ont_8737 classifies with the Horn rules in 13.9 s with a peak estimate of 3.0
-GB, where it passed its budget of 7.05 GB and classified again by the EL rules alone in
-21.9 s, leaving its symmetric and inverse property axioms out. ore_ont_16744 takes 3.9 s
-against 26.2 s, with 412 million conclusions against 2.25 billion and a peak resident set
-of 3.0 against 9.6 GiB. In three further rounds of alternating order the item's build
-takes 13.4 s on ore_ont_8737 with the Horn rules against 13.7 s with the EL rules alone,
-and 3.80 s on ore_ont_16744 against 3.71 s, so the Horn rules now cost about what the EL
-rules cost on both files. The 210 files of the ORE 2015 DL development set that classify
-give the same taxonomies as before, and ore_ont_7192 passes the 13 GiB cap of the
-comparison on both builds. GO and ChEBI lite give the same taxonomies, and in six rounds
-of rotating order on one and four threads the reviewed build takes 0.981 to 1.019 times
-the base's time by median, within the spread of the rounds.
+composed again. A path of 60 links by such a property derives 548,060 conclusions on one
+thread without the reduction and 72,284 with it, as many as the same path beside an
+unrelated pair of inverse properties. A link by a property counts for each of its
+superproperties in every rule, the table lists every pair of properties under a chain's
+operands, and a property that clashes with itself is empty, so the least properties lose
+no conclusion. Of equivalent properties the one with the smallest id stays, and the
+reduction reads each result's superproperty list once and polls the run's stop as it goes.
+Item 692 let the Horn rules take ore_ont_8737 and ore_ont_16744, whose inclusions under
+the top property had made the rules refuse both files, and both have one such property. On
+`atlas` on four threads ore_ont_8737 classifies with the Horn rules in 13.9 s with a peak
+estimate of 3.0 GB, where it passed its budget of 7.05 GB and classified again by the EL
+rules alone in 21.9 s, leaving its symmetric and inverse property axioms out.
+ore_ont_16744 takes 3.9 s against 26.2 s, with 446 million conclusions against 2.23
+billion by median and a peak resident set of 3.0 against 9.6 GiB. In three further rounds
+of alternating order the item's build takes 13.4 s on ore_ont_8737 with the Horn rules
+against 13.6 s with the EL rules alone, and 3.80 s on ore_ont_16744 against 3.71 s, so the
+Horn rules now cost about what the EL rules cost on both files. The 210 files of the ORE
+2015 DL development set that classify give the same taxonomies as before, and ore_ont_7192
+passes the 13 GiB cap of the comparison on both builds. GO and ChEBI lite give the same
+taxonomies, and in six rounds of rotating order on one and four threads the reviewed build
+takes 0.981 to 1.019 times the base's time by median, within the spread of the rounds, and
+item 963 follows ChEBI lite's 1.9% on four threads.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.

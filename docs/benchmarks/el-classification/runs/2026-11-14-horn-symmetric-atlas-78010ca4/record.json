@@ -13544,6 +13544,16 @@
    }
   }
  ],
+ "fixture": {
+  "test": "crates/sparkles-owl/tests/horn.rs a_symmetric_transitive_role_composes_each_link_once",
+  "command": "mbx test -p sparkles-owl --test horn symmetric_transitive, on stanley",
+  "path": "a path of 60 links A_i \u2291 \u2203r.A_(i+1) with r transitive, classified on one thread",
+  "conclusions_without_reduction": 548060,
+  "base_build": "3a1b9b04 with the test of 78010ca4",
+  "conclusions_with_reduction": 72284,
+  "reduction_build": "78010ca4",
+  "note": "the counts are the assertion failure of the test without the reduction, symmetric path against the same path beside an unrelated inverse pair; the reduction build gives 72,284 for both"
+ },
  "hosts": {
   "timing/before.txt": "host=atlas start=2026-11-14T13:13:26-05:00\n 13:13:26  up 22 days 20:59,  0 users,  load average: 2.08, 2.10, 2.02\n               total        used        free      shared  buff/cache   available\nMem:              15           1           5           0           8          14\nSwap:              7           0           7\ndeb0849a584ff281681e4b58dcae6ea28d7da650bb4ad68636279d26bc8d716f  /home/kclejeune/lanes/horn-budget-962/bin/base\nf03653f348c26650606b12eea405dabad63e95ffa827f2032ad41249e430d1c2  /home/kclejeune/lanes/horn-budget-962/bin/lane\n",
   "timing/after.txt": "end=2026-11-14T14:08:39-05:00\n 14:08:39  up 22 days 21:54,  0 users,  load average: 5.76, 5.91, 5.87\n",

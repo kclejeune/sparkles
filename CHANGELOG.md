@@ -58,11 +58,12 @@ rules add, had composed every link a second time by the property's inverse, so
 `ore_ont_8737` of the ORE 2015 DL sample passed its Horn budget and classified again by
 the EL rules alone, leaving its symmetric and inverse property axioms out. On atlas on
 four threads it now classifies with the Horn rules in 13.9 s instead of 21.9 s, with every
-axiom taken, and `ore_ont_16744` in 3.9 s instead of 26.2 s, with 412 million conclusions
-instead of 2.25 billion and a peak resident set of 3.0 instead of 9.6 GiB. The 210 files
-of the ORE 2015 DL development set that classify keep their taxonomies. GO and ChEBI lite
-keep their taxonomies and classify within 2% of the base by median on one and four
-threads. This is roadmap item 962.
+axiom taken, and `ore_ont_16744` in 3.9 s instead of 26.2 s, with 446 million conclusions
+instead of 2.23 billion by median and a peak resident set of 3.0 instead of 9.6 GiB. The
+210 files of the ORE 2015 DL development set that classify keep their taxonomies. GO and
+ChEBI lite keep their taxonomies and classify within 2% of the base by median on one and
+four threads, and roadmap item 963 follows ChEBI lite's 1.9% on four threads. This is
+roadmap item 962.
 
 With counting, an exact or minimum cardinality in a negative position, the form of a
 definition's right-to-left direction, is the calculus's own at-most clause with the

@@ -1022,19 +1022,21 @@ Horn rules add the mirror image of each chain, so the transitivity of the proper
 held for its inverse, and each composed link was derived by the property and again by its
 inverse. The item's build composes each pair of links into the least properties of a
 chain's result. On `atlas` on four threads, three rounds of alternating order with three
-classifications per process gave the medians below. `ore_ont_8737` passed its budget of
-7.05 GB on the base and classified again by the EL rules alone, leaving its symmetric and
-inverse property axioms out, and the item's build classifies it with the Horn rules and
-every axiom. Its conclusions before are those of the EL rules' second run, and its peak
-resident set before is the failed Horn attempt's.
+classifications per process gave the times below, each the median of the nine
+classifications. The conclusions are the median of the three processes' reports and the
+peak resident sets the largest. `ore_ont_8737` passed its budget of 7.05 GB on the base
+and classified again by the EL rules alone, leaving its symmetric and inverse property
+axioms out, and the item's build classifies it with the Horn rules and every axiom. Its
+conclusions before are those of the EL rules' second run, and its peak resident set before
+is the failed Horn attempt's.
 
 | Ontology | Base ms | Item 962 ms | Ratio | Conclusions before | Conclusions after | Peak RSS before | Peak RSS after |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `ore_ont_8737` | 21,876 | 13,911 | 0.64 | 1,255,023,809 | 1,285,835,615 | 10.4 GiB | 6.0 GiB |
-| `ore_ont_16744` | 26,204 | 3,857 | 0.15 | 2,247,028,043 | 411,819,306 | 9.6 GiB | 3.0 GiB |
+| `ore_ont_8737` | 21,876 | 13,911 | 0.64 | 1,257,475,084 | 1,284,400,422 | 10.4 GiB | 6.0 GiB |
+| `ore_ont_16744` | 26,204 | 3,857 | 0.15 | 2,228,811,518 | 445,855,316 | 9.6 GiB | 3.0 GiB |
 
 In three further rounds of alternating order the item's build takes 13.4 s on
-`ore_ont_8737` with the Horn rules against 13.7 s with the EL rules alone, and 3.80 s on
+`ore_ont_8737` with the Horn rules against 13.6 s with the EL rules alone, and 3.80 s on
 `ore_ont_16744` against 3.71 s. The eight smaller files of the same family derive the same
 conclusions on both builds and classify in 10 to 39 ms by median.
 
@@ -1042,7 +1044,8 @@ GO and ChEBI lite ran six rounds of rotating order with five classifications per
 on one and four threads, against the reviewed build, commit 2fb430aa, whose reduction
 gives the same properties. The ratio is the median of the rounds' ratios. The three rounds
 of the first set had put ChEBI lite 4% slower on four threads with the same conclusions,
-which the six rounds did not reproduce.
+which the six rounds did not reproduce. ChEBI lite's median on four threads is still 1.9%
+above the base's, within the spread of the rounds, and roadmap item 963 follows it.
 
 | Ontology | Threads | Base ms | Item 962 ms | Ratio | Range of the rounds |
 |---|---:|---:|---:|---:|---|
@@ -1055,9 +1058,10 @@ GO and ChEBI lite give the same taxonomies on both builds. Every file of the ORE
 development set classified once by each build with its taxonomy. The 210 files that
 classify gave the same bytes on both, the reader refuses `ore_ont_9881`, and
 `ore_ont_7192` passed the comparison's 13 GiB cap on both builds. `ore_ont_9663` and
-`ore_ont_14817` take the disjunctive rules, whose failed attempt took 10 to 229 s per
-classification on both builds before the Horn rules answered, so their times are not
-compared here.
+`ore_ont_14817` take the disjunctive rules, whose attempt fails before the Horn rules
+answer. Their completed classifications took 10 to 229 s on both builds, the Horn rules'
+run included, and one process of the base on `ore_ont_14817` passed the 900 s timeout, so
+their times are not compared here.
 
 ## Records
 

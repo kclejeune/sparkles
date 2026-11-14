@@ -36,6 +36,12 @@ rec = {
   'extra': runs(os.path.join(src, 'extra'), '**/*.json'),
   'extra_taxonomies': text(os.path.join(src, 'extra/tax.sha256')),
   'ab2': runs(os.path.join(src, 'ab2'), 'r*/*/*/*.json'),
+  'fixture': {'test': 'crates/sparkles-owl/tests/horn.rs a_symmetric_transitive_role_composes_each_link_once',
+              'command': 'mbx test -p sparkles-owl --test horn symmetric_transitive, on stanley',
+              'path': 'a path of 60 links A_i ⊑ ∃r.A_(i+1) with r transitive, classified on one thread',
+              'conclusions_without_reduction': 548060, 'base_build': '3a1b9b04 with the test of 78010ca4',
+              'conclusions_with_reduction': 72284, 'reduction_build': '78010ca4',
+              'note': 'the counts are the assertion failure of the test without the reduction, symmetric path against the same path beside an unrelated inverse pair; the reduction build gives 72,284 for both'},
   'hosts': {p: text(os.path.join(src, p)) for p in ['timing/before.txt','timing/after.txt','sweep/before.txt','sweep/after.txt','extra/before.txt','extra/after.txt','ab2/before.txt','ab2/after.txt']},
 }
 os.makedirs(dest, exist_ok=True)
