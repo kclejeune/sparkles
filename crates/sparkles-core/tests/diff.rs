@@ -510,8 +510,9 @@ fn changed_ids_of_older_snapshots_and_collected_generations() {
     assert!(matches!(got, Ok(None)), "{got:?}");
 }
 
-/// A read of the ids of a snapshot races the collection of its generation: the read gives
-/// the ids or none, and never an error.
+/// Reads of the ids of the live snapshot race the collections of its generation: a read
+/// gives the ids or none, and never an error. Which of the two a read gives is up to the
+/// scheduler, and `changed_ids_of_older_snapshots_and_collected_generations` checks each.
 #[test]
 fn changed_ids_survive_a_collection_of_their_generation() {
     use sparkles_core::id::Id;
@@ -526,30 +527,29 @@ fn changed_ids_survive_a_collection_of_their_generation() {
     )
     .unwrap();
     let done = AtomicBool::new(false);
-    let (mut read, mut none) = (0u64, 0u64);
+    let start = std::sync::Barrier::new(4);
     std::thread::scope(|scope| {
         let readers: Vec<_> = (0..3)
             .map(|_| {
                 scope.spawn(|| {
-                    let (mut read, mut none) = (0u64, 0u64);
+                    start.wait();
                     while !done.load(Ordering::Relaxed) {
                         let snap = s.snapshot();
                         let after = snap.commit.saturating_sub(1);
-                        match s.changed_ids(
+                        let got = s.changed_ids(
                             after,
                             &snap,
                             &[Id::DEFAULT_GRAPH],
                             &DiffOptions::default(),
-                        ) {
-                            Ok(Some(_)) => read += 1,
-                            Ok(None) => none += 1,
-                            Err(e) => panic!("{after}..{}: {e}", snap.commit),
+                        );
+                        if let Err(e) = got {
+                            panic!("{after}..{}: {e}", snap.commit);
                         }
                     }
-                    (read, none)
                 })
             })
             .collect();
+        start.wait();
         for i in 0..150 {
             for j in 0..2 {
                 update(
@@ -563,12 +563,9 @@ fn changed_ids_survive_a_collection_of_their_generation() {
         }
         done.store(true, Ordering::Relaxed);
         for r in readers {
-            let (a, b) = r.join().unwrap();
-            read += a;
-            none += b;
+            r.join().unwrap();
         }
     });
-    assert!(read > 0 && none > 0, "read {read}, none {none}");
 }
 
 /// The graph term of a canonical N-Quads line, `None` for the default graph.
