@@ -1230,19 +1230,20 @@ impl Vocab {
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
                 let e = self.entry::<F>(data, &mut pos, at == 0);
-                let total = key.len().min(e.shared).saturating_add(e.len);
-                if total > cap {
-                    reserve(total)?;
-                    key.reserve_exact(total - key.len());
-                    cap = key.capacity();
+                key.truncate(e.shared);
+                // The suffix fits the buffer exactly when `extend_from_slice` below
+                // would not grow it, and this is the same comparison, so the copy
+                // repeats no check. Growth admits the whole rebuilt key first.
+                if e.len > key.capacity() - key.len() {
+                    reserve(key.len().saturating_add(e.len))?;
+                    key.reserve_exact(e.len);
                     #[cfg(any(test, feature = "failpoints"))]
                     crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
                         "checked-vocab-scratch-allocated",
                         key.capacity(),
                     ));
                 }
-                key.truncate(e.shared);
-                self.push_suffix::<F>(data, e, id, usize::MAX, key, true);
+                key.extend_from_slice(&data[e.start..e.start + e.len]);
                 if mask >> at & 1 == 1 {
                     f(id, key)?;
                 }
@@ -3739,6 +3740,65 @@ mod tests {
                 assert!(cap >= want.len());
                 assert_eq!(run(&mut key, None), Ok(()));
                 assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
+            }
+        }
+    }
+
+    /// A writer reuses one rebuild buffer for every cell. Each growth of it is admitted
+    /// first, so its capacity never exceeds the largest reservation, and a step that
+    /// fits the buffer reserves nothing. Keys of varied lengths and shared prefixes are
+    /// decoded in several orders, for both codecs and with and without kept FSST room.
+    #[test]
+    fn reused_checked_buffer_grows_only_after_a_reservation() {
+        let mut keys: Vec<Vec<u8>> = (0..6 * FC_BLOCK)
+            .map(|i| {
+                let tail = "y".repeat((i * 37) % 300);
+                format!("<urn:reuse:{}:{i:04}{tail}", "seg/".repeat(i % 13)).into_bytes()
+            })
+            .collect();
+        keys.sort();
+        let n = keys.len() as u64;
+        let orders: [Vec<u64>; 3] = [
+            (0..n).collect(),
+            (0..n).rev().collect(),
+            (0..n).map(|i| (i * 7) % n).collect(),
+        ];
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let v = Vocab::open(d.path()).unwrap();
+            assert_eq!(v.is_fsst(), fsst);
+            for room in [false, true] {
+                for order in &orders {
+                    let mut key = Vec::new();
+                    let mut admitted = 0;
+                    for &id in order {
+                        let held = key.capacity();
+                        let mut reserved = false;
+                        let reserve = |need: usize| {
+                            assert!(need > held, "{need} fits the held {held} bytes");
+                            admitted = admitted.max(need);
+                            reserved = true;
+                            Ok::<_, ()>(())
+                        };
+                        let mut got = None;
+                        let f = |_, k: &[u8]| {
+                            got = Some(k.to_vec());
+                            Ok(())
+                        };
+                        if room {
+                            v.get_sorted_checked_in::<true, _>(&[id], &mut key, reserve, f)
+                        } else {
+                            v.get_sorted_checked_in::<false, _>(&[id], &mut key, reserve, f)
+                        }
+                        .unwrap();
+                        assert_eq!(got.as_ref(), Some(&keys[id as usize]));
+                        assert!(key.capacity() <= admitted, "unadmitted growth at {id}");
+                        if !reserved {
+                            assert_eq!(key.capacity(), held);
+                        }
+                    }
+                }
             }
         }
     }
