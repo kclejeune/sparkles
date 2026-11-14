@@ -355,7 +355,11 @@ fn query_pattern(q: &Query) -> &GraphPattern {
     }
 }
 
-fn parse(text: &str, prefixes: &[(String, String)], prebound: &[String]) -> Result<Query> {
+pub(crate) fn parse(
+    text: &str,
+    prefixes: &[(String, String)],
+    prebound: &[String],
+) -> Result<Query> {
     let q = parse_query(text, None, prefixes)
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("invalid SHACL-SPARQL query:\n{text}"))?;
@@ -554,6 +558,9 @@ impl Engine<'_> {
         ctx.allow_service = false;
         ctx.forbid_service = true;
         ctx.deadline = self.deadline;
+        if let Some(m) = self.query_memory {
+            ctx.mem_limit = ctx.mem_limit.min(m);
+        }
         ctx.cancellation = self.cancellation.clone();
         if let Some(c) = &self.cancel {
             ctx.cancel = c.clone();

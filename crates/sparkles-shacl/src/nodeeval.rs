@@ -453,6 +453,47 @@ impl Engine<'_> {
                 }
                 Ok(out)
             }
+            Expr::SparqlCall {
+                query,
+                params,
+                args,
+                ..
+            } => {
+                let mut vals: Vec<Vec<Id>> = Vec::with_capacity(args.len());
+                for a in args {
+                    let mut r = self.eval(*a, focus, scope, cx)?;
+                    r.sort_unstable();
+                    r.dedup();
+                    if r.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    vals.push(r);
+                }
+                // every combination of the arguments' nodes, the last argument fastest
+                let mut out = Vec::new();
+                let mut at = vec![0usize; vals.len()];
+                loop {
+                    self.check_limits()?;
+                    let mut binds: Vec<(&str, Term)> = Vec::with_capacity(params.len());
+                    for (i, p) in params.iter().enumerate() {
+                        binds.push((p.as_str(), self.term(vals[i][at[i]])?));
+                    }
+                    let (table, ctx) = self.run_query(query, &binds)?;
+                    out.extend(self.table_column(&table, &ctx)?);
+                    let mut i = vals.len();
+                    loop {
+                        if i == 0 {
+                            return Ok(out);
+                        }
+                        i -= 1;
+                        at[i] += 1;
+                        if at[i] < vals[i].len() {
+                            break;
+                        }
+                        at[i] = 0;
+                    }
+                }
+            }
             Expr::Arg(key) => match scope.args.iter().find(|a| &a.key == key) {
                 Some(a) => {
                     let (expr, f, sc) = (a.expr, a.focus, a.scope.clone());
