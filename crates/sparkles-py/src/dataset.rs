@@ -28,6 +28,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+/// The longest batch that `Dataset.contains_all` answers on a dataset in memory without
+/// giving up the GIL. Its lookups take a few tens of microseconds in all.
+const CONTAINS_ALL_INLINE: usize = 256;
+
 pub use sparkles::reasoning::INFERRED_GRAPH;
 
 /// An RDF dataset: the default graph and named graphs, in memory or in a database
@@ -1080,6 +1084,43 @@ impl PyDataset {
             None => quad_from_py(quad)?,
         };
         py.detach(|| ds.contains(q.as_ref())).py(py)
+    }
+
+    /// Whether each quad is in the dataset, in the order given. Every answer is read
+    /// from one snapshot, and the call enters the engine once for the whole batch.
+    fn contains_all(&self, py: Python<'_>, quads: &Bound<'_, PyAny>) -> PyResult<Vec<bool>> {
+        // A `Quad` is read where it is, and anything else is converted first.
+        enum Probe {
+            Borrowed(Py<PyQuad>),
+            Owned(Quad),
+        }
+        impl Probe {
+            fn quad(&self) -> oxrdf::QuadRef<'_> {
+                match self {
+                    Probe::Borrowed(q) => q.get().inner.as_ref(),
+                    Probe::Owned(q) => q.as_ref(),
+                }
+            }
+        }
+        let probes = quads
+            .try_iter()?
+            .map(|q| {
+                let q = q?;
+                Ok(match q.cast::<PyQuad>() {
+                    Ok(q) => Probe::Borrowed(q.clone().unbind()),
+                    Err(_) => Probe::Owned(quad_from_py(&q)?),
+                })
+            })
+            .collect::<PyResult<Vec<Probe>>>()?;
+        let ds = self.ds(py)?;
+        let answer = || ds.contains_all(probes.iter().map(Probe::quad));
+        // A few lookups in memory take less time than giving up the GIL and taking it
+        // back. A longer batch gives it up, so that other threads run meanwhile. The
+        // probes are dropped after the answer, with the GIL held.
+        if probes.len() <= CONTAINS_ALL_INLINE && ds.store().root().is_none() {
+            return answer().py(py);
+        }
+        py.detach(answer).py(py)
     }
 
     /// The number of quads.
