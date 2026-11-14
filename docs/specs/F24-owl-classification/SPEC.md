@@ -139,7 +139,8 @@ restriction that no other axiom named counted no neighbour, and the run reported
 that missed the restriction's consequences as complete. The reported cases and a generated
 ontology that was reported consistent now have HermiT's answers, and the 205 files of the
 ORE 2015 DL development set that give a taxonomy with counting give the same bytes as
-before, with no change of their times observed. Counting the neighbours that were missed costs work. The fixture `shiq-038`
+before. The names alone changed no time in single runs, and the step in which a context
+gives way made the failed attempt of ore_ont_6485 cheaper. Counting the neighbours that were missed costs work. The fixture `shiq-038`
 derives 815,758 conclusions on one thread where it derived 246,957, so it passes the
 default bound of 262,144 and falls back there, and it finishes with HermiT's answer at a
 raised bound. A context of the disjunctive rules now
@@ -653,11 +654,12 @@ to 4.2 GB on four threads on the laptop. The two taxonomies miss 33 and 27 of Ko
 subsumptions, which follow from axioms that are not Horn, and give none that Konclude
 does not entail. On one thread the Horn rules still derive 52.0 million conclusions on
 ore_ont_9663 and 29.4 million on ore_ont_14817, where the EL rules derive 18.5 and 20.8
-million, which item 693 follows. No file of the development set below and no case of the
-differential test reaches the budget with item 693's rules, and the budget stays as a
-safety net. The largest Horn run of the development set, ore_ont_9855, classifies in 1.5
-s on one thread on the benchmark host against 4.4 s with the rules of phase 3, with a
-peak resident set of 359 MiB.
+million, which item 693 follows. Of the files of the development set below that the
+rules accepted before item 692, none reaches the budget with item 693's rules, and no
+case of the differential test does. ore_ont_8737 and, in some runs, ore_ont_16744, which
+the rules accept since item 692, reach it. The largest Horn run among the files accepted
+before item 692, ore_ont_9855, classifies in 1.5 s on one thread on the benchmark host
+against 4.4 s with the rules of phase 3, with a peak resident set of 359 MiB.
 
 A run with the Horn rules composes only the property chains that some negative existential
 restriction needs, and carries every other property inclusion by the automata (item 693).
@@ -2923,7 +2925,7 @@ and 1,301 against 3,991 ms on four. A sweep of the 207 development files of the 
 DL sample in steps on four threads gives the same bytes as the default driver on each of
 the 205 files that give a taxonomy. The 92 of them that the disjunctive rules answer
 within their bounds take 22.2 s in steps against 22.7 s in single classifications, and
-the smallest of them, which classify in a few milliseconds, take up to three times as
+the smallest of them, which classify in a few milliseconds, take up to 3.3 times as
 long.
 
 ### Nominals in the disjunctive rules

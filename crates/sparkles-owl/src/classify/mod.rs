@@ -2872,13 +2872,12 @@ mod tests {
     }
 
     /// A panic in a worker of a saturation ends the run with the panic, in a helper and
-    /// in the calling thread, in a run in steps and in the default run. The callback
-    /// panics once the helpers have started, and a helper that is not to panic stays in
-    /// the callback until the calling thread has, so that the calling thread panics
-    /// while a helper works in the same saturation. The other workers waited for the one
-    /// that panicked without end: those of a run in steps at the barrier between the
-    /// phases, and those of the default run for a count of busy workers that never
-    /// reached zero.
+    /// in the calling thread, in a run in steps and in the default run. A helper that is
+    /// not to panic stays in the callback for a while, and the calling thread panics
+    /// only while a helper is there, so that it panics while a helper works in the same
+    /// saturation. The other workers waited for the one that panicked without end: those
+    /// of a run in steps at the barrier between the phases, and those of the default run
+    /// for a count of busy workers that never reached zero.
     #[test]
     fn a_panic_in_a_worker_ends_the_saturation_with_the_panic() {
         use std::cell::Cell;
@@ -2894,25 +2893,28 @@ mod tests {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let axioms = axioms.clone();
                 std::thread::spawn(move || {
-                    let started = Arc::new(AtomicBool::new(false));
+                    // the helpers that are in the callback now
+                    let waiting = Arc::new(AtomicUsize::new(0));
                     // whether the callback panicked where the case wants it
                     let fired = Arc::new(AtomicBool::new(false));
                     let hit = fired.clone();
                     let cancelled = move || {
                         let at = saturate::WORKER.with(Cell::get);
-                        if at == helper {
-                            started.store(true, Ordering::Relaxed);
-                            if in_helper {
-                                hit.store(true, Ordering::Relaxed);
-                                panic!("the poll panics in a helper");
-                            }
+                        if at == helper && in_helper {
+                            hit.store(true, Ordering::Relaxed);
+                            panic!("the poll panics in a helper");
+                        } else if at == helper {
+                            // long enough for the calling thread's next poll, and
+                            // short enough for a saturation in which it has none left
+                            waiting.fetch_add(1, Ordering::SeqCst);
                             let since = Instant::now();
                             while !hit.load(Ordering::Relaxed)
-                                && since.elapsed() < Duration::from_secs(30)
+                                && since.elapsed() < Duration::from_millis(200)
                             {
                                 std::thread::sleep(Duration::from_millis(1));
                             }
-                        } else if at == first && !in_helper && started.load(Ordering::Relaxed) {
+                            waiting.fetch_sub(1, Ordering::SeqCst);
+                        } else if at == first && !in_helper && waiting.load(Ordering::SeqCst) > 0 {
                             hit.store(true, Ordering::Relaxed);
                             panic!("the poll panics in the calling thread");
                         }
