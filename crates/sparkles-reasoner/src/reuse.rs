@@ -11,7 +11,8 @@
 //! 2. no differing quad unifies with an atom, a fact a builtin reads, or a head of the
 //!    rules that a session of `c1`'s view made its program from, after specialization to
 //!    the schema, or of the rules that specialization left out because their every head
-//!    is a relation the session proved complete, and
+//!    is a relation the session proved complete, as written or once specialized to a
+//!    binding of their schema atoms, and
 //! 3. for an atom whose predicate is a variable and whose subject and object occur nowhere
 //!    else in its rule, which reads only which predicates are in use, the predicate of
 //!    each differing quad has a stored quad in the input graphs that is at both commits.

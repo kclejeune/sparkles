@@ -1266,8 +1266,9 @@ the schema itself is unchanged.
   input graphs is a fact of the schema vocabulary, an RDF list fact or an `owl:sameAs`
   fact, and none unifies with an atom, a pattern a `noValue` or `listForAll` reads, or a
   head of the specialized rules or of the rules that specialization left out because
-  their every head is a relation the proof closed, such as a rule that turns an instance
-  fact into a `rdfs:subClassOf` fact. An atom whose predicate is a variable and whose
+  their every head is a relation the proof closed, as written or once specialized to a
+  binding of their schema atoms, such as a rule that turns an instance fact into a
+  `rdfs:subClassOf` fact. An atom whose predicate is a variable and whose
   subject and object occur nowhere else in its rule, as in `rdf1`, reads only which
   predicates are in use, so a differing quad passes it when its predicate has a stored
   quad in the input graphs at both commits, which a bounded scan of the predicate's quads
