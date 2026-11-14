@@ -235,13 +235,61 @@ threads, LUBM(100) takes 25.7 and 25.2 s against 24.8 and 24.7 s at one thread a
 and 14.6 s against 14.3 and 14.1 s at 20 threads, and its insertion and deletion of every
 hundredth triple at 20 threads take 2.2 and 3.0 s against 2.1 and 2.9 s. The budget's
 peak is 71.5 bytes per derived fact with the comparison sort and 87.3 with the digit
-sort's second buffer, under the gate of half of 199. The remaining cost at one thread
-is in `Graph::position`, 13.1 s of samples against 7.5 s for the same lookups: the row
-read costs the same in both builds, and the reads of the hash table's control bytes and
-buckets cost two to three times as much, which item 866 still has to explain. A
+sort's second buffer, under the gate of half of 199.
+
+The remaining cost at one thread was in `prp-symp`, which scans the first iteration's
+derived facts, looks up the symmetric declaration of each fact's predicate in the base,
+checks that the object is not a literal and looks up the head in the triple index. On
+atlas, an Intel Core i5-13500 like the benchmark host, with the run pinned to one core,
+the rule took 16.0 s against 9.95 s in the build before the tier. Both builds made the
+same lookups and spent the same instructions, branch misses and cache misses at every
+level on them, within a few percent. Counters sampled over the rule gave 741 cycles per
+candidate against 427, with 1.1 cache misses in flight on average against 1.8. A
+candidate's work, about 480 micro-operations, filled the core's reorder window, so the
+index misses of one candidate no longer overlapped those of the next.
+
+A scan now probes its candidates' heads in groups when the rest of the plan only checks
+them. In forward chaining, when an atom's scan binds the last variables of the rule's one
+triple head and every later step is an atom or a builtin whose variables are all bound,
+the scan matches 16 candidates, forms their heads and probes the triple index for all of
+them in a row. It then runs each candidate through the rest of the plan in order, and the
+emit takes the group's answer when the head it forms is the one the group probed, so the
+16 probes' misses overlap. A scan goes back to one candidate at a time when a group's
+instances used fewer than half of its probes, as in `prp-key-1`, whose later steps reject
+most candidates, or when the group probed fewer heads than a quarter of its candidates,
+as in `rdf1`, whose heads repeat. The grouped path gives the facts, ids, counters and
+stopping points of the one-at-a-time path, which a test compares over random OWL 2 RL and
+RDFS programs with and without an inferred-fact limit. `prp-symp` takes 7.0 s with it at
+one thread.
+
+Two further changes keep the tier's probes and plans level with the build before it. A
+run's probe searches a coarse fence of every 64th fence key before the fence keys. Each
+order counts the distinct keys its facts have had, dead ones included, as the hash lists
+before it did. A merge counts the keys of its run that no older run holds, and a
+compaction that drops dead facts keeps the keys it leaves without a fact, so the planner
+reads the same counts however the facts fall into runs. The sum of the runs' counts,
+which the tier read at first, had made `prp-key-1` choose a plan that scanned 44.5
+million rows in the third iteration, and an estimate from sketches of the runs changed a
+join order, and so a derived list link, with the split of a relation into runs. A scan
+with one candidate is not grouped, since it has no probe to overlap, and roadmap item 874
+carries the fallback across the short scans of one rule. Index entries with 32 hash bits,
+and huge pages for the index tables, measured no faster and are recorded in
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#reasoning).
+
+On atlas, in four interleaved rounds against the build before the tier, OWL2Bench(5)
+takes 100.8 to 105.4 s against 102.2 to 107.4 s at one thread and 50.2 to 52.7 s against
+50.8 to 54.2 s at 20 threads, where the tier took 114.7 to 116.0 s at one thread before
+the grouped probes. LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s at one thread
+and 16.1 to 16.7 s against 16.5 to 17.1 s at 20 threads. Its insertion of every hundredth
+triple takes 2.43 to 2.46 s against 2.35 to 2.41 s and its deletion 3.30 to 3.34 s
+against 3.23 to 3.27 s at 20 threads, 2% slower in every round, and roadmap item 875
+investigates that cost. Both builds derive the same 52,966,139 and 10,907,379 facts. The
+budget's peak stays at 4.6 GB, 87 bytes per derived fact, and the tier at 2,746 MB.
+`prp-key-1` still takes 1.9 s against 0.9 s in the second iteration, which reads its
+scan's keys through the fact rows, and the layout of item 862 compares keys in place. A
 compaction policy that left an older run alone when it was under an eighth of the runs
-behind it saved the third iteration's 1.25 s and was not kept, since the planner's
-distinct-key estimates sum over runs and the retained run changed a join order, and so
+behind it saved the third iteration's 1.25 s and was not kept, since the distinct-key
+counts of that build summed over runs and the retained run changed a join order, and so
 derived ids, in the reviewer's reproduction.
 
 ### Closure operators

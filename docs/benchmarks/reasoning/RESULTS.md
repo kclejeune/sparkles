@@ -130,9 +130,22 @@ further rounds against the same base build, the wall times were 81 and 78 s agai
 budget's peak at 4.6 GB, 87 bytes per fact, and the tier at 2,745 MB. LUBM(100) under
 `owl-rl` took 25.7 and 25.2 s against 24.8 and 24.7 s at one thread, 14.7 and 14.6 s
 against 14.3 and 14.1 s at 20 threads, and the insertion and deletion of every hundredth
-of its triples at 20 threads 2.2 and 3.0 s against 2.1 and 2.9 s. These are
-development-host measurements, and the benchmark host has not rerun them. Roadmap item
-866 covers the one-thread cost that remains, in the triple index's lookups.
+of its triples at 20 threads 2.2 and 3.0 s against 2.1 and 2.9 s.
+
+With the grouped head probes and exact distinct-key counts of item 866 at 75e7fb61, on
+atlas, an Intel Core i5-13500 like the benchmark host, in four interleaved rounds against
+the build before the tier with one thread pinned to one core or 20 threads, OWL2Bench(5)
+took 100.8 to 105.4 s against 102.2 to 107.4 s at one thread and 50.2 to 52.7 s against
+50.8 to 54.2 s at 20 threads. The tier before the grouped probes had taken 114.7 to
+116.0 s at one thread on the same host, and the rule `prp-symp`, whose probes of the
+triple index made most of that difference, took 7.0 s against 9.8 s. LUBM(100) under
+`owl-rl` took 37.5 to 38.0 s against 37.3 to 37.8 s at one thread and 16.1 to 16.7 s
+against 16.5 to 17.1 s at 20 threads. The insertion of every hundredth of its triples at
+20 threads took 2.43 to 2.46 s against 2.35 to 2.41 s and the deletion 3.30 to 3.34 s
+against 3.23 to 3.27 s, about 2% slower in every round, which roadmap item 875
+investigates. Both builds derived 52,966,139 and 10,907,379 facts, the budget's peak on
+OWL2Bench(5) stayed at 4.6 GB and the tier ended at 2,746 MB. These are benchmark-worker
+measurements, and the benchmark host has not rerun them.
 
 ### Small incremental runs
 
