@@ -3744,6 +3744,88 @@ mod tests {
         }
     }
 
+    /// A writer reuses one rebuild buffer for every cell. Each growth of it is admitted
+    /// first, so its capacity never exceeds the largest reservation, and a step that
+    /// fits the buffer reserves nothing. Keys of varied lengths and shared prefixes are
+    /// decoded in several orders, for both codecs and with and without kept FSST room.
+    #[test]
+    fn reused_checked_buffer_grows_only_after_a_reservation() {
+        let mut keys: Vec<Vec<u8>> = (0..6 * FC_BLOCK)
+            .map(|i| {
+                let tail = "y".repeat((i * 37) % 300);
+                format!("<urn:reuse:{}:{i:04}{tail}", "seg/".repeat(i % 13)).into_bytes()
+            })
+            .collect();
+        keys.sort();
+        let n = keys.len() as u64;
+        let orders: [Vec<u64>; 3] = [
+            (0..n).collect(),
+            (0..n).rev().collect(),
+            (0..n).map(|i| (i * 7) % n).collect(),
+        ];
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let v = Vocab::open(d.path()).unwrap();
+            assert_eq!(v.is_fsst(), fsst);
+            for room in [false, true] {
+                for order in &orders {
+                    let mut key = Vec::new();
+                    let mut admitted = 0;
+                    for &id in order {
+                        let held = key.capacity();
+                        // A refused growth leaves the buffer as it was, so the
+                        // reservation comes before the allocation.
+                        let refused = if room {
+                            v.get_sorted_checked_in::<true, _>(
+                                &[id],
+                                &mut key,
+                                |_| Err(()),
+                                |_, _| Ok(()),
+                            )
+                        } else {
+                            v.get_sorted_checked_in::<false, _>(
+                                &[id],
+                                &mut key,
+                                |_| Err(()),
+                                |_, _| Ok(()),
+                            )
+                        };
+                        assert_eq!(key.capacity(), held, "growth before admission at {id}");
+                        let mut reserved = false;
+                        // Each reservation grows the buffer to exactly what it admits, so
+                        // a later one in the same decode must exceed it.
+                        let mut fits = held;
+                        let reserve = |need: usize| {
+                            assert!(need > fits, "{need} fits the held {fits} bytes");
+                            fits = need;
+                            admitted = admitted.max(need);
+                            reserved = true;
+                            Ok::<_, ()>(())
+                        };
+                        let mut got = None;
+                        let f = |_, k: &[u8]| {
+                            got = Some(k.to_vec());
+                            Ok(())
+                        };
+                        if room {
+                            v.get_sorted_checked_in::<true, _>(&[id], &mut key, reserve, f)
+                        } else {
+                            v.get_sorted_checked_in::<false, _>(&[id], &mut key, reserve, f)
+                        }
+                        .unwrap();
+                        assert_eq!(got.as_ref(), Some(&keys[id as usize]));
+                        assert!(key.capacity() <= admitted, "unadmitted growth at {id}");
+                        if !reserved {
+                            assert_eq!(key.capacity(), held);
+                        }
+                        assert_eq!(refused.is_err(), reserved, "refusal at {id}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn controlled_vocabulary_open_matches_both_codecs_and_type_boundaries() {
         use crate::{
