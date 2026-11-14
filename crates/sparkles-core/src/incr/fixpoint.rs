@@ -153,14 +153,17 @@ impl<F, R> HashStore<F, R> {
 impl<F: Copy + Eq + Hash, R: Copy> FactStore<F, R> for HashStore<F, R> {
     type Error = Error;
 
+    #[inline]
     fn contains(&self, f: &F) -> bool {
         self.map.contains_key(f)
     }
 
+    #[inline]
     fn record(&self, f: &F) -> Option<R> {
         self.map.get(f).copied()
     }
 
+    #[inline]
     fn len(&self) -> usize {
         self.map.len()
     }
@@ -175,6 +178,7 @@ impl<F: Copy + Eq + Hash, R: Copy> FactStore<F, R> for HashStore<F, R> {
         self.map.capacity() as u64 * self.fact_bytes
     }
 
+    #[inline]
     fn insert(&mut self, f: F, r: R) -> Result<bool> {
         match self.map.entry(f) {
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -185,11 +189,13 @@ impl<F: Copy + Eq + Hash, R: Copy> FactStore<F, R> for HashStore<F, R> {
         }
     }
 
+    #[inline]
     fn set_record(&mut self, f: F, r: R) -> Result<()> {
         self.map.insert(f, r);
         Ok(())
     }
 
+    #[inline]
     fn remove(&mut self, f: &F) -> Result<bool> {
         Ok(self.map.remove(f).is_some())
     }
@@ -360,12 +366,18 @@ impl<'s, T, E: From<Error>> Sink<'s, T, E> {
     }
 
     /// Add one item, growing the buffer only once the growth is charged.
+    #[inline]
     pub fn push(&mut self, t: T) -> std::result::Result<(), E> {
         if self.buf.len() == self.buf.capacity() {
-            grow_charged(self.acct, self.max, &mut self.buf, &mut self.held, 1)?;
+            self.grow()?;
         }
         self.buf.push(t);
         Ok(())
+    }
+
+    #[inline(never)]
+    fn grow(&mut self) -> std::result::Result<(), E> {
+        grow_charged(self.acct, self.max, &mut self.buf, &mut self.held, 1)
     }
 
     pub fn len(&self) -> usize {
@@ -844,7 +856,23 @@ impl<P: Program> FixedPoint<P> {
 
     /// Make room in `h` for `add` more items, reserving the new allocation through the
     /// store before it grows and releasing the old one after.
+    #[inline]
     fn room<B: Buf>(
+        &self,
+        charges: &mut Charges,
+        h: &mut Held<B>,
+        add: usize,
+    ) -> std::result::Result<(), P::Error> {
+        // most calls add one item to a buffer with room for it
+        if h.buf.grown(add).is_none() {
+            return Ok(());
+        }
+        self.grow(charges, h, add)
+    }
+
+    /// [`room`](Self::room) when `h` has to grow.
+    #[inline(never)]
+    fn grow<B: Buf>(
         &self,
         charges: &mut Charges,
         h: &mut Held<B>,
@@ -900,8 +928,9 @@ impl<P: Program> FixedPoint<P> {
             &mut Sink<'_, T, P::Error>,
         ) -> std::result::Result<(), P::Error>,
     ) -> std::result::Result<(), P::Error> {
-        let before = self.used();
-        if buf.buf.capacity() > 0 {
+        // the state counted beside the sink, read only with a limit
+        let limit = max.map(|m| (m, self.used()));
+        if limit.is_some() && buf.buf.capacity() > 0 {
             self.check(max, buf.buf.alloc_bytes())?;
         }
         let store = &self.store;
@@ -914,7 +943,7 @@ impl<P: Program> FixedPoint<P> {
                 reserve: &reserve,
                 release: &release,
             }),
-            max: max.map(|m| (m, before)),
+            max: limit,
             held,
         };
         let res = produce(&mut self.program, cx, store, &mut sink);
@@ -944,17 +973,24 @@ impl<P: Program> FixedPoint<P> {
         let n = self.program.batch_len().max(1);
         let mut found: Held<Vec<(P::Fact, P::Record)>> = Held::default();
         let mut batch: Held<Vec<P::Fact>> = Held::default();
-        while !queue.is_empty() {
+        while let Some(first) = queue.buf.pop_front() {
             self.program.tick(cx)?;
-            batch.buf.clear();
-            self.room(charges, &mut batch, n.min(queue.len()))?;
-            while batch.len() < n
-                && let Some(f) = queue.buf.pop_front()
+            // a batch of one fact needs no buffer
+            let facts: &[P::Fact] = if n == 1 {
+                std::slice::from_ref(&first)
+            } else {
+                batch.buf.clear();
+                self.room(charges, &mut batch, n.min(queue.len() + 1))?;
+                batch.buf.push(first);
+                while batch.len() < n
+                    && let Some(f) = queue.buf.pop_front()
+                {
+                    batch.buf.push(f);
+                }
+                &batch.buf
+            };
             {
-                batch.buf.push(f);
-            }
-            {
-                let (pend, facts) = (&pending.buf, &batch.buf);
+                let pend = &pending.buf;
                 self.produce(cx, max, charges, &mut found, |p, cx, store, sink| {
                     p.consequences_batch(
                         cx,
@@ -989,7 +1025,7 @@ impl<P: Program> FixedPoint<P> {
         proved: &mut Held<Vec<P::Fact>>,
         added: &mut Held<Vec<P::Fact>>,
     ) -> std::result::Result<(), P::Error> {
-        if pending.buf.remove(&g) {
+        if !pending.buf.is_empty() && pending.buf.remove(&g) {
             self.store.set_record(g, r)?;
             self.room(charges, proved, 1)?;
             proved.buf.push(g);
@@ -1383,7 +1419,9 @@ impl<P: Program> FixedPoint<P> {
         let mut batch: Held<Vec<P::Fact>> = Held::default();
         while !broken.is_empty() {
             batch.buf.clear();
+            let mut one = None;
             while batch.len() < n
+                && one.is_none()
                 && let Some(f) = broken.buf.pop()
             {
                 if !self.store.contains(&f) || pending.contains(&f) {
@@ -1393,15 +1431,23 @@ impl<P: Program> FixedPoint<P> {
                 pending.buf.insert(f);
                 self.room(charges, &mut candidates, 1)?;
                 candidates.buf.push(f);
-                self.room(charges, &mut batch, 1)?;
-                batch.buf.push(f);
+                // a batch of one fact needs no buffer
+                if n == 1 {
+                    one = Some(f);
+                } else {
+                    self.room(charges, &mut batch, 1)?;
+                    batch.buf.push(f);
+                }
             }
-            if batch.is_empty() {
+            if batch.is_empty() && one.is_none() {
                 continue;
             }
             self.program.tick(cx)?;
             {
-                let facts = &batch.buf;
+                let facts: &[P::Fact] = match &one {
+                    Some(f) => std::slice::from_ref(f),
+                    None => &batch.buf,
+                };
                 self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
                     p.consequences_batch(cx, store, Which::Old, facts, &|x| store.contains(x), sink)
                 })?;
@@ -1426,13 +1472,17 @@ impl<P: Program> FixedPoint<P> {
             self.room(charges, &mut verdicts, chunk.len())?;
             {
                 let (store, pend) = (&self.store, &pending.buf);
-                self.program.prove_batch(
-                    cx,
-                    store,
-                    chunk,
-                    &|x| store.contains(x) && !pend.contains(x),
-                    &mut verdicts.buf,
-                )?;
+                let held = |x: &P::Fact| store.contains(x) && !pend.contains(x);
+                if n == 1
+                    && let [f] = chunk
+                {
+                    // a batch of one fact, without the batched form's loop
+                    let v = self.program.prove(cx, store, f, &held)?;
+                    verdicts.buf.push(v);
+                } else {
+                    self.program
+                        .prove_batch(cx, store, chunk, &held, &mut verdicts.buf)?;
+                }
             }
             if verdicts.len() != chunk.len() {
                 return Err(Error::Corrupt(
