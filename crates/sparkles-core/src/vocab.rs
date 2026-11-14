@@ -1222,34 +1222,48 @@ impl Vocab {
         ioacct::vocab_blocks_scanned(1);
         self.touch_block(b);
         key.clear();
-        // The steps below grow the buffer only through the reservations here, so its
-        // capacity is read once, rather than through `key` at every step.
-        let mut cap = key.capacity();
         if !F {
             // front coding rebuilds every key up to the last wanted one, in one pass
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
                 let e = self.entry::<F>(data, &mut pos, at == 0);
                 key.truncate(e.shared);
-                // The suffix fits the buffer exactly when `extend_from_slice` below
-                // would not grow it, and this is the same comparison, so the copy
-                // repeats no check. Growth admits the whole rebuilt key first.
-                if e.len > key.capacity() - key.len() {
-                    reserve(key.len().saturating_add(e.len))?;
-                    key.reserve_exact(e.len);
+                let suffix = &data[e.start..e.start + e.len];
+                // Growth admits the whole rebuilt key first.
+                if suffix.len() > key.capacity() - key.len() {
+                    reserve(key.len().saturating_add(suffix.len()))?;
+                    key.reserve_exact(suffix.len());
                     #[cfg(any(test, feature = "failpoints"))]
                     crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
                         "checked-vocab-scratch-allocated",
                         key.capacity(),
                     ));
                 }
-                key.extend_from_slice(&data[e.start..e.start + e.len]);
+                // The check above leaves room for the suffix, so the copy needs no
+                // growth check of its own, which `extend_from_slice` would repeat.
+                let len = key.len();
+                // SAFETY: `key.capacity() - len >= suffix.len()`, which the branch
+                // above establishes by finding the room or reserving it. `suffix`
+                // borrows the vocabulary's data, which never overlaps `key`'s own
+                // allocation. Every byte below `len + suffix.len()` is initialized: the
+                // first `len` before this step and the rest by this copy.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        suffix.as_ptr(),
+                        key.as_mut_ptr().add(len),
+                        suffix.len(),
+                    );
+                    key.set_len(len + suffix.len());
+                }
                 if mask >> at & 1 == 1 {
                     f(id, key)?;
                 }
             }
             return Ok(());
         }
+        // The steps below grow the buffer only through the reservations here, so its
+        // capacity is read once, rather than through `key` at every step.
+        let mut cap = key.capacity();
         let mut e = self.entry::<F>(data, &mut pos, true);
         for at in 0..=last {
             let id = (b * FC_BLOCK + at) as u64;
