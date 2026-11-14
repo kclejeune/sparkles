@@ -221,12 +221,14 @@ fn no_quad_count_or_history_surface_sees_the_ledger() {
     let graphs = ds
         .query("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
         .unwrap()
-        .rows();
+        .rows()
+        .unwrap();
     assert_eq!(graphs.len(), 0, "no named graph holds a record");
     let count = ds
         .query("SELECT (COUNT(*) AS ?n) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }")
         .unwrap()
-        .rows();
+        .rows()
+        .unwrap();
     assert_eq!(count.len(), 1);
     // the publication is one commit whose counts are its business quads alone
     let p = ds
