@@ -319,13 +319,16 @@ class Admission(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertNotIn('["expires_at"]-time.time()',text);self.assertIn('rx_runtime',text)
 
-    def fake_worker(self,mbx_version='1.29.1',rustc_version='1.99.1',install_mbx=True):
+    def fake_worker(self,mbx_version='1.29.1',rustc_version='1.99.1',install_mbx=True,install_rustdoc=True):
         """A fake worker home whose tools are tiny scripts, with the job environment's PATH."""
         profile=dict(self.fixtures['profile'],worker_home=str(self.root/'home'))
         home=Path(profile['worker_home']);cargo=home/'.cargo/bin';cargo.mkdir(parents=True)
         # rustup's proxy reports the pinned toolchain only when RUSTUP_TOOLCHAIN selects it.
         (cargo/'rustc').write_text('#!/bin/sh\nif [ "$RUSTUP_TOOLCHAIN" = 1.99.1 ]; then echo "rustc '+rustc_version+' (fixture)"; else echo "rustc 1.97.1 (fixture default)"; fi\n')
         (cargo/'rustc').chmod(0o755)
+        if install_rustdoc:
+            (cargo/'rustdoc').write_text('#!/bin/sh\nif [ "$RUSTUP_TOOLCHAIN" = 1.99.1 ]; then echo "rustdoc '+rustc_version+' (fixture)"; else echo "rustdoc 1.97.1 (fixture default)"; fi\n')
+            (cargo/'rustdoc').chmod(0o755)
         if install_mbx:
             pinned=home/'.local/share/mise/installs/mr-boxington/1.29.1';pinned.mkdir(parents=True)
             # The fake answers `settings get` the way mbx does: an environment variable
@@ -357,7 +360,8 @@ class Admission(unittest.TestCase):
     def test_admit_tool_check_refuses_missing_mbx_and_wrong_rustc_clearly(self):
         cases=[({'install_mbx':False},'mbx is not on the job PATH'),
                ({'mbx_version':'1.28.0'},'mbx reports 1.28.0, pinned 1.29.1'),
-               ({'rustc_version':'1.97.1'},'rustc reports 1.97.1, pinned 1.99.1')]
+               ({'rustc_version':'1.97.1'},'rustc reports 1.97.1, pinned 1.99.1'),
+               ({'install_rustdoc':False},'rustdoc is not on the job PATH')]
         for kwargs,reason in cases:
             with self.subTest(reason=reason),tempfile.TemporaryDirectory()as tmp:
                 self.root=Path(tmp);profile,env=self.fake_worker(**kwargs)
@@ -376,7 +380,7 @@ class Admission(unittest.TestCase):
         self.assertEqual(values['MBX_REMOTE_URL'],'')
         self.assertFalse([k for k in values if 'TOKEN' in k])
         body=RX.boat_environment.environment_body(profile).decode()
-        self.assertEqual(values['MBX_GC_MAX_TOTAL_SIZE'],'64GiB');self.assertEqual(values['MBX_GC_MIN_FREE_SIZE'],'45GiB')
+        self.assertEqual(values['MBX_GC_MAX_TOTAL_SIZE'],'40GiB');self.assertEqual(values['MBX_GC_MIN_FREE_SIZE'],'45GiB')
         # The provider's snapshot does not keep ~/.cache, so the worker's one shared
         # store lives in a home path that it keeps, and every job names that same path.
         home=profile['worker_home']
@@ -410,7 +414,7 @@ class Admission(unittest.TestCase):
         cases=[(lambda e:e.pop('MBX_REMOTE_URL'),'mbx resolves a remote cache URL, not local-only mode'),
                (lambda e:e.update(MBX_REMOTE_URL='https://other.invalid'),'mbx resolves a remote cache URL, not local-only mode'),
                (lambda e:e.update(MBX_REMOTE_TOKEN_FILE='/nonexistent'),'the job environment names an mbx remote token'),
-               (lambda e:e.update(MBX_GC_MAX_TOTAL_SIZE='5GiB'),'mbx local budget is 5GiB, pinned 64GiB'),
+               (lambda e:e.update(MBX_GC_MAX_TOTAL_SIZE='5GiB'),'mbx local budget is 5GiB, pinned 40GiB'),
                (lambda e:e.pop('MBX_GC_MIN_FREE_SIZE'),'mbx free-space floor is , pinned 45GiB'),
                (lambda e:e.pop('MBX_CACHE_DIR'),'mbx cache directory is , pinned {home}/.local/share/mbx-cache'),
                (lambda e:e.update(MBX_CACHE_DIR=e['HOME']+'/private'),'mbx cache directory is {home}/private, pinned {home}/.local/share/mbx-cache')]
@@ -432,6 +436,95 @@ class Admission(unittest.TestCase):
         build=(ROOT/'scripts/nsc-build-remote.sh').read_text()
         self.assertNotIn('MBX_REMOTE_TOKEN_FILE=',build)
         self.assertIn('MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do',build)
+
+    def test_gate_start_makes_its_files_private_whatever_the_login_umask(self):
+        """A worker whose login umask is 002 still gets a gate worktree, out directory and unit at umask 022."""
+        text=(ROOT/'scripts/gate/remote/gate-start.sh').read_text();lines=text.splitlines()
+        first=lambda p:next(i for i,l in enumerate(lines) if p(l))
+        umask=first(lambda l:l=='umask 022')
+        self.assertLess(umask,first(lambda l:l.startswith('mkdir ')))
+        self.assertLess(umask,first(lambda l:'worktree add' in l))
+        unit=first(lambda l:l.startswith('systemd-run --user --unit "$unit"'))
+        self.assertIn('-p UMask=0022',lines[unit+1])
+
+    def test_setup_host_stages_the_suites_without_links(self):
+        """The Boat transport refuses a link in an outbound archive, so the staged suites carry none."""
+        lines=(ROOT/'scripts/gate/setup-host.sh').read_text().splitlines()
+        pull=next(i for i,l in enumerate(lines) if 'rx_sync -- -a "$src:gate/suites/" "$stage/"' in l)
+        push=next(i for i,l in enumerate(lines) if 'rx_sync -- -a "$stage/" "$host:gate/suites/"' in l)
+        drop=next(i for i,l in enumerate(lines) if l.strip()=='find "$stage" -type l -delete')
+        self.assertLess(pull,drop);self.assertLess(drop,push)
+
+    def test_a_boat_gate_cleans_the_disk_at_its_start_and_end(self):
+        """A Boat gate needs its free space before its worktree, refusing otherwise, and cleans at 90% after its run."""
+        start=(ROOT/'scripts/gate/remote/gate-start.sh').read_text().splitlines()
+        call=next(i for i,l in enumerate(start) if 'disk_clean.py' in l and 'python3' in l)
+        self.assertEqual(start[call-1].strip(),'if [ "$executor" = boat ]; then')
+        self.assertIn('--need-free-gib "${min_free:-110}"',start[call]);self.assertTrue(start[call].lstrip().startswith('if ! python3'))
+        self.assertEqual(start[call+2].strip(),'exit 4')
+        gate=(ROOT/'scripts/gate/gate.sh').read_text()
+        self.assertIn('--executor boat --runtime $runtime --min-free-gib ${GATE_BOAT_MIN_FREE_GIB:-110}',gate)
+        self.assertIn('--setenv=GATE_MIN_FREE_GIB="${min_free:-110}"',(ROOT/'scripts/gate/remote/gate-start.sh').read_text())
+        # The check runs again under the heavy lock, before the build.
+        inner=(ROOT/'scripts/gate/remote/gate-inner.sh').read_text().splitlines()
+        lock=inner.index('flock 9');recheck=next(i for i,l in enumerate(inner) if '--need-free-gib "${GATE_MIN_FREE_GIB:-110}"' in l)
+        self.assertLess(lock,recheck);self.assertEqual(inner[recheck+2].strip(),'finish 4')
+        self.assertLess(next(i for i,l in enumerate(start) if l.startswith('mkdir -p "$out"')),call)
+        self.assertLess(call,next(i for i,l in enumerate(start) if 'worktree add' in l))
+        # The start holds the cleanup's lock from before its worktree until its unit runs.
+        lock=next(i for i,l in enumerate(start) if l.strip()=='flock -w 300 7')
+        self.assertEqual(start[lock-1].strip(),'exec 7>> "$G/.disk-clean.lock"');self.assertLess(call,lock)
+        self.assertLess(lock,next(i for i,l in enumerate(start) if 'worktree add' in l))
+        self.assertEqual(start[-2:],['[ "$executor" != boat ] || exec 7>&-','echo "$unit"'])
+        self.assertLess(next(i for i,l in enumerate(start) if l.startswith('systemd-run --user --unit')),len(start)-2)
+        inner=(ROOT/'scripts/gate/remote/gate-inner.sh').read_text().splitlines()
+        call=next(i for i,l in enumerate(inner) if 'disk_clean.py' in l and '--if-above 90' in l)
+        self.assertEqual(inner[call-1].strip(),'if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ]; then')
+        self.assertTrue(inner[call].rstrip().endswith('|| true'));self.assertEqual(inner[-1],'finish $fail')
+        gate=(ROOT/'scripts/gate/gate.sh').read_text()
+        self.assertIn('"$here/../boat/disk_clean.py" | sha256sum',gate)
+        self.assertIn('-C "$here/../boat" disk_clean.py | rx_exec "$h"',gate)
+
+    def test_a_boat_gate_start_runs_in_a_bounded_scope_and_its_runtime_counts_the_bound(self):
+        """Item 803: the unit activates within the prep scope's bound, so the reserve adds it."""
+        lines=(ROOT/'scripts/gate/gate.sh').read_text().splitlines()
+        body=lines[next(i for i,l in enumerate(lines) if l.startswith('start_on() {')):]
+        body=body[:next(i for i,l in enumerate(body) if l=='}')+1]
+        at=lambda text:next(i for i,l in enumerate(body) if text in l)
+        self.assertIn('local prep=${GATE_BOAT_PREP_SECONDS:-900}',body[at('local prep=')])
+        runtime=at('runtime=$(rx_runtime')
+        self.assertIn('--reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))"',body[runtime])
+        # The runtime is computed after the bundle and the install, just before the start.
+        self.assertLess(at('rx_bundle'),runtime);self.assertLess(at('bin=$(install_remote'),runtime)
+        start=at('systemd-run --user --scope -q --collect --unit gate-prep-$n -p RuntimeMaxSec=$prep')
+        self.assertLess(runtime,start);self.assertIn('\\$HOME/$bin/gate-start.sh $full $args',body[start])
+        self.assertEqual(body[start-6].strip(),'boat:*)')
+        # A retry first resets a scope that its bound ended.
+        self.assertIn('systemctl --user reset-failed gate-prep-$n.scope 2> /dev/null;',body[start])
+        # The closure watch counts the scope as a job unit, and gate.env may set the bound.
+        self.assertIn("'gate-'",(ROOT/'scripts/boat/controller.py').read_text().split('JOB_UNIT_PREFIXES=',1)[1].splitlines()[0])
+        self.assertIn('GATE_BOAT_PREP_SECONDS |',(ROOT/'scripts/gate/config.sh').read_text())
+
+    def test_setup_host_installs_a_disk_clean_timer_with_the_store_settings(self):
+        """The timer's service carries the job environment's store settings and never the token setting."""
+        import subprocess as sp
+        text=(ROOT/'scripts/gate/setup-host.sh').read_text()
+        begin=text.index("    set -e\n    d=$HOME/.config/systemd/user");end=text.index("'\n  ;;\nesac",begin)
+        script=text[begin:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp)/'home';home.mkdir();fake=Path(tmp)/'bin';fake.mkdir();calls=Path(tmp)/'calls'
+            (fake/'systemctl').write_text('#!/bin/sh\necho "$@" >> "%s"\necho active\n'%calls);(fake/'systemctl').chmod(0o755)
+            environ={'HOME':str(home),'PATH':str(fake)+':'+os.environ['PATH'],'MBX_REMOTE_URL':'','MBX_CACHE_DIR':str(home)+'/.local/share/mbx-cache',
+                     'MBX_GC_MAX_TOTAL_SIZE':'40GiB','MBX_GC_MIN_FREE_SIZE':'45GiB','MBX_REMOTE_TOKEN_FILE':'/run/secrets/x'}
+            out=sp.run(['bash','-c',script],env=environ,capture_output=True,text=True)
+            self.assertEqual(out.returncode,0,out.stderr);self.assertIn('disk clean timer: active',out.stdout)
+            unit=(home/'.config/systemd/user/sparkles-disk-clean.service').read_text().splitlines()
+            self.assertIn('Environment="MBX_REMOTE_URL="',unit);self.assertIn('Environment="MBX_CACHE_DIR=%s/.local/share/mbx-cache"'%home,unit)
+            self.assertIn('Environment="MBX_GC_MIN_FREE_SIZE=45GiB"',unit);self.assertFalse(any('TOKEN' in l for l in unit))
+            self.assertIn('ExecStart=/usr/bin/python3 -I %h/gate/bin/disk_clean.py --if-above 90 --stop-above 95 --deadline-seconds 240 --log %h/gate/disk-clean.jsonl',unit)
+            timer=(home/'.config/systemd/user/sparkles-disk-clean.timer').read_text().splitlines()
+            self.assertIn('OnBootSec=10min',timer);self.assertIn('OnUnitInactiveSec=60s',timer);self.assertIn('WantedBy=timers.target',timer)
+            self.assertEqual(calls.read_text().splitlines()[:2],['--user daemon-reload','--user enable -q --now sparkles-disk-clean.timer'])
 
     def test_admit_renders_its_probe_and_names_a_missing_worker_tool(self):
         """The admit probe parses as shell, carries its formatted values, and checks every worker tool."""

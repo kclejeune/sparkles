@@ -16,12 +16,17 @@
 #                 from the changed files (scripts/gate/select-checks.py)
 #   --full        every check with --force, with no selection, as the nightly gate runs
 #   --note        a line to record in progress.log before the run is queued
+#   --min-free-gib  on a Boat worker, the free space the run needs after the cleanup (default 110)
 #
 # The memory cap is the smaller of 24G and the host's RAM less 2G, with 2G of swap.
 # GATE_MEMORY_MAX overrides it. The default number of compile jobs is the cap in GiB less
 # one, halved, from 2 to 8, which gives 6 at a 13G cap and 8 at a 24G cap. A Rust test build
 # at 4 jobs peaked at about 9 GiB of process memory.
 set -euo pipefail
+# The worktree, the out directory and everything the run writes are private to the user, as
+# on a laptop with the usual umask. A host whose login umask is 002 would otherwise create
+# group-writable files, which the Boat package's receipt reader refuses in its tests.
+umask 022
 full=$1
 shift
 name=${full:0:8}
@@ -65,6 +70,10 @@ while [ $# -gt 0 ]; do
       ;;
     --executor)
       executor=$2
+      shift 2
+      ;;
+    --min-free-gib)
+      min_free=$2
       shift 2
       ;;
     --note)
@@ -113,6 +122,11 @@ case $executor in ssh | boat) ;; *)
   exit 2
   ;;
 esac
+case ${min_free:-110} in '' | *[!0-9]* | 0)
+  echo 'gate-start.sh: bad --min-free-gib' >&2
+  exit 2
+  ;;
+esac
 
 bin=$(cd "$(dirname "$0")" && pwd)
 G=$HOME/gate
@@ -127,6 +141,21 @@ fi
 systemctl --user reset-failed "$unit" 2> /dev/null || true
 if [ -d "$out" ]; then mv "$out" "$out.old-$(date +%s)"; fi
 mkdir -p "$out"
+# A Boat worker's provider warns the maintainer at 90% disk use, so a gate there first
+# frees finished work with scripts/boat/disk_clean.py when the disk is that full. The cleanup
+# keeps the store's live entries and every active job's files, and never stops the start.
+# A cold workspace build needs --min-free-gib GiB, 110 by default, so a start with less free
+# after the cleanup refuses rather than fill the disk that the stop's snapshot must save.
+if [ "$executor" = boat ]; then
+  if ! python3 -I "$bin/disk_clean.py" --need-free-gib "${min_free:-110}" --deadline-seconds 300 --log "$G/disk-clean.jsonl" > "$out/disk-clean-start.json" 2>&1; then
+    echo "gate-start.sh: under ${min_free:-110} GiB free after the cleanup; not starting (see $out/disk-clean-start.json)" >&2
+    exit 4
+  fi
+  # The worktree exists before its unit does, so the start holds the cleanup's lock until
+  # the unit runs, and a cleanup from the worker's timer cannot remove it meanwhile.
+  exec 7>> "$G/.disk-clean.lock"
+  flock -w 300 7
+fi
 git -C "$G/repo.git" cat-file -e "$full^{commit}"
 [ -z "$base" ] || git -C "$G/repo.git" cat-file -e "$base^{commit}"
 git -C "$G/repo.git" worktree prune
@@ -164,9 +193,11 @@ for n in MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE
   [ -z "${!n+x}" ] || forward+=("--setenv=$n=${!n}")
 done
 systemd-run --user --unit "$unit" --collect -q "${forward[@]}" \
-  -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" \
+  -p MemoryMax="$mem" -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec="$runtime" -p UMask=0022 \
   --setenv=HOME="$HOME" --setenv=USER="$USER" --setenv=PATH="$PATH" \
   --setenv=MBX_REMOTE_TOKEN_FILE="${MBX_REMOTE_TOKEN_FILE:-}" --setenv=SPARKLES_REMOTE_EXECUTOR="$executor" \
   --setenv=GATE_CARGO_JOBS="$cargo_jobs" --setenv=GATE_BASE="$base" --setenv=GATE_FULL="$all_checks" \
+  --setenv=GATE_MIN_FREE_GIB="${min_free:-110}" \
   timeout --signal=TERM --kill-after=30s "$runtime" "$bin/gate-inner.sh" "$full" "$name" "$part" "$jobs"
+[ "$executor" != boat ] || exec 7>&-
 echo "$unit"

@@ -43,9 +43,11 @@ exposes no `memory.stat` is refused.
 `admit` resolves `mbx` and `rustc` through the same environment that jobs receive. That
 environment puts the pinned mise MBX install on PATH, selects the pinned Rust toolchain
 with `RUSTUP_TOOLCHAIN` and turns off automatic toolchain installation. A missing `mbx`,
-an `mbx` found elsewhere or at another version, and a `rustc` at a version other than
-the pin each refuse admission with the reason named, rather than running with the
-rustup default.
+an `mbx` found elsewhere or at another version, a `rustc` at a version other than the pin,
+and a missing `rustdoc` or one at another version each refuse admission with the reason
+named, rather than running with the rustup default. The worker image keeps rustup's
+`rustdoc` proxy only in `/usr/local/cargo/bin`, so the job PATH includes it after
+`/usr/local/bin` for the doctests.
 
 Development credentials stay on the owned development worker. They are excluded from
 source packets, result manifests and reusable snapshot seeds. GitHub Actions retains
@@ -59,9 +61,11 @@ worker's configured remote cache, and the job shell drops any inherited token se
 The provider's snapshot saves the worker home but not `~/.cache`, so MBX's default cache
 directory would be empty after every resume. Every job therefore sets `MBX_CACHE_DIR` to
 `~/.local/share/mbx-cache`, which holds the worker's single shared store with its managed
-targets and incremental state, and the normal stop's snapshot keeps it. Its 64 GiB budget
-holds two release builds and the workspace test builds, and its 45 GiB free-space floor
-keeps the disk headroom that qualification requires. `admit` asks the pinned `mbx` for
+targets and incremental state, and the normal stop's snapshot keeps it. Its 40 GiB budget
+leaves a cold workspace test build room on the large worker's 146 GiB disk, and its 45 GiB
+free-space floor keeps the disk headroom that qualification requires. A build directory
+that a running build uses stays whatever its size, so the budget does not bound a build
+in progress. `admit` asks the pinned `mbx` for
 these effective settings and refuses a remote URL, a token setting, another cache
 directory or another budget. Laptops, gate hosts and other ssh hosts keep their own MBX
 configuration.
@@ -70,9 +74,9 @@ A cold server build on the 8-vCPU worker takes about 29 minutes, and the store t
 about 5 GiB of objects and a 5 GiB managed target. After a normal stop and a
 resume onto a new machine, the store comes back unchanged, and a rebuild of the same
 commit at its stable path takes about 4 minutes with no misses and gives the same binary.
-The snapshot holds the store's files, so a full 64 GiB store takes most of the 111 GB of
-own files that the provider restores on a large worker, and roadmap item 858 covers
-keeping the saved files under that limit.
+The snapshot holds the store's files, so a full 40 GiB store takes more than a third of the
+111 GB of own files that the provider restores on a large worker, and roadmap item 858
+covers keeping the saved files under that limit.
 
 A resume runs on a new machine and downloads the snapshot's files in the background. A
 file whose content arrives while a build reads it changes under the compiler, and mbx
@@ -160,13 +164,21 @@ mise run bench:jena-remote --executor "$worker" --no-build -- --arm sparkles=spa
 mise run test:partitioned --hosts "$worker" --no-local
 scripts/gate/setup-host.sh "$worker" wally
 scripts/gate/gate.sh --host "$worker" --helper none HEAD
+python3 scripts/remote-executor.py exec "$worker" 'python3 -I ~/gate/bin/disk_clean.py --force --log ~/gate/disk-clean.jsonl'
 mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
 
 The Jena example requires prepared bindings. Gates require the explicit setup command
 once per worker seed to copy public suites and prepare pytest. Boat jobs retain pinned
 tools without implicit reinstall. Screens/builds request at least 1800 remaining seconds
-and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. Partitions request
+and gates at least 7200 through `SPARKLES_REMOTE_MIN_LIFETIME`. A gate unit's runtime is
+computed to end `GATE_BOAT_RESERVE` seconds before the admitted end, 1200 by default, which
+leaves the closure watch its 900-second lead. The gate's start runs on the worker in the
+transient scope `gate-prep-NAME`, which systemd ends with all its processes
+`GATE_BOAT_PREP_SECONDS` after it begins, 900 by default, and the runtime adds that bound,
+so a late activation still ends in time. `gate.sh` computes the runtime before it sends the
+start, so a slow dispatch can still carry a gate past the lead, and roadmap item 803 keeps
+the absolute expiry open. Partitions request
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
 original qualification deadline. The legacy `--duration` screen option controls
 Namespace instance lifetime.
@@ -175,6 +187,13 @@ A worker kept warm past its jobs runs `boat:closure-watch`, which checks the job
 closure shortly before the guard's present end and finishes the operation, so the
 guard's stop does not depend on the provider TTL. The
 [scheduled closure](../scripts/boat/README.md#scheduled-closure) section describes it.
+
+A worker frees finished work when its root disk reaches 90% use, the level at which the
+provider warns the maintainer, and before the job-closure receipt of every stop, which the
+closure watch runs itself and the owner runs before `finish`. The cleanup removes finished
+gate worktrees and runs `mbx gc`, and keeps the store's live entries and every active
+job's files. The
+[disk cleanup](../scripts/boat/README.md#disk-cleanup) section describes where it runs.
 
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a
 host with a newer glibc do not run there. The executor does not choose the build host,
@@ -213,6 +232,39 @@ the pipes close even when closure stays unconfirmed. A transfer error stays the
 reported failure and carries the interrupt count. A command that would otherwise
 have returned is cancelled with `KeyboardInterrupt` once teardown ends. An
 unconfirmed closure after a zero exit is refused rather than reported as success.
+
+### Remote CI
+
+`scripts/remote-ci.sh` runs a lane's `scripts/ci.sh --fast --changed <base>` or a batch's
+`scripts/premerge.sh` on a gate host or an admitted Boat worker.
+
+```sh
+scripts/remote-ci.sh --host "$worker" --base origin/main HEAD
+scripts/remote-ci.sh --host "$worker" --premerge HEAD
+scripts/remote-ci.sh --host "$worker" --status ci-1234abcd-5678ef90
+scripts/remote-ci.sh --host "$worker" --fetch ci-1234abcd-5678ef90
+```
+
+The command bundles the commit and, for `--changed`, its merge base with the base, checks
+both on the host and starts the job as the user unit `gate-NAME`. The job script
+`scripts/gate/remote/ci-job.sh` runs the disk cleanup when the disk is 90% used, takes the
+heavy lock `~/gate/.lock`, adds a worktree, runs the check and removes the worktree, all
+inside that unit. On a Boat worker the job's end is fixed before the start at
+`REMOTE_CI_RESERVE` seconds before the admitted end, 1200 by default. The worker computes
+the unit's runtime from that end immediately before the start and refuses with under
+`REMOTE_CI_MIN_SECONDS` left, 600 by default. Because the runtime counts from the unit's
+activation, the job also stops its own unit at that end and takes every wait from it, and the
+unit's shutdown is bounded at 60 seconds, so the closure watch finds the job closed. Starts on
+one host are serialized, and a job of the same name starts only after the earlier unit has
+fully stopped. Under the heavy lock a job on a Boat worker needs `REMOTE_CI_MIN_FREE_GIB`
+free after the disk cleanup, 85 by default, and ends with exit 4 rather than start with
+less. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
+and the default adds 25% to that. The build cache does not help a second run on the large
+worker, because the test build stores about 48 GiB, more than the store's 40 GiB budget, so
+a rerun of the same commit measured 3 hits in 343 lookups and grew the disk by 65.7 GiB. The worker's disk timer stops any running job at 95% use, which is a recovery rather
+than a guarantee, since it checks once a minute and a build can fill the disk sooner. A job on an ssh host may run 6
+hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
+land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
 
 ## Source, results and cleanup
 
