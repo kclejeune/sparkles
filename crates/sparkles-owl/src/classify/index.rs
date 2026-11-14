@@ -271,6 +271,10 @@ pub struct Interner {
     /// the fresh role of each chain prefix, so that a later run over the same interner
     /// gives the prefix the same role
     prefix_roles: FxHashMap<(Role, Role), Role>,
+    /// the universals that the unfolding of a universal by an automaton made
+    /// ([`Interner::made_universal`]) and no normalization has named since, which a
+    /// later run over the same interner does not unfold again
+    made_universals: FxHashSet<Ex>,
     /// whether this is the interner of a chunk of a parallel normalization, which keeps
     /// intersections whole as [`Node::And`]
     chunk: bool,
@@ -372,6 +376,7 @@ impl Interner {
             + self.and_ops * 4
             + self.scope_bytes
             + self.prefix_roles.capacity() * 16
+            + self.made_universals.capacity() * 5
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
@@ -551,12 +556,39 @@ impl Interner {
             return e;
         }
         if let Some(&e) = self.map.get(&n) {
+            // a normalization names a universal that an automaton made, so it is
+            // unfolded from here on, as in a run that starts again
+            if !self.made_universals.is_empty() && matches!(n, Node::Forall(..)) {
+                self.made_universals.remove(&e);
+            }
             return e;
         }
         let e = self.nodes.len() as Ex;
         self.nodes.push(n);
         self.map.insert(n, e);
         e
+    }
+
+    /// The universal `∀r.x` of a transition of an automaton that unfolds a universal.
+    /// One that the interner did not hold is marked as made by an automaton, and a
+    /// run does not unfold a marked universal ([`Interner::made_by_automaton`]). A
+    /// run that starts again holds none of them when it chooses the universals to
+    /// unfold, and a kept interner holds those of the runs before.
+    pub fn made_universal(&mut self, r: Role, x: Ex) -> Ex {
+        let n = Node::Forall(r, x);
+        if let Some(&e) = self.map.get(&n) {
+            return e;
+        }
+        let e = self.nodes.len() as Ex;
+        self.nodes.push(n);
+        self.map.insert(n, e);
+        self.made_universals.insert(e);
+        e
+    }
+
+    /// Whether an automaton made the universal and no normalization has named it.
+    pub fn made_by_automaton(&self, e: Ex) -> bool {
+        self.made_universals.contains(&e)
     }
 
     pub fn get(&self, n: &Node) -> Option<Ex> {
@@ -2405,14 +2437,15 @@ fn horn_index(
         b.positive(e, it, ix);
     }
     // the universals on roles that chains reach, unfolded by the automata, each state a
-    // fresh class; the universals the automata make are not unfolded again
+    // fresh class; the universals the automata make are not unfolded again, in this
+    // run or in a later one over the same interner
     let mut flags = vec![0u8; it.nodes.len()];
     for (e, n) in it.nodes.iter().enumerate() {
         if let Node::Forall(r, f) = *n {
             if ix.is_universal(r) {
                 // a fact of a universal role, which `Index::build` lists
                 flags[e] |= super::horn::HornIx::GLOBAL;
-            } else if h.autos.contains_key(&r) {
+            } else if h.autos.contains_key(&r) && !it.made_by_automaton(e as Ex) {
                 flags[e] |= super::horn::HornIx::UNFOLDED;
                 unfold.push((e as Ex, r, f));
             }
@@ -2450,7 +2483,7 @@ fn horn_index(
             }
         }
         for &(p, l, q) in &a.trans {
-            let x = it.node(Node::Forall(l, states[q as usize]));
+            let x = it.made_universal(l, states[q as usize]);
             made.push(x);
             if states[p as usize] != x {
                 told.push((states[p as usize], x));

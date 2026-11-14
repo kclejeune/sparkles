@@ -110,6 +110,45 @@ fn a_change_after_a_horn_run_keeps_the_contexts_it_cannot_reach() {
     }
 }
 
+/// A universal over a transitive property, which the Horn rules unfold by the
+/// property's automaton into universals over fresh classes, with a class beside it.
+const UNFOLDED: &str = "TransitiveObjectProperty(:t)
+     SubClassOf(:A ObjectAllValuesFrom(:t :B))
+     SubClassOf(:A ObjectSomeValuesFrom(:t :C))
+     SubClassOf(:C ObjectSomeValuesFrom(:t :D))
+     SubClassOf(ObjectSomeValuesFrom(:t ObjectIntersectionOf(:D :B)) :P)
+     SubClassOf(:E :A)
+     SubClassOf(:K :L)";
+
+#[test]
+fn a_change_beside_an_unfolded_universal_keeps_its_holders() {
+    for threads in [1, 4] {
+        let (mut k, mut held) = started(UNFOLDED, threads);
+        let out = k.classify(&limits(threads)).unwrap();
+        // D, two steps of t from A, is in B by the unfolded universal
+        assert!(out.taxonomy.is_subclass(&c("E"), &c("P")));
+        // the universals that the automaton made are not unfolded in the runs after
+        // it, which would give them other classes each time and clear A and E
+        for round in 0..4 {
+            add(&mut k, &mut held, "SubClassOf(:M :K)");
+            let out = same_as_fresh(&mut k, &held, threads, "after a leaf joined");
+            assert!(out.stats.incremental, "the run started again");
+            assert_eq!(out.stats.cleared, 0, "in round {round}");
+            remove(&mut k, &mut held, "SubClassOf(:M :K)");
+            let out = same_as_fresh(&mut k, &held, threads, "after the leaf left");
+            assert!(out.stats.incremental, "the run started again");
+            assert!(out.stats.cleared <= 1, "in round {round}");
+        }
+        // a universal that the automaton made and an axiom then names is unfolded
+        // as in a run that starts again
+        remove(&mut k, &mut held, "SubClassOf(:E :A)");
+        let out = same_as_fresh(&mut k, &held, threads, "after E left A");
+        assert!(out.stats.incremental);
+        add(&mut k, &mut held, "SubClassOf(:E :A)");
+        same_as_fresh(&mut k, &held, threads, "after E came back");
+    }
+}
+
 #[test]
 fn a_removed_universal_takes_its_conclusions_with_it() {
     for threads in [1, 4, 8] {
