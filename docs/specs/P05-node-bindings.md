@@ -1585,6 +1585,17 @@ it while its queries run.
     it does now, and the RDF/JS term objects of a row are created when a property of the
     row is first read, with one object per distinct term in the batch. An export that
     writes bytes keeps using §3.7's byte streams, which create no term objects.
+  The term ids and the lazy terms are in place. A second pass profiled the calls on a
+  laptop at 105,302 triples. A streamed SELECT spent 35% of its samples in the memory
+  ledger, one pass per cell, and 7% hashing decoded terms to find repeats. Its batches now
+  ask each cell for its key and decode a term, through the budget, when the key is new to
+  the batch, and `Bindings.get` strips a variable's sigil without a regular expression.
+  The export of all 105,302 rows with every term read went from 117 to 48 ms at a load of
+  7 to 10 and from 162 to 74 ms at a load of 12, in runs whose spread calls for a rerun
+  on a quiet host. `has()` takes 0.7 µs in a tight loop against 0.1 µs for N3.js, and 15% of its
+  samples are the borrow tracking of the Node-API binding layer, so `hasAll` remains the
+  step that would change it. A trivial `ASK` takes 55 µs against the 30 µs of T1, nearly
+  all of it the hand-off to a worker thread and back.
 * **Release work** (item 58), designed in [X12](X12-release-engineering.md):
   * *npm publishing.* `node-packages.yml` builds and checks the packages, and publishing
     needs an explicitly enabled npm environment. Switching it on needs the npm scope,

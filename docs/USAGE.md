@@ -5718,7 +5718,8 @@ iterated, closed with `close()`, used as a context manager, asked for stats and
 serialized directly. When a Python cursor fails, during iteration or in `serialize()`,
 its status becomes `failed` and every later `next()` raises `InvalidInputError`, so a
 loop cannot mistake it for a complete answer. `serialize()` responds to Ctrl-C as a
-query does. `Dataset.query` and `Dataset.select` still run eagerly, because their
+query does. Iteration decodes up to 256 rows or one mebibyte of text ahead of the row
+it returns, and holds them outside the query's memory budget until they are read. `Dataset.query` and `Dataset.select` still run eagerly, because their
 results are collected values whose iteration cannot fail. Node runs `query`, `select`,
 `construct` and `queryToStream` in automatic mode by default and accepts
 `execution: 'eager' | 'streaming' | 'auto'` in its query options. A streamed Node result

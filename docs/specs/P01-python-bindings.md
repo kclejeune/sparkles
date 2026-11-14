@@ -1144,6 +1144,41 @@ retains both hashes, examples, every process sample and native provenance. The r
 `rustc` version is separate from the compiler that built the extension, and peak timed
 process RSS includes accumulated writes, so it is not a read-only memory measurement.
 
+### Per-call costs after the second pass
+
+A second look at item 33 profiled each call on a laptop at 105,302 triples with `perf`,
+and compared builds of the base and the changed source in interleaved runs of fresh
+processes. The host ran other work, so each figure is given with its one-minute load.
+
+The search of the base vocabulary took 45% of `in` and 15% of a value lookup. Pattern
+reads now remember what the base vocabulary answered for the terms a thread asked for
+last, in 1,024 slots per thread that hold the whole key, and `in` reads a `Quad` where
+it is. `in` went from 0.74 to 0.40 µs at a load of 4.4 to 4.7, against 1.31 µs for
+pyoxigraph. A value lookup stayed at 1.40 to 1.45 µs against 1.01 µs, and a scan of a
+subject at 7.4 µs against 5.7 µs. The memo costs each thread that reads patterns about
+115 KiB, and at most 320 KiB.
+
+The regular expression that renames generated variables in a result cache key took a
+fifth of a short property path query. A key that is all ASCII is now scanned by hand.
+`knows-reach` went from 20.9 to 15.7 µs at the same load, against 19.0 µs for
+pyoxigraph.
+
+A sync cursor handed out every row through the path of a fetch, which on Python's main
+thread is a helper thread. A fetch or a refill now decodes up to 256 rows or one
+mebibyte of text ahead in one detached call, and handing out a decoded row takes no
+work. A row on the main thread went from 2.56 to 1.76 µs at a load of 8 to 9, against
+0.82 µs for a row of the eager `query`. The rows decoded ahead are held outside the
+query's memory budget until they are handed out. The async bridge decodes a batch in one
+detached call and no longer reads the plan with every batch. Its rows went from about
+2.2 to 2.1 µs, since the event loop's own work per row and the memory ledger dominate
+them. The cursor figures come from a busy host and need a rerun on a quiet one.
+
+Three costs remain under item 33. PyO3's reference pool takes a lock on every call into
+the extension once any call has released the GIL, which is 13% of a value lookup's samples
+and 20% of a subject scan's. A cursor row passes the memory ledger once per cell, which is
+a third of its samples, where the result writers reserve once per row. The value lookup
+and the subject scan still trail pyoxigraph.
+
 ### Graph overview
 
 `Dataset.graph.groups(within, *, by=None, limit=None, at=None, ...)` binds the library's

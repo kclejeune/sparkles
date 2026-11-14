@@ -472,6 +472,17 @@ no permit.
   * *Batched calls.* `containsAll` and a `find` over several subjects in one call, used
     by `SmallQueries` when ARQ asks for a run of patterns, return their answers in one
     buffer.
+  A second pass profiled `Graph.contains` on a laptop at 105,302 triples. The search of
+  the base vocabulary for the pattern's three terms took 27% of its samples. The engine's
+  pattern reads now remember the base vocabulary's answers per thread, which serves the
+  purpose of the cached term ids above without a cache on the Kotlin side, and the reader
+  of an incoming batch keeps offsets for repeats in place of a copy of every term. In
+  interleaved runs at a load of 3 to 6, `Graph.contains` in its own read transaction went
+  from about 1.2 to 0.8 µs against 0.49 µs for TIM. `getProperty` took about a tenth
+  less, near 1.8 µs against 0.72 µs, within a spread that needs a quieter host to
+  settle, and `find` on a subject did not change at 4.3 µs against 2.5 µs. The one JNI
+  entry point for a read outside a transaction exists. Batched calls remain, and need
+  an API decision.
 * **JVM metrics** ([ROADMAP](../../ROADMAP.md) item 76). [FEATURES](../../FEATURES.md) lists no
   JVM metrics. The server's metrics are counted in `crates/sparkles-server/src/obs.rs` and
   are not reachable from the library, and the FFI exposes no dataset statistics. The
