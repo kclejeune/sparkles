@@ -611,6 +611,21 @@ impl Engine<'_> {
         Ok(b)
     }
 
+    /// The term of a query result whose blank nodes are new in each query: a blank node
+    /// the query made, rather than one of the store or one it was given, gets a label
+    /// that starts with `tag`, which the caller makes unique per query.
+    pub(crate) fn fresh_result_term(ctx: &Ctx, id: Id, tag: &str) -> Option<Term> {
+        match Self::result_term(ctx, id)? {
+            Term::BlankNode(b) if sparkles_core::store::parse_bnode_label(b.as_str()).is_none() => {
+                let label = ctx
+                    .outside_label(id)
+                    .unwrap_or_else(|| format!("{tag}x{}", b.as_str()));
+                Some(Term::BlankNode(oxrdf::BlankNode::new_unchecked(label)))
+            }
+            t => Some(t),
+        }
+    }
+
     pub(crate) fn result_term(ctx: &Ctx, id: Id) -> Option<Term> {
         if id.is_undef() {
             return None;
@@ -917,5 +932,37 @@ mod tests {
         let (_, ctx) = engine.run_query(&query, &[]).unwrap();
         assert!(!ctx.allow_service);
         assert!(ctx.forbid_service);
+    }
+
+    #[test]
+    fn a_query_result_keeps_the_blank_nodes_it_was_given_and_renames_its_own() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let shapes = crate::Shapes::default();
+        let (data, ids) =
+            crate::data::DataGraph::new(store.snapshot(), None, &[], &[], &shapes).unwrap();
+        let engine =
+            crate::validate::Engine::new(&shapes, &data, ids, &crate::ValidateOptions::default())
+                .unwrap();
+        let query = sparkles_core::sparql::parse_query(
+            "SELECT ?given ?made WHERE { BIND($a AS ?given) BIND(BNODE() AS ?made) }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let given = oxrdf::Term::BlankNode(oxrdf::BlankNode::new_unchecked("q3xq0"));
+        let (table, ctx) = engine.run_query(&query, &[("a", given.clone())]).unwrap();
+        let col = |name: &str| {
+            (0..table.width())
+                .find(|&c| ctx.var_name(table.vars[c]) == name)
+                .unwrap()
+        };
+        let term = |c: usize| {
+            crate::validate::Engine::fresh_result_term(&ctx, table.get(0, c), "q9").unwrap()
+        };
+        assert_eq!(term(col("given")), given);
+        let oxrdf::Term::BlankNode(made) = term(col("made")) else {
+            panic!("not a blank node")
+        };
+        assert!(made.as_str().starts_with("q9x"), "{made}");
     }
 }

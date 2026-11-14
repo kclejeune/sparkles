@@ -298,8 +298,9 @@ impl RuleData {
             .ok_or_else(|| anyhow!("cannot decode id {id:?}"))
     }
 
-    /// Evaluate `rule` over the data graph and pass each triple it infers to `emit`, at
-    /// most once per focus node. The caller removes duplicates across focus nodes.
+    /// Evaluate `rule` over the data graph and pass each triple it infers to `emit`. A
+    /// triple rule passes each triple once per focus node, a SPARQL rule once per solution
+    /// and template triple, and the caller removes the duplicates, within its budget.
     pub fn run(
         &self,
         shapes: &Shapes,
@@ -329,26 +330,40 @@ impl RuleData {
                     if os.is_empty() {
                         continue;
                     }
-                    let ss = engine.eval(*subject, f, &scope, &mut cx)?;
-                    let ps = engine.eval(*predicate, f, &scope, &mut cx)?;
-                    let mut seen = rustc_hash::FxHashSet::default();
+                    // the subjects that are not literals and the predicates that are
+                    // IRIs, each once, so that every combination is a new triple
+                    let mut ss = engine.eval(*subject, f, &scope, &mut cx)?;
+                    ss.sort_unstable();
+                    ss.dedup();
+                    let mut keep = Vec::with_capacity(ss.len());
+                    for s in ss {
+                        if !matches!(self.term_of(s)?, Term::Literal(_)) {
+                            keep.push(s);
+                        }
+                    }
+                    let ss = keep;
+                    let mut ps = engine.eval(*predicate, f, &scope, &mut cx)?;
+                    ps.sort_unstable();
+                    ps.dedup();
+                    let mut keep = Vec::with_capacity(ps.len());
+                    for p in ps {
+                        if matches!(self.term_of(p)?, Term::NamedNode(_)) {
+                            keep.push(p);
+                        }
+                    }
+                    let ps = keep;
+                    let mut os = os;
+                    os.sort_unstable();
+                    os.dedup();
                     let mut n = 0u32;
                     for s in &ss {
-                        if matches!(self.term_of(*s)?, Term::Literal(_)) {
-                            continue;
-                        }
                         for p in &ps {
-                            if !matches!(self.term_of(*p)?, Term::NamedNode(_)) {
-                                continue;
-                            }
                             for o in &os {
                                 n = n.wrapping_add(1);
                                 if n % 4096 == 0 {
                                     engine.check_limits()?;
                                 }
-                                if seen.insert([*s, *p, *o]) {
-                                    emit([self.node(*s)?, self.node(*p)?, self.node(*o)?])?;
-                                }
+                                emit([self.node(*s)?, self.node(*p)?, self.node(*o)?])?;
                             }
                         }
                     }
@@ -379,23 +394,10 @@ impl RuleData {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // a blank node the query made is new in each execution: its label is kept apart
         // from those of the other executions of the rule
-        let fresh = |t: Term| -> Term {
-            match t {
-                Term::BlankNode(b)
-                    if sparkles_core::store::parse_bnode_label(b.as_str()).is_none() =>
-                {
-                    Term::BlankNode(oxrdf::BlankNode::new_unchecked(format!(
-                        "e{exec}x{}",
-                        b.as_str()
-                    )))
-                }
-                t => t,
-            }
-        };
+        let tag = format!("e{exec}");
         // a blank node is named by every variable of the solution, so that solutions
         // that differ only in a variable the template does not use still differ
         let all: Vec<(String, usize)> = table_vars(&table, &ctx);
-        let mut seen = rustc_hash::FxHashSet::default();
         for row in 0..table.len() {
             if row % 4096 == 4095 {
                 engine.check_limits()?;
@@ -407,8 +409,8 @@ impl RuleData {
                 let Some(&(_, col)) = all.iter().find(|(n, _)| n == name) else {
                     return Ok(None);
                 };
-                match Engine::result_term(&ctx, table.get(row, col)) {
-                    Some(t) => Ok(Some(self.node(self.data.resolve_shared(&fresh(t), true))?)),
+                match Engine::fresh_result_term(&ctx, table.get(row, col), &tag) {
+                    Some(t) => Ok(Some(self.node(self.data.resolve_shared(&t, true))?)),
                     None => Ok(None),
                 }
             };
@@ -453,10 +455,7 @@ impl RuleData {
                 if !self.valid_subject(&s)? || !self.valid_predicate(&p)? {
                     continue;
                 }
-                let triple = [s, p, o];
-                if seen.insert(triple.clone()) {
-                    emit(triple)?;
-                }
+                emit([s, p, o])?;
             }
         }
         Ok(())

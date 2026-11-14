@@ -74,19 +74,9 @@ impl Engine<'_> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The id of a term from the result of query `call`. A blank node the query made,
-    /// rather than one of the store, is new in each query, so its label is kept apart from
-    /// those of the other queries.
-    fn result_id(&self, t: &Term, call: u64) -> Id {
-        match t {
-            Term::BlankNode(b) if sparkles_core::store::parse_bnode_label(b.as_str()).is_none() => {
-                self.lit_id(&Term::BlankNode(oxrdf::BlankNode::new_unchecked(format!(
-                    "q{call}x{}",
-                    b.as_str()
-                ))))
-            }
-            t => self.lit_id(t),
-        }
+    /// The id of the result `id` of query `call` ([`Engine::fresh_result_term`]).
+    fn result_id(&self, ctx: &sparkles_core::sparql::Ctx, id: Id, call: u64) -> Option<Id> {
+        Self::fresh_result_term(ctx, id, &format!("q{call}")).map(|t| self.lit_id(&t))
     }
 
     fn is_true(&self, id: Id) -> bool {
@@ -510,9 +500,9 @@ impl Engine<'_> {
                     let (table, ctx) = self.run_query(query, &binds)?;
                     if !table.is_empty()
                         && table.width() > 0
-                        && let Some(t) = Self::result_term(&ctx, table.get(0, 0))
+                        && let Some(id) = self.result_id(&ctx, table.get(0, 0), self.next_call())
                     {
-                        out.push(self.result_id(&t, self.next_call()));
+                        out.push(id);
                     }
                     let mut i = vals.len();
                     loop {
@@ -550,9 +540,8 @@ impl Engine<'_> {
         }
         let call = self.next_call();
         for row in 0..table.len() {
-            let id = table.get(row, 0);
-            if let Some(t) = Self::result_term(ctx, id) {
-                out.push(self.result_id(&t, call));
+            if let Some(id) = self.result_id(ctx, table.get(row, 0), call) {
+                out.push(id);
             }
         }
         Ok(out)
