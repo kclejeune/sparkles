@@ -54,6 +54,7 @@
 //! that takes it past [`SAMPLE_ROWS`](crate::facts::SAMPLE_ROWS) rows, whatever share
 //! of the rows belongs to other graphs. A sample of a relation makes one such read per
 //! start, and a count reads the index's blocks at the two ends of its range at most. A
+//! read that merges the delta can decode one block or segment more than it reads. A
 //! plan makes at most [`PROBES`] probes, and the facts they keep are charged to the
 //! run's memory budget, [`PROBE_BYTES`] each, until the plan is made. A plan that
 //! needs more probes, or more memory than the budget has left, or whose costs
@@ -287,8 +288,10 @@ fn plan_within(
         let (_, greedy_cost) = walk.run(Some(&greedy_order), SAMPLE);
         let (order, cost) = walk.run(None, SAMPLE);
         // a walk that ran out of probes or of memory, or failed to read the store, has
-        // no estimate
-        if walk.spent || order == greedy_order || !saves(cost, greedy_cost) {
+        // no estimate, and neither has one whose statistics hold a count that the index
+        // could not give
+        let uncounted = g.base().is_some_and(|b| b.uncounted());
+        if walk.spent || uncounted || order == greedy_order || !saves(cost, greedy_cost) {
             return None;
         }
         let steps = steps_in_order(rule, ranges, &order)?;
@@ -466,7 +469,8 @@ impl Walk<'_> {
             });
         }
         let mut p = self.probe_now(pattern, lo, hi);
-        p.facts.shrink_to_fit();
+        // a buffer of the facts' number, whatever the one they were gathered in holds
+        p.facts = p.facts.as_slice().to_vec();
         let p = std::rc::Rc::new(p);
         self.probes.insert((pattern, lo, hi), p.clone());
         p

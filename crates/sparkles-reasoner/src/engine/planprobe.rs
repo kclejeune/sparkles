@@ -19,7 +19,9 @@
 //! planner's own order have no time limit, as the run's evaluation of it has none. A
 //! plan is probed only when the builtins of its rule are comparisons, type tests and
 //! `noValue`. Other builtins make terms or compile patterns, which each evaluation
-//! would add to the run's terms and charge to its budget.
+//! would add to the run's terms and charge to its budget. The evaluations still read
+//! the store through the run's remembered lookups, so the patterns they ask for are
+//! remembered and charged to the run as the run's own are.
 
 use super::sampled::steps_in_order;
 use super::*;

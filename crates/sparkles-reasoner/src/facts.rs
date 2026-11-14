@@ -178,6 +178,8 @@ pub(crate) struct Base {
     len: u32,
     /// per predicate: quads in the store (an upper bound of the tier's)
     counts: RwLock<FxHashMap<u64, u64>>,
+    /// whether a count could not be read from the index, and [`UNCOUNTED`] stood for it
+    uncounted: std::sync::atomic::AtomicBool,
     scans: AtomicU64,
     /// the remembered lookups of a kept closure
     lookups: Option<Lookups>,
@@ -259,6 +261,7 @@ impl Base {
             sorted,
             len: n as u32,
             counts: RwLock::new(FxHashMap::default()),
+            uncounted: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             lookups: None,
         })
@@ -357,7 +360,9 @@ impl Base {
         if let (1, Some(p)) = (n, p) {
             return self.count_p(p);
         }
-        self.snap.count(perm, &prefix[..n]).unwrap_or(UNCOUNTED)
+        self.snap
+            .count(perm, &prefix[..n])
+            .unwrap_or_else(|_| self.no_count())
     }
 
     /// The permutation and the key prefix of a pattern.
@@ -781,8 +786,10 @@ impl Base {
     /// whether it took the fact. A start reads no further than the end of its own block,
     /// and it stops at the block, the segment or the row of the snapshot's delta that
     /// takes it past [`SAMPLE_ROWS`] rows, whatever share of the rows belongs to other
-    /// graphs or fails the pattern. A start also gives up after a few facts that `f`
-    /// does not take. Returns whether the sample read every fact of the pattern, which
+    /// graphs or fails the pattern. A scan that merges the delta decodes its next block
+    /// or segment before it learns that the allowance is spent, so a start can decode
+    /// one more than it reads. A start also gives up after a few facts that `f` does
+    /// not take. Returns whether the sample read every fact of the pattern, which
     /// one start does when its scan runs to the end of the pattern's range.
     pub fn sample(
         &self,
@@ -1017,6 +1024,19 @@ impl Base {
         self.snap.count(Perm::Pos, &[p, o]).map_or(true, |n| n > 0)
     }
 
+    /// [`UNCOUNTED`], for a count the index could not give, which is remembered.
+    fn no_count(&self) -> u64 {
+        self.uncounted.store(true, Ordering::Relaxed);
+        UNCOUNTED
+    }
+
+    /// Whether a count of this tier could not be read from the index so far, so that
+    /// an estimate may rest on [`UNCOUNTED`]. The greedy planner takes such an estimate
+    /// as it is, and the sampled planner keeps the greedy order.
+    pub fn uncounted(&self) -> bool {
+        self.uncounted.load(Ordering::Relaxed)
+    }
+
     /// Quads with predicate `p` in the store: an upper bound of the tier's facts.
     /// [`UNCOUNTED`] when the index cannot be read.
     pub fn count_p(&self, p: u64) -> u64 {
@@ -1027,7 +1047,10 @@ impl Base {
         // ends of the predicate's range
         let n = match self.snap.predicate_count(Perm::Pso, &[p]) {
             Some(n) => n,
-            None => self.snap.count(Perm::Pso, &[p]).unwrap_or(UNCOUNTED),
+            None => self
+                .snap
+                .count(Perm::Pso, &[p])
+                .unwrap_or_else(|_| self.no_count()),
         };
         self.counts.write().insert(p, n);
         n
@@ -1157,9 +1180,11 @@ mod tests {
         assert!((1..=4 * (4 * 8 + 8)).contains(&offered), "{offered}");
     }
 
-    /// A sample reads the block of each start and no further, whatever share of the
-    /// rows belongs to graphs that are not read. Two input graphs hold a few facts of a
-    /// predicate and a third graph, which is not an input, holds 400,000.
+    /// A sample does not read a relation through, whatever share of its rows belongs to
+    /// graphs that are not read: the rows its starts enter are within the allowance and
+    /// one block for each start. Two input graphs hold a few facts of a predicate and a
+    /// third graph, which is not an input, holds 400,000. The count is of rows entered
+    /// in all, not of blocks decoded by each start.
     #[test]
     fn a_sample_reads_one_block_per_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -1212,8 +1237,9 @@ mod tests {
         }
     }
 
-    /// The rows of the snapshot's delta are read within the allowance too: 60,000 quads
-    /// of a graph that is not read, inserted in one commit and held in no block.
+    /// The rows of a snapshot's delta are read within the allowance too: 60,000 quads of
+    /// a graph that is not read, inserted in one commit and held in no block. A delta
+    /// over blocks or segments, and deleted rows, are not covered here.
     #[test]
     fn a_sample_of_a_delta_stops_at_its_allowance() {
         let store = Store::in_memory(StoreOptions::default());
