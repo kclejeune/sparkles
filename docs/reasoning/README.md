@@ -888,11 +888,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
   restrictions over a transitive symmetric role derives each link of the transitive
   closure once per intermediate class, so it sends three billion messages for 32 million
-  conclusions. On `atlas` it takes 13.5 s on four threads and 9 s on twelve, and peaks at
-  5.1 GiB on four threads. Konclude 0.7.0 classifies it in 9.5 s on the same host at 6.7 GiB, with any
-  number of workers, so a run on four threads is 1.4 times slower in three quarters of
-  the memory and a run on twelve faster. Roadmap item 889 follows the rest of the
-  message cost.
+  conclusions. On `atlas` its saturation takes 8.9 s on four threads, 7.4 s on twelve and
+  24.6 s on one. Konclude 0.7.0 classifies it in 9.5 s on the same host at 6.7 GiB, with
+  any number of workers. Close to half of a four-thread run's cycles go to the checks of
+  the repeated messages against the contexts' tables, which roadmap item 956 follows. The ontology
+  takes the Horn rules, which classify it in 13.9 s on four threads with a peak resident
+  set of 6.0 GiB on `atlas`, as the
+  [EL classification results](../benchmarks/el-classification/RESULTS.md#symmetric-transitive-properties-with-the-horn-rules)
+  show.
 * A small ontology's first classification in a process on several threads starts its
   helper threads after 0.5 ms of work, and later ones after as long as the last start of
   the helpers took. Warm runs of some small files on eight threads take up to 0.2 ms

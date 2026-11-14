@@ -206,6 +206,17 @@ ms without it on one thread, where the entry above gives the times without steps
 than 10 ms take 9% longer in steps on one thread in sum and 4% longer on four, which
 roadmap item 950 follows. This is roadmap item 727.
 
+The EL saturation writes each chunk of a context's link products once for all the
+contexts it goes to, checks a congested delivery's run against the destination's tables
+in one inlined loop, and applies the batch an activation takes from its to-do list in
+place (roadmap item 889). Every context receives the same messages in the same order. On
+atlas the saturation of `ore_ont_8737` by the EL rules takes 8.9 s on four threads
+instead of 13.7 s, 24.6 s on one instead of 45.0 s and 7.4 s on twelve instead of 9.3 s,
+ChEBI lite classifies 8 to 14% faster and GO 1 to 3% faster, and the taxonomies of the
+298 ORE 2015 EL files, GO, ChEBI lite and `ore_ont_8737` are unchanged. An
+open-addressing table for large sets measured no faster and was reverted. The filter's
+remaining cost is item 956.
+
 ### Ask latency
 
 An ask whose question names an ambiguous mention now asks which one is meant before it

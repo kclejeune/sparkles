@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Writes the record.json of the atlas measurements of item 889 from a slot directory.
+
+record889.py OUT.json stanley.json PROF_DIR SLOT_DIR...: each SLOT_DIR holds log.txt, mem/ and the
+out-* directory of ab.sh. PROF_DIR holds the flat reports and JSON lines of prof889.sh on atlas.
+stanley.json is merged in as the "stanley" member and holds the profiles, the interleaved
+rounds and the taxonomy sweeps taken on the laptop.
+"""
+import json
+import statistics as st
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+med = st.median
+
+
+def rows(p):
+    return [json.loads(line) for line in (p / "runs.jsonl").read_text().splitlines() if line.strip()]
+
+
+def ab(R):
+    out = {}
+    for d in sorted(R.glob("out-*")):
+        g = defaultdict(list)
+        for r in rows(d):
+            if r.get("failed"):
+                g[(r["file"], r["threads"], r["side"])].append(None)
+                continue
+            g[(r["file"], r["threads"], r["side"])].append(r)
+        res = {}
+        for (f, t, s), v in sorted(g.items()):
+            ok = [x for x in v if x]
+            res[f"{f} t{t} {s}"] = {
+                "classify_median_ms": round(med(x["classifyMedianMs"] for x in ok), 2),
+                "saturation_ms": round(med(x["saturationMs"] for x in ok), 2),
+                "index_ms": round(med(x["indexMs"] for x in ok), 2),
+                "rounds_ms": [round(x["classifyMedianMs"], 2) for x in ok],
+                "failed": len(v) - len(ok),
+            }
+        out[d.name] = {
+            "env": (d / "env.txt").read_text().split("\n"),
+            "results": res,
+            "taxonomy_sha256": (d / "taxonomy.sha256").read_text().split("\n"),
+        }
+    return out
+
+
+def mem(R):
+    out = {}
+    log = (R / "log.txt").read_text().splitlines()
+    for f in sorted((R / "mem").glob("*.json")):
+        try:
+            j = json.loads(f.read_text())
+        except ValueError:
+            out[f.stem] = {"failed": True, "err": (R / "mem" / (f.stem + ".err")).read_text()[-500:]}
+            continue
+        time = dict(x.split("=") for x in (R / "mem" / (f.stem + ".time")).read_text().split())
+        s, t, r = f.stem.split(".")
+        line = next((l for l in log if f" {s} {t} {r} " in l), "")
+        out[f.stem] = {
+            "classify_s": round(j["classifyMs"][0] / 1000, 2),
+            "saturation_s": round(j["saturationMs"] / 1000, 2),
+            "wall_s": float(time["wall"]),
+            "cpu_s": round(float(time["user"]) + float(time["sys"]), 2),
+            "peak_rss_gib": round(int(time["rss_kib"]) / 2**20, 2),
+            "peak_estimate_gib": round(j["peakEstimatedBytes"] / 2**30, 2),
+            "conclusions": j["conclusions"],
+            "horn_over_budget": j["hornOverBudget"],
+            "taxonomy": line.split("tax=")[1].split()[0] if "tax=" in line else None,
+            "tier": j["tier"],
+        }
+    return out
+
+
+def konclude(R):
+    out = {}
+    for f in sorted((R / "konclude").glob("konclude.t*.json")) if (R / "konclude").exists() else []:
+        j = json.loads(f.read_text())
+        out[f.stem] = {k: j[k] for k in ("threads", "label", "parseMs", "classifyMs", "totalMs", "wallMs", "peakRssKib", "classes", "consistent") if k in j}
+    return out
+
+
+def profiles(P):
+    out = {}
+    for f in sorted(P.glob("*.txt")):
+        side = f.name[: -len(".sym.txt")]
+        j = json.loads((P / (f.name[:-4] + ".json")).read_text())
+        top = []
+        for line in f.read_text().splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].endswith("%") and parts[2] == "[.]":
+                top.append({"percent": float(parts[0][:-1]), "samples": int(parts[1]), "symbol": parts[3]})
+        top.sort(key=lambda x: -x["samples"])
+        samples = next(l.split()[2] for l in f.read_text().splitlines() if l.startswith("# Samples"))
+        out[side] = {"saturation_ms": round(j["saturationMs"], 1), "classify_ms": round(j["classifyMs"][0], 1), "samples": samples, "top": top[:15]}
+    return out
+
+
+def slot(R):
+    log = (R / "log.txt").read_text().splitlines()
+    return {
+        "binary_sha256_prefix": {l.split()[2]: l.split()[3] for l in log if " sha " in l},
+        "started": log[0].split()[0],
+        "ended": log[-1].split()[0],
+        "ore_ont_8737": mem(R),
+        "ab": ab(R),
+        "konclude": konclude(R),
+        "log": log,
+    }
+
+
+rec = {
+    "suite": "el-classification",
+    "kind": "measurement",
+    "scale": "ore_ont_8737 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on atlas",
+    "host": {"name": "atlas", "cpu": "13th Gen Intel(R) Core(TM) i5-13500", "cpus": 20, "ram_mib": 15620},
+    "manifest": {
+        "sides": {
+            "base": "3a1b9b04, the lane's base, lane/dl-897-727 with item 818 and the main of batch 20",
+            "c3": "1da472f2, one copy of a run for all its destinations, the inlined check of a run and the batch applied in place, the lane's final saturation code",
+            "c4": "79b0c707, c3 with the open-addressing table of Small and the fix of review round 1, reverted in bfa3401b since it measured no faster",
+        },
+        "build": "mbx build --release -p sparkles-owl --example el_classify on stanley at each commit, stripped and copied to atlas",
+        "scripts": ["slot889.sh.txt", "ab.sh.txt", "prof889.sh.txt", "record889.py.txt"],
+        "profiles": "prof889.sh profiled base and c4 with their symbols kept, perf 7.3.1, cpu-clock:u at 999 Hz, ore_ont_8737 on four threads",
+    },
+    "settings": {
+        "memory_runs": "three rounds of rotating order, one el_classify process per side and thread count in a 13 GiB scope, no swap, no pinning, wall time, CPU time and peak RSS from GNU time",
+        "ab_runs": "ab.sh, six rounds of rotating order, five classifications per process, one-thread runs pinned to CPU 4 and the others to CPUs 0-11",
+    },
+    "method": "Every part ran under ~/lanes/.heavy.lock on atlas with no other benchmark or gate on the host. slot889.sh ran three rounds of one classification of ore_ont_8737 per side on 4, 12 and 1 threads, then ab.sh with six rounds of rotating order, one process per side, file and thread count with --repeat 5, whose median classification is the round's value. On every side the Horn attempt of ore_ont_8737 passes its memory budget and the classifier classifies again by the EL rules alone (roadmap item 962), so saturation_s is the saturation of that second run and classify_s includes the attempt. The stanley member holds the profiles, the interleaved rounds and the taxonomy sweep taken on the laptop while other work ran there, so only their shares, ratios and hashes are evidence.",
+    "slots": {Path(d).name: slot(Path(d)) for d in sys.argv[4:]},
+    "atlas_profiles": profiles(Path(sys.argv[3])),
+    "stanley": json.loads(Path(sys.argv[2]).read_text()),
+}
+Path(sys.argv[1]).write_text(json.dumps(rec, indent=1) + "\n")
+print("wrote", sys.argv[1])
