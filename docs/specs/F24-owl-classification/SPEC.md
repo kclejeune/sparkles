@@ -1253,7 +1253,8 @@ follows. `shq-041` derives 17,844 conclusions with the order between number rest
 and 71,345 without it.
 
 A context that has processed 256 of its clauses in one activation gives way to the
-contexts that its worker woke. It goes behind them in the worker's queue with its other
+contexts that its worker woke. The count includes the minimums whose witnesses the
+context released. It goes behind them in the worker's queue with its other
 clauses left in its store, and its next activation takes them up. Without this step a
 context on one thread derives everything it can before any other context runs, and what
 the others conclude can make most of that work unnecessary. The generated ontology
@@ -2595,16 +2596,17 @@ against 83 and 119 without it, and no run answers a subsumption that the referen
 not entail.
 
 The order is on by default for a run that counts because of these measurements. Two more
-files of the sample, two more of the 206 fixtures and 26 more of the 296 generated
-ontologies below finish with it, none that finishes without it stops finishing, and no
-answer differs from a finished run without it. Its one measured cost is ore_ont_6485.
+files of the sample finish with it and none that finishes without it stops finishing. Of
+the 296 generated ontologies below, 270 finish with the order and 255 without it on one
+thread. Sixteen finish only with it, and one, `fz-0081`, finishes only without it, in
+218,013 conclusions against 1,671,639 with the order. Of the 206 fixtures with a minimum
+or exact cardinality of two or more, 202 stay within the bound on one thread with the
+order and the same 202 without it. No answer differs from a finished run without the
+order. Its measured costs are ore_ont_6485 and `fz-0081`.
 
-A context that [gives way](#the-disjunctive-rules) to the contexts it woke changed two of
-these counts after the order became the default. The two fixtures now finish without the
-order as well, so 202 of the 206 stay within the bound on one thread with the order and
-without it. Of the generated ontologies 270 finish with the order and 255 without it on
-one thread. Sixteen finish only with it, and one, `fz-0081`, finishes only without it, in
-218,013 conclusions against 1,671,639 with the order.
+When the order became the default, a context did not yet
+[give way](#the-disjunctive-rules) to the contexts it woke. Two fixtures and 26 generated
+ontologies then finished only with the order, and none finished only without it.
 
 ore_ont_6485 remains a measured limitation. Its counting attempt still passes the bound
 with the order, and the failed attempt is dearer. The classification with counting
