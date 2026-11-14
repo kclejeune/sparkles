@@ -126,9 +126,11 @@ witnesses for a minimum that a minimum of the context entails. With it ore_ont_6
 ore_ont_10140 classify with counting on and give HermiT's and Konclude's taxonomies, 6.3
 and 6.5 times faster than Konclude 0.7.0 on four threads on `atlas` and 2.0 and 2.1 times
 on one. ore_ont_6485 still passes the bound, and its classification with counting
-requested, the failed attempt and the run without counting together, takes 3.1 times as
-long with the order as without it, 576 ms against 184 ms on one thread. The default
-accepts that cost, and item 896 follows that file and the default of counting.
+requested, the failed attempt and the run without counting together, takes 1.28 times as
+long with the order as without it, 157 ms against 123 ms on one thread. It took 3.1
+times as long, 576 ms against 184 ms, before a context gave way to the contexts it woke.
+The default accepts that cost, and item 896 follows that file and the default of
+counting.
 
 Item 897 gives each compound qualifier of a number restriction
 [a name of its own](#compound-qualifiers-of-number-restrictions) in a counting run. Before
@@ -137,13 +139,28 @@ restriction that no other axiom named counted no neighbour, and the run reported
 that missed the restriction's consequences as complete. The reported cases and a generated
 ontology that was reported consistent now have HermiT's answers, and the 205 files of the
 ORE 2015 DL development set that give a taxonomy with counting give the same bytes as
-before, with no change of their times observed. Counting the neighbours that were missed costs work. The fixture `shiq-038`
+before. The names alone changed no time in single runs, and the step in which a context
+gives way made the failed attempt of ore_ont_6485 cheaper. Counting the neighbours that were missed costs work. The fixture `shiq-038`
 derives 815,758 conclusions on one thread where it derived 246,957, so it passes the
 default bound of 262,144 and falls back there, and it finishes with HermiT's answer at a
 raised bound. A context of the disjunctive rules now
 [gives way](#the-disjunctive-rules) to the contexts it woke after 256 clauses, which
 keeps a generated ontology of this item within the bound on one thread. Counting stays
 off by default until item 896.
+
+Item 727 makes the disjunctive rules
+[proceed in steps](#steps-for-a-bound-that-every-schedule-shares) in a run that has a
+bound on its derived conclusions. `Limits::dl_steps` controls the steps and is on by
+default. Such a run derives the same conclusions on one thread and on eight, so that it
+keeps or passes its bound, and answers in full or falls back, in the same way on every
+schedule. The 150 counting fixtures and the generated ontologies of items 894 and 897
+show it, with the answers of a run without steps. On `atlas` on four threads the two ORE
+2015 DL files that finish with counting take 4.0 and 4.9% longer in steps, and the three
+whose attempt fails take 1.3 to 2.6 times less. With the steps ore_ont_6485's
+classification with counting requested takes 213 ms with the order between number
+restrictions against 188 ms without it on one thread. Item 950 follows the cost of the steps on
+ontologies that classify in a few milliseconds. A rooted run and a run with the eager
+strategy that counts take one thread with the option, which item 951 follows.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
@@ -628,7 +645,13 @@ transitive parthood properties are each other's inverses, and the contexts of
 conjunctions composed the parthood chains again until the run passed 10 GiB, with most
 of the memory in waiting messages. With the budget they classified in 4.2 s and 2.4 GB
 on four threads on the laptop, with the EL rules' answer. Item 693's chain selection
-below removed that composition, and both now finish with the Horn rules. On the
+below removed that composition, and both now finish with the Horn rules. The waiting
+messages count toward the budget, so a run near it depends on the schedule.
+ore_ont_16744 of that sample has a budget of 7.57 GB, and its Horn run on four threads on
+`atlas` peaked between 5.6 and 7.4 GB in the 11 of 16 runs that finished, over five
+versions of the classifier, and passed the budget in the other five, which then
+classified by the EL rules alone and reported the file's two Horn axioms as left out.
+All 16 taxonomies are the same bytes. Item 693 follows the file. On the
 benchmark host ore_ont_9663 takes 4.0 s and 1.0 GiB on one thread and 0.89 s and 1.4 GiB
 on eight, and ore_ont_14817 takes 2.2 s and 0.7 GiB and 0.46 s and 1.0 GiB. The EL rules
 alone take 0.77 and 0.68 s on one thread, and Konclude 0.7.0 took 8.9 to 9.7 s and 3.5
@@ -636,11 +659,12 @@ to 4.2 GB on four threads on the laptop. The two taxonomies miss 33 and 27 of Ko
 subsumptions, which follow from axioms that are not Horn, and give none that Konclude
 does not entail. On one thread the Horn rules still derive 52.0 million conclusions on
 ore_ont_9663 and 29.4 million on ore_ont_14817, where the EL rules derive 18.5 and 20.8
-million, which item 693 follows. No file of the development set below and no case of the
-differential test reaches the budget with item 693's rules, and the budget stays as a
-safety net. The largest Horn run of the development set, ore_ont_9855, classifies in 1.5
-s on one thread on the benchmark host against 4.4 s with the rules of phase 3, with a
-peak resident set of 359 MiB.
+million, which item 693 follows. Of the files of the development set below that the
+rules accepted before item 692, none reaches the budget with item 693's rules, and no
+case of the differential test does. ore_ont_8737 and, in some runs, ore_ont_16744, which
+the rules accept since item 692, reach it. The largest Horn run among the files accepted
+before item 692, ore_ont_9855, classifies in 1.5 s on one thread on the benchmark host
+against 4.4 s with the rules of phase 3, with a peak resident set of 359 MiB.
 
 A run with the Horn rules composes only the property chains that some negative existential
 restriction needs, and carries every other property inclusion by the automata (item 693).
@@ -1293,7 +1317,13 @@ and 71,345 without it.
 A context that has processed 256 of its clauses in one activation gives way to the
 contexts that its worker woke. The count includes the minimums whose witnesses the
 context released. It goes behind them in the worker's queue with its other
-clauses left in its store, and its next activation takes them up. Without this step a
+clauses left in its store, and its next activation takes them up. Before it gives way it
+sends the products of the links and propagations that the activation stored, which a
+context otherwise sends once its to-do list is empty, since its next activation pairs
+only what that activation stores. A generated ontology in which the clause that gives a
+context a class is the last of its share shows the need. Its context stored the
+propagation of `owl:Nothing` over a role and gave way, and 375 of 511 unsatisfiable
+classes were satisfiable on one thread. Without this step a
 context on one thread derives everything it can before any other context runs, and what
 the others conclude can make most of that work unnecessary. The generated ontology
 `qz-0048` of item 897 shows it. Its class `C1` has six successors under a maximum of
@@ -1311,14 +1341,18 @@ answer. One ontology of item 894's fuzz that derived 5.4 million conclusions pas
 bound of 8 million with the step, and it passes the default bound either way. Shares of
 64 and of 256 clauses measure alike, a share of 1,024 loses the seven, and shares of 16
 and of one clause move ontologies across the bound in both directions. The step does not
-make the bound deterministic, which stays item 727.
+make the bound deterministic, which the steps of item 727 do.
 
-The bound has a limit that this section states plainly. Near it, the thread schedule can
-decide whether a run answers in full or falls back, since the clauses stored at the
-fixpoint vary with the schedule, for example 3,229 to 6,762 on `sriq-010` at four threads
-against 3,253 on one. A fallback is always reported through the statistics and the axioms
-left out and is never a different complete answer, so a caller learns from
-`dl_counting_over` whether counting finished. A deterministic bound is item 727.
+A run without those steps, which `dl_steps: false` asks for, has a limit that this
+section states plainly. Near the bound, the thread schedule can decide whether the run
+answers in full or falls back, since the clauses stored at the fixpoint vary with the
+schedule, for example 3,229 to 6,762 on `sriq-010` at four threads against 3,253 on one.
+A fallback is always reported through the statistics and the axioms left out and is
+never a different complete answer, so a caller learns from `dl_counting_over` whether
+counting finished. `Limits::dl_steps`, which is on by default, removes the dependence. A
+run with the bound then
+[proceeds in steps](#steps-for-a-bound-that-every-schedule-shares) and derives the same
+conclusions on every number of threads.
 
 The generated `shq`, `shiq` and `sriq` fixtures equal HermiT 1.4.5.519 on every case that
 Tier D takes whole with counting on, on one and four threads and under both strategies. Of 50 cases each,
@@ -2633,6 +2667,12 @@ equal the reference and 117 leave axioms out and answer only entailed subsumptio
 against 83 and 119 without it, and no run answers a subsumption that the reference does
 not entail.
 
+Both sweeps were repeated after a context [gives way](#the-disjunctive-rules) to the
+contexts it woke. Each of the 205 taxonomies is the same bytes as in the sweep before
+it, with the order and without it, so the same two files finish only with the order and
+the judgments stand. The three files that pass the bound take 232 against 208 ms, 6.9
+against 6.5 s and 3.8 against 3.7 s for the whole run with the order and without it.
+
 The order is on by default for a run that counts because of these measurements. Two more
 files of the sample finish with it and none that finishes without it stops finishing. Of
 the 296 generated ontologies below, 270 finish with the order and 255 without it on one
@@ -2648,8 +2688,15 @@ ontologies then finished only with the order, and none finished only without it.
 
 ore_ont_6485 remains a measured limitation. Its counting attempt still passes the bound
 with the order, and the failed attempt is dearer. The classification with counting
-requested, which is the attempt and the run without counting together, takes 576 against
-184 ms on one thread on `atlas`, 3.1 times as long, and 688 against 245 ms on four. A
+requested, which is the attempt and the run without counting together, takes 157 against
+123 ms on one thread on `atlas`, 1.28 times as long, and 205 against 170 ms on four, 1.21
+times, as medians of three interleaved rounds of five classifications. Before a context
+gave way to the contexts it woke, it took 576 against 184 ms on one thread, 3.1 times as
+long, and 688 against 245 ms on four, and the counts of derivations in the rest of this
+paragraph are of that run. With a context that gives way, the attempt on one thread
+spends its 262,144 conclusions differently. The Pred rule and the lazy witnesses make
+60,038 and 45,432 of them, which are cheap, and the universal rule and the qualified
+roles make 50,841 and 9,688. A
 caller for whom that attempt matters sets `Limits::number_order` to false. The order removes the cheap
 derivations of the disjointness rule, which fall from 110,800 to 1,078, and the bound is
 then spent on the universal rule and the qualified roles, which rise from 30,563 and
@@ -2745,12 +2792,15 @@ answer at the raised bound of its test. `shiq-013` derives 15,468 against 62,548
 item 729 follows `shiq-038`. Its trace shows the cost in the at-most rule, which makes
 493,787 of the conclusions, with 182,774 from paramodulation, spread over six contexts
 that each derive more than 50,000. The same work appears on four threads, so the order
-in which the contexts run does not cause it. On the ORE 2015 DL development set no change
-was observed.
-Its 205 files that give a taxonomy with counting on four threads on `atlas` give the same
-bytes as before, the two versions of the Protein Ontology classify in 375 and 382 ms
-against 380 and 371 ms in one run each, which is not a benchmark, and ore_ont_6485,
-ore_ont_14817 and ore_ont_9663 pass the bound as before.
+in which the contexts run does not cause it. On the ORE 2015 DL development set no
+taxonomy changes. Its 205 files that give a taxonomy with counting on four threads on
+`atlas` give the same bytes as before the names, with the names alone and with a context
+that gives way, and ore_ont_6485, ore_ont_14817 and ore_ont_9663 pass the bound as
+before. With the names alone the two versions of the Protein Ontology classified in 375
+and 382 ms against 380 and 371 ms in one run each, which is not a benchmark. With a
+context that gives way they classify in 363 and 373 ms against 379 and 383 ms with the
+names alone, and ore_ont_6485's classification with its failed attempt takes 210 against
+715 ms, as medians of three interleaved rounds of five classifications on four threads.
 
 The regressions are in `tests/dl_tier_d.rs` and `tests/dl_nominals.rs`. They cover a
 maximum over an intersection, over an existential restriction on a simple, an inverse and
@@ -2793,6 +2843,201 @@ finished on four. There the order of the contexts was the cause, and a context t
 [gives way](#the-disjunctive-rules) to the contexts it woke removes it. The run on one
 thread now derives 29,625 conclusions and has HermiT's answer. The difference that
 remains between schedules is the subject of item 727.
+
+#### Steps for a bound that every schedule shares
+
+This subsection records what item 727 delivers. `Limits::dl_steps`, which is on by
+default, makes every saturation of the disjunctive rules proceed in steps in a run that
+has a bound on its derived conclusions. With it such a run derives the same conclusions,
+passes or keeps its bound on them, and so answers in full or falls back, in the same way
+on every number of threads and every schedule. The memory budget, the deadline and a
+cancellation still stop a run when their checks see them, and the Horn rules' fallback on
+their memory budget is unchanged.
+
+Three runs have the bound. They are a run that counts, the run that starts again without
+counting after it passed the bound, and a rooted run. A run that counts is one that
+`Limits::counting` allows on an ontology with an axiom that needs counting. A run of the
+disjunctive rules without the bound finishes with the same answer on every schedule, so
+the steps would change only its cost, and it keeps the driver without steps whatever the
+option says. Counting and the root are off by default, so a classification under the
+default limits runs as it did before this item. `dl_steps: false`, and `--no-dl-steps`
+of `el_classify`, give a run with the bound the driver without steps. Its workers
+deliver their messages during the saturation, with no step between them, a run near its
+bound can then answer in full on one schedule and fall back on another, and an attempt
+on several threads that passed the bound is repeated on one thread before the run falls
+back.
+
+A step works on a frontier of contexts. The frontier is a queue that the seeds start and
+the roots join while it holds fewer than 4,096 contexts, and a step takes its first
+4,096. In the first phase the workers activate those contexts. An activation reads only
+its context's state and to-do list, and its messages for other contexts go to a list of
+its worker, so that no to-do list changes during the phase. In the second phase the
+workers deliver the messages. Each worker takes the destinations of its share and reads
+every activation's messages in the order of the frontier, so a to-do list receives its
+messages by the place of their sender in the frontier and, for one sender, in the order
+it sent them, whatever the number of workers is. Between steps one thread sorts the
+contexts that the deliveries woke and appends them to the queue, and compares the count
+of derived conclusions with the bound. The count is then a sum over whole activations,
+which no schedule changes. A run in steps compares that total with the bound nowhere
+else.
+
+An activation of a run in steps has a share of 256 clauses of its store, with the
+minimums it released, and a share of 4,096 derived conclusions. The activation reads both
+between two clauses, so they are thresholds and not limits. One inference can derive more
+than 4,096 conclusions, and one release of minimums can pass 256. A context that used a
+share and has clauses left gives way whoever else waits. It goes on in a later step, at
+once when it has new messages and otherwise when no other context is active, since what
+the others conclude can close it. A context sends the products of its links and
+propagations when its to-do list is empty and before it gives way. The driver without
+steps also sends them from a long activation when a worker is idle, which a run in steps
+does not do, so the order of an activation's messages is the same on every schedule.
+
+An activation also compares its own count of derived conclusions with the run's bound. It
+does so between clauses and at each look at the bounds within an inference of many
+conclusions, which comes after every 256 choices, whether the inference reserves memory
+for its record of them or not. Once that count alone is more than the bound, the
+activation ends its inference and marks the run past its bound. It decides this from its
+own count, so no schedule changes it. The total is compared between steps only, so a run
+can pass its bound by the work of one step before that comparison, which is the same
+amount on every schedule.
+
+The steps do not change which workers do the work. A step with two contexts or more is
+shared among the workers when it has 128 contexts or when the activations of the last
+step took 150 µs, its messages are delivered by all workers from 4,096 messages on, and
+otherwise the calling thread does the step alone. The helper threads start with the first
+shared step and wait between phases until the calling thread opens the next, so a small
+ontology starts none. A worker that panics, in a caller's callback for example, stops the
+run and leaves its phase as it unwinds, and the calling thread releases the helpers when
+it unwinds, so the panic reaches the caller. The workers of the driver without steps stop
+the run in the same way. Until this item the other workers of either driver waited
+without end for the one that had panicked.
+
+The argument that an activation is a function of its context's state and its to-do list
+rests on three observations about a run without the root that uses the cautious strategy.
+The rules read the index, their own context's state, the cores of contexts, which do not
+change during a saturation, and clauses of the shared table by id. The ids of that table
+follow the order in which the workers push clauses, and a receiver uses an id only to
+read the clause, as a member of the set of clauses it has seen from a successor, and in
+that successor's list, which is in the order of arrival. Nothing sorts by a table id or
+iterates a table keyed by one. The subsumption tests between saturations make their
+contexts on one thread in a fixed order. Two kinds of ids are not canonical. A rooted run
+interns its literals in the order the workers meet them and compares them, and the eager
+strategy interns contexts during the run. With the option a rooted run, and a run with
+the eager strategy that has the bound, take one worker of the driver without steps, whose
+order is fixed. Their worlds and their taxonomy keep the caller's threads. Item 951 gives
+those ids a canonical order, so that these runs share their steps among the workers.
+`run_with` does not repeat on one thread an attempt that passed its bound, since the
+repeat would derive the same.
+
+The review of the design found a defect of the driver without steps as well. An inference
+too wide to make passed the bound by adding a quarter of the count's range, so four of
+them between two checks wrapped the count to a small number, and the run ended as
+complete without those inferences. The mark is now a flag that stays set.
+
+The tests are in `tests/dl_steps.rs` and in the classifier's unit tests. The 150 counting
+fixtures and the 27 generated ontologies of item 897 derive the same conclusions, store
+the same clauses and give the same answer on one, two, four and eight threads, with
+HermiT's answer where the run finishes. One generated ontology run 36 times on one, four
+and eight threads gives one outcome at the default bound, at a bound equal to the
+conclusions it derives and at one conclusion less, where every run falls back. A unit
+test runs an ontology of more than 8,192 contexts with every step and every delivery
+shared among the workers, on one, three and eight threads, and cancels runs at six
+points, after which the same classifier gives the outcome of a new one. Eager and rooted
+runs give one outcome on one, four and eight threads. Runs without counting on the `alc`
+and `shi` fixtures, which have no bound on their conclusions, give HermiT's answer on
+one, four and eight threads with the option and without it. A unit test reads from the
+poll of a cancellation which driver calls it. A run that counts is in steps under the
+default limits and without them with `dl_steps: false`, with one answer, and a run
+without counting is without steps either way. A rooted run that counts falls back twice
+past a bound of one conclusion with the option as without it. One inference that derives
+3,600 new conclusions ends within 1,000 at a bound of 300, where its reservations of
+memory did not look at the count. A callback that panics in a helper or in the calling
+thread ends the run with the panic, with the step driver and with the driver without
+steps.
+
+On the 750 ontologies of the counting fixtures and the two fuzz sets, at a bound of 8
+million, a run in steps gives the same work, stored clauses and taxonomy on one, three
+and eight threads. On one thread it derives 16.16 million conclusions in all on the 722
+ontologies that both drivers finish, against 16.24 million for the driver without steps,
+and the same 714 ontologies stay within the default bound. One ontology that the driver
+without steps does not finish within 8 million conclusions finishes in steps in 1.66
+million. The differential runs against HermiT give 270 equal and 26 sound answers of 296
+and 292 equal and 3 sound of 295, on one thread and on four, as the driver without steps
+does. Of the fixtures that the section on compound qualifiers names, `qz-0048` derives
+10,448 conclusions in steps and `shiq-038` 821,347, on every number of threads, where a
+run without steps derives 29,625 and 815,758 on one thread and 13,319 and 914,090 in one
+run on four.
+
+The cost against the driver without steps was measured on `atlas`, one process at a time
+in a 13 GiB scope, while other work kept the load average of the host between 2 and 6.
+The times are medians of five classifications in one process, and for the five ORE 2015
+DL files that attempt counting the median of three such processes for each driver, run in
+turn. They compare the two drivers on one host and are not a published benchmark. The
+table is of the classifier of commit 335fb9c7, which has the outbox of item 818, except
+the row of ore_ont_14817 on one thread, which is of commit b351050c.
+
+| File | Threads | Without steps | In steps |
+|---|---|---|---|
+| ore_ont_6952 | 4 | 359.3 ms | 373.8 ms |
+| ore_ont_10140 | 4 | 364.2 ms | 382.0 ms |
+| ore_ont_6485 | 4 | 203.9 ms, falls back | 77.6 ms, falls back |
+| ore_ont_14817 | 4 | 6,090 ms, falls back | 3,401 ms, falls back |
+| ore_ont_9663 | 4 | 3,349 ms, falls back | 2,551 ms, falls back |
+| ore_ont_6952 | 1 | 1,134.0 ms | 1,134.3 ms |
+| ore_ont_10140 | 1 | 1,163.1 ms | 1,165.0 ms |
+| ore_ont_6485 | 1 | 157.7 ms, falls back | 213.1 ms, falls back |
+| ore_ont_14817 | 1 | 132 s, falls back | 10.1 s, falls back |
+| ore_ont_9663 | 1 | 6,910 ms, falls back | 7,118 ms, falls back |
+
+On four threads the two files that finish take 4.0 and 4.9% longer in steps. The three
+that fall back take 1.3 to 2.6 times less, since a run in steps does not repeat its failed
+attempt on one thread. On one thread the two that finish take the same time within 0.2%,
+the fallback of ore_ont_6485 takes 35% longer and that of ore_ont_9663 3% longer. The time
+without steps for ore_ont_14817 on one thread is one classification, since five passed
+600 s.
+
+The cost on the two finishing files varies with the build by more than its size. The
+classifier of commit b351050c measured 3.4 and 3.5% on four threads and 1.1 and 1.3% less
+on one, in the same run as the table. A build of commit 451a6b76, whose saturation is
+that of b351050c, measured 12 and 13% on four threads and 12% on one. Item 950 times the
+files on the benchmark host.
+
+With the steps the classification of ore_ont_6485 with counting requested, the failed
+attempt and the run without counting together, takes 213 ms with the order between number
+restrictions and 188 ms without it on one thread, 1.14 times as long, and 78 against 68
+ms on four.
+
+With the classifier of commit b351050c, the 149 counting fixtures that both drivers
+finish at a bound of 8 million take 2,180 ms in steps against 2,046 ms on one thread in
+sum, 6.5% longer, and 1,146 against 1,360 ms
+on four, 16% less, where `sriq-004` derives 387,617 conclusions in steps against
+2,171,241. `shiq-028`, which passes the bound, takes 4,370 against 3,505 ms on one thread
+and 1,301 against 3,991 ms on four.
+
+The steps cost most on the smallest inputs. The fixtures that take less than 10 ms
+without steps, which are 144 of the 149 on one thread and 143 on four, take 9% longer in
+steps on one thread in sum and 4% longer on four. Single fixtures go both ways, up to
+0.79 ms against 0.17 ms on one thread and 8.7 ms against 3.6 ms on four. Item 950 follows
+this cost.
+
+A sweep of the 207 development files of the ORE 2015 DL sample with counting on four
+threads gives the same bytes under the default limits as without steps on each of the
+205 files that give a taxonomy. An earlier sweep, of commit b351050c with every
+saturation of the disjunctive rules in steps, gave those bytes too, and its times follow. The disjunctive rules answer
+92 of them within their bounds, in 22.2 s in steps against 22.7 s in single
+classifications. No cardinality restriction on an object property and no functional,
+inverse functional, disjoint or asymmetric object property occurs in 23 of the 92, so
+they have no bound and keep the driver without steps. The file with the largest ratio of
+the sweep is one of them, at 2.3 ms against 0.7 ms. At most the other 69 have the bound.
+They take 16.4 s in steps against 17.8 s, and the largest ratio among them is 0.86 ms
+against 0.33 ms.
+
+The steps are the default for the determinism, at the cost this subsection states. On
+four threads a run that finishes with counting takes 4 to 5% longer in the measured
+build, and a run that falls back takes less, since it makes its attempt once. On one
+thread the fallback of ore_ont_6485 takes 55 ms longer, and that of ore_ont_14817 takes
+10 s against 132 s without steps. The times above are from one host under load, and
+none is from the benchmark host.
 
 ### Nominals in the disjunctive rules
 

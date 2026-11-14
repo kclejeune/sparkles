@@ -116,12 +116,43 @@ the generated fixture `shiq-038` now passes the default bound of the counting ru
 DL development set keeps its taxonomies, and no change of its times was observed. This is roadmap item 897.
 
 A context of the disjunctive rules that has processed 256 of its clauses in one activation
-gives way to the contexts its worker woke. On one thread a context that equated its
+gives way to the contexts its worker woke, after it has sent the products of the links
+and propagations of that activation. On one thread a context that equated its
 successors under a maximum otherwise finished that work before a successor without a model
 could close it. A generated ontology of item 897 derives 29,625 conclusions on one thread
 where it derived 2,122,545, and seven of 750 generated ontologies come within the default
 bound of the counting run on one thread, with none leaving it. The fixture `shq-041`
-finishes without the order between number restrictions, where it passed any bound.
+finishes without the order between number restrictions, where it passed any bound. The
+ORE 2015 DL development set keeps its taxonomies with and without the order, and the
+failed counting attempt of ore_ont_6485 is cheaper. Its classification with counting
+requested takes 157 ms on one thread with the order against 123 ms without it, 1.28
+times as long, where it took 576 against 184 ms.
+
+A run of the disjunctive rules that has a bound on its derived conclusions now proceeds
+in steps. Such a run is one that counts, the run without counting that follows it past
+the bound, or a rooted run. A step activates the waiting contexts on the workers and
+delivers their messages at its end in a fixed order, and the bound is compared between
+steps. The run then derives the same conclusions and answers in full or falls back in the
+same way on every number of threads, and it does not repeat on one thread an attempt that
+passed the bound. `Limits::dl_steps` controls the steps and is on by default, and
+`el_classify` takes `--no-dl-steps`. A run without the bound keeps the driver without
+steps, so a classification under the default limits runs as before. A rooted run and a
+run with the eager strategy that counts take one thread for their saturations with the
+option, which is roadmap item 951. An
+inference too wide to make now marks the run past its bound with a flag. Four of them
+between two checks wrapped the count before, and the run ended as complete without those
+inferences. A worker of a saturation that panics, in a caller's callback for example, now
+stops the run, and the panic reaches the caller. The other workers waited for it without
+end before, with either driver. On `atlas` on four threads the two versions of the
+Protein Ontology classify 4.0 and 4.9% slower in steps, and the three files of the ORE
+2015 DL sample whose counting attempt fails classify 1.3 to 2.6 times faster, since a run
+in steps does not repeat the attempt on one thread. On one thread the fallback of
+ore_ont_14817 takes 10 s in steps against 132 s without them, and 222 s before a context
+gave way to the contexts it woke. In steps the classification of ore_ont_6485 with
+counting requested takes 213 ms with the order between number restrictions against 188
+ms without it on one thread, where the entry above gives the times without steps. The counting fixtures that take less
+than 10 ms take 9% longer in steps on one thread in sum and 4% longer on four, which
+roadmap item 950 follows. This is roadmap item 727.
 
 ### Ask latency
 
