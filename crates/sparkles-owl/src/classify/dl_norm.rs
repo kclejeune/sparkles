@@ -286,6 +286,79 @@ impl Norm<'_> {
         }
     }
 
+    /// The qualifier of a maximum or of item 728's clauses, ⊤ when unqualified: an atom
+    /// `y` with `f ⊑ y`, which a neighbour derives when it is in `f` and which the
+    /// at-most rule then counts. The negative form of an intersection or of an existential
+    /// restriction is an expression that the rules build only where the left side of an
+    /// inclusion or the body of a clause names it. A qualifier is neither, so a compound
+    /// one gets a name of its own, with the inclusions that derive the name (roadmap
+    /// item 897). Without the name no neighbour derived such a qualifier unless another
+    /// axiom named the same expression, the maximum counted no neighbour, and the run
+    /// reported an answer that missed the maximum's consequences as complete.
+    fn qualifier(&mut self, f: Option<&ClassExpression>, d: usize) -> Result<Ex, Why> {
+        let Some(f) = f else {
+            return Ok(TOP);
+        };
+        let b = self.neg(f, d)?;
+        Ok(match self.it.nodes[b as usize] {
+            Node::Conj(..) => {
+                let e = self.named(b);
+                let n = self.it.fresh_class();
+                self.out.subs.push((e, n));
+                n
+            }
+            Node::Exist(..) => self.named(b),
+            _ => b,
+        })
+    }
+
+    /// The negative form `e` of a qualifier with a name in place of each existential
+    /// restriction: `N` with `F ⊑ ∀r⁻.N` for `∃r.F`, which is `∃r.F ⊑ N` as the calculus's
+    /// normal form writes an existential restriction in a negative position. The
+    /// expression `∃r.F` itself is also the positive restriction, whose successor term a
+    /// context makes wherever it derives the expression, so a neighbour that derived it
+    /// from a neighbour of its own would make a copy of that neighbour, which the at-most
+    /// rule would count. A rooted run has no rule for a universal restriction over an
+    /// inverse role beside a nominal and a maximum, so there the name is told above the
+    /// expression, `∃r.F ⊑ N`, as an axiom of the ontology would state it.
+    fn named(&mut self, e: Ex) -> Ex {
+        match self.it.nodes[e as usize] {
+            Node::Conj(..) => {
+                let mut parts = Vec::new();
+                let mut todo = vec![e];
+                while let Some(x) = todo.pop() {
+                    match self.it.nodes[x as usize] {
+                        Node::Conj(a, b) => todo.extend([a, b]),
+                        _ => parts.push(x),
+                    }
+                }
+                let parts = parts.into_iter().map(|x| self.named(x)).collect();
+                self.conj(parts)
+            }
+            Node::Exist(r, f) => {
+                let g = self.named(f);
+                let n = self.it.fresh_class();
+                let inverse = match self.it.roles[r as usize].clone() {
+                    RoleName::Object(p) if !self.rooted => Some(self.it.role(RoleName::Inverse(p))),
+                    RoleName::Inverse(p) if !self.rooted => Some(self.it.role(RoleName::Object(p))),
+                    _ => None,
+                };
+                match inverse {
+                    Some(i) => {
+                        let all = self.it.node(Node::Forall(i, n));
+                        self.out.subs.push((g, all));
+                    }
+                    None => {
+                        let some = self.it.node(Node::Exist(r, g));
+                        self.out.subs.push((some, n));
+                    }
+                }
+                n
+            }
+            _ => e,
+        }
+    }
+
     /// `x` with `x ⊑ c`.
     fn pos(&mut self, c: &ClassExpression, depth: usize) -> Result<Ex, Why> {
         use ClassExpression as C;
@@ -360,12 +433,9 @@ impl Norm<'_> {
                 }
             }
             C::ObjectMaxCardinality(n, p, f) if self.counting => {
-                // M ⊑ ≤n r.B with F ⊑ B, B the negative form of F
+                // M ⊑ ≤n r.B with F ⊑ B, B the negative form of F or its name
                 let r = self.role(p)?;
-                let b = match f {
-                    Some(f) => self.neg(f, d)?,
-                    None => TOP,
-                };
+                let b = self.qualifier(f.as_deref(), d)?;
                 if b == BOTTOM {
                     TOP
                 } else {
@@ -618,10 +688,7 @@ impl Norm<'_> {
                 // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f, written as the paper's at-most clause
                 // itself, `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ ⋁ z_i ≈ z_j`, item 728
                 let r = self.role(p)?;
-                let b = match f {
-                    Some(f) => self.neg(f, d)?,
-                    None => TOP,
-                };
+                let b = self.qualifier(f.as_deref(), d)?;
                 if b == BOTTOM {
                     return Ok(BOTTOM);
                 }
@@ -691,11 +758,12 @@ impl Norm<'_> {
                 // it knows a neighbour in f, a successor through its context or the
                 // predecessor through its own, and never from a hypothesis about the
                 // predecessor. For n ≥ 2 it is the paper's at-most clause itself,
-                // `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ H ⊔ ⋁ z_i ≈ z_j`.
+                // `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ H ⊔ ⋁ z_i ≈ z_j`, whose qualifier
+                // has a name when it is compound.
                 let r = self.role(p)?;
                 let b = match f {
-                    Some(f) => self.neg(f, d)?,
-                    None => TOP,
+                    Some(f) if *n == 1 => self.neg(f, d)?,
+                    _ => self.qualifier(f.as_deref(), d)?,
                 };
                 if b == BOTTOM {
                     return Ok(BOTTOM);

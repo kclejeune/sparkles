@@ -1685,6 +1685,9 @@ impl<'a> Run<'a> {
             }
             ctx.started.store(true, Ordering::Release);
         }
+        // the clauses Tier D processed in this activation, and whether it gave way
+        let mut clauses = 0usize;
+        let mut gave_way = false;
         'outer: loop {
             while let Some(c) = out.local.pop() {
                 if apply_rules::<_, R>(self.ix, me, &mut st, c, &mut out) {
@@ -1705,6 +1708,22 @@ impl<'a> Run<'a> {
                         self.share(out.woke);
                     }
                 }
+            }
+            // A context of Tier D that processed its share of clauses gives way to the
+            // contexts this worker woke and goes behind them, with its other clauses left
+            // in its store. What they conclude can close it before it derives the rest, as
+            // a successor without a model does for a context that is equating its
+            // successors, and one worker otherwise finishes that derivation first.
+            // The messages in the outbox show first whom they wake.
+            if R::DISJ && clauses >= DL_CLAUSES {
+                if out.woke.is_empty() {
+                    self.deliver(out.outbox, out.woke);
+                }
+                if !out.woke.is_empty() {
+                    gave_way = true;
+                    break;
+                }
+                clauses = 0;
             }
             // the to-do list leaves the context with its buffer, so that a context keeps
             // no room for the messages it took
@@ -1738,6 +1757,7 @@ impl<'a> Run<'a> {
                         dl_rules::flush(self.ix, me, &mut st, &mut out, DL_CLAUSES)
                     };
                     if n > 0 {
+                        clauses += n;
                         tally.applied += n;
                         if !self.flush_sends(&mut out, tally) {
                             break 'outer;
@@ -1764,7 +1784,7 @@ impl<'a> Run<'a> {
         }
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
-        if !self.stopped() && !ctx.todo.lock().is_empty() && self.mark(ctx) {
+        if !self.stopped() && (gave_way || !ctx.todo.lock().is_empty()) && self.mark(ctx) {
             mine.push_back(me);
         }
     }

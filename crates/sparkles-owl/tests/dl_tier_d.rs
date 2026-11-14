@@ -2084,3 +2084,216 @@ fn a_qualification_reaches_an_equated_successor_through_the_other_ones_role() {
         &[("H", "F"), ("F", "A")],
     );
 }
+
+/// The qualifier of a number restriction is in a negative position: a neighbour counts
+/// once it derives the qualifier. A qualifier that is an intersection or an existential
+/// restriction gets a name of its own, which the neighbour derives from the operands or
+/// from its own neighbour in the filler, over a simple role or a transitive one. No other
+/// axiom below registers a qualifier as the left side of an inclusion. A run that gave
+/// them no name counted no neighbour and left each class satisfiable (roadmap item 897).
+#[test]
+fn a_compound_qualifier_of_a_number_restriction_is_counted() {
+    // a maximum over an intersection
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :C)) SubClassOf(:C :P) SubClassOf(:C :Q)
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectIntersectionOf(:P :Q))) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("C", "Nothing")],
+    );
+    // a maximum over an existential restriction on a simple role
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :C)))
+             SubClassOf(:X ObjectSomeValuesFrom(:s :D)) SubClassOf(:D :C) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing")],
+    );
+    // a maximum over an existential restriction on a transitive role
+    check(
+        &format!(
+            "TransitiveObjectProperty(:t)
+             SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:t :C)))
+             SubClassOf(:X ObjectSomeValuesFrom(:t :Y))
+             SubClassOf(:Y ObjectSomeValuesFrom(:t :C)) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing")],
+    );
+    // the same over a restriction that holds in each case of a disjunction, where the
+    // role's automaton carries the qualifier and not the EL rules' chains
+    check(
+        &format!(
+            "TransitiveObjectProperty(:t)
+             SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:t :C)))
+             SubClassOf(:X ObjectUnionOf(ObjectSomeValuesFrom(:t :Y1)
+               ObjectSomeValuesFrom(:t :Y2)))
+             SubClassOf(:Y1 ObjectSomeValuesFrom(:t :C))
+             SubClassOf(:Y2 ObjectSomeValuesFrom(:t :C)) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing")],
+    );
+    // a minimum and an exact cardinality in a negative position, item 728's clauses
+    check(
+        &format!(
+            "SubClassOf(ObjectMinCardinality(2 :r ObjectIntersectionOf(:P :Q)) :E)
+             SubClassOf(ObjectIntersectionOf(:K ObjectExactCardinality(2 :r
+               ObjectIntersectionOf(:P :Q))) :F)
+             DisjointClasses(:K1 :K2) SubClassOf(:C :P) SubClassOf(:C :Q)
+             SubClassOf(:B ObjectIntersectionOf(:K
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :K1))
+               ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :K2))
+               ObjectMaxCardinality(2 :r :P)))
+             {UNION}"
+        ),
+        &[("B", "E"), ("B", "F")],
+        &[("B", "Nothing"), ("K", "E")],
+    );
+    // a minimum within an existential restriction in a negative position, which stays a
+    // minimum in a negative position and is item 728's clause, where the minimum on the
+    // left of an inclusion above becomes a maximum on its right
+    check(
+        &format!(
+            "SubClassOf(:C :P) SubClassOf(:C :Q)
+             SubClassOf(:D ObjectMinCardinality(2 :r :C))
+             SubClassOf(:A ObjectSomeValuesFrom(:v :D))
+             SubClassOf(ObjectSomeValuesFrom(:v
+               ObjectMinCardinality(2 :r ObjectIntersectionOf(:P :Q))) :E)
+             SubClassOf(:G ObjectSomeValuesFrom(:v :H))
+             SubClassOf(:H ObjectMinCardinality(2 :r :P)) {UNION}"
+        ),
+        &[("A", "E")],
+        &[("A", "Nothing"), ("G", "E")],
+    );
+}
+
+/// Compound qualifiers whose parts are compound: an existential restriction within an
+/// intersection and within another existential restriction, and one over an inverse role.
+/// The control class of each case has one neighbour fewer, or a neighbour outside the
+/// qualifier, and stays satisfiable.
+#[test]
+fn a_nested_qualifier_of_a_number_restriction_is_counted() {
+    // an intersection with an existential restriction
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r
+               ObjectIntersectionOf(:P ObjectSomeValuesFrom(:s :C))))
+             SubClassOf(:X :P) SubClassOf(:X ObjectSomeValuesFrom(:s :C))
+             SubClassOf(:B ObjectMinCardinality(2 :r :P))
+             SubClassOf(:B ObjectMaxCardinality(1 :r
+               ObjectIntersectionOf(:P ObjectSomeValuesFrom(:s :C)))) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing"), ("B", "Nothing")],
+    );
+    // an existential restriction over an intersection with an existential restriction
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s
+               ObjectIntersectionOf(:P ObjectSomeValuesFrom(:t :C)))))
+             SubClassOf(:X ObjectSomeValuesFrom(:s :Y))
+             SubClassOf(:Y :P) SubClassOf(:Y ObjectSomeValuesFrom(:t :C))
+             SubClassOf(:B ObjectMinCardinality(2 :r :X2))
+             SubClassOf(:B ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s
+               ObjectIntersectionOf(:P ObjectSomeValuesFrom(:t :C)))))
+             SubClassOf(:X2 ObjectSomeValuesFrom(:s :P)) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing"), ("B", "Nothing")],
+    );
+    // an existential restriction over an inverse role, which the counted neighbour's
+    // predecessor fills: each of the two witnesses is an r-successor of A, so it has an
+    // inverse-r neighbour in A's class K
+    check(
+        &format!(
+            "SubClassOf(:A :K) SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:A ObjectMaxCardinality(1 :r
+               ObjectSomeValuesFrom(ObjectInverseOf(:r) :K)))
+             SubClassOf(:B ObjectMinCardinality(2 :r :X))
+             SubClassOf(:B ObjectMaxCardinality(1 :r
+               ObjectSomeValuesFrom(ObjectInverseOf(:r) :K))) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("X", "Nothing"), ("B", "Nothing")],
+    );
+}
+
+/// The predecessor is a counted neighbour when it derives the qualifier. `B`'s element
+/// below `A` has `A`'s element as an inverse-r neighbour in `P` and `Q` and a second one
+/// of its own in a class disjoint from `A`, which a maximum of one equates. No axiom
+/// states the intersection of `P` and `Q`.
+#[test]
+fn a_predecessor_in_a_compound_qualifier_is_counted() {
+    check(
+        &format!(
+            "SubClassOf(:A :P) SubClassOf(:A :Q) SubClassOf(:A :K1)
+             SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+             SubClassOf(:B ObjectSomeValuesFrom(ObjectInverseOf(:r) :N))
+             SubClassOf(:N :P) SubClassOf(:N :Q) SubClassOf(:N :K2)
+             DisjointClasses(:K1 :K2)
+             SubClassOf(:B ObjectMaxCardinality(1 ObjectInverseOf(:r)
+               ObjectIntersectionOf(:P :Q)))
+             SubClassOf(:G :P) SubClassOf(:G :K1)
+             SubClassOf(:G ObjectSomeValuesFrom(:r :B)) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("B", "Nothing"), ("G", "Nothing")],
+    );
+}
+
+/// An existential restriction that is a qualifier and also occurs in a positive position,
+/// here in `W`. The neighbours derive the qualifier from a successor of their own in a
+/// class below its filler, and make no further successor for it. `A` has two
+/// r-successors with such a successor, and `B` has one with and one without.
+#[test]
+fn a_qualifier_that_is_also_a_positive_restriction_is_counted() {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :X))
+             SubClassOf(:X ObjectSomeValuesFrom(:s :D)) SubClassOf(:D :C)
+             SubClassOf(:A ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :C)))
+             SubClassOf(:B ObjectSomeValuesFrom(:r :X)) SubClassOf(:B ObjectSomeValuesFrom(:r :Y))
+             DisjointClasses(:X :Y)
+             SubClassOf(:B ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :C)))
+             SubClassOf(:W ObjectSomeValuesFrom(:s :C)) {UNION}"
+        ),
+        &[("A", "Nothing")],
+        &[("B", "Nothing"), ("X", "Nothing"), ("W", "Nothing")],
+    );
+}
+
+/// A generated ontology, `fz-0221` of item 894's fuzzing, that is inconsistent through a
+/// maximum over an intersection: `owl:Thing` is below `C2`, whose four r1-successors in
+/// `C6` each have four in `C4 ⊓ C0`, and `C4` allows two in `C2 ⊓ C1`. A run that gave the
+/// qualifier no name reported the ontology consistent and itself complete.
+#[test]
+fn an_ontology_inconsistent_through_a_maximum_over_an_intersection() {
+    let out = whole(&format!(
+        "SubObjectPropertyOf(:r0 :r1) EquivalentObjectProperties(:r0 :r2)
+         SymmetricObjectProperty(:s)
+         SubClassOf(:C0 :C3) SubClassOf(owl:Thing :C2)
+         SubClassOf(:C1 ObjectExactCardinality(2 :r0 :C0))
+         SubClassOf(:C4 ObjectMinCardinality(2 :r1 :C0))
+         SubClassOf(:C1 :C4)
+         EquivalentClasses(:C2 ObjectIntersectionOf(:C1 ObjectMinCardinality(2 :r0 :C3)))
+         SubClassOf(:C4 ObjectMaxCardinality(2 :r1 ObjectIntersectionOf(:C2 :C1)))
+         SubClassOf(:C2 ObjectAllValuesFrom(ObjectInverseOf(:r1) :C2))
+         SubClassOf(:C5 ObjectAllValuesFrom(:s :C5))
+         SubClassOf(:C0 ObjectAllValuesFrom(:r0 :C2))
+         EquivalentClasses(:C2 ObjectIntersectionOf(:C3
+           ObjectMinCardinality(3 ObjectInverseOf(:s) :C4)))
+         SubClassOf(:C2 ObjectExactCardinality(4 :r1 :C6))
+         SubClassOf(:C6 ObjectMinCardinality(4 :r1 ObjectIntersectionOf(:C4 :C0)))
+         SubClassOf(:C4 ObjectAllValuesFrom(:r2 :C3))
+         {UNION}"
+    ));
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+}

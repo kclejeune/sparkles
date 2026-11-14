@@ -340,8 +340,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   two Protein Ontology files of the ORE 2015 DL sample by 4 to 19% over the run without
   counting. A run that passes its bound with the order as without it can take longer to
   do so. The classification of ore_ont_6485 of that sample with counting requested takes
-  3.1 times as long with the order, which roadmap item 896 follows. Items 896 and 897
-  follow the default of counting.
+  3.1 times as long with the order, which roadmap item 896 follows with the default
+  of counting.
   Number restrictions, functional and inverse functional properties, disjoint properties
   and asymmetric properties then take equalities of successors, and a run that counts has
   a bound of 262,144 derived conclusions, `Limits::dl_work`. Without it those axioms are
@@ -825,11 +825,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   requested, the attempt and the run without it together, takes 576 ms on one thread with
   the order and 184 ms with `Limits::number_order` set to false, 3.1 times as long,
   against 7 ms without counting and 40 ms for Konclude. Roadmap items 896 and 729.
-* A counting run misses a maximum cardinality whose qualifier is an intersection or an
-  existential restriction that no other axiom names, because it never derives the
-  qualifier at a neighbour, and it reports itself complete. `A ⊑ ≥2 r.C`, `C ⊑ P`,
-  `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` leave `A` satisfiable. A run without counting leaves the
-  maximum out and reports it. Roadmap item 897.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times
   Konclude's speed. Roadmap item 712.
