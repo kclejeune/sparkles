@@ -57,6 +57,12 @@ pub struct WireBatch {
 /// into Rust. A larger one is handed over without a copy.
 pub struct Words(Vec<u32>);
 
+impl From<Vec<u32>> for Words {
+    fn from(words: Vec<u32>) -> Words {
+        Words(words)
+    }
+}
+
 /// The largest batch, in words, that is copied rather than handed over.
 const COPY_WORDS: usize = 4096;
 
