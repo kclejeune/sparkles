@@ -151,7 +151,6 @@ struct Completion {
 
 struct Unfold<'a> {
     session: Session,
-    work: crate::budget::Held,
     opts: &'a WhyNotOptions,
     rdf_type: u64,
     geo: Option<(u64, u64)>,
@@ -168,6 +167,7 @@ struct Unfold<'a> {
     lossy: bool,
     /// Only top-level candidates are returned with their builtin blockers.
     report_blockers: bool,
+    work: crate::budget::Held,
 }
 
 struct CallBytes(usize);
@@ -470,7 +470,7 @@ impl Unfold<'_> {
         Vec<Hyp>,
         Vec<(usize, Vec<u64>, Vec<(String, Option<Triple>)>)>,
     )> {
-        self.work.set(0);
+        self.work.shrink(self.work.bytes());
         self.steps = 0;
         self.complete = true;
         self.needed.clear();
@@ -949,13 +949,14 @@ fn why_not_inner(
     if session.graph().is_some_and(|g| g.contains(&root)) {
         return Ok(WhyNot::Entailed);
     }
-    let rdf_type = terms.id_for(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()));
+    let rdf_type = terms.id_for(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
     let same_as = terms.id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(
         "http://www.w3.org/2002/07/owl#sameAs",
-    )));
+    )))?;
     let geo = session
         .geo_default()
-        .then(|| crate::geo_ids(session.terms()));
+        .then(|| crate::geo_ids(session.terms()))
+        .transpose()?;
     let mut u = Unfold {
         geo,
         work: crate::budget::Held::new(session.budget()),
@@ -1149,7 +1150,7 @@ fn add_hypothesis(
     if !session.geo_default() {
         return session.add_facts(facts.to_vec()).map_err(session_error);
     }
-    let (has, default) = crate::geo_ids(session.terms());
+    let (has, default) = crate::geo_ids(session.terms())?;
     let base = session
         .graph()
         .and_then(Graph::base_arc)
@@ -1194,7 +1195,7 @@ fn add_hypothesis(
     }
     let graph = session.graph_mut().map_err(session_error)?;
     for t in remove {
-        graph.kill(&t);
+        graph.kill(&t)?;
     }
     session.add_facts(facts.to_vec()).map_err(session_error)?;
     session.add_facts(generated).map_err(session_error)
@@ -1415,11 +1416,12 @@ mod geometry_overlay_tests {
             let mut session = demand_session(&input, &options, false).unwrap();
             let facts: Vec<_> = additions
                 .iter()
-                .map(|t| t.each_ref().map(|t| session.terms().id_for(t)))
+                .map(|t| t.each_ref().map(|t| session.terms().id_for(t).unwrap()))
                 .collect();
             add_hypothesis(&mut session, &facts, &options).unwrap();
             for (geometry, expected) in [(&first, expected_first), (&second, expected_second)] {
-                let triple = [&feature, &default, geometry].map(|t| session.terms().id_for(t));
+                let triple =
+                    [&feature, &default, geometry].map(|t| session.terms().id_for(t).unwrap());
                 assert_eq!(
                     session.graph().unwrap().contains(&triple),
                     expected,

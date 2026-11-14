@@ -145,8 +145,11 @@ fn f16_local_term_budget() {
     load(&s, &format!("ex:b ex:p \"{big}\" ."));
     let (ts, two) = infer(s.snapshot(), &rules, &limited(Some(64 * MIB))).unwrap();
     assert_eq!(ts.len(), 2);
+    // The second literal and its lookup key are live while the first term stays
+    // interned, which adds 8 MiB. Interning the literal again would add its map key
+    // and its table copy, 16 MiB.
     assert!(
-        (two.peak_bytes as usize) < one.peak_bytes as usize + 4 * MIB,
+        (two.peak_bytes as usize) < one.peak_bytes as usize + 12 * MIB,
         "the same literal charged twice: {} after {}",
         two.peak_bytes,
         one.peak_bytes

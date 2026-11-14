@@ -185,11 +185,11 @@ impl ResultCache {
 
     /// Only algorithm-owned execution uses this private clone boundary. Entries stay
     /// plain data; the caller acquires its own capacity before copying any columns.
-    pub(super) fn get_owned(
+    pub(super) fn get_owned<'ctx>(
         &self,
         key: &CacheKey,
-        ctx: &Ctx,
-    ) -> crate::error::Result<Option<super::table::Materialized>> {
+        ctx: &'ctx Ctx,
+    ) -> crate::error::Result<Option<super::table::Materialized<'ctx>>> {
         use super::table::Materialized;
         use crate::algo::memory;
         use crate::id::Id;
@@ -219,10 +219,8 @@ impl ResultCache {
             memory::bytes::<Vec<Id>>(e.cols.len())?,
             128,
         ])?;
-        let mut out = Materialized {
-            table: Table::empty(Vec::new()),
-            lease: Some(ctx.output_lease(bytes)?),
-        };
+        let mut out =
+            Materialized::with_lease(Table::empty(Vec::new()), Some(ctx.output_lease(bytes)?));
         self.hits.fetch_add(1, Ordering::Relaxed);
         out.table.vars = e.vars.iter().map(|n| ctx.var(key.resolve(n))).collect();
         out.table.sorted = e.sorted.iter().map(|n| ctx.var(key.resolve(n))).collect();

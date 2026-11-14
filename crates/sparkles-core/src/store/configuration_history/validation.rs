@@ -138,20 +138,7 @@ fn verify_registry(
 /// The caller's cold allocations remain charged during this synchronous loan.
 /// No decoded generation, allocation or reservation escapes the check.
 fn metadata_preparation(budget: &ColdBudget<'_>) -> Result<Preparation> {
-    let limit = budget.owned_limit()?;
-    Preparation::new(
-        crate::task::Control {
-            cancel: limit
-                .options
-                .cancel
-                .clone()
-                .map(crate::task::Cancel::from_flag)
-                .unwrap_or_default(),
-            deadline: limit.options.deadline,
-            ..Default::default()
-        },
-        budget.available(),
-    )
+    budget.owned_limit()?.options.temporary(budget.available())
 }
 
 fn inspect_branch(

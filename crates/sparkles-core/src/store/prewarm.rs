@@ -484,7 +484,7 @@ mod tests {
     fn lookup(store: &Store) {
         let q = "SELECT ?v WHERE { <http://e/s4321> <http://e/p> ?v }";
         let r = crate::sparql::query(store.snapshot(), q, &QueryOptions::default()).unwrap();
-        assert_eq!(r.rows().len(), 1);
+        assert_eq!(r.test_application_rows().len(), 1);
     }
 
     #[test]

@@ -48,12 +48,12 @@ pub fn convert_results(
                     .map(|v| v.as_str().to_string())
                     .collect();
                 let names = s.variables().to_vec();
-                let mut rows = Vec::new();
+                let mut rows: Vec<Vec<Option<oxrdf::Term>>> = Vec::new();
                 for sol in s {
                     let sol = sol.context("reading the results")?;
                     rows.push(names.iter().map(|v| sol.get(v).cloned()).collect());
                 }
-                super::table::write_table(&vars, &rows, &Default::default(), out)?;
+                super::table::write_table(&vars, rows.iter(), &Default::default(), out)?;
             }
         }
         return Ok(());

@@ -14,7 +14,7 @@ mod diagnostic_summary;
 pub use diagnostic_summary::literal_typings_controlled;
 
 use crate::INFERRED_GRAPH;
-use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
+use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity};
 use crate::diagnostics::LiteralTypings;
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
@@ -416,15 +416,15 @@ pub(crate) fn previous(
         } = k;
         let raw = raw.map_err(Fallback)?;
         let mut held = Held::new(budget);
-        held.grow(set_bytes(&generalized));
+        held.grow(set_bytes(&generalized))?;
         let moved = closure.terms.rebase(snap.clone());
-        closure.remap(&moved);
+        closure.remap(&moved)?;
         if let Some(w) = witnesses.as_mut() {
             w.remap(&moved);
         }
         let old_lookups = closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
-        held.set(set_bytes(&generalized));
+        held.set(set_bytes(&generalized))?;
         let changes = raw.resolve(&closure.terms, snap, &ids)?;
         // the remembered lookups follow the changes: with one input graph they take them
         // in, and with several the answers they touch are dropped
@@ -447,8 +447,8 @@ pub(crate) fn previous(
             }
             closure.put_lookups(l);
         }
-        held.grow(changes.heap_bytes());
-        closure.settle();
+        held.grow(changes.heap_bytes())?;
+        closure.settle()?;
         budget.check()?;
         return Ok(Previous {
             closure,
@@ -478,16 +478,16 @@ pub(crate) fn previous(
     terms.set_budget(budget)?;
     let changes = raw.resolve(&terms, snap, &ids)?;
     let mut held = Held::new(budget);
-    held.grow(changes.heap_bytes());
+    held.grow(changes.heap_bytes())?;
     held.try_grow(table_bytes(table_capacity(keys.len()), size_of::<Triple>()))?;
     let generalized: FxHashSet<Triple> = keys
         .iter()
         .map(|k| {
-            let id = |b: &[u8]| terms.id_for(&sparkles_core::id::key_to_term(b));
-            [id(&k[0]), id(&k[1]), id(&k[2])]
+            let id = |b: &[u8]| terms.try_id_for_key(b);
+            Ok([id(&k[0])?, id(&k[1])?, id(&k[2])?])
         })
-        .collect();
-    held.set(changes.heap_bytes() + set_bytes(&generalized));
+        .collect::<Result<_, BudgetFailure>>()?;
+    held.set(changes.heap_bytes() + set_bytes(&generalized))?;
     budget.check()?;
     let closure = reconstruct(snap, terms, &changes, &generalized, run_ids, budget)?;
     Ok(Previous {
@@ -507,7 +507,7 @@ fn remap_set(
     s: &mut FxHashSet<Triple>,
     moved: &FxHashMap<u64, u64>,
     held: Option<&mut Held>,
-) -> Result<(), MemoryExceeded> {
+) -> Result<(), BudgetFailure> {
     if moved.is_empty() || !s.iter().flatten().any(|x| moved.contains_key(x)) {
         return Ok(());
     }
@@ -633,8 +633,12 @@ impl RawChanges {
                 union,
             } => {
                 let id = |t: Term| terms.id_for(&t);
-                let triple = |q: oxrdf::Quad| -> Triple {
-                    [id(q.subject.into()), id(q.predicate.into()), id(q.object)]
+                let triple = |q: oxrdf::Quad| -> Result<Triple, BudgetFailure> {
+                    Ok([
+                        id(q.subject.into())?,
+                        id(q.predicate.into())?,
+                        id(q.object)?,
+                    ])
                 };
                 let mut c = Changes::default();
                 if union {
@@ -648,7 +652,7 @@ impl RawChanges {
                             _ => Some(Id::DEFAULT_GRAPH),
                         };
                         by_triple
-                            .entry(triple(q))
+                            .entry(triple(q)?)
                             .or_default()
                             .push((g, op == DiffOp::Add));
                     }
@@ -678,15 +682,15 @@ impl RawChanges {
                 } else {
                     for (op, q) in base {
                         match op {
-                            DiffOp::Add => c.base_added.push(triple(q)),
-                            DiffOp::Remove => c.base_removed.push(triple(q)),
+                            DiffOp::Add => c.base_added.push(triple(q)?),
+                            DiffOp::Remove => c.base_removed.push(triple(q)?),
                         }
                     }
                 }
                 for (op, q) in inferred {
                     match op {
-                        DiffOp::Add => c.inferred_added.push(triple(q)),
-                        DiffOp::Remove => c.inferred_removed.push(triple(q)),
+                        DiffOp::Add => c.inferred_added.push(triple(q)?),
+                        DiffOp::Remove => c.inferred_removed.push(triple(q)?),
                     }
                 }
                 c

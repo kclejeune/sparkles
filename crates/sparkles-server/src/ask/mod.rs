@@ -319,6 +319,32 @@ pub fn ask(
     let profile = profile::pipeline();
     let pipeline = tracing::debug_span!(target: profile::TARGET, "ask.pipeline", pipeline_id = profile.id(), context_tokens = tracing::field::Empty);
     let _entered = pipeline.enter();
+    let cancel = o.cancel.clone().unwrap_or_default();
+    let deadline = started + o.deadline;
+    let preparation = match sparkles::access::Preparation::for_request(
+        &sparkles::sparql::QueryOptions {
+            max_memory_bytes: server.cfg().query_memory_bytes,
+            pool: server.state.catalog.pool().cloned(),
+            grant: o.grant.clone(),
+            cancel: Some(cancel.clone()),
+            deadline: Some(deadline),
+            ..Default::default()
+        },
+    ) {
+        Ok(preparation) => preparation,
+        Err(error) => {
+            let error = crate::mcp::errors::ErrorContext {
+                timeout_secs: o.deadline.as_secs_f64(),
+                max_timeout_secs: server.cfg().max_timeout.as_secs_f64(),
+                prefix_names: &[],
+                request_id: "ask",
+            }
+            .engine(error);
+            let failure = error.meta();
+            on("error", &failure);
+            return json!({"outcome":"error","error":failure,"dataset":o.dataset,"question":o.question});
+        }
+    };
     let mut lists = o.lists.clone().unwrap_or_else(|| {
         Role::ALL
             .into_iter()
@@ -338,7 +364,9 @@ pub fn ask(
         pos: BTreeMap::new(),
         moved: BTreeMap::new(),
         pending: BTreeMap::new(),
-        deadline: started + o.deadline,
+        deadline,
+        preparation,
+        cancel,
         steps: Vec::new(),
         signals: Vec::new(),
         failed_calls: 0,
@@ -444,6 +472,8 @@ struct Asking<'a, 'e> {
     /// the signal that moved a role, reported with its next step
     pending: BTreeMap<Role, &'static str>,
     deadline: Instant,
+    preparation: sparkles::access::Preparation,
+    cancel: Arc<AtomicBool>,
     steps: Vec<StepRecord>,
     /// the signal behind each step, when one moved its role
     signals: Vec<Option<&'static str>>,
@@ -741,12 +771,13 @@ impl Asking<'_, '_> {
         }
         let call = Call {
             arrived: Instant::now(),
-            cancel: self.o.cancel.clone().unwrap_or_default(),
+            cancel: self.cancel.clone(),
             request_id: "ask".into(),
             principal: self.principal.clone(),
             headers: None,
             held: None,
             grant: self.o.grant.clone(),
+            preparation: Some(self.preparation.clone()),
         };
         Ok((m, call))
     }
@@ -762,8 +793,8 @@ impl Asking<'_, '_> {
     }
 
     fn tool_unprofiled(&self, name: &str, args: Value, timed: bool) -> Result<Value, ToolError> {
-        let (m, call) = self.tool_call(name, args, timed)?;
-        Ok(match self.server.run_now(name, m, &call)? {
+        let (m, mut call) = self.tool_call(name, args, timed)?;
+        Ok(match self.server.run_now(name, m, &mut call)? {
             Outcome::Structured(v) => v,
             Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
         })
@@ -786,12 +817,15 @@ impl Asking<'_, '_> {
             Outcome::Structured(v) => v,
             Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),
         };
-        let (m, call) = self.tool_call("sparql_query", args, true)?;
+        let (m, mut call) = self.tool_call("sparql_query", args, true)?;
         if self.o.full_results {
-            let (o, full) = crate::mcp::tools::sparql_query_full(self.server, m, &call)?;
+            let (o, full) = crate::mcp::tools::sparql_query_full(self.server, m, &mut call)?;
             Ok((text(o), Some(full)))
         } else {
-            Ok((text(self.server.run_now("sparql_query", m, &call)?), None))
+            Ok((
+                text(self.server.run_now("sparql_query", m, &mut call)?),
+                None,
+            ))
         }
     }
 
@@ -2307,10 +2341,10 @@ impl Asking<'_, '_> {
         }
         let mut v = if seeds.is_empty() {
             // no entity yet: the policies and the map are checked, and no claim is read
-            let (m, call) = self.tool_call("recall", args, true)?;
+            let (m, mut call) = self.tool_call("recall", args, true)?;
             match self
                 .server
-                .run_now(crate::mcp::RECALL_PREFLIGHT, m, &call)?
+                .run_now(crate::mcp::RECALL_PREFLIGHT, m, &mut call)?
             {
                 Outcome::Structured(v) => v,
                 Outcome::Text(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)),

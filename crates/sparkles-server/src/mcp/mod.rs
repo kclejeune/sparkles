@@ -313,9 +313,77 @@ pub struct Call {
     /// queries charge; `None` on stdio and without a pool, where a query takes its own
     /// grant from its dataset's pool
     pub grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+    /// Initialized once at the real server entry, before derived tool work.
+    /// Continuations clone this same owner rather than making another allowance.
+    pub(crate) preparation: Option<sparkles::access::Preparation>,
 }
 
 impl McpServer {
+    fn call_control(&self, call: &Call) -> sparkles::Result<sparkles::task::Control> {
+        let mut control = sparkles::task::Control::with_cancel(call.cancel.clone());
+        control.deadline = Some(
+            call.arrived
+                .checked_add(self.cfg().max_timeout)
+                .ok_or_else(|| sparkles::Error::invalid("MCP call deadline overflow"))?,
+        );
+        control.check()?;
+        Ok(control)
+    }
+
+    fn call_error(&self, call: &Call, error: sparkles::Error) -> ToolError {
+        errors::ErrorContext {
+            timeout_secs: self.cfg().max_timeout.as_secs_f64(),
+            max_timeout_secs: self.cfg().max_timeout.as_secs_f64(),
+            prefix_names: &[],
+            request_id: &call.request_id,
+        }
+        .engine(error)
+    }
+
+    /// Exclusive initialization cannot race or run pool callbacks under a
+    /// receiver-initialization lock. Existing transport input is not retroactively
+    /// claimed as paid by constructing this request's root.
+    pub(crate) fn prepare_call(&self, call: &mut Call) -> Result<(), ToolError> {
+        if let Some(preparation) = &call.preparation {
+            self.call_control(call)
+                .map_err(|error| self.call_error(call, error))?;
+            return preparation
+                .check()
+                .map_err(|error| self.call_error(call, error));
+        }
+        let control = self
+            .call_control(call)
+            .map_err(|error| self.call_error(call, error))?;
+        let options = sparkles::sparql::QueryOptions {
+            max_memory_bytes: self.cfg().query_memory_bytes,
+            pool: self.state.catalog.pool().cloned(),
+            grant: call.grant.clone(),
+            cancel: Some(call.cancel.clone()),
+            deadline: control.deadline,
+            ..Default::default()
+        };
+        let preparation = sparkles::access::Preparation::for_request(&options)
+            .map_err(|error| self.call_error(call, error))?;
+        call.preparation = Some(preparation);
+        Ok(())
+    }
+
+    pub(crate) async fn admit_call(&self, call: &mut Call) -> Result<(), ToolError> {
+        if call.preparation.is_some() {
+            return self.prepare_call(call);
+        }
+        if call.grant.is_none() {
+            let control = self
+                .call_control(call)
+                .map_err(|error| self.call_error(call, error))?;
+            let grant = crate::server_memory::acquire_for_call(&self.state, &control)
+                .await
+                .map_err(|error| self.call_error(call, error))?;
+            call.grant = grant.map(Arc::new);
+        }
+        self.prepare_call(call)
+    }
+
     pub fn new(state: Arc<AppState>, cfg: McpConfig) -> McpServer {
         let read_only = state.read_only;
         let tools = schemas::tools(&cfg)
@@ -434,8 +502,9 @@ impl McpServer {
         &self,
         name: &str,
         args: Map<String, Value>,
-        call: &Call,
+        call: &mut Call,
     ) -> Result<Outcome, ToolError> {
+        self.prepare_call(call)?;
         tools::run(self, name, args, call)
     }
 
@@ -452,8 +521,9 @@ impl McpServer {
         &self,
         name: &str,
         args: Map<String, Value>,
-        call: Call,
+        mut call: Call,
     ) -> Result<Outcome, ToolError> {
+        self.admit_call(&mut call).await?;
         let Ok(permit) = self.shared.slots.clone().acquire_owned().await else {
             return Err(ToolError::internal(&call.request_id));
         };

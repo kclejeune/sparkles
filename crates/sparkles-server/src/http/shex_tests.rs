@@ -463,12 +463,14 @@ async fn result_bytes_budget() {
 
 #[tokio::test]
 async fn typing_pairs_fit_the_memory_budget() {
-    // 64 bytes per pair: one pair; alice's typing needs bob's too
+    // 64 bytes would allow one typing pair, but the validation's prepared view
+    // is charged too and does not fit, so the memory budget refuses first. The
+    // engine's own tests cover the typing pair limit itself.
     let (_dir, app) = server_with(PEOPLE, |st| st.limits.query_memory_bytes = Some(64));
     let node = enc("<http://ex.org/alice>");
     let r = send(&app, post(&format!("/ds/shex?node={node}"), PERSON)).await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
-    assert_eq!(r.json()["budget"], "validation-work");
+    assert_eq!(r.json()["budget"], "memory");
 }
 
 #[tokio::test]

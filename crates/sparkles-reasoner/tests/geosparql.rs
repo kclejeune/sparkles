@@ -57,6 +57,10 @@ fn select(s: &Store, q: &str, reasoning: bool) -> Vec<String> {
     let r = query(s.snapshot(), &format!("{P}{q}"), &o).unwrap_or_else(|e| panic!("{q}: {e}"));
     let mut v: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| match row.into_iter().next().flatten() {
             Some(Term::NamedNode(n)) => n.as_str().replace("http://example.org/", ""),
@@ -286,6 +290,10 @@ fn select_all(s: &Store) -> Vec<String> {
     let q = format!("SELECT ?s ?p ?o {{ GRAPH <{INFERRED_GRAPH}> {{ ?s ?p ?o }} }}");
     let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
     r.rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()

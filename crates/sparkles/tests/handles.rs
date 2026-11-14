@@ -154,7 +154,7 @@ fn stored_queries_run_with_parameters() {
         .queries()
         .run("by-s", &params, &Default::default())
         .unwrap();
-    assert_eq!(r.table.len(), 1);
+    assert_eq!(r.table().len(), 1);
     let e = ds
         .queries()
         .run("by-s", &BTreeMap::new(), &Default::default())
@@ -572,7 +572,7 @@ fn stored_queries_run_an_older_version_and_name_a_broken_file() {
     let none = BTreeMap::new();
     let rows = |version| {
         q.run_version("v", version, &none, &Default::default())
-            .map(|r| r.table.len())
+            .map(|r| r.table().len())
     };
     assert_eq!(rows(Some(1)).unwrap(), 2);
     assert_eq!(rows(None).unwrap(), 1);
@@ -863,7 +863,7 @@ fn algorithms_and_named_projections() {
     let r = ds
         .query(&format!("SELECT ?n ?c WHERE {{ {wcc} }}"))
         .unwrap();
-    assert_eq!(r.rows().len(), 2);
+    assert_eq!(r.len(), 2);
     ds.update(&format!(
         "INSERT {{ <urn:out> <urn:n> ?n }} WHERE {{ {wcc} }}"
     ))
@@ -876,12 +876,12 @@ fn algorithms_and_named_projections() {
         write: None,
     };
     let r = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
-    assert_eq!(r.rows().len(), 2);
+    assert_eq!(r.len(), 2);
     let stats = ds
         .algorithms()
         .stats(&req, &QueryOptions::default())
         .unwrap();
-    assert!(stats.contains("\"nodes\":2"), "{stats}");
+    assert!(stats.as_str().contains("\"nodes\":2"), "{stats}");
     assert!(ds.algorithms().projections().delete("p", None).unwrap());
     assert!(ds.algorithms().projections().list().is_empty());
 }
@@ -894,11 +894,11 @@ fn algorithms_graphalytics_clustering_request() {
         .unwrap();
     let req = AlgoRequest::from_json(serde_json::json!({"algorithm":"clustering","projection":{"predicates":["urn:p"]},"params":{"graphalytics":true}})).unwrap();
     let result = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
-    assert_eq!(result.vars, ["node", "coefficient"]);
-    assert_eq!(result.rows().len(), 3);
-    for row in result.rows() {
+    assert_eq!(result.variables(), ["node", "coefficient"]);
+    assert_eq!(result.len(), 3);
+    for row in result.rows().unwrap() {
         assert!(
-            matches!(&row[1], Some(oxrdf::Term::Literal(l)) if l.value().parse::<f64>().unwrap() == 0.5)
+            matches!(&row.values()[1], Some(oxrdf::Term::Literal(l)) if l.value().parse::<f64>().unwrap() == 0.5)
         );
     }
     let stats = ds
@@ -906,7 +906,7 @@ fn algorithms_graphalytics_clustering_request() {
         .stats(&req, &QueryOptions::default())
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&stats).unwrap()["nodes"],
+        serde_json::from_str::<serde_json::Value>(stats.as_str()).unwrap()["nodes"],
         3
     );
 }
@@ -926,7 +926,7 @@ fn algorithms_empty_stats(populated: bool) {
         .algorithms()
         .stats(&req, &QueryOptions::default())
         .unwrap();
-    let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let j: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
     assert_eq!(j["nodes"], 0);
     assert_eq!(j["edges"], 0);
     assert_eq!(j["iterations"], 0);
@@ -935,7 +935,6 @@ fn algorithms_empty_stats(populated: bool) {
         ds.algorithms()
             .run(&req, &QueryOptions::default())
             .unwrap()
-            .rows()
             .is_empty()
     );
 }
@@ -1007,7 +1006,6 @@ fn algorithms_numerical_refusal_has_no_rows_stats_or_writeback() {
     assert!(
         ds.query("SELECT ?s WHERE { GRAPH <urn:precision:out> { ?s ?p ?o } }")
             .unwrap()
-            .rows()
             .is_empty()
     );
 }

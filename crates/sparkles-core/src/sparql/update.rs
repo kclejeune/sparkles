@@ -454,14 +454,16 @@ fn run_op(
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
             let plan_depth = super::depth::check_plan(node.depth())?;
-            let executed =
-                super::depth::with_stack(plan_depth, || super::exec::execute(&ctx, &node));
+            let executed = super::depth::with_stack(plan_depth, || {
+                super::exec::execute_materialized(&ctx, &node)
+            });
             if let Err(error) = &executed
                 && ctx.calls_extensions
             {
                 ctx.fail_extension(super::extensions::ScalarError::from_engine(error));
             }
-            let (table, _) = executed?;
+            let (input, _) = executed?;
+            let table = &input.table;
             ctx.check()?;
             // a graph a template takes from a variable is checked for every solution,
             // before anything else of the quad is looked up

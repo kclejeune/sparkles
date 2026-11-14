@@ -83,7 +83,7 @@ async fn run(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let call = Call {
+    let mut call = Call {
         arrived: Instant::now(),
         cancel: Arc::new(AtomicBool::new(false)),
         request_id,
@@ -91,10 +91,12 @@ async fn run(
         headers: Some(headers),
         held: None,
         grant: crate::server_memory::current_grant(),
+
+        preparation: None,
     };
     let mode = if write { Mode::Write } else { Mode::Internal };
     let server = McpServer::new(st.clone(), config(&st, mode));
-    let out = blocking(move || Ok(server.run_now(tool, args, &call))).await?;
+    let out = blocking(move || Ok(server.run_now(tool, args, &mut call))).await?;
     match out {
         Err(e) => Err(tool_error(&e)),
         Ok(Outcome::Structured(v)) => Ok(Json(v).into_response()),

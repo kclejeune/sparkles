@@ -696,7 +696,7 @@ proptest! {
             let naive = Naive::run(&shapes, triples.clone(), &strata);
             prop_assert_eq!(results.results.len(), assocs.len());
             for (r, (v, s)) in results.results.iter().zip(&assocs) {
-                prop_assert_eq!(&r.node, &v.term());
+                prop_assert_eq!(r.node.as_term(), &v.term());
                 // a node outside the graph (and a literal not in it) has no arcs
                 let expected = match naive.typing.get(&(*v, *s)) {
                     Some(b) => *b,

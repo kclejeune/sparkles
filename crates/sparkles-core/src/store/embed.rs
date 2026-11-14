@@ -179,13 +179,15 @@ fn query_rows(
         }
     }
     let r = crate::sparql::query(snap.clone(), emb.query.as_deref().unwrap_or(""), &opts)?;
-    let col = |n: &str| r.vars.iter().position(|v| v == n);
+    let col = |n: &str| r.variables().iter().position(|v| v == n);
     let (cs, ct, cg) = (col("s"), col("text"), col("g"));
     let mut out: PairTexts = FxHashMap::default();
     let (Some(cs), Some(ct)) = (cs, ct) else {
         return Ok(out);
     };
-    for row in r.rows() {
+    let decoded = r.rows()?;
+    for row in decoded.iter() {
+        let row = row.values();
         let s = match &row[cs] {
             Some(t @ (Term::NamedNode(_) | Term::BlankNode(_))) => snap.lookup_term(t),
             _ => None,

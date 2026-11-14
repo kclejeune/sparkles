@@ -137,9 +137,9 @@ fn measure(
         }
         exec.push(r.timing.exec_ms);
         plan.push(r.timing.plan_ms);
-        rows = r.table.len();
+        rows = r.test_table().len();
         let mut f = Vec::new();
-        flatten(&r.plan, "0".into(), &mut f);
+        flatten(r.plan(), "0".into(), &mut f);
         if per_op.is_empty() {
             per_op = vec![Vec::new(); f.len()];
         }
@@ -226,9 +226,9 @@ fn cal_queries() {
 fn subjects(snap: &Arc<crate::store::Snapshot>, pred: &str) -> Vec<String> {
     let q = format!("{PREFIXES}SELECT DISTINCT ?s WHERE {{ ?s {pred} ?o }} ORDER BY ?s");
     let r = query(snap.clone(), &q, &opts(true)).unwrap();
-    let mut ids: Vec<(Id, String)> = r.table.cols[0]
+    let mut ids: Vec<(Id, String)> = r.test_table().cols[0]
         .iter()
-        .zip(r.rows())
+        .zip(r.test_application_rows())
         .filter_map(|(id, row)| match &row[0] {
             Some(oxrdf::Term::NamedNode(n)) => Some((*id, format!("<{}>", n.as_str()))),
             _ => None,

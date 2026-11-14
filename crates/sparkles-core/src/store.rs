@@ -11,7 +11,7 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 mod backup;
-mod bound_read_source;
+pub(crate) mod bound_read_source;
 #[cfg(test)]
 mod branch_ops_tests;
 #[cfg(test)]
@@ -2952,7 +2952,7 @@ impl Store {
     fn snapshot_at_inner(
         &self,
         at: &crate::history::At,
-        o: &crate::history::HistoryOptions,
+        o: &dyn crate::history::ReadControl,
         memory: Option<u64>,
     ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         let capacity = self

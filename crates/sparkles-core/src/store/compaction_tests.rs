@@ -314,7 +314,7 @@ fn writes_and_reads_go_on_during_a_compaction() {
                     &QueryOptions::default(),
                 )
                 .unwrap();
-                assert!(!r.rows().is_empty());
+                assert!(!r.test_application_rows().is_empty());
                 let mut all = 0;
                 snap.for_each_quad(|_| {
                     all += 1;
@@ -367,7 +367,7 @@ fn queries_answer_the_same_after_a_compaction() {
         qs.iter()
             .map(|q| {
                 let r = crate::sparql::query(s.snapshot(), q, &QueryOptions::default()).unwrap();
-                format!("{:?}", r.rows())
+                format!("{:?}", r.test_application_rows())
             })
             .collect()
     };
@@ -957,7 +957,7 @@ fn full_text_search_sees_the_commits_carried_over() {
             &QueryOptions::default(),
         )
         .unwrap();
-        r.rows().len()
+        r.test_application_rows().len()
     };
     assert_eq!(hits(&s), 2);
     drop(s);
@@ -1050,7 +1050,7 @@ fn diff_answers(s: &Store) -> Vec<String> {
         .map(|q| {
             let r = crate::sparql::query(s.snapshot(), q, &QueryOptions::default())
                 .unwrap_or_else(|e| panic!("{q}: {e}"));
-            format!("{:?}", r.rows())
+            format!("{:?}", r.test_application_rows())
         })
         .collect()
 }

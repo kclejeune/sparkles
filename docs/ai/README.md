@@ -632,6 +632,10 @@ count examples define no operational health policy or connector.
   the report's activity names every claim, decision and child report it read with
   `prov:used`, and a withdrawn, reversed or superseded claim rewrites the reports that
   read it ([C25](../specs/C25-evidence-and-assessments.md#reports-on-accepted-evidence)).
+  With `refresh.mode: auto`, a change of the policy's evidence, of the evidence
+  configuration or of the access policy starts a private check, a refresh's plan with no
+  model call or commit, and a refresh follows only when a report's input changed, including
+  through a decision the principal cannot see.
 * Ask answers questions about the whole dataset from the reports by map-reduce, and falls
   back to a query for callers who may not read them. The MCP tool `community_reports`,
   `recall` with `communities`, the brief, `sparkles graphrag` and the UI's Communities tab
@@ -652,12 +656,22 @@ and normalization status. A temporal match does not assert the claim's propositi
 or establish its acceptance. Recorded history still selects an actual retained commit;
 valid-time parameters do not change the meaning of `at`.
 
-C27 Phase 1 remains incomplete. The resources cannot authenticate local availability
-or refuse client backdating of an ordinary RDF timestamp. That A4 acceptance requirement
-needs C25's planned server-owned receipts and the shared protected-write boundary, or
-a separately reviewed runtime helper. Publication dates and arbitrary receipt triples
-do not establish a knowledge cutoff. The projection helper, event-time UI and expiry
-integration remain planned. Roadmap item 341.
+Local availability comes from the server. An authenticated claim proposal writes each
+new source revision's `ev:firstAvailableAt` as the time of the commit that publishes it,
+and commit times never decrease along a branch, including after a restart. An as-known
+read with `at=time:T` therefore contains exactly the authenticated revisions available
+by `T`, whatever their publication or validity dates. A proposal has no availability
+field and answers `400 invalid-proposal` to one. SPARQL Update, Graph Store writes, RDF
+Patch and loads that touch the evidence graphs answer `409 profile-managed-graph` and
+write nothing. Availability written into another graph is ordinary data that never
+resolves as an authenticated record. A clone's root commit is never earlier than the
+commit it copies. The [ordering argument](../specs/C27-valid-time-profiles.md#43-local-availability-and-backdating)
+gives the details.
+
+Claim proposals do not carry a validity interval, so the templates report
+authenticated claims with unknown validity, and roadmap item 925 adds that input. The
+projection helper, event-time UI and expiry integration remain planned under roadmap
+item 341.
 
 ## Known gaps
 
@@ -725,11 +739,6 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Maintained analyses remain planned in [C25](../specs/C25-evidence-and-assessments.md).
   Ordinary RDF shape validation does not establish the runtime guarantees of the typed
   evidence operations. Roadmap item 340.
-* The automatic refresh of reports read under a review policy notices only the changes
-  of the policy's evidence that the principal's change feed lists. A hidden decision,
-  support or withdrawal, a settings-only change of the evidence configuration, a reload
-  of the access policy and a state left behind by a crash wait for the next visible
-  change or a manual refresh. Roadmap item 652.
 * A report waiting for a rewrite after its claim was withdrawn keeps its earlier
   citations while the daily budget holds the rewrite back, without a `stale` mark.
   Roadmap item 809.
@@ -749,10 +758,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   result publication are planned in [F22](../specs/F22-analysis-lifecycle.md). Existing
   reasoner and view maintenance does not provide that application lifecycle. Roadmap
   item 340.
-* The [valid-time profile](#valid-time-profile) supplies static resources and temporal
-  queries. C27 Phase 1 remains incomplete until server-owned availability and backdating
-  refusal pass A4, dependent on C25 Phase 2 and protected writes. The runtime projection
-  helper, event-time control and expiry integration remain planned. Roadmap item 341.
+* The [valid-time profile](#valid-time-profile) supplies static resources, temporal
+  queries and server-owned availability. Authenticated claim proposals cannot carry a
+  validity interval, which roadmap item 925 adds. The runtime projection helper,
+  event-time control and expiry integration remain planned. Roadmap item 341.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
   have reports built from their own view. Roadmap item 100. Global answering is evaluated
   on one generated question set on the demo graph, compared with BM25 rather than vector

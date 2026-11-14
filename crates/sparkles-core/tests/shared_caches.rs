@@ -32,7 +32,6 @@ fn store(shared: &SharedCaches, quads: usize) -> Store {
 fn run(s: &Store, q: &str) -> usize {
     query(s.snapshot(), q, &QueryOptions::default())
         .unwrap()
-        .rows()
         .len()
 }
 

@@ -618,7 +618,7 @@ fn demo_set_gold_queries() {
             );
             continue;
         };
-        let call = Call {
+        let mut call = Call {
             arrived: Instant::now(),
             cancel: Arc::new(AtomicBool::new(false)),
             request_id: "t".into(),
@@ -626,12 +626,14 @@ fn demo_set_gold_queries() {
             headers: None,
             held: None,
             grant: None,
+
+            preparation: None,
         };
         let mut a = Map::new();
         a.insert("query".into(), gold.into());
         a.insert("format".into(), "json".into());
         a.insert("maxRows".into(), 1000.into());
-        let doc = match s.run_now("sparql_query", a, &call) {
+        let doc = match s.run_now("sparql_query", a, &mut call) {
             Ok(Outcome::Text(t)) => serde_json::from_str::<Value>(&t).unwrap(),
             Ok(_) => panic!("{id}"),
             Err(e) => panic!("{id}: {}", e.message),

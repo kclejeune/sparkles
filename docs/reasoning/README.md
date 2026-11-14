@@ -101,6 +101,12 @@ request or on every write, and the schema report counts what the data holds.
   the source of an explanation. A mode is read from the `reasoning` parameter of the HTTP
   endpoints, the `--reasoning` flag of `sparkles query` and the `reasoning` argument of
   the MCP tools. `Auto` is refused until a cost-based choice exists.
+* Embedded query providers implement `ReasoningSession::intensional` with a
+  `Result<bool>` return. Constant interning can refuse a memory reservation, and
+  callers propagate that refusal before preparing demands. Implementations that
+  previously returned a Boolean wrap successful values in `Ok` and return allocation
+  failures with `Err`. `AnalysisContext::new` returns `anyhow::Result<Arc<Self>>`.
+  A local reasoning limit still supports downcasting to `MemoryLimitExceeded`.
 * `POST /$/reason/{ds}/explain` returns derivation trees from materialized inferences,
   RDFS on read or the demand engine ([API.md](../API.md#explanations),
   [F18](../specs/F18-explanations-and-entailment-diffs.md#outcome)). A tree has well-founded
@@ -304,7 +310,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
   unknown, which leaves every class incomplete when unknown. The same rules can count, but
   counting is off by default, since it finishes on none of the ORE 2015 DL development
-  files and only delays their answer. `Limits::counting` turns it on. Roadmap item 728.
+  files and only delays their answer. `Limits::counting` turns it on. Roadmap item 894.
   Number restrictions, functional and inverse functional properties, disjoint properties
   and asymmetric properties then take equalities of successors, and a run that counts has
   a bound of 262,144 derived conclusions, `Limits::dl_work`. Without it those axioms are
@@ -754,10 +760,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap
   item 693.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
-  restrictions takes 28 s on four threads and peaks at 6.8 to 7.9 GiB, since many of its
-  waiting messages repeat what their contexts hold and wait while another thread holds
-  the context. Konclude 0.7.0 classifies it in 11 s. Its run on one thread peaks at 5.9
-  GiB. Roadmap item 818.
+  restrictions over a transitive symmetric role derives each link of the transitive
+  closure once per intermediate class, so it sends three billion messages for 32 million
+  conclusions. On `atlas` it takes 13.5 s on four threads and 9 s on twelve, and peaks at
+  5.1 GiB on four threads. Konclude 0.7.0 classifies it in 9.5 s on the same host at 6.7 GiB, with any
+  number of workers, so a run on four threads is 1.4 times slower in three quarters of
+  the memory and a run on twelve faster. Roadmap item 889 follows the rest of the
+  message cost.
 * A small ontology's first classification in a process on several threads starts its
   helper threads after 0.5 ms of work, and later ones after as long as the last start of
   the helpers took. Warm runs of some small files on eight threads take up to 0.2 ms
@@ -776,9 +785,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   item 768.
 * Counting is off by default. With it on, it passes its bound of derived conclusions on
   the five counting files of the ORE 2015 DL development set that the disjunctive rules
-  take, so those files get the answer without counting. ore_ont_6485 spends 205 ms on the
-  attempt against 7 ms for the run without it, and Konclude takes 18 ms on four threads. Roadmap items
-  728 and 729.
+  take, so those files get the answer without counting. On one thread on `atlas`, the
+  whole classification of ore_ont_6485 takes 190 ms with counting requested, the attempt
+  and the run without it together, against 11 ms without counting, where Konclude takes
+  18 ms on four threads, and the two versions of the Protein Ontology, ore_ont_6952 and
+  ore_ont_10140, take 1.1 s against 0.9 s. Roadmap items 894 and 729.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times
   Konclude's speed. Roadmap item 712.

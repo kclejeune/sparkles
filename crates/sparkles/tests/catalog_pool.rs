@@ -48,7 +48,7 @@ fn memory_clones_use_the_catalog_pool() {
     match b.query_with(CROSS, &Default::default()) {
         Err(Error::BudgetExceeded(x)) => assert_eq!(x.kind, BudgetKind::ServerMemory),
         Err(e) => panic!("{e}"),
-        Ok(r) => panic!("{} rows on the clone", r.rows().len()),
+        Ok(r) => panic!("{} rows on the clone", r.len()),
     }
 }
 

@@ -3883,12 +3883,15 @@ ignored. Operators that the circuit cannot maintain run as
 subtract the previous output. A property path with `+` or `*` over a step of IRIs,
 inverses, sequences and alternatives is maintained by a fixed-point operator, which the
 plan names `FixedPoint`. Other property paths with `*`, `+` or `?`, `LIMIT` and
-`OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, and `MINUS`, aggregates,
-`DISTINCT`, `VALUES` and subqueries under `GRAPH ?g` are recompute nodes. A `FILTER EXISTS`
-or `FILTER NOT EXISTS` whose `*`, `?` or `{0,n}` path ends at a variable of the outer rows
-is a recompute node together with the group it filters, since the empty path matches a
-substituted term that the graph does not hold. The plan in `GET /$/views/{ds}/{name}` marks each
-operator `incremental` or `recompute`, with the reason.
+`OFFSET`, a dataset clause, a `GRAPH` inside another `GRAPH`, custom aggregates, an
+`EXISTS` in a `BIND`, in an `OPTIONAL` filter or in an aggregate's argument, a
+correlated `EXISTS` under `GRAPH`, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and
+subqueries under `GRAPH ?g` are recompute nodes. A `FILTER` with a correlated `EXISTS`,
+one inside an expression, or one whose `*`, `?` or `{0,n}` path ends at a variable of the
+outer rows is maintained by the operator the plan names `ExistsFilter`, which evaluates
+the condition with the query engine for the rows a commit can have changed. The plan in
+`GET /$/views/{ds}/{name}` marks each operator `incremental` or `recompute`, with the
+reason.
 
 | Method | Path | Needs | Description |
 |---|---|---|---|
@@ -4235,6 +4238,8 @@ type PlanNode = {
   warnings?: { code: string; message: string }[];       // root only: notes about the plan
 };
 ```
+
+`planMs` covers planning and the setup that follows from the prepared query alone, which includes building a SELECT result's variables in both modes, and `execMs` starts after it.
 
 A native streaming response puts `rows` before `meta`. It includes the final counts and
 capabilities only when the query has produced every row successfully. When the query or
@@ -13982,9 +13987,12 @@ decision and child report its input read as `prov:used`, and its footprint also 
 policy's decisions and supports graphs and the proposal graphs the principal may read, so
 a reader who may not read them is not admitted. A refresh rewrites a report whose
 recorded claim was withdrawn, reversed or superseded, and that report's ancestors,
-whatever the fraction. The automatic refresh also starts after a new policy version, a
-change of `reviewPolicy`, or a change of the policy's decisions or supports that the
-principal's change feed lists. A report without a policy has none of these members.
+whatever the fraction. The automatic refresh also starts after a new policy version or a
+change of `reviewPolicy`. After a change of the policy's decisions or supports, a
+withdrawal, a settings-only change of the evidence configuration, a reload of the access
+policy or a server start, it first checks privately, without a model call, commit or
+task, whether a report's input changed, and starts a refresh only when one did. A report
+without a policy has none of these members.
 
 `POST /$/graphrag/{ds}/memberships` takes `{"nodes": ["<iri>", …], "level": 0}` with at
 most 20,000 IRIs and answers which communities hold each node, at the given level or at

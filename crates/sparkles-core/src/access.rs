@@ -545,8 +545,8 @@ impl GraphAccess {
     /// Use both the returned policy and its physical snapshot. Graph restrictions
     /// remain in the policy and are not enforced by the snapshot alone.
     /// Graph, predicate and class rules use the same allowance as controlled guard
-    /// providers. Protection patterns currently refuse with [`Error::Unsupported`]
-    /// because their planner does not provide the complete preparation contract.
+    /// providers. A protection's pattern runs as a query over the unmasked snapshot
+    /// under the same preparation, its controls and its allowance.
     /// Keep the returned owner while using its borrowed view. This cap covers view
     /// preparation; query execution requires its own limits.
     pub fn masked_controlled(

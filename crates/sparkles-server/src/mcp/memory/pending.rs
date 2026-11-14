@@ -399,6 +399,8 @@ fn count(
         held: None,
         // the reading request's grant, or none for a count outside any request
         grant,
+
+        preparation: None,
     };
     let t = Tools {
         server: &server,

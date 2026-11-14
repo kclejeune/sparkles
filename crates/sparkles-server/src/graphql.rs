@@ -261,10 +261,12 @@ pub fn run(args: GraphqlArgs, opts: StoreOptions) -> Result<()> {
                     if_version: None,
                 };
                 let (saved, warnings) =
-                    catalog.put(config, change, &backs).map_err(|e| match e {
-                        sparkles_graphql::PutError::Engine(e) => anyhow::Error::from(e),
-                        e => anyhow::anyhow!("the mapping schema is invalid: {}", e.message()),
-                    })?;
+                    catalog
+                        .put_checked(config, change, &backs)
+                        .map_err(|e| match e {
+                            sparkles_graphql::PutError::Engine(e) => anyhow::Error::from(e),
+                            e => anyhow::anyhow!("the mapping schema is invalid: {}", e.message()),
+                        })?;
                 for w in &warnings {
                     eprintln!("warning: {w}");
                 }

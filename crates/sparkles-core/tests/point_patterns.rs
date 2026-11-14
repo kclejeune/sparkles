@@ -72,6 +72,7 @@ fn point_patterns_preserve_graph_scope_terms_filters_and_algebra() {
             .unwrap_or_else(|e| panic!("{body}: {e}"));
             let mut rows = result
                 .rows()
+                .unwrap()
                 .into_iter()
                 .map(|r| format!("{r:?}"))
                 .collect::<Vec<_>>();
@@ -108,7 +109,7 @@ fn point_patterns_read_the_current_delta_and_keep_old_snapshots() {
                 },
             )
             .unwrap();
-            assert_eq!(r.rows().len(), expected);
+            assert_eq!(r.len(), expected);
         }
     }
 }
@@ -142,7 +143,7 @@ fn point_patterns_preserve_application_filter_evaluation_count() {
             },
         )
         .unwrap();
-        (r.rows().len(), calls.load(Ordering::SeqCst))
+        (r.len(), calls.load(Ordering::SeqCst))
     };
     let baseline = run(false);
     assert_eq!(baseline.0, 3);
@@ -175,9 +176,9 @@ fn point_patterns_leave_volatile_filters_at_their_original_input() {
             },
         )
         .unwrap();
-        assert_eq!(r.rows().len(), 3);
+        assert_eq!(r.len(), 3);
         assert_eq!(
-            assignments(&r.plan),
+            assignments(r.plan()),
             usize::from(substituted),
             "{condition}"
         );

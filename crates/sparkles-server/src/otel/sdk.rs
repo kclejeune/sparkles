@@ -620,7 +620,7 @@ pub(super) fn query_done(
     plan_spans: bool,
     descriptions: bool,
 ) {
-    let plan = plan_spans.then_some((&r.plan, descriptions));
+    let plan = plan_spans.then_some((r.plan(), descriptions));
     phases(
         span,
         t0,

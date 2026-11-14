@@ -2,7 +2,7 @@
 //! ownership and large parallel chunks are separate, still-gated migrations.
 use super::QueryResult;
 use crate::error::Result;
-use crate::sparql::ctx::OutputCredit;
+use crate::sparql::ctx::RowCredit;
 use oxrdf::Term;
 
 /// One writer's reused row. Each decode first drops the previous row's terms, so the
@@ -13,23 +13,23 @@ pub(super) struct ScratchRow<'a> {
     pub(super) terms: Vec<Option<Term>>,
     // The reused reconstruction buffer is freed before the credit that admitted it.
     key: Vec<u8>,
-    credit: OutputCredit<'a>,
-    keys: OutputCredit<'a>,
+    credit: RowCredit<'a>,
+    keys: RowCredit<'a>,
     r: &'a QueryResult,
 }
 
 impl<'a> ScratchRow<'a> {
     /// A scratch row for the writer of `r`, admitting the row's term slots.
     pub(super) fn new(r: &'a QueryResult) -> Result<Self> {
-        r.ctx.check_memory_failure()?;
-        let credit = OutputCredit::new(&r.ctx);
-        let width = r.table.width();
+        r.inner.ctx.check_memory_failure()?;
+        let credit = RowCredit::new(&r.inner.ctx);
+        let width = r.inner.table.width();
         credit.add(Self::slots(r, width)?)?;
         Ok(Self {
             terms: Vec::with_capacity(width),
             key: Vec::new(),
             credit,
-            keys: OutputCredit::new(&r.ctx),
+            keys: RowCredit::new(&r.inner.ctx),
             r,
         })
     }
@@ -38,19 +38,19 @@ impl<'a> ScratchRow<'a> {
         width
             .checked_mul(std::mem::size_of::<Option<Term>>())
             .and_then(|n| u64::try_from(n).ok())
-            .ok_or_else(|| r.ctx.memory_exceeded(u64::MAX))
+            .ok_or_else(|| r.inner.ctx.memory_exceeded(u64::MAX))
     }
 
     /// Decode row `index` into this scratch, replacing the previous row.
     pub(super) fn load(&mut self, index: usize) -> Result<&[Option<Term>]> {
         let r = self.r;
         // A refusal recorded while the last row was written stays the writer's error.
-        r.ctx.check_memory_failure()?;
+        r.inner.ctx.check_memory_failure()?;
         self.terms.clear();
         self.credit.reset();
-        self.credit.add(Self::slots(r, r.table.width())?)?;
-        for col in &r.table.cols {
-            r.ctx.output_term_into(
+        self.credit.add(Self::slots(r, r.inner.table.width())?)?;
+        for col in &r.inner.table.cols {
+            r.inner.ctx.output_term_into(
                 col[index],
                 &self.credit,
                 &self.keys,
@@ -58,7 +58,7 @@ impl<'a> ScratchRow<'a> {
                 &mut self.terms,
             )?;
         }
-        r.ctx.check_memory_failure()?;
+        r.inner.ctx.check_memory_failure()?;
         Ok(&self.terms)
     }
 

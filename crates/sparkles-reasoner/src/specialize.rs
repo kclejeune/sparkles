@@ -19,7 +19,7 @@
 //! [`MAX_RULES`] specialized rules. Its schema atoms still read the schema the pass
 //! derived.
 
-use crate::budget::{Budget, MemoryExceeded};
+use crate::budget::{Budget, BudgetFailure};
 use crate::builtins::BuiltinKind;
 use crate::demand::{Closed, Vocab, clone_builtin};
 use crate::engine::{self, Atom, CBuiltin, CHead, CRule, Eval, Mode, Slot};
@@ -206,7 +206,7 @@ pub(crate) fn specialize(
     terms: &Terms,
     budget: &Arc<Budget>,
     cancel: &AtomicBool,
-) -> Result<Specialized, MemoryExceeded> {
+) -> Result<Specialized, BudgetFailure> {
     let abort = AtomicBool::new(false);
     let mut out: Vec<CRule> = Vec::new();
     let mut made = 0usize;
@@ -257,9 +257,8 @@ pub(crate) fn specialize(
         let mut b = vec![0u64; r.nvars];
         ev.run(0, &mut b, None);
         if let Some(e) = ev.err.take() {
-            return Err(e
-                .downcast::<MemoryExceeded>()
-                .unwrap_or_else(|e| panic!("a schema join failed: {e:#}")));
+            return Err(BudgetFailure::from_anyhow(&e)
+                .unwrap_or_else(|| panic!("a schema join failed: {e:#}")));
         }
         let collected = std::mem::take(&mut ev.collected);
         drop(ev);

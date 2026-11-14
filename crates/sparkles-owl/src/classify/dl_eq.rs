@@ -87,7 +87,7 @@ impl Eqs<'_> {
             (C(u), X) => {
                 !eq_block()
                     || self.query.is_some()
-                        && matches!(v, XLit::Atom(b, C(w)) if w == u && rank(self.ix, b).0 == 1)
+                        && matches!(v, XLit::Atom(b, C(w)) if w == u && rank(self.ix, b).0 == 2)
             }
             _ => true,
         }

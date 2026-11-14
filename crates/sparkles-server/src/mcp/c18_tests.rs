@@ -206,8 +206,9 @@ async fn check_terms() {
 /// pattern with two unbound ends does not fail the whole diagnosis.
 #[tokio::test(flavor = "multi_thread")]
 async fn why_empty_over_budget_is_unknown() {
+    // The request root fits, and the checks do not.
     let cfg = McpConfig {
-        query_memory_bytes: Some(1),
+        query_memory_bytes: Some(512),
         ..McpConfig::default()
     };
     let mut c = Client::start(org(cfg));
@@ -230,8 +231,9 @@ async fn why_empty_over_budget_is_unknown() {
 #[test]
 fn why_empty_past_the_pool_is_unknown() {
     let server = org(McpConfig::default());
-    let pool = sparkles::sparql::pool::QueryPool::new(1);
-    let call = Call {
+    // The request root fits in the pool, and the checks do not.
+    let pool = sparkles::sparql::pool::QueryPool::new(512);
+    let mut call = Call {
         arrived: Instant::now(),
         cancel: Arc::new(AtomicBool::new(false)),
         request_id: "why-empty-pool".into(),
@@ -239,13 +241,15 @@ fn why_empty_past_the_pool_is_unknown() {
         headers: None,
         held: None,
         grant: Some(Arc::new(pool.empty_grant())),
+
+        preparation: None,
     };
     let q = format!(
         "{PREFIXES}SELECT ?p {{ ?p ex:memberOf res:payments . ?p (ex:memberOf|foaf:knows)* ?t . ?p foaf:name \"Nobody\" }}"
     );
     let args = json!({"dataset": "org", "query": q});
     let Outcome::Structured(s) = server
-        .run_now("why_empty", args.as_object().unwrap().clone(), &call)
+        .run_now("why_empty", args.as_object().unwrap().clone(), &mut call)
         .unwrap()
     else {
         panic!("expected a structured diagnosis")

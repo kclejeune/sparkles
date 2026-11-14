@@ -28,17 +28,23 @@ fn main() {
         },
     )
     .unwrap();
-    println!("{:?}  ({} results, boolean={})", r.vars, r.len(), r.boolean);
-    for row in r.rows() {
+    println!(
+        "{:?}  ({} results, boolean={})",
+        r.variables(),
+        r.len(),
+        r.boolean
+    );
+    for row in r.rows().unwrap() {
         println!(
             "  {}",
-            row.iter()
+            row.values()
+                .iter()
                 .map(|t| t.as_ref().map_or("-".into(), |t| t.to_string()))
                 .collect::<Vec<_>>()
                 .join("  ")
         );
     }
-    for t in &r.triples {
+    for t in r.triples() {
         println!("  {t}");
     }
     fn pr(p: &sparkles_core::sparql::PlanInfo, d: usize) {
@@ -51,5 +57,5 @@ fn main() {
         );
         p.children.iter().for_each(|c| pr(c, d + 1));
     }
-    pr(&r.plan, 0);
+    pr(r.plan(), 0);
 }

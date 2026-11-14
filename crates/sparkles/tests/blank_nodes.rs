@@ -46,8 +46,12 @@ fn opts(bindings: &[(&str, &Term)]) -> QueryOptions {
 /// The values of `var` in the solutions of a SELECT.
 fn column(ds: &Dataset, q: &str, var: &str, o: &QueryOptions) -> Vec<Term> {
     let r = ds.query_with(&format!("{PREFIX}{q}"), o).unwrap();
-    let i = r.vars.iter().position(|v| v == var).unwrap();
+    let i = r.variables().iter().position(|v| v == var).unwrap();
     r.rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| row[i].clone().unwrap())
         .collect()

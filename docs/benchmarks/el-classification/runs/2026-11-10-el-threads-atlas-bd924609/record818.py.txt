@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Writes the record.json of the atlas measurements of item 818 from a slot directory.
+
+record818.py OUT.json stanley.json SLOT_DIR...: each SLOT_DIR holds log.txt, mem/, the out-*
+directories of ab.sh and perhaps konclude/. stanley.json is merged in as the "stanley" member
+and holds the profile and the message statistics taken on the laptop.
+"""
+import json
+import statistics as st
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+med = st.median
+
+
+def rows(p):
+    return [json.loads(line) for line in (p / "runs.jsonl").read_text().splitlines() if line.strip()]
+
+
+def ab(R):
+    out = {}
+    for d in sorted(R.glob("out-*")):
+        g = defaultdict(list)
+        for r in rows(d):
+            if r.get("failed"):
+                g[(r["file"], r["threads"], r["side"])].append(None)
+                continue
+            g[(r["file"], r["threads"], r["side"])].append(r)
+        res = {}
+        for (f, t, s), v in sorted(g.items()):
+            ok = [x for x in v if x]
+            res[f"{f} t{t} {s}"] = {
+                "classify_median_ms": round(med(x["classifyMedianMs"] for x in ok), 2),
+                "saturation_ms": round(med(x["saturationMs"] for x in ok), 2),
+                "index_ms": round(med(x["indexMs"] for x in ok), 2),
+                "rounds_ms": [round(x["classifyMedianMs"], 2) for x in ok],
+                "failed": len(v) - len(ok),
+            }
+        out[d.name] = {
+            "env": (d / "env.txt").read_text().split("\n"),
+            "results": res,
+            "taxonomy_sha256": (d / "taxonomy.sha256").read_text().split("\n"),
+        }
+    return out
+
+
+def mem(R):
+    out = {}
+    log = (R / "log.txt").read_text().splitlines()
+    for f in sorted((R / "mem").glob("*.json")):
+        try:
+            j = json.loads(f.read_text())
+        except ValueError:
+            out[f.stem] = {"failed": True, "err": (R / "mem" / (f.stem + ".err")).read_text()[-500:]}
+            continue
+        time = dict(x.split("=") for x in (R / "mem" / (f.stem + ".time")).read_text().split())
+        line = next((l for l in log if f" {f.stem.split('.')[0]} {f.stem.split('.')[1]} " in l), "")
+        out[f.stem] = {
+            "classify_s": round(j["classifyMs"][0] / 1000, 2),
+            "saturation_s": round(j["saturationMs"] / 1000, 2),
+            "wall_s": float(time["wall"]),
+            "peak_rss_gib": round(int(time["rss_kib"]) / 2**20, 2),
+            "peak_estimate_gib": round(j["peakEstimatedBytes"] / 2**30, 2),
+            "conclusions": j["conclusions"],
+            "taxonomy": line.split("tax=")[1].split()[0] if "tax=" in line else None,
+            "tier": j["tier"],
+        }
+    return out
+
+
+def konclude(R):
+    out = {}
+    for f in sorted((R / "konclude").glob("konclude.t*.json")) if (R / "konclude").exists() else []:
+        j = json.loads(f.read_text())
+        out[f.stem] = {k: j[k] for k in ("threads", "label", "parseMs", "classifyMs", "totalMs", "wallMs", "peakRssKib", "classes", "consistent") if k in j}
+    return out
+
+
+def slot(R):
+    log = (R / "log.txt").read_text().splitlines()
+    return {
+        "binary_sha256_prefix": {l.split()[2]: l.split()[3] for l in log if " sha " in l},
+        "started": log[0].split()[0],
+        "ended": log[-1].split()[0],
+        "ore_ont_8737": mem(R),
+        "ab": ab(R),
+        "konclude": konclude(R),
+        "log": log,
+    }
+
+
+rec = {
+    "suite": "el-classification",
+    "kind": "measurement",
+    "scale": "ore_ont_8737 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on atlas",
+    "host": {"name": "atlas", "cpu": "13th Gen Intel(R) Core(TM) i5-13500", "cpus": 20, "ram_mib": 15620, "kernel": "7.2.9"},
+    "manifest": {
+        "sides": {
+            "base": "321508fe, origin/main",
+            "a": "181e9c95, the delivery filter of every held kind",
+            "b": "fb894c98, a plus the link products sent in runs",
+            "b3": "bd924609, b plus the flush that returns at once when nothing is pending and the fixes of review round 1, the lane's final saturation code",
+        },
+        "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas",
+        "konclude": "Konclude 0.7.0-1138 from nix/reasoners, copied to atlas, through scripts/elk-compare/konclude.py",
+        "scripts": ["slot818.sh.txt", "ab.sh.txt", "konclude818.sh.txt", "record818.py.txt"],
+    },
+    "settings": {
+        "memory_runs": "one el_classify process per side and thread count in a 13 GiB scope, no swap, no pinning, wall time and peak RSS from GNU time",
+        "ab_runs": "ab.sh, six rounds of rotating order, five classifications per process, one-thread runs pinned to CPU 4 and the others to CPUs 0-11",
+    },
+    "method": "Every part ran under ~/lanes/.heavy.lock on atlas with no other benchmark or gate on the host. slot818.sh ran one classification of ore_ont_8737 per side on 4, 12 and 1 threads, then ab.sh with six rounds of rotating order, one process per side, file and thread count with --repeat 5, whose median classification is the round's value. The first slot ran the base, a and b, the second slot the base and b3, and konclude818.sh ran Konclude after the first slot. The stanley member holds the profiles and message counters taken on the laptop while other work ran there, so only their shares and counts are evidence.",
+    "slots": {Path(d).name: slot(Path(d)) for d in sys.argv[3:]},
+    "stanley": json.loads(Path(sys.argv[2]).read_text()),
+}
+Path(sys.argv[1]).write_text(json.dumps(rec, indent=1) + "\n")
+print("wrote", sys.argv[1])

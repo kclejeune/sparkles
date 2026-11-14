@@ -2,11 +2,11 @@
 
 > **Status:** implemented in part
 >
-> **Phases:** Version 1 profile resources, shapes, fixtures and stored-query templates
-> are available. Phase 1 remains incomplete because A4's authenticated local availability
-> and backdating refusal need C25 Phase 2 and the shared protected-write boundary, or
-> a separately reviewed runtime helper. Phase 2's projection helper and event-time UI,
-> and Phase 3's expiry integration, remain planned. No temporal index is added.
+> **Phases:** Phase 1 is complete. Version 1 profile resources, shapes, fixtures and
+> stored-query templates are available, and authenticated claim proposals assign
+> server-owned local availability and refuse backdating. Validity intervals through the
+> authenticated writer are roadmap item 925. Phase 2's projection helper and event-time
+> UI, and Phase 3's expiry integration, remain planned. No temporal index is added.
 >
 > **User docs:** [Valid-time profile](../ai/README.md#valid-time-profile).
 >
@@ -201,6 +201,71 @@ Publication into a named graph is an F22 operation. This helper never asserts a
 proposition from a C25 proposed claim. Accepted projections must additionally enforce
 review and acceptance policy, source visibility and the selected temporal verdict.
 
+### 4.3 Local availability and backdating
+
+Local availability is assigned inside the commit that first makes a source revision
+visible. In a protected graph only the evidence owner's typed writer of
+[C25](C25-evidence-and-assessments.md#outcome) writes `ev:firstAvailableAt`. That writer
+serves `POST /{ds}/claims`, claims ingestion and the evidence MCP tools. It takes the
+managed-write capability, enters the branch writer and only then fixes the commit's stamp.
+The stamp names the sequence number after the held head and the later of the server
+clock and the head's time. The commit is never grouped with other commits and publishes
+with exactly that stamp. Each new source revision receives the stamp's time as
+`ev:firstAvailableAt`. Its receipt names the operation, whose description in the same
+graph records the same time, dataset, branch and commit. A revision already present with
+an equal record digest is reported as existing and keeps its first availability. A replay
+under the same idempotency key returns the first receipt without writing.
+
+Commit times never decrease along a branch. Recovery restores each commit's recorded
+time, so the first stamp after a restart is no earlier than the recovered head. F06
+resolves `at=time:T` to the last commit whose time is at most `T`. Suppose a revision
+first becomes visible at commit `c` with time `A`. When `A <= T`, the selected commit is
+`c` or a later one, so the revision is visible. When `A > T`, every commit from `c` on
+has a time of at least `A`, so the selected commit precedes `c` and the revision is
+absent. A revision available after the cutoff therefore never enters the as-known state,
+whatever its publication, validity or reported availability. While a branch's owned
+graphs stay protected, the state also contains every authenticated revision available
+by the cutoff. An administrator who detaches a graph can still delete or rewrite such a
+record, and the record then no longer authenticates, as described below. A server clock that runs backward repeats the head's time and never stamps
+a commit earlier than one already visible. A clone starts a new lineage whose root time
+is no earlier than the commit it copies, so a cloned record cannot enter a state that
+precedes its availability. Its receipts keep naming the original dataset, branch and
+commit.
+
+A client cannot supply availability through the typed writer. The proposal request has
+no availability member, and an unknown member fails as `400 invalid-proposal` while the
+request is parsed. An open scope refuses evidence, PROV, `rdf:type` and `rdf:reifies`
+predicates while the input is prepared. Both refusals come before the capability, the
+source hold and the commit, so they leave nothing behind.
+
+Every other write path is refused before publication. Every commit point admits its
+candidate before it publishes, including SPARQL Update, Graph Store writes, uploads,
+bulk replacement, RDF Patch, merges, replays, cherry-picks and dry runs. A change to a
+source-record or proposal graph without the owner's capability answers
+`409 profile-managed-graph`, and the refused commit changes neither the head, the
+write-ahead log nor the graph. A replay checks each commit separately, so the commits
+it replayed before the refused one stay published, and none of them changes an owned
+graph. Merges of an owned graph are refused, so a record cannot reappear in another
+branch's history under another time.
+
+A client can still write `ev:firstAvailableAt` into an unowned graph as ordinary RDF.
+Resolution looks for records only in the protected graphs, so such a record answers
+`evidence-unavailable` and never resolves as authenticated. A record found in a
+protected graph without a receipt that carries the graph's current protection nonce
+answers `origin-not-reproduced`. The unowned record's own commit also bounds the earliest state that can
+contain it. No template reads `ev:firstAvailableAt` as admission authority. An
+administrator who detaches a graph, edits it and protects it again gives the graph a
+new nonce, and the records written before then answer `origin-not-reproduced` until
+roadmap item 552's administered re-authentication.
+
+Availability, records, receipts and the operation description belong to one commit, so
+a crash publishes all of them or none. The C25 source hold is durable before the commit,
+and a hold whose operation never published is an orphan that reconciliation releases.
+After a restart the managed registry, its protection nonces and the commit catalog with
+each recorded time load before any write is admitted. The refusals and the ordering
+therefore hold across restarts without new state, and availability adds no on-disk
+record of its own.
+
 ## 5. Example
 
 An imported advisory revision says a product relationship was valid throughout an
@@ -389,16 +454,31 @@ Actual retained-commit tests exclude late imports from prior states, preserve th
 original revision and assessment after correction, and check that proposed matches
 remain unasserted. Existing F06 selection semantics are unchanged.
 
-Phase 1 is not complete. A4 includes an actual refusal of client backdating through
-server-owned availability receipts. Ordinary RDF and SHACL cannot authenticate that
-field, and the tests explicitly demonstrate that ordinary RDF accepts an arbitrary
-availability value. The retained-commit test proves snapshot selection only. Full A4
-requires the C25 Phase 2 runtime to assign dataset, branch, actual accepting commit and
-server timestamp atomically with ingestion through the shared protected-write boundary,
-or a separately reviewed C27 helper. Availability receipts remain readable under
-ordinary grants while raw writes must be denied. No template trusts publication or
-client-written availability as admission authority. This requirement remains under
-roadmap items 81 and 341.
+Phase 1 is complete. A4 passes through the C25 authenticated claim writer and the
+managed-graph boundary, as [§4.3](#43-local-availability-and-backdating) argues. No new
+format or API was needed. The `valid_time` availability tests propose a revision
+published in January through the typed writer at a March commit under a test clock.
+Its `ev:firstAvailableAt` equals that commit's time, and the claim is visible at the
+head while the as-known February state selected by time holds neither the revision nor
+the claim. SPARQL Update inserts and rewrites, a graph drop, RDF Patch, a load and an
+open-scope availability value are each refused, with the head and the stored value
+unchanged. An administrator's detach, rewrite and new protection leaves the record
+answering `origin-not-reproduced`, and an availability triple in an unowned graph never
+resolves. After a restart the commit time, the receipt and every refusal remain, and a
+server clock set back to January stamps the next import at the recovered head's time.
+A server test proposes as an authenticated user over HTTP and checks the principal on
+the receipt, the `400 invalid-proposal` answer to an availability member, the
+`?at=time:` exclusion and the `409 profile-managed-graph` answers of SPARQL Update and
+the Graph Store.
+
+Clones now stamp their root commit with the later of the store's clock and the copied
+commit's time on both the persistent and the in-memory path. Before this change a clock
+behind the copied commit gave the clone a root earlier than the writes it holds, which
+a failing-first clone test demonstrated.
+
+Claim proposals do not carry a validity interval, so the templates report authenticated
+claims with unknown validity. C25 §6 names validity records, and roadmap item 925 adds
+them to the claim input.
 
 The bounded projection helper, runtime configuration, event-time UI, expiry fencing
 and analysis invalidation remain unimplemented later phases. The existing U01 slider

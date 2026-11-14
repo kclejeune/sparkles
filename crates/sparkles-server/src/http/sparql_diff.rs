@@ -37,10 +37,10 @@ fn bad(msg: impl Into<String>) -> ApiError {
 }
 
 /// A 128-bit hash of a row: its terms in order, unbound cells apart from any term.
-fn row_hash(r: &QueryResult, i: usize, buf: &mut String) -> u128 {
+fn row_hash(r: &QueryResult, i: usize, buf: &mut String) -> sparkles::Result<u128> {
     buf.clear();
-    for col in &r.table.cols {
-        match r.term(col[i]) {
+    for col in r.table().columns() {
+        match r.term(col[i])? {
             Some(t) => {
                 let _ = write!(buf, "{t}\u{1}");
             }
@@ -53,18 +53,18 @@ fn row_hash(r: &QueryResult, i: usize, buf: &mut String) -> u128 {
     0x5Au8.hash(&mut b);
     buf.hash(&mut a);
     buf.hash(&mut b);
-    (u128::from(a.finish()) << 64) | u128::from(b.finish())
+    Ok((u128::from(a.finish()) << 64) | u128::from(b.finish()))
 }
 
 /// The row as a JSON object of its bound variables, in SPARQL JSON terms.
-fn row_json(r: &QueryResult, i: usize) -> J {
+fn row_json(r: &QueryResult, i: usize) -> sparkles::Result<J> {
     let mut o = serde_json::Map::new();
-    for (v, col) in r.vars.iter().zip(&r.table.cols) {
-        if let Some(t) = r.term(col[i]) {
-            o.insert(v.clone(), sparkles::sparql::results::term_json(&t));
+    for (v, col) in r.variables().iter().zip(r.table().columns()) {
+        if let Some(t) = r.term(col[i])? {
+            o.insert(v.clone(), sparkles::sparql::results::term_json(t.as_term()));
         }
     }
-    J::Object(o)
+    Ok(J::Object(o))
 }
 
 /// What a table of hashes takes when it can hold `capacity` entries: the slots of a
@@ -235,7 +235,7 @@ impl Drop for Charge {
 
 /// The bytes of the table a result keeps: a cell is a term id.
 fn table_bytes(r: &QueryResult) -> u64 {
-    (r.len() as u64).saturating_mul(r.table.cols.len() as u64) * 8
+    (r.len() as u64).saturating_mul(r.table().width() as u64) * 8
 }
 
 /// The rows listed so far, against the response's byte budget (`--max-result-mb` and the
@@ -372,7 +372,7 @@ pub(super) async fn sparql_diff(
             opts.timeout = deadline.left()?;
             opts.max_memory_bytes = charge.engine_budget()?;
             let (left, from_at) = run(&ds, &from, &query, &opts)?;
-            let vars = left.vars.clone();
+            let vars = left.variables().to_vec();
             let left_rows = left.len() as u64;
             // the table is held for as long as `left` is
             let left_bytes = table_bytes(&left);
@@ -380,7 +380,7 @@ pub(super) async fn sparql_diff(
             let mut seen = Seen::new();
             for i in 0..left.len() {
                 deadline.check(i)?;
-                seen.add(row_hash(&left, i, &mut buf), &mut charge)?;
+                seen.add(row_hash(&left, i, &mut buf)?, &mut charge)?;
             }
             drop(left);
             charge.release(left_bytes);
@@ -396,7 +396,7 @@ pub(super) async fn sparql_diff(
             let mut listed = Listed::new(max_bytes);
             for i in 0..right.len() {
                 deadline.check(i)?;
-                match seen.map.get_mut(&row_hash(&right, i, &mut buf)) {
+                match seen.map.get_mut(&row_hash(&right, i, &mut buf)?) {
                     Some(n) if *n > 0 => {
                         *n -= 1;
                         same += 1;
@@ -404,7 +404,7 @@ pub(super) async fn sparql_diff(
                     _ => {
                         added += 1;
                         if added_rows.len() < limit {
-                            added_rows.push(listed.add(row_json(&right, i), &mut charge)?);
+                            added_rows.push(listed.add(row_json(&right, i)?, &mut charge)?);
                         }
                     }
                 }
@@ -426,11 +426,11 @@ pub(super) async fn sparql_diff(
                     if removed_rows.len() >= limit {
                         break;
                     }
-                    if let Some(n) = seen.map.get_mut(&row_hash(&left, i, &mut buf))
+                    if let Some(n) = seen.map.get_mut(&row_hash(&left, i, &mut buf)?)
                         && *n > 0
                     {
                         *n -= 1;
-                        removed_rows.push(listed.add(row_json(&left, i), &mut charge)?);
+                        removed_rows.push(listed.add(row_json(&left, i)?, &mut charge)?);
                     }
                 }
                 drop(left);

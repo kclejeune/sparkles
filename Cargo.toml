@@ -13,6 +13,7 @@ repository = "https://github.com/kclejeune/sparkles"
 [workspace.dependencies]
 sparkles = { path = "crates/sparkles" }
 sparkles-core = { path = "crates/sparkles-core" }
+sparkles-budget = { path = "crates/sparkles-budget" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 sparkles-shacl = { path = "crates/sparkles-shacl" }
 sparkles-shaclc = { path = "crates/sparkles-shaclc" }
@@ -53,7 +54,7 @@ memchr = "2"
 # stack segments for planning and evaluating deeply nested queries
 stacker = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

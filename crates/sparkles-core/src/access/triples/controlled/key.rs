@@ -81,6 +81,23 @@ impl Key<'_> {
         self.raw("]")
     }
 
+    fn caller(&mut self, caller: &Caller) -> Result<()> {
+        self.raw("Caller { user: ")?;
+        match &caller.user {
+            Some(user) => {
+                self.raw("Some(")?;
+                self.quoted(user)?;
+                self.raw(")")?;
+            }
+            None => self.raw("None")?,
+        }
+        self.raw(", roles: ")?;
+        self.strings(&caller.roles)?;
+        self.raw(", groups: ")?;
+        self.strings(&caller.groups)?;
+        self.raw(" }")
+    }
+
     fn optional_strings(&mut self, values: Option<&[String]>) -> Result<()> {
         match values {
             None => self.raw("None"),
@@ -202,6 +219,16 @@ pub(super) fn serialize(
         key.raw(")")?;
     }
     key.raw("]|")?;
+    // A pattern may read the caller's attributes, so two callers share a mask only
+    // when they are the same caller, as the legacy key says.
+    if rules
+        .rules
+        .iter()
+        .any(|rule| !rule.read.is_all() && rule.protection.pattern.is_some())
+    {
+        key.caller(&rules.caller)?;
+        key.raw("|")?;
+    }
     // Only two fixed-width integers reach ordinary formatting here.
     let _ = write!(key.text, "{:?}", rules.limits);
     preparation.check()?;
@@ -336,7 +363,14 @@ mod tests {
                     .filter(|r| !r.read.is_all())
                     .map(|r| (&*r.protection, &r.read))
                     .collect();
-                let expected = format!("{:?}|{:?}|{:?}", access.read, entries, rules.limits);
+                let expected = if entries.iter().any(|(p, _)| p.pattern.is_some()) {
+                    format!(
+                        "{:?}|{:?}|{:?}|{:?}",
+                        access.read, entries, rules.caller, rules.limits
+                    )
+                } else {
+                    format!("{:?}|{:?}|{:?}", access.read, entries, rules.limits)
+                };
                 let preparation = Preparation::new(Control::none(), 16 << 20).unwrap();
                 assert_eq!(
                     serialize(&access, &rules, &preparation).unwrap().0,

@@ -65,8 +65,9 @@ fn vectors(s: &Store, subject: &str, graph: Option<&str>) -> Vec<String> {
     let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
     let mut out: Vec<String> = r
         .rows()
+        .unwrap()
         .into_iter()
-        .filter_map(|row| match &row[0] {
+        .filter_map(|row| match &row.values()[0] {
             Some(oxrdf::Term::Literal(l)) => Some(l.value().to_string()),
             _ => None,
         })
@@ -392,10 +393,13 @@ fn searches_with_text() {
         "{PREFIXES}SELECT ?s ?score WHERE {{ (?s ?score) spk:vectorSearch (ex:emb \"beta\" 1) }}"
     );
     let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
-    let rows = r.rows();
+    let rows = r.rows().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        rows[0][0].as_ref().unwrap().to_string(),
+        rows.row(0).unwrap().values()[0]
+            .as_ref()
+            .unwrap()
+            .to_string(),
         "<http://example.org/b>"
     );
     // a variable bound to text, and a cached second query
@@ -405,7 +409,7 @@ fn searches_with_text() {
     );
     let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
     assert_eq!(
-        r.rows()[0][0].as_ref().unwrap().to_string(),
+        r.row(0).unwrap().values()[0].as_ref().unwrap().to_string(),
         "<http://example.org/b>"
     );
     assert_eq!(mock.state().requests, requests);
@@ -468,7 +472,7 @@ fn long_texts_are_embedded_in_chunks() {
     );
     let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
     assert_eq!(
-        r.rows()[0][0].as_ref().unwrap().to_string(),
+        r.row(0).unwrap().values()[0].as_ref().unwrap().to_string(),
         "<http://example.org/a>"
     );
     // changing the chunking embeds the texts again
@@ -734,7 +738,7 @@ fn providers_of_the_model_configuration() {
                 "{PREFIXES}SELECT ?s ?score WHERE {{ (?s ?score) spk:vectorSearch (ex:emb \"alpha\" 1) }}"
             );
             let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
-            let score: f64 = match &r.rows()[0][1] {
+            let score: f64 = match &r.row(0).unwrap().values()[1] {
                 Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
                 t => panic!("{t:?}"),
             };

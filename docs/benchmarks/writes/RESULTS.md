@@ -947,6 +947,52 @@ every process, the comparison of the two builds and the commands. It also holds 
 runs of the overdeletion experiment that
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#incremental-views) records.
 
+### Aggregates and correlated EXISTS in views
+
+The ignored test `aggregate_pass_against_recompute` of
+`crates/sparkles-core/tests/incr_bench.rs` measures the operators of
+[F13 §4.2](../../specs/F13-incremental-views-and-provenance.md#aggregates-and-correlated-exists)
+on the people data of the other view tests, with the same 200 commits of one or two quads
+each and the same columns. Every team has at most one label, so the `GROUP_CONCAT` and
+`SAMPLE` of `team-labels` have one answer per snapshot and the maintained rows are
+checked against the query. `knows-older` keeps the people who know someone older, which
+is a correlated `EXISTS` with the outer age in a filter of its pattern. An age inserted for
+a new person touches its `?q :age ?b` pattern, which names no outer variable, so that
+commit evaluates the condition again for every row, and the p95 shows it while the
+median does not.
+
+The run below used a release build of commit 1f051759 on stanley, an Intel Core Ultra X7
+358H laptop with 16 threads, with `RAYON_NUM_THREADS=12`, under the host's heavy lock
+with other lanes' builds waiting, and 200,000 people. Every view's maintained rows matched
+its query evaluated again at the end, and no view had a `recompute` node. The raw output
+is the lane's `aggregate_pass_against_recompute-stanley-1f051759.log`. The numbers are a
+laptop measurement for the design, not a published result.
+
+| View | Build ms | Query ms | Pass median ms | Pass p95 ms | Query / pass | State MiB |
+|---|--:|--:|--:|--:|--:|--:|
+| `team-age-range`, MIN and MAX by team over a join | 118.9 | 51.6 | 0.013 | 0.022 | 3,919 | 0.3 |
+| `full-teams`, COUNT by team with HAVING | 32.7 | 0.4 | 0.010 | 0.017 | 40 | 0.2 |
+| `team-labels`, GROUP_CONCAT and SAMPLE by team | 131.6 | 18.9 | 0.018 | 0.048 | 1,073 | 14.7 |
+| `knows-older`, correlated EXISTS | 19,101.5 | 22,485.8 | 2.531 | 19,415.7 | 8,882 | 20.6 |
+
+The three aggregate views cost a pass of 10 to 18 µs after a one- or two-quad commit, as
+the `COUNT`, `SUM` and `AVG` views of the gate do, against 0.4 to 52 ms for the query.
+The engine answers `knows-older` in 22.5 s, since it evaluates the condition for each of
+the 200,000 rows, and the view's build pays the same once. A commit that touches the
+`knows` pattern evaluates the condition for the rows of one person again, which is the
+2.5 ms median. A commit that inserts an age touches the condition's `?q :age ?b` pattern,
+which names no outer variable, so the view evaluates the condition for every row again,
+which is the 19.4 s p95 and about what the query costs. Before item 418 this condition
+was a `recompute` node that evaluated the whole query at every touching commit, so the
+view now pays that cost at a quarter of the commits of this mix instead of all of them,
+and item 906 scopes such a change through the condition's joins.
+
+The writes screen of `scripts/nsc-writes.sh` with `--views async:4`, four table views over
+the writers' predicate, ran three rounds of `serial-literal`, `writers` and `mixed` on a
+Namespace instance for the build before item 418 and the build with it. The medians were
+0.85, 1.23 and 0.94 of the base's transactions per second, with every range overlapping,
+and item 907 pins them on the batch screen and forge.
+
 ### Incremental view gate baseline
 
 `mise run bench:incr` is the rewrite gate of incremental view maintenance, as

@@ -428,14 +428,32 @@ roadmap item 701 prices probes by how their keys spread.
 The other slower queries keep their plans. WatDiv `F4` and the synthetic and DBpedia
 queries under 0.15 ms spend 1 to 90 microseconds longer in planning, 5% to 10% of their
 time, on registering the sets of their variables and walking their plans for set masks.
-Roadmap item 702 keeps that work across queries. In eight rounds `expr-agg-arg`
+Roadmap item 702 tried to keep that work across the candidate plans and measured no
+faster, and item 876 keeps the per-split cost. In eight rounds `expr-agg-arg`
 ran 0.99 times as long, the synthetic `f-regex-iri-join` 1.06 times and
 `f-expr-range-join` 1.11 times, the last two in execution. The rounds of either build
 ran `f-expr-range-join` in 1.7 to 2.3 ms or in 2.7 to 3.3 ms of execution, as the
 record's per-round medians show, so its median depends on which rounds fall slow.
 `two-hop-count` and `births-by-decade`, which an earlier pair of builds ran 1.15 and 1.13
-times as long, ran 0.98 and 1.00 times as long here. Roadmap item 703 separates code layout from
-code in these execution differences.
+times as long, ran 0.98 and 1.00 times as long here.
+
+Roadmap item 703 counted the instructions and cache misses of these four queries on
+atlas, with `perf stat` attached to the server, on three later binaries that keep the
+same plans. The [record](runs/2026-11-10-insn-703-atlas/README.md) has the method and
+every count. The binaries retire the same instructions per request to within 0.04% with
+one pinned thread and 0.2% with twelve, with the same decoded-icache coverage, so the
+differences are not differences of code. With one thread, `f-regex-iri-join` runs 3%
+fewer cycles on the two newer binaries, with 7,000 fewer cache misses per request, and
+no query runs slower on a newer binary. `f-expr-range-join` has two modes in every
+binary, 0.62 to 0.65 ms with 66K to 88K cache misses per request or 0.70 to 0.81 ms with
+106K to 153K, which changed at the same time for all three binaries, so they are the
+state of the host's shared cache while the processes ran. With twelve threads on the six
+performance cores, the configuration of the forge record above, the four queries take 2
+to 4 times as long as with one thread, with 4% to 15% more instructions, half the
+instructions per cycle and 4 to 15 times the decoded-icache misses, and the per-process
+medians of `f-expr-range-join` spread from 1.7 to 3.8 ms in every binary, which is where
+the forge record's two modes come from. Roadmap item 878 takes up the twelve-thread cost
+of short queries.
 
 ## Rewrite gate baselines
 

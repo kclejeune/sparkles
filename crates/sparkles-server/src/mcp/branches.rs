@@ -155,6 +155,8 @@ pub(super) fn branch_call(
         headers: call.headers.clone(),
         held: call.held.clone(),
         grant: call.grant.clone(),
+
+        preparation: call.preparation.clone(),
     }))
 }
 

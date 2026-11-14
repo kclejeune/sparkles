@@ -110,6 +110,8 @@ impl State {
             let Some(Ok(row)) = self.batch.as_ref().map(|batch| batch.row(self.row)) else {
                 break;
             };
+            // The row kept ahead owns its terms, as the Python solution will.
+            let row = row.values().to_vec();
             // an unbound cell still takes its place in the row
             bytes += row
                 .iter()
@@ -147,7 +149,8 @@ impl State {
             let Some(batch) = &self.batch else {
                 return Ok(None);
             };
-            let values = batch.row(self.row)?;
+            // The Python solution keeps its own terms.
+            let values = batch.row(self.row)?.values().to_vec();
             self.row += 1;
             self.emitted += 1;
             Ok(Some(values))

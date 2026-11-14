@@ -54,6 +54,14 @@ pub struct DlAx {
     /// in a rooted run with counting, the minimum restrictions: a holder M and the
     /// existential restrictions whose successor terms differ, `M(x) → f_i(x) ≉ f_j(x)`
     pub ne: Vec<(Ex, Vec<Ex>)>,
+    /// item 728's clauses for an exact or minimum cardinality in a negative position,
+    /// `r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → head ⊔ ⋁ z_i ≈ z_j`: the bound `n - 1` that the
+    /// at-most rule counts to, the role, the filler's negative form B, ⊤ when unqualified,
+    /// and the head's atoms over x, `y` with the at-least conjunction `H` of an exact one
+    pub lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
+    /// the at-least conjunctions `H` that a cardinality in a negative position makes,
+    /// which the order of a run without the root ranks below every class
+    pub low: Vec<Ex>,
 }
 
 impl DlAx {
@@ -117,6 +125,10 @@ struct Out {
     irreflexive: Vec<Role>,
     /// the minimum restrictions of a rooted run with counting, as [`DlAx::ne`]
     ne: Vec<(Ex, Vec<Ex>)>,
+    /// item 728's clauses of a cardinality in a negative position, as [`DlAx::lazy`]
+    lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
+    /// the at-least conjunctions ranked lowest, as [`DlAx::low`]
+    low: Vec<Ex>,
     /// whether an inverse property occurs, which a symmetric or inverse functional
     /// property also makes
     inverse: bool,
@@ -134,6 +146,8 @@ impl Out {
         self.rdis.extend(o.rdis);
         self.irreflexive.extend(o.irreflexive);
         self.ne.extend(o.ne);
+        self.lazy.extend(o.lazy);
+        self.low.extend(o.low);
         self.inverse |= o.inverse;
     }
 }
@@ -483,7 +497,17 @@ impl Norm<'_> {
                 let mut head = Vec::new();
                 for c in moved {
                     let dual = self.dual(c).expect("a conjunct with a dual");
-                    head.push(self.pos(&dual, d)?);
+                    let h = self.pos(&dual, d)?;
+                    // with counting the at-least conjunction of a moved maximum ranks
+                    // lowest, item 728
+                    if self.counting
+                        && matches!(c, C::ObjectMaxCardinality(n, ..) if *n >= 1)
+                        && h != TOP
+                        && h != BOTTOM
+                    {
+                        self.out.low.push(h);
+                    }
+                    head.push(h);
                 }
                 if head.contains(&TOP) || body.contains(&BOTTOM) {
                     return Ok(BOTTOM);
@@ -543,10 +567,26 @@ impl Norm<'_> {
             C::ObjectSomeValuesFrom(p, f) => self.neg_some(p, Some(f), d)?,
             C::ObjectMinCardinality(0, ..) => TOP,
             C::ObjectMinCardinality(1, p, f) => self.neg_some(p, f.as_deref(), d)?,
-            C::ObjectMinCardinality(n, p, f) if self.counting => {
-                // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f
+            C::ObjectMinCardinality(n, p, f) if self.counting && self.rooted => {
+                // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f, with a holder for the maximum: a rooted
+                // run keeps its rules (F24, item 728)
                 let m = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
                 self.global_or(m)?
+            }
+            C::ObjectMinCardinality(n, p, f) if self.counting => {
+                // ≥n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f, written as the paper's at-most clause
+                // itself, `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ ⋁ z_i ≈ z_j`, item 728
+                let r = self.role(p)?;
+                let b = match f {
+                    Some(f) => self.neg(f, d)?,
+                    None => TOP,
+                };
+                if b == BOTTOM {
+                    return Ok(BOTTOM);
+                }
+                let y = self.it.fresh_class();
+                self.out.lazy.push((n - 1, r, b, vec![y]));
+                y
             }
             C::ObjectMinCardinality(..) => {
                 return Err("a minimum cardinality above one in a negative position");
@@ -572,14 +612,19 @@ impl Norm<'_> {
                     None => *n,
                 };
                 let m = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
+                // with counting the at-least conjunction of ≥(n+1) ranks lowest, item 728
+                if self.counting && *n >= 1 && m != TOP && m != BOTTOM {
+                    self.out.low.push(m);
+                }
                 self.global_or(m)?
             }
             C::ObjectExactCardinality(0, p, f) => {
                 let m = self.pos(&C::ObjectMinCardinality(1, p.clone(), f.clone()), d)?;
                 self.global_or(m)?
             }
-            C::ObjectExactCardinality(n, p, f) if self.counting => {
-                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f
+            C::ObjectExactCardinality(n, p, f) if self.counting && self.rooted => {
+                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f, with a holder for the
+                // maximum: a rooted run keeps its rules (F24, item 728)
                 let lo = self.pos(&C::ObjectMaxCardinality(n - 1, p.clone(), f.clone()), d)?;
                 let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
                 let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
@@ -595,6 +640,48 @@ impl Norm<'_> {
                     return Ok(TOP);
                 }
                 self.out.clauses.push((Vec::new(), head));
+                y
+            }
+            C::ObjectExactCardinality(n, p, f) if self.counting => {
+                // =n p.f ⊑ y is ⊤ ⊑ y ⊔ ≤(n-1) p.f ⊔ ≥(n+1) p.f, with H the at-least
+                // conjunction, which the order ranks lowest, item 728. For n = 1 the maximum
+                // is ∀p.¬f, and the axiom is ∃p.f ⊑ y ⊔ H, an existential restriction in a
+                // negative position as any other, so that a context derives y ⊔ H only once
+                // it knows a neighbour in f, a successor through its context or the
+                // predecessor through its own, and never from a hypothesis about the
+                // predecessor. For n ≥ 2 it is the paper's at-most clause itself,
+                // `p_B(x, z_1) ∧ … ∧ p_B(x, z_n) → y ⊔ H ⊔ ⋁ z_i ≈ z_j`.
+                let r = self.role(p)?;
+                let b = match f {
+                    Some(f) => self.neg(f, d)?,
+                    None => TOP,
+                };
+                if b == BOTTOM {
+                    return Ok(BOTTOM);
+                }
+                let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+                let hi = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), d)?;
+                if hi == TOP {
+                    return Ok(BOTTOM);
+                }
+                let y = self.it.fresh_class();
+                if hi != BOTTOM {
+                    self.out.low.push(hi);
+                }
+                if *n == 1 {
+                    let e = self.it.node(Node::Exist(r, b));
+                    if hi == BOTTOM {
+                        self.out.subs.push((e, y));
+                    } else {
+                        self.out.clauses.push((vec![e], vec![y, hi]));
+                    }
+                } else {
+                    let mut head = vec![y];
+                    if hi != BOTTOM {
+                        head.push(hi);
+                    }
+                    self.out.lazy.push((n - 1, r, b, head));
+                }
                 y
             }
             C::ObjectExactCardinality(..) => {
@@ -1009,7 +1096,7 @@ pub fn normalize(
     }
     // the Nom rule, which a nominal, an inverse and an at-most restriction need together,
     // is not built
-    if rooted && all.inverse && !all.atmost.is_empty() {
+    if rooted && all.inverse && (!all.atmost.is_empty() || !all.lazy.is_empty()) {
         return Ok(None);
     }
     // the role box: the inclusions closed under inverses, with the chains
@@ -1039,6 +1126,7 @@ pub fn normalize(
     }
     // number restrictions and disjointness need simple roles, which OWL 2 DL asks
     if all.atmost.iter().any(|&(_, _, r, _)| !rb.simple(r))
+        || all.lazy.iter().any(|&(_, r, _, _)| !rb.simple(r))
         || all
             .rdis
             .iter()
@@ -1091,6 +1179,8 @@ pub fn normalize(
         rdis: all.rdis,
         counting,
         ne: all.ne,
+        lazy: all.lazy,
+        low: all.low,
         ..DlAx::default()
     };
     // the hypothetical successor of each existential restriction

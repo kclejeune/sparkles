@@ -160,7 +160,7 @@ fn check(s: &Store, q: &str) -> bool {
     assert_eq!(a, solutions(&run(s, q, Optimizations::NONE)), "{q}");
     let counts = Optimizations::ALL.disable("filter_scan_runs").unwrap();
     assert_eq!(a, solutions(&run(s, q, counts)), "{q}");
-    has_op(&fast.plan, "CountFilterFromRuns") || has_desc(&fast.plan, "[runs of ?")
+    has_op(fast.plan(), "CountFilterFromRuns") || has_desc(fast.plan(), "[runs of ?")
 }
 
 fn queries(next: &mut impl FnMut() -> u64, n: usize) -> Vec<String> {
@@ -310,11 +310,15 @@ fn prefix_filters_are_costed_by_their_key_ranges() {
             p.children.iter().find_map(filter_cost)
         }
         let fast = run(&s, &q, Optimizations::ALL);
-        assert!(has_desc(&fast.plan, "key ranges"), "{q}: {:#?}", fast.plan);
+        assert!(
+            has_desc(fast.plan(), "key ranges"),
+            "{q}: {:#?}",
+            fast.plan()
+        );
         let a = solutions(&fast);
         assert_eq!(a.len(), 40, "{q}");
         // 120 rows in the range of "The B", read in 3 key ranges
-        let cost = filter_cost(&fast.plan).unwrap();
+        let cost = filter_cost(fast.plan()).unwrap();
         assert!(cost < 200.0, "{q}: {cost}");
         assert_eq!(a, solutions(&run(&s, &q, Optimizations::NONE)), "{q}");
     }
@@ -347,9 +351,9 @@ fn runs_at_block_boundaries() {
         let a = solutions(&fast);
         assert_eq!(a, solutions(&run(&s, q, without())), "{q}");
         assert!(
-            has_op(&fast.plan, "CountFilterFromRuns") || has_desc(&fast.plan, "[runs of ?"),
+            has_op(fast.plan(), "CountFilterFromRuns") || has_desc(fast.plan(), "[runs of ?"),
             "{q}: {:#?}",
-            fast.plan
+            fast.plan()
         );
         a
     };
@@ -382,32 +386,32 @@ fn counts_from_runs_are_chosen_and_explained() {
     let s = store(7, 5000, false);
     let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(CONTAINS(?v, \"b\")) }";
     let r = run(&s, q, Optimizations::ALL);
-    assert!(has_op(&r.plan, "CountFilterFromRuns"), "{:#?}", r.plan);
+    assert!(has_op(r.plan(), "CountFilterFromRuns"), "{:#?}", r.plan());
     assert!(
-        has_desc(&r.plan, "values tested on vocabulary keys"),
+        has_desc(r.plan(), "values tested on vocabulary keys"),
         "{:#?}",
-        r.plan
+        r.plan()
     );
     // a fixed start reads only the key ranges that can match
     let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(STRSTARTS(STR(?v), \"Ab\")) }";
     let r = run(&s, q, Optimizations::ALL);
-    assert!(has_desc(&r.plan, "in 3 key ranges"), "{:#?}", r.plan);
+    assert!(has_desc(r.plan(), "in 3 key ranges"), "{:#?}", r.plan());
     let q = "SELECT ?s WHERE { ?s ex:v ?v FILTER(REGEX(?v, \"^Ab\")) }";
     let r = run(&s, q, Optimizations::ALL);
-    assert!(has_desc(&r.plan, "in 3 key ranges"), "{:#?}", r.plan);
+    assert!(has_desc(r.plan(), "in 3 key ranges"), "{:#?}", r.plan());
     // Length comparisons use vocabulary keys too.
     let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(STRLEN(STR(?v)) > 3) }";
     let r = run(&s, q, Optimizations::ALL);
     assert!(
-        has_desc(&r.plan, "values tested on vocabulary keys"),
+        has_desc(r.plan(), "values tested on vocabulary keys"),
         "{:#?}",
-        r.plan
+        r.plan()
     );
     // A wrapper outside the key-filter matcher still exercises generic per-value
     // evaluation, with the same answer as scalar execution.
     let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(ABS(STRLEN(STR(?v))) > 3) }";
     let r = run(&s, q, Optimizations::ALL);
-    assert!(has_desc(&r.plan, "values tested, "), "{:#?}", r.plan);
+    assert!(has_desc(r.plan(), "values tested, "), "{:#?}", r.plan());
     assert_eq!(solutions(&r), solutions(&run(&s, q, Optimizations::NONE)));
     // not over two variables, an impure expression or EXISTS, nor when switched off
     for q in [
@@ -417,7 +421,7 @@ fn counts_from_runs_are_chosen_and_explained() {
         "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:v ?v FILTER(CONTAINS(?v, \"b\")) }",
     ] {
         let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_op(&r.plan, "CountFilterFromRuns"), "{q}");
+        assert!(!has_op(r.plan(), "CountFilterFromRuns"), "{q}");
         assert_eq!(
             solutions(&r),
             solutions(&run(&s, q, Optimizations::NONE)),
@@ -429,5 +433,5 @@ fn counts_from_runs_are_chosen_and_explained() {
         "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(CONTAINS(?v, \"b\")) }",
         without(),
     );
-    assert!(!has_op(&r.plan, "CountFilterFromRuns"));
+    assert!(!has_op(r.plan(), "CountFilterFromRuns"));
 }

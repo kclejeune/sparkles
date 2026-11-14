@@ -64,7 +64,7 @@ impl PyAlgorithms {
         let text = py
             .detach(|| ds.algorithms().stats(&req, &QueryOptions::default()))
             .py(py)?;
-        let v: serde_json::Value = serde_json::from_str(&text)
+        let v: serde_json::Value = serde_json::from_str(text.as_str())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         admin::to_py(py, &v)
     }

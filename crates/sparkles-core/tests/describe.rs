@@ -85,7 +85,7 @@ fn run(s: &Store, q: &str, d: &DescribeOptions) -> sparkles_core::sparql::QueryR
 }
 
 fn describe(s: &Store, q: &str, d: &DescribeOptions) -> Graph {
-    canon(run(s, q, d).triples)
+    canon(run(s, q, d).triples().iter().cloned())
 }
 
 fn check(s: &Store, q: &str, d: &DescribeOptions, want: &str) {
@@ -295,10 +295,10 @@ fn depth_and_size_limits() {
         ..Default::default()
     };
     let r = run(&s, "DESCRIBE ex:a", &small);
-    assert_eq!(r.triples.len(), 3);
+    assert_eq!(r.triples().len(), 3);
     assert!(r.describe_truncated);
     assert!(
-        r.plan
+        r.plan()
             .warnings
             .iter()
             .any(|w| w.code == "describe-truncated")
@@ -308,7 +308,7 @@ fn depth_and_size_limits() {
         ..Default::default()
     };
     let r = run(&s, "DESCRIBE ex:a", &exact);
-    assert_eq!(r.triples.len(), 10);
+    assert_eq!(r.triples().len(), 10);
     assert!(!r.describe_truncated);
 }
 
@@ -349,7 +349,10 @@ fn the_querys_dataset_is_described() {
         &opts,
     )
     .unwrap();
-    assert_eq!(canon(r.triples), turtle("ex:other ex:p ex:a ."));
+    assert_eq!(
+        canon(r.triples().iter().cloned()),
+        turtle("ex:other ex:p ex:a .")
+    );
 }
 
 #[test]
@@ -390,7 +393,7 @@ fn materialized_inferences_count_only_through_the_default_graph() {
     )
     .unwrap();
     assert_eq!(
-        canon(r.triples),
+        canon(r.triples().iter().cloned()),
         turtle("ex:other ex:p ex:a ; ex:inferred \"x\" .")
     );
 }
@@ -561,7 +564,13 @@ fn a_streamed_description_stays_within_its_budget() {
     )])
     .unwrap();
     let q = "DESCRIBE ?s WHERE { ?s <urn:r> ?o }";
-    let want = canon(query(s.snapshot(), q, &Default::default()).unwrap().triples);
+    let want = canon(
+        query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .triples()
+            .iter()
+            .cloned(),
+    );
     assert_eq!(want.len(), 9000);
     for memory in [1u64 << 20, 4 << 20, 64 << 20] {
         let opts = QueryOptions {

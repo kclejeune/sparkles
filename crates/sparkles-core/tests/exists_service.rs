@@ -66,7 +66,7 @@ fn rows_with(s: &Store, q: &str, mode: ExecutionMode, o: &QueryOptions) -> usize
             }
             n
         }
-        QueryExecution::Eager(r) => r.into_result().rows().len(),
+        QueryExecution::Eager(r) => r.into_result().len(),
         _ => unreachable!("a SELECT"),
     }
 }

@@ -679,7 +679,9 @@ async fn updates_have_their_own_timeout() {
 
 #[tokio::test]
 async fn memory_budget_fails_with_507() {
-    let s = server_with(|st| st.limits.query_memory_bytes = Some(1024));
+    // A one-row answer charges its result backing, variables and table, which
+    // need more than 1 KiB, so the budget is 4 KiB.
+    let s = server_with(|st| st.limits.query_memory_bytes = Some(4096));
     let r = get(
         &s.app,
         "/ds/sparql?query=SELECT%20*%20WHERE%20%7B%3Fa%20%3Fb%20%3Fc%20.%20%3Fd%20%3Fe%20%3Ff%7D",
@@ -695,8 +697,8 @@ async fn memory_budget_fails_with_507() {
         "{j}"
     );
     assert_eq!(j["budget"], "memory");
-    assert_eq!(j["limit"], 1024);
-    assert!(j["requested"].as_u64().unwrap() > 1024);
+    assert_eq!(j["limit"], 4096);
+    assert!(j["requested"].as_u64().unwrap() > 4096);
     let m = metrics(&s.app).await;
     assert_eq!(
         sample(
@@ -884,7 +886,8 @@ async fn row_limit_keeps_507() {
             j["limit"].as_u64(),
             j["requested"].as_u64()
         ),
-        (Some("rows"), Some(5), Some(9))
+        // the scan is refused at its sixth row, before the whole table is built
+        (Some("rows"), Some(5), Some(6))
     );
 }
 

@@ -92,7 +92,7 @@ fn acceptance_example() {
     }));
     assert!(carol.failures.iter().any(|f| matches!(f,
         ShexFailure::Facet { constraint, value } if constraint == "MAXINCLUSIVE 150"
-            && *value == Term::from(oxrdf::Literal::from(200)))));
+            && value.as_term() == &Term::from(oxrdf::Literal::from(200)))));
     assert_eq!(
         carol.reason.as_deref(),
         Some("ex:carol: 0 foaf:name arcs, {1,1} needed")
@@ -100,7 +100,7 @@ fn acceptance_example() {
     let acme = &r.results[3];
     assert!(matches!(&acme.failures[0],
         ShexFailure::Closed { predicate, value }
-            if predicate == "http://ex.org/mayor" && *value == ex("bob")));
+            if predicate == "http://ex.org/mayor" && value.as_term() == &ex("bob")));
     assert_eq!(
         acme.reason.as_deref(),
         Some("ex:acme: CLOSED shape forbids ex:mayor ex:bob")
@@ -122,7 +122,7 @@ fn acceptance_example() {
     };
     let r = validate(&store.snapshot(), &schema, &m, &opts).unwrap();
     assert_eq!((r.conformant, r.nonconformant, r.results.len()), (1, 1, 1));
-    assert_eq!(r.results[0].node, ex("nobody"));
+    assert_eq!(r.results[0].node.as_term(), &ex("nobody"));
     // an undefined label
     let err = validate(
         &store.snapshot(),
@@ -154,7 +154,7 @@ fn recursion_is_a_greatest_fixed_point() {
         r.results[0].failures,
         vec![ShexFailure::Reference {
             shape: "ex:Person".into(),
-            value: ex("bob"),
+            value: crate::owned_test_term(ex("bob")),
         }]
     );
     assert!(matches!(
@@ -201,7 +201,7 @@ fn inverse_cardinality_and_extra() {
     );
     assert!(r.results[2].failures.contains(&ShexFailure::Reference {
         shape: "ex:Person".into(),
-        value: ex("x"),
+        value: crate::owned_test_term(ex("x")),
     }));
 }
 
@@ -354,6 +354,7 @@ fn naive(store: &Store, schema: &CompiledSchema, nodes: &[Id]) -> FxHashMap<(Id,
     let snap = store.snapshot();
     let data = DataGraph::new(snap.clone(), None, &[], &[]).unwrap();
     let ir = schema.ir();
+    let output = crate::shapemap::output_root(&snap, &Default::default(), None).unwrap();
     let env = Env::new(
         ir,
         &snap,
@@ -361,6 +362,7 @@ fn naive(store: &Store, schema: &CompiledSchema, nodes: &[Id]) -> FxHashMap<(Id,
         schema.prefixes(),
         Vec::new(),
         &Default::default(),
+        &output,
     );
     let table = std::cell::RefCell::new(FxHashMap::default());
     let mut w = Worker::new(&env.registry, &snap);

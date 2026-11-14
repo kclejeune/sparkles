@@ -23,7 +23,6 @@ use crate::matcher::{self, Budget};
 use crate::nc::NcPlan;
 use crate::neigh::{self, FetchOutcome, Neigh, SnapPlan};
 use crate::semact::{ActCtx, Registry};
-use oxrdf::Term;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use sparkles_core::id::{Id, Tag};
@@ -86,7 +85,8 @@ pub struct Env<'a> {
     /// the semantic-action handlers while typing (no `print` output kept)
     pub registry: Registry,
     /// map nodes that are not in the store, by the payload of their local id
-    pub absent: Vec<Term>,
+    pub absent: Vec<sparkles_core::sparql::output::OwnedTerm>,
+    pub output: &'a sparkles_core::sparql::output::SnapshotOutputRoot,
     pub max_partitions: Option<u64>,
     pub max_pairs: Option<usize>,
     pub limits: Limits,
@@ -148,8 +148,9 @@ impl<'a> Env<'a> {
         snap: &'a Arc<Snapshot>,
         data: &'a DataGraph,
         prefixes: &crate::PrefixMap,
-        absent: Vec<Term>,
+        absent: Vec<sparkles_core::sparql::output::OwnedTerm>,
         opts: &crate::ValidateOptions,
+        output: &'a sparkles_core::sparql::output::SnapshotOutputRoot,
     ) -> Env<'a> {
         let mut pure = vec![None; ir.ses.len()];
         for se in 0..ir.ses.len() {
@@ -163,6 +164,7 @@ impl<'a> Env<'a> {
             nc: NcPlan::new(snap, &ir.ncs).with_prefixes(prefixes),
             registry: Registry::new(false),
             absent,
+            output,
             max_partitions: opts.max_partitions,
             max_pairs: opts.max_pairs,
             limits: Limits {
@@ -186,15 +188,19 @@ impl<'a> Env<'a> {
     }
 
     /// The term of a node id (map nodes not in the store included).
-    pub fn term(&self, id: Id) -> Term {
+    pub fn term(&self, id: Id) -> sparkles_core::Result<sparkles_core::sparql::output::OwnedTerm> {
         if id.tag() == Tag::Local
             && let Some(t) = self.absent.get(id.payload() as usize)
         {
-            return t.clone();
+            return Ok(t.clone());
         }
-        self.snap
-            .term(id)
-            .unwrap_or_else(|| oxrdf::NamedNode::new_unchecked("urn:x-sparkles:unknown").into())
+        match self.output.term(id)? {
+            Some(value) => Ok(value),
+            None => self
+                .output
+                .budget()
+                .copy_term(oxrdf::NamedNodeRef::new_unchecked("urn:x-sparkles:unknown").into()),
+        }
     }
 
     /// Is `se` evaluated at the value, without a pair?
@@ -207,7 +213,7 @@ impl<'a> Env<'a> {
         if node.tag() == Tag::Local
             && let Some(t) = self.absent.get(node.payload() as usize)
         {
-            return self.nc.check_term(nc, t);
+            return self.nc.check_term(nc, t.as_term());
         }
         self.nc.check(nc, node)
     }

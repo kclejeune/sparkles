@@ -5844,6 +5844,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles-budget"
+version = "0.1.0"
+
+[[package]]
 name = "sparkles-client"
 version = "0.1.0"
 dependencies = [
@@ -5921,6 +5925,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparkles-alloc",
+ "sparkles-budget",
  "sparkles-owl",
  "stacker",
  "tantivy",
@@ -6076,6 +6081,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "sparkles-budget",
  "sparkles-core",
  "tempfile",
  "thiserror 2.0.21",

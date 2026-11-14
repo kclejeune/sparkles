@@ -126,7 +126,7 @@ fn all_eight_queries_match_independently_authored_full_term_bindings() {
             .iter()
             .map(|v| v.as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(result.vars, columns, "{name} columns");
+        assert_eq!(result.variables(), columns, "{name} columns");
         let mut actual: Vec<Vec<Option<String>>> = result
             .iter()
             .map(|row| {

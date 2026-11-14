@@ -118,7 +118,7 @@ fn saturation(capacity: usize, owner_threads: usize, deadline: bool, service: bo
                     None,
                 )])
                 .unwrap();
-            query(store.snapshot(), "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:concurrency 1 ; algo:node ?n ; algo:component ?c } }", &QueryOptions { cancel: Some(flag), ..Default::default() }).map(|r| r.rows().len())
+            query(store.snapshot(), "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:concurrency 1 ; algo:node ?n ; algo:component ?c } }", &QueryOptions { cancel: Some(flag), ..Default::default() }).map(|r| r.test_application_rows().len())
         } else {
             let control = Control::new(
                 flag,

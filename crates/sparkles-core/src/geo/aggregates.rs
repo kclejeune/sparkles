@@ -126,7 +126,7 @@ PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
         let text = format!("{P}{q}");
         let r = query(s.snapshot(), &text, &QueryOptions::default())
             .unwrap_or_else(|e| panic!("{text}: {e}"));
-        r.rows()
+        r.test_application_rows()
             .into_iter()
             .map(|row| row.into_iter().next().flatten())
             .collect()

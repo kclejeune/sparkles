@@ -1039,8 +1039,9 @@ async fn body_aware_query_and_update_views_preserve_graph_and_triple_limits() {
     assert_eq!(result.len(), 2);
     let output: Vec<String> = result
         .rows()
+        .unwrap()
         .iter()
-        .map(|row| row[0].as_ref().unwrap().to_string())
+        .map(|row| row.values()[0].as_ref().unwrap().to_string())
         .collect();
     assert_eq!(output, ["<http://ex/allowed-a>", "<http://ex/allowed-b>"]);
 }

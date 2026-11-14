@@ -5461,8 +5461,11 @@ configuration history. The build then reads the policy's output graph with the p
 graphs, and an accepted fact enters a report only when the principal may see the claim
 that supports it. Each finding cites the claims and decisions behind its facts, and the
 report records the policy and its version. Withdrawing or reversing a claim rewrites the
-reports that read it at the next refresh. A projection that names no graph reads the
-accepted evidence alone.
+reports that read it at the next refresh. With `refresh.mode: auto`, a change of the
+policy's decisions, supports or withdrawals, of the evidence configuration or of the
+access policy, and a server start, first run a check of the refresh's plan without any
+model call or commit, and a refresh starts only when a report's input changed. A
+projection that names no graph reads the accepted evidence alone.
 
 ```sh
 sparkles settings set org graphrag.reviewPolicy=main 'graphrag.projection.graphs=[]'

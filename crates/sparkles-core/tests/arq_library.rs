@@ -61,8 +61,9 @@ fn rows(s: &Store, q: &str) -> Vec<String> {
         query(s.snapshot(), &text, &QueryOptions::default()).unwrap_or_else(|e| panic!("{q}: {e}"));
     let mut out: Vec<String> = r
         .rows()
+        .unwrap()
         .iter()
-        .map(|row| row.iter().map(short).collect::<Vec<_>>().join(" "))
+        .map(|row| row.values().iter().map(short).collect::<Vec<_>>().join(" "))
         .collect();
     out.sort();
     out
@@ -368,7 +369,12 @@ fn container_functions_match_arq() {
         &QueryOptions::default(),
     )
     .unwrap();
-    let got: Vec<String> = r.rows().iter().map(|row| short(&row[0])).collect();
+    let got: Vec<String> = r
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|row| short(&row.values()[0]))
+        .collect();
     assert_eq!(got, [":y", ":z", ":w"]);
 }
 

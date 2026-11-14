@@ -1556,6 +1556,15 @@ impl Saturation {
             None if disj => Some(saturate::Dynamic::new(n as Ex)),
             None => None,
         };
+        if ix.dl.is_some() && dl_rules::tracing() {
+            // the trace names each class by the last part of its IRI, once
+            for (id, c) in self.interner.classes.iter().enumerate() {
+                if let Some(e) = self.interner.get(&Node::Class(id as u32)) {
+                    let name = c.as_str().rsplit(['#', '/']).next().unwrap_or("");
+                    eprintln!("TR NAME {e} {name}");
+                }
+            }
+        }
         let dl_run = ix.dl.as_ref().map(|_| {
             dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone())
         });
@@ -1961,7 +1970,18 @@ impl Saturation {
         // again
         self.entangled |= horn || disj;
         if let Some(d) = &dl_run {
-            for c in self.ctx.iter().filter_map(|c| c.get()) {
+            // the contexts made during the run, the tests and the keyed hypothetical
+            // successors, count with the index's
+            let base = self.ctx.len() as Ex;
+            let made = dynamic
+                .iter()
+                .flat_map(|dy| (0..dy.len() as Ex).filter_map(move |i| dy.get_ctx(base + i)));
+            for c in self
+                .ctx
+                .iter()
+                .filter_map(|c| c.get().map(|c| &**c))
+                .chain(made)
+            {
                 if let Some(n) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref()) {
                     stats.dl_contexts += 1;
                     stats.dl_stored += n.store.clauses.len();

@@ -1,0 +1,245 @@
+"""Instruction and cache counts of the server per request, per binary, over one store (item 703).
+
+    perfstat.py STORE PORT ROUNDS REPS OUT.json ARM... -- QUERY.rq...
+
+An ARM is NAME=BINARY[:DISABLE], as in abbin.py. Each round starts a fresh server per arm in
+the order given and then in reverse, with the result cache off. For every query it warms the
+server with three requests, takes a structural fingerprint of the plan from the last one, and
+then runs the PHASES below, each of which attaches `perf stat -p` to the server, sends REPS
+requests, stops perf with SIGINT and keeps the user-space counts divided by REPS together with
+the median planMs and execMs of those requests. One idle sample per process, half a second of
+perf with no requests, shows what the server costs between requests.
+
+Environment: PERF (the perf binary), THREADS (RAYON_NUM_THREADS, default 1), SERVER_CPU (a
+taskset list, default 2) and CLIENT_CPU (default 4), SPIN=1 (default) for an idle-priority
+spinner on each server CPU and on the client CPU, as scripts/nsc-bench-remote.sh does.
+SERVER_CPU=none disables pinning and the spinners.
+
+Per-request counts are what separate code from layout: equal instructions with different
+cycles point at layout or placement, and the frontend phase says whether the decoded-icache
+(DSB) coverage, MITE fallback or icache stalls moved; different instructions mean the binaries
+run different code for the same plan.
+"""
+
+import hashlib
+import json
+import os
+import re
+import signal
+import statistics
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+PHASES = {
+    "basic": ["instructions:u", "cycles:u", "cache-misses:u", "branch-misses:u",
+              "cpu_core/mem_load_retired.l3_miss/u", "cpu_core/baclears.any/u"],
+    "front": ["instructions:u", "cycles:u", "cpu_core/idq.dsb_uops/u", "cpu_core/idq.mite_uops/u",
+              "cpu_core/frontend_retired.any_dsb_miss/u",
+              "cpu_core/dsb2mite_switches.penalty_cycles/u"],
+    "icache": ["instructions:u", "cycles:u", "cpu_core/icache_data.stalls/u",
+               "cpu_core/icache_tag.stalls/u", "L1-icache-load-misses:u", "iTLB-load-misses:u"],
+}
+
+loc, port, rounds, reps, out, *rest = sys.argv[1:]
+rounds, reps = int(rounds), int(reps)
+sep = rest.index("--")
+arms = []
+for a in rest[:sep]:
+    name, spec = a.split("=", 1)
+    binary, _, disable = spec.partition(":")
+    arms.append((name, binary, disable))
+queries = rest[sep + 1:]
+PERF = os.environ.get("PERF", "perf")
+THREADS = os.environ.get("THREADS", "1")
+SERVER_CPU = os.environ.get("SERVER_CPU", "2")
+CLIENT_CPU = os.environ.get("CLIENT_CPU", "4")
+PIN = SERVER_CPU != "none"
+
+
+def cpu_list(spec):
+    cpus = []
+    for part in spec.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            cpus.extend(range(int(lo), int(hi) + 1))
+        else:
+            cpus.append(int(part))
+    return cpus
+
+
+spinners = []
+if PIN:
+    subprocess.run(["taskset", "-cp", CLIENT_CPU, str(os.getpid())], check=True,
+                   stdout=subprocess.DEVNULL)
+    if os.environ.get("SPIN", "1") == "1":
+        for c in cpu_list(SERVER_CPU) + cpu_list(CLIENT_CPU):
+            spinners.append(subprocess.Popen(
+                ["taskset", "-c", str(c), "chrt", "-i", "0", "sh", "-c", "while :; do :; done"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+
+def serve(binary, disable):
+    env = dict(os.environ)
+    env["RAYON_NUM_THREADS"] = THREADS
+    if disable:
+        env["SPARKLES_DISABLE_OPTIMIZATIONS"] = disable
+    data = f"/tmp/x15-perfstat-{port}"
+    subprocess.run(["rm", "-rf", data], check=False)
+    pin = ["taskset", "-c", SERVER_CPU] if PIN else []
+    srv = subprocess.Popen(
+        pin + [binary, "--result-cache-mb", "0", "serve", "--data", data, "--loc", f"bench={loc}",
+               "--port", port, "--no-access-log"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    for _ in range(600):
+        try:
+            urllib.request.urlopen(f"http://localhost:{port}/$/ready", timeout=2)
+            break
+        except Exception:
+            time.sleep(0.1)
+    return srv
+
+
+def post(q):
+    body = urllib.parse.urlencode({"query": q}).encode()
+    req = urllib.request.Request(
+        f"http://localhost:{port}/bench/sparql?nocache=true", data=body,
+        headers={"Accept": "application/x-sparkles+json",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    r = json.load(urllib.request.urlopen(req, timeout=120))
+    meta = r.get("meta") or {}
+    t = meta.get("timing") or r.get("timing") or {}
+    return t.get("planMs", 0.0), t.get("execMs", 0.0), r.get("plan") or meta.get("plan")
+
+
+def plan_lines(node, depth=0, est=False):
+    """The plan's operators and descriptions; without `est`, the estimates and the bracketed
+    runtime annotations (sampled selectivities, run counts) are left out, so that the
+    fingerprint is the plan's shape."""
+    extra = f" est={node.get('estimatedRows', 0):.0f} cost={node.get('estimatedCost', 0):.0f}" if est else ""
+    desc = node.get("description", "")
+    if not est:
+        desc = re.sub(r"\s*\[[^\]]*\]", "", desc)
+    yield f"{'  ' * depth}{node.get('operator')}{extra} {desc}"
+    for c in node.get("children", []):
+        yield from plan_lines(c, depth + 1, est)
+
+
+def fingerprint(plan):
+    if not plan:
+        return "none", ""
+    text = "\n".join(plan_lines(plan))
+    return hashlib.sha256(text.encode()).hexdigest()[:12], "\n".join(plan_lines(plan, est=True))
+
+
+def perf_counts(pid, events, body):
+    """Run `body()` while perf stat is attached to the server; return counts and run percentages."""
+    path = f"/tmp/x15-perfstat-{port}.perf"
+    p = subprocess.Popen([PERF, "stat", "-x,", "-o", path, "-e", ",".join(events), "-p", str(pid)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.25)
+    try:
+        result = body()
+    finally:
+        p.send_signal(signal.SIGINT)
+        p.wait(timeout=30)
+    counts, pct = {}, {}
+    for line in open(path):
+        if line.startswith("#") or not line.strip():
+            continue
+        f = line.rstrip("\n").split(",")
+        if len(f) < 5 or f[0] in ("<not counted>", "<not supported>"):
+            continue
+        ev = f[2]
+        pmu = "core"
+        if ev.startswith("cpu_atom/"):
+            pmu, ev = "atom", ev[len("cpu_atom/"):]
+        elif ev.startswith("cpu_core/"):
+            ev = ev[len("cpu_core/"):]
+        ev = ev.rstrip("/").removesuffix("/u")
+        if ev.endswith(":u"):
+            ev = ev[:-2]
+        if pmu == "atom":
+            if float(f[0]) > 0:
+                counts["atom:" + ev] = float(f[0])
+            continue
+        counts[ev] = float(f[0])
+        pct[ev] = float(f[4]) if f[4] else 100.0
+    return result, counts, pct
+
+
+res = {}
+plans = {}
+try:
+    for rnd in range(rounds):
+        for name, binary, disable in arms + arms[::-1]:
+            srv = serve(binary, disable)
+            try:
+                first = True
+                for qf in queries:
+                    q = open(qf).read()
+                    qn = os.path.basename(qf)[:-3]
+                    plan = None
+                    for _ in range(3):
+                        _, _, plan = post(q)
+                    fp, text = fingerprint(plan)
+                    plans.setdefault(qn, {}).setdefault(name, {}).setdefault(fp, text)
+                    rec = {"plan": fp}
+                    if first:
+                        first = False
+                        _, idle, _ = perf_counts(srv.pid, PHASES["basic"], lambda: time.sleep(0.5))
+                        rec["idle_per_s"] = {k: v / 0.5 for k, v in idle.items()}
+
+                    for phase, events in PHASES.items():
+                        def body():
+                            ps, es = [], []
+                            for _ in range(reps):
+                                p, e, _ = post(q)
+                                ps.append(p)
+                                es.append(e)
+                            return statistics.median(ps), statistics.median(es)
+                        (pm, em), counts, pct = perf_counts(srv.pid, events, body)
+                        rec[phase] = {"planMs": pm, "execMs": em,
+                                      "per_req": {k: v / reps for k, v in counts.items()},
+                                      "pct_min": min(pct.values()) if pct else 0.0}
+                    res.setdefault(qn, {}).setdefault(name, []).append(rec)
+            finally:
+                srv.send_signal(signal.SIGTERM)
+                srv.wait(timeout=30)
+        print(f"round {rnd + 1}/{rounds} done", flush=True)
+finally:
+    for sp in spinners:
+        sp.kill()
+        sp.wait()
+
+json.dump({"settings": {"store": loc, "rounds": rounds, "reps": reps, "threads": THREADS,
+                        "server_cpu": SERVER_CPU, "client_cpu": CLIENT_CPU,
+                        "arms": [[n, b, d] for n, b, d in arms], "phases": PHASES},
+           "results": res, "plans": plans}, open(out, "w"), indent=1)
+
+
+def med(recs, phase, key):
+    return statistics.median(r[phase]["per_req"].get(key, 0.0) for r in recs)
+
+
+print(f"{'query':18} {'arm':6} {'exec ms':>8} {'spread':>7} {'instr/req':>12} {'cycles/req':>12} "
+      f"{'IPC':>5} {'L3miss':>8} {'dsb%':>6} {'dsbmiss':>8} {'ic.stall':>9} plans")
+for qn, byarm in res.items():
+    for name, _, _ in arms:
+        recs = byarm[name]
+        es = [r["basic"]["execMs"] for r in recs]
+        e = statistics.median(es)
+        ins = med(recs, "basic", "instructions")
+        cyc = med(recs, "basic", "cycles")
+        dsb = med(recs, "front", "idq.dsb_uops")
+        mite = med(recs, "front", "idq.mite_uops")
+        print(f"{qn:18} {name:6} {e:8.4f} {(max(es) - min(es)) / e * 100:6.0f}% {ins:12.0f} {cyc:12.0f} "
+              f"{ins / cyc if cyc else 0:5.2f} {med(recs, 'basic', 'mem_load_retired.l3_miss'):8.0f} "
+              f"{dsb / (dsb + mite) * 100 if dsb + mite else 0:5.1f}% "
+              f"{med(recs, 'front', 'frontend_retired.any_dsb_miss'):8.0f} "
+              f"{med(recs, 'icache', 'icache_data.stalls'):9.0f} "
+              f"{','.join(sorted({r['plan'] for r in recs}))}")

@@ -69,14 +69,17 @@ fn a_selective_pattern_limits_work_inside_union_branches() {
             if ask {
                 assert!(result.boolean);
             } else {
-                let mut names = result.rows();
-                names.sort_by_key(|row| row[0].as_ref().unwrap().to_string());
+                let mut names = result.rows().unwrap().into_iter().collect::<Vec<_>>();
+                names.sort_by_key(|row| row.values()[0].as_ref().unwrap().to_string());
                 assert_eq!(
-                    names,
-                    vec![
+                    names.iter().map(|row| row.values()).collect::<Vec<_>>(),
+                    [
                         vec![Some(Term::Literal(Literal::new_simple_literal("Alice")))],
-                        vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))],
+                        vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))]
                     ]
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<_>>()
                 );
             }
             eprintln!(
@@ -116,9 +119,9 @@ fn an_ordinary_anchor_preserves_hidden_duplicates_and_union_bags() {
             );
             let r = query(store.snapshot(), &q, &QueryOptions::default()).unwrap();
             assert_eq!(r.len(), if distinct { 1 } else { 4 }, "{q}");
-            for row in r.rows() {
+            for row in r.rows().unwrap() {
                 assert_eq!(
-                    row,
+                    row.values(),
                     vec![Some(Term::Literal(Literal::new_simple_literal("Alice")))]
                 );
             }
@@ -147,8 +150,9 @@ fn a_distributed_shared_anchor_preserves_repeated_union_bags() {
         .unwrap();
         let mut names = result
             .rows()
+            .unwrap()
             .into_iter()
-            .map(|row| row[0].as_ref().unwrap().to_string())
+            .map(|row| row.values()[0].as_ref().unwrap().to_string())
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["\"Alice\"", "\"Alice\"", "\"Bob\"", "\"Bob\""]);
@@ -226,7 +230,7 @@ fn a_broad_anchor_is_not_repeated_in_each_union_branch() {
             p.children.iter().map(check_union).sum()
         }
     }
-    assert_eq!(check_union(&r.plan), 1);
+    assert_eq!(check_union(r.plan()), 1);
 }
 
 #[test]
@@ -237,7 +241,8 @@ fn the_replanned_union_streams_across_requested_batch_sizes() {
     let ask = format!("ASK WHERE {{ {BODY} }}");
     let expected = query(store.snapshot(), &select, &QueryOptions::default())
         .unwrap()
-        .rows();
+        .rows()
+        .unwrap();
     let mut expected = expected
         .into_iter()
         .map(|row| format!("{row:?}"))
@@ -261,7 +266,7 @@ fn the_replanned_union_streams_across_requested_batch_sizes() {
         while let Some(batch) = cursor.next_batch().unwrap() {
             assert!(batch.len() <= rows);
             for row in 0..batch.len() {
-                actual.push(format!("{:?}", batch.row(row).unwrap()));
+                actual.push(format!("{:?}", batch.row(row).unwrap().values()));
             }
         }
         actual.sort();
@@ -314,9 +319,9 @@ fn a_small_anchor_with_expensive_reads_is_computed_once() {
     )
     .unwrap();
     assert_eq!(result.len(), 8);
-    for row in result.rows() {
+    for row in result.rows().unwrap() {
         assert_eq!(
-            row,
+            row.values(),
             vec![
                 Some(Term::NamedNode(
                     oxrdf::NamedNode::new("urn:shared").unwrap()
@@ -339,7 +344,7 @@ fn a_small_anchor_with_expensive_reads_is_computed_once() {
             p.children.iter().map(check).sum()
         }
     }
-    assert_eq!(check(&result.plan), 1);
+    assert_eq!(check(result.plan()), 1);
 }
 
 #[test]
@@ -373,14 +378,17 @@ fn outer_filters_keep_the_original_join_boundary() {
                 },
             )
             .unwrap();
-            let mut names = result.rows();
-            names.sort_by_key(|row| row[0].as_ref().unwrap().to_string());
+            let mut names = result.rows().unwrap().into_iter().collect::<Vec<_>>();
+            names.sort_by_key(|row| row.values()[0].as_ref().unwrap().to_string());
             assert_eq!(
-                names,
-                vec![
+                names.iter().map(|row| row.values()).collect::<Vec<_>>(),
+                [
                     vec![Some(Term::Literal(Literal::new_simple_literal("Alice")))],
-                    vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))],
-                ],
+                    vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))]
+                ]
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>(),
                 "{q}"
             );
             fn has_anchor(p: &sparkles_core::sparql::PlanInfo) -> bool {
@@ -394,13 +402,13 @@ fn outer_filters_keep_the_original_join_boundary() {
                     p.children.iter().map(check_union).sum()
                 }
             }
-            assert_eq!(check_union(&result.plan), 1, "{q}");
+            assert_eq!(check_union(result.plan()), 1, "{q}");
             fn rand_filters(p: &sparkles_core::sparql::PlanInfo) -> usize {
                 usize::from(p.operator == "Filter" && p.description.contains("RAND()"))
                     + p.children.iter().map(rand_filters).sum::<usize>()
             }
             if expression.starts_with("RAND()") {
-                assert_eq!(rand_filters(&result.plan), 1, "{q}");
+                assert_eq!(rand_filters(result.plan()), 1, "{q}");
             }
         }
     }

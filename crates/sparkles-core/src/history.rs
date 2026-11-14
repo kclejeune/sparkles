@@ -353,35 +353,81 @@ pub struct HistoryOptions {
     pub deadline: Option<std::time::Instant>,
 }
 
+// A prepared scan must poll the complete same-root control view, including
+// composed query cancellation, inside decoders and their lock waits. Ordinary
+// historical readers keep the existing HistoryOptions behavior unchanged.
+pub(crate) trait ReadControl: Send + Sync {
+    fn check_read(&self) -> Result<()>;
+    fn no_wait(&self) -> bool {
+        false
+    }
+    /// A synchronous temporary preparation with this read's complete controls
+    /// and its own allowance, for a cold check that needs a Preparation.
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation>;
+}
+
+impl ReadControl for HistoryOptions {
+    fn check_read(&self) -> Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
+
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+        crate::access::Preparation::new(
+            crate::task::Control {
+                cancel: self
+                    .cancel
+                    .clone()
+                    .map(crate::task::Cancel::from_flag)
+                    .unwrap_or_default(),
+                deadline: self.deadline,
+                ..Default::default()
+            },
+            memory_bytes,
+        )
+    }
+}
+
+impl ReadControl for crate::access::Preparation {
+    fn check_read(&self) -> Result<()> {
+        self.check()
+    }
+
+    fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+        self.temporary_with_controls(memory_bytes)
+    }
+
+    fn no_wait(&self) -> bool {
+        self.refuses_wait()
+    }
+}
+
 /// Fixed selector/result/error metadata, including bounded snapshot names.
 pub(crate) const READ_METADATA_BYTES: u64 = 1024;
 
 /// One read's preparation limit. This does not resize the shared history cache.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadLimit<'a> {
-    pub(crate) options: &'a HistoryOptions,
+    pub(crate) options: &'a dyn ReadControl,
     pub(crate) memory: Option<u64>,
     pub(crate) held: u64,
 }
 
 impl ReadLimit<'_> {
     pub(crate) fn check(&self, bytes: u64) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        if self
-            .options
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed))
-        {
-            return Err(Error::Cancelled);
-        }
-        if self
-            .options
-            .deadline
-            .is_some_and(|t| std::time::Instant::now() >= t)
-        {
-            return Err(Error::Timeout);
-        }
+        self.options.check_read()?;
         if let Some(limit) = self.memory
             && bytes.saturating_add(self.held) > limit
         {
@@ -411,6 +457,14 @@ impl ReadLimit<'_> {
         &self,
         lock: &'m parking_lot::RwLock<T>,
     ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        if self.options.no_wait() {
+            self.check(0)?;
+            let held = lock.try_read().ok_or_else(|| {
+                Error::invalid("controlled view preparation would wait (no_wait)")
+            })?;
+            self.check(0)?;
+            return Ok(held);
+        }
         crate::task::read_lock(lock, || self.check(0))
     }
 
@@ -420,6 +474,13 @@ impl ReadLimit<'_> {
     ) -> Result<parking_lot::MutexGuard<'m, T>> {
         loop {
             self.check(0)?;
+            if self.options.no_wait() {
+                let held = mutex.try_lock().ok_or_else(|| {
+                    Error::invalid("controlled view preparation would wait (no_wait)")
+                })?;
+                self.check(0)?;
+                return Ok(held);
+            }
             if let Some(guard) = mutex.try_lock_for(std::time::Duration::from_millis(10)) {
                 self.check(0)?;
                 return Ok(guard);
@@ -480,17 +541,39 @@ pub(crate) struct HistoryConfig {
     pub catalog: CatalogHorizon,
 }
 
+fn read_bytes(root: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(root.join("history.json")) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
-/// file is missing).
+/// file is missing), checked against the selected store's actual identity.
 pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
-    let bytes = match std::fs::read(root.join("history.json")) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(HistoryConfig::default());
-        }
-        Err(e) => return Err(e.into()),
+    let Some(bytes) = read_bytes(root)? else {
+        return Ok(HistoryConfig::default());
     };
     decode_file(&bytes, dataset_id, None)
+}
+
+/// Validate current history metadata without startup writers or recovery cleanup.
+/// A legacy directory without history needs no recorded identity. A present
+/// identity-bearing history requires its own dataset.json, never a fabricated ID.
+pub(crate) fn preflight_file(root: &Path) -> Result<()> {
+    let Some(bytes) = read_bytes(root)? else {
+        return Ok(());
+    };
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    crate::formats::check_settings("history.json", &v)?;
+    let f: HistoryFile =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
+    let dataset_id = commit::read_dataset_file(root)?.ok_or_else(|| {
+        Error::Corrupt("history.json requires its recorded dataset.json identity".into())
+    })?;
+    checked_document(&f, &bytes, dataset_id, &|| Ok(()))
 }
 
 // The capture reader uses the same legacy semantics and format2 validation as

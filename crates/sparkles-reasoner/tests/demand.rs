@@ -85,6 +85,10 @@ fn reasoner(p: &Profile) -> QueryReasoner {
 fn rows(r: &QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
         .rows()
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|row| {
             row.into_iter()
@@ -279,7 +283,7 @@ fn backward_rules_answer_on_demand() {
     let qr = reasoner(&rules);
     let r = run(&s, "SELECT ?a { ex:n10 ex:ancestor ?a }", &demand(&qr));
     assert_eq!(r.len(), n - 10);
-    let applied = r.ctx.reasoning.clone().expect("reasoning applied");
+    let applied = r.reasoning().cloned().expect("reasoning applied");
     // linear in the chain: the answers about ex:n10 alone, so nothing about ex:n0 to
     // ex:n9 and not every pair of the chain
     assert_eq!(applied.report.derived, n as u64 - 10);
@@ -351,7 +355,7 @@ fn join_seeds_bound_variables() {
     let q = "SELECT ?x { ?x ex:takes ex:c7 . ?x a ex:Person }";
     let r = run(&s, q, &demand(&qr));
     assert_eq!(r.len(), 10);
-    let a = r.ctx.reasoning.clone().unwrap();
+    let a = r.reasoning().cloned().unwrap();
     // the ten students' types, and the schema the cone reads
     assert!(a.report.derived < 100, "derived {}", a.report.derived);
     let derive = a
@@ -364,7 +368,7 @@ fn join_seeds_bound_variables() {
     assert_eq!(c["seeds"], "join", "{c:?}");
     assert_eq!(c["seedCount"], 10, "{c:?}");
     // the plan shows the Reason node over the query's plan
-    assert_eq!(r.plan.operator, "Reason");
+    assert_eq!(r.plan().operator, "Reason");
 }
 
 /// Tables are cached per snapshot and view: the second run of a query reads them.
@@ -375,10 +379,10 @@ fn tables_are_cached_per_snapshot() {
     let q = "SELECT ?x { ?x a ex:B }";
     let first = run(&s, q, &demand(&qr));
     assert_eq!(rows(&first).len(), 2);
-    let a = first.ctx.reasoning.clone().unwrap();
+    let a = first.reasoning().cloned().unwrap();
     assert_eq!((a.report.tables, a.report.cached), (1, 0));
     let second = run(&s, q, &demand(&qr));
-    let b = second.ctx.reasoning.clone().unwrap();
+    let b = second.reasoning().cloned().unwrap();
     assert_eq!(b.report.cached, b.report.tables);
     assert_eq!(rows(&second), rows(&first));
     // a commit makes a new snapshot, whose tables are derived again
@@ -389,7 +393,7 @@ fn tables_are_cached_per_snapshot() {
     )])
     .unwrap();
     let third = run(&s, q, &demand(&qr));
-    let c = third.ctx.reasoning.clone().unwrap();
+    let c = third.reasoning().cloned().unwrap();
     assert_eq!(c.report.cached, 0);
     assert_eq!(rows(&third).len(), 3);
     let _ = tables::stats();
@@ -413,9 +417,9 @@ fn rdfs_on_read_does_not_apply_under_demand() {
     let r = run(&s, "SELECT ?x { ?x a ex:Person }", &opts);
     assert_eq!(rows(&r), vec!["<http://ex.org/tom>"]);
     assert!(
-        r.plan.description.contains("RDFS on read did not apply"),
+        r.plan().description.contains("RDFS on read did not apply"),
         "{}",
-        r.plan.description
+        r.plan().description
     );
     let (_, plan) = explain(s.snapshot(), "SELECT ?x { ?x a ex:Person }", &opts).unwrap();
     assert_eq!(plan.operator, "Reason");
@@ -491,7 +495,7 @@ fn owl_rl_demand_follows_the_schema() {
     let r = run(&s, q, &demand(&qr));
     assert_eq!(rows(&r), want);
     assert_eq!(want.len(), 10);
-    let a = r.ctx.reasoning.clone().unwrap();
+    let a = r.reasoning().cloned().unwrap();
     assert!(
         a.report.derived * 4 < report.inferred,
         "derived {} of the {} a materialization derives",
@@ -532,7 +536,13 @@ fn imports_follow_the_graph_view() {
     )));
     let r = run(&s, q, &o);
     assert!(rows(&r).is_empty(), "{:?}", rows(&r));
-    let warnings: Vec<String> = r.ctx.warnings().into_iter().map(|w| w.message).collect();
+    let warnings: Vec<String> = r
+        .plan()
+        .warnings
+        .clone()
+        .into_iter()
+        .map(|w| w.message)
+        .collect();
     assert!(
         !warnings.iter().any(|w| w.contains("secret")),
         "{warnings:?}"
@@ -1031,7 +1041,7 @@ fn derived_schema_selective_query_avoids_unrelated_instance_closure() {
     let result = run(&s, "SELECT ?x { ?x a ex:Person }", &demand(&qr));
     assert_eq!(rows(&result), vec!["<http://ex.org/alice>"]);
     assert!(
-        result.ctx.reasoning.as_ref().unwrap().report.derived < 100,
+        result.reasoning().unwrap().report.derived < 100,
         "unrelated instance closure was derived"
     );
     let mut cancelled = demand(&qr);
@@ -1083,7 +1093,7 @@ fn derived_schema_list_for_all_remains_complete_when_abstract_fact_cap_falls_bac
                 "listForAll schema consequence, padding={padding}, no_cache={no_cache}"
             );
             assert!(
-                result.ctx.reasoning.as_ref().unwrap().report.derived < 100,
+                result.reasoning().unwrap().report.derived < 100,
                 "the selective schema demand must not derive the unrelated padding"
             );
         }
@@ -1352,15 +1362,15 @@ fn fresh_schema_unreached_generators_keep_result_tables() {
     let text = "SELECT ?s { ?s a ex:Stable }";
     let first = run(&input, text, &demand(&qr));
     assert_eq!(rows(&first), vec!["<http://ex.org/a>"]);
-    assert_eq!(first.ctx.reasoning.as_ref().unwrap().report.cached, 0);
+    assert_eq!(first.reasoning().unwrap().report.cached, 0);
     let second = run(&input, text, &demand(&qr));
     assert_eq!(rows(&second), rows(&first));
-    assert_eq!(second.ctx.reasoning.as_ref().unwrap().report.cached, 1);
+    assert_eq!(second.reasoning().unwrap().report.cached, 1);
     let mut options = demand(&qr);
     options.no_cache = true;
     let uncached = run(&input, text, &options);
     assert_eq!(rows(&uncached), rows(&first));
-    assert_eq!(uncached.ctx.reasoning.as_ref().unwrap().report.cached, 0);
+    assert_eq!(uncached.reasoning().unwrap().report.cached, 0);
 }
 
 /// Demand and materialization give the same rows for `text` over `ttl` under OWL RL,
