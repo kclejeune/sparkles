@@ -149,6 +149,88 @@ fn a_change_beside_an_unfolded_universal_keeps_its_holders() {
     }
 }
 
+/// Two negative existential restrictions with one filler over two transitive
+/// properties, each unfolded by the automaton of its property's inverse. The inverse
+/// restrictions on X and Y make the Horn rules take the ontology.
+const TWO_UNFOLDINGS: &str = "TransitiveObjectProperty(:r)
+     TransitiveObjectProperty(:s)
+     SubClassOf(ObjectSomeValuesFrom(:r :B) :C)
+     SubClassOf(ObjectSomeValuesFrom(:s :B) :D)
+     SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+     SubClassOf(:X ObjectSomeValuesFrom(ObjectInverseOf(:r) owl:Thing))
+     SubClassOf(:Y ObjectSomeValuesFrom(ObjectInverseOf(:s) owl:Thing))";
+
+#[test]
+fn two_unfoldings_from_one_filler_keep_their_own_states() {
+    for threads in [1, 4] {
+        let (mut k, mut held) = started(TWO_UNFOLDINGS, threads);
+        let out = k.classify(&limits(threads)).unwrap();
+        // the states of the two automata are classes of their own: with the same ones,
+        // B's predecessor by r would take what the restriction over s gives
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        let s = "SubClassOf(ObjectSomeValuesFrom(:s :B) :D)";
+        remove(&mut k, &mut held, s);
+        let out = same_as_fresh(&mut k, &held, threads, "after the restriction over s left");
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        add(&mut k, &mut held, s);
+        let out = same_as_fresh(&mut k, &held, threads, "after it came back");
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        add(
+            &mut k,
+            &mut held,
+            "SubClassOf(:A ObjectSomeValuesFrom(:s :B))",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "after A got a successor by s");
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    }
+}
+
+/// An ontology whose only axiom outside OWL 2 EL is a pair of inverse properties that
+/// no rule of the Horn tier reads, as in ChEBI: the Horn normalization takes the axiom
+/// and the EL rules saturate.
+const IDLE_INVERSE: &str = "InverseObjectProperties(:p :q)
+     TransitiveObjectProperty(:p)
+     SubClassOf(:A ObjectSomeValuesFrom(:p :B))
+     SubClassOf(:B ObjectSomeValuesFrom(:p :C))
+     SubClassOf(:C :D)
+     SubClassOf(:E :A)
+     SubClassOf(:K :L)";
+
+#[test]
+fn a_run_whose_horn_normalization_gives_no_rule_keeps_its_contexts() {
+    for threads in [1, 4] {
+        let (mut k, mut held) = started(IDLE_INVERSE, threads);
+        add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh(&mut k, &held, threads, "after a leaf joined");
+        assert!(out.stats.incremental, "the run started again");
+        assert_eq!(out.stats.cleared, 0);
+        add(&mut k, &mut held, "SubClassOf(:C :F)");
+        let out = same_as_fresh(&mut k, &held, threads, "after C got a subsumer");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("C"), &c("F")));
+        remove(&mut k, &mut held, "SubClassOf(:C :D)");
+        let out = same_as_fresh(&mut k, &held, threads, "after C lost one");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("C"), &c("D")));
+        // a negative existential restriction, which the inverse gives a universal: the
+        // Horn rules take over and the run starts again
+        add(
+            &mut k,
+            &mut held,
+            "SubClassOf(ObjectSomeValuesFrom(:p :D) :G) SubClassOf(:C :D)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "after the rules changed");
+        assert!(out.taxonomy.is_subclass(&c("E"), &c("G")));
+        add(&mut k, &mut held, "SubClassOf(:N :E)");
+        let out = same_as_fresh(&mut k, &held, threads, "after a leaf joined the Horn run");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("N"), &c("G")));
+    }
+}
+
 #[test]
 fn a_removed_universal_takes_its_conclusions_with_it() {
     for threads in [1, 4, 8] {
@@ -1135,6 +1217,57 @@ fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
             restarted > 0,
             "no kept run passed the budget of a fresh one"
         );
+    }
+}
+
+#[test]
+fn a_run_after_a_change_beside_a_data_value_fits_the_budget_of_a_fresh_run() {
+    // an integer whose value takes most of the budget, in an ontology of the Horn rules
+    let base = format!(
+        "{UNIVERSALS}\nSubClassOf(:A DataHasValue(:d \"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>))",
+        "9".repeat(20_000)
+    );
+    let held = {
+        let mut held = axioms(&base);
+        held.extend(axioms("SubClassOf(:M :K)"));
+        held
+    };
+    let fresh = |limit: usize| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(limit),
+                ..limits(1)
+            })
+            .ok()?;
+        k.excluded().is_empty().then_some(out)
+    };
+    let (mut low, mut high) = (0usize, 1usize << 30);
+    assert!(fresh(high).is_some());
+    while high - low > 64 {
+        let mid = low + (high - low) / 2;
+        if fresh(mid).is_some() {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let want = fresh(high).unwrap();
+    // the run after the change holds no index of the last run beside the value, whose
+    // budget a stop would not leave for a run that starts again
+    for more in [0usize, 64, 256, 1024, 4096] {
+        let (mut k, _) = started(&base, 1);
+        k.add(&axioms("SubClassOf(:M :K)"));
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(high + more),
+                ..limits(1)
+            })
+            .unwrap();
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert_eq!(k.excluded(), Vec::new());
+        assert!(!out.stats.incremental);
     }
 }
 

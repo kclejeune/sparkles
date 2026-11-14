@@ -1064,7 +1064,6 @@ impl Saturation {
         let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
         if let Err(Error::Memory { .. }) = r
             && self.reused
-            && !self.numeric_halt
         {
             // A run that kept contexts of a run with the Horn rules or Tier D passed its
             // budget, which a run that starts again may not: the last index, which it
@@ -1072,6 +1071,8 @@ impl Saturation {
             // nothing reaches any more count against the budget too. The run starts
             // again in full with the same rules before a lower tier takes over, so that
             // its answer is that of a run without the kept contexts (roadmap item 753).
+            // That holds for a stop on the budget of exact numeric values too, which
+            // counts the kept state as well.
             // Its charges draw first on what the pool admitted.
             self.reset();
             let a = admitted.clone();
@@ -1766,7 +1767,7 @@ impl Saturation {
             .flatten()
             .collect();
         poll(limits)?;
-        let (ax, mut ix, normalized_peak, outside_el) =
+        let (ax, mut ix, mut normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes + old_bytes, limits)?;
         drop(outside);
         stats.outside_el = outside_el;
@@ -1785,21 +1786,21 @@ impl Saturation {
             stats.clauses = d.clauses.len();
         }
         // the rules of this run, when a later run may keep its contexts: the EL rules,
-        // the Horn rules without individuals, universal roles or functional data
-        // roles, whose contexts depend on one another only along their links, or Tier D
+        // the Horn rules without individuals, universal roles, keys or data, whose
+        // contexts depend on one another only along their links, or Tier D
         // with the cautious strategy and without a bound on its conclusions, which a
         // run that counts, a rooted run and the run after a passed bound have, and whose
         // count of conclusions a kept context would change
         let tier = match (horn, disj) {
             (false, false) => Some(KeptTier::El),
-            (true, false) if ix.horn.is_some() && saturate::plain(&ix) && ix.keys.is_empty() => {
-                Some(KeptTier::Horn)
-            }
+            // also a run whose Horn normalization gave the index no rule that can fire,
+            // which the EL rules saturate: its contexts follow from the same entries
+            (true, false) if saturate::plain(&ix) && ix.comparable() => Some(KeptTier::Horn),
             (false, true)
                 if ix.horn.is_none()
                     && ix.dl.as_deref().is_some_and(|d| d.keyed_by_expressions())
                     && saturate::plain(&ix)
-                    && ix.keys.is_empty()
+                    && ix.comparable()
                     && limits.expansion == Expansion::Cautious
                     && !self.no_counting =>
             {
@@ -1876,8 +1877,10 @@ impl Saturation {
                 debug_assert_eq!(h.base as usize, n);
                 Some(saturate::Dynamic::new(n as Ex))
             }
-            // the test contexts of Tier D get ids above the index's
-            None if disj => Some(saturate::Dynamic::new(n as Ex)),
+            // the test contexts of Tier D get ids above the index's, and a run whose
+            // Horn normalization gave no rule has no conjunctions and an empty table,
+            // which a run that keeps its contexts expects
+            None if disj || horn => Some(saturate::Dynamic::new(n as Ex)),
             None => None,
         };
         if ix.dl.is_some() && dl_rules::tracing() {
@@ -1907,6 +1910,32 @@ impl Saturation {
             let d = dynamic
                 .as_ref()
                 .expect("the contexts above the index's of a run that keeps them");
+            // the comparison holds both indexes beside the kept contexts and their
+            // clause table, with its marks and the set and the queue of the
+            // invalidation, which count against the budget as the kept state does; a
+            // run that passes it starts again in full (`run_with`)
+            let scratch = ix.changed_scratch(&old) + (self.ctx.len() + d.len()) * 16;
+            let held = self.index_bytes(&ix)
+                + old.bytes()
+                + held_bytes
+                + ax.bytes()
+                + self.context_bytes()
+                + d.retained_bytes()
+                + dl_run.as_ref().map_or(0, |d| d.bytes())
+                + scratch;
+            let more = held.saturating_sub(normalized_peak);
+            if limits.max_memory.is_some_and(|m| held > m)
+                || limits
+                    .charge
+                    .as_deref()
+                    .is_some_and(|f| more > 0 && !f(more))
+            {
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(held),
+                    used: held,
+                });
+            }
+            normalized_peak = normalized_peak.max(held);
             stats.cleared = self.invalidate_changed(&ix.changed(&old), &ix, d);
             drop(old);
             poll(limits)?;

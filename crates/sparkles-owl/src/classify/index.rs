@@ -292,7 +292,8 @@ pub struct Interner {
 pub enum Scope {
     /// the Horn normalization of an axiom outside OWL 2 EL, by [`Interner::scope_axiom`]
     Horn(u32),
-    /// the automaton states of an unfolded universal, by its expression
+    /// the automaton states that the Horn rules unfold a universal or a negative
+    /// existential restriction into, by that expression
     Unfold(Ex),
     /// Tier D's normalization of an axiom outside OWL 2 EL, by
     /// [`Interner::scope_axiom`]
@@ -1936,6 +1937,21 @@ impl Index {
         }
     }
 
+    /// Whether a later run may compare this index with its own
+    /// ([`Index::same_tables`]): it has no data, individuals, universal roles or keys,
+    /// with which that comparison always fails. A run over such an index keeps no
+    /// contexts for the next, which then holds no last index beside its own.
+    pub fn comparable(&self) -> bool {
+        self.roles.data_range.iter().all(|r| r.is_none())
+            && self.roles.functional.iter().all(|f| f.is_empty())
+            && self.vals.is_empty()
+            && self.neg_data.is_empty()
+            && self.universal.is_empty()
+            && self.keys.is_empty()
+            && self.nominals.is_empty()
+            && !self.nominal_selfs
+    }
+
     /// Whether a context that a run over `old` saturated reads the same tables here
     /// when it holds none of the expressions that [`Index::changed`] lists (roadmap
     /// item 753): the tables that no expression keys are equal on the roles of `old`,
@@ -2020,7 +2036,19 @@ impl Index {
             }
             sets
         };
-        let (old_sets, new_sets) = (members(old), members(self));
+        // each set has one number in both indexes, so that an expression's sets compare
+        // without their members
+        let mut numbers: FxHashMap<Vec<Ex>, u32> = FxHashMap::default();
+        let mut numbered = |sets: Vec<Vec<Ex>>| -> Vec<u32> {
+            sets.into_iter()
+                .map(|members| {
+                    let next = numbers.len() as u32;
+                    *numbers.entry(members).or_insert(next)
+                })
+                .collect()
+        };
+        let old_sets = numbered(members(old));
+        let new_sets = numbered(members(self));
         let flag = |ix: &Index, e: usize| -> u8 {
             ix.horn
                 .as_ref()
@@ -2043,11 +2071,11 @@ impl Index {
         for (e, changed) in changed.iter_mut().enumerate() {
             let (a, b) = (&old.heads[e], &self.heads[e]);
             debug_assert_eq!(a.node, b.node);
-            let sets = |ix: &Index, h: &Head, sets: &[Vec<Ex>]| -> Vec<Vec<Ex>> {
-                let mut v: Vec<Vec<Ex>> = ix
+            let sets = |ix: &Index, h: &Head, sets: &[u32]| -> Vec<u32> {
+                let mut v: Vec<u32> = ix
                     .disjoint_of(h)
                     .iter()
-                    .map(|&s| sets[s as usize].clone())
+                    .map(|&s| sets[s as usize])
                     .collect();
                 v.sort_unstable();
                 v
@@ -2070,6 +2098,13 @@ impl Index {
             b.changed(a, &mut changed);
         }
         changed
+    }
+
+    /// The bytes that [`Index::changed`] allocates for the comparison with `old`,
+    /// roughly: a mark for each expression, and the members of the disjointness sets of
+    /// both indexes with their numbers.
+    pub fn changed_scratch(&self, old: &Index) -> usize {
+        old.heads.len() + (old.disjoint.len() + self.disjoint.len()) * 12
     }
 
     /// The bytes the index takes, roughly, the role table included.
@@ -2460,7 +2495,14 @@ fn horn_index(
     let mut made: Vec<Ex> = Vec::new();
     for (holder, r, f) in unfold {
         let a = autos.entry(r).or_insert_with(|| h.autos[&r].eps_free());
-        it.begin_scope(Scope::Unfold(holder));
+        // a universal's holder is the universal, and a negative existential
+        // restriction's is its filler, which restrictions over other roles share, so
+        // the restriction names the scope
+        let key = match it.nodes[holder as usize] {
+            Node::Forall(t, c) if t == r && c == f => holder,
+            _ => f,
+        };
+        it.begin_scope(Scope::Unfold(key));
         let states: Vec<Ex> = (0..a.states)
             .map(|s| {
                 if s == a.start && !a.entered[s as usize] {
