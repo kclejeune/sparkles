@@ -4099,7 +4099,6 @@ struct BaseScan {
     block: Option<crate::index::Block>,
     row: usize,
     row_end: usize,
-    passes: bool,
     _charge: Arc<OwnedCharge>,
 }
 
@@ -4172,7 +4171,6 @@ impl Scan {
                 block: None,
                 row: 0,
                 row_end: 0,
-                passes: false,
                 _charge: Arc::new(charge),
             });
             self.base_checked = true;
@@ -4234,7 +4232,6 @@ impl Scan {
                     block.key_range(&lo, &hi)
                 };
                 base.next += 1;
-                base.passes = exec::block_passes(&self.spec, &block, base.row, base.row_end);
                 base.block = Some(block);
             }
             if base.row == base.row_end {
@@ -4242,12 +4239,14 @@ impl Scan {
                 continue;
             }
             let block = base.block.as_ref().expect("loaded immutable block");
-            if !base.passes {
-                // No row was consumed: the owned path can resume this block.
+            // Only the rows of this batch are checked, so a small demand does not read
+            // the graph column of the whole block.
+            let end = base.row_end.min(base.row.saturating_add(cap));
+            if !exec::block_passes(&self.spec, block, base.row, end) {
+                // No row of the batch was consumed: the owned path resumes from it.
                 return Ok(SharedAttempt::Unsupported);
             }
             let charge = OwnedCharge::new(ctx, 512)?;
-            let end = base.row_end.min(base.row.saturating_add(cap));
             let batch = SharedBatch {
                 block: block.clone(),
                 columns,
@@ -4378,12 +4377,11 @@ impl Scan {
                     block.key_range(&lo, &hi)
                 };
                 base.next += 1;
-                base.passes = exec::block_passes(&self.spec, &block, base.row, base.row_end);
                 base.block = Some(block);
             }
             let block = base.block.as_ref().unwrap();
-            if !self.spec.dedup && base.passes {
-                let end = base.row_end.min(base.row + cap - out.table.len);
+            let end = base.row_end.min(base.row + cap - out.table.len);
+            if !self.spec.dedup && exec::block_passes(&self.spec, block, base.row, end) {
                 for (column, &source) in out.table.cols.iter_mut().zip(&columns) {
                     column.extend(block.cols[source][base.row..end].iter().copied().map(Id));
                 }
@@ -4434,7 +4432,6 @@ impl Scan {
                     block: None,
                     row: 0,
                     row_end: 0,
-                    passes: false,
                     _charge: Arc::new(charge),
                 });
             }
