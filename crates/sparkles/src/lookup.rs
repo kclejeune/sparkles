@@ -13,9 +13,10 @@
 //! lookup as before. A slot holds the whole key, so two keys with one hash never share an
 //! answer.
 //!
-//! The memo costs each thread that reads patterns up to [`SLOTS`] slots of 56 bytes and
-//! the key bytes they hold, about 100 KiB with keys of 50 bytes. A key longer than
-//! [`MAX_KEY`] is not remembered, which bounds a thread's memo at about 300 KiB.
+//! The memo costs each thread that reads patterns up to [`SLOTS`] slots of 64 bytes and
+//! the key bytes they hold, about 115 KiB with keys of 50 bytes. A key longer than
+//! [`MAX_KEY`] is not remembered and a slot's buffer never holds more than that, which
+//! bounds a thread's memo at 320 KiB.
 
 use crate::id::{self, Id};
 use crate::store::Snapshot;
@@ -76,8 +77,13 @@ fn base_index(snap: &Snapshot, key: &[u8]) -> Option<u64> {
         slot.uid = uid;
         slot.hash = hash;
         slot.base = base;
-        slot.key.clear();
-        slot.key.extend_from_slice(key);
+        if slot.key.capacity() < key.len() {
+            // exactly the key's length, so that no buffer grows past `MAX_KEY`
+            slot.key = key.to_vec();
+        } else {
+            slot.key.clear();
+            slot.key.extend_from_slice(key);
+        }
         base
     })
 }
