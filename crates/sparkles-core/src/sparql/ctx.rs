@@ -1541,6 +1541,19 @@ impl Ctx {
         }
     }
 
+    /// This context in an `Arc` that holds a weak reference to it, as query preparation
+    /// shares every context it runs. A caller that plans and executes a node itself
+    /// shares its context with this once planning is done, since a LIMIT without ORDER
+    /// BY, an ASK and an EXISTS pattern pull their input through cursor operators only
+    /// to the rows they need in a shared context, and a context that was never shared
+    /// runs that input whole (item 980). Retained state, such as the EXISTS memo, is
+    /// charged to the query's memory budget from then on.
+    pub fn into_shared(self) -> Arc<Ctx> {
+        let ctx = Arc::new(self);
+        ctx.attach_owner();
+        ctx
+    }
+
     /// The shared context, for an eager join that runs the cursor's partitioned join
     /// over its inputs when its build does not fit. `None` for a context that was never
     /// shared, such as one a test builds alone.

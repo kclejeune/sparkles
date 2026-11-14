@@ -2273,7 +2273,9 @@ pub(super) fn spilled_join(ctx: &Arc<Ctx>, node: Node, out: &mut Table) -> Resul
 /// what ran, with the nodes that stopped before their end marked, and whether the
 /// input ended. The rows keep the order the plan claims for `node`, which an eager
 /// operator above may rely on. A context that was never shared, as some unit tests
-/// build, runs `node` whole.
+/// build, runs `node` whole, so every caller that executes a plan shares its context
+/// first, through query preparation, [`Ctx::into_shared`] or the [`exec::execute`]
+/// facade (item 980).
 pub(super) fn pull<'ctx>(
     ctx: &'ctx Ctx,
     node: &Node,
@@ -2296,6 +2298,13 @@ fn pull_planned<'ctx>(
     planned: bool,
 ) -> Result<(super::table::Materialized<'ctx>, PlanInfo, bool)> {
     let Some(shared) = ctx.shared() else {
+        // Only the crate's unit tests build a context that is never shared, so a debug
+        // build outside them flags a caller that would read its whole input here.
+        #[cfg(not(test))]
+        debug_assert!(
+            false,
+            "a LIMIT, ASK or EXISTS ran in a context that was never shared"
+        );
         let (rows, info) = exec::execute_materialized(ctx, node)?;
         return Ok((rows, info, true));
     };

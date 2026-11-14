@@ -543,12 +543,12 @@ fn display(t: &Term) -> String {
 
 impl Engine<'_> {
     /// Execute a parsed query with pre-bound variables.
-    pub(crate) fn run_query(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Ctx)> {
+    pub(crate) fn run_query(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Arc<Ctx>)> {
         let depth = depth::check_query(q).map_err(|e| anyhow!("{e}"))?;
         depth::with_stack(depth, || self.run_query_on(q, binds))
     }
 
-    fn run_query_on(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Ctx)> {
+    fn run_query_on(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Arc<Ctx>)> {
         let mut ctx = Ctx::new(self.data.snap.clone());
         ctx.use_cache = false;
         ctx.allow_service = false;
@@ -580,6 +580,8 @@ impl Engine<'_> {
                 .plan(&pattern, &ActiveGraph::Default, Vec::new())
                 .map_err(|e| anyhow!("{e}"))?
         };
+        // A shared context pulls an ASK, a LIMIT and an EXISTS only to the rows they need.
+        let ctx = ctx.into_shared();
         let (table, _) = exec::execute(&ctx, &node).map_err(|e| anyhow!("{e}"))?;
         Ok((table, ctx))
     }
@@ -910,5 +912,83 @@ mod tests {
         let (_, ctx) = engine.run_query(&query, &[]).unwrap();
         assert!(!ctx.allow_service);
         assert!(ctx.forbid_service);
+    }
+
+    /// A store whose two predicates each hold `side` triples, so a pattern that reads
+    /// both without a shared variable answers `side * side` rows.
+    fn product_store(side: usize) -> sparkles_core::store::Store {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut data = String::new();
+        for i in 0..side {
+            data.push_str(&format!("<urn:a:{i}> <urn:p> <urn:b:{i}> .\n"));
+            data.push_str(&format!("<urn:c:{i}> <urn:q> <urn:d:{i}> .\n"));
+        }
+        store
+            .load(&[sparkles_core::io::Source::from_bytes(
+                data.into_bytes(),
+                sparkles_core::io::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store
+    }
+
+    /// The rows the operators of `text` produce when the engine runs it as a SHACL-SPARQL
+    /// query, with `$this` bound to `<urn:a:7>`.
+    fn produced(store: &sparkles_core::store::Store, text: &str) -> (usize, u64) {
+        let shapes = crate::Shapes::default();
+        let (data, ids) =
+            crate::data::DataGraph::new(store.snapshot(), None, &[], &[], &shapes).unwrap();
+        let engine =
+            crate::validate::Engine::new(&shapes, &data, ids, &crate::ValidateOptions::default())
+                .unwrap();
+        let query = sparkles_core::sparql::parse_query(text, None, &[]).unwrap();
+        let this = oxrdf::Term::NamedNode(NamedNode::new_unchecked("urn:a:7"));
+        let (table, ctx) = engine.run_query(&query, &[("this", this)]).unwrap();
+        (table.len(), ctx.rows_produced())
+    }
+
+    // A SHACL-SPARQL ASK, a LIMIT and an EXISTS read their input until they have the rows
+    // they need, as a query does (items 827 and 980). Each pattern below answers a million
+    // rows, and the pulled prefix produces far fewer.
+    const PULLED: u64 = 300_000;
+
+    #[test]
+    fn a_shacl_ask_reads_its_pattern_until_its_first_solution() {
+        let store = product_store(1_000);
+        let (rows, produced) = produced(&store, "ASK { ?a <urn:p> ?b . ?c <urn:q> ?d }");
+        assert_eq!(rows, 1);
+        assert!(produced < PULLED, "{produced}");
+        let (_, produced) = produced_union(&store);
+        assert!(produced < PULLED, "{produced}");
+    }
+
+    fn produced_union(store: &sparkles_core::store::Store) -> (usize, u64) {
+        produced(
+            store,
+            "ASK { { ?a <urn:p> ?b . ?c <urn:q> ?d } UNION { ?a <urn:q> ?b . ?c <urn:p> ?d } }",
+        )
+    }
+
+    #[test]
+    fn a_shacl_limit_reads_its_pattern_until_its_limit() {
+        let store = product_store(1_000);
+        let (rows, produced) = produced(
+            &store,
+            "SELECT $this ?c WHERE { $this <urn:p> ?b . ?c <urn:q> ?d . ?e <urn:p> ?f } LIMIT 1",
+        );
+        assert_eq!(rows, 1);
+        assert!(produced < PULLED, "{produced}");
+    }
+
+    #[test]
+    fn a_shacl_exists_reads_its_pattern_until_its_first_solution() {
+        let store = product_store(1_000);
+        let (rows, produced) = produced(
+            &store,
+            "SELECT $this WHERE { FILTER EXISTS { $this <urn:p> ?b . ?c <urn:q> ?d . ?e <urn:p> ?f } }",
+        );
+        assert_eq!(rows, 1);
+        assert!(produced < PULLED, "{produced}");
     }
 }

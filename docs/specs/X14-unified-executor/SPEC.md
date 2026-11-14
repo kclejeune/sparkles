@@ -238,7 +238,12 @@ the first rows, from each branch's cost and estimated rows, when no branch calls
 application function, a SERVICE or another operator with effects. `run_limited`,
 `execute_limited`, the first-work estimator, `limited_input`, `filtered_ask_admitted`,
 `order_ask` and `Dataset::ask_streaming_with` are gone, and the accounting mode is read
-in four places. The planner marks a LIMIT or an ASK to run its input whole, as a SELECT
+in four places. Pulling needs a shared context, so every caller that executes a plan shares
+its context once planning is done (item 980). The WHERE clause of an update and the
+queries that SHACL-SPARQL constraints, SPARQL functions and node expressions run share
+theirs through `Ctx::into_shared`, the public `exec::execute` shares a context it is
+given, and a debug build fails a pull in a context that was never shared outside the
+core crate's unit tests. The planner marks a LIMIT or an ASK to run its input whole, as a SELECT
 does, when exact index counts bound every operator of the input, and the rows an index
 join's probes read, to a cursor batch of 4,096 rows and its estimated cost past the first
 rows is below the 4,096 units that building cursor operators costs

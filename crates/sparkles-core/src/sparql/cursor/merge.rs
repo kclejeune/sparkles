@@ -1328,7 +1328,12 @@ mod tests {
             values(vec![0, 1], &left),
             optional(values(vec![0, 2], &middle), values(vec![0, 3], &right)),
         );
-        let expected = rows(&exec::execute(&context(u64::MAX), &node).unwrap().0);
+        let expected = rows(
+            &exec::execute_materialized(&context(u64::MAX), &node)
+                .unwrap()
+                .0
+                .table,
+        );
         assert_eq!(expected.len(), 24 * 24 * 24 + 2);
         for encrypted in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1395,7 +1400,11 @@ mod tests {
             values(vec![0, 1], &side(0)),
             values(vec![0, 2], &side(100_000)),
         );
-        let expected = exec::execute(&context(u64::MAX), &node).unwrap().0.len as u64;
+        let expected = exec::execute_materialized(&context(u64::MAX), &node)
+            .unwrap()
+            .0
+            .table
+            .len as u64;
         assert_eq!(expected, 4000 * 4000 + 51);
         for cap in [64, 1000] {
             let ctx = context_with_spill(128 << 10, Some(&spill));
@@ -1442,7 +1451,7 @@ mod tests {
                 join(other, nested)
             };
             let eager = context(u64::MAX);
-            let expected = rows(&exec::execute(&eager, &node).unwrap().0);
+            let expected = rows(&exec::execute_materialized(&eager, &node).unwrap().0.table);
             for cap in [32, 127] {
                 let ctx = context_with_spill(128 << 10, Some(&spill));
                 let mut op =
@@ -1630,7 +1639,7 @@ mod tests {
             for cap in [1, 2, 3, 4096] {
                 let ctx = context(1 << 20);
                 let node = join(values(vec![0, 1, 2], left), values(vec![0, 1, 3], right));
-                let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
+                let expected = rows(&exec::execute_materialized(&ctx, &node).unwrap().0.table);
                 let mut op =
                     Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
                 assert!(!op.materializes);
@@ -1682,7 +1691,7 @@ mod tests {
                     node.kind = Kind::LeftJoin { expr: None };
                 }
                 assert!(eligible(&ctx, &node));
-                let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
+                let expected = rows(&exec::execute_materialized(&ctx, &node).unwrap().0.table);
                 let mut op =
                     Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
                 assert!(matches!(op.state, super::super::State::Merge(_)));
@@ -1747,7 +1756,7 @@ mod tests {
                     node.sorted = vec![0];
                     node.children = vec![left, values(vec![0, 2], right)];
                     assert!(eligible(&ctx, &node));
-                    let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
+                    let expected = rows(&exec::execute_materialized(&ctx, &node).unwrap().0.table);
                     let mut op =
                         Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
                             .unwrap();
@@ -1820,7 +1829,7 @@ mod tests {
         );
         let ctx = context(1 << 20);
         assert!(eligible(&ctx, &node));
-        let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
+        let expected = rows(&exec::execute_materialized(&ctx, &node).unwrap().0.table);
         let mut op = Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
         assert!(matches!(op.state, super::super::State::Binary(_)));
         let mut result = Vec::new();
@@ -1870,7 +1879,12 @@ mod tests {
                 if optional {
                     node.kind = Kind::LeftJoin { expr: None };
                 }
-                let expected = rows(&exec::execute(&context(u64::MAX), &node).unwrap().0);
+                let expected = rows(
+                    &exec::execute_materialized(&context(u64::MAX), &node)
+                        .unwrap()
+                        .0
+                        .table,
+                );
                 for cap in [7, 512] {
                     let ctx = {
                         let store = Store::in_memory(StoreOptions::default());

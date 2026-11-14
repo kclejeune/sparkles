@@ -50,6 +50,14 @@ memory than the eager limited join it replaces when both inputs are large, and r
 item 947 follows it up. Some pulled first rows still take 1.05 to 1.37 times as long as
 the eager path did, and roadmap item 952 follows them up.
 
+The WHERE clause of a SPARQL Update and the queries of SHACL-SPARQL constraints, SPARQL
+functions and node expressions pull their ASK, LIMIT and EXISTS patterns the same way
+(roadmap item 980). Their contexts were not shared with the cursor operators, so they
+read the whole input of such a pattern. An update whose WHERE clause takes one row of a
+product of two 1,000-row patterns produced two million rows and now produces about a
+thousand, so it fits a budget of produced rows again. These contexts now charge their
+retained state, such as the EXISTS memo, to the query's memory budget, as a query does.
+
 ### Valid time
 
 C27 Phase 1 is complete (roadmap item 341). An authenticated claim proposal records each
