@@ -1678,12 +1678,12 @@ impl Saturation {
         // With `Limits::dl_steps` every saturation of Tier D runs in steps. The ids of a
         // rooted run's literals and of the eager strategy's contexts follow the order in
         // which the threads make them, so those runs take one thread instead, whose order
-        // is fixed.
+        // is fixed. The worlds and the taxonomy keep the caller's threads.
         let fixed = limits.dl_steps && disj && dl_run.is_some();
         let steps = fixed && rooted.is_none() && limits.expansion == Expansion::Cautious;
-        let threads = if fixed && !steps { 1 } else { threads };
+        let saturation_threads = if fixed && !steps { 1 } else { threads };
         let bounds = Bounds {
-            threads,
+            threads: saturation_threads,
             deadline: limits.deadline,
             max_memory,
             cancelled: cancel_fn,
@@ -1734,6 +1734,10 @@ impl Saturation {
             (_, Some(s)) => {
                 self.dl_worked
                     .store(matches!(s, Stop::Work { .. }), Ordering::Relaxed);
+                #[cfg(test)]
+                if matches!(s, Stop::Work { .. }) {
+                    PASSED_AT.with(|p| p.set(dl_run.as_ref().map_or(0, |d| d.work())));
+                }
                 return Err(stopped(s));
             }
         };
@@ -1835,6 +1839,10 @@ impl Saturation {
         // fallback chain of `run_with` takes to the run that starts again, with counting
         // or the rooted rules left out, and the caller gets that run's answer.
         self.dl_worked.store(over_work, Ordering::Relaxed);
+        #[cfg(test)]
+        if over_work {
+            PASSED_AT.with(|p| p.set(dl_run.as_ref().map_or(0, |d| d.work())));
+        }
         if (!partial || over_work)
             && let Some(h) = halted.take()
         {
@@ -2606,6 +2614,13 @@ impl WorldBudget<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The conclusions that the last run of Tier D on this thread had derived when it
+    /// stopped at its bound on them, so that a test sees how far past the bound it went.
+    static PASSED_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn poll(limits: &Limits) -> Result<(), Error> {
     if limits.deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(Error::Timeout);
@@ -2684,16 +2699,11 @@ mod tests {
         }
     }
 
-    /// Roadmap item 727: a run in steps over more contexts than one step takes, where
-    /// under test the workers share every step of two contexts and every delivery, derives
-    /// the same conclusions and the same answer on one, three and eight threads, and the
-    /// answer is the default run's. Each `C` has two successors that a maximum merges, a
-    /// union on the merged successor gives `P`, every seventh `C` has disjoint fillers,
-    /// and a filler reaches the next `C` in one case of a union. A run that a cancellation stops fails or answers in part, and the next
-    /// run of that classifier gives the outcome of a new one.
-    #[test]
-    fn a_run_in_steps_over_many_steps_derives_the_same_on_every_number_of_threads() {
-        let n = 700;
+    /// An ontology whose saturation with counting takes more contexts than two steps of a
+    /// run in steps. Each `C` has two successors that a maximum merges, a union on the
+    /// merged successor gives `P`, every seventh `C` has disjoint fillers, and a filler
+    /// reaches the next `C` in one case of a union.
+    fn many_contexts(n: usize) -> Vec<Axiom> {
         let mut text = String::from("Prefix(:=<http://ex.org/>)\nOntology(\n");
         for i in 0..n {
             text += &format!(
@@ -2712,7 +2722,18 @@ mod tests {
             }
         }
         text += ")";
-        let doc = crate::ofn_read::parse(&text).unwrap();
+        crate::ofn_read::parse(&text).unwrap().axioms
+    }
+
+    /// Roadmap item 727: a run in steps over more contexts than one step takes, where
+    /// under test the workers share every step of two contexts and every delivery, derives
+    /// the same conclusions and the same answer on one, three and eight threads, and the
+    /// answer is the default run's. A run that a cancellation stops fails or answers in
+    /// part, and the next run of that classifier gives the outcome of a new one.
+    #[test]
+    fn a_run_in_steps_over_many_steps_derives_the_same_on_every_number_of_threads() {
+        let n = 700;
+        let axioms = many_contexts(n);
         let class = |s: String| Class::new(format!("http://ex.org/{s}"));
         let limits = |threads: usize, dl_steps: bool| Limits {
             threads,
@@ -2741,9 +2762,7 @@ mod tests {
             )
         };
         let first = {
-            let out = Classifier::of(&doc.axioms)
-                .classify(&limits(1, true))
-                .unwrap();
+            let out = Classifier::of(&axioms).classify(&limits(1, true)).unwrap();
             assert!(out.complete && !out.stats.dl_over_budget);
             assert!(out.stats.contexts > 2 * saturate::STEP_CONTEXTS);
             outcome(&out)
@@ -2752,19 +2771,17 @@ mod tests {
             assert_eq!((p, unsat, h), (true, i % 7 == 0, false), "C{i}");
         }
         for threads in [3, 8] {
-            let out = Classifier::of(&doc.axioms)
+            let out = Classifier::of(&axioms)
                 .classify(&limits(threads, true))
                 .unwrap();
             assert_eq!(outcome(&out), first, "{threads} threads");
         }
-        let default = Classifier::of(&doc.axioms)
-            .classify(&limits(4, false))
-            .unwrap();
+        let default = Classifier::of(&axioms).classify(&limits(4, false)).unwrap();
         assert_eq!(outcome(&default).0, first.0);
         // a cancellation at its n-th poll, then the same classifier again
         for threads in [1, 8] {
             for at in [0, 3, 10, 30, 100, 300] {
-                let mut k = Classifier::of(&doc.axioms);
+                let mut k = Classifier::of(&axioms);
                 let polls = Arc::new(AtomicUsize::new(0));
                 let p = polls.clone();
                 let stopped = k.classify(&Limits {
@@ -2784,6 +2801,126 @@ mod tests {
                 }
                 let out = k.classify(&limits(threads, true)).unwrap();
                 assert_eq!(outcome(&out), first, "{threads} threads after poll {at}");
+            }
+        }
+    }
+
+    /// An inference of a run in steps that derives more conclusions than the run's bound
+    /// ends at its next look at the bounds, also when every conclusion is new and the
+    /// inference reserves memory for its record of them. `Z` holds 60 clauses with `A`,
+    /// 60 with `B` and three with `C`, which it processes in that order, so that each
+    /// of the three makes 3,600 new conclusions in one inference with
+    /// `A ⊓ B ⊓ C ⊑ D ⊔ E`. The maximum makes the run one that counts, which has the
+    /// bound. The reservation asked only the memory budget, so the activation derived
+    /// the 3,600 of the first inference before it looked at its count.
+    #[test]
+    fn a_wide_inference_of_a_run_in_steps_ends_once_it_passes_the_bound() {
+        let k = 60;
+        // The other classes of the unions come first, in an axiom that derives nothing,
+        // so that `A`, `B` and `C` are the maximal literals of their clauses.
+        let unions = |a: &str, p: &str, n: usize| {
+            let us: Vec<String> = (0..n)
+                .map(|i| format!("ObjectUnionOf(:{a} :{p}{i})"))
+                .collect();
+            us.join(" ")
+        };
+        let others: Vec<String> = (0..k)
+            .map(|i| format!(":P{i}"))
+            .chain((0..k).map(|i| format!(":Q{i}")))
+            .chain((0..3).map(|i| format!(":R{i}")))
+            .collect();
+        let text = format!(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+             SubClassOf(ObjectIntersectionOf({}) :W)
+             SubClassOf(:X ObjectMaxCardinality(1 :r))
+             SubClassOf(:Z ObjectIntersectionOf({} {} {}))
+             SubClassOf(ObjectIntersectionOf(:A :B :C) ObjectUnionOf(:D :E))
+             )",
+            others.join(" "),
+            unions("A", "P", k),
+            unions("B", "Q", k),
+            unions("C", "R", 3),
+        );
+        let doc = crate::ofn_read::parse(&text).unwrap();
+        // in the order of the document, which the order of the classes follows
+        let axioms: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let limits = |threads: usize, dl_work: usize| Limits {
+            threads,
+            counting: true,
+            dl_steps: true,
+            dl_work: Some(dl_work),
+            ..Limits::default()
+        };
+        // the whole run derives each product
+        let whole = Saturation::new()
+            .classify(&axioms, None, &limits(1, 1 << 20))
+            .unwrap();
+        assert!(!whole.stats.dl_counting_over);
+        assert!(whole.stats.dl_work > 3 * k * k, "{}", whole.stats.dl_work);
+        for threads in [1, 4] {
+            PASSED_AT.with(|p| p.set(0));
+            let out = Saturation::new()
+                .classify(&axioms, None, &limits(threads, 300))
+                .unwrap();
+            assert!(out.stats.dl_counting_over);
+            let at = PASSED_AT.with(std::cell::Cell::get);
+            // the bound, the conclusions before the inference and those between two
+            // looks at the bounds
+            assert!(at > 300 && at < 1000, "{threads} threads: {at}");
+        }
+    }
+
+    /// A panic in a worker of a saturation ends the run with the panic, in a helper and
+    /// in the calling thread, in a run in steps and in the default run. The callback
+    /// panics once the helpers have started. The other workers waited for the one that
+    /// panicked without end: those of a run in steps at the barrier between the phases,
+    /// and those of the default run for a count of busy workers that never reached zero.
+    #[test]
+    fn a_panic_in_a_worker_ends_the_saturation_with_the_panic() {
+        use std::cell::Cell;
+        let axioms = many_contexts(700);
+        for dl_steps in [true, false] {
+            for in_helper in [true, false] {
+                let (first, helper) = if dl_steps {
+                    (saturate::STEP_CALLER, saturate::STEP_HELPER)
+                } else {
+                    (saturate::FIRST_WORKER, saturate::HELPER)
+                };
+                let (tx, rx) = std::sync::mpsc::channel();
+                let axioms = axioms.clone();
+                std::thread::spawn(move || {
+                    let started = Arc::new(AtomicBool::new(false));
+                    let cancelled = move || {
+                        let at = saturate::WORKER.with(Cell::get);
+                        if at == helper {
+                            started.store(true, Ordering::Relaxed);
+                            if in_helper {
+                                panic!("the poll panics in a helper");
+                            }
+                        } else if at == first && !in_helper && started.load(Ordering::Relaxed) {
+                            panic!("the poll panics in the calling thread");
+                        }
+                        false
+                    };
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Classifier::of(&axioms)
+                            .classify(&Limits {
+                                threads: 8,
+                                counting: true,
+                                dl_steps,
+                                cancelled: Some(Arc::new(cancelled)),
+                                ..Limits::default()
+                            })
+                            .is_ok()
+                    }));
+                    let _ = tx.send(run.is_err());
+                });
+                assert_eq!(
+                    rx.recv_timeout(std::time::Duration::from_secs(120)),
+                    Ok(true),
+                    "steps {dl_steps}, in a helper {in_helper}"
+                );
             }
         }
     }

@@ -581,7 +581,19 @@ thread_local! {
     /// Where the saturations this thread starts record their starts of the helpers in
     /// place of [`STARTED_NS`], so that a test sees its own.
     pub(super) static STARTED_IN: std::cell::Cell<Option<&'static AtomicU64>> = const { std::cell::Cell::new(None) };
+    /// What this thread is in a saturation that runs now: 0 outside one, [`FIRST_WORKER`]
+    /// and [`HELPER`] in the default run, [`STEP_CALLER`] and [`STEP_HELPER`] in a run
+    /// in steps, so that a test's callback knows where it is called.
+    pub(super) static WORKER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
+#[cfg(test)]
+pub(super) const FIRST_WORKER: u8 = 1;
+#[cfg(test)]
+pub(super) const HELPER: u8 = 2;
+#[cfg(test)]
+pub(super) const STEP_CALLER: u8 = 3;
+#[cfg(test)]
+pub(super) const STEP_HELPER: u8 = 4;
 
 struct Run<'a> {
     ix: &'a Index,
@@ -643,16 +655,102 @@ struct Steps {
     woke: Vec<Mutex<Vec<Ex>>>,
     /// the step's activations that sent messages, by place in the frontier: the place,
     /// the worker, and the range of the worker's messages
-    order: RwLock<Vec<(u32, u32, u32, u32)>>,
-    /// what the helpers do when the start barrier opens
-    phase: AtomicU8,
-    start: std::sync::Barrier,
-    end: std::sync::Barrier,
+    order: RwLock<Vec<(u32, u32, usize, usize)>>,
+    /// the phase the helpers take part in
+    gate: Mutex<Gate>,
+    /// tells the helpers that a phase opened
+    opened: Condvar,
+    /// tells the calling thread that the last helper left a phase
+    left: Condvar,
+}
+
+/// Where the helpers of a run in steps are. The calling thread opens a phase for them
+/// and waits until each has left it. A helper leaves a phase when it unwinds too, and
+/// the calling thread releases the helpers when it unwinds, so that a panic in one
+/// worker ends the run and is not waited for.
+struct Gate {
+    /// counts the phases opened, so that a helper takes each once
+    round: u64,
+    /// what the helpers do in the phase
+    phase: u8,
+    /// the helpers that have not left the phase
+    busy: usize,
+    /// whether a helper panicked
+    failed: bool,
 }
 
 const STEP_ACTIVATE: u8 = 0;
 const STEP_DELIVER: u8 = 1;
 const STEP_DONE: u8 = 2;
+
+/// Whether the thread began to unwind since `before` was read from
+/// [`std::thread::panicking`], which is true from the start for a saturation that a
+/// destructor runs while its thread unwinds.
+fn unwinds(before: bool) -> bool {
+    !before && std::thread::panicking()
+}
+
+/// Stops the run when its thread unwinds, so that the other workers of the saturation
+/// end and the panic reaches the caller. A worker that panicked was otherwise waited for
+/// without end.
+struct HaltOnPanic<'r, 'a>(&'r Run<'a>, bool);
+
+impl<'r, 'a> HaltOnPanic<'r, 'a> {
+    fn new(run: &'r Run<'a>) -> Self {
+        HaltOnPanic(run, std::thread::panicking())
+    }
+}
+
+impl Drop for HaltOnPanic<'_, '_> {
+    fn drop(&mut self) {
+        if unwinds(self.1) {
+            self.0.halt(STOP_CANCEL);
+        }
+    }
+}
+
+/// A helper's part in a phase of a run in steps, which it leaves when it is dropped,
+/// at the end of its work and when it unwinds.
+struct InPhase<'r, 'a>(&'r Run<'a>, &'r Steps);
+
+impl Drop for InPhase<'_, '_> {
+    fn drop(&mut self) {
+        // a helper is a thread of the run, which does not start while unwinding
+        let panicked = std::thread::panicking();
+        if panicked {
+            self.0.halt(STOP_CANCEL);
+        }
+        let mut g = self.1.gate.lock();
+        g.failed |= panicked;
+        g.busy -= 1;
+        if g.busy == 0 {
+            self.1.left.notify_one();
+        }
+    }
+}
+
+/// The calling thread's hold on the helpers of a run in steps, which ends them when it
+/// is dropped, at the end of the run and when the calling thread unwinds.
+struct Helpers<'r, 'a>(&'r Run<'a>, &'r Steps, bool);
+
+impl<'r, 'a> Helpers<'r, 'a> {
+    fn new(run: &'r Run<'a>, steps: &'r Steps) -> Self {
+        Helpers(run, steps, std::thread::panicking())
+    }
+}
+
+impl Drop for Helpers<'_, '_> {
+    fn drop(&mut self) {
+        if unwinds(self.2) {
+            self.0.halt(STOP_CANCEL);
+        }
+        let mut g = self.1.gate.lock();
+        g.round += 1;
+        g.phase = STEP_DONE;
+        drop(g);
+        self.1.opened.notify_all();
+    }
+}
 
 /// What a worker's activations of one step left.
 #[derive(Default)]
@@ -660,7 +758,7 @@ struct StepOut {
     /// the messages, in the order the activations sent them
     outbox: Outbox,
     /// for each activation, its place in the frontier and the end of its messages
-    segs: Vec<(u32, u32)>,
+    segs: Vec<(u32, usize)>,
     /// the contexts that gave way
     again: VecDeque<Ex>,
     tally: Tally,
@@ -928,7 +1026,10 @@ impl Sink for Out<'_, '_> {
             self.data_overflow();
             return false;
         }
-        self.run.check(0, bytes, 0)
+        // An inference of a run in steps that reserves as it goes ends as one that does
+        // not: once the activation alone has derived more than the run's bound
+        // ([`Sink::go_on`]). The caller releases what it reserved.
+        self.run.check(0, bytes, 0) && !(self.run.steps && self.dl().past(self.work))
     }
     fn data_overflow(&mut self) {
         self.run.peak.fetch_max(usize::MAX, Ordering::Relaxed);
@@ -1361,8 +1462,12 @@ impl<'a> Run<'a> {
     /// small ontology, whose saturation takes less time than starting threads, runs on
     /// one (roadmap items 709 and 720).
     fn workers<R: Rules>(&self, threads: usize) {
+        #[cfg(test)]
+        WORKER.with(|w| w.set(FIRST_WORKER));
         if threads == 1 {
             self.worker::<R>(None);
+            #[cfg(test)]
+            WORKER.with(|w| w.set(0));
             return;
         }
         std::thread::scope(|s| {
@@ -1372,7 +1477,11 @@ impl<'a> Run<'a> {
                 self.pending.fetch_add(threads - 1, Ordering::SeqCst);
                 let called = Instant::now();
                 for _ in 1..threads {
-                    s.spawn(move || self.worker::<R>(None));
+                    s.spawn(move || {
+                        #[cfg(test)]
+                        WORKER.with(|w| w.set(HELPER));
+                        self.worker::<R>(None)
+                    });
                 }
                 // the saturations that start after this one wait as long, also while
                 // this one runs
@@ -1381,6 +1490,8 @@ impl<'a> Run<'a> {
             };
             self.worker::<R>(Some(&start));
         });
+        #[cfg(test)]
+        WORKER.with(|w| w.set(0));
     }
 
     /// A worker activates up to [`ROOTS_PER_ROUND`] roots, then the contexts those
@@ -1389,6 +1500,8 @@ impl<'a> Run<'a> {
     /// that fills many existential restrictions, then takes the conclusions of a round
     /// in one activation rather than one at a time.
     fn worker<R: Rules>(&self, mut others: Option<&dyn Fn()>) {
+        // dropped last, after what the worker holds
+        let _halt = HaltOnPanic::new(self);
         if self.roots.len() >= EAGER_ROOTS
             && let Some(start) = others.take()
         {
@@ -1497,9 +1610,14 @@ impl<'a> Run<'a> {
             outs: (0..threads).map(|_| RwLock::default()).collect(),
             woke: (0..threads).map(|_| Mutex::default()).collect(),
             order: RwLock::new(Vec::new()),
-            phase: AtomicU8::new(STEP_ACTIVATE),
-            start: std::sync::Barrier::new(threads),
-            end: std::sync::Barrier::new(threads),
+            gate: Mutex::new(Gate {
+                round: 0,
+                phase: STEP_ACTIVATE,
+                busy: 0,
+                failed: false,
+            }),
+            opened: Condvar::new(),
+            left: Condvar::new(),
         };
         let mut queue: VecDeque<Ex> = {
             let mut seeds = std::mem::take(&mut *self.queue.lock());
@@ -1508,6 +1626,8 @@ impl<'a> Run<'a> {
         };
         let mut root = 0;
         std::thread::scope(|s| {
+            // dropped last, so that the helpers end however this thread leaves
+            let _helpers = Helpers::new(self, &sh);
             let mut helpers = false;
             // whether the last step's activations took long
             let mut heavy = false;
@@ -1546,35 +1666,60 @@ impl<'a> Run<'a> {
                     for w in 1..threads {
                         let sh = &sh;
                         s.spawn(move || {
+                            let mut seen = 0;
                             loop {
-                                sh.start.wait();
-                                match sh.phase.load(Ordering::SeqCst) {
-                                    STEP_ACTIVATE => self.step_activate::<R>(sh, w),
-                                    STEP_DELIVER => self.step_deliver(sh, w, threads),
-                                    _ => break,
+                                let phase = {
+                                    let mut g = sh.gate.lock();
+                                    while g.round == seen {
+                                        sh.opened.wait(&mut g);
+                                    }
+                                    seen = g.round;
+                                    g.phase
+                                };
+                                if phase == STEP_DONE {
+                                    break;
                                 }
-                                sh.end.wait();
+                                let _in = InPhase(self, sh);
+                                if phase == STEP_ACTIVATE {
+                                    self.step_activate::<R>(sh, w);
+                                } else {
+                                    self.step_deliver(sh, w, threads);
+                                }
                             }
                         });
                     }
                 }
-                // a phase on every worker, or on this one alone
+                // a phase on every worker, or on this one alone, and whether every
+                // helper came through it
                 let phase = |p: u8, together: bool| {
                     if together {
-                        sh.phase.store(p, Ordering::SeqCst);
-                        sh.start.wait();
+                        let mut g = sh.gate.lock();
+                        g.round += 1;
+                        g.phase = p;
+                        g.busy = threads - 1;
+                        drop(g);
+                        sh.opened.notify_all();
                     }
                     if p == STEP_ACTIVATE {
                         self.step_activate::<R>(&sh, 0);
                     } else {
                         self.step_deliver(&sh, 0, if together { threads } else { 1 });
                     }
-                    if together {
-                        sh.end.wait();
+                    if !together {
+                        return true;
                     }
+                    let mut g = sh.gate.lock();
+                    while g.busy > 0 {
+                        sh.left.wait(&mut g);
+                    }
+                    !g.failed
                 };
                 let began = Instant::now();
-                phase(STEP_ACTIVATE, together);
+                // a helper that panicked has stopped the run, and the scope passes its
+                // panic on once the others have ended
+                if !phase(STEP_ACTIVATE, together) {
+                    break;
+                }
                 heavy = began.elapsed() >= STEP_HEAVY;
                 let mut messages = 0;
                 {
@@ -1588,11 +1733,13 @@ impl<'a> Run<'a> {
                             }
                             from = to;
                         }
-                        messages += from as usize;
+                        messages += from;
                     }
                     order.sort_unstable();
                 }
-                phase(STEP_DELIVER, helpers && messages >= STEP_MESSAGES);
+                if !phase(STEP_DELIVER, helpers && messages >= STEP_MESSAGES) {
+                    break;
+                }
                 let mut woke: Vec<Ex> = Vec::new();
                 for (o, w) in sh.outs.iter().zip(&sh.woke) {
                     let mut o = o.write();
@@ -1619,17 +1766,17 @@ impl<'a> Run<'a> {
                     break;
                 }
             }
-            if helpers {
-                sh.phase.store(STEP_DONE, Ordering::SeqCst);
-                sh.start.wait();
-            }
         });
+        #[cfg(test)]
+        WORKER.with(|w| w.set(0));
     }
 
     /// A worker's part of a step's first phase: it activates the contexts of the
     /// frontier that it takes, and records for each its place in the frontier and the
     /// end of its messages in the worker's list.
     fn step_activate<R: Rules>(&self, sh: &Steps, w: usize) {
+        #[cfg(test)]
+        WORKER.with(|at| at.set(if w == 0 { STEP_CALLER } else { STEP_HELPER }));
         let frontier = sh.frontier.read();
         let mut o = sh.outs[w].write();
         let o = &mut *o;
@@ -1648,7 +1795,7 @@ impl<'a> Run<'a> {
                 &mut o.local,
                 &mut o.outbox,
             );
-            o.segs.push((at as u32, o.outbox.msgs.len() as u32));
+            o.segs.push((at as u32, o.outbox.msgs.len()));
         }
         self.flush(&mut o.tally);
     }
@@ -1660,7 +1807,7 @@ impl<'a> Run<'a> {
         let outs: Vec<_> = sh.outs.iter().map(|o| o.read()).collect();
         let mut woke = sh.woke[w].lock();
         for &(_, from, a, b) in sh.order.read().iter() {
-            for &(to, c) in &outs[from as usize].outbox.msgs[a as usize..b as usize] {
+            for &(to, c) in &outs[from as usize].outbox.msgs[a..b] {
                 // a destination is in the share of one worker
                 if ((to as usize).wrapping_mul(0x9E37_79B9) >> 16) % of != w {
                     continue;

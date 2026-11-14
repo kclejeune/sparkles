@@ -240,9 +240,10 @@ fn one_case_run_many_times_gives_one_outcome() {
 }
 
 /// The option changes no answer of a run that stays within its bound: on the cases that
-/// both drivers finish, the answers are equal.
+/// both drivers finish with the disjunctive rules and counting, the answers are equal.
 #[test]
 fn a_run_in_steps_answers_as_the_default_run_does() {
+    let mut compared = 0;
     for case in cases().iter().step_by(3) {
         let limits = |dl_steps: bool| Limits {
             threads: 4,
@@ -253,10 +254,57 @@ fn a_run_in_steps_answers_as_the_default_run_does() {
         };
         let (a, sa) = run(case, &limits(true));
         let (b, sb) = run(case, &limits(false));
-        if !sa.dl_counting_over && !sb.dl_counting_over {
+        let finished = |s: &Stats| !s.dl_counting_over && !s.dl_over_budget;
+        if finished(&sa) && finished(&sb) {
+            compared += 1;
             assert_eq!(a, b, "{}", case.stem);
         }
     }
+    // most of the cases are compared
+    assert!(compared >= 50, "{compared}");
+}
+
+fn family(dir: &str, prefix: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(fixtures(dir))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(prefix) && n.ends_with(".ofn") && n.matches('.').count() == 1
+            })
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// A run of the disjunctive rules without counting has no bound on its derived
+/// conclusions, and with the option it proceeds in steps as well: the cases of the
+/// families without number restrictions derive the same and give HermiT's answer on one,
+/// four and eight threads.
+#[test]
+fn a_run_in_steps_without_a_bound_derives_the_same_on_every_number_of_threads() {
+    let mut derived = 0;
+    for prefix in ["alc-", "shi-"] {
+        for path in family("dl603", prefix).iter().step_by(5) {
+            let case = case(path);
+            let limits = |threads: usize| Limits {
+                threads,
+                dl_steps: true,
+                ..Limits::default()
+            };
+            let first = outcome(&case, &limits(1));
+            for threads in [4, 8] {
+                assert_eq!(outcome(&case, &limits(threads)), first, "{}", case.stem);
+            }
+            let ((got, whole), [work, ..], over) = first;
+            assert_eq!(over, [false; 3], "{}", case.stem);
+            assert!(whole && got == case.want, "{}", case.stem);
+            derived += work;
+        }
+    }
+    // the cases went through the disjunctive rules
+    assert!(derived > 0);
 }
 
 /// A run with the eager strategy and a rooted run take one thread with the option, so
@@ -279,17 +327,7 @@ fn eager_and_rooted_runs_in_steps_give_one_outcome() {
             );
         }
     }
-    let mut shoi: Vec<PathBuf> = std::fs::read_dir(fixtures("dl603"))
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                n.starts_with("shoi-") && n.ends_with(".ofn") && n.matches('.').count() == 1
-            })
-        })
-        .collect();
-    shoi.sort();
-    for path in shoi.iter().step_by(5) {
+    for path in family("dl603", "shoi-").iter().step_by(5) {
         let case = case(path);
         let limits = |threads: usize| Limits {
             rooted: true,
