@@ -88,7 +88,8 @@ the generated fixture `shiq-038` now passes the default bound of the counting ru
 DL development set keeps its taxonomies, and no change of its times was observed. This is roadmap item 897.
 
 A context of the disjunctive rules that has processed 256 of its clauses in one activation
-gives way to the contexts its worker woke. On one thread a context that equated its
+gives way to the contexts its worker woke, after it has sent the products of the links
+and propagations of that activation. On one thread a context that equated its
 successors under a maximum otherwise finished that work before a successor without a model
 could close it. A generated ontology of item 897 derives 29,625 conclusions on one thread
 where it derived 2,122,545, and seven of 750 generated ontologies come within the default

@@ -1315,7 +1315,13 @@ and 71,345 without it.
 A context that has processed 256 of its clauses in one activation gives way to the
 contexts that its worker woke. The count includes the minimums whose witnesses the
 context released. It goes behind them in the worker's queue with its other
-clauses left in its store, and its next activation takes them up. Without this step a
+clauses left in its store, and its next activation takes them up. Before it gives way it
+sends the products of the links and propagations that the activation stored, which a
+context otherwise sends once its to-do list is empty, since its next activation pairs
+only what that activation stores. A generated ontology in which the clause that gives a
+context a class is the last of its share shows the need. Its context stored the
+propagation of `owl:Nothing` over a role and gave way, and 375 of 511 unsatisfiable
+classes were satisfiable on one thread. Without this step a
 context on one thread derives everything it can before any other context runs, and what
 the others conclude can make most of that work unnecessary. The generated ontology
 `qz-0048` of item 897 shows it. Its class `C1` has six successors under a maximum of
@@ -2878,7 +2884,10 @@ between two clauses, so they are thresholds and not limits. One inference can de
 than 4,096 conclusions, and one release of minimums can pass 256. A context that used a
 share and has clauses left gives way whoever else waits. It goes on in a later step, at
 once when it has new messages and otherwise when no other context is active, since what
-the others conclude can close it.
+the others conclude can close it. A context sends the products of its links and
+propagations when its to-do list is empty and before it gives way. The driver without
+steps also sends them from a long activation when a worker is idle, which a run in steps
+does not do, so the order of an activation's messages is the same on every schedule.
 
 An activation also compares its own count of derived conclusions with the run's bound. It
 does so between clauses and at each look at the bounds within an inference of many

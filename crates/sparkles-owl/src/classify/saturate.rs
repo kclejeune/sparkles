@@ -2160,7 +2160,15 @@ impl<'a> Run<'a> {
             }
             // An activation of a run in steps that derived its share of conclusions gives
             // way too, so that the bound is compared before one context derives far more.
+            // It sends the products of its links first, as the context below does that
+            // processed its share of clauses.
             if self.steps && out.pause() && !st.bottom {
+                if !self.flush_links(&st, &mut out, tally) {
+                    break 'outer;
+                }
+                if !out.local.is_empty() {
+                    continue;
+                }
                 gave_way = true;
                 break;
             }
