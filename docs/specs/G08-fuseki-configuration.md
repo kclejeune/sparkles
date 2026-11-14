@@ -239,7 +239,7 @@ there.
 
 | `jr:ruleMode` | Sparkles |
 |---|---|
-| `hybrid`, or none, which is Jena's default | The rules are materialized, and the query-time default is `auto`. Queries read the materialization and derive the facts of backward rules on demand. |
+| `hybrid`, or none, which is Jena's default | The rules are materialized, and the query-time default is `auto`. Queries read the materialization and derive the facts of backward rules on demand. The setting also records the rules, so queries derive on demand while no materialization is there. |
 | `backward` | Nothing is materialized. `infer --query-default demand --query-only` records the rules as the dataset's query-time reasoning, and every query derives what it needs. |
 | `forward`, `forwardRETE` | The rules are materialized, and queries read the materialization. |
 
@@ -465,11 +465,14 @@ rules, as Jena's hybrid engine does. The backward mode materializes nothing and 
 the rules in the dataset's query-time setting. `load.sh` does that with the new
 `infer --query-default demand --query-only`, which records `--rules` or `--profile` and
 the input graph options without a run, and `serve --fuseki-config` does it with
-`Dataset::set_query_reasoning` at the first start of an in-memory dataset. A dataset whose
+`Dataset::set_query_reasoning` at the first start of an in-memory dataset. Under the
+hybrid mode that setting holds the rules too, since a query that arrives before the first
+materialization ends, or after one fails, has nothing else to derive with. A dataset whose
 setting already names a default keeps it. `--auto-reason` is left out when every
 inference model is backward, since nothing is materialized. An unknown `jr:ruleMode` is
-reported as unsupported. The test is `rule_modes_choose_the_query_time_default` in
-`fuseki_config/tests.rs`.
+reported as unsupported. The tests are `rule_modes_choose_the_query_time_default` in
+`fuseki_config/tests.rs` and `a_hybrid_configuration_derives_before_a_materialization` in
+the server's reasoning router tests.
 
 ### Roadmap follow-ups (2026-10-12)
 

@@ -372,6 +372,8 @@ fn query_only_records_the_rules_without_a_run() {
             rules.to_str().unwrap(),
             "--data-graph",
             "default",
+            "--imports",
+            "none",
             "--query-default",
             "demand",
             "--query-only",
@@ -387,6 +389,7 @@ fn query_only_records_the_rules_without_a_run() {
         "{setting}"
     );
     assert_eq!(setting["inputs"]["dataGraphs"][0], "default", "{setting}");
+    assert_eq!(setting["inputs"]["imports"], "none", "{setting}");
     assert!(!db.join("reasoning.json").exists());
     // the default mode derives the backward rule's fact
     let o = expect(
@@ -401,4 +404,18 @@ fn query_only_records_the_rules_without_a_run() {
     assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "yes", "{o:?}");
     // --query-only needs --query-default
     expect(&["infer", "--loc", dbs, "--query-only"], 2);
+    // and fetches no imports, which only a materialization records
+    let fetch = [
+        "infer",
+        "--loc",
+        dbs,
+        "--profile",
+        "rdfs",
+        "--imports",
+        "fetch",
+        "--query-default",
+        "demand",
+        "--query-only",
+    ];
+    expect(&fetch, 2);
 }

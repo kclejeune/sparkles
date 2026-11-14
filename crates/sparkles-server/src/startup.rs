@@ -120,6 +120,12 @@ pub fn spawn(
 pub struct StopFlag(Arc<AtomicBool>);
 
 impl StopFlag {
+    /// A flag that no shutdown sets, for a test that runs a startup step alone.
+    #[cfg(test)]
+    pub(crate) fn unset() -> StopFlag {
+        StopFlag(Arc::new(AtomicBool::new(false)))
+    }
+
     /// Whether a shutdown has started.
     pub fn stopped(&self) -> bool {
         self.0.load(Ordering::SeqCst)

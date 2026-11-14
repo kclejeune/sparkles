@@ -1393,7 +1393,7 @@ impl Tools<'_> {
         let derived = r.reasoning().and_then(|a| a.header());
         let text = match r.kind {
             QueryKind::Ask => match format {
-                Format::Table => render::ask_table(snap.commit, r.boolean),
+                Format::Table => render::ask_table(snap.commit, r.boolean, derived.as_deref()),
                 Format::Json => render::ask_json(
                     &ds.name,
                     snap.commit,
@@ -1433,11 +1433,6 @@ impl Tools<'_> {
                     Format::Json => render::json(&page, &prefixes),
                 }
             }
-        };
-        // the table form says what query-time reasoning derived on a line of its own
-        let text = match (&derived, format) {
-            (Some(h), Format::Table) => format!("# reasoning: {h}\n{text}"),
-            _ => text,
         };
         Ok((Outcome::Text(text), whole))
     }

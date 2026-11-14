@@ -2073,3 +2073,68 @@ async fn review_adapters_streamed_patch_starts_the_analysis_clock_after_its_body
     assert_eq!(response.json()["entailments"]["added"], 0);
     assert_eq!(st.get("t").unwrap().store.snapshot().commit, 0);
 }
+
+/// A Fuseki configuration in the hybrid rule mode sets `auto` with the reasoner's rules,
+/// so a query derives on demand while no materialization is there: before the first one
+/// ends, or after it is gone (spec G08 §5.5).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hybrid_configuration_derives_before_a_materialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("h", DbType::Persistent).unwrap();
+    load(&st, "h", "ex:a ex:p ex:b .");
+    let rules = dir.path().join("sym.rules");
+    std::fs::write(
+        &rules,
+        "[sym: (?a <http://ex.org/p> ?b) -> (?b <http://ex.org/p> ?a)]",
+    )
+    .unwrap();
+    let add = crate::fuseki_config::ServeAdditions {
+        reason: vec![(
+            "h".into(),
+            crate::fuseki_config::convert::Reasoning {
+                query_default: Some("auto"),
+                ..Default::default()
+            },
+            Some(rules),
+        )],
+        ..Default::default()
+    };
+    let st2 = st.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::fuseki_config::start(&st2, &add, &crate::startup::StopFlag::unset())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    // the setting holds the rules before the materialization ends
+    let setting = st.get("h").unwrap().dataset.query_reasoning().unwrap();
+    assert_eq!(setting.default.as_deref(), Some("auto"));
+    assert_eq!(setting.profile.as_deref(), Some("rules"));
+    assert!(setting.rules.as_deref().unwrap().contains("sym"));
+    wait_tasks(&st).await;
+    // with the materialization gone, the default mode derives on demand
+    let app = router(st.clone());
+    let r = send(
+        &app,
+        Request::delete("/$/reason/h").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let q = "ASK { <http://ex.org/b> <http://ex.org/p> <http://ex.org/a> }";
+    let (r, h) = send_h(
+        &app,
+        Request::get(format!(
+            "/h/sparql?query={}",
+            form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+        ))
+        .header(header::ACCEPT, "application/sparql-results+json")
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["boolean"], true, "{}", r.text());
+    let hdr = h["sparkles-reasoning"].to_str().unwrap();
+    assert!(hdr.starts_with("auto; derived="), "{hdr}");
+}

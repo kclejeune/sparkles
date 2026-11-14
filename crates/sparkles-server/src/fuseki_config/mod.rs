@@ -337,6 +337,36 @@ pub fn for_serve(path: &Path, data_dir: &Path, own_auth: bool) -> Result<ServeAd
     Ok(add)
 }
 
+/// Give the query-time `setting` the reasoner's profile or rules and its input graphs, so
+/// that a query derives on demand while no materialization is there: under the backward
+/// mode always, and under the hybrid mode until the first materialization ends, or when it
+/// fails (Codex review qtr-step2 #4).
+#[cfg(feature = "reasoning")]
+fn query_profile(
+    setting: &mut sparkles::reasoning::setting::QuerySetting,
+    r: &convert::Reasoning,
+    rules: Option<&std::path::Path>,
+) -> Result<()> {
+    match rules {
+        Some(p) => {
+            setting.profile = Some("rules".into());
+            setting.rules = Some(
+                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
+            );
+        }
+        None => {
+            setting.profile = Some(r.profile.unwrap_or("rdfs").into());
+            setting.rules = None;
+        }
+    }
+    if !r.schema.is_empty() {
+        setting.inputs = Some(serde_json::json!({
+            "ontologyGraphs": [convert::SCHEMA_GRAPH],
+        }));
+    }
+    Ok(())
+}
+
 /// After the datasets are attached: load the data files of in-memory datasets, and
 /// materialize the inferences of datasets that have none recorded yet.
 /// A shutdown (`stop`) starts no further load or materialization.
@@ -379,20 +409,7 @@ pub fn start(
         {
             let mut setting = ds.dataset.query_reasoning().unwrap_or_default();
             setting.default = Some(mode.to_string());
-            if r.demand_only
-                && let Some(p) = rules
-            {
-                setting.profile = Some("rules".into());
-                setting.rules = Some(
-                    std::fs::read_to_string(p)
-                        .with_context(|| format!("reading {}", p.display()))?,
-                );
-                if !r.schema.is_empty() {
-                    setting.inputs = Some(serde_json::json!({
-                        "ontologyGraphs": [convert::SCHEMA_GRAPH],
-                    }));
-                }
-            }
+            query_profile(&mut setting, r, rules.as_deref())?;
             ds.dataset
                 .set_query_reasoning(Some(setting))
                 .with_context(|| format!("--fuseki-config: the query-time reasoning of /{name}"))?;

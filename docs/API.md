@@ -9275,8 +9275,10 @@ version member `queryReasoningFormat`. `serve --query-reasoning NAME=PROFILE` se
 dataset's profile at startup, with `rules:FILE` for a Jena rules file, and
 `sparkles infer --loc DB --query-default auto` sets the default mode of a database.
 With `--query-only`, `infer --query-default MODE` also records `--profile` or `--rules`
-and the input graph options as the setting's profile, rules and inputs, and materializes
-nothing, which suits a rule set whose queries all derive on demand.
+and the input graph options, `--imports` and `--location-mapping` among them, as the
+setting's profile, rules and inputs, and materializes nothing, which suits a rule set
+whose queries all derive on demand. It refuses `--imports fetch` and `--refresh-imports`,
+since only a materialization fetches imports and records them.
 
 ## Write-time validation
 

@@ -1137,3 +1137,33 @@ ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat .
         .await;
     assert!(t.contains("ex:tom") && !t.contains("# reasoning"), "{t}");
 }
+
+/// The line that says what query-time reasoning derived counts toward `maxBytes`.
+#[cfg(feature = "reasoning")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reasoning_line_fits_max_bytes() {
+    let mut data = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:Cat rdfs:subClassOf ex:Animal .\n",
+    );
+    for i in 0..400 {
+        data.push_str(&format!("ex:cat{i} a ex:Cat .\n"));
+    }
+    let srv = server_with(&[("t", &[data.as_str()])], McpConfig::default());
+    let mut c = Client::start(srv);
+    for (format, query) in [
+        ("table", "SELECT ?x { ?x a ex:Animal }"),
+        ("table", "ASK { ex:cat1 a ex:Animal }"),
+        ("json", "SELECT ?x { ?x a ex:Animal }"),
+    ] {
+        let t = c
+            .text(
+                "sparql_query",
+                json!({"query": query, "reasoning": "demand", "reasoningProfile": "rdfs",
+                       "maxRows": 1000, "maxBytes": 1024, "format": format}),
+            )
+            .await;
+        assert!(t.len() <= 1024, "{format} {query}: {} bytes", t.len());
+        assert!(t.contains("demand; derived="), "{t}");
+    }
+}

@@ -537,6 +537,9 @@ pub fn table(page: &QueryPage, prefixes: &Prefixes) -> String {
     let mut shortened = 0usize;
     let mut done = 0usize;
     let header_bytes = header.as_ref().map_or(0, |h| h.len() + 1);
+    // what query-time reasoning derived, on a first line of its own
+    let reasoning = page.reasoning.map(|h| format!("# reasoning: {h}\n"));
+    let reasoning_bytes = reasoning.as_ref().map_or(0, String::len);
     let fit = fit(page, rows.len(), |k, truncated| {
         while done < k {
             for &id in &rows[done].used {
@@ -548,7 +551,8 @@ pub fn table(page: &QueryPage, prefixes: &Prefixes) -> String {
             shortened += rows[done].shortened;
             done += 1;
         }
-        status_line(page, k, truncated, shortened).len()
+        reasoning_bytes
+            + status_line(page, k, truncated, shortened).len()
             + 1
             + used_bytes
             + header_bytes
@@ -562,7 +566,8 @@ pub fn table(page: &QueryPage, prefixes: &Prefixes) -> String {
         used.extend(r.used.iter().copied());
         shortened += r.shortened;
     }
-    let mut out = status_line(page, k, fit.truncated, shortened);
+    let mut out = reasoning.unwrap_or_default();
+    out.push_str(&status_line(page, k, fit.truncated, shortened));
     out.push('\n');
     // PREFIX lines in name order
     let mut plines: Vec<(String, String)> = used
@@ -589,9 +594,10 @@ pub fn table(page: &QueryPage, prefixes: &Prefixes) -> String {
     out
 }
 
-/// `format: "table"` for ASK.
-pub fn ask_table(commit: u64, boolean: bool) -> String {
-    format!("# ASK · commit {commit}\n{boolean}")
+/// `format: "table"` for ASK, after what query-time reasoning derived.
+pub fn ask_table(commit: u64, boolean: bool, reasoning: Option<&str>) -> String {
+    let line = reasoning.map_or(String::new(), |h| format!("# reasoning: {h}\n"));
+    format!("{line}# ASK · commit {commit}\n{boolean}")
 }
 
 #[derive(Serialize)]
