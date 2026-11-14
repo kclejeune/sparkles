@@ -8,7 +8,7 @@ use super::graph::{
 use super::report::Report;
 use super::users::UserFile;
 use anyhow::{Result, bail};
-use oxrdf::NamedOrBlankNode;
+use oxrdf::{NamedOrBlankNode, Term};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -53,8 +53,8 @@ pub struct DataFile {
 
 #[derive(Clone, Debug, Default)]
 pub struct Reasoning {
-    /// `rdfs` or `owl-rl`; `None` with rules
-    pub profile: Option<&'static str>,
+    /// `rdfs`, `owl-rl` or a `shacl-af` profile with its options; `None` with rules
+    pub profile: Option<String>,
     /// rule files and inline rules, in order
     pub rule_files: Vec<PathBuf>,
     pub rule_texts: Vec<String>,
@@ -172,6 +172,21 @@ impl Converter<'_> {
             );
         }
         let server = servers.into_iter().next();
+        // a shapes graph that asks for its rules to be applied before validation
+        for g in &inputs.graphs {
+            for t in &g.triples {
+                if t.predicate.as_str() == super::parts::SH_ENTAILMENT
+                    && matches!(&t.object, Term::NamedNode(n) if n.as_str() == super::parts::SHACL_RULES_IRI)
+                {
+                    self.report.manual(
+                        g.show(&t.subject),
+                        "sh:entailment sh:Rules: SHACL validation does not run the rules first; \
+                         materialize them with the shacl-af profile (a reasoner with \
+                         ja:reasonerURL sh:Rules) and validate with the inferred graph",
+                    );
+                }
+            }
+        }
         let mut plan_server = ServerPlan::default();
         let mut server_allowed: Option<Vec<String>> = None;
         let mut listed: Option<(usize, Vec<NamedOrBlankNode>)> = None;

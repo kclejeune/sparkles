@@ -236,7 +236,11 @@ pub fn recorded(
     let receipt = report.receipt.as_ref();
     ReasoningRecord {
         reasoning_format: 2,
-        profile: profile.name().to_string(),
+        // the options of `shacl-af` travel in its text form, which a re-run reads back
+        profile: match profile {
+            Profile::ShaclAf(c) => c.text(),
+            _ => profile.name().to_string(),
+        },
         inferred: report.inferred,
         at: crate::builder::now_rfc3339(),
         // the run's own commit, or the head it read when it changed nothing
@@ -314,6 +318,17 @@ pub fn run_info(report: &ReasonReport) -> RunInfo {
         peak_bytes: report.peak_bytes,
         base_scans: report.base_scans,
         threads: report.threads as u64,
+        max_rounds: report.max_rounds.map(|n| n as u64),
+        rule_groups: report
+            .rule_groups
+            .iter()
+            .map(|g| super::RuleGroupInfo {
+                shape_order: g.shape_order,
+                order: g.order,
+                rules: g.rules as u64,
+                rounds: g.rounds as u64,
+            })
+            .collect(),
     }
 }
 
