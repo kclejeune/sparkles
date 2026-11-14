@@ -1592,8 +1592,9 @@ before its block measured no faster. Per-thread counters in the block cache meas
 on the laptop. On atlas a first comparison, between builds that also held the first of
 those ideas, had them 2 to 8% faster in 11 of 12 cells at 16 threads. A second comparison
 of five rounds, between builds that differ only in the counters, had the undos and repeats
-at 0.997 of the time for RDFS and 0.987 for OWL 2 RL on the pool, between 0.95 and 1.05
-by cell, and at 1.002 at one thread, so the counters were not adopted. The build before the follow-up, which keeps the input facts in memory, indicates what the
+with the counters at 0.997 of their time without them for RDFS and 0.987 for OWL 2 RL on
+the pool, between 0.95 and 1.05 by cell, and at 1.002 at one thread. The earlier
+advantage was not reproduced, so the counters were not adopted. The build before the follow-up, which keeps the input facts in memory, indicates what the
 index could gain on this workload, and that gain has not been measured.
 
 **Outcome of item 113.** The runs compare four builds of `examples/lubm.rs` with the same
