@@ -1714,8 +1714,18 @@ impl<'a> Run<'a> {
             // in its store. What they conclude can close it before it derives the rest, as
             // a successor without a model does for a context that is equating its
             // successors, and one worker otherwise finishes that derivation first.
-            // The messages in the outbox show first whom they wake.
+            // The messages in the outbox show first whom they wake. The products of the
+            // links and propagations this activation stored go out before that, since the
+            // marks of the context's next activation start at the lists' ends and that
+            // activation would leave them out. Those for the context itself come back as
+            // its own conclusions, which it applies before it gives way.
             if R::DISJ && clauses >= DL_CLAUSES {
+                if !self.flush_links(&st, &mut out, tally) {
+                    break 'outer;
+                }
+                if !out.local.is_empty() {
+                    continue;
+                }
                 if out.woke.is_empty() {
                     self.deliver(out.outbox, out.woke);
                 }

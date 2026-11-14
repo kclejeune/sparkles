@@ -2297,3 +2297,84 @@ fn an_ontology_inconsistent_through_a_maximum_over_an_intersection() {
     ));
     assert_eq!(out.consistency, Consistency::Inconsistent);
 }
+
+/// An ontology in which `D` holds more disjunctions than a context processes before it
+/// gives way. `D` is below `X` through two of them, no `r`-successor is in `X`, and each
+/// `Q` has `D` as an `r`-successor, so every `Q` and `C` are unsatisfiable. `a`, `b` and
+/// `c` disjunctions stand before, between and after the two that give `X1` and `X`, which
+/// places the clause that gives `X`. `counts` adds a maximum cardinality that nothing
+/// uses, so that a run with counting has a bound on its conclusions.
+fn gives_way(a: usize, b: usize, c: usize, counts: bool) -> Vec<Axiom> {
+    let mut body = String::from(
+        "SubClassOf(:C ObjectSomeValuesFrom(:r :D))
+         SubClassOf(:X1 :Z1)
+         SubClassOf(:X :Z)\n",
+    );
+    let mut i = 0;
+    let mut disjunctions = |body: &mut String, n: usize| {
+        for _ in 0..n {
+            *body += &format!(
+                "SubClassOf(:D ObjectUnionOf(:P{i} ObjectSomeValuesFrom(:s :Q{i})))
+                 SubClassOf(:P{i} :R{i})
+                 SubClassOf(:Q{i} ObjectSomeValuesFrom(:r :D))\n"
+            );
+            i += 1;
+        }
+    };
+    disjunctions(&mut body, a);
+    body += "SubClassOf(:D ObjectUnionOf(:U1 :V1))
+             SubClassOf(:U1 :X1)
+             SubClassOf(:V1 :X1)\n";
+    disjunctions(&mut body, b);
+    body += "SubClassOf(:D ObjectUnionOf(:U :V))
+             SubClassOf(:U :X)
+             SubClassOf(:V :X)
+             SubClassOf(ObjectSomeValuesFrom(:r :X) owl:Nothing)\n";
+    disjunctions(&mut body, c);
+    if counts {
+        body += "SubClassOf(:Zz ObjectMaxCardinality(1 :t))\n";
+    }
+    axioms(&body)
+}
+
+/// A context that gives way after its share of clauses sends the products of the links
+/// and propagations of that activation first. In the second and third ontology the clause
+/// that gives `D` the class `X` is the last of a share, so `D` stores the propagation of
+/// `owl:Nothing` over `r` and gives way at once. The marks of its next activation start
+/// at the ends of its lists, and the sources of its `r` links, which were there before the
+/// propagation, never got `owl:Nothing`: 375 of the 511 `Q` were satisfiable on one
+/// thread. The first and the last ontology place the clause elsewhere.
+#[test]
+fn a_context_that_gives_way_sends_the_products_of_its_links_first() {
+    let mut failures = Vec::new();
+    for (a, b, cc) in [
+        (111, 100, 200),
+        (111, 100, 300),
+        (111, 200, 200),
+        (111, 200, 300),
+    ] {
+        for counts in [false, true] {
+            for threads in [1, 4] {
+                let ax = gives_way(a, b, cc, counts);
+                let out = Classifier::of(&ax)
+                    .classify(&Limits {
+                        threads,
+                        counting: counts,
+                        dl_work: Some(1 << 26),
+                        ..Limits::default()
+                    })
+                    .unwrap();
+                let run = format!("{a} {b} {cc}, counting {counts}, {threads} threads");
+                assert!(out.complete && !out.stats.dl_over_budget, "{run}");
+                assert!(out.taxonomy.is_subclass(&c("D"), &c("X")), "{run}");
+                let satisfiable = (0..a + b + cc)
+                    .filter(|i| !out.taxonomy.is_unsatisfiable(&c(&format!("Q{i}"))))
+                    .count();
+                if satisfiable > 0 || !out.taxonomy.is_unsatisfiable(&c("C")) {
+                    failures.push(format!("{run}: {satisfiable} of the Q are satisfiable"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
