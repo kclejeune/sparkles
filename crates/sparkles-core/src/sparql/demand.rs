@@ -75,9 +75,8 @@ fn below_projections(mut node: &mut Node) -> &mut Node {
 /// that the first matching pair ends it, and a hash join in either input that would read
 /// one of its own inputs whole becomes an index join where it can. A cursor keyed join
 /// that held one small input and probed it measured slower than reading both
-/// alternately, so the join holds neither, and a small input runs whole instead (see
-/// [`runs_whole`]). A filtered product streams its larger input against the smaller
-/// one, which it holds.
+/// alternately, so the join holds neither. A filtered product streams its larger input
+/// against the smaller one, which it holds.
 fn orient_first_row(ctx: &Ctx, node: &mut Node) {
     let filtered = below_projections(node);
     if let Kind::KeyedJoin { ripple, .. } = &mut filtered.kind {
@@ -192,11 +191,8 @@ const PULL_COST: f64 = 4096.0;
 /// answers. A scan is bounded by the rows of its prefix, a join by the product of its
 /// inputs or, where an input that always binds a key meets a pattern with a constant
 /// predicate, by the rows of that input times the most rows the pattern has for one key,
-/// which the predicate's statistics bound. A keyed join whose condition only compares
-/// terms is bounded the same way by the rows of its inputs and of one key, which runs a
-/// keyed ASK over small inputs through the eager join that holds one input, and
-/// reads both inputs alternately only for larger ones. An input that evaluates other
-/// expressions, such as a FILTER, a BIND or a range scan that tests its rows, is pulled,
+/// which the predicate's statistics bound. An input that evaluates expressions, such as a
+/// FILTER, a BIND, a keyed join's condition or a range scan that tests its rows, is pulled,
 /// since an expression may form new terms whose memory no row count bounds, and so is
 /// every input of a query with a budget of produced rows, which the rows its consumer
 /// takes and a refused whole run would count against as well. The choice depends on the
@@ -269,30 +265,6 @@ fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Opti
                         rows = rows.min(rb.saturating_mul(each));
                     }
                 }
-            }
-            rows
-        }
-        Kind::KeyedJoin {
-            expr,
-            left: lkey,
-            right: rkey,
-            ..
-        } if node.children.len() == 2 && compares(expr, &mut MAX_NODES.clone()) => {
-            // A row meets the other input's rows whose key has its value. The rows with
-            // one id bound those with one value, except for distinct ids of equal
-            // values, such as numbers in two lexical forms, which a whole run that
-            // reads more rows than this refuses or takes longer to read.
-            let [a, b] = [&node.children[0], &node.children[1]];
-            let (ra, rb) = (
-                upper_rows(ctx, a, left, bytes)?,
-                upper_rows(ctx, b, left, bytes)?,
-            );
-            let mut rows = ra.saturating_mul(rb);
-            if let Some(each) = key_rows(ctx, b, *rkey, &mut MAX_NODES.clone()) {
-                rows = rows.min(ra.saturating_mul(each));
-            }
-            if let Some(each) = key_rows(ctx, a, *lkey, &mut MAX_NODES.clone()) {
-                rows = rows.min(rb.saturating_mul(each));
             }
             rows
         }
@@ -394,24 +366,6 @@ fn plain(node: &Node, left: &mut usize) -> bool {
         _ => false,
     };
     shape && node.children.iter().all(|c| plain(c, left))
-}
-
-/// Whether `expr` only compares variables and constants, which forms no new term.
-fn compares(expr: &Expr, left: &mut usize) -> bool {
-    if *left == 0 {
-        return false;
-    }
-    *left -= 1;
-    match expr {
-        Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
-        Expr::Or(a, b)
-        | Expr::And(a, b)
-        | Expr::Eq(a, b)
-        | Expr::SameTerm(a, b)
-        | Expr::Cmp(a, b, _) => compares(a, left) && compares(b, left),
-        Expr::Not(a) => compares(a, left),
-        _ => false,
-    }
 }
 
 /// Whether evaluating `expr` fewer times, or in another order, changes nothing but its
@@ -686,14 +640,10 @@ mod tests {
             &small,
             "SELECT ?p WHERE { ?p ex:knows ?x . ?x ex:name ?n } ORDER BY ?n LIMIT 10"
         ));
-        // a keyed join of two small inputs that compares terms runs whole, and one that
-        // forms terms in its condition or reads larger inputs is pulled
-        let keyed = "ASK { ?a ex:name ?n . ?b ex:name ?m FILTER(?n = ?m) }";
-        assert!(whole(&small, keyed));
-        assert!(!whole(&large, keyed));
+        // a keyed join's condition compares values, whose decoding no row count bounds
         assert!(!whole(
             &small,
-            "ASK { ?a ex:name ?n . ?b ex:name ?m FILTER(?n = ?m && STR(?a) != \"x\") }"
+            "ASK { ?a ex:name ?n . ?b ex:name ?m FILTER(?n = ?m) }"
         ));
     }
 
