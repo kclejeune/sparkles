@@ -1600,8 +1600,11 @@ impl Ctx {
             Some(id) => self.memory().release(id, bytes),
             None => {
                 debug_assert_eq!(bytes, 0);
-                // Only cursor accounting trims, and it always has a ledger.
-                if let Some(ledger) = self.memory.get() {
+                // Only cursor accounting trims, and it always has a ledger. An eager
+                // query that a pulled LIMIT gave a ledger does not take its lock here.
+                if self.streams
+                    && let Some(ledger) = self.memory.get()
+                {
                     ledger.trim_zero(self.grant.as_ref());
                 }
             }

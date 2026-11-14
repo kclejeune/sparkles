@@ -1131,6 +1131,45 @@ mod tests {
         );
         assert_eq!(pool.granted(), 0);
     }
+    /// A LIMIT over a path pulls the path's cursor, which takes the query's ledger, and
+    /// a long narrow walk then charges a step at a time and checks its output each
+    /// time it doubles, rather than taking the ledger's lock several times per level.
+    #[test]
+    fn a_pulled_path_limit_takes_the_ledger_once_per_step() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{QueryOptions, query};
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        // one cycle of 300 people, so every walk is 300 levels of one node
+        for i in 0..300 {
+            data.push_str(&format!("ex:p{i} ex:knows ex:p{} .\n", (i + 1) % 300));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            pool: Some(QueryPool::new(64 * MB)),
+            max_memory_bytes: Some(32 * MB),
+            no_cache: true,
+            ..Default::default()
+        };
+        let before = LEDGER_OPS.with(|n| n.get());
+        let r = query(
+            store.snapshot(),
+            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x } LIMIT 500",
+            &opts,
+        )
+        .unwrap();
+        let ops = LEDGER_OPS.with(|n| n.get()) - before;
+        assert_eq!(r.len(), 500);
+        // two walks of 300 levels took about 3,000 operations with several per level
+        assert!(ops < 300, "{ops} ledger operations");
+    }
     /// A grant set after the first charge would leave that charge on the old grant,
     /// which debug builds refuse.
     #[test]

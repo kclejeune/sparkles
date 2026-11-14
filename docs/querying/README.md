@@ -158,11 +158,17 @@ check them against the W3C suites and Jena's own answers.
   every execution mode, so each operator reads its inputs a batch at a time and stops
   once the query has the rows it asks for. A LIMIT over a single scan or a table of values
   reads the rows directly. A UNION under such a LIMIT, or under an ASK, reads its branch
-  with the lowest estimated cost to the first rows first, unless a branch calls an
-  application function, a SERVICE or another operator whose effects could observe the
-  order. An ASK or a `LIMIT 1` over a keyed join reads both inputs a few rows at a time,
-  and over a product filtered by an equality it streams the larger input against the
-  smaller one.
+  with the lowest estimated cost to the first rows first, unless a branch evaluates an
+  EXISTS, an extension or application function, RAND, UUID or BNODE, or holds an
+  operator such as SERVICE whose effects could observe the order. An ASK or a `LIMIT 1`
+  over a keyed join reads both inputs a few rows at a time, and a product streams its
+  larger input against the smaller one, which it holds.
+* A LIMIT over an inner hash join builds the hash index of one whole input before its
+  first row, so a `LIMIT 1` over the join of two inputs of 65,537 rows needs about 7 MB.
+  A join that reads both inputs a few rows at a time for a small LIMIT is
+  [roadmap item 947](../ROADMAP.md). A pulled LIMIT charges its operators' batches to the
+  query's memory ledger, as a streaming query does, and each charge takes the ledger's
+  lock. A small LIMIT over a join takes 50 to 100 of them.
 * A query has one plan whatever its execution mode, which EXPLAIN shows. A DISTINCT over
   an ORDER BY deduplicates below the sort in every mode when the query may spill, and
   `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in every

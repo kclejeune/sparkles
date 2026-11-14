@@ -7077,6 +7077,10 @@ impl<'a> Growth<'a> {
     }
 }
 
+/// The bytes a path walk adds to what it holds before it charges them, at most a few
+/// hundred reached nodes.
+const WALK_CHARGE_BYTES: u64 = 16 << 10;
+
 /// A frontier at least `rows / SWEEP_RATIO` long is expanded by one merged pass over the
 /// predicate's rows instead of one index seek per node (a seek costs about as much as
 /// merging a few hundred rows).
@@ -7323,7 +7327,15 @@ impl Graph<'_> {
         // The visited set, the reached nodes and the frontier are charged as they grow,
         // in eager execution as in a cursor, so that a wide closure fails at the memory
         // budget rather than growing without bound.
+        // The charge takes what the walk adds once it comes to [`WALK_CHARGE_BYTES`],
+        // as the neighbour buffer's growth is charged, and the output's bytes are
+        // checked again each time it doubles, so that a long narrow walk takes the
+        // query's memory ledger, when it has one, once per few hundred nodes rather
+        // than several times per level. Neither depends on the budget, so a run within
+        // a budget of its own peak charges as one without a budget does.
         let held = self.ctx.charge(64)?;
+        let mut pending = 0u64;
+        let mut checked_rows = 0usize;
         if self.spec.min == 0 {
             out.push(start);
             seen.insert(start);
@@ -7353,12 +7365,19 @@ impl Graph<'_> {
             // growth of the neighbour buffer
             let grown = found.capacity().saturating_sub(found_charged);
             found_charged = found_charged.max(found.capacity());
-            held.add(next.len() as u64 * 48 + grown as u64 * 8)?;
+            pending = pending.saturating_add(next.len() as u64 * 48 + grown as u64 * 8);
+            if pending >= WALK_CHARGE_BYTES {
+                held.add(std::mem::take(&mut pending))?;
+            }
             if self.spec.max_one && depth >= 1 {
                 break;
             }
             frontier = next;
-            self.ctx.check_output(out.len(), 1)?;
+            self.ctx.check_output_rows(out.len())?;
+            if out.len() >= checked_rows.saturating_mul(2).max(1024) {
+                self.ctx.check_output_bytes(out.len(), 1)?;
+                checked_rows = out.len();
+            }
         }
         Ok(out)
     }

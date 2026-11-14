@@ -235,11 +235,17 @@ function, a SERVICE or another operator with effects. `run_limited`, `execute_li
 the first-work estimator, `limited_input`, `filtered_ask_admitted`, `order_ask` and
 `Dataset::ask_streaming_with` are gone, and the accounting mode is read in four places.
 `scan_limited` remains for the planner's two-row probe and the direct reads. A pulled
-limit charges its operators' batches to the query's ledger, which an eager query of a
-few rows did not take before, and the cursor's scan charges one decoded block. A cursor
-cross product now holds its smaller estimated input and streams the larger one, as an
-inner hash join does, so a LIMIT over a cross product with a short VALUES list holds the
-list rather than the other input's whole answer.
+limit charges its operators' batches and its copy of the plan to the query's ledger,
+which an eager query of a few rows did not take before, and the cursor's scan charges one
+decoded block. A path walk grows its charge a reservation step at a time and checks its
+output each time it doubles, and an eager query's empty charges do not take the ledger to
+trim its grant, so a pulled `LIMIT 500` over walks of 300 levels takes 585 ledger
+operations rather than 3,233. A small pulled LIMIT over a join still takes 50 to 100, one
+group per batch and operator, as a streaming query does. A `PatternScan` of a constant
+subject hands out its predicates a batch at a time, and the cursor charges the pattern
+reader's decoded block. A cursor cross product now holds its smaller estimated input and
+streams the larger one, as an inner hash join does, so a LIMIT over a cross product with a
+short VALUES list holds the list rather than the other input's whole answer.
 
 The phase departs from its plan in three places. The UNION branch order is a choice of
 the planner's LIMIT and ASK arm in `demand.rs` on the branches' cost summaries, not a
