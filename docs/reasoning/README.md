@@ -334,7 +334,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   on every schedule. `Limits::dl_steps` controls the steps and is on by default. Set to
   false, it gives the run the driver of a run without a bound, with which the thread
   schedule can decide near the bound whether the run answers in full or falls back. The
-  steps cost 4 to 5% on the two Protein Ontology files on four threads, and more on
+  steps cost 4 to 5% on the two Protein Ontology files on four threads in the build
+  measured on `atlas`, and more on
   ontologies that classify in a few milliseconds, which roadmap item 950 follows. A
   rooted run and a run with the eager strategy that counts take one thread for their
   saturations with the steps, which roadmap item 951 follows. In an
