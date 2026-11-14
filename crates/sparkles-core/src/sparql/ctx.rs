@@ -683,9 +683,6 @@ pub struct Ctx {
     /// the planner met a `SERVICE` of the graph-algorithm namespace (see
     /// [`Ctx::calls_algorithm`])
     algorithmic: AtomicBool,
-    /// The whole eager ASK was admitted as a bounded pure UNION. Only that
-    /// consumer may reduce pure input demand below the ordinary prefix policy.
-    pub(super) eager_union_demand: AtomicBool,
     /// The plan of the operator that failed, as far as it ran, keyed by the address of
     /// its node, until its parent takes it (see [`Ctx::take_failed`]). Execution state:
     /// a plan shared between executions must not keep it.
@@ -1199,7 +1196,6 @@ impl Ctx {
             geo: Default::default(),
             warnings: Default::default(),
             algorithmic: AtomicBool::new(false),
-            eager_union_demand: AtomicBool::new(false),
             failed: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),
@@ -1499,10 +1495,9 @@ impl Ctx {
         // cursor keeps them.
         self.memory().cursor_mode()?;
         self.streams = true;
-        // The result cache and sampled filters are planning choices that stage 6 of
-        // item 453 makes independent of the execution mode.
-        self.use_cache = false;
-        self.opt.sampled_filters = false;
+        // The result cache and sampled filters stay as the query set them, so that a
+        // query plans alike in every mode (item 827). The cache serves the subtrees a
+        // cursor runs whole, and sampled filters take their samples once per plan.
         Ok(())
     }
 
@@ -1538,13 +1533,6 @@ impl Ctx {
         if first {
             self.regex.clear();
         }
-    }
-
-    /// Drop the context's weak reference to itself, which lets a test take the prepared
-    /// context back with `Arc::get_mut`.
-    #[cfg(test)]
-    pub(super) fn detach_owner_for_tests(&self) {
-        *self.owner.lock() = Weak::new();
     }
 
     /// The shared context, for an eager join that runs the cursor's partitioned join
@@ -3852,9 +3840,11 @@ mod charge_tests {
     }
 
     /// The executors read the accounting mode in at most this many places outside tests.
-    /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, to the planning and
-    /// routing sites that stage 6 removes, so that new twins do not come back.
-    const MODE_CHECKS: usize = 6;
+    /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, and item 827 took
+    /// the planning reads out, so that a query plans alike in every mode. The routing of
+    /// `query_execution_with_plan`, the EXISTS key set, the decoding envelope and
+    /// `string_order_mask` remain.
+    const MODE_CHECKS: usize = 4;
 
     /// Counts the calls of `streams()` in the non-test sources of the SPARQL engine,
     /// and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453).

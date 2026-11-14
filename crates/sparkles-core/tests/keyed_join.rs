@@ -313,7 +313,11 @@ fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
             ExecutionMode::Auto,
         )
         .unwrap();
-        assert!(matches!(auto, QueryExecution::Eager(_)));
+        // every ASK pulls through the cursor under automatic execution (item 827)
+        let QueryExecution::Ask(auto) = auto else {
+            panic!("automatic execution streams every ASK")
+        };
+        assert!(auto.result().boolean);
         let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
         assert_eq!(query(store.snapshot(), &select, &opts).unwrap().len(), 1);
     }

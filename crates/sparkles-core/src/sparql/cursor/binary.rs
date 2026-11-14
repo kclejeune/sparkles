@@ -37,13 +37,15 @@ pub(super) fn eligible(node: &Node) -> bool {
 }
 
 /// The input that is streamed. It matches the planner's hash probe order: the larger
-/// input of an inner hash join, and child zero of every other join.
+/// input of an inner hash join or a cross product, and child zero of every other join.
+/// A cross product holds its build input whole, so a LIMIT over it reads only the
+/// smaller input in full.
 pub(super) fn probe_side(node: &Node) -> usize {
     usize::from(
         matches!(
             node.kind,
             Kind::Join {
-                algo: JoinAlgo::Hash,
+                algo: JoinAlgo::Hash | JoinAlgo::Cross,
                 ..
             }
         ) && node.children[0].est < node.children[1].est,

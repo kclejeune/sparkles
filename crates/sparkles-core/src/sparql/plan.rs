@@ -1327,6 +1327,9 @@ impl<'a> Planner<'a> {
                 let child = self.plan(inner, g, Vec::new())?;
                 let mut n = Node::unary(Kind::Distinct, child, String::new());
                 n.est = n.children[0].est; // unknown reduction
+                if self.ctx.spill.is_some() {
+                    n = super::demand::distinct_below_order(self.ctx, n);
+                }
                 Ok(self.apply_filters(n, filters))
             }
             GP::Reduced { inner } => {
@@ -1338,7 +1341,8 @@ impl<'a> Planner<'a> {
                 start,
                 length,
             } => {
-                let child = self.plan(inner, g, Vec::new())?;
+                let mut child = self.plan(inner, g, Vec::new())?;
+                super::demand::plan_slice(self.ctx, &mut child, *start, *length);
                 let n = slice(child, *start, *length, self.ctx);
                 Ok(self.apply_filters(n, filters))
             }
@@ -5153,8 +5157,18 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
     // ORDER BY + LIMIT → top-k (also through a projection), over a single scan read in
     // value order when that is cheaper
     let limit = length.map(|l| l.saturating_add(start));
+    // A DISTINCT that the planner moved below its sort so that it may spill keeps the
+    // sort, which spills too, where a top-k heap would hold its `k` rows in memory.
+    let spilling = |order: &Node| {
+        order
+            .children
+            .first()
+            .is_some_and(super::demand::numbered_distinct)
+    };
     let child = match (child, limit) {
-        (mut n, Some(k)) if matches!(n.kind, Kind::OrderBy { limit: None, .. }) => {
+        (mut n, Some(k))
+            if matches!(n.kind, Kind::OrderBy { limit: None, .. }) && !spilling(&n) =>
+        {
             if let Kind::OrderBy { limit, .. } = &mut n.kind {
                 *limit = Some(k);
             }
@@ -5165,7 +5179,8 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
-                && matches!(n.children[0].kind, Kind::OrderBy { limit: None, .. }) =>
+                && matches!(n.children[0].kind, Kind::OrderBy { limit: None, .. })
+                && !spilling(&n.children[0]) =>
         {
             if let Kind::OrderBy { limit, .. } = &mut n.children[0].kind {
                 *limit = Some(k);
@@ -6181,9 +6196,13 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
         g => g.clone(),
     };
     let node = p.plan(&spec.pattern, &graph, Vec::new())?;
-    let node = slice(node, 0, Some(1), ctx);
-    let (input, _) = super::exec::execute_materialized(ctx, &node)?;
-    Ok(!input.table.is_empty())
+    // A substituted pattern of one triple or a table of values reads its first row
+    // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger pattern pulls
+    // its first solution through cursor operators, as a LIMIT does.
+    if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
+        return Ok(!rows.table.is_empty());
+    }
+    super::cursor::has_solution(ctx, &node)
 }
 
 /// Literal helper for tests.

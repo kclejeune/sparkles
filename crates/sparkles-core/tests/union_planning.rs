@@ -413,3 +413,131 @@ fn outer_filters_keep_the_original_join_boundary() {
         }
     }
 }
+
+/// A UNION under a LIMIT reads its cheapest branch first in every execution mode, so a
+/// query whose first branch must join two large inputs before its first row answers
+/// from the cheap branch alone (item 827).
+#[test]
+fn a_limited_union_reads_its_cheap_branch_first_in_every_mode() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("<urn:yes> <urn:cheap> 0 .\n");
+    for i in 0..20_000 {
+        data.push_str(&format!("<urn:a{i}> <urn:left> {} .\n", i % 5_000));
+        data.push_str(&format!("<urn:b{i}> <urn:right> {} .\n", i % 5_000));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let union = "{ ?a <urn:left> ?v . ?b <urn:right> ?v } UNION { <urn:yes> <urn:cheap> ?v }";
+    for text in [
+        format!("SELECT ?v WHERE {{ {union} }} LIMIT 1"),
+        format!("SELECT ?v WHERE {{ {union} }} LIMIT 1 OFFSET 0"),
+        format!("ASK {{ {union} }}"),
+    ] {
+        for mode in [
+            ExecutionMode::Eager,
+            ExecutionMode::Auto,
+            ExecutionMode::Streaming,
+        ] {
+            let mut execution = query_execution(
+                store.snapshot(),
+                &text,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap();
+            let produced = match &mut execution {
+                QueryExecution::Select(cursor) => {
+                    let mut rows = 0;
+                    while let Some(batch) = cursor.next_batch().unwrap() {
+                        rows += batch.len();
+                    }
+                    assert_eq!(rows, 1, "{text} under {mode:?}");
+                    cursor.stats().rows_produced
+                }
+                QueryExecution::Eager(result) | QueryExecution::Ask(result) => {
+                    let result = result.result();
+                    if result.kind == sparkles_core::sparql::QueryKind::Ask {
+                        assert!(result.boolean);
+                    } else {
+                        assert_eq!(result.len(), 1, "{text} under {mode:?}");
+                    }
+                    result.rows_produced
+                }
+                QueryExecution::Graph(_) => unreachable!(),
+            };
+            assert!(
+                produced < 1_000,
+                "{text} under {mode:?} produced {produced} rows"
+            );
+        }
+    }
+}
+
+/// A LIMIT over a UNION whose branches share no variable, and an OFFSET past the
+/// answer, give the rows the whole UNION would.
+#[test]
+fn limited_unions_without_shared_variables_and_offsets_past_the_answer() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..300 {
+        data.push_str(&format!("<urn:a{i}> <urn:p> {i} .\n"));
+    }
+    data.push_str("<urn:b> <urn:q> \"b\" .\n");
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    for (text, rows) in [
+        (
+            "SELECT * WHERE { { ?a <urn:p> ?x } UNION { ?b <urn:q> ?y } } LIMIT 5",
+            5,
+        ),
+        (
+            "SELECT * WHERE { { ?a <urn:p> ?x } UNION { ?b <urn:q> ?y } } LIMIT 5 OFFSET 299",
+            2,
+        ),
+        (
+            "SELECT * WHERE { { ?a <urn:p> ?x } UNION { ?b <urn:q> ?y } } LIMIT 5 OFFSET 301",
+            0,
+        ),
+        ("SELECT * WHERE { ?a <urn:p> ?x } LIMIT 10 OFFSET 1000", 0),
+    ] {
+        for mode in [
+            ExecutionMode::Eager,
+            ExecutionMode::Auto,
+            ExecutionMode::Streaming,
+        ] {
+            let mut execution = query_execution(
+                store.snapshot(),
+                text,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap();
+            let got = match &mut execution {
+                QueryExecution::Select(cursor) => {
+                    let mut n = 0;
+                    while let Some(batch) = cursor.next_batch().unwrap() {
+                        n += batch.len();
+                    }
+                    n
+                }
+                QueryExecution::Eager(result) => result.result().len(),
+                _ => unreachable!(),
+            };
+            assert_eq!(got, rows, "{text} under {mode:?}");
+        }
+    }
+}

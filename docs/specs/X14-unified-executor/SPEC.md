@@ -215,6 +215,51 @@ hierarchical budget of item 675 and the decoding twins of item 678 remain. Stage
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
+The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable
+cursor over the predicate patterns, which the eager scan shares, so `spk:hasPredicate`
+plans its scan in every mode. The planner deduplicates a DISTINCT below its ORDER BY
+whenever the query may spill, and the eager executor numbers the rows of that DISTINCT as
+the cursor does. The planner also sets the ripple join and the first-row index joins of an
+ASK or a `LIMIT 1` over a keyed join, with the default cursor batch size, and streams a
+filtered product's larger input. The result cache and sampled filters stay on under
+cursor accounting. Every ASK and every LIMIT without ORDER BY pulls its input through
+cursor operators with a demand of `offset + limit` rows, in eager execution through the
+eager context and in automatic execution, which streams every ASK without initial
+bindings. A LIMIT over one scan or a table of values, under projections, reads its rows
+directly, and so does the per-row evaluation of an EXISTS pattern of that shape, which
+item 829 leaves eager. A larger EXISTS pattern evaluated per row pulls its first solution.
+A LIMIT over an ORDER BY runs its input as before, since the sort reads it whole. A UNION
+under a LIMIT or an ASK orders its branches by their estimated cost to the first rows,
+from each branch's cost and estimated rows, when no branch calls an application
+function, a SERVICE or another operator with effects. `run_limited`, `execute_limited`,
+the first-work estimator, `limited_input`, `filtered_ask_admitted`, `order_ask` and
+`Dataset::ask_streaming_with` are gone, and the accounting mode is read in four places.
+`scan_limited` remains for the planner's two-row probe and the direct reads. A pulled
+limit charges its operators' batches to the query's ledger, which an eager query of a
+few rows did not take before, and the cursor's scan charges one decoded block. A cursor
+cross product now holds its smaller estimated input and streams the larger one, as an
+inner hash join does, so a LIMIT over a cross product with a short VALUES list holds the
+list rather than the other input's whole answer.
+
+The phase departs from its plan in three places. The UNION branch order is a choice of
+the planner's LIMIT and ASK arm in `demand.rs` on the branches' cost summaries, not a
+term of the join-order program in `joinorder.rs`. That program orders the operands of a
+join, while a UNION's branches are not joined and their order matters only to a consumer
+that stops early, so the choice belongs where the planner knows the demand. The ASK
+orientation, the ripple join and the first-row index joins apply to every slice of one
+row at offset zero, which covers a `LIMIT 1` as well as an ASK, rather than to the shapes
+the removed admission accepted. Both need one row, and a choice that depended on the
+admission would have kept the plan dependent on the mode. `scan_limited` stays, for the
+planner's two-row probe and for the direct reads of a LIMIT over one scan, because
+building cursor operators and a ledger for a read of a few rows costs more than the read.
+
+A LIMIT over an inner hash join now builds the hash index of one whole input, as the
+cursor does, where the removed eager limited join indexed a prefix of the limited input
+and ran again with eight times the demand until it had its rows. A `LIMIT 1` over the join
+of two 65,537-row inputs peaks at about 7 MB where it fit in a 6 MiB pool before. A
+first-rows join that reads both inputs a few rows at a time for small demand is
+[item 947](../../ROADMAP.md).
+
 Native SELECT output and standard solution responses of at most 65,536 rows admit and
 decode a complete row before serializing its cells. Row storage and decoded terms keep
 query credit until their payloads are freed. A required decode refusal returns its

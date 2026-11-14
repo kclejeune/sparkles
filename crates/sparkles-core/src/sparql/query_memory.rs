@@ -1098,7 +1098,10 @@ mod tests {
             "SELECT ?p ?n ?a WHERE { ?p ex:worksFor ex:o3 ; ex:name ?n ; ex:age ?a }",
             "SELECT ?p ?d ?t WHERE { ?p ex:worksFor ex:o3 . ?p ex:authorOf ?d . ?d ex:title ?t }",
             "SELECT ?p ?a WHERE { ?p ex:name ?n OPTIONAL { ?p ex:age ?a FILTER(?a > 50) } }",
-            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x } LIMIT 500",
+            // a LIMIT over a scan reads it directly, while one over a path pulls the
+            // path's cursor, whose batches the ledger charges (item 827)
+            "SELECT ?p ?x WHERE { ?p ex:knows ?x } LIMIT 500",
+            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x }",
             "SELECT ?p ?x WHERE { ex:p5 (ex:knows|ex:worksFor)* ?x . BIND(ex:p5 AS ?p) }",
             "CONSTRUCT { ?p ex:friend ?o } WHERE { ?p ex:knows ?o . ?o ex:worksFor ex:o3 }",
             "DESCRIBE ex:p3 ex:p4",

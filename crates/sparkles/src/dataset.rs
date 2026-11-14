@@ -792,20 +792,6 @@ impl Dataset {
         )
     }
 
-    pub fn ask_streaming_with(
-        &self,
-        query: &str,
-        opts: &QueryOptions,
-        cursor: &crate::sparql::CursorOptions,
-    ) -> Result<QueryResult> {
-        crate::sparql::ask_streaming(
-            self.inner.store.snapshot(),
-            query,
-            &self.with_query_defaults(opts),
-            cursor,
-        )
-    }
-
     /// The options a query of this dataset runs with by default. They hold RDFS on read
     /// when the dataset has it set, the graph of materialized inferences
     /// ([`INFERRED_GRAPH`](crate::reasoning::INFERRED_GRAPH)) as part of the default

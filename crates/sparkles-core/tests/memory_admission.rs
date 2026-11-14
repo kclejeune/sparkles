@@ -107,7 +107,9 @@ fn assert_not_admitted_to_fail(outcome: Auto, rows: usize) {
 
 /// A hash join keeps its build rows and a hash index over them, whose buckets and row
 /// arrays outweigh the rows. A plan that eager execution answers within the budget must
-/// not be streamed on an estimate that counts only the rows.
+/// not be streamed on an estimate that counts only the rows. A LIMIT pulls its input in
+/// both modes (item 827), so both hold the index of one whole input: neither answers
+/// within a pool too small for it, and both answer within one that holds it.
 #[test]
 fn a_hash_join_whose_index_does_not_fit_is_not_streamed_without_spill() {
     let mut data = String::new();
@@ -122,7 +124,11 @@ fn a_hash_join_whose_index_does_not_fit_is_not_streamed_without_spill() {
         { { ?x <urn:p> ?k } UNION { ?x <urn:q> ?k } }
         { { ?y <urn:p> ?k } UNION { ?y <urn:q> ?k } }
         VALUES ?v { 1 2 3 4 5 6 7 8 9 10 } } LIMIT 1";
-    let opts = pooled(6 << 20);
+    // the index of one 65,537-row input alone takes about 4 MiB
+    let small = pooled(4 << 20);
+    assert!(query(s.snapshot(), q, &small).is_err());
+    assert_not_admitted_to_fail(automatic(&s, q, &small), 1);
+    let opts = pooled(10 << 20);
     // the eager result holds its pool memory until it drops
     let eager = query(s.snapshot(), q, &opts)
         .unwrap_or_else(|e| panic!("eager: {e}"))
@@ -132,6 +138,42 @@ fn a_hash_join_whose_index_does_not_fit_is_not_streamed_without_spill() {
         Auto::Eager(rows) | Auto::Streamed(rows) => assert_eq!(rows.len(), 1),
         other => panic!("automatic execution failed a query that eager answers: {other:?}"),
     }
+}
+
+/// A cross product holds one input whole and streams the other, so a LIMIT over it holds
+/// the smaller input, here ten VALUES rows, rather than the whole of a 262,145-row join.
+#[test]
+fn a_limited_cross_product_holds_its_smaller_input() {
+    use sparkles_core::sparql::{PlanInfo, query_with_plan};
+    let mut data = String::new();
+    for i in 0..65_537 {
+        let k = i / 4;
+        let p = if i % 2 == 0 { "p" } else { "q" };
+        data.push_str(&format!("<urn:a:{i}> <urn:{p}> <urn:k:{k}> .\n"));
+    }
+    let s = store(data);
+    let q = "SELECT * {
+        { { ?x <urn:p> ?k } UNION { ?x <urn:q> ?k } }
+        { { ?y <urn:p> ?k } UNION { ?y <urn:q> ?k } }
+        VALUES ?v { 1 2 3 4 5 6 7 8 9 10 } } LIMIT 1";
+    let r = query_with_plan(s.snapshot(), q, &budget(64 << 20)).unwrap();
+    assert_eq!(r.len(), 1);
+    fn find<'a>(p: &'a PlanInfo, operator: &str) -> Option<&'a PlanInfo> {
+        if p.operator == operator {
+            return Some(p);
+        }
+        p.children.iter().find_map(|c| find(c, operator))
+    }
+    let plan = r.plan();
+    let cross = find(plan, "CartesianProduct").expect("a cross product with the VALUES");
+    let join = find(cross, "HashJoin").expect("the join of the two unions");
+    assert!(
+        join.actual_rows < 1000,
+        "{}",
+        serde_json::to_string(plan).unwrap()
+    );
+    // the join's build input and index, not its 262,145 output rows
+    assert!(r.mem_peak_bytes < 12 << 20, "{}", r.mem_peak_bytes);
 }
 
 /// A COUNT(DISTINCT *) keeps every distinct input row although it answers one row, so a
