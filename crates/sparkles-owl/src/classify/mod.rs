@@ -225,8 +225,8 @@ pub struct Limits {
     /// Ontology, where the run without it passes [`dl_work`](Limits::dl_work). A run
     /// that passes the bound either way can spend longer before it does: the
     /// classification of ore_ont_6485 of the ORE 2015 DL sample with counting, the
-    /// attempt and the run without counting together, takes 157 ms with the order and
-    /// 123 ms without it on one thread. False turns the order off.
+    /// attempt and the run without counting together, takes 213 ms with the order and
+    /// 188 ms without it on one thread. False turns the order off.
     pub number_order: bool,
     /// Makes the saturations of a run of Tier D that has a bound on its derived
     /// conclusions proceed in steps, so that the run derives the same conclusions, passes
@@ -240,9 +240,10 @@ pub struct Limits {
     /// on one thread with the option. A run without the bound has no outcome that a
     /// schedule decides, so the option changes nothing for it. The memory budget, the
     /// deadline and a cancellation still stop a run when they are reached. False takes
-    /// the driver whose threads deliver conclusions as they derive them, with which a
-    /// run near its bound can answer in full on one schedule and fall back on another,
-    /// and which repeats on one thread an attempt that passed the bound on several.
+    /// the driver whose threads deliver their messages during the saturation, with no
+    /// step between them. With it a run near its bound can answer in full on one
+    /// schedule and fall back on another, and an attempt that passed the bound on
+    /// several threads is repeated on one.
     pub dl_steps: bool,
 }
 

@@ -320,7 +320,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   two Protein Ontology files of the ORE 2015 DL sample by 4 to 19% over the run without
   counting. A run that passes its bound with the order as without it can take longer to
   do so. The classification of ore_ont_6485 of that sample with counting requested takes
-  1.28 times as long with the order, which roadmap item 896 follows with the default
+  1.14 times as long with the order, which roadmap item 896 follows with the default
   of counting.
   Number restrictions, functional and inverse functional properties, disjoint properties
   and asymmetric properties then take equalities of successors, and a run that counts has
@@ -334,7 +334,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   on every schedule. `Limits::dl_steps` controls the steps and is on by default. Set to
   false, it gives the run the driver of a run without a bound, with which the thread
   schedule can decide near the bound whether the run answers in full or falls back. The
-  steps cost about 3% on the two Protein Ontology files on four threads, and more on
+  steps cost 4 to 5% on the two Protein Ontology files on four threads, and more on
   ontologies that classify in a few milliseconds, which roadmap item 950 follows. A
   rooted run and a run with the eager strategy that counts take one thread for their
   saturations with the steps, which roadmap item 951 follows. In an
@@ -809,8 +809,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   against 0.9 and 0.3 s without counting and 2.3 to 2.5 s for Konclude 0.7.0. The other
   three pass the bound of derived conclusions and get the answer without counting. The
   order makes the failed attempt of ore_ont_6485 dearer. Its classification with counting
-  requested, the attempt and the run without it together, takes 157 ms on one thread with
-  the order and 123 ms with `Limits::number_order` set to false, 1.28 times as long,
+  requested, the attempt and the run without it together, takes 213 ms on one thread with
+  the order and 188 ms with `Limits::number_order` set to false, 1.14 times as long,
   against 7 ms without counting and 40 ms for Konclude. Roadmap items 896 and 729.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times

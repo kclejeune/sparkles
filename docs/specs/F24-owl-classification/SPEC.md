@@ -155,8 +155,10 @@ default. Such a run derives the same conclusions on one thread and on eight, so 
 keeps or passes its bound, and answers in full or falls back, in the same way on every
 schedule. The 150 counting fixtures and the generated ontologies of items 894 and 897
 show it, with the answers of a run without steps. On `atlas` on four threads the two ORE
-2015 DL files that finish with counting take 3.3% longer in steps, and the three whose
-attempt fails take 1.3 to 2.7 times less. Item 950 follows the cost of the steps on
+2015 DL files that finish with counting take 4.0 and 4.9% longer in steps, and the three
+whose attempt fails take 1.3 to 2.6 times less. With the steps ore_ont_6485's
+classification with counting requested takes 213 ms with the order between number
+restrictions against 188 ms without it on one thread. Item 950 follows the cost of the steps on
 ontologies that classify in a few milliseconds. A rooted run and a run with the eager
 strategy that counts take one thread with the option, which item 951 follows.
 
@@ -2860,9 +2862,10 @@ the steps would change only its cost, and it keeps the driver without steps what
 option says. Counting and the root are off by default, so a classification under the
 default limits runs as it did before this item. `dl_steps: false`, and `--no-dl-steps`
 of `el_classify`, give a run with the bound the driver without steps. Its workers
-deliver each conclusion as they derive it, a run near its bound can then answer in full
-on one schedule and fall back on another, and an attempt on several threads that passed
-the bound is repeated on one thread before the run falls back.
+deliver their messages during the saturation, with no step between them, a run near its
+bound can then answer in full on one schedule and fall back on another, and an attempt
+on several threads that passed the bound is repeated on one thread before the run falls
+back.
 
 A step works on a frontier of contexts. The frontier is a queue that the seeds start and
 the roots join while it holds fewer than 4,096 contexts, and a step takes its first
@@ -2965,34 +2968,48 @@ does. Of the fixtures that the section on compound qualifiers names, `qz-0048` d
 run without steps derives 29,625 and 815,758 on one thread and 13,319 and 914,090 in one
 run on four.
 
-The cost against the driver without steps was measured on `atlas` with the classifier of
-commit b351050c, one process at a time in a 13 GiB scope, while other work kept the load
-average of the host between 3 and 6. The times are medians of five classifications in one
-process, and for the five ORE 2015 DL files that attempt counting the median of three
-such processes for each driver, run in turn. They compare the two drivers on one host and
-are not a published benchmark.
+The cost against the driver without steps was measured on `atlas`, one process at a time
+in a 13 GiB scope, while other work kept the load average of the host between 2 and 6.
+The times are medians of five classifications in one process, and for the five ORE 2015
+DL files that attempt counting the median of three such processes for each driver, run in
+turn. They compare the two drivers on one host and are not a published benchmark. The
+table is of the classifier of commit 335fb9c7, which has the outbox of item 818, except
+the row of ore_ont_14817 on one thread, which is of commit b351050c.
 
 | File | Threads | Without steps | In steps |
 |---|---|---|---|
-| ore_ont_6952 | 4 | 365.5 ms | 377.5 ms |
-| ore_ont_10140 | 4 | 374.3 ms | 386.5 ms |
-| ore_ont_6485 | 4 | 205.5 ms, falls back | 76.6 ms, falls back |
-| ore_ont_14817 | 4 | 6,192 ms, falls back | 3,498 ms, falls back |
-| ore_ont_9663 | 4 | 3,701 ms, falls back | 2,752 ms, falls back |
-| ore_ont_6952 | 1 | 1,166 ms | 1,153 ms |
-| ore_ont_10140 | 1 | 1,197 ms | 1,180 ms |
-| ore_ont_6485 | 1 | 156.7 ms, falls back | 211.6 ms, falls back |
+| ore_ont_6952 | 4 | 359.3 ms | 373.8 ms |
+| ore_ont_10140 | 4 | 364.2 ms | 382.0 ms |
+| ore_ont_6485 | 4 | 203.9 ms, falls back | 77.6 ms, falls back |
+| ore_ont_14817 | 4 | 6,090 ms, falls back | 3,401 ms, falls back |
+| ore_ont_9663 | 4 | 3,349 ms, falls back | 2,551 ms, falls back |
+| ore_ont_6952 | 1 | 1,134.0 ms | 1,134.3 ms |
+| ore_ont_10140 | 1 | 1,163.1 ms | 1,165.0 ms |
+| ore_ont_6485 | 1 | 157.7 ms, falls back | 213.1 ms, falls back |
 | ore_ont_14817 | 1 | 132 s, falls back | 10.1 s, falls back |
-| ore_ont_9663 | 1 | 7,329 ms, falls back | 7,775 ms, falls back |
+| ore_ont_9663 | 1 | 6,910 ms, falls back | 7,118 ms, falls back |
 
-On four threads the two files that finish take 3.3% longer in steps. The three that fall
-back take 1.3 to 2.7 times less, since a run in steps does not repeat its failed attempt
-on one thread. On one thread the two that finish take 1.2 and 1.4% less, the fallback of
-ore_ont_6485 takes 35% longer and that of ore_ont_9663 6% longer. The time without steps
-for ore_ont_14817 on one thread is one classification, since five passed 600 s.
+On four threads the two files that finish take 4.0 and 4.9% longer in steps. The three
+that fall back take 1.3 to 2.6 times less, since a run in steps does not repeat its failed
+attempt on one thread. On one thread the two that finish take the same time within 0.2%,
+the fallback of ore_ont_6485 takes 35% longer and that of ore_ont_9663 3% longer. The time
+without steps for ore_ont_14817 on one thread is one classification, since five passed
+600 s.
 
-The 149 counting fixtures that both drivers finish at a bound of 8 million take 2,180 ms
-in steps against 2,046 ms on one thread in sum, 6.5% longer, and 1,146 against 1,360 ms
+The cost on the two finishing files varies with the build by more than its size. The
+classifier of commit b351050c measured 3.4 and 3.5% on four threads and 1.1 and 1.3% less
+on one, in the same run as the table. A build of commit 451a6b76, whose saturation is
+that of b351050c, measured 12 and 13% on four threads and 12% on one. Item 950 times the
+files on the benchmark host.
+
+With the steps the classification of ore_ont_6485 with counting requested, the failed
+attempt and the run without counting together, takes 213 ms with the order between number
+restrictions and 188 ms without it on one thread, 1.14 times as long, and 78 against 68
+ms on four.
+
+With the classifier of commit b351050c, the 149 counting fixtures that both drivers
+finish at a bound of 8 million take 2,180 ms in steps against 2,046 ms on one thread in
+sum, 6.5% longer, and 1,146 against 1,360 ms
 on four, 16% less, where `sriq-004` derives 387,617 conclusions in steps against
 2,171,241. `shiq-028`, which passes the bound, takes 4,370 against 3,505 ms on one thread
 and 1,301 against 3,991 ms on four.
@@ -3003,9 +3020,10 @@ steps on one thread in sum and 4% longer on four. Single fixtures go both ways, 
 0.79 ms against 0.17 ms on one thread and 8.7 ms against 3.6 ms on four. Item 950 follows
 this cost.
 
-A sweep of the 207 development files of the ORE 2015 DL sample on four threads, with
-every saturation of the disjunctive rules in steps, gives the same bytes as the driver
-without steps on each of the 205 files that give a taxonomy. The disjunctive rules answer
+A sweep of the 207 development files of the ORE 2015 DL sample with counting on four
+threads gives the same bytes under the default limits as without steps on each of the
+205 files that give a taxonomy. An earlier sweep, of commit b351050c with every
+saturation of the disjunctive rules in steps, gave those bytes too, and its times follow. The disjunctive rules answer
 92 of them within their bounds, in 22.2 s in steps against 22.7 s in single
 classifications. No cardinality restriction on an object property and no functional,
 inverse functional, disjoint or asymmetric object property occurs in 23 of the 92, so
@@ -3015,10 +3033,11 @@ They take 16.4 s in steps against 17.8 s, and the largest ratio among them is 0.
 against 0.33 ms.
 
 The steps are the default for the determinism, at the cost this subsection states. On
-four threads a run that finishes with counting takes about 3% longer, and a run that
-falls back takes less, since it makes its attempt once. On one thread the fallback of
-ore_ont_6485 takes 55 ms longer, and that of ore_ont_14817 takes 10 s where it took 132 s.
-The times above are from one host under load, and none is from the benchmark host.
+four threads a run that finishes with counting takes 4 to 5% longer in the measured
+build, and a run that falls back takes less, since it makes its attempt once. On one
+thread the fallback of ore_ont_6485 takes 55 ms longer, and that of ore_ont_14817 takes
+10 s against 132 s without steps. The times above are from one host under load, and
+none is from the benchmark host.
 
 ### Nominals in the disjunctive rules
 

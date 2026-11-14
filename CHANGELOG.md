@@ -116,9 +116,13 @@ between two checks wrapped the count before, and the run ended as complete witho
 inferences. A worker of a saturation that panics, in a caller's callback for example, now
 stops the run, and the panic reaches the caller. The other workers waited for it without
 end before, with either driver. On `atlas` on four threads the two versions of the
-Protein Ontology classify 3.3% slower in steps, and the three files of the ORE 2015 DL
-sample whose counting attempt fails classify 1.3 to 2.7 times faster, since a run in
-steps does not repeat the attempt on one thread. The counting fixtures that take less
+Protein Ontology classify 4.0 and 4.9% slower in steps, and the three files of the ORE
+2015 DL sample whose counting attempt fails classify 1.3 to 2.6 times faster, since a run
+in steps does not repeat the attempt on one thread. On one thread the fallback of
+ore_ont_14817 takes 10 s in steps against 132 s without them, and 222 s before a context
+gave way to the contexts it woke. In steps the classification of ore_ont_6485 with
+counting requested takes 213 ms with the order between number restrictions against 188
+ms without it on one thread, where the entry above gives the times without steps. The counting fixtures that take less
 than 10 ms take 9% longer in steps on one thread in sum and 4% longer on four, which
 roadmap item 950 follows. This is roadmap item 727.
 
