@@ -59,12 +59,17 @@ failed counting attempt of ore_ont_6485 is cheaper. Its classification with coun
 requested takes 157 ms on one thread with the order against 123 ms without it, 1.28
 times as long, where it took 576 against 184 ms.
 
-`Limits::dl_steps`, off by default, makes every saturation of the disjunctive rules
-proceed in steps, and `el_classify` takes `--dl-steps`. A step activates the waiting
-contexts on the workers and delivers their messages at its end in a fixed order, and the
-bound on derived conclusions is compared between steps. A run then derives the same
-conclusions and answers in full or falls back in the same way on every number of threads.
-A rooted run and a run with the eager strategy take one thread with the option. An
+A run of the disjunctive rules that has a bound on its derived conclusions now proceeds
+in steps. Such a run is one that counts, the run without counting that follows it past
+the bound, or a rooted run. A step activates the waiting contexts on the workers and
+delivers their messages at its end in a fixed order, and the bound is compared between
+steps. The run then derives the same conclusions and answers in full or falls back in the
+same way on every number of threads, and it does not repeat on one thread an attempt that
+passed the bound. `Limits::dl_steps` controls the steps and is on by default, and
+`el_classify` takes `--no-dl-steps`. A run without the bound keeps the driver without
+steps, so a classification under the default limits runs as before. A rooted run and a
+run with the eager strategy that counts take one thread for their saturations with the
+option, which is roadmap item 951. An
 inference too wide to make now marks the run past its bound with a flag. Four of them
 between two checks wrapped the count before, and the run ended as complete without those
 inferences. A worker of a saturation that panics, in a caller's callback for example, now
@@ -72,8 +77,9 @@ stops the run, and the panic reaches the caller. The other workers waited for it
 end before, with either driver. On `atlas` on four threads the two versions of the
 Protein Ontology classify 3.3% slower in steps, and the three files of the ORE 2015 DL
 sample whose counting attempt fails classify 1.3 to 2.7 times faster, since a run in
-steps does not repeat the attempt on one thread. This is roadmap item 727, which keeps
-the decision about the default.
+steps does not repeat the attempt on one thread. The counting fixtures that take less
+than 10 ms take 9% longer in steps on one thread in sum and 4% longer on four, which
+roadmap item 950 follows. This is roadmap item 727.
 
 ### Compatibility
 

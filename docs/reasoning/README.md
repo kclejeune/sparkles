@@ -321,13 +321,17 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   a bound of 262,144 derived conclusions, `Limits::dl_work`. Without it those axioms are
   left out and reported. A run that passes it classifies
   again without counting, leaves the axioms that need counting out and reports them, and
-  sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. Near the bound the thread
-  schedule can decide whether a run answers in full or falls back, and the fallback is
-  always reported and never a different complete answer. `Limits::dl_steps`, off by
-  default, makes the disjunctive rules proceed in steps that derive the same conclusions
-  on every number of threads, so that a run answers in full or falls back in the same way
-  on every schedule. A rooted run and a run with the eager strategy take one thread with
-  it. Roadmap item 727 keeps the decision about the default. In an
+  sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. The fallback is always
+  reported and never a different complete answer. A run with such a bound, which a run
+  that counts and a rooted run have, proceeds in steps that derive the same conclusions
+  on every number of threads, so that it answers in full or falls back in the same way
+  on every schedule. `Limits::dl_steps` controls the steps and is on by default. Set to
+  false, it gives the run the driver of a run without a bound, with which the thread
+  schedule can decide near the bound whether the run answers in full or falls back. The
+  steps cost about 3% on the two Protein Ontology files on four threads, and more on
+  ontologies that classify in a few milliseconds, which roadmap item 950 follows. A
+  rooted run and a run with the eager strategy that counts take one thread for their
+  saturations with the steps, which roadmap item 951 follows. In an
   ontology with individuals or nominals, `Limits::rooted` lets the disjunctive rules take
   nominals, class and property assertions, equalities and inequalities of individuals and
   negative assertions through a root context where the individuals' facts meet, with the
