@@ -732,8 +732,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   quad of one away derives again. A table that a later commit's query derives under an
   earlier commit's tables, and that holds a term the earlier commit lacked, is not kept.
   An anchor keeps a clone of its commit's delta, which retains the key-set nodes that
-  later writes replaced. After a commit the rules read, some `owl-rl` demand queries measured 20
-  to 38% slower than before reuse on a loaded host. Roadmap item 960.
+  later writes replaced.
 * Demand reasoning has per-query schema analysis and program setup costs. Schema
   completeness analysis can stream the visible inputs twice, including when schema
   tables are warm, and reserves a conservative workspace against the memory budget.

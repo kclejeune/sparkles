@@ -1313,10 +1313,12 @@ the schema itself is unchanged.
   neither reuses, as §6.2 says.
 
 **Measurement.** The `table_reuse` example took most `owl-rl` LUBM queries from about
-250 ms to between 0.5 and 70 ms after a commit that the rules do not read, at 10
-universities on a loaded laptop, since the schema's table and the completeness proof
-carry over. After a commit that the rules read, queries 9 and 11 to 14 took 20 to 38%
-longer than before reuse, which roadmap item 960 follows up. The figures are in the
+250 ms to between 0.6 and 90 ms after a commit that the rules do not read, at 10
+universities on atlas, since the schema's table and the completeness proof carry over.
+After a commit that the rules read, each query took between 6% less and 5% more time than
+before reuse. A first pair of runs on a loaded laptop had shown queries 9 and 11 to 14 20
+to 38% slower in that case, which the quiet runs did not reproduce, and a build that timed
+the reuse steps put their cost per session below 1.2 ms. The figures are in the
 [reasoning results](../benchmarks/reasoning/RESULTS.md#reuse-of-tables-across-commits).
 
 **Tests.** `crates/sparkles-reasoner/tests/demand_reuse.rs` runs a query, commits a change,
