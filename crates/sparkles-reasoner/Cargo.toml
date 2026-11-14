@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The plan probe, a diagnostic that times every atom order of each rule plan
+# (`bench_plan_probe`). It perturbs the run it measures, so it is for measurements only.
+plan-probe = []
+
 [dependencies]
 sparkles-core.workspace = true
 oxrdf.workspace = true

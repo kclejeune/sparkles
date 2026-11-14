@@ -1915,7 +1915,10 @@ pub fn bench_sampled_search_all(on: bool) {
 
 /// Turn the plan probe on or off for the runs of this process: a diagnostic that times
 /// every atom order of each rule plan and prints one line per plan to the standard
-/// error. For benchmarks.
+/// error. It exists only with the `plan-probe` feature, and it perturbs the runs it
+/// measures: they build both orders over the whole tier and take far longer. For
+/// measurements.
+#[cfg(feature = "plan-probe")]
 #[doc(hidden)]
 pub fn bench_plan_probe(on: bool) {
     engine::planprobe::set(on);

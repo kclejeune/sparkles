@@ -17,7 +17,8 @@
 //! order of every rule body, and `1` orders bodies from sampled bindings, the default.
 //! `SPARKLES_MAX_INFERRED=N` raises their limit of derived triples, a profile of the
 //! form `@FILE` reads Jena rule text from a file, and `SPARKLES_PLAN_PROBE=1` makes
-//! `infer` time every atom order of each rule plan and print one line per plan.
+//! `infer` time every atom order of each rule plan and print one line per plan, in a
+//! build with `--features plan-probe`.
 //! `SPARKLES_WITNESSES=N` makes `materialize` and `keep` keep up to `N` witnesses per fact
 //! (spec F18 §7.1) and report them. The peak heap counts every allocation
 //! of the process from the start of the run, so it includes the data the run returns.
@@ -274,7 +275,10 @@ fn main() {
                 None => args[3].parse().expect("profile"),
             };
             if std::env::var("SPARKLES_PLAN_PROBE").as_deref() == Ok("1") {
+                #[cfg(feature = "plan-probe")]
                 sparkles_reasoner::bench_plan_probe(true);
+                #[cfg(not(feature = "plan-probe"))]
+                panic!("SPARKLES_PLAN_PROBE needs a build with --features plan-probe");
             }
             let store = Store::open(&db, StoreOptions::default()).unwrap();
             let snap = store.snapshot();

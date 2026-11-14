@@ -14,6 +14,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(feature = "plan-probe")]
 pub(crate) mod planprobe;
 pub(crate) mod sampled;
 
@@ -2192,7 +2193,10 @@ pub(crate) fn run_observed(
                     .map_err(|e| memory(e, iteration))?;
             }
         }
+        #[cfg(feature = "plan-probe")]
         if planprobe::enabled() {
+            // the orders the probe tries read the whole tier by subject and by object,
+            // which the run is charged for and keeps
             g.ensure_index(true, true)
                 .map_err(|e| memory(e, iteration))?;
             g.ensure_index(false, true)
@@ -2206,7 +2210,6 @@ pub(crate) fn run_observed(
                 !(iteration == 0 && start.is_none()),
                 ds,
                 de,
-                limits,
             );
         }
         // ---- split into parallel work items

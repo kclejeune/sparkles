@@ -9,6 +9,16 @@
 //! matched of the planner's order and of the fastest order, and discards what the orders
 //! derive. The run itself continues with the planner's plans, so it derives the same
 //! facts with and without the probe.
+//!
+//! The probe is compiled only with the crate's `plan-probe` feature, which no released
+//! build turns on, and it is switched on for a whole process. It perturbs the run it
+//! measures, so a probed run is for its probe lines and not for its time or its memory.
+//! The engine builds both orders over the whole tier before it probes, which the run's
+//! memory budget is charged for and which can make a run with a tight budget fail. The
+//! evaluations of the orders are charged to no budget, and the first evaluations of the
+//! planner's own order have no time limit, as the run's evaluation of it has none. A
+//! plan of a rule whose builtins bind variables is not probed, since each evaluation
+//! would add the terms those builtins make to the run's terms.
 
 use super::sampled::steps_in_order;
 use super::*;
@@ -117,9 +127,9 @@ pub(crate) fn probe(
     replays: bool,
     ds: u32,
     de: u32,
-    limits: &Limits,
 ) {
     let abort = AtomicBool::new(false);
+    let budget = Budget::unlimited();
     let run = |r: &CRule, steps: &[Step], limit: Option<Duration>| -> Run {
         let mut ev = Eval::new(
             g,
@@ -131,7 +141,7 @@ pub(crate) fn probe(
             None,
             usize::MAX,
             Mode::New,
-            &limits.budget,
+            &budget,
         );
         if replays && implicit_fact_delta(g, r, ds, de) {
             ev.delta_since = Some(ds);
@@ -150,6 +160,12 @@ pub(crate) fn probe(
         .par_iter()
         .map(|(ri, steps)| {
             let r = &rules[*ri];
+            if r.builtins.iter().any(|f| !f.outputs.is_empty()) {
+                return format!(
+                    "PLANPROBE-SKIPPED\t{iteration}\t{}\ta builtin binds a variable",
+                    r.name
+                );
+            }
             let mut ranges = vec![(0, 0); r.atoms.len()];
             let mut greedy = Vec::new();
             for s in steps {
