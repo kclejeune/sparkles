@@ -1780,7 +1780,7 @@ mod history_refusal_nonmutation_tests {
     }
 
     #[test]
-    fn absent_history_keeps_new_and_legacy_identity_upgrade_paths() {
+    fn absent_history_keeps_the_new_path_and_refuses_the_pre_release_layout() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("db");
         std::fs::create_dir(&root).unwrap();
@@ -1794,9 +1794,18 @@ mod history_refusal_nonmutation_tests {
         std::fs::remove_file(root.join("dataset.json")).unwrap();
         std::fs::remove_file(root.join("commits.bin")).unwrap();
         crate::history::preflight_file(&root).unwrap();
-        let upgraded = Store::open(&root, StoreOptions::default()).unwrap();
-        assert!(upgraded.snapshot().is_empty());
-        assert!(crate::commit::read_dataset_file(&root).unwrap().is_some());
+        // The first-release format cutoff (item 479) refuses a database without
+        // dataset.json instead of upgrading it, and the refusal writes nothing.
+        let before = metadata_files(&root);
+        match Store::open(&root, StoreOptions::default()) {
+            Err(Error::Unsupported(message)) => {
+                assert!(message.contains("dataset.json is missing"), "{message}")
+            }
+            Err(other) => panic!("expected the pre-release refusal, got {other}"),
+            Ok(_) => panic!("a database without dataset.json opened"),
+        }
+        assert_eq!(metadata_files(&root), before);
+        assert!(!root.join("dataset.json").exists());
     }
 
     #[test]
