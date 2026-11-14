@@ -137,7 +137,7 @@ restriction that no other axiom named counted no neighbour, and the run reported
 that missed the restriction's consequences as complete. The reported cases and a generated
 ontology that was reported consistent now have HermiT's answers, and the 205 files of the
 ORE 2015 DL development set that give a taxonomy with counting give the same bytes as
-before. Counting the neighbours that were missed costs work. The fixture `shiq-038`
+before, with no change of their times observed. Counting the neighbours that were missed costs work. The fixture `shiq-038`
 derives 877,028 conclusions on one thread where it derived 246,957, so it passes the
 default bound of 262,144 and falls back there, and it finishes with HermiT's answer at a
 raised bound. Counting stays off by default until item 896.
@@ -2635,7 +2635,10 @@ neighbour unless another axiom happened to name the same expression. `A ⊑ ≥2
 `C ⊑ P`, `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` left `A` satisfiable in a run that reported
 itself complete, and so did a maximum over `∃s.C`.
 
-The normalization of a counting run now gives a compound qualifier a name.
+The normalization of a counting run now gives a compound qualifier a name, for a maximum
+of one or more and for item 728's clause of a minimum or an exact cardinality of two or
+more. A maximum of zero is a universal restriction and an exact cardinality of one in a
+negative position is an existential restriction, and both keep their forms.
 `dl_norm::Norm::qualifier` replaces an intersection by a fresh class `N` with the told
 inclusion `P ⊓ Q ⊑ N`. It replaces an existential restriction `∃s.F`, as a qualifier or
 within one, by a fresh class `N` with `F ⊑ ∀s⁻.N` in a run without the root. That is
@@ -2651,7 +2654,8 @@ restriction over an inverse role beside a nominal and a maximum, so there the na
 above the expression, `∃s.F ⊑ N`, as an axiom of the ontology would state it.
 
 The names keep the answers of the ontology. Every model of the ontology extends to one of
-the normalized axioms by reading each name as its qualifier, and in every model of the
+the normalized axioms by reading each name as the expression it stands for, the inner
+names first, and in every model of the
 normalized axioms the qualifier is below its name, so the maximum over the name gives the
 maximum over the qualifier and item 728's clause over the name gives the clause over the
 qualifier. This is the structural transformation of a negative position, which the
@@ -2664,11 +2668,11 @@ through a minimum of three over `∃r1.C3` in a negative position, so it now pas
 default bound of 262,144 and classifies again without counting. It finishes with HermiT's
 answer at the raised bound of its test. `shiq-013` derives 102,896 against 62,548 and
 `shq-015` 18,415 against 12,188. No other fixture moves across the default bound, and
-item 729 follows `shiq-038`. The ORE 2015 DL development set has no cost. Its 205 files
-that give a taxonomy with counting on four threads on `atlas` give the same bytes as
-before, the two versions of the Protein Ontology classify in 375 and 382 ms against 380
-and 371 ms in single runs, and ore_ont_6485, ore_ont_14817 and ore_ont_9663 pass the bound
-as before.
+item 729 follows `shiq-038`. On the ORE 2015 DL development set no change was observed.
+Its 205 files that give a taxonomy with counting on four threads on `atlas` give the same
+bytes as before, the two versions of the Protein Ontology classify in 375 and 382 ms
+against 380 and 371 ms in one run each, which is not a benchmark, and ore_ont_6485,
+ore_ont_14817 and ore_ont_9663 pass the bound as before.
 
 The regressions are in `tests/dl_tier_d.rs` and `tests/dl_nominals.rs`. They cover a
 maximum over an intersection, over an existential restriction on a simple, an inverse and

@@ -2088,9 +2088,9 @@ fn a_qualification_reaches_an_equated_successor_through_the_other_ones_role() {
 /// The qualifier of a number restriction is in a negative position: a neighbour counts
 /// once it derives the qualifier. A qualifier that is an intersection or an existential
 /// restriction gets a name of its own, which the neighbour derives from the operands or
-/// from its own neighbour in the filler, over a simple role or a transitive one. Each
-/// qualifier below occurs in no other axiom. A run that gave them no name counted no
-/// neighbour and left each class satisfiable (roadmap item 897).
+/// from its own neighbour in the filler, over a simple role or a transitive one. No other
+/// axiom below registers a qualifier as the left side of an inclusion. A run that gave
+/// them no name counted no neighbour and left each class satisfiable (roadmap item 897).
 #[test]
 fn a_compound_qualifier_of_a_number_restriction_is_counted() {
     // a maximum over an intersection
@@ -2154,6 +2154,22 @@ fn a_compound_qualifier_of_a_number_restriction_is_counted() {
         ),
         &[("B", "E"), ("B", "F")],
         &[("B", "Nothing"), ("K", "E")],
+    );
+    // a minimum within an existential restriction in a negative position, which stays a
+    // minimum in a negative position and is item 728's clause, where the minimum on the
+    // left of an inclusion above becomes a maximum on its right
+    check(
+        &format!(
+            "SubClassOf(:C :P) SubClassOf(:C :Q)
+             SubClassOf(:D ObjectMinCardinality(2 :r :C))
+             SubClassOf(:A ObjectSomeValuesFrom(:v :D))
+             SubClassOf(ObjectSomeValuesFrom(:v
+               ObjectMinCardinality(2 :r ObjectIntersectionOf(:P :Q))) :E)
+             SubClassOf(:G ObjectSomeValuesFrom(:v :H))
+             SubClassOf(:H ObjectMinCardinality(2 :r :P)) {UNION}"
+        ),
+        &[("A", "E")],
+        &[("A", "Nothing"), ("G", "E")],
     );
 }
 

@@ -37,15 +37,15 @@ together, takes 3.1 times as long with the order, 576 ms against 184 ms on one t
 which roadmap item 896 follows. Counting stays off by default. `el_classify` takes
 `--no-number-order` to turn the order off. This is roadmap item 894.
 
-A counting run gives each compound qualifier of a number restriction a name of its own.
-Before, a maximum cardinality, or a minimum or exact cardinality in a negative position,
-whose qualifier was an intersection or an existential restriction that no other axiom
+A counting run gives the compound qualifier of a maximum cardinality of one or more, and
+of a minimum or exact cardinality of two or more in a negative position, a name of its
+own. Before, such a restriction whose qualifier was an intersection or an existential restriction that no other axiom
 named counted no neighbour, and the run reported an answer that missed the restriction's
 consequences as complete. `A ⊑ ≥2 r.C`, `C ⊑ P`, `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` left `A`
 satisfiable. Counting those neighbours costs work on ontologies with such qualifiers, and
 the generated fixture `shiq-038` now passes the default bound of the counting run, at
 877,028 conclusions against 246,957, and classifies again without counting. The ORE 2015
-DL development set keeps its taxonomies and times. This is roadmap item 897.
+DL development set keeps its taxonomies, and no change of its times was observed. This is roadmap item 897.
 
 ### Compatibility
 
