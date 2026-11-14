@@ -499,6 +499,12 @@ pub struct Saturation {
     /// the invalidation does not follow: a context merged with an individual, a world, a
     /// key or a fact of a universal role
     entangled: bool,
+    /// whether the interner may hold expressions that are not [`tier_neutral`] of a
+    /// removed axiom or of an added axiom outside OWL 2 EL, or what a normalization
+    /// outside OWL 2 EL interned that [`TierMark::passed`] finds, which a run that
+    /// decides its tier over the interner would read as present, so a run with axioms
+    /// outside OWL 2 EL starts again
+    stale_tier: bool,
     /// whether the last run whose saturation ended found the ontology consistent
     consistent: bool,
     /// the contexts of conjunctions that the last run's Horn rules created
@@ -562,6 +568,87 @@ fn needs_full_run(ax: &AxiomKind) -> bool {
             Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
         )
     })
+}
+
+/// Whether the expressions of the axiom, once it is removed or when a change interns an
+/// added axiom outside OWL 2 EL as a premise, leave nothing in a kept interner that a
+/// run's choice of tier reads. That choice looks for self restrictions,
+/// at-most restrictions, nominals, data and the top and bottom object properties among
+/// every expression the interner holds, so a removed axiom with any of them could keep
+/// Tier D from the axioms that remain. Class axioms and domains built from classes,
+/// intersections, unions, complements and existentials over other properties are
+/// neutral, and so are declarations and annotations.
+fn tier_neutral(ax: &AxiomKind) -> bool {
+    use ClassExpression as C;
+    fn plain(c: &ClassExpression) -> bool {
+        match c {
+            C::Class(_) => true,
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().all(plain),
+            C::ObjectComplementOf(c) => plain(c),
+            C::ObjectSomeValuesFrom(p, c) => {
+                let p = p.named();
+                *p != ObjectProperty::top() && *p != ObjectProperty::bottom() && plain(c)
+            }
+            _ => false,
+        }
+    }
+    match ax {
+        _ if !logical(ax) => true,
+        AxiomKind::Declaration(e) => !matches!(
+            e,
+            Entity::ObjectProperty(p) if *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
+        ),
+        AxiomKind::SubClassOf(a, b) => plain(a) && plain(b),
+        AxiomKind::EquivalentClasses(cs) | AxiomKind::DisjointClasses(cs) => cs.iter().all(plain),
+        AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
+        AxiomKind::ObjectPropertyDomain(p, c) => {
+            let p = p.named();
+            *p != ObjectProperty::top() && *p != ObjectProperty::bottom() && plain(c)
+        }
+        _ => false,
+    }
+}
+
+/// How far the interner's tables reached at one point of a run, to tell whether what
+/// was interned since holds anything that a run's choice of tier reads.
+struct TierMark {
+    nodes: usize,
+    roles: usize,
+    individuals: usize,
+    vals: usize,
+}
+
+impl TierMark {
+    fn of(it: &Interner) -> TierMark {
+        TierMark {
+            nodes: it.nodes.len(),
+            roles: it.roles.len(),
+            individuals: it.individuals.len(),
+            vals: it.vals.len(),
+        }
+    }
+
+    /// Whether the interner has gained, since the mark, an individual, a data value, a
+    /// data role, the top or bottom object property, or a nominal, self, data or
+    /// at-most-one restriction, which [`dl_norm::eligible`] and
+    /// [`Saturation::disj_allowed`] read.
+    fn passed(&self, it: &Interner) -> bool {
+        it.individuals.len() > self.individuals
+            || it.vals.len() > self.vals
+            || it.roles[self.roles..].iter().any(|r| match r {
+                index::RoleName::Data(_) => true,
+                index::RoleName::Object(p) => {
+                    *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
+                }
+                _ => false,
+            })
+            || it.nodes[self.nodes..].iter().any(|n| {
+                matches!(
+                    n,
+                    Node::Nominal(_) | Node::SelfLoop(_) | Node::DataSome(..) | Node::AtMost1(..)
+                )
+            })
+    }
 }
 
 /// Whether a change to the axiom affects the role table, which a run builds once.
@@ -861,6 +948,7 @@ impl Saturation {
             dirty: true,
             worlds: FxHashMap::default(),
             entangled: false,
+            stale_tier: false,
             consistent: true,
             dynamic: None,
             horn_tried: false,
@@ -1154,6 +1242,7 @@ impl Saturation {
     fn reset(&mut self) {
         self.index = None;
         self.interner = Interner::new();
+        self.stale_tier = false;
         self.ctx = Vec::new();
         self.dynamic = None;
     }
@@ -1356,6 +1445,9 @@ impl Saturation {
                 outside_el.add(dl::shape(k));
             }
         }
+        // what the interner holds before the normalizations outside OWL 2 EL, which
+        // intern into it whether or not they take their axioms
+        let mark = TierMark::of(&self.interner);
         // The Horn rules take what they can of these (items 603 and 692).
         let mut taken: FxHashSet<&AxiomKind> = FxHashSet::default();
         let stop = || poll(limits).is_err();
@@ -1423,6 +1515,10 @@ impl Saturation {
             );
         }
         self.interner.ranges.check()?;
+        // A fresh run decides its tier before these normalizations, so what they intern
+        // that the decision reads would keep a later run over this interner from Tier D.
+        // A run whose rules take it starts again anyway, as `entangled` says.
+        self.stale_tier |= mark.passed(&self.interner);
         ax.classes.extend(self.interner.met_classes());
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
@@ -1523,29 +1619,6 @@ impl Saturation {
         self.dl_tried = false;
         self.partial_over = false;
         self.numeric_halt = false;
-        let changes = changes.filter(|_| !again);
-        let full = self.entangled
-            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
-        self.worlds.clear();
-        if full {
-            self.interner = Interner::new();
-            self.ctx = Vec::new();
-        }
-        // the premises of the changed axioms, read from the interner before the index of
-        // the new axioms is built
-        let premises = match changes {
-            Some(c) if !full => {
-                let mut scratch = Axioms::default();
-                for &k in c.added.iter().chain(c.removed) {
-                    index::normalize(k, &mut self.interner, &mut scratch);
-                }
-                Some(scratch)
-            }
-            _ => None,
-        };
-        // The old index is no longer read. Drop its handles before constructing the
-        // replacement, while cached contexts retain their shared numeric ledger.
-        self.index = None;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
@@ -1563,6 +1636,43 @@ impl Saturation {
             .flatten()
             .collect();
         poll(limits)?;
+        let changes = changes.filter(|_| !again);
+        // The run decides its tier over the interner, which keeps the expressions of
+        // removed axioms and those that the premises below intern for added axioms
+        // outside OWL 2 EL, which a fresh run leaves to the rules outside it. One of
+        // them that the decision reads, such as a self restriction or the top property,
+        // could keep Tier D from the axioms outside OWL 2 EL, so such a run starts again.
+        let stale = self.stale_tier
+            || changes.is_some_and(|c| {
+                c.removed.iter().any(|k| !tier_neutral(k))
+                    || c.added.iter().any(|k| {
+                        !tier_neutral(k) && profiles::el_axiom(k).into_iter().next().is_some()
+                    })
+            });
+        let full = self.entangled
+            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)))
+            || stale && !outside.is_empty() && !limits.el_only;
+        self.worlds.clear();
+        if full {
+            self.interner = Interner::new();
+            self.ctx = Vec::new();
+        }
+        self.stale_tier = stale && !full;
+        // the premises of the changed axioms, read from the interner before the index of
+        // the new axioms is built
+        let premises = match changes {
+            Some(c) if !full => {
+                let mut scratch = Axioms::default();
+                for &k in c.added.iter().chain(c.removed) {
+                    index::normalize(k, &mut self.interner, &mut scratch);
+                }
+                Some(scratch)
+            }
+            _ => None,
+        };
+        // The old index is no longer read. Drop its handles before constructing the
+        // replacement, while cached contexts retain their shared numeric ledger.
+        self.index = None;
         let (ax, mut ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
