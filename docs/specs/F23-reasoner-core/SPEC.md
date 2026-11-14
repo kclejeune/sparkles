@@ -257,10 +257,11 @@ emit takes the group's answer when the head it forms is the one the group probed
 16 probes' misses overlap. A scan goes back to one candidate at a time when a group's
 instances used fewer than half of its probes, as in `prp-key-1`, whose later steps reject
 most candidates, or when the group probed fewer heads than a quarter of its candidates,
-as in `rdf1`, whose heads repeat. The grouped path gives the facts, ids, counters and
-stopping points of the one-at-a-time path, which a test compares over random OWL 2 RL and
-RDFS programs with and without an inferred-fact limit. `prp-symp` takes 7.0 s with it at
-one thread.
+as in `rdf1`, whose heads repeat. The grouped path is built to give the facts, ids,
+counters and stopping points of the one-at-a-time path. A test compares the derived facts
+in order, their liveness, the iterations and the errors of both paths over random OWL 2
+RL and RDFS programs, with and without an inferred-fact limit. `prp-symp` takes 7.0 s
+with it at one thread.
 
 Two further changes keep the tier's probes and plans level with the build before it. A
 run's probe searches a coarse fence of every 64th fence key before the fence keys. Each
@@ -283,8 +284,10 @@ the grouped probes. LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s at one
 and 16.1 to 16.7 s against 16.5 to 17.1 s at 20 threads. Its insertion of every hundredth
 triple takes 2.43 to 2.46 s against 2.35 to 2.41 s and its deletion 3.30 to 3.34 s
 against 3.23 to 3.27 s at 20 threads, 2% slower in every round, and roadmap item 875
-investigates that cost. Both builds derive the same 52,966,139 and 10,907,379 facts. The
-budget's peak stays at 4.6 GB, 87 bytes per derived fact, and the tier at 2,746 MB.
+investigates that cost with the one-thread run, 0.5% slower in every round. The [run
+record](../../benchmarks/reasoning/runs/2026-11-13-item-866-atlas/env.txt) holds the
+commands, host and builds. Both builds derive the same 52,966,139 and 10,907,379 facts.
+The budget's peak stays at 4.6 GB, 87 bytes per derived fact, and the tier at 2,746 MB.
 `prp-key-1` still takes 1.9 s against 0.9 s in the second iteration, which reads its
 scan's keys through the fact rows, and the layout of item 862 compares keys in place. A
 compaction policy that left an older run alone when it was under an eighth of the runs

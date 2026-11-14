@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Session 5 on atlas, under ~/lanes/.heavy.lock: build the base 88538906 and the lane tip,
+# generate and prepare LUBM(100) and load OWL2Bench(5) (the base.nt of session 4) as
+# session 3 did on wally, then
+# ROUNDS interleaved rounds of base against the tip: OWL2Bench(5) and LUBM(100) full
+# materializations at one thread pinned to CPU 2 and at 20 threads on CPUs 0-19, and
+# LUBM(100) incremental insertion and deletion of every 100th triple at 20 threads.
+set -uo pipefail
+D=$HOME/lanes/derived-tier-835-data
+W=$HOME/lanes/derived-tier-835
+S=$D/s9
+TIP=${TIP:?}
+TIME=/run/current-system/sw/bin/time
+ROUNDS=${ROUNDS:-4}
+mkdir -p "$S/logs" && cd "$S" || exit 1
+log() { echo "[$(date +%T)] $*" | tee -a "$S/progress.log"; }
+scope() { systemd-run --user --scope -q --expand-environment=no -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+build() {
+  local name=$1 rev=$2
+  [ -x "$D/bin/$name/sparkles" ] && return 0
+  git -C "$W" fetch -q origin lane-derived-tier-835-s9
+  git -C "$W" checkout -q --detach "$rev" || { log "checkout $rev failed"; exit 1; }
+  log "build $name $rev"
+  (cd "$W" && scope mbx build --release -p sparkles-server --bin sparkles > "$S/build-$name.log" 2>&1) || { log "build $name failed"; exit 1; }
+  mkdir -p "$D/bin/$name" && cp "$W/target/release/sparkles" "$D/bin/$name/sparkles"
+}
+build base9 88538906
+build tip "$TIP"
+B=$D/bin/base9/sparkles
+if [ ! -d owl2bench5/base.db ]; then
+  mkdir -p owl2bench5
+  ln -sf "$D/owl2bench5/base.nt" owl2bench5/base.nt
+  log "loading OWL2Bench(5)"
+  "$B" load --loc owl2bench5/base.db owl2bench5/base.nt > owl2bench5/load.log 2>&1 || { log "load failed"; exit 1; }
+fi
+if [ ! -f lubm100/data/base.nt ]; then
+  log "generating LUBM(100)"
+  mkdir -p lubm100
+  SPARKLES=$B ENGINES="" INFER_PROFILES=" " "$W/scripts/bench-lubm.sh" 100 "$S/lubm100/data" > lubm100/generate.log 2>&1 || { log "LUBM generation failed"; exit 1; }
+fi
+if [ ! -d lubm100/base.db ]; then
+  log "loading LUBM(100)"
+  "$B" load --loc lubm100/base.db lubm100/data/base.nt > lubm100/load.log 2>&1 || { log "load failed"; exit 1; }
+  "$B" dump --loc lubm100/base.db --graph default --format nt --out lubm100/base.nt > lubm100/dump.log 2>&1 || { log "dump failed"; exit 1; }
+  python3 -I "$W/scripts/rl-reference/rl_terms.py" delta lubm100/base.nt 100 lubm100/delta.nt lubm100/minus.nt lubm100/insert.ru lubm100/delete.ru 2> lubm100/delta.log || { log "delta failed"; exit 1; }
+fi
+if [ ! -d lubm100/full.db ]; then
+  log "materializing LUBM(100) full.db and minus.db with the base build"
+  cp -a lubm100/base.db lubm100/full.db
+  scope "$B" infer --loc lubm100/full.db --profile owl-rl --full --threads 20 > lubm100/prepare-full.log 2>&1 || { log "prepare full failed"; exit 1; }
+  cp -a lubm100/base.db lubm100/minus.db
+  "$B" update --loc lubm100/minus.db --update lubm100/delete.ru > lubm100/prepare-minus-update.log 2>&1 || { log "delete failed"; exit 1; }
+  scope "$B" infer --loc lubm100/minus.db --profile owl-rl --full --threads 20 > lubm100/prepare-minus.log 2>&1 || { log "prepare minus failed"; exit 1; }
+fi
+timed() {
+  local name=$1 arm=$2 cpus=$3; shift 3
+  local rc=0
+  RUST_LOG=sparkles_reasoner=trace scope "$TIME" -v taskset -c "$cpus" "$D/bin/$arm/sparkles" "$@" > "logs/$name.out" 2> "logs/$name.err" || rc=$?
+  local wall rss ms
+  wall=$(sed -n 's/.*Elapsed (wall clock) time (h:mm:ss or m:ss): //p' "logs/$name.err")
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "logs/$name.err")
+  ms=$(sed 's/\x1b\[[0-9;]*m//g' "logs/$name.err" | grep -o 'millis=[0-9]*' | head -1)
+  echo "$name rc=$rc wall=$wall rss_kib=$rss $ms load=$(cut -d' ' -f1 /proc/loadavg)" | tee -a results.txt "$S/progress.log"
+}
+for r in $(seq 1 "$ROUNDS"); do
+  for suite in owl2bench5 lubm100; do
+    for t in 1 20; do
+      cpus=2; [ "$t" = 20 ] && cpus=0-19
+      for arm in base9 tip; do
+        rm -rf run.db && cp -a "$suite/base.db" run.db && sync
+        timed "$suite-full-$arm-t$t-r$r" "$arm" "$cpus" infer --loc run.db --profile owl-rl --full --threads "$t" --max-inferred 200000000
+      done
+    done
+  done
+  for arm in base9 tip; do
+    rm -rf run.db && cp -a lubm100/minus.db run.db
+    "$D/bin/$arm/sparkles" update --loc run.db --update lubm100/insert.ru > "logs/lubm100-insert-update-$arm-r$r.log" 2>&1 || log "insert failed ($arm)"
+    sync
+    timed "lubm100-insert-$arm-t20-r$r" "$arm" 0-19 infer --loc run.db --profile owl-rl --threads 20
+    rm -rf run.db && cp -a lubm100/full.db run.db
+    "$D/bin/$arm/sparkles" update --loc run.db --update lubm100/delete.ru > "logs/lubm100-delete-update-$arm-r$r.log" 2>&1 || log "delete failed ($arm)"
+    sync
+    timed "lubm100-delete-$arm-t20-r$r" "$arm" 0-19 infer --loc run.db --profile owl-rl --threads 20
+  done
+done
+rm -rf run.db
+log "S9-DONE"

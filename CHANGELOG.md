@@ -616,7 +616,7 @@ facts keep the ids one merge of the whole closure gave them. The reasoner's peak
 that run fell from 199 to 72 bytes per derived fact, or 87 with the digit sort's second
 buffer. The tier's merges are faster than the hash lists were.
 
-Full materialization with the derived tier is no slower than the build before it (item
+Full materialization with the derived tier takes the time of the build before it (item
 866). A scan probes its candidates' heads in the triple index in groups of 16 when the
 rest of the rule's plan only checks them, so the cache misses of the probes overlap,
 where one candidate's work had grown past the core's reorder window and each probe waited
@@ -626,8 +626,8 @@ facts exactly, whatever runs hold them, where the sum over runs had changed a jo
 in the third iteration of OWL2Bench(5). On atlas, OWL2Bench(5) takes 101 to 105 s against
 102 to 107 s before the tier at one thread and 50 to 53 s against 51 to 54 s at 20
 threads, and LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s and 16.1 to 16.7 s
-against 16.5 to 17.1 s. Incremental insertion and deletion on LUBM(100) are about 2%
-slower (item 875).
+against 16.5 to 17.1 s. LUBM(100) at one thread is 0.5% slower, and its incremental
+insertion and deletion about 2% slower (item 875).
 
 Notification channels deliver independently (item 46). Each channel has its own queue
 and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own

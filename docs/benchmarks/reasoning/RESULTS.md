@@ -142,8 +142,14 @@ triple index made most of that difference, took 7.0 s against 9.8 s. LUBM(100) u
 `owl-rl` took 37.5 to 38.0 s against 37.3 to 37.8 s at one thread and 16.1 to 16.7 s
 against 16.5 to 17.1 s at 20 threads. The insertion of every hundredth of its triples at
 20 threads took 2.43 to 2.46 s against 2.35 to 2.41 s and the deletion 3.30 to 3.34 s
-against 3.23 to 3.27 s, about 2% slower in every round, which roadmap item 875
-investigates. Both builds derived 52,966,139 and 10,907,379 facts, the budget's peak on
+against 3.23 to 3.27 s, about 2% slower in every round, and the one-thread run 0.5%
+slower in every round, which roadmap item 875 investigates. The
+[run directory](runs/2026-11-13-item-866-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-13-item-866-atlas/env.txt), the
+[timings](runs/2026-11-13-item-866-atlas/results.txt), the
+[trace lines](runs/2026-11-13-item-866-atlas/trace-lines.txt) with each run's derived count,
+and the [earlier rounds](runs/2026-11-13-item-866-atlas/earlier-rounds.txt) of the tier
+before the grouped probes. Both builds derived 52,966,139 and 10,907,379 facts, the budget's peak on
 OWL2Bench(5) stayed at 4.6 GB and the tier ended at 2,746 MB. These are benchmark-worker
 measurements, and the benchmark host has not rerun them.
 

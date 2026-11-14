@@ -43,6 +43,12 @@ request or on every write, and the schema report counts what the data holds.
   is not monotonic, or one that reads lists and builds them in a rule head, evaluates
   every rule as a join. A run whose rules read lists and derive list facts through a
   property, such as a subproperty of `rdf:first`, starts again without the operators.
+* Derived facts live in a columnar tier, each fact one row by a dense id, with each
+  predicate's facts sorted by subject and by object. OWL2Bench with 5 universities holds
+  its 53 million derived facts in about 52 bytes each with the triple index, against about
+  135 in the hash lists before the tier. Full materializations take the time they took
+  before, and incremental runs on LUBM(100) are about 2% slower
+  ([roadmap item 875](../ROADMAP.md)).
 * Each iteration merges its results in parallel on a reasoning pool, half the cores by
   default with `serve --reason-threads`, that admits runs in arrival order. A run stops at
   50 million derived triples by default, and `sparkles infer --max-inferred`,
