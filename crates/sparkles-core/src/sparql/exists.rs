@@ -1163,18 +1163,6 @@ pub(super) fn explain(
     )
 }
 
-/// Add the EXPLAIN note and counters of [`explain`] to the runtime information of a
-/// filter.
-pub(super) fn annotate(ctx: &Ctx, info: &mut super::exec::PlanInfo, exprs: &[Expr]) {
-    let (note, counters) = explain(ctx, exprs);
-    if let Some(n) = note {
-        info.description = format!("{} {n}", info.description);
-    }
-    if counters.is_some() {
-        info.counters = counters;
-    }
-}
-
 #[cfg(test)]
 mod borrowed_input_tests {
     use super::*;

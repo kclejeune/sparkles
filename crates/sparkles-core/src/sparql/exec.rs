@@ -1385,7 +1385,7 @@ fn run_node<'ctx>(
                 }
             }
         }
-        Kind::Distinct => distinct(child(0, infos)?),
+        Kind::Distinct => distinct_of(ctx, n, child(0, infos)?)?,
         Kind::PatternCount(spec) => {
             let input = if n.children.is_empty() {
                 None
@@ -1397,18 +1397,27 @@ fn run_node<'ctx>(
             t
         }
         Kind::PatternScan(spec) => {
-            let (t, nt, _) = super::patternplan::run_scan(ctx, spec, &n.vars, None)?;
+            let (t, nt) = super::patternplan::run_scan(ctx, spec, &n.vars)?;
             note = Some(nt);
             t
         }
         Kind::Slice {
             offset,
             limit: Some(limit),
-        } => {
+            whole,
+        } if !super::demand::ordered_input(&n.children[0]) => {
             // LIMIT without ORDER BY: any `offset + limit` solutions will do, so the
-            // input is computed with early termination
-            let (mut t, info, _) =
-                execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
+            // input runs as cursor operators that stop when they have them (item 827),
+            // or whole when the planner found it small
+            let want = offset.saturating_add(*limit);
+            let (mut t, info, _) = match leaf_rows(ctx, &n.children[0], want)? {
+                Some(rows) => rows,
+                None if *whole => match whole_or_refused(ctx, &n.children[0])? {
+                    Some((t, info)) => (t, info, true),
+                    None => super::cursor::pull(ctx, &n.children[0], want)?,
+                },
+                None => super::cursor::pull(ctx, &n.children[0], want)?,
+            };
             infos.push(info);
             t = t.slice(ctx, *offset, Some(*limit))?;
             match t.adopt_input(ctx, &held)? {
@@ -1418,7 +1427,7 @@ fn run_node<'ctx>(
             }
             t.table
         }
-        Kind::Slice { offset, limit } => {
+        Kind::Slice { offset, limit, .. } => {
             let input = child(0, infos)?;
             match last_input.get() {
                 InputCredit::Plain => input.slice(*offset, *limit),
@@ -2718,7 +2727,7 @@ fn apply_unary_noted(
         }
         Kind::Project(vars) => t.project(vars),
         Kind::Unpack { t: tv, parts } => unpack(ctx, t, *tv, parts, &n.vars)?,
-        Kind::Distinct => distinct(t),
+        Kind::Distinct => distinct_of(ctx, n, t)?,
         Kind::IndexJoin(spec) => {
             let (t, stats) = super::indexjoin::run(ctx, spec, &t, &n.vars)?;
             *note = Some(stats.note());
@@ -2755,38 +2764,16 @@ pub(super) fn apply_blocking(
     }
 }
 
-/// Execute `n` so that it produces at least `want` solutions if it has that many; any
-/// subset of the solutions is acceptable (LIMIT without ORDER BY, ASK, EXISTS). Scans stop
-/// early; operators whose output over a prefix of their input is a subset of their full
-/// output re-run with a geometrically growing input budget until they have enough rows.
-/// Returns `(table, info, complete)`; `complete` means no further rows exist.
-fn execute_limited<'ctx>(
+/// The first `want` rows of a scan, a pattern scan or a table of values, under
+/// projections, read directly for a LIMIT without ORDER BY: a scan stops at them, as a
+/// cursor scan does, without the cursor operators that a larger input runs as (item 827). `None` for
+/// another input. Also returns the plan and whether the input ended.
+pub(super) fn leaf_rows<'ctx>(
     ctx: &'ctx Ctx,
     n: &Node,
     want: usize,
-) -> Result<(Materialized<'ctx>, PlanInfo, bool)> {
-    ctx.check()
-        .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
+) -> Result<Option<(Materialized<'ctx>, PlanInfo, bool)>> {
     let start = Instant::now();
-    let mut done = Vec::new();
-    run_limited(ctx, n, want, start, &mut done).inspect_err(|_| {
-        match ctx.take_failed(n) {
-            // `execute` ran the node and recorded its failure
-            Some(own) => ctx.set_failed(n, own),
-            None => fail_at(ctx, n, start, done),
-        }
-    })
-}
-
-/// [`execute_limited`] after its first check. Children whose plans are final before a
-/// failure go to `done` with their index.
-fn run_limited<'ctx>(
-    ctx: &'ctx Ctx,
-    n: &Node,
-    want: usize,
-    start: Instant,
-    done: &mut Vec<(usize, PlanInfo)>,
-) -> Result<(Materialized<'ctx>, PlanInfo, bool)> {
     let finish = |t: Materialized<'ctx>, children: Vec<PlanInfo>, complete: bool| {
         ctx.produced(t.table.len())?;
         let mut info = describe(ctx, n);
@@ -2797,257 +2784,76 @@ fn run_limited<'ctx>(
             info.description = format!("{} [stopped early]", info.description);
             info.fidelity_mut().stopped_early = true;
         }
-        Ok((t, info, complete))
+        Ok(Some((t, info, complete)))
     };
     match &n.kind {
         Kind::Scan(spec) => {
-            let (t, truncated) = scan_limited(ctx, spec, &n.vars, &n.sorted, Some(want))?;
+            let (t, truncated) = scan_limited(ctx, spec, &n.vars, &n.sorted, Some(want))
+                .inspect_err(|_| fail(ctx, n, start, Vec::new()))?;
             finish(t, Vec::new(), !truncated)
         }
-        Kind::PatternScan(spec) => {
-            let (t, _, stopped) = super::patternplan::run_scan(ctx, spec, &n.vars, Some(want))?;
-            finish(Materialized::plain(t), Vec::new(), !stopped)
+        Kind::Values(_) | Kind::Empty => {
+            let (t, info) = execute_materialized(ctx, n)?;
+            Ok(Some((t, info, true)))
         }
-        Kind::Project(vars) => {
-            // Projection preserves row count, so one limited child run suffices.
-            // The actual Materialized owner stays live through metadata and errors.
-            let budget = if super::unionpush::limited_input(ctx, n) {
-                want
-            } else {
-                want.max(64)
+        // the pattern reader stops at the rows asked for, as the cursor's does
+        Kind::PatternScan(spec) => {
+            let mut t = Table::new(n.vars.clone());
+            let mut reader = super::patternplan::scan_reader(spec);
+            let held = ctx.charge(0)?;
+            let complete =
+                super::patternplan::fill_scan(ctx, spec, &mut reader, &mut t, want, &mut |bytes| {
+                    held.resize(bytes)
+                })
+                .inspect_err(|_| fail(ctx, n, start, Vec::new()))?;
+            drop(reader);
+            drop(held);
+            let mut rows = finish(Materialized::plain(t), Vec::new(), complete)?;
+            if let Some((_, info, _)) = &mut rows {
+                info.description = format!("{} {}", info.description, spec.uses.note());
+            }
+            Ok(rows)
+        }
+        Kind::Project(vars) if n.children.len() == 1 => {
+            let Some((input, info, complete)) = leaf_rows(ctx, &n.children[0], want)? else {
+                return Ok(None);
             };
-            let (input, info, complete) = execute_limited(ctx, &n.children[0], budget)?;
             let output = match input.project(ctx, vars) {
                 Ok(output) => output,
                 Err(error) => {
-                    done.push((0, info));
+                    fail(ctx, n, start, vec![info]);
                     return Err(error);
                 }
             };
             finish(output, vec![info], complete)
         }
-        Kind::Filter(_)
-        | Kind::Extend(..)
-        | Kind::Unpack { .. }
-        | Kind::Distinct
-        | Kind::IndexJoin(_) => {
-            let mut budget = if super::unionpush::limited_input(ctx, n) {
-                want
-            } else {
-                want.max(64)
-            };
-            // the child's runs so far, added up
-            let mut runs: Option<PlanInfo> = None;
-            loop {
-                let (mut input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
-                let cinfo = match runs.take() {
-                    Some(earlier) => earlier.merge_run(cinfo),
-                    None => cinfo,
-                };
-                let mut report = ExprReport::default();
-                let mut note = None;
-                let mut counters = None;
-                let input_held = ctx.charge(0)?;
-                let owned = input.lease.is_some();
-                if owned {
-                    input_held.adopt(&mut input.lease)?;
-                }
-                let out = match apply_unary_noted(
-                    ctx,
-                    n,
-                    input.table,
-                    &mut report,
-                    &mut note,
-                    &mut counters,
-                ) {
-                    Ok(out) => out,
-                    Err(e) => {
-                        done.push((0, cinfo));
-                        return Err(e);
-                    }
-                };
-                let lease = if owned {
-                    Some(input_held.output_lease(super::algosvc::table_capacity(&out)?)?)
-                } else {
-                    None
-                };
-                let out = Materialized::with_lease(out, lease);
-                if out.table.len() >= want || complete {
-                    let (t, mut info, complete) = finish(out, vec![cinfo], complete)?;
-                    if let Kind::Filter(exprs) = &n.kind {
-                        super::exists::annotate(ctx, &mut info, exprs);
-                    }
-                    if let Some(x) = note {
-                        info.description = format!("{} {x}", info.description);
-                    }
-                    if counters.is_some() {
-                        info.counters = merge_counters(info.counters.take(), counters);
-                    }
-                    if let Some(x) = report.note() {
-                        info.description = format!("{} {x}", info.description);
-                        info.counters = merge_counters(info.counters.take(), report.counters());
-                    }
-                    return Ok((t, info, complete));
-                }
-                runs = Some(cinfo);
-                budget = budget.saturating_mul(8);
-            }
+        _ => Ok(None),
+    }
+}
+
+/// Run `n` whole for a LIMIT, an ASK or an EXISTS pattern whose input the planner chose
+/// to run whole. `None` when a row or memory budget refused the run: its bounds keep the
+/// input small, but not every allocation, the pool's headroom or what the query already
+/// holds, so the consumer then pulls the input as it would have otherwise. Nothing of
+/// the refused run is kept, and its partial plan is forgotten.
+pub(super) fn whole_or_refused<'ctx>(
+    ctx: &'ctx Ctx,
+    n: &Node,
+) -> Result<Option<(Materialized<'ctx>, PlanInfo)>> {
+    match execute_materialized(ctx, n) {
+        Ok(run) => Ok(Some(run)),
+        Err(Error::BudgetExceeded(b))
+            if matches!(
+                b.kind,
+                crate::BudgetKind::Rows
+                    | crate::BudgetKind::Memory
+                    | crate::BudgetKind::ServerMemory
+            ) =>
+        {
+            ctx.clear_failed();
+            Ok(None)
         }
-        Kind::Join { .. } | Kind::KeyedJoin { .. } => {
-            // limit the (estimated) larger side, compute the other one fully
-            let lim = if n.children[0].est >= n.children[1].est {
-                0
-            } else {
-                1
-            };
-            let (mut other, oinfo) = execute_materialized(ctx, &n.children[1 - lim])?;
-            let other_held = ctx.charge(0)?;
-            let other_kind = other.adopt_input(ctx, &other_held)?;
-            let other_owned = other_kind == InputCredit::Lease;
-            if other_kind == InputCredit::Plain {
-                other_held.add(other.table.mem_bytes())?;
-            }
-            let other = other.table;
-            if other.is_empty() {
-                let mut e = Table::empty(n.vars.clone());
-                e.sorted.clear();
-                let skipped =
-                    describe(ctx, &n.children[lim]).skip("the other side produced no rows");
-                let infos = if lim == 0 {
-                    vec![skipped, oinfo]
-                } else {
-                    vec![oinfo, skipped]
-                };
-                return finish(Materialized::plain(e), infos, true);
-            }
-            let mut budget = if super::unionpush::limited_input(ctx, n) {
-                want
-            } else {
-                want.max(64)
-            };
-            let mut runs: Option<PlanInfo> = None;
-            loop {
-                let (mut part, pinfo, complete) =
-                    match execute_limited(ctx, &n.children[lim], budget) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            // the other side ran
-                            done.push((1 - lim, oinfo));
-                            return Err(e);
-                        }
-                    };
-                let pinfo = match runs.take() {
-                    Some(earlier) => earlier.merge_run(pinfo),
-                    None => pinfo,
-                };
-                let part_held = ctx.charge(0)?;
-                let part_kind = part.adopt_input(ctx, &part_held)?;
-                let part_owned = part_kind == InputCredit::Lease;
-                if part_kind == InputCredit::Plain {
-                    part_held.add(part.table.mem_bytes())?;
-                }
-                let part = part.table;
-                let (l, r) = if lim == 0 {
-                    (&part, &other)
-                } else {
-                    (&other, &part)
-                };
-                let out = match &n.kind {
-                    Kind::Join { algo, .. } => match algo {
-                        JoinAlgo::Cross => cross(ctx, l, r)?,
-                        JoinAlgo::Merge => join_tables(ctx, l, r, &[], true)?,
-                        JoinAlgo::Hash => join_tables(ctx, l, r, &[], false)?,
-                    },
-                    Kind::KeyedJoin {
-                        expr, left, right, ..
-                    } => keyed_join(ctx, l, r, expr, (*left, *right), false, &mut None)?,
-                    _ => unreachable!("limited inner join"),
-                };
-                if out.len() >= want || complete {
-                    let infos = if lim == 0 {
-                        vec![pinfo, oinfo]
-                    } else {
-                        vec![oinfo, pinfo]
-                    };
-                    let lease = if other_owned || part_owned {
-                        Some(ctx.output_lease(super::algosvc::table_capacity(&out)?)?)
-                    } else {
-                        None
-                    };
-                    return finish(Materialized::with_lease(out, lease), infos, complete);
-                }
-                runs = Some(pinfo);
-                budget = budget.saturating_mul(8);
-            }
-        }
-        Kind::Union => {
-            let held = ctx.charge(0)?;
-            let mut owned = false;
-            let mut out = Table::new(n.vars.clone());
-            let mut complete = true;
-            for (i, c) in n.children.iter().enumerate() {
-                if out.len() >= want {
-                    complete = false;
-                    done.extend(n.children[i..].iter().enumerate().map(|(k, c)| {
-                        (
-                            i + k,
-                            describe(ctx, c).skip("earlier branches met the limit"),
-                        )
-                    }));
-                    break;
-                }
-                let (mut t, info, c_complete) = execute_limited(ctx, c, want - out.len())?;
-                complete &= c_complete;
-                done.push((i, info));
-                if t.lease.is_some() {
-                    held.adopt(&mut t.lease)?;
-                    owned = true;
-                }
-                out.append(t.table);
-                ctx.check_output(out.len(), out.width())?;
-            }
-            let infos = std::mem::take(done).into_iter().map(|(_, i)| i).collect();
-            let lease = if owned {
-                Some(held.output_lease(super::algosvc::table_capacity(&out)?)?)
-            } else {
-                None
-            };
-            finish(Materialized::with_lease(out, lease), infos, complete)
-        }
-        // A path without inputs is walked one start node at a time until it has the
-        // rows asked for, so that an ASK or a LIMIT over a closure with two unbound
-        // ends reads a few start nodes rather than every node of the graph.
-        Kind::Path {
-            spec,
-            bound_from_left: false,
-        } if n.children.is_empty() => {
-            let mut walk = PathWalk::new(ctx, spec, &n.vars)?;
-            let mut out = Table::new(n.vars.clone());
-            let mut complete = true;
-            while let Some(t) = walk.next(ctx)? {
-                out.append(t);
-                ctx.check_output(out.len(), out.width())?;
-                if out.len() >= want {
-                    complete = false;
-                    break;
-                }
-            }
-            finish(Materialized::plain(out), Vec::new(), complete)
-        }
-        Kind::Slice {
-            offset,
-            limit: Some(limit),
-        } => {
-            let (mut t, info, _) =
-                execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
-            // Slice consumes the same backing; keep its ownership through the move.
-            t = t.slice(ctx, *offset, Some(*limit))?;
-            finish(t, vec![info], true)
-        }
-        _ => {
-            let (t, info) = execute_materialized(ctx, n)?;
-            Ok((t, info, true))
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -6631,28 +6437,53 @@ fn order_by_rows(
     Ok(sorted)
 }
 
-fn distinct(t: Table) -> Table {
+/// The rows of `t` that DISTINCT keeps, each value's first, in input order.
+fn distinct_rows(t: &Table) -> Vec<usize> {
     if t.width() == 1 {
         let mut seen = FxHashSet::default();
-        let idx: Vec<usize> = (0..t.len())
+        return (0..t.len())
             .filter(|&i| seen.insert(t.cols[0][i]))
             .collect();
-        let sorted = t.sorted.clone();
-        let mut out = t.take_rows(&idx);
-        out.sorted = sorted;
-        return out;
     }
+    if t.width() == 0 {
+        return (0..t.len().min(1)).collect();
+    }
+    let mut seen: FxHashSet<Vec<Id>> = FxHashSet::default();
+    (0..t.len()).filter(|&i| seen.insert(t.row(i))).collect()
+}
+
+fn distinct(t: Table) -> Table {
     if t.width() == 0 {
         let mut t = t;
         t.len = t.len.min(1);
         return t;
     }
-    let mut seen: FxHashSet<Vec<Id>> = FxHashSet::default();
-    let idx: Vec<usize> = (0..t.len()).filter(|&i| seen.insert(t.row(i))).collect();
+    let idx = distinct_rows(&t);
     let sorted = t.sorted.clone();
     let mut out = t.take_rows(&idx);
     out.sorted = sorted;
     out
+}
+
+/// The DISTINCT `n` over `t`. A numbered DISTINCT below an ORDER BY (item 85) adds to
+/// each row it keeps the number of that row's first occurrence in its input, as the
+/// cursor's DISTINCT does, and the sort above orders ties on it.
+fn distinct_of(ctx: &Ctx, n: &Node, t: Table) -> Result<Table> {
+    if !super::demand::numbered_distinct(n) {
+        return Ok(distinct(t));
+    }
+    let number = *n.vars.last().expect("a numbered DISTINCT's number");
+    let idx = distinct_rows(&t);
+    ctx.check_output(idx.len(), t.width() + 1)?;
+    let column = idx
+        .iter()
+        .map(|&i| Id::from_i64(i as i64).ok_or_else(|| Error::invalid("too many DISTINCT rows")))
+        .collect::<Result<Vec<Id>>>()?;
+    let mut out = t.take_rows(&idx);
+    out.sorted.clear();
+    out.vars.push(number);
+    out.cols.push(column);
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ group ------
@@ -7296,6 +7127,10 @@ impl<'a> Growth<'a> {
     }
 }
 
+/// The bytes a path walk adds to what it holds before it charges them, at most a few
+/// hundred reached nodes.
+const WALK_CHARGE_BYTES: u64 = 16 << 10;
+
 /// A frontier at least `rows / SWEEP_RATIO` long is expanded by one merged pass over the
 /// predicate's rows instead of one index seek per node (a seek costs about as much as
 /// merging a few hundred rows).
@@ -7542,7 +7377,15 @@ impl Graph<'_> {
         // The visited set, the reached nodes and the frontier are charged as they grow,
         // in eager execution as in a cursor, so that a wide closure fails at the memory
         // budget rather than growing without bound.
+        // The charge takes what the walk adds once it comes to [`WALK_CHARGE_BYTES`],
+        // as the neighbour buffer's growth is charged, and the output's bytes are
+        // checked again each time it doubles, so that a long narrow walk takes the
+        // query's memory ledger, when it has one, once per few hundred nodes rather
+        // than several times per level. Neither depends on the budget, so a run within
+        // a budget of its own peak charges as one without a budget does.
         let held = self.ctx.charge(64)?;
+        let mut pending = 0u64;
+        let mut checked_rows = 0usize;
         if self.spec.min == 0 {
             out.push(start);
             seen.insert(start);
@@ -7572,12 +7415,19 @@ impl Graph<'_> {
             // growth of the neighbour buffer
             let grown = found.capacity().saturating_sub(found_charged);
             found_charged = found_charged.max(found.capacity());
-            held.add(next.len() as u64 * 48 + grown as u64 * 8)?;
+            pending = pending.saturating_add(next.len() as u64 * 48 + grown as u64 * 8);
+            if pending >= WALK_CHARGE_BYTES {
+                held.add(std::mem::take(&mut pending))?;
+            }
             if self.spec.max_one && depth >= 1 {
                 break;
             }
             frontier = next;
-            self.ctx.check_output(out.len(), 1)?;
+            self.ctx.check_output_rows(out.len())?;
+            if out.len() >= checked_rows.saturating_mul(2).max(1024) {
+                self.ctx.check_output_bytes(out.len(), 1)?;
+                checked_rows = out.len();
+            }
         }
         Ok(out)
     }
@@ -9506,290 +9356,6 @@ mod string_cross_tests {
 }
 
 #[cfg(test)]
-mod limited_startup_tests {
-    use super::*;
-    use crate::io::{RdfFormat, Source};
-    use crate::store::{Store, StoreOptions};
-
-    fn unary(kind: Kind, child: Node, description: &str) -> Node {
-        let mut node = Node::leaf(kind, child.vars.clone(), child.est, description.into());
-        node.cost = child.cost;
-        node.children.push(child);
-        node
-    }
-
-    fn run(
-        reduced: bool,
-        row_limit: usize,
-        build_rows: usize,
-        duplicate_keys: bool,
-        match_row: usize,
-        memory: Option<u64>,
-    ) -> Result<u32> {
-        let store = Store::in_memory(StoreOptions::default());
-        let data: String = (0..2000)
-            .map(|i| format!("<urn:record:{i:04}> <urn:key> <urn:bucket:0> .\n"))
-            .collect();
-        store
-            .load(&[Source::from_bytes(
-                data.into_bytes(),
-                RdfFormat::Turtle,
-                None,
-            )])
-            .unwrap();
-        let mut ctx = Ctx::new(store.snapshot());
-        ctx.use_cache = false;
-        ctx.max_rows = row_limit;
-        ctx.mem_limit = memory.unwrap_or(u64::MAX);
-        let subject = ctx.var("subject");
-        let key = ctx.var("key");
-        let target = ctx.var("target");
-        let term = |text: &str| ctx.intern_term(&oxrdf::NamedNode::new(text).unwrap().into());
-        let predicate = term("urn:key");
-        let witness = term(&format!("urn:record:{match_row:04}"));
-        let scan = Node::leaf(
-            Kind::Scan(ScanSpec {
-                perm: Perm::Pso,
-                prefix: vec![predicate.0],
-                cols: vec![(1, subject), (2, key)],
-                eqs: Vec::new(),
-                graph: GraphFilter::Default,
-                graph_col: 3,
-                dedup: false,
-                src: None,
-            }),
-            vec![subject, key],
-            2000.0,
-            "driving scan".into(),
-        );
-        let mut values = Table::new(vec![key, target]);
-        for i in 0..build_rows {
-            let bucket = if duplicate_keys { 0 } else { i };
-            values.push_row(&[term(&format!("urn:bucket:{bucket}")), witness]);
-        }
-        let build = Node::leaf(
-            Kind::Values(values),
-            vec![key, target],
-            build_rows as f64,
-            "full build".into(),
-        );
-        let mut joined = Node::leaf(
-            Kind::Join {
-                algo: JoinAlgo::Hash,
-                keys: vec![key],
-            },
-            vec![subject, key, target],
-            2000.0,
-            "hash join".into(),
-        );
-        joined.children = vec![scan, build];
-        joined.cost = 6000.0;
-        let mut filtered = unary(
-            Kind::Filter(vec![Expr::SameTerm(
-                Box::new(Expr::Var(subject)),
-                Box::new(Expr::Var(target)),
-            )]),
-            joined,
-            "matching both inputs",
-        );
-        filtered.est = 1.0;
-        let mut union = Node::leaf(Kind::Union, filtered.vars.clone(), 1.0, "pure union".into());
-        union.cost = filtered.cost;
-        union.children = vec![filtered, Node::empty(vec![subject, key, target])];
-        let mut root = unary(
-            Kind::Slice {
-                offset: 0,
-                limit: Some(1),
-            },
-            union,
-            "ASK demand",
-        );
-        super::super::unionpush::order_ask(&ctx, &mut root);
-        assert!(ctx.eager_union_demand.load(AtomicOrdering::Relaxed));
-        if !reduced {
-            ctx.eager_union_demand.store(false, AtomicOrdering::Relaxed);
-        }
-        let (output, plan) = execute(&ctx, &root)?;
-        assert_eq!(output.len(), 1);
-        assert_eq!(output.cols[0][0], witness);
-        fn find_build(p: &PlanInfo) -> Option<&PlanInfo> {
-            if p.operator == "Values" && p.description == "full build" {
-                return Some(p);
-            }
-            p.children.iter().find_map(find_build)
-        }
-        let build = find_build(&plan).unwrap();
-        assert_eq!(build.actual_rows, build_rows as i64);
-        Ok(build.fidelity().reruns + 1)
-    }
-
-    #[test]
-    fn admitted_ask_filters_do_not_restart_full_join_builds() {
-        assert_eq!(
-            run(false, 2_000_000, 1000, false, 8, None).unwrap(),
-            1,
-            "ordinary prefixes build the input once"
-        );
-        assert_eq!(
-            run(true, 2_000_000, 1000, false, 8, None).unwrap(),
-            1,
-            "reduced filter demand must not rebuild full inputs"
-        );
-    }
-
-    #[test]
-    fn early_filtered_join_keeps_its_budget_safe_exact_prefix() {
-        assert_eq!(run(true, 64, 64, true, 0, None).unwrap(), 1);
-    }
-
-    #[test]
-    fn tight_memory_keeps_exact_demand_when_wider_work_cannot_be_proven() {
-        assert_eq!(
-            run(true, 2_000_000, 1000, false, 8, Some(2 << 20)).unwrap(),
-            3
-        );
-    }
-
-    fn expanding_consumer(index_probe: bool) -> Result<()> {
-        use super::super::indexjoin::{IndexJoinSpec, Probe};
-
-        let store = Store::in_memory(StoreOptions::default());
-        let data: String = (0..64)
-            .map(|i| {
-                format!(
-                    "<urn:record:{i:04}> <urn:driver> <urn:key> . \
-                 <urn:key> <urn:probe> <urn:value:{i:04}> .\n"
-                )
-            })
-            .collect();
-        store
-            .load(&[Source::from_bytes(
-                data.into_bytes(),
-                RdfFormat::Turtle,
-                None,
-            )])
-            .unwrap();
-        let mut ctx = Ctx::new(store.snapshot());
-        ctx.use_cache = false;
-        ctx.max_rows = 1000;
-        let subject = ctx.var("subject");
-        let key = ctx.var("key");
-        let value = ctx.var("value");
-        let term = |text: &str| ctx.intern_term(&oxrdf::NamedNode::new(text).unwrap().into());
-        let key_id = term("urn:key");
-        let driver = Node::leaf(
-            Kind::Scan(ScanSpec {
-                perm: Perm::Pso,
-                prefix: vec![term("urn:driver").0],
-                cols: vec![(1, subject)],
-                eqs: Vec::new(),
-                graph: GraphFilter::Default,
-                graph_col: 3,
-                dedup: false,
-                src: None,
-            }),
-            vec![subject],
-            64.0,
-            "bounded driving scan".into(),
-        );
-        let mut one = Table::new(vec![key]);
-        one.push_row(&[key_id]);
-        let build = Node::leaf(Kind::Values(one), vec![key], 1.0, "nested build".into());
-        let mut nested = Node::leaf(
-            Kind::Join {
-                algo: JoinAlgo::Cross,
-                keys: Vec::new(),
-            },
-            vec![subject, key],
-            128.0,
-            "bounded nested join".into(),
-        );
-        nested.children = vec![driver, build];
-        let mut consumer = if index_probe {
-            let mut node = Node::leaf(
-                Kind::IndexJoin(Box::new(IndexJoinSpec {
-                    key,
-                    probes: vec![Probe {
-                        scan: ScanSpec {
-                            perm: Perm::Pso,
-                            prefix: vec![term("urn:probe").0],
-                            cols: vec![(1, key), (2, value)],
-                            eqs: Vec::new(),
-                            graph: GraphFilter::Default,
-                            graph_col: 3,
-                            dedup: false,
-                            src: None,
-                        },
-                        filter: Vec::new(),
-                        star: None,
-                    }],
-                })),
-                vec![subject, key, value],
-                4096.0,
-                "expanding probe".into(),
-            );
-            node.children.push(nested);
-            node
-        } else {
-            let mut values = Table::new(vec![value]);
-            for i in 0..64 {
-                values.push_row(&[term(&format!("urn:value:{i:04}"))]);
-            }
-            let build = Node::leaf(
-                Kind::Values(values),
-                vec![value],
-                64.0,
-                "consumer build".into(),
-            );
-            let mut node = Node::leaf(
-                Kind::Join {
-                    algo: JoinAlgo::Cross,
-                    keys: Vec::new(),
-                },
-                vec![subject, key, value],
-                4096.0,
-                "expanding join".into(),
-            );
-            node.children = vec![nested, build];
-            node
-        };
-        consumer.cost = 4096.0;
-        let mut union = Node::leaf(
-            Kind::Union,
-            consumer.vars.clone(),
-            4096.0,
-            "pure union".into(),
-        );
-        union.cost = consumer.cost;
-        union.children = vec![consumer, Node::empty(vec![subject, key, value])];
-        let mut root = unary(
-            Kind::Slice {
-                offset: 0,
-                limit: Some(1),
-            },
-            union,
-            "ASK demand",
-        );
-        super::super::unionpush::order_ask(&ctx, &mut root);
-        assert!(ctx.eager_union_demand.load(AtomicOrdering::Relaxed));
-        let (out, _) = execute(&ctx, &root)?;
-        assert_eq!(out.len(), 1);
-        assert_eq!(out.cols[1][0], key_id);
-        Ok(())
-    }
-
-    #[test]
-    fn nested_join_prefix_keeps_the_expanding_consumer_within_its_budget() {
-        expanding_consumer(false).unwrap();
-    }
-
-    #[test]
-    fn probe_prefix_keeps_the_expanding_consumer_within_its_budget() {
-        expanding_consumer(true).unwrap();
-    }
-}
-
-#[cfg(test)]
 mod path_lookup_tests {
     use super::*;
     use crate::io::{RdfFormat, Source};
@@ -9915,92 +9481,9 @@ mod paid_eager_producer_tests {
     use crate::store::{Store, StoreOptions};
 
     #[test]
-    fn limited_identity_projection_keeps_actual_fast_child_credit() {
-        let store = scan_fixture();
-        let mut ctx = Ctx::new(store.snapshot());
-        ctx.use_cache = false;
-        let spec = default_subject_scan(&ctx);
-        let child = Node::leaf(Kind::Scan(spec), vec![0], 3.0, "paid limited scan".into());
-        let mut node = Node::leaf(
-            Kind::Project(vec![0]),
-            vec![0],
-            3.0,
-            "paid limited projection".into(),
-        );
-        node.children.push(child);
-        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
-        let (output, _, complete) = execute_limited(&ctx, &node, 1).unwrap();
-        assert!(complete);
-        assert_eq!(output.table.len, 3);
-        assert_eq!(
-            ctx.live_bytes(),
-            super::super::algosvc::table_capacity(&output.table).unwrap(),
-            "limited projection must retain its actual prepaid child credit"
-        );
-        assert_eq!(
-            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
-            before
-        );
-        drop(output);
-        assert_eq!(ctx.live_bytes(), 0);
-    }
-
-    #[test]
-    fn limited_projection_admits_missing_columns_before_allocation() {
-        use crate::algo::memory::probe;
-        use std::{cell::Cell, rc::Rc};
-        let store = scan_fixture();
-        for short in [false, true] {
-            let mut ctx = Ctx::new(store.snapshot());
-            ctx.use_cache = false;
-            let spec = default_subject_scan(&ctx);
-            ctx.var("missing");
-            ctx.mem_limit = 388 - u64::from(short);
-            let child = Node::leaf(Kind::Scan(spec), vec![0], 3.0, "limited source".into());
-            let mut node = Node::leaf(
-                Kind::Project(vec![0, 1]),
-                vec![0, 1],
-                3.0,
-                "limited projection".into(),
-            );
-            node.children.push(child);
-            let allocations = Rc::new(Cell::new(0));
-            let seen = allocations.clone();
-            let hook = probe::install(
-                move |point| {
-                    if let probe::Point::Allocation(name, _) = point
-                        && name.starts_with("eager-project-")
-                    {
-                        seen.set(seen.get() + 1);
-                    }
-                },
-                None,
-            );
-            let result = execute_limited(&ctx, &node, 1);
-            if short {
-                assert!(matches!(result, Err(Error::BudgetExceeded(_))));
-                assert_eq!(allocations.get(), 0);
-                assert_eq!(ctx.live_bytes(), 0);
-            } else {
-                let (output, _, complete) = result.unwrap();
-                assert!(complete);
-                assert_eq!(output.table.cols[1], [Id::UNDEF; 3]);
-                assert!(allocations.get() > 0);
-                assert_eq!(
-                    ctx.live_bytes(),
-                    super::super::algosvc::table_capacity(&output.table).unwrap()
-                );
-                drop(output);
-                assert_eq!(ctx.live_bytes(), 0);
-            }
-            drop(hook);
-        }
-    }
-
-    #[test]
     fn eager_and_nested_limited_slice_keep_prepaid_columns_without_ledger() {
         let store = scan_fixture();
-        for limited in [false, true] {
+        {
             let mut ctx = Ctx::new(store.snapshot());
             ctx.use_cache = false;
             let spec = default_subject_scan(&ctx);
@@ -10009,6 +9492,7 @@ mod paid_eager_producer_tests {
                 Kind::Slice {
                     offset: 1,
                     limit: Some(1),
+                    whole: false,
                 },
                 vec![0],
                 1.0,
@@ -10016,11 +9500,7 @@ mod paid_eager_producer_tests {
             );
             node.children.push(child);
             let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
-            let output = if limited {
-                execute_limited(&ctx, &node, 1).unwrap().0
-            } else {
-                execute_materialized(&ctx, &node).unwrap().0
-            };
+            let output = execute_materialized(&ctx, &node).unwrap().0;
             assert_eq!(output.table.len, 1);
             assert_eq!(output.table.cols[0].capacity(), 2);
             assert_eq!(
@@ -10055,6 +9535,7 @@ mod paid_eager_producer_tests {
             Kind::Slice {
                 offset: 0,
                 limit: Some(1),
+                whole: false,
             },
             vec![0],
             1.0,
@@ -10071,34 +9552,6 @@ mod paid_eager_producer_tests {
         assert_eq!(
             super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
             before
-        );
-        drop(output);
-        assert_eq!(ctx.live_bytes(), 0);
-    }
-
-    #[test]
-    fn review_f2_borrowed_limited_values_stays_fast() {
-        let store = Store::in_memory(StoreOptions::default());
-        let mut ctx = Ctx::new(store.snapshot());
-        ctx.use_cache = false;
-        ctx.var("value");
-        ctx.mem_limit = 164;
-        let table = Table {
-            vars: vec![0],
-            cols: vec![vec![Id::UNDEF]],
-            len: 1,
-            sorted: Vec::new(),
-        };
-        let node = Node::leaf(Kind::Values(table), vec![0], 1.0, "review values".into());
-        let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
-        let (output, _, complete) = execute_limited(&ctx, &node, 1).unwrap();
-        assert!(complete);
-        assert_eq!(output.table.cols, [vec![Id::UNDEF]]);
-        assert_eq!(ctx.live_bytes(), 164);
-        assert_eq!(
-            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
-            before,
-            "borrowed limited Values must not initialize the query ledger"
         );
         drop(output);
         assert_eq!(ctx.live_bytes(), 0);

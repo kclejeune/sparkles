@@ -1,4 +1,7 @@
-//! ASK must not reserve an entire filtered Cartesian product to find one binding.
+//! ASK must not reserve an entire filtered Cartesian product to find one binding. Every
+//! ASK pulls its pattern through the cursor until the first solution (item 827): eager
+//! execution through its LIMIT 1, automatic execution as a native ASK. Both keep the
+//! query's real row, produced-row and memory budgets.
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
 use sparkles_core::sparql::{ExecutionMode, QueryExecution, QueryOptions, query, query_execution};
@@ -69,10 +72,10 @@ fn automatic_ask_finds_a_binding_without_reserving_filtered_candidates() {
             no_cache: true,
             ..cross_options()
         };
-        assert!(matches!(
-            query(store.snapshot(), ASK, &options),
-            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows
-        ));
+        // the full candidate product would exceed the row budget, the pulled one does not
+        let eager = query(store.snapshot(), ASK, &options).unwrap();
+        assert!(eager.boolean, "{left} = {right}");
+        assert!(eager.rows_produced < 1024);
         let execution = query_execution(
             store.snapshot(),
             ASK,
@@ -82,7 +85,7 @@ fn automatic_ask_finds_a_binding_without_reserving_filtered_candidates() {
         )
         .unwrap();
         let QueryExecution::Ask(answer) = execution else {
-            panic!("over-budget filtered ASK must use its native cursor")
+            panic!("filtered ASK must use its native cursor")
         };
         assert!(answer.result().boolean, "{left} = {right}");
         assert!(answer.result().rows_produced < 1024);
@@ -131,10 +134,10 @@ fn automatic_ask_avoids_candidate_memory_without_lifting_its_budget() {
         no_cache: true,
         ..cross_options()
     };
-    assert!(matches!(
-        query(store.snapshot(), ASK, &options),
-        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
-    ));
+    // the 16M-pair candidate table would exceed the memory budget, the pull does not
+    let eager = query(store.snapshot(), ASK, &options).unwrap();
+    assert!(eager.boolean);
+    assert!(eager.mem_peak_bytes <= 4 << 20);
     let execution = query_execution(
         store.snapshot(),
         ASK,
@@ -148,6 +151,20 @@ fn automatic_ask_avoids_candidate_memory_without_lifting_its_budget() {
     };
     assert!(answer.result().boolean);
     assert!(answer.result().mem_peak_bytes <= 4 << 20);
+    // the budget still binds: a pull that cannot fit fails rather than lifting it
+    let tight = QueryOptions {
+        max_memory_bytes: Some(1),
+        ..options
+    };
+    for mode in [ExecutionMode::Eager, ExecutionMode::Auto] {
+        assert!(
+            matches!(
+                query_execution(store.snapshot(), ASK, &tight, &Default::default(), mode),
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+            ),
+            "{mode:?}"
+        );
+    }
 }
 
 #[test]
@@ -175,7 +192,7 @@ fn automatic_ask_can_prove_false_within_its_real_candidate_budget() {
 }
 
 #[test]
-fn automatic_ask_preserves_errors_and_small_query_policy() {
+fn automatic_ask_preserves_errors_and_streams_small_queries() {
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::Instant;
     let store = fixture(64, "\"same\"", "\"same\"");
@@ -184,17 +201,18 @@ fn automatic_ask_preserves_errors_and_small_query_policy() {
         no_cache: true,
         ..cross_options()
     };
-    assert!(matches!(
-        query_execution(
-            store.snapshot(),
-            ASK,
-            &options,
-            &Default::default(),
-            ExecutionMode::Auto,
-        )
-        .unwrap(),
-        QueryExecution::Eager(_)
-    ));
+    // a small ASK streams too: it needs one solution at any size (item 827)
+    let QueryExecution::Ask(answer) = query_execution(
+        store.snapshot(),
+        ASK,
+        &options,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap() else {
+        panic!("automatic execution streams every ASK")
+    };
+    assert!(answer.result().boolean);
     let options = QueryOptions {
         max_rows: Some(1024),
         no_cache: true,
@@ -239,7 +257,7 @@ fn automatic_ask_preserves_errors_and_small_query_policy() {
 }
 
 #[test]
-fn automatic_ask_keeps_successful_cheap_asymmetric_prefixes_eager() {
+fn automatic_ask_answers_cheap_asymmetric_prefixes_within_their_budget() {
     for (left, right) in [(1, 2048), (2048, 1)] {
         let store = fixture_sizes(left, right, "\"same\"", "\"same\"");
         let options = QueryOptions {
@@ -256,8 +274,8 @@ fn automatic_ask_keeps_successful_cheap_asymmetric_prefixes_eager() {
             ExecutionMode::Auto,
         )
         .unwrap();
-        let QueryExecution::Eager(answer) = execution else {
-            panic!("a bounded cheap eager prefix must stay ordinary")
+        let QueryExecution::Ask(answer) = execution else {
+            panic!("automatic execution streams every ASK")
         };
         assert!(answer.result().boolean);
     }
@@ -319,7 +337,7 @@ fn admitted_ask_builds_the_smaller_pure_input_without_renaming_values() {
 }
 
 #[test]
-fn repeated_variable_scan_estimates_do_not_claim_a_cheap_eager_prefix() {
+fn repeated_variable_scan_asks_pull_within_their_row_budget() {
     let store = Store::in_memory(StoreOptions::default());
     let mut data = String::from(
         "<urn:0shared> <urn:left> <urn:0shared> .\n<urn:0shared> <urn:right> <urn:0shared> .\n",
@@ -343,9 +361,8 @@ fn repeated_variable_scan_estimates_do_not_claim_a_cheap_eager_prefix() {
         no_cache: true,
         ..cross_options()
     };
-    assert!(
-        matches!(query(store.snapshot(), ask, &options), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows)
-    );
+    // the full candidate product exceeds the row budget, which both modes keep
+    assert!(query(store.snapshot(), ask, &options).unwrap().boolean);
     let execution = query_execution(
         store.snapshot(),
         ask,
@@ -355,13 +372,13 @@ fn repeated_variable_scan_estimates_do_not_claim_a_cheap_eager_prefix() {
     )
     .unwrap();
     let QueryExecution::Ask(answer) = execution else {
-        panic!("a discounted scan estimate cannot prove that the eager prefix fits")
+        panic!("automatic execution streams every ASK")
     };
     assert!(answer.result().boolean);
 }
 
 #[test]
-fn graph_ratio_estimates_do_not_claim_a_cheap_eager_prefix() {
+fn graph_ratio_asks_pull_within_their_row_budget() {
     let store = Store::in_memory(StoreOptions::default());
     let mut data = String::from(
         "<urn:0shared> <urn:left> <urn:0shared> .\n<urn:0shared> <urn:right> <urn:0shared> .\n",
@@ -388,9 +405,8 @@ fn graph_ratio_estimates_do_not_claim_a_cheap_eager_prefix() {
         no_cache: true,
         ..cross_options()
     };
-    assert!(
-        matches!(query(store.snapshot(), ask, &options), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows)
-    );
+    // the full candidate product exceeds the row budget, which both modes keep
+    assert!(query(store.snapshot(), ask, &options).unwrap().boolean);
     let execution = query_execution(
         store.snapshot(),
         ask,
@@ -400,7 +416,7 @@ fn graph_ratio_estimates_do_not_claim_a_cheap_eager_prefix() {
     )
     .unwrap();
     let QueryExecution::Ask(answer) = execution else {
-        panic!("a graph ratio estimate cannot prove that the eager prefix fits")
+        panic!("automatic execution streams every ASK")
     };
     assert!(answer.result().boolean);
 }

@@ -125,9 +125,9 @@ fn a_join_whose_left_side_is_empty_skips_its_right_side() {
 }
 
 #[test]
-fn reruns_under_limit_add_up_and_say_they_stopped_early() {
+fn a_limit_pulls_its_input_once_and_says_it_stopped_early() {
     let s = store_with(&people(3000), StoreOptions::default());
-    // a selective filter makes the limited input grow over several rounds
+    // a selective filter pulls more of its input, in one run of it (item 827)
     let r = query(
         s.snapshot(),
         "SELECT ?p WHERE { ?p ex:age ?a FILTER(?a + 0 >= 2) } LIMIT 20",
@@ -142,18 +142,13 @@ fn reruns_under_limit_add_up_and_say_they_stopped_early() {
         .expect("a filter node");
     assert!(filter.fidelity().stopped_early, "{:#?}", r.plan());
     let child = &filter.children[0];
-    assert!(
-        child.fidelity().reruns > 0,
-        "the scan ran more than once: {:#?}",
-        r.plan()
-    );
+    assert!(child.fidelity().stopped_early, "{:#?}", r.plan());
+    assert_eq!(child.fidelity().reruns, 0, "{:#?}", r.plan());
+    assert!(child.actual_rows < 3000, "{:#?}", r.plan());
     // the children's time is all within the parent's
     assert!(child.time_ms <= filter.time_ms + 1e-6);
     let j = serde_json::to_value(r.plan()).unwrap().to_string();
-    assert!(
-        j.contains("\"stoppedEarly\":true") && j.contains("\"runs\""),
-        "{j}"
-    );
+    assert!(j.contains("\"stoppedEarly\":true"), "{j}");
 }
 
 #[test]
@@ -555,4 +550,134 @@ fn a_restricted_scans_domain_is_seen_at_any_depth() {
             "the top join is estimated at {shallow} rows shallow and {deep} rows under 70 subqueries"
         );
     }
+}
+
+/// The operators of the plan a query reports under `mode`, in tree order with their
+/// depth. A cursor plan names its operator inside an object.
+fn mode_shape(
+    s: &Store,
+    text: &str,
+    o: &QueryOptions,
+    mode: ExecutionMode,
+) -> Vec<(usize, String)> {
+    fn go(p: &serde_json::Value, d: usize, out: &mut Vec<(usize, String)>) {
+        let op = match &p["operator"] {
+            serde_json::Value::Object(o) => o["operator"].as_str().unwrap_or_default(),
+            other => other.as_str().unwrap_or_default(),
+        };
+        out.push((d, op.to_string()));
+        for c in p["children"].as_array().into_iter().flatten() {
+            go(c, d + 1, out);
+        }
+    }
+    let mut execution = query_execution(s.snapshot(), text, o, &CursorOptions::default(), mode)
+        .unwrap_or_else(|e| panic!("{text} under {mode:?}: {e}"));
+    if let QueryExecution::Select(cursor) = &mut execution {
+        while cursor.next_batch().unwrap().is_some() {}
+    }
+    let plan: serde_json::Value = serde_json::from_str(&execution.plan_json().unwrap()).unwrap();
+    let mut out = Vec::new();
+    go(&plan, 0, &mut out);
+    out
+}
+
+/// One plan for a query whatever the execution mode (item 827): a variable predicate
+/// read from the predicate patterns plans its scan the same way in every mode.
+#[test]
+fn a_variable_predicate_has_one_plan_in_every_mode() {
+    let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..2000 {
+        data.push_str(&format!(
+            "ex:s{i} ex:p{} {i} ; ex:q{} {i} .\n",
+            i % 5,
+            i % 3
+        ));
+    }
+    let s = store_with(&data, StoreOptions::default());
+    let o = QueryOptions {
+        no_cache: true,
+        ..opts()
+    };
+    for text in [
+        "SELECT ?s ?p WHERE { ?s <urn:x-sparkles:hasPredicate> ?p }",
+        "SELECT ?s ?p WHERE { ?s <urn:x-sparkles:hasPredicate> ?p } LIMIT 10",
+        // two scans in subject order join the same way in every mode
+        "SELECT ?s ?p ?q WHERE { ?s <urn:x-sparkles:hasPredicate> ?p . \
+         ?s <urn:x-sparkles:hasPredicate> ?q }",
+    ] {
+        let eager = mode_shape(&s, text, &o, ExecutionMode::Eager);
+        assert!(eager.iter().any(|(_, op)| op == "PatternScan"), "{eager:?}");
+        for mode in [ExecutionMode::Streaming, ExecutionMode::Auto] {
+            assert_eq!(
+                mode_shape(&s, text, &o, mode),
+                eager,
+                "{text} under {mode:?}"
+            );
+        }
+    }
+}
+
+/// A DISTINCT over an ORDER BY of a query that may spill deduplicates below its sort
+/// in every mode, so its plan and its rows, in their order, are the same whatever the
+/// mode (item 827).
+#[test]
+fn a_spilling_distinct_over_order_by_has_one_plan_in_every_mode() {
+    let s = store_with(&people(500), StoreOptions::default());
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+        dir: tmp.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let o = QueryOptions {
+        spill: Some(spill),
+        no_cache: true,
+        ..opts()
+    };
+    let text = "SELECT DISTINCT ?a ?t WHERE { ?p ex:age ?a ; ex:team ?t } ORDER BY DESC(?a) ?t";
+    let eager = mode_shape(&s, text, &o, ExecutionMode::Eager);
+    assert!(
+        eager.iter().filter(|(_, op)| op == "Distinct").count() == 1
+            && eager.iter().position(|(_, op)| op == "Distinct").unwrap()
+                > eager.iter().position(|(_, op)| op == "OrderBy").unwrap(),
+        "the DISTINCT runs below the sort: {eager:?}"
+    );
+    for mode in [ExecutionMode::Streaming, ExecutionMode::Auto] {
+        assert_eq!(mode_shape(&s, text, &o, mode), eager, "{mode:?}");
+    }
+    let rows = |mode| {
+        let mut execution =
+            query_execution(s.snapshot(), text, &o, &CursorOptions::default(), mode).unwrap();
+        let mut out = Vec::new();
+        match &mut execution {
+            QueryExecution::Select(cursor) => {
+                while let Some(b) = cursor.next_batch().unwrap() {
+                    for i in 0..b.len() {
+                        out.push(format!("{:?}", b.row(i).unwrap().values()));
+                    }
+                }
+            }
+            QueryExecution::Eager(result) => {
+                for row in result.result().rows().unwrap() {
+                    out.push(format!("{:?}", row.values()));
+                }
+            }
+            _ => unreachable!(),
+        }
+        out
+    };
+    let expected = rows(ExecutionMode::Eager);
+    assert_eq!(expected.len(), 500);
+    let plain = query(s.snapshot(), text, &opts()).unwrap();
+    let plain: Vec<String> = plain
+        .rows()
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{:?}", r.values()))
+        .collect();
+    assert_eq!(expected, plain);
+    assert_eq!(rows(ExecutionMode::Streaming), expected);
 }
