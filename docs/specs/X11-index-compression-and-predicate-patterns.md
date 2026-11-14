@@ -787,6 +787,10 @@ copied only up to the next key's shared prefix, and a key that gives the next no
 than its own shared prefix is not copied at all. A block whose keys are all wanted up to
 the last one is still decoded whole in one pass.
 
+The lookahead reaches one key ahead. Two long keys that share most of their bytes are
+still rebuilt up to their shared prefix for a short key later in the block, and a checked
+lookup by key rebuilds every key before the probe in full. Roadmap item 949 follows both.
+
 The instruction screen of `crates/sparkles-core/tests/insn_screen.rs` counts 50,000
 random lookups through the checked decoder as well as the unchecked one. On stanley, an
 Intel Core Ultra X7 358H, the first version of the change, which sent plain blocks
@@ -798,7 +802,10 @@ smaller steps, each a reallocation. Starting the buffer at the unchecked decoder
 that copies the suffix in place of the FSST step brought it to 0.97. The same first size
 takes FSST's checked lookups to 0.69 of their earlier count. The unchecked lookups and
 the ordered reads of every seventh id stay within the screen's spread between
-processes, which is up to 5% on this host.
+processes, which is up to 5% on this host. A Namespace screen of the 30 benchmark queries
+at 100,000 people returned the same answers from both builds and flagged five queries
+under 0.05 ms at 1.10 or more. Their rerun of eight rounds gave 0.94 to 1.04 and a
+geometric mean of 0.99. The queries of 0.3 ms or more ran at 0.97 to 1.05 of the base.
 
 ### Phases not built
 

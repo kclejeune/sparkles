@@ -9,6 +9,7 @@ use sparkles_core::error::{BudgetKind, Error};
 use sparkles_core::io::Source;
 use sparkles_core::sparql::{CursorOptions, QueryOptions, query, select_cursor};
 use sparkles_core::store::{Store, StoreOptions};
+use sparkles_core::vocab::FC_BLOCK;
 
 const BUDGET: u64 = 1 << 20;
 const LITERAL: usize = 600_000;
@@ -35,6 +36,24 @@ fn store() -> Store {
             None,
         )])
         .unwrap();
+    // The case needs the literal before the subjects in one front-coded block.
+    let snap = store.snapshot();
+    let vocab = &snap.generation.vocab;
+    assert!(!vocab.is_fsst());
+    let (mut literal, mut subjects) = (None, Vec::new());
+    vocab.for_each(|id, key| {
+        if key.len() > LITERAL {
+            literal = Some(id);
+        } else if key.windows(5).any(|w| w == b"urn:s") {
+            subjects.push(id);
+        }
+    });
+    let literal = literal.expect("the literal is in the base vocabulary");
+    assert_eq!(subjects.len(), 5);
+    for s in subjects {
+        assert!(literal < s, "the literal {literal} comes after subject {s}");
+        assert_eq!(literal / FC_BLOCK as u64, s / FC_BLOCK as u64, "one block");
+    }
     store
 }
 
