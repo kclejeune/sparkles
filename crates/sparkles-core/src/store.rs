@@ -6602,6 +6602,20 @@ impl WriteTxn<'_> {
         &self.base
     }
 
+    /// Remove the terms and blank node ids this transaction added, before the caller
+    /// drops it uncommitted after a failure, so that a failed write leaves the
+    /// vocabulary as it was. No view or id that names them may outlive the call. A
+    /// rollback that fails part way poisons the store's writer until it is reopened, as a
+    /// failed load does.
+    pub fn discard_terms(&mut self) -> Result<()> {
+        if let Err(e) = self.base.generation.dvocab.rollback(&self.mark) {
+            self.guard.poisoned = true;
+            return Err(e);
+        }
+        self.guard.next_bnode = self.start_bnode;
+        Ok(())
+    }
+
     /// Get or create the id for a term (new terms go to the delta vocabulary). A blank
     /// node, also inside a triple term, must be a stored one named by its label (see
     /// [`parse_bnode_label`]). [`WriteTxn::intern_scoped`] and [`WriteTxn::new_bnode`]
