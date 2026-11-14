@@ -1,0 +1,4 @@
+mbx build --release -p sparkles-reasoner --example table_reuse   # in each worktree
+sparkles-heavy-run 12 table_reuse-<base|tip> 10 3 > pair1-<base|tip>.log   # base first
+sparkles-heavy-run 12 table_reuse-<tip|base> 10 3 > pair2-<tip|base>.log   # tip first
+perf record -F 499 -g --user-callchains table_reuse-tip 10 1   # attribution, not kept here

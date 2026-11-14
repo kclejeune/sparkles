@@ -1312,6 +1312,13 @@ the schema itself is unchanged.
   graph's membership changes the view key, and compaction changes the generation, so
   neither reuses, as §6.2 says.
 
+**Measurement.** The `table_reuse` example took most `owl-rl` LUBM queries from about
+250 ms to between 0.5 and 70 ms after a commit that the rules do not read, at 10
+universities on a loaded laptop, since the schema's table and the completeness proof
+carry over. After a commit that the rules read, queries 9 and 11 to 14 took 20 to 38%
+longer than before reuse, which roadmap item 960 follows up. The figures are in the
+[reasoning results](../benchmarks/reasoning/RESULTS.md#reuse-of-tables-across-commits).
+
 **Tests.** `crates/sparkles-reasoner/tests/demand_reuse.rs` runs a query, commits a change,
 runs it again and compares the answer with a fresh store of the changed data. A commit
 of facts that no rule reads or gives, and a commit to a graph outside the inputs, read
