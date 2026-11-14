@@ -35,9 +35,12 @@
 //! another over the same kept closure.
 //! `LUBM_PERF_CONTROL` names a control FIFO of `perf record --control`, to which `churn`
 //! writes `enable` before the rounds and `disable` after them, so that a record started
-//! with `--delay=-1` holds the rounds without the full run. With `LUBM_POOL=1` the runs
-//! of `churn` evaluate on a reasoning pool of `RAYON_NUM_THREADS` threads, as a server's
-//! do, instead of on the global pool from the main thread.
+//! with `--delay=-1` holds the rounds without the full run.
+//!
+//! The runs of `keep` and `churn` evaluate on a reasoning pool of `RAYON_NUM_THREADS`
+//! threads, as a server's do. `LUBM_POOL=0` runs them on the global pool from the main
+//! thread instead, where each parallel section of a run is handed to a worker and waited
+//! for, which for changes of 100 triples at 16 threads costs more than the sections save.
 //!
 //! `diag` runs the check `literal-not-in-datatype` twice on the same snapshot and reports
 //! the time and the peak heap of each run.
@@ -185,6 +188,14 @@ fn run_options() -> ReasonOptions {
     }
 }
 
+/// The pool the runs of `keep` and `churn` evaluate on: a reasoning pool of `threads`
+/// threads, as a server's, or none with `LUBM_POOL=0`, which leaves them on the global
+/// pool.
+fn reasoning_pool(threads: usize) -> Option<std::sync::Arc<sparkles_reasoner::ReasoningPool>> {
+    (std::env::var("LUBM_POOL").as_deref() != Ok("0"))
+        .then(|| sparkles_reasoner::thread_pool(threads).unwrap())
+}
+
 /// The witnesses `SPARKLES_WITNESSES` asks for.
 fn witnesses() -> Option<usize> {
     std::env::var("SPARKLES_WITNESSES")
@@ -320,6 +331,7 @@ fn main() {
             let cache = Cache::new(usize::MAX);
             let opts = ReasonOptions {
                 witnesses: witnesses(),
+                pool: reasoning_pool(threads),
                 ..ReasonOptions::default()
             };
             let run = |since: Option<u64>, cache: Option<&Cache>| -> (ReasonReport, usize) {
@@ -404,11 +416,8 @@ fn main() {
             let store = Store::open(&db, StoreOptions::default()).unwrap();
             let threads = rayon::current_num_threads();
             let cache = Cache::new(usize::MAX);
-            // a server evaluates on a reasoning pool, not on the global pool
-            let pool = (std::env::var("LUBM_POOL").as_deref() == Ok("1"))
-                .then(|| sparkles_reasoner::thread_pool(threads).unwrap());
             let opts = ReasonOptions {
-                pool,
+                pool: reasoning_pool(threads),
                 ..ReasonOptions::default()
             };
             let run = |since: Option<u64>| -> (ReasonReport, u128) {
