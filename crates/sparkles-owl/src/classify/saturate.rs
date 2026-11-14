@@ -27,7 +27,7 @@ use super::dl_rules;
 use super::horn::HornIx;
 use super::horn_rules;
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
@@ -504,6 +504,10 @@ pub struct Bounds<'a> {
     /// whether a stop leaves every context's unapplied conclusions in its to-do list, for
     /// a partial answer
     pub partial: bool,
+    /// whether a run of Tier D proceeds in steps ([`Run::steps`]), so that what it derives
+    /// and where it passes its bound on derived conclusions do not depend on the threads
+    /// (roadmap item 727)
+    pub steps: bool,
 }
 
 const STOP_NONE: u8 = 0;
@@ -528,6 +532,19 @@ pub const CONTEXT_BYTES: usize = 320;
 const OUTBOX: usize = 4096;
 /// The clauses of Tier D a context processes between checks of the bounds.
 const DL_CLAUSES: usize = 256;
+/// The contexts a step of [`Run::steps`] activates.
+pub(super) const STEP_CONTEXTS: usize = 4096;
+/// The conclusions of Tier D after which an activation of a run in steps processes no
+/// further clause.
+const STEP_WORK: usize = 4096;
+/// The contexts from which the workers activate a step together, whatever the last
+/// step took.
+const STEP_PARALLEL: usize = if cfg!(test) { 2 } else { 128 };
+/// The time of a step's activations from which the workers activate the next step
+/// together, when it has two contexts or more.
+const STEP_HEAVY: Duration = Duration::from_micros(if cfg!(test) { 0 } else { 150 });
+/// The messages from which the workers deliver a step's messages together.
+const STEP_MESSAGES: usize = if cfg!(test) { 1 } else { 4096 };
 /// The bytes of waiting messages below which a saturation never counts as congested.
 const CONGESTED_BYTES: usize = 256 << 20;
 /// The roots from which a saturation on several threads starts them all at once.
@@ -604,12 +621,51 @@ struct Run<'a> {
     horn: bool,
     /// whether the rules are those of Tier D
     disj: bool,
+    /// whether the run proceeds in steps, [`Bounds::steps`] in a run of Tier D
+    steps: bool,
     dynamic: Option<&'a Dynamic>,
     bounds: &'a Bounds<'a>,
     /// where the run records its start of the helpers, [`STARTED_NS`] outside tests
     started: &'static AtomicU64,
     #[cfg(test)]
     always_congested: bool,
+}
+
+/// What the workers of a run in steps share ([`Run::steps`]).
+struct Steps {
+    /// the contexts of the step
+    frontier: RwLock<Vec<Ex>>,
+    /// the next place of the frontier to activate
+    next: AtomicUsize,
+    /// what each worker's activations left
+    outs: Vec<RwLock<StepOut>>,
+    /// the contexts each worker's deliveries woke
+    woke: Vec<Mutex<Vec<Ex>>>,
+    /// the step's activations that sent messages, by place in the frontier: the place,
+    /// the worker, and the range of the worker's messages
+    order: RwLock<Vec<(u32, u32, u32, u32)>>,
+    /// what the helpers do when the start barrier opens
+    phase: AtomicU8,
+    start: std::sync::Barrier,
+    end: std::sync::Barrier,
+}
+
+const STEP_ACTIVATE: u8 = 0;
+const STEP_DELIVER: u8 = 1;
+const STEP_DONE: u8 = 2;
+
+/// What a worker's activations of one step left.
+#[derive(Default)]
+struct StepOut {
+    /// the messages, in the order the activations sent them
+    outbox: Outbox,
+    /// for each activation, its place in the frontier and the end of its messages
+    segs: Vec<(u32, u32)>,
+    /// the contexts that gave way
+    again: VecDeque<Ex>,
+    tally: Tally,
+    /// the buffer of a context's conclusions, kept across contexts
+    local: Vec<Concl>,
 }
 
 /// What a worker counted since it last added to the totals.
@@ -681,6 +737,7 @@ pub fn saturate_counted(
         plain: plain(ix),
         horn: ix.horn.is_some() && bounds.dynamic.is_some(),
         disj: ix.dl.is_some() && bounds.dl.is_some(),
+        steps: bounds.steps && ix.dl.is_some() && bounds.dl.is_some(),
         dynamic: bounds.dynamic,
         bounds,
         #[cfg(not(test))]
@@ -704,6 +761,8 @@ pub fn saturate_counted(
         run.workers::<Horn>(threads);
     } else if run.horn {
         run.workers::<HornFull>(threads);
+    } else if run.steps {
+        run.steps::<Disj>(threads);
     } else if run.disj {
         run.workers::<Disj>(threads);
     } else if run.plain {
@@ -742,6 +801,8 @@ struct Out<'r, 'a> {
     outbox: &'r mut Outbox,
     /// the messages sent to other contexts since the last check
     sent: usize,
+    /// the conclusions of Tier D this activation derived
+    work: usize,
 }
 
 /// A worker's messages for other contexts, which it delivers by destination, with the
@@ -839,6 +900,15 @@ pub trait Sink {
     fn go_on(&self) -> bool {
         true
     }
+    /// Counts `n` conclusions of Tier D for the run's bound on derived conclusions.
+    fn worked(&mut self, n: usize) {
+        self.dl().count(n);
+    }
+    /// whether the activation has derived its share of a step of a run in steps, so that
+    /// it processes no further clause
+    fn pause(&self) -> bool {
+        false
+    }
     /// whether the run has stopped, without a check of its bounds
     fn stopped(&self) -> bool {
         false
@@ -879,6 +949,11 @@ impl Sink for Out<'_, '_> {
     fn send(&mut self, to: Ex, c: Concl) {
         if to == self.me {
             self.local.push(c);
+        } else if self.run.steps {
+            // a step delivers its messages at its end, in an order that the threads do
+            // not decide
+            self.outbox.msgs.push((to, c));
+            self.sent += 1;
         } else if !self.run.batch.load(Ordering::Relaxed) {
             // one worker meets no other at a to-do list, and sorting costs more than it
             // saves
@@ -934,7 +1009,24 @@ impl Sink for Out<'_, '_> {
     }
 
     fn go_on(&self) -> bool {
+        // An activation of a run in steps that alone derived more than the run's bound
+        // ends its inference, and the run is past its bound whatever the others derive.
+        // The activation decides it from its own count, so no schedule changes it.
+        if self.run.steps && self.dl().past(self.work) {
+            return false;
+        }
         self.run.check(0, 0, 0)
+    }
+
+    #[inline]
+    fn worked(&mut self, n: usize) {
+        self.work += n;
+        self.dl().count(n);
+    }
+
+    #[inline]
+    fn pause(&self) -> bool {
+        self.run.steps && (self.work >= STEP_WORK || self.dl().past(self.work))
     }
 
     #[inline]
@@ -1385,6 +1477,203 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// Runs a saturation of Tier D in steps, so that what it derives does not depend on
+    /// the threads (roadmap item 727). The frontier is a queue of active contexts, which
+    /// the seeds start and the roots join while it is short. A step takes its first
+    /// [`STEP_CONTEXTS`] entries. The workers activate them, and an activation only reads
+    /// its context's state and to-do list and appends its messages to its worker's list,
+    /// so that no to-do list changes meanwhile. Then the workers deliver the messages:
+    /// each takes the destinations of its share and reads every activation's messages in
+    /// the order of the frontier, so that a to-do list receives its messages in the
+    /// order of their senders in the frontier and, for one sender, the order it sent
+    /// them. The contexts the deliveries woke and those that gave way join the queue
+    /// sorted. The bound on derived conclusions is compared between steps, where the
+    /// count is a sum over the step's activations. A stop by the memory budget, the
+    /// deadline or a cancellation still comes when its check sees it.
+    fn steps<R: Rules>(&self, threads: usize) {
+        let sh = Steps {
+            frontier: RwLock::new(Vec::new()),
+            next: AtomicUsize::new(0),
+            outs: (0..threads).map(|_| RwLock::default()).collect(),
+            woke: (0..threads).map(|_| Mutex::default()).collect(),
+            order: RwLock::new(Vec::new()),
+            phase: AtomicU8::new(STEP_ACTIVATE),
+            start: std::sync::Barrier::new(threads),
+            end: std::sync::Barrier::new(threads),
+        };
+        let mut queue: VecDeque<Ex> = {
+            let mut seeds = std::mem::take(&mut *self.queue.lock());
+            seeds.sort_unstable();
+            seeds.into()
+        };
+        let mut root = 0;
+        std::thread::scope(|s| {
+            let mut helpers = false;
+            // whether the last step's activations took long
+            let mut heavy = false;
+            // The contexts that gave way and have no message. They go on once no other
+            // context is active, since what the others conclude can close them, as
+            // `Run::process` says of a context that gives way.
+            let mut later: Vec<Ex> = Vec::new();
+            loop {
+                while queue.len() < STEP_CONTEXTS && root < self.roots.len() {
+                    let c = self.get(self.roots[root]);
+                    if !c.started.load(Ordering::Acquire) && self.mark(c) {
+                        queue.push_back(self.roots[root]);
+                    }
+                    root += 1;
+                }
+                if queue.is_empty() {
+                    later.sort_unstable();
+                    queue.extend(later.drain(..));
+                }
+                if queue.is_empty() {
+                    break;
+                }
+                let n = queue.len().min(STEP_CONTEXTS);
+                {
+                    let mut f = sh.frontier.write();
+                    f.clear();
+                    f.extend(queue.drain(..n));
+                }
+                sh.next.store(0, Ordering::SeqCst);
+                // Which workers take a phase does not change what it does, so the clock
+                // may decide it: the helpers join for a long frontier, for one whose
+                // contexts were slow in the last step, and for many messages.
+                let together = threads > 1 && n >= 2 && (n >= STEP_PARALLEL || heavy);
+                if together && !helpers {
+                    helpers = true;
+                    for w in 1..threads {
+                        let sh = &sh;
+                        s.spawn(move || {
+                            loop {
+                                sh.start.wait();
+                                match sh.phase.load(Ordering::SeqCst) {
+                                    STEP_ACTIVATE => self.step_activate::<R>(sh, w),
+                                    STEP_DELIVER => self.step_deliver(sh, w, threads),
+                                    _ => break,
+                                }
+                                sh.end.wait();
+                            }
+                        });
+                    }
+                }
+                // a phase on every worker, or on this one alone
+                let phase = |p: u8, together: bool| {
+                    if together {
+                        sh.phase.store(p, Ordering::SeqCst);
+                        sh.start.wait();
+                    }
+                    if p == STEP_ACTIVATE {
+                        self.step_activate::<R>(&sh, 0);
+                    } else {
+                        self.step_deliver(&sh, 0, if together { threads } else { 1 });
+                    }
+                    if together {
+                        sh.end.wait();
+                    }
+                };
+                let began = Instant::now();
+                phase(STEP_ACTIVATE, together);
+                heavy = began.elapsed() >= STEP_HEAVY;
+                let mut messages = 0;
+                {
+                    let mut order = sh.order.write();
+                    order.clear();
+                    for (w, o) in sh.outs.iter().enumerate() {
+                        let mut from = 0;
+                        for &(at, to) in &o.read().segs {
+                            if to > from {
+                                order.push((at, w as u32, from, to));
+                            }
+                            from = to;
+                        }
+                        messages += from as usize;
+                    }
+                    order.sort_unstable();
+                }
+                phase(STEP_DELIVER, helpers && messages >= STEP_MESSAGES);
+                let mut woke: Vec<Ex> = Vec::new();
+                for (o, w) in sh.outs.iter().zip(&sh.woke) {
+                    let mut o = o.write();
+                    later.extend(o.again.drain(..));
+                    o.outbox.msgs.clear();
+                    o.segs.clear();
+                    woke.append(&mut w.lock());
+                }
+                // a context that gave way and has messages goes on with the others
+                later.retain(|&e| {
+                    let waits = self.get(e).todo.lock().is_empty();
+                    if !waits {
+                        woke.push(e);
+                    }
+                    waits
+                });
+                woke.sort_unstable();
+                woke.dedup();
+                queue.extend(woke);
+                if !self.stopped() && self.bounds.dl.is_some_and(|d| d.over_work()) {
+                    self.halt(STOP_WORK);
+                }
+                if self.stopped() {
+                    break;
+                }
+            }
+            if helpers {
+                sh.phase.store(STEP_DONE, Ordering::SeqCst);
+                sh.start.wait();
+            }
+        });
+    }
+
+    /// A worker's part of a step's first phase: it activates the contexts of the
+    /// frontier that it takes, and records for each its place in the frontier and the
+    /// end of its messages in the worker's list.
+    fn step_activate<R: Rules>(&self, sh: &Steps, w: usize) {
+        let frontier = sh.frontier.read();
+        let mut o = sh.outs[w].write();
+        let o = &mut *o;
+        loop {
+            if self.stopped() {
+                break;
+            }
+            let at = sh.next.fetch_add(1, Ordering::Relaxed);
+            if at >= frontier.len() {
+                break;
+            }
+            self.process::<R>(
+                frontier[at],
+                &mut o.again,
+                &mut o.tally,
+                &mut o.local,
+                &mut o.outbox,
+            );
+            o.segs.push((at as u32, o.outbox.msgs.len() as u32));
+        }
+        self.flush(&mut o.tally);
+    }
+
+    /// A worker's part of a step's second phase, as one of `of` workers: it delivers the
+    /// messages whose destination is in its share, reading the activations in the order
+    /// of the frontier, and records the contexts it woke.
+    fn step_deliver(&self, sh: &Steps, w: usize, of: usize) {
+        let outs: Vec<_> = sh.outs.iter().map(|o| o.read()).collect();
+        let mut woke = sh.woke[w].lock();
+        for &(_, from, a, b) in sh.order.read().iter() {
+            for &(to, c) in &outs[from as usize].outbox.msgs[a as usize..b as usize] {
+                // a destination is in the share of one worker
+                if ((to as usize).wrapping_mul(0x9E37_79B9) >> 16) % of != w {
+                    continue;
+                }
+                let ctx = self.get(to);
+                ctx.todo.lock().push(c);
+                if self.mark(ctx) {
+                    woke.push(to);
+                }
+            }
+        }
+    }
+
     /// Checks the bounds, and stops the run when one is reached. `bytes` is the growth
     /// of the stored conclusions and `queued` the change in waiting messages since the
     /// worker's last check.
@@ -1411,8 +1700,9 @@ impl<'a> Run<'a> {
             return false;
         }
         // the work bound is its own reason, so that the first stop published decides
-        // whether the run falls back or answers in part
-        if b.dl.is_some_and(|d| d.over_work()) {
+        // whether the run falls back or answers in part; a run in steps compares it
+        // between steps only
+        if !self.steps && b.dl.is_some_and(|d| d.over_work()) {
             self.halt(STOP_WORK);
             return false;
         }
@@ -1456,6 +1746,7 @@ impl<'a> Run<'a> {
             woke: mine,
             outbox,
             sent: 0,
+            work: 0,
         };
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
@@ -1473,7 +1764,8 @@ impl<'a> Run<'a> {
             }
             ctx.started.store(true, Ordering::Release);
         }
-        // the clauses Tier D processed in this activation, and whether it gave way
+        // the clauses Tier D processed in this activation, with the minimums whose
+        // witnesses it released, and whether it gave way
         let mut clauses = 0usize;
         let mut gave_way = false;
         'outer: loop {
@@ -1488,20 +1780,34 @@ impl<'a> Run<'a> {
                     if !self.flush(tally) {
                         break 'outer;
                     }
-                    // a long activation gives idle workers what it woke as it goes
-                    if self.idle.load(Ordering::Relaxed) > 0 {
+                    // a long activation gives idle workers what it woke as it goes, and
+                    // one of a run in steps delivers nothing before its step ends
+                    if !self.steps && self.idle.load(Ordering::Relaxed) > 0 {
                         self.deliver(out.outbox, out.woke);
                         self.share(out.woke);
                     }
                 }
             }
-            // A context of Tier D that processed its share of clauses gives way to the
+            // An activation of a run in steps that derived its share of conclusions gives
+            // way too, so that the bound is compared before one context derives far more.
+            if self.steps && out.pause() && !st.bottom {
+                gave_way = true;
+                break;
+            }
+            // A context of Tier D that processed its share of clauses, which counts the
+            // minimums it released as [`dl_rules::flush`] does, gives way to the
             // contexts this worker woke and goes behind them, with its other clauses left
             // in its store. What they conclude can close it before it derives the rest, as
             // a successor without a model does for a context that is equating its
             // successors, and one worker otherwise finishes that derivation first.
-            // The messages in the outbox show first whom they wake.
+            // The messages in the outbox show first whom they wake. In a run in steps the
+            // context gives way whoever waits, so that its activation does not depend on
+            // the others'.
             if R::DISJ && clauses >= DL_CLAUSES {
+                if self.steps {
+                    gave_way = true;
+                    break;
+                }
                 if out.woke.is_empty() {
                     self.deliver(out.outbox, out.woke);
                 }
@@ -1528,10 +1834,16 @@ impl<'a> Run<'a> {
                 }
                 // Tier D's clauses wait for the units, which the EL rules take first
                 if R::DISJ {
-                    let n = if self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
-                        dl_root::flush(self.ix, &mut st, &mut out, DL_CLAUSES)
+                    // an activation of a run in steps has one share of clauses in all
+                    let share = if self.steps {
+                        DL_CLAUSES - clauses
                     } else {
-                        dl_rules::flush(self.ix, me, &mut st, &mut out, DL_CLAUSES)
+                        DL_CLAUSES
+                    };
+                    let n = if self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                        dl_root::flush(self.ix, &mut st, &mut out, share)
+                    } else {
+                        dl_rules::flush(self.ix, me, &mut st, &mut out, share)
                     };
                     if n > 0 {
                         clauses += n;
@@ -2416,6 +2728,7 @@ mod horn_accounting_tests {
             plain: false,
             horn: true,
             disj: false,
+            steps: false,
             dynamic: None,
             bounds,
             started: &STARTED_NS,
@@ -2444,6 +2757,7 @@ mod horn_accounting_tests {
             dynamic: None,
             dl: None,
             partial: false,
+            steps: false,
         };
         let run = run(&f.ix, &ctx, &bounds);
         let mut tally = Tally::default();
@@ -2509,6 +2823,7 @@ mod horn_accounting_tests {
                         dynamic: None,
                         dl: None,
                         partial: false,
+                        steps: false,
                     };
                     let run = run(&f.ix, &ctx, &bounds);
                     let mut tally = Tally::default();
@@ -2587,6 +2902,7 @@ mod horn_accounting_tests {
                 dynamic: None,
                 dl: None,
                 partial: false,
+                steps: false,
             };
             let run = run(&f.ix, &ctx, &bounds);
             let mut tally = Tally::default();

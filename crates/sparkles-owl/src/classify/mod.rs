@@ -228,6 +228,16 @@ pub struct Limits {
     /// attempt and the run without counting together, takes 576 ms with the order and
     /// 184 ms without it on one thread. False turns the order off.
     pub number_order: bool,
+    /// Makes every saturation of Tier D proceed in steps, so that the run derives the
+    /// same conclusions, passes or keeps its bound on them, and so answers in full or
+    /// falls back, in the same way on every number of threads and every schedule
+    /// (roadmap item 727). A step activates the waiting
+    /// contexts in parallel and delivers their messages at its end in a fixed order.
+    /// The run does not repeat on one thread an attempt that passed its bound. A rooted
+    /// run and a run with [`Expansion::Eager`] run their saturations on one thread with
+    /// the option. The memory budget, the deadline and a cancellation still stop a run
+    /// when they are reached. Off by default.
+    pub dl_steps: bool,
 }
 
 impl Default for Limits {
@@ -245,6 +255,7 @@ impl Default for Limits {
             counting: false,
             rooted: false,
             number_order: true,
+            dl_steps: false,
         }
     }
 }
@@ -932,6 +943,7 @@ impl Saturation {
         if let Err(Error::Memory { .. }) = r
             && self.dl_tried
             && limits.threads != 1
+            && !limits.dl_steps
             && !limits.el_only
             && !self.partial_over
             && !self.numeric_halt
@@ -941,8 +953,8 @@ impl Saturation {
             // depends on the order in which the threads delivered the contexts'
             // conclusions: the run starts again on one thread, whose order is fixed, before
             // it falls back to the Horn rules. A schedule that stays within the bound where
-            // one thread does not still answers in full, which the roadmap's item on a
-            // deterministic bound covers. Its charges draw first on what the pool admitted
+            // one thread does not still answers in full. A run in steps
+            // (`Limits::dl_steps`) derives the same on every schedule and does not repeat. Its charges draw first on what the pool admitted
             // for the first run.
             self.reset();
             self.dl_worked.store(false, Ordering::Relaxed);
@@ -1663,6 +1675,13 @@ impl Saturation {
         } else {
             limits.max_memory
         };
+        // With `Limits::dl_steps` every saturation of Tier D runs in steps. The ids of a
+        // rooted run's literals and of the eager strategy's contexts follow the order in
+        // which the threads make them, so those runs take one thread instead, whose order
+        // is fixed.
+        let fixed = limits.dl_steps && disj && dl_run.is_some();
+        let steps = fixed && rooted.is_none() && limits.expansion == Expansion::Cautious;
+        let threads = if fixed && !steps { 1 } else { threads };
         let bounds = Bounds {
             threads,
             deadline: limits.deadline,
@@ -1674,6 +1693,7 @@ impl Saturation {
             dynamic: dynamic.as_ref(),
             dl: dl_run.as_ref(),
             partial: limits.partial && disj && with_taxonomy,
+            steps,
         };
         // the pool has been charged for the peak of a parallel normalization
         let more = base.saturating_sub(normalized_peak);
@@ -2661,6 +2681,110 @@ mod tests {
                 answered,
                 "{threads} threads: no poll reached the saturation"
             );
+        }
+    }
+
+    /// Roadmap item 727: a run in steps over more contexts than one step takes, where
+    /// under test the workers share every step of two contexts and every delivery, derives
+    /// the same conclusions and the same answer on one, three and eight threads, and the
+    /// answer is the default run's. Each `C` has two successors that a maximum merges, a
+    /// union on the merged successor gives `P`, every seventh `C` has disjoint fillers,
+    /// and a filler reaches the next `C` in one case of a union. A run that a cancellation stops fails or answers in part, and the next
+    /// run of that classifier gives the outcome of a new one.
+    #[test]
+    fn a_run_in_steps_over_many_steps_derives_the_same_on_every_number_of_threads() {
+        let n = 700;
+        let mut text = String::from("Prefix(:=<http://ex.org/>)\nOntology(\n");
+        for i in 0..n {
+            text += &format!(
+                "SubClassOf(:C{i} ObjectSomeValuesFrom(:r :D{i}))
+                 SubClassOf(:C{i} ObjectSomeValuesFrom(:r :E{i}))
+                 SubClassOf(:C{i} ObjectMaxCardinality(1 :r))
+                 SubClassOf(:D{i} ObjectUnionOf(:F{i} :G{i}))
+                 SubClassOf(ObjectIntersectionOf(:F{i} :E{i}) :H{i})
+                 SubClassOf(:G{i} :H{i})
+                 SubClassOf(ObjectSomeValuesFrom(:r :H{i}) :P{i})
+                 SubClassOf(:E{i} ObjectUnionOf(:Q{i} ObjectSomeValuesFrom(:r :C{})))\n",
+                (i + 1) % n
+            );
+            if i % 7 == 0 {
+                text += &format!("DisjointClasses(:D{i} :E{i})\n");
+            }
+        }
+        text += ")";
+        let doc = crate::ofn_read::parse(&text).unwrap();
+        let class = |s: String| Class::new(format!("http://ex.org/{s}"));
+        let limits = |threads: usize, dl_steps: bool| Limits {
+            threads,
+            counting: true,
+            dl_steps,
+            ..Limits::default()
+        };
+        // the answer on the classes the test reads, and what Tier D derived
+        let outcome = |out: &Classification| {
+            let mut got = Vec::new();
+            for i in 0..n {
+                got.push((
+                    out.taxonomy
+                        .is_subclass(&class(format!("C{i}")), &class(format!("P{i}"))),
+                    out.taxonomy
+                        .is_subclass(&class(format!("C{i}")), &Class::nothing()),
+                    out.taxonomy
+                        .is_subclass(&class(format!("D{i}")), &class(format!("H{i}"))),
+                ));
+            }
+            (
+                got,
+                out.stats.dl_work,
+                out.stats.dl_stored,
+                out.stats.dl_over_budget,
+            )
+        };
+        let first = {
+            let out = Classifier::of(&doc.axioms)
+                .classify(&limits(1, true))
+                .unwrap();
+            assert!(out.complete && !out.stats.dl_over_budget);
+            assert!(out.stats.contexts > 2 * saturate::STEP_CONTEXTS);
+            outcome(&out)
+        };
+        for (i, &(p, unsat, h)) in first.0.iter().enumerate() {
+            assert_eq!((p, unsat, h), (true, i % 7 == 0, false), "C{i}");
+        }
+        for threads in [3, 8] {
+            let out = Classifier::of(&doc.axioms)
+                .classify(&limits(threads, true))
+                .unwrap();
+            assert_eq!(outcome(&out), first, "{threads} threads");
+        }
+        let default = Classifier::of(&doc.axioms)
+            .classify(&limits(4, false))
+            .unwrap();
+        assert_eq!(outcome(&default).0, first.0);
+        // a cancellation at its n-th poll, then the same classifier again
+        for threads in [1, 8] {
+            for at in [0, 3, 10, 30, 100, 300] {
+                let mut k = Classifier::of(&doc.axioms);
+                let polls = Arc::new(AtomicUsize::new(0));
+                let p = polls.clone();
+                let stopped = k.classify(&Limits {
+                    partial: true,
+                    cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= at)),
+                    ..limits(threads, true)
+                });
+                match stopped {
+                    Err(Error::Cancelled) => {}
+                    Err(e) => panic!("{threads} threads, poll {at}: {e:?}"),
+                    Ok(out) if out.complete => assert_eq!(outcome(&out), first),
+                    Ok(out) => {
+                        for (i, &(p, unsat, h)) in outcome(&out).0.iter().enumerate() {
+                            assert!(p <= first.0[i].0 && unsat <= first.0[i].1 && !h);
+                        }
+                    }
+                }
+                let out = k.classify(&limits(threads, true)).unwrap();
+                assert_eq!(outcome(&out), first, "{threads} threads after poll {at}");
+            }
         }
     }
 
