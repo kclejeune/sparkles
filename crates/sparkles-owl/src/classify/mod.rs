@@ -482,9 +482,10 @@ pub struct Saturation {
     /// key or a fact of a universal role
     entangled: bool,
     /// whether the interner may hold expressions that are not [`tier_neutral`] of a
-    /// removed axiom or of an added axiom outside OWL 2 EL, which a run that decides
-    /// its tier over the interner would read as present, so a run with axioms outside
-    /// OWL 2 EL starts again
+    /// removed axiom or of an added axiom outside OWL 2 EL, or what a normalization
+    /// outside OWL 2 EL interned that [`TierMark::passed`] finds, which a run that
+    /// decides its tier over the interner would read as present, so a run with axioms
+    /// outside OWL 2 EL starts again
     stale_tier: bool,
     /// whether the last run whose saturation ended found the ontology consistent
     consistent: bool,
@@ -587,6 +588,48 @@ fn tier_neutral(ax: &AxiomKind) -> bool {
             *p != ObjectProperty::top() && *p != ObjectProperty::bottom() && plain(c)
         }
         _ => false,
+    }
+}
+
+/// How far the interner's tables reached at one point of a run, to tell whether what
+/// was interned since holds anything that a run's choice of tier reads.
+struct TierMark {
+    nodes: usize,
+    roles: usize,
+    individuals: usize,
+    vals: usize,
+}
+
+impl TierMark {
+    fn of(it: &Interner) -> TierMark {
+        TierMark {
+            nodes: it.nodes.len(),
+            roles: it.roles.len(),
+            individuals: it.individuals.len(),
+            vals: it.vals.len(),
+        }
+    }
+
+    /// Whether the interner has gained, since the mark, an individual, a data value, a
+    /// data role, the top or bottom object property, or a nominal, self, data or
+    /// at-most-one restriction, which [`dl_norm::eligible`] and
+    /// [`Saturation::disj_allowed`] read.
+    fn passed(&self, it: &Interner) -> bool {
+        it.individuals.len() > self.individuals
+            || it.vals.len() > self.vals
+            || it.roles[self.roles..].iter().any(|r| match r {
+                index::RoleName::Data(_) => true,
+                index::RoleName::Object(p) => {
+                    *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
+                }
+                _ => false,
+            })
+            || it.nodes[self.nodes..].iter().any(|n| {
+                matches!(
+                    n,
+                    Node::Nominal(_) | Node::SelfLoop(_) | Node::DataSome(..) | Node::AtMost1(..)
+                )
+            })
     }
 }
 
@@ -1383,6 +1426,9 @@ impl Saturation {
                 outside_el.add(dl::shape(k));
             }
         }
+        // what the interner holds before the normalizations outside OWL 2 EL, which
+        // intern into it whether or not they take their axioms
+        let mark = TierMark::of(&self.interner);
         // The Horn rules take what they can of these (items 603 and 692).
         let mut taken: FxHashSet<&AxiomKind> = FxHashSet::default();
         let stop = || poll(limits).is_err();
@@ -1450,6 +1496,10 @@ impl Saturation {
             );
         }
         self.interner.ranges.check()?;
+        // A fresh run decides its tier before these normalizations, so what they intern
+        // that the decision reads would keep a later run over this interner from Tier D.
+        // A run whose rules take it starts again anyway, as `entangled` says.
+        self.stale_tier |= mark.passed(&self.interner);
         ax.classes.extend(self.interner.met_classes());
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;

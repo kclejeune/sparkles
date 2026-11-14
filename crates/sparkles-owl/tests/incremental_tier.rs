@@ -141,6 +141,22 @@ fn an_added_self_restriction_in_an_el_run_leaves_tier_d_to_the_disjunction() {
     agree(&out, &held, &limits);
 }
 
+/// A first run whose rules outside OWL 2 EL intern a self restriction and then leave its
+/// disjunction out must not keep Tier D from a disjunction a later change adds, since a
+/// fresh classifier decides the tier before that normalization.
+#[test]
+fn a_self_restriction_interned_outside_el_leaves_tier_d_to_an_added_disjunction() {
+    let base = axioms("SubClassOf(ObjectHasSelf(:r) ObjectUnionOf(:P :Q))");
+    let added = axioms(CASES);
+    let limits = Limits::default();
+    let mut k = Classifier::of(&base);
+    k.classify(&limits).unwrap();
+    k.add(&added);
+    let out = k.classify(&limits).unwrap();
+    let held: Vec<Axiom> = base.iter().chain(&added).cloned().collect();
+    agree(&out, &held, &limits);
+}
+
 /// A run that leaves the disjunction out, since a self restriction that stays keeps Tier D
 /// from it, keeps its state when a plain class axiom is removed, and agrees with a fresh
 /// classifier.
