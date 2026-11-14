@@ -126,9 +126,11 @@ witnesses for a minimum that a minimum of the context entails. With it ore_ont_6
 ore_ont_10140 classify with counting on and give HermiT's and Konclude's taxonomies, 6.3
 and 6.5 times faster than Konclude 0.7.0 on four threads on `atlas` and 2.0 and 2.1 times
 on one. ore_ont_6485 still passes the bound, and its classification with counting
-requested, the failed attempt and the run without counting together, takes 3.1 times as
-long with the order as without it, 576 ms against 184 ms on one thread. The default
-accepts that cost, and item 896 follows that file and the default of counting.
+requested, the failed attempt and the run without counting together, takes 1.28 times as
+long with the order as without it, 157 ms against 123 ms on one thread. It took 3.1
+times as long, 576 ms against 184 ms, before a context gave way to the contexts it woke.
+The default accepts that cost, and item 896 follows that file and the default of
+counting.
 
 Item 897 gives each compound qualifier of a number restriction
 [a name of its own](#compound-qualifiers-of-number-restrictions) in a counting run. Before
@@ -637,7 +639,13 @@ transitive parthood properties are each other's inverses, and the contexts of
 conjunctions composed the parthood chains again until the run passed 10 GiB, with most
 of the memory in waiting messages. With the budget they classified in 4.2 s and 2.4 GB
 on four threads on the laptop, with the EL rules' answer. Item 693's chain selection
-below removed that composition, and both now finish with the Horn rules. On the
+below removed that composition, and both now finish with the Horn rules. The waiting
+messages count toward the budget, so a run near it depends on the schedule.
+ore_ont_16744 of that sample has a budget of 7.57 GB, and its Horn run on four threads on
+`atlas` peaked between 5.6 and 7.4 GB in the 11 of 16 runs that finished, over five
+versions of the classifier, and passed the budget in the other five, which then
+classified by the EL rules alone and reported the file's two Horn axioms as left out.
+All 16 taxonomies are the same bytes. Item 693 follows the file. On the
 benchmark host ore_ont_9663 takes 4.0 s and 1.0 GiB on one thread and 0.89 s and 1.4 GiB
 on eight, and ore_ont_14817 takes 2.2 s and 0.7 GiB and 0.46 s and 1.0 GiB. The EL rules
 alone take 0.77 and 0.68 s on one thread, and Konclude 0.7.0 took 8.9 to 9.7 s and 3.5
@@ -2607,6 +2615,12 @@ equal the reference and 117 leave axioms out and answer only entailed subsumptio
 against 83 and 119 without it, and no run answers a subsumption that the reference does
 not entail.
 
+Both sweeps were repeated after a context [gives way](#the-disjunctive-rules) to the
+contexts it woke. Each of the 205 taxonomies is the same bytes as in the sweep before
+it, with the order and without it, so the same two files finish only with the order and
+the judgments stand. The three files that pass the bound take 232 against 208 ms, 6.9
+against 6.5 s and 3.8 against 3.7 s for the whole run with the order and without it.
+
 The order is on by default for a run that counts because of these measurements. Two more
 files of the sample finish with it and none that finishes without it stops finishing. Of
 the 296 generated ontologies below, 270 finish with the order and 255 without it on one
@@ -2622,8 +2636,15 @@ ontologies then finished only with the order, and none finished only without it.
 
 ore_ont_6485 remains a measured limitation. Its counting attempt still passes the bound
 with the order, and the failed attempt is dearer. The classification with counting
-requested, which is the attempt and the run without counting together, takes 576 against
-184 ms on one thread on `atlas`, 3.1 times as long, and 688 against 245 ms on four. A
+requested, which is the attempt and the run without counting together, takes 157 against
+123 ms on one thread on `atlas`, 1.28 times as long, and 205 against 170 ms on four, 1.21
+times, as medians of three interleaved rounds of five classifications. Before a context
+gave way to the contexts it woke, it took 576 against 184 ms on one thread, 3.1 times as
+long, and 688 against 245 ms on four, and the counts of derivations in the rest of this
+paragraph are of that run. With a context that gives way, the attempt on one thread
+spends its 262,144 conclusions differently. The Pred rule and the lazy witnesses make
+60,038 and 45,432 of them, which are cheap, and the universal rule and the qualified
+roles make 50,841 and 9,688. A
 caller for whom that attempt matters sets `Limits::number_order` to false. The order removes the cheap
 derivations of the disjointness rule, which fall from 110,800 to 1,078, and the bound is
 then spent on the universal rule and the qualified roles, which rise from 30,563 and
@@ -2719,12 +2740,15 @@ answer at the raised bound of its test. `shiq-013` derives 15,468 against 62,548
 item 729 follows `shiq-038`. Its trace shows the cost in the at-most rule, which makes
 493,787 of the conclusions, with 182,774 from paramodulation, spread over six contexts
 that each derive more than 50,000. The same work appears on four threads, so the order
-in which the contexts run does not cause it. On the ORE 2015 DL development set no change
-was observed.
-Its 205 files that give a taxonomy with counting on four threads on `atlas` give the same
-bytes as before, the two versions of the Protein Ontology classify in 375 and 382 ms
-against 380 and 371 ms in one run each, which is not a benchmark, and ore_ont_6485,
-ore_ont_14817 and ore_ont_9663 pass the bound as before.
+in which the contexts run does not cause it. On the ORE 2015 DL development set no
+taxonomy changes. Its 205 files that give a taxonomy with counting on four threads on
+`atlas` give the same bytes as before the names, with the names alone and with a context
+that gives way, and ore_ont_6485, ore_ont_14817 and ore_ont_9663 pass the bound as
+before. With the names alone the two versions of the Protein Ontology classified in 375
+and 382 ms against 380 and 371 ms in one run each, which is not a benchmark. With a
+context that gives way they classify in 363 and 373 ms against 379 and 383 ms with the
+names alone, and ore_ont_6485's classification with its failed attempt takes 210 against
+715 ms, as medians of three interleaved rounds of five classifications on four threads.
 
 The regressions are in `tests/dl_tier_d.rs` and `tests/dl_nominals.rs`. They cover a
 maximum over an intersection, over an existential restriction on a simple, an inverse and

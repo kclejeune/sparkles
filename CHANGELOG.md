@@ -53,7 +53,11 @@ successors under a maximum otherwise finished that work before a successor witho
 could close it. A generated ontology of item 897 derives 29,625 conclusions on one thread
 where it derived 2,122,545, and seven of 750 generated ontologies come within the default
 bound of the counting run on one thread, with none leaving it. The fixture `shq-041`
-finishes without the order between number restrictions, where it passed any bound.
+finishes without the order between number restrictions, where it passed any bound. The
+ORE 2015 DL development set keeps its taxonomies with and without the order, and the
+failed counting attempt of ore_ont_6485 is cheaper. Its classification with counting
+requested takes 157 ms on one thread with the order against 123 ms without it, 1.28
+times as long, where it took 576 against 184 ms.
 
 `Limits::dl_steps`, off by default, makes every saturation of the disjunctive rules
 proceed in steps, and `el_classify` takes `--dl-steps`. A step activates the waiting

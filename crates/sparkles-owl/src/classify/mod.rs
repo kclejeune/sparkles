@@ -225,8 +225,8 @@ pub struct Limits {
     /// Ontology, where the run without it passes [`dl_work`](Limits::dl_work). A run
     /// that passes the bound either way can spend longer before it does: the
     /// classification of ore_ont_6485 of the ORE 2015 DL sample with counting, the
-    /// attempt and the run without counting together, takes 576 ms with the order and
-    /// 184 ms without it on one thread. False turns the order off.
+    /// attempt and the run without counting together, takes 157 ms with the order and
+    /// 123 ms without it on one thread. False turns the order off.
     pub number_order: bool,
     /// Makes every saturation of Tier D proceed in steps, so that the run derives the
     /// same conclusions, passes or keeps its bound on them, and so answers in full or
