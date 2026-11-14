@@ -324,8 +324,8 @@ pub(super) fn run_count(
 /// predicates on the first call and hands them out from there, and a variable subject
 /// reads the table's pairs a block of subjects at a time. The eager executor reads every
 /// row in one call, and the cursor a batch at a time. `account` sets the charge of the
-/// reader's decoded storage: to what it may decode before a call, and to what it holds
-/// after.
+/// reader's decoded storage, which the reader charges as it grows and before it decodes
+/// a block, and to 0 once it has read every row.
 pub(super) fn fill_scan(
     ctx: &Ctx,
     spec: &PatternScanSpec,
@@ -368,16 +368,14 @@ pub(super) fn fill_scan(
         out.push_row(&row);
         Ok(())
     };
-    account(reader.heap_bytes().saturating_add(reader.next_bytes(table)))?;
     match spec.s {
         PathEnd::Const(s) => {
-            reader.fill_subject(table, &u.corr, s.0, want, &mut push)?;
+            reader.fill_subject(table, &u.corr, s.0, want, account, &mut push)?;
         }
         PathEnd::Var(_) => {
-            reader.fill(table, &u.corr, want, &|| ctx.check(), &mut push)?;
+            reader.fill(table, &u.corr, want, &|| ctx.check(), account, &mut push)?;
         }
     }
-    account(reader.heap_bytes())?;
     // the rows since the last power of two
     ctx.check_output(out.len(), out.width())?;
     Ok(reader.done())

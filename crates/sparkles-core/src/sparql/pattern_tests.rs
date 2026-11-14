@@ -889,3 +889,60 @@ fn pattern_scan_cursors_charge_their_decoded_block() {
     );
     while cur.next_batch().unwrap().is_some() {}
 }
+
+/// An eager pattern scan charges the patterns its reader keeps decoded while it reads,
+/// although it drops them once it has read every pair (review round 2).
+#[test]
+fn eager_pattern_scans_charge_their_kept_patterns() {
+    let peak = |distinct: bool| {
+        let s = Store::in_memory(StoreOptions::default());
+        let data: String = (0..6000)
+            .map(|i| {
+                let p = if distinct { i } else { 0 };
+                format!("<urn:s{i}> <urn:p{p}> 1 .\n")
+            })
+            .collect();
+        load(&s, &data, RdfFormat::Turtle);
+        let text = format!("{SPK}SELECT ?s ?p WHERE {{ ?s spk:hasPredicate ?p }}");
+        let r = query(s.snapshot(), &text, &opts(Optimizations::ALL)).unwrap();
+        assert!(has_op(r.plan(), "PatternScan"));
+        assert_eq!(r.len(), 6000);
+        r.mem_peak_bytes
+    };
+    let (one, many) = (peak(false), peak(true));
+    // the reader keeps the first KEPT_PATTERNS patterns, each a slot of 24 bytes and a
+    // list of its predicates, where one pattern keeps one
+    assert!(
+        many >= one + 4096 * 24,
+        "one pattern peaked at {one} bytes and 6,000 at {many}"
+    );
+}
+
+/// A constant subject's scan charges its predicate list once and decodes no block of
+/// subjects, so its pulls charge no block (review round 2).
+#[test]
+fn constant_subject_pulls_charge_no_subject_block() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data: String = (0..3000)
+        .map(|i| format!("<urn:s> <urn:p{i}> 1 .\n"))
+        .collect();
+    load(&s, &data, RdfFormat::Turtle);
+    let text = format!("{SPK}SELECT ?p WHERE {{ <urn:s> spk:hasPredicate ?p }}");
+    let c = crate::sparql::cursor::CursorOptions {
+        batch_rows: 1,
+        ..Default::default()
+    };
+    let mut cur =
+        crate::sparql::select_cursor(s.snapshot(), &text, &opts(Optimizations::ALL), &c).unwrap();
+    let before = cur.stats().mem_peak_bytes;
+    let mut n = 0;
+    while let Some(b) = cur.next_batch().unwrap() {
+        n += b.len();
+    }
+    assert_eq!(n, 3000);
+    // The list of 3,000 predicates, with the reader's allowance for growth, and a
+    // batch raised the peak by 41,336 bytes, and by 49,316 when every pull charged a
+    // block of subjects as well.
+    let grown = cur.stats().mem_peak_bytes - before;
+    assert!(grown < 45_000, "the pulls raised the peak by {grown} bytes");
+}

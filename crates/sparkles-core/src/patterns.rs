@@ -1321,6 +1321,8 @@ pub struct PairCursor {
     kept_bytes: u64,
     /// Whether [`PairCursor::fill_subject`] has read its subject's predicates.
     subject_read: bool,
+    /// The bytes the reader's caller last charged for its storage.
+    charged: u64,
     done: bool,
 }
 
@@ -1338,12 +1340,6 @@ impl PairCursor {
         self.done
     }
 
-    /// Mark every pair read, for a reader whose caller read them another way.
-    pub fn finish(&mut self) {
-        self.done = true;
-        self.release();
-    }
-
     /// The bytes the reader's decoded storage holds: the predicate flags of the
     /// patterns, a block of subjects, the predicates of the current subject and the
     /// patterns it keeps.
@@ -1356,37 +1352,47 @@ impl PairCursor {
             .saturating_add(self.kept_bytes)
     }
 
-    /// What the next [`PairCursor::fill`] of `t` may decode before it returns, besides
-    /// the patterns it reads: the predicate flags of every pattern on the first call
-    /// with one predicate, and a block of subjects. A caller charges it first.
-    pub fn next_bytes(&self, t: TableRef<'_>) -> u64 {
-        let holds = match (self.only, &self.holds) {
-            (Some(_), None) => t.patterns() as u64,
-            _ => 0,
-        };
-        let block = (BLOCK_SUBJECTS as u64 * 16).saturating_sub(self.rows.capacity() as u64 * 16);
-        holds.saturating_add(block)
+    /// Charge through `account` what the reader holds and `more` that it is about to
+    /// decode, when that passes what it charged last, with up to a quarter more (at
+    /// most 16 KiB) for the growth that follows, so that a reader that keeps many
+    /// small patterns charges a few times rather than once for each.
+    fn charge(&mut self, more: u64, account: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        let need = self.heap_bytes().saturating_add(more);
+        if need > self.charged {
+            let to = need.saturating_add((need / 4).min(16 << 10));
+            account(to)?;
+            self.charged = to;
+        }
+        Ok(())
     }
 
-    /// Drop the decoded storage once every pair is read.
-    fn release(&mut self) {
+    /// Mark every pair read, drop the decoded storage and its charge.
+    fn finish(&mut self, account: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        self.done = true;
         self.holds = None;
         self.rows = Vec::new();
         self.pending = Vec::new();
         self.pending_at = 0;
         self.kept = Vec::new();
         self.kept_bytes = 0;
+        if self.charged > 0 {
+            self.charged = 0;
+            account(0)?;
+        }
+        Ok(())
     }
 
     /// Hand at most `max` further predicates of subject `s` to `f`, from table `t`
     /// corrected by `corr`, and return how many it handed. The first call reads the
     /// subject's predicates, and later calls go on from where the last one stopped.
+    /// `account` sets the charge of the reader's storage, as for [`PairCursor::fill`].
     pub fn fill_subject(
         &mut self,
         t: TableRef<'_>,
         corr: &Correction,
         s: u64,
         max: usize,
+        account: &mut dyn FnMut(u64) -> Result<()>,
         f: &mut dyn FnMut(u64, u64) -> Result<()>,
     ) -> Result<usize> {
         if self.done {
@@ -1397,6 +1403,7 @@ impl PairCursor {
             self.subject = s;
             self.pending_at = 0;
             self.subject_read = true;
+            self.charge(0, account)?;
         }
         let mut n = 0;
         while n < max && self.pending_at < self.pending.len() {
@@ -1408,26 +1415,31 @@ impl PairCursor {
             }
         }
         if self.pending_at == self.pending.len() {
-            self.finish();
+            self.finish(account)?;
         }
         Ok(n)
     }
 
     /// Hand at most `max` further pairs to `f`, and return how many it handed. Fewer
     /// than `max` means the table has no more, and [`PairCursor::done`] then holds.
-    /// `t` and `corr` must be those of every earlier call.
+    /// `t` and `corr` must be those of every earlier call. `account` sets the charge of
+    /// the reader's decoded storage ([`PairCursor::heap_bytes`]): before it decodes the
+    /// predicate flags or a block of subjects, after it decodes a pattern, and to 0
+    /// once it has read every pair and dropped its storage.
     pub fn fill(
         &mut self,
         t: TableRef<'_>,
         corr: &Correction,
         max: usize,
         check: &dyn Fn() -> Result<()>,
+        account: &mut dyn FnMut(u64) -> Result<()>,
         f: &mut dyn FnMut(u64, u64) -> Result<()>,
     ) -> Result<usize> {
         if self.done {
             return Ok(0);
         }
         if let (Some(p), None) = (self.only, &self.holds) {
+            self.charge(t.patterns(), account)?;
             let mut holds = vec![false; t.patterns() as usize];
             let mut buf = Vec::new();
             for (pid, x) in holds.iter_mut().enumerate() {
@@ -1459,6 +1471,9 @@ impl PairCursor {
             if self.row == self.rows.len() {
                 if self.block < t.t.blocks {
                     check()?;
+                    let block = (BLOCK_SUBJECTS as u64 * 16)
+                        .saturating_sub(self.rows.capacity() as u64 * 16);
+                    self.charge(block, account)?;
                     t.block(self.block, &mut self.rows)?;
                     self.block += 1;
                     self.row = 0;
@@ -1469,11 +1484,9 @@ impl PairCursor {
                     Some(x) => {
                         self.touched += 1;
                         self.take(x.subject, &x.now);
+                        self.charge(0, account)?;
                     }
-                    None => {
-                        self.done = true;
-                        self.release();
-                    }
+                    None => self.finish(account)?,
                 }
                 continue;
             }
@@ -1485,6 +1498,7 @@ impl PairCursor {
                     self.row += 1;
                 }
                 self.take(x.subject, &x.now);
+                self.charge(0, account)?;
                 continue;
             }
             self.row += 1;
@@ -1514,12 +1528,14 @@ impl PairCursor {
                             self.kept_bytes =
                                 self.kept_bytes.saturating_add(v.capacity() as u64 * 8);
                             self.kept[i] = Some(v);
+                            self.charge(0, account)?;
                         }
                         self.kept[i].as_deref().unwrap_or_default()
                     } else {
                         t.pattern(pid, &mut self.pending)?;
                         self.subject = s;
                         self.pending_at = 0;
+                        self.charge(0, account)?;
                         continue;
                     };
                     let room = (max - n).min(preds.len());
@@ -1532,6 +1548,7 @@ impl PairCursor {
                         self.pending.clear();
                         self.pending.extend_from_slice(&preds[room..]);
                         self.pending_at = 0;
+                        self.charge(0, account)?;
                     }
                 }
             }
@@ -1956,10 +1973,17 @@ mod tests {
         let mut pairs = Vec::new();
         let mut reader = PairCursor::new(Some(30));
         reader
-            .fill(n, &corr, usize::MAX, &|| Ok(()), &mut |s, p| {
-                pairs.push((s, p));
-                Ok(())
-            })
+            .fill(
+                n,
+                &corr,
+                usize::MAX,
+                &|| Ok(()),
+                &mut |_| Ok(()),
+                &mut |s, p| {
+                    pairs.push((s, p));
+                    Ok(())
+                },
+            )
             .unwrap();
         assert!(reader.done());
         assert_eq!(pairs.len(), 1000);
@@ -1993,10 +2017,17 @@ mod tests {
         let mut whole = Vec::new();
         let mut reader = PairCursor::new(None);
         reader
-            .fill(t, &corr, usize::MAX, &|| Ok(()), &mut |s, p| {
-                whole.push((s, p));
-                Ok(())
-            })
+            .fill(
+                t,
+                &corr,
+                usize::MAX,
+                &|| Ok(()),
+                &mut |_| Ok(()),
+                &mut |s, p| {
+                    whole.push((s, p));
+                    Ok(())
+                },
+            )
             .unwrap();
         assert_eq!(&whole[..5], &[(1, 10), (1, 40), (6, 20), (6, 30), (6, 40)]);
         assert_eq!(whole.last(), Some(&(9500, 10)));
@@ -2007,7 +2038,7 @@ mod tests {
             let mut calls = 0;
             while !reader.done() {
                 let got = reader
-                    .fill(t, &corr, step, &|| Ok(()), &mut |s, p| {
+                    .fill(t, &corr, step, &|| Ok(()), &mut |_| Ok(()), &mut |s, p| {
                         parts.push((s, p));
                         Ok(())
                     })
@@ -2022,7 +2053,7 @@ mod tests {
         let mut reader = PairCursor::new(Some(20));
         while !reader.done() {
             reader
-                .fill(t, &corr, 3, &|| Ok(()), &mut |s, p| {
+                .fill(t, &corr, 3, &|| Ok(()), &mut |_| Ok(()), &mut |s, p| {
                     twenty.push((s, p));
                     Ok(())
                 })
@@ -2043,14 +2074,21 @@ mod tests {
         for only in [None, Some(12)] {
             let mut calls = 0;
             let mut reader = PairCursor::new(only);
-            let got = reader.fill(t, &corr, usize::MAX, &|| Ok(()), &mut |_, _| {
-                calls += 1;
-                if calls == 3 {
-                    Err(crate::error::Error::Cancelled)
-                } else {
-                    Ok(())
-                }
-            });
+            let got = reader.fill(
+                t,
+                &corr,
+                usize::MAX,
+                &|| Ok(()),
+                &mut |_| Ok(()),
+                &mut |_, _| {
+                    calls += 1;
+                    if calls == 3 {
+                        Err(crate::error::Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
             assert!(
                 matches!(got, Err(crate::error::Error::Cancelled)),
                 "{only:?}"
@@ -2062,7 +2100,7 @@ mod tests {
         let mut seen = Vec::new();
         assert_eq!(
             reader
-                .fill_subject(t, &corr, 5, 1, &mut |s, p| {
+                .fill_subject(t, &corr, 5, 1, &mut |_| Ok(()), &mut |s, p| {
                     seen.push((s, p));
                     Ok(())
                 })
