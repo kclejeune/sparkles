@@ -710,18 +710,22 @@ for its allowances and the editors.
   with DL-safe SWRL rules, and a vocabulary bundle as disjointness axioms over its
   concepts and relation entities. Sparkles reads that OWL form from files or from a
   dataset that holds each ontology in the named graph of its IRI, and follows the imports
-  between those graphs. On openCAESAR's Kepler16b sample, the classifier's taxonomy and
-  the named types of its individuals equal HermiT's, and the classifier finds the
+  between those graphs. On openCAESAR's Kepler16b sample, the classifier's taxonomy
+  equals HermiT's, its named types of individuals equal HermiT's apart from types it
+  gives the SWRL rules' variables, and the classifier finds the
   inconsistencies that the bundle's disjointness, keys, functional properties, universal
   restrictions and property characteristics raise
   ([F24](../specs/F24-owl-classification/SPEC.md#oml-and-opencaesar-models)).
 * `sparkles serve --fuseki-config` starts from an openCAESAR project's `.fuseki.ttl`,
   with its in-memory dataset, union default graph, query timeout and SHACL endpoint. It
   answers the requests that openCAESAR's `owl-load`, `owl-query` and `owl-shacl` send,
-  which are a Graph Store `PUT` of each ontology into the graph of its IRI, the
-  project's queries on the `sparql` service and shapes posted to `shacl?graph=default`.
-* The Jena rules file that the adapter writes with `generateRules` materializes with
-  `sparkles infer --rules` and derives the facts that Jena's rule engine derives.
+  which are a Graph Store `PUT` of each ontology and of each entailment ontology into
+  the graph of its IRI, the project's queries on the `sparql` service and shapes posted
+  to `shacl?graph=default`. The queries then read the entailments that `owl-reason`
+  wrote, not Sparkles' own reasoning.
+* A Jena rules file in the form that the adapter writes with `generateRules`
+  materializes with `sparkles infer --rules` and derives the facts that Jena's rule
+  engine derives.
 * The SWRL rules are not read, so a reified relation's forward property and the facts of
   an OML rule are not derived, and the OWL RL materialization answers a query that needs
   them with fewer rows. Rule-derived inconsistencies, enumerations beside keys, OWL 2 DL
@@ -891,10 +895,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The ontology readers map SWRL rules in RDF to assertions about anonymous individuals,
   and their variables to named individuals. Roadmap item 970. DL-safe SWRL rules do not
   run in materialization, query-time reasoning or the classifier. Roadmap item 971.
-* A rooted run refuses keys over data properties and functional data properties, which
-  every OML model has. Roadmap item 972. The classifier leaves out the literals and
-  ranges of datatypes outside OWL 2 EL, such as `xsd:double` and `xsd:boolean`, and data
-  cardinalities over `owl:rational`. Roadmap item 973.
+* A rooted run refuses keys over data properties, which OML vocabularies declare for
+  their identifiers, as the Kepler16b sample and its metrology library do. Roadmap item
+  972. The classifier leaves out the literals and ranges of datatypes outside OWL 2 EL,
+  such as `xsd:double` and `xsd:boolean`. Roadmap item 973. Functional data properties
+  and data cardinalities in the disjunctive and rooted rules are roadmap item 768.
 * A lenient read maps no axiom for an `owl:AllDisjointClasses` with an undeclared member
   and reports no warning. Roadmap item 974. The `all-disjoint-classes` check of
   `sparkles infer --check` passes its intermediate-row limit on a 55-member list with a

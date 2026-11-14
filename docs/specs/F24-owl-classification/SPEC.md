@@ -3626,7 +3626,7 @@ table of correspondences, so the axiom-level mapping was read from the public so
 openCAESAR's `oml2owl` adapter and its `owl-reason`, `owl-load`, `owl-query` and
 `owl-shacl` tools, which are Apache-2.0.
 
-**The mapping.** Each OML ontology becomes an OWL ontology with `owl:imports` for its
+In that mapping, each OML ontology becomes an OWL ontology with `owl:imports` for its
 imports. Concepts, aspects and relation entities become classes, with `SubClassOf`,
 `EquivalentClasses`, `HasKey` and an `ObjectOneOf` equivalence for an enumeration, and
 property restrictions become universal, existential, value, self and qualified
@@ -3648,21 +3648,26 @@ into the named graph of its IRI with Graph Store `PUT`, into a Fuseki dataset wh
 default graph is the union of its named graphs, and `owl-query` and `owl-shacl` post
 queries and shapes to it.
 
-**The run.** The survey translated the Kepler16b sample and its metrology library by a
+The survey translated the Kepler16b sample and its metrology library by a
 re-implementation of this mapping, since the sample's Gradle build was not run, and
-compared Sparkles with HermiT 1.4.5.519 running `owl-reason`'s checks in place
-of Openllet, with Jena 6.2.0's rule engine on the adapter's Jena rules file, and with
-Jena's `arq` on the sample's five queries. The closure is 17 ontologies and 2,998
+wrote the Jena rules file in the adapter's form the same way. It compared Sparkles with
+HermiT 1.4.5.519 running `owl-reason`'s checks in place of Openllet, with Jena 6.2.0's
+rule engine on that rules file, and with Jena's `arq` on the sample's five queries over
+the asserted data and HermiT's entailments. The closure is 17 ontologies and 2,998
 triples, with 644 logical axioms, 42 SWRL rules, two keys and seven `DisjointClasses`
-axioms. The classifier's taxonomy and its named types equal HermiT's, with or without
+axioms. The classifier's taxonomy equals HermiT's 102 subclass pairs with or without
 counting and the rooted option, and both find the sample consistent with no unsatisfiable
-class. OWL RL materialization gives the same named types and 125 of the 159 object
-property values, missing only those that follow from SWRL rules. Four of the five queries
+class. `ontology reason` gives HermiT's 307 named types of named individuals and 21 more,
+the `swrl:Variable` types of the rule variables that the RDF reader takes for
+individuals. OWL RL materialization gives the same 307 types, an `rdfs:Resource` type for
+each of the 84 individuals, and 125 of HermiT's 159 object property values, missing only
+those that follow from SWRL rules. Four of the five queries
 equal the reference under OWL RL, materialized or on demand, and the `connections` query
 needs the rules. Sparkles' Jena rule engine derives exactly Jena's 337 facts from the
-adapter's rules file. `sparkles serve --fuseki-config` starts from the sample's own
-`.fuseki.ttl`, and the Graph Store loads, the five queries and the SHACL endpoint answer
-as openCAESAR's tools expect.
+rules file. `sparkles serve --fuseki-config` starts from the sample's own `.fuseki.ttl`.
+With the requests that `owl-load`, `owl-query` and `owl-shacl` send, made with `curl`, it
+stores the ontologies and HermiT's entailment graphs, answers the five queries as the
+reference does over them and answers the SHACL request.
 
 Thirteen probes each added one violation to the sample. The classifier agrees with
 HermiT on the eight that need disjointness from the closure, keys, asymmetry, universal
@@ -3670,8 +3675,9 @@ restrictions, the closure's differences, functional properties and a functional 
 property. It misses a reflexive fact that a SWRL rule derives, an individual of an
 enumeration that differs from its members, two values of a functional `xsd:double`
 property and a string in an `xsd:boolean` range, and it has no closed-world cardinality
-check. The rooted run creates no contexts on OML models, because it refuses keys and
-functional data properties. Items 970 to 978 record these gaps, the SWRL reader, the
+check. The rooted run creates no contexts on the sample, because it refuses keys and
+functional data properties, and the sample's base vocabulary and the metrology library
+declare both. Items 970 to 978 record these gaps, the SWRL reader, the
 lenient read that drops an `AllDisjointClasses` axiom with an undeclared member, the
 `all-disjoint-classes` check that passes its row limit on the sample, owl-reason's
 entailment outputs and an OML importer.
