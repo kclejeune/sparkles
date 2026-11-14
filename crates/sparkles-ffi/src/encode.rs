@@ -392,12 +392,18 @@ impl<'a> Reader<'a> {
         Ok(b)
     }
 
+    /// A length or a position, which must fit the address space.
+    fn index(&mut self) -> Result<usize, Malformed> {
+        usize::try_from(self.len()?).map_err(|_| bad("length too long"))
+    }
+
     fn len(&mut self) -> Result<u64, Malformed> {
         let mut n: u64 = 0;
         let mut shift = 0;
         loop {
             let b = self.byte()?;
-            if shift >= 64 {
+            // a tenth byte holds the one bit left of 64, and there is no eleventh
+            if shift >= 64 || (shift == 63 && b & 0x7f > 1) {
                 return Err(bad("length too long"));
             }
             n |= u64::from(b & 0x7f) << shift;
@@ -409,7 +415,7 @@ impl<'a> Reader<'a> {
     }
 
     pub fn string(&mut self) -> Result<&'a str, Malformed> {
-        let n = self.len()? as usize;
+        let n = self.index()?;
         let end = self
             .pos
             .checked_add(n)
@@ -428,7 +434,7 @@ impl<'a> Reader<'a> {
             DEFAULT_GRAPH => Item::DefaultGraph,
             UNION_GRAPH => Item::UnionGraph,
             REPEAT => {
-                let i = self.len()? as usize;
+                let i = self.index()?;
                 let at = *self
                     .seen
                     .get(i)
@@ -457,7 +463,7 @@ impl<'a> Reader<'a> {
             DEFAULT_GRAPH => Indexed::DefaultGraph,
             UNION_GRAPH => Indexed::UnionGraph,
             REPEAT => {
-                let i = self.len()? as usize;
+                let i = self.index()?;
                 if i >= self.seen.len() {
                     return Err(bad(format!("repeat of term {i}, which is not there")));
                 }
@@ -545,6 +551,29 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A length takes at most ten bytes, and the tenth holds one bit. A longer or larger
+    /// one is refused and not cut down to 64 bits.
+    #[test]
+    fn a_length_that_overflows_is_refused() {
+        let read = |bytes: &[u8]| Reader::new(bytes, &|_| None).len();
+        assert_eq!(read(&[0x05]).unwrap(), 5);
+        assert_eq!(read(&[0x80, 0x01]).unwrap(), 128);
+        let mut max = vec![0xff; 9];
+        max.push(0x01);
+        assert_eq!(read(&max).unwrap(), u64::MAX);
+        let mut over = vec![0x80; 9];
+        over.push(0x02);
+        assert!(read(&over).is_err());
+        let mut eleven = vec![0x80; 10];
+        eleven.push(0x01);
+        assert!(read(&eleven).is_err());
+        // a string whose length overflows is refused as well
+        let mut text = vec![STRING];
+        text.extend(&over);
+        text.push(b'x');
+        assert!(Reader::new(&text, &|_| None).item().is_err());
+    }
 
     fn every_kind() -> Vec<Term> {
         let mut terms: Vec<Term> = vec![

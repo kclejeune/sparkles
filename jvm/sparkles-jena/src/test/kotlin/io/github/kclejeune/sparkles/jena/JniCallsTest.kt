@@ -144,6 +144,35 @@ class JniCallsTest {
         assertThrows(SparklesInvalidException::class.java) { dsg.containsAll(emptyList()) }
     }
 
+    /**
+     * A null array reaches an entry point only through reflection, since the Kotlin
+     * callers take a `ByteArray`. The entry point refuses it with the exception of a
+     * malformed request, and the JVM goes on.
+     */
+    @Test
+    fun a_null_array_is_refused_by_the_jni_calls() {
+        val dsg = filled(1)
+        assumeTrue(SparklesJni.CONTAINS)
+        val jni = Class.forName("io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni")
+        for (name in listOf("containsAllHead", "containsHead")) {
+            val method = jni.getDeclaredMethod(name, Long::class.javaPrimitiveType, ByteArray::class.java)
+            method.isAccessible = true
+            // the array is read before the handle, so no handle is needed to be refused
+            val thrown = assertThrows(java.lang.reflect.InvocationTargetException::class.java) {
+                method.invoke(null, 0L, null)
+            }
+            val failure = thrown.targetException
+            assertEquals("SparklesJniFailure", failure.javaClass.simpleName, name)
+            val toException = failure.javaClass.getDeclaredMethod("toException")
+            toException.isAccessible = true
+            val e = toException.invoke(failure) as FfiException.Engine
+            assertEquals(ErrorKind.MALFORMED, e.kind, name)
+        }
+        // the dataset answers afterwards
+        assertTrue(dsg.contains(Quad.defaultGraphIRI, iri("s0"), iri("p0"), NodeFactory.createLiteralString("v0")))
+        assertEquals(listOf(true), dsg.containsAll(listOf(Quad.create(iri("g"), iri("s0"), iri("p0"), NodeFactory.createLiteralString("v0")))).toList())
+    }
+
     @Test
     fun errors_and_panics_become_the_exceptions_uniffi_throws() {
         filled(1)

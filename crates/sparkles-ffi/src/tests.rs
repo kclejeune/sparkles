@@ -411,6 +411,20 @@ fn contains_all_answers_each_pattern_as_contains_does() {
         ds.contains_all(vec![crate::encode::REPEAT, 0, NONE, NONE, NONE])
             .is_err()
     );
+    // A repeat whose position is 2^64, written in ten bytes, names no term. It must not
+    // be read as position 0 with the upper bits dropped.
+    let mut overlong = Vec::new();
+    quad_items(&mut overlong, None, &s0, &p, &lit);
+    let first = overlong.len();
+    overlong.push(DEFAULT_GRAPH);
+    overlong.push(crate::encode::REPEAT);
+    overlong.extend([0x80; 9]);
+    overlong.push(0x02);
+    overlong.extend([crate::encode::REPEAT, 1, crate::encode::REPEAT, 2]);
+    assert!(ds.contains_all(overlong.clone()).is_err());
+    // the same batch with the position written in one byte is two probes
+    overlong.splice(first + 2..first + 12, [0]);
+    assert_eq!(ds.contains_all(overlong).unwrap(), vec![0, 0]);
 }
 
 #[test]

@@ -70,15 +70,27 @@ unsafe fn free<T: HandleAlloc<UniFfiTag>>(handle: jlong) {
     }
 }
 
-/// The bytes of a Java `byte[]`, copied.
-unsafe fn read_bytes(env: Env, array: jbyteArray) -> Vec<u8> {
+/// The bytes of a Java `byte[]`, copied. A null array is refused, since JNI does not
+/// define reading one, and so is a copy that left an exception pending, which then
+/// reaches Java in place of this error. An entry point reads its arrays before it
+/// borrows the object behind a handle.
+unsafe fn read_bytes(env: Env, array: jbyteArray) -> FfiResult<Vec<u8>> {
+    if array.is_null() {
+        return Err(FfiError::new(ErrorKind::Malformed, "a null byte array"));
+    }
     unsafe {
         let f = jni(env);
         let n = (f.GetArrayLength)(env, array).max(0) as usize;
         let mut v = Vec::<u8>::with_capacity(n);
         (f.GetByteArrayRegion)(env, array, 0, n as jsize, v.as_mut_ptr() as *mut jbyte);
+        if (f.ExceptionCheck)(env) {
+            return Err(FfiError::new(
+                ErrorKind::Malformed,
+                "a byte array could not be read",
+            ));
+        }
         v.set_len(n);
-        v
+        Ok(v)
     }
 }
 
@@ -218,8 +230,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     pattern: jbyteArray,
 ) -> jboolean {
     call(env, false, || {
+        let pattern = unsafe { read_bytes(env, pattern) }?;
         let ds = unsafe { borrow::<FfiDataset>(dataset) };
-        ds.contains(unsafe { read_bytes(env, pattern) })
+        ds.contains(pattern)
     })
 }
 
@@ -231,8 +244,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     pattern: jbyteArray,
 ) -> jboolean {
     call(env, false, || {
+        let pattern = unsafe { read_bytes(env, pattern) }?;
         let t = unsafe { borrow::<FfiReadTxn>(txn) };
-        t.contains(unsafe { read_bytes(env, pattern) })
+        t.contains(pattern)
     })
 }
 
@@ -245,8 +259,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     patterns: jbyteArray,
 ) -> jbyteArray {
     call(env, null_mut(), || {
+        let patterns = unsafe { read_bytes(env, patterns) }?;
         let ds = unsafe { borrow::<FfiDataset>(dataset) };
-        let found = ds.contains_all(unsafe { read_bytes(env, patterns) })?;
+        let found = ds.contains_all(patterns)?;
         Ok(unsafe { new_bytes(env, &found) })
     })
 }
@@ -260,8 +275,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     patterns: jbyteArray,
 ) -> jbyteArray {
     call(env, null_mut(), || {
+        let patterns = unsafe { read_bytes(env, patterns) }?;
         let t = unsafe { borrow::<FfiReadTxn>(txn) };
-        let found = t.contains_all(unsafe { read_bytes(env, patterns) })?;
+        let found = t.contains_all(patterns)?;
         Ok(unsafe { new_bytes(env, &found) })
     })
 }
@@ -290,11 +306,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     out: jlongArray,
 ) -> jbyteArray {
     call(env, null_mut(), || {
+        let pattern = unsafe { read_bytes(env, pattern) }?;
         let ds = unsafe { borrow::<FfiDataset>(dataset) };
-        let r = ds.find(
-            unsafe { read_bytes(env, pattern) },
-            first_rows.max(0) as u32,
-        )?;
+        let r = ds.find(pattern, first_rows.max(0) as u32)?;
         Ok(unsafe { find_result(env, r, out) })
     })
 }
@@ -309,11 +323,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     out: jlongArray,
 ) -> jbyteArray {
     call(env, null_mut(), || {
+        let pattern = unsafe { read_bytes(env, pattern) }?;
         let t = unsafe { borrow::<FfiReadTxn>(txn) };
-        let r = t.find(
-            unsafe { read_bytes(env, pattern) },
-            first_rows.max(0) as u32,
-        )?;
+        let r = t.find(pattern, first_rows.max(0) as u32)?;
         Ok(unsafe { find_result(env, r, out) })
     })
 }
@@ -349,9 +361,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     options: jbyteArray,
 ) -> jlong {
     call(env, 0, || {
+        let text = utf8(unsafe { read_bytes(env, text) }?)?;
+        let opts = query_opts(&unsafe { read_bytes(env, options) }?)?;
         let ds = unsafe { borrow::<FfiDataset>(dataset) };
-        let text = utf8(unsafe { read_bytes(env, text) })?;
-        let opts = query_opts(&unsafe { read_bytes(env, options) })?;
         Ok(handle(ds.prepare_query(text, opts)?))
     })
 }
@@ -365,9 +377,9 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     options: jbyteArray,
 ) -> jlong {
     call(env, 0, || {
+        let text = utf8(unsafe { read_bytes(env, text) }?)?;
+        let opts = query_opts(&unsafe { read_bytes(env, options) }?)?;
         let t = unsafe { borrow::<FfiReadTxn>(txn) };
-        let text = utf8(unsafe { read_bytes(env, text) })?;
-        let opts = query_opts(&unsafe { read_bytes(env, options) })?;
         Ok(handle(t.prepare_query(text, opts)?))
     })
 }
