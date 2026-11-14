@@ -1,5 +1,5 @@
 //! Differential tests of rule-body planning from sampled bindings (spec F23, roadmap item
-//! 487): a run that orders rule bodies from the sample derives exactly the facts that the
+//! 939): a run that orders rule bodies from the sample derives exactly the facts that the
 //! same run derives with the greedy planner's orders.
 
 use sparkles_core::index::Perm;

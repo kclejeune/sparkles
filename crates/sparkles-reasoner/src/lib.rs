@@ -205,8 +205,9 @@ pub struct ReasonOptions {
     pub closure_operators: bool,
     /// Order the bodies of rules with three or more atoms from sampled bindings where
     /// the sample makes an order at least twice as cheap as the greedy planner's
-    /// (spec F23, roadmap item 487). The run derives the same facts either way. `false`
-    /// by default.
+    /// (spec F23, roadmap item 939). `true` by default. `false` keeps the greedy
+    /// planner's order of every body, for differential tests and measurements. A run
+    /// derives the same facts either way.
     #[doc(hidden)]
     pub sampled_planning: bool,
     /// Keep up to this many witnesses per fact of the closure (spec F18 §7.1): sets of
@@ -241,7 +242,7 @@ impl Default for ReasonOptions {
             threads: None,
             pool: None,
             closure_operators: true,
-            sampled_planning: false,
+            sampled_planning: true,
             witnesses: None,
             inspect: None,
         }

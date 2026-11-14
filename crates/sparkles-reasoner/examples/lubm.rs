@@ -12,9 +12,10 @@
 //! ```
 //!
 //! `RAYON_NUM_THREADS` sets the number of threads, and `SPARKLES_GENERIC_CLOSURES=1` makes
-//! `infer` evaluate transitive and equivalence rules as ordinary rules.
-//! `SPARKLES_SAMPLED_PLANNING=1` makes `infer` order rule bodies from sampled bindings.
-//! `SPARKLES_MAX_INFERRED=N` raises `infer`'s limit of derived triples, a profile of the
+//! `infer` and `materialize` evaluate transitive and equivalence rules as ordinary rules.
+//! `SPARKLES_SAMPLED_PLANNING=0` makes `infer` and `materialize` keep the greedy planner's
+//! order of every rule body, and `1` orders bodies from sampled bindings, the default.
+//! `SPARKLES_MAX_INFERRED=N` raises their limit of derived triples, a profile of the
 //! form `@FILE` reads Jena rule text from a file, and `SPARKLES_PLAN_PROBE=1` makes
 //! `infer` time every atom order of each rule plan and print one line per plan.
 //! `SPARKLES_WITNESSES=N` makes `materialize` and `keep` keep up to `N` witnesses per fact
@@ -169,7 +170,11 @@ fn change_sets(k: usize) -> (Vec<Triple>, Vec<Triple>) {
 fn run_options() -> ReasonOptions {
     ReasonOptions {
         closure_operators: std::env::var("SPARKLES_GENERIC_CLOSURES").as_deref() != Ok("1"),
-        sampled_planning: std::env::var("SPARKLES_SAMPLED_PLANNING").as_deref() == Ok("1"),
+        sampled_planning: match std::env::var("SPARKLES_SAMPLED_PLANNING").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => ReasonOptions::default().sampled_planning,
+        },
         max_inferred: std::env::var("SPARKLES_MAX_INFERRED")
             .ok()
             .map_or(sparkles_reasoner::DEFAULT_MAX_INFERRED, |v| {
@@ -296,7 +301,7 @@ fn main() {
             } else {
                 let opts = ReasonOptions {
                     witnesses: witnesses(),
-                    ..ReasonOptions::default()
+                    ..run_options()
                 };
                 let r = materialize(&store, &profile, &opts).unwrap();
                 let peak = PEAK.load(Ordering::Relaxed) - before;

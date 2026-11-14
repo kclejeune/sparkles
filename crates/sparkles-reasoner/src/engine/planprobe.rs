@@ -1,4 +1,4 @@
-//! A diagnostic of rule-body planning (roadmap item 487): the cost of every atom order
+//! A diagnostic of rule-body planning (roadmap item 939): the cost of every atom order
 //! of each plan of an iteration, measured on the facts the iteration reads.
 //!
 //! For each plan the probe evaluates the planner's order and then every other order of

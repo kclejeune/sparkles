@@ -1,4 +1,4 @@
-//! Rule-body planning from sampled bindings (spec F23, roadmap item 487).
+//! Rule-body planning from sampled bindings (spec F23, roadmap item 939).
 //!
 //! The greedy planner of [`plan`](super::plan) places, at each step, the atom with the
 //! fewest estimated matches, and estimates each atom from averages: the rows of its
