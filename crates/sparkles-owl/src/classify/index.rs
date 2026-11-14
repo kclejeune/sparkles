@@ -2300,8 +2300,12 @@ fn select_chains(roles: &Roles, told: &[(Vec<Role>, Role)], seeds: &[Role]) -> S
         }
     }
     for v in comp.values_mut() {
-        v.sort_unstable();
-        v.dedup();
+        // the role table's build polled the stop over the same superrole lists
+        let _ = minimal_roles(
+            v,
+            |r| roles.sup[r as usize].as_slice(),
+            |_| Ok::<(), ()>(()),
+        );
     }
     composed.sort_unstable();
     Selection {
@@ -2310,6 +2314,45 @@ fn select_chains(roles: &Roles, told: &[(Vec<Role>, Role)], seeds: &[Role]) -> S
         left,
         right,
     }
+}
+
+/// Keeps the least roles of `v`, the roles that a chain composes a pair of links into,
+/// where `sup(r)` lists r's superroles with r itself, sorted. A role above another role of
+/// `v` is dropped, and of equivalent roles the one with the smallest id stays. Every rule
+/// reads a link's role through its superroles, and the composition table lists every pair
+/// of roles under a chain's operands, so a link by the least role counts for the others.
+/// Without the reduction a symmetric transitive role, which is its own inverse, composed
+/// each link once by the role and once by its inverse, since the Horn rules add the mirror
+/// image of its transitivity. `tick` takes the work of each role as the reduction goes,
+/// the length of its superrole list, so that the caller polls its stop.
+fn minimal_roles<'a, E>(
+    v: &mut Vec<Role>,
+    sup: impl Fn(Role) -> &'a [Role],
+    mut tick: impl FnMut(usize) -> Result<(), E>,
+) -> Result<(), E> {
+    v.sort_unstable();
+    v.dedup();
+    if v.len() < 2 {
+        return Ok(());
+    }
+    let mut dropped = vec![false; v.len()];
+    for &u in v.iter() {
+        let above = sup(u);
+        tick(1 + above.len())?;
+        for &s in above {
+            let Ok(k) = v.binary_search(&s) else { continue };
+            // u is under s: s goes, unless it is equivalent to u and comes first
+            if s != u && !(s < u && sup(s).binary_search(&u).is_ok()) {
+                dropped[k] = true;
+            }
+        }
+    }
+    let mut k = 0;
+    v.retain(|_| {
+        k += 1;
+        !dropped[k - 1]
+    });
+    Ok(())
 }
 
 /// A set of expressions, as a flag for each.
@@ -2568,8 +2611,7 @@ fn roles(
         }
     }
     for v in comp.values_mut() {
-        v.sort_unstable();
-        v.dedup();
+        minimal_roles(v, |r| sup[r as usize].as_slice(), &tick)?;
     }
     let mut reflexive: BTreeSet<Role> = BTreeSet::new();
     for &r in &ax.reflexive {
@@ -2709,3 +2751,79 @@ mod a1_regression_probes;
 #[cfg(test)]
 #[path = "a1_repair_accounting_tests.rs"]
 mod a1_repair_accounting_tests;
+#[cfg(test)]
+mod minimal_roles_tests {
+    use super::{Role, minimal_roles};
+
+    /// `sup` from direct superroles, closed and sorted, each role with itself.
+    fn closed(n: usize, direct: &[(Role, Role)]) -> Vec<Vec<Role>> {
+        (0..n as Role)
+            .map(|r| {
+                let mut seen = vec![r];
+                let mut i = 0;
+                while i < seen.len() {
+                    let x = seen[i];
+                    for &(a, b) in direct {
+                        if a == x && !seen.contains(&b) {
+                            seen.push(b);
+                        }
+                    }
+                    i += 1;
+                }
+                seen.sort_unstable();
+                seen
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keeps_the_least_roles_and_the_first_of_equivalent_ones() {
+        // 0 ⊑ 1, 2 ≡ 3 ≡ 5, 4 unrelated, 3 ⊑ 6
+        let sup = closed(7, &[(0, 1), (2, 3), (3, 5), (5, 2), (3, 6)]);
+        let none = |_| Ok::<(), ()>(());
+        let mut v = vec![6, 5, 4, 3, 2, 1, 0, 3];
+        minimal_roles(&mut v, |r| sup[r as usize].as_slice(), none).unwrap();
+        assert_eq!(v, vec![0, 2, 4]);
+        // the survivor of equivalent roles does not depend on the order given
+        let mut v = vec![5, 3];
+        minimal_roles(&mut v, |r| sup[r as usize].as_slice(), none).unwrap();
+        assert_eq!(v, vec![3]);
+    }
+
+    #[test]
+    fn many_unrelated_roles_take_linear_work() {
+        let n = 200_000;
+        let sup: Vec<Vec<Role>> = (0..n as Role).map(|r| vec![r]).collect();
+        let mut v: Vec<Role> = (0..n as Role).rev().collect();
+        let mut work = 0;
+        minimal_roles(
+            &mut v,
+            |r| sup[r as usize].as_slice(),
+            |w| {
+                work += w;
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(v.len(), n);
+        assert_eq!(work, 2 * n);
+    }
+
+    #[test]
+    fn a_stop_ends_the_reduction_as_it_goes() {
+        let n = 10_000;
+        let sup: Vec<Vec<Role>> = (0..n as Role).map(|r| vec![r]).collect();
+        let mut v: Vec<Role> = (0..n as Role).collect();
+        let mut calls = 0;
+        let r = minimal_roles(
+            &mut v,
+            |r| sup[r as usize].as_slice(),
+            |_| {
+                calls += 1;
+                if calls == 3 { Err(()) } else { Ok(()) }
+            },
+        );
+        assert_eq!(r, Err(()));
+        assert_eq!(calls, 3);
+    }
+}

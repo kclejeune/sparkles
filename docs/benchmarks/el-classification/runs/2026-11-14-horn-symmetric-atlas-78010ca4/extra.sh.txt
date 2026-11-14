@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# extra.sh: taxonomies of GO and ChEBI lite by base and lane, and three interleaved rounds of
+# the lane with and without --el-only on ore_ont_8737 and ore_ont_16744, four threads.
+# The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/horn-budget-962
+OUT=$D/out/extra
+mkdir -p "$OUT/tax" "$OUT/el"
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/*; } > "$OUT/before.txt"
+run() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue timeout 900 "$@"; }
+for f in go.ofn chebi_lite.ofn; do
+  n=${f%.ofn}
+  for tag in base lane; do
+    run "$D/bin/$tag" --threads 4 --taxonomy "$OUT/tax/$n.$tag.tax" "$D/files/$f" > "$OUT/tax/$n.$tag.json" 2> "$OUT/tax/$n.$tag.err"
+    echo "tax $tag $n status=$?" >> "$OUT/log.txt"
+  done
+done
+for round in 1 2 3; do
+  for f in ore_ont_8737.owl ore_ont_16744.owl; do
+    n=${f%.owl}
+    order="horn el"; [ $((round % 2)) -eq 0 ] && order="el horn"
+    for side in $order; do
+      flag=""; [ $side = el ] && flag=--el-only
+      mkdir -p "$OUT/el/r$round/$side"
+      run "$D/bin/lane" --threads 4 --repeat 3 $flag "$D/files/$f" > "$OUT/el/r$round/$side/$n.json" 2> "$OUT/el/r$round/$side/$n.err"
+      echo "el r$round $side $n status=$?" >> "$OUT/log.txt"
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > "$OUT/after.txt"
+echo EXTRA-DONE >> "$OUT/log.txt"

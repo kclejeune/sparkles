@@ -1,0 +1,16 @@
+# summ.py OUT: medians per file and side of the timing rounds
+import json,sys,os,glob,statistics as st
+out=sys.argv[1]; rows={}
+for p in glob.glob(f"{out}/r*/*/*.json"):
+    r,tag,f=p.split('/')[-3:]
+    try: d=json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: continue
+    k=(f[:-5],tag); rows.setdefault(k,[]).append(d)
+files=sorted({k[0] for k in rows})
+print(f"{'file':16} {'side':5} {'n':>2} {'classify ms':>12} {'min':>9} {'max':>9} {'tier':>12} {'hob':>5} {'out':>4} {'conclusions':>14} {'peakEst GB':>10} {'rss GiB':>8}")
+for f in files:
+    for tag in ('base','lane'):
+        ds=rows.get((f,tag),[])
+        if not ds: continue
+        cs=[c for d in ds for c in d['classifyMs']]
+        print(f"{f:16} {tag:5} {len(cs):>2} {st.median(cs):12.1f} {min(cs):9.1f} {max(cs):9.1f} {ds[0]['tier']:>12} {str(any(d['hornOverBudget'] for d in ds)):>5} {ds[0]['outside']:>4} {ds[0]['conclusions']:>14} {max(d['peakEstimatedBytes'] for d in ds)/1e9:10.2f} {max(d['peakRssKib'] for d in ds)/2**20:8.2f}")

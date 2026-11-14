@@ -1,0 +1,27 @@
+# cmp.py OUT: compares the sweep's taxonomies and reports of base and lane
+import json,sys,os,hashlib,glob
+out=sys.argv[1]
+def rep(p):
+    try: return json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: return None
+def tax(p):
+    if not os.path.exists(p): return None
+    return hashlib.sha256(b''.join(sorted(open(p,'rb').readlines()))).hexdigest()[:16]
+status={}
+for l in open(f"{out}/log.txt"):
+    p=l.split()
+    if len(p)==3: status[(p[0],p[1])]=p[2]
+names=sorted({n for (_,n) in status})
+same=diff=0; rows=[]
+for n in names:
+    b,l=rep(f"{out}/base/{n}.json"),rep(f"{out}/lane/{n}.json")
+    tb,tl=tax(f"{out}/base/{n}.tax"),tax(f"{out}/lane/{n}.tax")
+    sb,sl=status.get(('base',n)),status.get(('lane',n))
+    eq = tb is not None and tb==tl
+    same+=eq; diff+=not eq
+    changed = (not eq) or (b and l and (b['tier'],b['hornOverBudget'],b['outside'],b['conclusions'])!=(l['tier'],l['hornOverBudget'],l['outside'],l['conclusions']))
+    if changed:
+        f=lambda d:(d['tier'],d['hornOverBudget'],d['outside'],d['conclusions'],round(d['classifyMs'][0])) if d else None
+        rows.append((n,eq,sb,sl,tb,tl,f(b),f(l)))
+print(f"files {len(names)} same-taxonomy {same} different-or-missing {diff}")
+for r in rows: print(*r)

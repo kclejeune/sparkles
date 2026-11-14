@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# sweep.sh: one classification of every file by base and lane, four threads, with taxonomies.
+# The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/horn-budget-962
+OUT=$D/out/sweep
+mkdir -p "$OUT/base" "$OUT/lane"
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/*; } > "$OUT/before.txt"
+for f in $(ls $D/files | grep '^ore_ont_' | sort); do
+  n=${f%.owl}
+  for tag in base lane; do
+    systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+      timeout 900 "$D/bin/$tag" --threads 4 --taxonomy "$OUT/$tag/$n.tax" "$D/files/$f" > "$OUT/$tag/$n.json" 2> "$OUT/$tag/$n.err"
+    echo "$tag $n status=$?" >> "$OUT/log.txt"
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > "$OUT/after.txt"
+echo SWEEP-DONE >> "$OUT/log.txt"

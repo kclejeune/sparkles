@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# all.sh: the lane's whole atlas set under the heavy lock
+cd $HOME/lanes/horn-budget-962
+exec flock $HOME/lanes/.heavy.lock sh -c './timing.sh; ./sweep.sh; echo ALL-DONE'

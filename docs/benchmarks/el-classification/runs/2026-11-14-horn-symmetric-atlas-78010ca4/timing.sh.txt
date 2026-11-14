@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# timing.sh: three interleaved rounds on the files the change reaches and on GO and ChEBI lite,
+# base and lane in alternating order, four threads, three classifications per call.
+# The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/horn-budget-962
+OUT=$D/out/timing
+mkdir -p "$OUT"
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/*; } > "$OUT/before.txt"
+FILES="ore_ont_8737.owl ore_ont_16744.owl ore_ont_2491.owl ore_ont_3238.owl ore_ont_7823.owl ore_ont_12317.owl ore_ont_14776.owl ore_ont_1310.owl ore_ont_15249.owl ore_ont_1272.owl ore_ont_9663.owl ore_ont_14817.owl go.ofn chebi_lite.ofn"
+for round in 1 2 3; do
+  order="base lane"; [ $((round % 2)) -eq 0 ] && order="lane base"
+  for f in $FILES; do
+    n=${f%.*}
+    for tag in $order; do
+      mkdir -p "$OUT/r$round/$tag"
+      systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+        timeout 900 "$D/bin/$tag" --threads ${THREADS:-4} --repeat 3 "$D/files/$f" > "$OUT/r$round/$tag/$n.json" 2> "$OUT/r$round/$tag/$n.err"
+      echo "r$round $tag $n status=$?" >> "$OUT/log.txt"
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > "$OUT/after.txt"
+echo TIME-DONE >> "$OUT/log.txt"

@@ -1,0 +1,49 @@
+# make-record.py SRC DEST: builds the benchmark record of item 962 from the atlas outputs
+import json, sys, os, glob, re
+src, dest = sys.argv[1], sys.argv[2]
+def rep(p):
+    try: return json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: return None
+keep = ['classifyMs','indexMs','saturationMs','taxonomyMs','tier','hornOverBudget','dlOverBudget','outside','outsideTaken','conclusions','contexts','conjunctions','peakEstimatedBytes','peakRssKib','threads']
+def runs(root, pattern):
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, pattern), recursive=True)):
+        rel = os.path.relpath(p, root).split('/')
+        d = rep(p)
+        out.append({'path': '/'.join(rel), 'report': {k: d.get(k) for k in keep} if d else None})
+    return out
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'ore_ont_8737, ore_ont_16744, the ortho family and 210 classifiable files of the ORE 2015 DL development set, GO 2026-07-26 and ChEBI lite 256 on atlas',
+  'host': {'name': 'atlas', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+  'manifest': {
+    'sides': {'base': '3a1b9b04, the lane base (main plus items 894, 897 and 727)',
+              'lane': '78010ca4, the least roles of a composition',
+              'final': '2fb430aa, the lane tip after review, with the same reduction computed in linear work with polls'},
+    'build': 'mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas',
+    'scripts': ['all.sh.txt', 'timing.sh.txt', 'sweep.sh.txt', 'extra.sh.txt', 'ab2.sh.txt', 'summ.py.txt', 'cmp.py.txt']},
+  'settings': {'threads': 'four unless a run says one', 'scope': 'one process per run in a 13 GiB systemd scope without swap',
+               'lock': 'every part ran under ~/lanes/.heavy.lock with no other benchmark or gate on the host'},
+  'method': 'timing.sh ran three rounds of alternating order, one process per side and file with --repeat 3. sweep.sh classified every ORE file once per side with its taxonomy, and cmp.py compared the sorted taxonomies. extra.sh wrote the taxonomies of GO and ChEBI lite and ran the lane with and without --el-only on ore_ont_8737 and ore_ont_16744 in three rounds. ab2.sh ran six rounds of rotating order on GO and ChEBI lite with --repeat 5 on one and four threads.',
+  'timing': runs(os.path.join(src, 'timing'), 'r*/*/*.json'),
+  'timing_log': text(os.path.join(src, 'timing/log.txt')),
+  'sweep': runs(os.path.join(src, 'sweep'), '*/*.json'),
+  'sweep_log': text(os.path.join(src, 'sweep/log.txt')),
+  'sweep_comparison': text(os.path.join(src, 'sweep/cmp.txt')),
+  'sweep_taxonomies': text(os.path.join(src, 'sweep/taxonomy.sha256')),
+  'extra': runs(os.path.join(src, 'extra'), '**/*.json'),
+  'extra_taxonomies': text(os.path.join(src, 'extra/tax.sha256')),
+  'ab2': runs(os.path.join(src, 'ab2'), 'r*/*/*/*.json'),
+  'fixture': {'test': 'crates/sparkles-owl/tests/horn.rs a_symmetric_transitive_role_composes_each_link_once',
+              'command': 'mbx test -p sparkles-owl --test horn symmetric_transitive, on stanley',
+              'path': 'a path of 60 links A_i ⊑ ∃r.A_(i+1) with r transitive, classified on one thread',
+              'conclusions_without_reduction': 548060, 'base_build': '3a1b9b04 with the test of 78010ca4',
+              'conclusions_with_reduction': 72284, 'reduction_build': '78010ca4',
+              'note': 'the counts are the assertion failure of the test without the reduction, symmetric path against the same path beside an unrelated inverse pair; the reduction build gives 72,284 for both'},
+  'hosts': {p: text(os.path.join(src, p)) for p in ['timing/before.txt','timing/after.txt','sweep/before.txt','sweep/after.txt','extra/before.txt','extra/after.txt','ab2/before.txt','ab2/after.txt']},
+}
+os.makedirs(dest, exist_ok=True)
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']), 'sweep', len(rec['sweep']), 'extra', len(rec['extra']), 'ab2', len(rec['ab2']))
