@@ -336,6 +336,44 @@ pub struct Changes {
     pub source: String,
 }
 
+/// The wall time of a run's phases in microseconds, for the trace event that [`finish`]
+/// writes with the target `sparkles_reasoner::timing`.
+struct Laps {
+    last: Instant,
+    laps: Vec<(&'static str, u64)>,
+}
+
+impl Laps {
+    fn new(start: Instant) -> Laps {
+        Laps {
+            last: start,
+            laps: Vec::new(),
+        }
+    }
+
+    /// The time since the lap before is the time of `phase`.
+    fn lap(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        self.add(phase, now.duration_since(self.last).as_micros() as u64);
+        self.last = now;
+    }
+
+    /// A phase timed by its own code, which lies inside the next lap.
+    fn add(&mut self, phase: &'static str, micros: u64) {
+        self.laps.push((phase, micros));
+    }
+}
+
+impl fmt::Display for Laps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, (phase, micros)) in self.laps.iter().enumerate() {
+            let sep = if i == 0 { "" } else { " " };
+            write!(f, "{sep}{phase}={micros}")?;
+        }
+        Ok(())
+    }
+}
+
 fn progress(opts: &ReasonOptions, f: f32, msg: &str) {
     if let Some(p) = &opts.progress {
         p(f, msg);
@@ -933,7 +971,8 @@ fn materialize_admitted(
     opts: &ReasonOptions,
     t0: Instant,
 ) -> anyhow::Result<ReasonReport> {
-    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
+    let mut laps = Laps::new(t0);
+    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs, &mut laps);
     let snap = txn.base().clone();
     let inspected = match &opts.inspect {
         Some(f) => {
@@ -948,12 +987,13 @@ fn materialize_admitted(
     let mut fallback = None;
     if let (Some(since), Some(raw)) = (inc.since, raw) {
         match update_closure(
-            exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw, opts,
+            exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw,
+            opts, &mut laps,
         ) {
             Ok(mut done) => {
                 done.warnings.extend(inspected);
                 return finish(
-                    store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
+                    store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
                 );
             }
             Err(e) => {
@@ -971,10 +1011,12 @@ fn materialize_admitted(
         &resolved.ids(&snap),
         opts,
     )?;
+    laps.lap("derive");
     progress(opts, 0.8, "writing inferred graph");
     let mut warnings = d.warnings.clone();
     warnings.extend(inspected);
     let w = write_full(&mut txn, &snap, &d, opts)?;
+    laps.lap("write");
     if w.generalized > 0 {
         warnings.push(format!(
             "{} derived generalized triples (literal subjects or non-IRI predicates) were not written",
@@ -1015,7 +1057,7 @@ fn materialize_admitted(
         changes: None,
     };
     finish(
-        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
+        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
     )
 }
 
@@ -1032,6 +1074,7 @@ fn lock_with_changes<'s>(
     store: &'s Store,
     inc: Incremental<'_>,
     inputs: &Inputs,
+    laps: &mut Laps,
 ) -> (
     sparkles_core::store::WriteTxn<'s>,
     Option<Result<maintain::RawChanges, String>>,
@@ -1043,13 +1086,16 @@ fn lock_with_changes<'s>(
     };
     let Some(since) = inc.since else {
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
+        laps.lap("lock");
         return (txn, None, r);
     };
     for _ in 0..3 {
         let live = store.snapshot();
         let graphs = inputs::resolve(&live, inputs).graph_set();
         let raw = maintain::changes(store, since, &live, inc.cache, &graphs);
+        laps.lap("changes");
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
+        laps.lap("lock");
         let raw = if r.graph_set() != graphs {
             Err("the input graphs changed while the changes were read".into())
         } else if txn.base().commit == live.commit {
@@ -1064,6 +1110,7 @@ fn lock_with_changes<'s>(
         return (txn, Some(raw), r);
     }
     let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
+    laps.lap("lock");
     (
         txn,
         Some(Err(
@@ -1186,6 +1233,7 @@ fn finish(
     opts: &ReasonOptions,
     t0: Instant,
     done: Done,
+    mut laps: Laps,
 ) -> anyhow::Result<ReasonReport> {
     if opts
         .cancel
@@ -1207,7 +1255,9 @@ fn finish(
             anyhow::bail!("analysis closure was unavailable before diagnostics capture");
         }
     }
+    laps.lap("checks");
     let receipt = txn.commit()?;
+    laps.lap("commit");
     progress(opts, 1.0, "done");
     let mut warnings = resolved.warnings.clone();
     warnings.extend(done.warnings);
@@ -1228,6 +1278,7 @@ fn finish(
             tracing::warn!("saving the closure state for incremental runs: {e:#}");
             None
         });
+        laps.lap("save");
         // keeping the closure after the commit is charged strictly: a closure that does
         // not fit is not kept, and the run still succeeds
         if let Some(cache) = inc.cache
@@ -1254,6 +1305,7 @@ fn finish(
     if !kept && let Some(c) = inc.cache {
         c.clear();
     }
+    laps.lap("keep");
     let report = ReasonReport {
         profile: profile.name().to_string(),
         rules: done.rules,
@@ -1283,6 +1335,13 @@ fn finish(
         removed = report.inferred_removed,
         millis = report.millis,
         "materialized inferences"
+    );
+    tracing::trace!(
+        target: "sparkles_reasoner::timing",
+        method = report.method.as_str(),
+        micros = t0.elapsed().as_micros() as u64,
+        phases = %laps,
+        "run phases"
     );
     Ok(report)
 }
@@ -1419,6 +1478,7 @@ fn update_closure(
     inc: Incremental<'_>,
     raw: Result<maintain::RawChanges, String>,
     opts: &ReasonOptions,
+    laps: &mut Laps,
 ) -> anyhow::Result<Done> {
     if since > snap.commit {
         return Err(Fallback("the store position moved backwards".into()).into());
@@ -1447,6 +1507,7 @@ fn update_closure(
             .into());
         }
     }
+    laps.lap("rules");
     progress(opts, 0.0, "reading the previous closure");
     let budget = Budget::new(opts.max_memory);
     // on the run's threads: this thread may stand in for a parked worker of the pool
@@ -1458,6 +1519,7 @@ fn update_closure(
             store, snap, since, digest, &graphs, &run_ids, inc.cache, raw, &budget, wanted,
         )
     })?;
+    laps.lap("closure");
     let mut closure = prev.closure;
     let mut ch = prev.changes;
     let _prev_held = prev.held;
@@ -1493,6 +1555,7 @@ fn update_closure(
     };
     let wl = witness_limits(&budget, opts);
     let mut prepared: Option<witness::Prepared> = None;
+    laps.lap("compile");
     progress(opts, 0.1, "updating the closure");
     let (up, threads) = exec.install(|| {
         let has = prior.is_some();
@@ -1514,6 +1577,9 @@ fn update_closure(
         (up, rayon::current_num_threads())
     });
     let up = up?;
+    laps.add("delete", up.delete_micros);
+    laps.add("insert", up.insert_micros);
+    laps.lap("update");
     let mut base_scans = base.scans();
     drop(base);
     let mut generalized = prev.generalized;
@@ -1570,6 +1636,7 @@ fn update_closure(
     {
         base_scans = base_scans.max(b.scans());
     }
+    laps.lap("witnesses");
     progress(opts, 0.8, "writing inferred graph");
     let candidates = up
         .deleted
@@ -1581,6 +1648,7 @@ fn update_closure(
         .chain(&ch.inferred_removed)
         .chain(&touched);
     let written = write_changes(exec, txn, snap, &closure, candidates, &budget)?;
+    laps.lap("write");
     let changes = Changes {
         base_added: ch.base_added.len() as u64,
         base_removed: ch.base_removed.len() as u64,

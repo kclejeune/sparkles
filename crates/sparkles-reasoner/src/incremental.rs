@@ -509,6 +509,9 @@ pub(crate) struct Update {
     pub held_beside: usize,
     /// semi-naive iterations of the insertion
     pub iterations: usize,
+    /// the wall time of the deletion and of the insertion, in microseconds
+    pub delete_micros: u64,
+    pub insert_micros: u64,
     /// the charge of the update's buffers that remain, `deleted` among them
     pub held: Option<Held>,
 }
@@ -587,6 +590,7 @@ pub(crate) fn update(
     }
 
     // ---- deletion
+    let started = std::time::Instant::now();
     held.try_grow(3 * removed.len() * size_of::<Triple>())?;
     let mut queue: Vec<Triple> = Vec::new();
     // the removed facts that were in the base tier: they join the derived tier as
@@ -700,6 +704,8 @@ pub(crate) fn update(
     }
 
     // ---- insertion
+    out.delete_micros = started.elapsed().as_micros() as u64;
+    let started = std::time::Instant::now();
     let start = c.graph.len();
     out.added_from = start;
     held.try_grow(std::mem::size_of_val(inserted))?;
@@ -737,6 +743,7 @@ pub(crate) fn update(
         }
     }
     drop(ins);
+    out.insert_micros = started.elapsed().as_micros() as u64;
     // the removed facts stay with the update
     out.held = Some(held);
     Ok(out)

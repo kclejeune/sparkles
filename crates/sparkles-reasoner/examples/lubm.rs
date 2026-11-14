@@ -8,6 +8,7 @@
 //! cargo run --release -p sparkles-reasoner --example lubm -- infer /tmp/lubm/db10 rdfs
 //! cargo run --release -p sparkles-reasoner --example lubm -- materialize /tmp/lubm/db10 owl-rl
 //! cargo run --release -p sparkles-reasoner --example lubm -- keep /tmp/lubm/db10 rdfs 1000
+//! cargo run --release -p sparkles-reasoner --example lubm -- churn /tmp/lubm/db10 rdfs 100 10 40
 //! cargo run --release -p sparkles-reasoner --example lubm -- diag /tmp/lubm/db10
 //! ```
 //!
@@ -23,6 +24,18 @@
 //! triples of the first university and adds `K` new ones, after it is undone and after it
 //! is made again, and one that reads the closure back from the dataset after the change
 //! is undone once more. The dataset is changed, so it should be a fresh copy.
+//!
+//! `churn DB PROFILE K U ROUNDS` keeps a closure the same way and then makes a change of
+//! `K` triples to one university after another of the first `U`, each change followed by
+//! its undo, the change again and a second undo, which leaves the dataset as it was. It
+//! reports the time of each incremental run in microseconds, with the commit, and the
+//! quartiles of each step over the rounds. The first round is the first change after the
+//! closure is kept, and each later round changes data that no earlier round read.
+//! `LUBM_PERF_CONTROL` names a control FIFO of `perf record --control`, to which `churn`
+//! writes `enable` before the rounds and `disable` after them, so that a record started
+//! with `--delay=-1` holds the rounds without the full run. With `LUBM_POOL=1` the runs
+//! of `churn` evaluate on a reasoning pool of `RAYON_NUM_THREADS` threads, as a server's
+//! do, instead of on the global pool from the main thread.
 //!
 //! `diag` runs the check `literal-not-in-datatype` twice on the same snapshot and reports
 //! the time and the peak heap of each run.
@@ -130,10 +143,10 @@ fn change(s: &Store, add: &[Triple], del: &[Triple]) {
     txn.commit().unwrap();
 }
 
-/// `k` triples of the first university, spread over its data, and `k` new triples about
-/// new graduate students of its first department.
-fn change_sets(k: usize) -> (Vec<Triple>, Vec<Triple>) {
-    let text = lubm::university(0);
+/// `k` triples of university `u`, spread over its data, and `k` new triples about new
+/// graduate students of its first department.
+fn change_sets(u: usize, k: usize) -> (Vec<Triple>, Vec<Triple>) {
+    let text = lubm::university(u);
     let all: Vec<Triple> = oxttl::NTriplesParser::new()
         .for_slice(text.as_bytes())
         .map(|t| t.unwrap())
@@ -142,7 +155,8 @@ fn change_sets(k: usize) -> (Vec<Triple>, Vec<Triple>) {
     let del: Vec<Triple> = all.iter().step_by(step).take(k).cloned().collect();
     let n = |s: String| NamedNode::new_unchecked(s);
     let ty = n("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into());
-    let dept = "http://www.Department0.University0.edu";
+    let dept = format!("http://www.Department0.University{u}.edu");
+    let dept = dept.as_str();
     let add = (0..k)
         .map(|j| {
             let s = n(format!("{dept}/NewStudent{}", j / 3));
@@ -318,7 +332,7 @@ fn main() {
                 .unwrap();
                 (r, PEAK.load(Ordering::Relaxed) - before)
             };
-            let (del, add) = change_sets(k);
+            let (del, add) = change_sets(0, k);
             let line = |what: &str, r: &ReasonReport, peak: usize| {
                 let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
                 println!(
@@ -375,6 +389,98 @@ fn main() {
                 vm_hwm()
             );
         }
+        "churn" => {
+            let db = PathBuf::from(&args[2]);
+            let profile: Profile = args[3].parse().expect("profile");
+            let k: usize = args[4].parse().expect("triples");
+            let universities: usize = args[5].parse().expect("universities");
+            let rounds: usize = args[6].parse().expect("rounds");
+            let store = Store::open(&db, StoreOptions::default()).unwrap();
+            let threads = rayon::current_num_threads();
+            let cache = Cache::new(usize::MAX);
+            // a server evaluates on a reasoning pool, not on the global pool
+            let pool = (std::env::var("LUBM_POOL").as_deref() == Ok("1"))
+                .then(|| sparkles_reasoner::thread_pool(threads).unwrap());
+            let opts = ReasonOptions {
+                pool,
+                ..ReasonOptions::default()
+            };
+            let run = |since: Option<u64>| -> (ReasonReport, u128) {
+                let t = Instant::now();
+                let r = materialize_incremental(
+                    &store,
+                    &profile,
+                    &Extras::default(),
+                    Incremental {
+                        since,
+                        cache: Some(&cache),
+                    },
+                    &opts,
+                )
+                .unwrap();
+                (r, t.elapsed().as_micros())
+            };
+            let (r, _) = run(None);
+            let mut since = r.receipt.unwrap().commit.seq;
+            let (r, _) = run(Some(since));
+            since = r.receipt.unwrap().commit.seq;
+            let sets: Vec<(Vec<Triple>, Vec<Triple>)> = (0..universities.min(rounds))
+                .map(|u| change_sets(u, k))
+                .collect();
+            // a profiler started with its events off records the rounds only
+            let control = |word: &str| {
+                if let Ok(path) = std::env::var("LUBM_PERF_CONTROL") {
+                    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                    writeln!(f, "{word}").unwrap();
+                }
+            };
+            control("enable");
+            let steps = ["change", "revert", "change-again", "revert-again"];
+            let mut times: Vec<Vec<u128>> = vec![Vec::new(); steps.len()];
+            for round in 0..rounds {
+                let (del, add) = &sets[round % universities];
+                let mut line = format!(
+                    "churn {} threads={threads} k={k} round={round}",
+                    profile.name()
+                );
+                for (i, step) in steps.iter().enumerate() {
+                    if i % 2 == 0 {
+                        change(&store, add, del);
+                    } else {
+                        change(&store, del, add);
+                    }
+                    let (r, us) = run(Some(since));
+                    since = r.receipt.unwrap().commit.seq;
+                    let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
+                    assert!(
+                        r.method.as_str() == "incremental" && source == "memory",
+                        "round {round} {step}: method={} source={source}",
+                        r.method.as_str()
+                    );
+                    times[i].push(us);
+                    line.push_str(&format!(" {step}_us={us}"));
+                    if i == 3 {
+                        line.push_str(&format!(" inferred={}", r.inferred));
+                    }
+                }
+                println!("{line}");
+            }
+            control("disable");
+            for (step, t) in steps.iter().zip(&mut times) {
+                let first = t.first().copied().unwrap_or(0);
+                t.sort_unstable();
+                let q = |f: f64| t[((t.len() - 1) as f64 * f).round() as usize];
+                println!(
+                    "churn {} threads={threads} k={k} rounds={rounds} {step} first_us={first} min_us={} p25_us={} median_us={} p75_us={} max_us={}",
+                    profile.name(),
+                    q(0.0),
+                    q(0.25),
+                    q(0.5),
+                    q(0.75),
+                    q(1.0)
+                );
+            }
+        }
         "diag" => {
             let db = PathBuf::from(&args[2]);
             let store = Store::open(&db, StoreOptions::default()).unwrap();
@@ -396,7 +502,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: lubm gen U DIR | load DIR U DB | infer DB PROFILE | materialize DB PROFILE | keep DB PROFILE [K] | diag DB"
+                "usage: lubm gen U DIR | load DIR U DB | infer DB PROFILE | materialize DB PROFILE | keep DB PROFILE [K] | churn DB PROFILE K U ROUNDS | diag DB"
             );
             std::process::exit(2);
         }
