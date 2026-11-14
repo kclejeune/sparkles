@@ -297,17 +297,18 @@ LIMIT queries and three filtered products over generated people datasets of 300 
 alternating over three passes. It measured a small pulled ASK and a `LIMIT 1` or `LIMIT
 10` over a join of 300-row patterns at 1.00 to 1.05 times the earlier build, a filtered
 or path LIMIT at 0.14 to 0.87 times, and a filtered product under an ASK or a `LIMIT 1`
-at 0.77 to 1.25 times. A pulled `LIMIT 1` or `LIMIT 10` over a join of 3,000-row patterns
-takes 1.16 to 1.18 times as long and a `LIMIT 500` 1.28 times, and a false keyed ASK
-takes 1.32 times over 300-row patterns and 1.13 times over 3,000-row patterns in eager
-execution, against 0.67 in automatic execution. These costs of building and charging
-cursor operators are [item 952](../../ROADMAP.md). A FILTER that reads ahead evaluates
-its condition on rows past its consumer's first solutions, so a memory budget that a row
-past them exceeds, such as one whose value decodes a long literal, refuses the query
-where reading at the consumer's demand would have answered. The scan FILTER's morsels
-read ahead in the same way. The `grow_input` switch turns off the generic FILTER's read-
-ahead and the growth of the scan FILTER's morsels, while a demand of 4,096 rows or more
-still reads a first morsel.
+at 0.77 to 1.37 times. A pulled `LIMIT 1` or `LIMIT 10` over a join of 3,000-row patterns
+takes 1.16 to 1.18 times as long and a `LIMIT 500` 1.28 times, a false keyed ASK takes
+1.31 to 1.33 times over 300-row patterns and 1.12 to 1.13 times over 3,000-row patterns
+in eager execution, against 0.67 in automatic execution, and a three-pattern ASK and a
+`LIMIT` over `spk:hasPredicate` over 3,000 people take 1.05 to 1.07 times. These costs of
+building and charging cursor operators are [item 952](../../ROADMAP.md). A FILTER that
+reads ahead evaluates its condition on rows past its consumer's first solutions, so a
+memory budget that a row past them exceeds, such as one whose value decodes a long
+literal, refuses the query where reading at the consumer's demand would have answered.
+The scan FILTER's morsels read ahead in the same way. The `grow_input` switch turns off
+the generic FILTER's read- ahead and the growth of the scan FILTER's morsels, while a
+demand of 4,096 rows or more still reads a first morsel.
 
 Native SELECT output and standard solution responses of at most 65,536 rows admit and
 decode a complete row before serializing its cells. Row storage and decoded terms keep
