@@ -1887,6 +1887,18 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+Whether a query ran within its memory budget no longer depends on which terms share its
+terms' vocabulary blocks (roadmap item 948). A lookup in a front-coded vocabulary without
+FSST rebuilt every earlier key of the term's 16-key block in full, so a 600,000-byte
+literal next to a short IRI was allocated and charged when only the IRI was wanted, and
+`SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY DESC(?s)` under a 1 MiB budget was refused
+before its first row although it never matched the literal. An eager decode allocated
+the same neighbour outside the budget. Each earlier key is now decoded only up to the
+bytes that the key after it takes, as FSST lookups already did, and a checked lookup
+starts its buffer at 64 bytes, or 192 with FSST, instead of growing it from nothing. On
+the instruction screen, 50,000 checked random lookups take 0.97 of their earlier
+instructions with front coding and 0.69 with FSST.
+
 Reading the `main` branch's information no longer holds the dataset's branch table while
 it waits for the main writer. The periodic history collector takes the writer and then
 the branch table, so a branch listing that ran during a collection could deadlock both,

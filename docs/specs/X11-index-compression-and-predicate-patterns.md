@@ -775,6 +775,31 @@ key's shared prefix removed a tenth of the branch misses but added 5% of instruc
 saved no cycles, so it was dropped. Roadmap item 160 follows up on this lookup and on
 cold `entity-summary-1`.
 
+### Item 948, front-coded lookups
+
+Before roadmap item 948, a lookup in a front-coded vocabulary without FSST rebuilt every
+key of its 16-key block up to the wanted one in full, on the unchecked, checked and
+fallible decoders alike. A checked decode reserved room for each of those keys from the
+query's memory budget, so a long literal next to a short IRI was charged to a query that
+only wanted the IRI, and the unchecked decoder allocated it outside the budget. Plain
+suffixes now take the same lookahead as FSST suffixes. A key before the wanted one is
+copied only up to the next key's shared prefix, and a key that gives the next no more
+than its own shared prefix is not copied at all. A block whose keys are all wanted up to
+the last one is still decoded whole in one pass.
+
+The instruction screen of `crates/sparkles-core/tests/insn_screen.rs` counts 50,000
+random lookups through the checked decoder as well as the unchecked one. On stanley, an
+Intel Core Ultra X7 358H, the first version of the change, which sent plain blocks
+through the FSST loop, counted 1.48 times the checked lookups' earlier instructions.
+Most of the cost was the buffer. A checked decode starts from an empty buffer and
+reserves exactly what each step needs, and the shorter partial keys grow it in more and
+smaller steps, each a reallocation. Starting the buffer at the unchecked decoder's size,
+64 bytes for front coding and 192 for FSST, brought the count to 1.11, and a plain loop
+that copies the suffix in place of the FSST step brought it to 0.97. The same first size
+takes FSST's checked lookups to 0.69 of their earlier count. The unchecked lookups and
+the ordered reads of every seventh id stay within the screen's spread between
+processes, which is up to 5% on this host.
+
 ### Phases not built
 
 #### Phase 2b, encoded IRIs
