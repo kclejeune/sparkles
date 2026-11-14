@@ -1383,6 +1383,12 @@ impl Ctx {
     }
 
     /// The plan of the failed node `node`, when the failure came from it.
+    /// Forget the plan of a failure that the executor recovered from, such as a LIMIT's
+    /// whole run that a budget refused before the LIMIT pulled its input instead.
+    pub(super) fn clear_failed(&self) {
+        *self.failed.lock() = None;
+    }
+
     pub(super) fn take_failed(&self, node: &super::plan::Node) -> Option<super::exec::PlanInfo> {
         let mut f = self.failed.lock();
         match &*f {

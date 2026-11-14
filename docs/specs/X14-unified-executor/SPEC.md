@@ -220,8 +220,10 @@ cursor over the predicate patterns, which the eager scan shares, so `spk:hasPred
 plans its scan in every mode. The planner deduplicates a DISTINCT below its ORDER BY
 whenever the query may spill, and the eager executor numbers the rows of that DISTINCT as
 the cursor does. The planner also sets the ripple join and the first-row index joins of an
-ASK or a `LIMIT 1` over a keyed join, with the default cursor batch size, and streams a
-filtered product's larger input. The result cache and sampled filters stay on under
+ASK or a `LIMIT 1` over a keyed join whose inputs are both estimated larger than the
+default cursor batch, and streams a filtered product's larger input. A keyed join with a
+smaller input holds it, since reading both inputs alternately probes about twice per row
+and took 1.7 to 1.8 times as long when no pair matched. The result cache and sampled filters stay on under
 cursor accounting. Every ASK and every LIMIT without ORDER BY pulls its input through
 cursor operators with a demand of `offset + limit` rows, in eager execution through the
 eager context and in automatic execution, which streams every ASK without initial
@@ -235,12 +237,16 @@ function, a SERVICE or another operator with effects. `run_limited`, `execute_li
 the first-work estimator, `limited_input`, `filtered_ask_admitted`, `order_ask` and
 `Dataset::ask_streaming_with` are gone, and the accounting mode is read in four places.
 The planner marks a LIMIT or an ASK to run its input whole, as a SELECT does, when exact
-index counts bound every operator of the input to a cursor batch of 4,096 rows and its
-estimated cost past the first rows is below the 4,096 units that building cursor
-operators costs (`demand::runs_whole`). An input that evaluates a FILTER, a BIND or
-another expression is pulled, since an expression may form terms whose memory no row
-count bounds, and so is every input of a query with a budget of produced rows, which
-the consumer's rows count against too. A join is bounded by the product of its inputs or, where an input
+index counts bound every operator of the input, and the rows an index join's probes read,
+to a cursor batch of 4,096 rows and its estimated cost past the first rows is below the
+4,096 units that building cursor operators costs (`demand::runs_whole`). An input that
+evaluates a FILTER, a BIND, a range scan's test or another expression is pulled, since an
+expression may form terms whose memory no row count bounds, and so is every input of a
+query with a budget of produced rows, which the consumer's rows count against too. A
+whole run that a row or memory budget refuses gives way to pulling the input
+(`exec::whole_or_refused`), because the bounds do not cover the server pool's headroom or
+what the query already holds. A LIMIT over a `spk:hasPredicate` scan reads the pattern
+reader directly, as one over a scan does. A join is bounded by the product of its inputs or, where an input
 that always binds a key meets a pattern with a constant predicate, by that input's rows
 times the pattern's most rows for one key, which the predicate's statistics bound. The
 eager LIMIT runs such an input whole, automatic execution keeps such an ASK eager, and

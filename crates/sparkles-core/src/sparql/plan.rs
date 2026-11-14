@@ -6211,8 +6211,9 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
     if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
         return Ok(!rows.table.is_empty());
     }
-    if super::demand::runs_whole(ctx, &node, 1) {
-        let (rows, _) = super::exec::execute_materialized(ctx, &node)?;
+    if super::demand::runs_whole(ctx, &node, 1)
+        && let Some((rows, _)) = super::exec::whole_or_refused(ctx, &node)?
+    {
         return Ok(!rows.table.is_empty());
     }
     super::cursor::has_solution(ctx, &node)

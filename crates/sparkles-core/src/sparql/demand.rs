@@ -5,9 +5,10 @@
 //! have the rows they ask for, in every execution mode. The planner therefore makes the
 //! choices that suit a few rows here, so that one query has one plan whatever its mode.
 //! A UNION under such a limit reads its branches in order, so its cheapest branch to
-//! the first rows goes first. An ASK, or a LIMIT of one row, over a keyed join reads
-//! both inputs a few rows at a time, and over a filtered product it streams the larger
-//! input against the smaller. A DISTINCT over an ORDER BY deduplicates below the sort
+//! the first rows goes first. An ASK, or a LIMIT of one row, over a keyed join of two
+//! inputs larger than a cursor batch reads both a few rows at a time, and over a
+//! filtered product it streams the larger input against the smaller. A LIMIT or an ASK
+//! runs a small input whole when its operators would read their inputs whole anyway. A DISTINCT over an ORDER BY deduplicates below the sort
 //! when the query may spill.
 
 use super::ctx::Ctx;
@@ -70,15 +71,22 @@ fn below_projections(mut node: &mut Node) -> &mut Node {
     node
 }
 
-/// One row answers the query. A keyed join reads both inputs a few rows at a time, so
-/// that the first matching pair ends it, and a hash join in either input that would
-/// read one of its own inputs whole becomes an index join where it can. A filtered
-/// product streams its larger input against the smaller one, which it holds.
+/// One row answers the query. A keyed join whose inputs are both estimated larger than a
+/// cursor batch reads both a few rows at a time, so that the first matching pair ends
+/// it. A keyed join with a smaller input holds that input, which costs at most a batch to
+/// read, and probes it about twice as fast as reading both inputs alternately when no
+/// pair matches. Either way a hash join in either input that would read one of its own
+/// inputs whole becomes an index join where it can. A filtered product streams its
+/// larger input against the smaller one, which it holds.
 fn orient_first_row(ctx: &Ctx, node: &mut Node) {
     let filtered = below_projections(node);
     if let Kind::KeyedJoin { ripple, .. } = &mut filtered.kind {
-        *ripple = filtered.children.len() == 2;
         let batch_rows = super::cursor::CursorOptions::default().batch_rows;
+        *ripple = filtered.children.len() == 2
+            && filtered
+                .children
+                .iter()
+                .all(|input| input.est > batch_rows as f64);
         for input in &mut filtered.children {
             first_rows(input, ctx, batch_rows);
         }
@@ -180,16 +188,19 @@ const PULL_COST: f64 = 4096.0;
 /// of the whole input exceeds its cost of the first `want` rows by less than building
 /// and running cursor operators costs, so a small input runs whole and a larger one
 /// stops early. The input must also be small by upper bounds from exact index counts:
-/// no operator of it may give more rows than a cursor's batch, and together their rows
-/// stay within half the query's memory budget, so that running it whole fails no budget
-/// that pulling it would pass whatever the estimates. A scan is bounded by the rows of
+/// no operator of it may give more rows than a cursor's batch or the query's row limit,
+/// and together their rows stay within half the query's memory budget. The bounds do
+/// not cover every allocation, the server pool's headroom or what the query already
+/// holds, so a whole run that a row or memory budget refuses gives way to pulling the
+/// input ([`super::exec::whole_or_refused`]), which therefore answers whatever pulling
+/// answers. A scan is bounded by the rows of
 /// its prefix, a join by the product of its inputs or, where an input that always binds
 /// a key meets a pattern with a constant predicate, by the rows of that input times the
 /// most rows the pattern has for one key, which the predicate's statistics bound. An
-/// input that evaluates expressions, such as a FILTER or a BIND, is pulled, since an
-/// expression may form new terms whose memory no row count bounds, and so is every input
-/// of a query with a budget of produced rows, which the rows its consumer takes count
-/// against as well. The choice depends on the plan, the snapshot and the query's
+/// input that evaluates expressions, such as a FILTER, a BIND or a range scan that tests
+/// its rows, is pulled, since an expression may form new terms whose memory no row count
+/// bounds, and so is every input of a query with a budget of produced rows, which the
+/// rows its consumer takes and a refused whole run would count against as well. The choice depends on the plan, the snapshot and the query's
 /// budgets, never on the execution mode.
 pub(super) fn runs_whole(ctx: &Ctx, node: &Node, want: usize) -> bool {
     if ctx.calls_extensions
@@ -219,7 +230,11 @@ fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Opti
     *left -= 1;
     let only = || (node.children.len() == 1).then(|| &node.children[0]);
     let rows = match &node.kind {
-        Kind::Scan(spec) | Kind::RangeScan(spec, _) => scan_rows(ctx, spec)?,
+        Kind::Scan(spec) => scan_rows(ctx, spec)?,
+        // a range whose ids do not all pass tests its rows with the pushed filter
+        Kind::RangeScan(spec, range) if range.ranges.iter().all(|r| r.exact) => {
+            scan_rows(ctx, spec)?
+        }
         Kind::Values(table) => table.len() as u64,
         Kind::Empty => 0,
         Kind::Project(_) | Kind::Distinct | Kind::Sort(_) => upper_rows(ctx, only()?, left, bytes)?,
@@ -259,15 +274,23 @@ fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Opti
             rows
         }
         Kind::IndexJoin(spec) if spec.probes.iter().all(|p| p.filter.is_empty()) => {
-            // the input always binds the key, and each of its rows meets the rows of
-            // every probe for its key
-            let mut rows = upper_rows(ctx, only()?, left, bytes)?;
+            // The input always binds the key, and each of its rows meets the rows of
+            // every probe for its key. The rows the probes read for the input's keys
+            // are held together, and count against the limits as well.
+            let input = upper_rows(ctx, only()?, left, bytes)?;
+            let mut rows = input;
+            let mut read = 0u64;
             for probe in &spec.probes {
                 let each = scan_rows(ctx, &probe.scan)?.min(
                     super::indexjoin::key_fanout(ctx, &probe.scan, spec.key).unwrap_or(u64::MAX),
                 );
                 rows = rows.saturating_mul(each);
+                read = read.saturating_add(input.saturating_mul(each));
             }
+            if read > WHOLE_ROWS || read > ctx.max_rows as u64 {
+                return None;
+            }
+            *bytes = bytes.saturating_add(read.saturating_mul(4 * 16 + 64));
             rows
         }
         _ => return None,
@@ -695,5 +718,68 @@ mod tests {
             assert_eq!(rows, 1, "{mode:?}");
         }
         assert!(!whole_with(&store, &text, &tight));
+    }
+
+    /// A whole run that a budget refuses gives way to pulling the input, so running a
+    /// LIMIT's input whole never fails a query that pulling answers (review round 4).
+    /// The test marks a LIMIT over a UNION of two 3,000-row scans to run whole, which
+    /// the planner would not, under a row limit that the UNION's whole output passes
+    /// and pulling its first row does not.
+    #[test]
+    fn a_refused_whole_run_pulls_its_input() {
+        use super::super::execute_prepared;
+        let store = people(3000);
+        let options = QueryOptions {
+            max_rows: Some(4000),
+            ..options()
+        };
+        let text = "SELECT ?p WHERE { { ?p ex:name ?n } UNION { ?p ex:age ?a } } LIMIT 1";
+        let parsed = parse_query(text, None, &options.prefixes).unwrap();
+        let mut prepared = prepare_query(store.snapshot(), &parsed, &options, None, None).unwrap();
+        fn mark(node: &mut Node) -> bool {
+            if let Kind::Slice { whole, .. } = &mut node.kind {
+                *whole = true;
+                return true;
+            }
+            node.children.iter_mut().any(mark)
+        }
+        assert!(mark(&mut prepared.node));
+        let result = execute_prepared(&parsed, &options, 0.0, 0.0, prepared)
+            .unwrap_or_else(|failed| panic!("{}", failed.error));
+        assert_eq!(result.len(), 1);
+    }
+
+    /// A range scan that tests the rows of a range with its filter, as the ranges of
+    /// doubles and of the vocabulary's literals do, is pulled (review round 4).
+    #[test]
+    fn a_range_scan_that_tests_its_rows_is_pulled() {
+        let ask = "ASK { ?p ex:age ?a FILTER(?a > 80) }";
+        let ranged = |store: &Store| {
+            let parsed = parse_query(ask, None, &options().prefixes).unwrap();
+            let prepared =
+                prepare_query(store.snapshot(), &parsed, &options(), None, None).unwrap();
+            fn find(node: &Node) -> Option<bool> {
+                if let Kind::RangeScan(_, range) = &node.kind {
+                    return Some(range.ranges.iter().all(|r| r.exact));
+                }
+                node.children.iter().find_map(find)
+            }
+            find(&prepared.node)
+        };
+        // a range of integers tests the rows of the vocabulary's literals as well
+        let ints = people(300);
+        assert_eq!(ranged(&ints), Some(false));
+        assert!(!whole(&ints, ask));
+        let doubles = people(300);
+        doubles
+            .load(&[Source::from_bytes(
+                b"<http://ex.org/q> <http://ex.org/age> \"85.5\"^^<http://www.w3.org/2001/XMLSchema#double> .\n"
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        assert_eq!(ranged(&doubles), Some(false));
+        assert!(!whole(&doubles, ask));
     }
 }

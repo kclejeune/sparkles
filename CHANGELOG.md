@@ -13,7 +13,9 @@ filter or a join under a LIMIT reads its input once rather than in growing prefi
 planner runs a small input whole instead, when exact index counts bound each of its
 operators to a cursor batch, it evaluates no expression and its estimated cost past the
 first rows is below the cost of building cursor operators, and an EXISTS pattern
-evaluated per row does the same. A
+evaluated per row does the same. A whole run that a row or memory budget refuses pulls
+the input instead. An ASK or a `LIMIT 1` over a keyed join reads both inputs alternately
+only when both are larger than a cursor batch. A
 UNION under a LIMIT or an ASK reads its cheapest branch first in every mode. Automatic
 execution streams every ASK without initial bindings whose input does not run whole. A
 pattern scan's reader charges the patterns it decodes as they grow, and the decoded rows

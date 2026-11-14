@@ -1412,10 +1412,10 @@ fn run_node<'ctx>(
             let want = offset.saturating_add(*limit);
             let (mut t, info, _) = match leaf_rows(ctx, &n.children[0], want)? {
                 Some(rows) => rows,
-                None if *whole => {
-                    let (t, info) = execute_materialized(ctx, &n.children[0])?;
-                    (t, info, true)
-                }
+                None if *whole => match whole_or_refused(ctx, &n.children[0])? {
+                    Some((t, info)) => (t, info, true),
+                    None => super::cursor::pull(ctx, &n.children[0], want)?,
+                },
                 None => super::cursor::pull(ctx, &n.children[0], want)?,
             };
             infos.push(info);
@@ -2764,9 +2764,9 @@ pub(super) fn apply_blocking(
     }
 }
 
-/// The first `want` rows of a scan or a table of values, under projections, read
-/// directly for a LIMIT without ORDER BY: a scan stops at them, as a cursor scan does,
-/// without the cursor operators that a larger input runs as (item 827). `None` for
+/// The first `want` rows of a scan, a pattern scan or a table of values, under
+/// projections, read directly for a LIMIT without ORDER BY: a scan stops at them, as a
+/// cursor scan does, without the cursor operators that a larger input runs as (item 827). `None` for
 /// another input. Also returns the plan and whether the input ended.
 pub(super) fn leaf_rows<'ctx>(
     ctx: &'ctx Ctx,
@@ -2796,6 +2796,24 @@ pub(super) fn leaf_rows<'ctx>(
             let (t, info) = execute_materialized(ctx, n)?;
             Ok(Some((t, info, true)))
         }
+        // the pattern reader stops at the rows asked for, as the cursor's does
+        Kind::PatternScan(spec) => {
+            let mut t = Table::new(n.vars.clone());
+            let mut reader = super::patternplan::scan_reader(spec);
+            let held = ctx.charge(0)?;
+            let complete =
+                super::patternplan::fill_scan(ctx, spec, &mut reader, &mut t, want, &mut |bytes| {
+                    held.resize(bytes)
+                })
+                .inspect_err(|_| fail(ctx, n, start, Vec::new()))?;
+            drop(reader);
+            drop(held);
+            let mut rows = finish(Materialized::plain(t), Vec::new(), complete)?;
+            if let Some((_, info, _)) = &mut rows {
+                info.description = format!("{} {}", info.description, spec.uses.note());
+            }
+            Ok(rows)
+        }
         Kind::Project(vars) if n.children.len() == 1 => {
             let Some((input, info, complete)) = leaf_rows(ctx, &n.children[0], want)? else {
                 return Ok(None);
@@ -2810,6 +2828,32 @@ pub(super) fn leaf_rows<'ctx>(
             finish(output, vec![info], complete)
         }
         _ => Ok(None),
+    }
+}
+
+/// Run `n` whole for a LIMIT, an ASK or an EXISTS pattern whose input the planner chose
+/// to run whole. `None` when a row or memory budget refused the run: its bounds keep the
+/// input small, but not every allocation, the pool's headroom or what the query already
+/// holds, so the consumer then pulls the input as it would have otherwise. Nothing of
+/// the refused run is kept, and its partial plan is forgotten.
+pub(super) fn whole_or_refused<'ctx>(
+    ctx: &'ctx Ctx,
+    n: &Node,
+) -> Result<Option<(Materialized<'ctx>, PlanInfo)>> {
+    match execute_materialized(ctx, n) {
+        Ok(run) => Ok(Some(run)),
+        Err(Error::BudgetExceeded(b))
+            if matches!(
+                b.kind,
+                crate::BudgetKind::Rows
+                    | crate::BudgetKind::Memory
+                    | crate::BudgetKind::ServerMemory
+            ) =>
+        {
+            ctx.clear_failed();
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
