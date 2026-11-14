@@ -48,7 +48,7 @@ request or on every write, and the schema report counts what the data holds.
   its 53 million derived facts in about 52 bytes each with the triple index, against about
   135 in the hash lists before the tier. Full materializations take the time they took
   before, and incremental runs on LUBM(100) are about 2% slower
-  ([roadmap item 875](../ROADMAP.md)).
+  ([roadmap item 938](../ROADMAP.md)).
 * Each iteration merges its results in parallel on a reasoning pool, half the cores by
   default with `serve --reason-threads`, that admits runs in arrival order. A run stops at
   50 million derived triples by default, and `sparkles infer --max-inferred`,

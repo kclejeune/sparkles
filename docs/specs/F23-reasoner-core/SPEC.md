@@ -272,7 +272,7 @@ reads the same counts however the facts fall into runs. The sum of the runs' cou
 which the tier read at first, had made `prp-key-1` choose a plan that scanned 44.5
 million rows in the third iteration, and an estimate from sketches of the runs changed a
 join order, and so a derived list link, with the split of a relation into runs. A scan
-with one candidate is not grouped, since it has no probe to overlap, and roadmap item 874
+with one candidate is not grouped, since it has no probe to overlap, and roadmap item 937
 carries the fallback across the short scans of one rule. Index entries with 32 hash bits,
 and huge pages for the index tables, measured no faster and are recorded in
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#reasoning).
@@ -283,7 +283,7 @@ takes 100.8 to 105.4 s against 102.2 to 107.4 s at one thread and 50.2 to 52.7 s
 the grouped probes. LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s at one thread
 and 16.1 to 16.7 s against 16.5 to 17.1 s at 20 threads. Its insertion of every hundredth
 triple takes 2.43 to 2.46 s against 2.35 to 2.41 s and its deletion 3.30 to 3.34 s
-against 3.23 to 3.27 s at 20 threads, 2% slower in every round, and roadmap item 875
+against 3.23 to 3.27 s at 20 threads, 2% slower in every round, and roadmap item 938
 investigates that cost with the one-thread run, 0.5% slower in every round. The [run
 record](../../benchmarks/reasoning/runs/2026-11-13-item-866-atlas/env.txt) holds the
 commands, host and builds. Both builds derive the same 52,966,139 and 10,907,379 facts.

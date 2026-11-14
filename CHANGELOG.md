@@ -627,7 +627,7 @@ in the third iteration of OWL2Bench(5). On atlas, OWL2Bench(5) takes 101 to 105 
 102 to 107 s before the tier at one thread and 50 to 53 s against 51 to 54 s at 20
 threads, and LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s and 16.1 to 16.7 s
 against 16.5 to 17.1 s. LUBM(100) at one thread is 0.5% slower, and its incremental
-insertion and deletion about 2% slower (item 875).
+insertion and deletion about 2% slower (item 938).
 
 Notification channels deliver independently (item 46). Each channel has its own queue
 and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own

@@ -143,7 +143,7 @@ triple index made most of that difference, took 7.0 s against 9.8 s. LUBM(100) u
 against 16.5 to 17.1 s at 20 threads. The insertion of every hundredth of its triples at
 20 threads took 2.43 to 2.46 s against 2.35 to 2.41 s and the deletion 3.30 to 3.34 s
 against 3.23 to 3.27 s, about 2% slower in every round, and the one-thread run 0.5%
-slower in every round, which roadmap item 875 investigates. The
+slower in every round, which roadmap item 938 investigates. The
 [run directory](runs/2026-11-13-item-866-atlas/run.sh.txt) holds the commands, the
 [host and builds](runs/2026-11-13-item-866-atlas/env.txt), the
 [timings](runs/2026-11-13-item-866-atlas/results.txt), the
