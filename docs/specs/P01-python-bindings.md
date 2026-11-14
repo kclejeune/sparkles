@@ -1159,16 +1159,17 @@ subject at 7.4 µs against 5.7 µs. The memo costs each thread that reads patter
 115 KiB, and at most 320 KiB.
 
 The regular expression that renames generated variables in a result cache key took a
-fifth of a short property path query. A key that is all ASCII is now scanned by hand.
+fifth of a short property path query. A key that is all ASCII is now scanned by hand,
+and a key with other text still goes through the expression.
 `knows-reach` went from 20.9 to 15.7 µs at the same load, against 19.0 µs for
 pyoxigraph.
 
 A sync cursor handed out every row through the path of a fetch, which on Python's main
-thread is a helper thread. A fetch or a refill now decodes up to 256 rows or one
-mebibyte of text ahead in one detached call, and handing out a decoded row takes no
-work. A row on the main thread went from 2.56 to 1.76 µs at a load of 8 to 9, against
-0.82 µs for a row of the eager `query`. The rows decoded ahead are held outside the
-query's memory budget until they are handed out. The async bridge decodes a batch in one
+thread is a helper thread. A fetch or a refill now decodes up to 255 further rows ahead
+in one detached call, stopping once they pass one mebibyte of text, and handing out a
+decoded row takes no work. A row on the main thread went from 2.56 to 1.76 µs at a load of 8 to 9, against
+0.82 µs for a row of the eager `query`. The rows decoded ahead, about one mebibyte and
+one row at most, are held outside the query's memory budget until they are handed out. The async bridge decodes a batch in one
 detached call and no longer reads the plan with every batch. Its rows went from about
 2.2 to 2.1 µs, since the event loop's own work per row and the memory ledger dominate
 them. The cursor figures come from a busy host and need a rerun on a quiet one.

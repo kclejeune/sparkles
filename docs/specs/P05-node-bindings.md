@@ -1588,8 +1588,9 @@ it while its queries run.
   The term ids and the lazy terms are in place. A second pass profiled the calls on a
   laptop at 105,302 triples. A streamed SELECT spent 35% of its samples in the memory
   ledger, one pass per cell, and 7% hashing decoded terms to find repeats. Its batches now
-  ask each cell for its key and decode a term, through the budget, when the key is new to
-  the batch, and `Bindings.get` strips a variable's sigil without a regular expression.
+  ask each cell for its key. The first cell of a key in each batch of the query decodes
+  its term through the budget, and the term's text is written once per batch sent.
+  `Bindings.get` strips a variable's sigil without a regular expression.
   The export of all 105,302 rows with every term read went from 117 to 48 ms at a load of
   7 to 10 and from 162 to 74 ms at a load of 12, in runs whose spread calls for a rerun
   on a quiet host. `has()` takes 0.7 µs in a tight loop against 0.1 µs for N3.js, and 15% of its
