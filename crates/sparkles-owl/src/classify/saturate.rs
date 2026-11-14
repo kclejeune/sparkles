@@ -582,7 +582,7 @@ thread_local! {
     /// place of [`STARTED_NS`], so that a test sees its own.
     pub(super) static STARTED_IN: std::cell::Cell<Option<&'static AtomicU64>> = const { std::cell::Cell::new(None) };
     /// What this thread is in a saturation that runs now: 0 outside one, [`FIRST_WORKER`]
-    /// and [`HELPER`] in the default run, [`STEP_CALLER`] and [`STEP_HELPER`] in a run
+    /// and [`HELPER`] in a run without steps, [`STEP_CALLER`] and [`STEP_HELPER`] in a run
     /// in steps, so that a test's callback knows where it is called.
     pub(super) static WORKER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }

@@ -490,6 +490,10 @@ impl DlRun {
     pub fn set_work_limit(&self, n: usize) {
         self.work_limit.store(n, Ordering::Relaxed);
     }
+    /// Whether the run has a bound on the conclusions it derives.
+    pub fn bounded(&self) -> bool {
+        self.work_limit.load(Ordering::Relaxed) != 0
+    }
     /// Counts `n` derived conclusions.
     pub(super) fn count(&self, n: usize) {
         self.work.fetch_add(n, Ordering::Relaxed);

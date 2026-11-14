@@ -228,15 +228,21 @@ pub struct Limits {
     /// attempt and the run without counting together, takes 157 ms with the order and
     /// 123 ms without it on one thread. False turns the order off.
     pub number_order: bool,
-    /// Makes every saturation of Tier D proceed in steps, so that the run derives the
-    /// same conclusions, passes or keeps its bound on them, and so answers in full or
-    /// falls back, in the same way on every number of threads and every schedule
-    /// (roadmap item 727). A step activates the waiting
+    /// Makes the saturations of a run of Tier D that has a bound on its derived
+    /// conclusions proceed in steps, so that the run derives the same conclusions, passes
+    /// or keeps its bound on them, and so answers in full or falls back, in the same way
+    /// on every number of threads and every schedule (roadmap item 727). On by default.
+    /// The runs with such a bound are a run that counts, the run that starts again
+    /// without counting after it, and a rooted run. A step activates the waiting
     /// contexts in parallel and delivers their messages at its end in a fixed order.
     /// The run does not repeat on one thread an attempt that passed its bound. A rooted
-    /// run and a run with [`Expansion::Eager`] run their saturations on one thread with
-    /// the option. The memory budget, the deadline and a cancellation still stop a run
-    /// when they are reached. Off by default.
+    /// run and a run with [`Expansion::Eager`] that has the bound run their saturations
+    /// on one thread with the option. A run without the bound has no outcome that a
+    /// schedule decides, so the option changes nothing for it. The memory budget, the
+    /// deadline and a cancellation still stop a run when they are reached. False takes
+    /// the driver whose threads deliver conclusions as they derive them, with which a
+    /// run near its bound can answer in full on one schedule and fall back on another,
+    /// and which repeats on one thread an attempt that passed the bound on several.
     pub dl_steps: bool,
 }
 
@@ -255,7 +261,7 @@ impl Default for Limits {
             counting: false,
             rooted: false,
             number_order: true,
-            dl_steps: false,
+            dl_steps: true,
         }
     }
 }
@@ -1675,11 +1681,13 @@ impl Saturation {
         } else {
             limits.max_memory
         };
-        // With `Limits::dl_steps` every saturation of Tier D runs in steps. The ids of a
-        // rooted run's literals and of the eager strategy's contexts follow the order in
-        // which the threads make them, so those runs take one thread instead, whose order
-        // is fixed. The worlds and the taxonomy keep the caller's threads.
-        let fixed = limits.dl_steps && disj && dl_run.is_some();
+        // With `Limits::dl_steps` every saturation of a run of Tier D that has a bound on
+        // its derived conclusions runs in steps. A run without the bound gives the same
+        // answer on every schedule and keeps the driver without steps. The ids of a rooted
+        // run's literals and of the eager strategy's contexts follow the order in which
+        // the threads make them, so those runs take one thread instead, whose order is
+        // fixed. The worlds and the taxonomy keep the caller's threads.
+        let fixed = limits.dl_steps && disj && dl_run.as_ref().is_some_and(|d| d.bounded());
         let steps = fixed && rooted.is_none() && limits.expansion == Expansion::Cautious;
         let saturation_threads = if fixed && !steps { 1 } else { threads };
         let bounds = Bounds {
@@ -2728,7 +2736,7 @@ mod tests {
     /// Roadmap item 727: a run in steps over more contexts than one step takes, where
     /// under test the workers share every step of two contexts and every delivery, derives
     /// the same conclusions and the same answer on one, three and eight threads, and the
-    /// answer is the default run's. A run that a cancellation stops fails or answers in
+    /// answer is that of a run without steps. A run that a cancellation stops fails or answers in
     /// part, and the next run of that classifier gives the outcome of a new one.
     #[test]
     fn a_run_in_steps_over_many_steps_derives_the_same_on_every_number_of_threads() {
@@ -2805,6 +2813,77 @@ mod tests {
         }
     }
 
+    /// Roadmap item 727: a run that counts, which has a bound on its derived conclusions,
+    /// proceeds in steps by default, and `dl_steps: false` gives it the driver without
+    /// steps. A run without counting or the root has no bound and takes the driver
+    /// without steps whatever the option says. The poll of a cancellation sees which
+    /// driver calls it. Both drivers give a run that counts the same answer.
+    #[test]
+    fn a_run_with_a_bound_proceeds_in_steps_by_default_and_false_turns_them_off() {
+        use std::cell::Cell;
+        assert!(Limits::default().dl_steps);
+        let n = 700;
+        let axioms = many_contexts(n);
+        let class = |s: String| Class::new(format!("http://ex.org/{s}"));
+        // the drivers whose workers polled, as (in steps, without steps), and the answer
+        let run = |limits: Limits| {
+            let seen = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+            let s = seen.clone();
+            let out = Classifier::of(&axioms)
+                .classify(&Limits {
+                    threads: 4,
+                    cancelled: Some(Arc::new(move || {
+                        match saturate::WORKER.with(Cell::get) {
+                            saturate::STEP_CALLER | saturate::STEP_HELPER => {
+                                s[0].store(true, Ordering::Relaxed);
+                            }
+                            saturate::FIRST_WORKER | saturate::HELPER => {
+                                s[1].store(true, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                        false
+                    })),
+                    ..limits
+                })
+                .unwrap();
+            assert!(out.complete && !out.stats.dl_over_budget);
+            let answer: Vec<bool> = (0..n)
+                .map(|i| {
+                    out.taxonomy
+                        .is_subclass(&class(format!("C{i}")), &class(format!("P{i}")))
+                })
+                .collect();
+            (
+                seen[0].load(Ordering::Relaxed),
+                seen[1].load(Ordering::Relaxed),
+                answer,
+            )
+        };
+        let counting = Limits {
+            counting: true,
+            ..Limits::default()
+        };
+        let (steps, without, by_default) = run(counting.clone());
+        assert!(steps && !without);
+        assert!(by_default.iter().all(|&p| p));
+        let (steps, without, off) = run(Limits {
+            dl_steps: false,
+            ..counting
+        });
+        assert!(!steps && without);
+        assert_eq!(off, by_default);
+        // without counting the maximum is left out, so no `C` is below its `P`
+        for dl_steps in [true, false] {
+            let (steps, without, answer) = run(Limits {
+                dl_steps,
+                ..Limits::default()
+            });
+            assert!(!steps && without, "steps {dl_steps}");
+            assert!(answer.iter().all(|&p| !p), "steps {dl_steps}");
+        }
+    }
+
     /// An inference of a run in steps that derives more conclusions than the run's bound
     /// ends at its next look at the bounds, also when every conclusion is new and the
     /// inference reserves memory for its record of them. `Z` holds 60 clauses with `A`,
@@ -2872,11 +2951,11 @@ mod tests {
     }
 
     /// A panic in a worker of a saturation ends the run with the panic, in a helper and
-    /// in the calling thread, in a run in steps and in the default run. A helper that is
+    /// in the calling thread, in a run in steps and in a run without them. A helper that is
     /// not to panic stays in the callback for a while, and the calling thread panics
     /// only while a helper is there, so that it panics while a helper works in the same
     /// saturation. The other workers waited for the one that panicked without end: those
-    /// of a run in steps at the barrier between the phases, and those of the default run
+    /// of a run in steps at the barrier between the phases, and those of a run without steps
     /// for a count of busy workers that never reached zero.
     #[test]
     fn a_panic_in_a_worker_ends_the_saturation_with_the_panic() {

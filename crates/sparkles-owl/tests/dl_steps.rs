@@ -1,6 +1,7 @@
-//! Roadmap item 727: with `Limits::dl_steps` a run of the disjunctive rules that has a
-//! bound on its derived conclusions derives the same conclusions on every number of
-//! threads, so that it answers in full or falls back in the same way on every schedule.
+//! Roadmap item 727: with `Limits::dl_steps`, which is on by default, a run of the
+//! disjunctive rules that has a bound on its derived conclusions derives the same
+//! conclusions on every number of threads, so that it answers in full or falls back in
+//! the same way on every schedule.
 //!
 //! The cases are the 150 counting fixtures of item 603 and the generated ontologies of
 //! item 897, with HermiT's taxonomies beside them.
@@ -161,17 +162,18 @@ fn outcome(case: &Case, limits: &Limits) -> (Answer, [usize; 3], [bool; 3]) {
     )
 }
 
+/// A run that counts with the default limits, which proceeds in steps.
 fn steps(threads: usize) -> Limits {
+    assert!(Limits::default().dl_steps);
     Limits {
         threads,
         counting: true,
-        dl_steps: true,
         ..Limits::default()
     }
 }
 
 /// Every counting case derives the same conclusions and gives the same answer on one,
-/// two, four and eight threads with the option, whether it stays within the default bound
+/// two, four and eight threads by default, whether it stays within the default bound
 /// or passes it. A run that stays within it and takes the case whole has HermiT's
 /// answer, and every other answer is among HermiT's subsumptions.
 #[test]
@@ -239,10 +241,11 @@ fn one_case_run_many_times_gives_one_outcome() {
     }
 }
 
-/// The option changes no answer of a run that stays within its bound: on the cases that
-/// both drivers finish with the disjunctive rules and counting, the answers are equal.
+/// The steps change no answer of a run that stays within its bound: on the cases that
+/// a run in steps and a run with `dl_steps: false` both finish with the disjunctive rules
+/// and counting, the answers are equal.
 #[test]
-fn a_run_in_steps_answers_as_the_default_run_does() {
+fn a_run_in_steps_answers_as_a_run_without_steps_does() {
     let mut compared = 0;
     for case in cases().iter().step_by(3) {
         let limits = |dl_steps: bool| Limits {
@@ -278,37 +281,40 @@ fn family(dir: &str, prefix: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// A run of the disjunctive rules without counting has no bound on its derived
-/// conclusions, and with the option it proceeds in steps as well: the cases of the
-/// families without number restrictions derive the same and give HermiT's answer on one,
-/// four and eight threads.
+/// A run of the disjunctive rules without counting or the root has no bound on its
+/// derived conclusions, so no schedule decides its outcome, and the option leaves it to
+/// the driver without steps: the cases of the families without number restrictions give
+/// HermiT's answer on one, four and eight threads with the option on and off.
 #[test]
-fn a_run_in_steps_without_a_bound_derives_the_same_on_every_number_of_threads() {
+fn a_run_without_a_bound_answers_the_same_with_the_option_and_without_it() {
     let mut derived = 0;
     for prefix in ["alc-", "shi-"] {
         for path in family("dl603", prefix).iter().step_by(5) {
             let case = case(path);
-            let limits = |threads: usize| Limits {
-                threads,
-                dl_steps: true,
-                ..Limits::default()
-            };
-            let first = outcome(&case, &limits(1));
-            for threads in [4, 8] {
-                assert_eq!(outcome(&case, &limits(threads)), first, "{}", case.stem);
+            for dl_steps in [true, false] {
+                for threads in [1, 4, 8] {
+                    let ((got, whole), [work, ..], over) = outcome(
+                        &case,
+                        &Limits {
+                            threads,
+                            dl_steps,
+                            ..Limits::default()
+                        },
+                    );
+                    let run = format!("{}, {threads} threads, steps {dl_steps}", case.stem);
+                    assert_eq!(over, [false; 3], "{run}");
+                    assert!(whole && got == case.want, "{run}");
+                    derived += work;
+                }
             }
-            let ((got, whole), [work, ..], over) = first;
-            assert_eq!(over, [false; 3], "{}", case.stem);
-            assert!(whole && got == case.want, "{}", case.stem);
-            derived += work;
         }
     }
     // the cases went through the disjunctive rules
     assert!(derived > 0);
 }
 
-/// A run with the eager strategy and a rooted run take one thread with the option, so
-/// that they too give one outcome on every number of threads.
+/// A run with the eager strategy that counts and a rooted run take one thread with the
+/// option, so that they too give one outcome on every number of threads.
 #[test]
 fn eager_and_rooted_runs_in_steps_give_one_outcome() {
     let all = cases();
