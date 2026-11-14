@@ -95,12 +95,12 @@ pub enum Concl {
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
 const _: () = assert!(std::mem::size_of::<Concl>() == 12);
 
-/// A set kept as a list in the order of insertion, with a hash set beside it once it
+/// A set kept as a list in the order of insertion, with a hash table beside it once it
 /// has more than a few members, so that a small set takes one allocation.
 #[derive(Clone)]
 pub struct Small<T> {
     pub list: Vec<T>,
-    set: Option<FxHashSet<T>>,
+    set: Option<Table<T>>,
 }
 
 impl<T> Default for Small<T> {
@@ -118,10 +118,126 @@ pub fn table_bytes(capacity: usize, size: usize) -> usize {
     capacity * (size + 1) * 8 / 7
 }
 
-/// The members a [`Small`] set searches in its list before it keeps a hash set.
+/// The members a [`Small`] set searches in its list before it keeps a hash table.
 const SMALL: usize = 16;
 
-impl<T: Copy + Eq + std::hash::Hash> Small<T> {
+/// A member of a [`Small`] set: a key of one or two words, with a value that marks an
+/// empty slot of its table and a hash whose high bits choose the slot.
+pub trait Key: Copy + Eq {
+    const EMPTY: Self;
+    fn mix(self) -> u64;
+}
+
+const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+impl Key for u32 {
+    const EMPTY: u32 = u32::MAX;
+    #[inline]
+    fn mix(self) -> u64 {
+        (self as u64 ^ (self as u64) << 32).wrapping_mul(MIX)
+    }
+}
+
+impl Key for (u32, u32) {
+    const EMPTY: (u32, u32) = (u32::MAX, u32::MAX);
+    #[inline]
+    fn mix(self) -> u64 {
+        ((self.0 as u64) << 32 | self.1 as u64).wrapping_mul(MIX)
+    }
+}
+
+/// An open-addressing hash table of keys with linear probing, filled to at most three
+/// quarters, for the members of a large [`Small`] set (roadmap item 889). The key that
+/// marks an empty slot is kept aside when it is a member.
+#[derive(Clone)]
+struct Table<T> {
+    slots: Box<[T]>,
+    /// the members, the empty key's included
+    len: usize,
+    /// 64 less the bits of a slot's place
+    shift: u32,
+    empty: bool,
+}
+
+impl<T: Key> Table<T> {
+    fn with_capacity(n: usize) -> Table<T> {
+        let cap = (n * 4 / 3 + 1).next_power_of_two().max(8);
+        Table {
+            slots: vec![T::EMPTY; cap].into_boxed_slice(),
+            len: 0,
+            shift: 64 - cap.trailing_zeros(),
+            empty: false,
+        }
+    }
+
+    #[inline]
+    fn contains(&self, x: T) -> bool {
+        if x == T::EMPTY {
+            return self.empty;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = (x.mix() >> self.shift) as usize;
+        loop {
+            let s = self.slots[i];
+            if s == x {
+                return true;
+            }
+            if s == T::EMPTY {
+                return false;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Adds a key, and says whether it is new.
+    #[inline]
+    fn insert(&mut self, x: T) -> bool {
+        if x == T::EMPTY {
+            let new = !self.empty;
+            self.empty = true;
+            self.len += new as usize;
+            return new;
+        }
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = (x.mix() >> self.shift) as usize;
+        loop {
+            let s = self.slots[i];
+            if s == x {
+                return false;
+            }
+            if s == T::EMPTY {
+                self.slots[i] = x;
+                self.len += 1;
+                return true;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let mut t = Table::with_capacity(2 * self.slots.len());
+        t.extend(self.slots.iter().copied().filter(|&s| s != T::EMPTY));
+        t.empty = self.empty;
+        t.len += self.empty as usize;
+        *self = t;
+    }
+
+    fn extend(&mut self, xs: impl IntoIterator<Item = T>) {
+        for x in xs {
+            self.insert(x);
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.slots.len() * std::mem::size_of::<T>()
+    }
+}
+
+impl<T: Key> Small<T> {
     /// Adds a member, and says whether it is new.
     #[inline]
     pub fn insert(&mut self, x: T) -> bool {
@@ -136,8 +252,7 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
                     return false;
                 }
                 if self.list.len() >= SMALL {
-                    let mut set: FxHashSet<T> =
-                        FxHashSet::with_capacity_and_hasher(2 * SMALL, Default::default());
+                    let mut set = Table::with_capacity(2 * SMALL);
                     set.extend(self.list.iter().copied());
                     set.insert(x);
                     self.set = Some(set);
@@ -151,7 +266,7 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
     #[inline]
     pub fn contains(&self, x: &T) -> bool {
         match &self.set {
-            Some(set) => set.contains(x),
+            Some(set) => set.contains(*x),
             None => self.list.contains(x),
         }
     }
@@ -159,16 +274,14 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
     pub fn retain(&mut self, keep: impl Fn(&T) -> bool) {
         self.list.retain(|x| keep(x));
         if let Some(set) = &mut self.set {
-            set.retain(|x| keep(x));
+            let mut t = Table::with_capacity(self.list.len().max(2 * SMALL));
+            t.extend(self.list.iter().copied());
+            *set = t;
         }
     }
 
     pub fn bytes(&self) -> usize {
-        self.list.capacity() * std::mem::size_of::<T>()
-            + self
-                .set
-                .as_ref()
-                .map_or(0, |s| table_bytes(s.capacity(), std::mem::size_of::<T>()))
+        self.list.capacity() * std::mem::size_of::<T>() + self.set.as_ref().map_or(0, Table::bytes)
     }
 }
 
@@ -3020,6 +3133,52 @@ fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) 
     let after = st.bytes();
     debug_assert!(after.saturating_sub(before) <= reserve);
     out.release_data(reserve.saturating_add(before).saturating_sub(after));
+}
+
+#[cfg(test)]
+mod small_tests {
+    use super::*;
+
+    /// A [`Small`] set answers as a hash set does, through its list and its table, with
+    /// the key that marks an empty slot among its members and after a retain.
+    fn check<T: Key + std::hash::Hash + std::fmt::Debug>(key: impl Fn(u64) -> T) {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut small: Small<T> = Small::default();
+        let mut want: FxHashSet<T> = FxHashSet::default();
+        for i in 0..5000 {
+            let x = if i % 97 == 0 {
+                T::EMPTY
+            } else {
+                key(next() % 3000)
+            };
+            assert_eq!(small.insert(x), want.insert(x), "insert {x:?}");
+            let y = key(next() % 3000);
+            assert_eq!(small.contains(&y), want.contains(&y), "contains {y:?}");
+        }
+        assert_eq!(small.list.len(), want.len());
+        assert!(small.contains(&T::EMPTY));
+        let keep = |x: &T| x.mix() % 3 != 0;
+        small.retain(keep);
+        want.retain(keep);
+        assert_eq!(small.list.len(), want.len());
+        for k in 0..3000 {
+            let x = key(k);
+            assert_eq!(small.contains(&x), want.contains(&x));
+        }
+        assert_eq!(small.contains(&T::EMPTY), want.contains(&T::EMPTY));
+    }
+
+    #[test]
+    fn a_small_set_answers_as_a_hash_set() {
+        check(|v| v as u32);
+        check(|v| ((v % 7) as u32, (v / 7) as u32));
+    }
 }
 
 #[cfg(test)]
