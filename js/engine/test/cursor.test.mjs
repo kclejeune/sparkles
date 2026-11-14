@@ -461,6 +461,41 @@ test(
 );
 
 test(
+  'a term decoded in an earlier batch of a streamed query asks the memory budget again',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      const long = 'x'.repeat(64 << 10);
+      await ds.load(
+        `<urn:a> <urn:p> "${long}" . <urn:b> <urn:p> "${long}" . <urn:c> <urn:p> "${long}" .`,
+        { format: 'ttl' },
+      );
+      // The three arms give three batches of the query inside one batch sent to
+      // JavaScript. The first arm's batch decodes the literal. The filter of the second
+      // arm holds about half a mebibyte while its batch is read, and the literal is a
+      // key that was decoded before. Decoding it for that batch does not fit beside what
+      // the filter holds, so the query is refused, as it is when every cell is decoded.
+      const q =
+        'SELECT ?o WHERE { { <urn:a> <urn:p> ?o } UNION ' +
+        '{ <urn:b> <urn:p> ?o FILTER(STRLEN(?o) + RAND() > 0) } UNION { <urn:c> <urn:p> ?o } }';
+      const read = async (maxMemoryBytes) => {
+        const lengths = [];
+        const rows = await ds.select(q, { execution: 'streaming', maxMemoryBytes });
+        for await (const row of rows) lengths.push(row.get('o').value.length);
+        return lengths;
+      };
+      for (let run = 0; run < 20; run++)
+        await assert.rejects(read(1 << 20), /memory budget/, `run ${run}`);
+      // a budget with room for the filter and the term reads every row
+      assert.deepEqual(await read(8 << 20), [64 << 10, 64 << 10, 64 << 10]);
+    } finally {
+      await ds.close();
+    }
+  },
+);
+
+test(
   'a term that repeats across the batches of a streamed query is read by every row',
   { timeout: 30000 },
   async () => {

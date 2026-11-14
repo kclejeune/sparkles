@@ -33,17 +33,29 @@ fn term_bytes(term: &oxrdf::Term) -> usize {
             l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
         }
         oxrdf::Term::Triple(t) => {
-            128 + t.subject.to_string().len() + t.predicate.as_str().len() + term_bytes(&t.object)
+            128 + subject_bytes(&t.subject) + t.predicate.as_str().len() + term_bytes(&t.object)
         }
+    }
+}
+
+/// The text of a subject.
+fn subject_bytes(subject: &oxrdf::NamedOrBlankNode) -> usize {
+    match subject {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
     }
 }
 
 /// [`term_bytes`] for every field of a quad.
 fn quad_bytes(quad: &oxrdf::Quad) -> usize {
-    192 + quad.subject.to_string().len()
+    192 + subject_bytes(&quad.subject)
         + quad.predicate.as_str().len()
         + term_bytes(&quad.object)
-        + quad.graph_name.to_string().len()
+        + match &quad.graph_name {
+            oxrdf::GraphName::NamedNode(n) => n.as_str().len(),
+            oxrdf::GraphName::BlankNode(b) => b.as_str().len(),
+            oxrdf::GraphName::DefaultGraph => 0,
+        }
 }
 
 struct State {
@@ -409,6 +421,12 @@ impl PyQueryCursor {
         Ok(values.map(|values| PyQuerySolution::new(self.vars.clone(), values)))
     }
 
+    /// Internal, for the tests of the read-ahead limit: the rows that are decoded and
+    /// not yet handed out, or `None` while another operation holds the cursor.
+    fn _rows_ahead(&self) -> Option<usize> {
+        self.state.try_lock().ok().map(|state| state.ahead.len())
+    }
+
     /// Internal async bridge: deliver one remaining native batch, without prefetch. The
     /// whole batch is decoded in one detached call, so the event loop's thread can run
     /// while it is.
@@ -752,6 +770,12 @@ impl PyGraphCursor {
         values
             .map(|quad| crate::terms::quad_to_py(py, quad))
             .transpose()
+    }
+
+    /// Internal, for the tests of the read-ahead limit: the quads that are copied ahead
+    /// and not yet handed out, or `None` while another operation holds the cursor.
+    fn _rows_ahead(&self) -> Option<usize> {
+        self.state.try_lock().ok().map(|state| state.ahead.len())
     }
 
     /// Internal async bridge: deliver one remaining native batch, without prefetch, copied

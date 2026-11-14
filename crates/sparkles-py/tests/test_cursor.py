@@ -227,3 +227,52 @@ def test_cursor_decoding_ahead_counts_datatypes_and_triple_terms():
         assert cursor.stats()["emittedRows"] == 300
     quads = ds.graph_cursor("CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }")
     assert len(list(quads)) == 300
+
+
+def _ahead_after_first(cursor):
+    """The rows a cursor holds decoded ahead once its first row is handed out."""
+    next(cursor)
+    ahead = cursor._rows_ahead()
+    cursor.close()
+    return ahead
+
+
+def test_cursor_read_ahead_stops_at_a_mebibyte_of_owned_text():
+    """A refill decodes up to 255 rows ahead and stops near one mebibyte of the text those
+    rows own. The count takes in a literal's datatype, the parts of a triple term and
+    every field of a quad, so rows of 64 KiB each stop a refill after about 16 of them."""
+    ds = Dataset()
+    long = "x" * 65_536
+    rows = range(300)
+    data = " ".join(f'<urn:s{i}> <urn:short> "x" .' for i in rows)
+    # the long text is a datatype, each part of a triple term, and each field of a quad
+    data += " ".join(f' <urn:s{i}> <urn:datatype> "x"^^<urn:dt:{long}> .' for i in rows)
+    data += " ".join(f" <urn:s{i}> <urn:nested-s> <<( <urn:{long}> <urn:b> <urn:c> )>> ." for i in rows)
+    data += " ".join(f" <urn:s{i}> <urn:nested-p> <<( <urn:a> <urn:{long}> <urn:c> )>> ." for i in rows)
+    data += " ".join(f' <urn:s{i}> <urn:nested-o> <<( <urn:a> <urn:b> "x"^^<urn:dt:{long}> )>> .' for i in rows)
+    ds.load(data, "ttl")
+    # short rows fill a refill to its row limit
+    assert _ahead_after_first(ds.select_cursor("SELECT ?o WHERE { ?s <urn:short> ?o }")) == 255
+    assert (
+        _ahead_after_first(ds.graph_cursor("CONSTRUCT { ?s <urn:short> ?o } WHERE { ?s <urn:short> ?o }"))
+        == 255
+    )
+    # 64 KiB of text in each row stops it after a mebibyte and one row
+    for predicate in ("datatype", "nested-s", "nested-p", "nested-o"):
+        q = f"SELECT ?o WHERE {{ ?s <urn:{predicate}> ?o }}"
+        ahead = _ahead_after_first(ds.select_cursor(q))
+        assert 10 <= ahead <= 17, (predicate, ahead)
+    # a quad's subject, predicate and object each count, and so does its graph name
+    templates = (
+        f"?s <urn:{long}> ?o",
+        f"<urn:{long}> <urn:p> ?s",
+        f"?s <urn:p> <urn:{long}>",
+        f"GRAPH <urn:{long}> {{ ?s <urn:p> ?o }}",
+    )
+    for template in templates:
+        q = f"CONSTRUCT {{ {template} }} WHERE {{ ?s <urn:short> ?o }}"
+        ahead = _ahead_after_first(ds.graph_cursor(q))
+        assert 10 <= ahead <= 17, (template[:40], ahead)
+    # two long fields in each quad halve the rows a refill holds
+    q = f"CONSTRUCT {{ <urn:{long}> <urn:{long}> ?s }} WHERE {{ ?s <urn:short> ?o }}"
+    assert 5 <= _ahead_after_first(ds.graph_cursor(q)) <= 9
