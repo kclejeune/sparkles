@@ -17,8 +17,9 @@
 //! memory budget is charged for and which can make a run with a tight budget fail. The
 //! evaluations of the orders are charged to no budget, and the first evaluations of the
 //! planner's own order have no time limit, as the run's evaluation of it has none. A
-//! plan of a rule whose builtins bind variables is not probed, since each evaluation
-//! would add the terms those builtins make to the run's terms.
+//! plan is probed only when the builtins of its rule are comparisons, type tests and
+//! `noValue`. Other builtins make terms or compile patterns, which each evaluation
+//! would add to the run's terms and charge to its budget.
 
 use super::sampled::steps_in_order;
 use super::*;
@@ -160,9 +161,30 @@ pub(crate) fn probe(
         .par_iter()
         .map(|(ri, steps)| {
             let r = &rules[*ri];
-            if r.builtins.iter().any(|f| !f.outputs.is_empty()) {
+            use BuiltinKind as B;
+            let tests = |k: BuiltinKind| {
+                matches!(
+                    k,
+                    B::Equal
+                        | B::NotEqual
+                        | B::LessThan
+                        | B::GreaterThan
+                        | B::Le
+                        | B::Ge
+                        | B::IsLiteral
+                        | B::NotLiteral
+                        | B::IsBNode
+                        | B::NotBNode
+                        | B::IsDType
+                        | B::NotDType
+                        | B::IsFunctor
+                        | B::NotFunctor
+                        | B::NoValue
+                )
+            };
+            if r.builtins.iter().any(|f| !tests(f.kind)) {
                 return format!(
-                    "PLANPROBE-SKIPPED\t{iteration}\t{}\ta builtin binds a variable",
+                    "PLANPROBE-SKIPPED\t{iteration}\t{}\ta builtin makes terms",
                     r.name
                 );
             }

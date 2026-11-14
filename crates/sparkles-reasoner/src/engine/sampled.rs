@@ -49,14 +49,19 @@
 //! itself, and a variable that a builtin binds and an atom or another builtin also
 //! holds would be generated in one order and checked in another ([`order_matters`]).
 //!
-//! A plan's probes are bounded. A probe of the store reads one block of its scan at
-//! most, and a sample of a relation one block per start. A plan makes at most
-//! [`PROBES`] probes, and the facts they keep are charged to the run's memory budget,
-//! [`PROBE_BYTES`] each, until the plan is made. A plan that needs more probes, or
-//! more memory than the budget has left, or whose costs overflow, keeps the greedy
-//! order. The planner's scans of the store count in the run's scans.
+//! A plan's probes are bounded. A read of the store stops at the end of one block of
+//! its scan, and earlier at the block, the segment or the row of the snapshot's delta
+//! that takes it past [`SAMPLE_ROWS`](crate::facts::SAMPLE_ROWS) rows, whatever share
+//! of the rows belongs to other graphs. A sample of a relation makes one such read per
+//! start, and a count reads the index's blocks at the two ends of its range at most. A
+//! plan makes at most [`PROBES`] probes, and the facts they keep are charged to the
+//! run's memory budget, [`PROBE_BYTES`] each, until the plan is made. A plan that
+//! needs more probes, or more memory than the budget has left, or whose costs
+//! overflow, or that fails to read the store, keeps the greedy order. The planner's
+//! scans of the store count in the run's scans.
 
 use super::*;
+use crate::facts::UNCOUNTED;
 use std::sync::atomic::AtomicU64;
 
 /// The bindings the sample keeps.
@@ -95,8 +100,11 @@ pub(crate) const MIN_COST: f64 = 50_000.0;
 /// keeps the greedy order.
 pub(crate) const PROBES: usize = 2048;
 /// The bytes a probe is charged to the run's memory budget, an upper bound of what it
-/// keeps: its entry in the plan's table and at most [`SAMPLE`] facts of 24 bytes in a
-/// buffer of up to twice that.
+/// keeps: at most [`SAMPLE`] facts of 24 bytes in a buffer of their number, the 48
+/// bytes of its count and its buffer's header, and its entry of 64 bytes in the plan's
+/// table, which a table at its lowest load and its copy while it grows make 300 at
+/// most. The buffers a probe works in, of at most 64 facts, are freed before the next
+/// probe and are not charged.
 pub(crate) const PROBE_BYTES: usize = 1024;
 
 /// Whether every body of [`MIN_ATOMS`] atoms or more is sampled and searched, whatever
@@ -457,7 +465,9 @@ impl Walk<'_> {
                 facts: Vec::new(),
             });
         }
-        let p = std::rc::Rc::new(self.probe_now(pattern, lo, hi));
+        let mut p = self.probe_now(pattern, lo, hi);
+        p.facts.shrink_to_fit();
+        let p = std::rc::Rc::new(p);
         self.probes.insert((pattern, lo, hi), p.clone());
         p
     }
@@ -517,9 +527,11 @@ impl Walk<'_> {
             // a relation, or every fact: the statistics count it, and its facts come from
             // a few places along it
             let stored = match p {
-                Some(p) => base.count_p(p) as f64,
-                None => base.len() as f64,
+                Some(p) => base.count_p(p),
+                None => base.len() as u64,
             };
+            self.spent |= stored >= UNCOUNTED;
+            let stored = stored as f64;
             let want = SAMPLE - facts.len().min(SAMPLE / 2);
             let mut some = Vec::new();
             let read = base.sample(self.memo, [s, p, o], want, STORE_STARTS, |t| {
@@ -534,29 +546,25 @@ impl Walk<'_> {
             };
         }
         // a probe with a subject or an object: its first facts, which are all of them
-        // when they are few, and then the scan counted them. A scan of several blocks
-        // is read in its first block alone, and the index counts it.
+        // when they are few, and then the read counted them. A read that stops before
+        // the end of the pattern's range, at the end of its block or of its allowance of
+        // rows, leaves the count to the index.
         let mut some = Vec::new();
-        let read = if base.blocks(s, p, o) <= 1 {
-            base.for_each_with(self.memo, s, p, o, |t| {
-                some.push(t);
-                some.len() <= SAMPLE
-            })
-        } else {
-            base.sample(self.memo, [s, p, o], SAMPLE + 1, 1, |t| {
-                some.push(t);
-                true
-            })
-        };
-        let ended = read.unwrap_or_else(|_| {
+        let read = base.sample(self.memo, [s, p, o], SAMPLE + 1, 1, |t| {
+            some.push(t);
+            true
+        });
+        let whole = read.unwrap_or_else(|_| {
             self.spent = true;
             true
         });
-        let stored = if ended {
+        let stored = if whole && some.len() <= SAMPLE {
             some.len() as f64
         } else {
             some.truncate(SAMPLE);
-            base.count(s, p, o) as f64
+            let n = base.count(s, p, o);
+            self.spent |= n >= UNCOUNTED;
+            n as f64
         };
         mix(&mut facts, some);
         Probe {
