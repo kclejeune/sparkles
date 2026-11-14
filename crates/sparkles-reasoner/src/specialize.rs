@@ -298,6 +298,11 @@ pub(crate) fn specialize(
                     dropped.push(r.clone_shallow());
                     written = true;
                 } else {
+                    let mut s = s;
+                    // list expansion can leave spare room, which a kept rule need not hold
+                    s.atoms.shrink_to_fit();
+                    s.builtins.shrink_to_fit();
+                    s.head.shrink_to_fit();
                     let key = rule_key(&s);
                     if !seen_out.contains(&key) {
                         held.try_grow(rule_bytes(&s))?;
@@ -331,8 +336,7 @@ fn rule_bytes(r: &CRule) -> usize {
         .builtins
         .iter()
         .map(|b| {
-            size_of::<CBuiltin>()
-                + slots(b.args.capacity())
+            slots(b.args.capacity())
                 + (b.inputs.capacity() + b.outputs.capacity()) * size_of::<usize>()
                 // the key's copy of the arguments
                 + size_of::<(BuiltinKind, Vec<Slot>)>()
@@ -347,8 +351,7 @@ fn rule_bytes(r: &CRule) -> usize {
                 CHead::Triple(..) => 3,
                 CHead::Action(_, args) => args.capacity(),
             };
-            size_of::<CHead>()
-                + slots(args)
+            slots(args)
                 + size_of::<(Option<crate::builtins::HeadAction>, Vec<Slot>)>()
                 + slots(args)
         })
@@ -358,7 +361,9 @@ fn rule_bytes(r: &CRule) -> usize {
         + r.name.capacity()
         + r.atoms.capacity() * size_of::<Atom>()
         + r.atoms.len() * size_of::<[Slot; 3]>()
+        + r.builtins.capacity() * size_of::<CBuiltin>()
         + builtins
+        + r.head.capacity() * size_of::<CHead>()
         + heads
         // the key set's entry and hash
         + 16
@@ -639,5 +644,21 @@ mod tests {
         assert!(r.is_err());
         drop(r);
         assert_eq!(budget.used(), 0);
+    }
+
+    /// The charge counts the room a rule's lists hold beyond their elements, such as the
+    /// builtins that list expansion removed (Codex review qtr-step2, round 5).
+    #[test]
+    fn spare_room_is_charged() {
+        let rule = |builtins: Vec<CBuiltin>| CRule {
+            name: String::new(),
+            nvars: 0,
+            atoms: vec![],
+            builtins,
+            head: vec![],
+        };
+        let empty = rule_bytes(&rule(Vec::new()));
+        let spare = rule_bytes(&rule(Vec::with_capacity(1000)));
+        assert!(spare - empty >= 1000 * std::mem::size_of::<CBuiltin>());
     }
 }
