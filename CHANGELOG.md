@@ -6,20 +6,22 @@
 
 Calls that read a few quads cost less, as part of roadmap item 33. Pattern reads remember the base
 vocabulary's answers for the terms a thread asked for last, which nearly halves a Python
-`in` and takes about a third off a JVM `Graph.contains`, for about 115 KiB per thread
+`in` and takes 30% off a JVM `Graph.contains`, for about 115 KiB per thread
 that reads patterns. A result cache key that is all ASCII renames generated variables
 without a regular expression, which takes a quarter off a short property path query
 through Python. A streamed Node SELECT decodes each distinct term once per batch of the
-query and writes its text once per batch it sends. A Python cursor decodes up to 255
-further rows ahead in one detached call, held outside the query's memory budget until
-they are read, and the async cursor reads its plan when asked and on close.
+query and writes its text once per batch it sends, which takes the export of 105,302
+rows from 105 to 40 ms. A Python cursor decodes up to 255 further rows ahead in one
+detached call, held outside the query's memory budget until they are read, which takes
+a row on the main thread from 2.75 to 1.61 µs. The async cursor reads its plan when
+asked and on close. The figures are from atlas at 105,302 triples.
 
 Each binding answers many membership tests in one call. `Dataset.contains_all` in
 Python, `DatasetGraphSparkles.containsAll` on the JVM and `Dataset.hasAll` in Node take
 a batch of quads and return the answer of `in`, `contains` or `has` for each, in order
-and from one state of the dataset. On a laptop at 105,302 triples, a probe in a batch
-of 64 took about 0.30 µs on the JVM against 0.81 µs for a single call, and 0.27 µs in
-Node against 0.71 µs. In Python a batch saves about a seventh, since the lookup is most
+and from one state of the dataset. On atlas at 105,302 triples, a probe in a batch
+of 64 took 0.31 µs on the JVM against 0.97 µs for a single call, and 0.31 µs in
+Node against 0.84 µs. In Python a batch saves about a tenth, since the lookup is most
 of an `in`.
 
 ### Valid time

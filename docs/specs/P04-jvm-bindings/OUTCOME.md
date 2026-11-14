@@ -477,21 +477,21 @@ no permit.
   pattern reads now remember the base vocabulary's answers per thread, which serves the
   purpose of the cached term ids above without a cache on the Kotlin side, and the reader
   of an incoming batch keeps offsets for repeats in place of a copy of every term. In
-  interleaved runs at a load of 3 to 6, `Graph.contains` in its own read transaction went
-  from about 1.2 to 0.8 µs against 0.49 µs for TIM. `getProperty` took about a tenth
-  less, near 1.8 µs against 0.72 µs, within a spread that needs a quieter host to
-  settle, and `find` on a subject did not change at 4.3 µs against 2.5 µs. The one JNI
-  entry point for a read outside a transaction exists.
+  five interleaved rounds on atlas, pinned to four CPUs, `Graph.contains` in its own
+  read transaction went from 1.37 to 0.96 µs against 0.49 µs for TIM. `getProperty`
+  went from 2.38 to 2.16 µs against 0.64 µs, and `find` on a subject did not change at
+  4.7 µs against 1.7 µs. The one JNI entry point for a read outside a transaction
+  exists.
 
   `DatasetGraphSparkles.containsAll` is the batched call. It encodes a batch of quads
   into one request, in which a shared term is sent once, and one native call returns a
   byte for each quad. For a quad whose four terms are given, the native side looks the
   id of each distinct term up once and probes the index by ids. A pattern with a
-  wildcard is answered as `contains` answers it. In batches of 64 probes inside one read transaction, a probe
-  took about 0.30 µs against 0.81 µs for `Graph.contains` in a transaction of its own,
-  at a load of 7. TIM answered the same batch one by one in 0.15 µs each in one
-  transaction, and a single probe in its own transaction in 0.42 µs. A profile of the
-  batch puts 27% of its samples in the index probe, most of it the block cache lookup
+  wildcard is answered as `contains` answers it. In batches of 64 probes inside one read
+  transaction on atlas, a probe took 0.31 µs against 0.97 µs for `Graph.contains` in a
+  transaction of its own. TIM answered the same batch one by one in 0.18 µs each in one
+  transaction, and a single probe in its own transaction in 0.49 µs. A profile of the
+  batch on the laptop puts 27% of its samples in the index probe, most of it the block cache lookup
   that each quad makes, 14% in the lookup of term ids and 14% in the Kotlin writer. A
   probe of a sorted batch that reads each block once is the step left for it, which is
   [ROADMAP](../../ROADMAP.md) item 946. `find` over several subjects in one call is not

@@ -1146,46 +1146,50 @@ process RSS includes accumulated writes, so it is not a read-only memory measure
 
 ### Per-call costs after the second pass
 
-A second look at item 33 profiled each call on a laptop at 105,302 triples with `perf`,
-and compared builds of the base and the changed source in interleaved runs of fresh
-processes. The host ran other work, so each figure is given with its one-minute load.
+A second look at item 33 profiled each call on a laptop at 105,302 triples with `perf`.
+The figures below come from atlas, on the same data. They compare builds of the source
+before and after the changes in six interleaved rounds of fresh processes pinned to
+four CPUs, and the spread of each case's rounds stayed under 5%.
 
 The search of the base vocabulary took 45% of `in` and 15% of a value lookup. Pattern
 reads now remember what the base vocabulary answered for the terms a thread asked for
 last, in 1,024 slots per thread that hold the whole key, and `in` reads a `Quad` where
-it is. `in` went from 0.74 to 0.40 µs at a load of 4.4 to 4.7, against 1.31 µs for
-pyoxigraph. A value lookup stayed at 1.40 to 1.45 µs against 1.01 µs, and a scan of a
-subject at 7.4 µs against 5.7 µs. The memo costs each thread that reads patterns about
-115 KiB, and at most 320 KiB.
+it is. `in` went from 0.95 to 0.50 µs, against 1.84 µs for pyoxigraph. A value lookup
+went from 1.84 to 1.65 µs against 1.21 µs, and a scan of a subject stayed at 9.3 to 9.4
+µs against 7.2 µs. The memo costs each thread that reads patterns about 115 KiB, and at
+most 320 KiB.
 
 The regular expression that renames generated variables in a result cache key took a
 fifth of a short property path query. A key that is all ASCII is now scanned by hand,
 and a key with other text still goes through the expression.
-`knows-reach` went from 20.9 to 15.7 µs at the same load, against 19.0 µs for
-pyoxigraph.
+`knows-reach` went from 26.4 to 20.2 µs. The `star-lookup`, `values-star` and
+`employee-docs` queries stayed within 1.5% of their earlier times. pyoxigraph was not
+run for `knows-reach` on atlas. On the laptop it took 19.0 µs against 15.7 µs for the
+changed build.
 
 A sync cursor handed out every row through the path of a fetch, which on Python's main
 thread is a helper thread. A fetch or a refill now decodes up to 255 further rows ahead
 in one detached call, stopping once they pass one mebibyte of text, and handing out a
-decoded row takes no work. A row on the main thread went from 2.56 to 1.76 µs at a load of 8 to 9, against
-0.82 µs for a row of the eager `query`. The rows decoded ahead, about one mebibyte and
-one row at most, are held outside the query's memory budget until they are handed out. The async bridge decodes a batch in one
-detached call and no longer reads the plan with every batch. Its rows went from about
-2.2 to 2.1 µs, since the event loop's own work per row and the memory ledger dominate
-them. The cursor figures come from a busy host and need a rerun on a quiet one.
+decoded row takes no work. A row on the main thread went from 2.75 to 1.61 µs, and a
+row on another thread from 1.71 to 1.40 µs, against 0.95 µs for a row of the eager
+`query`. The rows decoded ahead, about one mebibyte and one row at most, are held
+outside the query's memory budget until they are handed out. The async bridge decodes a
+batch in one detached call and no longer reads the plan with every batch. Its rows went
+from 2.07 to 1.92 µs, since the event loop's own work per row and the memory ledger
+dominate them.
 
 `Dataset.contains_all` answers a batch of membership tests in one call, from one
 snapshot. It reads a `Quad` where it is, and gives up the GIL for a batch longer than
-256 quads or a dataset on disk. On quads built beforehand, a probe of a batch took 0.23
-µs against 0.27 µs for `in`, at a load of 8. With a `Quad` built for each probe, as the
-benchmark does, a probe took 0.41 µs against 0.50 µs for `in` and 1.5 µs for pyoxigraph,
-at a load of 10. The batch saves little in Python because the lookup itself is most of
-an `in`, and the call is not.
+256 quads or a dataset on disk. On quads built beforehand, a probe in a batch of 64
+took 0.30 µs against 0.33 µs for `in`. With a `Quad` built for each probe, as the
+benchmark does, a probe took 0.47 µs against 0.50 µs for `in` and 1.84 µs for
+pyoxigraph. The batch saves little in Python because the lookup itself is most of an
+`in`, and the call is not.
 
 PyO3's reference pool takes a lock on every call into the extension once any call has
 released the GIL, which is 13% of a value lookup's samples and 20% of a subject scan's.
-A build with `--cfg pyo3_disable_reference_pool` has no pool. In interleaved runs at a
-load of 34 to 38 it took 10% off `in`, 11% off a value lookup, 7% off a subject scan
+A build with `--cfg pyo3_disable_reference_pool` has no pool. In interleaved runs on
+the laptop at a load of 34 to 38 it took 10% off `in`, 11% off a value lookup, 7% off a subject scan
 and 4% off a batched probe. It is not adopted, because without the pool a Python
 reference that is dropped while the GIL is not held aborts the process, and the
 extension has such drops. Five files of the test suite abort on that build:
