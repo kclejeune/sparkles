@@ -6,6 +6,7 @@ import json
 
 import pytest
 from sparkles import (
+    BudgetExceededError,
     CancelledError,
     CancelToken,
     ConflictError,
@@ -187,26 +188,31 @@ def test_cursor_rows_decoded_ahead_count_when_handed_out():
 
 
 def test_cursor_decoding_ahead_raises_a_budget_error_at_its_row():
+    # a budget of one mebibyte cannot hold the decoded form of this literal
+    big = f' <urn:z> <urn:p> "{"x" * 4_000_000}" .'
+    q = "SELECT ?o WHERE { ?s <urn:p> ?o }"
+    # when the long literal is the first row, that row fails and nothing is handed out
     ds = Dataset()
-    ds.load(_numbers(40) + f' <urn:big> <urn:p> "{"x" * 400_000}" .', "ttl")
-    q = "SELECT ?o WHERE { ?s <urn:p> ?o } ORDER BY ?s"
-    # the long literal sorts first; with a budget that cannot hold its decoded form the
-    # first row fails, and nothing is handed out
+    ds.load(big, "ttl")
     cursor = ds.select_cursor(q, max_memory_bytes=1 << 20)
-    with pytest.raises(Exception):
+    with pytest.raises(BudgetExceededError):
         next(cursor)
     assert cursor.status == "failed"
-    # with the literal last, the 40 rows before it are handed out before the error
-    q = "SELECT ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?s)"
+    assert cursor.stats()["emittedRows"] == 0
+    # with rows before the literal in the batch, they are handed out before the error
+    ds = Dataset()
+    ds.load(_numbers(40) + big, "ttl")
+    at = [len(str(row[0])) > 1000 for row in ds.select_cursor(q)].index(True)
+    assert at > 0
     cursor = ds.select_cursor(q, max_memory_bytes=1 << 20)
     rows = []
-    with pytest.raises(Exception):
+    with pytest.raises(BudgetExceededError):
         for row in cursor:
             rows.append(row)
             assert cursor.status == "open"
-    assert len(rows) == 40
+    assert len(rows) == at
     assert cursor.status == "failed"
-    assert cursor.stats()["emittedRows"] == 40
+    assert cursor.stats()["emittedRows"] == at
 
 
 def test_cursor_decoding_ahead_counts_datatypes_and_triple_terms():

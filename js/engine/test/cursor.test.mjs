@@ -464,34 +464,65 @@ test(
   'a term decoded in an earlier batch of a streamed query asks the memory budget again',
   { timeout: 30000 },
   async () => {
-    const ds = Dataset.memory();
-    try {
-      const long = 'x'.repeat(64 << 10);
-      await ds.load(
-        `<urn:a> <urn:p> "${long}" . <urn:b> <urn:p> "${long}" . <urn:c> <urn:p> "${long}" .`,
-        { format: 'ttl' },
-      );
-      // The three arms give three batches of the query inside one batch sent to
-      // JavaScript. The first arm's batch decodes the literal. The filter of the second
-      // arm holds about half a mebibyte while its batch is read, and the literal is a
-      // key that was decoded before. Decoding it for that batch does not fit beside what
-      // the filter holds, so the query is refused, as it is when every cell is decoded.
-      const q =
-        'SELECT ?o WHERE { { <urn:a> <urn:p> ?o } UNION ' +
-        '{ <urn:b> <urn:p> ?o FILTER(STRLEN(?o) + RAND() > 0) } UNION { <urn:c> <urn:p> ?o } }';
-      const read = async (maxMemoryBytes) => {
-        const lengths = [];
-        const rows = await ds.select(q, { execution: 'streaming', maxMemoryBytes });
-        for await (const row of rows) lengths.push(row.get('o').value.length);
-        return lengths;
-      };
-      for (let run = 0; run < 20; run++)
-        await assert.rejects(read(1 << 20), /memory budget/, `run ${run}`);
-      // a budget with room for the filter and the term reads every row
-      assert.deepEqual(await read(8 << 20), [64 << 10, 64 << 10, 64 << 10]);
-    } finally {
-      await ds.close();
-    }
+    // The three arms give three batches of the query inside one batch sent to
+    // JavaScript. The first arm's batch decodes its literal. The filter of the second
+    // arm holds several times the literal while its batch is read. When that arm reads
+    // the first arm's literal, the literal is a key that was decoded before, and
+    // decoding it for the second batch has to fit beside what the filter holds, as it
+    // does when the arms read three different literals and every cell is decoded. The
+    // lowest budget that reads the rows is therefore the same in both cases. A key that
+    // asked the budget only in its first batch would need one literal less.
+    const size = 64 << 10;
+    const q =
+      'SELECT ?o WHERE { { <urn:a> <urn:p> ?o } UNION ' +
+      '{ <urn:b> <urn:p> ?o FILTER(STRLEN(?o) + RAND() > 0) } UNION { <urn:c> <urn:p> ?o } }';
+    const lowestBudget = async (letters) => {
+      const ds = Dataset.memory();
+      try {
+        const [a, b, c] = [...letters].map((letter) => letter.repeat(size));
+        await ds.load(
+          `<urn:a> <urn:p> "${a}" . <urn:b> <urn:p> "${b}" . <urn:c> <urn:p> "${c}" .`,
+          { format: 'ttl' },
+        );
+        const read = async (maxMemoryBytes) => {
+          const lengths = [];
+          const rows = await ds.select(q, { execution: 'streaming', maxMemoryBytes });
+          for await (const row of rows) lengths.push(row.get('o').value.length);
+          return lengths;
+        };
+        const fits = async (maxMemoryBytes) => {
+          try {
+            await read(maxMemoryBytes);
+            return true;
+          } catch (error) {
+            assert.match(error.message, /memory budget/);
+            return false;
+          }
+        };
+        // a budget of one literal is refused, and one with room reads every row
+        let refused = size;
+        let enough = 8 << 20;
+        assert.equal(await fits(refused), false);
+        assert.deepEqual(await read(enough), [size, size, size]);
+        while (enough - refused > 1024) {
+          const middle = (refused + enough) >> 1;
+          if (await fits(middle)) enough = middle;
+          else refused = middle;
+        }
+        // the refusal just under the lowest budget does not depend on the run
+        for (let run = 0; run < 20; run++)
+          await assert.rejects(read(refused), /memory budget/, `run ${run}`);
+        return enough;
+      } finally {
+        await ds.close();
+      }
+    };
+    const repeated = await lowestBudget('xxx');
+    const distinct = await lowestBudget('xyz');
+    assert.ok(
+      Math.abs(repeated - distinct) <= size / 4,
+      `a repeated literal needs ${repeated} bytes and three literals need ${distinct}`,
+    );
   },
 );
 
