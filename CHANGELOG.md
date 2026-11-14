@@ -2106,12 +2106,13 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 ### Fixed
 
 A classifier that keeps its state between runs no longer misses a subsumption that only
-Tier D finds after a removal. The run chose its tier over an interner that still held the
-expressions of removed axioms, so a removed self restriction or a removed use of the top
-object property kept Tier D from the disjunctions that remained. With `A ⊑ ∃r.Self`,
+Tier D finds after a change. The run chose its tier over an interner that still held the
+expressions of removed axioms and those of added axioms outside OWL 2 EL, so a removed
+self restriction, a removed use of the top object property or an added self restriction
+outside OWL 2 EL kept Tier D from the disjunctions in the ontology. With `A ⊑ ∃r.Self`,
 `B ⊑ C ⊔ D`, `C ⊑ E` and `D ⊑ E`, removing the first axiom lost `B ⊑ E`. A run with axioms
-outside OWL 2 EL now starts again with a new interner once a removal has left an
-expression that the choice of tier reads. Removals of plain class axioms keep the state.
+outside OWL 2 EL now starts again with a new interner once a change has left an
+expression that the choice of tier reads. Changes to plain class axioms keep the state.
 
 Query-time reasoning with `reasoning=demand` no longer derives about the whole OWL RL type
 closure for every query (roadmap item 911). The schema completeness proof gave up on

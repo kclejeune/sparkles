@@ -101,6 +101,65 @@ fn a_removed_at_most_restriction_after_an_el_run_leaves_tier_d_to_the_disjunctio
     agree(&out, &cases, &limits);
 }
 
+/// An added axiom outside OWL 2 EL with a self restriction, whose normalization as a
+/// premise of the change interns the restriction, must not keep Tier D from the
+/// disjunction added beside it. A fresh classifier leaves that axiom to the rules
+/// outside OWL 2 EL.
+#[test]
+fn an_added_self_restriction_outside_el_leaves_tier_d_to_the_disjunction() {
+    let base = axioms("SubClassOf(:X :Y)");
+    let added = axioms(&format!(
+        "SubClassOf(ObjectHasSelf(:r) ObjectUnionOf(:P :Q))\n{CASES}"
+    ));
+    let limits = Limits::default();
+    let mut k = Classifier::of(&base);
+    k.classify(&limits).unwrap();
+    k.add(&added);
+    let out = k.classify(&limits).unwrap();
+    let held: Vec<Axiom> = base.iter().chain(&added).cloned().collect();
+    agree(&out, &held, &limits);
+}
+
+/// The same addition in a run by the EL rules alone, and a later run without that limit.
+#[test]
+fn an_added_self_restriction_in_an_el_run_leaves_tier_d_to_the_disjunction() {
+    let base = axioms("SubClassOf(:X :Y)");
+    let added = axioms(&format!(
+        "SubClassOf(ObjectHasSelf(:r) ObjectUnionOf(:P :Q))\n{CASES}"
+    ));
+    let mut k = Classifier::of(&base);
+    k.classify(&Limits::default()).unwrap();
+    k.add(&added);
+    k.classify(&Limits {
+        el_only: true,
+        ..Limits::default()
+    })
+    .unwrap();
+    let limits = Limits::default();
+    let out = k.classify(&limits).unwrap();
+    let held: Vec<Axiom> = base.iter().chain(&added).cloned().collect();
+    agree(&out, &held, &limits);
+}
+
+/// A run that leaves the disjunction out, since a self restriction that stays keeps Tier D
+/// from it, keeps its state when a plain class axiom is removed, and agrees with a fresh
+/// classifier.
+#[test]
+fn a_plain_removal_keeps_the_state_of_a_run_by_the_el_rules() {
+    let stays = axioms(&format!("SubClassOf(:A ObjectHasSelf(:r))\n{CASES}"));
+    let gone = axioms("SubClassOf(:X ObjectSomeValuesFrom(:s :Y))");
+    let limits = Limits::default();
+    let mut k = Classifier::of(stays.iter().chain(&gone));
+    k.classify(&limits).unwrap();
+    k.remove(&gone);
+    let out = k.classify(&limits).unwrap();
+    assert!(out.stats.incremental);
+    let mut f = Classifier::of(&stays);
+    let full = f.classify(&limits).unwrap();
+    assert_eq!(out.taxonomy, full.taxonomy);
+    assert_eq!(k.excluded(), f.excluded());
+}
+
 /// A change that touches only plain class axioms keeps the interner's state, and the
 /// disjunction still goes to Tier D.
 #[test]
