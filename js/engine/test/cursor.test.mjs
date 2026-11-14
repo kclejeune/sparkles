@@ -432,3 +432,30 @@ test(
     }
   },
 );
+
+test(
+  'a streamed term that the memory budget refuses fails the batch',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      const long = 'x'.repeat(2 << 20);
+      await ds.load(`<urn:s> <urn:p> "${long}" , "short" . <urn:t> <urn:p> "short" .`, {
+        format: 'ttl',
+      });
+      const q = 'SELECT ?o WHERE { ?s <urn:p> ?o }';
+      const read = async (options) => {
+        const values = [];
+        for await (const row of await ds.select(q, { execution: 'streaming', ...options }))
+          values.push(row.get('o').value.length);
+        return values.sort((a, b) => a - b);
+      };
+      // a term that repeats in the batch is decoded once and read by every row
+      assert.deepEqual(await read({}), [5, 5, 2 << 20]);
+      // the decoded literal does not fit in one mebibyte, so the stream fails
+      await assert.rejects(read({ maxMemoryBytes: 1 << 20 }), /memory/i);
+    } finally {
+      await ds.close();
+    }
+  },
+);

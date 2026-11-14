@@ -312,18 +312,23 @@ impl TermTable {
     }
 
     /// The entry of the term that a query batch knows by `key`, decoded once per batch
-    /// with `decode`; 0 when the key has no term. Two keys can name equal terms, which
-    /// then have an entry each.
-    pub fn keyed(&mut self, key: u64, decode: impl FnOnce() -> Option<Term>) -> u32 {
+    /// with `decode`; 0 when the key has no term. A failed decode, such as a term that
+    /// the query's memory budget refuses, is returned and not remembered. Two keys can
+    /// name equal terms, which then have an entry each.
+    pub fn keyed(
+        &mut self,
+        key: u64,
+        decode: impl FnOnce() -> sparkles::Result<Option<Term>>,
+    ) -> sparkles::Result<u32> {
         if let Some(e) = self.ids.get(&key) {
-            return *e;
+            return Ok(*e);
         }
-        let e = match decode() {
+        let e = match decode()? {
             Some(t) => self.term(&t),
             None => 0,
         };
         self.ids.insert(key, e);
-        e
+        Ok(e)
     }
 
     fn datatype(&mut self, iri: &str) -> u32 {

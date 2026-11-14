@@ -1022,14 +1022,15 @@ fn pull(
                 drained = true;
                 break;
             };
-            // A term is decoded when its key is new to this batch's table and dropped
-            // once its text is in the table, as the eager rows are decoded. The table
-            // is bounded by `max_bytes`, so the term needs no place in the query's
-            // memory budget, which cost each cell a pass through the ledger.
+            // A term is decoded when its key is new to this batch's table. That decode
+            // asks the query's memory budget for the term, as every cell's did, and a
+            // refusal fails the batch. A cell that repeats a key of the batch asks
+            // nothing: the reservation ends with the decode, so the repeat would ask the
+            // same budget for the same term again.
             width = batch.width();
             for column in 0..width {
                 cells.push(match batch.key(state.row, column)? {
-                    Some(key) => table.keyed(key, || batch.transient_term(key)),
+                    Some(key) => table.keyed(key, || batch.term(state.row, column))?,
                     None => 0,
                 });
             }
