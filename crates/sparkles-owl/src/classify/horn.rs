@@ -26,7 +26,7 @@
 //! simple roles, stays left out and reported, which is sound.
 
 use super::index::{
-    Axioms, BOTTOM, Ex, Halt, Interner, NO_ROLE, Node, POLL_WORK, Role, RoleName, TOP,
+    Axioms, BOTTOM, Ex, Halt, Interner, NO_ROLE, Node, POLL_WORK, Role, RoleName, Scope, TOP,
     class_expression,
 };
 use crate::model::*;
@@ -1170,13 +1170,20 @@ pub fn normalize(
     let mut roles = Out::default();
     let mut role_taken = Vec::new();
     for (i, k) in axioms.iter().enumerate() {
+        if !Norm::is_role_axiom(k) {
+            continue;
+        }
+        let scope = Scope::Horn(it.scope_axiom(k));
+        it.begin_scope(scope);
         let mut n = Norm {
             it,
             rb: None,
             out: Out::default(),
             individuals,
         };
-        if Norm::is_role_axiom(k) && n.role_axiom(k).is_ok() {
+        let accepted = n.role_axiom(k).is_ok();
+        n.it.end_scope();
+        if accepted {
             let o = n.out;
             roles.role_subs.extend(o.role_subs);
             roles.chains.extend(o.chains);
@@ -1237,19 +1244,20 @@ pub fn normalize(
     // once one is taken
     let mut class_out: Vec<Out> = Vec::new();
     for (i, k) in axioms.iter().enumerate() {
-        if taken[i] {
+        if taken[i] || Norm::is_role_axiom(k) {
             continue;
         }
+        // the fresh classes of an axiom are those of its last run (roadmap item 753)
+        let scope = Scope::Horn(it.scope_axiom(k));
+        it.begin_scope(scope);
         let mut n = Norm {
             it,
             rb: Some(&rb),
             out: Out::default(),
             individuals,
         };
-        if Norm::is_role_axiom(k) {
-            continue;
-        }
         let accepted = n.axiom(k).is_ok();
+        n.it.end_scope();
         n.it.ranges.check_halt()?;
         if accepted {
             class_out.push(n.out);
