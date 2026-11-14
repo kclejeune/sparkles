@@ -172,9 +172,8 @@ format 2 dataset at commit 534a7ad3.*
 The kept closure leaves out the explicit facts, so it needs 41% and 47% of the 2,267 and
 2,654 MiB that a closure keeping them needs.
 
-`churn` of `examples/lubm.rs` makes many changes over one kept closure. Each change goes to
-data that no earlier change touched and is followed by its undo, the change again and a
-second undo. A process makes 40 changes of 100 triples, 20 of 1,000 and 6 of 10,000 on the
+`churn` of `examples/lubm.rs` makes many changes over one kept closure. Each change goes to a university that no
+earlier change touched and is followed by its undo, the change again and a second undo. A process makes 40 changes of 100 triples, 20 of 1,000 and 6 of 10,000 on the
 same dataset. The table gives the medians of three interleaved rounds, each process alone
 on a fresh copy of the dataset, at one thread and on a reasoning pool of 16 threads.
 
@@ -196,11 +195,11 @@ on a fresh copy of the dataset, at one thread and on a reasoning pool of 16 thre
 *Measured on atlas, a benchmark worker with the benchmark host's hardware, on 2026-11-14
 at commit 1590064b. The benchmark host has not rerun these.*
 
-RDFS undos and repeated changes take 0.85 to 1.08 times their time with the larger closure
-at one thread and 0.67 to 1.05 times on the pool. OWL 2 RL changes take 1.2 to 2.3 times as
+On this data and host, RDFS undos and repeated changes take 0.85 to 1.08 times their time
+with the larger closure at one thread and 0.67 to 1.05 times on the pool. OWL 2 RL changes take 1.2 to 2.3 times as
 long at one thread and 0.9 to 1.7 times on the pool, which [roadmap](../../ROADMAP.md)
-item 941 follows up. A change of 100 RDFS triples to data that no earlier run read takes
-2.6 times as long at one thread, which is item 942. The
+item 941 follows up. The first change of 100 RDFS triples to a university takes 2.6 times
+as long at one thread, which is item 942. The
 [run directory](runs/2026-11-14-item-113-atlas/run.sh.txt) holds the commands, the
 [host and builds](runs/2026-11-14-item-113-atlas/env.txt), the
 [medians with their ranges](runs/2026-11-14-item-113-atlas/results.txt) and

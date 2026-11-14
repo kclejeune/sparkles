@@ -1528,9 +1528,8 @@ process and reports whole milliseconds, so each figure above for 100 triples is 
 a few milliseconds. `examples/lubm.rs` has a second measurement, `churn`, which keeps one
 closure and then makes 40 changes of 100 triples, 20 of 1,000 and 6 of 10,000. Each change
 goes to a university that no earlier round changed and is followed by its undo, the change
-again and a second undo, and `churn` reports the median of each step in microseconds. The
-first step of a round reads data that no earlier run read. The three steps after it find
-that data in the store's block cache and in the lookups the closure remembers. A trace
+again and a second undo, and `churn` reports the median of each step in microseconds. The first step of a round is the first change of its university, and the three steps
+after it repeat the lookups that the first step made. A trace
 event with the target `sparkles_reasoner::timing` gives the time of each phase of a run.
 
 `keep` ran the reasoner on the global thread pool from the main thread, which hands each
@@ -1555,10 +1554,10 @@ trace on atlas found four costs.
 * Every incremental run parsed its profile's rules and compiled them to check that they
   can be maintained incrementally. That took 0.3 ms for RDFS and 1.0 ms for OWL 2 RL,
   about a tenth of a change of 100 triples.
-* A change of data that no earlier run read decodes whole blocks of the store for lookups
-  whose answers the closure then remembers. The decodes are 57% of the samples of the
-  first change after a closure is kept, and they are the difference between the first step
-  of a round and the three after it.
+* The first change after a closure is kept decodes whole blocks of the store for lookups
+  whose answers the closure then remembers, and the decodes are 57% of its samples. The
+  first step of a round, which changes a university for the first time, takes about three
+  times as long as its undo for 100 RDFS triples at one thread.
 * The deletion's backward search, `Search::prove`, has 87% of the samples of a warm
   OWL 2 RL change of 1,000 triples. A check of a fully bound atom probes the derived tier's
   triple index and then the remembered lookups, where one table held both before the
@@ -1591,8 +1590,8 @@ built. [PERFORMANCE-EXPERIMENTS](../PERFORMANCE-EXPERIMENTS.md#reasoning) record
 changed range of the base tier read by segments and the first segment of a range read
 before its block measured no faster. Per-thread counters in the block cache measured no
 faster on the laptop and 2 to 8% faster in 11 of 12 cells at 16 threads on atlas, with
-ranges that overlap in most cells, in builds that also held the first of those ideas. The
-build before the follow-up bounds what the in-memory index could gain.
+ranges that overlap in most cells, in builds that also held the first of those ideas. The build before the follow-up, which keeps the input facts in memory, indicates what the
+index could gain on this workload, and that gain has not been measured.
 
 **Outcome of item 113.** The runs compare four builds of `examples/lubm.rs` with the same
 `churn` driver on atlas, an Intel Core i5-13500 with 20 hardware threads, on 2026-11-14.
@@ -1604,7 +1603,9 @@ one-thread runs were pinned to CPUs 2 to 5. A cell gives the change, the undo, t
 again and the second undo in milliseconds, each the median over the three processes of
 the process's median. The
 [run record](../benchmarks/reasoning/runs/2026-11-14-item-113-atlas/results.txt) has the
-ranges. The commits after `1590064b` change the example's default pool, bound the kept
+ranges, and its
+[phase times](../benchmarks/reasoning/runs/2026-11-14-item-113-atlas/phases.txt) are the
+source of the phase figures in this section. The commits after `1590064b` change the example's default pool, bound the kept
 rule sets and put the read's plan and open under one lock, and were not measured again.
 These are benchmark-worker measurements, and the benchmark host has not rerun them.
 
@@ -1629,16 +1630,17 @@ These are benchmark-worker measurements, and the benchmark host has not rerun th
 | RDFS, full run, pool of 16 | 15.7 s | 14.4 s | 14.5 s | 14.6 s |
 | OWL 2 RL, full run, pool of 16 | 21.7 s | 20.1 s | 20.1 s | 20.2 s |
 
-RDFS undos and repeated changes take 0.85 to 1.08 times their time before the follow-up at
-one thread and 0.67 to 1.05 times on the pool, where they took 1.12 to 1.42 and 0.85 to
-1.42 times before this work. The rules' own work did not get faster. In the undo of 1,000
+On this data and host, RDFS undos and repeated changes take 0.85 to 1.08 times their time
+before the follow-up at one thread and 0.67 to 1.05 times on the pool, where they took
+1.12 to 1.42 and 0.85 to 1.42 times before this work. The slowest cell is the undo of
+10,000 triples at one thread, 127 ms against 118 ms. The rules' own work did not get faster. In the undo of 1,000
 triples at one thread the deletion and the insertion take 9.2 ms against 4.4 ms before the
 follow-up, and the run is level because reading the changes and the closure takes 1.0 ms
 where it took 5.4 ms then and 5.1 ms before this work.
 
-Two costs remain. The first step of a round, a change of data that no earlier run read,
-takes 2.6 times its time before the follow-up for 100 RDFS triples at one thread and 1.7
-times on the pool, which is [ROADMAP](../ROADMAP.md) item 942. OWL 2 RL changes take 1.2
+Two costs remain. The first step of a round, the first change of a university, takes 2.6
+times its time before the follow-up for 100 RDFS triples at one thread and 1.7 times on
+the pool, which is [ROADMAP](../ROADMAP.md) item 942. OWL 2 RL changes take 1.2
 to 2.3 times their time before the follow-up at one thread and 0.9 to 1.7 times on the
 pool, against 1.4 to 2.4 and 1.0 to 1.9 times before this work, which is item 941. For
 OWL 2 RL the build before this work takes 1.03 to 1.09 times the time of the build before
@@ -1657,8 +1659,8 @@ investigates.
 Item 938 stays open. A change of 100,000 triples under OWL 2 RL at 20 threads, read back
 from the dataset, takes 5.86 to 5.99 s with this work against 6.25 to 6.40 s before it and
 5.69 to 5.96 s before the derived tier, so the read of the changes as ids recovers most
-of what the tier cost that run. A run without changes, which loads the kept closure into
-the tier, takes 1.82 s against 1.75 s before the tier, as it did before this work.
+of what the tier cost that run. A run without changes, which loads the kept closure into the tier, takes 1.82 s, against
+1.85 s before this work and 1.75 s before the tier.
 
 `changed_ids_agree_with_the_states` in `tests/diff.rs` of `sparkles-core` compares the ids
 of every range of random histories with the two materialized states, for four selections

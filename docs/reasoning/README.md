@@ -725,9 +725,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap items 9 and 53.
 * Because the kept closure holds only derived facts, OWL 2 RL changes of 100 to 10,000
   triples over it take 1.2 to 2.3 times as long at one thread as with a closure that also
-  holds the explicit facts, on LUBM-style data. Roadmap item 941. A change of 100 RDFS
-  triples to data that no earlier run read takes 2.6 times as long. Roadmap item 942.
-  RDFS undos and repeated changes take the same time or less.
+  holds the explicit facts, on LUBM-style data. Roadmap item 941. The first change of 100 RDFS
+  triples to a part of the data takes 2.6 times as long. Roadmap item 942. RDFS undos and
+  repeated changes take 0.85 to 1.08 times as long on that data.
 * Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints not
   anchored at the focus node, in full on every write. Roadmap item 78.
 * ShEx keeps no typing when the process is killed or exits without closing the store, so
@@ -835,7 +835,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md),  [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
