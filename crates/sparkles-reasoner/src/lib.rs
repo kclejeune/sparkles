@@ -347,6 +347,44 @@ pub struct Changes {
     pub source: String,
 }
 
+/// The wall time of a run's phases in microseconds, for the trace event that [`finish`]
+/// writes with the target `sparkles_reasoner::timing`.
+struct Laps {
+    last: Instant,
+    laps: Vec<(&'static str, u64)>,
+}
+
+impl Laps {
+    fn new(start: Instant) -> Laps {
+        Laps {
+            last: start,
+            laps: Vec::new(),
+        }
+    }
+
+    /// The time since the lap before is the time of `phase`.
+    fn lap(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        self.add(phase, now.duration_since(self.last).as_micros() as u64);
+        self.last = now;
+    }
+
+    /// A phase timed by its own code, which lies inside the next lap.
+    fn add(&mut self, phase: &'static str, micros: u64) {
+        self.laps.push((phase, micros));
+    }
+}
+
+impl fmt::Display for Laps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, (phase, micros)) in self.laps.iter().enumerate() {
+            let sep = if i == 0 { "" } else { " " };
+            write!(f, "{sep}{phase}={micros}")?;
+        }
+        Ok(())
+    }
+}
+
 fn progress(opts: &ReasonOptions, f: f32, msg: &str) {
     if let Some(p) = &opts.progress {
         p(f, msg);
@@ -850,6 +888,132 @@ pub(crate) fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Resul
     Ok(rules)
 }
 
+/// The most rule sets that [`incremental_rules`] keeps.
+const KEPT_RULE_SETS: usize = 8;
+
+/// The most bytes of parsed rules, as [`rules_bytes`] estimates them, that the kept rule
+/// sets hold in all. A larger rule set is not kept, and its runs parse it every time.
+const KEPT_RULE_BYTES: usize = 4 << 20;
+
+/// The parsed rule sets of the incremental runs made last, oldest first, by their digest
+/// ([`rules_digest`]). They stay with the process and no run's budget counts them, so
+/// their number and their size are bounded.
+struct KeptRuleSets {
+    sets: Vec<KeptRules>,
+    /// the bytes of `sets`
+    bytes: usize,
+}
+
+/// A kept rule set: its digest, the estimate of its bytes, its rules, and why they cannot
+/// be maintained incrementally, if they cannot.
+struct KeptRules {
+    digest: u64,
+    bytes: usize,
+    rules: Arc<Vec<Rule>>,
+    blocker: Option<String>,
+}
+
+impl KeptRuleSets {
+    const fn new() -> KeptRuleSets {
+        KeptRuleSets {
+            sets: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&self, digest: u64) -> Option<(Arc<Vec<Rule>>, Option<String>)> {
+        self.sets
+            .iter()
+            .find(|k| k.digest == digest)
+            .map(|k| (k.rules.clone(), k.blocker.clone()))
+    }
+
+    /// Keep `set` within `max_sets` sets and `max_bytes` bytes in all, in place of the
+    /// oldest sets. A set over `max_bytes` by itself is not kept.
+    fn keep(&mut self, set: KeptRules, max_sets: usize, max_bytes: usize) {
+        if set.bytes > max_bytes || max_sets == 0 || self.get(set.digest).is_some() {
+            return;
+        }
+        while self.sets.len() == max_sets || self.bytes + set.bytes > max_bytes {
+            self.bytes -= self.sets.remove(0).bytes;
+        }
+        self.bytes += set.bytes;
+        self.sets.push(set);
+    }
+}
+
+static INCREMENTAL_RULES: std::sync::Mutex<KeptRuleSets> =
+    std::sync::Mutex::new(KeptRuleSets::new());
+
+/// An estimate of the memory of parsed rules: their clauses and nodes with the text of
+/// their names, variables and constants. A rule that an `@include` or a prefix expands
+/// counts at its parsed size, which the length of the rule text does not bound.
+fn rules_bytes(rules: &[Rule]) -> usize {
+    fn node(n: &Node) -> usize {
+        size_of::<Node>()
+            + match n {
+                Node::Var(v) => v.len(),
+                Node::Const(t) => t.to_string().len(),
+                Node::Any => 0,
+                Node::Functor(name, args) => name.len() + args.iter().map(node).sum::<usize>(),
+            }
+    }
+    fn clause(c: &Clause) -> usize {
+        size_of::<Clause>()
+            + match c {
+                Clause::Triple(t) => node(&t.subject) + node(&t.predicate) + node(&t.object),
+                Clause::Builtin(b) => b.name.len() + b.args.iter().map(node).sum::<usize>(),
+                Clause::Rule(r) => rule(r),
+            }
+    }
+    fn rule(r: &Rule) -> usize {
+        size_of::<Rule>()
+            + r.name.as_ref().map_or(0, |n| n.len())
+            + r.body.iter().chain(&r.head).map(clause).sum::<usize>()
+    }
+    rules.iter().map(rule).sum()
+}
+
+/// The parsed rules of a profile and its extras for an incremental run, and why they
+/// keep a materialization from being maintained incrementally, if they do
+/// ([`engine::incremental_blocker`]). Both follow from the rule text alone, which the
+/// digest covers, so they are kept for the next runs with the same digest: a run after
+/// each small write would otherwise parse the profile and compile it for the check
+/// every time, about a tenth of the time of a change of 100 triples. The kept sets cost
+/// memory that outlives the runs, at most [`KEPT_RULE_SETS`] sets of
+/// [`KEPT_RULE_BYTES`] bytes in all.
+fn incremental_rules(
+    profile: &Profile,
+    extras: &Extras,
+    digest: u64,
+    snap: &Arc<Snapshot>,
+) -> anyhow::Result<(Arc<Vec<Rule>>, Option<String>)> {
+    let kept = INCREMENTAL_RULES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(digest);
+    if let Some(found) = kept {
+        return Ok(found);
+    }
+    let rules = Arc::new(profile_rules(profile, extras)?);
+    let terms = Terms::new(snap.clone());
+    let mut w = WorkingWarnings::new(&terms.budget());
+    let blocker = engine::compile(&rules, &terms, &mut w)?
+        .iter()
+        .find_map(|r| engine::incremental_blocker(r, &terms));
+    let set = KeptRules {
+        digest,
+        bytes: rules_bytes(&rules),
+        rules: rules.clone(),
+        blocker: blocker.clone(),
+    };
+    INCREMENTAL_RULES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keep(set, KEPT_RULE_SETS, KEPT_RULE_BYTES);
+    Ok((rules, blocker))
+}
+
 /// A digest of everything that determines a materialization besides the data: the rule
 /// text of the profile and its vocabularies, and the switches of `extras`. An incremental
 /// run needs the previous run's digest to be the same.
@@ -945,7 +1109,8 @@ fn materialize_admitted(
     opts: &ReasonOptions,
     t0: Instant,
 ) -> anyhow::Result<ReasonReport> {
-    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
+    let mut laps = Laps::new(t0);
+    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs, &mut laps);
     let snap = txn.base().clone();
     let inspected = match &opts.inspect {
         Some(f) => {
@@ -960,12 +1125,13 @@ fn materialize_admitted(
     let mut fallback = None;
     if let (Some(since), Some(raw)) = (inc.since, raw) {
         match update_closure(
-            exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw, opts,
+            exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw,
+            opts, &mut laps,
         ) {
             Ok(mut done) => {
                 done.warnings.extend_borrowed(&inspected)?;
                 return finish(
-                    store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
+                    store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
                 );
             }
             Err(e) => {
@@ -983,10 +1149,12 @@ fn materialize_admitted(
         &resolved.ids(&snap),
         opts,
     )?;
+    laps.lap("derive");
     progress(opts, 0.8, "writing inferred graph");
     let mut warnings = WorkingWarnings::try_clone_from(d.warnings.as_slice(), &d.budget)?;
     warnings.extend_borrowed(&inspected)?;
     let w = write_full(&mut txn, &snap, &d, opts)?;
+    laps.lap("write");
     if w.generalized > 0 {
         warnings.push_fmt(format_args!(
             "{} derived generalized triples (literal subjects or non-IRI predicates) were not written",
@@ -1027,7 +1195,7 @@ fn materialize_admitted(
         changes: None,
     };
     finish(
-        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
+        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
     )
 }
 
@@ -1044,6 +1212,7 @@ fn lock_with_changes<'s>(
     store: &'s Store,
     inc: Incremental<'_>,
     inputs: &Inputs,
+    laps: &mut Laps,
 ) -> (
     sparkles_core::store::WriteTxn<'s>,
     Option<Result<maintain::RawChanges, String>>,
@@ -1055,13 +1224,16 @@ fn lock_with_changes<'s>(
     };
     let Some(since) = inc.since else {
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
+        laps.lap("lock");
         return (txn, None, r);
     };
     for _ in 0..3 {
         let live = store.snapshot();
         let graphs = inputs::resolve(&live, inputs).graph_set();
         let raw = maintain::changes(store, since, &live, inc.cache, &graphs);
+        laps.lap("changes");
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
+        laps.lap("lock");
         let raw = if r.graph_set() != graphs {
             Err("the input graphs changed while the changes were read".into())
         } else if txn.base().commit == live.commit {
@@ -1076,6 +1248,7 @@ fn lock_with_changes<'s>(
         return (txn, Some(raw), r);
     }
     let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
+    laps.lap("lock");
     (
         txn,
         Some(Err(
@@ -1200,6 +1373,7 @@ fn finish(
     opts: &ReasonOptions,
     t0: Instant,
     done: Done,
+    mut laps: Laps,
 ) -> anyhow::Result<ReasonReport> {
     if opts
         .cancel
@@ -1226,7 +1400,9 @@ fn finish(
     let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
     warnings.extend_borrowed(done.warnings.as_slice())?;
     done.budget.check_peak()?;
+    laps.lap("checks");
     let receipt = txn.commit()?;
+    laps.lap("commit");
     progress(opts, 1.0, "done");
     let graphs = resolved.graph_set();
     let mut kept = false;
@@ -1245,6 +1421,7 @@ fn finish(
             tracing::warn!("saving the closure state for incremental runs: {e:#}");
             None
         });
+        laps.lap("save");
         // keeping the closure after the commit is charged strictly: a closure that does
         // not fit is not kept, and the run still succeeds
         if let Some(cache) = inc.cache
@@ -1271,6 +1448,7 @@ fn finish(
     if !kept && let Some(c) = inc.cache {
         c.clear();
     }
+    laps.lap("keep");
     let report = ReasonReport {
         profile: profile.name().to_string(),
         rules: done.rules,
@@ -1300,6 +1478,13 @@ fn finish(
         removed = report.inferred_removed,
         millis = report.millis,
         "materialized inferences"
+    );
+    tracing::trace!(
+        target: "sparkles_reasoner::timing",
+        method = report.method.as_str(),
+        micros = t0.elapsed().as_micros() as u64,
+        phases = %laps,
+        "run phases"
     );
     Ok(report)
 }
@@ -1436,20 +1621,14 @@ fn update_closure(
     inc: Incremental<'_>,
     raw: Result<maintain::RawChanges, String>,
     opts: &ReasonOptions,
+    laps: &mut Laps,
 ) -> anyhow::Result<Done> {
     if since > snap.commit {
         return Err(Fallback("the store position moved backwards".into()).into());
     }
-    let rules = profile_rules(profile, extras)?;
-    {
-        let terms = Terms::new(snap.clone());
-        let mut w = WorkingWarnings::new(&terms.budget());
-        let compiled = engine::compile(&rules, &terms, &mut w)?;
-        for r in compiled.iter() {
-            if let Some(why) = engine::incremental_blocker(r, &terms) {
-                return Err(Fallback(why).into());
-            }
-        }
+    let (rules, blocker) = incremental_rules(profile, extras, digest, snap)?;
+    if let Some(why) = blocker {
+        return Err(Fallback(why).into());
     }
     let graphs = resolved.graph_set();
     if let Ok(r) = &raw {
@@ -1465,6 +1644,7 @@ fn update_closure(
             .into());
         }
     }
+    laps.lap("rules");
     progress(opts, 0.0, "reading the previous closure");
     let budget = Budget::new(opts.max_memory);
     // on the run's threads: this thread may stand in for a parked worker of the pool
@@ -1476,6 +1656,7 @@ fn update_closure(
             store, snap, since, digest, &graphs, &run_ids, inc.cache, raw, &budget, wanted,
         )
     })?;
+    laps.lap("closure");
     let mut closure = prev.closure;
     let mut ch = prev.changes;
     let _prev_held = prev.held;
@@ -1512,6 +1693,7 @@ fn update_closure(
     };
     let wl = witness_limits(&budget, opts);
     let mut prepared: Option<witness::Prepared> = None;
+    laps.lap("compile");
     progress(opts, 0.1, "updating the closure");
     let (up, threads) = exec.install(|| {
         let has = prior.is_some();
@@ -1533,6 +1715,9 @@ fn update_closure(
         (up, rayon::current_num_threads())
     });
     let up = up?;
+    laps.add("delete", up.delete_micros);
+    laps.add("insert", up.insert_micros);
+    laps.lap("update");
     let mut base_scans = base.scans();
     drop(base);
     let mut generalized = prev.generalized;
@@ -1589,6 +1774,7 @@ fn update_closure(
     {
         base_scans = base_scans.max(b.scans());
     }
+    laps.lap("witnesses");
     progress(opts, 0.8, "writing inferred graph");
     let candidates = up
         .deleted
@@ -1600,6 +1786,7 @@ fn update_closure(
         .chain(&ch.inferred_removed)
         .chain(&touched);
     let written = write_changes(exec, txn, snap, &closure, candidates, &budget)?;
+    laps.lap("write");
     let changes = Changes {
         base_added: ch.base_added.len() as u64,
         base_removed: ch.base_removed.len() as u64,
@@ -1960,6 +2147,64 @@ pub fn bench_derive(
         seq = maintain::fnv(&h.to_le_bytes(), seq);
     }
     Ok((d.closure_len(), d.iterations, set, seq))
+}
+
+#[cfg(test)]
+mod kept_rule_sets_tests {
+    use super::*;
+
+    fn set(digest: u64, bytes: usize) -> KeptRules {
+        KeptRules {
+            digest,
+            bytes,
+            rules: Arc::new(Vec::new()),
+            blocker: None,
+        }
+    }
+
+    fn digests(k: &KeptRuleSets) -> Vec<u64> {
+        k.sets.iter().map(|s| s.digest).collect()
+    }
+
+    #[test]
+    fn kept_rule_sets_are_bounded_by_number_and_bytes() {
+        let mut k = KeptRuleSets::new();
+        // a set over the bound by itself is not kept and evicts nothing
+        k.keep(set(1, 40), 3, 100);
+        k.keep(set(2, 101), 3, 100);
+        assert_eq!(digests(&k), [1]);
+        assert!(k.get(2).is_none());
+        // the oldest sets leave until the new one fits
+        k.keep(set(3, 40), 3, 100);
+        k.keep(set(4, 70), 3, 100);
+        assert_eq!(digests(&k), [4]);
+        assert_eq!(k.bytes, 70);
+        // a set that is kept already stays as it is
+        k.keep(set(4, 10), 3, 100);
+        assert_eq!(k.bytes, 70);
+        // the number of sets
+        for d in 5..9 {
+            k.keep(set(d, 1), 3, 100);
+        }
+        assert_eq!(digests(&k), [6, 7, 8]);
+        assert_eq!(k.bytes, 3);
+        assert!(k.get(7).is_some() && k.get(4).is_none());
+    }
+
+    #[test]
+    fn rules_bytes_count_what_includes_and_prefixes_expand() {
+        let own = parse_rules("[r: (?a <urn:p> ?b) -> (?b <urn:q> ?a)]").unwrap();
+        let included = parse_rules("@include <owl-rl> .").unwrap();
+        let prefixed = parse_rules(&format!(
+            "@prefix ex: <urn:{}> .\n[r: (?a ex:p ?b) -> (?b ex:q ?a)]",
+            "x".repeat(1000)
+        ))
+        .unwrap();
+        let small = rules_bytes(&own);
+        assert!(small >= size_of::<Rule>() + 6 * size_of::<Node>());
+        assert!(rules_bytes(&included) > OWL_RL_RULES.len());
+        assert!(rules_bytes(&prefixed) >= small + 2000);
+    }
 }
 
 #[cfg(test)]

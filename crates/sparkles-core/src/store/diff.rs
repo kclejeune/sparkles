@@ -123,6 +123,9 @@ impl DiffOptions {
     }
 }
 
+/// A change of [`Store::changed_ids`]: a quad as ids, and whether it was added.
+pub type IdChange = ([Id; 4], bool);
+
 /// The net difference between two commits: what `to` has that `from` lacks (added) and
 /// the reverse (removed). Changes are ordered removals first, then additions, each by
 /// graph, subject, predicate and object.
@@ -432,6 +435,22 @@ fn plan(gens: &[(u32, u64, u64)], lo: u64, hi: u64) -> Vec<Step> {
     }
     steps
 }
+
+/// `(number, base, end)` of every retained generation, as [`plan`] takes them. The log of
+/// the current generation ends at the head.
+fn retained_logs(
+    h: &crate::history::HistoryState,
+    current: u32,
+    head: u64,
+) -> Vec<(u32, u64, u64)> {
+    h.gens
+        .iter()
+        .map(|(&no, g)| (no, g.base.seq, if no == current { head } else { g.end }))
+        .collect()
+}
+
+/// A retained generation, its history entry and its open log.
+type RetainedLog = (Arc<Generation>, crate::history::GenEntry, File);
 
 /// Read the changes of the commits after `after` through `through` from a generation's
 /// WAL, streaming from the cursor (at or before the end of `after`). The commits are
@@ -862,6 +881,81 @@ impl Store {
         })
     }
 
+    /// The net changes of the graphs `graphs` in the commits after `after` through the
+    /// commit of `to`, as quads of ids of `to`'s generation with whether each was added,
+    /// read from that generation's log. `None` when that log does not hold every one of
+    /// those commits: across a bulk commit or a compaction, after the generation was
+    /// collected, and in a store without a log. [`diff`](Self::diff) then gives the
+    /// changes as terms.
+    ///
+    /// A caller that works with the ids of `to`, such as a materialization kept for the
+    /// state at `after`, needs no term of the changes: the log holds ids, and `diff`
+    /// turns each into its term. The removed quads come first, each group in the order
+    /// of its ids. Only the limits of `o` apply (`max_quads`, `cancel` and `deadline`).
+    pub fn changed_ids(
+        &self,
+        after: u64,
+        to: &Snapshot,
+        graphs: &[Id],
+        o: &DiffOptions,
+    ) -> Result<Option<Vec<IdChange>>> {
+        if self.history.is_none() || after > to.commit {
+            return Ok(None);
+        }
+        if after == to.commit {
+            return Ok(Some(Vec::new()));
+        }
+        o.check()?;
+        let no = commit::generation_number(&to.generation.name);
+        let whole = Step::Log {
+            generation: no,
+            after,
+            through: to.commit,
+        };
+        // the plan and the open share one hold of the history lock, so a collection
+        // cannot remove the generation between them
+        let opened = {
+            let hist = self.history.as_ref().expect("checked above");
+            let live = self.snapshot();
+            let current = commit::generation_number(&live.generation.name);
+            let head = self.head_commit().seq;
+            let mut h = hist.lock();
+            if plan(&retained_logs(&h, current, head), after, to.commit) != [whole] {
+                return Ok(None);
+            }
+            self.retained_log(&mut h, no, current, &live)?
+        };
+        let Some(opened) = opened else {
+            return Ok(None);
+        };
+        let (generation, mut cursor) = self.log_cursor(opened, after)?;
+        if !Arc::ptr_eq(&generation, &to.generation) {
+            return Ok(None);
+        }
+        let mut net: FxHashMap<[Id; 4], bool> = FxHashMap::default();
+        walk_wal(&mut cursor, after, to.commit, o, &mut |op, q| {
+            if !graphs.contains(&q[3]) {
+                return Ok(());
+            }
+            match net.entry(q) {
+                Entry::Occupied(e) => {
+                    e.remove();
+                }
+                Entry::Vacant(e) => {
+                    e.insert(op == WAL_INSERT);
+                    if net.len() & 0xFFFF == 0 {
+                        o.over(net.len() as u64)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        o.over(net.len() as u64)?;
+        let mut changes: Vec<IdChange> = net.into_iter().collect();
+        changes.sort_unstable_by_key(|(q, added)| (*added, [q[3].0, q[0].0, q[1].0, q[2].0]));
+        Ok(Some(changes))
+    }
+
     /// The changes between two commits from the change log, when the write-ahead logs
     /// cannot give them all (an end is no longer readable, or a bulk commit lies between
     /// them) and the change log records every commit between them. `None` otherwise.
@@ -959,12 +1053,7 @@ impl Store {
         let current = commit::generation_number(&live.generation.name);
         let head = self.head_commit().seq;
         let h = hist.lock();
-        let gens: Vec<(u32, u64, u64)> = h
-            .gens
-            .iter()
-            .map(|(&no, g)| (no, g.base.seq, if no == current { head } else { g.end }))
-            .collect();
-        Ok(plan(&gens, lo, hi))
+        Ok(plan(&retained_logs(&h, current, head), lo, hi))
     }
 
     /// Open generation `no`'s log to read the commits after `after`: the generation, and
@@ -977,20 +1066,44 @@ impl Store {
         after: u64,
     ) -> Result<(Arc<Generation>, super::wal::WalCursor)> {
         let hist = self.history.as_ref().expect("a persistent store");
-        let (generation, entry, file) = {
+        let opened = {
             let live = self.snapshot();
             let current = commit::generation_number(&live.generation.name);
             let mut h = hist.lock();
-            let Some(entry) = h.gens.get(&no).cloned() else {
-                return Err(Error::Corrupt(format!(
-                    "generation {no} was collected while it was read; retry"
-                )));
-            };
-            let generation =
-                self.history_generation(&mut h, no, current, &live, &entry, u64::MAX)?;
-            let file = File::open(entry.dir.join("wal.log"))?;
-            (generation, entry, file)
+            self.retained_log(&mut h, no, current, &live)?
         };
+        let Some(opened) = opened else {
+            return Err(Error::Corrupt(format!(
+                "generation {no} was collected while it was read; retry"
+            )));
+        };
+        self.log_cursor(opened, after)
+    }
+
+    /// Generation `no`, its history entry and its open log, or `None` when the generation
+    /// was collected. The caller holds the history lock `h`, which collection takes too.
+    fn retained_log(
+        &self,
+        h: &mut crate::history::HistoryState,
+        no: u32,
+        current: u32,
+        live: &Snapshot,
+    ) -> Result<Option<RetainedLog>> {
+        let Some(entry) = h.gens.get(&no).cloned() else {
+            return Ok(None);
+        };
+        let generation = self.history_generation(h, no, current, live, &entry, u64::MAX)?;
+        let file = File::open(entry.dir.join("wal.log"))?;
+        Ok(Some((generation, entry, file)))
+    }
+
+    /// A cursor over a log that [`retained_log`](Self::retained_log) opened, at the
+    /// nearest indexed position at or before the end of `after`.
+    fn log_cursor(
+        &self,
+        (generation, entry, file): RetainedLog,
+        after: u64,
+    ) -> Result<(Arc<Generation>, super::wal::WalCursor)> {
         let path = entry.dir.join("wal.log");
         let from = {
             let mut ix = generation.wal_index.lock();

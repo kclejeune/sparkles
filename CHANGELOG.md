@@ -746,6 +746,25 @@ Rules in which a builtin binds a variable that an atom also holds, and every rul
 the derived tier holds a dead fact after a deletion, keep the greedy orders (item 944). The planner of item 487,
 which ordered bodies from statistics, stays unadopted.
 
+RDFS undos and repeated changes over a kept closure take about the time they took when
+the closure also held the explicit facts (item 113). An incremental run of the reasoner read the
+commits since its last run through the commit diff, which started up to a mebibyte before
+the commit in the generation's log, turned every changed quad into terms and looked the
+terms up again. The index of a generation's log now holds the ends of its newest 64
+commits, the new `Store::changed_ids` gives the net changes of some graphs up to a
+snapshot as quads of that snapshot's ids, and an incremental run reads its changes
+through it when the log holds them. A run also keeps its parsed rules, with the check
+that they can be maintained incrementally, by the digest of the rule text. The kept sets
+stay with the process, at most eight sets and 4 MiB by an estimate of their parsed size. On atlas, on
+LUBM-style data with 100 universities, RDFS undos and repeated changes of 100 to 10,000
+triples take 0.85 to 1.08 times their time with the larger closure at one thread, where
+they took 1.12 to 1.42 times. OWL 2 RL changes still take 1.2 to 2.3 times at one thread
+(item 941), and the first change of a part of the data still takes about three times as long as its
+undo for 100 RDFS triples (item 942). `examples/lubm.rs` of the reasoner has a `churn` measurement of many
+changes over one kept closure, its `keep` and `churn` run on a reasoning pool as a
+server's runs do, and the trace event `sparkles_reasoner::timing` gives the time of each
+phase of a run.
+
 Notification channels deliver independently (item 46). Each channel has its own queue
 and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own
 deliveries. A channel's queue holds its share of 1,000 deliveries, at least 50, and a

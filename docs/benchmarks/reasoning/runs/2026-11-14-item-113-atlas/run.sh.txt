@@ -1,0 +1,102 @@
+# atlas-job.sh, run as: flock ~/lanes/.heavy.lock ~/lanes/closure-updates-113/atlas-job.sh
+#!/usr/bin/env bash
+# The lane's whole A/B on atlas, one job under ~/lanes/.heavy.lock (taken by the caller).
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+cd "$L" || exit 1
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+log() { echo "[$(date +%T)] $*" >> "$L/job.log"; }
+mkdir -p data
+if [ ! -d data/db-tip ] || [ ! -d data/db-pre ]; then
+  log "generating and loading the data"
+  bin/lubm-base gen 100 data/src > data/gen.log 2>&1 || { log "gen failed"; exit 1; }
+  scope bin/lubm-base load data/src 100 data/db-tip > data/load-tip.log 2>&1 || { log "load failed"; exit 1; }
+  scope bin/lubm-pre load data/src 100 data/db-pre > data/load-pre.log 2>&1 || { log "pre load failed"; exit 1; }
+fi
+log "matrix"
+ARMS="pre pretier base fin" PIN1=2-5 TAG=atlas ./ab.sh
+log "counters"
+ARMS="c d" PROFILES=rdfs MODES=p16 TAG=atlas-counters ./ab.sh
+log "large changes read back from the dataset (item 938)"
+mkdir -p runs-atlas-938
+for round in 1 2; do
+  for arm in pretier base fin; do
+    rm -rf data/run-938.db && cp -r data/db-tip data/run-938.db
+    RAYON_NUM_THREADS=20 scope bin/lubm-$arm keep "$L/data/run-938.db" owl-rl 100000 \
+      > "runs-atlas-938/$arm-r$round.out" 2> "runs-atlas-938/$arm-r$round.err"
+    log "938 $arm r$round rc=$?"
+  done
+done
+rm -rf data/run-938.db
+log "job-finished load=$(cut -d' ' -f1 /proc/loadavg)"
+
+# ab.sh
+#!/usr/bin/env bash
+# Interleaved rounds of `lubm churn` for several builds, each on a fresh copy of the dataset.
+#
+#   ab.sh    (env: ARMS PROFILES MODES ROUNDS SIZES BATCHES THREADS PIN1 MEM TAG)
+#
+# The lane directory holds bin/lubm-ARM and data/db-tip (and data/db-pre, in index format 2,
+# for the arm `pre`). Modes: t1 is one thread, t16 is THREADS threads on the global pool
+# from the main thread (as `lubm keep` runs), p16 is THREADS threads on a reasoning pool
+# (as a server runs). Results go to runs/ARM-PROFILE-MODE-rROUND.{out,err}; a run whose
+# output is complete is not repeated. The order of the arms rotates from round to round.
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+ARMS=${ARMS:-"pre base a b c d"}
+PROFILES=${PROFILES:-"rdfs owl-rl"}
+MODES=${MODES:-"t1 t16 p16"}
+ROUNDS=${ROUNDS:-3}
+SIZES=${SIZES:-100,1000,10000}
+BATCHES=${BATCHES:-40,20,6}
+THREADS=${THREADS:-16}
+PIN1=${PIN1:-}
+MEM=${MEM:-13G}
+R=$L/runs${TAG:+-$TAG}
+mkdir -p "$R" && cd "$L/data" || exit 1
+last=${SIZES##*,}
+read -r -a arms <<< "$ARMS"
+n=${#arms[@]}
+for round in $(seq 1 "$ROUNDS"); do
+  for profile in $PROFILES; do
+    for mode in $MODES; do
+      for i in $(seq 0 $((n - 1))); do
+        arm=${arms[$(((i + round - 1) % n))]}
+        name=$arm-$profile-$mode-r$round
+        if grep -q "k=$last rounds=.* revert-again first_us" "$R/$name.out" 2> /dev/null; then
+          continue
+        fi
+        db=db-tip
+        [ "$arm" = pre ] && db=db-pre
+        run=run-ab${TAG:+-$TAG}.db
+        rm -rf "$run" && cp -r "$db" "$run"
+        threads=$THREADS pool=0 pin=
+        case $mode in
+          t1) threads=1 pin=$PIN1 ;;
+          p16) pool=1 ;;
+        esac
+        env RUST_LOG=sparkles_reasoner::timing=trace LUBM_POOL=$pool RAYON_NUM_THREADS=$threads \
+          systemd-run --user --scope -q -p "MemoryMax=$MEM" -p MemorySwapMax=0 -p OOMPolicy=continue \
+          ${pin:+taskset -c "$pin"} "$L/bin/lubm-$arm" churn "$L/data/$run" "$profile" "$SIZES" 100 "$BATCHES" \
+          > "$R/$name.out" 2> "$R/$name.err"
+        echo "[$(date +%T)] $name rc=$? load=$(cut -d' ' -f1 /proc/loadavg)" >> "$R/progress.log"
+        rm -rf "$run"
+      done
+    done
+  done
+done
+echo "[$(date +%T)] ab-finished" >> "$R/progress.log"
+
+# atlas-job2.sh, the second job, run as: flock ~/lanes/.heavy.lock ~/lanes/closure-updates-113/atlas-job2.sh
+#!/usr/bin/env bash
+# The clean A/B of the per-thread counters of the block cache on atlas, one job under
+# ~/lanes/.heavy.lock (taken by the caller): fin (1590064b) against ctr (bd23a60f, which is
+# fin with the counters of f24e9d62 and nothing else).
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+cd "$L" || exit 1
+log() { echo "[$(date +%T)] $*" >> "$L/job2.log"; }
+[ -d data/db-tip ] && [ -x bin/lubm-ctr ] && [ -x bin/lubm-fin ] || { log "data or binaries missing"; exit 1; }
+log "counters A/B load=$(cut -d' ' -f1 /proc/loadavg)"
+ARMS="fin ctr" PROFILES="rdfs owl-rl" MODES="t1 p16" ROUNDS=5 PIN1=2-5 TAG=atlas-ctr ./ab.sh
+log "job2-finished load=$(cut -d' ' -f1 /proc/loadavg)"

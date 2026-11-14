@@ -315,6 +315,11 @@ pub(crate) fn changes(
     cache: Option<&Cache>,
     inputs: &[GraphRef],
 ) -> Result<RawChanges, String> {
+    // the log of the snapshot's generation gives the changes as its ids, without their
+    // terms; other histories give them as terms
+    if let Ok(Some(r)) = logged_ids(store, since, snap, inputs) {
+        return Ok(r);
+    }
     let e = match logged_changes(store, since, snap.commit, inputs) {
         Ok(r) => return Ok(r),
         Err(e) => e,
@@ -656,29 +661,7 @@ impl RawChanges {
                             .or_default()
                             .push((g, op == DiffOp::Add));
                     }
-                    for (t, changed) in by_triple {
-                        let stored = t
-                            .iter()
-                            .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
-                        let (mut before, mut after) = (false, false);
-                        for &g in inputs {
-                            let now =
-                                stored && snap.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?;
-                            after |= now;
-                            before |= match changed.iter().find(|(cg, _)| *cg == Some(g)) {
-                                Some((_, added)) => !added,
-                                None => now,
-                            };
-                        }
-                        // a graph the snapshot no longer names held the triple before when
-                        // the diff removed it there
-                        before |= changed.iter().any(|(cg, added)| cg.is_none() && !added);
-                        match (before, after) {
-                            (false, true) => c.base_added.push(t),
-                            (true, false) => c.base_removed.push(t),
-                            _ => c.base_moved.push(t),
-                        }
-                    }
+                    union_changes(by_triple, snap, inputs, &mut c)?;
                 } else {
                     for (op, q) in base {
                         match op {
@@ -699,6 +682,41 @@ impl RawChanges {
     }
 }
 
+/// The changes of the union of several input graphs. `by_triple` holds, for each triple
+/// that changed in an input graph, the graphs whose change was reported (`None` for a graph
+/// the snapshot no longer names) and whether the triple was added there. A triple joins or
+/// leaves the union only when no other input graph holds it, and otherwise moved.
+fn union_changes(
+    by_triple: FxHashMap<Triple, Vec<(Option<Id>, bool)>>,
+    snap: &Snapshot,
+    inputs: &[Id],
+    c: &mut Changes,
+) -> anyhow::Result<()> {
+    for (t, changed) in by_triple {
+        let stored = t
+            .iter()
+            .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local);
+        let (mut before, mut after) = (false, false);
+        for &g in inputs {
+            let now = stored && snap.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?;
+            after |= now;
+            before |= match changed.iter().find(|(cg, _)| *cg == Some(g)) {
+                Some((_, added)) => !added,
+                None => now,
+            };
+        }
+        // a graph the snapshot no longer names held the triple before when the diff
+        // removed it there
+        before |= changed.iter().any(|(cg, added)| cg.is_none() && !added);
+        match (before, after) {
+            (false, true) => c.base_added.push(t),
+            (true, false) => c.base_removed.push(t),
+            _ => c.base_moved.push(t),
+        }
+    }
+    Ok(())
+}
+
 /// The ids of the input graphs in `snap` (or in `other`, for a graph only it names).
 pub(crate) fn input_ids(snap: &Snapshot, other: Option<&Snapshot>, inputs: &[GraphRef]) -> Vec<Id> {
     let mut ids: Vec<Id> = inputs
@@ -713,6 +731,49 @@ pub(crate) fn input_ids(snap: &Snapshot, other: Option<&Snapshot>, inputs: &[Gra
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+/// The changes from commit `since` to `snap` as ids of `snap`, from the log of its
+/// generation, when that log holds every commit between them (see
+/// [`Store::changed_ids`]). The log holds ids, so this reads no term, where the commit
+/// diff of [`logged_changes`] turns every changed quad into terms that
+/// [`RawChanges::resolve`] then looks up again.
+fn logged_ids(
+    store: &Store,
+    since: u64,
+    snap: &Snapshot,
+    inputs: &[GraphRef],
+) -> anyhow::Result<Option<RawChanges>> {
+    let ids = input_ids(snap, None, inputs);
+    let inferred = snap.lookup_iri(INFERRED_GRAPH);
+    if inferred.is_some_and(|g| ids.contains(&g)) {
+        return Ok(None);
+    }
+    let mut graphs = ids.clone();
+    graphs.extend(inferred);
+    let Some(found) = store.changed_ids(since, snap, &graphs, &DiffOptions::default())? else {
+        return Ok(None);
+    };
+    let mut c = Changes::default();
+    let mut by_triple: FxHashMap<Triple, Vec<(Option<Id>, bool)>> = FxHashMap::default();
+    for (q, added) in found {
+        let t = [q[0].0, q[1].0, q[2].0];
+        if Some(q[3]) == inferred {
+            if added {
+                c.inferred_added.push(t);
+            } else {
+                c.inferred_removed.push(t);
+            }
+        } else if ids.len() > 1 {
+            by_triple.entry(t).or_default().push((Some(q[3]), added));
+        } else if added {
+            c.base_added.push(t);
+        } else {
+            c.base_removed.push(t);
+        }
+    }
+    union_changes(by_triple, snap, &ids, &mut c)?;
+    Ok(Some(RawChanges::Ids(c)))
 }
 
 /// The changes between two commits from the store's commit diff.
