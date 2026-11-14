@@ -2889,6 +2889,43 @@ driver does not finish within 8 million conclusions finishes in steps in 1.66 mi
 The differential runs against HermiT give 270 equal and 26 sound answers of 296 and 292
 equal and 3 sound of 295, on one thread and on four, as the default driver does.
 
+The cost against the default driver was measured on `atlas` with the classifier of commit
+b351050c, one process at a time in a 13 GiB scope, while other work kept the load average
+of the host between 3 and 6. The times are medians of five classifications in one
+process, and for the five ORE 2015 DL files that attempt counting the median of three
+such processes for each driver, run in turn. They compare the two drivers on one host and
+are not a published benchmark.
+
+| File | Threads | Default driver | In steps |
+|---|---|---|---|
+| ore_ont_6952 | 4 | 365.5 ms | 377.5 ms |
+| ore_ont_10140 | 4 | 374.3 ms | 386.5 ms |
+| ore_ont_6485 | 4 | 205.5 ms, falls back | 76.6 ms, falls back |
+| ore_ont_14817 | 4 | 6,192 ms, falls back | 3,498 ms, falls back |
+| ore_ont_9663 | 4 | 3,701 ms, falls back | 2,752 ms, falls back |
+| ore_ont_6952 | 1 | 1,166 ms | 1,153 ms |
+| ore_ont_10140 | 1 | 1,197 ms | 1,180 ms |
+| ore_ont_6485 | 1 | 156.7 ms, falls back | 211.6 ms, falls back |
+| ore_ont_14817 | 1 | 132 s, falls back | 10.1 s, falls back |
+| ore_ont_9663 | 1 | 7,329 ms, falls back | 7,775 ms, falls back |
+
+On four threads the two files that finish take 3.3% longer in steps. The three that fall
+back take 1.3 to 2.7 times less, since a run in steps does not repeat its failed attempt
+on one thread. On one thread the two that finish take 1.2 and 1.4% less, the fallback of
+ore_ont_6485 takes 35% longer and that of ore_ont_9663 6% longer. The default driver's
+time for ore_ont_14817 on one thread is one classification, since five passed 600 s.
+
+The 149 counting fixtures that both drivers finish at a bound of 8 million take 2,180 ms
+in steps against 2,046 ms on one thread in sum, 6.5% longer, and 1,146 against 1,360 ms
+on four, 16% less, where `sriq-004` derives 387,617 conclusions in steps against
+2,171,241. `shiq-028`, which passes the bound, takes 4,370 against 3,505 ms on one thread
+and 1,301 against 3,991 ms on four. A sweep of the 207 development files of the ORE 2015
+DL sample in steps on four threads gives the same bytes as the default driver on each of
+the 205 files that give a taxonomy. The 92 of them that the disjunctive rules answer
+within their bounds take 22.2 s in steps against 22.7 s in single classifications, and
+the smallest of them, which classify in a few milliseconds, take up to three times as
+long.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules

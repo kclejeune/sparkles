@@ -69,8 +69,11 @@ inference too wide to make now marks the run past its bound with a flag. Four of
 between two checks wrapped the count before, and the run ended as complete without those
 inferences. A worker of a saturation that panics, in a caller's callback for example, now
 stops the run, and the panic reaches the caller. The other workers waited for it without
-end before, with either driver. This is roadmap item 727, which keeps the decision about
-the default.
+end before, with either driver. On `atlas` on four threads the two versions of the
+Protein Ontology classify 3.3% slower in steps, and the three files of the ORE 2015 DL
+sample whose counting attempt fails classify 1.3 to 2.7 times faster, since a run in
+steps does not repeat the attempt on one thread. This is roadmap item 727, which keeps
+the decision about the default.
 
 ### Compatibility
 
