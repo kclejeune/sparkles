@@ -460,7 +460,7 @@ fn seeded_edits_keep_contexts_often_enough_to_test_them() {
         (0usize, 0, 0, 0, 0);
     for round in 0..240usize {
         let threads = [1usize, 4, 8][round % 3];
-        let mut gen_axioms = |n: usize, next: &mut dyn FnMut() -> u64| -> Vec<Axiom> {
+        let gen_axioms = |n: usize, next: &mut dyn FnMut() -> u64| -> Vec<Axiom> {
             let mut out = Vec::new();
             for _ in 0..n {
                 let x = next();
@@ -528,4 +528,632 @@ fn seeded_edits_keep_contexts_often_enough_to_test_them() {
         kept_a_class >= 300,
         "{kept_a_class} steps kept a class beside cleared ones"
     );
+}
+
+const UNIONS: &str = "SubClassOf(:A ObjectUnionOf(:B :C))
+     SubClassOf(:B :D)
+     SubClassOf(:C :D)
+     SubClassOf(:E :A)
+     SubClassOf(:F ObjectSomeValuesFrom(:r :A))
+     SubClassOf(ObjectSomeValuesFrom(:r :D) :G)
+     SubClassOf(:K :L)";
+
+/// A classifier over `base` that has run once with Tier D.
+fn started_disjunctive(base: &str, threads: usize) -> (Classifier, Vec<Axiom>) {
+    let (k, held) = started(base, threads);
+    assert!(k.excluded().is_empty(), "{:?}", k.excluded());
+    (k, held)
+}
+
+#[test]
+fn a_change_after_a_run_of_tier_d_keeps_the_contexts_it_cannot_reach() {
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = started_disjunctive(UNIONS, threads);
+        let out = k.classify(&limits(threads)).unwrap();
+        assert_eq!(out.stats.tier, sparkles_owl::classify::Tier::Disjunctive);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(out.taxonomy.is_subclass(&c("F"), &c("G")));
+        // a class beside the rest
+        add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh(&mut k, &held, threads, "after a leaf joined");
+        assert!(out.stats.incremental, "the run started again");
+        assert_eq!(out.stats.cleared, 0);
+        assert!(out.taxonomy.is_subclass(&c("M"), &c("L")));
+        // a told subsumer of K: K and M are saturated again
+        add(&mut k, &mut held, "SubClassOf(:K :D)");
+        let out = same_as_fresh(&mut k, &held, threads, "after K got a subsumer");
+        assert!(out.stats.incremental);
+        assert_eq!(out.stats.cleared, 2);
+        assert!(out.taxonomy.is_subclass(&c("M"), &c("D")));
+    }
+}
+
+#[test]
+fn a_test_that_held_loses_its_support() {
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = started_disjunctive(UNIONS, threads);
+        // A is below D only by the case analysis, which a test of A and not D shows
+        remove(&mut k, &mut held, "SubClassOf(:C :D)");
+        let out = same_as_fresh(&mut k, &held, threads, "after a case lost its subsumer");
+        assert!(out.stats.incremental, "the run started again");
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(!out.taxonomy.is_subclass(&c("E"), &c("D")));
+        assert!(!out.taxonomy.is_subclass(&c("F"), &c("G")));
+        assert!(out.taxonomy.is_subclass(&c("K"), &c("L")));
+        add(&mut k, &mut held, "SubClassOf(:C :D)");
+        let out = same_as_fresh(&mut k, &held, threads, "after the case got it back");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("E"), &c("D")));
+        assert!(out.taxonomy.is_subclass(&c("F"), &c("G")));
+    }
+}
+
+#[test]
+fn a_union_comes_and_goes_beside_another() {
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = started_disjunctive(UNIONS, threads);
+        add(
+            &mut k,
+            &mut held,
+            "SubClassOf(:K ObjectUnionOf(:P :Q)) SubClassOf(:P :L2) SubClassOf(:Q :L2)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "after a second union");
+        assert!(out.stats.incremental, "the run started again");
+        assert!(out.taxonomy.is_subclass(&c("K"), &c("L2")));
+        remove(&mut k, &mut held, "SubClassOf(:K ObjectUnionOf(:P :Q))");
+        let out = same_as_fresh(&mut k, &held, threads, "after the second union left");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("K"), &c("L2")));
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+        // the last union leaves: the EL rules take over, and the run starts again
+        remove(&mut k, &mut held, "SubClassOf(:A ObjectUnionOf(:B :C))");
+        let out = same_as_fresh(&mut k, &held, threads, "after the last union left");
+        assert!(!out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+    }
+}
+
+#[test]
+fn a_clause_of_every_context_clears_every_context() {
+    for threads in [1, 4] {
+        let (mut k, mut held) = started_disjunctive(UNIONS, threads);
+        // a complement on the left is a clause with owl:Thing as its body
+        add(&mut k, &mut held, "SubClassOf(ObjectComplementOf(:B) :D)");
+        let out = same_as_fresh(&mut k, &held, threads, "after a complement on the left");
+        assert!(out.stats.incremental, "the run started again");
+        assert!(out.stats.cleared >= 7, "{} cleared", out.stats.cleared);
+        assert!(out.taxonomy.is_subclass(&c("K"), &c("D")));
+        remove(&mut k, &mut held, "SubClassOf(ObjectComplementOf(:B) :D)");
+        let out = same_as_fresh(&mut k, &held, threads, "after it left");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("K"), &c("D")));
+    }
+}
+
+#[test]
+fn a_successor_of_tier_d_answers_a_predecessor_that_is_saturated_again() {
+    for threads in [1, 4, 8] {
+        // B's successor is conditional in A, so A registers with the hypothetical
+        // successor of the restriction, and the universal sends it a marker
+        let (mut k, mut held) = started_disjunctive(
+            "SubClassOf(:A ObjectUnionOf(:X ObjectSomeValuesFrom(:r :B)))
+             SubClassOf(:A ObjectAllValuesFrom(:r :C))
+             SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)
+             SubClassOf(:X :Y)
+             SubClassOf(:Z ObjectSomeValuesFrom(:r :B))
+             SubClassOf(:Z ObjectAllValuesFrom(:r :C2))
+             SubClassOf(ObjectIntersectionOf(:B :C2) :W)
+             SubClassOf(ObjectSomeValuesFrom(:r :W) :V)",
+            threads,
+        );
+        let out = k.classify(&limits(threads)).unwrap();
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+        // A is saturated again and registers again with the successors that are kept
+        add(&mut k, &mut held, "SubClassOf(:A :N)");
+        let out = same_as_fresh(&mut k, &held, threads, "after A got a subsumer");
+        assert!(out.stats.incremental, "the run started again");
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        // the disjointness leaves, and with it the clause that the successor sent back
+        remove(
+            &mut k,
+            &mut held,
+            "SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "after the disjointness left");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+        add(
+            &mut k,
+            &mut held,
+            "SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "after the disjointness came back");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+    }
+}
+
+#[test]
+fn changes_that_tier_d_does_not_follow_start_again() {
+    let (mut k, mut held) = started_disjunctive(UNIONS, 1);
+    add(&mut k, &mut held, "SubObjectPropertyOf(:r :s)");
+    let out = same_as_fresh(&mut k, &held, 1, "after a role inclusion");
+    assert!(!out.stats.incremental);
+    add(&mut k, &mut held, "ObjectPropertyDomain(:r :W)");
+    let out = same_as_fresh(&mut k, &held, 1, "after a domain");
+    assert!(!out.stats.incremental);
+    add(&mut k, &mut held, "SubClassOf(:K :L3)");
+    let out = same_as_fresh(&mut k, &held, 1, "after a told subsumer");
+    assert!(out.stats.incremental);
+    // an individual takes the union from Tier D
+    add(&mut k, &mut held, "ClassAssertion(:A :a)");
+    let out = same_as_fresh(&mut k, &held, 1, "after an assertion");
+    assert!(!out.stats.incremental);
+    // a run that counts has a bound on its conclusions and starts again
+    let counting = Limits {
+        counting: true,
+        ..Limits::default()
+    };
+    let held = axioms(&format!(
+        "{UNIONS} SubClassOf(:A ObjectMaxCardinality(2 :r :B))"
+    ));
+    let mut k = Classifier::of(&held);
+    k.classify(&counting).unwrap();
+    let more = axioms("SubClassOf(:M :K)");
+    k.add(&more);
+    let out = k.classify(&counting).unwrap();
+    assert!(!out.stats.incremental);
+}
+
+/// One axiom of a generated ontology that needs case analysis, or one of [`axiom`].
+fn disjunctive_axiom(kind: u8, a: u8, b: u8, d: u8, r: u8) -> String {
+    let (x, y) = (a % 7, b % 7);
+    // a second operand that differs from the first, which a union needs
+    let z = (y + 1 + d % 6) % 7;
+    let role = r % 3;
+    match kind % 20 {
+        0 | 1 => format!("SubClassOf(:C{x} ObjectUnionOf(:C{y} :C{z}))"),
+        2 => format!("SubClassOf(:C{x} ObjectComplementOf(:C{y}))"),
+        3 => format!("SubClassOf(:C{x} ObjectSomeValuesFrom(:r{role} ObjectUnionOf(:C{y} :C{z})))"),
+        4 => format!("SubClassOf(:C{x} ObjectUnionOf(:C{y} ObjectSomeValuesFrom(:r{role} :C{z})))"),
+        5 => format!("SubClassOf(:C{x} ObjectAllValuesFrom(:r{role} ObjectUnionOf(:C{y} :C{z})))"),
+        6 => format!("SubClassOf(ObjectAllValuesFrom(:r{role} :C{x}) :C{y})"),
+        7 => format!(
+            "EquivalentClasses(:C{x} ObjectUnionOf(:C{y} ObjectAllValuesFrom(:r{role} :C{z})))"
+        ),
+        _ => axiom(kind, a, b, d, r),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+
+    /// Random sequences of additions and removals over a generated ontology with
+    /// unions, complements and universals in every position: every run of the kept
+    /// classifier answers as a classifier that starts again.
+    #[test]
+    fn edits_of_a_disjunctive_ontology_answer_as_a_fresh_run(
+        base in prop::collection::vec(gen_axiom(), 4..24),
+        edits in prop::collection::vec(
+            (prop::collection::vec(gen_axiom(), 0..3), prop::collection::vec(any::<u8>(), 0..3)),
+            1..8,
+        ),
+        threads in prop::sample::select(vec![1usize, 4, 8]),
+    ) {
+        let text = |g: &Gen| disjunctive_axiom(g.0, g.1, g.2, g.3, g.4);
+        let mut held: Vec<Axiom> = Vec::new();
+        for g in &base {
+            for a in axioms(&text(g)) {
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    held.push(a);
+                }
+            }
+        }
+        let mut k = Classifier::of(&held);
+        same_as_fresh(&mut k, &held, threads, "at the start");
+        for (step, (added, removed)) in edits.iter().enumerate() {
+            for &i in removed {
+                if !held.is_empty() {
+                    let gone = held.remove(i as usize % held.len());
+                    k.remove([&gone]);
+                }
+            }
+            for g in added {
+                for a in axioms(&text(g)) {
+                    if !held.iter().any(|h| h.kind == a.kind) {
+                        k.add([&a]);
+                        held.push(a);
+                    }
+                }
+            }
+            same_as_fresh(&mut k, &held, threads, &format!("after edit {step}"));
+        }
+    }
+}
+
+/// Seeded sequences of edits over generated ontologies that need case analysis,
+/// counted as [`seeded_edits_keep_contexts_often_enough_to_test_them`] counts those of
+/// the Horn rules, with the steps whose run was one of Tier D.
+#[test]
+fn seeded_edits_of_tier_d_keep_contexts_often_enough_to_test_them() {
+    use sparkles_owl::classify::Tier;
+    let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let (mut steps, mut disjunctive, mut incremental, mut cleared_some, mut cleared_none) =
+        (0usize, 0, 0, 0, 0);
+    let (mut kept_a_class, mut tests_held) = (0usize, 0);
+    for round in 0..360usize {
+        let threads = [1usize, 4, 8][round % 3];
+        let gen_axioms = |n: usize, next: &mut dyn FnMut() -> u64| -> Vec<Axiom> {
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let x = next();
+                let text = disjunctive_axiom(
+                    x as u8,
+                    (x >> 8) as u8,
+                    (x >> 16) as u8,
+                    (x >> 24) as u8,
+                    (x >> 32) as u8,
+                );
+                out.extend(axioms(&text));
+            }
+            out
+        };
+        let mut held: Vec<Axiom> = Vec::new();
+        for a in gen_axioms(8 + (next() % 16) as usize, &mut next) {
+            if !held.iter().any(|h| h.kind == a.kind) {
+                held.push(a);
+            }
+        }
+        let mut k = Classifier::of(&held);
+        let first = same_as_fresh(&mut k, &held, threads, "at the start");
+        let mut classes_before = first.taxonomy.classes().count();
+        for step in 0..6 {
+            for _ in 0..next() % 3 {
+                if !held.is_empty() {
+                    let gone = held.remove(next() as usize % held.len());
+                    k.remove([&gone]);
+                }
+            }
+            for a in gen_axioms((next() % 3) as usize, &mut next) {
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    k.add([&a]);
+                    held.push(a);
+                }
+            }
+            let at = format!("in round {round} after edit {step}");
+            let out = same_as_fresh(&mut k, &held, threads, &at);
+            steps += 1;
+            if out.stats.tier == Tier::Disjunctive && out.stats.outside_el.taken > 0 {
+                disjunctive += 1;
+                if out.stats.incremental {
+                    incremental += 1;
+                    cleared_some += usize::from(out.stats.cleared > 0);
+                    cleared_none += usize::from(out.stats.cleared == 0);
+                    kept_a_class +=
+                        usize::from(out.stats.cleared > 0 && out.stats.cleared < classes_before);
+                    tests_held += usize::from(out.stats.dl_tests_held > 0);
+                }
+            }
+            classes_before = out.taxonomy.classes().count();
+        }
+    }
+    eprintln!(
+        "TALLY steps={steps} disjunctive={disjunctive} incremental={incremental} \
+         cleared_some={cleared_some} cleared_none={cleared_none} kept_a_class={kept_a_class} \
+         tests_held={tests_held}"
+    );
+    // The run measured 2160 steps, 2143 of them runs of Tier D, 2138 that kept
+    // contexts, 1838 that cleared a context, 300 that cleared none, 316 that kept a
+    // class's context beside cleared ones and 308 in which a test held. The floors are
+    // about half of each.
+    assert!(incremental >= 1000, "{incremental} incremental steps");
+    assert!(
+        cleared_some >= 900,
+        "{cleared_some} steps cleared a context"
+    );
+    assert!(cleared_none >= 150, "{cleared_none} steps cleared none");
+    assert!(
+        kept_a_class >= 150,
+        "{kept_a_class} steps kept a class beside cleared ones"
+    );
+    assert!(
+        tests_held >= 150,
+        "{tests_held} steps with a test that held"
+    );
+}
+
+/// The ontologies of a fixture folder: the files `NAME.ofn`, without the reasoners'
+/// answers beside them.
+fn fixture_files(dir: &str) -> Vec<std::path::PathBuf> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(dir);
+    let mut cases: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".ofn") && n.matches('.').count() == 1)
+        })
+        .collect();
+    cases.sort();
+    cases
+}
+
+/// What [`edits_of_files`] counted.
+#[derive(Default, Debug)]
+struct Tally {
+    files: usize,
+    steps: usize,
+    incremental: usize,
+    horn: usize,
+    disjunctive: usize,
+    kept_a_class: usize,
+}
+
+/// Seeded removals and returns of axioms over each ontology, on 1, 4 and 8 threads:
+/// a few axioms leave, a run, they come back, a run, and each run of the kept
+/// classifier answers as a classifier that starts again.
+fn edits_of_files(
+    files: &[std::path::PathBuf],
+    rounds: usize,
+    limits_of: &dyn Fn(usize) -> Limits,
+) -> Tally {
+    use sparkles_owl::classify::Tier;
+    let mut tally = Tally::default();
+    for (n, path) in files.iter().enumerate() {
+        let text = std::fs::read_to_string(path).unwrap();
+        let Ok(doc) = ofn_read::parse(&text) else {
+            continue;
+        };
+        tally.files += 1;
+        let mut seed =
+            0x9E37_79B9_7F4A_7C15u64 ^ (n as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03);
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for threads in [1usize, 4, 8] {
+            let limits = limits_of(threads);
+            let mut held: Vec<Axiom> = doc.axioms.clone();
+            let mut k = Classifier::of(&held);
+            let first = k.classify(&limits).unwrap();
+            let mut classes_before = first.taxonomy.classes().count();
+            let mut check = |k: &mut Classifier, held: &[Axiom], at: &str, tally: &mut Tally| {
+                let out = k.classify(&limits).unwrap();
+                let mut fresh = Classifier::of(held);
+                let want = fresh.classify(&limits).unwrap();
+                let at = format!("{at} of {} on {threads} threads", path.display());
+                assert_eq!(answer(&out), answer(&want), "the answers differ {at}");
+                assert_eq!(out.taxonomy, want.taxonomy, "the taxonomies differ {at}");
+                assert_eq!(
+                    k.excluded(),
+                    fresh.excluded(),
+                    "the axioms left out differ {at}"
+                );
+                tally.steps += 1;
+                if out.stats.incremental {
+                    tally.incremental += 1;
+                    match out.stats.tier {
+                        Tier::Disjunctive if out.stats.clauses > 0 => tally.disjunctive += 1,
+                        Tier::El => {}
+                        _ => tally.horn += usize::from(out.stats.outside_el.taken > 0),
+                    }
+                    tally.kept_a_class += usize::from(out.stats.cleared < classes_before);
+                }
+                classes_before = out.taxonomy.classes().count();
+            };
+            for round in 0..rounds {
+                let mut gone: Vec<Axiom> = Vec::new();
+                for _ in 0..1 + next() % 3 {
+                    if !held.is_empty() {
+                        let a = held.remove(next() as usize % held.len());
+                        k.remove([&a]);
+                        gone.push(a);
+                    }
+                }
+                check(&mut k, &held, &format!("after removal {round}"), &mut tally);
+                for a in gone {
+                    if !held.iter().any(|h| h.kind == a.kind) {
+                        k.add([&a]);
+                        held.push(a);
+                    }
+                }
+                check(&mut k, &held, &format!("after return {round}"), &mut tally);
+            }
+        }
+    }
+    tally
+}
+
+/// The fixtures of roadmap item 603: generated families of ALC to SROIQ and
+/// hand-written cases, with the limits of a default run. The floors are about half of
+/// what the run counted, so that a rule that makes most steps start again fails here.
+#[test]
+fn edits_of_the_dl603_fixtures_answer_as_a_fresh_run() {
+    let tally = edits_of_files(&fixture_files("dl603"), 2, &limits);
+    eprintln!("TALLY dl603 {tally:?}");
+    // The run counted 640 files and 7680 steps, of which 1298 kept contexts, 953 of
+    // them with Tier D and 287 with the Horn rules, and 800 kept a class's context.
+    // The other steps start again: they change a declaration of a property, a role
+    // axiom or an axiom with data or an individual, or the ontology counts.
+    assert!(tally.files >= 600, "{tally:?}");
+    assert!(tally.incremental >= 650, "{tally:?}");
+    assert!(tally.disjunctive >= 475, "{tally:?}");
+    assert!(tally.horn >= 140, "{tally:?}");
+    assert!(tally.kept_a_class >= 400, "{tally:?}");
+}
+
+/// The generated ontologies of roadmap item 897, whose number restrictions have
+/// compound qualifiers.
+#[test]
+fn edits_of_the_dl897_fixtures_answer_as_a_fresh_run() {
+    let tally = edits_of_files(&fixture_files("dl897"), 3, &limits);
+    eprintln!("TALLY dl897 {tally:?}");
+    // The run counted 27 files and 486 steps, of which 286 kept contexts, 285 of them
+    // with Tier D, and 254 kept a class's context.
+    assert!(tally.files >= 25, "{tally:?}");
+    assert!(tally.disjunctive >= 140, "{tally:?}");
+    assert!(tally.kept_a_class >= 125, "{tally:?}");
+}
+
+/// The files of the ORE 2015 sample that `SPARKLES_ORE_DIR` names, when it is set:
+/// every `.owl` file in functional-style syntax of at most `SPARKLES_ORE_MAX_BYTES`,
+/// 300,000 by default.
+#[test]
+fn edits_of_ore_files_answer_as_a_fresh_run() {
+    let Ok(dir) = std::env::var("SPARKLES_ORE_DIR") else {
+        return;
+    };
+    let most: u64 = std::env::var("SPARKLES_ORE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300_000);
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.extension().is_some_and(|x| x == "owl" || x == "ofn")
+                && std::fs::metadata(p).is_ok_and(|m| m.len() <= most)
+        })
+        .collect();
+    files.sort();
+    let tally = edits_of_files(&files, 2, &limits);
+    eprintln!("TALLY ore {tally:?}");
+    assert!(tally.files > 0, "no file of {dir} was read");
+}
+
+/// The two bases of the tests of a kept run's bounds: one that the Horn rules take and
+/// one that Tier D takes.
+const BOUNDED: [&str; 2] = [UNIVERSALS, UNIONS];
+
+#[test]
+fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
+    for base in BOUNDED {
+        let held = {
+            let mut held = axioms(base);
+            held.extend(axioms("SubClassOf(:M :K)"));
+            held
+        };
+        // the least budget with which a classifier that starts again over the edited
+        // axioms takes every axiom: below it the run falls back to the EL rules and
+        // leaves axioms out, or fails
+        let fresh = |limit: usize| {
+            let mut k = Classifier::of(&held);
+            let out = k
+                .classify(&Limits {
+                    max_memory: Some(limit),
+                    ..limits(1)
+                })
+                .ok()?;
+            k.excluded().is_empty().then_some(out)
+        };
+        let (mut low, mut high) = (0usize, 1usize << 30);
+        assert!(fresh(high).is_some());
+        while high - low > 64 {
+            let mid = low + (high - low) / 2;
+            if fresh(mid).is_some() {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        let want = fresh(high).unwrap();
+        // a kept run holds more than that, the last index among it, and answers as the
+        // classifier that starts again does
+        let mut restarted = 0;
+        for more in [0usize, 64, 256, 1024, 4096] {
+            let (mut k, _) = started(base, 1);
+            k.add(&axioms("SubClassOf(:M :K)"));
+            let out = k
+                .classify(&Limits {
+                    max_memory: Some(high + more),
+                    ..limits(1)
+                })
+                .unwrap();
+            assert_eq!(answer(&out), answer(&want));
+            assert_eq!(out.taxonomy, want.taxonomy);
+            assert_eq!(out.stats.tier, want.stats.tier);
+            assert_eq!(k.excluded(), Vec::new());
+            restarted += usize::from(!out.stats.incremental);
+            // the run after it keeps contexts again
+            k.add(&axioms("SubClassOf(:M2 :K)"));
+            let out = k.classify(&limits(1)).unwrap();
+            assert!(out.stats.incremental);
+        }
+        assert!(
+            restarted > 0,
+            "no kept run passed the budget of a fresh one"
+        );
+    }
+}
+
+#[test]
+fn a_kept_run_that_is_cancelled_leaves_a_classifier_that_starts_again() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for base in BOUNDED {
+        let mut stopped = 0;
+        for polls in 0..40usize {
+            let (mut k, mut held) = started(base, 1);
+            add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :K)");
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            let cancelled = Limits {
+                cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+                ..limits(1)
+            };
+            if k.classify(&cancelled).is_err() {
+                stopped += 1;
+            }
+            let out = same_as_fresh(&mut k, &held, 1, &format!("after a stop at poll {polls}"));
+            assert!(out.taxonomy.is_subclass(&c("A"), &c("L")));
+            // a deadline that has passed stops the next run too
+            add(&mut k, &mut held, "SubClassOf(:N :N2)");
+            let late = Limits {
+                deadline: Some(std::time::Instant::now()),
+                ..limits(1)
+            };
+            assert!(k.classify(&late).is_err());
+            let out = same_as_fresh(&mut k, &held, 1, "after a deadline");
+            assert!(out.taxonomy.is_subclass(&c("A"), &c("N2")));
+        }
+        assert!(stopped > 0, "no run was cancelled");
+    }
+}
+
+#[test]
+fn a_run_starts_again_once_it_keeps_twice_the_expressions_of_a_full_run() {
+    for base in BOUNDED {
+        let (mut k, mut held) = started(base, 4);
+        let mut restarts = 0;
+        let mut kept = 0;
+        for round in 0..7 {
+            // each axiom interns a class and an existential restriction
+            let more: String = (0..500)
+                .map(|i| format!("SubClassOf(:K ObjectSomeValuesFrom(:r :N{round}x{i}))\n"))
+                .collect();
+            add(&mut k, &mut held, &more);
+            let out = k.classify(&limits(4)).unwrap();
+            let mut fresh = Classifier::of(&held);
+            let want = fresh.classify(&limits(4)).unwrap();
+            assert_eq!(out.taxonomy, want.taxonomy, "after batch {round}");
+            assert_eq!(k.excluded(), fresh.excluded());
+            restarts += usize::from(!out.stats.incremental);
+            kept += usize::from(out.stats.incremental);
+        }
+        assert!(restarts >= 1, "the kept state never passed its bound");
+        assert!(kept >= 4, "{kept} runs kept contexts");
+    }
 }

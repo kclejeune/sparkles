@@ -534,9 +534,13 @@ pub struct Saturation {
     /// what the last run whose saturation ended was, which decides whether the next
     /// run may keep its contexts (roadmap item 753)
     kept: Option<Kept>,
-    /// whether the current run keeps contexts of a run with the Horn rules, so that a
-    /// stop on its memory budget starts again in full before a lower tier takes over
+    /// whether the current run keeps contexts of a run with the Horn rules or Tier D,
+    /// so that a stop on its memory budget starts again in full before a lower tier
+    /// takes over
     reused: bool,
+    /// the clause table of the last run of Tier D whose contexts the next run may keep,
+    /// which name its clauses by id
+    dl_run: Option<dl_rules::DlRun>,
 }
 
 /// The rules of a run whose contexts the next run may keep.
@@ -547,6 +551,10 @@ enum KeptTier {
     /// the Horn rules without individuals, whose invalidation follows the expressions
     /// whose rules differ between the two indexes
     Horn,
+    /// Tier D without counting, a root or the eager strategy, whose invalidation
+    /// follows the expressions that the units, markers and stored clauses of a context
+    /// name, the predecessors of a context and the class of a test that held
+    Disj,
 }
 
 /// The options that select a run's rules. A run keeps contexts only of a run with the
@@ -577,6 +585,8 @@ struct Kept {
     /// run that started again, which bound what the runs since may keep
     nodes: usize,
     dynamic: usize,
+    /// the clauses of Tier D's table after the last run that started again
+    table: usize,
 }
 
 /// The expressions and the contexts above the index's that a run may keep beyond twice
@@ -968,6 +978,7 @@ impl Saturation {
             partial: None,
             kept: None,
             reused: false,
+            dl_run: None,
         }
     }
 
@@ -1045,9 +1056,10 @@ impl Saturation {
             && self.reused
             && !self.numeric_halt
         {
-            // A run that kept contexts of a run with the Horn rules passed its budget,
-            // which a run that starts again may not: what it keeps of the contexts that
-            // nothing reaches any more counts against the budget too. The run starts
+            // A run that kept contexts of a run with the Horn rules or Tier D passed its
+            // budget, which a run that starts again may not: the last index, which it
+            // holds until the new one is built, and what it keeps of the contexts that
+            // nothing reaches any more count against the budget too. The run starts
             // again in full with the same rules before a lower tier takes over, so that
             // its answer is that of a run without the kept contexts (roadmap item 753).
             // Its charges draw first on what the pool admitted.
@@ -1279,6 +1291,7 @@ impl Saturation {
         self.interner = Interner::new();
         self.ctx = Vec::new();
         self.dynamic = None;
+        self.dl_run = None;
     }
 
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
@@ -1695,16 +1708,22 @@ impl Saturation {
             self.interner = Interner::new();
             self.ctx = Vec::new();
             self.dynamic = None;
+            self.dl_run = None;
         }
-        // a run that keeps the contexts of a run with the Horn rules compares the two
-        // indexes, so the last one stays until the new one is built, and counts
-        // against the budget until then
+        // a run that keeps the contexts of a run with the Horn rules or Tier D compares
+        // the two indexes, so the last one stays until the new one is built, and counts
+        // against the budget until then, as do the contexts above the index's and Tier
+        // D's clause table
         let old_ix = match &kept {
-            Some(k) if k.tier == KeptTier::Horn => self.index.take(),
+            Some(k) if k.tier != KeptTier::El => self.index.take(),
             _ => None,
         };
         let old_bytes = old_ix.as_ref().map_or(0, |ix| ix.bytes())
-            + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes());
+            + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
+            + self.dl_run.as_ref().map_or(0, |d| d.bytes());
+        // from here on a stop on the memory budget may be the kept state's, which a run
+        // that starts again does not hold
+        self.reused = old_ix.is_some();
         // the premises of the changed axioms, read from the interner before the index of
         // the new axioms is built
         let premises = match changes {
@@ -1756,12 +1775,25 @@ impl Saturation {
             stats.clauses = d.clauses.len();
         }
         // the rules of this run, when a later run may keep its contexts: the EL rules,
-        // or the Horn rules without individuals, universal roles or functional data
-        // roles, whose contexts depend on one another only along their links
+        // the Horn rules without individuals, universal roles or functional data
+        // roles, whose contexts depend on one another only along their links, or Tier D
+        // with the cautious strategy and without a bound on its conclusions, which a
+        // run that counts, a rooted run and the run after a passed bound have, and whose
+        // count of conclusions a kept context would change
         let tier = match (horn, disj) {
             (false, false) => Some(KeptTier::El),
             (true, false) if ix.horn.is_some() && saturate::plain(&ix) && ix.keys.is_empty() => {
                 Some(KeptTier::Horn)
+            }
+            (false, true)
+                if ix.horn.is_none()
+                    && ix.dl.as_deref().is_some_and(|d| d.keyed_by_expressions())
+                    && saturate::plain(&ix)
+                    && ix.keys.is_empty()
+                    && limits.expansion == Expansion::Cautious
+                    && !self.no_counting =>
+            {
+                Some(KeptTier::Disj)
             }
             _ => None,
         };
@@ -1783,6 +1815,7 @@ impl Saturation {
         };
         if !reuse {
             self.dynamic = None;
+            self.dl_run = None;
         }
         let premises = if (horn || disj) && !reuse {
             self.ctx = Vec::new();
@@ -1806,13 +1839,13 @@ impl Saturation {
                 return Err(e);
             }
         }
+        debug_assert!(ix.horn.as_ref().is_none_or(|h| h.base as usize == n));
         let dynamic = match &ix.horn {
-            Some(h) if reuse => {
-                debug_assert_eq!(h.base as usize, n);
-                let mut d = self
-                    .dynamic
-                    .take()
-                    .expect("the conjunctions of the last run with the Horn rules");
+            _ if reuse => {
+                let mut d = self.dynamic.take().expect(
+                    "the conjunctions of the last run with the Horn rules, or the tests of \
+                     the last run of Tier D",
+                );
                 // the conjunctions' contexts move above the expressions the edit added
                 let from = d.base();
                 let delta = n as Ex - from;
@@ -1846,8 +1879,13 @@ impl Saturation {
                 }
             }
         }
-        let dl_run = ix.dl.as_ref().map(|_| {
-            dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone())
+        let dl_run = ix.dl.as_ref().map(|_| match self.dl_run.take() {
+            // the kept contexts name the clauses of the last run's table by id
+            Some(mut d) if reuse => {
+                d.begin_run();
+                d
+            }
+            _ => dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone()),
         });
         if let Some(scratch) = premises {
             stats.incremental = true;
@@ -1856,10 +1894,9 @@ impl Saturation {
         }
         if let Some(old) = old_ix.filter(|_| reuse) {
             stats.incremental = true;
-            self.reused = true;
             let d = dynamic
                 .as_ref()
-                .expect("the conjunctions of a run with the Horn rules");
+                .expect("the contexts above the index's of a run that keeps them");
             stats.cleared = self.invalidate_changed(&ix.changed(&old), &ix, d);
             drop(old);
             poll(limits)?;
@@ -2038,6 +2075,24 @@ impl Saturation {
                         Some((y, bs)) if *y == x => bs.push(b),
                         _ => tests.push((x, vec![b])),
                     }
+                }
+                if reuse {
+                    // A run that keeps the tests of the last one finds a class's
+                    // candidates in one round where that run found them over several,
+                    // so their group is new while each has a test of its own. Those
+                    // tests answer for the group.
+                    let mut split: Vec<(Ex, Vec<Ex>)> = Vec::with_capacity(tests.len());
+                    for (x, bs) in tests {
+                        if bs.len() > 1
+                            && !dl_rules::has_test(d, x, &bs)
+                            && bs.iter().all(|&b| dl_rules::has_test(d, x, &[b]))
+                        {
+                            split.extend(bs.into_iter().map(|b| (x, vec![b])));
+                        } else {
+                            split.push((x, bs));
+                        }
+                    }
+                    tests = split;
                 }
                 tests.extend(singles.drain(..).map(|(x, b)| (x, vec![b])));
                 if tests.is_empty() {
@@ -2291,6 +2346,7 @@ impl Saturation {
             disjunctive: stats.outside_el.disjunctive > 0,
             nodes: kept.map_or(self.interner.len(), |k| k.nodes),
             dynamic: kept.map_or(dynamic.as_ref().map_or(0, |d| d.len()), |k| k.dynamic),
+            table: kept.map_or(dl_run.as_ref().map_or(0, |d| d.table.len()), |k| k.table),
         });
         if let Some(d) = &dl_run {
             // the contexts made during the run, the tests and the keyed hypothetical
@@ -2334,7 +2390,9 @@ impl Saturation {
                 totals.peak = totals.peak.max(totals.memory);
             }
         }
-        drop(dl_run);
+        // the next run may keep the contexts of a run of Tier D, and with them the table
+        // of the clauses they sent one another
+        self.dl_run = dl_run.filter(|_| kept_now.is_some_and(|k| k.tier == KeptTier::Disj));
         if let Some(d) = &dynamic {
             totals.memory += d.bytes();
             totals.peak = totals.peak.max(totals.memory);
@@ -2478,6 +2536,7 @@ impl Saturation {
             + root_bytes
             + self.context_bytes()
             + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
+            + self.dl_run.as_ref().map_or(0, |d| d.table.bytes())
             + world_bytes
     }
 
@@ -2535,6 +2594,13 @@ impl Saturation {
                     || self.interner.len() > 2 * k.nodes + KEPT_SLACK
                     || self.dynamic.as_ref().map_or(0, |d| d.len()) > 2 * k.dynamic + KEPT_SLACK
             }
+            // Tier D takes or leaves each axiom by the axiom alone, and a run that finds
+            // another tier once its index is built starts again
+            KeptTier::Disj => {
+                self.interner.len() > 2 * k.nodes + KEPT_SLACK
+                    || self.dynamic.as_ref().map_or(0, |d| d.len()) > 2 * k.dynamic + KEPT_SLACK
+                    || self.dl_run.as_ref().map_or(0, |d| d.table.len()) > 2 * k.table + KEPT_SLACK
+            }
         }
     }
 
@@ -2547,6 +2613,16 @@ impl Saturation {
     /// contexts as their predecessors, which register again when they are saturated,
     /// and number their disjointness sets by the new index. The answer is the number
     /// cleared.
+    ///
+    /// In a run of Tier D a context holds an expression when a unit, a marker or a
+    /// stored clause names it, the contexts above the index's are the tests, and a
+    /// test that held and is cleared clears its class, whose subsumer it gave. A kept
+    /// context there need not be as a run that starts again leaves it: it keeps the
+    /// markers that cleared predecessors sent, which are tautologies, and the clauses
+    /// they gave. Each kept clause follows from the ontology as it is now, and the
+    /// saturation closes every context under the rules, which is what the
+    /// completeness of the calculus asks (Bate and others, JAIR 2018, Theorem 9, for
+    /// any context structure to which no rule applies, with Theorem 8 for soundness).
     fn invalidate_changed(
         &mut self,
         changed: &[bool],
@@ -2571,25 +2647,44 @@ impl Saturation {
         for e in all.clone() {
             with(e, &mut |st| {
                 if st.init
-                    && st
+                    && (st
                         .subs
                         .iter()
                         .any(|&s| changed.get(s as usize).copied().unwrap_or(true))
+                        || dl_rules::dl(st).is_some_and(|d| d.names_changed(changed)))
                 {
                     affected.insert(e);
                 }
             });
         }
-        // every context with a link into an affected context is affected
+        // every context with a link into an affected context is affected, as is every
+        // context that registered with one as its predecessor, which took its clauses
+        // over the predecessor, and the class whose subsumer a test that held gave
+        let tests = ix.dl.is_some();
         let mut queue: Vec<Ex> = affected.iter().copied().collect();
         while let Some(e) = queue.pop() {
             with(e, &mut |st| {
+                let mut add = |s: Ex| {
+                    if affected.insert(s) {
+                        queue.push(s);
+                    }
+                };
                 for (_, srcs) in &st.back {
                     for &s in &srcs.list {
-                        if affected.insert(s) {
-                            queue.push(s);
-                        }
+                        add(s);
                     }
+                }
+                if let Some(d) = dl_rules::dl(st) {
+                    for &(u, _) in &d.dpreds {
+                        add(u);
+                    }
+                }
+                if tests
+                    && e >= base
+                    && st.bottom
+                    && let Some(x) = dl_rules::tested_class(dynamic.core(e))
+                {
+                    add(x);
                 }
             });
         }

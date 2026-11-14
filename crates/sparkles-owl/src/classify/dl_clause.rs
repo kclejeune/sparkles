@@ -810,6 +810,11 @@ impl Table {
     pub fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
+
+    /// The clauses the table holds.
+    pub fn len(&self) -> usize {
+        self.next.load(Ordering::Relaxed) as usize
+    }
 }
 
 /// A clause of a context's store.

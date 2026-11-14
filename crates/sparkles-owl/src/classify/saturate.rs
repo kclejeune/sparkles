@@ -455,6 +455,9 @@ impl State {
                     set.retain(|m| !gone.contains(m));
                 }
             }
+            if let Some(d) = x.dl.as_deref_mut() {
+                d.drop_predecessors(gone);
+            }
         }
     }
 
@@ -473,7 +476,10 @@ impl State {
             self.fwd.map(|(r, f)| (r, up(f)));
         }
         if let Some(x) = self.extra.as_mut() {
-            debug_assert!(x.noms.is_empty() && x.links.is_empty() && x.dl.is_none());
+            debug_assert!(x.noms.is_empty() && x.links.is_empty());
+            if let Some(d) = x.dl.as_deref_mut() {
+                d.shift_contexts(from, delta);
+            }
             if x.members.list.iter().any(|&e| e >= from) {
                 x.members.map(up);
             }

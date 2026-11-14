@@ -290,6 +290,14 @@ pub enum Scope {
     Horn(u32),
     /// the automaton states of an unfolded universal, by its expression
     Unfold(Ex),
+    /// Tier D's normalization of an axiom outside OWL 2 EL, by
+    /// [`Interner::scope_axiom`]
+    Dl(u32),
+    /// the automaton states that Tier D's normalization unfolds a universal or a
+    /// negative existential restriction into, by that expression
+    DlUnfold(Ex),
+    /// the hypothetical successor of an existential restriction, by its expression
+    Hyp(Ex),
 }
 
 /// The estimated bytes of a scope's entry, its classes aside.
@@ -1900,8 +1908,10 @@ impl Index {
     /// when it holds none of the expressions that [`Index::changed`] lists (roadmap
     /// item 753): the tables that no expression keys are equal on the roles of `old`,
     /// neither index has individuals, universal roles, keys or data, and both have the
-    /// Horn rules or neither. Roles that `old` lacks may be new here, since a kept
-    /// context holds no link by them.
+    /// Horn rules or neither, and Tier D or neither, where Tier D's tables are those
+    /// its expressions key ([`DlIx::keyed_by_expressions`](super::dl_rules::DlIx)).
+    /// Roles that `old` lacks may be new here, since a kept context holds no link by
+    /// them.
     pub fn same_tables(&self, old: &Index) -> bool {
         let (a, b) = (&old.roles, &self.roles);
         let n = a.sup.len();
@@ -1949,15 +1959,19 @@ impl Index {
             && !self.nominal_selfs
             && old.tops == self.tops
             && old.horn.is_some() == self.horn.is_some()
-            && old.dl.is_none()
-            && self.dl.is_none()
+            && match (&old.dl, &self.dl) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.keyed_by_expressions() && b.keyed_by_expressions(),
+                _ => false,
+            }
     }
 
     /// For each expression of `old`, whether a context that holds it reads other rules
     /// here than a run over `old` gave it (roadmap item 753): another successor, told
     /// superexpressions, conjunctions, negative existential restrictions or
     /// disjointness sets, as sets, or other flags of the Horn rules, on the expression
-    /// or, for a universal restriction, on its filler.
+    /// or, for a universal restriction, on its filler, and in a run of Tier D other
+    /// clauses with the expression in their body or another hypothetical successor.
     pub fn changed(&self, old: &Index) -> Vec<bool> {
         let n = old.heads.len();
         debug_assert!(self.heads.len() >= n);
@@ -2019,6 +2033,9 @@ impl Index {
                 || !same(old.exist_of(a), self.exist_of(b))
                 || (a.disj.len != 0 || b.disj.len != 0)
                     && sets(old, a, &old_sets) != sets(self, b, &new_sets);
+        }
+        if let (Some(a), Some(b)) = (&old.dl, &self.dl) {
+            b.changed(a, &mut changed);
         }
         changed
     }

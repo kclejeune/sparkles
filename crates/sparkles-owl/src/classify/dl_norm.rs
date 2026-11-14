@@ -28,7 +28,7 @@
 //! box. A run whose role inclusions are not regular takes nothing.
 
 use super::horn::RoleBox;
-use super::index::{Axioms, BOTTOM, Ex, Halt, Interner, NO_ROLE, Node, Role, RoleName, TOP};
+use super::index::{Axioms, BOTTOM, Ex, Halt, Interner, NO_ROLE, Node, Role, RoleName, Scope, TOP};
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1194,6 +1194,11 @@ fn normalize_within(
         if !Norm::is_role_axiom(k) {
             continue;
         }
+        // the fresh classes of an axiom are those of the last run over this interner
+        // that normalized it, so that the contexts kept from that run name the same
+        // classes (roadmap item 753)
+        let scope = Scope::Dl(it.scope_axiom(k));
+        it.begin_scope(scope);
         let mut n = Norm {
             it,
             out: Out::default(),
@@ -1201,7 +1206,9 @@ fn normalize_within(
             rooted,
             order,
         };
-        if n.role_axiom(k).is_ok() {
+        let ok = n.role_axiom(k).is_ok();
+        n.it.end_scope();
+        if ok {
             all.extend(n.out);
             taken[i] = true;
         }
@@ -1211,6 +1218,8 @@ fn normalize_within(
         if taken[i] || Norm::is_role_axiom(k) {
             continue;
         }
+        let scope = Scope::Dl(it.scope_axiom(k));
+        it.begin_scope(scope);
         let mut n = Norm {
             it,
             out: Out::default(),
@@ -1218,7 +1227,9 @@ fn normalize_within(
             rooted,
             order,
         };
-        if n.axiom(k).is_ok() {
+        let ok = n.axiom(k).is_ok();
+        n.it.end_scope();
+        if ok {
             if !super::dl::shape(k).horn {
                 disjunctive += 1;
             }
@@ -1339,7 +1350,9 @@ fn normalize_within(
         .map(|(e, _)| e as Ex)
         .collect();
     for e in exists {
+        it.begin_scope(Scope::Hyp(e));
         let h = it.fresh_class();
+        it.end_scope();
         dl.hyp.insert(e, h);
     }
     if rooted {
@@ -1657,7 +1670,15 @@ fn unfold(it: &mut Interner, ax: &mut Axioms, clauses: &[(Vec<Ex>, Vec<Ex>)], rb
             continue;
         };
         let a = autos.entry(r).or_insert_with(|| nfa.eps_free());
+        // a universal's holder is the universal, and a negative existential
+        // restriction's is its filler, so the restriction names the scope
+        let key = match it.nodes[holder as usize] {
+            Node::Forall(t, c) if t == r && c == f => holder,
+            _ => f,
+        };
+        it.begin_scope(Scope::DlUnfold(key));
         let states: Vec<Ex> = (0..a.states).map(|_| it.fresh_class()).collect();
+        it.end_scope();
         ax.subs.push((holder, states[a.start as usize]));
         for (s, &x) in states.iter().enumerate() {
             if a.finals[s] {
