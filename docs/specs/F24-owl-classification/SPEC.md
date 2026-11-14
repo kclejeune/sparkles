@@ -188,7 +188,7 @@ Horn rules now cost about what the EL rules cost on both files. The 210 files of
 passes the 13 GiB cap of the comparison on both builds. GO and ChEBI lite give the same
 taxonomies, and in six rounds of rotating order on one and four threads the reviewed build
 takes 0.981 to 1.019 times the base's time by median, within the spread of the rounds, and
-item 963 follows ChEBI lite's 1.9% on four threads.
+item 968 follows ChEBI lite's 1.9% on four threads.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.

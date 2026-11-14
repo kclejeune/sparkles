@@ -1045,7 +1045,7 @@ on one and four threads, against the reviewed build, commit 2fb430aa, whose redu
 gives the same properties. The ratio is the median of the rounds' ratios. The three rounds
 of the first set had put ChEBI lite 4% slower on four threads with the same conclusions,
 which the six rounds did not reproduce. ChEBI lite's median on four threads is still 1.9%
-above the base's, within the spread of the rounds, and roadmap item 963 follows it.
+above the base's, within the spread of the rounds, and roadmap item 968 follows it.
 
 | Ontology | Threads | Base ms | Item 962 ms | Ratio | Range of the rounds |
 |---|---:|---:|---:|---:|---|
@@ -1061,7 +1061,7 @@ classify gave the same bytes on both, the reader refuses `ore_ont_9881`, and
 `ore_ont_14817` take the disjunctive rules, whose attempt fails before the Horn rules
 answer. Their completed classifications took 10 to 229 s on both builds, the Horn rules'
 run included, and one process of the base on `ore_ont_14817` passed the 900 s timeout, so
-their times are not compared here.
+their times are not compared here. Roadmap item 969 follows them.
 
 ## Records
 

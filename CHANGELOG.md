@@ -116,7 +116,7 @@ axiom taken, and `ore_ont_16744` in 3.9 s instead of 26.2 s, with 446 million co
 instead of 2.23 billion by median and a peak resident set of 3.0 instead of 9.6 GiB. The
 210 files of the ORE 2015 DL development set that classify keep their taxonomies. GO and
 ChEBI lite keep their taxonomies and classify within 2% of the base by median on one and
-four threads, and roadmap item 963 follows ChEBI lite's 1.9% on four threads. This is
+four threads, and roadmap item 968 follows ChEBI lite's 1.9% on four threads. This is
 roadmap item 962.
 
 With counting, an exact or minimum cardinality in a negative position, the form of a
