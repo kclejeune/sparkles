@@ -135,36 +135,46 @@ impl<'a> Cands<'a> {
         self.parts.is_empty()
     }
 
-    /// The ids visited: counted when a piece is filtered by the range and the candidates
-    /// are at most `exact`, and [`len`](Self::len), an upper bound, otherwise.
-    pub fn count(&self, exact: usize) -> usize {
-        let len = self.len();
-        if len <= exact && self.parts.iter().any(|p| matches!(p, Part::Ids(_, true))) {
+    /// Whether a piece is filtered by the range when visited, so that
+    /// [`len`](Self::len) counts ids that are not visited.
+    fn filtered(&self) -> bool {
+        self.parts.iter().any(|p| matches!(p, Part::Ids(_, true)))
+    }
+
+    /// The ids visited, exactly: [`len`](Self::len), or a count of the ids the range
+    /// admits when a piece is filtered by it.
+    pub fn count(&self) -> usize {
+        if self.filtered() {
             self.iter().count()
         } else {
-            len
+            self.len()
         }
     }
 
-    /// Up to `n` of the ids, evenly spaced over the candidates in their order.
-    pub fn spread(&self, n: usize) -> impl Iterator<Item = u32> + '_ {
+    /// Up to `n` of the ids visited, evenly spaced in their order. A relation's ids and
+    /// the ids of a probe ascend, whatever runs hold them, so the same facts give the
+    /// same ids however they fall into runs.
+    pub fn spread(&self, n: usize) -> Vec<u32> {
+        let n = n.max(1);
+        if self.filtered() {
+            let ids: Vec<u32> = self.iter().collect();
+            let step = ids.len().div_ceil(n).max(1);
+            return ids.into_iter().step_by(step).collect();
+        }
         let len = self.len();
-        let step = len.div_ceil(n.max(1)).max(1);
-        (0..len).step_by(step).filter_map(move |k| self.nth(k))
+        let step = len.div_ceil(n).max(1);
+        (0..len).step_by(step).filter_map(|k| self.nth(k)).collect()
     }
 
-    /// Candidate `k` in order, when the range admits it.
+    /// Candidate `k` in order, of candidates that no piece filters.
     fn nth(&self, mut k: usize) -> Option<u32> {
         for p in &self.parts {
             let n = p.len();
             if k < n {
-                return match *p {
-                    Part::Ids(s, filtered) => {
-                        let id = s[k];
-                        (!filtered || (id >= self.lo && id < self.hi)).then_some(id)
-                    }
-                    Part::Range(a, _) => Some(a + k as u32),
-                };
+                return Some(match *p {
+                    Part::Ids(s, _) => s[k],
+                    Part::Range(a, _) => a + k as u32,
+                });
             }
             k -= n;
         }
@@ -964,25 +974,57 @@ mod tests {
 
     #[test]
     fn spread_and_count_of_candidates() {
-        // 40 facts of one subject, and a range that admits every other one
+        // 40 facts of one subject
         let ts: Vec<Triple> = (0..40).map(|i| [1, 10, 100 + i]).collect();
         let t = tier(&ts);
         let all = t.cands(Some(1), Some(10), None, 0, 40);
-        assert_eq!(all.len(), 40);
-        assert_eq!(all.count(256), 40);
-        let picked: Vec<u32> = all.spread(4).collect();
-        assert_eq!(picked, [0, 10, 20, 30]);
+        assert_eq!((all.len(), all.count()), (40, 40));
+        assert_eq!(all.spread(4), [0, 10, 20, 30]);
         // more asked for than there are: each once
-        assert_eq!(all.spread(100).count(), 40);
-        assert_eq!(Cands::empty().spread(4).count(), 0);
-        assert_eq!(Cands::range(5, 9).spread(2).collect::<Vec<_>>(), [5, 7]);
-        // a part of the range: the count is exact below the bound and `len` above it
+        assert_eq!(all.spread(100).len(), 40);
+        assert!(Cands::empty().spread(4).is_empty());
+        assert_eq!(Cands::range(5, 9).spread(2), [5, 7]);
+        // a part of the run: the count and the spread are of the ids the range admits
         let part = t.cands(Some(1), Some(10), None, 10, 20);
-        let exact = ids(part.clone()).len();
-        assert_eq!(exact, 10);
-        assert_eq!(part.count(256), exact);
-        assert!(part.count(0) >= exact);
-        assert!(part.spread(64).all(|id| (10..20).contains(&id)));
+        assert_eq!(ids(part.clone()), (10..20).collect::<Vec<u32>>());
+        assert_eq!(part.count(), 10);
+        assert_eq!(part.spread(5), [10, 12, 14, 16, 18]);
+    }
+
+    /// The same facts in one run and in several give a probe the same count and the same
+    /// spread of ids.
+    #[test]
+    fn spread_and_count_follow_the_facts_not_the_runs() {
+        let ts: Vec<Triple> = (0..300)
+            .map(|i| [1 + i % 3, 10, 1000 - i])
+            .chain((0..50).map(|i| [1, 11, i]))
+            .collect();
+        let whole = tier(&ts);
+        let mut split = Tier::new(0);
+        let b = Budget::unlimited();
+        let mut m = Meter::new(&b, true);
+        let mut from = 0;
+        for chunk in ts.chunks(37) {
+            for &x in chunk {
+                split.push(x);
+            }
+            split.index_new(from, &mut m).unwrap();
+            from += chunk.len();
+        }
+        for (s, p, o) in [
+            (Some(1), Some(10), None),
+            (Some(2), Some(10), None),
+            (None, Some(10), Some(900)),
+            (None, Some(10), None),
+            (None, Some(11), None),
+        ] {
+            for (lo, hi) in [(0, 350), (0, 111), (74, 350)] {
+                let (a, b) = (whole.cands(s, p, o, lo, hi), split.cands(s, p, o, lo, hi));
+                assert_eq!(a.count(), b.count(), "{s:?} {p:?} {o:?} {lo} {hi}");
+                assert_eq!(a.spread(7), b.spread(7), "{s:?} {p:?} {o:?} {lo} {hi}");
+                assert_eq!(a.spread(64), b.spread(64), "{s:?} {p:?} {o:?} {lo} {hi}");
+            }
+        }
     }
 
     #[test]

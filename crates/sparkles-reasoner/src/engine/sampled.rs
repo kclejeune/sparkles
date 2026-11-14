@@ -30,15 +30,18 @@
 //! object that the greedy order does not. Bodies of fewer
 //! than [`MIN_ATOMS`] atoms keep the greedy order: the choice among two atoms is which
 //! one reads the smaller relation, which the greedy planner's counts already decide.
-//! The sample is drawn at fixed, evenly spaced positions, so that a run plans the same
-//! way each time.
+//! The sample is drawn at fixed places, so that a run plans the same way each time. In
+//! the derived tier those are evenly spaced candidates in the order of their ids, which
+//! is the same however the facts fall into runs, so the sampled orders follow the facts
+//! and not the runs, as the greedy planner's statistics do. In the store they are the
+//! starts of blocks along a scan, which are fixed for a snapshot.
 
 use super::*;
 use std::sync::atomic::AtomicU64;
 
 /// The bindings the sample keeps.
 pub(crate) const SAMPLE: usize = 16;
-/// The candidates one sampled binding looks at for facts that extend it.
+/// The candidates of the derived tier a probe reads for its facts.
 const VISIT: usize = 64;
 /// The places of a scan of the store that a binding's facts are sampled from. The facts
 /// of the derived tier are sampled at evenly spaced candidates, which costs a read of
@@ -47,8 +50,6 @@ const VISIT: usize = 64;
 /// neighbouring facts from a few places: neighbours share their blocks, in this scan and
 /// often in the scans their values lead to.
 const STORE_STARTS: usize = 4;
-/// Filtered candidate lists of up to this many ids are counted, not bounded.
-const EXACT: usize = 256;
 /// The sampled order replaces the greedy order only when its sampled cost is at most
 /// the greedy order's divided by this.
 pub(crate) const SAVING: f64 = 2.0;
@@ -387,9 +388,6 @@ impl Walk<'_> {
         }
         let cands = g.cands(s, p, o, lo, hi);
         for id in cands.spread(VISIT) {
-            if facts.len() == SAMPLE {
-                break;
-            }
             if g.alive(id) {
                 let t = g.triple(id);
                 if matches(&t) {
@@ -397,7 +395,11 @@ impl Walk<'_> {
                 }
             }
         }
-        let derived = cands.count(EXACT) as f64;
+        if facts.len() > SAMPLE {
+            let step = facts.len().div_ceil(SAMPLE);
+            facts = facts.into_iter().step_by(step).collect();
+        }
+        let derived = cands.count() as f64;
         let Some(base) = base else {
             return Probe {
                 count: derived,
@@ -554,6 +556,11 @@ mod tests {
     /// classes of five members and 40 properties of 200 facts, so that the average class
     /// is small and the average property is not.
     fn key_graph(members: u64) -> Graph {
+        key_graph_in(members, usize::MAX)
+    }
+
+    /// [`key_graph`] with its facts added `batch` at a time, each batch a run of its own.
+    fn key_graph_in(members: u64, batch: usize) -> Graph {
         let mut g = Graph::default();
         let mut ts: Vec<Triple> = vec![[PERSON, KEY, LIST], [LIST, FIRST, ID], [LIST, REST, NIL]];
         for i in 0..members {
@@ -570,8 +577,35 @@ mod tests {
                 ts.push([30_000 + i, 4000 + p, 60_000 + i]);
             }
         }
-        g.add_batch(ts);
+        for chunk in ts.chunks(batch.min(ts.len())) {
+            g.add_batch(chunk.iter().copied());
+        }
         g
+    }
+
+    /// The same facts plan the same way however they fall into runs, as the greedy
+    /// planner's statistics follow the facts and not the runs.
+    #[test]
+    fn sampled_orders_follow_the_facts_not_the_runs() {
+        let r = key_rule();
+        let whole = key_graph(400);
+        let ranges = vec![(0, whole.len()); r.atoms.len()];
+        let (steps, by_sample) = plan(&whole, &r, &ranges).unwrap();
+        assert!(by_sample);
+        for batch in [97, 1000, 5000] {
+            let split = key_graph_in(400, batch);
+            assert_eq!(split.len(), whole.len());
+            let (other, by_sample) = plan(&split, &r, &ranges).unwrap();
+            assert!(by_sample, "batches of {batch}");
+            assert_eq!(atom_order(&other), atom_order(&steps), "batches of {batch}");
+            // and a part of the facts, which cuts the runs of the whole graph
+            let part = vec![(0, 5000); r.atoms.len()];
+            assert_eq!(
+                plan(&split, &r, &part).map(|p| atom_order(&p.0)),
+                plan(&whole, &r, &part).map(|p| atom_order(&p.0)),
+                "batches of {batch}"
+            );
+        }
     }
 
     fn position(steps: &[Step], a: usize) -> usize {
