@@ -55,6 +55,16 @@ where it derived 2,122,545, and seven of 750 generated ontologies come within th
 bound of the counting run on one thread, with none leaving it. The fixture `shq-041`
 finishes without the order between number restrictions, where it passed any bound.
 
+`Limits::dl_steps`, off by default, makes every saturation of the disjunctive rules
+proceed in steps, and `el_classify` takes `--dl-steps`. A step activates the waiting
+contexts on the workers and delivers their messages at its end in a fixed order, and the
+bound on derived conclusions is compared between steps. A run then derives the same
+conclusions and answers in full or falls back in the same way on every number of threads.
+A rooted run and a run with the eager strategy take one thread with the option. An
+inference too wide to make now marks the run past its bound with a flag. Four of them
+between two checks wrapped the count before, and the run ended as complete without those
+inferences. This is roadmap item 727, which keeps the decision about the default.
+
 ### Compatibility
 
 The adopted HTTP, CLI and public library compatibility policy is documented.

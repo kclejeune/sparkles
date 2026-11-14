@@ -323,7 +323,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   again without counting, leaves the axioms that need counting out and reports them, and
   sets `Stats::dl_counting_over` and `Stats::dl_over_budget`. Near the bound the thread
   schedule can decide whether a run answers in full or falls back, and the fallback is
-  always reported and never a different complete answer. Roadmap item 727. In an
+  always reported and never a different complete answer. `Limits::dl_steps`, off by
+  default, makes the disjunctive rules proceed in steps that derive the same conclusions
+  on every number of threads, so that a run answers in full or falls back in the same way
+  on every schedule. A rooted run and a run with the eager strategy take one thread with
+  it. Roadmap item 727 keeps the decision about the default. In an
   ontology with individuals or nominals, `Limits::rooted` lets the disjunctive rules take
   nominals, class and property assertions, equalities and inequalities of individuals and
   negative assertions through a root context where the individuals' facts meet, with the

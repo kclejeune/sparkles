@@ -145,6 +145,15 @@ raised bound. A context of the disjunctive rules now
 keeps a generated ontology of this item within the bound on one thread. Counting stays
 off by default until item 896.
 
+Item 727 adds `Limits::dl_steps`, off by default, with which the disjunctive rules
+[proceed in steps](#steps-for-a-bound-that-every-schedule-shares). A run then derives the
+same conclusions on one thread and on eight, so that it keeps or passes its bound on
+derived conclusions, and answers in full or falls back, in the same way on every
+schedule. The 150 counting fixtures and the generated ontologies of items 894 and 897
+show it, with the answers of the default driver. A rooted run and a run with the eager
+strategy take one thread with the option, and the decision about the default stays with
+item 727.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -1280,7 +1289,10 @@ decide whether a run answers in full or falls back, since the clauses stored at 
 fixpoint vary with the schedule, for example 3,229 to 6,762 on `sriq-010` at four threads
 against 3,253 on one. A fallback is always reported through the statistics and the axioms
 left out and is never a different complete answer, so a caller learns from
-`dl_counting_over` whether counting finished. A deterministic bound is item 727.
+`dl_counting_over` whether counting finished. `Limits::dl_steps` removes the dependence:
+with it a run [proceeds in steps](#steps-for-a-bound-that-every-schedule-shares) and
+derives the same conclusions on every number of threads. It is off by default, and item
+727 keeps the decision about the default.
 
 The generated `shq`, `shiq` and `sriq` fixtures equal HermiT 1.4.5.519 on every case that
 Tier D takes whole with counting on, on one and four threads and under both strategies. Of 50 cases each,
@@ -2755,6 +2767,83 @@ finished on four. There the order of the contexts was the cause, and a context t
 [gives way](#the-disjunctive-rules) to the contexts it woke removes it. The run on one
 thread now derives 29,625 conclusions and has HermiT's answer. The difference that
 remains between schedules is the subject of item 727.
+
+#### Steps for a bound that every schedule shares
+
+This subsection records what item 727 delivers. `Limits::dl_steps`, off by default, makes
+every saturation of the disjunctive rules proceed in steps, and `el_classify` takes
+`--dl-steps`. With it a run derives the same conclusions, passes or keeps its bound on
+them, and so answers in full or falls back, in the same way on every number of threads
+and every schedule. The memory budget, the deadline and a cancellation still stop a run
+when their checks see them, and the Horn rules' fallback on their memory budget is
+unchanged.
+
+A step works on a frontier of contexts. The frontier is a queue that the seeds start and
+the roots join while it holds fewer than 4,096 contexts, and a step takes its first
+4,096. In the first phase the workers activate those contexts. An activation reads only
+its context's state and to-do list, and its messages for other contexts go to a list of
+its worker, so that no to-do list changes during the phase. In the second phase the
+workers deliver the messages. Each worker takes the destinations of its share and reads
+every activation's messages in the order of the frontier, so a to-do list receives its
+messages by the place of their sender in the frontier and, for one sender, in the order
+it sent them, whatever the number of workers is. Between steps one thread sorts the
+contexts that the deliveries woke and appends them to the queue, and compares the count
+of derived conclusions with the bound. The count is then a sum over whole activations,
+which no schedule changes. A run in steps compares the bound nowhere else.
+
+An activation of a run in steps has a share: 256 clauses of its store, with the minimums
+it released, or 4,096 derived conclusions, whichever comes first. A context that used its
+share and has clauses left gives way whoever else waits. It goes on in a later step, at
+once when it has new messages and otherwise when no other context is active, since what
+the others conclude can close it. An activation that alone derives more than the run's
+bound ends its inference and marks the run past its bound, which it decides from its own
+count. A run can pass its bound by the work of one step before the comparison, which is
+the same amount on every schedule.
+
+The steps do not change which workers do the work. A step with two contexts or more is
+shared among the workers when it has 128 contexts or when the activations of the last
+step took 150 µs, its messages are delivered by all workers from 4,096 messages on, and
+otherwise the calling thread does the step alone. The helper threads start with the first
+shared step and wait on a barrier between phases, so a small ontology starts none.
+
+The argument that an activation is a function of its context's state and its to-do list
+rests on three observations about a run without the root that uses the cautious strategy.
+The rules read the index, their own context's state, the cores of contexts, which do not
+change during a saturation, and clauses of the shared table by id. The ids of that table
+follow the order in which the workers push clauses, and a receiver uses an id only to
+read the clause, as a member of the set of clauses it has seen from a successor, and in
+that successor's list, which is in the order of arrival. Nothing sorts by a table id or
+iterates a table keyed by one. The subsumption tests between saturations make their
+contexts on one thread in a fixed order. Two kinds of ids are not canonical. A rooted run
+interns its literals in the order the workers meet them and compares them, and the eager
+strategy interns contexts during the run. With the option those runs take one worker of
+the default driver, whose order is fixed. `run_with` does not repeat on one thread an
+attempt that passed its bound, since the repeat would derive the same.
+
+The review of the design found a defect of the default driver as well. An inference too
+wide to make passed the bound by adding a quarter of the count's range, so four of them
+between two checks wrapped the count to a small number, and the run ended as complete
+without those inferences. The mark is now a flag that stays set.
+
+The tests are in `tests/dl_steps.rs` and in the classifier's unit tests. The 150 counting
+fixtures and the 27 generated ontologies of item 897 derive the same conclusions, store
+the same clauses and give the same answer on one, two, four and eight threads, with
+HermiT's answer where the run finishes. One generated ontology run 36 times on one, four
+and eight threads gives one outcome at the default bound, at a bound equal to the
+conclusions it derives and at one conclusion less, where every run falls back. A unit
+test runs an ontology of more than 8,192 contexts with every step and every delivery
+shared among the workers, on one, three and eight threads, and cancels runs at six
+points, after which the same classifier gives the outcome of a new one. Eager and rooted
+runs give one outcome on one, four and eight threads.
+
+On the 750 ontologies of the counting fixtures and the two fuzz sets, at a bound of 8
+million, a run in steps gives the same work, stored clauses and taxonomy on one, three
+and eight threads. On one thread it derives 16.16 million conclusions in all on the 722
+ontologies that both drivers finish, against 16.24 million for the default driver, and
+the same 714 ontologies stay within the default bound. One ontology that the default
+driver does not finish within 8 million conclusions finishes in steps in 1.66 million.
+The differential runs against HermiT give 270 equal and 26 sound answers of 296 and 292
+equal and 3 sound of 295, on one thread and on four, as the default driver does.
 
 ### Nominals in the disjunctive rules
 
