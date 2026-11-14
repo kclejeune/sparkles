@@ -11,7 +11,7 @@
 //! when the query may spill.
 
 use super::ctx::Ctx;
-use super::expr::Expr;
+use super::expr::{Expr, Func};
 use super::plan::{JoinAlgo, Kind, Node};
 
 /// The branches of a UNION that the planner orders at most, and the nodes of a branch
@@ -151,30 +151,65 @@ fn order_union(ctx: &Ctx, node: &mut Node, want: usize) {
     union.children = costs.into_iter().map(|(_, b)| b).collect();
 }
 
-/// Whether a branch holds only operators whose order of evaluation nothing observes.
+/// Whether a branch holds only operators whose order of evaluation nothing observes:
+/// scans, joins, projections and the like, whose expressions are [`effect_free`].
 fn plain(node: &Node, left: &mut usize) -> bool {
     if *left == 0 {
         return false;
     }
     *left -= 1;
-    matches!(
-        node.kind,
+    let shape = match &node.kind {
         Kind::Scan(_)
-            | Kind::RangeScan(..)
-            | Kind::Values(_)
-            | Kind::Empty
-            | Kind::PatternScan(_)
-            | Kind::Join { .. }
-            | Kind::KeyedJoin { .. }
-            | Kind::IndexJoin(_)
-            | Kind::Union
-            | Kind::Project(_)
-            | Kind::Sort(_)
-            | Kind::Extend(..)
-            | Kind::Filter(_)
-            | Kind::Distinct
-            | Kind::Slice { .. }
-    ) && node.children.iter().all(|c| plain(c, left))
+        | Kind::RangeScan(..)
+        | Kind::Values(_)
+        | Kind::Empty
+        | Kind::PatternScan(_)
+        | Kind::Join { .. }
+        | Kind::Union
+        | Kind::Project(_)
+        | Kind::Sort(_)
+        | Kind::Distinct
+        | Kind::Slice { .. } => true,
+        Kind::Extend(_, expr) | Kind::KeyedJoin { expr, .. } => effect_free(expr, left),
+        Kind::Filter(exprs) => exprs.iter().all(|e| effect_free(e, left)),
+        Kind::IndexJoin(spec) => spec
+            .probes
+            .iter()
+            .all(|p| p.filter.iter().all(|e| effect_free(e, left))),
+        _ => false,
+    };
+    shape && node.children.iter().all(|c| plain(c, left))
+}
+
+/// Whether evaluating `expr` fewer times, or in another order, changes nothing but its
+/// own values: built-in functions and operators that give the same value for the same
+/// input. An EXISTS, which may call SERVICE, an extension or application function,
+/// which may have effects, and RAND, UUID or BNODE are not.
+fn effect_free(expr: &Expr, left: &mut usize) -> bool {
+    if *left == 0 {
+        return false;
+    }
+    *left -= 1;
+    if crate::sparql::exprcache::impurity(expr).is_some() {
+        return false;
+    }
+    match expr {
+        Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
+        Expr::Exists(_) => false,
+        Expr::Call(Func::Ext(_) | Func::Registered(_), _) => false,
+        Expr::Call(Func::Builtin(_) | Func::Cast(_), args) | Expr::Coalesce(args) => {
+            args.iter().all(|a| effect_free(a, left))
+        }
+        Expr::Or(a, b)
+        | Expr::And(a, b)
+        | Expr::Eq(a, b)
+        | Expr::SameTerm(a, b)
+        | Expr::Cmp(a, b, _)
+        | Expr::Arith(a, b, _) => effect_free(a, left) && effect_free(b, left),
+        Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => effect_free(a, left),
+        Expr::In(a, list) => effect_free(a, left) && list.iter().all(|e| effect_free(e, left)),
+        Expr::If(a, b, c) => effect_free(a, left) && effect_free(b, left) && effect_free(c, left),
+    }
 }
 
 /// The share of `rows` estimated rows that `want` of them are.
@@ -239,9 +274,9 @@ fn first_cost(node: &Node, want: f64, left: &mut usize) -> f64 {
                     + first_cost(b, input_want(b), left)
                     + own(inputs)
             } else {
-                // the hash join holds one input whole and streams the other
-                // the larger input of a hash join, and the first of a product
-                let probe = usize::from(*algo == JoinAlgo::Hash && a.est < b.est);
+                // a hash join or a product holds its smaller input whole and streams
+                // the larger, as the cursor's binary join does
+                let probe = usize::from(a.est < b.est);
                 let (streamed, held) = (&node.children[probe], &node.children[1 - probe]);
                 held.cost + first_cost(streamed, input_want(streamed), left) + own(inputs)
             }

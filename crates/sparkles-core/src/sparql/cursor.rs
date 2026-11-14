@@ -2299,6 +2299,9 @@ fn pull_planned<'ctx>(
         return Ok((rows, info, true));
     };
     let options = CursorOptions::default();
+    // The operators keep a copy of the plan, such as its tables of values, until they
+    // drop, which they do before this charge.
+    let _plan = OwnedCharge::new(&shared, plan_bytes(node))?;
     let mut root = Operator::build(&shared, node.clone(), FallbackPolicy::AllowMaterialization)?;
     let mut out = Buffer::new(&shared, &root.vars, 0)?;
     let ran = (|| {
@@ -2346,7 +2349,10 @@ fn pull_planned<'ctx>(
         out
     }
     if let Err(error) = ran {
-        ctx.set_failed(node, info(&plan, false, true));
+        // the rows the operators gave were not delivered, even when they all ran
+        let mut failed = info(&plan, false, true);
+        failed.fidelity_mut().incomplete = true;
+        ctx.set_failed(node, failed);
         return Err(error);
     }
     let mut info = info(&plan, !ended, false);
@@ -2373,19 +2379,27 @@ fn pull_planned<'ctx>(
     annotate(ctx, node, &mut info);
     let kept = std::mem::take(&mut root.order);
     drop(root);
-    if !kept.starts_with(&node.sorted) && !out.table.sorted.starts_with(&node.sorted) {
-        // Row indices and the reordered copy coexist with the pulled rows.
-        out.charge.resize(
-            capacity_bytes(&out.table)
-                .saturating_mul(2)
-                .saturating_add(out.table.len as u64 * 8),
-        )?;
-        out.table.sort_by_vars(&node.sorted);
-        ctx.check()?;
-        out.reconcile()?;
+    let finished = (|| {
+        if !kept.starts_with(&node.sorted) && !out.table.sorted.starts_with(&node.sorted) {
+            // Row indices and the reordered copy coexist with the pulled rows.
+            out.charge.resize(
+                capacity_bytes(&out.table)
+                    .saturating_mul(2)
+                    .saturating_add(out.table.len as u64 * 8),
+            )?;
+            out.table.sort_by_vars(&node.sorted);
+            ctx.check()?;
+            out.reconcile()?;
+        }
+        out.set_order(&node.sorted)?;
+        out.reconcile()
+    })();
+    if let Err(error) = finished {
+        // the subtree ran, and the rows it gave were not delivered
+        info.fidelity_mut().incomplete = true;
+        ctx.set_failed(node, info);
+        return Err(error);
     }
-    out.set_order(&node.sorted)?;
-    out.reconcile()?;
     let rows = super::table::Materialized::with_owned(out.table, out.charge)?;
     Ok((rows, info, ended))
 }
@@ -2426,6 +2440,8 @@ enum State {
     PatternScan {
         spec: Box<super::patternplan::PatternScanSpec>,
         reader: crate::patterns::PairCursor,
+        /// The reader's decoded storage, which it keeps between pulls.
+        charge: OwnedCharge,
     },
     Values {
         table: Table,
@@ -2687,6 +2703,8 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
                 spec.cols.iter().map(|&(_, v)| v).collect()
             }
             Kind::Values(table) => table.sorted.clone(),
+            // pairs come in subject order and each subject's predicates in order
+            Kind::PatternScan(_) => node.sorted.clone(),
             Kind::Path {
                 bound_from_left: false,
                 ..
@@ -3058,6 +3076,7 @@ impl Operator {
                 Kind::PatternScan(spec) => State::PatternScan {
                     reader: super::patternplan::scan_reader(spec),
                     spec: spec.clone(),
+                    charge: OwnedCharge::new(ctx, 0)?,
                 },
                 Kind::Values(_) => {
                     let Kind::Values(table) = node.kind else {
@@ -3663,10 +3682,20 @@ impl Operator {
                     self.done = scan.done();
                     b
                 }
-                State::PatternScan { spec, reader } => {
+                State::PatternScan {
+                    spec,
+                    reader,
+                    charge,
+                } => {
                     let mut b = Buffer::new(ctx, &self.vars, cap)?;
-                    self.done =
-                        super::patternplan::fill_scan(ctx, spec, reader, &mut b.table, cap)?;
+                    self.done = super::patternplan::fill_scan(
+                        ctx,
+                        spec,
+                        reader,
+                        &mut b.table,
+                        cap,
+                        &mut |bytes| charge.resize(bytes),
+                    )?;
                     b.reconcile()?;
                     Some(b)
                 }
@@ -4495,6 +4524,60 @@ mod tests {
             let first = Id::from_i64(1).unwrap();
             assert_eq!(out.table.get(0, 0), first);
         }
+    }
+
+    /// A pull whose sort into the planned order is refused after its operators ran
+    /// keeps the plan as far as it ran, as a failure while they run does.
+    #[test]
+    fn a_pull_refused_after_its_input_ran_keeps_its_plan() {
+        use crate::store::{Store, StoreOptions};
+        const ROWS: usize = 20_000;
+        let store = Store::in_memory(StoreOptions::default());
+        // a context of `limit` KiB and unordered values, which the node claims are
+        // ordered when `ordered`
+        let setup = |limit: u64, ordered: bool| {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit << 10;
+            let ctx = Arc::new(ctx);
+            ctx.attach_owner();
+            let a = ctx.var("a");
+            let b = ctx.var("b");
+            let mut table = Table::new(vec![a, b]);
+            for i in 0..ROWS {
+                let v = Id::from_i64((ROWS - i) as i64).unwrap();
+                table.push_row(&[v, v]);
+            }
+            table.sorted.clear();
+            let mut node = Node::leaf(
+                Kind::Values(table),
+                vec![a, b],
+                ROWS as f64,
+                "unordered values".into(),
+            );
+            if ordered {
+                node.sorted = vec![a, b];
+            }
+            (ctx, node)
+        };
+        let mut sort_refused = 0;
+        for limit in (64..4096).step_by(16) {
+            let (ctx, node) = setup(limit, false);
+            if pull(&ctx, &node, ROWS).is_err() {
+                continue;
+            }
+            // the input runs within this budget, and only the sort can refuse
+            let (ctx, node) = setup(limit, true);
+            if pull(&ctx, &node, ROWS).is_ok() {
+                break;
+            }
+            let failed = ctx
+                .take_failed(&node)
+                .expect("a pull refused after its input ran keeps its plan");
+            assert_eq!(failed.actual_rows, ROWS as i64);
+            assert!(failed.fidelity().incomplete);
+            sort_refused += 1;
+        }
+        assert!(sort_refused > 0, "no budget refused the sort alone");
     }
 
     #[test]

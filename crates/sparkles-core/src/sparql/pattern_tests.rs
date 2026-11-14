@@ -806,3 +806,86 @@ fn a_limited_scan_checks_its_final_rows() {
     let r = same(&s, &text, Some(true));
     assert_eq!(r.len(), 1000);
 }
+
+/// A constant subject's predicates come at most a batch at a time, so a LIMIT reads one
+/// of a subject's three hundred predicates in every mode, within a row budget of two.
+#[test]
+fn constant_subject_scans_follow_their_demand() {
+    use crate::sparql::cursor::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let s = Store::in_memory(StoreOptions::default());
+    let data: String = (0..300)
+        .map(|i| format!("<urn:s> <urn:p{i}> 1 .\n"))
+        .collect();
+    load(&s, &data, RdfFormat::Turtle);
+    let text = format!("{SPK}SELECT ?p WHERE {{ <urn:s> spk:hasPredicate ?p }}");
+    let limited = format!("{text} LIMIT 1");
+    let tight = QueryOptions {
+        max_rows: Some(2),
+        ..opts(Optimizations::ALL)
+    };
+    for mode in [
+        ExecutionMode::Eager,
+        ExecutionMode::Streaming,
+        ExecutionMode::Auto,
+    ] {
+        let execution = query_execution(
+            s.snapshot(),
+            &limited,
+            &tight,
+            &CursorOptions::default(),
+            mode,
+        )
+        .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        let plan = execution.plan_json().unwrap();
+        assert!(plan.contains("PatternScan"), "{plan}");
+        let rows = match execution {
+            QueryExecution::Select(mut c) => {
+                let mut n = 0;
+                while let Some(b) = c.next_batch().unwrap() {
+                    n += b.len();
+                }
+                n
+            }
+            QueryExecution::Eager(r) => r.result().len(),
+            _ => unreachable!("a SELECT"),
+        };
+        assert_eq!(rows, 1, "{mode:?}");
+    }
+    // a cursor of one row a batch hands out every predicate, one at a time
+    let c = CursorOptions {
+        batch_rows: 1,
+        ..Default::default()
+    };
+    let mut cur =
+        crate::sparql::select_cursor(s.snapshot(), &text, &opts(Optimizations::ALL), &c).unwrap();
+    let mut n = 0;
+    while let Some(b) = cur.next_batch().unwrap() {
+        assert!(b.len() <= 1);
+        n += b.len();
+    }
+    assert_eq!(n, 300);
+}
+
+/// A cursor's pattern scan charges the block of subjects it decodes and keeps between
+/// pulls, and releases it once the scan ends.
+#[test]
+fn pattern_scan_cursors_charge_their_decoded_block() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s, &films(), RdfFormat::TriG);
+    let text = format!("{PREFIXES}{SPK}SELECT ?s ?p WHERE {{ ?s spk:hasPredicate ?p }}");
+    let c = crate::sparql::cursor::CursorOptions {
+        batch_rows: 1,
+        ..Default::default()
+    };
+    let mut cur =
+        crate::sparql::select_cursor(s.snapshot(), &text, &opts(Optimizations::ALL), &c).unwrap();
+    let before = cur.stats().mem_peak_bytes;
+    assert_eq!(cur.next_batch().unwrap().map(|b| b.len()), Some(1));
+    // the decoded block of subjects alone is BLOCK_SUBJECTS pairs of 16 bytes
+    let grown = cur.stats().mem_peak_bytes - before;
+    assert!(
+        grown >= crate::patterns::BLOCK_SUBJECTS as u64 * 16,
+        "the first pull raised the peak by {grown} bytes"
+    );
+    while cur.next_batch().unwrap().is_some() {}
+}

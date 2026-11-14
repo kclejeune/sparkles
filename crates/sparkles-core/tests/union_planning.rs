@@ -541,3 +541,51 @@ fn limited_unions_without_shared_variables_and_offsets_past_the_answer() {
         }
     }
 }
+
+/// A UNION whose branches evaluate an expression with effects, or an EXISTS that may
+/// call SERVICE, keeps its written branch order under a LIMIT, so that the effects
+/// happen as written. The same branches without the effect go cheapest first.
+#[test]
+fn a_limited_union_with_effects_keeps_its_written_order() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("<urn:yes> <urn:cheap> 0 .\n");
+    for i in 0..2_000 {
+        data.push_str(&format!("<urn:a{i}> <urn:left> {} .\n", i % 500));
+        data.push_str(&format!("<urn:b{i}> <urn:right> {} .\n", i % 500));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let first_branch = |filter: &str| {
+        let text = format!(
+            "PREFIX afn: <http://jena.apache.org/ARQ/function#> SELECT ?v WHERE {{ \
+             {{ ?a <urn:left> ?v . ?b <urn:right> ?v {filter} }} \
+             UNION {{ <urn:yes> <urn:cheap> ?v }} }} LIMIT 1"
+        );
+        let r = query(store.snapshot(), &text, &QueryOptions::default())
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(r.len(), 1, "{text}");
+        let plan = serde_json::to_string(r.plan()).unwrap();
+        let left = plan.find("urn:left").expect("the expensive branch");
+        let cheap = plan.find("urn:cheap").expect("the cheap branch");
+        left < cheap
+    };
+    assert!(
+        !first_branch(""),
+        "a plain UNION reads its cheap branch first"
+    );
+    assert!(!first_branch("FILTER(?v != 7)"));
+    for filter in [
+        "FILTER(afn:wait(0))",
+        "FILTER(afn:print(?v))",
+        "FILTER(EXISTS { ?v <urn:cheap> ?w })",
+        "BIND(IF(EXISTS { ?a <urn:cheap> ?w }, 1, 0) AS ?e)",
+        "FILTER(STRLEN(STRUUID()) > 0)",
+    ] {
+        assert!(first_branch(filter), "{filter} keeps the written order");
+    }
+}

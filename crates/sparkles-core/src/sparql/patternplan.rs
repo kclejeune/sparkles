@@ -321,15 +321,18 @@ pub(super) fn run_count(
 /// Read the next rows of a [`PatternScanSpec`] into `out`, whose columns follow its
 /// variables, until `out` has `max` rows or the scan ends, and return whether it ended.
 /// `reader` keeps the scan's place between calls: a constant subject reads its
-/// predicates on the first call, and a variable subject reads the table's pairs a block
-/// of subjects at a time. The eager executor reads every row in one call, and the
-/// cursor a batch at a time.
+/// predicates on the first call and hands them out from there, and a variable subject
+/// reads the table's pairs a block of subjects at a time. The eager executor reads every
+/// row in one call, and the cursor a batch at a time. `account` sets the charge of the
+/// reader's decoded storage: to what it may decode before a call, and to what it holds
+/// after.
 pub(super) fn fill_scan(
     ctx: &Ctx,
     spec: &PatternScanSpec,
     reader: &mut PairCursor,
     out: &mut Table,
     max: usize,
+    account: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<bool> {
     let u = &spec.uses;
     let table = u
@@ -347,16 +350,14 @@ pub(super) fn fill_scan(
     let width = out.width();
     let want = max.saturating_sub(out.len());
     let mut row = vec![Id::UNDEF; width];
-    let mut checked = Ok(());
-    let mut push = |s: u64, p: u64| {
+    let mut push = |s: u64, p: u64| -> Result<()> {
         // the columns double as they fill: admit the next size's bytes before they grow,
         // and the rows there are against the row limits
         let n = out.len();
-        if checked.is_ok() && n >= 4096 && n.is_power_of_two() {
-            checked = ctx
-                .check()
-                .and_then(|()| ctx.check_output_rows(n))
-                .and_then(|()| ctx.check_output_bytes(n.saturating_mul(2), width));
+        if n >= 4096 && n.is_power_of_two() {
+            ctx.check()?;
+            ctx.check_output_rows(n)?;
+            ctx.check_output_bytes(n.saturating_mul(2), width)?;
         }
         if let Some(c) = sc {
             row[c] = Id(s);
@@ -365,30 +366,18 @@ pub(super) fn fill_scan(
             row[c] = Id(p);
         }
         out.push_row(&row);
+        Ok(())
     };
+    account(reader.heap_bytes().saturating_add(reader.next_bytes(table)))?;
     match spec.s {
         PathEnd::Const(s) => {
-            if !reader.done() {
-                let mut preds = Vec::new();
-                crate::patterns::predicates_of(table, &u.corr, s.0, &mut preds)?;
-                let only = match spec.p {
-                    PathEnd::Const(c) => Some(c.0),
-                    PathEnd::Var(_) => None,
-                };
-                // a subject has few predicates, read in one call
-                for q in preds {
-                    if only.is_none_or(|c| c == q) {
-                        push(s.0, q);
-                    }
-                }
-                reader.finish();
-            }
+            reader.fill_subject(table, &u.corr, s.0, want, &mut push)?;
         }
         PathEnd::Var(_) => {
             reader.fill(table, &u.corr, want, &|| ctx.check(), &mut push)?;
         }
     }
-    checked?;
+    account(reader.heap_bytes())?;
     // the rows since the last power of two
     ctx.check_output(out.len(), out.width())?;
     Ok(reader.done())
@@ -411,6 +400,9 @@ pub(super) fn run_scan(
 ) -> Result<(Table, String)> {
     let mut out = Table::new(vars.to_vec());
     let mut reader = scan_reader(spec);
-    fill_scan(ctx, spec, &mut reader, &mut out, usize::MAX)?;
+    let held = ctx.charge(0)?;
+    fill_scan(ctx, spec, &mut reader, &mut out, usize::MAX, &mut |bytes| {
+        held.resize(bytes)
+    })?;
     Ok((out, spec.uses.note()))
 }

@@ -176,6 +176,52 @@ fn a_limited_cross_product_holds_its_smaller_input() {
     assert!(r.mem_peak_bytes < 12 << 20, "{}", r.mem_peak_bytes);
 }
 
+/// A LIMIT pulls its input through cursor operators, which keep a copy of the plan,
+/// such as its table of values. The copy is charged in eager execution as a cursor's
+/// plan is in streaming execution, so both refuse a budget that the table outgrows and
+/// both answer within one that holds it.
+#[test]
+fn a_pulled_limit_charges_its_copy_of_the_plan() {
+    let s = store("<urn:s> <urn:p> 99999 .\n".into());
+    let values: String = (0..100_000).map(|i| format!("{i} ")).collect();
+    // the table of values holds 800 KB
+    let q = format!("SELECT ?s {{ VALUES ?x {{ {values} }} ?s <urn:p> ?x }} LIMIT 1");
+    for mode in [ExecutionMode::Eager, ExecutionMode::Streaming] {
+        let refused = query_execution(
+            s.snapshot(),
+            &q,
+            &budget(512 << 10),
+            &CursorOptions::default(),
+            mode,
+        );
+        assert!(
+            matches!(&refused, Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Memory),
+            "{mode:?}: {:?}",
+            refused.as_ref().err()
+        );
+        let answered = match query_execution(
+            s.snapshot(),
+            &q,
+            &budget(16 << 20),
+            &CursorOptions::default(),
+            mode,
+        )
+        .unwrap()
+        {
+            QueryExecution::Select(mut c) => {
+                let mut n = 0;
+                while let Some(b) = c.next_batch().unwrap() {
+                    n += b.len();
+                }
+                n
+            }
+            QueryExecution::Eager(r) => r.result().len(),
+            _ => unreachable!("a SELECT"),
+        };
+        assert_eq!(answered, 1, "{mode:?}");
+    }
+}
+
 /// A COUNT(DISTINCT *) keeps every distinct input row although it answers one row, so a
 /// million-row input does not fit a small pool whether it streams or not. Under a UNION,
 /// where the rule for groupings does not stream it, only the memory estimate could admit

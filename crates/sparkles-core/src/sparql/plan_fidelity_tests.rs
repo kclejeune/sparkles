@@ -601,6 +601,9 @@ fn a_variable_predicate_has_one_plan_in_every_mode() {
     for text in [
         "SELECT ?s ?p WHERE { ?s <urn:x-sparkles:hasPredicate> ?p }",
         "SELECT ?s ?p WHERE { ?s <urn:x-sparkles:hasPredicate> ?p } LIMIT 10",
+        // two scans in subject order join the same way in every mode
+        "SELECT ?s ?p ?q WHERE { ?s <urn:x-sparkles:hasPredicate> ?p . \
+         ?s <urn:x-sparkles:hasPredicate> ?q }",
     ] {
         let eager = mode_shape(&s, text, &o, ExecutionMode::Eager);
         assert!(eager.iter().any(|(_, op)| op == "PatternScan"), "{eager:?}");
