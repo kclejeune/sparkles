@@ -239,9 +239,10 @@ application function, a SERVICE or another operator with effects. `run_limited`,
 `execute_limited`, the first-work estimator, `limited_input`, `filtered_ask_admitted`,
 `order_ask` and `Dataset::ask_streaming_with` are gone, and the accounting mode is read
 in four places. Pulling needs a shared context, so every caller that executes a plan shares
-its context once planning is done (item 980). The WHERE clause of an update and the
-queries that SHACL-SPARQL constraints, SPARQL functions and node expressions run share
-theirs through `Ctx::into_shared`, the public `exec::execute` shares a context it is
+its context once planning is done (item 980). The WHERE clause of an update, the
+queries that SHACL-SPARQL constraints, SPARQL functions and node expressions run, and
+the context in which an incremental view evaluates a correlated EXISTS share theirs
+through `Ctx::into_shared`, the public `exec::execute` shares a context it is
 given, and a debug build fails a pull in a context that was never shared outside the
 core crate's unit tests. The planner marks a LIMIT or an ASK to run its input whole, as a SELECT
 does, when exact index counts bound every operator of the input, and the rows an index
@@ -616,7 +617,7 @@ a cache of the plan, now work in both modes. Every context that query preparatio
 holds a weak reference to itself, attached once the automatic choice between eager and
 cursor execution is made, and a retained charge releases through it. A retained charge
 grows on its own owner, which an eager context's lock-free account takes without the
-ledger. A context that is never shared, such as one of an incremental view, has no owner,
+ledger. A context that is never shared, such as one a unit test builds alone, has no owner,
 so an eager one keeps such state uncharged as before. With that owner the EXISTS memo is
 one path, which holds at most 100,000 entries and an eighth of the budget and charges each
 entry in both modes. The key sets of a decorrelated EXISTS take one charge shape, in which

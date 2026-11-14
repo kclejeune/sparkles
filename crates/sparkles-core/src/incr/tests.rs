@@ -1241,3 +1241,41 @@ fn generator_found_engine_divergences() {
         check(&s, &c, q, "the engine");
     }
 }
+
+/// A correlated EXISTS that a view evaluates for each changed row pulls the pattern only
+/// to its first solution, as a query does (item 980). The pattern answers a product of a
+/// million rows, which the view's memory budget does not hold and its first rows fit.
+#[test]
+fn a_view_asks_a_correlated_exists_for_its_first_solution() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("<http://ex/a> <http://ex/age> 30 .\n");
+    for i in 0..1_000 {
+        data.push_str(&format!(
+            "<http://ex/x{i}> <http://ex/p> <http://ex/y{i}> .\n"
+        ));
+        data.push_str(&format!(
+            "<http://ex/z{i}> <http://ex/q> <http://ex/w{i}> .\n"
+        ));
+    }
+    s.load(&[crate::io::Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q =
+        "SELECT ?p ?a WHERE { ?p :age ?a FILTER EXISTS { ?x :p ?y . ?z :q ?w FILTER(?a > 0) } }";
+    let parsed = sparql::parse_query(&format!("{PREFIX}{q}"), None, &[]).expect("parse");
+    let mut c = Circuit::new(compile(&parsed, None).expect("compile"), None);
+    c.max_memory_bytes = Some(4 << 20);
+    c.build(s.snapshot(), &Control::none()).expect("build");
+    assert_eq!(result(&c).len(), 1);
+    sparql::update::update(
+        &s,
+        "INSERT DATA { <http://ex/b> <http://ex/age> 40 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    step(&s, &mut c);
+    assert_eq!(result(&c).len(), 2);
+}
