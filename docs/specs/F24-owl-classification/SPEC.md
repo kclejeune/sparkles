@@ -870,27 +870,29 @@ destination's tables, 29%, and the to-do list copies, 8%, which item 889 follows
 
 Item 889 takes up that cost in three changes. A flush writes each chunk of a group's link
 products into the outbox once, and each destination's run header points at that copy, so
-that a message is written once into the to-do list it reaches rather than into the outbox
-and again into the list. A run without an outbox takes each to-do list's lock once for the
-chunk, and a run in steps keeps one message for each destination in its own list, in the
-order each destination received them before. A congested delivery checks a run against
-the context's tables in one inlined loop, which looks up the sources of a backward link's
-role once for each change of role. An activation applies the batch it takes from its to-do
-list from the list's buffer instead of copying it reversed onto its own conclusions, and a
-run that answers in part gives back the rest of the batch in the order it did. Every
-destination receives the same messages in the same order as before, so the derivations do
-not change. On `atlas` the saturation of `ore_ont_8737` by the EL rules takes 8.9 s on four
-threads against 13.7 s, 24.6 s on one against 45.0 s and 7.4 s on twelve against 9.3 s,
-the medians of three rounds, with the same taxonomy. On this build its Horn attempt passes
-its memory budget before that saturation, which item 962 follows, so these are the times of
-the saturation and the classification times include the attempt. ChEBI lite classifies 8 to
-14% faster, GO 1 to 3% faster, `ore_ont_13482` 1 to 2% faster and `ore_ont_3836` within
-its spread, and the 298 ORE 2015 EL files, GO, ChEBI lite and `ore_ont_8737` give the
-base's taxonomies on one and eight threads. An open-addressing table for the sets of more
-than 16 members measured no faster on `ore_ont_8737` and slower on ChEBI lite and
-`ore_ont_13482`, and was not kept. In a profile on the laptop the filter's probes take 45% of
-a four-thread run's cycles and the rules' inserts 13%, since the run still sends three
-billion messages for 32 million conclusions, and item 956 follows them.
+that the outbox holds one copy of the chunk for all its destinations and a delivery writes
+each message once more, into the to-do list of each destination that does not hold it. A
+run without an outbox takes each to-do list's lock once for the chunk, and a run in steps
+keeps one message for each destination in its own list, in the order each destination
+received them before. A congested delivery checks a run against the context's tables in
+one inlined loop, which looks up the sources of a backward link's role once for each
+change of role. An activation applies the batch it takes from its to-do list from the
+list's buffer instead of copying it reversed onto its own conclusions, and a run that
+answers in part gives back the rest of the batch in the order it did. Every destination
+receives the same messages in the same order as before, so the derivations do not change.
+On `atlas` the saturation of `ore_ont_8737` by the EL rules takes 8.9 s on four threads
+against 13.7 s, 24.6 s on one against 45.0 s and 7.4 s on twelve against 9.3 s, the
+medians of three rounds, with the same taxonomy. On this build its Horn attempt passes its
+memory budget before that saturation, which item 962 follows, so these are the times of
+the saturation and the classification times include the attempt. ChEBI lite classifies 8
+to 14% faster, GO 1 to 3% faster, `ore_ont_13482` 1 to 2% faster and `ore_ont_3836` within
+its spread, 0.3 and 0.4% slower on four and twelve threads, which item 890 rechecks, and
+the 298 ORE 2015 EL files, GO, ChEBI lite and `ore_ont_8737` give the base's taxonomies on
+one and eight threads. An open-addressing table for the sets of more than 16 members
+measured no faster on `ore_ont_8737` and slower on ChEBI lite and `ore_ont_13482`, and was
+not kept. In a profile on the laptop the filter's probes take 45% of a four-thread run's
+cycles and the rules' inserts 13%, since the run still sends three billion messages for 32
+million conclusions, and item 956 follows them.
 
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the

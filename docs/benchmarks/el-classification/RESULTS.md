@@ -1077,8 +1077,9 @@ the rounds in milliseconds and the ratios to the base.
 
 The table measured no faster on `ore_ont_8737` and slower on ChEBI lite, `ore_ont_3836` and
 `ore_ont_13482`, so it was reverted, and
-[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md) records it. Every round gave
-the base's taxonomies. On the laptop the 298 ORE 2015 EL files, GO, ChEBI lite and
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md) records it. `ore_ont_3836`
+classifies 0.3 and 0.4% slower on four and twelve threads, within its spread, which item
+890 rechecks. The taxonomies of the last round equal the base's. On the laptop the 298 ORE 2015 EL files, GO, ChEBI lite and
 `ore_ont_8737` gave the base's taxonomies on one and eight threads.
 
 ## Records
