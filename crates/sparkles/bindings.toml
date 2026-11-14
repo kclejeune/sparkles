@@ -311,6 +311,11 @@ python = "Dataset.construct"
 jvm = "Jena QueryExec.dataset(ds).query(...).constructTriples/constructQuads"
 node = "Dataset.construct"
 
+["dataset.contains_all"]
+python = "Dataset.contains_all"
+jvm = "DatasetGraphSparkles.containsAll"
+node = "Dataset.hasAll"
+
 ["dataset.dataset_id"]
 python = "Dataset.dataset_id"
 jvm = "DatasetGraphSparkles.datasetId"
@@ -935,6 +940,21 @@ node = "Dataset.reasoning.justify"
 python = "Dataset.reasoning.explain"
 jvm = "planned: a typed handle after the Python and Node.js ones"
 node = "Dataset.reasoning.explain"
+
+["reasoning.query.clear"]
+python = "planned: the query-time reasoning setting in the bindings under item 913"
+jvm = "planned: the query-time reasoning setting in the bindings under item 913"
+node = "planned: the query-time reasoning setting in the bindings under item 913"
+
+["reasoning.query.get"]
+python = "planned: the query-time reasoning setting in the bindings under item 913"
+jvm = "planned: the query-time reasoning setting in the bindings under item 913"
+node = "planned: the query-time reasoning setting in the bindings under item 913"
+
+["reasoning.query.set"]
+python = "planned: the query-time reasoning setting in the bindings under item 913"
+jvm = "planned: the query-time reasoning setting in the bindings under item 913"
+node = "planned: the query-time reasoning setting in the bindings under item 913"
 
 ["reasoning.rdfs.get"]
 python = "Dataset.reasoning.rdfs.get"

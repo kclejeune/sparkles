@@ -68,3 +68,63 @@ fn a_dataset_queries_with_its_setting() {
         1
     );
 }
+
+/// `contains_all` answers each quad as `contains` does, in the order given, for quads
+/// that are there, quads whose terms the dataset does not know and repeated quads.
+#[test]
+fn contains_all_answers_each_quad_as_contains_does() {
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<urn:a> <urn:p> <urn:b> .\n\
+         <urn:a> <urn:p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g> .\n\
+         _:x <urn:p> \"chat\"@fr <urn:g> .\n",
+        RdfFormat::NQuads,
+    )
+    .unwrap();
+    let mut quads: Vec<oxrdf::Quad> = ds
+        .quads(None, None, None, None)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(quads.len(), 3);
+    // the same triples in the other graph, an unknown term in each position, and a repeat
+    let other = |q: &oxrdf::Quad| {
+        let mut q = q.clone();
+        q.graph_name = match q.graph_name {
+            oxrdf::GraphName::DefaultGraph => oxrdf::NamedNode::new_unchecked("urn:g").into(),
+            _ => oxrdf::GraphName::DefaultGraph,
+        };
+        q
+    };
+    let unknown = oxrdf::NamedNode::new_unchecked("urn:unknown");
+    let stored = quads.clone();
+    for q in &stored {
+        quads.push(other(q));
+        let mut u = q.clone();
+        u.subject = unknown.clone().into();
+        quads.push(u);
+        let mut u = q.clone();
+        u.predicate = unknown.clone();
+        quads.push(u);
+        let mut u = q.clone();
+        u.object = unknown.clone().into();
+        quads.push(u);
+        let mut u = q.clone();
+        u.graph_name = unknown.clone().into();
+        quads.push(u);
+        quads.push(q.clone());
+    }
+    let one_by_one: Vec<bool> = quads
+        .iter()
+        .map(|q| ds.contains(q.as_ref()).unwrap())
+        .collect();
+    assert_eq!(
+        ds.contains_all(quads.iter().map(|q| q.as_ref())).unwrap(),
+        one_by_one
+    );
+    assert_eq!(one_by_one.iter().filter(|found| **found).count(), 6);
+    assert!(one_by_one[..3].iter().all(|found| *found));
+    assert_eq!(
+        ds.contains_all(std::iter::empty()).unwrap(),
+        Vec::<bool>::new()
+    );
+}

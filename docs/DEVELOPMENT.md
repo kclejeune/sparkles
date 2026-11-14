@@ -327,6 +327,14 @@ worker's tools and resources. Keep designated benchmark workers free of builds a
 unless the host policy explicitly permits an idle fallback. The
 [remote executor guidance](#remote-executors) applies to both implementation and validation.
 
+`scripts/remote-ci.sh --host <host> --base origin/main HEAD` runs these checks on a gate
+host or an admitted Boat worker and brings the logs back to `.artifacts/remote-ci`.
+`scripts/remote-ci.sh --host <host> --premerge <rev>` runs `scripts/premerge.sh` there in
+the same way. Each job is one systemd user unit on the host that holds the host's heavy
+lock, so jobs from several lanes queue rather than compete. `--no-wait` starts a job and
+returns, and `--status` and `--fetch` follow it later. The
+[remote CI section](REMOTE-EXECUTORS.md#remote-ci) describes the bounds on a Boat worker.
+
 ### Remote executors
 
 Prefer available local resources before renting another worker. A 16 GiB Boat worker is

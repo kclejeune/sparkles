@@ -3,10 +3,10 @@
 > **Status:** implemented in part
 >
 > **Phases:** Phase 1 is complete. Version 1 profile resources, shapes, fixtures and
-> stored-query templates are available, and authenticated claim proposals assign
-> server-owned local availability and refuse backdating. Validity intervals through the
-> authenticated writer are roadmap item 925. Phase 2's projection helper and event-time
-> UI, and Phase 3's expiry integration, remain planned. No temporal index is added.
+> stored-query templates are available. Authenticated claim proposals assign
+> server-owned local availability, refuse backdating and carry validity records. Phase
+> 2's projection helper and event-time UI, and Phase 3's expiry integration, remain
+> planned. No temporal index is added.
 >
 > **User docs:** [Valid-time profile](../ai/README.md#valid-time-profile).
 >
@@ -266,6 +266,52 @@ each recorded time load before any write is admitted. The refusals and the order
 therefore hold across restarts without new state, and availability adds no on-disk
 record of its own.
 
+### 4.4 Validity records through the authenticated writer
+
+A claim occurrence proposed through the C25 writer can carry one validity record. The
+templates read a claim and its interval from one graph, and only the evidence owner
+writes the proposal graph, so the writer itself records the interval. The claim input
+has an optional `validity` member with a `start` boundary, an `end` boundary and a
+`normalization` description. A boundary has a `kind` of `known`, `unknown` or
+`unbounded`. A known boundary has `earliest` and `latest` instants, a `precision` IRI
+and a `sourceValue` string. An unknown or unbounded boundary has no instants and may
+keep a `sourceValue`. The normalization has a `status` of `normalized`, `unresolved`,
+`unsupportedCalendar`, `unsupportedPrecision`, `indeterminateOrder` or
+`nonexistentLocalTime`, a `method` IRI, a `methodVersion` string and a `calendar` IRI.
+It may add a `timezonePolicy`, a `tzdbVersion` and a `foldChoice` of `earlier` or
+`later`.
+
+The writer adds the record to the claim's own triples in the claim's graph. The claim
+receives `vt:validDuring` with the interval, and the interval, its two boundaries and
+its normalization use fragment IRIs of the claim, namely `#validity`,
+`#validity-start`, `#validity-end` and `#validity-normalization`. Each known instant is
+stored as its UTC value, and its source expression stays in `vt:sourceValue`. The
+normalization is a description of the run that interpreted this claim's source time, so
+each record carries its own copy rather than naming a shared run node that the writer
+does not own.
+
+The writer refuses a validity record that the version 1 shapes would refuse, before
+the capability, the hold and the commit, and the HTTP and MCP surfaces answer
+`400 invalid-proposal`. An instant without an explicit offset, a
+reversed envelope, a known boundary without its precision or source value, an unknown
+or unbounded boundary with instants and a normalized status with a calendar other than
+`vt:Gregorian` are all refused. A fold choice without a timezone policy and a pinned
+database version is refused too. When both boundaries are known, the latest start must
+precede the earliest end, and an overlap is refused with `temporal-indeterminate-order`
+in its message. An importer that cannot order the endpoints records them as unknown
+under the `indeterminateOrder` status instead. Open claim scope refuses every predicate
+in the `vt:` namespace, so validity enters only through this member. An assessment's
+scope keeps accepting them, as it accepted `vt:expiresAt` before.
+
+The record is immutable content of the claim. The record digest covers its triples,
+and the proposal's payload digest frames the member under its own tag only when it is
+present. A claim without validity therefore keeps its record digest, its payload digest
+and the outcome of an idempotent replay. The same occurrence key with other validity
+answers `409 immutable-record-conflict`, and a corrected interval is a new occurrence.
+Event occurrence windows are not a claim input, because an event is not a claim
+occurrence. This adds no storage format. It adds an optional member to the claim input
+of `POST /{ds}/claims`, the MCP tool `propose_claims` and `sparkles::evidence::propose`.
+
 ## 5. Example
 
 An imported advisory revision says a product relationship was valid throughout an
@@ -476,9 +522,20 @@ commit's time on both the persistent and the in-memory path. Before this change 
 behind the copied commit gave the clone a root earlier than the writes it holds, which
 a failing-first clone test demonstrated.
 
-Claim proposals do not carry a validity interval, so the templates report authenticated
-claims with unknown validity. C25 §6 names validity records, and roadmap item 925 adds
-them to the claim input.
+Validity records through the authenticated writer followed as roadmap item 925, as
+[§4.4](#44-validity-records-through-the-authenticated-writer) specifies. The claim input
+of `sparkles::evidence::propose`, `POST /{ds}/claims` and the MCP tool `propose_claims`
+has an optional `validity` member. The writer stores the interval, its boundaries and its
+normalization under fragment IRIs of the claim, with known instants in UTC, and the
+record digest covers them. Preparation refuses what the version 1 shapes refuse, and
+open claim scope refuses `vt:` predicates. A golden test pins the payload digest of a
+batch without validity to the value measured on the build before the member existed,
+so earlier idempotent replays keep their outcome. Library tests propose a validity
+record that the active template evaluates as definite at the head and that conforms to
+the shapes, while the as-known February state excludes it. An equal record replays as
+existing and other validity under the same occurrence answers
+`immutable-record-conflict`. A server test covers the JSON member, its refusals and the
+stored triples.
 
 The bounded projection helper, runtime configuration, event-time UI, expiry fencing
 and analysis invalidation remain unimplemented later phases. The existing U01 slider

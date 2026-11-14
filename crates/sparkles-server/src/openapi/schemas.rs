@@ -720,8 +720,8 @@ pub(super) fn schemas() -> Map<String, J> {
                 "created": { "type": "string" },
                 "scratch": {
                     "type": ["object", "null"],
-                    "description": "Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it.",
-                    "properties": { "creator": { "type": "string" } },
+                    "description": "Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it, and `keep` when the branch never expires.",
+                    "properties": { "creator": { "type": "string" }, "keep": { "type": "boolean" } },
                 },
                 "storage": {
                     "type": "object",
@@ -857,6 +857,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "name": { "type": "string", "description": "A new name: the branch keeps its id, commits and storage." },
                 "protected": { "type": "boolean" },
                 "note": { "type": ["string", "null"] },
+                "scratch": { "type": "boolean", "enum": [false], "description": "`false` clears the scratch mark, so the branch becomes an ordinary branch that never expires and that only grants without graph restrictions merge or delete. Needs `admin` on the branch." },
             }),
         ),
     );

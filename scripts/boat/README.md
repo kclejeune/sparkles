@@ -238,12 +238,13 @@ file whose content arrives during a build changes under the compiler, so mbx dis
 result and the build fails. `admit` therefore refuses a worker until `boat info` reports
 it `hydrated`.
 
-`MBX_GC_MAX_TOTAL_SIZE` is 64 GiB, which holds two release builds and the workspace test
-builds in one budget for the store, managed targets and incremental state.
+`MBX_GC_MAX_TOTAL_SIZE` is 40 GiB, one budget for the store, managed targets and incremental
+state that leaves a cold workspace test build room on the large worker's disk. A build
+directory in use stays whatever its size.
 `MBX_GC_MIN_FREE_SIZE` is 45 GiB, which keeps the 40 GiB of free disk that the metadata
 probe requires at the next qualification. The snapshot now holds the store, and the
 provider restores at most 111 GB of a large worker's own files, so a full store leaves
-about 40 GB for checkouts and build directories. Roadmap item 858 covers keeping the
+about 65 GB for checkouts and build directories. Roadmap item 858 covers keeping the
 saved files under that limit. `remote-executor.py admit` asks the pinned `mbx` for its effective `remote.url`,
 `cache_dir`, `gc.max_total_size` and `gc.min_free_size` through the job environment and
 refuses a remote URL, a token setting, another cache directory or another budget by
@@ -286,6 +287,7 @@ mise run bench:remote-writes --executor "$worker" base=path/to/baseline head=pat
 mise run test:partitioned --hosts "$worker" --no-local
 scripts/gate/setup-host.sh "$worker" wally
 scripts/gate/gate.sh --host "$worker" --helper none HEAD
+python3 scripts/remote-executor.py exec "$worker" 'python3 -I ~/gate/bin/disk_clean.py --force --log ~/gate/disk-clean.jsonl'
 mise run boat:finish --operation "$OWNED_OPERATION" --job-closure "$PRIVATE_JOB_CLOSURE"
 ```
 
@@ -444,3 +446,57 @@ unknown or unresolved stop fails and retains reconciliation ownership. It never 
 resumes, retries stop or selects another worker. `request-stop --operation OPERATION`
 remains available to submit the trigger without claiming completion. Recovery uses the
 operation's protected original profile snapshot and source seal.
+
+## Disk cleanup
+
+The provider emails the maintainer when a worker's root disk reaches 90% use, and a stop
+saves whatever the disk holds into the snapshot of the next resume. `disk_clean.py` runs
+on the worker and frees finished work. It removes each gate or lane CI worktree
+`~/gate/wt-NAME` whose unit `gate-NAME` is not active, and then runs `mbx gc` with the job
+environment's store settings, which keeps the targets and entries that running commands
+use. It never follows a link, never removes a path whose unit it cannot show inactive and
+never deletes store files itself. It leaves the remote build checkouts under
+`~/lanes/nsc-build-work`, because a build moves its sources there before its scope is
+listed, and `mbx gc` bounds their managed targets in the store. One cleanup runs at a time
+under `~/gate/.disk-clean.lock`, and a gate start holds that lock from before it creates
+its worktree until its unit runs. `--deadline-seconds` bounds the whole cleanup. Each
+command runs in its own process group, which is killed when its share of the deadline
+ends. A cleanup prints one record with the disk use before and after and appends it to
+`~/gate/disk-clean.jsonl`.
+
+`scripts/gate/setup-host.sh` installs the user timer `sparkles-disk-clean.timer`, which
+runs the cleanup every minute from ten minutes after boot and does nothing below 90% use.
+At 95% use the timer's cleanup first stops every active `gate-*` unit, the gate, lane CI
+and preparation units, because no cleanup may take a running build's files. This is a
+recovery at best, since the check runs once a minute and a build can fill the disk sooner,
+which is why a job also needs its room before it starts. The stop is written to the record and to the job's `progress.log`, and the job's
+results stay. The timer's unit files live in the home, so the snapshot keeps them and the
+timer runs again after a resume.
+
+A job also refuses to start without room for its build. With `--need-free-gib N` the
+cleanup runs only when less than N GiB are free and exits 3 when less is still free
+afterwards. A lane CI job runs it under the heavy lock with `REMOTE_CI_MIN_FREE_GIB`, 85 by
+default, which is the 67.8 GiB that a cold workspace test build of the lane CI added to the
+large worker's disk plus 25%. A Boat gate start runs it before it creates its worktree, and
+the gate again under the heavy lock, with `GATE_BOAT_MIN_FREE_GIB`, 110 by default, because
+a gate also builds the conformance suites. A Boat gate also cleans at 90% after its run, and keeps the records as
+`disk-clean-start.json` and `disk-clean-end.json` in its results.
+
+Every stop after a Root handoff needs a fresh job-closure receipt, so the forced cleanup
+runs before that receipt is taken. The closure watch runs it with `--force` for at most
+240 seconds after a check finds the jobs closed. It holds `jobs.lock` exclusively
+meanwhile, so no command can launch a job whose files it would remove, and its bound
+leaves the floor, the guard's wait for the extension lock, the decision and one more check.
+The check under the locks follows the cleanup, so a cleanup process that is still running
+holds off the publication. The watch keeps the result as
+`closure-watch-disk-clean.json`. A failed cleanup, or one with less than a minute to
+spare, is recorded and never holds off the stop. Before `finish` or `request-stop`, the
+owner runs the cleanup and then takes the job-closure receipt.
+
+```sh
+python3 scripts/remote-executor.py exec "$worker" 'python3 -I ~/gate/bin/disk_clean.py --force --log ~/gate/disk-clean.jsonl'
+```
+
+A stop before the handoff follows a qualification that ran no job, so it saves the disk
+that the previous cleaned stop left. The guard's deadline path stops only with the
+closure receipt that the watch or the owner published after the cleanup.

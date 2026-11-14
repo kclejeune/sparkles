@@ -1,0 +1,513 @@
+diff --git a/crates/sparkles-reasoner/examples/lubm.rs b/crates/sparkles-reasoner/examples/lubm.rs
+index 3366936e..c1cccb70 100644
+--- a/crates/sparkles-reasoner/examples/lubm.rs
++++ b/crates/sparkles-reasoner/examples/lubm.rs
+@@ -4,16 +4,51 @@
+ //! ```sh
+ //! cargo run --release -p sparkles-reasoner --example lubm -- gen 10 /tmp/lubm
+ //! cargo run --release -p sparkles-reasoner --example lubm -- load /tmp/lubm 10 /tmp/lubm/db10
++//! cargo run --release -p sparkles-reasoner --example lubm -- loadfile /tmp/owl2bench/db2 owl2bench-2.nt
+ //! cargo run --release -p sparkles-reasoner --example lubm -- infer /tmp/lubm/db10 rdfs
+ //! cargo run --release -p sparkles-reasoner --example lubm -- materialize /tmp/lubm/db10 owl-rl
++//! cargo run --release -p sparkles-reasoner --example lubm -- keep /tmp/lubm/db10 rdfs 1000
++//! cargo run --release -p sparkles-reasoner --example lubm -- churn /tmp/lubm/db10 rdfs 100 10 40
++//! cargo run --release -p sparkles-reasoner --example lubm -- diag /tmp/lubm/db10
+ //! ```
+ //!
+-//! `RAYON_NUM_THREADS` sets the number of threads. The peak heap counts every allocation
++//! `RAYON_NUM_THREADS` sets the number of threads, and `SPARKLES_GENERIC_CLOSURES=1` makes
++//! `infer` evaluate transitive and equivalence rules as ordinary rules.
++//! `SPARKLES_WITNESSES=N` makes `materialize` and `keep` keep up to `N` witnesses per fact
++//! (spec F18 §7.1) and report them. The peak heap counts every allocation
+ //! of the process from the start of the run, so it includes the data the run returns.
++//!
++//! `keep` measures the closure kept for incremental runs, as a server keeps it: a full
++//! run, a run without changes that keeps the closure in memory, the heap the closure
++//! holds, then incremental runs with the kept closure after a change that removes `K`
++//! triples of the first university and adds `K` new ones, after it is undone and after it
++//! is made again, and one that reads the closure back from the dataset after the change
++//! is undone once more. The dataset is changed, so it should be a fresh copy.
++//!
++//! `churn DB PROFILE K U ROUNDS` keeps a closure the same way and then makes a change of
++//! `K` triples to one university after another of the first `U`, each change followed by
++//! its undo, the change again and a second undo, which leaves the dataset as it was. It
++//! reports the time of each incremental run in microseconds, with the commit, and the
++//! quartiles of each step over the rounds. The first round is the first change after the
++//! closure is kept, and each later round changes data that no earlier round read. `K` and
++//! `ROUNDS` can be lists such as `100,1000,10000` and `40,20,6`, which run one size after
++//! another over the same kept closure.
++//! `LUBM_PERF_CONTROL` names a control FIFO of `perf record --control`, to which `churn`
++//! writes `enable` before the rounds and `disable` after them, so that a record started
++//! with `--delay=-1` holds the rounds without the full run. With `LUBM_POOL=1` the runs
++//! of `churn` evaluate on a reasoning pool of `RAYON_NUM_THREADS` threads, as a server's
++//! do, instead of on the global pool from the main thread.
++//!
++//! `diag` runs the check `literal-not-in-datatype` twice on the same snapshot and reports
++//! the time and the peak heap of each run.
+ 
++use oxrdf::{GraphName, NamedNode, Quad, Triple};
+ use sparkles_core::io::Source;
+ use sparkles_core::store::{Store, StoreOptions};
+-use sparkles_reasoner::{Profile, ReasonOptions, bench_derive, materialize};
++use sparkles_reasoner::{
++    Cache, Extras, Incremental, Profile, ReasonOptions, ReasonReport, bench_derive, materialize,
++    materialize_incremental,
++};
+ use std::alloc::{GlobalAlloc, Layout, System};
+ use std::io::Write as _;
+ use std::path::{Path, PathBuf};
+@@ -87,6 +122,68 @@ fn data_files(dir: &Path, u: usize) -> (PathBuf, PathBuf) {
+     (dir.join("univ-bench.ttl"), dir.join(format!("lubm-{u}.nt")))
+ }
+ 
++/// Remove `del` from the default graph and add `add`, in one commit.
++fn change(s: &Store, add: &[Triple], del: &[Triple]) {
++    let mut txn = s.write();
++    let mut labels = Default::default();
++    let q = |t: &Triple| {
++        Quad::new(
++            t.subject.clone(),
++            t.predicate.clone(),
++            t.object.clone(),
++            GraphName::DefaultGraph,
++        )
++    };
++    for t in del {
++        let x = txn.encode_quad(&q(t), &mut labels).unwrap();
++        txn.delete(x).unwrap();
++    }
++    for t in add {
++        let x = txn.encode_quad(&q(t), &mut labels).unwrap();
++        txn.insert(x).unwrap();
++    }
++    txn.commit().unwrap();
++}
++
++/// `k` triples of university `u`, spread over its data, and `k` new triples about new
++/// graduate students of its first department.
++fn change_sets(u: usize, k: usize) -> (Vec<Triple>, Vec<Triple>) {
++    let text = lubm::university(u);
++    let all: Vec<Triple> = oxttl::NTriplesParser::new()
++        .for_slice(text.as_bytes())
++        .map(|t| t.unwrap())
++        .collect();
++    let step = (all.len() / k.max(1)).max(1);
++    let del: Vec<Triple> = all.iter().step_by(step).take(k).cloned().collect();
++    let n = |s: String| NamedNode::new_unchecked(s);
++    let ty = n("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into());
++    let dept = format!("http://www.Department0.University{u}.edu");
++    let dept = dept.as_str();
++    let add = (0..k)
++        .map(|j| {
++            let s = n(format!("{dept}/NewStudent{}", j / 3));
++            match j % 3 {
++                0 => Triple::new(s, ty.clone(), n(format!("{}GraduateStudent", lubm::UB))),
++                1 => Triple::new(s, n(format!("{}memberOf", lubm::UB)), n(dept.into())),
++                _ => Triple::new(
++                    s,
++                    n(format!("{}takesCourse", lubm::UB)),
++                    n(format!("{dept}/GraduateCourse{}", j % 10)),
++                ),
++            }
++        })
++        .collect();
++    (del, add)
++}
++
++fn run_options() -> ReasonOptions {
++    ReasonOptions::default()
++}
++
++fn witness_fields(_r: &ReasonReport) -> String {
++    String::new()
++}
++
+ fn main() {
+     tracing_subscriber::fmt()
+         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+@@ -131,6 +228,22 @@ fn main() {
+                 t.elapsed().as_millis()
+             );
+         }
++        "loadfile" => {
++            let db = PathBuf::from(&args[2]);
++            let _ = std::fs::remove_dir_all(&db);
++            let store = Store::open(&db, StoreOptions::default()).unwrap();
++            let t = Instant::now();
++            let sources: Vec<Source> = args[3..]
++                .iter()
++                .map(|f| Source::from_path(Path::new(f), None).unwrap())
++                .collect();
++            store.load(&sources).unwrap();
++            println!(
++                "{} quads loaded in {} ms",
++                store.snapshot().len(),
++                t.elapsed().as_millis()
++            );
++        }
+         "infer" | "materialize" => {
+             let db = PathBuf::from(&args[2]);
+             let profile: Profile = args[3].parse().expect("profile");
+@@ -142,7 +255,7 @@ fn main() {
+             if cmd == "infer" {
+                 let done = std::sync::Mutex::new((0usize, 0u128));
+                 let (derived, iterations, digest, order) =
+-                    bench_derive(snap, &profile, &ReasonOptions::default(), &|| {
++                    bench_derive(snap, &profile, &run_options(), &|| {
+                         *done.lock().unwrap() = (
+                             PEAK.load(Ordering::Relaxed) - before,
+                             t.elapsed().as_millis(),
+@@ -157,22 +270,209 @@ fn main() {
+                     vm_hwm()
+                 );
+             } else {
+-                let r = materialize(&store, &profile, &ReasonOptions::default()).unwrap();
++                let opts = ReasonOptions::default();
++                let r = materialize(&store, &profile, &opts).unwrap();
+                 let peak = PEAK.load(Ordering::Relaxed) - before;
+                 println!(
+-                    "materialize {} threads={threads} inferred={} iterations={} ms={} peak_heap_mib={:.1} vm_hwm={}",
++                    "materialize {} threads={threads} inferred={} iterations={} ms={} peak_heap_mib={:.1} vm_hwm={}{}",
+                     profile.name(),
+                     r.inferred,
+                     r.iterations,
+                     r.millis,
+                     mib(peak),
+-                    vm_hwm()
++                    vm_hwm(),
++                    witness_fields(&r)
+                 );
+             }
+         }
++        "keep" => {
++            let db = PathBuf::from(&args[2]);
++            let profile: Profile = args[3].parse().expect("profile");
++            let k: usize = args.get(4).map_or(1000, |a| a.parse().expect("triples"));
++            let store = Store::open(&db, StoreOptions::default()).unwrap();
++            let threads = rayon::current_num_threads();
++            let cache = Cache::new(usize::MAX);
++            let opts = ReasonOptions::default();
++            let run = |since: Option<u64>, cache: Option<&Cache>| -> (ReasonReport, usize) {
++                let before = reset_peak();
++                let r = materialize_incremental(
++                    &store,
++                    &profile,
++                    &Extras::default(),
++                    Incremental { since, cache },
++                    &opts,
++                )
++                .unwrap();
++                (r, PEAK.load(Ordering::Relaxed) - before)
++            };
++            let (del, add) = change_sets(0, k);
++            let line = |what: &str, r: &ReasonReport, peak: usize| {
++                let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
++                println!(
++                    "keep {} threads={threads} {what} method={} source={source} ms={} inferred={} peak_heap_mib={:.1} reasoner_peak_mib={:.1}{}",
++                    profile.name(),
++                    r.method.as_str(),
++                    r.millis,
++                    r.inferred,
++                    mib(peak),
++                    mib(r.peak_bytes as usize),
++                    witness_fields(r),
++                );
++            };
++            let (r, peak) = run(None, Some(&cache));
++            line("full", &r, peak);
++            let mut since = r.receipt.unwrap().commit.seq;
++            // the full run's commit rebuilt the generation, so its closure is not kept: a
++            // run without changes keeps it
++            let (r, peak) = run(Some(since), Some(&cache));
++            line("settle", &r, peak);
++            since = r.receipt.unwrap().commit.seq;
++            let kept = cache.kept().map_or(0, |k| k.0);
++            let with = CURRENT.load(Ordering::Relaxed);
++            cache.clear();
++            let closure = with.saturating_sub(CURRENT.load(Ordering::Relaxed));
++            println!(
++                "keep {} threads={threads} kept_facts={kept} kept_closure_mib={:.1}",
++                profile.name(),
++                mib(closure)
++            );
++            let (r, _) = run(Some(since), Some(&cache));
++            since = r.receipt.unwrap().commit.seq;
++            change(&store, &add, &del);
++            let (r, peak) = run(Some(since), Some(&cache));
++            line("change", &r, peak);
++            since = r.receipt.unwrap().commit.seq;
++            // the same changes again, undone and redone, with the kept closure and the
++            // blocks the first change read
++            change(&store, &del, &add);
++            let (r, peak) = run(Some(since), Some(&cache));
++            line("revert", &r, peak);
++            since = r.receipt.unwrap().commit.seq;
++            change(&store, &add, &del);
++            let (r, peak) = run(Some(since), Some(&cache));
++            line("change-again", &r, peak);
++            since = r.receipt.unwrap().commit.seq;
++            cache.clear();
++            change(&store, &del, &add);
++            let (r, peak) = run(Some(since), None);
++            line("revert-from-store", &r, peak);
++            println!(
++                "keep {} threads={threads} vm_hwm={}",
++                profile.name(),
++                vm_hwm()
++            );
++        }
++        "churn" => {
++            let db = PathBuf::from(&args[2]);
++            let profile: Profile = args[3].parse().expect("profile");
++            let list = |a: &str, what: &str| -> Vec<usize> {
++                a.split(',').map(|x| x.parse().expect(what)).collect()
++            };
++            let sizes = list(&args[4], "triples");
++            let universities: usize = args[5].parse().expect("universities");
++            let batches = list(&args[6], "rounds");
++            assert_eq!(sizes.len(), batches.len(), "a number of rounds for each K");
++            let store = Store::open(&db, StoreOptions::default()).unwrap();
++            let threads = rayon::current_num_threads();
++            let cache = Cache::new(usize::MAX);
++            // a server evaluates on a reasoning pool, not on the global pool
++            let pool = (std::env::var("LUBM_POOL").as_deref() == Ok("1"))
++                .then(|| sparkles_reasoner::thread_pool(threads).unwrap());
++            let opts = ReasonOptions {
++                pool,
++                ..ReasonOptions::default()
++            };
++            let run = |since: Option<u64>| -> (ReasonReport, u128) {
++                let t = Instant::now();
++                let r = materialize_incremental(
++                    &store,
++                    &profile,
++                    &Extras::default(),
++                    Incremental {
++                        since,
++                        cache: Some(&cache),
++                    },
++                    &opts,
++                )
++                .unwrap();
++                (r, t.elapsed().as_micros())
++            };
++            let (r, full) = run(None);
++            let mut since = r.receipt.unwrap().commit.seq;
++            let (r, settle) = run(Some(since));
++            since = r.receipt.unwrap().commit.seq;
++            println!(
++                "churn {} threads={threads} full_ms={} settle_ms={} inferred={}",
++                profile.name(),
++                full / 1000,
++                settle / 1000,
++                r.inferred
++            );
++            // a profiler started with its events off records the rounds only
++            let control = |word: &str| {
++                if let Ok(path) = std::env::var("LUBM_PERF_CONTROL") {
++                    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
++                    writeln!(f, "{word}").unwrap();
++                }
++            };
++            let steps = ["change", "revert", "change-again", "revert-again"];
++            // each round of each size changes the next university
++            let mut next = 0;
++            for (&k, &rounds) in sizes.iter().zip(&batches) {
++                let sets: Vec<(Vec<Triple>, Vec<Triple>)> = (0..universities.min(rounds))
++                    .map(|u| change_sets((next + u) % universities, k))
++                    .collect();
++                next += sets.len();
++                control("enable");
++                let mut times: Vec<Vec<u128>> = vec![Vec::new(); steps.len()];
++                for round in 0..rounds {
++                    let (del, add) = &sets[round % sets.len()];
++                    let mut line = format!(
++                        "churn {} threads={threads} k={k} round={round}",
++                        profile.name()
++                    );
++                    for (i, step) in steps.iter().enumerate() {
++                        if i % 2 == 0 {
++                            change(&store, add, del);
++                        } else {
++                            change(&store, del, add);
++                        }
++                        let (r, us) = run(Some(since));
++                        since = r.receipt.unwrap().commit.seq;
++                        let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
++                        assert!(
++                            r.method.as_str() == "incremental" && source == "memory",
++                            "round {round} {step}: method={} source={source}",
++                            r.method.as_str()
++                        );
++                        times[i].push(us);
++                        line.push_str(&format!(" {step}_us={us}"));
++                        if i == 3 {
++                            line.push_str(&format!(" inferred={}", r.inferred));
++                        }
++                    }
++                    println!("{line}");
++                }
++                control("disable");
++                for (step, t) in steps.iter().zip(&mut times) {
++                    let first = t.first().copied().unwrap_or(0);
++                    t.sort_unstable();
++                    let q = |f: f64| t[((t.len() - 1) as f64 * f).round() as usize];
++                    println!(
++                        "churn {} threads={threads} k={k} rounds={rounds} {step} first_us={first} min_us={} p25_us={} median_us={} p75_us={} max_us={}",
++                        profile.name(),
++                        q(0.0),
++                        q(0.25),
++                        q(0.5),
++                        q(0.75),
++                        q(1.0)
++                    );
++                }
++            }
++        }
+         _ => {
+             eprintln!(
+-                "usage: lubm gen U DIR | load DIR U DB | infer DB PROFILE | materialize DB PROFILE"
++                "usage: lubm gen U DIR | load DIR U DB | infer DB PROFILE | materialize DB PROFILE | keep DB PROFILE [K] | churn DB PROFILE K U ROUNDS | diag DB"
+             );
+             std::process::exit(2);
+         }
+diff --git a/crates/sparkles-reasoner/src/incremental.rs b/crates/sparkles-reasoner/src/incremental.rs
+index fb6144ec..106b9dcd 100644
+--- a/crates/sparkles-reasoner/src/incremental.rs
++++ b/crates/sparkles-reasoner/src/incremental.rs
+@@ -419,6 +419,7 @@ pub(crate) fn update(
+     let mut held = Held::new(budget);
+ 
+     // ---- deletion
++    let started = std::time::Instant::now();
+     held.try_grow(2 * removed.len() * size_of::<Triple>())?;
+     let mut queue: Vec<Triple> = Vec::new();
+     for t in removed {
+@@ -505,6 +506,8 @@ pub(crate) fn update(
+     }
+ 
+     // ---- insertion
++    crate::lap_add("delete", started.elapsed().as_micros() as u64);
++    let started = std::time::Instant::now();
+     let start = c.graph.len();
+     out.added_from = start;
+     held.try_grow(std::mem::size_of_val(inserted))?;
+@@ -529,6 +532,7 @@ pub(crate) fn update(
+     }
+     // the removed facts stay with the update
+     out.held = Some(held);
++    crate::lap_add("insert", started.elapsed().as_micros() as u64);
+     Ok(out)
+ }
+ 
+diff --git a/crates/sparkles-reasoner/src/lib.rs b/crates/sparkles-reasoner/src/lib.rs
+index a052f171..561b2aac 100644
+--- a/crates/sparkles-reasoner/src/lib.rs
++++ b/crates/sparkles-reasoner/src/lib.rs
+@@ -257,6 +257,24 @@ pub struct Changes {
+     pub source: String,
+ }
+ 
++pub(crate) static LAPS: std::sync::Mutex<Option<(Instant, Vec<(&'static str, u64)>)>> =
++    std::sync::Mutex::new(None);
++pub(crate) fn lap_start(t0: Instant) {
++    *LAPS.lock().unwrap() = Some((t0, Vec::new()));
++}
++pub(crate) fn lap(phase: &'static str) {
++    if let Some((last, laps)) = LAPS.lock().unwrap().as_mut() {
++        let now = Instant::now();
++        laps.push((phase, now.duration_since(*last).as_micros() as u64));
++        *last = now;
++    }
++}
++pub(crate) fn lap_add(phase: &'static str, us: u64) {
++    if let Some((_, laps)) = LAPS.lock().unwrap().as_mut() {
++        laps.push((phase, us));
++    }
++}
++
+ fn progress(opts: &ReasonOptions, f: f32, msg: &str) {
+     if let Some(p) = &opts.progress {
+         p(f, msg);
+@@ -776,7 +794,9 @@ fn materialize_admitted(
+     opts: &ReasonOptions,
+     t0: Instant,
+ ) -> anyhow::Result<ReasonReport> {
++    lap_start(t0);
+     let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
++    lap("changes");
+     let snap = txn.base().clone();
+     let digest = rules_digest(profile, extras);
+     let mut fallback = None;
+@@ -979,7 +999,9 @@ fn finish(
+     // a run that went over its limit fails before its commit, also when its charges are
+     // back under it now
+     done.budget.check_peak()?;
++    lap("checks");
+     let receipt = txn.commit()?;
++    lap("commit");
+     progress(opts, 1.0, "done");
+     let mut warnings = resolved.warnings.clone();
+     warnings.extend(done.warnings);
+@@ -1053,6 +1075,17 @@ fn finish(
+         millis = report.millis,
+         "materialized inferences"
+     );
++    lap("save+keep");
++    if std::env::var_os("RUST_LOG").is_some()
++        && let Some((_, laps)) = LAPS.lock().unwrap().take()
++    {
++        let text: Vec<String> = laps.iter().map(|(k, v)| format!("{k}={v}")).collect();
++        eprintln!(
++            "run phases micros={} phases={}",
++            t0.elapsed().as_micros(),
++            text.join(" ")
++        );
++    }
+     Ok(report)
+ }
+ 
+@@ -1216,9 +1249,11 @@ fn update_closure(
+             .into());
+         }
+     }
++    lap("rules");
+     progress(opts, 0.0, "reading the previous closure");
+     let budget = Budget::new(opts.max_memory);
+     let prev = maintain::previous(store, snap, since, digest, &graphs, inc.cache, raw, &budget)?;
++    lap("closure");
+     let mut closure = prev.closure;
+     let mut ch = prev.changes;
+     let _prev_held = prev.held;
+@@ -1243,6 +1278,7 @@ fn update_closure(
+         budget: budget.clone(),
+     };
+     let ch = &ch;
++    lap("compile");
+     progress(opts, 0.1, "updating the closure");
+     let (up, threads) = exec.install(|| {
+         let up = incremental::update(
+@@ -1255,6 +1291,7 @@ fn update_closure(
+         (up, rayon::current_num_threads())
+     });
+     let up = up?;
++    lap("update");
+     let mut generalized = prev.generalized;
+     let mut gen_changes = maintain::GeneralizedChanges::default();
+     for t in &up.deleted {
+@@ -1272,6 +1309,7 @@ fn update_closure(
+             gen_changes.added.push(*t);
+         }
+     }
++    lap("witnesses");
+     progress(opts, 0.8, "writing inferred graph");
+     let candidates = up
+         .deleted
+@@ -1283,6 +1321,7 @@ fn update_closure(
+         .chain(&ch.inferred_removed)
+         .chain(&touched);
+     let written = write_changes(txn, snap, &closure, candidates, &budget)?;
++    lap("write");
+     let changes = Changes {
+         base_added: ch.base_added.len() as u64,
+         base_removed: ch.base_removed.len() as u64,

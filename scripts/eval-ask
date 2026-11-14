@@ -279,8 +279,10 @@ class Runner:
         self.clarifications = getattr(args, "clarifications", None) or "answer"
         if self.clarifications not in CLARIFICATIONS:
             raise Invalid("unknown clarification policy")
+        self.profile = bool(getattr(args, "profile_stages", False))
         self.env = leaf_environment(
-            {"SPARKLES_EVAL_GATE_TOKEN": proxy.token} if proxy else None
+            {"SPARKLES_EVAL_GATE_TOKEN": proxy.token} if proxy else None,
+            profile=self.profile,
         )
         cfg = strict_json(bounded_file(args.model_config, 1024 * 1024))
         self.cli_priced_pairs = set()
@@ -488,6 +490,9 @@ class Runner:
             cmd += ["--model-secret", secret]
         if self.args.allow_loopback:
             cmd += ["--outbound-allow", "127.0.0.1/32"]
+        if self.profile:
+            # One JSON object per stage completion on the child's stderr.
+            cmd += ["--log-format", "json"]
         cmd += getattr(self.args, "ask_option", None) or []
         return cmd
 
@@ -1762,6 +1767,11 @@ def parse_args(argv=None):
         default=[],
         metavar="FLAG",
         help="a pipeline option passed to every Ask: --explore, --shape-check or --type-hints, each also as --no-, or --drafts=N",
+    )
+    ap.add_argument(
+        "--profile-stages",
+        action="store_true",
+        help="record the Ask stage diagnostics as JSON lines in each child's stderr",
     )
     ap.add_argument("--self-test", action="store_true")
     return ap.parse_args(argv)

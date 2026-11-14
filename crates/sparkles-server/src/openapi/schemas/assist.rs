@@ -762,7 +762,59 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
             "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
         )
     };
+    let claim_terms = || {
+        with_desc(
+            json!({ "type": "object", "additionalProperties": array(string()) }),
+            "Domain scope: predicate IRIs to N-Triples terms. Profile, valid-time, PROV-O and structural predicates are refused. A claim's validity uses its validity member.",
+        )
+    };
     let date_time = |d: &str| with_desc(json!({ "type": "string", "format": "date-time" }), d);
+    let boundary = || {
+        with_desc(
+            closed(
+                &["kind"],
+                json!({
+                    "kind": string_enum(&["known", "unknown", "unbounded"]),
+                    "earliest": date_time("A known boundary's earliest possible instant, inclusive, with an explicit offset."),
+                    "latest": date_time("A known boundary's latest possible instant, inclusive, with an explicit offset."),
+                    "precision": iri("A known boundary's source precision, such as urn:x-sparkles:valid-time:Day."),
+                    "sourceValue": with_desc(string(), "The source's original expression. A known boundary requires it."),
+                }),
+            ),
+            "A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision.",
+        )
+    };
+    let validity = || {
+        with_desc(
+            closed(
+                &["start", "end", "normalization"],
+                json!({
+                    "start": boundary(),
+                    "end": boundary(),
+                    "normalization": closed(
+                        &["status", "method", "methodVersion", "calendar"],
+                        json!({
+                            "status": string_enum(&[
+                                "normalized",
+                                "unresolved",
+                                "unsupportedCalendar",
+                                "unsupportedPrecision",
+                                "indeterminateOrder",
+                                "nonexistentLocalTime",
+                            ]),
+                            "method": iri("The normalization method."),
+                            "methodVersion": with_desc(string(), "The method's version. It cannot be empty."),
+                            "calendar": iri("The calendar. Normalized values use urn:x-sparkles:valid-time:Gregorian."),
+                            "timezonePolicy": with_desc(string(), "The declared timezone policy. It cannot be empty."),
+                            "tzdbVersion": with_desc(string(), "The pinned timezone database version. It cannot be empty."),
+                            "foldChoice": with_desc(string_enum(&["earlier", "later"]), "The choice for an ambiguous local time. It requires timezonePolicy and tzdbVersion."),
+                        }),
+                    ),
+                }),
+            ),
+            "The claim's C27 validity record, a half-open interval written with the claim and covered by its record digest. The latest start must precede the earliest end of two known boundaries.",
+        )
+    };
     put(
         "EvidenceProposal",
         doc(
@@ -854,11 +906,12 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "kind": string_enum(&["reported", "observation", "hypothesis", "preference"]),
                             "polarity": string_enum(&["positive", "negative", "uncertain"]),
                             "author": iri("The attributed source author, not the authenticated caller."),
-                            "scope": terms(),
+                            "scope": claim_terms(),
                             "confidence": closed(
                                 &[],
                                 json!({ "source": confidence(), "extraction": confidence(), "analyst": confidence() }),
                             ),
+                            "validity": validity(),
                         }),
                     )),
                     "links": array(closed(
@@ -2030,7 +2083,9 @@ fn memory(put: &mut dyn FnMut(&str, J)) {
                     })), "The retention of session graphs, off without it."),
                     "scratchBranches": with_desc(closed(&[], json!({
                         "ttl": with_desc(string(), "How long a scratch branch may sit idle before the server deletes it, from `1m` to `3650d`, such as `24h`. `off` keeps the dataset's scratch branches even when the server's `--mcp-scratch-branch-ttl` sets a duration. Without it, the server flag decides. A dataset with this member needs a release that reads `memory.json` format 2."),
-                    })), "When idle scratch branches expire. Written as `format` 2 of `memory.json`."),
+                        "maxPerPrincipal": with_desc(int(), "The most scratch branches one principal may have in the dataset, from 1 to 65535. Kept branches count. `create_branch` past it is refused with `409 scratch-branch-limit`. Without it, only the dataset's branch limit applies."),
+                        "notifyBefore": with_desc(string(), "How long before a scratch branch expires the brief, the `sparkles://{ds}/branches` resource and `list_branches` name it, from `1m` to `3650d`, such as `6h`. `memory.review.pending` names those of them with commits of their own. Without it, nothing warns."),
+                    })), "Limits, warnings and expiry of the scratch branches that MCP agents create. Written as `format` 2 of `memory.json` with `ttl` only, and as `format` 3 with `maxPerPrincipal` or `notifyBefore`."),
                 }),
             ),
             "The memory settings of a dataset.",
@@ -2556,6 +2611,7 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
                     "citations": array(any_object("One source of the facts.")),
                     "prefixes": any_object("The prefixes the compact terms use."),
                     "review": sref("ReviewCounts"),
+                    "expiringBranches": with_desc(array(any_object("A scratch branch with `name`, `head`, `created`, `lastChange`, `ahead`, `expires` and `expiresSoon`.")), "The caller's scratch branches that expire within the dataset's `memory.scratchBranches.notifyBefore`. The `# scratch:` lines of `text` name as many of them as `maxChars` leaves room for, at most five."),
                     "communities": with_desc(array(any_object("A report with `iri`, `community`, `title`, `summary`, `status` and `memberCount`.")), "In a project brief, the best rated reports of the coarsest level that the caller may read."),
                 }),
             ),

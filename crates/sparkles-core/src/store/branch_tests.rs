@@ -2015,6 +2015,7 @@ fn scratch_marks_persist() {
     assert!(s.branch_info("try").unwrap().scratch.is_none());
     let mark = crate::branch::Scratch {
         creator: "user:agent-7".into(),
+        keep: false,
     };
     let info = s.set_branch_scratch("try", Some(mark.clone())).unwrap();
     assert_eq!(info.scratch.as_ref().unwrap().creator, "user:agent-7");
@@ -2030,6 +2031,42 @@ fn scratch_marks_persist() {
     assert!(b("main").scratch.is_none());
     s.set_branch_scratch("try", None).unwrap();
     assert!(s.branch_info("try").unwrap().scratch.is_none());
+}
+
+#[test]
+fn kept_scratch_marks_need_table_format_three() {
+    let (dir, s) = setup();
+    let table = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.path().join("ds").join(BRANCHES_FILE)).unwrap())
+            .unwrap()
+    };
+    s.create_branch("try", &BranchOptions::default()).unwrap();
+    let mark = |keep| crate::branch::Scratch {
+        creator: "user:agent-7".into(),
+        keep,
+    };
+    s.set_branch_scratch("try", Some(mark(false))).unwrap();
+    assert_eq!(table()["format"], 1, "a scratch mark alone is format 1");
+    assert!(table()["branches"][0]["scratch"].get("keep").is_none());
+    let info = s.set_branch_scratch("try", Some(mark(true))).unwrap();
+    assert!(info.scratch.unwrap().keep);
+    let t = table();
+    assert_eq!(t["format"], 3, "{t}");
+    assert_eq!(t["branches"][0]["scratch"]["keep"], true, "{t}");
+    // a release that reads format 2 refuses the table instead of expiring the branch
+    crate::formats::check_settings(BRANCHES_FILE, &t).unwrap();
+    let mut newer = t.clone();
+    newer["format"] = 4.into();
+    assert!(matches!(
+        crate::formats::check_settings(BRANCHES_FILE, &newer),
+        Err(Error::Unsupported(_))
+    ));
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert!(s.branch_info("try").unwrap().scratch.unwrap().keep);
+    // clearing the mark returns the table to format 1
+    s.set_branch_scratch("try", None).unwrap();
+    assert_eq!(table()["format"], 1);
 }
 
 // Run potentially self-deadlocking operations in a child so the failing control

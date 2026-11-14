@@ -1585,6 +1585,32 @@ it while its queries run.
     it does now, and the RDF/JS term objects of a row are created when a property of the
     row is first read, with one object per distinct term in the batch. An export that
     writes bytes keeps using §3.7's byte streams, which create no term objects.
+  The term ids and the lazy terms are in place. A second pass profiled the calls on a
+  laptop at 105,302 triples. A streamed SELECT spent 35% of its samples in the memory
+  ledger, one pass per cell, and 7% hashing decoded terms to find repeats. Its batches now
+  ask each cell for its key. The first cell of a key in each batch of the query decodes
+  its term through the budget, and the term's text is written once per batch sent.
+  `Bindings.get` strips a variable's sigil without a regular expression.
+  In six interleaved rounds on atlas, pinned to four CPUs, the export of all 105,302
+  rows with every term read went from 105 to 40 ms. The `star-lookup` and `values-star`
+  queries took 3 to 4% less time, and `has()`, a value lookup, a subject scan and a full
+  iteration stayed within 3% of their earlier times. `has()` takes 0.84 µs in a tight
+  loop against 0.13 µs for N3.js, and 15% of its samples are the borrow tracking of the
+  Node-API binding layer. A trivial `ASK` takes 47 µs against the 30 µs of T1, nearly
+  all of it the hand-off to a worker thread and back.
+
+  `hasAll(quads)` is the batched probe. It sends the quads in one request of the binary
+  form that `addAll` uses and receives a bit array, read from the dataset's state at the
+  call. Up to 256 quads on a dataset in memory are answered on the JavaScript thread,
+  and a longer batch or a dataset on disk on the pool. In batches of 64 on atlas, a
+  probe took 0.31 µs against 0.84 µs for `has()`. N3.js took 0.13 µs for `has()` and
+  0.08 µs for each probe of a loop with one await per batch, so a batched probe is at
+  3.7 times N3.js where a single one is at 6.5 times. A profile of the batch on the
+  laptop puts 21%
+  of its samples in the block cache lookup that each quad's index probe makes, 20% in
+  reading the kept id of each term, 14% in reading the request and 17% in the
+  JavaScript term table and encoder. A probe of a sorted batch that reads each index
+  block once is the step left for it, which is ROADMAP item 946.
 * **Release work** (item 58), designed in [X12](X12-release-engineering.md):
   * *npm publishing.* `node-packages.yml` builds and checks the packages, and publishing
     needs an explicitly enabled npm environment. Switching it on needs the npm scope,

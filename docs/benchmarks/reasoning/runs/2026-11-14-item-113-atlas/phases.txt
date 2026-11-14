@@ -1,0 +1,42 @@
+# Median microseconds per phase of the trace event sparkles_reasoner::timing, round 1, one thread
+# (phases2.py of the lane: change, undo, change again, second undo of each size)
+== pre rdfs, 100 triples
+change   total=3034 changes=520 rules=330 closure=345 compile=140 delete=608 insert=266 write=301 commit=291 save+keep=66
+revert   total=2639 changes=508 rules=328 closure=337 compile=142 delete=398 insert=242 write=247 commit=282 save+keep=61
+again    total=2675 changes=482 rules=326 closure=326 compile=143 delete=469 insert=224 write=264 commit=279 save+keep=61
+revert2  total=2508 changes=487 rules=322 closure=334 compile=148 delete=370 insert=200 write=228 commit=280 save+keep=61
+== pre rdfs, 1,000 triples
+change   total=15798 changes=2074 rules=368 closure=3155 compile=190 delete=4808 insert=1194 write=2724 commit=859 save+keep=146
+revert   total=13756 changes=2136 rules=360 closure=3215 compile=179 delete=3130 insert=1238 write=2289 commit=828 save+keep=140
+again    total=14608 changes=2208 rules=364 closure=2948 compile=154 delete=4120 insert=1026 write=2432 commit=828 save+keep=144
+revert2  total=13353 changes=2066 rules=352 closure=3103 compile=204 delete=3118 insert=1182 write=2208 commit=858 save+keep=134
+== base rdfs, 100 triples
+change   total=8966 changes=819 rules=267 closure=268 compile=106 delete=5924 insert=536 write=868 commit=297 save=70 keep=23
+revert   total=3783 changes=804 rules=266 closure=278 compile=106 delete=876 insert=542 write=264 commit=294 save=61 keep=24
+again    total=3278 changes=662 rules=266 closure=282 compile=106 delete=734 insert=453 write=278 commit=288 save=59 keep=9
+revert2  total=3102 changes=660 rules=260 closure=280 compile=106 delete=620 insert=466 write=240 commit=282 save=60 keep=9
+== base rdfs, 1,000 triples
+change   total=23312 changes=2546 rules=304 closure=2250 compile=118 delete=10652 insert=2735 write=2520 commit=892 save=164 keep=128
+revert   total=18726 changes=2630 rules=296 closure=2422 compile=123 delete=7142 insert=2364 write=2192 commit=869 save=138 keep=159
+again    total=17078 changes=2237 rules=304 closure=2574 compile=117 delete=5790 insert=2315 write=2394 commit=852 save=142 keep=12
+revert2  total=16340 changes=2258 rules=284 closure=2516 compile=119 delete=5370 insert=2350 write=2194 commit=930 save=142 keep=14
+== fin rdfs, 100 triples
+change   total=8074 changes=312 rules=8 closure=26 compile=128 delete=5963 insert=531 write=907 commit=320 save=70 keep=24
+revert   total=2748 changes=270 rules=7 closure=48 compile=125 delete=884 insert=541 write=254 commit=301 save=61 keep=25
+again    total=2290 changes=210 rules=8 closure=58 compile=126 delete=732 insert=460 write=274 commit=283 save=60 keep=9
+revert2  total=2120 changes=203 rules=7 closure=54 compile=122 delete=633 insert=470 write=239 commit=280 save=58 keep=9
+== fin rdfs, 1,000 triples
+change   total=19470 changes=578 rules=10 closure=210 compile=152 delete=11126 insert=2710 write=2488 commit=832 save=169 keep=134
+revert   total=14017 changes=618 rules=9 closure=398 compile=156 delete=6963 insert=2211 write=2004 commit=961 save=139 keep=172
+again    total=12881 changes=322 rules=9 closure=580 compile=152 delete=5696 insert=2219 write=2282 commit=1015 save=144 keep=13
+revert2  total=11804 changes=274 rules=9 closure=630 compile=181 delete=5172 insert=2223 write=1968 commit=954 save=140 keep=14
+== base owl-rl, 1,000 triples
+change   total=53406 changes=2240 rules=958 closure=2384 compile=530 delete=30072 insert=11163 write=4440 commit=818 save=86 keep=458
+revert   total=89087 changes=2454 rules=940 closure=2444 compile=367 delete=68975 insert=5485 write=4645 commit=1140 save=84 keep=1357
+again    total=42326 changes=2166 rules=978 closure=2698 compile=376 delete=20470 insert=10138 write=4350 commit=825 save=82 keep=16
+revert2  total=75279 changes=2339 rules=1031 closure=2800 compile=375 delete=56442 insert=5633 write=4636 commit=1158 save=85 keep=18
+== fin owl-rl, 1,000 triples
+change   total=48304 changes=324 rules=22 closure=264 compile=506 delete=29787 insert=11023 write=4306 commit=853 save=86 keep=464
+revert   total=84118 changes=400 rules=22 closure=526 compile=610 delete=69256 insert=5564 write=4394 commit=1185 save=82 keep=1385
+again    total=37782 changes=304 rules=22 closure=856 compile=534 delete=20552 insert=9966 write=4157 commit=808 save=82 keep=16
+revert2  total=70449 changes=301 rules=21 closure=770 compile=514 delete=56701 insert=5808 write=4382 commit=1198 save=82 keep=18

@@ -8,7 +8,7 @@
 use super::explain::ExplainSource;
 use crate::Dataset;
 use crate::dataset::DatasetState;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::incr::Inference;
 use crate::sparql::QueryOptions;
 use crate::sparql::rdfs::RdfsOnRead;
@@ -25,9 +25,10 @@ pub enum ReasoningMode {
     Materialized,
     /// Facts derived while the query runs, by the query-time reasoner.
     Demand(Demand),
-    /// A choice between materialized and demand reasoning by cost. No such choice is made
-    /// at present, and [`Dataset::inference_view`] refuses it.
-    Auto,
+    /// The materialized inferences for the patterns they can answer, and derivation for
+    /// the others, chosen by cost (spec F17 §4). The query-time reasoner is as under
+    /// [`ReasoningMode::Demand`].
+    Auto(Demand),
 }
 
 /// The query-time reasoner that [`ReasoningMode::Demand`] asks for.
@@ -49,7 +50,7 @@ impl ReasoningMode {
             "false" => Some(ReasoningMode::Off),
             "true" | "materialized" => Some(ReasoningMode::Materialized),
             "demand" => Some(ReasoningMode::Demand(Demand::default())),
-            "auto" => Some(ReasoningMode::Auto),
+            "auto" => Some(ReasoningMode::Auto(Demand::default())),
             _ => None,
         }
     }
@@ -65,6 +66,14 @@ impl ReasoningMode {
     /// Whether the mode reads inferred data of any kind.
     pub fn reads_inferences(&self) -> bool {
         *self != ReasoningMode::Off
+    }
+
+    /// The query-time reasoner's settings of a demand or auto mode.
+    pub fn demand(&self) -> Option<&Demand> {
+        match self {
+            ReasoningMode::Demand(d) | ReasoningMode::Auto(d) => Some(d),
+            ReasoningMode::Off | ReasoningMode::Materialized => None,
+        }
     }
 }
 
@@ -117,8 +126,10 @@ impl InferenceView {
     /// the dataset's defaults yet get them first, so that the dataset cannot fill in
     /// inferred data later. Off leaves the materialized inferences, RDFS on read and any
     /// query-time reasoner out, and demand installs the query-time reasoner, which reads
-    /// the asserted data alone. Materialized reasoning removes a query-time reasoner and
-    /// keeps the rest of what `opts` read, so a caller's own RDFS on read stays.
+    /// the asserted data alone. Auto installs its reasoner and keeps the inferred graph,
+    /// which the query reads while the materialization can answer (spec F17 §4).
+    /// Materialized reasoning removes a query-time reasoner and keeps the rest of what
+    /// `opts` read, so a caller's own RDFS on read stays.
     pub fn apply(&self, opts: &mut QueryOptions) {
         if !opts.defaults_applied {
             *opts = self.dataset.with_query_defaults(opts).into_owned();
@@ -129,9 +140,10 @@ impl InferenceView {
                 opts.rdfs = None;
                 opts.reasoning = None;
             }
-            ReasoningMode::Demand(_) => opts.reasoning = self.provider.clone(),
+            ReasoningMode::Demand(_) | ReasoningMode::Auto(_) => {
+                opts.reasoning = self.provider.clone()
+            }
             ReasoningMode::Materialized => opts.reasoning = None,
-            ReasoningMode::Auto => {}
         }
     }
 
@@ -152,35 +164,48 @@ impl InferenceView {
     pub fn explain_source(&self) -> Option<ExplainSource> {
         match self.mode {
             ReasoningMode::Materialized => Some(ExplainSource::Materialized),
-            ReasoningMode::Demand(_) => Some(ExplainSource::Demand),
-            ReasoningMode::Off | ReasoningMode::Auto => None,
+            ReasoningMode::Demand(_) | ReasoningMode::Auto(_) => Some(ExplainSource::Demand),
+            ReasoningMode::Off => None,
         }
     }
 }
 
 impl Dataset {
-    /// The inferred data that `mode` selects. Demand reasoning builds the query-time
-    /// reasoner, as [`Dataset::query_reasoner`] does, and fails as it does. Automatic
-    /// reasoning is refused, since no cost-based choice exists.
+    /// The inferred data that `mode` selects. Demand and auto reasoning build the
+    /// query-time reasoner, as [`Dataset::query_reasoner`] does, and fail as it does. The
+    /// dataset's query-time setting (spec F17 §2.2) gives the budget a demand leaves
+    /// unset and whether auto reads a stale materialization.
     pub fn inference_view(&self, mode: ReasoningMode) -> Result<InferenceView> {
         let provider = match &mode {
-            ReasoningMode::Auto => {
-                return Err(Error::invalid(
-                    "reasoning=auto is not available yet; use demand, materialized or false",
-                ));
-            }
             #[cfg(feature = "reasoning")]
-            ReasoningMode::Demand(demand) => {
+            ReasoningMode::Demand(demand) | ReasoningMode::Auto(demand) => {
+                let setting = self.query_reasoning();
                 let reasoner = self.query_reasoner(demand.profile.clone())?;
-                let reasoner = match demand.max_derived {
+                let max_derived = demand
+                    .max_derived
+                    .or(setting.as_ref().and_then(|s| s.budget.max_derived));
+                let reasoner = match max_derived {
                     Some(n) => reasoner.with_max_derived(n),
                     None => reasoner,
                 };
-                Some(reasoner.provider())
+                let provider: Arc<dyn ReasoningProvider> = match &mode {
+                    ReasoningMode::Auto(_) => Arc::new(super::auto::AutoReasoner::new(
+                        reasoner,
+                        self.clone(),
+                        setting.as_ref().is_some_and(|s| s.stale_allowed()),
+                    )),
+                    _ => reasoner.provider(),
+                };
+                Some(match setting.as_ref().and_then(|s| s.budget.max_millis) {
+                    Some(ms) => Arc::new(super::auto::Limited::new(provider, ms)),
+                    None => provider,
+                })
             }
             #[cfg(not(feature = "reasoning"))]
-            ReasoningMode::Demand(_) => {
-                return Err(Error::unsupported("built without the `reasoning` feature"));
+            ReasoningMode::Demand(_) | ReasoningMode::Auto(_) => {
+                return Err(crate::error::Error::unsupported(
+                    "built without the `reasoning` feature",
+                ));
             }
             ReasoningMode::Off | ReasoningMode::Materialized => None,
         };

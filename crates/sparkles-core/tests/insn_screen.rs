@@ -526,6 +526,24 @@ fn vocab_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usi
                     .sum::<usize>()
             },
         );
+        // the checked decode of one key, which a cursor's sort and `term` use
+        measure(
+            out,
+            c,
+            &format!("{p}/get-random-checked"),
+            reps,
+            random_bytes,
+            || {
+                random
+                    .iter()
+                    .map(|&i| {
+                        v.get_with_checked(i, |_| Ok::<_, ()>(()), <[u8]>::len)
+                            .unwrap()
+                            .unwrap_or(0)
+                    })
+                    .sum::<usize>()
+            },
+        );
         measure(out, c, &format!("{p}/find-present"), reps, id_sum, || {
             keys.iter()
                 .map(|k| v.find(k).unwrap_or(u64::MAX / 4))
@@ -681,8 +699,9 @@ fn fnv(parts: &[&str]) -> u64 {
 
 /// The cases' parameters beyond the data and the commits, which a change to the screen
 /// bumps so that a comparison with an older baseline fails.
-const CASES: &str = "vocab: open, for-each, get-sorted every 7th, get-random 50000, find every 13th, \
-                     missing, prefix 12 bytes of every 130th; wal: open, open with commits, replay; v1";
+const CASES: &str = "vocab: open, for-each, get-sorted every 7th, get-random 50000, \
+                     get-random-checked 50000, find every 13th, missing, prefix 12 bytes of \
+                     every 130th; wal: open, open with commits, replay; v2";
 
 fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize) {
     let commits = env("INSN_SCREEN_COMMITS", 2000);

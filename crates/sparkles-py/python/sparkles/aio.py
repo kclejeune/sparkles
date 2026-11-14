@@ -245,13 +245,13 @@ class _Cursor(Generic[_T]):
             if not self._pending:
                 native = self._native
 
-                def fetch() -> tuple[Any, dict[str, Any], dict[str, Any]]:
+                # The plan is read when it is asked for and when the cursor closes, so a
+                # batch brings only the statistics that `status` reads.
+                def fetch() -> tuple[Any, dict[str, Any]]:
                     rows = native._next_batch()
-                    return rows, native.stats(), native.plan()
+                    return rows, native.stats()
 
-                rows, self._stats, self._plan = await self._worker.call(
-                    fetch, self._token
-                )
+                rows, self._stats = await self._worker.call(fetch, self._token)
                 if rows is None:
                     self._busy = False
                     await self.aclose()
@@ -312,13 +312,27 @@ class _Cursor(Generic[_T]):
         native = self._native
         try:
 
-            def close() -> tuple[dict[str, Any], dict[str, Any]]:
-                native.close()
-                return native.stats(), native.plan()
+            # The plan is read before the close as well, so that a close that fails
+            # still leaves the plan as the last batch left it.
+            def close() -> tuple[Any, Any, BaseException | None]:
+                try:
+                    before = native.plan()
+                except BaseException:
+                    before = None
+                try:
+                    native.close()
+                    return native.stats(), native.plan(), None
+                except BaseException as error:
+                    return None, before, error
 
-            self._stats, self._plan = await self._worker.call(
+            stats, plan, error = await self._worker.call(
                 close, _token(), interruptible=False
             )
+            if plan is not None:
+                self._plan = plan
+            if error is not None:
+                raise error
+            self._stats = stats
             if pending and self._stats["status"] == "complete":
                 self._stats = dict(self._stats, status="stopped")
         finally:

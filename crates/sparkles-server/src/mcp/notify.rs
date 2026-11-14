@@ -71,13 +71,26 @@ impl McpServer {
     fn resource_state(&self, p: &Principal, uri: &str) -> Option<u64> {
         let rest = uri.strip_prefix(SCHEME)?;
         let (name, path) = rest.split_once('/')?;
-        let ds = self.dataset(p, Some(name)).ok()?;
+        let ds = if path == Kind::Branches.path() {
+            self.main_dataset(&p.clone().on_branch(None), Some(name))
+                .ok()?
+        } else {
+            self.dataset(p, Some(name)).ok()?
+        };
         // a dataset deleted and created again under its name is another one
         let instance = Arc::as_ptr(&ds) as usize;
         match path {
             x if x == Kind::Schema.path() => Some(hash(&(instance, ds.store.head_commit().seq))),
             x if x == Kind::Review.path() => {
                 let state = super::memory::pending::state(&self.state, &ds, p)?;
+                Some(hash(&(instance, state)))
+            }
+            x if x == Kind::Branches.path() => {
+                if !self.allows(p, "create_branch") {
+                    return None;
+                }
+                let default = self.shared.cfg.scratch_ttl;
+                let state = super::branches::own_branches_state(&self.state, &ds, p, default);
                 Some(hash(&(instance, state)))
             }
             x if x == Kind::Prefixes.path() => {

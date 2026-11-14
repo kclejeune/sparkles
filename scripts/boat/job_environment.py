@@ -39,11 +39,12 @@ def pinned_mbx(profile):
 # so MBX's default cache directory is empty after every resume. Every job therefore
 # names one cache directory outside ~/.cache, which holds the worker's single shared
 # store with its managed targets and incremental state, and the normal stop's snapshot
-# keeps it for the next resume. Its shared budget holds two release builds and the
-# workspace test builds. The free-space floor keeps the 40 GiB that the metadata probe
-# requires at the next qualification on the large worker's disk.
+# keeps it for the next resume. Its shared budget is 40 GiB, so that with the system's
+# share the store leaves a cold workspace test build its peak on the large worker's 146 GiB
+# disk. The free-space floor keeps the 40 GiB that the metadata probe requires at the next
+# qualification.
 LOCAL_STORE_DIR = '.local/share/mbx-cache'
-LOCAL_STORE_TOTAL = '64GiB'
+LOCAL_STORE_TOTAL = '40GiB'
 LOCAL_STORE_MIN_FREE = '45GiB'
 
 
@@ -55,9 +56,11 @@ def local_store(profile):
 def environment(profile):
     # Jobs resolve the pinned MBX install directly and select the pinned Rust
     # toolchain by name, so neither a missing shim nor the rustup default is used.
+    # The worker image has rustup's rustdoc proxy only in /usr/local/cargo/bin, which follows
+    # /usr/local/bin, so doctests find it and rustc still resolves as before.
     home = profile['worker_home']
     return {'PATH': ':'.join([home+'/.local/share/mbx/bin', pinned_mbx(profile).removesuffix('/mbx'), home+'/.local/bin',
-                             home+'/.cargo/bin', '/usr/local/bin', '/usr/bin', '/bin']),
+                             home+'/.cargo/bin', '/usr/local/bin', '/usr/local/cargo/bin', '/usr/bin', '/bin']),
             'RUSTUP_TOOLCHAIN': profile['tool_versions']['rust'],
             'RUSTUP_AUTO_INSTALL': '0',
             'MBX_REMOTE_URL': '',

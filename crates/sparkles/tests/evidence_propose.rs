@@ -206,6 +206,7 @@ fn claim(alias: &str, occurrence: &str, proposition: Triple) -> ClaimInput {
         attributed_author: iri("urn:publisher"),
         scope: Default::default(),
         confidence: Default::default(),
+        validity: None,
     }
 }
 

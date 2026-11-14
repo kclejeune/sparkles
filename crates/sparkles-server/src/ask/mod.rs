@@ -543,6 +543,21 @@ struct Ground {
     prefixes: Map<String, Value>,
 }
 
+/// The linker's result for the question's mentions.
+#[derive(Default)]
+struct Linked {
+    /// the context lines of the mentions that link, with their candidates
+    lines: String,
+    /// each mention with its verdict and candidates, for the ground event
+    entities: Vec<Value>,
+    ambiguous: Option<(String, Vec<Value>)>,
+    exact: bool,
+    /// the linker's prefixes, which its candidate IRIs use
+    prefixes: Value,
+    /// the expanded IRIs of the candidates the context shows
+    shown: std::collections::BTreeSet<String>,
+}
+
 /// The graphs that usage queries read.
 struct UsageScope {
     named: bool,
@@ -1035,6 +1050,15 @@ impl Asking<'_, '_> {
         };
         let mut ctx = String::new();
         let mut ground_event = json!({});
+        let mentions = mentions(&self.o.question);
+        // §4.4: without type hints the linker reads only the question, so it runs first,
+        // and an ambiguous mention is asked about before the schema, the examples and
+        // the predicate use are read for a draft that does not happen yet.
+        let mut linked = (!self.o.type_hints)
+            .then(|| self.link_mentions(&mentions, candidates_k, &[], &Value::Null));
+        if let Some(l) = linked.take_if(|l| self.clarifies(l)) {
+            return self.clarify_ground(l, mentions, candidates_k, context_tokens, small);
+        }
         // Keep common vocabulary for joins and labels alongside question matches.
         // Both calls read the caller-visible cached report, never evaluation gold.
         let common = self
@@ -1147,6 +1171,17 @@ impl Asking<'_, '_> {
         }
         ground_event["classes"] = classes.iter().map(|c| c["iri"].clone()).collect();
         ground_event["predicates"] = predicates.iter().map(|c| c["iri"].clone()).collect();
+        // with type hints the linker reads the matched classes, so it runs after the schema
+        let linked = match linked {
+            Some(l) => l,
+            None => {
+                let l = self.link_mentions(&mentions, candidates_k, &classes, &schema["prefixes"]);
+                if self.clarifies(&l) {
+                    return self.clarify_ground(l, mentions, candidates_k, context_tokens, small);
+                }
+                l
+            }
+        };
         // stored examples
         let examples = self
             .ground_tool(
@@ -1186,100 +1221,17 @@ impl Asking<'_, '_> {
             .map(str::to_string);
         ground_event["examples"] = examples.iter().map(|e| e["name"].clone()).collect();
         // linked mentions
-        let mut ambiguous = None;
-        let mut exact = false;
-        let mentions = mentions(&self.o.question);
-        let mut entities = Vec::new();
-        let mut link_prefixes = Value::Null;
-        let mut shown = std::collections::BTreeSet::new();
-        if !mentions.is_empty() {
-            let list: Vec<Value> = mentions
-                .iter()
-                .map(|m| {
-                    let mut v = json!({ "text": m });
-                    if self.o.type_hints {
-                        let around = crate::mcp::relevance::words(&repair::mention_context(
-                            &self.o.question,
-                            m,
-                        ));
-                        let types =
-                            grounding::matched_classes(&classes, &around, &schema["prefixes"], 2);
-                        if !types.is_empty() {
-                            v["types"] = json!(types);
-                        }
-                    }
-                    v
-                })
-                .collect();
-            if let Ok(v) = self
-                .ground_tool(
-                    profile::Stage::Linker,
-                    "link_entities",
-                    json!({"mentions": list, "k": candidates_k, "evidence": true, "popularity": true}),
-                    true,
-                )
-                .or_else(|error| {
-                    if error.code.as_ref() == "budget-result-bytes" {
-                        self.ground_tool(
-                            profile::Stage::Linker,
-                            "link_entities",
-                            json!({"mentions": list, "k": candidates_k, "popularity": true}),
-                            true,
-                        )
-                    } else {
-                        Err(error)
-                    }
-                })
-            {
-                link_prefixes = v["prefixes"].clone();
-                let ms = v["mentions"].as_array().cloned().unwrap_or_default();
-                let mut lines = String::new();
-                for m in &ms {
-                    let text = m["text"].as_str().unwrap_or("");
-                    let verdict = m["verdict"].as_str().unwrap_or("none");
-                    let mut cands = m["candidates"].as_array().cloned().unwrap_or_default();
-                    for candidate in &mut cands {
-                        entity_evidence::restore_identity(candidate);
-                    }
-                    if verdict == "ambiguous"
-                        && let Some(index) = entity_evidence::preferred_display_candidate(
-                            text,
-                            &self.o.question,
-                            &m["evidence"],
-                            &cands,
-                            &v["prefixes"],
-                        )
-                    {
-                        // The bounded display is not proof of uniqueness. Reorder
-                        // offered choices without changing the linker's verdict.
-                        let chosen = cands.remove(index);
-                        cands.insert(0, chosen);
-                    }
-                    exact |= verdict == "exact";
-                    if verdict == "ambiguous" && ambiguous.is_none() {
-                        ambiguous = Some((text.to_string(), cands.clone()));
-                    }
-                    entities.push(json!({
-                        "text": text,
-                        "verdict": verdict,
-                        "candidates": cands.iter().map(|c| json!({"iri": c["iri"], "label": c["label"]})).collect::<Vec<_>>(),
-                    }));
-                    if verdict == "none" {
-                        continue;
-                    }
-                    lines.push_str(&format!("{} ({verdict}):\n", Value::from(text)));
-                    for c in &cands {
-                        if let Some(i) = c["iri"].as_str() {
-                            shown.insert(grounding::expanded(i, &v["prefixes"]));
-                        }
-                        lines.push_str(&candidate_line(c, self.o.type_hints));
-                    }
-                }
-                if !lines.is_empty() {
-                    ctx.push_str("\nEntities that the question may name:\n");
-                    ctx.push_str(&lines);
-                }
-            }
+        let Linked {
+            lines,
+            entities,
+            ambiguous,
+            exact,
+            prefixes: link_prefixes,
+            shown,
+        } = linked;
+        if !lines.is_empty() {
+            ctx.push_str("\nEntities that the question may name:\n");
+            ctx.push_str(&lines);
         }
         // The predicates that the linked entities and the instances of the question's
         // classes use, from the data itself, so that a relation the question names in
@@ -1395,6 +1347,144 @@ impl Asking<'_, '_> {
             usage_entities,
             link_k: candidates_k,
             prefixes: schema["prefixes"].as_object().cloned().unwrap_or_default(),
+        }
+    }
+
+    /// The linker's candidates for the question's mentions, with the context lines that
+    /// show them. A linker error leaves every mention unlinked, as before.
+    fn link_mentions(
+        &self,
+        mentions: &[String],
+        candidates_k: usize,
+        classes: &[Value],
+        schema_prefixes: &Value,
+    ) -> Linked {
+        let mut out = Linked::default();
+        if mentions.is_empty() {
+            return out;
+        }
+        let list: Vec<Value> = mentions
+            .iter()
+            .map(|m| {
+                let mut v = json!({ "text": m });
+                if self.o.type_hints {
+                    let around =
+                        crate::mcp::relevance::words(&repair::mention_context(&self.o.question, m));
+                    let types = grounding::matched_classes(classes, &around, schema_prefixes, 2);
+                    if !types.is_empty() {
+                        v["types"] = json!(types);
+                    }
+                }
+                v
+            })
+            .collect();
+        let Ok(v) = self
+            .ground_tool(
+                profile::Stage::Linker,
+                "link_entities",
+                json!({"mentions": list, "k": candidates_k, "evidence": true, "popularity": true}),
+                true,
+            )
+            .or_else(|error| {
+                if error.code.as_ref() == "budget-result-bytes" {
+                    self.ground_tool(
+                        profile::Stage::Linker,
+                        "link_entities",
+                        json!({"mentions": list, "k": candidates_k, "popularity": true}),
+                        true,
+                    )
+                } else {
+                    Err(error)
+                }
+            })
+        else {
+            return out;
+        };
+        out.prefixes = v["prefixes"].clone();
+        let ms = v["mentions"].as_array().cloned().unwrap_or_default();
+        for m in &ms {
+            let text = m["text"].as_str().unwrap_or("");
+            let verdict = m["verdict"].as_str().unwrap_or("none");
+            let mut cands = m["candidates"].as_array().cloned().unwrap_or_default();
+            for candidate in &mut cands {
+                entity_evidence::restore_identity(candidate);
+            }
+            if verdict == "ambiguous"
+                && let Some(index) = entity_evidence::preferred_display_candidate(
+                    text,
+                    &self.o.question,
+                    &m["evidence"],
+                    &cands,
+                    &v["prefixes"],
+                )
+            {
+                // The bounded display is not proof of uniqueness. Reorder
+                // offered choices without changing the linker's verdict.
+                let chosen = cands.remove(index);
+                cands.insert(0, chosen);
+            }
+            out.exact |= verdict == "exact";
+            if verdict == "ambiguous" && out.ambiguous.is_none() {
+                out.ambiguous = Some((text.to_string(), cands.clone()));
+            }
+            out.entities.push(json!({
+                "text": text,
+                "verdict": verdict,
+                "candidates": cands.iter().map(|c| json!({"iri": c["iri"], "label": c["label"]})).collect::<Vec<_>>(),
+            }));
+            if verdict == "none" {
+                continue;
+            }
+            out.lines
+                .push_str(&format!("{} ({verdict}):\n", Value::from(text)));
+            for c in &cands {
+                if let Some(i) = c["iri"].as_str() {
+                    out.shown.insert(grounding::expanded(i, &v["prefixes"]));
+                }
+                out.lines.push_str(&candidate_line(c, self.o.type_hints));
+            }
+        }
+        out
+    }
+
+    /// An initial ask with an ambiguous mention asks about it before drafting (§4.4).
+    fn clarifies(&self, linked: &Linked) -> bool {
+        self.o.clarification.is_none() && linked.ambiguous.is_some()
+    }
+
+    /// The grounding of an ask that stops at a clarification: the linked mentions,
+    /// without the schema terms, examples, predicate use or communities that only a
+    /// draft reads.
+    fn clarify_ground(
+        &mut self,
+        linked: Linked,
+        mentions: Vec<String>,
+        candidates_k: usize,
+        context_tokens: u64,
+        small: bool,
+    ) -> Ground {
+        self.trimmed = json!({
+            "contextTokens": context_tokens,
+            "trimmed": small,
+            "classes": 0,
+            "predicates": 0,
+            "examples": 0,
+        });
+        self.emit(
+            "ground",
+            &json!({ "entities": linked.entities, "trimmed": small }),
+        );
+        Ground {
+            stable: String::new(),
+            context: String::new(),
+            ambiguous: linked.ambiguous,
+            best_example: None,
+            exact: linked.exact,
+            mentions,
+            shown: linked.shown,
+            usage_entities: Vec::new(),
+            link_k: candidates_k,
+            prefixes: Map::new(),
         }
     }
 

@@ -67,6 +67,11 @@ export interface NativeDataset {
   ): NativeBatch | NativeResult | null;
   /** whether the quad of a `TermCache` request is there, in memory; null for a dataset on disk */
   containsTerms(text: string, data: Uint32Array): boolean | null;
+  /**
+   * whether each quad of a `TermCache` request is there, as a bit array in the order of
+   * the request; a promise for a long request or a dataset on disk
+   */
+  containsAllTerms(text: string, data: Uint32Array): Uint32Array | Promise<Uint32Array>;
   matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;

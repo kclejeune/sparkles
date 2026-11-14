@@ -315,3 +315,127 @@ async fn brief_entities() {
     .await;
     assert_eq!(s, 400, "a session needs a query: {v}");
 }
+
+/// Item 435: the brief names the caller's scratch branches that expire within the
+/// dataset's `notifyBefore`, in text lines whose names are escaped and in
+/// `expiringBranches`, and names none without the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn brief_names_expiring_scratch_branches() {
+    let (server, app) = writable("").await;
+    let ds = server.state.get("org").unwrap();
+    for (name, creator) in [("w-1", "local"), ("other", "user:someone")] {
+        ds.dataset.create_branch(name, &Default::default()).unwrap();
+        ds.store
+            .set_branch_scratch(
+                name,
+                Some(sparkles::branch::Scratch {
+                    creator: creator.into(),
+                    keep: false,
+                }),
+            )
+            .unwrap();
+    }
+    ds.dataset
+        .branch("w-1")
+        .unwrap()
+        .update("INSERT DATA { <urn:a> <urn:p> 1 }")
+        .unwrap();
+    let body = json!({"scope": "project", "projectKey": "github.com/acme/shop"}).to_string();
+    let settings = |sb: Value| {
+        json!({"agentGraphs": [format!("{BASE}*")], "imports": {"base": BASE}, "scratchBranches": sb})
+            .to_string()
+    };
+    // a TTL without a window: no lines
+    let (s, v) = send(
+        &app,
+        "PUT",
+        "/$/memory/org",
+        &settings(json!({"ttl": "1h"})),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = send(&app, "POST", "/org/memory/brief", &body).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(!v["text"].as_str().unwrap().contains("# scratch:"), "{v}");
+    assert!(v.get("expiringBranches").is_none(), "{v}");
+    let (s, v) = send(
+        &app,
+        "PUT",
+        "/$/memory/org",
+        &settings(json!({"ttl": "1h", "notifyBefore": "2h"})),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = send(&app, "POST", "/org/memory/brief", &body).await;
+    assert_eq!(s, 200, "{v}");
+    let text = v["text"].as_str().unwrap();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("# scratch:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(
+        lines[0].starts_with("# scratch: branch w-1 expires at ")
+            && lines[0].ends_with(" with 1 commit not merged"),
+        "{text}"
+    );
+    let list = v["expiringBranches"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{v}");
+    assert_eq!(list[0]["name"], "w-1");
+    assert_eq!(list[0]["ahead"], 1);
+    // a brief that reads a branch, as the MCP `branch` argument selects, names them too
+    let mut call = Call {
+        arrived: std::time::Instant::now(),
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        request_id: "brief-on-branch".into(),
+        principal: crate::auth::Principal::local().on_branch(Some("w-1")),
+        headers: None,
+        held: None,
+        grant: None,
+        preparation: None,
+    };
+    let args = json!({"dataset": "org", "scope": "project", "projectKey": "github.com/acme/shop"});
+    let out = tokio::task::block_in_place(|| {
+        server.run_now("memory_brief", args.as_object().unwrap().clone(), &mut call)
+    });
+    let v = match out {
+        Ok(Outcome::Structured(v)) => v,
+        Ok(Outcome::Text(t)) => panic!("{t}"),
+        Err(e) => panic!("{}", e.message),
+    };
+    assert!(
+        v["text"]
+            .as_str()
+            .unwrap()
+            .contains("# scratch: branch w-1 "),
+        "{v}"
+    );
+    // long names within the smallest maxChars: the lines fit or are left out
+    for i in 0..6 {
+        let name = format!("{}{i}", "x".repeat(63));
+        ds.dataset
+            .create_branch(&name, &Default::default())
+            .unwrap();
+        ds.store
+            .set_branch_scratch(
+                &name,
+                Some(sparkles::branch::Scratch {
+                    creator: "local".into(),
+                    keep: false,
+                }),
+            )
+            .unwrap();
+    }
+    let small = json!({"scope": "project", "projectKey": "github.com/acme/shop", "maxChars": 500})
+        .to_string();
+    let (s, v) = send(&app, "POST", "/org/memory/brief", &small).await;
+    assert_eq!(s, 200, "{v}");
+    let text = v["text"].as_str().unwrap();
+    assert!(
+        text.chars().count() <= 500,
+        "{} chars: {text}",
+        text.chars().count()
+    );
+    assert!(text.contains("# scratch:"), "{text}");
+    assert_eq!(v["expiringBranches"].as_array().unwrap().len(), 7, "{v}");
+}

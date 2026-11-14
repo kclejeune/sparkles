@@ -107,10 +107,106 @@ operators' build, whose OWL 2 RL rule set also gained the missing rules of the P
 tables, which add 720 facts to each OWL2Bench run and 350 to LUBM(100). Within one build,
 `examples/lubm.rs` derived the same facts, with the same order-free digest, with and
 without the operators. OWL2Bench(10) exceeded the 14 GiB run limit with or without the operators, and with the
-operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally. Where
-that memory goes has not been profiled, and roadmap item 522 covers it. LUBM(100)
+operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally. The
+profile of roadmap items 835 and 865 found where the memory of the 5-university run goes
+and bounded it, as the next paragraph records, and item 522 covers the 10-university run. LUBM(100)
 gains nothing, because its transitive relations are short and its time goes to the
 other rules.
+
+On wally, a 20-thread development host with 32 GiB, `sparkles infer --full --profile
+owl-rl --max-inferred 2e8` on OWL2Bench with 5 universities, two interleaved rounds per
+thread count against the build before the columnar derived tier (88538906), derived
+52,966,139 facts in six iterations with every build. The derived tier at 2ced03ad held
+them in 2,137 MB, 40 bytes per fact with the triple index, and the reasoner's budget
+peaked at 10.5 GB, 199 bytes per fact, in the closure operators' first step. With the
+operators' batched merges at f6264c44 the budget peaked at 4.2 GB, 80 bytes per fact, and
+the tier ended at 2,467 MB. The whole command's peak resident set stayed between 9.4 and
+10.9 GiB for every build, since the commit of the derived triples to the store follows
+the reasoning. Wall times at one thread were 70 and 67 s before the tier, 89 and 84 s with
+it and 89 and 85 s with the batches, and at 20 threads 38 and 34 s, 41 and 42 s, and 41
+and 38 s. With item 866's row of 24 bytes, 16-byte sort entries and digit sort, in two
+further rounds against the same base build, the wall times were 81 and 78 s against 75 and
+69 s at one thread and 39.0 and 37.6 s against 40.7 and 37.3 s at 20 threads, with the
+budget's peak at 4.6 GB, 87 bytes per fact, and the tier at 2,745 MB. LUBM(100) under
+`owl-rl` took 25.7 and 25.2 s against 24.8 and 24.7 s at one thread, 14.7 and 14.6 s
+against 14.3 and 14.1 s at 20 threads, and the insertion and deletion of every hundredth
+of its triples at 20 threads 2.2 and 3.0 s against 2.1 and 2.9 s.
+
+With the grouped head probes and exact distinct-key counts of item 866 at 75e7fb61, on
+atlas, an Intel Core i5-13500 like the benchmark host, in four interleaved rounds against
+the build before the tier with one thread pinned to one core or 20 threads, OWL2Bench(5)
+took 100.8 to 105.4 s against 102.2 to 107.4 s at one thread and 50.2 to 52.7 s against
+50.8 to 54.2 s at 20 threads. The tier before the grouped probes had taken 114.7 to
+116.0 s at one thread on the same host, and the rule `prp-symp`, whose probes of the
+triple index made most of that difference, took 7.0 s against 9.8 s. LUBM(100) under
+`owl-rl` took 37.5 to 38.0 s against 37.3 to 37.8 s at one thread and 16.1 to 16.7 s
+against 16.5 to 17.1 s at 20 threads. The insertion of every hundredth of its triples at
+20 threads took 2.43 to 2.46 s against 2.35 to 2.41 s and the deletion 3.30 to 3.34 s
+against 3.23 to 3.27 s, about 2% slower in every round, and the one-thread run 0.5%
+slower in every round, which roadmap item 938 investigates. The
+[run directory](runs/2026-11-13-item-866-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-13-item-866-atlas/env.txt), the
+[timings](runs/2026-11-13-item-866-atlas/results.txt), the
+[trace lines](runs/2026-11-13-item-866-atlas/trace-lines.txt) with each run's derived count,
+and the [earlier rounds](runs/2026-11-13-item-866-atlas/earlier-rounds.txt) of the tier
+before the grouped probes. Both builds derived 52,966,139 and 10,907,379 facts, the budget's peak on
+OWL2Bench(5) stayed at 4.6 GB and the tier ended at 2,746 MB. These are benchmark-worker
+measurements, and the benchmark host has not rerun them.
+
+### Sampled rule-body planning
+
+Roadmap item 939 orders rule bodies from sampled bindings. On atlas, an Intel Core
+i5-13500 like the benchmark host, one build of `examples/lubm.rs` at `a63916c0` ran each
+workload with the greedy orders and with the sampled orders in interleaved rounds, with
+one thread pinned to one core or 20 threads. The rules' time is the time of `infer`,
+which derives the closure in memory, and the materialization's is that of `materialize`
+on a fresh copy of the database.
+
+| Workload | Threads | Greedy orders | Sampled orders | Pairs |
+|---|---|---|---|---|
+| OWL2Bench(5), rules | 1 | 51.6 to 51.8 s | 29.9 s | 3 |
+| OWL2Bench(5), rules | 20 | 12.5 to 12.8 s | 9.5 to 9.7 s | 5 |
+| OWL2Bench(5), materialization | 1 | 102.5 to 102.8 s | 80.6 to 80.8 s | 2 |
+| OWL2Bench(5), materialization | 20 | 45.5 to 49.2 s | 42.5 to 42.7 s | 3 |
+| OWL2Bench(1), rules | 1 | 976 to 988 ms | 662 to 696 ms | 7 |
+| OWL2Bench(1), rules | 20 | 403 to 451 ms | 319 to 355 ms | 7 |
+| LUBM(100), rules | 1 | 14.50 to 14.55 s | 14.51 to 14.55 s | 6 |
+| LUBM(100), rules | 20 | 2.85 to 2.91 s | 2.82 to 2.89 s | 6 |
+| LUBM(100), materialization | 1 | 40.7 to 41.3 s | 40.7 to 40.8 s | 3 |
+| LUBM(100), materialization | 20 | 18.4 to 18.8 s | 18.5 to 18.7 s | 3 |
+| LUBM(10), rules | 1 | 926 to 933 ms | 930 to 970 ms | 7 |
+| LUBM(10), rules | 20 | 236 to 291 ms | 213 to 317 ms | 7 |
+| LUBM(100), long-body user rules | 1 | 5.69 to 5.74 s | 5.68 to 5.70 s | 4 |
+| LUBM(100), long-body user rules | 20 | 1.08 to 1.11 s | 1.08 to 1.14 s | 5 |
+| LUBM(10), long-body user rules | 1 | 375 to 383 ms | 376 to 417 ms | 7 |
+| LUBM(10), long-body user rules | 20 | 147 to 169 ms | 152 to 176 ms | 7 |
+
+Every pair of `infer` runs derived the same facts, with equal digests. Under OWL 2 RL
+they are 52,966,139 facts on OWL2Bench(5), 1,400,688 on OWL2Bench(1), 10,907,379 on
+LUBM(100) and 1,038,100 on LUBM(10), and the long-body rules derive 416,960 on LUBM(100)
+and 39,667 on LUBM(10). `materialize` prints no digest, and every pair of its runs
+inferred the same number of facts. The planner counts the plans that take a sampled
+order. On the same databases that count is zero in every iteration of the four LUBM
+workloads and four on OWL2Bench(1), as the
+[plan counts](runs/2026-11-14-item-939-atlas/plan-counts.txt) record, and `prp-key` is
+the rule that reads a key's value before it joins the keyed class with itself. The
+difference on LUBM is therefore taken to be the cost of planning. On LUBM(10) at one
+thread six of the seven sampled runs took 930 to 936 ms and one took 970 ms. The median
+of the seven paired differences is 4 ms and their mean 9 ms, and roadmap item 945 covers
+this cost. The highest peak heap of the sampled runs of a workload is within 3.1 MiB of
+that of the greedy runs under OWL 2 RL, where single pairs at 20 threads differ by up to
+13.7 MiB. With the long-body rules it is 805.9 against 790.6 MiB on LUBM(100) at one
+thread, 804.7 against 791.2 MiB at 20 threads, where one pair differs by 19.6 MiB, and
+95.6 against 90.2 MiB on LUBM(10) at 20 threads. The
+[run directory](runs/2026-11-14-item-939-atlas/run.sh.txt) holds the commands, the
+[host and build](runs/2026-11-14-item-939-atlas/env.txt), the
+[rule file](runs/2026-11-14-item-939-atlas/long-bodies.rules), the timings of the
+[first](runs/2026-11-14-item-939-atlas/results-part1.txt) and the
+[second](runs/2026-11-14-item-939-atlas/results-part2.txt) part of the run and their
+[summary](runs/2026-11-14-item-939-atlas/summary.txt). These are benchmark-worker
+measurements of `a63916c0`. The item's later commits, which make the planner keep the
+greedy order in more cases and bound its reads, and the benchmark host have not repeated
+them.
 
 ### Small incremental runs
 
@@ -129,10 +225,40 @@ threads, each run alone on a fresh copy of the dataset.
 format 2 dataset at commit 534a7ad3.*
 
 The kept closure leaves out the explicit facts, so it needs 41% and 47% of the 2,267 and
-2,654 MiB that a closure keeping them needs. Changes of 1,000 triples stay within 1.2 times
-their time with the larger closure, while changes of 100 triples at 16 threads and undos at
-1 thread take 1.3 to 2.3 times as long. [Roadmap](../../ROADMAP.md) item 113 follows up those
-slowdowns.
+2,654 MiB that a closure keeping them needs.
+
+`churn` of `examples/lubm.rs` makes many changes over one kept closure. Each change goes to a university that no
+earlier change touched and is followed by its undo, the change again and a second undo. A process makes 40 changes of 100 triples, 20 of 1,000 and 6 of 10,000 on the
+same dataset. The table gives the medians of three interleaved rounds, each process alone
+on a fresh copy of the dataset, at one thread and on a reasoning pool of 16 threads.
+
+| Run | Change | Undo | Change again | Second undo |
+|---|---:|---:|---:|---:|
+| RDFS, 100 triples, 1 thread | 8.0 ms | 2.7 ms | 2.3 ms | 2.1 ms |
+| RDFS, 1,000 triples, 1 thread | 19.4 ms | 14.0 ms | 12.7 ms | 11.7 ms |
+| RDFS, 10,000 triples, 1 thread | 130 ms | 127 ms | 106 ms | 105 ms |
+| OWL 2 RL, 100 triples, 1 thread | 12.0 ms | 10.7 ms | 6.2 ms | 8.7 ms |
+| OWL 2 RL, 1,000 triples, 1 thread | 48.6 ms | 83.3 ms | 37.2 ms | 69.3 ms |
+| OWL 2 RL, 10,000 triples, 1 thread | 379 ms | 957 ms | 366 ms | 823 ms |
+| RDFS, 100 triples, pool of 16 | 5.5 ms | 2.8 ms | 2.1 ms | 2.1 ms |
+| RDFS, 1,000 triples, pool of 16 | 11.4 ms | 10.6 ms | 9.5 ms | 9.9 ms |
+| RDFS, 10,000 triples, pool of 16 | 79.3 ms | 88.0 ms | 77.4 ms | 78.0 ms |
+| OWL 2 RL, 100 triples, pool of 16 | 8.8 ms | 11.3 ms | 5.8 ms | 10.2 ms |
+| OWL 2 RL, 1,000 triples, pool of 16 | 27.2 ms | 53.4 ms | 24.3 ms | 48.4 ms |
+| OWL 2 RL, 10,000 triples, pool of 16 | 210 ms | 411 ms | 200 ms | 367 ms |
+
+*Measured on atlas, a benchmark worker with the benchmark host's hardware, on 2026-11-14
+at commit 1590064b. The benchmark host has not rerun these.*
+
+On this data and host, RDFS undos and repeated changes take 0.85 to 1.08 times their time
+with the larger closure at one thread and 0.67 to 1.05 times on the pool. OWL 2 RL changes take 1.2 to 2.3 times as
+long at one thread and 0.9 to 1.7 times on the pool, which [roadmap](../../ROADMAP.md)
+item 941 follows up. The first change of 100 RDFS triples to a university takes 2.6 times
+as long at one thread, which is item 942. The
+[run directory](runs/2026-11-14-item-113-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-14-item-113-atlas/env.txt), the
+[medians with their ranges](runs/2026-11-14-item-113-atlas/results.txt) and
+[every step's quartiles](runs/2026-11-14-item-113-atlas/steps.txt).
 
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.

@@ -1,12 +1,12 @@
 # F17: Query-time reasoning
 
-> **Status:** implemented in part, Phase 1.
+> **Status:** implemented in part, Phase 1 and the first part of Phase 2.
 >
 > **Phases:** Demand derivation, Jena backward rules, tables cached per snapshot and
-> view, budgets and EXPLAIN are available. Automatic cost selection, hybrid execution,
-> OWL 2 QL rewriting, additional settings and surfaces, and reuse across commits remain
-> planned in Phase 2. Incremental maintenance through F13 and later provenance remain
-> planned in Phase 3.
+> view, budgets and EXPLAIN are available, with `auto`, its cost model and the dataset
+> setting. Hybrid execution, OWL 2 QL rewriting, reuse across commits and the remaining
+> surfaces remain planned in Phase 2. Incremental maintenance through F13 and later
+> provenance remain planned in Phase 3.
 >
 > **User docs:** [Query-time reasoning](../API.md#query-time-reasoning) and
 > [features](../reasoning/README.md#reasoning-validation-and-schema).
@@ -879,6 +879,119 @@ schema terms can expand the demand program far beyond the closure (roadmap items
 and 190).
 
 
+### Schema completeness at scale (item 911)
+
+Item 191 made schema facts that follow from derived instance facts complete under
+`demand`. A session proves which schema relations its preliminary schema pass already
+holds in full with two analyses. `complete_schema` reads the rules alone, and
+`refine_schema` evaluates a finite abstraction of the visible facts, in which every
+schema or program constant, every predicate and every type class stays concrete and
+every other instance position becomes a wildcard. Only proven relations are specialized
+into the query's program. An unproven relation stays in the ordinary demand program,
+which follows its derived premises.
+
+On LUBM the abstraction never finished. Its join enumerated every abstract fact for
+every binding, and a rule with a variable predicate passed the cap of 1,024 bindings,
+so the analysis fell back to the conservative answer and left every schema relation
+open. Measured on one university, `rdfs` closed none of its 4 schema predicates and 4
+meta classes and `owl-rl` none of its 19 and 12. The program was then about 780 rules
+over the unspecialized schema joins, and an `owl-rl` query derived about the whole type
+closure, 0.5 to 1.1 s for LUBM q1 at one university and 1.9 to 3.1 s at ten. The
+analysis also scanned the visible facts twice for every query, 23 to 50 ms of an `rdfs`
+q1 of 30 to 57 ms at one university.
+
+Three changes keep item 191's guarantee and repair the path.
+
+* **(a) An abstraction that scales.** The join indexes the abstract facts by predicate
+  and the abstract types by class, so an atom whose predicate or class is known visits
+  only the facts it can match, and a fact with a wildcard predicate or class stays a
+  candidate of every atom it can match. Those facts are listed once beside the buckets,
+  so the index stays linear in the abstract facts and within the admitted workspace.
+  The caps rise to 16,384 abstract facts and 16,384 bindings per join step. LUBM's abstraction holds about 1,450 facts under
+  `owl-rl` and 750 under `rdfs`. The workspace admitted before the analysis grows with
+  the caps, from about 5 MB to about 40 MB for the shipped profiles. Two
+  overestimates that kept relations open on LUBM narrow without losing soundness.
+  `listMember` and `listEntry` follow the list from its head through `rdf:rest` when
+  every abstract list link has a concrete node, and take the members of every list
+  otherwise. A `regex` with a constant pattern rules out a binding whose known text it
+  does not match, so `rdfs12cmp` no longer makes every property a container membership
+  property. The abstraction remains an overestimate, so a relation it proves complete
+  is complete, and a relation it cannot prove stays open as before.
+* **(b) The proof once per schema table.** The proof reads the rules and the session's
+  graph. A session that read the schema's table, and holds nothing else yet, holds the
+  view's facts and that table's facts, so every such session of the same table proves
+  the same relations. The first of them stores its proof, as the IRIs of the closed
+  predicates and classes, in a process-wide cache under the view key and the rules
+  digest together with the table it read, and later sessions that read the same table
+  use it instead of scanning. A table made again, after the cache dropped the old one,
+  gets a proof of its own. A session whose schema came from a pass of its own proves
+  again rather than share a proof, since two passes can differ and the table can lack a
+  fact its pass held. Rules that read `now` or test a made blank node's label give
+  each pass its own facts, an explanation's session keeps linear recursion and so
+  derives other intermediate facts, and the table leaves out a generalized fact, such
+  as one whose subject is a literal. A session prepared again, as a why-not search
+  prepares its session for each step, and a session with facts of its own, such as a
+  hypothesis or GeoSPARQL default geometries, hold more than the view's facts and the
+  table's, so they neither read nor keep a proof, and such a session keeps no schema
+  table either. The cache holds at most 64 views and drops the oldest, and `nocache`
+  does not bypass it, like the schema table. A view that cannot be cached, such as a
+  transaction's snapshot, proves again in every session. The first query after a
+  commit runs the pass and the proof, and the second, the first to read the table,
+  pays the two scans and the abstraction once more, which item 190 keeps for
+  measurement.
+* **(c) The axioms in the schema pass.** The schema pass reads instance facts as stored,
+  so it missed schema facts that follow from an axiom about an instance. Under `owl-rl`,
+  `rdf:nil rdf:type rdf:List` gives `rdf:List rdf:type rdfs:Class` and
+  `rdf:List rdfs:subClassOf rdf:List`, which the proof then rightly left open, and with
+  them all of `rdfs:subClassOf`. The facts of rules without a body now join the pass's
+  seeds, so the pass derives these schema facts and the proof closes the relation. The
+  axioms are entailed by every dataset, so they add no answer the rules do not give.
+  An axiom the input graphs already hold is not seeded, since a derived copy of a
+  stored fact would reach the answer twice.
+
+Measured on one LUBM university on stanley, with the release build and `nocache`, the
+proof now closes all 4 schema predicates and 4 meta classes of `rdfs` and all 19 and 12
+of `owl-rl`. Once a view's proof is cached, LUBM q1 takes 1.5 to 1.6 ms under `rdfs` and
+3.4 to 3.7 ms under `owl-rl`, against 29 to 57 ms and 0.5 to 1.1 s before. q14 takes 1.2
+to 1.6 ms and 2.1 to 2.5 ms. The first query of a view pays the proof, 25 ms under `rdfs`
+and 230 ms under `owl-rl`, most of it the `owl-rl` abstraction's joins over rules with a
+variable predicate.
+
+Two costs that every query paid remained after these changes, and both are gone.
+
+* **(d) Cone estimates only where they are read.** A session estimated each demand's
+  cone, its atoms and their sizes, whether or not anything read the estimate. The walk
+  costs about as much as a narrow derivation, and a profile of `owl-rl` LUBM q1 put
+  about 14% of the query's samples in it. A session now makes the estimates only for
+  EXPLAIN and for `auto` when it reads a materialization, and an executed `demand`
+  query's `Derive` nodes carry no estimate.
+* **(e) A structural key for specialized rules.** Specialization drops a rule that
+  another schema binding already made, with its atoms in another order. The key that
+  told such rules apart was the formatted text of the rule's atoms, builtins and head,
+  which the same profile showed among the query's costs. The key is now the sorted
+  atoms, the builtins and the head themselves.
+
+At ten universities on stanley, with three interleaved runs of `reasoning_latency` for
+each build, each of three rounds after a checked run, the medians of LUBM q1 under
+`demand` are 1.89 ms with `owl-rl` and 1.15 ms with `rdfs`, against 1.76 ms and 1.26 ms
+before item 191 (`6fae0eb2`). Before (d) and (e), q1 took 4.65 ms and 2.00 ms, and
+before (a) to (c) it took 3,217 ms and 94.4 ms. Every query's answers equal the
+materialized ones in both builds. The `rdfs` queries now take what they took before item
+191, within the runs' spread. The `owl-rl` queries take 0.9 to 1.35 times as long, and
+the broad queries q6, q8 and q9 take 1.95 to 1.99 s against 1.71 to 1.74 s. The
+specialized `owl-rl` program holds 589 rules for LUBM against 501 before item 191, since
+the axioms of (c) add reflexive schema facts that specialization expands. Item 911 stays
+open for the `owl-rl` remainder.
+
+Options that give up completeness were not taken. Trusting the preliminary schema pass,
+as before item 191, would again miss schema facts that only derived instance facts
+give. Bounding the proof by the relations a query's patterns reach would leave the
+program unspecialized for a query that reads the type closure, which is most of them.
+
+A regression test on the LUBM generator checks the answers and a bound on what a
+demand query derives under the shipped profiles, so an analysis that gives up again,
+and leaves the type closure to derive, fails the test.
+
 ### Bounded positive feedback evaluation
 
 A cold demand session can evaluate the original rules over a temporary closure when
@@ -1022,6 +1135,119 @@ rewriting remain in Phase 2 of this spec, roadmap item 19.
 ### Scope changes
 
 **OWL 2 EL classification.** The non-goal in §1 excluded OWL 2 DL or EL reasoning. OWL 2 EL classification is now planned under [ROADMAP](../ROADMAP.md) item 457 and [F24](F24-owl-classification/README.md). OWL 2 DL reasoning stays a non-goal of this spec.
+
+### Phase 2: automatic choice and the dataset setting
+
+**Built** for roadmap item 19. `reasoning=auto` (§2.1, §4) and the dataset setting (§2.2)
+are available. Hybrid Jena rules (§5.2), OWL 2 QL rewriting (§7), reuse of tables across
+commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in Phase 2.
+
+* **The choice.** `crates/sparkles/src/reasoning/auto.rs` wraps the dataset's query-time
+  reasoner. When a query starts, it decides for the snapshot the query reads whether the
+  materialized inferences can answer: the record's profile, rules digest and input graphs
+  equal the query-time program's, C08's freshness is fresh at the snapshot's commit, and
+  the caller can read the inferred graph. The engine (`sparql/reasoning.rs`) keeps the
+  inferred graph in the query's default graph while the materialization can answer and
+  takes it out otherwise. While the materialization can answer, an intensional pattern
+  reads it unless its dependency cone holds a top-level backward rule, and such a pattern
+  derives into the overlay as under `demand`, since the materializer skips those rules
+  although the rules digest covers them. Both sources give facts of one closure, so the
+  union answers as a fresh materialization does. When the program holds no backward rule,
+  as `rdfs`, `rdfs-simple` and `owl-rl` do not, a query that executes starts no reasoner
+  session at all (`ReasoningProvider::reads_all`) and runs as materialized reasoning does.
+  EXPLAIN starts the session to show each pattern's estimate and costs.
+* **The estimate.** `demand::estimate_cone` walks the dependency cone from the pattern
+  with its bound positions. For each rule whose head gives the pattern, the body is joined
+  in a greedy order, bound positions first, and each atom multiplies the join by the facts
+  it matches per binding from the generation's predicate statistics and the delta's. The
+  join's size counts as the rule's facts, a body atom that rules give is estimated in turn
+  with the positions the join has bound, once per rule and adornment, and the walk stops
+  at depth six. The free-adornment strata are the atoms the cone reaches with no position
+  bound. EXPLAIN gives the read cost `READ_BASE + rows` and the derivation cost, which is
+  the read cost plus `DERIVE_BASE + facts × DERIVE_FACT`, or plus `READ_BASE + facts ×
+  CACHED_FACT` for a table the cache holds, in the planner's unit of one scanned row,
+  with the constants in `sparql::reasoning::cost`. The costs inform and do not decide,
+  as the next paragraph explains. The walk costs about as much as a narrow derivation,
+  so a session makes the estimate only for EXPLAIN and for `auto` when it reads a
+  materialization. An executed `demand` query's `Derive` nodes carry no estimate, as
+  decision 5 of Phase 1 states (item 911). The derivation constants are provisional and have
+  not been fitted to the demand path that item 911 repaired.
+* **Why reading always wins.** §4.3 has the planner compare the two estimates per pattern
+  and derive where deriving is cheaper. In this engine a derived pattern still reads the
+  inferred graph, which stays in the query's default graph while the materialization
+  answers, and its derived facts only join an overlay. Deriving therefore costs the read
+  and the derivation, and is never the cheaper source. Leaving the inferred graph out per
+  pattern would not change that, since a derivation of a pattern's facts costs at least
+  reading them from the store's indexes. The measurements below agree, and the
+  per-pattern comparison with a derivation charged for its read, which always reads,
+  also cost 1 to 8 ms per query in reasoner setup, cone estimates and seed queries at one
+  LUBM university, so `auto` reads by rule instead and keeps the
+  estimates for EXPLAIN. Roadmap item 910 revisits a per-pattern choice once a separate
+  derived layer (item 9, F16) makes reading inferences costlier than an index probe.
+* **Measurements.** `crates/sparkles/examples/auto_latency.rs` times the 14 LUBM
+  queries at 10 universities on persistent datasets, materialized with `rdfs` and with
+  `owl-rl`, one kept fresh and one made stale by a triple outside every query's cone.
+  The run used atlas (Intel), alone, at commit 2afc0e08, with 3 rounds of 2 timed runs
+  after one checked run, and each mode's answers equal the materialized ones. With a
+  fresh materialization `auto` starts no session and reads, and takes 0.04 to 8.2 ms
+  with `rdfs` and 0.37 to 9.2 ms with `owl-rl`. Materialized reasoning takes 0.23 to
+  8.9 ms and 0.07 to 8.2 ms. So `auto` is 0.1 to 0.7 ms faster than materialized with
+  `rdfs` and 0.2 to 1.0 ms slower with `owl-rl`, a difference that roadmap item 912
+  investigates. Over a stale materialization `auto` derives and takes what `demand` does,
+  45 to 149 ms with `rdfs` and 1.9 to 3.1 s with `owl-rl`. These derivation times come
+  from the demand path before item 911's changes, when an `owl-rl` demand derived about
+  the whole closure, 1,232,447 facts at 10 universities, for every query. The
+  [measurements of item 911](#schema-completeness-at-scale-item-911) give the repaired
+  path's times.
+
+* **The setting.** `crates/sparkles/src/reasoning/setting.rs` holds `default`, `profile`,
+  `rules`, `inputs`, `budget` and `stale`, in `query-reasoning.json` with the version
+  member `queryReasoningFormat`. `PUT`, `GET` and `DELETE /$/reason/{ds}/query` change it,
+  `serve --query-reasoning NAME=PROFILE` and `sparkles infer --query-default MODE` set it
+  from the command line, and `Dataset::set_query_reasoning` from the library. A query
+  without a `reasoning` parameter takes the setting's default. `budget.maxMillis` wraps
+  the session's stop check and fails a longer derivation with `reasoning-budget`.
+* **Responses.** `Sparkles-Reasoning` begins with `auto;` and is present only when a
+  pattern was derived. `Sparkles-Inferences` is present only when a stale materialization
+  was read under `"stale": "allow"`. EXPLAIN's `Reason` node says whether the
+  materialization was fresh, stale or absent, and each `Derive` node carries `source`,
+  `readCost`, `deriveCost`, `estimatedDerived` and `reason`.
+
+**Decisions where this spec left the choice open.**
+
+1. The setting lives in `query-reasoning.json` rather than inside `reasoning.json`. The
+   record describes a materialization, and every reader treats its presence as one, so a
+   dataset with a query-time setting and no materialization could not have carried the
+   setting in the record without appearing materialized. "Next to the C08 record" in §2.2
+   is read as the directory.
+2. The header's first token under `auto` is `auto`, not `demand`, so that a client can
+   tell the mode that derived.
+3. A materialization of unknown freshness (an older record, or one of another dataset) is
+   treated as stale: it is not read unless the setting allows reading a stale one.
+4. The setting is not yet locked through C19's declared settings, whose kinds own their
+   files through the server's settings layer while the library owns this one. Roadmap
+   item 909 covers the lock.
+5. Under `auto` with a readable materialization, a pattern reads unless a backward rule
+   lies in its cone, rather than by the comparison of §4.3, for the reasons and
+   measurements above.
+6. Reading a materialization beside derived facts is sound only when the materialization
+   holds a subset of the whole program's closure. With backward rules that holds when the
+   rest of the program is monotone and makes no terms, so `auto` does not read the
+   materialization of a rule file with backward rules and any builtin outside the pure
+   tests and functions of their arguments, a list action in a head, or a blank node or
+   functor in a head (`QueryReasoner::mixing_hazard`).
+
+**Acceptance.** A4 and A5 hold in `auto_reads_a_fresh_materialization_and_derives_over_a_stale_one`
+(`crates/sparkles/tests/auto_reasoning.rs`) and over HTTP in
+`auto_reasoning_and_the_query_setting_over_http`. The backward-rule and profile cases
+hold in `auto_derives_what_the_materialization_cannot_hold`, the setting in
+`the_query_setting_names_the_default_mode_and_the_stale_policy` and
+`the_setting_budget_bounds_a_derivation`, the rule in
+`auto_reads_what_the_materialization_holds`, decision 6 in
+`auto_does_not_mix_a_materialization_with_negation_over_backward_rules`,
+`auto_does_not_mix_fresh_witnesses` and `auto_does_not_mix_lists_that_backward_rules_extend`,
+and the estimate in
+`cone_estimates_follow_the_statistics_and_the_bound_positions`.
 
 ### Roadmap follow-ups
 

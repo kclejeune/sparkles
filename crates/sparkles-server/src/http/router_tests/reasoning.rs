@@ -1452,10 +1452,155 @@ async fn demand_reasoning_over_http() {
         get("reasoning=demand&reasoningProfile=rdfs-simple&maxDerived=1&nocache=true").await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
     assert!(r.text().contains("reasoning-budget"), "{}", r.text());
+    // auto without a materialization derives everything, with the profile named
+    let (r, h) = get("reasoning=auto&reasoningProfile=rdfs-simple").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let hdr = h["sparkles-reasoning"].to_str().unwrap();
+    assert!(hdr.starts_with("auto; derived="), "{hdr}");
     let (r, _) = get("reasoning=auto").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
     let (r, _) = get("reasoning=demand&reasoningProfile=nope").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+/// `reasoning=auto` over HTTP (spec F17 §4, A4 and A5) and the dataset's query-time
+/// setting (§2.2): a fresh materialization answers without a `Sparkles-Reasoning`
+/// header, a stale one is derived around unless the setting allows reading it, in which
+/// case `Sparkles-Inferences` says so, and the setting's default applies to a query that
+/// names no mode.
+#[tokio::test]
+async fn auto_reasoning_and_the_query_setting_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "ex:C rdfs:subClassOf ex:B . ex:x a ex:C . ex:z a ex:B .",
+    );
+    let app = router(st.clone());
+    let r = post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    wait_tasks(&st).await;
+    let q = "SELECT ?s { ?s a <http://ex.org/B> } ORDER BY ?s";
+    let get = |params: &str| {
+        let app = app.clone();
+        let uri = format!(
+            "/t/sparql?{params}query={}",
+            form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+        );
+        async move {
+            let (r, h) = send_h(
+                &app,
+                Request::get(uri)
+                    .header(header::ACCEPT, "application/sparql-results+json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            let rows: Vec<String> = r.json()["results"]["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["s"]["value"].as_str().unwrap().to_string())
+                .collect();
+            let reasoning = h
+                .get("sparkles-reasoning")
+                .map(|v| v.to_str().unwrap().to_string());
+            let inferences = h
+                .get("sparkles-inferences")
+                .map(|v| v.to_str().unwrap().to_string());
+            (rows, reasoning, inferences)
+        }
+    };
+    let (x, z) = ("http://ex.org/x".to_string(), "http://ex.org/z".to_string());
+    let y = "http://ex.org/y".to_string();
+    // A5: fresh, read
+    let (rows, reasoning, inferences) = get("reasoning=auto&").await;
+    assert_eq!(rows, [x.clone(), z.clone()]);
+    assert_eq!((reasoning, inferences), (None, None));
+    // A4: stale, derived
+    update(&app, "t", "INSERT DATA { ex:y a ex:C }").await;
+    let (rows, reasoning, inferences) = get("reasoning=auto&").await;
+    assert_eq!(rows, [x.clone(), y.clone(), z.clone()]);
+    assert!(
+        reasoning
+            .as_deref()
+            .is_some_and(|h| h.starts_with("auto; derived=")),
+        "{reasoning:?}"
+    );
+    assert_eq!(inferences, None);
+    // the default mode still reads the stale materialization and says so
+    let (rows, reasoning, inferences) = get("").await;
+    assert_eq!(rows, [x.clone(), z.clone()]);
+    assert_eq!(reasoning, None);
+    assert!(
+        inferences
+            .as_deref()
+            .is_some_and(|h| h.starts_with("stale")),
+        "{inferences:?}"
+    );
+    // the setting makes auto the default
+    let put = |body: &str| {
+        let app = app.clone();
+        let body = body.to_string();
+        async move {
+            send(
+                &app,
+                Request::put("/$/reason/t/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let r = put(r#"{"default":"sometimes"}"#).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["code"], "reasoning-setting", "{}", r.text());
+    let r = put(r#"{"default":"auto"}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["default"], "auto", "{}", r.text());
+    let (rows, reasoning, inferences) = get("").await;
+    assert_eq!(rows, [x.clone(), y.clone(), z.clone()]);
+    assert!(reasoning.is_some());
+    assert_eq!(inferences, None);
+    // stale allowed: read, with the freshness header (spec F17 §4.2)
+    let r = put(r#"{"default":"auto","stale":"allow"}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let (rows, reasoning, inferences) = get("").await;
+    assert_eq!(rows, [x.clone(), z.clone()]);
+    assert_eq!(reasoning, None);
+    assert!(
+        inferences
+            .as_deref()
+            .is_some_and(|h| h.starts_with("stale")),
+        "{inferences:?}"
+    );
+    // a query names its own mode regardless
+    let (rows, _, _) = get("reasoning=false&").await;
+    assert_eq!(rows, std::slice::from_ref(&z));
+    let got = get_json(&app, "/$/reason/t/query").await;
+    assert_eq!(got["default"], "auto", "{got}");
+    assert_eq!(got["stale"], "allow", "{got}");
+    assert!(
+        got["tables"].is_object(),
+        "the test caller has every permission: {got}"
+    );
+    // removed: materialized reasoning is the default again
+    let r = send(
+        &app,
+        Request::delete("/$/reason/t/query")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let (rows, reasoning, _) = get("").await;
+    assert_eq!(rows, [x, z]);
+    assert_eq!(reasoning, None);
+    assert!(get_json(&app, "/$/reason/t/query").await["default"].is_null());
 }
 
 #[tokio::test]

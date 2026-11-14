@@ -26,6 +26,9 @@ internal sealed interface Source {
     fun find(pattern: ByteArray, firstRows: Int): FindResult
     fun count(pattern: ByteArray): Long
     fun contains(pattern: ByteArray): Boolean
+
+    /** Whether each pattern of a batch matches a quad: one byte per pattern, one native call. */
+    fun containsAll(patterns: ByteArray): ByteArray
     fun graphNames(): ByteArray
     fun prepareQuery(text: String, opts: QueryOpts): FfiQuery
 
@@ -42,6 +45,7 @@ internal sealed interface Source {
         override fun find(pattern: ByteArray, firstRows: Int) = ffi { SparklesJni.find(ds, pattern, firstRows) }
         override fun count(pattern: ByteArray) = ffi { ds.count(pattern).toLong() }
         override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(ds, pattern) }
+        override fun containsAll(patterns: ByteArray) = ffi { SparklesJni.containsAll(ds, patterns) }
         override fun graphNames() = ffi { ds.graphNames() }
         override fun findAll(pattern: ByteArray) = ffi { ds.findAll(pattern) }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(ds, text, opts) }
@@ -53,6 +57,7 @@ internal sealed interface Source {
         override fun find(pattern: ByteArray, firstRows: Int) = ffi { SparklesJni.find(t, pattern, firstRows) }
         override fun count(pattern: ByteArray) = ffi { t.count(pattern).toLong() }
         override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(t, pattern) }
+        override fun containsAll(patterns: ByteArray) = ffi { SparklesJni.containsAll(t, patterns) }
         override fun graphNames() = ffi { t.graphNames() }
         override fun findAll(pattern: ByteArray) = ffi { t.findAll(pattern) }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(t, text, opts) }
@@ -64,6 +69,7 @@ internal sealed interface Source {
         override fun find(pattern: ByteArray, firstRows: Int) = ffi { t.find(pattern, firstRows.toUInt()) }
         override fun count(pattern: ByteArray) = ffi { t.count(pattern).toLong() }
         override fun contains(pattern: ByteArray) = ffi { t.contains(pattern) }
+        override fun containsAll(patterns: ByteArray) = ffi { t.containsAll(patterns) }
         override fun graphNames() = ffi { t.graphNames() }
         override fun findAll(pattern: ByteArray) = ffi { t.findAll(pattern) }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { t.prepareQuery(text, opts) }

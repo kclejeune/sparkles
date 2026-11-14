@@ -179,6 +179,40 @@ pub fn inferences_header(ds: &Dataset, seq: u64) -> Option<HeaderValue> {
     HeaderValue::from_str(&v).ok()
 }
 
+/// `serve --query-reasoning NAME=PROFILE` (spec F17 §2.2): the dataset's query-time
+/// profile, `rdfs`, `rdfs-simple`, `owl-rl` or `rules:FILE` with a Jena rules file. A
+/// setting the dataset already has keeps its other members.
+pub fn configure_query(st: &AppState, spec: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let (name, profile) = spec
+        .split_once('=')
+        .with_context(|| format!("--query-reasoning {spec}: expected NAME=PROFILE"))?;
+    let ds = st
+        .datasets()
+        .get(name)
+        .cloned()
+        .with_context(|| format!("--query-reasoning {spec}: no dataset /{name}"))?;
+    let mut setting = ds.dataset.query_reasoning().unwrap_or_default();
+    match profile.strip_prefix("rules:") {
+        Some(file) => {
+            setting.profile = Some("rules".to_string());
+            setting.rules = Some(
+                std::fs::read_to_string(file)
+                    .with_context(|| format!("--query-reasoning {spec}: reading {file}"))?,
+            );
+        }
+        None => {
+            setting.profile = Some(profile.to_string());
+            setting.rules = None;
+        }
+    }
+    setting
+        .validate()
+        .with_context(|| format!("--query-reasoning {spec}"))?;
+    ds.dataset.set_query_reasoning(Some(setting))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- running ------
 
 /// What started a reasoning run.
