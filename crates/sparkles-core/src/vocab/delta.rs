@@ -674,12 +674,17 @@ impl DeltaVocab {
         let written = parsed.keys.len() as u64;
         let end = parsed.end as u64;
         drop(buf);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        // An existing entry is opened as it is, and an absent one is created new, so a
+        // dangling symbolic link fails instead of creating its target.
+        let file = match std::fs::symlink_metadata(path) {
+            Ok(_) => OpenOptions::new().read(true).write(true).open(path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)?,
+            Err(e) => return Err(e.into()),
+        };
         let alloc = file.metadata()?.len();
         let inner = Arc::new(RwLock::new(v));
         Ok(DeltaVocab {

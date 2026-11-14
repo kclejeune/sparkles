@@ -724,3 +724,31 @@ fn a_refused_open_adds_at_most_an_empty_vocabulary() {
     }
     assert_eq!(before, after);
 }
+
+/// A dangling symbolic link in place of the delta vocabulary fails the open without
+/// creating its target, so a refused open cannot create a settings file through it.
+#[cfg(unix)]
+#[test]
+fn a_dangling_vocabulary_link_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ds");
+    let s = open(&root).unwrap();
+    let dvocab = s
+        .snapshot()
+        .generation
+        .dir
+        .clone()
+        .unwrap()
+        .join("delta.vocab");
+    drop(s);
+    let _ = std::fs::remove_file(&dvocab);
+    std::os::unix::fs::symlink("../jobs.json", &dvocab).unwrap();
+    assert!(open(&root).is_err());
+    assert!(!root.join(crate::jobs::FILE).exists());
+    assert!(
+        std::fs::symlink_metadata(&dvocab)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
