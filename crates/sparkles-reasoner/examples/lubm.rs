@@ -196,16 +196,14 @@ fn fresh_universities(
     batches: &[usize],
     universities: usize,
 ) -> Option<Vec<std::ops::Range<usize>>> {
-    let mut next = 0;
-    let ranges = batches
-        .iter()
-        .map(|&rounds| {
-            let range = next..next + rounds;
-            next = range.end;
-            range
-        })
-        .collect();
-    (next <= universities).then_some(ranges)
+    let mut next = 0usize;
+    let mut ranges = Vec::new();
+    for &rounds in batches {
+        let end = next.checked_add(rounds).filter(|&e| e <= universities)?;
+        ranges.push(next..end);
+        next = end;
+    }
+    Some(ranges)
 }
 
 /// The pool the runs of `keep` and `churn` evaluate on: a reasoning pool of `threads`
@@ -434,10 +432,7 @@ fn main() {
             let batches = list(&args[6], "rounds");
             assert_eq!(sizes.len(), batches.len(), "a number of rounds for each K");
             let fresh = fresh_universities(&batches, universities).unwrap_or_else(|| {
-                panic!(
-                    "{} rounds need as many universities, and U is {universities}",
-                    batches.iter().sum::<usize>()
-                )
+                panic!("the rounds {batches:?} need a university each, and U is {universities}")
             });
             let store = Store::open(&db, StoreOptions::default()).unwrap();
             let threads = rayon::current_num_threads();
@@ -575,5 +570,8 @@ mod tests {
         );
         assert_eq!(fresh_universities(&[40, 20, 6], 65), None);
         assert_eq!(fresh_universities(&[], 0), Some(vec![]));
+        // rounds whose sum passes the largest number
+        assert_eq!(fresh_universities(&[usize::MAX, 1], 10), None);
+        assert_eq!(fresh_universities(&[1, usize::MAX], usize::MAX), None);
     }
 }
