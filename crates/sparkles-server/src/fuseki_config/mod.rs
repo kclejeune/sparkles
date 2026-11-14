@@ -355,7 +355,7 @@ fn query_profile(
             );
         }
         None => {
-            setting.profile = Some(r.profile.unwrap_or("rdfs").into());
+            setting.profile = Some(r.profile.as_deref().unwrap_or("rdfs").into());
             setting.rules = None;
         }
     }
