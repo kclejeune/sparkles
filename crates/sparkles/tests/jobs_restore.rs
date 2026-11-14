@@ -263,3 +263,66 @@ fn a_restore_of_a_restore_adopts_the_runs_it_holds_paused() {
         assert_eq!(state(&again, run), State::Queued);
     }
 }
+
+/// A restore whose capture holds more paused runs than one scan reads adopts every one of
+/// them, through the cursor its recovery record keeps.
+#[test]
+fn a_restore_adopts_paused_runs_beyond_one_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::open(dir.path().join("data"), Default::default()).unwrap();
+    let repos = cat.repositories().unwrap();
+    repos
+        .add(RepoConfig {
+            name: "local".into(),
+            kind: RepoType::Fs,
+            path: Some(dir.path().join("repo").display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let repo = repos.open("local").unwrap();
+    let ds = cat.create("src", &Default::default()).unwrap();
+    let mut s = Settings {
+        enabled: true,
+        max_queued: 4096,
+        ..Default::default()
+    };
+    let mut d = Definition::quads(vec!["urn:g".into()]);
+    d.concurrency = 2;
+    s.definitions.insert("collect".into(), d);
+    ds.jobs().configure(&s).unwrap();
+    let mut runs: Vec<uuid::Uuid> = (0..4096).map(|k| submit(&ds, &format!("k{k}"))).collect();
+    for _ in 0..2 {
+        ds.jobs().claim(&[], &worker()).unwrap().unwrap();
+    }
+    runs.extend((0..2).map(|k| submit(&ds, &format!("extra{k}"))));
+    let backup = |from: &Dataset, name: &str, to: &str| {
+        from.backups(&repo)
+            .create_with(
+                &CreateOptions {
+                    name: name.into(),
+                    ..Default::default()
+                },
+                &Default::default(),
+            )
+            .unwrap();
+        cat.restore(
+            &repo,
+            name,
+            &RestoreRequest {
+                target: Some(to.into()),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap()
+    };
+    let copy = backup(&ds, "b1", "copy");
+    copy.jobs().recover().unwrap();
+    let again = backup(&copy, "b2", "again");
+    again.jobs().recover().unwrap();
+    let mut resumed = 0;
+    for chunk in runs.chunks(256) {
+        resumed += again.jobs().resume(chunk, &admin()).unwrap().resumed.len();
+    }
+    assert_eq!(resumed, runs.len());
+}

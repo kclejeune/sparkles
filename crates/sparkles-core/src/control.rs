@@ -67,7 +67,7 @@ pub const MAX_VALUE: usize = 4 << 20;
 pub const MAX_FRAME: usize = 16 << 20;
 
 /// The bytes of a frame's fixed header.
-const FRAME_HEADER: usize = 33;
+pub const FRAME_HEADER: usize = 33;
 
 /// The payload bytes of one `WAL_CONTROL` record.
 pub const CHUNK: usize = 32;
@@ -250,11 +250,11 @@ impl Frame {
                 1 => {
                     let vlen = r.u32()? as usize;
                     let value: Arc<[u8]> = r.take(vlen)?.into();
-                    check_entry(&key, Some(&value)).map_err(|e| corrupt(e))?;
+                    check_entry(&key, Some(&value)).map_err(corrupt)?;
                     ops.push(Op::Put(key, value));
                 }
                 2 => {
-                    check_entry(&key, None).map_err(|e| corrupt(e))?;
+                    check_entry(&key, None).map_err(corrupt)?;
                     ops.push(Op::Delete(key));
                 }
                 other => return Err(corrupt(format!("unknown operation {other}"))),
@@ -457,7 +457,7 @@ pub fn decode_checkpoint(bytes: &[u8]) -> Result<ControlState> {
         let key: Box<[u8]> = r.take(klen)?.into();
         let vlen = r.u32()? as usize;
         let value: Arc<[u8]> = r.take(vlen)?.into();
-        check_entry(&key, Some(&value)).map_err(|e| corrupt(e))?;
+        check_entry(&key, Some(&value)).map_err(corrupt)?;
         if last.as_ref().is_some_and(|l| *l >= key) {
             return Err(corrupt(format!("{CHECKPOINT_FILE} keys are out of order")));
         }
@@ -748,7 +748,7 @@ mod tests {
         // a non-zero padding byte, a whole extra chunk and a newer version are refused
         let mut bad = payload.clone();
         *bad.last_mut().unwrap() = 1;
-        if bytes.len() % CHUNK != 0 {
+        if !bytes.len().is_multiple_of(CHUNK) {
             assert!(Frame::from_chunks(&bad).is_err());
         }
         let mut extra = payload.clone();

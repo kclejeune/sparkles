@@ -26,16 +26,28 @@ use uuid::Uuid;
 /// The most runs one recovery frame pauses and one recovery request resumes.
 const PAUSE_BATCH: usize = 256;
 
-/// The bytes of run and attempt records that one recovery frame stages at most, half
-/// of the largest frame, so that long principal IRIs never make a recovery frame too
-/// large to write.
-const FRAME_BUDGET: usize = sparkles_core::control::MAX_FRAME / 2;
+/// The bytes of records after which a recovery frame takes no further run. A run adds
+/// at most its record and its attempt's, each at most `MAX_VALUE` with a key of at most
+/// `MAX_KEY`, and two index operations, and the frame's last record is the epoch or
+/// the recovery, so a frame stays below `MAX_FRAME` whatever the principals' IRIs.
+const FRAME_BUDGET: usize = sparkles_core::control::MAX_FRAME / 4;
 
-/// The bytes run `run`'s record and attempt `attempt`'s record take in a frame.
+/// What one run can add to a frame beyond [`FRAME_BUDGET`], with the frame's header,
+/// the operation headers and the epoch or recovery record.
+const RUN_BOUND: usize =
+    2 * (sparkles_core::control::MAX_VALUE + sparkles_core::control::MAX_KEY) + (64 << 10);
+
+const _: () = assert!(
+    FRAME_BUDGET + RUN_BOUND + (1 << 20) < sparkles_core::control::MAX_FRAME,
+    "a recovery frame must fit its last run and its epoch or recovery record"
+);
+
+/// The bytes run `run`'s record and attempt `attempt`'s record take in a frame, with
+/// their keys and the run's index operations.
 fn staged_bytes(ch: &mut Changes, run: &Run, attempt: Option<&Attempt>) -> usize {
-    let mut bytes = ledger::encode(ch.run(run)).len() + 64;
+    let mut bytes = ledger::encode(ch.run(run)).len() + 256;
     if let Some(a) = attempt {
-        bytes += ledger::encode(ch.attempt(a)).len() + 64;
+        bytes += ledger::encode(ch.attempt(a)).len() + 128;
     }
     bytes
 }
@@ -619,7 +631,6 @@ impl Jobs {
                     installed_ms: now,
                 });
             }
-            drop(l);
             ch.apply(&mut t)?;
             t.commit()?;
             if !full {
@@ -668,8 +679,9 @@ impl Jobs {
                     paused: 0,
                     resumed: 0,
                     cancelled: 0,
+                    adopted_through: None,
+                    adopted: false,
                 }));
-                drop(l);
                 ch.apply(&mut t)?;
                 t.commit()?;
                 self.ds.store().failpoint("jobs-recovery-started");
@@ -684,12 +696,37 @@ impl Jobs {
             let mut paused = 0;
             let mut bytes = 0;
             let mut full = false;
-            'states: for st in [
-                State::Queued,
-                State::RetryWait,
-                State::Leased,
-                State::Paused,
-            ] {
+            // First the runs that an earlier recovery paused, captured while it awaited a
+            // decision: they join this recovery's set. The cursor in the record walks the
+            // paused runs once in key order, since every frame leaves them paused.
+            while !rec.adopted && !full {
+                let scan = l.runs_in_after(State::Paused, rec.adopted_through)?;
+                for id in &scan.ids {
+                    if paused == PAUSE_BATCH || bytes >= FRAME_BUDGET {
+                        full = true;
+                        break;
+                    }
+                    rec.adopted_through = Some(*id);
+                    let Some(run) = l.run_header(*id)? else {
+                        continue;
+                    };
+                    if run.recovery == Some(rec.id) {
+                        continue;
+                    }
+                    ch.run(&run).recovery = Some(rec.id);
+                    bytes += staged_bytes(&mut ch, &run, None);
+                    paused += 1;
+                }
+                if !full && !scan.truncated {
+                    rec.adopted = true;
+                }
+            }
+            // Then every other run that has not ended. Each leaves the states the scans
+            // read, so the next frame starts where this one stopped.
+            'states: for st in [State::Queued, State::RetryWait, State::Leased] {
+                if full {
+                    break;
+                }
                 for id in l.runs_in(st)?.ids {
                     if paused == PAUSE_BATCH || bytes >= FRAME_BUDGET {
                         full = true;
@@ -698,17 +735,6 @@ impl Jobs {
                     let Some(run) = l.run_header(id)? else {
                         continue;
                     };
-                    // A run that an earlier recovery paused, captured while it awaited a
-                    // decision, joins this recovery's set.
-                    if st == State::Paused {
-                        if run.recovery == Some(rec.id) {
-                            continue;
-                        }
-                        ch.run(&run).recovery = Some(rec.id);
-                        bytes += staged_bytes(&mut ch, &run, None);
-                        paused += 1;
-                        continue;
-                    }
                     let mut attempt = None;
                     if let Some(a) = run.current_attempt
                         && let Some(a) = l.attempt(a)?
@@ -736,7 +762,6 @@ impl Jobs {
                 rec.phase = RecoveryPhase::AwaitingDecision;
             }
             ch.recovery(Some(&rec));
-            drop(l);
             ch.apply(&mut t)?;
             t.commit()?;
             self.ds.store().failpoint("jobs-recovery-paused");
@@ -827,7 +852,6 @@ impl Jobs {
         // the recovery stays once no run is paused, so that a retry of a restored run
         // that ended still waits for a decision
         ch.recovery(Some(&rec));
-        drop(l);
         if !ch.is_empty() {
             ch.apply(&mut t)?;
             t.commit()?;
@@ -1198,7 +1222,6 @@ impl Jobs {
             },
             &input,
         );
-        drop(l);
         ch.apply(&mut t)?;
         // Admission is bounded by the size of the control state with every record the
         // submission stages, so that the memory it takes stays within the settings'
@@ -1374,7 +1397,6 @@ impl Jobs {
             break;
         }
         let Some((chosen, def)) = chosen else {
-            drop(l);
             if !ch.is_empty() {
                 ch.apply(&mut t)?;
                 t.commit()?;
@@ -1410,7 +1432,6 @@ impl Jobs {
             state: AttemptState::Active,
             diagnostic: None,
         });
-        drop(l);
         ch.apply(&mut t)?;
         ds.store().failpoint("jobs-before-claim-commit");
         // The monotonic deadline exists before the commit publishes, while this
@@ -1561,7 +1582,6 @@ impl Jobs {
         let mut ch = Changes::default();
         ch.attempt(&attempt).lease_expires_ms = expires;
         ch.run(&run).version = run.version + 1;
-        drop(l);
         ch.apply(&mut t)?;
         // The new deadline counts only once this commit's version is the committed one,
         // and one that does not commit leaves the committed deadline as it was.
@@ -1685,7 +1705,6 @@ impl Jobs {
         self.transition(&mut ch, &run, State::Succeeded, None, None);
         ch.run(&run).publication = Some(p.operation);
         ch.attempt(&attempt).state = AttemptState::Published;
-        drop(l);
         ch.apply(&mut t)?;
         ds.store().failpoint("jobs-before-publish-commit");
         let receipt = t.commit()?;
@@ -1792,7 +1811,6 @@ impl Jobs {
             (None, true) => Some(String::new()),
         };
         self.transition(&mut ch, &run, state, next, reason);
-        drop(l);
         ch.apply(&mut t)?;
         t.commit()?;
         #[cfg(test)]
@@ -1864,7 +1882,6 @@ impl Jobs {
             rec.cancelled += 1;
             ch.recovery(Some(&rec));
         }
-        drop(l);
         ch.apply(&mut t)?;
         t.commit()?;
         self.runtime().revoke_through(run.id, run.version + 1);

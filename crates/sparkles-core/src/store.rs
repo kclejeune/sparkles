@@ -2291,6 +2291,11 @@ impl Store {
             None => Store::block_cache_for(&opts),
         };
         let gen_dir = root.join(&name);
+        // A writable generation's open creates its delta vocabulary when it is absent,
+        // which a refusal of the control keyspace below undoes, so that a refused open
+        // changes no file (spec C26 §7.2).
+        let dvocab_path = gen_dir.join("delta.vocab");
+        let dvocab_existed = ctx.is_some() || dvocab_path.exists();
         let mut gen_ = match link::read_link(&gen_dir)? {
             Some(f) if ctx.is_some() => {
                 Generation::open_linked(&gen_dir, &name, root, f, false, &cache)?
@@ -2451,7 +2456,12 @@ impl Store {
                 std::mem::take(&mut wal_control),
                 head_seq,
                 control_store::jobs_configured(root, wal_version),
-            )?
+            )
+            .inspect_err(|_| {
+                if !dvocab_existed && std::fs::metadata(&dvocab_path).is_ok_and(|m| m.len() == 0) {
+                    let _ = std::fs::remove_file(&dvocab_path);
+                }
+            })?
         } else if !wal_control.is_empty() {
             return Err(Error::Corrupt(format!(
                 "{}: a branch's log carries control frames",

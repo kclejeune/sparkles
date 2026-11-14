@@ -35,6 +35,9 @@ pub struct ControlWrite {
     owner: ControlOwner,
 }
 
+/// A control key and its value.
+pub type ControlEntry = (Box<[u8]>, Arc<[u8]>);
+
 /// What a transaction's frame will be stamped with ([`WriteTxn::control_stamp`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControlStamp {
@@ -232,7 +235,7 @@ pub(crate) fn capture_checkpoint(
         label: label.into(),
         time_ms: crate::commit::now_ms(),
     };
-    let value = serde_json::to_vec(&origin).map_err(|e| corrupt(e))?;
+    let value = serde_json::to_vec(&origin).map_err(corrupt)?;
     let mut rendered = state.with_entry(control::ORIGIN_KEY, Some(value.into()));
     rendered.follows = commit;
     Ok(control::encode_checkpoint(&rendered))
@@ -531,11 +534,7 @@ impl WriteTxn<'_> {
 
     /// Up to `limit` entries whose keys start with `prefix`, as this transaction sees
     /// them, in key order, and whether more exist.
-    pub fn control_prefix(
-        &self,
-        prefix: &[u8],
-        limit: usize,
-    ) -> Result<(Vec<(Box<[u8]>, Arc<[u8]>)>, bool)> {
+    pub fn control_prefix(&self, prefix: &[u8], limit: usize) -> Result<(Vec<ControlEntry>, bool)> {
         let c = self.control_txn()?;
         let mut base = c.base.prefix(prefix).peekable();
         let start: Box<[u8]> = prefix.into();

@@ -618,7 +618,6 @@ fn force_eligible(ds: &Dataset, run: Uuid) {
     let old = l.run_header(run).unwrap().unwrap();
     let mut ch = ledger::Changes::default();
     ch.run(&old).next_eligible_ms = Some(0);
-    drop(l);
     ch.apply(&mut t).unwrap();
     t.commit().unwrap();
 }

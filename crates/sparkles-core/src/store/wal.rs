@@ -135,7 +135,7 @@ impl ConfigurationRecords {
         // the frame ends in the last control record: it fits them, and no whole record
         // after its end is padding
         let frame_fits = !self.control
-            || (self.frame_len >= 5
+            || (self.frame_len >= crate::control::FRAME_HEADER as u64
                 && self.frame_len <= crate::control::MAX_FRAME as u64
                 && self.frame_len <= self.frame_seen
                 && self.frame_seen - self.frame_len < chunk);
@@ -2107,9 +2107,18 @@ mod tests {
         // a byte after the frame's end
         let mut padded = records(&frame);
         let last = padded.len() - 1;
-        if frame.len() % (WAL_REC - 1) != 0 {
+        if !frame.len().is_multiple_of(WAL_REC - 1) {
             padded[last] = 1;
             assert!(configuration_records(&padded, v3, flags).is_err());
+        }
+        // a declared length shorter than a frame's header
+        for short in 5..crate::control::FRAME_HEADER {
+            let mut f = frame[..short].to_vec();
+            f[1..5].copy_from_slice(&(short as u32).to_le_bytes());
+            assert!(
+                configuration_records(&records(&f), v3, flags).is_err(),
+                "{short}"
+            );
         }
         // a declared length past the records, or one that leaves a whole record of padding
         let mut long = frame.clone();

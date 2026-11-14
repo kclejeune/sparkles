@@ -79,9 +79,12 @@ fn workload(ds: &Dataset, jobs: bool) {
 /// unreconstructable.
 type Feed = Option<Vec<(u64, u64, u64)>>;
 
+/// Each commit's number and counts, the change feed and the sorted export.
+type Observed = (Vec<(u64, u64, u64, u64)>, Feed, Vec<String>);
+
 /// What A15 compares: each commit's number, kind and counts, the change feed's counts
 /// and the dataset's export.
-fn observed(ds: &Dataset) -> (Vec<(u64, u64, u64, u64)>, Feed, Vec<String>) {
+fn observed(ds: &Dataset) -> Observed {
     let mut commits: Vec<_> = ds
         .history()
         .commits(CommitRange::Latest, 1000)

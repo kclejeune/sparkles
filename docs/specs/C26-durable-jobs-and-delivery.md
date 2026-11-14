@@ -911,8 +911,10 @@ before it reidentifies the dataset. The first jobs operation of a restored datas
 consumes the origin and pauses every restored run that is not terminal, 256 runs per
 frame, before it installs a boot epoch. Until the pausing ends, every transition answers
 `jobs-recovering`, and a restart continues the recovery. The pausing also takes runs
-that an earlier recovery paused, when the backup was taken of a restored dataset, and
-it and the epoch recovery write frames of at most 8 MiB of records each. `Jobs::resume`
+that an earlier recovery paused, when the backup was taken of a restored dataset, with a
+cursor in the recovery record. It and the epoch recovery add no run to a frame that
+already holds 4 MiB of records, which keeps every frame under the 16 MiB limit whatever
+the principals' IRIs. `Jobs::resume`
 and `POST /$/jobs/{ds}/recover` resume named paused runs for an administrator of the
 dataset, and a request that finds the pausing unfinished is refused with
 `jobs-recovering` after the pausing ends. The recovery record stays after its last

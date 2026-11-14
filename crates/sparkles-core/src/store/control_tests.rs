@@ -697,3 +697,24 @@ fn an_upgraded_log_needs_its_control_files() {
     std::fs::remove_file(root.join(control::LOG_FILE)).unwrap();
     integrity(open(&root));
 }
+
+/// A refused open does not leave behind a delta vocabulary it created.
+#[test]
+fn a_refused_open_creates_no_vocabulary() {
+    let (_dir, root, s) = setup();
+    transition(&s, &[("jobs/a", "1")], None).unwrap();
+    let dvocab = s
+        .snapshot()
+        .generation
+        .dir
+        .clone()
+        .unwrap()
+        .join("delta.vocab");
+    drop(s);
+    let _ = std::fs::remove_file(&dvocab);
+    std::fs::remove_file(root.join(control::CHECKPOINT_FILE)).unwrap();
+    let before = walkdir(&root);
+    integrity(open(&root));
+    assert_eq!(before, walkdir(&root));
+    assert!(!dvocab.exists());
+}

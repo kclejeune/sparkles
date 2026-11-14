@@ -312,6 +312,12 @@ pub(super) struct Recovery {
     pub paused: u64,
     pub resumed: u64,
     pub cancelled: u64,
+    /// Where the adoption of runs that an earlier recovery paused stands: the last
+    /// paused run it looked at, in key order, and whether it reached the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_through: Option<Uuid>,
+    #[serde(default)]
+    pub adopted: bool,
 }
 
 /// The redacted state of a run for inspection.
@@ -495,10 +501,19 @@ impl<'a> Ledger<'a> {
     /// The ids of the runs in `state`, up to [`MAX_SCAN`], and whether the ledger holds
     /// more of them than the scan read.
     pub fn runs_in(&mut self, state: State) -> Result<Scan> {
+        self.runs_in_after(state, None)
+    }
+
+    /// [`runs_in`](Self::runs_in) from the run after `after` in key order.
+    pub fn runs_in_after(&mut self, state: State, after: Option<Uuid>) -> Result<Scan> {
         let prefix = state_prefix(state);
         let mut ids = Vec::new();
         let mut truncated = false;
+        let skip = after.map(|id| state_key(state, id));
         for (k, v) in self.state.prefix(&prefix) {
+            if skip.as_deref().is_some_and(|s| &k[..] <= s) {
+                continue;
+            }
             if ids.len() == MAX_SCAN {
                 truncated = true;
                 break;
