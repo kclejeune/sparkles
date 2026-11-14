@@ -197,8 +197,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   record give the round cap and the rounds each group took.
 * The terms the rules compute, such as a new literal or IRI, are added to the dataset's
   vocabulary as the run goes, so that later rounds read them. A run that fails, is
-  cancelled or passes its memory budget before its commit removes them again. Each SPARQL
-  query of a rule runs within the run's memory budget, and cancelling the run stops it.
+  cancelled or passes its memory budget before its commit removes them again. A failure
+  of the commit itself leaves them, as it does for every write. Each round sets aside a
+  quarter of the run's remaining memory budget for the SPARQL queries of its rules, and
+  cancelling the run stops it between queries and within large cartesian products.
+* A blank node that a query makes, through `BNODE()` in a SPARQL rule or in a
+  `sh:SPARQLFunction`, is a new node for each focus node, call and round, so a rule that
+  derives such nodes from facts of its own group does not reach a fixed point. A function
+  call gives the binding of the first solution, and an `sh:optional` parameter without an
+  argument value is left unbound. The queries of rules follow the pre-binding rules of
+  SHACL-SPARQL, which refuse `VALUES`, `MINUS`, `SERVICE` and an `AS` that assigns
+  `$this`.
+* The input record of a run lists the shapes graphs that `shapes=` names among the
+  graphs it watches, so a change to the rules marks the inferences stale.
 * The shapes are read from the input graphs, as TopBraid's `shaclinfer` reads them without
   a shapes file, or from the graphs that `shapes=` names. The options follow the profile
   name, as in `sparkles infer --profile 'shacl-af?shapes=urn:x:shapes&mode=one-pass'`.
