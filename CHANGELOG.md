@@ -31,11 +31,12 @@ minimum cardinality in a positive position gets a name, the run tells itself tha
 a context that holds a minimum makes no witnesses for a minimum that it entails. With it
 the two versions of the Protein Ontology in the ORE 2015 DL development set classify with
 counting and give HermiT's and Konclude's taxonomies, 6.3 and 6.5 times faster than
-Konclude 0.7.0 on four threads. ore_ont_6485 still passes the bound, and its failed
-attempt takes 3.1 times as long with the order, 576 ms against 184 ms on one thread, which
-roadmap item 896 follows. A counting run misses a maximum over a compound qualifier that
-no other axiom names, which is item 897. Counting stays off by default. `el_classify`
-takes `--no-number-order` to turn the order off. This is roadmap item 894.
+Konclude 0.7.0 on four threads. ore_ont_6485 still passes the bound, and its
+classification with counting requested, the failed attempt and the run without counting
+together, takes 3.1 times as long with the order, 576 ms against 184 ms on one thread,
+which roadmap item 896 follows. A counting run misses a maximum over a compound qualifier
+that no other axiom names, which is item 897. Counting stays off by default.
+`el_classify` takes `--no-number-order` to turn the order off. This is roadmap item 894.
 
 ### Compatibility
 

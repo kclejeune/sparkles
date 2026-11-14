@@ -125,7 +125,8 @@ the entailments between minimums and their contradictions with maximums, and mak
 witnesses for a minimum that a minimum of the context entails. With it ore_ont_6952 and
 ore_ont_10140 classify with counting on and give HermiT's and Konclude's taxonomies, 6.3
 and 6.5 times faster than Konclude 0.7.0 on four threads on `atlas` and 2.0 and 2.1 times
-on one. ore_ont_6485 still passes the bound, and its failed attempt takes 3.1 times as
+on one. ore_ont_6485 still passes the bound, and its classification with counting
+requested, the failed attempt and the run without counting together, takes 3.1 times as
 long with the order as without it, 576 ms against 184 ms on one thread. The default
 accepts that cost, and item 896 follows that file and the default of counting. The item also found that a counting run misses a maximum over a compound
 qualifier that no other axiom names, which is item 897, so counting stays off by default.
@@ -2563,9 +2564,10 @@ ontologies below finish with it, none that finishes without it stops finishing, 
 answer differs from a finished run without it. Its one measured cost is ore_ont_6485.
 
 ore_ont_6485 remains a measured limitation. Its counting attempt still passes the bound
-with the order, and the failed attempt is dearer, 576 against 184 ms on one thread on
-`atlas`, 3.1 times, and 688 against 245 ms on four. A caller for whom that attempt
-matters sets `Limits::number_order` to false. The order removes the cheap
+with the order, and the failed attempt is dearer. The classification with counting
+requested, which is the attempt and the run without counting together, takes 576 against
+184 ms on one thread on `atlas`, 3.1 times as long, and 688 against 245 ms on four. A
+caller for whom that attempt matters sets `Limits::number_order` to false. The order removes the cheap
 derivations of the disjointness rule, which fall from 110,800 to 1,078, and the bound is
 then spent on the universal rule and the qualified roles, which rise from 30,563 and
 10,036 derivations to 118,258 and 68,900 and cost more each. What remains is the

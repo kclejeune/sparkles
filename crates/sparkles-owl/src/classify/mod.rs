@@ -138,7 +138,7 @@ const ROOTED_WORK_BOUND: usize = 1 << 19;
 /// small ontology. Of the 150 counting fixtures, with the order between number
 /// restrictions, 146 derive at most 63,000 conclusions on one thread and one derives
 /// 247,000. Two derive 392,000 and 1.3 million, which [`Limits::dl_work`] lets a caller
-/// allow, and one passes any bound.
+/// allow, and one passes 8 million.
 const DL_WORK_BOUND: usize = 1 << 18;
 
 /// The bound on the conclusions of the run that starts again without counting once the run
@@ -223,9 +223,10 @@ pub struct Limits {
     /// answers are those of a run without the order that finishes, and a run with it
     /// finishes on ontologies with many related cardinalities, such as the Protein
     /// Ontology, where the run without it passes [`dl_work`](Limits::dl_work). A run
-    /// that passes the bound either way can spend longer before it does: ore_ont_6485 of
-    /// the ORE 2015 DL sample takes 576 ms with the order and 184 ms without it on one
-    /// thread. False turns the order off.
+    /// that passes the bound either way can spend longer before it does: the
+    /// classification of ore_ont_6485 of the ORE 2015 DL sample with counting, the
+    /// attempt and the run without counting together, takes 576 ms with the order and
+    /// 184 ms without it on one thread. False turns the order off.
     pub number_order: bool,
 }
 

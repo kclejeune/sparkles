@@ -313,8 +313,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   bound. It keeps tables of the related restrictions, which raise the peak memory of the
   two Protein Ontology files of the ORE 2015 DL sample by 4 to 19% over the run without
   counting. A run that passes its bound with the order as without it can take longer to
-  do so, 3.1 times on ore_ont_6485 of that sample, which roadmap item 896 follows.
-  Items 896 and 897 follow the default of counting.
+  do so. The classification of ore_ont_6485 of that sample with counting requested takes
+  3.1 times as long with the order, which roadmap item 896 follows. Items 896 and 897
+  follow the default of counting.
   Number restrictions, functional and inverse functional properties, disjoint properties
   and asymmetric properties then take equalities of successors, and a run that counts has
   a bound of 262,144 derived conclusions, `Limits::dl_work`. Without it those axioms are

@@ -64,32 +64,40 @@ fn classes(ax: &[Axiom]) -> Vec<Class> {
     cs.into_iter().collect()
 }
 
-/// Classifies at one and at eight threads, checks that the answers agree and that Tier D
-/// took every axiom, and returns one of them.
+/// Classifies at one and at eight threads, without the order between number restrictions
+/// and with it, which is the default, checks that the answers agree and that Tier D took
+/// every axiom, and returns one of the default. The order tells a contradiction between a
+/// minimum and a maximum that the rules for equalities of successors would otherwise
+/// derive, so the runs without it keep those rules under test.
 fn whole(body: &str) -> Classification {
     let ax = axioms(body);
     let cs = classes(&ax);
     let mut outs = Vec::new();
-    for threads in [1, 8] {
-        let mut k = Classifier::of(&ax);
-        let out = k
-            .classify(&Limits {
-                threads,
-                counting: true,
-                ..Limits::default()
-            })
-            .unwrap();
-        assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
-        assert_eq!(out.stats.tier, Tier::Disjunctive);
-        assert!(out.stats.clauses > 0, "Tier D took no clause");
-        assert!(out.complete);
-        outs.push(out);
+    for number_order in [false, true] {
+        for threads in [1, 8] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    counting: true,
+                    number_order,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+            assert!(out.stats.clauses > 0, "Tier D took no clause");
+            assert!(out.complete);
+            outs.push(out);
+        }
     }
-    assert_eq!(
-        pairs(&outs[0].taxonomy, &cs),
-        pairs(&outs[1].taxonomy, &cs),
-        "the answer depends on the threads"
-    );
+    for out in &outs[1..] {
+        assert_eq!(
+            pairs(&outs[0].taxonomy, &cs),
+            pairs(&out.taxonomy, &cs),
+            "the answer depends on the threads or on the order between number restrictions"
+        );
+    }
     outs.pop().unwrap()
 }
 
@@ -109,7 +117,8 @@ fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
     }
 }
 
-/// The limits of a run that counts, which is off by default.
+/// The limits of a run that counts, which is off by default, with the order between
+/// number restrictions, which such a run has by default.
 fn counting() -> Limits {
     Limits {
         counting: true,

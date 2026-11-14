@@ -178,11 +178,13 @@ fn the_order_is_on_by_default_and_the_field_turns_it_off() {
          {UNION}"
     ));
     let cs = classes(&ax);
+    // the answer with what the run left out and reported
     let classify = |limits: Limits| {
         let mut k = Classifier::of(&ax);
         let out = k.classify(&limits).unwrap();
-        (out, k.excluded().len())
+        (out, format!("{:?}", k.excluded()))
     };
+    const NONE: &str = "[]";
     for threads in [1, 8] {
         let (default, left) = classify(Limits {
             threads,
@@ -190,7 +192,7 @@ fn the_order_is_on_by_default_and_the_field_turns_it_off() {
             ..Limits::default()
         });
         assert!(
-            !default.stats.dl_over_budget && default.complete && left == 0,
+            !default.stats.dl_over_budget && default.complete && left == NONE,
             "the default run that counts passed its bound on {threads} threads"
         );
         assert!(default.taxonomy.is_subclass(&c("D"), &c("Nothing")));
@@ -206,7 +208,7 @@ fn the_order_is_on_by_default_and_the_field_turns_it_off() {
             ..Limits::default()
         });
         assert!(
-            off.stats.dl_over_budget && left > 0,
+            off.stats.dl_over_budget && left != NONE,
             "the run without the order stayed in its bound on {threads} threads"
         );
         assert!(!off.taxonomy.is_subclass(&c("D"), &c("Nothing")));
@@ -221,7 +223,7 @@ fn the_order_is_on_by_default_and_the_field_turns_it_off() {
         ..Limits::default()
     });
     assert!(!plain.stats.dl_over_budget && !plain_off.stats.dl_over_budget);
-    assert!(left > 0 && left == left_off);
+    assert!(left != NONE && left == left_off);
     assert_eq!(plain.stats.dl_work, plain_off.stats.dl_work);
     assert_eq!(pairs(&plain, &cs), pairs(&plain_off, &cs));
     assert!(!plain.taxonomy.is_subclass(&c("D"), &c("Nothing")));

@@ -266,12 +266,11 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
     }
 }
 
-/// The counting cases that pass Tier D's bound on derived conclusions: every run, on one
-/// thread or several and with either strategy, passes it and falls back to the Horn rules,
-/// so that the answer is the same for every schedule. `shiq-028` passes the bound with the
-/// order between number restrictions, which is the default, and without it. `shq-041`
-/// passes it only without the order, and `tests/dl_number_order.rs` holds its answer with
-/// the order.
+/// The counting cases that pass Tier D's bound on derived conclusions: each run, on one,
+/// four and eight threads and with either strategy, passes it and classifies again without
+/// counting, and these runs give one answer. `shiq-028` passes the bound with the order
+/// between number restrictions, which is the default, and without it. `shq-041` passes it
+/// only without the order, and `tests/dl_number_order.rs` holds its answer with the order.
 #[test]
 fn the_cases_past_the_bound_fall_back_on_every_schedule() {
     for (stem, number_order) in [("shq-041", false), ("shiq-028", false), ("shiq-028", true)] {
