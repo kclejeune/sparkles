@@ -95,6 +95,8 @@ and inspect explanations. Validate data with [SHACL](reasoning/README.md#shacl),
 [discover schema and draft shapes](reasoning/README.md#schema-discovery-and-drafted-shapes)
 from existing data. ShEx write guards verify copied schemas before installation or
 reuse. Legacy configurations without a copy digest validate the head in full at install.
+The OWL form of [OML models](reasoning/README.md#oml-and-opencaesar-models) classifies
+and loads through openCAESAR's Fuseki tools, with the gaps that guide lists.
 
 <a id="server-and-protocols"></a>
 <a id="sparql-protocol-and-fuseki-compatibility"></a>
