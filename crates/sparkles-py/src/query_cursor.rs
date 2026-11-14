@@ -11,12 +11,34 @@ use sparkles::sparql::results::{SolutionsFormat, write_cursor_solutions};
 use sparkles::sparql::{
     CursorStats, CursorStatus, GraphBatch, GraphCursor, QueryBatch, QueryCursor,
 };
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError, atomic::AtomicBool};
+
+/// Rows that one fetch or refill decodes: the row asked for and the ones after it in the
+/// batch, so that iteration leaves the caller's thread once per so many rows.
+const AHEAD_ROWS: usize = 256;
+/// The bytes of term text at which a refill stops decoding ahead. The rows decoded ahead
+/// are held outside the query's memory budget until they are handed out, so this bounds
+/// what a cursor holds there at about this much and one row.
+const AHEAD_BYTES: usize = 1 << 20;
+
+/// About how many bytes of text a term holds, for [`AHEAD_BYTES`].
+fn term_bytes(term: &oxrdf::Term) -> usize {
+    64 + match term {
+        oxrdf::Term::NamedNode(n) => n.as_str().len(),
+        oxrdf::Term::BlankNode(b) => b.as_str().len(),
+        oxrdf::Term::Literal(l) => l.value().len(),
+        oxrdf::Term::Triple(_) => 256,
+    }
+}
 
 struct State {
     cursor: Option<QueryCursor>,
     batch: Option<QueryBatch>,
+    /// the next row of `batch` to decode
     row: usize,
+    /// rows of `batch` before `row` that are decoded and not yet handed out
+    ahead: VecDeque<Vec<Option<oxrdf::Term>>>,
     emitted: u64,
     stats: CursorStats,
     plan: String,
@@ -29,21 +51,44 @@ impl State {
             .cursor
             .as_ref()
             .map_or(self.stats.status, QueryCursor::status);
-        if status == CursorStatus::Complete
-            && self.batch.as_ref().is_some_and(|b| self.row < b.len())
-        {
+        if status == CursorStatus::Complete && self.pending() {
             CursorStatus::Open
         } else {
             status
         }
     }
 
-    /// Whether the next row is in the batch already fetched, so that reading it runs no
-    /// part of the query.
+    /// Whether rows that were fetched have not been handed out.
+    fn pending(&self) -> bool {
+        !self.ahead.is_empty() || self.batch.as_ref().is_some_and(|b| self.row < b.len())
+    }
+
+    /// Whether the next row to decode is in the batch already fetched, so that reading it
+    /// runs no part of the query.
     fn buffered(&self) -> bool {
         !self.serializing
             && self.cursor.is_some()
             && self.batch.as_ref().is_some_and(|b| self.row < b.len())
+    }
+
+    /// The next row, with up to `rows - 1` of the rows after it in the batch decoded
+    /// into `ahead`. Decoding ahead stops at [`AHEAD_BYTES`] of text and at a row that
+    /// fails. That row is decoded again when it is asked for, so its error is raised and
+    /// recorded for the row it belongs to, after the rows before it were handed out.
+    fn refill(&mut self, rows: usize) -> sparkles::Result<Option<Vec<Option<oxrdf::Term>>>> {
+        let Some(first) = self.next_row()? else {
+            return Ok(None);
+        };
+        let mut bytes = 0;
+        while self.ahead.len() + 1 < rows && bytes < AHEAD_BYTES && self.buffered() {
+            let Some(Ok(row)) = self.batch.as_ref().map(|batch| batch.row(self.row)) else {
+                break;
+            };
+            bytes += row.iter().flatten().map(term_bytes).sum::<usize>();
+            self.row += 1;
+            self.ahead.push_back(row);
+        }
+        Ok(Some(first))
     }
 
     /// The next row, from the batch already fetched or from the cursor's next batch.
@@ -244,6 +289,7 @@ impl PyQueryCursor {
                 cursor: Some(cursor),
                 batch: None,
                 row: 0,
+                ahead: VecDeque::new(),
                 emitted: 0,
                 stats,
                 plan,
@@ -321,53 +367,62 @@ impl PyQueryCursor {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyQuerySolution>> {
-        // A row of the batch already fetched is decoded here with the GIL held. It runs no
-        // part of the query and waits for nothing, and it takes less time than leaving
-        // the thread does. Only a fetch runs detached, where Ctrl-C can cancel it.
-        let ready = match self.state.try_lock() {
-            Ok(mut state) if state.buffered() => Some(state.next_row()),
-            _ => None,
-        };
+        // A row that an earlier call decoded is handed out here, which takes no work. A
+        // fetch or a refill runs detached, where Ctrl-C can cancel it, and decodes the
+        // rows that follow in its batch, so iteration leaves this thread once per
+        // `AHEAD_ROWS` rows and decodes nothing with the GIL held.
+        let ready = self.state.try_lock().ok().and_then(|mut state| {
+            let row = state.ahead.pop_front()?;
+            state.emitted += 1;
+            Some(row)
+        });
         let values = match ready {
-            Some(row) => row.py(py)?,
+            Some(row) => Some(row),
             None => {
                 let state = self.state.clone();
                 interrupt::run(py, &self.cancel, move || {
                     state
                         .try_lock()
                         .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?
-                        .next_row()
+                        .refill(AHEAD_ROWS)
                 })?
             }
         };
         Ok(values.map(|values| PyQuerySolution::new(self.vars.clone(), values)))
     }
 
-    /// Internal async bridge: deliver one remaining native batch, without prefetch.
+    /// Internal async bridge: deliver one remaining native batch, without prefetch. The
+    /// whole batch is decoded in one detached call, so the event loop's thread can run
+    /// while it is.
     fn _next_batch(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyQuerySolution>>>> {
-        let Some(first) = self.__next__(py)? else {
-            return Ok(None);
-        };
-        let remaining = self
-            .state
-            .try_lock()
-            .map(|state| {
-                state
-                    .batch
-                    .as_ref()
-                    .map_or(0, |batch| batch.len() - state.row)
-            })
-            .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))
-            .py(py)?;
-        let mut rows = Vec::with_capacity(remaining + 1);
-        rows.push(Py::new(py, first)?);
-        for _ in 0..remaining {
-            let row = self
-                .__next__(py)?
-                .ok_or_else(|| invalid(py, "cursor changed while reading a batch"))?;
-            rows.push(Py::new(py, row)?);
-        }
-        Ok(Some(rows))
+        let state = self.state.clone();
+        let rows = interrupt::run(py, &self.cancel, move || {
+            let mut state = state
+                .try_lock()
+                .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
+            // rows that `__next__` decoded ahead come first
+            let mut rows: Vec<_> = state.ahead.drain(..).collect();
+            state.emitted += rows.len() as u64;
+            if rows.is_empty() {
+                let Some(first) = state.next_row()? else {
+                    return Ok(None);
+                };
+                rows.push(first);
+            }
+            while state.buffered() {
+                match state.next_row()? {
+                    Some(row) => rows.push(row),
+                    None => break,
+                }
+            }
+            Ok(Some(rows))
+        })?;
+        rows.map(|rows| {
+            rows.into_iter()
+                .map(|values| Py::new(py, PyQuerySolution::new(self.vars.clone(), values)))
+                .collect()
+        })
+        .transpose()
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -379,7 +434,8 @@ impl PyQueryCursor {
                 if state.serializing {
                     return Ok(false);
                 }
-                let pending = state.batch.as_ref().is_some_and(|b| state.row < b.len());
+                let pending = state.pending();
+                state.ahead.clear();
                 if let Some(mut cursor) = state.cursor.take() {
                     cursor.close();
                     state.stats = cursor.stats();
@@ -454,7 +510,10 @@ impl PyQueryCursor {
 struct GraphState {
     cursor: Option<GraphCursor>,
     batch: Option<GraphBatch>,
+    /// the next quad of `batch` to hand out or copy ahead
     row: usize,
+    /// quads of `batch` before `row` that are copied and not yet handed out
+    ahead: VecDeque<oxrdf::Quad>,
     emitted: u64,
     stats: CursorStats,
     plan: String,
@@ -467,13 +526,16 @@ impl GraphState {
             .cursor
             .as_ref()
             .map_or(self.stats.status, GraphCursor::status);
-        if status == CursorStatus::Complete
-            && self.batch.as_ref().is_some_and(|b| self.row < b.len())
-        {
+        if status == CursorStatus::Complete && self.pending() {
             CursorStatus::Open
         } else {
             status
         }
+    }
+
+    /// Whether quads that were fetched have not been handed out.
+    fn pending(&self) -> bool {
+        !self.ahead.is_empty() || self.batch.as_ref().is_some_and(|b| self.row < b.len())
     }
 
     /// Whether the next quad is in the batch already fetched, so that reading it runs no
@@ -482,6 +544,28 @@ impl GraphState {
         !self.serializing
             && self.cursor.is_some()
             && self.batch.as_ref().is_some_and(|b| self.row < b.len())
+    }
+
+    /// The next quad, with up to `quads - 1` of the quads after it in the batch copied
+    /// into `ahead`, up to [`AHEAD_BYTES`] of text.
+    fn refill(&mut self, quads: usize) -> sparkles::Result<Option<oxrdf::Quad>> {
+        let Some(first) = self.next_quad()? else {
+            return Ok(None);
+        };
+        let mut bytes = 0;
+        while self.ahead.len() + 1 < quads && bytes < AHEAD_BYTES && self.buffered() {
+            let Some(quad) = self
+                .batch
+                .as_ref()
+                .map(|batch| batch.quads()[self.row].clone())
+            else {
+                break;
+            };
+            bytes += 192 + term_bytes(&quad.object);
+            self.row += 1;
+            self.ahead.push_back(quad);
+        }
+        Ok(Some(first))
     }
 
     /// The next quad, from the batch already fetched or from the cursor's next batch.
@@ -558,6 +642,7 @@ impl PyGraphCursor {
                 cursor: Some(cursor),
                 batch: None,
                 row: 0,
+                ahead: VecDeque::new(),
                 emitted: 0,
                 stats,
                 plan,
@@ -627,21 +712,22 @@ impl PyGraphCursor {
     }
 
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        // As for a SELECT cursor, a quad of the batch already fetched is handed out here
-        // with the GIL held, and only a fetch runs detached.
-        let ready = match self.state.try_lock() {
-            Ok(mut state) if state.buffered() => Some(state.next_quad()),
-            _ => None,
-        };
+        // As for a SELECT cursor: a quad copied ahead is handed out here, and a fetch or
+        // a refill runs detached.
+        let ready = self.state.try_lock().ok().and_then(|mut state| {
+            let quad = state.ahead.pop_front()?;
+            state.emitted += 1;
+            Some(quad)
+        });
         let values = match ready {
-            Some(quad) => quad.py(py)?,
+            Some(quad) => Some(quad),
             None => {
                 let state = self.state.clone();
                 interrupt::run(py, &self.cancel, move || {
                     state
                         .try_lock()
                         .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?
-                        .next_quad()
+                        .refill(AHEAD_ROWS)
                 })?
             }
         };
@@ -650,31 +736,38 @@ impl PyGraphCursor {
             .transpose()
     }
 
-    /// Internal async bridge: deliver one remaining native batch, without prefetch.
+    /// Internal async bridge: deliver one remaining native batch, without prefetch, copied
+    /// in one detached call.
     fn _next_batch(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyAny>>>> {
-        let Some(first) = self.__next__(py)? else {
-            return Ok(None);
-        };
-        let remaining = self
-            .state
-            .try_lock()
-            .map(|state| {
-                state
-                    .batch
-                    .as_ref()
-                    .map_or(0, |batch| batch.len() - state.row)
+        let state = self.state.clone();
+        let quads = interrupt::run(py, &self.cancel, move || {
+            let mut state = state
+                .try_lock()
+                .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
+            let mut quads: Vec<_> = state.ahead.drain(..).collect();
+            state.emitted += quads.len() as u64;
+            if quads.is_empty() {
+                let Some(first) = state.next_quad()? else {
+                    return Ok(None);
+                };
+                quads.push(first);
+            }
+            while state.buffered() {
+                match state.next_quad()? {
+                    Some(quad) => quads.push(quad),
+                    None => break,
+                }
+            }
+            Ok(Some(quads))
+        })?;
+        quads
+            .map(|quads| {
+                quads
+                    .into_iter()
+                    .map(|quad| crate::terms::quad_to_py(py, quad).map(Bound::unbind))
+                    .collect()
             })
-            .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))
-            .py(py)?;
-        let mut rows = Vec::with_capacity(remaining + 1);
-        rows.push(first.unbind());
-        for _ in 0..remaining {
-            let row = self
-                .__next__(py)?
-                .ok_or_else(|| invalid(py, "cursor changed while reading a batch"))?;
-            rows.push(row.unbind());
-        }
-        Ok(Some(rows))
+            .transpose()
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -686,7 +779,8 @@ impl PyGraphCursor {
                 if state.serializing {
                     return Ok(false);
                 }
-                let pending = state.batch.as_ref().is_some_and(|b| state.row < b.len());
+                let pending = state.pending();
+                state.ahead.clear();
                 if let Some(mut cursor) = state.cursor.take() {
                     cursor.close();
                     state.stats = cursor.stats();

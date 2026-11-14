@@ -312,13 +312,27 @@ class _Cursor(Generic[_T]):
         native = self._native
         try:
 
-            def close() -> tuple[dict[str, Any], dict[str, Any]]:
-                native.close()
-                return native.stats(), native.plan()
+            # The plan is read before the close as well, so that a close that fails
+            # still leaves the plan as the last batch left it.
+            def close() -> tuple[Any, Any, BaseException | None]:
+                try:
+                    before = native.plan()
+                except BaseException:
+                    before = None
+                try:
+                    native.close()
+                    return native.stats(), native.plan(), None
+                except BaseException as error:
+                    return None, before, error
 
-            self._stats, self._plan = await self._worker.call(
+            stats, plan, error = await self._worker.call(
                 close, _token(), interruptible=False
             )
+            if plan is not None:
+                self._plan = plan
+            if error is not None:
+                raise error
+            self._stats = stats
             if pending and self._stats["status"] == "complete":
                 self._stats = dict(self._stats, status="stopped")
         finally:

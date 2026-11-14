@@ -1058,18 +1058,27 @@ impl PyDataset {
     }
 
     fn __contains__(&self, py: Python<'_>, quad: &Bound<'_, PyAny>) -> PyResult<bool> {
+        // A `Quad` is read where it is. Anything else is converted first, which raises
+        // for a wrong type before the dataset's state is looked at.
+        let borrowed = quad.cast::<PyQuad>().ok();
+        let owned = match borrowed {
+            Some(_) => None,
+            None => Some(quad_from_py(quad)?),
+        };
         let ds = self.ds(py)?;
-        // a lookup in memory takes less time than giving up the GIL and taking it back,
-        // and it reads a `Quad` where it is, without a copy of its terms
-        if ds.store().root().is_none()
-            && let Ok(q) = quad.cast::<PyQuad>()
-        {
-            return ds.contains(q.get().inner.as_ref()).py(py);
-        }
-        let q = quad_from_py(quad)?;
+        // a lookup in memory takes less time than giving up the GIL and taking it back
         if ds.store().root().is_none() {
-            return ds.contains(q.as_ref()).py(py);
+            return match (&borrowed, &owned) {
+                (Some(q), _) => ds.contains(q.get().inner.as_ref()),
+                (None, Some(q)) => ds.contains(q.as_ref()),
+                (None, None) => unreachable!("a quad is borrowed or converted"),
+            }
+            .py(py);
         }
+        let q = match owned {
+            Some(q) => q,
+            None => quad_from_py(quad)?,
+        };
         py.detach(|| ds.contains(q.as_ref())).py(py)
     }
 

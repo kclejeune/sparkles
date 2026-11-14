@@ -140,3 +140,70 @@ def test_cursor_serialization_to_a_bad_path_fails_the_cursor(tmp_path):
             next(cursor)
         cursor.close()
         assert cursor.status == "failed"
+
+
+def _numbers(n):
+    return " ".join(f"<urn:s{i}> <urn:p> {i} ." for i in range(n))
+
+
+def test_cursor_rows_decoded_ahead_count_when_handed_out():
+    ds = Dataset()
+    ds.load(_numbers(1000), "ttl")
+    q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }"
+    expected = sorted(tuple(map(str, row)) for row in ds.select(q))
+    # one batch holds every row, and a refill decodes 256 of them at a time
+    cursor = ds.select_cursor(q)
+    rows = [next(cursor) for _ in range(3)]
+    assert cursor.stats()["emittedRows"] == 3
+    assert cursor.status == "open"
+    rows += list(cursor)
+    assert sorted(tuple(map(str, row)) for row in rows) == expected
+    assert cursor.status == "complete"
+    assert cursor.stats()["emittedRows"] == 1000
+
+    # rows decoded ahead are pending rows: closing before they are read stops the cursor
+    cursor = ds.select_cursor(q)
+    next(cursor)
+    assert cursor.status == "open"
+    cursor.close()
+    assert cursor.status == "stopped"
+    assert cursor.stats()["emittedRows"] == 1
+    assert list(cursor) == []
+
+    # the async bridge takes what a sync read left decoded, then the rest of the batch
+    cursor = ds.select_cursor(q)
+    first = next(cursor)
+    rest = cursor._next_batch()
+    assert len(rest) == 999
+    assert cursor.stats()["emittedRows"] == 1000
+    assert sorted(tuple(map(str, row)) for row in [first, *rest]) == expected
+    assert cursor._next_batch() is None
+
+    quads = ds.graph_cursor("CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }")
+    assert next(quads) is not None
+    assert quads.stats()["emittedRows"] == 1
+    assert len(list(quads)) == 999
+    assert quads.stats()["emittedRows"] == 1000
+
+
+def test_cursor_decoding_ahead_raises_a_budget_error_at_its_row():
+    ds = Dataset()
+    ds.load(_numbers(40) + f' <urn:big> <urn:p> "{"x" * 400_000}" .', "ttl")
+    q = "SELECT ?o WHERE { ?s <urn:p> ?o } ORDER BY ?s"
+    # the long literal sorts first; with a budget that cannot hold its decoded form the
+    # first row fails, and nothing is handed out
+    cursor = ds.select_cursor(q, max_memory_bytes=1 << 20)
+    with pytest.raises(Exception):
+        next(cursor)
+    assert cursor.status == "failed"
+    # with the literal last, the 40 rows before it are handed out before the error
+    q = "SELECT ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?s)"
+    cursor = ds.select_cursor(q, max_memory_bytes=1 << 20)
+    rows = []
+    with pytest.raises(Exception):
+        for row in cursor:
+            rows.append(row)
+            assert cursor.status == "open"
+    assert len(rows) == 40
+    assert cursor.status == "failed"
+    assert cursor.stats()["emittedRows"] == 40

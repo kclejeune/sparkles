@@ -295,3 +295,10 @@ def test_apply_patch() -> None:
         ds.apply_patch('A "s" <urn:p> 1 .')
     with pytest.raises(TypeError):
         ds.apply_patch(42)  # type: ignore[arg-type]
+
+
+def test_contains_checks_the_type_before_the_dataset_state():
+    ds = Dataset()
+    ds.close()
+    with pytest.raises(TypeError):
+        object() in ds
