@@ -118,6 +118,74 @@
 | rdfs p16 k=10000 change-again, ms | 76.06 (69.91 to 79.46) | 71.69 (70.63 to 72.81) |
 | rdfs p16 k=10000 revert-again, ms | 79.28 (70.75 to 80.05) | 77.41 (77.12 to 77.56) |
 
+# counters, second job: fin (shared counters) and ctr (per-thread counters, otherwise the same build), five rounds
+| Run | fin | ctr |
+|---|---|---|
+| owl-rl p16 full run, s | 20.23 (20.18 to 20.26) | 20.10 (20.03 to 20.19) |
+| owl-rl t1 full run, s | 41.87 (41.81 to 42.06) | 41.90 (41.82 to 41.93) |
+| rdfs p16 full run, s | 14.49 (14.44 to 14.62) | 14.49 (14.40 to 14.58) |
+| rdfs t1 full run, s | 24.55 (24.41 to 24.62) | 24.47 (24.39 to 24.81) |
+| owl-rl p16 first change, ms | 19.96 (19.31 to 22.65) | 21.47 (18.92 to 27.25) |
+| owl-rl p16 first change-again, ms | 7.08 (6.80 to 8.70) | 6.86 (6.14 to 8.89) |
+| owl-rl p16 first revert, ms | 17.67 (14.29 to 20.47) | 16.90 (13.00 to 23.17) |
+| owl-rl t1 first change, ms | 48.22 (47.38 to 48.59) | 48.24 (47.68 to 48.85) |
+| owl-rl t1 first change-again, ms | 6.15 (6.06 to 6.69) | 6.27 (6.17 to 6.56) |
+| owl-rl t1 first revert, ms | 12.57 (12.21 to 12.66) | 12.84 (12.24 to 14.63) |
+| rdfs p16 first change, ms | 13.86 (13.22 to 16.10) | 14.86 (13.04 to 15.05) |
+| rdfs p16 first change-again, ms | 3.24 (2.16 to 3.36) | 2.49 (2.06 to 3.34) |
+| rdfs p16 first revert, ms | 6.32 (4.35 to 6.89) | 5.55 (4.37 to 6.95) |
+| rdfs t1 first change, ms | 25.74 (24.73 to 27.39) | 25.59 (25.18 to 28.46) |
+| rdfs t1 first change-again, ms | 2.40 (2.32 to 2.97) | 2.57 (2.29 to 2.82) |
+| rdfs t1 first revert, ms | 4.26 (4.03 to 5.16) | 4.67 (4.12 to 5.15) |
+| owl-rl p16 k=100 change, ms | 9.09 (8.64 to 9.89) | 9.21 (8.90 to 9.35) |
+| owl-rl p16 k=100 revert, ms | 12.54 (10.98 to 13.40) | 11.91 (11.61 to 12.38) |
+| owl-rl p16 k=100 change-again, ms | 6.47 (5.74 to 6.73) | 6.12 (5.83 to 6.49) |
+| owl-rl p16 k=100 revert-again, ms | 11.33 (9.68 to 11.76) | 10.80 (9.59 to 11.50) |
+| owl-rl p16 k=1000 change, ms | 26.85 (25.78 to 27.55) | 26.84 (26.08 to 27.22) |
+| owl-rl p16 k=1000 revert, ms | 54.20 (51.04 to 55.00) | 52.77 (51.20 to 63.01) |
+| owl-rl p16 k=1000 change-again, ms | 24.47 (23.97 to 25.56) | 25.47 (24.87 to 26.55) |
+| owl-rl p16 k=1000 revert-again, ms | 48.67 (42.80 to 52.90) | 48.95 (47.12 to 52.41) |
+| owl-rl p16 k=10000 change, ms | 208.16 (203.41 to 222.12) | 207.31 (203.03 to 213.04) |
+| owl-rl p16 k=10000 revert, ms | 394.00 (371.33 to 408.41) | 401.88 (354.96 to 442.38) |
+| owl-rl p16 k=10000 change-again, ms | 207.48 (203.22 to 213.47) | 197.37 (185.40 to 201.54) |
+| owl-rl p16 k=10000 revert-again, ms | 366.81 (351.09 to 412.16) | 384.25 (350.19 to 392.03) |
+| owl-rl t1 k=100 change, ms | 12.09 (11.89 to 12.27) | 11.86 (11.56 to 12.29) |
+| owl-rl t1 k=100 revert, ms | 10.63 (10.47 to 10.88) | 10.68 (10.32 to 10.86) |
+| owl-rl t1 k=100 change-again, ms | 6.10 (6.00 to 6.20) | 6.16 (5.97 to 6.22) |
+| owl-rl t1 k=100 revert-again, ms | 8.61 (8.48 to 8.80) | 8.60 (8.36 to 8.81) |
+| owl-rl t1 k=1000 change, ms | 48.42 (47.31 to 48.96) | 48.07 (47.69 to 48.42) |
+| owl-rl t1 k=1000 revert, ms | 83.17 (83.08 to 83.53) | 83.52 (82.98 to 84.41) |
+| owl-rl t1 k=1000 change-again, ms | 37.36 (36.52 to 37.64) | 37.26 (36.94 to 37.97) |
+| owl-rl t1 k=1000 revert-again, ms | 69.44 (69.06 to 69.69) | 69.10 (68.84 to 70.52) |
+| owl-rl t1 k=10000 change, ms | 376.40 (372.59 to 381.06) | 376.67 (375.43 to 379.97) |
+| owl-rl t1 k=10000 revert, ms | 956.05 (953.44 to 960.32) | 958.18 (955.55 to 963.33) |
+| owl-rl t1 k=10000 change-again, ms | 366.49 (362.48 to 377.11) | 365.21 (363.81 to 373.70) |
+| owl-rl t1 k=10000 revert-again, ms | 818.59 (817.46 to 829.93) | 824.31 (820.57 to 830.43) |
+| rdfs p16 k=100 change, ms | 4.96 (4.68 to 5.50) | 4.77 (4.52 to 5.33) |
+| rdfs p16 k=100 revert, ms | 2.72 (2.65 to 3.18) | 2.77 (2.64 to 2.90) |
+| rdfs p16 k=100 change-again, ms | 2.08 (2.04 to 2.50) | 2.15 (2.08 to 2.31) |
+| rdfs p16 k=100 revert-again, ms | 2.14 (2.03 to 2.15) | 2.06 (1.98 to 2.20) |
+| rdfs p16 k=1000 change, ms | 10.65 (10.35 to 10.95) | 10.39 (10.04 to 11.14) |
+| rdfs p16 k=1000 revert, ms | 9.83 (9.44 to 11.03) | 9.81 (8.99 to 10.82) |
+| rdfs p16 k=1000 change-again, ms | 8.75 (8.19 to 9.29) | 8.57 (8.53 to 9.36) |
+| rdfs p16 k=1000 revert-again, ms | 8.88 (8.25 to 9.76) | 8.96 (8.64 to 9.88) |
+| rdfs p16 k=10000 change, ms | 78.13 (74.66 to 89.44) | 79.88 (74.93 to 83.83) |
+| rdfs p16 k=10000 revert, ms | 90.34 (87.03 to 91.71) | 87.83 (84.81 to 92.63) |
+| rdfs p16 k=10000 change-again, ms | 72.85 (71.37 to 74.16) | 73.79 (72.23 to 83.33) |
+| rdfs p16 k=10000 revert-again, ms | 79.43 (77.23 to 82.90) | 78.02 (76.66 to 81.00) |
+| rdfs t1 k=100 change, ms | 8.30 (8.03 to 8.69) | 8.35 (8.16 to 8.91) |
+| rdfs t1 k=100 revert, ms | 2.71 (2.69 to 2.74) | 2.75 (2.68 to 2.76) |
+| rdfs t1 k=100 change-again, ms | 2.36 (2.32 to 2.39) | 2.36 (2.30 to 2.44) |
+| rdfs t1 k=100 revert-again, ms | 2.16 (2.10 to 2.18) | 2.13 (2.08 to 2.14) |
+| rdfs t1 k=1000 change, ms | 19.11 (18.91 to 19.63) | 19.32 (19.10 to 19.53) |
+| rdfs t1 k=1000 revert, ms | 14.05 (13.96 to 14.25) | 14.16 (13.91 to 14.25) |
+| rdfs t1 k=1000 change-again, ms | 12.72 (12.59 to 13.10) | 12.84 (12.70 to 13.25) |
+| rdfs t1 k=1000 revert-again, ms | 11.94 (11.65 to 12.31) | 12.10 (11.52 to 12.15) |
+| rdfs t1 k=10000 change, ms | 130.79 (129.69 to 132.34) | 131.80 (129.87 to 135.21) |
+| rdfs t1 k=10000 revert, ms | 127.36 (124.33 to 127.83) | 125.43 (119.28 to 127.80) |
+| rdfs t1 k=10000 change-again, ms | 105.78 (104.08 to 106.53) | 106.29 (104.76 to 107.71) |
+| rdfs t1 k=10000 revert-again, ms | 105.80 (105.05 to 106.47) | 105.43 (105.23 to 109.87) |
+
 # large changes: lubm keep DB owl-rl 100000 at 20 threads
 base-r1 keep owl-rl threads=20 full method=full source= ms=20150 inferred=12476225 peak_heap_mib=3190.2 reasoner_peak_mib=1707.6
 base-r1 keep owl-rl threads=20 settle method=incremental source=store ms=1854 inferred=12476225 peak_heap_mib=1048.0 reasoner_peak_mib=1034.7

@@ -86,3 +86,17 @@ for round in $(seq 1 "$ROUNDS"); do
   done
 done
 echo "[$(date +%T)] ab-finished" >> "$R/progress.log"
+
+# atlas-job2.sh, the second job, run as: flock ~/lanes/.heavy.lock ~/lanes/closure-updates-113/atlas-job2.sh
+#!/usr/bin/env bash
+# The clean A/B of the per-thread counters of the block cache on atlas, one job under
+# ~/lanes/.heavy.lock (taken by the caller): fin (1590064b) against ctr (bd23a60f, which is
+# fin with the counters of f24e9d62 and nothing else).
+set -uo pipefail
+L=$(cd "$(dirname "$0")" && pwd)
+cd "$L" || exit 1
+log() { echo "[$(date +%T)] $*" >> "$L/job2.log"; }
+[ -d data/db-tip ] && [ -x bin/lubm-ctr ] && [ -x bin/lubm-fin ] || { log "data or binaries missing"; exit 1; }
+log "counters A/B load=$(cut -d' ' -f1 /proc/loadavg)"
+ARMS="fin ctr" PROFILES="rdfs owl-rl" MODES="t1 p16" ROUNDS=5 PIN1=2-5 TAG=atlas-ctr ./ab.sh
+log "job2-finished load=$(cut -d' ' -f1 /proc/loadavg)"
