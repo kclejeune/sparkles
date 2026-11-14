@@ -70,6 +70,7 @@ DEFERRED = {
     "jobs.list",
     "jobs.publish",
     "jobs.renew",
+    "jobs.resume",
     "jobs.retry",
     "jobs.settings",
     "jobs.submit",

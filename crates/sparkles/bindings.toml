@@ -536,6 +536,11 @@ python = "planned: job handles in the bindings under roadmap item 901"
 jvm = "planned: job handles in the bindings under roadmap item 901"
 node = "planned: job handles in the bindings under roadmap item 901"
 
+["jobs.resume"]
+python = "planned: job handles in the bindings under roadmap item 901"
+jvm = "planned: job handles in the bindings under roadmap item 901"
+node = "planned: job handles in the bindings under roadmap item 901"
+
 ["evidence.withdraw"]
 python = "planned: evidence withdrawals in the bindings with the typed evidence operations"
 jvm = "planned: evidence withdrawals in the bindings with the typed evidence operations"

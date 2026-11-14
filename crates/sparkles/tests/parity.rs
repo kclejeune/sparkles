@@ -486,6 +486,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("listJobs", "jobs.list", |ds| {
             let _ = ds.jobs().list(&any(), &any());
         }),
+        op!("recoverJobs", "jobs.resume", |ds| {
+            let _ = ds.jobs().resume(&[], &any());
+        }),
         op!("withdrawClaims", "evidence.withdraw", |ds| {
             let _ = sparkles::evidence::withdraw(ds, ds, &[], &any(), &mut |_, _| None, &any());
         }),
