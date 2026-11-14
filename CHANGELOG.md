@@ -63,7 +63,10 @@ conclusions and answers in full or falls back in the same way on every number of
 A rooted run and a run with the eager strategy take one thread with the option. An
 inference too wide to make now marks the run past its bound with a flag. Four of them
 between two checks wrapped the count before, and the run ended as complete without those
-inferences. This is roadmap item 727, which keeps the decision about the default.
+inferences. A worker of a saturation that panics, in a caller's callback for example, now
+stops the run, and the panic reaches the caller. The other workers waited for it without
+end before, with either driver. This is roadmap item 727, which keeps the decision about
+the default.
 
 ### Compatibility
 

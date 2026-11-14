@@ -2789,22 +2789,36 @@ messages by the place of their sender in the frontier and, for one sender, in th
 it sent them, whatever the number of workers is. Between steps one thread sorts the
 contexts that the deliveries woke and appends them to the queue, and compares the count
 of derived conclusions with the bound. The count is then a sum over whole activations,
-which no schedule changes. A run in steps compares the bound nowhere else.
+which no schedule changes. A run in steps compares that total with the bound nowhere
+else.
 
-An activation of a run in steps has a share: 256 clauses of its store, with the minimums
-it released, or 4,096 derived conclusions, whichever comes first. A context that used its
+An activation of a run in steps has a share of 256 clauses of its store, with the
+minimums it released, and a share of 4,096 derived conclusions. The activation reads both
+between two clauses, so they are thresholds and not limits. One inference can derive more
+than 4,096 conclusions, and one release of minimums can pass 256. A context that used a
 share and has clauses left gives way whoever else waits. It goes on in a later step, at
 once when it has new messages and otherwise when no other context is active, since what
-the others conclude can close it. An activation that alone derives more than the run's
-bound ends its inference and marks the run past its bound, which it decides from its own
-count. A run can pass its bound by the work of one step before the comparison, which is
-the same amount on every schedule.
+the others conclude can close it.
+
+An activation also compares its own count of derived conclusions with the run's bound. It
+does so between clauses and at each look at the bounds within an inference of many
+conclusions, which comes after every 256 choices, whether the inference reserves memory
+for its record of them or not. Once that count alone is more than the bound, the
+activation ends its inference and marks the run past its bound. It decides this from its
+own count, so no schedule changes it. The total is compared between steps only, so a run
+can pass its bound by the work of one step before that comparison, which is the same
+amount on every schedule.
 
 The steps do not change which workers do the work. A step with two contexts or more is
 shared among the workers when it has 128 contexts or when the activations of the last
 step took 150 µs, its messages are delivered by all workers from 4,096 messages on, and
 otherwise the calling thread does the step alone. The helper threads start with the first
-shared step and wait on a barrier between phases, so a small ontology starts none.
+shared step and wait between phases until the calling thread opens the next, so a small
+ontology starts none. A worker that panics, in a caller's callback for example, stops the
+run and leaves its phase as it unwinds, and the calling thread releases the helpers when
+it unwinds, so the panic reaches the caller. The workers of the default driver stop the
+run in the same way. Until this item the other workers of either driver waited without
+end for the one that had panicked.
 
 The argument that an activation is a function of its context's state and its to-do list
 rests on three observations about a run without the root that uses the cautious strategy.
@@ -2834,7 +2848,13 @@ conclusions it derives and at one conclusion less, where every run falls back. A
 test runs an ontology of more than 8,192 contexts with every step and every delivery
 shared among the workers, on one, three and eight threads, and cancels runs at six
 points, after which the same classifier gives the outcome of a new one. Eager and rooted
-runs give one outcome on one, four and eight threads.
+runs give one outcome on one, four and eight threads. So do runs without counting on the
+`alc` and `shi` fixtures, which have no bound on their conclusions. A rooted run that
+counts falls back twice past a bound of one conclusion with the option as without it. One
+inference that derives 3,600 new conclusions ends within 1,000 at a bound of 300, where
+its reservations of memory did not look at the count. A callback that panics in a helper
+or in the calling thread ends the run with the panic, with the step driver and with the
+default one.
 
 On the 750 ontologies of the counting fixtures and the two fuzz sets, at a bound of 8
 million, a run in steps gives the same work, stored clauses and taxonomy on one, three
