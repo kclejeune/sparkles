@@ -401,24 +401,123 @@ pub fn key(n: &Node, ctx: &Ctx) -> Option<CacheKey> {
     }
     let raw = raw_key(n, ctx)?;
     let mut anon: Vec<String> = Vec::new();
-    let key = anon_regex()
-        .replace_all(&raw, |c: &regex::Captures<'_>| {
-            let tok = c[1].to_string();
-            // only rename actual variables of this query (never IRI / literal text)
-            if !ctx.has_var(&tok) {
-                return c[0].to_string();
+    // only rename actual variables of this query (never IRI / literal text)
+    let key = rename_anon(raw, |tok| {
+        if !ctx.has_var(tok) {
+            return None;
+        }
+        Some(match anon.iter().position(|a| a == tok) {
+            Some(i) => i,
+            None => {
+                anon.push(tok.to_string());
+                anon.len() - 1
             }
-            let i = match anon.iter().position(|a| *a == tok) {
-                Some(i) => i,
-                None => {
-                    anon.push(tok);
-                    anon.len() - 1
-                }
-            };
-            format!("?\u{a7}{i}{}", &c[2])
         })
-        .into_owned();
+    });
     Some(CacheKey { key, anon })
+}
+
+/// `raw` with each generated variable name that [`anon_regex`] matches and `index` knows
+/// replaced by `\u{a7}` and its index.
+///
+/// Every query with a cacheable subtree builds a key, so this runs on the path of each
+/// small query, where the regular expression with its capture groups took about a fifth
+/// of a short property path query's time. A key that is all ASCII, as nearly all are, is
+/// scanned by [`rename_anon_ascii`], which matches exactly what the expression matches
+/// there. Other keys go through the expression, whose `\d` also matches digits outside
+/// ASCII.
+fn rename_anon(raw: String, mut index: impl FnMut(&str) -> Option<usize>) -> String {
+    if !raw.contains('?') {
+        return raw;
+    }
+    if raw.is_ascii() {
+        return rename_anon_ascii(&raw, index);
+    }
+    anon_regex()
+        .replace_all(&raw, |c: &regex::Captures<'_>| match index(&c[1]) {
+            Some(i) => format!("?\u{a7}{i}{}", &c[2]),
+            None => c[0].to_string(),
+        })
+        .into_owned()
+}
+
+/// Where the generated variable name that starts at `at` ends, when [`anon_regex`] matches
+/// there: the name is one of its three forms and the next byte, if any, cannot continue a
+/// name. Each form is a run of bytes that its last class would also take, so the longest
+/// run is the only candidate, as it is for the expression.
+fn anon_name_end(b: &[u8], at: usize) -> Option<usize> {
+    let run = |from: usize, class: fn(&u8) -> bool| {
+        from + b[from.min(b.len())..]
+            .iter()
+            .take_while(|c| class(c))
+            .count()
+    };
+    let digit = |c: &u8| c.is_ascii_digit();
+    let end = match *b.get(at)? {
+        // 17 to 32 lowercase hex digits
+        b'0'..=b'9' | b'a'..=b'f' => {
+            let end = run(at, |c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+            if !(17..=32).contains(&(end - at)) {
+                return None;
+            }
+            end
+        }
+        b' ' => match *b.get(at + 1)? {
+            // ` _` and digits
+            b'_' => {
+                let end = run(at + 2, digit);
+                if end == at + 2 {
+                    return None;
+                }
+                end
+            }
+            // ` bn`, digits, `_` and a label
+            b'b' if b.get(at + 2) == Some(&b'n') => {
+                let digits = run(at + 3, digit);
+                if digits == at + 3 || b.get(digits) != Some(&b'_') {
+                    return None;
+                }
+                let end = run(digits + 1, |c| {
+                    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-')
+                });
+                if end == digits + 1 {
+                    return None;
+                }
+                end
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match b.get(end) {
+        Some(c) if c.is_ascii_alphanumeric() || *c == b'_' => None,
+        _ => Some(end),
+    }
+}
+
+/// [`rename_anon`] for a key that is all ASCII.
+fn rename_anon_ascii(raw: &str, mut index: impl FnMut(&str) -> Option<usize>) -> String {
+    use std::fmt::Write;
+    let b = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    // `raw[copied..]` is still to be written, and the search goes on from `from`
+    let (mut copied, mut from) = (0, 0);
+    while let Some(q) = b[from..].iter().position(|&c| c == b'?').map(|i| from + i) {
+        let Some(end) = anon_name_end(b, q + 1) else {
+            from = q + 1;
+            continue;
+        };
+        // The expression takes the byte after the name into its match, so the search goes
+        // on after that byte, even when it is a `?`.
+        from = (end + 1).min(b.len());
+        if let Some(i) = index(&raw[q + 1..end]) {
+            out.push_str(&raw[copied..q]);
+            let _ = write!(out, "?\u{a7}{i}");
+            copied = end;
+        }
+    }
+    out.push_str(&raw[copied..]);
+    out
 }
 
 /// What the data a query reads is a function of: the generation instance and the commit
@@ -813,6 +912,149 @@ mod shard_tests {
                 "{shards} shards ({} of {} bytes) dropped an entry that put accepts",
                 c.num_shards(),
                 c.shard_capacity()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::{anon_regex, rename_anon, rename_anon_ascii};
+
+    /// What the regular expression alone makes of a key, which [`rename_anon`] must match.
+    fn by_regex(raw: &str, mut index: impl FnMut(&str) -> Option<usize>) -> String {
+        anon_regex()
+            .replace_all(raw, |c: &regex::Captures<'_>| match index(&c[1]) {
+                Some(i) => format!("?\u{a7}{i}{}", &c[2]),
+                None => c[0].to_string(),
+            })
+            .into_owned()
+    }
+
+    /// An index like the cache key's: a name is known when `known` says so, and gets the
+    /// position of its first use.
+    fn indexer(known: fn(&str) -> bool) -> impl FnMut(&str) -> Option<usize> {
+        let mut seen: Vec<String> = Vec::new();
+        move |name| {
+            if !known(name) {
+                return None;
+            }
+            Some(match seen.iter().position(|s| s == name) {
+                Some(i) => i,
+                None => {
+                    seen.push(name.to_string());
+                    seen.len() - 1
+                }
+            })
+        }
+    }
+
+    const HEX17: &str = "0123456789abcdef0";
+    const HEX32: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn ascii_scan_matches_the_expression_on_edge_cases() {
+        let cases = [
+            String::new(),
+            "no variables".into(),
+            "?".into(),
+            "?x ?y".into(),
+            format!("?{HEX17}"),
+            format!("?{HEX17} ?{HEX17}|?{HEX32})"),
+            // 16 and 33 digits are not generated names
+            format!("?{} ?{HEX32}0 ", &HEX17[..16]),
+            // a name character after the digits
+            format!("?{HEX17}g ?{HEX17}_ ?{HEX17}A ?{HEX17}-"),
+            // the byte after a name is part of the match, so a `?` there starts no name
+            format!("?{HEX17}?{HEX32} ?{HEX17}"),
+            format!("? _1?{HEX17} ? _2"),
+            "? _12 ? _ ? _x ? _3a ? _4_".into(),
+            "? bn1_a ? bn12_a.b-c_d ? bn_a ? bn1 ? bn1_ ? bn1_a?".into(),
+            "? bn1_a.? bn2_b".into(),
+            "?? _1?? bn1_x??".into(),
+            format!("<http://e/?q={HEX17}> \"? _1\" ?{HEX17}"),
+        ];
+        for known in [
+            (|_| true) as fn(&str) -> bool,
+            |_| false,
+            |n| n.len() % 2 == 0,
+        ] {
+            for raw in &cases {
+                assert_eq!(
+                    rename_anon_ascii(raw, indexer(known)),
+                    by_regex(raw, indexer(known)),
+                    "{raw:?}"
+                );
+                assert_eq!(
+                    rename_anon(raw.clone(), indexer(known)),
+                    by_regex(raw, indexer(known)),
+                    "{raw:?}"
+                );
+            }
+        }
+    }
+
+    /// Keys assembled at random from the pieces that matter to the expression.
+    #[test]
+    fn ascii_scan_matches_the_expression_on_generated_keys() {
+        let pieces = [
+            "?",
+            " ",
+            "_",
+            "bn",
+            "b",
+            "n",
+            "1",
+            "42",
+            "a",
+            "f",
+            "g",
+            "Z",
+            ".",
+            "-",
+            "|",
+            "(",
+            ")",
+            "0123456789abcdef",
+            "0123456789abcde",
+            "x",
+        ];
+        // a small deterministic generator, so that a failure can be reproduced
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let n = 1 + (next() % 12) as usize;
+            let raw: String = (0..n)
+                .map(|_| pieces[(next() % pieces.len() as u64) as usize])
+                .collect();
+            for known in [(|_| true) as fn(&str) -> bool, |n| n.len() % 2 == 0] {
+                assert_eq!(
+                    rename_anon_ascii(&raw, indexer(known)),
+                    by_regex(&raw, indexer(known)),
+                    "{raw:?}"
+                );
+            }
+        }
+    }
+
+    /// A key with text outside ASCII goes through the expression, whose digits include
+    /// those of other scripts.
+    #[test]
+    fn other_scripts_use_the_expression() {
+        for raw in [
+            format!("\"caf\u{e9}\" ?{HEX17} ? _1"),
+            "? _\u{663}?".to_string(),
+            format!("? bn\u{663}_a ?{HEX32}\u{e9}"),
+        ] {
+            assert_eq!(
+                rename_anon(raw.clone(), indexer(|_| true)),
+                by_regex(&raw, indexer(|_| true)),
+                "{raw:?}"
             );
         }
     }

@@ -716,7 +716,8 @@ fn select_star_columns(q: &str, vars: &[String]) -> Option<Vec<usize>> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE
         .get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap());
-    if !re.is_match(q) {
+    // the expression needs a `*`, which most small queries do not have
+    if !q.contains('*') || !re.is_match(q) {
         return None;
     }
     let pos = |v: &str| {
