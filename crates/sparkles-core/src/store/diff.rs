@@ -123,6 +123,9 @@ impl DiffOptions {
     }
 }
 
+/// A change of [`Store::changed_ids`]: a quad as ids, and whether it was added.
+pub type IdChange = ([Id; 4], bool);
+
 /// The net difference between two commits: what `to` has that `from` lacks (added) and
 /// the reverse (removed). Changes are ordered removals first, then additions, each by
 /// graph, subject, predicate and object.
@@ -879,7 +882,7 @@ impl Store {
         to: &Snapshot,
         graphs: &[Id],
         o: &DiffOptions,
-    ) -> Result<Option<Vec<([Id; 4], bool)>>> {
+    ) -> Result<Option<Vec<IdChange>>> {
         if self.history.is_none() || after > to.commit {
             return Ok(None);
         }
@@ -918,7 +921,7 @@ impl Store {
             Ok(())
         })?;
         o.over(net.len() as u64)?;
-        let mut changes: Vec<([Id; 4], bool)> = net.into_iter().collect();
+        let mut changes: Vec<IdChange> = net.into_iter().collect();
         changes.sort_unstable_by_key(|(q, added)| (*added, [q[3].0, q[0].0, q[1].0, q[2].0]));
         Ok(Some(changes))
     }
