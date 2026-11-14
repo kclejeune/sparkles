@@ -174,6 +174,52 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `literal-not-in-datatype` finds ill-typed literals for the datatypes whose value spaces
   it can decide. The checks never prove consistency.
 
+### SHACL rules
+
+* The `shacl-af` profile materializes the rules of SHACL Advanced Features. A
+  `sh:TripleRule` infers the triples of its `sh:subject`, `sh:predicate` and `sh:object`
+  node expressions at each focus node, and a `sh:SPARQLRule` runs its CONSTRUCT query
+  once per focus node with `$this` pre-bound. Focus nodes are the shape's target nodes
+  that conform to every shape of the rule's `sh:condition`. Deactivated shapes and rules
+  do not run. The node expressions are those of the 2017 note, which are `sh:this`,
+  constants, `sh:path` with `sh:nodes`, `sh:filterShape`, `sh:intersection`, `sh:union`
+  and calls of `sh:SPARQLFunction`s over every combination of their arguments, and the
+  SHACL 1.2 `shnex:` expressions also work. A rule of another type fails the run with an
+  error that names it. TopBraid's own rule tests pass.
+* Rules run in groups of equal shape `sh:order` and rule `sh:order`, from the lowest.
+  The rules of a group run in rounds over the input graphs and every fact derived before
+  the round, and the group ends when a round adds nothing. `mode=one-pass` runs each group
+  once, which is TopBraid's evaluation, so that the rules of a group do not see each
+  other's facts. A group that has not reached its fixed point after `max-rounds` rounds,
+  100 by default, fails the run with an error that names its order, and the run changes
+  nothing. A blank node in a CONSTRUCT template is the same node for the same rule and
+  solution in every round, so such a rule reaches a fixed point. The run's report and its
+  record give the round cap and the rounds each group took.
+* The terms the rules compute, such as a new literal or IRI, are added to the dataset's
+  vocabulary as the run goes, so that later rounds read them. A run that fails, is
+  cancelled or passes its memory budget before its commit removes them again. Each SPARQL
+  query of a rule runs within the run's memory budget, and cancelling the run stops it.
+* The shapes are read from the input graphs, as TopBraid's `shaclinfer` reads them without
+  a shapes file, or from the graphs that `shapes=` names. The options follow the profile
+  name, as in `sparkles infer --profile 'shacl-af?shapes=urn:x:shapes&mode=one-pass'`.
+  A run reads its shapes graph into memory and decodes the nodes each rule produces, so
+  the profile suits rule sets over data that a SHACL validation handles. Each derived
+  fact also holds about 450 bytes in the view the rules read, beside its place in the
+  derived facts.
+* SPIN rules in the shapes graph run as SPARQL rules. A query attached to a class with
+  `spin:rule`, or a subproperty of it, runs with `?this` bound to each instance of the
+  class, and a query that does not mention `?this` runs once. The query is read from
+  `sp:text` and gets declarations of the RDF, RDFS, OWL, XSD, SHACL and SPIN prefixes.
+  Other prefixes need their own declarations in the text, since a store does not keep
+  the prefixes of the file it loaded.
+* A Fuseki configuration whose reasoner has `ja:reasonerURL sh:Rules` converts to the
+  `shacl-af` profile. This reasoner URL is a Sparkles convention, since neither Jena nor
+  TopBraid defines an assembler for SHACL rules, and `sh:Rules` is the IRI under which
+  TopBraid applies rules as an entailment. `sh:shapesGraph` on the reasoner names the
+  shapes graph, and `tosh:maxIterations` sets one pass when it is 1 and the round cap
+  otherwise. The converter reports a shapes graph that declares `sh:entailment sh:Rules`,
+  because validation does not run rules first.
+
 ### SHACL
 
 * `sparkles-shacl` validates SHACL Core and SHACL-SPARQL in parallel over the indexes.
@@ -702,6 +748,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Reasoning and validation
 
+* An update of a `shacl-af` materialization runs in full, and the rules are evaluated
+  per focus node in each round rather than semi-naively. Native maintenance of triple
+  rules and of SPARQL rules whose bodies are basic graph patterns, and a recompute stratum
+  for other bodies, follow the shared maintenance core of item 837. Roadmap item 958.
+  Query-time reasoning, explanations and witnesses do not cover the profile.
+* SPIN rules given only in SPIN's RDF syntax, without `sp:text`, and calls of SPIN
+  templates are refused. Roadmap item 959.
 * The `owl-rl` profile has property chains of 2 and 3 properties and keys of 1 and 2.
   Roadmap item 517. It leaves out `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff`. Roadmap
   item 518. Its rule tests follow the Profiles tables rather than the OWL 2 test cases.
@@ -875,7 +928,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md),  [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md),  [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

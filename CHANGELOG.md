@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### SHACL rules
+
+Roadmap item 838 adds the `shacl-af` reasoning profile, which materializes SHACL Advanced
+Features rules read from a shapes graph. Triple rules evaluate the 2017 node expressions,
+including calls of `sh:SPARQLFunction`s, and SPARQL rules run their CONSTRUCT queries per
+focus node with `$this` pre-bound. Conditions, deactivation and `sh:order` groups are
+honoured. A group iterates to a fixed point, or runs once with `mode=one-pass`, and a
+group past its round cap fails the run with an error that names its order. SPIN rules
+with `sp:text` run as SPARQL rules. The Fuseki converter maps a reasoner with
+`ja:reasonerURL sh:Rules` to the profile. TopBraid's rule tests pass. Updates of such a
+materialization run in full until item 958, and SPIN rules in RDF syntax alone are item
+959.
+
 ### Bindings
 
 Calls that read a few quads cost less, as part of roadmap item 33. Pattern reads remember the base

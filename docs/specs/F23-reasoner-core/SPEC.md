@@ -120,7 +120,11 @@ are translated to the rule engine.
 This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: Differential Dataflow (McSherry et al. CIDR 2013), DBSP (Budiu et al. VLDB 2023), DDlog, RDFox transitive closure handling, Souffle eqrel, GraphDB sameAs optimization, Nuutila TC, VLog (Urbani et al. AAAI 2016), Nemo (Ivliev et al. KR 2022), Souffle B-tree and brie, Nemo, VLog, RDFox Datalog extensions, Souffle, RDFox dynamic planning, Souffle profile-guided scheduling, Green, Karvounarakis and Tannen PODS 2007, ProvSQL, RDFox counting, TopBraid SHACL-AF, EYE reasoner, W3C SWRL submission, Souffle (Jordan et al. CAV 2016) and Carac. The [plan](PLAN.md) also draws on the
 backward/forward algorithm of Motik, Nenov, Piro and Horrocks (AAAI 2015), on Nemo's
 public program conventions through item 791, and on the W3C SHACL Advanced Features note.
-No code from another project is copied.
+The evaluation order of the SHACL rules follows the behaviour of TopQuadrant's TopBraid
+SHACL API (`RuleEngine`, `TripleRule`, `SPARQLRule` and the `shaclinfer` tool), whose source
+is under the Apache License 2.0, and its rule tests are vendored with that licence under
+`crates/sparkles-reasoner/tests/shacl-af/topbraid`. The SPIN translation follows the SPIN
+W3C Member Submission. No code from another project is copied.
 
 ## Outcome
 
@@ -128,7 +132,9 @@ The quick-fixes phase is built. Roadmap items 485 and 486 shipped. The planner o
 was measured and not adopted, and item 939 orders rule bodies from sampled bindings
 instead. The reasoner also records witnesses for F18 under item 416.
 The columnar derived tier, the first phase of the core, is built under item 835. The
-other core and convergence phases remain under [item 456](../../ROADMAP.md).
+SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its maintenance in
+item 958 and SPIN's RDF syntax in item 959. The other core and convergence phases remain
+under [item 456](../../ROADMAP.md).
 
 ### Columnar derived tier
 
@@ -295,6 +301,49 @@ compaction policy that left an older run alone when it was under an eighth of th
 behind it saved the third iteration's 1.25 s and was not kept, since the distinct-key
 counts of that build summed over runs and the retained run changed a join order, and so
 derived ids, in the reviewer's reproduction.
+
+### SHACL rules and SPIN
+
+Item 838 added the `shacl-af` profile in `crates/sparkles-reasoner/src/shacl_af.rs`, over
+the rule parser and evaluator of `crates/sparkles-shacl/src/rules.rs` and the SPIN
+translation of `crates/sparkles-shacl/src/spin.rs`. Rules are grouped by the shape's and
+the rule's `sh:order`, and each group runs in rounds until a round adds nothing, or once
+with `mode=one-pass`. A round evaluates every rule over an overlay of the run's snapshot
+that holds the facts derived before it, so targets, conditions, node expressions and
+SPARQL queries read derived facts as they read the input. A triple rule evaluates its node
+expressions per focus node with the SHACL evaluator, and a SPARQL rule runs its CONSTRUCT
+per focus node with `$this` pre-bound, as TopBraid's engine does. The terms the rules
+compute are interned in the run's write transaction, so the overlay names them with store
+ids, and a template blank node is one new node per rule, label and solution, which gives
+such a rule a fixed point. A group past `max-rounds`, 100 by default, fails the run and
+names its order, as decision 3 asks.
+
+The plan compiled triple rules to engine rules with a `shConforms` builtin. Item 838 kept
+one evaluator for both rule kinds instead, because a condition that reads facts the rule's
+atoms do not match needs the rule evaluated again whenever those facts change, which the
+semi-naive engine does not do for builtins, and because the computed terms of node
+expressions and SPARQL functions need store ids that the engine's local terms do not
+give the SHACL validator or the query engine. The general SPARQL bodies run in full
+materializations now, since only their maintenance needs the recompute stratum of Phase 4.
+An incremental run of the profile therefore materializes in full and says why, and item
+958 holds the compiled form and its maintenance. The SHACL-AF 2017 node expressions map
+onto the SHACL 1.2 expression tree, with a new `SparqlCall` node for `sh:SPARQLFunction`
+calls over the combinations of their arguments. TopBraid's seven rule tests pass and are
+vendored with their licence. SPIN rules run from `sp:text`, and SPIN's RDF syntax and
+template calls are item 959. The Fuseki converter maps `ja:reasonerURL sh:Rules`, a
+Sparkles convention, with `sh:shapesGraph` and `tosh:maxIterations`.
+
+The example `shacl_af_bench` of the reasoner measures the evaluator. It makes N rectangles,
+a third of them squares, and runs a triple rule that computes each area through a
+`sh:SPARQLFunction`, a SPARQL rule whose condition finds the squares and, in a later
+order, a triple rule that reads the squares' areas. Each order takes two rounds. On
+stanley, a 16-thread Intel Core Ultra X7 358H laptop, with a release build of commit
+6af0a6cf and one run per size, 1,000 rectangles took 42 ms, 5,000 took 218 ms and
+20,000 took 897 ms, which is 10.4 to 11.2 µs per rectangle and round, linear in the
+focus nodes. The work is the per-focus-node evaluation on one thread, with a query for
+each function call and each SPARQL rule. That cost per focus node and round is the figure
+the compiled semi-naive form of item 958 has to beat, since it evaluates only the facts
+that are new in a round.
 
 ### Closure operators
 
