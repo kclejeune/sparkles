@@ -153,6 +153,61 @@ before the grouped probes. Both builds derived 52,966,139 and 10,907,379 facts, 
 OWL2Bench(5) stayed at 4.6 GB and the tier ended at 2,746 MB. These are benchmark-worker
 measurements, and the benchmark host has not rerun them.
 
+### Sampled rule-body planning
+
+Roadmap item 939 orders rule bodies from sampled bindings. On atlas, an Intel Core
+i5-13500 like the benchmark host, one build of `examples/lubm.rs` at `a63916c0` ran each
+workload with the greedy orders and with the sampled orders in interleaved rounds, with
+one thread pinned to one core or 20 threads. The rules' time is the time of `infer`,
+which derives the closure in memory, and the materialization's is that of `materialize`
+on a fresh copy of the database.
+
+| Workload | Threads | Greedy orders | Sampled orders | Pairs |
+|---|---|---|---|---|
+| OWL2Bench(5), rules | 1 | 51.6 to 51.8 s | 29.9 s | 3 |
+| OWL2Bench(5), rules | 20 | 12.5 to 12.8 s | 9.5 to 9.7 s | 5 |
+| OWL2Bench(5), materialization | 1 | 102.5 to 102.8 s | 80.6 to 80.8 s | 2 |
+| OWL2Bench(5), materialization | 20 | 45.5 to 49.2 s | 42.5 to 42.7 s | 3 |
+| OWL2Bench(1), rules | 1 | 976 to 988 ms | 662 to 696 ms | 7 |
+| OWL2Bench(1), rules | 20 | 403 to 451 ms | 319 to 355 ms | 7 |
+| LUBM(100), rules | 1 | 14.50 to 14.55 s | 14.51 to 14.55 s | 6 |
+| LUBM(100), rules | 20 | 2.85 to 2.91 s | 2.82 to 2.89 s | 6 |
+| LUBM(100), materialization | 1 | 40.7 to 41.3 s | 40.7 to 40.8 s | 3 |
+| LUBM(100), materialization | 20 | 18.4 to 18.8 s | 18.5 to 18.7 s | 3 |
+| LUBM(10), rules | 1 | 926 to 933 ms | 930 to 970 ms | 7 |
+| LUBM(10), rules | 20 | 236 to 291 ms | 213 to 317 ms | 7 |
+| LUBM(100), long-body user rules | 1 | 5.69 to 5.74 s | 5.68 to 5.70 s | 4 |
+| LUBM(100), long-body user rules | 20 | 1.08 to 1.11 s | 1.08 to 1.14 s | 5 |
+| LUBM(10), long-body user rules | 1 | 375 to 383 ms | 376 to 417 ms | 7 |
+| LUBM(10), long-body user rules | 20 | 147 to 169 ms | 152 to 176 ms | 7 |
+
+Every pair of `infer` runs derived the same facts, with equal digests. Under OWL 2 RL
+they are 52,966,139 facts on OWL2Bench(5), 1,400,688 on OWL2Bench(1), 10,907,379 on
+LUBM(100) and 1,038,100 on LUBM(10), and the long-body rules derive 416,960 on LUBM(100)
+and 39,667 on LUBM(10). `materialize` prints no digest, and every pair of its runs
+inferred the same number of facts. The planner counts the plans that take a sampled
+order. On the same databases that count is zero in every iteration of the four LUBM
+workloads and four on OWL2Bench(1), as the
+[plan counts](runs/2026-11-14-item-939-atlas/plan-counts.txt) record, and `prp-key` is
+the rule that reads a key's value before it joins the keyed class with itself. The
+difference on LUBM is therefore taken to be the cost of planning. On LUBM(10) at one
+thread six of the seven sampled runs took 930 to 936 ms and one took 970 ms. The median
+of the seven paired differences is 4 ms and their mean 9 ms, and roadmap item 945 covers
+this cost. The highest peak heap of the sampled runs of a workload is within 3.1 MiB of
+that of the greedy runs under OWL 2 RL, where single pairs at 20 threads differ by up to
+13.7 MiB. With the long-body rules it is 805.9 against 790.6 MiB on LUBM(100) at one
+thread, 804.7 against 791.2 MiB at 20 threads, where one pair differs by 19.6 MiB, and
+95.6 against 90.2 MiB on LUBM(10) at 20 threads. The
+[run directory](runs/2026-11-14-item-939-atlas/run.sh.txt) holds the commands, the
+[host and build](runs/2026-11-14-item-939-atlas/env.txt), the
+[rule file](runs/2026-11-14-item-939-atlas/long-bodies.rules), the timings of the
+[first](runs/2026-11-14-item-939-atlas/results-part1.txt) and the
+[second](runs/2026-11-14-item-939-atlas/results-part2.txt) part of the run and their
+[summary](runs/2026-11-14-item-939-atlas/summary.txt). These are benchmark-worker
+measurements of `a63916c0`. The item's later commits, which make the planner keep the
+greedy order in more cases and bound its reads, and the benchmark host have not repeated
+them.
+
 ### Small incremental runs
 
 Each run materializes the closure, then changes 1,000 triples, undoes the change and makes

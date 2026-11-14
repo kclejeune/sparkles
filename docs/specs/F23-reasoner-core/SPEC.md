@@ -124,8 +124,9 @@ No code from another project is copied.
 
 ## Outcome
 
-The quick-fixes phase is built. Roadmap items 485 and 486 shipped and item 487 was
-measured and not adopted. The reasoner also records witnesses for F18 under item 416.
+The quick-fixes phase is built. Roadmap items 485 and 486 shipped. The planner of item 487
+was measured and not adopted, and item 939 orders rule bodies from sampled bindings
+instead. The reasoner also records witnesses for F18 under item 416.
 The columnar derived tier, the first phase of the core, is built under item 835. The
 other core and convergence phases remain under [item 456](../../ROADMAP.md).
 
@@ -394,6 +395,95 @@ It derived the same facts, was slower on OWL2Bench with 1 university and no fast
 elsewhere, and raised LUBM(100)'s peak heap by 50 MiB.
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records the
 measurement.
+
+That planner kept the greedy estimate of every atom that holds a variable, and the greedy
+order is wrong by orders of magnitude where the rule itself binds the predicate or the
+class that an atom asks for. The greedy estimate of an atom whose predicate is a variable
+bound earlier in the body is a quarter of an average predicate's rows, and its estimate of
+`(?y rdf:type ?c)` with `?c` bound is the size of an average class. In `prp-key` the
+ontology binds the keyed class and the key property, and the greedy order joined the
+members of the class with themselves before it read a key value.
+
+A probe that evaluates every atom order of each plan on one thread measured what the
+greedy orders cost. It is the `plan-probe` feature of `sparkles-reasoner`, which
+`SPARKLES_PLAN_PROBE=1` turns on in `examples/lubm.rs`. On a development laptop with one
+pinned thread, at `e66d8b70`, it found the following.
+
+| Workload | Rule evaluation in the greedy orders | In the fastest orders | Where the difference is |
+|---|---|---|---|
+| OWL2Bench(1), `owl-rl` | 494 ms | 158 ms | `prp-key` falls from 334 ms to 0.4 ms. |
+| OWL2Bench(5), `owl-rl` | 30.7 s | 9.2 s at most | `prp-key` takes 21.6 s. Its longest plan outran the probe's budget. |
+| LUBM(10) and LUBM(100), `owl-rl` | 0.89 s and 11.12 s | The probe found the same times. | The probe found no faster order. |
+| LUBM(10), user rules with bodies of four to six atoms | 286 ms | 228 ms | Two rules gain, and their candidate counts fall far less than their times. |
+| LUBM(100), the same rules | 4.14 s | 4.03 s | The probe did not try every order of the longest body. |
+
+Item 939 orders rule bodies from sampled bindings (`engine/sampled.rs`). The planner keeps
+a sample of up to 16 bindings of the steps placed so far, read from the facts the plan
+reads. It takes an atom's estimate as the mean number of candidates the atom has under
+those bindings, counted in the derived tier's orders and in the store's index, places the
+atom with the fewest and extends the sample by that atom's facts. Its order replaces the
+greedy order only when the sample puts its cost at half the greedy order's or less, and
+only when it needs no order over the whole tier that the greedy order does not need.
+Three gates keep the cost of planning low. A body of fewer than three atoms keeps the
+greedy order. A body whose predicates are all constants is sampled only when the
+statistics put its plan at two million candidates or more. A walk of the greedy order with
+four bindings comes first, and a greedy order that it puts under 50,000 candidates is
+kept without a search. `ReasonOptions::sampled_planning` is on by default, and `false`
+keeps the greedy order of every body.
+
+A run derives the same facts with either planner. The order of a body changes the work of
+an evaluation and the order in which facts are derived, so fact ids can differ between
+the planners. Two cases keep the greedy order because another order could change more
+than that. A builtin checks a variable that is already bound by value, so that the
+integer 3 passes for the decimal 3.0, where an atom matches the term itself. A rule in
+which a builtin binds a variable that an atom also holds, or that another builtin also
+binds, therefore keeps the greedy order. Every rule keeps it while the derived tier holds
+a dead fact, which a deletion leaves when it removes a derived fact, since an order
+counts a dead fact among its candidates until a compaction of its run drops it. Roadmap
+item 944 covers both. Query-time reasoning and
+the maintenance of witnesses plan greedily as before.
+
+The sample is drawn at fixed places, so one snapshot plans the same way each time. In the
+derived tier the places are evenly spaced candidates in id order, which do not depend on
+how the facts fall into runs. In the store they are the starts of blocks along a scan.
+The same quads in other blocks, after another sequence of loads or a compaction, can give
+another sample and another order, which changes the time of a run and never its facts.
+
+Planning is bounded. A read of the store ends with one block of the index at the latest,
+whatever share of the rows belongs to graphs that the run does not read. Within that
+block it has an allowance of 4,096 rows, counted in the pieces the scan delivers, which
+are blocks, segments and rows of the snapshot's delta. The read stops before the piece
+that follows the one that passed the allowance, so it can enter more rows than the
+allowance by the size of one piece. A scan that merges the delta decodes a piece before
+it delivers it, and it consumes deleted rows without delivering them, so it can decode
+more than it delivers. A plan makes at most 2,048 probes, and each is charged 1 KiB to the run's
+memory budget until the plan is made. A plan that needs more, that fails to read the
+store or whose costs overflow keeps the greedy order. The planner's scans count in a
+run's `base_scans`, so that count differs between the planners.
+
+On atlas, with one binary at `a63916c0` and interleaved runs of the two planners, the
+rules of OWL2Bench(5) take 29.9 s against 51.6 to 51.8 s at one thread and 9.5 to 9.7 s
+against 12.5 to 12.8 s at 20 threads. Its whole materialization takes 80.6 to 80.8 s
+against 102.5 to 102.8 s and 42.5 to 42.7 s against 45.5 to 49.2 s. The rules of
+OWL2Bench(1) take 662 to 696 ms against 976 to 988 ms at one thread. No plan of LUBM
+changes, and the rules of LUBM(100) take 14.51 to 14.55 s against 14.50 to 14.55 s at one
+thread. On LUBM the planner changed no plan, by its count of changed plans, so the
+difference there is taken to be the cost of planning. It shows on LUBM(10) at one thread,
+where six of seven sampled runs took 930 to 936 ms and one 970 ms against 926 to 933 ms.
+The median of the seven paired differences is 4 ms, 0.4%, and roadmap item 945 covers
+that cost. The highest peak heap of the sampled runs of a workload is within 3.1 MiB of
+that of the greedy runs under OWL 2 RL. With the long-body rules on LUBM(100) it is
+15.3 MiB higher at one thread, 805.9 against 790.6 MiB, and 13.5 MiB higher at 20
+threads. Every pair of `infer` runs derived the same facts by their digests, and every
+pair of materializations inferred the same number. The
+[results](../../benchmarks/reasoning/RESULTS.md#sampled-rule-body-planning) hold the
+table. These are benchmark-worker measurements of `a63916c0`, and neither the later
+commits of the item nor the benchmark host have repeated them.
+
+The DL Horn rules of `sparkles-owl` are a calculus of their own and do not use this
+planner. Bodies of constant predicates whose orders differ by less than a factor of two
+in candidates keep the greedy order, and roadmap item 940 covers the time the probe
+found there.
 
 ### Witnesses
 

@@ -205,6 +205,13 @@ pub struct ReasonOptions {
     /// ordinary rules, for differential tests and measurements.
     #[doc(hidden)]
     pub closure_operators: bool,
+    /// Order the bodies of rules with three or more atoms from sampled bindings where
+    /// the sample makes an order at least twice as cheap as the greedy planner's
+    /// (spec F23, roadmap item 939). `true` by default. `false` keeps the greedy
+    /// planner's order of every body, for differential tests and measurements. A run
+    /// derives the same facts either way.
+    #[doc(hidden)]
+    pub sampled_planning: bool,
     /// Keep up to this many witnesses per fact of the closure (spec F18 §7.1): sets of
     /// input quads from which the rules derive the fact, kept with the provenance
     /// algebra of F13 and maintained by incremental runs. They live with the closure a
@@ -237,6 +244,7 @@ impl Default for ReasonOptions {
             threads: None,
             pool: None,
             closure_operators: true,
+            sampled_planning: true,
             witnesses: None,
             inspect: None,
         }
@@ -255,6 +263,7 @@ impl fmt::Debug for ReasonOptions {
             .field("threads", &self.threads)
             .field("pool", &self.pool.as_ref().map(|p| p.threads()))
             .field("closure_operators", &self.closure_operators)
+            .field("sampled_planning", &self.sampled_planning)
             .field("witnesses", &self.witnesses)
             .field("inspect", &self.inspect.as_ref().map(|_| "…"))
             .finish()
@@ -434,6 +443,7 @@ fn derive_here(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: opts.closure_operators && opts.analysis.is_none(),
+        sampled_planning: opts.sampled_planning,
     };
     progress(opts, 0.1, "reasoning");
     let out = loop {
@@ -1124,6 +1134,7 @@ fn witness_limits(budget: &Arc<Budget>, opts: &ReasonOptions) -> engine::Limits 
         progress: None,
         budget: budget.clone(),
         closures: false,
+        sampled_planning: false,
     }
 }
 
@@ -1488,6 +1499,7 @@ fn update_closure(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: false,
+        sampled_planning: opts.sampled_planning,
     };
     let ch = &ch;
     // the witnesses of the previous closure, when the run keeps witnesses with the same
@@ -1836,6 +1848,7 @@ pub fn dred_overdeletion(
         progress: None,
         budget: Budget::unlimited(),
         closures: false,
+        sampled_planning: false,
     };
     let mut c = d.into_closure()?;
     incremental::dred_overdeletion(&mut c, &rules, &limits, &removed)
@@ -1888,6 +1901,32 @@ pub fn infer(
         ..Default::default()
     };
     Ok((out, report))
+}
+
+/// The rule plans of this process that took an order from sampled bindings
+/// ([`ReasonOptions::sampled_planning`]) so far. For tests.
+#[doc(hidden)]
+pub fn bench_sampled_plans() -> u64 {
+    engine::sampled::changed_plans()
+}
+
+/// Sample and search every rule body of three atoms or more in the runs of this process
+/// ([`ReasonOptions::sampled_planning`]), whatever its plan costs. Tests on small inputs
+/// set it, since small plans keep the greedy planner's order without a sample.
+#[doc(hidden)]
+pub fn bench_sampled_search_all(on: bool) {
+    engine::sampled::search_all(on);
+}
+
+/// Turn the plan probe on or off for the runs of this process: a diagnostic that times
+/// every atom order of each rule plan and prints one line per plan to the standard
+/// error. It exists only with the `plan-probe` feature, and it perturbs the runs it
+/// measures: they build both orders over the whole tier and take far longer. For
+/// measurements.
+#[cfg(feature = "plan-probe")]
+#[doc(hidden)]
+pub fn bench_plan_probe(on: bool) {
+    engine::planprobe::set(on);
 }
 
 /// Run the rules over a snapshot's input graphs and return the number of derived facts

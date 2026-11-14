@@ -43,6 +43,18 @@ request or on every write, and the schema report counts what the data holds.
   is not monotonic, or one that reads lists and builds them in a rule head, evaluates
   every rule as a join. A run whose rules read lists and derive list facts through a
   property, such as a subproperty of `rdf:first`, starts again without the operators.
+* A rule body of three or more atoms is ordered from sampled bindings where that is
+  clearly cheaper than the order the statistics give. The planner follows up to 16
+  bindings through the facts the plan reads and counts each atom's candidates under
+  them, which matters where the rule itself binds a predicate or a class, as `prp-key`
+  does with the keyed class and its key property. On a benchmark worker the rules of
+  OWL2Bench with 5 universities take 29.9 s instead of 51.7 s at one thread and 9.6 s
+  instead of 12.6 s at 20
+  ([results](../benchmarks/reasoning/RESULTS.md#sampled-rule-body-planning)). A run
+  derives the same facts in either order. A rule in which a builtin binds a variable
+  that an atom also holds keeps the statistical order, and so does every rule while the
+  derived facts hold one that a deletion removed. Planning costs a few milliseconds per
+  run. Roadmap items 944 and 945 cover these two limits and that cost.
 * Derived facts live in a columnar tier, each fact one row by a dense id, with each
   predicate's facts sorted by subject and by object. OWL2Bench with 5 universities holds
   its 53 million derived facts in about 52 bytes each with the triple index, against about

@@ -111,6 +111,7 @@ impl<'a> Cands<'a> {
         }
     }
 
+    /// Add a piece. The ids of a filtered piece ascend.
     #[inline]
     pub(super) fn push_ids(&mut self, ids: &'a [u32], filtered: bool) {
         if !ids.is_empty() {
@@ -133,6 +134,74 @@ impl<'a> Cands<'a> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.parts.is_empty()
+    }
+
+    /// Whether a piece is filtered by the range when visited, so that
+    /// [`len`](Self::len) counts ids that are not visited.
+    fn filtered(&self) -> bool {
+        self.parts.iter().any(|p| matches!(p, Part::Ids(_, true)))
+    }
+
+    /// The pieces without the ids the range leaves out. A filtered piece holds the ids
+    /// of one key in one run, which ascend, so the range admits one interval of it,
+    /// found by two searches and without a read of the ids between them.
+    fn admitted(&self) -> SmallVec<[Part<'a>; 4]> {
+        let (lo, hi) = (self.lo, self.hi);
+        self.parts
+            .iter()
+            .map(|p| match *p {
+                Part::Ids(s, true) => {
+                    let a = s.partition_point(|&id| id < lo);
+                    let b = s.partition_point(|&id| id < hi).max(a);
+                    Part::Ids(&s[a..b], false)
+                }
+                p => p,
+            })
+            .collect()
+    }
+
+    /// The ids visited, exactly: [`len`](Self::len), or the ids the range admits when a
+    /// piece is filtered by it.
+    pub fn count(&self) -> usize {
+        if self.filtered() {
+            self.admitted().iter().map(Part::len).sum()
+        } else {
+            self.len()
+        }
+    }
+
+    /// Up to `n` of the ids visited, evenly spaced in their order. A relation's ids and
+    /// the ids of a probe ascend, whatever runs hold them, so the same facts give the
+    /// same ids however they fall into runs, as long as no fact is dead: a dead fact
+    /// stays among the candidates until a compaction of its run drops it.
+    pub fn spread(&self, n: usize) -> Vec<u32> {
+        let n = n.max(1);
+        let parts = if self.filtered() {
+            self.admitted()
+        } else {
+            self.parts.clone()
+        };
+        let len: usize = parts.iter().map(Part::len).sum();
+        let step = len.div_ceil(n).max(1);
+        (0..len)
+            .step_by(step)
+            .filter_map(|k| Self::nth(&parts, k))
+            .collect()
+    }
+
+    /// Candidate `k` in order, of pieces that the range does not filter.
+    fn nth(parts: &[Part<'a>], mut k: usize) -> Option<u32> {
+        for p in parts {
+            let n = p.len();
+            if k < n {
+                return Some(match *p {
+                    Part::Ids(s, _) => s[k],
+                    Part::Range(a, _) => a + k as u32,
+                });
+            }
+            k -= n;
+        }
+        None
     }
 
     /// The ids, in order.
@@ -920,6 +989,61 @@ mod tests {
 
     fn ids(c: Cands<'_>) -> Vec<u32> {
         c.iter().collect()
+    }
+
+    #[test]
+    fn spread_and_count_of_candidates() {
+        // 40 facts of one subject
+        let ts: Vec<Triple> = (0..40).map(|i| [1, 10, 100 + i]).collect();
+        let t = tier(&ts);
+        let all = t.cands(Some(1), Some(10), None, 0, 40);
+        assert_eq!((all.len(), all.count()), (40, 40));
+        assert_eq!(all.spread(4), [0, 10, 20, 30]);
+        // more asked for than there are: each once
+        assert_eq!(all.spread(100).len(), 40);
+        assert!(Cands::empty().spread(4).is_empty());
+        assert_eq!(Cands::range(5, 9).spread(2), [5, 7]);
+        // a part of the run: the count and the spread are of the ids the range admits
+        let part = t.cands(Some(1), Some(10), None, 10, 20);
+        assert_eq!(ids(part.clone()), (10..20).collect::<Vec<u32>>());
+        assert_eq!(part.count(), 10);
+        assert_eq!(part.spread(5), [10, 12, 14, 16, 18]);
+    }
+
+    /// The same facts in one run and in several give a probe the same count and the same
+    /// spread of ids.
+    #[test]
+    fn spread_and_count_follow_the_facts_not_the_runs() {
+        let ts: Vec<Triple> = (0..300)
+            .map(|i| [1 + i % 3, 10, 1000 - i])
+            .chain((0..50).map(|i| [1, 11, i]))
+            .collect();
+        let whole = tier(&ts);
+        let mut split = Tier::new(0);
+        let b = Budget::unlimited();
+        let mut m = Meter::new(&b, true);
+        let mut from = 0;
+        for chunk in ts.chunks(37) {
+            for &x in chunk {
+                split.push(x);
+            }
+            split.index_new(from, &mut m).unwrap();
+            from += chunk.len();
+        }
+        for (s, p, o) in [
+            (Some(1), Some(10), None),
+            (Some(2), Some(10), None),
+            (None, Some(10), Some(900)),
+            (None, Some(10), None),
+            (None, Some(11), None),
+        ] {
+            for (lo, hi) in [(0, 350), (0, 111), (74, 350)] {
+                let (a, b) = (whole.cands(s, p, o, lo, hi), split.cands(s, p, o, lo, hi));
+                assert_eq!(a.count(), b.count(), "{s:?} {p:?} {o:?} {lo} {hi}");
+                assert_eq!(a.spread(7), b.spread(7), "{s:?} {p:?} {o:?} {lo} {hi}");
+                assert_eq!(a.spread(64), b.spread(64), "{s:?} {p:?} {o:?} {lo} {hi}");
+            }
+        }
     }
 
     #[test]
