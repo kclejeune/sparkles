@@ -532,6 +532,9 @@ const ROOTS_PER_ROUND: usize = 1024;
 pub const CONTEXT_BYTES: usize = 320;
 /// The messages a worker's outbox holds before it delivers them.
 const OUTBOX: usize = 4096;
+/// The messages that the runs of an outbox may stand for before it delivers them, those
+/// that several destinations share counted for each
+const OUTBOX_TOTAL: usize = 16 * OUTBOX;
 /// The clauses of Tier D a context processes between checks of the bounds.
 const DL_CLAUSES: usize = 256;
 /// The contexts a step of [`Run::steps`] activates.
@@ -926,6 +929,9 @@ struct Marks {
     /// the messages that every source of one group of backward links takes, built
     /// [`RUN_CHUNK`] at a time and sent to each source as one run
     run: Vec<Concl>,
+    /// the targets of consecutive forward links by one role, which take the same
+    /// backward links
+    dests: Vec<Ex>,
 }
 
 /// The products of one group of a context's links that a flush builds at a time, so that
@@ -955,12 +961,16 @@ struct Dest {
 /// A worker's messages for other contexts, which it delivers by destination, with the
 /// buffers that group them. Consecutive messages to one destination form a run, and a
 /// delivery sorts the runs rather than the messages, since the products of a context's
-/// links leave it in one run per source or target (roadmap item 818).
+/// links leave it in one run per source or target (roadmap item 818). The products that
+/// several destinations take are written once, and each destination's run points at them
+/// (roadmap item 889).
 #[derive(Default)]
 struct Outbox {
     msgs: Vec<Concl>,
-    /// the runs, in the order sent
+    /// the runs, in the order sent, which may share their messages
     runs: Vec<Dest>,
+    /// the messages the runs stand for, those they share counted for each
+    total: usize,
     tmp: Vec<Dest>,
     counts: Vec<u32>,
     /// the messages of a run in steps with their destinations, in the order sent, which
@@ -982,20 +992,40 @@ impl Outbox {
     #[inline]
     fn push(&mut self, to: Ex, c: Concl) {
         let at = self.msgs.len() as u32;
-        match self.runs.last_mut() {
-            Some(d) if d.to == to => d.end = at + 1,
-            _ => self.runs.push(Dest {
-                to,
-                start: at,
-                end: at + 1,
-            }),
-        }
+        self.to(to, at, at + 1);
         self.msgs.push(c);
+    }
+
+    /// Writes messages that several destinations take, and gives their places for
+    /// [`Outbox::to`].
+    fn shared(&mut self, msgs: &[Concl]) -> (u32, u32) {
+        let start = self.msgs.len() as u32;
+        self.msgs.extend_from_slice(msgs);
+        (start, self.msgs.len() as u32)
+    }
+
+    /// Sends a destination the messages at the places `start..end`, which continue its
+    /// last run when they follow it.
+    #[inline]
+    fn to(&mut self, to: Ex, start: u32, end: u32) {
+        self.total += (end - start) as usize;
+        match self.runs.last_mut() {
+            Some(d) if d.to == to && d.end == start => d.end = end,
+            _ => self.runs.push(Dest { to, start, end }),
+        }
+    }
+
+    /// Whether the outbox holds enough to deliver: [`OUTBOX`] messages written, as many
+    /// runs, or runs that stand for [`OUTBOX_TOTAL`] messages.
+    #[inline]
+    fn full(&self) -> bool {
+        self.msgs.len() >= OUTBOX || self.runs.len() >= OUTBOX || self.total >= OUTBOX_TOTAL
     }
 
     fn clear(&mut self) {
         self.msgs.clear();
         self.runs.clear();
+        self.total = 0;
     }
 
     /// Orders the runs by destination, keeping the order of each destination's.
@@ -1151,7 +1181,7 @@ impl Sink for Out<'_, '_> {
         } else {
             self.outbox.push(to, c);
             self.sent += 1;
-            if self.outbox.msgs.len() >= OUTBOX {
+            if self.outbox.full() {
                 self.run.deliver(self.outbox, self.woke);
             }
         }
@@ -1223,6 +1253,51 @@ impl Sink for Out<'_, '_> {
     #[inline]
     fn stopped(&self) -> bool {
         self.run.stopped()
+    }
+}
+
+impl Out<'_, '_> {
+    /// Sends the same messages to each destination in turn, as [`Sink::send`] does one
+    /// at a time. An outbox writes them once and gives each destination a run that
+    /// points at them, a run without one takes each to-do list's lock once, and a run in
+    /// steps keeps a message for each destination in its own list (roadmap item 889).
+    fn send_all(&mut self, dests: &[Ex], msgs: &[Concl]) {
+        if msgs.is_empty() {
+            return;
+        }
+        if self.run.steps {
+            for &to in dests {
+                for &c in msgs {
+                    self.send(to, c);
+                }
+            }
+            return;
+        }
+        let batch = self.run.batch.load(Ordering::Relaxed);
+        let mut at = None;
+        for &to in dests {
+            if to == self.me {
+                self.local.extend_from_slice(msgs);
+                continue;
+            }
+            self.sent += msgs.len();
+            if batch {
+                let (start, end) = match at {
+                    Some(at) => at,
+                    None => *at.insert(self.outbox.shared(msgs)),
+                };
+                self.outbox.to(to, start, end);
+            } else {
+                let ctx = self.run.get(to);
+                ctx.todo.lock().extend_from_slice(msgs);
+                if self.run.mark(ctx) {
+                    self.woke.push_back(to);
+                }
+            }
+        }
+        if batch && self.outbox.full() {
+            self.run.deliver(self.outbox, self.woke);
+        }
     }
 }
 
@@ -1518,10 +1593,11 @@ impl<'a> Run<'a> {
                     if marks.run.is_empty() {
                         break;
                     }
-                    for &e in sources {
-                        for &c in &marks.run {
-                            out.send(e, c);
-                        }
+                    // the sources take the chunk a slice at a time, so that the bounds
+                    // are checked as often as when each message was sent alone
+                    let slice = (SEND_EVERY / marks.run.len()).max(1);
+                    for some in sources.chunks(slice) {
+                        out.send_all(some, &marks.run);
                         if out.sent >= SEND_EVERY && !self.flush_sends(out, tally) {
                             ok = false;
                             if !self.bounds.partial {
@@ -1533,30 +1609,48 @@ impl<'a> Run<'a> {
             }
         }
         // the backward link each composed link gives its target: new targets take every
-        // source, old targets the new sources
+        // source, old targets the new sources. Consecutive forward links by one role take
+        // the same links, which go to their targets together, so that each target
+        // receives its messages in the order of the forward links.
         if ok || self.bounds.partial {
             'targets: for (fwds, all) in [(new_fwd, true), (old_fwd, false)] {
-                for &(r2, f) in fwds {
-                    for (i, (r1, srcs)) in st.back.iter().enumerate() {
-                        let mark = marks.back[i].min(srcs.list.len());
+                let mut next = 0;
+                while next < fwds.len() {
+                    let r2 = fwds[next].0;
+                    let n = fwds[next..].iter().take_while(|&&(r, _)| r == r2).count();
+                    marks.dests.clear();
+                    marks
+                        .dests
+                        .extend(fwds[next..next + n].iter().map(|&(_, f)| f));
+                    next += n;
+                    let back_marks = &marks.back;
+                    let mut links = st.back.iter().enumerate().flat_map(|(i, (r1, srcs))| {
+                        let mark = back_marks[i].min(srcs.list.len());
                         let sources = if all {
                             &srcs.list[..]
                         } else {
                             &srcs.list[mark..]
                         };
-                        if sources.is_empty() {
-                            continue;
+                        roles
+                            .comp(*r1, r2)
+                            .iter()
+                            .flat_map(move |&t| sources.iter().map(move |&e| Concl::Back(e, t)))
+                    });
+                    loop {
+                        marks.run.clear();
+                        marks.run.extend(links.by_ref().take(RUN_CHUNK));
+                        if marks.run.is_empty() {
+                            break;
                         }
-                        for &t in roles.comp(*r1, r2) {
-                            for &e in sources {
-                                out.send(f, Concl::Back(e, t));
+                        let slice = (SEND_EVERY / marks.run.len()).max(1);
+                        for some in marks.dests.chunks(slice) {
+                            out.send_all(some, &marks.run);
+                            if out.sent >= SEND_EVERY && !self.flush_sends(out, tally) {
+                                ok = false;
+                                if !self.bounds.partial {
+                                    break 'targets;
+                                }
                             }
-                        }
-                    }
-                    if out.sent >= SEND_EVERY && !self.flush_sends(out, tally) {
-                        ok = false;
-                        if !self.bounds.partial {
-                            break 'targets;
                         }
                     }
                 }
@@ -3296,6 +3390,85 @@ mod horn_accounting_tests {
         };
         assert!(run.flush_links(&st, &mut out, &mut tally));
         assert_eq!(out.sent, 0);
+    }
+
+    /// A flush writes the products of one group of links into the outbox once, with one
+    /// run header per destination, and a source that is the context itself takes them as
+    /// its own conclusions. Each destination receives what it did when every message was
+    /// written for it, in the same order. Without batching each destination's to-do
+    /// list takes the products directly (roadmap item 889).
+    #[test]
+    fn a_flush_writes_each_run_once_for_all_its_destinations() {
+        let f = fixture();
+        let [e1, e2, f1, f2, x1, x2] = [1, 2, 3, 4, 5, 6].map(|i| f.targets[i]);
+        let mut st = State {
+            init: true,
+            ..Default::default()
+        };
+        for e in [e1, f.root, e2] {
+            st.back_by(f.s).insert(e);
+        }
+        st.fwd.insert((f.r, f1));
+        st.fwd.insert((f.r, f2));
+        st.props.push((f.s, x1));
+        st.props.push((f.s, x2));
+        let bounds = bounds(false);
+        let products = [Concl::Sub(x1), Concl::Sub(x2)];
+        let backs = [
+            Concl::Back(e1, f.t),
+            Concl::Back(f.root, f.t),
+            Concl::Back(e2, f.t),
+        ];
+        for batch in [true, false] {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let run = run(&f.ix, &ctx, &bounds);
+            run.batch.store(batch, Ordering::Relaxed);
+            let (mut local, mut woke, mut outbox, mut marks) = (
+                Vec::new(),
+                VecDeque::new(),
+                Outbox::default(),
+                Marks::default(),
+            );
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut local,
+                woke: &mut woke,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: true,
+                sent: 0,
+                work: 0,
+            };
+            assert!(run.flush_links(&st, &mut out, &mut Tally::default()));
+            // the messages to other contexts, the context's own aside
+            assert_eq!(out.sent, 2 * 2 + 2 * 3);
+            assert_eq!(local, products);
+            let want = vec![
+                (e1, products.to_vec()),
+                (e2, products.to_vec()),
+                (f1, backs.to_vec()),
+                (f2, backs.to_vec()),
+            ];
+            if batch {
+                // one copy of the products and one of the backward links
+                assert_eq!(outbox.msgs.len(), products.len() + backs.len());
+                let mut by: Vec<(Ex, Vec<Concl>)> = Vec::new();
+                for (to, c) in sent(&outbox) {
+                    match by.iter_mut().find(|(t, _)| *t == to) {
+                        Some((_, v)) => v.push(c),
+                        None => by.push((to, vec![c])),
+                    }
+                }
+                assert_eq!(by, want);
+            } else {
+                assert!(outbox.is_empty());
+                for (to, msgs) in want {
+                    assert_eq!(*ctx[to as usize].get().unwrap().todo.lock(), msgs);
+                    assert!(woke.contains(&to));
+                }
+            }
+        }
     }
 
     /// The messages an outbox holds, by destination, in the order sent.
