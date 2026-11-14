@@ -30,9 +30,15 @@ use std::sync::Arc;
 /// The rows of the first batch read from each input.
 const FIRST_BATCH: usize = 64;
 
+/// The bytes of one row's candidate key.
+const KEY_BYTES: u64 = std::mem::size_of::<EqKey>() as u64;
+
 /// The rows of one input read so far, indexed by candidate key.
 struct Side {
     held: Option<Buffer>,
+    /// The candidate key of each held row, computed once when the row is read, since
+    /// the row is indexed and probed with it.
+    keys: Vec<EqKey>,
     keyed: FxHashMap<Id, Vec<u32>>,
     loose: Vec<u32>,
     /// The input has no more rows.
@@ -51,6 +57,7 @@ impl Side {
 
     fn discard_history(&mut self) -> Result<()> {
         self.held = None;
+        self.keys = Vec::new();
         self.keyed = FxHashMap::default();
         self.loose = Vec::new();
         self.position_bytes = 0;
@@ -118,6 +125,7 @@ impl Ripple {
         let side = || -> Result<Side> {
             Ok(Side {
                 held: None,
+                keys: Vec::new(),
                 keyed: FxHashMap::default(),
                 loose: Vec::new(),
                 done: false,
@@ -182,51 +190,76 @@ impl Ripple {
                 Some(held) => merge::append(ctx, held, &batch.table, 0..n)?,
                 None => side.held = Some(batch),
             }
-            // Rows that no later row of the other input will meet are not indexed.
-            if !self.sides[1 - s].done {
-                let side = &mut self.sides[s];
-                let held = &side.held.as_ref().expect("held rows").table;
-                // Reserve before either the map or its row vectors can allocate.
-                // Each u32 vector's geometric capacity is at most four times its
-                // populated rows. The old index remains charged while an allocation
-                // moves, and reserving the map for every incoming key prevents any
-                // unplanned bucket growth during the fill.
-                if let Some(charge) = &mut side.charge {
-                    charge.resize(
-                        map_bytes(side.keyed.capacity(), 32)
-                            .saturating_add(side.position_bytes)
-                            .saturating_add(map_bytes(side.keyed.len().saturating_add(n), 32))
-                            .saturating_add((start.saturating_add(n) as u64).saturating_mul(16))
-                            .saturating_add(1024),
-                    )?;
+            // Each new row's key, which its probe uses too. Rows that no later row of
+            // the other input will meet are not indexed.
+            let index = !self.sides[1 - s].done;
+            let key = self.key[s];
+            let side = &mut self.sides[s];
+            side.keys.truncate(start);
+            let key_bytes = |rows: usize| (rows as u64).saturating_mul(KEY_BYTES);
+            // Reserve before the keys, the map or its row vectors can allocate. The
+            // keys move to an exact capacity while their old storage stays charged.
+            // Each u32 vector's geometric capacity is at most four times its populated
+            // rows. The old index remains charged while an allocation moves, and
+            // reserving the map for every incoming key prevents any unplanned bucket
+            // growth during the fill.
+            if let Some(charge) = &mut side.charge {
+                let mut bytes = key_bytes(side.keys.capacity())
+                    .saturating_add(key_bytes(start.saturating_add(n)))
+                    .saturating_add(map_bytes(side.keyed.capacity(), 32))
+                    .saturating_add(side.position_bytes)
+                    .saturating_add(1024);
+                if index {
+                    bytes = bytes
+                        .saturating_add(map_bytes(side.keyed.len().saturating_add(n), 32))
+                        .saturating_add((start.saturating_add(n) as u64).saturating_mul(16));
                 }
-                side.keyed.reserve(n);
-                for row in start..start + n {
-                    if row.is_multiple_of(1024) {
-                        ctx.check()?;
+                charge.resize(bytes)?;
+            }
+            side.keys.reserve_exact(n);
+            let Side {
+                held,
+                keys,
+                keyed,
+                loose,
+                position_bytes,
+                ..
+            } = side;
+            let held = &held.as_ref().expect("held rows").table;
+            if index {
+                keyed.reserve(n);
+            }
+            for row in start..start + n {
+                if row.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let k = eq_key(ctx, held.cols[key][row])?;
+                keys.push(k);
+                if !index {
+                    continue;
+                }
+                match k {
+                    EqKey::Unbound => {}
+                    EqKey::Key(k) => {
+                        let rows = keyed.entry(k).or_default();
+                        let before = rows.capacity();
+                        rows.push(row as u32);
+                        *position_bytes += (rows.capacity() - before) as u64 * 4;
                     }
-                    match eq_key(ctx, held.cols[self.key[s]][row])? {
-                        EqKey::Unbound => {}
-                        EqKey::Key(k) => {
-                            let rows = side.keyed.entry(k).or_default();
-                            let before = rows.capacity();
-                            rows.push(row as u32);
-                            side.position_bytes += (rows.capacity() - before) as u64 * 4;
-                        }
-                        EqKey::Loose => {
-                            let before = side.loose.capacity();
-                            side.loose.push(row as u32);
-                            side.position_bytes += (side.loose.capacity() - before) as u64 * 4;
-                        }
+                    EqKey::Loose => {
+                        let before = loose.capacity();
+                        loose.push(row as u32);
+                        *position_bytes += (loose.capacity() - before) as u64 * 4;
                     }
                 }
-                if let Some(charge) = &mut side.charge {
-                    charge.resize(
-                        map_bytes(side.keyed.capacity(), 32)
-                            .saturating_add(side.position_bytes)
-                            .saturating_add(1024),
-                    )?;
-                }
+            }
+            if let Some(charge) = &mut side.charge {
+                charge.resize(
+                    key_bytes(side.keys.capacity())
+                        .saturating_add(map_bytes(side.keyed.capacity(), 32))
+                        .saturating_add(side.position_bytes)
+                        .saturating_add(1024),
+                )?;
             }
             self.probe = Some(Probe {
                 side: s,
@@ -245,13 +278,13 @@ impl Ripple {
             return Ok(());
         };
         let (s, o) = (probe.side, 1 - probe.side);
-        let held = &self.sides[s].held.as_ref().expect("probed rows").table;
+        let keys = &self.sides[s].keys;
         let other = &self.sides[o];
         while probe.row < probe.end && pairs.len() < room {
             if probe.row.is_multiple_of(1024) {
                 ctx.check()?;
             }
-            let rows: &[u32] = match eq_key(ctx, held.cols[self.key[s]][probe.row])? {
+            let rows: &[u32] = match keys[probe.row] {
                 EqKey::Unbound => &[],
                 EqKey::Key(k) => other.keyed.get(&k).map_or(&[], Vec::as_slice),
                 EqKey::Loose => &other.loose,
@@ -335,6 +368,7 @@ impl Ripple {
     pub(super) fn release_working_sets(&mut self) {
         for side in &mut self.sides {
             side.held = None;
+            side.keys = Vec::new();
             side.keyed = FxHashMap::default();
             side.loose = Vec::new();
             side.position_bytes = 0;
