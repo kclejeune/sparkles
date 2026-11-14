@@ -843,8 +843,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   proofs.
 * A classification runs within one request's deadline and is not kept up to date as
   commits land. Roadmap item 589.
-* A Horn classification of an ontology with individuals, keys or functional data
-  properties rebuilds after every axiom insertion and deletion. Roadmap
+* A Horn classification of an ontology with individuals, keys or data restrictions
+  rebuilds after every axiom insertion and deletion. Roadmap
   [item 753](../ROADMAP.md) under item 603.
 * A classification that counts, a rooted one and one with the eager strategy rebuild
   after every edit, since the bound on their derived conclusions depends on the order
@@ -852,6 +852,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A classification that keeps its contexts after an edit still normalizes every axiom
   and builds its index and its taxonomy again, which bounds what a small edit saves.
   Roadmap [item 955](../ROADMAP.md).
+* An edit that clears most contexts of a kept classification costs more than a
+  classification that starts again, by the comparison of the two indexes. Roadmap
+  [item 954](../ROADMAP.md).
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
 

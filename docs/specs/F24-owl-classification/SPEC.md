@@ -3632,8 +3632,10 @@ materializing reasoner adds, which item 691 follows.
 
 Item 753 delivers item 603's affected-module maintenance for axiom insertions and
 deletions in two kinds of run. The first is a run with the Horn rules whose index has no
-individuals, universal properties, keys or functional data properties. The second is a
-run of the disjunctive rules with the cautious strategy and without counting or a root.
+individuals, universal properties, keys or data. It includes a run whose Horn
+normalization gives the index no rule that can fire, such as a pair of inverse
+properties beside OWL 2 EL axioms in ChEBI, which the EL rules then saturate. The second
+is a run of the disjunctive rules with the cautious strategy and without counting or a root.
 Both keep their contexts, the contexts of conjunctions or of tests, and for the
 disjunctive rules the table of the clauses that contexts sent one another. The other
 runs start again after every edit: Horn runs with individuals, which wait on items 590
@@ -3662,7 +3664,14 @@ last index, or the run starts again.
 The fresh classes of a normalization are named by scope, so that a later run over the
 same interner gives the same axiom, unfolded universal or hypothetical successor the
 same classes. The interner keeps a copy of each axiom outside OWL 2 EL as the key of its
-scope, which the retained bytes count.
+scope, which the retained bytes count. The scope of an unfolding is the universal or the
+negative existential restriction it unfolds, since two restrictions over different
+properties can share a filler. The Horn rules unfold every universal of the interner
+over a property that chains reach, and the unfolding makes universals over its fresh
+classes that a run does not unfold again. The interner marks those, so that a later run
+over it does not unfold them either, and a normalization that names one removes the
+mark. Without the mark each run gave them new classes and cleared every context that
+held one, which was about half the contexts of the Gene Ontology after any edit.
 
 A kept run of the Horn rules leaves each kept context as a run that starts again would.
 A kept run of the disjunctive rules does not. Its fresh classes have other ids and so
@@ -3685,7 +3694,9 @@ the options that select rules do. The tables that no expression keys differ. The
 keeps more than twice the expressions, the conjunctions or tests, or the clauses of the
 table that the last full run had, plus 4,096. A kept run that stops on its memory budget
 also starts again in full before a lower tier takes over, since the last index and the
-contexts that nothing reaches count against the budget of a kept run alone. A run that
+contexts that nothing reaches count against the budget of a kept run alone. Before the
+comparison the run admits both indexes, the kept contexts, the clause table and the
+marks and queue of the invalidation against that budget. A run that
 its deadline or a cancellation stops leaves a classifier whose next run starts again.
 
 `tests/dl_incremental.rs` compares each run of a kept classifier with a classifier that
@@ -3695,7 +3706,7 @@ take away the last support of a subsumption, of a test that held and of a clause
 successor sent back, random and seeded sequences over generated Horn and disjunctive
 ontologies, removals and returns of axioms over the 640 fixtures of item 603 and the
 generated ontologies of item 897, the ORE files that `SPARKLES_ORE_DIR` names, a memory
-budget that only a kept run passes, cancellation and a deadline during a kept run, and
+budget that only a kept run passes, with and without a large data value, cancellation and a deadline during a kept run, and
 the bound on kept state. `examples/incremental_classify.rs` times kept runs after
 single-axiom edits against a classifier that starts again and checks their taxonomies.
 
@@ -3704,6 +3715,36 @@ an edit saves the saturation of the kept contexts and not those steps, which ite
 follows. The memory tradeoff is the last index beside the new one during the
 comparison, the copies of the axioms outside OWL 2 EL, and the expressions, tests and
 clauses that nothing reaches until the run starts again.
+
+The figures below are development measurements on a laptop that ran other work, with
+`examples/incremental_classify.rs`, and are not benchmark-host results. Each file takes
+20 removals of one class axiom, each followed by its return, and the time of a kept run
+after a removal is compared with a classifier that starts again over the same axioms,
+both as medians. The taxonomies are equal after every run.
+
+| Ontology | Rules | Four threads, kept against full | One thread, kept against full |
+|---|---|---|---|
+| `ore_ont_12141`, 440 contexts | Disjunctive | 6.4 against 42.8 ms | 3.9 against 91.8 ms |
+| `ore_ont_6485`, 215 contexts | Disjunctive | 0.67 against 3.5 ms | 0.64 against 8.5 ms |
+| Five other ORE 2015 DL files | Disjunctive | 1.2 to 2.4 times faster | 1.1 to 2.0 times faster |
+| Eleven ORE 2015 DL files | Horn | 1.1 to 2.0 times faster | 1.1 to 2.3 times faster |
+| Gene Ontology, 54,692 contexts | Horn | 143 against 219 ms | 147 against 540 ms |
+| ChEBI lite, 238,151 contexts | Horn, no rule fires | 530 against 981 ms | 743 against 1,921 ms |
+
+The median edit clears one to three contexts on the two large files and on most of the
+ORE files. On the Gene Ontology a kept run saturates in 0.4 ms where a full run takes
+120 ms on four threads, and spends 93 ms on the normalization, the index and the
+comparison against 52 ms in a full run, and 30 ms on the taxonomy in both. An edit that
+clears most contexts therefore costs more than a run that starts again: the removal
+that clears 331 of the 440 contexts of `ore_ont_12141` takes 94 ms on one thread, where
+the full runs take 80 to 95 ms. Item 954 follows the cost of the comparison. A counting
+run of `ore_ont_6485` keeps nothing and takes the time of a full run.
+
+The retained state after the 20 edits is within 3% of the state after the first run,
+151 against 147 MB for the Gene Ontology and 653 against 636 MB for ChEBI lite. The
+peak of a kept run on four threads is 1.3 to 1.45 times that of the first run, 212
+against 147 MB for the Gene Ontology and 863 against 651 MB for ChEBI lite, since the
+run holds the last index and the chunks of the parallel normalization at once.
 
 Item 590 owns assertion retention and item 664 owns EL individual, merge, key and world
 invalidation. Coordinate their dependency records before making those changes eligible

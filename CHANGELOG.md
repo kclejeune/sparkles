@@ -54,7 +54,11 @@ and 8 threads. Other changes, Horn ontologies with individuals and runs with a b
 their derived conclusions start again, and so does a kept run that passes its memory
 budget. A classifier whose tier was decided over the expressions of a removed axiom,
 such as a self restriction that kept a union from the disjunctive rules, now decides it
-again. Items 953 and 955 follow the bounded runs and the steps a kept run repeats.
+again. Items 953 and 955 follow the bounded runs and the steps a kept run repeats. In a
+development measurement on a laptop a run after a single-axiom edit of the Gene Ontology
+takes 143 ms against 219 ms for a classification that starts again on four threads, and
+6.4 against 42.8 ms on `ore_ont_12141` with the disjunctive rules. An edit that clears
+most contexts costs more than starting again, which item 954 follows.
 
 The Horn rules classify ontologies with individuals, functional data properties and top
 properties, in one saturation with the EL rules of individuals, with two rules over the
