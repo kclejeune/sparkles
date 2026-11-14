@@ -25,7 +25,8 @@ ledger, which a small eager LIMIT over anything but a scan or a table of values 
 take before. A cursor cross product holds its smaller input and streams the larger one. A
 LIMIT over an inner hash join builds the index of one whole input, which takes more
 memory than the eager limited join it replaces when both inputs are large, and roadmap
-item 947 follows it up.
+item 947 follows it up. Some pulled first rows still take 1.13 to 1.32 times as long as
+the eager path did, and roadmap item 952 follows them up.
 
 ### Valid time
 

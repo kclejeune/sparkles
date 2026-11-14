@@ -291,6 +291,21 @@ of two 65,537-row inputs peaks at about 7 MB where it fit in a 6 MiB pool before
 first-rows join that reads both inputs a few rows at a time for small demand is
 [item 947](../../ROADMAP.md).
 
+An A/B on `atlas` of release builds before and after the item, in three alternating passes
+over people datasets of 300 and 3,000, measured a small pulled ASK and a `LIMIT 1` or
+`LIMIT 10` over a join of 300-row patterns at 1.00 to 1.05 times the earlier build, a
+filtered or path LIMIT at 0.14 to 0.87 times, and a filtered product under an ASK or a
+`LIMIT 1` at 0.77 to 1.25 times. A pulled `LIMIT 1` or `LIMIT 10` over a join of
+3,000-row patterns takes 1.16 to 1.18 times as long and a `LIMIT 500` 1.28 times, and a
+false keyed ASK takes 1.32 times over 300-row patterns and 1.13 times over 3,000-row
+patterns in eager execution, against 0.67 in automatic execution. These costs of
+building and charging cursor operators are [item 952](../../ROADMAP.md). A FILTER that
+reads ahead evaluates its condition on rows past its consumer's first solutions, so a
+memory budget that a row past them exceeds, such as one whose value decodes a long
+literal, refuses the query where reading at the consumer's demand would have answered.
+The scan FILTER's morsels read ahead in the same way, and the `grow_input` switch turns
+both off.
+
 Native SELECT output and standard solution responses of at most 65,536 rows admit and
 decode a complete row before serializing its cells. Row storage and decoded terms keep
 query credit until their payloads are freed. A required decode refusal returns its

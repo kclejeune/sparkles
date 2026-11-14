@@ -171,7 +171,12 @@ check them against the W3C suites and Jena's own answers.
   over a keyed join reads both inputs a few rows at a time, and over a product it streams
   the larger input against the smaller one, which it holds. A FILTER without effects
   whose rows do not pass asks its input for four times as many rows each time, up to
-  eight cursor batches, when the query has no budget of produced rows.
+  eight cursor batches, when the query has no budget of produced rows. It evaluates its
+  condition on rows past the first solutions, so a memory budget that one of those rows
+  exceeds refuses the query, and the `grow_input` optimization switch turns the
+  read-ahead off. Pulled first rows still cost more than the eager path in some shapes,
+  such as a `LIMIT 10` over a join of two 3,000-row patterns at about 1.17 times, which
+  [roadmap item 952](../ROADMAP.md) follows up.
 * A LIMIT over an inner hash join builds the hash index of one whole input before its
   first row, so a `LIMIT 1` over the join of two inputs of 65,537 rows needs about 7 MB.
   A join that reads both inputs a few rows at a time for a small LIMIT is
