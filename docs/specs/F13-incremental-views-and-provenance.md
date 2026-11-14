@@ -1348,7 +1348,8 @@ order and faster annotated builds.
 
 Item 417 delivers the fixed-point operator of §4.3 in `incr/fixpoint.rs`, maintains
 property paths with `+` and `*` through it in `incr/ops/path.rs`, and plugs the reasoner's
-forward rules into it in `sparkles-reasoner/src/fixpoint.rs`.
+forward rules into it in `sparkles-reasoner/src/fixpoint.rs`. Item 837 runs the
+reasoner's own maintenance on it in exact mode.
 
 - **Interface.** A `Program` names its derived facts, the base facts its rule instances
   read, and the instances themselves through `axioms`, `consequences`, `prove`, `broken`
@@ -1404,6 +1405,20 @@ forward rules into it in `sparkles-reasoner/src/fixpoint.rs`.
   ([results](../benchmarks/reasoning/RESULTS.md#the-rule-plug-in-against-the-reasoners-maintenance)).
   Item 837 therefore moves the reasoner onto the operator as an exact program over its
   derived tier, and `RuleProgram` remains a test of the interface.
+- **Reasoner maintenance.** An incremental run of the reasoner is one pass of the
+  operator in exact mode. `TierProgram` in `sparkles-reasoner/src/incremental.rs` is the
+  program, and `TierStore`, the closure's derived tier, is its store, whose facts are the
+  tier's live rows. Its `prepare` flags the inserted facts the tier holds, moves the
+  removed explicit facts into the tier as candidates and calls the witness hook. Its first
+  frontier is the removed explicit facts, and each round is one batch, which `prove_batch`
+  searches in parallel with `Search::prove` under the visit and memory bound of item 798.
+  The consequences of the dead facts at the old snapshot are the heads of the rule
+  instances that read them, and a removal kills the row. `saturate` runs the engine
+  semi-naively from the inserted facts, and its additions are the live rows it appended.
+  The operator's buffers are charged to the run's budget through the store, and a run
+  that falls back to a full one drops the pass. `ReasonOptions::inferred_change` reports
+  the change an incremental run commits to the inferred graph as triples of the committed
+  snapshot with weights `+1` and `-1`.
 - **Provenance.** With a provenance setting a fact counts one derivation, its recorded
   one, and its support is the union of the instances' supports along its record chain,
   so the witness it reports is real. A fact whose record changes, and the facts recorded

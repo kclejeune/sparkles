@@ -20,7 +20,7 @@
 //! exists, which is how the query engine evaluates them. Neither needs state: the nodes
 //! and graphs that the changed quads name are checked at both snapshots.
 
-use super::super::fixpoint::{self, Change, FixedPoint, HashStore, Program, Sink};
+use super::super::fixpoint::{self, Change, FixedPoint, HashStore, NewStore, Program, Sink};
 use super::super::pass::{GraphSel, Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{AChanges, Ann, Atom, Provenance, Witness};
@@ -311,17 +311,19 @@ impl Closure {
     }
 }
 
+impl NewStore for Closure {
+    fn new_store(&self) -> HashStore<Fact, Id> {
+        // the key, the record and the map's slot overhead
+        HashStore::new(24 + 8 + 8)
+    }
+}
+
 impl Program for Closure {
     type Fact = Fact;
     type Record = Id;
     type Cx<'c> = Pass<'c>;
     type Error = Error;
     type Store = HashStore<Fact, Id>;
-
-    fn new_store(&self) -> HashStore<Fact, Id> {
-        // the key, the record and the map's slot overhead
-        HashStore::new(24 + 8 + 8)
-    }
 
     fn premises(&self, f: &Fact, r: &Id, out: &mut Sink<'_, Fact, Error>) -> Result<()> {
         if !r.is_undef() {

@@ -75,8 +75,9 @@ impl FactStore<u32, u32> for Tally {
         Ok(self.inner.remove(f)?)
     }
 
-    fn clear(&mut self) {
-        self.inner.clear()
+    fn clear(&mut self) -> std::result::Result<(), Oops> {
+        self.inner.clear()?;
+        Ok(())
     }
 
     fn reserve(&self, bytes: u64) -> std::result::Result<(), Oops> {
@@ -145,6 +146,12 @@ impl<const X: bool> Count<X> {
     }
 }
 
+impl<const X: bool> NewStore for Count<X> {
+    fn new_store(&self) -> Tally {
+        Tally::new(self.cap)
+    }
+}
+
 impl<const X: bool> Program for Count<X> {
     type Fact = u32;
     type Record = u32;
@@ -153,10 +160,6 @@ impl<const X: bool> Program for Count<X> {
     type Store = Tally;
 
     const EXACT: bool = X;
-
-    fn new_store(&self) -> Tally {
-        Tally::new(self.cap)
-    }
 
     fn premises(
         &self,

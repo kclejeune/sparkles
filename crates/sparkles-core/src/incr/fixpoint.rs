@@ -122,7 +122,8 @@ pub trait FactStore<F, R> {
     /// Stop holding `f`. Returns whether it was held.
     fn remove(&mut self, f: &F) -> std::result::Result<bool, Self::Error>;
 
-    fn clear(&mut self);
+    /// Stop holding every fact.
+    fn clear(&mut self) -> std::result::Result<(), Self::Error>;
 
     /// Charge `bytes` that the operator or a producer is about to allocate.
     fn reserve(&self, _bytes: u64) -> std::result::Result<(), Self::Error> {
@@ -200,8 +201,9 @@ impl<F: Copy + Eq + Hash, R: Copy> FactStore<F, R> for HashStore<F, R> {
         Ok(self.map.remove(f).is_some())
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> Result<()> {
         self.map.clear();
+        Ok(())
     }
 }
 
@@ -430,9 +432,6 @@ pub trait Program {
     /// Whether the program maintains in exact mode (see the module's documentation).
     const EXACT: bool = false;
 
-    /// An empty store for the program's facts.
-    fn new_store(&self) -> Self::Store;
-
     /// How many facts one call of a batched method takes.
     fn batch_len(&self) -> usize {
         1
@@ -618,6 +617,14 @@ pub trait Program {
     }
 }
 
+/// A program that makes an empty store of its own, which [`FixedPoint::new`] starts
+/// from. A program whose store wraps state it does not own, such as the reasoner's
+/// closure, starts from [`FixedPoint::with_store`] instead.
+pub trait NewStore: Program {
+    /// An empty store for the program's facts.
+    fn new_store(&self) -> Self::Store;
+}
+
 /// One change of the operator's facts: the fact, its weight's change (`+1` when it
 /// starts to hold, `−1` when it stops, `0` when only its annotation moved), and the
 /// change of its annotation in annotated maintenance.
@@ -716,12 +723,14 @@ impl<C> std::ops::Deref for Held<C> {
     }
 }
 
-impl<P: Program> FixedPoint<P> {
+impl<P: NewStore> FixedPoint<P> {
     pub fn new(program: P) -> FixedPoint<P> {
         let store = program.new_store();
         FixedPoint::with_store(program, store)
     }
+}
 
+impl<P: Program> FixedPoint<P> {
     /// A fixed point over `store`, which holds what it holds; call
     /// [`build`](Self::build) or [`load`](Self::load) unless it is the program's closure.
     pub fn with_store(program: P, store: P::Store) -> FixedPoint<P> {
@@ -1056,7 +1065,7 @@ impl<P: Program> FixedPoint<P> {
         max_bytes: Option<u64>,
         charges: &mut Charges,
     ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
-        self.store.clear();
+        self.store.clear()?;
         self.ann.clear();
         self.ann_bytes = 0;
         let mut found: Held<Vec<(P::Fact, P::Record)>> = Held::default();
@@ -1673,7 +1682,7 @@ impl<P: Program> FixedPoint<P> {
 
     /// Read what [`save`](Self::save) wrote.
     pub fn load(&mut self, r: &mut Reader) -> std::result::Result<(), P::Error> {
-        self.store.clear();
+        self.store.clear()?;
         self.ann.clear();
         self.ann_bytes = 0;
         let n = r.u64()?;

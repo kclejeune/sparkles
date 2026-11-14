@@ -22,7 +22,7 @@ use crate::parser::{Clause, Direction, Node, Rule};
 use oxrdf::Term;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::id::Id;
-use sparkles_core::incr::fixpoint::{self, FactStore, Program, Sink};
+use sparkles_core::incr::fixpoint::{self, FactStore, NewStore, Program, Sink};
 use sparkles_core::incr::pass::Which;
 use sparkles_core::incr::persist::{Reader, Writer};
 use sparkles_core::incr::prov::{Ann, Atom, FactKey, Provenance};
@@ -254,11 +254,12 @@ impl FactStore<Triple, Record> for IndexedStore {
         Ok(true)
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> sparkles_core::Result<()> {
         self.facts.clear();
         self.by_p.clear();
         self.ps.clear();
         self.po.clear();
+        Ok(())
     }
 }
 
@@ -553,16 +554,18 @@ impl RuleProgram {
     }
 }
 
+impl NewStore for RuleProgram {
+    fn new_store(&self) -> IndexedStore {
+        IndexedStore::default()
+    }
+}
+
 impl Program for RuleProgram {
     type Fact = Triple;
     type Record = Record;
     type Cx<'c> = RuleCx<'c>;
     type Error = sparkles_core::Error;
     type Store = IndexedStore;
-
-    fn new_store(&self) -> IndexedStore {
-        IndexedStore::default()
-    }
 
     fn batch_len(&self) -> usize {
         self.batch.max(1)

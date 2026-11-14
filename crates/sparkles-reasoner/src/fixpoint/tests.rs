@@ -633,7 +633,7 @@ impl FactStore<Triple, Record> for Counting {
         self.inner.remove(f)
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> sparkles_core::Result<()> {
         self.inner.clear()
     }
 
@@ -728,6 +728,15 @@ impl<const X: bool> Rules<X> {
     }
 }
 
+impl<const X: bool> NewStore for Rules<X> {
+    fn new_store(&self) -> Counting {
+        Counting {
+            cap: self.cap,
+            ..Default::default()
+        }
+    }
+}
+
 impl<const X: bool> Program for Rules<X> {
     type Fact = Triple;
     type Record = Record;
@@ -736,13 +745,6 @@ impl<const X: bool> Program for Rules<X> {
     type Store = Counting;
 
     const EXACT: bool = X;
-
-    fn new_store(&self) -> Counting {
-        Counting {
-            cap: self.cap,
-            ..Default::default()
-        }
-    }
 
     fn batch_len(&self) -> usize {
         self.batch

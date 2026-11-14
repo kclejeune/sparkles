@@ -219,6 +219,10 @@ pub struct ReasonOptions {
     /// none, and a run then does no work for them. A protection that shows inferences
     /// by their support turns them on.
     pub witnesses: Option<usize>,
+    /// Report the change of [`INFERRED_GRAPH`] that an incremental run commits, as
+    /// [`ReasonReport::inferred_change`]. Off by default, since the change is held in
+    /// memory until the report is read.
+    pub inferred_change: bool,
     /// Called once with the state the run reads, while the run holds the writer lock and
     /// before it derives anything, after a progress report. The warnings it returns join
     /// the report's, so that a check of the input graphs sees exactly what the rules
@@ -246,6 +250,7 @@ impl Default for ReasonOptions {
             closure_operators: true,
             sampled_planning: true,
             witnesses: None,
+            inferred_change: false,
             inspect: None,
         }
     }
@@ -295,6 +300,13 @@ pub struct ReasonReport {
     pub inferred_added: u64,
     /// triples the run removed from [`INFERRED_GRAPH`]
     pub inferred_removed: u64,
+    /// With [`ReasonOptions::inferred_change`], the change an incremental run committed
+    /// to [`INFERRED_GRAPH`]: each triple it added with weight `+1` and each it removed
+    /// with weight `-1`, once each, in the ids of the snapshot that
+    /// [`receipt`](Self::receipt) names. `None` for a full run, a run that fell back to
+    /// one, and a run without the option, which tells a reader of the change to read the
+    /// inferred graph again.
+    pub inferred_change: Option<Vec<([Id; 3], i64)>>,
     /// the graphs the run read, with its imports
     pub inputs: Option<Resolved>,
     /// the largest estimated heap the run used at any time, within
@@ -1359,7 +1371,13 @@ struct Written {
     generalized: u64,
     /// local ids the run stored, with their store ids
     stored: FxHashMap<u64, Id>,
+    /// the change written, when the run reports it ([`ReasonOptions::inferred_change`]),
+    /// with its charge
+    change: Option<(InferredChange, Held)>,
 }
+
+/// A change of [`INFERRED_GRAPH`]: triples with weights `+1` and `-1`.
+type InferredChange = Vec<([Id; 3], i64)>;
 
 #[allow(clippy::too_many_arguments)]
 fn finish(
@@ -1462,6 +1480,7 @@ fn finish(
         changes: done.changes,
         inferred_added: done.written.added,
         inferred_removed: done.written.removed,
+        inferred_change: done.written.change.map(|(c, _)| c),
         inputs: Some(resolved.clone()),
         peak_bytes: done.budget.peak() as u64,
         base_scans: done.base_scans,
@@ -1785,7 +1804,15 @@ fn update_closure(
         .chain(&ch.inferred_added)
         .chain(&ch.inferred_removed)
         .chain(&touched);
-    let written = write_changes(exec, txn, snap, &closure, candidates, &budget)?;
+    let written = write_changes(
+        exec,
+        txn,
+        snap,
+        &closure,
+        candidates,
+        &budget,
+        opts.inferred_change,
+    )?;
     laps.lap("write");
     let changes = Changes {
         base_added: ch.base_added.len() as u64,
@@ -1842,6 +1869,7 @@ fn write_changes<'a>(
     c: &incremental::Closure,
     candidates: impl Iterator<Item = &'a [u64; 3]>,
     budget: &Arc<Budget>,
+    report_change: bool,
 ) -> anyhow::Result<Written> {
     let mut w = Written::default();
     let defaults = c.defaults.as_ref();
@@ -1915,6 +1943,24 @@ fn write_changes<'a>(
         }
     };
     let mut insert: Vec<[u64; 3]> = Vec::new();
+    // the change, charged before each growth of its buffer
+    let mut change: Option<(InferredChange, Held)> =
+        report_change.then(|| (Vec::new(), Held::new(budget)));
+    let mut note = |t: [Id; 3], weight: i64| -> anyhow::Result<()> {
+        if let Some((v, h)) = change.as_mut() {
+            if v.len() == v.capacity() {
+                let elem = size_of::<([Id; 3], i64)>();
+                let old = v.capacity();
+                let new = (old * 2).max(4);
+                h.try_grow(new * elem)
+                    .map_err(|e| e.with_context(context()))?;
+                v.reserve_exact(new - v.len());
+                h.shrink(old * elem);
+            }
+            v.push((t, weight));
+        }
+        Ok(())
+    };
     for ((t, want), have) in cands.iter().zip(have) {
         if *want && !have {
             if insert.len() == insert.capacity() {
@@ -1932,6 +1978,7 @@ fn write_changes<'a>(
             let g = graph.expect("present");
             txn.delete(quad(t, g))?;
             w.removed += 1;
+            note([Id(t[0]), Id(t[1]), Id(t[2])], -1)?;
         }
     }
     drop(cands);
@@ -1949,12 +1996,14 @@ fn write_changes<'a>(
         let mut quads = Vec::with_capacity(insert.len());
         for t in &insert {
             let ids = store_ids(txn, &c.terms, &mut w.stored, t)?;
+            note(ids, 1)?;
             quads.push([ids[0], ids[1], ids[2], g]);
         }
         w.added = quads.len() as u64;
         txn.insert_bulk(quads)?;
     }
     w.inferred = before + w.added - w.removed;
+    w.change = change;
     Ok(w)
 }
 
