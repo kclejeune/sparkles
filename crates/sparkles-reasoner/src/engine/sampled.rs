@@ -21,16 +21,16 @@
 //! A sample costs probes of the indexes, so the planner draws one only where it can pay.
 //! A body with a variable predicate is always sampled, since the greedy estimate of such
 //! an atom is a guess. A body whose predicates are all constants has estimates from the
-//! statistics of its relations, and is sampled only when those put its plan above
-//! [`LARGE_COST`] candidates. The planner then walks the greedy order with a sample of
-//! four bindings first, and keeps it when they put its cost below [`MIN_COST`]
-//! candidates, so that a plan that is cheap anyway pays for one short walk and no
-//! search. Otherwise it searches as above, and its order replaces the
-//! greedy order only when the sample puts its cost at no more than the greedy order's
-//! divided by [`SAVING`], and when it needs no order over the whole tier by subject or
-//! object that the greedy order does not. Bodies of fewer
-//! than [`MIN_ATOMS`] atoms keep the greedy order: the choice among two atoms is which
-//! one reads the smaller relation, which the greedy planner's counts already decide.
+//! statistics of its relations, and is sampled only when those put its plan at
+//! [`LARGE_COST`] candidates or more. The planner then walks the greedy order with a
+//! sample of four bindings first, and keeps it when they put its cost below [`MIN_COST`]
+//! candidates, so that a plan that is cheap anyway pays for one short walk and no search.
+//! Otherwise it searches as above, and its order replaces the greedy order only when the
+//! sample puts its cost at no more than the greedy order's divided by [`SAVING`], and
+//! when it needs no order over the whole tier by subject or object that the greedy order
+//! does not. Bodies of fewer than [`MIN_ATOMS`] atoms keep the greedy order: the choice
+//! among two atoms is which one reads the smaller relation, which the greedy planner's
+//! counts already decide.
 //! The sample is drawn at fixed places, so that a run plans the same way each time. In
 //! the derived tier those are evenly spaced candidates in the order of their ids, which
 //! is the same however the facts fall into runs, so the sampled orders follow the facts
@@ -46,15 +46,19 @@
 //! it derives its facts, and never the facts. One kind of rule is the exception, and it
 //! keeps the greedy order: a builtin checks a variable that is bound already by value,
 //! so that the integer 3 passes for the decimal 3.0, where an atom matches the term
-//! itself, and a variable that a builtin binds and an atom or another builtin also
-//! holds would be generated in one order and checked in another ([`order_matters`]).
+//! itself, and a variable that a builtin binds and that an atom also holds, or that
+//! another builtin also binds, would be generated in one order and checked in another
+//! ([`order_matters`]).
 //!
 //! A plan's probes are bounded. A read of the store stops at the end of one block of
 //! its scan, and earlier at the block, the segment or the row of the snapshot's delta
 //! that takes it past [`SAMPLE_ROWS`](crate::facts::SAMPLE_ROWS) rows, whatever share
 //! of the rows belongs to other graphs. A sample of a relation makes one such read per
-//! start, and a count reads the index's blocks at the two ends of its range at most. A
-//! read that merges the delta can decode one block or segment more than it reads. A
+//! start, and a count reads the index's blocks at the two ends of its range at most.
+//! The allowance counts the blocks, segments and delta rows a scan delivers, so a read
+//! can enter more rows than its allowance by one of them, and a scan that merges the
+//! delta can decode more than it delivers, as [`Base::sample`](crate::facts::Base::sample)
+//! says. A
 //! plan makes at most [`PROBES`] probes, and the facts they keep are charged to the
 //! run's memory budget, [`PROBE_BYTES`] each, until the plan is made. A plan that
 //! needs more probes, or more memory than the budget has left, or whose costs
@@ -211,10 +215,10 @@ fn atom_order(steps: &[Step]) -> Vec<usize> {
 /// Whether the order of the rule's atoms can change what the rule derives. A builtin
 /// that is given a bound variable where it binds one checks the variable by value
 /// ([`Eval::bind_and_continue`]), so that the integer 3 passes for the decimal 3.0, and
-/// an atom matches the term itself. A variable that a builtin binds and that an atom or
-/// another builtin also holds is therefore generated in one order and checked in
-/// another, and the two can differ in the facts they derive and in the terms of those
-/// facts.
+/// an atom matches the term itself. A variable that a builtin binds and that an atom
+/// also holds, or that another builtin also binds, is therefore generated in one order
+/// and checked in another, and the two can differ in the facts they derive and in the
+/// terms of those facts.
 pub(crate) fn order_matters(rule: &CRule) -> bool {
     rule.builtins.iter().enumerate().any(|(j, f)| {
         f.outputs.iter().any(|&v| {

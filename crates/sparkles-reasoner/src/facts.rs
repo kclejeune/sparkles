@@ -786,10 +786,11 @@ impl Base {
     /// whether it took the fact. A start reads no further than the end of its own block,
     /// and it stops at the block, the segment or the row of the snapshot's delta that
     /// takes it past [`SAMPLE_ROWS`] rows, whatever share of the rows belongs to other
-    /// graphs or fails the pattern. A scan that merges the delta decodes its next block
-    /// or segment before it learns that the allowance is spent, so a start can decode
-    /// one more than it reads. A start also gives up after a few facts that `f` does
-    /// not take. Returns whether the sample read every fact of the pattern, which
+    /// graphs or fails the pattern. The allowance counts what the scan delivers. A scan
+    /// that merges the delta decodes its next block or segment before it learns that
+    /// the allowance is spent, and it consumes rows the delta deletes without
+    /// delivering them, so such a start can decode more than it reads, up to the end of
+    /// its block. A start also gives up after a few facts that `f` does not take. Returns whether the sample read every fact of the pattern, which
     /// one start does when its scan runs to the end of the pattern's range.
     pub fn sample(
         &self,
