@@ -20,8 +20,7 @@
 //! index does not hold, and beside the rules of individuals, universal roles and
 //! functional data roles when the ontology has them (roadmap item 692), with two rules
 //! over the predecessors of a context that stands for one element and the worlds over
-//! the conjunction contexts. A run with the Horn rules saturates everything again on its
-//! next run. An axiom the
+//! the conjunction contexts. An axiom the
 //! classifier does not take is left out and reported, with the rule of the OWL 2 Profiles
 //! recommendation it breaks, and the run's [`Stats`] count the axioms outside OWL 2 EL by
 //! whether they are Horn, give the [`Tier`] of rules the ontology needs and count the
@@ -41,6 +40,17 @@
 //! the role hierarchy, chains, reflexivity or ranges, to an axiom with an individual, a
 //! data property, a datatype or a key, and any change after a run that merged a context
 //! with an individual saturates everything.
+//!
+//! A run with the Horn rules without individuals, and a run of the disjunctive rules
+//! with the cautious strategy and without counting or a root, keep their contexts too
+//! (roadmap item 753). The next run compares its index with the last one and clears
+//! the contexts that hold an expression whose rules differ, with every context that
+//! links to a cleared one. Its answer is that of a run that starts again. Such a run
+//! starts again itself when the change is to more than class axioms and domains over
+//! classes and object restrictions, when the rules the ontology needs change, and once
+//! it keeps more than twice the expressions, conjunctions, tests or clauses of the
+//! last run that started again. Runs with a bound on their derived conclusions, which
+//! a run that counts and a rooted run have, start again after every change.
 //!
 //! The profile check, the taxonomy and the saturation run on the threads of
 //! [`Limits`], and the answer is the same for every number of threads.

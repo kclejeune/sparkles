@@ -12,8 +12,10 @@
 //! axioms gives the time of a full run after each removal, and with `--check` its
 //! taxonomy must equal the kept classifier's after every run. The output is one JSON
 //! line: the cold run, the medians and the extremes of the kept and the full runs, how
-//! many kept runs kept contexts, the contexts they cleared, and the classifier's
-//! estimate of the bytes it keeps and of its peak.
+//! many kept runs kept contexts, the contexts they cleared, the median time of the
+//! index with the normalization, of the saturation and of the taxonomy in the kept and
+//! in the full runs, and the classifier's estimate of the bytes it keeps and of its
+//! peak.
 
 use sparkles_owl::classify::{Classifier, Limits};
 use sparkles_owl::model::AxiomKind;
@@ -92,6 +94,17 @@ fn main() {
     let (mut removals, mut returns, mut full) = (Vec::new(), Vec::new(), Vec::new());
     let (mut incremental, mut cleared, mut runs) = (0usize, Vec::new(), 0usize);
     let (mut memory, mut peak) = (cold.stats.memory, cold.stats.peak_memory);
+    // the steps of the kept runs and of the full runs: the index with the
+    // normalization, the saturation and the taxonomy
+    let (mut kept_steps, mut full_steps) = (
+        [Vec::new(), Vec::new(), Vec::new()],
+        [Vec::new(), Vec::new(), Vec::new()],
+    );
+    let steps = |into: &mut [Vec<f64>; 3], s: &sparkles_owl::classify::Stats| {
+        into[0].push(ms(s.index));
+        into[1].push(ms(s.saturation));
+        into[2].push(ms(s.taxonomy));
+    };
     let contexts = cold.stats.contexts;
     for _ in 0..edits {
         if candidates.is_empty() {
@@ -108,6 +121,7 @@ fn main() {
         incremental += usize::from(out.stats.incremental);
         if out.stats.incremental {
             cleared.push(out.stats.cleared as f64);
+            steps(&mut kept_steps, &out.stats);
         }
         memory = memory.max(out.stats.memory);
         peak = peak.max(out.stats.peak_memory);
@@ -121,6 +135,7 @@ fn main() {
         let t = Instant::now();
         let want = fresh.classify(&limits).expect("the full run");
         full.push(ms(t.elapsed()));
+        steps(&mut full_steps, &want.stats);
         if check {
             assert!(
                 out.taxonomy == want.taxonomy,
@@ -138,6 +153,7 @@ fn main() {
         incremental += usize::from(out.stats.incremental);
         if out.stats.incremental {
             cleared.push(out.stats.cleared as f64);
+            steps(&mut kept_steps, &out.stats);
         }
         memory = memory.max(out.stats.memory);
         peak = peak.max(out.stats.peak_memory);
@@ -153,12 +169,15 @@ fn main() {
     let (am, alo, ahi) = spread(returns);
     let (fm, flo, fhi) = spread(full);
     let (cm, clo, chi) = spread(cleared);
+    let [ki, ks, kt] = kept_steps.map(|v| spread(v).0);
+    let [fi, fs, ft] = full_steps.map(|v| spread(v).0);
     println!(
         "{{\"file\":\"{}\",\"threads\":{threads},\"counting\":{counting},\"tier\":\"{:?}\",\
          \"axioms\":{},\"classes\":{},\"contexts\":{contexts},\"cold_ms\":{cold_ms:.2},\
          \"runs\":{runs},\"incremental\":{incremental},\
          \"removal_ms\":[{rm:.3},{rlo:.3},{rhi:.3}],\"return_ms\":[{am:.3},{alo:.3},{ahi:.3}],\
          \"full_ms\":[{fm:.2},{flo:.2},{fhi:.2}],\"cleared\":[{cm},{clo},{chi}],\
+         \"kept_steps_ms\":[{ki:.3},{ks:.3},{kt:.3}],\"full_steps_ms\":[{fi:.3},{fs:.3},{ft:.3}],\
          \"cold_memory\":{},\"cold_peak\":{},\"kept_memory\":{memory},\"kept_peak\":{peak},\
          \"checked\":{check}}}",
         std::path::Path::new(&input)

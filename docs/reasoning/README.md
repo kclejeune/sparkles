@@ -356,11 +356,18 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the top object property, is used as far as the calculus goes and reported as partial.
   Every answer is entailed, and it is complete for named classes when nothing is reported.
   For eligible EL additions and removals, the classifier keeps its contexts and saturates
-  again only those the changes can reach. Horn and disjunctive classifications rebuild
-  after edits. Their incremental maintenance is planned. Roadmap item 753 under item 603.
-  A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
-  with an individual, a data property, a datatype or a key, and any change after a run
-  that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
+  again only those the changes can reach. A classification with the Horn rules of an
+  ontology without individuals, and one with the disjunctive rules that does not count,
+  keep their contexts in the same way. After an edit of class axioms the next run clears
+  the contexts that hold an expression whose rules changed, with the contexts that reach
+  them, and its answer is that of a classification that starts again. A change to the
+  property hierarchy, chains, reflexivity or ranges, a domain, a property declaration, an
+  axiom with an individual, a data property, a datatype, a key or a self restriction, and
+  a change that moves the ontology to other rules, saturates everything again. So does
+  any change to a Horn ontology with individuals, to a counting or a rooted run, and to a
+  run with the eager strategy. Roadmap items 753 and 953. A kept classification holds
+  the last index beside the new one while it compares them, and starts again once it
+  keeps more than twice the expressions of its last full run. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
   closure, saturates and builds the taxonomy. Integer, decimal and rational literals
   use exact arbitrary-precision values, so equal reduced fractions and equivalent
@@ -402,9 +409,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   taxonomy that graph held, and records PROV-O provenance on the graph's ontology
   header. The dataset keeps its last classification of an ontology for callers who read
   every graph, so a compatible same-commit call can reuse a retained result. At a later
-  commit, eligible EL additions and removals reuse affected contexts. Horn and
-  disjunctive runs rebuild after edits, and affected-module reuse is planned. Roadmap
-  item 753 under item 603. Finer invalidation for EL individual, merge, key and world
+  commit, eligible EL additions and removals reuse affected contexts, as do edits of
+  class axioms in Horn ontologies without individuals and in disjunctive runs that do
+  not count. Horn runs with individuals and counting or rooted runs rebuild after edits.
+  Roadmap items 753 and 953 under item 603. Finer invalidation for EL individual, merge, key and world
   changes is open. Roadmap item 664. Same-commit reuse is separate from incremental
   reclassification. That kept state holds the classifier's contexts, index
   and taxonomy in memory while the dataset is open and reads the axioms of the open
@@ -835,9 +843,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   proofs.
 * A classification runs within one request's deadline and is not kept up to date as
   commits land. Roadmap item 589.
-* Native Horn and disjunctive classifications rebuild after axiom insertions and
-  deletions. Incremental maintenance with safe full fallback and measured edit latency
-  and retained memory is planned. Roadmap [item 753](../ROADMAP.md) under item 603.
+* A Horn classification of an ontology with individuals, keys or functional data
+  properties rebuilds after every axiom insertion and deletion. Roadmap
+  [item 753](../ROADMAP.md) under item 603.
+* A classification that counts, a rooted one and one with the eager strategy rebuild
+  after every edit, since the bound on their derived conclusions depends on the order
+  of the derivations. Roadmap [item 953](../ROADMAP.md).
+* A classification that keeps its contexts after an edit still normalizes every axiom
+  and builds its index and its taxonomy again, which bounds what a small edit saves.
+  Roadmap [item 955](../ROADMAP.md).
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
 

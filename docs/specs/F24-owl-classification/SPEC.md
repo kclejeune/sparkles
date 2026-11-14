@@ -162,6 +162,12 @@ restrictions against 188 ms without it on one thread. Item 950 follows the cost 
 ontologies that classify in a few milliseconds. A rooted run and a run with the eager
 strategy that counts take one thread with the option, which item 951 follows.
 
+Item 753 makes a run after an edit of class axioms
+[keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
+without individuals and of a run of the disjunctive rules that does not count, with the
+answer of a run that starts again. Horn runs with individuals stay with the item, and
+runs with a bound on their derived conclusions are item 953.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -322,9 +328,9 @@ additions and removals gives the taxonomy of a full run.
 
 This reuse applies to eligible EL edits. Normalization with Horn or disjunctive axioms
 currently clears the contexts and marks the run entangled, so a later edited source
-rebuilds those runs. Reusing the completed result at the same commit is separate from
-incremental maintenance. Item 753 delivers item 603's affected-module incremental DL
-requirement, as [the follow-up](#incremental-native-dl-classification) describes.
+rebuilds those runs, unless the run is one that
+[keeps its contexts](#incremental-native-dl-classification). Reusing the completed
+result at the same commit is separate from incremental maintenance.
 
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
@@ -361,8 +367,10 @@ inferred read is refused, since a classification reads the asserted axioms. The 
 keeps its last classification of an ontology for callers who read every graph, without
 assertions, keyed by the graphs, imports and mode. A compatible classification at the
 same commit answers from the retained result. At a later commit eligible EL additions
-and removals reuse affected contexts, while Horn and disjunctive runs rebuild after
-edits. Item 753 covers incremental native DL maintenance under item 603, and item 664
+and removals reuse affected contexts, as do edits of class axioms after a Horn run
+without individuals and a disjunctive run that does not count, while the other Horn and
+disjunctive runs rebuild after edits. Item 753 covers incremental native DL maintenance
+under item 603, and item 664
 covers the EL individual, merge, key and world invalidation gaps. One kept classification
 runs at a time, and a second caller waits for it under
 its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
@@ -3623,13 +3631,79 @@ materializing reasoner adds, which item 691 follows.
 #### Incremental native DL classification
 
 Item 753 delivers item 603's affected-module maintenance for axiom insertions and
-deletions. It first covers supported Horn and disjunctive constructs and extends
-eligibility with later phases of item 603. Dependencies must cover normalized rules,
-Horn conjunction contexts, disjunctive test contexts and taxonomy consequences,
-including consequences whose last support was removed. An edit with untracked effects
-must fall back to fresh full classification, including global role or chain changes,
-tier transitions and new constructs without complete dependency tracking. An affected
-module can be the whole ontology, and case analysis retains its exponential worst case.
+deletions in two kinds of run. The first is a run with the Horn rules whose index has no
+individuals, universal properties, keys or functional data properties. The second is a
+run of the disjunctive rules with the cautious strategy and without counting or a root.
+Both keep their contexts, the contexts of conjunctions or of tests, and for the
+disjunctive rules the table of the clauses that contexts sent one another. The other
+runs start again after every edit: Horn runs with individuals, which wait on items 590
+and 664, and runs with a bound on their derived conclusions, which a counting run, a
+rooted run and the run after a passed bound have and which item 953 follows, since that
+bound counts derivations in an order that a kept context would change.
+
+A run with changes holds the last index until the new one is built and compares the two
+by expression. An expression is changed when its successor, its told superexpressions,
+its conjunctions, its negative existential restrictions or its disjointness sets differ,
+when a Horn flag on it or on a universal's filler differs, and for the disjunctive rules
+when a clause with the expression in its body exists in only one index or its
+hypothetical successor, its successor's core or its rank in the order of atoms differs.
+A context is cleared when it holds a changed expression. For the Horn rules its
+subsumers are what it holds. For the disjunctive rules they are its units, its markers
+and every literal of every clause its store took, including the clauses a later one
+subsumed, since each premise of an inference is one of these and the rules read the
+index by the atoms and successor terms of their premises. The run also clears every
+source of a backward link into a cleared context and every predecessor that registered
+with one, since a predecessor holds what its successors sent back, and the class of a
+cleared test that had held. Kept contexts drop the cleared ones from their predecessors,
+which register again and are answered again. The tables that no expression keys, the
+property hierarchy, chains, ranges and inverses, must be equal on the properties of the
+last index, or the run starts again.
+
+The fresh classes of a normalization are named by scope, so that a later run over the
+same interner gives the same axiom, unfolded universal or hypothetical successor the
+same classes. The interner keeps a copy of each axiom outside OWL 2 EL as the key of its
+scope, which the retained bytes count.
+
+A kept run of the Horn rules leaves each kept context as a run that starts again would.
+A kept run of the disjunctive rules does not. Its fresh classes have other ids and so
+another order, and a kept successor holds the markers that cleared predecessors sent,
+with the clauses they gave. Its answer is still that of a run that starts again. Each
+kept clause follows from the edited ontology with its context's core, by the argument
+above, and a marker is a tautology, so the context structure is sound for the edited
+ontology in the sense of Definition 6 of Bate and others. The saturation then closes
+every context under the rules. Theorem 9 of that paper gives completeness for every
+context structure to which no rule applies, and the paper notes that the claim does not
+depend on the expansion strategy that built the structure. The tests of candidate
+subsumers are refutations in contexts of their own, and each run computes the
+candidates of every class again, so a kept test answers at once.
+
+A run starts again with a new interner in these cases, which is the safe full rebuild.
+The change is to an axiom other than a class axiom or a domain over classes,
+intersections, unions, complements and object restrictions, while axioms outside OWL 2
+EL are in play. The rules that the edited ontology needs differ from the last run's, or
+the options that select rules do. The tables that no expression keys differ. The run
+keeps more than twice the expressions, the conjunctions or tests, or the clauses of the
+table that the last full run had, plus 4,096. A kept run that stops on its memory budget
+also starts again in full before a lower tier takes over, since the last index and the
+contexts that nothing reaches count against the budget of a kept run alone. A run that
+its deadline or a cancellation stops leaves a classifier whose next run starts again.
+
+`tests/dl_incremental.rs` compares each run of a kept classifier with a classifier that
+starts again, in subsumptions, taxonomy, unsatisfiable classes, consistency,
+completeness and the axioms left out, on 1, 4 and 8 threads. It covers fixed edits that
+take away the last support of a subsumption, of a test that held and of a clause that a
+successor sent back, random and seeded sequences over generated Horn and disjunctive
+ontologies, removals and returns of axioms over the 640 fixtures of item 603 and the
+generated ontologies of item 897, the ORE files that `SPARKLES_ORE_DIR` names, a memory
+budget that only a kept run passes, cancellation and a deadline during a kept run, and
+the bound on kept state. `examples/incremental_classify.rs` times kept runs after
+single-axiom edits against a classifier that starts again and checks their taxonomies.
+
+A kept run still normalizes every axiom and builds its index and its taxonomy again, so
+an edit saves the saturation of the kept contexts and not those steps, which item 955
+follows. The memory tradeoff is the last index beside the new one during the
+comparison, the copies of the axioms outside OWL 2 EL, and the expressions, tests and
+clauses that nothing reaches until the run starts again.
 
 Item 590 owns assertion retention and item 664 owns EL individual, merge, key and world
 invalidation. Coordinate their dependency records before making those changes eligible
