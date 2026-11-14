@@ -7,7 +7,7 @@ use oxrdf::{Literal, NamedNode, Term};
 use sparkles_core::sparql::value::{self, NumOp, Value};
 use std::cmp::Ordering;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BuiltinKind {
     Equal,
     NotEqual,
@@ -135,7 +135,7 @@ impl BuiltinKind {
 }
 
 /// Builtins allowed in heads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HeadAction {
     /// `listMapAsSubject(?list, ?p, ?o)`: assert `(m ?p ?o)` for each member m
     ListMapAsSubject,

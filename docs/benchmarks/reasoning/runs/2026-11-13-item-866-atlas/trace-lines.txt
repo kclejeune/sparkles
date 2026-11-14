@@ -1,0 +1,560 @@
+== lubm100-delete-base9-t20-r1.err
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2519
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.23
+	Maximum resident set size (kbytes): 3402868
+== lubm100-delete-base9-t20-r2.err
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2562
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.27
+	Maximum resident set size (kbytes): 3386428
+== lubm100-delete-base9-t20-r3.err
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2550
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.27
+	Maximum resident set size (kbytes): 3300984
+== lubm100-delete-base9-t20-r4.err
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2511
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.23
+	Maximum resident set size (kbytes): 3257872
+== lubm100-delete-tip-t20-r1.err
+TRACE sparkles_reasoner::tier: index new=10907379 rewrote=0 rels_ms=184 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110966 rewrote=0 rels_ms=1 whole_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2635
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.33
+	Maximum resident set size (kbytes): 2620272
+== lubm100-delete-tip-t20-r2.err
+TRACE sparkles_reasoner::tier: index new=10907379 rewrote=0 rels_ms=183 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110966 rewrote=0 rels_ms=2 whole_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2654
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.34
+	Maximum resident set size (kbytes): 2653296
+== lubm100-delete-tip-t20-r3.err
+TRACE sparkles_reasoner::tier: index new=10907379 rewrote=0 rels_ms=180 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110966 rewrote=0 rels_ms=2 whole_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2606
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.30
+	Maximum resident set size (kbytes): 2653708
+== lubm100-delete-tip-t20-r4.err
+TRACE sparkles_reasoner::tier: index new=10907379 rewrote=0 rels_ms=179 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110966 rewrote=0 rels_ms=2 whole_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=0 inferred=10885589 added=16 removed=21806 millis=2624
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:03.31
+	Maximum resident set size (kbytes): 2643724
+== lubm100-full-base9-t1-r1.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1182 merge_ms=1923
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3288 merge_ms=1612
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2146 merge_ms=778
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1935 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=244 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37719
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.77
+	Maximum resident set size (kbytes): 3872052
+== lubm100-full-base9-t1-r2.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1220 merge_ms=1914
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3209 merge_ms=1611
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2139 merge_ms=776
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1949 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=245 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37461
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.52
+	Maximum resident set size (kbytes): 3889376
+== lubm100-full-base9-t1-r3.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1189 merge_ms=1951
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3235 merge_ms=1605
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2143 merge_ms=772
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1938 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=244 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37197
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.26
+	Maximum resident set size (kbytes): 3938948
+== lubm100-full-base9-t1-r4.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1181 merge_ms=1978
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3248 merge_ms=1609
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2137 merge_ms=773
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1944 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=245 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37295
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.35
+	Maximum resident set size (kbytes): 3928228
+== lubm100-full-base9-t20-r1.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=215 merge_ms=890
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=334 merge_ms=540
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=200 merge_ms=206
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=178 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=66 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16992
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:17.05
+	Maximum resident set size (kbytes): 4176752
+== lubm100-full-base9-t20-r2.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=198 merge_ms=878
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=326 merge_ms=531
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=199 merge_ms=202
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=178 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=67 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16806
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:16.86
+	Maximum resident set size (kbytes): 4216216
+== lubm100-full-base9-t20-r3.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=191 merge_ms=853
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=334 merge_ms=532
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=199 merge_ms=209
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=181 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=66 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16509
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:16.56
+	Maximum resident set size (kbytes): 4175004
+== lubm100-full-base9-t20-r4.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=217 merge_ms=879
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=329 merge_ms=544
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=208 merge_ms=200
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=183 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=67 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16453
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:16.51
+	Maximum resident set size (kbytes): 4195940
+== lubm100-full-tip-t1-r1.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=179 whole_ms=1
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1204 merge_ms=1878 used_bytes=357410220 peak_bytes=976719402 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 in
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=225 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3466 merge_ms=1681 used_bytes=452484968 peak_bytes=1114134736 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=214 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2178 merge_ms=818 used_bytes=748786100 peak_bytes=1301672915 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=76 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1904 merge_ms=76 used_bytes=748786172 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_ca
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=278 merge_ms=0 used_bytes=748786036 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37947
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.02
+	Maximum resident set size (kbytes): 3616784
+== lubm100-full-tip-t1-r2.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=179 whole_ms=1
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1212 merge_ms=1897 used_bytes=357410220 peak_bytes=976719402 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 in
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=225 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3444 merge_ms=1677 used_bytes=452484968 peak_bytes=1114134736 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=215 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2208 merge_ms=827 used_bytes=748786100 peak_bytes=1301672915 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=75 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1860 merge_ms=76 used_bytes=748786172 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_ca
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=278 merge_ms=0 used_bytes=748786036 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37522
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.65
+	Maximum resident set size (kbytes): 3707960
+== lubm100-full-tip-t1-r3.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=180 whole_ms=1
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1204 merge_ms=1876 used_bytes=357410220 peak_bytes=976719402 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 in
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=225 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3455 merge_ms=1676 used_bytes=452484968 peak_bytes=1114134736 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=215 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2210 merge_ms=819 used_bytes=748786100 peak_bytes=1301672915 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=76 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1861 merge_ms=76 used_bytes=748786172 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_ca
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=280 merge_ms=0 used_bytes=748786036 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37402
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.46
+	Maximum resident set size (kbytes): 3688188
+== lubm100-full-tip-t1-r4.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=179 whole_ms=1
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=1211 merge_ms=1899 used_bytes=357410220 peak_bytes=976719402 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 in
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=224 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=3433 merge_ms=1677 used_bytes=452484968 peak_bytes=1114134736 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=252 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316390 eval_ms=2163 merge_ms=865 used_bytes=748786100 peak_bytes=1301672915 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=76 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=1857 merge_ms=76 used_bytes=748786172 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_ca
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=279 merge_ms=0 used_bytes=748786036 peak_bytes=1301672915 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=37433
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.51
+	Maximum resident set size (kbytes): 3697256
+== lubm100-full-tip-t20-r1.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=92 whole_ms=4
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=209 merge_ms=944 used_bytes=357410220 peak_bytes=976834602 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 inde
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=64 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=327 merge_ms=546 used_bytes=452484968 peak_bytes=1114251472 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 in
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=78 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=199 merge_ms=263 used_bytes=748786100 peak_bytes=1288062595 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=65 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=182 merge_ms=66 used_bytes=748786172 peak_bytes=1288062595 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=67 merge_ms=0 used_bytes=748786036 peak_bytes=1288062595 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=2
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16599
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:16.67
+	Maximum resident set size (kbytes): 3844868
+== lubm100-full-tip-t20-r2.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=82 whole_ms=1
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=205 merge_ms=927 used_bytes=357410220 peak_bytes=976834602 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 inde
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=65 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=342 merge_ms=540 used_bytes=452484968 peak_bytes=1114251472 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 in
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=74 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=205 merge_ms=256 used_bytes=748786100 peak_bytes=1288062595 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=70 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=163 merge_ms=70 used_bytes=748786172 peak_bytes=1288062595 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=70 merge_ms=0 used_bytes=748786036 peak_bytes=1288062595 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=2
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16124
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:16.18
+	Maximum resident set size (kbytes): 3868684
+== lubm100-full-tip-t20-r3.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=79 whole_ms=1
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=213 merge_ms=916 used_bytes=357410218 peak_bytes=976834600 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 inde
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=65 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=337 merge_ms=593 used_bytes=452484966 peak_bytes=1114251470 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 in
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=77 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=196 merge_ms=261 used_bytes=748786098 peak_bytes=1288062593 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=71 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=162 merge_ms=71 used_bytes=748786170 peak_bytes=1288062593 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=71 merge_ms=0 used_bytes=748786034 peak_bytes=1288062593 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=2
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16173
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:16.22
+	Maximum resident set size (kbytes): 3906784
+== lubm100-full-tip-t20-r4.err
+TRACE sparkles_reasoner::tier: index new=5069474 rewrote=0 rels_ms=79 whole_ms=1
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=65 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=30036 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=5099576 visible=5099576 candidates=9434529 eval_ms=198 merge_ms=916 used_bytes=357410220 peak_bytes=976834602 tier_bytes=357258680 index_cap=7340032 index_len=5099576 index_cap_max=114688 inde
+TRACE sparkles_reasoner::tier: index new=3302176 rewrote=0 rels_ms=64 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=1 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=3302177 visible=8401753 candidates=8301126 eval_ms=348 merge_ms=557 used_bytes=452484968 peak_bytes=1114251472 tier_bytes=452316484 index_cap=14680064 index_len=8401753 index_cap_max=229376 in
+TRACE sparkles_reasoner::tier: index new=2505433 rewrote=356 rels_ms=83 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=2505433 visible=10907186 candidates=5316391 eval_ms=194 merge_ms=266 used_bytes=748786100 peak_bytes=1288062595 tier_bytes=748617736 index_cap=14680064 index_len=10907186 index_cap_max=229376 
+TRACE sparkles_reasoner::tier: index new=193 rewrote=12479466 rels_ms=69 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=193 visible=10907379 candidates=341 eval_ms=173 merge_ms=69 used_bytes=748786172 peak_bytes=1288062595 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=0 visible=10907379 candidates=0 eval_ms=71 merge_ms=0 used_bytes=748786036 peak_bytes=1288062595 tier_bytes=748619680 index_cap=14680064 index_len=10907379 index_cap_max=229376 index_cap_min=2
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=5 inferred=10907379 added=10907379 removed=0 millis=16076
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:16.12
+	Maximum resident set size (kbytes): 3885404
+== lubm100-insert-base9-t20-r1.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=84 merge_ms=11
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=9 merge_ms=1
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=3 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1638
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.39
+	Maximum resident set size (kbytes): 3048444
+== lubm100-insert-base9-t20-r2.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=88 merge_ms=10
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=9 merge_ms=1
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=3 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1641
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.40
+	Maximum resident set size (kbytes): 3077544
+== lubm100-insert-base9-t20-r3.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=84 merge_ms=11
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=9 merge_ms=1
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=3 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1651
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.41
+	Maximum resident set size (kbytes): 2983724
+== lubm100-insert-base9-t20-r4.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=84 merge_ms=11
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=9 merge_ms=1
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=3 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1598
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.35
+	Maximum resident set size (kbytes): 3038100
+== lubm100-insert-tip-t20-r1.err
+TRACE sparkles_reasoner::tier: index new=10885589 rewrote=0 rels_ms=185 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110950 rewrote=0 rels_ms=1 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=16528 rewrote=0 rels_ms=5 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=86 merge_ms=17 used_bytes=816499684 peak_bytes=1028048072 tier_bytes=804675756 index_cap=14680064 index_len=11013067 index_cap_max=229376 index_cap
+TRACE sparkles_reasoner::tier: index new=5278 rewrote=1316 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=11 merge_ms=2 used_bytes=818457776 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_mi
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=3 merge_ms=0 used_bytes=818458280 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_min=22937
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1674
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.45
+	Maximum resident set size (kbytes): 2562236
+== lubm100-insert-tip-t20-r2.err
+TRACE sparkles_reasoner::tier: index new=10885589 rewrote=0 rels_ms=185 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110950 rewrote=0 rels_ms=1 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=16528 rewrote=0 rels_ms=5 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=78 merge_ms=15 used_bytes=816499684 peak_bytes=1028048072 tier_bytes=804675756 index_cap=14680064 index_len=11013067 index_cap_max=229376 index_cap
+TRACE sparkles_reasoner::tier: index new=5278 rewrote=1316 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=10 merge_ms=2 used_bytes=818457776 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_mi
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=3 merge_ms=0 used_bytes=818458280 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_min=22937
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1673
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.46
+	Maximum resident set size (kbytes): 2504960
+== lubm100-insert-tip-t20-r3.err
+TRACE sparkles_reasoner::tier: index new=10885589 rewrote=0 rels_ms=187 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110950 rewrote=0 rels_ms=2 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=16528 rewrote=0 rels_ms=4 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=81 merge_ms=16 used_bytes=816499684 peak_bytes=1028048072 tier_bytes=804675756 index_cap=14680064 index_len=11013067 index_cap_max=229376 index_cap
+TRACE sparkles_reasoner::tier: index new=5278 rewrote=1316 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=10 merge_ms=2 used_bytes=818457776 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_mi
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=3 merge_ms=0 used_bytes=818458280 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_min=22937
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1674
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.44
+	Maximum resident set size (kbytes): 2521756
+== lubm100-insert-tip-t20-r4.err
+TRACE sparkles_reasoner::tier: index new=10885589 rewrote=0 rels_ms=185 whole_ms=3
+TRACE sparkles_reasoner::tier: index new=110950 rewrote=0 rels_ms=2 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=16528 rewrote=0 rels_ms=4 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=16528 visible=16528 candidates=35586 eval_ms=83 merge_ms=15 used_bytes=816499684 peak_bytes=1028048072 tier_bytes=804675756 index_cap=14680064 index_len=11013067 index_cap_max=229376 index_cap
+TRACE sparkles_reasoner::tier: index new=5278 rewrote=1316 rels_ms=2 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=5278 visible=21806 candidates=6447 eval_ms=11 merge_ms=3 used_bytes=818457776 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_mi
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=0 visible=21806 candidates=0 eval_ms=4 merge_ms=0 used_bytes=818458280 peak_bytes=1028048072 tier_bytes=806587200 index_cap=14680064 index_len=11018345 index_cap_max=229376 index_cap_min=22937
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="incremental" rules=152 iterations=3 inferred=10907379 added=21806 removed=16 millis=1663
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:02.43
+	Maximum resident set size (kbytes): 2512176
+== owl2bench5-full-base9-t1-r1.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=40 merge_ms=18658
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=27978 merge_ms=1302
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=1075 merge_ms=1585
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=131 merge_ms=110
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=61 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=107088
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:47.35
+	Maximum resident set size (kbytes): 9662764
+== owl2bench5-full-base9-t1-r2.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=40 merge_ms=16560
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=27541 merge_ms=237
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=1128 merge_ms=427
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=122 merge_ms=139
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=60 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=104026
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:44.23
+	Maximum resident set size (kbytes): 9674984
+== owl2bench5-full-base9-t1-r3.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=40 merge_ms=16449
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=27326 merge_ms=233
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=1147 merge_ms=244
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=123 merge_ms=111
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=59 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=103633
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:43.83
+	Maximum resident set size (kbytes): 9679496
+== owl2bench5-full-base9-t1-r4.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=40 merge_ms=16191
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=27366 merge_ms=233
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=1128 merge_ms=221
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=122 merge_ms=111
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=59 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=102029
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:42.22
+	Maximum resident set size (kbytes): 9683156
+== owl2bench5-full-base9-t20-r1.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=28 merge_ms=8648
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2817 merge_ms=190
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=180 merge_ms=100
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=15 merge_ms=1282
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=9 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=53918
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:54.19
+	Maximum resident set size (kbytes): 9957880
+== owl2bench5-full-base9-t20-r2.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=33 merge_ms=8041
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2817 merge_ms=190
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=175 merge_ms=102
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=17 merge_ms=904
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=9 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=51621
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:51.85
+	Maximum resident set size (kbytes): 9968364
+== owl2bench5-full-base9-t20-r3.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=40 merge_ms=7678
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2798 merge_ms=191
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=168 merge_ms=102
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=15 merge_ms=758
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=8 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=50843
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:51.09
+	Maximum resident set size (kbytes): 9962356
+== owl2bench5-full-base9-t20-r4.err
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=30 merge_ms=7486
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2754 merge_ms=194
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=176 merge_ms=103
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=16 merge_ms=746
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=8 merge_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=50522
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:50.76
+	Maximum resident set size (kbytes): 9956780
+== owl2bench5-full-tip-t1-r1.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=7 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=3859 whole_ms=31
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=43 merge_ms=19035 used_bytes=2739424174 peak_bytes=4625047226 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=9175
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=8 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=24860 merge_ms=70 used_bytes=2742659558 peak_bytes=4625047226 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=1589 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=2086 merge_ms=1637 used_bytes=2745057254 peak_bytes=4625047226 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=9 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=115 merge_ms=25 used_bytes=2746324674 peak_bytes=4625047226 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 ind
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=54 merge_ms=2 used_bytes=2746367810 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_c
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0 used_bytes=2746367762 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=105046
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:45.42
+	Maximum resident set size (kbytes): 9701080
+== owl2bench5-full-tip-t1-r2.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=4 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=2145 whole_ms=16
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=41 merge_ms=17170 used_bytes=2739424174 peak_bytes=4625047226 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=9175
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=8 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=25020 merge_ms=70 used_bytes=2742659558 peak_bytes=4625047226 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=958 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=2087 merge_ms=1005 used_bytes=2745057254 peak_bytes=4625047226 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=9 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=116 merge_ms=25 used_bytes=2746324674 peak_bytes=4625047226 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 ind
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=54 merge_ms=2 used_bytes=2746367810 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_c
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0 used_bytes=2746367762 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=101270
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:41.54
+	Maximum resident set size (kbytes): 9705548
+== owl2bench5-full-tip-t1-r3.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=4 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=1986 whole_ms=16
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=41 merge_ms=17022 used_bytes=2739424174 peak_bytes=4625047226 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=9175
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=8 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=24925 merge_ms=69 used_bytes=2742659558 peak_bytes=4625047226 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=991 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=2086 merge_ms=1038 used_bytes=2745057254 peak_bytes=4625047226 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=9 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=116 merge_ms=26 used_bytes=2746324674 peak_bytes=4625047226 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 ind
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=53 merge_ms=2 used_bytes=2746367810 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_c
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0 used_bytes=2746367762 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=101170
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:41.37
+	Maximum resident set size (kbytes): 9711412
+== owl2bench5-full-tip-t1-r4.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=5 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=1963 whole_ms=16
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=305401 eval_ms=43 merge_ms=16984 used_bytes=2739424174 peak_bytes=4625047226 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=9175
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=8 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=367008 eval_ms=24982 merge_ms=67 used_bytes=2742659558 peak_bytes=4625047226 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=959 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=377635 eval_ms=2085 merge_ms=1006 used_bytes=2745057254 peak_bytes=4625047226 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=9 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92650 eval_ms=118 merge_ms=26 used_bytes=2746324674 peak_bytes=4625047226 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 ind
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=53 merge_ms=2 used_bytes=2746367810 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_c
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=2 merge_ms=0 used_bytes=2746367762 peak_bytes=4625047226 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=100478
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:40.75
+	Maximum resident set size (kbytes): 9709276
+== owl2bench5-full-tip-t20-r1.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=6 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=2231 whole_ms=25
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=31 merge_ms=7453 used_bytes=2739424174 peak_bytes=3786997418 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=2 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2397 merge_ms=26 used_bytes=2742659558 peak_bytes=3786997418 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504 
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=1042 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=202 merge_ms=1058 used_bytes=2745057254 peak_bytes=3869720330 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=917504
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=4 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=17 merge_ms=10 used_bytes=2746324674 peak_bytes=3869720330 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 inde
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=2 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=10 merge_ms=2 used_bytes=2746367810 peak_bytes=3869720330 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_c
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0 used_bytes=2746367762 peak_bytes=3869720330 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=52311
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:52.72
+	Maximum resident set size (kbytes): 9920084
+== owl2bench5-full-tip-t20-r2.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=1 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=1771 whole_ms=16
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=32 merge_ms=6878 used_bytes=2739424174 peak_bytes=3786997418 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=12 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2488 merge_ms=39 used_bytes=2742659558 peak_bytes=3786997418 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504 
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=804 whole_ms=6
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=191 merge_ms=832 used_bytes=2745057254 peak_bytes=3869720330 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=917504 
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=4 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=16 merge_ms=9 used_bytes=2746324674 peak_bytes=3869720330 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 index
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=2 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=10 merge_ms=2 used_bytes=2746367810 peak_bytes=3869720330 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_c
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0 used_bytes=2746367762 peak_bytes=3869720330 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=51884
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:52.24
+	Maximum resident set size (kbytes): 8887916
+== owl2bench5-full-tip-t20-r3.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=3 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=1625 whole_ms=16
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=41 merge_ms=6715 used_bytes=2739424174 peak_bytes=3786997418 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=2 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2422 merge_ms=25 used_bytes=2742659558 peak_bytes=3786997418 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504 
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=805 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=190 merge_ms=820 used_bytes=2745057254 peak_bytes=3869642042 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=917504 
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=5 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=15 merge_ms=10 used_bytes=2746324674 peak_bytes=3869642042 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 inde
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=2 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=8 merge_ms=2 used_bytes=2746367810 peak_bytes=3869642042 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_ca
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0 used_bytes=2746367762 peak_bytes=3869642042 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=50076
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:50.38
+	Maximum resident set size (kbytes): 9916888
+== owl2bench5-full-tip-t20-r4.err
+TRACE sparkles_reasoner::tier: index new=145652 rewrote=0 rels_ms=1 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=60 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=177 rewrote=0 rels_ms=0 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=52377089 rewrote=0 rels_ms=1587 whole_ms=16
+TRACE sparkles_reasoner::tier: index new=135 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=1 new=52523113 visible=52523113 candidates=311139 eval_ms=27 merge_ms=6713 used_bytes=2739424174 peak_bytes=3786997418 tier_bytes=2739275920 index_cap=58720256 index_len=52523113 index_cap_max=91750
+TRACE sparkles_reasoner::tier: index new=204049 rewrote=0 rels_ms=2 whole_ms=0
+TRACE sparkles_reasoner::tier: index new=19 rewrote=0 rels_ms=0 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=2 new=204068 visible=52727181 candidates=372221 eval_ms=2437 merge_ms=26 used_bytes=2742659558 peak_bytes=3786997418 tier_bytes=2742494360 index_cap=58720256 index_len=52727181 index_cap_max=917504 
+TRACE sparkles_reasoner::tier: index new=144290 rewrote=104772422 rels_ms=677 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=3 new=144290 visible=52871471 candidates=379542 eval_ms=189 merge_ms=692 used_bytes=2745057254 peak_bytes=3869642042 tier_bytes=2744892168 index_cap=58720256 index_len=52871471 index_cap_max=917504 
+TRACE sparkles_reasoner::tier: index new=90341 rewrote=362138 rels_ms=3 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=4 new=90341 visible=52961812 candidates=92653 eval_ms=41 merge_ms=8 used_bytes=2746324674 peak_bytes=3869642042 tier_bytes=2746159524 index_cap=58720256 index_len=52961812 index_cap_max=917504 index
+TRACE sparkles_reasoner::tier: index new=4327 rewrote=243944 rels_ms=1 whole_ms=0
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=5 new=4327 visible=52966139 candidates=4327 eval_ms=7 merge_ms=2 used_bytes=2746367810 peak_bytes=3869642042 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_ca
+DEBUG sparkles_reasoner::engine: reasoner iteration iteration=6 new=0 visible=52966139 candidates=0 eval_ms=1 merge_ms=0 used_bytes=2746367762 peak_bytes=3869642042 tier_bytes=2746202796 index_cap=58720256 index_len=52966139 index_cap_max=917504 index_cap_min=
+INFO sparkles_reasoner: materialized inferences profile=owl-rl method="full" rules=152 iterations=6 inferred=52966139 added=52966139 removed=0 millis=49912
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:50.21
+	Maximum resident set size (kbytes): 9909480

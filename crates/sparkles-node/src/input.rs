@@ -440,12 +440,27 @@ impl Request {
         Ok(n)
     }
 
-    /// Whether `snap` has the quad of row 0, looked up through the kept ids where they
+    /// Whether `snap` has the quad of each row, as a bit array: bit `r % 32` of word
+    /// `r / 32` is set when row `r` is there. A row that needs the general pattern match
+    /// is answered by it.
+    pub fn contains_all(&self, snap: &Arc<Snapshot>, epoch: u64) -> Result<Vec<u32>> {
+        let mut found = vec![0u32; self.rows.div_ceil(32)];
+        for r in 0..self.rows {
+            let there = match self.contains(r, snap, epoch)? {
+                Some(there) => there,
+                None => sparkles::embed::contains_in(snap, &self.pattern(r)?)?,
+            };
+            found[r / 32] |= u32::from(there) << (r % 32);
+        }
+        Ok(found)
+    }
+
+    /// Whether `snap` has the quad of row `r`, looked up through the kept ids where they
     /// are valid. Returns `None` when the lookup needs the general pattern match: a
     /// blank node or triple term, or the default graph read as the union of the named
     /// graphs.
-    pub fn contains(&self, snap: &Snapshot, epoch: u64) -> Result<Option<bool>> {
-        let hs = self.quad_handles(0)?;
+    pub fn contains(&self, r: usize, snap: &Snapshot, epoch: u64) -> Result<Option<bool>> {
+        let hs = self.quad_handles(r)?;
         if hs.iter().any(|h| !h.keep)
             || (snap.union_default_graph && matches!(hs[3].cell, Cell::DefaultGraph))
         {

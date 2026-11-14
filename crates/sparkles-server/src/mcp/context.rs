@@ -2,7 +2,8 @@
 //! dataset (`sparkles://{ds}/schema`, `sparkles://{ds}/prefixes`), one per stored query
 //! the caller may run as a tool (`sparkles://{ds}/queries/{name}`), the open items of
 //! the memory review inbox of each dataset with memory settings whose inbox the caller
-//! may review (`sparkles://{ds}/memory/review`), and eight prompts
+//! may review (`sparkles://{ds}/memory/review`), the caller's scratch branches of each
+//! dataset where it may create them (`sparkles://{ds}/branches`), and eight prompts
 //! (`explore_dataset`, `answer_question`, `run_stored_query`, `ask_graph`,
 //! `explain_term`, `agent_memory`, `ingest_document`, `consolidate_memory`). Each lists
 //! and reads only the datasets the caller may read. Prompt text is static apart from the
@@ -29,10 +30,18 @@ pub enum Kind {
     Query,
     /// the open items of the memory review inbox (`memory/review`)
     Review,
+    /// the caller's scratch branches, with those that expire soon (`branches`)
+    Branches,
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [Kind::Schema, Kind::Prefixes, Kind::Query, Kind::Review];
+    const ALL: [Kind; 5] = [
+        Kind::Schema,
+        Kind::Prefixes,
+        Kind::Query,
+        Kind::Review,
+        Kind::Branches,
+    ];
 
     /// The path after the dataset name (for a stored query, before its name).
     pub fn path(self) -> &'static str {
@@ -41,12 +50,13 @@ impl Kind {
             Kind::Prefixes => "prefixes",
             Kind::Query => "queries",
             Kind::Review => "memory/review",
+            Kind::Branches => "branches",
         }
     }
 
     pub fn mime_type(self) -> &'static str {
         match self {
-            Kind::Schema | Kind::Query | Kind::Review => "application/json",
+            Kind::Schema | Kind::Query | Kind::Review | Kind::Branches => "application/json",
             Kind::Prefixes => "application/sparql-query",
         }
     }
@@ -57,6 +67,7 @@ impl Kind {
             Kind::Prefixes => "Prefixes",
             Kind::Query => "Stored query",
             Kind::Review => "Memory review",
+            Kind::Branches => "Your scratch branches",
         }
     }
 
@@ -73,6 +84,9 @@ impl Kind {
             }
             Kind::Review => {
                 "What waits for a person's review in the dataset's agent memory: unreviewed facts and open review branches, with the oldest of each kind."
+            }
+            Kind::Branches => {
+                "The scratch branches you created in the dataset with create_branch: their last change, their own commits, whether they are kept and when they expire, and the ones that expire within the dataset's warning window."
             }
         }
     }
@@ -124,7 +138,7 @@ pub fn parse_uri(uri: &str) -> Option<(&str, Kind, Option<&str>)> {
     if let Some(q) = path.strip_prefix("queries/") {
         return (!q.is_empty()).then_some((name, Kind::Query, Some(q)));
     }
-    let kind = [Kind::Schema, Kind::Prefixes, Kind::Review]
+    let kind = [Kind::Schema, Kind::Prefixes, Kind::Review, Kind::Branches]
         .into_iter()
         .find(|k| k.path() == path)?;
     Some((name, kind, None))
@@ -152,6 +166,16 @@ impl McpServer {
                     uri: format!("{SCHEME}{}/{}", ds.name, Kind::Review.path()),
                     name: format!("{} memory review", ds.name),
                     kind: Kind::Review,
+                });
+            }
+        }
+        if self.allows(&call.principal, "create_branch") {
+            // every dataset where the caller may read some branch, as create_branch takes
+            for ds in self.visible_any_branch(&call.principal.clone().on_branch(None)) {
+                out.push(Resource {
+                    uri: format!("{SCHEME}{}/{}", ds.name, Kind::Branches.path()),
+                    name: format!("{} scratch branches", ds.name),
+                    kind: Kind::Branches,
                 });
             }
         }
@@ -197,7 +221,13 @@ impl McpServer {
     ) -> Result<(Kind, String), ContextError> {
         let unknown = || ContextError::InvalidParams(format!("unknown resource: {uri}"));
         let (name, kind, query) = parse_uri(uri).ok_or_else(unknown)?;
-        let ds = self.resource_dataset(&call, name)?;
+        let ds = if kind == Kind::Branches {
+            // the dataset's main, which a caller who reads only other branches may name
+            self.main_dataset(&call.principal.clone().on_branch(None), Some(name))
+                .map_err(|e| ContextError::InvalidParams(e.message))?
+        } else {
+            self.resource_dataset(&call, name)?
+        };
         match kind {
             Kind::Prefixes => Ok((kind, prefix_lines(&ds))),
             Kind::Query => {
@@ -219,6 +249,23 @@ impl McpServer {
                 let grant = call.grant.clone();
                 let read = tokio::task::spawn_blocking(move || {
                     super::memory::pending::review_json(&st, &ds, &p, grant)
+                })
+                .await
+                .ok()
+                .flatten();
+                match read {
+                    Some(v) => Ok((kind, v.to_string())),
+                    None => Err(unknown()),
+                }
+            }
+            Kind::Branches => {
+                if !self.allows(&call.principal, "create_branch") {
+                    return Err(unknown());
+                }
+                let (st, p) = (self.state.clone(), call.principal.clone());
+                let default = self.shared.cfg.scratch_ttl;
+                let read = tokio::task::spawn_blocking(move || {
+                    super::branches::own_branches_json(&st, &ds, &p, default)
                 })
                 .await
                 .ok()

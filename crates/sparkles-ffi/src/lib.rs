@@ -369,6 +369,14 @@ impl FfiDataset {
         self.reader(&snap, &labels).contains(&quad)
     }
 
+    /// Whether each pattern of a batch matches a quad on the head snapshot, one byte
+    /// per pattern.
+    pub fn contains_all(&self, patterns: Vec<u8>) -> FfiResult<Vec<u8>> {
+        let snap = self.head();
+        let labels = self.inner.labels();
+        self.reader(&snap, &labels).contains_all(&patterns)
+    }
+
     pub fn graph_names(&self) -> FfiResult<Vec<u8>> {
         let snap = self.head();
         let labels = self.inner.labels();
@@ -508,6 +516,13 @@ impl FfiReadTxn {
     pub fn contains(&self, quad: Vec<u8>) -> FfiResult<bool> {
         let labels = self.ds.labels();
         self.reader(&labels).contains(&quad)
+    }
+
+    /// Whether each pattern of a batch matches a quad on the transaction's snapshot,
+    /// one byte per pattern.
+    pub fn contains_all(&self, patterns: Vec<u8>) -> FfiResult<Vec<u8>> {
+        let labels = self.ds.labels();
+        self.reader(&labels).contains_all(&patterns)
     }
 
     pub fn graph_names(&self) -> FfiResult<Vec<u8>> {
@@ -767,6 +782,12 @@ impl FfiWriteTxn {
 
     pub fn contains(&self, quad: Vec<u8>) -> FfiResult<bool> {
         self.with_reader(|r| r.contains(&quad))
+    }
+
+    /// Whether each pattern of a batch matches a quad in the transaction's view, one
+    /// byte per pattern.
+    pub fn contains_all(&self, patterns: Vec<u8>) -> FfiResult<Vec<u8>> {
+        self.with_reader(|r| r.contains_all(&patterns))
     }
 
     pub fn graph_names(&self) -> FfiResult<Vec<u8>> {

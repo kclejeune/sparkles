@@ -459,7 +459,12 @@ def prf(gold, got):
     return score_sets(gold, got)[1]
 
 
-def leaf_environment(extra=None):
+# The bounded Ask stage diagnostics (docs/ai/README.md). Their fields hold no question,
+# label, IRI, prompt or error message, so a profiled child's stderr holds none either.
+PROFILE_FILTER = "warn,sparkles::ask::profile=debug"
+
+
+def leaf_environment(extra=None, profile=False):
     # Never copy ambient credential, proxy, loader or fnox variables into children.
     env = {
         "PATH": "/usr/bin:/bin",
@@ -467,6 +472,8 @@ def leaf_environment(extra=None):
         "LC_ALL": "C.UTF-8",
         "RAYON_NUM_THREADS": "1",
     }
+    if profile:
+        env["RUST_LOG"] = PROFILE_FILTER
     if extra:
         if set(extra) != {"SPARKLES_EVAL_GATE_TOKEN"} or not isinstance(
             extra["SPARKLES_EVAL_GATE_TOKEN"], str

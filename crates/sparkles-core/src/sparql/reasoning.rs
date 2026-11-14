@@ -54,12 +54,40 @@ pub struct Demand {
 }
 
 /// What a provider says about a demand after [`ReasoningSession::prepare`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DemandInfo {
     /// the predicate and the adornment, such as `rdf:type^fbb`
     pub adornment: String,
     /// the rules in the demand's dependency cone
     pub rules: Vec<String>,
+    /// the facts a derivation of the demand is estimated to produce, from the dependency
+    /// cone and the statistics of the input graphs (spec F17 §4.3)
+    pub estimate: f64,
+    /// whether a materialization with the same rules holds every fact of the demand: it
+    /// does not when a top-level backward rule, which the materializer skips, lies in
+    /// the demand's cone
+    pub materialized: bool,
+    /// whether the demand's table, with its constants alone, is in the cache
+    pub cached: bool,
+}
+
+/// Whether the materialized inferences can answer a query's patterns under `auto`, for
+/// the snapshot a session reads (spec F17 §4.1, §4.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Materialization {
+    /// the query derives every intensional pattern and does not read the inferred graph
+    /// (`reasoning=demand`)
+    #[default]
+    NotRead,
+    /// fresh at the snapshot's commit, with the query-time profile, rules and inputs, and
+    /// readable by the caller: a pattern may read it
+    Fresh,
+    /// stale, and the dataset's setting allows reading it: patterns read it and the
+    /// response says so
+    StaleRead { reason: String },
+    /// the inferred graph cannot answer, for the reason given, so every intensional
+    /// pattern is derived
+    Derive { reason: String },
 }
 
 /// A term that a derivation made and the store does not have.
@@ -128,6 +156,20 @@ pub trait ReasoningProvider: Send + Sync {
     fn label(&self) -> String;
     /// A session for one query.
     fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>>;
+    /// Whether the provider chooses per pattern between the materialized inferences and
+    /// derivation (`reasoning=auto`, spec F17 §4). The query then keeps the inferred
+    /// graph in its default graph until the session says it cannot answer.
+    fn auto(&self) -> bool {
+        false
+    }
+    /// Under `auto`, the state of the materialized inferences when they answer every
+    /// pattern of a query on `req`'s snapshot, so that the query reads them and starts no
+    /// session: the materialization can answer and the rules hold no backward rule, whose
+    /// facts it would lack (spec F17 §4.3 as built). `None` starts a session.
+    fn reads_all(&self, req: &SessionRequest) -> Option<Materialization> {
+        let _ = req;
+        None
+    }
 }
 
 /// The derivations of one query.
@@ -137,13 +179,84 @@ pub trait ReasoningSession: Send {
     /// caller stops before preparing demands or checking later patterns.
     fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> Result<bool>;
     /// Make the program for the demands the query can ask for. Demand `i` of later
-    /// calls is `demands[i]`.
-    fn prepare(&mut self, demands: &[Demand]) -> Result<Vec<DemandInfo>>;
+    /// calls is `demands[i]`. With `estimates` false the infos' estimates are left at
+    /// zero, for a caller that neither chooses by them nor shows them, since the
+    /// estimate walks the dependency cone against the statistics for every demand.
+    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>>;
     /// Derive the facts of the demands, each with the seeds of its seeded position (an
     /// empty list for a demand without one), and return the facts not returned before.
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> Result<Derived>;
     /// What the session did so far.
     fn report(&self) -> Report;
+    /// Whether the materialized inferences can answer the query's patterns, for the
+    /// snapshot the session reads. A provider that is not [`ReasoningProvider::auto`]
+    /// answers [`Materialization::NotRead`].
+    fn materialization(&self) -> Materialization {
+        Materialization::NotRead
+    }
+}
+
+/// The estimated cost of reading a pattern's facts from the inferred graph and of
+/// deriving them, in the planner's unit of one scanned row (spec F17 §4.3). EXPLAIN shows
+/// both, and they do not decide: a pattern that `auto` derives still reads the inferred
+/// graph, which stays in the query's default graph, so deriving costs the read and the
+/// derivation and is never the cheaper source ([`choose`]). The derivation constants
+/// are provisional: they are measured once roadmap item 911 repairs the demand path, as
+/// the F17 Outcome says. A derivation's fixed cost is the session's setup,
+/// the program made for the query and the merge of its facts into the query's view, and
+/// a table in the cache spares the program and the evaluation but not the merge.
+pub mod cost {
+    /// An index probe for a pattern's constants.
+    pub const READ_BASE: f64 = 50.0;
+    /// Reading one fact of the inferred graph.
+    pub const READ_ROW: f64 = 1.0;
+    /// Starting a derivation: the session, its program and the view's merge.
+    pub const DERIVE_BASE: f64 = 500_000.0;
+    /// Deriving one fact, with its magic facts and joins.
+    pub const DERIVE_FACT: f64 = 1_000.0;
+    /// Copying one fact of a cached table into the query's view.
+    pub const CACHED_FACT: f64 = 100.0;
+
+    /// The estimated cost of reading `rows` facts of the inferred graph.
+    pub fn read(rows: f64) -> f64 {
+        READ_BASE + rows * READ_ROW
+    }
+
+    /// The estimated cost of deriving `facts` facts, or of copying them from a cached
+    /// table, beside the read of the pattern.
+    pub fn derive(facts: f64, cached: bool) -> f64 {
+        if cached {
+            READ_BASE + facts * CACHED_FACT
+        } else {
+            DERIVE_BASE + facts * DERIVE_FACT
+        }
+    }
+}
+
+/// What `auto` chose for one intensional pattern, and why (spec F17 §2.4).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Choice {
+    /// read the materialized inferences
+    Read,
+    /// derive the pattern's facts
+    Derive,
+}
+
+/// The source `auto` chooses for a pattern when the materialization can answer, with
+/// the estimated costs of reading `read_rows` facts and of deriving the pattern. A
+/// pattern reads unless a backward rule lies in its cone, whose facts the
+/// materialization lacks. Its derivation would cost the read as well, since the inferred
+/// graph stays in the query's default graph, so reading is never the dearer source
+/// (spec F17 §4.3 as built).
+pub fn choose(info: &DemandInfo, read_rows: u64) -> (Choice, f64, f64) {
+    let read = cost::read(read_rows as f64);
+    let derive = read + cost::derive(info.estimate, info.cached);
+    let c = if info.materialized {
+        Choice::Read
+    } else {
+        Choice::Derive
+    };
+    (c, read, derive)
 }
 
 impl std::fmt::Debug for dyn ReasoningProvider {
@@ -172,20 +285,40 @@ pub fn check_form(q: &spargebra::Query) -> Result<()> {
 pub struct Applied {
     pub label: String,
     pub report: Report,
-    /// a `Derive` node per derived pattern
+    /// a `Derive` node per intensional pattern
     pub nodes: Vec<PlanInfo>,
     /// the dataset has RDFS on read, which did not apply
     pub rdfs_skipped: bool,
     /// time spent deriving, in milliseconds
     pub millis: f64,
+    /// `reasoning=auto` (spec F17 §4)
+    pub auto: bool,
+    /// under `auto`, what the session said about the materialized inferences
+    pub materialization: Materialization,
+    /// under `auto`, the intensional patterns that read the materialized inferences
+    pub read: u64,
 }
 
 impl Applied {
-    /// The value of the `Sparkles-Reasoning` response header.
-    pub fn header(&self) -> String {
-        format!(
-            "demand; derived={}; tables={}; cached={}",
+    /// The value of the `Sparkles-Reasoning` response header: present when the query
+    /// derived facts for a pattern, which under `demand` is every query (spec F17 §2.3).
+    pub fn header(&self) -> Option<String> {
+        if self.auto && self.report.tables == 0 {
+            return None;
+        }
+        let mode = if self.auto { "auto" } else { "demand" };
+        Some(format!(
+            "{mode}; derived={}; tables={}; cached={}",
             self.report.derived, self.report.tables, self.report.cached
+        ))
+    }
+
+    /// Whether the query read the inferred graph as part of its default graph, so that
+    /// the freshness of the materialized inferences concerns its answer.
+    pub fn reads_inferred(&self) -> bool {
+        matches!(
+            self.materialization,
+            Materialization::Fresh | Materialization::StaleRead { .. }
         )
     }
 
@@ -195,10 +328,39 @@ impl Applied {
         if self.rdfs_skipped {
             description.push_str("; RDFS on read did not apply");
         }
+        match &self.materialization {
+            Materialization::NotRead => {}
+            Materialization::Fresh => {
+                description.push_str("; the materialized inferences are fresh");
+            }
+            Materialization::StaleRead { reason } => {
+                description.push_str(&format!(
+                    "; the materialized inferences are read although {reason}"
+                ));
+            }
+            Materialization::Derive { reason } => {
+                description.push_str(&format!(
+                    "; the materialized inferences are not read: {reason}"
+                ));
+            }
+        }
         let mut counters = serde_json::Map::new();
         counters.insert("derived".into(), self.report.derived.into());
         counters.insert("tables".into(), self.report.tables.into());
         counters.insert("cached".into(), self.report.cached.into());
+        if self.auto {
+            counters.insert("read".into(), self.read.into());
+            counters.insert(
+                "materialization".into(),
+                match &self.materialization {
+                    Materialization::NotRead => "not read",
+                    Materialization::Fresh => "fresh",
+                    Materialization::StaleRead { .. } => "stale, read",
+                    Materialization::Derive { .. } => "not read",
+                }
+                .into(),
+            );
+        }
         let mut children = self.nodes.clone();
         let warnings = plan.warnings.clone();
         let (estimated_rows, estimated_cost, actual_rows, time_ms) = (
@@ -240,6 +402,21 @@ struct Pat {
     /// constants alone; an index into the demands
     seeded: Option<(usize, Variable)>,
     plain: Option<usize>,
+    /// the stored facts the pattern's constants match (`u64::MAX`: none, intensional)
+    stored: u64,
+    /// under `auto` with a readable materialization, the source chosen for the pattern
+    choice: Option<Decision>,
+    /// a seeded pattern derived with its constants alone, since its seeds were too many
+    fell_to_plain: bool,
+}
+
+impl Pat {
+    /// Whether the pattern reads the materialized inferences instead of deriving.
+    fn reads(&self) -> bool {
+        self.choice
+            .as_ref()
+            .is_some_and(|d| d.choice == Choice::Read)
+    }
 }
 
 /// Collects the patterns that can read derived facts: those outside `GRAPH` and
@@ -448,19 +625,6 @@ pub(crate) fn apply(
     execute: bool,
 ) -> Result<()> {
     let t0 = Instant::now();
-    // the derived facts go to the store's default graph, which the query must read
-    let reads_default = match &ctx.dataset.default {
-        None => !ctx.dataset.union_default && !ctx.snap.union_default_graph,
-        Some(l) => l.contains(&Id::DEFAULT_GRAPH),
-    };
-    if !reads_default {
-        return Err(Error::Unsupported(
-            "query-time reasoning adds the derived facts to the store's default graph, \
-             which this query does not read (its dataset names other graphs, or the default \
-             graph is the union of the named graphs)"
-                .into(),
-        ));
-    }
     let mut collect = Collect::default();
     collect.walk(pattern);
     let stop = {
@@ -488,13 +652,57 @@ pub(crate) fn apply(
         }
         _ => None,
     };
-    let mut session = provider.start(SessionRequest {
+    let req = SessionRequest {
         snap: ctx.snap.clone(),
         readable,
         stop,
         max_memory: opts.max_memory_bytes,
         no_cache: opts.no_cache,
-    })?;
+    };
+    let auto = provider.auto();
+    // ---- under `auto`, a materialization that answers every pattern: the query reads
+    // it as materialized reasoning does, and EXPLAIN alone starts a session to show the
+    // estimates (spec F17 §4.3 as built)
+    let reads_all = if auto { provider.reads_all(&req) } else { None };
+    if execute && let Some(materialization) = reads_all.clone() {
+        ctx.reasoning = Some(Arc::new(Applied {
+            label: provider.label(),
+            rdfs_skipped,
+            millis: t0.elapsed().as_secs_f64() * 1000.0,
+            auto,
+            materialization,
+            ..Default::default()
+        }));
+        return Ok(());
+    }
+    // the derived facts go to the store's default graph, which the query must read,
+    // unless the materialization answers every pattern and nothing is derived
+    let reads_default = match &ctx.dataset.default {
+        None => !ctx.dataset.union_default && !ctx.snap.union_default_graph,
+        Some(l) => l.contains(&Id::DEFAULT_GRAPH),
+    };
+    if !reads_default && reads_all.is_none() {
+        return Err(Error::Unsupported(
+            "query-time reasoning adds the derived facts to the store's default graph, \
+             which this query does not read (its dataset names other graphs, or the default \
+             graph is the union of the named graphs)"
+                .into(),
+        ));
+    }
+    let mut session = provider.start(req)?;
+    // ---- under `auto`, whether the materialized inferences answer (spec F17 §4.1, §4.2)
+    let materialization = if auto {
+        session.materialization()
+    } else {
+        Materialization::NotRead
+    };
+    let reads_inferred = matches!(
+        materialization,
+        Materialization::Fresh | Materialization::StaleRead { .. }
+    );
+    if auto && !reads_inferred {
+        drop_extra_graphs(ctx, &opts.default_graph_extra);
+    }
     // ---- demands, in the order of each group
     let mut demands: Vec<Demand> = Vec::new();
     let mut index: FxHashMap<Demand, usize> = FxHashMap::default();
@@ -588,6 +796,9 @@ pub(crate) fn apply(
                     t: t.clone(),
                     seeded,
                     plain: Some(plain_idx),
+                    stored: estimates[i],
+                    choice: None,
+                    fell_to_plain: false,
                 });
             } else {
                 pats.push(Pat {
@@ -595,6 +806,9 @@ pub(crate) fn apply(
                     t: t.clone(),
                     seeded: None,
                     plain: None,
+                    stored: estimates[i],
+                    choice: None,
+                    fell_to_plain: false,
                 });
             }
             for v in pattern_vars(t) {
@@ -617,13 +831,54 @@ pub(crate) fn apply(
             path_demands.push(add(d, &mut demands));
         }
     }
+    // EXPLAIN shows the estimates and `auto` chooses by them, so an executed query that
+    // reads no materialization leaves them out of its `Derive` nodes
+    let estimates = !execute || reads_inferred;
     let infos = if demands.is_empty() {
         Vec::new()
     } else {
-        session.prepare(&demands)?
+        session.prepare(&demands, estimates)?
     };
+    // ---- under `auto` with a readable materialization, the patterns that read it
+    // (spec F17 §4.3). A seeded pattern has the cone, and so the choice, of its plain
+    // demand.
+    let decide = |pats: &mut Vec<Pat>, infos: &[DemandInfo]| {
+        for p in pats.iter_mut() {
+            let Some(d) = p.plain else { continue };
+            let info = &infos[d];
+            let variable = matches!(&p.t.predicate, NamedNodePattern::Variable(_));
+            let rows = if p.stored == u64::MAX { 0 } else { p.stored };
+            let (c, read, derive) = choose(info, rows);
+            let reason = decision_reason(&c, variable);
+            p.choice = Some(Decision {
+                choice: c,
+                read,
+                derive,
+                reason,
+            });
+        }
+    };
+    if reads_inferred {
+        decide(&mut pats, &infos);
+    }
     let label = provider.label();
-    let node = |d: usize, text: &str, how: &str, report: Option<&DemandReport>| {
+    let reason_text = |auto: bool, mat: &Materialization| -> Option<String> {
+        if !auto {
+            return None;
+        }
+        Some(match mat {
+            Materialization::Fresh => "the materialization is fresh".to_string(),
+            Materialization::StaleRead { reason } | Materialization::Derive { reason } => {
+                reason.clone()
+            }
+            Materialization::NotRead => "no materialization".to_string(),
+        })
+    };
+    let node = |d: usize,
+                text: &str,
+                how: &str,
+                report: Option<&DemandReport>,
+                decision: Option<&Decision>| {
         let info = infos.get(d).cloned().unwrap_or_default();
         let mut counters = serde_json::Map::new();
         counters.insert("adornment".into(), info.adornment.clone().into());
@@ -632,13 +887,35 @@ pub(crate) fn apply(
             serde_json::Value::Array(info.rules.iter().map(|r| r.clone().into()).collect()),
         );
         counters.insert("seeds".into(), how.into());
+        if estimates {
+            counters.insert("estimatedDerived".into(), info.estimate.into());
+        }
         if let Some(r) = report {
             counters.insert("derived".into(), r.derived.into());
             counters.insert("seedCount".into(), r.seeds.into());
         }
+        let read = decision.is_some_and(|d| d.choice == Choice::Read);
+        if auto {
+            counters.insert(
+                "source".into(),
+                if read { "materialized" } else { "derived" }.into(),
+            );
+            if let Some(d) = decision {
+                counters.insert("readCost".into(), d.read.into());
+                counters.insert("deriveCost".into(), d.derive.into());
+                counters.insert("reason".into(), d.reason.clone().into());
+            } else if let Some(r) = reason_text(auto, &materialization) {
+                counters.insert("reason".into(), r.into());
+            }
+        }
+        let description = if read {
+            format!("{text} as {}, read from the inferred graph", info.adornment)
+        } else {
+            format!("{text} as {}", info.adornment)
+        };
         PlanInfo {
             operator: "Derive".into(),
-            description: format!("{text} as {}", info.adornment),
+            description,
             estimated_rows: 0.0,
             actual_rows: report.map_or(-1, |r| r.derived as i64),
             cached: report.is_some_and(|r| r.cached),
@@ -646,8 +923,23 @@ pub(crate) fn apply(
             ..Default::default()
         }
     };
+    let path_decision = |d: usize| -> Option<Decision> {
+        if !reads_inferred {
+            return None;
+        }
+        let info = &infos[d];
+        let rows = stored_count_of(&ctx.snap, &demands[d]);
+        let (c, read, derive) = choose(info, rows);
+        Some(Decision {
+            reason: decision_reason(&c, true),
+            choice: c,
+            read,
+            derive,
+        })
+    };
     if !execute {
         let mut nodes = Vec::new();
+        let mut read = 0;
         for p in &pats {
             if let Some(d) = p.seeded.as_ref().map(|s| s.0).or(p.plain) {
                 let how = if p.seeded.is_some() {
@@ -655,11 +947,20 @@ pub(crate) fn apply(
                 } else {
                     "constants"
                 };
-                nodes.push(node(d, &pattern_text(&p.t), how, None));
+                read += p.reads() as u64;
+                nodes.push(node(d, &pattern_text(&p.t), how, None, p.choice.as_ref()));
             }
         }
         for &d in &path_demands {
-            nodes.push(node(d, "property path step", "constants", None));
+            let dec = path_decision(d);
+            read += dec.as_ref().is_some_and(|d| d.choice == Choice::Read) as u64;
+            nodes.push(node(
+                d,
+                "property path step",
+                "constants",
+                None,
+                dec.as_ref(),
+            ));
         }
         ctx.reasoning = Some(Arc::new(Applied {
             label,
@@ -667,6 +968,9 @@ pub(crate) fn apply(
             nodes,
             rdfs_skipped,
             millis: t0.elapsed().as_secs_f64() * 1000.0,
+            auto,
+            materialization,
+            read,
         }));
         return Ok(());
     }
@@ -675,14 +979,19 @@ pub(crate) fn apply(
     let mut first: Vec<(usize, Vec<u64>)> = Vec::new();
     for p in &pats {
         if p.seeded.is_none()
+            && !p.reads()
             && let Some(d) = p.plain
             && !first.iter().any(|(x, _)| *x == d)
         {
             first.push((d, Vec::new()));
         }
     }
+    let mut path_decisions: Vec<Option<Decision>> = Vec::new();
     for &d in &path_demands {
-        if !first.iter().any(|(x, _)| *x == d) {
+        let dec = path_decision(d);
+        let read = dec.as_ref().is_some_and(|x| x.choice == Choice::Read);
+        path_decisions.push(dec);
+        if !read && !first.iter().any(|(x, _)| *x == d) {
             first.push((d, Vec::new()));
         }
     }
@@ -692,14 +1001,19 @@ pub(crate) fn apply(
     }
     // ---- seeded patterns, in the order of their groups
     let mut used_plain: Vec<usize> = Vec::new();
-    for (k, p) in pats.iter().enumerate() {
-        let Some((d, var)) = &p.seeded else {
+    for k in 0..pats.len() {
+        let Some((d, var)) = pats[k].seeded.clone() else {
             continue;
         };
+        // under `auto`, a pattern that reads needs no seeds
+        if pats[k].reads() {
+            continue;
+        }
         // the earlier patterns of the group that connect to the variable
+        let group = pats[k].group;
         let earlier: Vec<&TriplePattern> = pats[..k]
             .iter()
-            .filter(|q| q.group == p.group)
+            .filter(|q| q.group == group)
             .map(|q| &q.t)
             .collect();
         let mut reach: Vec<Variable> = vec![var.clone()];
@@ -727,14 +1041,17 @@ pub(crate) fn apply(
                 break;
             }
         }
-        let seeds = seed_values(ctx, &view, &chosen, var, opts, dataset, base)?;
+        let seeds = seed_values(ctx, &view, &chosen, &var, opts, dataset, base)?;
         match seeds.and_then(|s| view.reasoner_ids(&s)) {
             Some(ids) => {
-                let out = session.derive(vec![(*d, ids)])?;
+                let out = session.derive(vec![(d, ids)])?;
                 view.add(ctx, out)?;
             }
             None => {
-                let plain = p.plain.expect("an intensional pattern has a plain demand");
+                pats[k].fell_to_plain = true;
+                let plain = pats[k]
+                    .plain
+                    .expect("an intensional pattern has a plain demand");
                 if !used_plain.contains(&plain) {
                     used_plain.push(plain);
                     let out = session.derive(vec![(plain, Vec::new())])?;
@@ -745,28 +1062,39 @@ pub(crate) fn apply(
     }
     let report = session.report();
     let mut nodes = Vec::new();
+    let mut read = 0;
     for p in &pats {
         let chosen = match (&p.seeded, p.plain) {
             (Some((d, _)), Some(pl)) => {
-                if report.demands.get(*d).is_some_and(|r| r.used) {
-                    Some((*d, "join"))
-                } else {
+                if p.fell_to_plain {
                     Some((pl, "constants (too many seeds)"))
+                } else {
+                    Some((*d, "join"))
                 }
             }
             (None, Some(pl)) => Some((pl, "constants")),
             _ => None,
         };
         if let Some((d, how)) = chosen {
-            nodes.push(node(d, &pattern_text(&p.t), how, report.demands.get(d)));
+            read += p.reads() as u64;
+            nodes.push(node(
+                d,
+                &pattern_text(&p.t),
+                how,
+                report.demands.get(d),
+                p.choice.as_ref(),
+            ));
         }
     }
-    for &d in &path_demands {
+    for (i, &d) in path_demands.iter().enumerate() {
+        let dec = path_decisions.get(i).and_then(|x| x.as_ref());
+        read += dec.is_some_and(|x| x.choice == Choice::Read) as u64;
         nodes.push(node(
             d,
             "property path step",
             "constants",
             report.demands.get(d),
+            dec,
         ));
     }
     for w in &report.warnings {
@@ -784,8 +1112,75 @@ pub(crate) fn apply(
         nodes,
         rdfs_skipped,
         millis: t0.elapsed().as_secs_f64() * 1000.0,
+        auto,
+        materialization,
+        read,
     }));
     Ok(())
+}
+
+/// Under `auto`, what the planner chose for one intensional pattern (spec F17 §2.4).
+#[derive(Clone, Debug)]
+struct Decision {
+    choice: Choice,
+    /// the estimated cost of reading the inferred graph, in the planner's row units
+    read: f64,
+    /// the estimated cost of deriving
+    derive: f64,
+    reason: String,
+}
+
+/// Why `auto` chose as it did for a pattern.
+fn decision_reason(c: &Choice, variable_predicate: bool) -> String {
+    match c {
+        Choice::Derive => "backward rules in the cone, which the materialization lacks".to_string(),
+        Choice::Read if variable_predicate => {
+            "the materialization holds the facts, and a variable predicate demands the whole \
+             program"
+                .to_string()
+        }
+        Choice::Read => {
+            "the materialization holds the facts, and deriving them would add to reading them"
+                .to_string()
+        }
+    }
+}
+
+/// Take the graphs of `opts.default_graph_extra`, the inferred graph, out of the
+/// query's default graph: under `auto`, when the materialization cannot answer (spec F17
+/// §4.2).
+fn drop_extra_graphs(ctx: &mut Ctx, extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    let ids: Vec<Id> = extra.iter().map(|i| ctx.graph_id(i)).collect();
+    if let Some(d) = &mut ctx.dataset.default {
+        d.retain(|g| !ids.contains(g));
+        if d.as_slice() == [Id::DEFAULT_GRAPH] && !ctx.snap.union_default_graph {
+            ctx.dataset.default = None;
+        }
+    }
+}
+
+/// [`stored_count`] of a demand's constants.
+fn stored_count_of(snap: &Snapshot, d: &Demand) -> u64 {
+    let term = |x: &DemandTerm| match x {
+        DemandTerm::Const(Term::NamedNode(n)) => TermPattern::NamedNode(n.clone()),
+        DemandTerm::Const(Term::Literal(l)) => TermPattern::Literal(l.clone()),
+        _ => TermPattern::Variable(Variable::new_unchecked("x")),
+    };
+    let t = TriplePattern {
+        subject: term(&d.s),
+        predicate: match &d.p {
+            DemandTerm::Const(Term::NamedNode(n)) => NamedNodePattern::NamedNode(n.clone()),
+            _ => NamedNodePattern::Variable(Variable::new_unchecked("p")),
+        },
+        object: term(&d.o),
+    };
+    match stored_count(snap, &t) {
+        u64::MAX => 0,
+        n => n,
+    }
 }
 
 /// The stored facts that match the constants of `t`, in all graphs, as the index counts
@@ -980,5 +1375,76 @@ impl Overlay {
 
     fn finish(self) -> Arc<Snapshot> {
         self.snap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(estimate: f64, materialized: bool, cached: bool) -> DemandInfo {
+        DemandInfo {
+            adornment: "p^bf".into(),
+            rules: vec!["r".into()],
+            estimate,
+            materialized,
+            cached,
+        }
+    }
+
+    /// A pattern reads whenever the materialization holds its facts, since its
+    /// derivation would add to the read, and derives when a backward rule lies in its
+    /// cone. EXPLAIN's costs say so (spec F17 §4.3 as built).
+    #[test]
+    fn auto_reads_what_the_materialization_holds() {
+        for rows in [0, 100, 1_000_000_000] {
+            for estimate in [0.0, 10.0, 1e9] {
+                for cached in [false, true] {
+                    let (c, read, derive) = choose(&info(estimate, true, cached), rows);
+                    assert_eq!(c, Choice::Read, "{rows} {estimate} {cached}");
+                    assert!(read < derive, "{read} {derive}");
+                }
+            }
+        }
+        // a cached table costs less to copy than a derivation
+        let (_, _, cached) = choose(&info(10.0, true, true), 100);
+        let (_, _, fresh) = choose(&info(10.0, true, false), 100);
+        assert!(cached < fresh);
+        assert_eq!(
+            choose(&info(10.0, false, false), 1).0,
+            Choice::Derive,
+            "backward rules in the cone"
+        );
+        assert!(decision_reason(&Choice::Derive, false).contains("backward"));
+        assert!(decision_reason(&Choice::Read, true).contains("variable"));
+    }
+
+    /// The header is present under `demand` always and under `auto` only when a pattern
+    /// was derived.
+    #[test]
+    fn the_header_names_the_mode_and_is_left_out_when_auto_read_everything() {
+        let mut a = Applied::default();
+        assert_eq!(
+            a.header().as_deref(),
+            Some("demand; derived=0; tables=0; cached=0")
+        );
+        a.auto = true;
+        a.materialization = Materialization::Fresh;
+        assert_eq!(a.header(), None);
+        assert!(a.reads_inferred());
+        a.report.tables = 2;
+        a.report.derived = 7;
+        assert_eq!(
+            a.header().as_deref(),
+            Some("auto; derived=7; tables=2; cached=0")
+        );
+        a.materialization = Materialization::Derive {
+            reason: "stale".into(),
+        };
+        assert!(!a.reads_inferred());
+        a.materialization = Materialization::StaleRead {
+            reason: "stale".into(),
+        };
+        assert!(a.reads_inferred());
     }
 }

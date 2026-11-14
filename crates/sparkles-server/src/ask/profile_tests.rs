@@ -221,10 +221,18 @@ fn profile_matrix(rounds: usize, emit: bool) {
                             "{case}"
                         );
                         let stages = &candidate.2;
-                        for name in ["ground", "schema_common", "schema_question", "examples"] {
+                        assert_eq!(
+                            stages.iter().filter(|v| v["stage"] == "ground").count(),
+                            1,
+                            "{case}: {stages:?}"
+                        );
+                        // An initial clarification asks before it reads the context
+                        // that only a draft uses.
+                        let drafted = usize::from(case != "clarification");
+                        for name in ["schema_common", "schema_question", "examples"] {
                             assert_eq!(
                                 stages.iter().filter(|v| v["stage"] == name).count(),
-                                1,
+                                drafted,
                                 "{case}: {stages:?}"
                             );
                         }
@@ -243,10 +251,9 @@ fn profile_matrix(rounds: usize, emit: bool) {
                             assert_eq!(candidate.0["outcome"], "clarify");
                             assert_eq!(mock.requests().len(), before);
                             assert_eq!(candidate.0["usage"]["modelMs"], 0);
-                            assert!(
-                                !stages.iter().any(|v| v["stage"] == "query_check"
-                                    || v["stage"] == "query_execution")
-                            );
+                            assert!(!stages.iter().any(|v| v["stage"] == "query_check"
+                                || v["stage"] == "query_execution"
+                                || v["stage"] == "predicate_use"));
                         } else {
                             assert_eq!(candidate.0["outcome"], "answered", "{}", candidate.0);
                             for name in ["query_check", "query_execution"] {
@@ -296,6 +303,40 @@ fn profile_matrix(rounds: usize, emit: bool) {
                 }
             }
         }
+    }
+}
+
+/// A clarification answers from the linker alone. With type hints the linker reads the
+/// schema's classes first, and neither path reads the examples or the predicate use.
+#[test]
+fn a_clarification_reads_only_what_the_linker_needs() {
+    let s = fixture();
+    let mock = scripted(vec![], json!({}));
+    let m = models(&mock.url(), json!({"contextTokens":200000}));
+    for type_hints in [false, true] {
+        let o = AskOptions {
+            summary: false,
+            mode: AskMode::Local,
+            type_hints,
+            // no class matches the words around the mention, so type hints narrow nothing
+            ..opts("Who is Ana?")
+        };
+        let (out, events, stages) = observed(&s, &m, &Principal::local(), &o, true);
+        assert_eq!(out["outcome"], "clarify", "{out}");
+        assert_eq!(out["clarify"]["choices"].as_array().unwrap().len(), 3);
+        assert!(mock.requests().is_empty());
+        let count = |name: &str| stages.iter().filter(|v| v["stage"] == name).count();
+        assert_eq!(count("linker"), 1);
+        let schema = usize::from(type_hints);
+        assert_eq!(count("schema_common"), schema, "{stages:?}");
+        assert_eq!(count("schema_question"), schema, "{stages:?}");
+        for name in ["examples", "predicate_use", "community_recall"] {
+            assert_eq!(count(name), 0, "{name}: {stages:?}");
+        }
+        let ground = &events.iter().find(|v| v["event"] == "ground").unwrap()["value"];
+        assert_eq!(ground["entities"][0]["verdict"], "ambiguous");
+        assert!(ground.get("classes").is_none() && ground.get("examples").is_none());
+        assert_eq!(out["usage"]["grounding"]["classes"], 0);
     }
 }
 
@@ -382,6 +423,29 @@ fn embedding_work_is_nested_and_is_not_ask_role_model_time() {
     assert_eq!(out["usage"]["modelCalls"], 0);
     assert_eq!(out["usage"]["modelMs"], 0);
     assert!(mock.requests().is_empty());
+    // The clarification asks before it reads the stored examples, so its only nested
+    // stage is the linker's vector search.
+    assert!(
+        stages.iter().any(|v| v["stage"] == "linker_vector_search"
+            && v["calls"] == 1
+            && v["outcome"] == "ok"),
+        "missing linker_vector_search: {stages:?}"
+    );
+    for stage in [
+        "examples",
+        "example_query_embedding",
+        "example_document_embedding",
+    ] {
+        assert!(
+            !stages.iter().any(|v| v["stage"] == stage),
+            "{stage} before a clarification: {stages:?}"
+        );
+    }
+    let follow_up = AskOptions {
+        clarification: Some("res:ana2".into()),
+        ..o.clone()
+    };
+    let (_, _, stages) = observed(&s, &m, &Principal::local(), &follow_up, true);
     assert!(
         provider.state().requests > before,
         "the fixture must actually request embeddings"
@@ -503,19 +567,24 @@ fn production_json_correlates_requests_after_grounding_and_nested_embeddings() {
             .expect("numeric process-generated pipeline identifier");
         assert!(ids.insert(id), "two asks reused a pipeline identifier");
         assert!(scoped.iter().all(|v| v["pipeline_id"] == id));
+        for stage in ["linker", "ground", "linker_vector_search"] {
+            assert!(
+                scoped.iter().any(|v| v["stage"] == stage),
+                "missing {stage} for {context}"
+            );
+        }
+        // the small context's ask is the clarification, which asks before the rest
         for stage in [
             "schema_common",
             "schema_question",
             "examples",
-            "linker",
-            "ground",
             "example_query_embedding",
             "example_document_embedding",
-            "linker_vector_search",
         ] {
-            assert!(
+            assert_eq!(
                 scoped.iter().any(|v| v["stage"] == stage),
-                "missing {stage} for {context}"
+                context == 200000,
+                "{stage} for {context}"
             );
         }
         for stage in ["query_check", "query_execution"] {

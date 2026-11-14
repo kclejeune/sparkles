@@ -189,6 +189,8 @@ pub struct McpConfig {
     pub max_bytes: usize,
     /// largest `timeoutSeconds`
     pub max_timeout: Duration,
+    /// the timeout of calls that set none, and of estimated plans, at most `max_timeout`
+    pub default_timeout: Duration,
     /// memory budget of every call's queries (`None`: unlimited)
     pub query_memory_bytes: Option<u64>,
     pub allow_service: bool,
@@ -221,6 +223,7 @@ impl Default for McpConfig {
             max_rows: 1000,
             max_bytes: 1 << 20,
             max_timeout: Duration::from_secs(60),
+            default_timeout: Duration::from_secs(30),
             query_memory_bytes: Some(2 << 30),
             allow_service: false,
             allow_update: false,
@@ -251,9 +254,10 @@ impl McpConfig {
         number(self.max_timeout.as_secs_f64())
     }
 
-    /// The timeout of calls that do not set one: 30 s, or the maximum if lower.
+    /// The timeout of calls that do not set one: `default_timeout`, 30 s unless a test
+    /// sets it, or the maximum if lower.
     pub fn default_timeout(&self) -> Duration {
-        self.max_timeout.min(Duration::from_secs(30))
+        self.max_timeout.min(self.default_timeout)
     }
 
     pub fn default_timeout_secs(&self) -> Value {

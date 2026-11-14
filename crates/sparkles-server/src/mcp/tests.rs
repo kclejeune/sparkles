@@ -70,6 +70,8 @@ fn m() -> Value {
 struct Client {
     w: WriteHalf<DuplexStream>,
     r: Lines<BufReader<ReadHalf<DuplexStream>>>,
+    /// how long [`recv`](Self::recv) waits for a response
+    patience: Duration,
 }
 
 impl Client {
@@ -82,6 +84,7 @@ impl Client {
         Client {
             w,
             r: BufReader::new(r).lines(),
+            patience: Duration::from_secs(60),
         }
     }
 
@@ -102,9 +105,7 @@ impl Client {
     }
 
     async fn recv(&mut self) -> Value {
-        self.recv_within(Duration::from_secs(60))
-            .await
-            .expect("no response")
+        self.recv_within(self.patience).await.expect("no response")
     }
 
     /// A request; returns the whole response.
@@ -1607,12 +1608,30 @@ async fn the_explain_output_schema_names_the_truncation_flag() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_basic_graph_pattern_at_the_plan_limit() {
     use sparkles::sparql::depth::MAX_PLAN_DEPTH;
-    let mut c = Client::start(fixture_server());
+    // Planning the deepest plan takes about 10 s in a debug build on a quiet host, and
+    // a loaded host stretches that past the default 30 s timeout. The test checks the
+    // plan's size and depth limits, not planning time, so those calls get a timeout and
+    // a wait far past their run time. An estimated plan has the default timeout, since
+    // `timeoutSeconds` is the deadline of a run, so the default is raised too.
+    let wait = Duration::from_secs(400);
+    let mut c = Client::start(server_with(
+        &[("t", &[FIXTURE])],
+        McpConfig {
+            max_timeout: wait,
+            default_timeout: wait,
+            ..McpConfig::default()
+        },
+    ));
+    c.patience = wait;
     let bgp = |n: usize| format!("SELECT * WHERE {{ {}}}", "?s a ?o . ".repeat(n));
     // the projection and the group are plan levels too
     let n = (MAX_PLAN_DEPTH - 3) / 2;
+    let secs = wait.as_secs();
     let s = c
-        .structured("explain_query", json!({"query": bgp(n)}))
+        .structured(
+            "explain_query",
+            json!({"query": bgp(n), "timeoutSeconds": secs}),
+        )
         .await;
     // a join and a scan for each triple pattern make a plan text of about 16 MB, which is
     // cut at the size of a tool result
@@ -1638,17 +1657,22 @@ async fn a_basic_graph_pattern_at_the_plan_limit() {
     assert_eq!(s["plan"].as_str().unwrap().lines().count(), 40, "{s}");
     assert!(s.get("planTruncated").is_none(), "{s}");
     // the notes read plans of up to 256 levels, and a run's deeper plan is refused
-    let args = json!({"query": bgp(n), "notes": true, "profile": "run"});
+    let args = json!({"query": bgp(n), "notes": true, "profile": "run", "timeoutSeconds": secs});
     let (t, e) = c.error("explain_query", args).await;
     assert!(t.contains("the plan nests deeper than 256 levels"), "{t}");
     assert_eq!(e, json!({"code": "bad-argument", "status": 400}));
     let s = c
-        .structured("check_query", json!({"query": bgp(n), "explain": true}))
+        .structured(
+            "check_query",
+            json!({"query": bgp(n), "explain": true, "timeoutSeconds": secs}),
+        )
         .await;
     assert_eq!(s["ok"], true, "{s}");
     let limit = format!("query plan nested deeper than {MAX_PLAN_DEPTH} levels");
     for tool in ["sparql_query", "explain_query"] {
-        let (t, _) = c.error(tool, json!({"query": bgp(n + 1)})).await;
+        let (t, _) = c
+            .error(tool, json!({"query": bgp(n + 1), "timeoutSeconds": secs}))
+            .await;
         assert!(t.contains(&limit), "{tool}: {t}");
     }
 }

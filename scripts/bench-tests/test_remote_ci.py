@@ -1,0 +1,231 @@
+"""scripts/remote-ci.sh and its job script against a fake host; no ssh or provider call runs."""
+from pathlib import Path
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+FAKE_RX = r'''
+RX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# The fake host is this machine with HOME set to the fake worker's home.
+# FAKE_SHELL stands in for the login shell an ssh host runs the command in.
+rx_exec() { shift; HOME=$FAKE_HOME PATH=$FAKE_BIN:$PATH ${FAKE_SHELL:-bash} -c "$1"; }
+rx_admit() { echo "admit $*" >> "$FAKE_LOG"; echo '{}'; }
+rx_runtime() { echo "runtime $*" >> "$FAKE_LOG"; echo "${FAKE_RUNTIME:-5000}"; }
+rx_bundle() { echo "bundle $*" >> "$FAKE_LOG"; git -C "$FAKE_HOME/gate/repo.git" fetch -q "$FAKE_SRC" "$2"; }
+# sync takes `-- RSYNC-ARGS SRC DEST` with SRC as HOST:PATH/ and copies a directory.
+rx_sync() { local a=("$@"); local n=${#a[@]}; local src=${a[n-2]} dst=${a[n-1]}; echo "sync ${src}" >> "$FAKE_LOG"; cp -r "$FAKE_HOME/${src#*:bx_test:}." "$dst"; }
+'''
+
+# systemd-run runs the unit's command at once, with the --setenv values, and records its
+# properties; systemctl reports every unit inactive.
+FAKE_SYSTEMD_RUN = r'''#!/usr/bin/env bash
+props=(); envs=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --user | --collect | -q) shift ;;
+    --unit) echo "unit $2" >> "$FAKE_LOG"; shift 2 ;;
+    -p) props+=("$2"); shift 2 ;;
+    --setenv=*) envs+=("${1#--setenv=}"); shift ;;
+    *) break ;;
+  esac
+done
+printf 'prop %s\n' "${props[@]}" >> "$FAKE_LOG"
+env -i FAKE_LOG="$FAKE_LOG" FAKE_CI_EXIT="${FAKE_CI_EXIT:-0}" FAKE_CLEAN_EXIT="${FAKE_CLEAN_EXIT:-0}" "${envs[@]}" "$@"
+'''
+
+
+class RemoteCI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        t = Path(self.tmp.name); self.t = t
+        # A source repository with the script under test, a fake ci.sh and premerge.sh.
+        src = t / 'src'; (src / 'scripts/gate/remote').mkdir(parents=True)
+        shutil.copy(ROOT / 'scripts/remote-ci.sh', src / 'scripts/remote-ci.sh')
+        shutil.copy(ROOT / 'scripts/gate/remote/ci-job.sh', src / 'scripts/gate/remote/ci-job.sh')
+        shutil.copy(ROOT / 'scripts/gate/config.sh', src / 'scripts/gate/config.sh')
+        (src / 'scripts/remote-executor.sh').write_text(FAKE_RX)
+        (src / 'scripts/ci.sh').write_text('#!/usr/bin/env bash\necho "ci $*"; mkdir -p .artifacts/ci/logs; echo log > .artifacts/ci/logs/test.log; exit "${FAKE_CI_EXIT:-0}"\n')
+        (src / 'scripts/premerge.sh').write_text('#!/usr/bin/env bash\necho premerge; mkdir -p .artifacts/premerge; echo ok > .artifacts/premerge/doc-paths.log\n')
+        for f in ['ci.sh', 'premerge.sh', 'remote-ci.sh']:
+            (src / 'scripts' / f).chmod(0o755)
+        g = ['git', '-C', str(src)]
+        subprocess.run(['git', 'init', '-q', str(src)], check=True)
+        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base'], check=True)
+        subprocess.run(g + ['update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
+        subprocess.run(g + ['add', '-A'], check=True)
+        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'tip'], check=True)
+        self.src = src
+        home = t / 'home'; (home / 'gate/bin').mkdir(parents=True); (home / 'gate/out').mkdir()
+        subprocess.run(['git', 'init', '-q', '--bare', str(home / 'gate/repo.git')], check=True)
+        # The worker's admission checker, which setup-host installs; it finds room by default.
+        (home / 'gate/bin/disk_clean.py').write_text('import sys\nopen(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))\nsys.exit(int(__import__("os").environ.get("FAKE_CLEAN_EXIT", "0")))\n')
+        self.home = home
+        fake = t / 'bin'; fake.mkdir()
+        (fake / 'systemd-run').write_text(FAKE_SYSTEMD_RUN)
+        (fake / 'systemctl').write_text('#!/bin/sh\necho "systemctl $*" >> "$FAKE_LOG"\n[ "$2" = is-active ] && { echo inactive; exit 3; }\n[ "$2" = show ] && echo "${FAKE_STATE-inactive}"\nexit 0\n')
+        (fake / 'mise').write_text('#!/bin/sh\nexit 0\n')
+        (fake / 'flock').write_text('#!/bin/sh\necho "flock $*" >> "$FAKE_LOG"\n[ "$3" != "${FAKE_FLOCK_FAIL:-none}" ]\n')
+        for f in fake.iterdir():
+            f.chmod(0o755)
+        self.log = t / 'log'
+        self.env = dict(os.environ, FAKE_HOME=str(home), FAKE_BIN=str(fake), FAKE_SRC=str(src), FAKE_LOG=str(self.log),
+                        PATH=str(fake) + ':' + os.environ['PATH'],
+                        SPARKLES_GATE_CONFIG=str(t / 'no-gate.env'), SPARKLES_BENCH_HOST='forge')
+
+    def run_ci(self, *args, **env):
+        return subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'boat:bx_test', *args],
+                              cwd=self.src, env=dict(self.env, **env), capture_output=True, text=True, timeout=120)
+
+    def rev(self, r):
+        return subprocess.run(['git', '-C', str(self.src), 'rev-parse', r], capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_a_lane_ci_runs_in_its_unit_and_returns_its_results(self):
+        r = self.run_ci('--base', 'origin/main')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        log = self.log.read_text()
+        self.assertIn('unit gate-' + name, log); self.assertIn('flock', log)
+        self.assertIn('admit boat:bx_test --minimum 2400', log); self.assertIn('runtime', log)
+        self.assertIn('--reserve 1200', log)
+        rt = [l for l in log.splitlines() if l.startswith('prop RuntimeMaxSec=')]
+        self.assertEqual(len(rt), 1); self.assertLessEqual(int(rt[0].split('=')[1]), 5000)
+        self.assertIn('prop UMask=0022', log)
+        out = self.home / 'gate/out' / name
+        self.assertEqual((out / 'ci.exit').read_text().strip(), '0')
+        self.assertIn('ci --fast --changed ' + self.rev('origin/main'), (out / 'ci.log').read_text())
+        self.assertTrue((out / 'ci/logs/test.log').exists())
+        # The results came back through the directory sync, and the start held the start lock.
+        self.assertIn('sync boat:bx_test:gate/out/%s/' % name, log)
+        self.assertIn('flock -w 120 8', log); self.assertIn('prop TimeoutStopSec=60', log)
+        self.assertTrue((self.src / '.artifacts/remote-ci' / name / 'ci/logs/test.log').exists())
+        # The worktree was created under the cleanup's lock, after the bounded heavy-lock wait.
+        self.assertIn('flock -w 300 7', log)
+        w = [l for l in log.splitlines() if l.startswith('flock -w') and l.endswith(' 9')]
+        self.assertEqual(len(w), 1); self.assertLessEqual(int(w[0].split()[2]), 5000 - 120)
+        # The job removed its worktree and kept its results.
+        self.assertFalse((self.home / 'gate' / ('wt-' + name)).exists())
+
+    @unittest.skipUnless(shutil.which('zsh'), 'zsh is not installed')
+    def test_a_host_whose_login_shell_is_zsh_starts_the_job_and_forwards_its_settings(self):
+        # An ssh host runs the start command in its login shell, which is zsh on wally.
+        r = self.run_ci('--base', 'origin/main', FAKE_SHELL='zsh', MBX_REMOTE_URL='', RUSTUP_TOOLCHAIN='x y')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('started gate-', r.stdout)
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        self.assertEqual((self.home / 'gate/out' / name / 'ci.exit').read_text().strip(), '0')
+
+    def test_a_base_that_moved_on_uses_the_merge_base_the_tip_carries(self):
+        g = ['git', '-C', str(self.src), '-c', 'user.name=t', '-c', 'user.email=t@t']
+        mb = self.rev('origin/main')
+        subprocess.run(g + ['checkout', '-q', '-b', 'side', 'origin/main'], check=True)
+        subprocess.run(g + ['commit', '-q', '--allow-empty', '-m', 'main moved'], check=True)
+        subprocess.run(g + ['update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
+        subprocess.run(g + ['checkout', '-q', '-'], check=True)
+        r = self.run_ci('--base', 'origin/main')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = self.home / 'gate/out' / ('ci-%s-%s' % (self.rev('HEAD')[:8], mb[:8]))
+        self.assertIn('ci --fast --changed ' + mb, (out / 'ci.log').read_text())
+
+    def test_a_failing_ci_returns_its_exit_code(self):
+        r = self.run_ci(FAKE_CI_EXIT='1')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+    def test_premerge_runs_the_premerge_script(self):
+        r = self.run_ci('--premerge')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = self.home / 'gate/out' / ('pm-' + self.rev('HEAD')[:8])
+        self.assertEqual((out / 'ci.log').read_text().strip(), 'premerge')
+        self.assertTrue((out / 'premerge/doc-paths.log').exists())
+
+    def test_too_little_time_refuses_the_start(self):
+        r = self.run_ci('--no-wait', FAKE_RUNTIME='300')
+        self.assertNotEqual(r.returncode, 0); self.assertIn('not starting', r.stderr)
+        self.assertNotIn('unit gate-', self.log.read_text())
+
+    def test_a_job_with_too_little_time_inside_its_unit_does_not_build(self):
+        r = self.run_ci('--no-wait', FAKE_RUNTIME='700', REMOTE_CI_MIN_SECONDS='600')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.run_ci('--no-wait', FAKE_RUNTIME='100', REMOTE_CI_MIN_SECONDS='50')
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        self.assertEqual((self.home / 'gate/out' / name / 'ci.exit').read_text().strip(), '3')
+
+    def run_job(self, end, **env):
+        # The job script alone, as its unit runs it.
+        out = self.home / 'gate/out/job'
+        e = dict(self.env, HOME=str(self.home), NAME='job', FULL=self.rev('HEAD'), BASE=self.rev('origin/main'),
+                 MODE='ci', END=str(end), **env)
+        subprocess.run(['git', '-C', str(self.home / 'gate/repo.git'), 'fetch', '-q', str(self.src), 'HEAD'], check=True)
+        r = subprocess.run(['bash', str(self.src / 'scripts/gate/remote/ci-job.sh')], env=e, capture_output=True, text=True, timeout=60)
+        return r, out
+
+    def test_a_job_whose_end_has_passed_waits_for_no_lock(self):
+        import time
+        r, out = self.run_job(int(time.time()) + 60)
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual((out / 'ci.exit').read_text().strip(), '3')
+        log = self.log.read_text() if self.log.exists() else ''
+        self.assertNotIn('flock', log); self.assertNotIn('stop --no-block', log)
+
+    def test_a_heavy_lock_that_stays_held_ends_the_job_before_its_end(self):
+        import time
+        r, out = self.run_job(int(time.time()) + 3000, FAKE_FLOCK_FAIL='9')
+        self.assertEqual(r.returncode, 3)
+        self.assertIn('did not come free', (out / 'progress.log').read_text())
+        self.assertFalse((self.home / 'gate/wt-job').exists())
+
+    def test_the_job_ends_its_watchdog(self):
+        import time
+        r, out = self.run_job(int(time.time()) + 3000)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Had the watchdog outlived the job, subprocess.run would have waited on its pipe.
+        self.assertNotIn('stop --no-block', self.log.read_text())
+
+    def test_a_unit_still_shutting_down_keeps_its_results(self):
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        out = self.home / 'gate/out' / name; out.mkdir(parents=True); (out / 'progress.log').write_text('live\n')
+        for st in ['deactivating', 'active', 'activating', '']:
+            with self.subTest(state=st):
+                r = self.run_ci('--no-wait', FAKE_STATE=st)
+                self.assertEqual(r.returncode, 1, r.stderr); self.assertIn('must have stopped first', r.stderr)
+                self.assertEqual((out / 'progress.log').read_text(), 'live\n')
+        self.assertEqual(sorted(p.name for p in (self.home / 'gate/out').iterdir()), [name])
+        self.assertNotIn('unit gate-', self.log.read_text())
+
+    def test_a_disk_without_room_for_the_build_refuses_the_job(self):
+        clean = self.home / 'gate/bin/disk_clean.py'
+        r = self.run_ci(FAKE_CLEAN_EXIT='3', REMOTE_CI_MIN_FREE_GIB='120')
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        out = self.home / 'gate/out' / name
+        self.assertIn('under 120 GiB free', (out / 'progress.log').read_text())
+        self.assertIn('--need-free-gib 120', Path(str(clean) + '.args').read_text())
+        self.assertFalse((out / 'ci.log').exists()); self.assertFalse((self.home / 'gate' / ('wt-' + name)).exists())
+        self.assertEqual(self.run_ci('--no-wait', REMOTE_CI_MIN_FREE_GIB='x').returncode, 2)
+
+    def test_a_boat_job_without_the_checker_refuses(self):
+        (self.home / 'gate/bin/disk_clean.py').unlink()
+        r = self.run_ci()
+        name = 'ci-%s-%s' % (self.rev('HEAD')[:8], self.rev('origin/main')[:8])
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertIn('no ~/gate/bin/disk_clean.py', (self.home / 'gate/out' / name / 'progress.log').read_text())
+
+    def test_the_benchmark_host_never_runs_ci(self):
+        for h in ['forge', 'user@forge.local']:
+            with self.subTest(host=h):
+                r = self.run_ci('--host', h)
+                self.assertEqual(r.returncode, 2); self.assertIn('benchmark host', r.stderr)
+
+    def test_the_command_line_refuses_bad_input(self):
+        for args in [['--status', 'a b'], ['--bogus']]:
+            with self.subTest(args=args):
+                self.assertEqual(self.run_ci(*args).returncode, 2)
+        r = subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh')], cwd=self.src, env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2); self.assertIn('no host', r.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

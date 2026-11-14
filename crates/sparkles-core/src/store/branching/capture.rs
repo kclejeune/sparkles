@@ -59,7 +59,7 @@ struct BorrowedTable<'a> {
 impl<'a> BorrowedTable<'a> {
     fn new(table: &'a TableFile) -> Self {
         Self {
-            format: if table.retired.is_empty() { 1 } else { 2 },
+            format: table.stamped_format(),
             dataset_id: table.dataset_id,
             next_ordinal: table.next_ordinal,
             main: &table.main,
@@ -86,7 +86,7 @@ fn inspect(bytes: &[u8], table: &TableFile, preparation: &Preparation) -> Result
     let raw: crate::store::cold::Loaded<serde_json::Value> = budget.json(bytes)?;
     crate::formats::check_settings(BRANCHES_FILE, &raw.value)?;
     let mut decoded: TableFile = budget.value(raw.value)?;
-    let format = if table.retired.is_empty() { 1 } else { 2 };
+    let format = table.stamped_format();
     if decoded.format != format {
         return Err(managed_history::unavailable(
             "original branch table version differs from live retirement state",

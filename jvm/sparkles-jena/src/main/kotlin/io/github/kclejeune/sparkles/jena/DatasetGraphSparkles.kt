@@ -2,6 +2,7 @@ package io.github.kclejeune.sparkles.jena
 
 import io.github.kclejeune.sparkles.jena.internal.GraphViewSparkles
 import io.github.kclejeune.sparkles.jena.internal.Handle
+import io.github.kclejeune.sparkles.jena.internal.PatternBatch
 import io.github.kclejeune.sparkles.jena.internal.PrefixMapSparkles
 import io.github.kclejeune.sparkles.jena.internal.QuadIter
 import io.github.kclejeune.sparkles.jena.internal.Registry
@@ -17,6 +18,7 @@ import io.github.kclejeune.sparkles.jena.internal.toInfo
 import io.github.kclejeune.sparkles.jena.internal.toReceipt
 import org.apache.jena.graph.Graph
 import org.apache.jena.graph.Node
+import org.apache.jena.graph.Triple
 import org.apache.jena.query.ReadWrite
 import org.apache.jena.query.TxnType
 import org.apache.jena.riot.Lang
@@ -110,6 +112,41 @@ public class DatasetGraphSparkles internal constructor(
         source().contains(encodePattern(g, s, p, o))
 
     override fun contains(quad: Quad): Boolean = contains(quad.graph, quad.subject, quad.predicate, quad.`object`)
+
+    /**
+     * Whether each quad is in the dataset, in the order given: element `i` of the answer
+     * is what `contains` returns for the quad at position `i`. The quads cross into the
+     * engine in one call, in which a term that several quads share is sent once, so a
+     * batch costs much less per quad than as many calls of `contains`. Every answer is
+     * read from one state, which is the thread's transaction, or the newest commit
+     * outside a transaction.
+     */
+    public fun containsAll(quads: Collection<Quad>): BooleanArray {
+        if (quads.isEmpty()) {
+            checkOpen()
+            return BooleanArray(0)
+        }
+        val batch = PatternBatch(quads.size)
+        for (q in quads) batch.add(q.graph, q.subject, q.predicate, q.`object`)
+        return probe(batch, quads.size)
+    }
+
+    /** [containsAll] for the triples of one graph, as `getGraph(graph).contains` answers each. */
+    public fun containsAll(graph: Node, triples: Collection<Triple>): BooleanArray {
+        if (triples.isEmpty()) {
+            checkOpen()
+            return BooleanArray(0)
+        }
+        val batch = PatternBatch(triples.size)
+        for (t in triples) batch.add(graph, t.subject, t.predicate, t.`object`)
+        return probe(batch, triples.size)
+    }
+
+    private fun probe(batch: PatternBatch, count: Int): BooleanArray {
+        val found = source().containsAll(batch.toByteArray())
+        check(found.size == count) { "the engine answered ${found.size} of $count probes" }
+        return BooleanArray(count) { found[it] != 0.toByte() }
+    }
 
     override fun isEmpty(): Boolean = !contains(null, null, null, null)
 

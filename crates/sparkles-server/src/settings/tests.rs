@@ -942,6 +942,106 @@ async fn scratch_branch_ttl_is_a_dataset_setting() {
     assert!(stored.get("scratchBranches").is_none(), "{stored}");
 }
 
+/// Item 435: `maxPerPrincipal` and `notifyBefore` validate at their bounds, follow the
+/// layers and their locks, and make `memory.json` format 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn scratch_branch_limits_are_layered_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        json!({
+            "defaults": {
+                "memory": {"scratchBranches": {"maxPerPrincipal": 5, "notifyBefore": "6h"}},
+                "locked": ["memory.scratchBranches.maxPerPrincipal"],
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let st = state(&dir.path().join("data"), Some(&f));
+    st.create("wiki", DbType::Persistent).unwrap();
+    let app = crate::http::router(st.clone());
+    let u = "/$/settings/wiki/memory";
+    let (_, v, _) = send(&app, req("GET", u, None)).await;
+    assert_eq!(
+        v["effective"]["scratchBranches"]["maxPerPrincipal"], 5,
+        "{v}"
+    );
+    assert_eq!(
+        v["effective"]["scratchBranches"]["notifyBefore"], "6h",
+        "{v}"
+    );
+    assert_eq!(
+        v["sources"]["scratchBranches.maxPerPrincipal"], "locked",
+        "{v}"
+    );
+    // the locked limit refuses a change, the unlocked window takes one
+    let patch = |body: Value| req("PATCH", u, Some(body));
+    let (s, v, _) = send(
+        &app,
+        patch(json!({"scratchBranches": {"maxPerPrincipal": 6}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "locked-by-config");
+    let (s, v, _) = send(
+        &app,
+        patch(json!({"scratchBranches": {"notifyBefore": "1d"}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["effective"]["scratchBranches"]["notifyBefore"], "1d",
+        "{v}"
+    );
+    assert_eq!(
+        v["effective"]["scratchBranches"]["maxPerPrincipal"], 5,
+        "{v}"
+    );
+    let ds = st.get("wiki").unwrap();
+    let file = ds.store.root().unwrap().join("memory.json");
+    let stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(stored["format"], 3, "{stored}");
+    sparkles::formats::check_settings("memory.json", &stored).unwrap();
+    assert_eq!(
+        crate::assist::memory_settings(&st, &ds)
+            .scratch_branches
+            .and_then(|s| s.max_per_principal),
+        Some(5)
+    );
+    // the bounds, on a dataset whose layers lock nothing of the window
+    let checks = |m: &crate::assist::MemorySettings| m.validate();
+    let sb = |v: Value| -> crate::assist::MemorySettings {
+        serde_json::from_value(json!({"scratchBranches": v})).unwrap()
+    };
+    for ok in [
+        json!({"maxPerPrincipal": 1}),
+        json!({"maxPerPrincipal": 65535}),
+    ] {
+        assert!(checks(&sb(ok.clone())).is_ok(), "{ok}");
+    }
+    for bad in [
+        json!({"maxPerPrincipal": 0}),
+        json!({"maxPerPrincipal": 65536}),
+    ] {
+        let e = checks(&sb(bad.clone())).unwrap_err();
+        assert!(e.contains("scratchBranches.maxPerPrincipal"), "{bad}: {e}");
+    }
+    for ok in ["1m", "6h", "3650d"] {
+        assert!(checks(&sb(json!({"notifyBefore": ok}))).is_ok(), "{ok}");
+    }
+    for bad in ["59s", "3651d", "off", "", "6 hours"] {
+        let e = checks(&sb(json!({"notifyBefore": bad}))).unwrap_err();
+        assert!(e.contains("scratchBranches.notifyBefore"), "{bad}: {e}");
+    }
+    // a negative or fractional limit is not a number of branches
+    for bad in [json!(-1), json!(1.5), json!("2")] {
+        let v = json!({"scratchBranches": {"maxPerPrincipal": bad}});
+        assert!(serde_json::from_value::<crate::assist::MemorySettings>(v).is_err());
+    }
+}
+
 #[test]
 fn a_repair_setting_can_be_locked() {
     let d = declared(json!({

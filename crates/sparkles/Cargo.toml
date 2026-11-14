@@ -51,6 +51,10 @@ zeroize = { version = "=1.9.0", optional = true }
 name = "entity_search_bench"
 required-features = ["ontology"]
 
+[[example]]
+name = "auto_latency"
+required-features = ["reasoning"]
+
 [dev-dependencies]
 toml = "1"
 oxrdfio.workspace = true

@@ -1,0 +1,158 @@
+# Part 1: atlas-ab.sh, stopped after the first pair of its third block.
+#!/usr/bin/env bash
+# Item 939 on atlas, one job under ~/lanes/.heavy.lock (taken by the caller): interleaved
+# rounds of the greedy planner (SPARKLES_SAMPLED_PLANNING=0) against the sampled planner (=1)
+# with one binary, the `lubm` example of sparkles-reasoner at the lane tip. `infer` derives
+# the closure in memory and prints its digest, and `materialize` runs the whole
+# materialization on a fresh copy of the database, as `sparkles infer --full` does.
+# One thread is pinned to CPU 2, and 20 threads run on CPUs 0-19. The order of the two arms
+# alternates from round to round. No builds run here.
+set -uo pipefail
+S=$HOME/lanes/rule-planning-487
+BIN=$S/bin/lubm
+cd "$S" || exit 1
+mkdir -p logs
+log() { echo "[$(date +%T)] $*" | tee -a progress.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+# one NAME CMD THREADS DB PROFILE SAMPLED
+one() {
+  local name=$1 cmd=$2 t=$3 db=$4 profile=$5 m=$6 cpus=2 rc=0 load t0 t1 line
+  [ "$t" = 20 ] && cpus=0-19
+  load=$(cut -d' ' -f1 /proc/loadavg)
+  t0=$(date +%s%N)
+  SPARKLES_MAX_INFERRED=200000000 SPARKLES_SAMPLED_PLANNING=$m RAYON_NUM_THREADS=$t \
+    scope taskset -c "$cpus" "$BIN" "$cmd" "$db" "$profile" > "logs/$name.out" 2> "logs/$name.err" || rc=$?
+  t1=$(date +%s%N)
+  line=$(tail -1 "logs/$name.out")
+  echo "$name rc=$rc sampled=$m wall_ms=$(( (t1 - t0) / 1000000 )) load=$load $line" | tee -a results.txt
+}
+# block CMD ROUNDS THREADS DBNAME PROFILE
+block() {
+  local cmd=$1 rounds=$2 t=$3 dbn=$4 profile=$5 tag r m arms db
+  tag=${profile#@}; tag=${tag%.rules}
+  log "block $cmd $dbn $tag t$t x$rounds"
+  for r in $(seq 1 "$rounds"); do
+    arms="0 1"; [ $((r % 2)) = 0 ] && arms="1 0"
+    for m in $arms; do
+      db=db/$dbn
+      if [ "$cmd" = materialize ]; then
+        rm -rf run.db && cp -a "db/$dbn" run.db && sync
+        db=run.db
+      fi
+      one "$dbn-$tag-$cmd-t$t-s$m-r$r" "$cmd" "$t" "$db" "$profile" "$m"
+    done
+  done
+}
+{
+  echo "host: $(hostname)"
+  echo "cpu: $(sed -n 's/^model name[^:]*: //p' /proc/cpuinfo | head -1)"
+  echo "cpus: $(nproc)"
+  echo "ram_mib: $(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
+  echo "kernel: $(uname -r)"
+  echo "binary_sha256: $(sha256sum "$BIN" | cut -d' ' -f1)"
+  echo "load_at_start: $(cat /proc/loadavg)"
+} > env.txt
+log "START"
+# Warm the page cache of every database with one discarded greedy run.
+for d in lubm100 owl2bench5 lubm10 owl2bench1; do
+  one "warm-$d" infer 20 "db/$d" owl-rl 0
+done
+sed -i '/^warm-/d' results.txt
+block infer 6 1 lubm100 owl-rl
+block infer 3 1 owl2bench5 owl-rl
+block infer 4 20 owl2bench5 owl-rl
+block infer 6 20 lubm100 owl-rl
+block infer 7 1 lubm10 owl-rl
+block infer 7 20 lubm10 owl-rl
+block infer 7 1 owl2bench1 owl-rl
+block infer 7 20 owl2bench1 owl-rl
+block infer 4 1 lubm100 @long-bodies.rules
+block infer 5 20 lubm100 @long-bodies.rules
+block infer 7 1 lubm10 @long-bodies.rules
+block infer 7 20 lubm10 @long-bodies.rules
+block materialize 4 1 lubm100 owl-rl
+block materialize 4 20 lubm100 owl-rl
+block materialize 3 1 owl2bench5 owl-rl
+block materialize 3 20 owl2bench5 owl-rl
+rm -rf run.db
+log "AB-DONE"
+
+# Part 2: atlas-ab2.sh, the third block in full and the rest.
+#!/usr/bin/env bash
+# Part 2 (part 1 ran atlas-ab.sh up to the first pair of the OWL2Bench(5) block at 20
+# threads and was stopped to let another lane's job take the host first; this part runs
+# that block in full and the rest, with fewer materialize rounds).
+# Item 939 on atlas, one job under ~/lanes/.heavy.lock (taken by the caller): interleaved
+# rounds of the greedy planner (SPARKLES_SAMPLED_PLANNING=0) against the sampled planner (=1)
+# with one binary, the `lubm` example of sparkles-reasoner at the lane tip. `infer` derives
+# the closure in memory and prints its digest, and `materialize` runs the whole
+# materialization on a fresh copy of the database, as `sparkles infer --full` does.
+# One thread is pinned to CPU 2, and 20 threads run on CPUs 0-19. The order of the two arms
+# alternates from round to round. No builds run here.
+set -uo pipefail
+S=$HOME/lanes/rule-planning-487
+BIN=$S/bin/lubm
+cd "$S" || exit 1
+mkdir -p logs
+log() { echo "[$(date +%T)] $*" | tee -a progress.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+# one NAME CMD THREADS DB PROFILE SAMPLED
+one() {
+  local name=$1 cmd=$2 t=$3 db=$4 profile=$5 m=$6 cpus=2 rc=0 load t0 t1 line
+  [ "$t" = 20 ] && cpus=0-19
+  load=$(cut -d' ' -f1 /proc/loadavg)
+  t0=$(date +%s%N)
+  SPARKLES_MAX_INFERRED=200000000 SPARKLES_SAMPLED_PLANNING=$m RAYON_NUM_THREADS=$t \
+    scope taskset -c "$cpus" "$BIN" "$cmd" "$db" "$profile" > "logs/$name.out" 2> "logs/$name.err" || rc=$?
+  t1=$(date +%s%N)
+  line=$(tail -1 "logs/$name.out")
+  echo "$name rc=$rc sampled=$m wall_ms=$(( (t1 - t0) / 1000000 )) load=$load $line" | tee -a results.txt
+}
+# block CMD ROUNDS THREADS DBNAME PROFILE
+block() {
+  local cmd=$1 rounds=$2 t=$3 dbn=$4 profile=$5 tag r m arms db
+  tag=${profile#@}; tag=${tag%.rules}
+  log "block $cmd $dbn $tag t$t x$rounds"
+  for r in $(seq 1 "$rounds"); do
+    arms="0 1"; [ $((r % 2)) = 0 ] && arms="1 0"
+    for m in $arms; do
+      db=db/$dbn
+      if [ "$cmd" = materialize ]; then
+        rm -rf run.db && cp -a "db/$dbn" run.db && sync
+        db=run.db
+      fi
+      one "$dbn-$tag-$cmd-t$t-s$m-r$r" "$cmd" "$t" "$db" "$profile" "$m"
+    done
+  done
+}
+{
+  echo "host: $(hostname)"
+  echo "cpu: $(sed -n 's/^model name[^:]*: //p' /proc/cpuinfo | head -1)"
+  echo "cpus: $(nproc)"
+  echo "ram_mib: $(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
+  echo "kernel: $(uname -r)"
+  echo "binary_sha256: $(sha256sum "$BIN" | cut -d' ' -f1)"
+  echo "load_at_start: $(cat /proc/loadavg)"
+} > env.txt
+log "START"
+# Warm the page cache of every database with one discarded greedy run.
+for d in lubm100 owl2bench5 lubm10 owl2bench1; do
+  one "warm-$d" infer 20 "db/$d" owl-rl 0
+done
+sed -i '/^warm-/d' results.txt
+block infer 4 20 owl2bench5 owl-rl
+block infer 6 20 lubm100 owl-rl
+block infer 7 1 lubm10 owl-rl
+block infer 7 20 lubm10 owl-rl
+block infer 7 1 owl2bench1 owl-rl
+block infer 7 20 owl2bench1 owl-rl
+block infer 4 1 lubm100 @long-bodies.rules
+block infer 5 20 lubm100 @long-bodies.rules
+block infer 7 1 lubm10 @long-bodies.rules
+block infer 7 20 lubm10 @long-bodies.rules
+block materialize 3 1 lubm100 owl-rl
+block materialize 3 20 lubm100 owl-rl
+block materialize 2 1 owl2bench5 owl-rl
+block materialize 3 20 owl2bench5 owl-rl
+rm -rf run.db
+log "AB-DONE"

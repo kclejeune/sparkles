@@ -1098,7 +1098,10 @@ mod tests {
             "SELECT ?p ?n ?a WHERE { ?p ex:worksFor ex:o3 ; ex:name ?n ; ex:age ?a }",
             "SELECT ?p ?d ?t WHERE { ?p ex:worksFor ex:o3 . ?p ex:authorOf ?d . ?d ex:title ?t }",
             "SELECT ?p ?a WHERE { ?p ex:name ?n OPTIONAL { ?p ex:age ?a FILTER(?a > 50) } }",
-            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x } LIMIT 500",
+            // a LIMIT over a scan reads it directly, while one over a path pulls the
+            // path's cursor, whose batches the ledger charges (item 827)
+            "SELECT ?p ?x WHERE { ?p ex:knows ?x } LIMIT 500",
+            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x }",
             "SELECT ?p ?x WHERE { ex:p5 (ex:knows|ex:worksFor)* ?x . BIND(ex:p5 AS ?p) }",
             "CONSTRUCT { ?p ex:friend ?o } WHERE { ?p ex:knows ?o . ?o ex:worksFor ex:o3 }",
             "DESCRIBE ex:p3 ex:p4",
@@ -1127,6 +1130,146 @@ mod tests {
             "ledger operations for an update"
         );
         assert_eq!(pool.granted(), 0);
+    }
+    /// A LIMIT over a path pulls the path's cursor, which takes the query's ledger, and
+    /// a long narrow walk then charges a step at a time and checks its output each
+    /// time it doubles, rather than taking the ledger's lock several times per level.
+    #[test]
+    fn a_pulled_path_limit_takes_the_ledger_once_per_step() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{QueryOptions, query};
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        // one cycle of 300 people, so every walk is 300 levels of one node
+        for i in 0..300 {
+            data.push_str(&format!("ex:p{i} ex:knows ex:p{} .\n", (i + 1) % 300));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            pool: Some(QueryPool::new(64 * MB)),
+            max_memory_bytes: Some(32 * MB),
+            no_cache: true,
+            ..Default::default()
+        };
+        let before = LEDGER_OPS.with(|n| n.get());
+        let r = query(
+            store.snapshot(),
+            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x } LIMIT 500",
+            &opts,
+        )
+        .unwrap();
+        let ops = LEDGER_OPS.with(|n| n.get()) - before;
+        assert_eq!(r.len(), 500);
+        // two walks of 300 levels took about 3,000 operations with several per level
+        assert!(ops < 300, "{ops} ledger operations");
+    }
+    /// Decoding the rows of a pulled LIMIT charges its terms in steps rather than one
+    /// ledger operation per term.
+    #[test]
+    fn decoded_rows_of_a_pulled_limit_take_the_ledger_in_steps() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{QueryOptions, query};
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        // more people than a cursor batch, so the LIMIT pulls its join
+        for i in 0..5000 {
+            data.push_str(&format!(
+                "ex:p{i} ex:knows ex:p{} ; ex:name \"n{i}\" .\n",
+                (i * 7 + 1) % 5000
+            ));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            pool: Some(QueryPool::new(64 * MB)),
+            max_memory_bytes: Some(32 * MB),
+            no_cache: true,
+            ..Default::default()
+        };
+        let r = query(
+            store.snapshot(),
+            "SELECT ?p ?n WHERE { ?p ex:knows ?x . ?x ex:name ?n } LIMIT 500",
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(r.len(), 500);
+        let before = LEDGER_OPS.with(|n| n.get());
+        let rows = r.rows().unwrap();
+        let ops = LEDGER_OPS.with(|n| n.get()) - before;
+        assert_eq!(rows.len(), 500);
+        // a charge per term took about 4,000 operations
+        assert!(ops < 100, "{ops} ledger operations");
+    }
+
+    /// A FILTER over a product without a key, under an ASK, reads its input in batches
+    /// that grow while no row passes, rather than one pair at a time with the ledger
+    /// operations of a batch each.
+    #[test]
+    fn a_filter_whose_batches_come_back_empty_reads_larger_ones() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{QueryOptions, query};
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..300 {
+            data.push_str(&format!("ex:p{i} ex:age {} .\n", i % 90));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            no_cache: true,
+            ..Default::default()
+        };
+        let before = LEDGER_OPS.with(|n| n.get());
+        let r = query(
+            store.snapshot(),
+            "ASK { ?a ex:age ?x . ?b ex:age ?y FILTER(?x + ?y > 1000) }",
+            &opts,
+        )
+        .unwrap();
+        let ops = LEDGER_OPS.with(|n| n.get()) - before;
+        assert!(!r.boolean);
+        // one pair at a time took several operations for each of the 90,000 pairs
+        assert!(ops < 5_000, "{ops} ledger operations");
+    }
+
+    /// A FILTER that reads ahead checks its grown demand against the row limit before
+    /// each read, so it answers where reading at its consumer's demand answers (review
+    /// round 8).
+    #[test]
+    fn a_grown_filter_demand_that_no_longer_fits_the_row_limit_shrinks() {
+        use crate::sparql::{QueryOptions, query};
+        let store = Store::in_memory(StoreOptions::default());
+        let values: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        let text = format!(
+            "SELECT ?x WHERE {{ VALUES ?x {{ {} }} FILTER(?x >= 21) }} LIMIT 1",
+            values.join(" ")
+        );
+        let opts = QueryOptions {
+            max_rows: Some(32),
+            no_cache: true,
+            ..Default::default()
+        };
+        let r = query(store.snapshot(), &text, &opts).unwrap();
+        assert_eq!(r.len(), 1);
     }
     /// A grant set after the first charge would leave that charge on the old grant,
     /// which debug builds refuse.

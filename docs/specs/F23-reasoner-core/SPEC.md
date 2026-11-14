@@ -124,10 +124,177 @@ No code from another project is copied.
 
 ## Outcome
 
-The quick-fixes phase is built. Roadmap items 485 and 486 shipped and item 487 was
-measured and not adopted. The reasoner also records witnesses for F18 under item 416.
-The core and convergence phases remain under
-[item 456](../../ROADMAP.md).
+The quick-fixes phase is built. Roadmap items 485 and 486 shipped. The planner of item 487
+was measured and not adopted, and item 939 orders rule bodies from sampled bindings
+instead. The reasoner also records witnesses for F18 under item 416.
+The columnar derived tier, the first phase of the core, is built under item 835. The
+other core and convergence phases remain under [item 456](../../ROADMAP.md).
+
+### Columnar derived tier
+
+`crates/sparkles-reasoner/src/tier` holds the derived facts. A fact gets a dense `u32`
+id in the order of its first derivation, as the rows were numbered before, and its
+subject, object and the index of its predicate live in one row of 24 bytes by id, of
+which 4 are padding free for a later column, so the facts of one merge are an interval
+of ids and the semi-naive ranges of the engine keep their meaning, and a hit in the
+triple index checks its fact with one cache line. Each
+predicate is a relation with its ids in ascending order, as its row list was before, and
+two orders of its ids, by subject then id and by object then id. An order is a list of
+immutable sorted runs, and a run keeps a fence key every eight entries, so a probe with a
+bound subject or object searches the fence keys, which are few, and then the keys of at
+most eight facts. A merge sorts its ids into each order as `(key, id)` entries of 16
+bytes, by least significant digit over the digits in which the keys differ when the
+batch is large and the pool has at most three threads, and by a parallel comparison sort
+otherwise, and builds the run from the sorted entries. It appends one run per order and
+compacts the older runs first, from the newest back while the next older run is at most
+twice their size and further back until eight runs remain, and a relation with a quarter
+of its facts dead is rebuilt without them. The engine sets a compaction floor at the start of each iteration's delta,
+so a run the iteration reads is never merged with older ones, and a batch added between
+runs lowers the floor to its first id. Orders over the whole tier by subject and by
+object serve atoms with a variable predicate and are built on demand. A probe with a
+bound predicate alone reads the predicate's id list, and a count of a predicate's facts
+over an id range is a binary search in it. The triple index by hash stays, since the merge deduplicates its candidates through it and
+`position` finds a fact by its triple in one lookup. The explicit flags of a maintained
+closure are a bitmap of the tier beside the dead bitmap. `graph.rs` is a front over the
+tier with the same interface, and the candidates of a probe are pieces of runs or id
+ranges rather than a list of rows, filtered by the id range where a run is met in part.
+
+The plan weighed two layouts. The first keeps each order as columns of subject, object
+and id, 20 bytes per fact per order, with a position table of 8 bytes from id to place,
+48 bytes in all. The second, which is built, keeps the fact by id once, 24 bytes in a row
+that was three columns of 20 bytes until item 866, the predicate's id list, 4 bytes, and
+each order as ids with fence keys, 5 bytes, 38 bytes in all, and pays an indirection for
+each key it compares. The second was chosen because the memory gate of the phase is a
+halving of the peak heap per derived fact and the candidate buffers, the term table and
+the operators' workspace take a share of that peak the tier does not control, so the
+smaller tier gives the gate room, and because the fence keys keep the indirect
+comparisons of a probe to about three dependent reads. Measuring the first layout
+against it is roadmap item 862, and a merge that deduplicates against the sorted orders
+without the triple index is item 863. The ids still start after the base tier's facts,
+so an input of more than `u32::MAX / 2` triples is still refused, and item 864 moves the
+base tier off the id space.
+
+The candidates of every probe are visited by ascending id, as the row lists gave them:
+the id list of a predicate ascends, a probe with a bound subject or object finds ids
+sorted by id within a run and the runs' id intervals ascend, and an id range ascends. The
+facts an iteration derives therefore get the ids the previous tier gave them, and a
+derived list link keeps its earliest value.
+
+On wally, a 20-thread development host with 32 GiB, `sparkles infer --full` under
+`owl-rl` on OWL2Bench with 5 universities derived 52,966,139 facts in six iterations with
+both builds. The tier held them in 2,137 MB at the end, 40 bytes per derived fact with
+the triple index and the cache of base facts, against about 135 bytes before, and RDFox
+reports 40 to 60. The peak of the run did not fall with it. The budget's peak was
+10.5 GB, 199 bytes per derived fact, and the peak resident set was 8.7 to 9.5 GiB against
+9.0 to 10.0 GiB for the build before. The peak lies in the first iteration, where the
+closure operators derive 52.4 million facts in one step: the step held 1.6 GB before the
+merge of its outputs and the merge's buffers and probes of the base tier took the run to
+its peak, so the tier is not where the memory of OWL2Bench(5) goes, which answers item
+522's question. Roadmap item 865, below, bounds that step. On the quiet host the tier
+build took 89 and 84 s at one thread against 77 and 70 s, and 41.0 and 42.0 s at 20
+threads against 41.1 and 36.9 s. Its one-thread cost lies in the second iteration's
+evaluation, 31.2 s against 24.4 s, and in the operators' step of the first, 18.2 s
+against 13.2 s, which sorts the step's 52 million facts into the orders.
+
+The closure operators merge their pairs into the tier in batches of four million (item
+865). A batch enters the columns and the triple index as soon as it is full, so the next
+batch is deduplicated against it, and a predicate's new facts are sorted into its orders
+once when its closure is done, as one merge of the whole closure sorted them, so each
+order still gets one run per closure and every fact keeps the id one merge would have
+given it. The sink holds the graph while a predicate's closure runs, so no probe can read
+the facts before they are indexed, and the probe roots assert that in debug builds. An
+operator decides before it emits a pair whether it gives its rules back, an equivalence
+by checking the literals of every class first and a guarded operator with a `notEqual`
+filter by building each predicate's graph once for the check and once for the closure,
+so a fallback has merged nothing, as it had when the step held every pair. The
+columns double when a merge does not fit them, since a closure now arrives in many
+merges. On OWL2Bench(5) the budget's peak fell from 10.5 GB to 4.2 GB, 80 bytes per
+derived fact against 199, under the gate of half. The peak is now the sort of the
+step's 52.4 million facts into the two orders at the end of the closure, 1.3 GB of keyed
+entries and the two runs over the tier's 2.5 GB, and the intermediate peaks are the
+doublings of the columns while a batch is merged. The tier ends at 2,467 MB, 47 bytes per
+fact, since the columns hold the capacity of their last doubling. The peak resident set
+of the whole `infer` command did not fall, 9.6 to 10.9 GiB against 9.4 to 10.0 GiB for
+the build before, because the command commits the 53 million derived triples to the
+store after reasoning, and a profile of the command finds that commit, which sorts the
+quads on every thread, in most of its samples in both builds.
+
+The tier was slower at one thread on OWL2Bench(5) when the batches landed: 88.6 and
+84.5 s against 70.3 and 67.1 s, and 41.3 and 38.4 s against 38.3 and 34.3 s at 20 threads,
+on a quiet wally. The per-rule times placed the cost in the second iteration's `prp-symp`,
+14.8 s against 8.5 s, which rederives the facts of a symmetric closure and checks each
+through the triple index, in the sort of a merge's ids into the orders, 5.9 s against
+1.9 s for the hash lists it replaces in the first iteration's fill, and in the third
+iteration's compaction, 1.3 s. Item 866 took these up. The fact is now one row of 24 bytes
+in place of three columns, the sort keys `(key, id)` entries of 16 bytes and builds the
+run from them in one pass, and a large batch sorts by least significant digit on one to
+three threads. With these, on the same host in two interleaved rounds against the build
+before the tier, the first iteration's merge takes 14.8 s against 15.5 s at one thread,
+so the fill is faster than the hash lists were, the whole run takes 81.3 and 77.7 s
+against 74.9 and 69.1 s at one thread and 39.0 and 37.6 s against 40.7 and 37.3 s at 20
+threads, LUBM(100) takes 25.7 and 25.2 s against 24.8 and 24.7 s at one thread and 14.7
+and 14.6 s against 14.3 and 14.1 s at 20 threads, and its insertion and deletion of every
+hundredth triple at 20 threads take 2.2 and 3.0 s against 2.1 and 2.9 s. The budget's
+peak is 71.5 bytes per derived fact with the comparison sort and 87.3 with the digit
+sort's second buffer, under the gate of half of 199.
+
+The remaining cost at one thread was in `prp-symp`, which scans the first iteration's
+derived facts, looks up the symmetric declaration of each fact's predicate in the base,
+checks that the object is not a literal and looks up the head in the triple index. On
+atlas, an Intel Core i5-13500 like the benchmark host, with the run pinned to one core,
+the rule took 16.0 s against 9.95 s in the build before the tier. Both builds made the
+same lookups and spent the same instructions, branch misses and cache misses at every
+level on them, within a few percent. Counters sampled over the rule gave 741 cycles per
+candidate against 427, with 1.1 cache misses in flight on average against 1.8. A
+candidate's work, about 480 micro-operations, filled the core's reorder window, so the
+index misses of one candidate no longer overlapped those of the next.
+
+A scan now probes its candidates' heads in groups when the rest of the plan only checks
+them. In forward chaining, when an atom's scan binds the last variables of the rule's one
+triple head and every later step is an atom or a builtin whose variables are all bound,
+the scan matches 16 candidates, forms their heads and probes the triple index for all of
+them in a row. It then runs each candidate through the rest of the plan in order, and the
+emit takes the group's answer when the head it forms is the one the group probed, so the
+16 probes' misses overlap. A scan goes back to one candidate at a time when a group's
+instances used fewer than half of its probes, as in `prp-key-1`, whose later steps reject
+most candidates, or when the group probed fewer heads than a quarter of its candidates,
+as in `rdf1`, whose heads repeat. The grouped path is built to give the facts, ids,
+counters and stopping points of the one-at-a-time path. A test compares the derived facts
+in order, their liveness, the iterations and the errors of both paths over random OWL 2
+RL and RDFS programs, with and without an inferred-fact limit. `prp-symp` takes 7.0 s
+with it at one thread.
+
+Two further changes keep the tier's probes and plans level with the build before it. A
+run's probe searches a coarse fence of every 64th fence key before the fence keys. Each
+order counts the distinct keys its facts have had, dead ones included, as the hash lists
+before it did. A merge counts the keys of its run that no older run holds, and a
+compaction that drops dead facts keeps the keys it leaves without a fact, so the planner
+reads the same counts however the facts fall into runs. The sum of the runs' counts,
+which the tier read at first, had made `prp-key-1` choose a plan that scanned 44.5
+million rows in the third iteration, and an estimate from sketches of the runs changed a
+join order, and so a derived list link, with the split of a relation into runs. A scan
+with one candidate is not grouped, since it has no probe to overlap, and roadmap item 937
+carries the fallback across the short scans of one rule. Index entries with 32 hash bits,
+and huge pages for the index tables, measured no faster and are recorded in
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#reasoning).
+
+On atlas, in four interleaved rounds against the build before the tier, OWL2Bench(5)
+takes 100.8 to 105.4 s against 102.2 to 107.4 s at one thread and 50.2 to 52.7 s against
+50.8 to 54.2 s at 20 threads, where the tier took 114.7 to 116.0 s at one thread before
+the grouped probes. LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s at one thread
+and 16.1 to 16.7 s against 16.5 to 17.1 s at 20 threads. Its insertion of every hundredth
+triple takes 2.43 to 2.46 s against 2.35 to 2.41 s and its deletion 3.30 to 3.34 s
+against 3.23 to 3.27 s at 20 threads, 2% slower in every round, and roadmap item 938
+investigates that cost with the one-thread run, 0.5% slower in every round. The [run
+record](../../benchmarks/reasoning/runs/2026-11-13-item-866-atlas/env.txt) holds the
+commands, host and builds. Both builds derive the same 52,966,139 and 10,907,379 facts.
+The budget's peak stays at 4.6 GB, 87 bytes per derived fact, and the tier at 2,746 MB.
+`prp-key-1` still takes 1.9 s against 0.9 s in the second iteration, which reads its
+scan's keys through the fact rows, and the layout of item 862 compares keys in place. A
+compaction policy that left an older run alone when it was under an eighth of the runs
+behind it saved the third iteration's 1.25 s and was not kept, since the distinct-key
+counts of that build summed over runs and the retained run changed a join order, and so
+derived ids, in the reviewer's reproduction.
 
 ### Closure operators
 
@@ -228,6 +395,95 @@ It derived the same facts, was slower on OWL2Bench with 1 university and no fast
 elsewhere, and raised LUBM(100)'s peak heap by 50 MiB.
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records the
 measurement.
+
+That planner kept the greedy estimate of every atom that holds a variable, and the greedy
+order is wrong by orders of magnitude where the rule itself binds the predicate or the
+class that an atom asks for. The greedy estimate of an atom whose predicate is a variable
+bound earlier in the body is a quarter of an average predicate's rows, and its estimate of
+`(?y rdf:type ?c)` with `?c` bound is the size of an average class. In `prp-key` the
+ontology binds the keyed class and the key property, and the greedy order joined the
+members of the class with themselves before it read a key value.
+
+A probe that evaluates every atom order of each plan on one thread measured what the
+greedy orders cost. It is the `plan-probe` feature of `sparkles-reasoner`, which
+`SPARKLES_PLAN_PROBE=1` turns on in `examples/lubm.rs`. On a development laptop with one
+pinned thread, at `e66d8b70`, it found the following.
+
+| Workload | Rule evaluation in the greedy orders | In the fastest orders | Where the difference is |
+|---|---|---|---|
+| OWL2Bench(1), `owl-rl` | 494 ms | 158 ms | `prp-key` falls from 334 ms to 0.4 ms. |
+| OWL2Bench(5), `owl-rl` | 30.7 s | 9.2 s at most | `prp-key` takes 21.6 s. Its longest plan outran the probe's budget. |
+| LUBM(10) and LUBM(100), `owl-rl` | 0.89 s and 11.12 s | The probe found the same times. | The probe found no faster order. |
+| LUBM(10), user rules with bodies of four to six atoms | 286 ms | 228 ms | Two rules gain, and their candidate counts fall far less than their times. |
+| LUBM(100), the same rules | 4.14 s | 4.03 s | The probe did not try every order of the longest body. |
+
+Item 939 orders rule bodies from sampled bindings (`engine/sampled.rs`). The planner keeps
+a sample of up to 16 bindings of the steps placed so far, read from the facts the plan
+reads. It takes an atom's estimate as the mean number of candidates the atom has under
+those bindings, counted in the derived tier's orders and in the store's index, places the
+atom with the fewest and extends the sample by that atom's facts. Its order replaces the
+greedy order only when the sample puts its cost at half the greedy order's or less, and
+only when it needs no order over the whole tier that the greedy order does not need.
+Three gates keep the cost of planning low. A body of fewer than three atoms keeps the
+greedy order. A body whose predicates are all constants is sampled only when the
+statistics put its plan at two million candidates or more. A walk of the greedy order with
+four bindings comes first, and a greedy order that it puts under 50,000 candidates is
+kept without a search. `ReasonOptions::sampled_planning` is on by default, and `false`
+keeps the greedy order of every body.
+
+A run derives the same facts with either planner. The order of a body changes the work of
+an evaluation and the order in which facts are derived, so fact ids can differ between
+the planners. Two cases keep the greedy order because another order could change more
+than that. A builtin checks a variable that is already bound by value, so that the
+integer 3 passes for the decimal 3.0, where an atom matches the term itself. A rule in
+which a builtin binds a variable that an atom also holds, or that another builtin also
+binds, therefore keeps the greedy order. Every rule keeps it while the derived tier holds
+a dead fact, which a deletion leaves when it removes a derived fact, since an order
+counts a dead fact among its candidates until a compaction of its run drops it. Roadmap
+item 944 covers both. Query-time reasoning and
+the maintenance of witnesses plan greedily as before.
+
+The sample is drawn at fixed places, so one snapshot plans the same way each time. In the
+derived tier the places are evenly spaced candidates in id order, which do not depend on
+how the facts fall into runs. In the store they are the starts of blocks along a scan.
+The same quads in other blocks, after another sequence of loads or a compaction, can give
+another sample and another order, which changes the time of a run and never its facts.
+
+Planning is bounded. A read of the store ends with one block of the index at the latest,
+whatever share of the rows belongs to graphs that the run does not read. Within that
+block it has an allowance of 4,096 rows, counted in the pieces the scan delivers, which
+are blocks, segments and rows of the snapshot's delta. The read stops before the piece
+that follows the one that passed the allowance, so it can enter more rows than the
+allowance by the size of one piece. A scan that merges the delta decodes a piece before
+it delivers it, and it consumes deleted rows without delivering them, so it can decode
+more than it delivers. A plan makes at most 2,048 probes, and each is charged 1 KiB to the run's
+memory budget until the plan is made. A plan that needs more, that fails to read the
+store or whose costs overflow keeps the greedy order. The planner's scans count in a
+run's `base_scans`, so that count differs between the planners.
+
+On atlas, with one binary at `a63916c0` and interleaved runs of the two planners, the
+rules of OWL2Bench(5) take 29.9 s against 51.6 to 51.8 s at one thread and 9.5 to 9.7 s
+against 12.5 to 12.8 s at 20 threads. Its whole materialization takes 80.6 to 80.8 s
+against 102.5 to 102.8 s and 42.5 to 42.7 s against 45.5 to 49.2 s. The rules of
+OWL2Bench(1) take 662 to 696 ms against 976 to 988 ms at one thread. No plan of LUBM
+changes, and the rules of LUBM(100) take 14.51 to 14.55 s against 14.50 to 14.55 s at one
+thread. On LUBM the planner changed no plan, by its count of changed plans, so the
+difference there is taken to be the cost of planning. It shows on LUBM(10) at one thread,
+where six of seven sampled runs took 930 to 936 ms and one 970 ms against 926 to 933 ms.
+The median of the seven paired differences is 4 ms, 0.4%, and roadmap item 945 covers
+that cost. The highest peak heap of the sampled runs of a workload is within 3.1 MiB of
+that of the greedy runs under OWL 2 RL. With the long-body rules on LUBM(100) it is
+15.3 MiB higher at one thread, 805.9 against 790.6 MiB, and 13.5 MiB higher at 20
+threads. Every pair of `infer` runs derived the same facts by their digests, and every
+pair of materializations inferred the same number. The
+[results](../../benchmarks/reasoning/RESULTS.md#sampled-rule-body-planning) hold the
+table. These are benchmark-worker measurements of `a63916c0`, and neither the later
+commits of the item nor the benchmark host have repeated them.
+
+The DL Horn rules of `sparkles-owl` are a calculus of their own and do not use this
+planner. Bodies of constant predicates whose orders differ by less than a factor of two
+in candidates keep the greedy order, and roadmap item 940 covers the time the probe
+found there.
 
 ### Witnesses
 

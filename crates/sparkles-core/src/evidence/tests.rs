@@ -93,6 +93,7 @@ fn sample() -> EvidenceInput {
             attributed_author: node("urn:publisher"),
             scope: BTreeMap::from([("urn:configuration".into(), vec![node("urn:linux").into()])]),
             confidence: ConfidenceFacets::default(),
+            validity: None,
         }],
         links: vec![EvidenceLinkInput {
             version: RecordVersion::V1,
@@ -858,4 +859,166 @@ fn many_structured_references_validate_each_retained_revision_once() {
         *value_digest = digest(b"a changed digest on one duplicated selection");
     }
     assert!(prepare_input(&input, &Control::none()).is_err());
+}
+
+const VT: &str = "urn:x-sparkles:valid-time:";
+
+fn known(earliest: &str, latest: &str) -> BoundaryInput {
+    BoundaryInput::Known {
+        earliest: timestamp(earliest),
+        latest: timestamp(latest),
+        precision: node(&format!("{VT}Instant")),
+        source_value: earliest.into(),
+    }
+}
+
+fn validity(start: BoundaryInput, end: BoundaryInput) -> ValidityInput {
+    ValidityInput {
+        start,
+        end,
+        normalization: NormalizationInput {
+            status: NormalizationStatus::Normalized,
+            method: node("urn:method:explicit-offset"),
+            method_version: "1".into(),
+            calendar: node(&format!("{VT}Gregorian")),
+            timezone_policy: None,
+            tzdb_version: None,
+            fold_choice: None,
+        },
+    }
+}
+
+fn with_validity(v: ValidityInput) -> EvidenceInput {
+    let mut input = sample();
+    input.claims[0].validity = Some(v);
+    input
+}
+
+/// The payload digest of a batch without validity, computed before validity records
+/// existed (commit e71020a8). Framing the member only when present keeps it, and with
+/// it every idempotent replay of an earlier proposal (spec C27 §4.4).
+#[test]
+fn claims_without_validity_keep_their_payload_digest() {
+    let digest = prepare_input(&sample(), &Control::none())
+        .unwrap()
+        .body_digest();
+    assert_eq!(digest.to_string(), PAYLOAD_WITHOUT_VALIDITY);
+    let with = prepare_input(
+        &with_validity(validity(
+            known("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            BoundaryInput::Unbounded { source_value: None },
+        )),
+        &Control::none(),
+    )
+    .unwrap()
+    .body_digest();
+    assert_ne!(with, digest);
+}
+
+const PAYLOAD_WITHOUT_VALIDITY: &str =
+    "sha256:c40308586cc3ed3e2b3aefed4a8690a859e2b72c566c4a0b5388d650d27b8fe5";
+
+#[test]
+fn validity_records_are_framed_and_refused_like_the_v1_shapes() {
+    let ok = |v: ValidityInput| {
+        prepare_input(&with_validity(v), &Control::none()).map(|p| p.body_digest())
+    };
+    let open = || BoundaryInput::Unbounded { source_value: None };
+    // accepted: exact, uncertain, unknown and unbounded endpoints, any explicit offset
+    let a = ok(validity(
+        known("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        known("2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z"),
+    ))
+    .unwrap();
+    let b = ok(validity(
+        known("2026-01-01T02:00:00+02:00", "2026-01-01T02:00:00+02:00"),
+        known("2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z"),
+    ))
+    .unwrap();
+    // the lexical source is part of the payload even when the instant is equal
+    assert_ne!(a, b);
+    ok(validity(
+        BoundaryInput::Unknown {
+            source_value: Some("unresolved".into()),
+        },
+        open(),
+    ))
+    .unwrap();
+    // the kinds are framed distinctly
+    assert_ne!(
+        ok(validity(
+            BoundaryInput::Unknown { source_value: None },
+            open()
+        ))
+        .unwrap(),
+        ok(validity(open(), open())).unwrap()
+    );
+    let refused = |v: ValidityInput, why: &str| {
+        let e = ok(v).unwrap_err();
+        assert!(matches!(e, Error::Invalid(_)), "{why}: {e}");
+        assert!(e.to_string().contains(why), "{why}: {e}");
+    };
+    refused(
+        validity(known("2026-01-01T00:00:00", "2026-01-01T00:00:00Z"), open()),
+        "explicit offset",
+    );
+    refused(
+        validity(
+            known("2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z"),
+            open(),
+        ),
+        "earliest instant follows the latest",
+    );
+    // touching and overlapping endpoint envelopes are not a nonempty ordered interval
+    for (s1, e0) in [
+        ("2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z"),
+        ("2026-02-02T00:00:00Z", "2026-02-01T00:00:00Z"),
+        ("2026-02-01T01:00:00+01:00", "2026-02-01T00:00:00Z"),
+    ] {
+        refused(
+            validity(
+                known("2026-01-01T00:00:00Z", s1),
+                known(e0, "2026-03-01T00:00:00Z"),
+            ),
+            "temporal-indeterminate-order",
+        );
+    }
+    let mut v = validity(open(), open());
+    v.normalization.calendar = node("urn:calendar:julian");
+    refused(v.clone(), "Gregorian");
+    v.normalization.status = NormalizationStatus::UnsupportedCalendar;
+    ok(v).unwrap();
+    let mut v = validity(open(), open());
+    v.normalization.fold_choice = Some(FoldChoice::Earlier);
+    v.normalization.timezone_policy = Some("Europe/Berlin".into());
+    refused(v.clone(), "fold choice");
+    v.normalization.tzdb_version = Some("2025b".into());
+    ok(v.clone()).unwrap();
+    v.normalization.tzdb_version = Some(String::new());
+    refused(v, "cannot be empty");
+    let mut v = validity(open(), open());
+    v.normalization.method_version = String::new();
+    refused(v, "cannot be empty");
+    // validity enters only through the member, never through open scope
+    for predicate in [
+        "urn:x-sparkles:valid-time:validDuring",
+        "urn:x-sparkles:valid-time:expiresAt",
+    ] {
+        let mut input = sample();
+        input.claims[0]
+            .scope
+            .insert(predicate.into(), vec![node("urn:period").into()]);
+        assert!(
+            prepare_input(&input, &Control::none()).is_err(),
+            "{predicate}"
+        );
+    }
+    // an assessment's scope still names valid-time terms, such as its freshness
+    // deadline
+    let mut input = sample();
+    input.assessments[0].scope.insert(
+        "urn:x-sparkles:valid-time:expiresAt".into(),
+        vec![timestamp("2026-06-01T00:00:00Z").into()],
+    );
+    prepare_input(&input, &Control::none()).unwrap();
 }

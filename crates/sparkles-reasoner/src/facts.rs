@@ -75,9 +75,21 @@ pub(crate) struct Memo {
     next: usize,
     /// scans made through this memo, not yet added to the tier's count
     pub scans: u64,
+    /// the rows of the blocks' key ranges that the scans through this memo entered, an
+    /// upper bound of the rows they read, for the tests of bounded reads
+    #[cfg(test)]
+    pub rows: u64,
 }
 
 const MEMO_SLOTS: usize = 8;
+
+/// The count of a pattern whose range of the index could not be read: larger than any
+/// store, and small enough to add up.
+pub(crate) const UNCOUNTED: u64 = u64::MAX / 4;
+
+/// The rows a start of [`Base::sample`] enters before it stops: it ends with the block,
+/// the segment or the row of the delta that takes it past this.
+pub(crate) const SAMPLE_ROWS: u64 = 4096;
 
 /// The fewest sorted triples a task of [`Base::contains_sorted`] searches.
 const SORTED_RUN: usize = 64;
@@ -166,6 +178,8 @@ pub(crate) struct Base {
     len: u32,
     /// per predicate: quads in the store (an upper bound of the tier's)
     counts: RwLock<FxHashMap<u64, u64>>,
+    /// whether a count could not be read from the index, and [`UNCOUNTED`] stood for it
+    uncounted: std::sync::atomic::AtomicBool,
     scans: AtomicU64,
     /// the remembered lookups of a kept closure
     lookups: Option<Lookups>,
@@ -247,6 +261,7 @@ impl Base {
             sorted,
             len: n as u32,
             counts: RwLock::new(FxHashMap::default()),
+            uncounted: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             lookups: None,
         })
@@ -331,6 +346,27 @@ impl Base {
 
     /// The permutation and the key range of a pattern.
     fn access(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> (Perm, Key, Key) {
+        let (perm, prefix, n) = self.prefix(s, p, o);
+        (perm, pad(&prefix[..n], 0), pad(&prefix[..n], u64::MAX))
+    }
+
+    /// The store's quads in the key range of a pattern: an upper bound of the tier's
+    /// facts that match it, as [`count_p`](Self::count_p) is of a predicate's, since a
+    /// pattern without a subject counts the quads of every graph and a pattern with a
+    /// subject and an object but no predicate counts the subject's. [`UNCOUNTED`] when
+    /// the index cannot be read.
+    pub fn count(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> u64 {
+        let (perm, prefix, n) = self.prefix(s, p, o);
+        if let (1, Some(p)) = (n, p) {
+            return self.count_p(p);
+        }
+        self.snap
+            .count(perm, &prefix[..n])
+            .unwrap_or_else(|_| self.no_count())
+    }
+
+    /// The permutation and the key prefix of a pattern.
+    fn prefix(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> (Perm, [u64; 4], usize) {
         let (perm, prefix, n): (Perm, [u64; 4], usize) = match (self.single(), s, p, o) {
             (Some(g), Some(s), Some(p), Some(o)) => (Perm::Gspo, [g, s, p, o], 4),
             (Some(g), Some(s), Some(p), None) => (Perm::Gspo, [g, s, p, 0], 3),
@@ -344,7 +380,7 @@ impl Base {
             (_, None, None, Some(o)) => (Perm::Osp, [o, 0, 0, 0], 1),
             (_, None, None, None) => (Perm::Spo, [0; 4], 0),
         };
-        (perm, pad(&prefix[..n], 0), pad(&prefix[..n], u64::MAX))
+        (perm, prefix, n)
     }
 
     /// Visit the facts matching a pattern, in the order of the module documentation.
@@ -438,7 +474,7 @@ impl Base {
     ) -> anyhow::Result<bool> {
         let (perm, lo, hi) = self.access(s, p, o);
         for pass in 0..self.passes() {
-            if !self.scan(memo, perm, lo, hi, [s, p, o], Some(pass), &mut f)? {
+            if !self.scan(memo, perm, lo, hi, [s, p, o], Some(pass), None, &mut f)? {
                 return Ok(false);
             }
         }
@@ -474,7 +510,7 @@ impl Base {
             return Ok(!few.is_empty());
         }
         let (perm, lo, hi) = self.access(s, p, o);
-        Ok(!self.scan(memo, perm, lo, hi, [s, p, o], None, |_| false)?)
+        Ok(!self.scan(memo, perm, lo, hi, [s, p, o], None, None, |_| false)?)
     }
 
     /// [`for_each`](Self::for_each) over one share of a pattern's scan.
@@ -487,7 +523,7 @@ impl Base {
         o: Option<u64>,
         f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
-        self.scan(memo, r.perm, r.lo, r.hi, [s, p, o], Some(r.pass), f)
+        self.scan(memo, r.perm, r.lo, r.hi, [s, p, o], Some(r.pass), None, f)
     }
 
     /// Scan `[lo, hi]` of `perm`. With several input graphs, pass `Some(i)` emits the
@@ -502,9 +538,13 @@ impl Base {
         hi: Key,
         bound: [Option<u64>; 3],
         pass: Option<usize>,
+        allow: Option<u64>,
         mut f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         memo.scans += 1;
+        // the rows entered so far, and whether the allowance ended the scan
+        let allow = allow.unwrap_or(u64::MAX);
+        let (mut entered, mut cut) = (0u64, false);
         let at = positions(perm);
         let single = self.single();
         // a graph column outside the key prefix needs a check
@@ -568,45 +608,64 @@ impl Base {
         let snap = &*self.snap;
         if touched(snap, perm, &lo, &hi) {
             snap.scan_between(perm, lo, hi, |c| {
+                if entered >= allow {
+                    cut = true;
+                    return Ok(false);
+                }
                 Ok(match c {
                     Chunk::Block(b, s, e) => {
+                        entered += (e - s) as u64;
                         let cols = &b.cols;
                         (s..e)
                             .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], &mut f))
                     }
-                    Chunk::Row(k) => row(k, &mut f),
+                    Chunk::Row(k) => {
+                        entered += 1;
+                        row(k, &mut f)
+                    }
                 })
             })?;
         } else {
             let idx = snap.perm(perm);
             let (b0, b1) = idx.key_block_range(&lo, &hi);
-            let mut rows_of = |blk: &Block, whole: bool, f: &mut dyn FnMut(Triple) -> bool| {
-                let (s, e) = if whole {
-                    (0, blk.len())
-                } else {
-                    blk.key_range(&lo, &hi)
+            let mut rows_of =
+                |blk: &Block, whole: bool, entered: &mut u64, f: &mut dyn FnMut(Triple) -> bool| {
+                    let (s, e) = if whole {
+                        (0, blk.len())
+                    } else {
+                        blk.key_range(&lo, &hi)
+                    };
+                    *entered += (e - s) as u64;
+                    let cols = &blk.cols;
+                    (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f))
                 };
-                let cols = &blk.cols;
-                (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f))
-            };
             'blocks: for b in b0..b1 {
+                if entered >= allow {
+                    cut = true;
+                    break;
+                }
                 let m = &idx.blocks[b];
                 let whole = m.first >= lo && m.last <= hi;
                 if whole {
-                    if !rows_of(memo.block(snap, idx, b)?, true, &mut f) {
+                    if !rows_of(memo.block(snap, idx, b)?, true, &mut entered, &mut f) {
                         break;
                     }
                     continue;
                 }
                 match memo.rows(snap, idx, b, &lo, &hi)? {
                     Rows::Whole(blk) => {
-                        if !rows_of(blk, false, &mut f) {
+                        if !rows_of(blk, false, &mut entered, &mut f) {
                             break;
                         }
                     }
                     Rows::Segments(s0, s1) => {
                         for s in s0..s1 {
-                            if !rows_of(memo.segment(snap, idx, b, s)?, false, &mut f) {
+                            if entered >= allow {
+                                cut = true;
+                                break 'blocks;
+                            }
+                            let blk = memo.segment(snap, idx, b, s)?;
+                            if !rows_of(blk, false, &mut entered, &mut f) {
                                 break 'blocks;
                             }
                         }
@@ -614,7 +673,11 @@ impl Base {
                 }
             }
         }
-        Ok(completed && last(cur, &mut f))
+        #[cfg(test)]
+        {
+            memo.rows += entered;
+        }
+        Ok(!cut && completed && last(cur, &mut f))
     }
 
     /// The number of blocks the scan of a pattern reads, without reading any.
@@ -714,6 +777,65 @@ impl Base {
             );
         }
         Ok(out)
+    }
+
+    /// Offers `f` facts that match a pattern until it has taken `n`, for a sample of the
+    /// pattern's facts: runs of facts from the starts of up to `starts` blocks of the
+    /// pattern's scan at evenly spaced positions, so that the facts of a long scan come
+    /// from along its length without a read of the blocks between them. `f` returns
+    /// whether it took the fact. A start reads no further than the end of its own block,
+    /// and it stops at the block, the segment or the row of the snapshot's delta that
+    /// takes it past [`SAMPLE_ROWS`] rows, whatever share of the rows belongs to other
+    /// graphs or fails the pattern. The allowance counts what the scan delivers. A scan
+    /// that merges the delta decodes its next block or segment before it learns that
+    /// the allowance is spent, and it consumes rows the delta deletes without
+    /// delivering them, so such a start can decode more than it reads, up to the end of
+    /// its block. A start also gives up after a few facts that `f` does not take. Returns whether the sample read every fact of the pattern, which
+    /// one start does when its scan runs to the end of the pattern's range.
+    pub fn sample(
+        &self,
+        memo: &mut Memo,
+        [s, p, o]: [Option<u64>; 3],
+        n: usize,
+        starts: usize,
+        mut f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        if n == 0 {
+            return Ok(false);
+        }
+        let (perm, lo, hi) = self.access(s, p, o);
+        let idx = self.snap.perm(perm);
+        let (b0, b1) = idx.key_block_range(&lo, &hi);
+        let starts = (b1 - b0).clamp(1, starts.clamp(1, n));
+        let mut taken = 0usize;
+        let mut whole = false;
+        for k in 0..starts {
+            let b = b0 + k * (b1 - b0) / starts;
+            // the first key of the block. With several input graphs it can lie among the
+            // rows of one triple, which is then offered if a graph from there on holds it.
+            let from = if k == 0 { lo } else { idx.blocks[b].first };
+            // the last key of the block, or of the scan in its last block
+            let to = if b + 1 < b1 {
+                idx.blocks[b].last.min(hi)
+            } else {
+                hi
+            };
+            // what is left, over the starts that are left
+            let quota = (n - taken).div_ceil(starts - k);
+            let (mut got, mut offered) = (0usize, 0usize);
+            let rows = Some(SAMPLE_ROWS);
+            let ended = self.scan(memo, perm, from.max(lo), to, [s, p, o], None, rows, |t| {
+                offered += 1;
+                got += usize::from(f(t));
+                got < quota && offered < 4 * quota + 8
+            })?;
+            whole = ended && k == 0 && to == hi;
+            taken += got;
+            if taken >= n {
+                break;
+            }
+        }
+        Ok(whole)
     }
 
     /// Whether a triple is a fact of the tier.
@@ -903,7 +1025,21 @@ impl Base {
         self.snap.count(Perm::Pos, &[p, o]).map_or(true, |n| n > 0)
     }
 
+    /// [`UNCOUNTED`], for a count the index could not give, which is remembered.
+    fn no_count(&self) -> u64 {
+        self.uncounted.store(true, Ordering::Relaxed);
+        UNCOUNTED
+    }
+
+    /// Whether a count of this tier could not be read from the index so far, so that
+    /// an estimate may rest on [`UNCOUNTED`]. The greedy planner takes such an estimate
+    /// as it is, and the sampled planner keeps the greedy order.
+    pub fn uncounted(&self) -> bool {
+        self.uncounted.load(Ordering::Relaxed)
+    }
+
     /// Quads with predicate `p` in the store: an upper bound of the tier's facts.
+    /// [`UNCOUNTED`] when the index cannot be read.
     pub fn count_p(&self, p: u64) -> u64 {
         if let Some(n) = self.counts.read().get(&p) {
             return *n;
@@ -912,7 +1048,10 @@ impl Base {
         // ends of the predicate's range
         let n = match self.snap.predicate_count(Perm::Pso, &[p]) {
             Some(n) => n,
-            None => self.snap.count(Perm::Pso, &[p]).unwrap_or(u64::MAX / 4),
+            None => self
+                .snap
+                .count(Perm::Pso, &[p])
+                .unwrap_or_else(|_| self.no_count()),
         };
         self.counts.write().insert(p, n);
         n
@@ -937,10 +1076,221 @@ mod tests {
     use sparkles_core::io::{RdfFormat, Source};
     use sparkles_core::store::{Store, StoreOptions};
 
-    /// Reads of a few rows of a segmented generation decode segments, and give the facts
-    /// a scan of whole blocks gives, in the same order: every pattern of bound positions,
-    /// a probe of a fact and of a triple the tier may lack, with and without remembered
-    /// lookups.
+    /// A pattern's count is the number of its facts with one input graph, and a sample
+    /// of a scan that spans several blocks takes matching facts from along it.
+    #[test]
+    fn counts_and_samples_of_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        let mut nt = String::new();
+        for i in 0..600_000u64 {
+            nt.push_str(&format!(
+                "<urn:s{}> <urn:p{}> <urn:o{}> .\n",
+                i / 3,
+                i % 3,
+                i % 500
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let id = |iri: &str| snap.lookup_iri(iri).unwrap().0;
+        let (s, p, o) = (id("urn:s7"), id("urn:p1"), id("urn:o22"));
+        let base = Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+        let facts = |s, p, o| {
+            let mut out = Vec::new();
+            base.for_each(s, p, o, |t| {
+                out.push(t);
+                true
+            })
+            .unwrap();
+            out
+        };
+        for pattern in [
+            (Some(s), Some(p), None),
+            (None, Some(p), Some(o)),
+            (None, Some(p), None),
+            (Some(s), None, None),
+            (None, None, None),
+            (Some(s), Some(p), Some(o)),
+        ] {
+            let (s, p, o) = pattern;
+            assert_eq!(
+                base.count(s, p, o),
+                facts(s, p, o).len() as u64,
+                "{pattern:?}"
+            );
+        }
+        // a relation of several blocks: eight facts from four places, not its first eight
+        let relation = facts(None, Some(p), None);
+        assert!(
+            base.blocks(None, Some(p), None) >= 4,
+            "{}",
+            base.blocks(None, Some(p), None)
+        );
+        let mut memo = Memo::default();
+        let mut got = Vec::new();
+        let whole = base
+            .sample(&mut memo, [None, Some(p), None], 8, 4, |t| {
+                got.push(t);
+                true
+            })
+            .unwrap();
+        assert!(!whole);
+        assert_eq!(got.len(), 8);
+        assert!(got.iter().all(|t| t[1] == p && relation.contains(t)));
+        let mut distinct = got.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 8);
+        assert_ne!(got, relation[..8]);
+        assert_eq!(got[..2], relation[..2]);
+        // a probe within one block: its facts, and no more than asked for
+        let mut few = Vec::new();
+        let whole = base
+            .sample(&mut memo, [Some(s), None, None], 2, 4, |t| {
+                few.push(t);
+                true
+            })
+            .unwrap();
+        assert_eq!(few, facts(Some(s), None, None)[..2]);
+        // it stopped at the two it was asked for, and a sample that reads to the end of
+        // a scan within one block says that it read every fact
+        assert!(!whole);
+        let mut all = Vec::new();
+        let whole = base
+            .sample(&mut memo, [Some(s), None, None], 100, 4, |t| {
+                all.push(t);
+                true
+            })
+            .unwrap();
+        assert!(whole);
+        assert_eq!(all, facts(Some(s), None, None));
+        // facts the caller does not take do not count, and a start gives up after a few
+        let mut offered = 0;
+        base.sample(&mut memo, [None, Some(p), None], 8, 4, |_| {
+            offered += 1;
+            false
+        })
+        .unwrap();
+        assert!((1..=4 * (4 * 8 + 8)).contains(&offered), "{offered}");
+    }
+
+    /// A sample does not read a relation through, whatever share of its rows belongs to
+    /// graphs that are not read: the rows its starts enter are within the allowance and
+    /// one block for each start. Two input graphs hold a few facts of a predicate and a
+    /// third graph, which is not an input, holds 400,000. The count is of rows entered
+    /// in all, not of blocks decoded by each start.
+    #[test]
+    fn a_sample_reads_one_block_per_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        let mut nq = String::new();
+        for i in 0..400_000u64 {
+            nq.push_str(&format!(
+                "<urn:s{i}> <urn:p> <urn:o{}> <urn:other> .\n",
+                i % 7
+            ));
+        }
+        for i in 0..6u64 {
+            nq.push_str(&format!(
+                "<urn:s{}> <urn:p> <urn:x> <urn:g{}> .\n",
+                i * 60_000,
+                i % 2
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let snap = store.snapshot();
+        let id = |iri: &str| snap.lookup_iri(iri).unwrap();
+        let p = id("urn:p").0;
+        let base = Base::new(snap.clone(), &[id("urn:g0"), id("urn:g1")]).unwrap();
+        let blocks = base.blocks(None, Some(p), None);
+        assert!(blocks >= 4, "{blocks}");
+        let mut every = Vec::new();
+        base.for_each(None, Some(p), None, |t| {
+            every.push(t);
+            true
+        })
+        .unwrap();
+        assert_eq!(every.len(), 6);
+        for starts in [1, 2] {
+            let mut memo = Memo::default();
+            let mut got = Vec::new();
+            let whole = base
+                .sample(&mut memo, [None, Some(p), None], 8, starts, |t| {
+                    got.push(t);
+                    true
+                })
+                .unwrap();
+            assert!(!whole);
+            assert!(got.iter().all(|t| every.contains(t)), "{got:?}");
+            // each start stops with the block that takes it past its allowance, among
+            // the predicate's blocks, which hold the 400,006 rows of every graph
+            let most = starts as u64 * (SAMPLE_ROWS + sparkles_core::index::BLOCK_ROWS as u64);
+            assert!(memo.rows > 0 && memo.rows <= most, "{}", memo.rows);
+        }
+    }
+
+    /// The rows of a snapshot's delta are read within the allowance too: 60,000 quads of
+    /// a graph that is not read, inserted in one commit and held in no block. A delta
+    /// over blocks or segments, and deleted rows, are not covered here.
+    #[test]
+    fn a_sample_of_a_delta_stops_at_its_allowance() {
+        let store = Store::in_memory(StoreOptions::default());
+        let iri = |s: String| oxrdf::NamedNode::new_unchecked(s);
+        let quad = |i: u64, g: &str| {
+            oxrdf::Quad::new(
+                iri(format!("urn:s{i}")),
+                iri("urn:p".into()),
+                iri(format!("urn:o{}", i % 7)),
+                oxrdf::GraphName::NamedNode(iri(g.into())),
+            )
+        };
+        let mut txn = store.write();
+        let mut labels = Default::default();
+        for i in 0..60_000u64 {
+            let q = txn.encode_quad(&quad(i, "urn:other"), &mut labels).unwrap();
+            txn.insert(q).unwrap();
+        }
+        for i in 0..6u64 {
+            let g = format!("urn:g{}", i % 2);
+            let q = txn.encode_quad(&quad(i * 9_000, &g), &mut labels).unwrap();
+            txn.insert(q).unwrap();
+        }
+        txn.commit().unwrap();
+        let snap = store.snapshot();
+        let id = |iri: &str| snap.lookup_iri(iri).unwrap();
+        let p = id("urn:p").0;
+        let base = Base::new(snap.clone(), &[id("urn:g0"), id("urn:g1")]).unwrap();
+        assert_eq!(
+            base.blocks(None, Some(p), None),
+            0,
+            "the quads are in a block"
+        );
+        let mut memo = Memo::default();
+        let mut got = Vec::new();
+        let whole = base
+            .sample(&mut memo, [None, Some(p), None], 8, 4, |t| {
+                got.push(t);
+                true
+            })
+            .unwrap();
+        assert!(!whole);
+        assert!(got.len() < 6, "{got:?}");
+        assert!(
+            memo.rows >= SAMPLE_ROWS && memo.rows <= SAMPLE_ROWS + 1,
+            "{}",
+            memo.rows
+        );
+    }
+
     #[test]
     fn segment_reads_match_whole_blocks() {
         let dir = tempfile::tempdir().unwrap();

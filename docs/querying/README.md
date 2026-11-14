@@ -154,15 +154,39 @@ check them against the W3C suites and Jena's own answers.
   on its own when it binds a variable that a FILTER inside the pattern reads and the
   pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
   as IF or OR, is evaluated once per distinct outer key.
-* Eager ASK execution can visit a pure UNION branch with lower estimated work before
-  its first answer. On an unchanged snapshot without a total produced-row cap, a
-  bounded whitelist of the whole ASK lets pure input operators request only the rows
-  the limit needs. Expression calls, EXISTS and external effects retain their ordinary
-  order and demand policy. Reordering also requires conservative output bounds that fit its
-  row and memory budgets. Joins through index probes retain their order because their
-  duplicate-key fanout lacks such a bound. A retrying operator retains the ordinary
-  prefix when its input would restart a full join build and conservative bounds prove
-  that the larger request fits its row and memory limits. Explicit streaming keeps its policy.
+* An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
+  every execution mode, so each operator reads its inputs a batch at a time and stops
+  once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
+  scan or a table of values reads the rows directly. The planner runs a small input whole instead, as a SELECT
+  does, when exact index counts show that none of its operators gives more rows than a
+  cursor batch of 4,096, it evaluates no FILTER, BIND or keyed join condition, the
+  query has no budget of produced rows and its estimated cost past the first rows is below what building the
+  cursor operators costs, which is about eight microseconds. A whole run that a row or
+  memory budget refuses pulls the input instead. Automatic execution then
+  keeps such an ASK eager, and an EXISTS pattern evaluated per row runs whole by the same
+  test. A UNION under such a LIMIT, or under an ASK, reads its branch
+  with the lowest estimated cost to the first rows first, unless a branch evaluates an
+  EXISTS, an extension or application function, RAND, UUID or BNODE, or holds an
+  operator such as SERVICE whose effects could observe the order. An ASK or a `LIMIT 1`
+  over a keyed join reads both inputs a few rows at a time, and over a product it streams
+  the larger input against the smaller one, which it holds. A FILTER without effects
+  whose rows do not pass asks its input for four times as many rows each time, up to
+  eight cursor batches, when the query has no budget of produced rows. It evaluates its
+  condition on rows past the first solutions, so a memory budget that one of those rows
+  exceeds refuses the query, and the `grow_input` optimization switch turns this
+  read-ahead off. Pulled first rows still cost more than the eager path in some shapes,
+  such as a `LIMIT 10` over a join of two 3,000-row patterns at about 1.17 times, which
+  [roadmap item 952](../ROADMAP.md) follows up.
+* A LIMIT over an inner hash join builds the hash index of one whole input before its
+  first row, so a `LIMIT 1` over the join of two inputs of 65,537 rows needs about 7 MB.
+  A join that reads both inputs a few rows at a time for a small LIMIT is
+  [roadmap item 947](../ROADMAP.md). A pulled LIMIT charges its operators' batches to the
+  query's memory ledger, as a streaming query does, and each charge takes the ledger's
+  lock. A small LIMIT over a join takes 50 to 100 of them.
+* A query has one plan whatever its execution mode, which EXPLAIN shows. A DISTINCT over
+  an ORDER BY deduplicates below the sort in every mode when the query may spill, and
+  `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in every
+  mode.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](../internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
@@ -181,9 +205,8 @@ check them against the W3C suites and Jena's own answers.
 * Queries can run eagerly or as streaming cursors
   ([X05](../specs/X05-streaming-query-execution.md)). Automatic execution, the default over
   HTTP, in the CLI, in Node and in the JVM library, streams scans expected to return at
-  least a thousand rows, groupings of an estimated 20,000 input rows or more, and bounded
-  ASK products whose eager candidates would exceed a budget, and large equality-keyed
-  ASK joins. Other plans run eagerly, and
+  least a thousand rows, groupings of an estimated 20,000 input rows or more and every
+  ASK without initial bindings. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice. Both modes join
   through the same hash, keyed and merge kernels, so an OPTIONAL without a condition over
   two inputs sorted on their shared variable merges in both when `merge_left_join` is on

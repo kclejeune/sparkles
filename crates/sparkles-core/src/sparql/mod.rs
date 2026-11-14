@@ -11,6 +11,7 @@ pub mod charsets;
 mod constkeys;
 pub mod ctx;
 pub mod cursor;
+mod demand;
 pub mod depth;
 pub mod describe;
 pub mod enhancer;
@@ -1348,8 +1349,13 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
 
 fn is_select_star(q: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap())
-        .is_match(q)
+    // the expression needs a `*`, which most small queries do not have
+    q.contains('*')
+        && RE
+            .get_or_init(|| {
+                regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap()
+            })
+            .is_match(q)
 }
 
 fn select_star_columns_checked(
@@ -1441,11 +1447,17 @@ struct PreparedQuery {
 /// graph in the default graph and without RDFS on read (spec F17 §2.1, §4.4), and whether
 /// RDFS on read was set and does not apply.
 fn demand_options(opts: &QueryOptions) -> (Option<QueryOptions>, bool) {
-    if opts.reasoning.is_none() {
+    let Some(provider) = &opts.reasoning else {
         return (None, false);
-    }
+    };
+    // under `auto`, the inferred graph stays until the session finds that the
+    // materialization cannot answer (`reasoning::apply`)
     let o = QueryOptions {
-        default_graph_extra: Vec::new(),
+        default_graph_extra: if provider.auto() {
+            opts.default_graph_extra.clone()
+        } else {
+            Vec::new()
+        },
         rdfs: None,
         ..opts.clone()
     };
@@ -1648,7 +1660,7 @@ fn execute_prepared_parts(
 ) -> std::result::Result<ResultParts, Box<Failed>> {
     let PreparedQuery {
         ctx,
-        mut node,
+        node,
         pattern,
         bound,
         kind,
@@ -1676,9 +1688,6 @@ fn execute_prepared_parts(
         _ => None,
     };
     let t2 = Instant::now();
-    if kind == QueryKind::Ask {
-        unionpush::order_ask(&ctx, &mut node);
-    }
     // the plan of a failed query as far as it ran, under the root of a graph query
     let failed = |error: Error, plan: Option<PlanInfo>, stage: Option<Instant>| {
         let mut plan = plan.or_else(|| ctx.failed_plan());

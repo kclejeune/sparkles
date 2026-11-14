@@ -6,6 +6,7 @@ import json
 
 import pytest
 from sparkles import (
+    BudgetExceededError,
     CancelledError,
     CancelToken,
     ConflictError,
@@ -140,3 +141,144 @@ def test_cursor_serialization_to_a_bad_path_fails_the_cursor(tmp_path):
             next(cursor)
         cursor.close()
         assert cursor.status == "failed"
+
+
+def _numbers(n):
+    return " ".join(f"<urn:s{i}> <urn:p> {i} ." for i in range(n))
+
+
+def test_cursor_rows_decoded_ahead_count_when_handed_out():
+    ds = Dataset()
+    ds.load(_numbers(1000), "ttl")
+    q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }"
+    expected = sorted(tuple(map(str, row)) for row in ds.select(q))
+    # one batch holds every row, and a refill decodes 256 of them at a time
+    cursor = ds.select_cursor(q)
+    rows = [next(cursor) for _ in range(3)]
+    assert cursor.stats()["emittedRows"] == 3
+    assert cursor.status == "open"
+    rows += list(cursor)
+    assert sorted(tuple(map(str, row)) for row in rows) == expected
+    assert cursor.status == "complete"
+    assert cursor.stats()["emittedRows"] == 1000
+
+    # rows decoded ahead are pending rows: closing before they are read stops the cursor
+    cursor = ds.select_cursor(q)
+    next(cursor)
+    assert cursor.status == "open"
+    cursor.close()
+    assert cursor.status == "stopped"
+    assert cursor.stats()["emittedRows"] == 1
+    assert list(cursor) == []
+
+    # the async bridge takes what a sync read left decoded, then the rest of the batch
+    cursor = ds.select_cursor(q)
+    first = next(cursor)
+    rest = cursor._next_batch()
+    assert len(rest) == 999
+    assert cursor.stats()["emittedRows"] == 1000
+    assert sorted(tuple(map(str, row)) for row in [first, *rest]) == expected
+    assert cursor._next_batch() is None
+
+    quads = ds.graph_cursor("CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }")
+    assert next(quads) is not None
+    assert quads.stats()["emittedRows"] == 1
+    assert len(list(quads)) == 999
+    assert quads.stats()["emittedRows"] == 1000
+
+
+def test_cursor_decoding_ahead_raises_a_budget_error_at_its_row():
+    # a budget of one mebibyte cannot hold the decoded form of this literal
+    big = f' <urn:z> <urn:p> "{"x" * 4_000_000}" .'
+    q = "SELECT ?o WHERE { ?s <urn:p> ?o }"
+    # when the long literal is the first row, that row fails and nothing is handed out
+    ds = Dataset()
+    ds.load(big, "ttl")
+    cursor = ds.select_cursor(q, max_memory_bytes=1 << 20)
+    with pytest.raises(BudgetExceededError):
+        next(cursor)
+    assert cursor.status == "failed"
+    assert cursor.stats()["emittedRows"] == 0
+    # with rows before the literal in the batch, they are handed out before the error
+    ds = Dataset()
+    ds.load(_numbers(40) + big, "ttl")
+    at = [len(str(row[0])) > 1000 for row in ds.select_cursor(q)].index(True)
+    assert at > 0
+    cursor = ds.select_cursor(q, max_memory_bytes=1 << 20)
+    rows = []
+    with pytest.raises(BudgetExceededError):
+        for row in cursor:
+            rows.append(row)
+            assert cursor.status == "open"
+    assert len(rows) == at
+    assert cursor.status == "failed"
+    assert cursor.stats()["emittedRows"] == at
+
+
+def test_cursor_decoding_ahead_counts_datatypes_and_triple_terms():
+    ds = Dataset()
+    datatype = "urn:dt:" + "d" * 65_536
+    data = " ".join(f'<urn:s{i}> <urn:p> "x"^^<{datatype}> .' for i in range(300))
+    data += " ".join(f" <urn:t{i}> <urn:q> <<( <urn:a{i}> <urn:b> <urn:c> )>> ." for i in range(300))
+    ds.load(data, "ttl")
+    for q in (
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+        "SELECT ?s ?o WHERE { ?s <urn:q> ?o }",
+    ):
+        expected = sorted(tuple(map(str, row)) for row in ds.select(q))
+        assert len(expected) == 300
+        # a refill stops at one mebibyte of owned text, which 16 of the typed rows fill
+        cursor = ds.select_cursor(q)
+        assert sorted(tuple(map(str, row)) for row in cursor) == expected
+        assert cursor.stats()["emittedRows"] == 300
+    quads = ds.graph_cursor("CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:p> ?o }")
+    assert len(list(quads)) == 300
+
+
+def _ahead_after_first(cursor):
+    """The rows a cursor holds decoded ahead once its first row is handed out."""
+    next(cursor)
+    ahead = cursor._rows_ahead()
+    cursor.close()
+    return ahead
+
+
+def test_cursor_read_ahead_stops_at_a_mebibyte_of_owned_text():
+    """A refill decodes up to 255 rows ahead and stops near one mebibyte of the text those
+    rows own. The count takes in a literal's datatype, the parts of a triple term and
+    every field of a quad, so rows of 64 KiB each stop a refill after about 16 of them."""
+    ds = Dataset()
+    long = "x" * 65_536
+    rows = range(300)
+    data = " ".join(f'<urn:s{i}> <urn:short> "x" .' for i in rows)
+    # the long text is a datatype, each part of a triple term, and each field of a quad
+    data += " ".join(f' <urn:s{i}> <urn:datatype> "x"^^<urn:dt:{long}> .' for i in rows)
+    data += " ".join(f" <urn:s{i}> <urn:nested-s> <<( <urn:{long}> <urn:b> <urn:c> )>> ." for i in rows)
+    data += " ".join(f" <urn:s{i}> <urn:nested-p> <<( <urn:a> <urn:{long}> <urn:c> )>> ." for i in rows)
+    data += " ".join(f' <urn:s{i}> <urn:nested-o> <<( <urn:a> <urn:b> "x"^^<urn:dt:{long}> )>> .' for i in rows)
+    ds.load(data, "ttl")
+    # short rows fill a refill to its row limit
+    assert _ahead_after_first(ds.select_cursor("SELECT ?o WHERE { ?s <urn:short> ?o }")) == 255
+    assert (
+        _ahead_after_first(ds.graph_cursor("CONSTRUCT { ?s <urn:short> ?o } WHERE { ?s <urn:short> ?o }"))
+        == 255
+    )
+    # 64 KiB of text in each row stops it after a mebibyte and one row
+    for predicate in ("datatype", "nested-s", "nested-p", "nested-o"):
+        q = f"SELECT ?o WHERE {{ ?s <urn:{predicate}> ?o }}"
+        ahead = _ahead_after_first(ds.select_cursor(q))
+        assert 10 <= ahead <= 17, (predicate, ahead)
+    # a quad's subject, predicate and object each count, and so does its graph name
+    templates = (
+        f"?s <urn:{long}> ?o",
+        f"<urn:{long}> <urn:p> ?s",
+        f"?s <urn:p> <urn:{long}>",
+        f"GRAPH <urn:{long}> {{ ?s <urn:p> ?o }}",
+    )
+    for template in templates:
+        q = f"CONSTRUCT {{ {template} }} WHERE {{ ?s <urn:short> ?o }}"
+        ahead = _ahead_after_first(ds.graph_cursor(q))
+        assert 10 <= ahead <= 17, (template[:40], ahead)
+    # two long fields in each quad halve the rows a refill holds
+    q = f"CONSTRUCT {{ <urn:{long}> <urn:{long}> ?s }} WHERE {{ ?s <urn:short> ?o }}"
+    assert 5 <= _ahead_after_first(ds.graph_cursor(q)) <= 9

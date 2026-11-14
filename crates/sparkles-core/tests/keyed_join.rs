@@ -291,7 +291,9 @@ fn keyed_join_answers_ask_in_a_cursor_and_eagerly() {
 
 #[test]
 fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
-    for (left, right) in [(1, 2048), (2048, 1)] {
+    // two inputs within a cursor batch whose held input exceeds the row limit still
+    // read both a few rows at a time (review round 5)
+    for (left, right) in [(1, 2048), (2048, 1), (2048, 2048)] {
         let store = Store::in_memory(StoreOptions::default());
         let mut data = String::new();
         for (rows, predicate) in [(left, "left"), (right, "right")] {
@@ -313,7 +315,11 @@ fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
             ExecutionMode::Auto,
         )
         .unwrap();
-        assert!(matches!(auto, QueryExecution::Eager(_)));
+        // every ASK pulls through the cursor under automatic execution (item 827)
+        let QueryExecution::Ask(auto) = auto else {
+            panic!("automatic execution streams every ASK")
+        };
+        assert!(auto.result().boolean);
         let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
         assert_eq!(query(store.snapshot(), &select, &opts).unwrap().len(), 1);
     }
@@ -666,4 +672,65 @@ fn forced_ask_probes_preserve_a_bounded_hash_cursor_for_repeated_keys() {
             }
         }
     }
+}
+
+/// A keyed ASK answers from the first rows of its inputs although keying a large literal
+/// at the end of an input needs more scratch than the memory budget allows (review
+/// round 6).
+#[test]
+fn keyed_ask_answers_when_keying_the_held_input_would_exceed_its_budget() {
+    let store = Store::in_memory(StoreOptions::default());
+    let large = "z".repeat(1 << 20);
+    let mut data = String::new();
+    for side in ["left", "right"] {
+        data += &format!("<urn:{side}-first> <urn:{side}> \"a\" .\n");
+        for i in 1..2047 {
+            data += &format!("<urn:{side}{i}> <urn:{side}> \"x-{side}-{i:05}\" .\n");
+        }
+        data += &format!("<urn:{side}~last> <urn:{side}> \"{large}{side}\" .\n");
+    }
+    load(&store, data);
+    store.compact().unwrap();
+    let text = "ASK { ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y) }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(512 << 10),
+        ..options(4096, true)
+    };
+    let eager = query(store.snapshot(), text, &opts).unwrap();
+    assert!(eager.boolean);
+    let auto = query_execution(
+        store.snapshot(),
+        text,
+        &opts,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Ask(auto) = auto else {
+        panic!("automatic execution streams every ASK")
+    };
+    assert!(auto.result().boolean);
+    let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
+    assert_eq!(query(store.snapshot(), &select, &opts).unwrap().len(), 1);
+}
+
+/// Once one input of a keyed ASK has ended, the other input's rows are keyed as the
+/// probe reaches them, so a long literal after the first matching row is never keyed
+/// (review round 8).
+#[test]
+fn a_probe_only_batch_keys_no_row_past_the_first_match() {
+    let store = Store::in_memory(StoreOptions::default());
+    let large = "z".repeat(1 << 20);
+    let data = format!(
+        "<urn:left-first> <urn:left> \"a\" .\n<urn:left~last> <urn:left> \"{large}\" .\n\
+         <urn:right-only> <urn:right> \"a\" .\n"
+    );
+    load(&store, data);
+    store.compact().unwrap();
+    let text = "ASK { ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y) }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(512 << 10),
+        ..options(4096, true)
+    };
+    assert!(query(store.snapshot(), text, &opts).unwrap().boolean);
 }

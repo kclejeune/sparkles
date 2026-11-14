@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Dataset, factory as f } from '../dist/index.js';
 
 const n = (s) => f.namedNode(`urn:x:${s}`);
@@ -196,4 +199,175 @@ test('quad positions reject incompatible terms after those terms were cached', a
       assert.equal(await ds.has(valid), true);
     }
   }
+});
+
+/** Quads that are there and quads that are not, for a dataset that holds `stored`. */
+function probes(stored) {
+  const out = [];
+  for (const s of stored) {
+    out.push(s);
+    out.push(q(n('unknown'), s.predicate, s.object, s.graph));
+    out.push(q(s.subject, n('unknown'), s.object, s.graph));
+    out.push(q(s.subject, s.predicate, n('unknown'), s.graph));
+    out.push(q(s.subject, s.predicate, s.object, n('unknown')));
+    out.push(
+      q(
+        s.subject,
+        s.predicate,
+        s.object,
+        s.graph.termType === 'DefaultGraph' ? n('g') : f.defaultGraph(),
+      ),
+    );
+    out.push(s);
+  }
+  return out;
+}
+
+async function fillForProbes(ds) {
+  const objects = [
+    f.literal('plain'),
+    f.literal('chat', 'fr'),
+    f.literal('42', f.namedNode('http://www.w3.org/2001/XMLSchema#integer')),
+    n('iri-object'),
+    f.quad(n('a'), n('b'), n('c')),
+  ];
+  await ds.transaction(async (tx) => {
+    for (const [i, o] of objects.entries()) {
+      await tx.add(q(n(`s${i}`), n('p'), o));
+      await tx.add(q(n(`s${i}`), n('q'), o, n('g')));
+      await tx.add(q(f.blankNode(`b${i}`), n('p'), o, n('h')));
+    }
+  });
+  return ds.match().toArray();
+}
+
+async function assertHasAllMatchesHas(ds, quads, label) {
+  const one = [];
+  for (const quad of quads) one.push(await ds.has(quad));
+  assert.deepEqual(await ds.hasAll(quads), one, label);
+  return one;
+}
+
+test('hasAll answers each quad as has does, in batches short and long', async () => {
+  for (const options of [{}, { unionDefaultGraph: true }]) {
+    const ds = Dataset.memory(options);
+    const stored = await fillForProbes(ds);
+    assert.equal(stored.length, 15);
+    const short = probes(stored);
+    const label = JSON.stringify(options);
+    const answers = await assertHasAllMatchesHas(ds, short, label);
+    // Where the default graph is the union of the named graphs, a quad of the default
+    // graph is not read and a quad of a named graph is also found in the default graph.
+    assert.equal(answers.filter(Boolean).length, 30, label);
+    assert.equal(answers.length, 105);
+    // a batch too long for the calling thread is answered on the pool
+    const long = Array.from({ length: 12 }, () => short).flat();
+    assert.deepEqual(
+      await ds.hasAll(long),
+      Array.from({ length: 12 }, () => answers).flat(),
+      label,
+    );
+    // every length around a word of the answer's bit array
+    for (const length of [1, 2, 31, 32, 33, 63, 64, 65])
+      assert.deepEqual(
+        await ds.hasAll(short.slice(0, length)),
+        answers.slice(0, length),
+        `${length}`,
+      );
+    // any iterable is read, and an empty one gives an empty answer
+    const each = [];
+    for (const quad of stored) each.push(await ds.has(quad));
+    assert.deepEqual(await ds.hasAll(new Set(stored)), each);
+    assert.equal(each.filter(Boolean).length, options.unionDefaultGraph ? 10 : 15, label);
+    assert.deepEqual(
+      await ds.hasAll(
+        (function* () {
+          yield* short;
+        })(),
+      ),
+      answers,
+    );
+    assert.deepEqual(await ds.hasAll([]), []);
+    await ds.close();
+  }
+});
+
+test('hasAll answers a dataset on disk as has does', async () => {
+  const path = await mkdtemp(join(tmpdir(), 'sparkles-has-all-'));
+  try {
+    const ds = await Dataset.open(path);
+    const stored = await fillForProbes(ds);
+    const short = probes(stored);
+    const answers = await assertHasAllMatchesHas(ds, short, 'on disk');
+    assert.equal(answers.filter(Boolean).length, 30);
+    const long = Array.from({ length: 5 }, () => short).flat();
+    assert.deepEqual(await ds.hasAll(long), Array.from({ length: 5 }, () => answers).flat());
+    assert.deepEqual(await ds.hasAll([]), []);
+    await ds.close();
+  } finally {
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+test('hasAll reads one state of the dataset and sees later commits', async () => {
+  const ds = Dataset.memory();
+  const quads = Array.from({ length: 600 }, (_, i) => q(n(`s${i}`), n('p'), f.literal(`${i}`)));
+  assert.deepEqual(
+    await ds.hasAll(quads),
+    quads.map(() => false),
+  );
+  await ds.addAll(quads.filter((_, i) => i % 3 === 0));
+  assert.deepEqual(
+    await ds.hasAll(quads),
+    quads.map((_, i) => i % 3 === 0),
+  );
+  // answers asked for before a commit do not see it, on this thread or on the pool
+  const before = [ds.hasAll(quads.slice(0, 10)), ds.hasAll(quads)];
+  await ds.addAll(quads);
+  assert.deepEqual(
+    await before[0],
+    quads.slice(0, 10).map((_, i) => i % 3 === 0),
+  );
+  assert.deepEqual(
+    await before[1],
+    quads.map((_, i) => i % 3 === 0),
+  );
+  assert.deepEqual(
+    await ds.hasAll(quads),
+    quads.map(() => true),
+  );
+  await ds.delete(quads[5]);
+  assert.deepEqual(
+    await ds.hasAll(quads.slice(0, 10)),
+    quads.slice(0, 10).map((_, i) => i !== 5),
+  );
+});
+
+test('hasAll rejects what is not a quad, and a closed dataset', async () => {
+  const ds = Dataset.memory();
+  const there = q(n('a'), n('p'), n('o'));
+  await ds.add(there);
+  const bad = { termType: 'NamedNode', value: 'not an iri', equals: () => false };
+  await assert.rejects(ds.hasAll([there, q(n('b'), n('p'), bad)]));
+  await assert.rejects(ds.hasAll([there, n('a')]), /Expected an RDF quad/);
+  await assert.rejects(ds.hasAll([there, null]), /Expected an RDF quad/);
+  await assert.rejects(ds.hasAll(42));
+  // the rejected requests left no numbers that the addon lacks
+  assert.deepEqual(await ds.hasAll([there, q(n('b'), n('p'), n('o'))]), [true, false]);
+  await ds.close();
+  await assert.rejects(ds.hasAll([there]), /closed/i);
+  await assert.rejects(ds.hasAll([]), /closed/i);
+});
+
+test('hasAll stays correct with more distinct terms than the table keeps', async () => {
+  const ds = Dataset.memory();
+  const quads = Array.from({ length: 70000 }, (_, i) => q(n(`s${i}`), n('p'), f.literal(`${i}`)));
+  await ds.addAll(quads.filter((_, i) => i % 2 === 0));
+  const answers = await ds.hasAll(quads);
+  assert.equal(answers.length, 70000);
+  assert.ok(answers.every((found, i) => found === (i % 2 === 0)));
+  // and again, with the terms the table kept sent by number
+  assert.deepEqual(await ds.hasAll(quads), answers);
+  assert.equal(await ds.has(quads[69998]), true);
+  assert.equal(await ds.has(quads[69999]), false);
 });

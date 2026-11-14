@@ -47,7 +47,9 @@ build community reports.
   `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
   need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle
   scratch branches, and a dataset's `memory.scratchBranches.ttl` overrides it for that
-  dataset. `sparkles mcp --loc` applies the dataset setting as well.
+  dataset. `sparkles mcp --loc` applies the dataset setting as well. `create_branch`
+  takes `keep: true` for a branch that never expires, `maxPerPrincipal` caps each
+  principal's scratch branches, and `notifyBefore` names the branches that expire soon.
 * `link_entities` can include versioned evidence about the named types and literal
   labels retained for each candidate, with separate flags for display, per-entity and
   query limits. It reports values and counts from the caller's query view. Bounded text
@@ -197,6 +199,10 @@ when the tool returns one. Each scoped completion also records a process-generat
 and the context-window size when selected. These remain in JSON logs without
 ancestor span lists. Standalone tool stages have no Ask identifier. These are diagnostic fields, not metric labels.
 The added fields contain no questions, labels, entity IRIs, prompts or error messages.
+An initial ask that stops because a mention links ambiguously records the total
+grounding stage, the linker with any nested vector search and, with type hints, the two
+schema stages, because it asks before reading the rest of the context. A clarification
+that the draft model asks for comes after the whole grounding.
 
 Nested stages identify example-query and example-document embedding preparation and
 linker vector search. These include caches, admission and any local or remote model
@@ -263,8 +269,17 @@ retrieval quality, model accuracy or latency. Shared-profile independence, accep
 support ownership and dependent freshness remain planned. Roadmap items 81 and 340.
 
 Idle scratch branches expire after the dataset's `memory.scratchBranches.ttl`, over HTTP
-and in a `sparkles mcp --loc --allow-update` session. A limit per principal, warnings
-before a branch expires and a way to keep one branch remain planned. Roadmap item 435.
+and in a `sparkles mcp --loc --allow-update` session. A branch created with `keep: true`
+never expires, and an administrator turns a scratch branch into an ordinary one with
+`PATCH /$/branches/{ds}/{name}` and `{"scratch": false}`.
+`memory.scratchBranches.maxPerPrincipal` caps the scratch branches each principal has in
+the dataset, kept ones included. `memory.scratchBranches.notifyBefore` sets a window
+before expiry in which `list_branches`, the caller's `sparkles://{ds}/branches`
+resource and the memory brief name the branch, and in which the `memory.review.pending`
+notification names branches that hold unmerged commits. That notification fires only on
+a server that expires branches, so a `sparkles mcp --loc` session warns through
+`list_branches`, the resource and the brief alone. See
+[Memory writes](../API.md#memory-writes).
 
 ### Document ingestion
 
@@ -668,10 +683,12 @@ resolves as an authenticated record. A clone's root commit is never earlier than
 commit it copies. The [ordering argument](../specs/C27-valid-time-profiles.md#43-local-availability-and-backdating)
 gives the details.
 
-Claim proposals do not carry a validity interval, so the templates report
-authenticated claims with unknown validity, and roadmap item 925 adds that input. The
-projection helper, event-time UI and expiry integration remain planned under roadmap
-item 341.
+A claim proposal can carry the claim's validity record, which the writer stores with
+the claim in the proposal graph and covers by the claim's record digest, so the
+templates evaluate authenticated claims directly. The writer refuses an interval that
+the version 1 shapes refuse, and claim scope cannot name valid-time predicates. The
+[claims API](../API.md) describes the `validity` member. The projection helper,
+event-time UI and expiry integration remain planned under roadmap item 341.
 
 ### Durable jobs
 
@@ -783,10 +800,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   answers, and wrong query shape most of the rest. Property path evaluation runs within
   Ask's query memory budget and timeout, so a generated query with a property path fails
   with the usual error rather than exhausting memory. Model-dependent accuracy and
-  contextual namesake resolution remain open. Roadmap item 263. The median end-to-end
-  latency is also higher. Roadmap item 318. Local and OpenAI-compatible models, LC-QuAD
-  2.0, which needs a Wikidata load from the full dump, and an evaluation of independent
-  roles have not run. Roadmap item 6.
+  contextual namesake resolution remain open. Roadmap item 263. Model calls take most of
+  an answer's time. A fresh `sparkles ask` process also spends about half a second
+  before its first draft computing the schema context that a running server keeps. Roadmap item 914. Local and
+  OpenAI-compatible models, LC-QuAD 2.0, which needs a Wikidata load from the full dump,
+  and an evaluation of independent roles have not run. Roadmap item 6.
 * Prompt caching has not been measured against Anthropic. Neither the cache hit rate of
   real calls nor Ask's accuracy with its grounding reordered for the cache has run.
   Roadmap item 503.
@@ -827,9 +845,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   reasoner and view maintenance does not provide that application lifecycle. Roadmap
   item 340.
 * The [valid-time profile](#valid-time-profile) supplies static resources, temporal
-  queries and server-owned availability. Authenticated claim proposals cannot carry a
-  validity interval, which roadmap item 925 adds. The runtime projection helper,
-  event-time control and expiry integration remain planned. Roadmap item 341.
+  queries, validity records on authenticated claims and server-owned availability. The
+  runtime projection helper, event-time control and expiry integration remain planned.
+  Roadmap item 341.
 * A dataset has one GraphRAG configuration, so readers with different views cannot each
   have reports built from their own view. Roadmap item 100. Global answering is evaluated
   on one generated question set on the demo graph, compared with BM25 rather than vector
@@ -857,7 +875,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 318](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item 503](../ROADMAP.md).
+The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item 503](../ROADMAP.md), [item 914](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -1033,6 +1033,42 @@ export class Dataset extends Queryable {
     }
     return this.hasMatch(quad);
   }
+  /**
+   * Whether each quad is in the dataset, in the order given. The quads cross into the
+   * engine in one call and every answer is read from one snapshot, so a batch costs
+   * much less per quad than as many calls of `has()`. The snapshot is the dataset's
+   * state when `hasAll` is called. A short batch on a dataset in memory is answered on
+   * this thread, and a longer one on the pool.
+   */
+  hasAll(quads: Iterable<RDF.Quad>): Promise<boolean[]> {
+    let count: number;
+    let found: Uint32Array | Promise<Uint32Array>;
+    try {
+      this.check();
+      if (quads == null || typeof (quads as any)[Symbol.iterator] !== 'function')
+        throw new InvalidInputError('Expected an iterable of RDF quads');
+      const list = Array.isArray(quads) ? (quads as RDF.Quad[]) : Array.from(quads);
+      count = list.length;
+      if (count === 0) return Promise.resolve([]);
+      const { text, data } = this.terms.encode(list);
+      try {
+        found = this.handle.containsAllTerms(text, data);
+      } catch (e) {
+        this.terms.forget();
+        throw nativeError(e);
+      }
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    const answers = (bits: Uint32Array) => {
+      const out = new Array<boolean>(count);
+      for (let i = 0; i < count; i++) out[i] = ((bits[i >>> 5] >>> (i & 31)) & 1) === 1;
+      return out;
+    };
+    if (found instanceof Uint32Array) return Promise.resolve(answers(found));
+    const pending = found;
+    return this.run<Uint32Array>({}, () => pending).then(answers);
+  }
   private async hasMatch(quad: RDF.Quad) {
     for await (const _ of this.match(quad.subject, quad.predicate, quad.object, quad.graph))
       return true;

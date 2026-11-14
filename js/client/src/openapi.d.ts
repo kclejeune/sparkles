@@ -688,8 +688,8 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Rename, protect or annotate a branch
-         * @description `name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only.
+         * Rename, protect, annotate or unmark a branch
+         * @description `name` renames the branch: it keeps its id, commits, storage and children, and the old name answers `404` afterwards. A rename needs write on the old and the new name, admin when the branch is protected, and grants without graph restrictions. Its answer carries `Location` and `grantsChanged`, the number of configured grants that cover one of the two names and not the other. `protected` needs admin on the branch. A protected branch takes changes through merges only. `scratch: false` clears the scratch mark of a branch that the MCP tool `create_branch` made, so it no longer expires, and needs admin on the branch.
          */
         patch: operations["updateBranch"];
         trace?: never;
@@ -2991,6 +2991,25 @@ export interface paths {
          */
         post: operations["justifyFinding"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/reason/{ds}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The dataset's query-time reasoning setting */
+        get: operations["getQueryReasoning"];
+        /** Set the dataset's query-time reasoning */
+        put: operations["setQueryReasoning"];
+        post?: never;
+        /** Remove the dataset's query-time reasoning setting */
+        delete: operations["clearQueryReasoning"];
         options?: never;
         head?: never;
         patch?: never;
@@ -5871,9 +5890,10 @@ export interface components {
             note?: string | null;
             ordinal?: number;
             protected: boolean;
-            /** @description Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it. */
+            /** @description Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it, and `keep` when the branch never expires. */
             scratch?: {
                 creator?: string;
+                keep?: boolean;
             } | null;
             storage: {
                 generation?: string;
@@ -5904,6 +5924,11 @@ export interface components {
             name?: string;
             note?: string | null;
             protected?: boolean;
+            /**
+             * @description `false` clears the scratch mark, so the branch becomes an ordinary branch that never expires and that only grants without graph restrictions merge or delete. Needs `admin` on the branch.
+             * @enum {boolean}
+             */
+            scratch?: false;
         };
         /** @description What a review branch proposes and retracts, its new entities and the text of the sources it cites. */
         BranchReview: {
@@ -6072,6 +6097,10 @@ export interface components {
                 [key: string]: unknown;
             }[];
             dataset: string;
+            /** @description The caller's scratch branches that expire within the dataset's `memory.scratchBranches.notifyBefore`. The `# scratch:` lines of `text` name as many of them as `maxChars` leaves room for, at most five. */
+            expiringBranches?: {
+                [key: string]: unknown;
+            }[];
             facts?: {
                 [key: string]: unknown;
             }[];
@@ -7427,9 +7456,69 @@ export interface components {
                     /** @description A record of this batch, by its key. */
                     key?: string;
                 };
-                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused. */
+                /** @description Domain scope: predicate IRIs to N-Triples terms. Profile, valid-time, PROV-O and structural predicates are refused. A claim's validity uses its validity member. */
                 scope?: {
                     [key: string]: string[];
+                };
+                /** @description The claim's C27 validity record, a half-open interval written with the claim and covered by its record digest. The latest start must precede the earliest end of two known boundaries. */
+                validity?: {
+                    /** @description A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision. */
+                    end: {
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's earliest possible instant, inclusive, with an explicit offset.
+                         */
+                        earliest?: string;
+                        /** @enum {string} */
+                        kind: "known" | "unknown" | "unbounded";
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's latest possible instant, inclusive, with an explicit offset.
+                         */
+                        latest?: string;
+                        /** @description A known boundary's source precision, such as urn:x-sparkles:valid-time:Day. */
+                        precision?: string;
+                        /** @description The source's original expression. A known boundary requires it. */
+                        sourceValue?: string;
+                    };
+                    normalization: {
+                        /** @description The calendar. Normalized values use urn:x-sparkles:valid-time:Gregorian. */
+                        calendar: string;
+                        /**
+                         * @description The choice for an ambiguous local time. It requires timezonePolicy and tzdbVersion.
+                         * @enum {string}
+                         */
+                        foldChoice?: "earlier" | "later";
+                        /** @description The normalization method. */
+                        method: string;
+                        /** @description The method's version. It cannot be empty. */
+                        methodVersion: string;
+                        /** @enum {string} */
+                        status: "normalized" | "unresolved" | "unsupportedCalendar" | "unsupportedPrecision" | "indeterminateOrder" | "nonexistentLocalTime";
+                        /** @description The declared timezone policy. It cannot be empty. */
+                        timezonePolicy?: string;
+                        /** @description The pinned timezone database version. It cannot be empty. */
+                        tzdbVersion?: string;
+                    };
+                    /** @description A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision. */
+                    start: {
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's earliest possible instant, inclusive, with an explicit offset.
+                         */
+                        earliest?: string;
+                        /** @enum {string} */
+                        kind: "known" | "unknown" | "unbounded";
+                        /**
+                         * Format: date-time
+                         * @description A known boundary's latest possible instant, inclusive, with an explicit offset.
+                         */
+                        latest?: string;
+                        /** @description A known boundary's source precision, such as urn:x-sparkles:valid-time:Day. */
+                        precision?: string;
+                        /** @description The source's original expression. A known boundary requires it. */
+                        sourceValue?: string;
+                    };
                 };
             }[];
             /** @description Check and preview the write without committing it or holding commits. */
@@ -9574,8 +9663,12 @@ export interface components {
                 /** @description Delete only graphs whose facts a reviewed graph asserts too (true by default). */
                 requireConsolidated?: boolean;
             };
-            /** @description When idle scratch branches expire. Written as `format` 2 of `memory.json`. */
+            /** @description Limits, warnings and expiry of the scratch branches that MCP agents create. Written as `format` 2 of `memory.json` with `ttl` only, and as `format` 3 with `maxPerPrincipal` or `notifyBefore`. */
             scratchBranches?: {
+                /** @description The most scratch branches one principal may have in the dataset, from 1 to 65535. Kept branches count. `create_branch` past it is refused with `409 scratch-branch-limit`. Without it, only the dataset's branch limit applies. */
+                maxPerPrincipal?: number;
+                /** @description How long before a scratch branch expires the brief, the `sparkles://{ds}/branches` resource and `list_branches` name it, from `1m` to `3650d`, such as `6h`. `memory.review.pending` names those of them with commits of their own. Without it, nothing warns. */
+                notifyBefore?: string;
                 /** @description How long a scratch branch may sit idle before the server deletes it, from `1m` to `3650d`, such as `24h`. `off` keeps the dataset's scratch branches even when the server's `--mcp-scratch-branch-ttl` sets a duration. Without it, the server flag decides. A dataset with this member needs a release that reads `memory.json` format 2. */
                 ttl?: string;
             };
@@ -11177,6 +11270,42 @@ export interface components {
             dataset: string;
             promoted: number;
             target: string;
+        };
+        /** @description The dataset's query-time reasoning setting: the mode of a query that names none, the profile and rules that derive on demand, the input graphs, the budget of a derivation and the policy for a stale materialization. */
+        QueryReasoningSetting: {
+            budget?: {
+                maxDerived?: number;
+                maxMillis?: number;
+            };
+            /** @enum {string} */
+            default?: "auto" | "demand" | "materialized" | "false";
+            /** @description The input graphs, as a reasoning request names them. */
+            inputs?: {
+                /** @description `default` or graph IRIs. */
+                dataGraphs?: string[];
+                /** @enum {string} */
+                imports?: "none" | "dataset" | "fetch";
+                locationMapping?: ({
+                    altName: string;
+                    name: string;
+                } | {
+                    altPrefix: string;
+                    prefix: string;
+                })[];
+                /** @description `default` or graph IRIs. */
+                ontologyGraphs?: string[];
+            };
+            /** @enum {string} */
+            profile?: "rdfs" | "rdfs-simple" | "owl-rl" | "rules";
+            queryReasoningFormat?: number;
+            /** @description The Jena rule text of the profile `rules`. */
+            rules?: string;
+            /** @enum {string} */
+            stale?: "derive" | "allow";
+            /** @description The process-wide cache of derived tables, for callers with the metrics permission (responses only). */
+            tables?: {
+                [key: string]: unknown;
+            };
         };
         /** @description One of the two members; 0 means unlimited. */
         QuotaRequest: {
@@ -21854,6 +21983,92 @@ export interface operations {
             422: components["responses"]["Unprocessable"];
             501: components["responses"]["NotImplemented"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getQueryReasoning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The setting. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryReasoningSetting"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setQueryReasoning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryReasoningSetting"];
+            };
+        };
+        responses: {
+            /** @description The setting. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryReasoningSetting"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    clearQueryReasoning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The setting, now empty. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryReasoningSetting"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

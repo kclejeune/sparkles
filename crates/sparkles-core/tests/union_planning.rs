@@ -413,3 +413,179 @@ fn outer_filters_keep_the_original_join_boundary() {
         }
     }
 }
+
+/// A UNION under a LIMIT reads its cheapest branch first in every execution mode, so a
+/// query whose first branch must join two large inputs before its first row answers
+/// from the cheap branch alone (item 827).
+#[test]
+fn a_limited_union_reads_its_cheap_branch_first_in_every_mode() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("<urn:yes> <urn:cheap> 0 .\n");
+    for i in 0..20_000 {
+        data.push_str(&format!("<urn:a{i}> <urn:left> {} .\n", i % 5_000));
+        data.push_str(&format!("<urn:b{i}> <urn:right> {} .\n", i % 5_000));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let union = "{ ?a <urn:left> ?v . ?b <urn:right> ?v } UNION { <urn:yes> <urn:cheap> ?v }";
+    for text in [
+        format!("SELECT ?v WHERE {{ {union} }} LIMIT 1"),
+        format!("SELECT ?v WHERE {{ {union} }} LIMIT 1 OFFSET 0"),
+        format!("ASK {{ {union} }}"),
+    ] {
+        for mode in [
+            ExecutionMode::Eager,
+            ExecutionMode::Auto,
+            ExecutionMode::Streaming,
+        ] {
+            let mut execution = query_execution(
+                store.snapshot(),
+                &text,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap();
+            let produced = match &mut execution {
+                QueryExecution::Select(cursor) => {
+                    let mut rows = 0;
+                    while let Some(batch) = cursor.next_batch().unwrap() {
+                        rows += batch.len();
+                    }
+                    assert_eq!(rows, 1, "{text} under {mode:?}");
+                    cursor.stats().rows_produced
+                }
+                QueryExecution::Eager(result) | QueryExecution::Ask(result) => {
+                    let result = result.result();
+                    if result.kind == sparkles_core::sparql::QueryKind::Ask {
+                        assert!(result.boolean);
+                    } else {
+                        assert_eq!(result.len(), 1, "{text} under {mode:?}");
+                    }
+                    result.rows_produced
+                }
+                QueryExecution::Graph(_) => unreachable!(),
+            };
+            assert!(
+                produced < 1_000,
+                "{text} under {mode:?} produced {produced} rows"
+            );
+        }
+    }
+}
+
+/// A LIMIT over a UNION whose branches share no variable, and an OFFSET past the
+/// answer, give the rows the whole UNION would.
+#[test]
+fn limited_unions_without_shared_variables_and_offsets_past_the_answer() {
+    use sparkles_core::sparql::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..300 {
+        data.push_str(&format!("<urn:a{i}> <urn:p> {i} .\n"));
+    }
+    data.push_str("<urn:b> <urn:q> \"b\" .\n");
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    for (text, rows) in [
+        (
+            "SELECT * WHERE { { ?a <urn:p> ?x } UNION { ?b <urn:q> ?y } } LIMIT 5",
+            5,
+        ),
+        (
+            "SELECT * WHERE { { ?a <urn:p> ?x } UNION { ?b <urn:q> ?y } } LIMIT 5 OFFSET 299",
+            2,
+        ),
+        (
+            "SELECT * WHERE { { ?a <urn:p> ?x } UNION { ?b <urn:q> ?y } } LIMIT 5 OFFSET 301",
+            0,
+        ),
+        ("SELECT * WHERE { ?a <urn:p> ?x } LIMIT 10 OFFSET 1000", 0),
+    ] {
+        for mode in [
+            ExecutionMode::Eager,
+            ExecutionMode::Auto,
+            ExecutionMode::Streaming,
+        ] {
+            let mut execution = query_execution(
+                store.snapshot(),
+                text,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap();
+            let got = match &mut execution {
+                QueryExecution::Select(cursor) => {
+                    let mut n = 0;
+                    while let Some(batch) = cursor.next_batch().unwrap() {
+                        n += batch.len();
+                    }
+                    n
+                }
+                QueryExecution::Eager(result) => result.result().len(),
+                _ => unreachable!(),
+            };
+            assert_eq!(got, rows, "{text} under {mode:?}");
+        }
+    }
+}
+
+/// A UNION whose branches evaluate an expression with effects, or an EXISTS that may
+/// call SERVICE, keeps its written branch order under a LIMIT, so that the effects
+/// happen as written. The same branches without the effect go cheapest first.
+#[test]
+fn a_limited_union_with_effects_keeps_its_written_order() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("<urn:yes> <urn:cheap> 0 .\n");
+    for i in 0..2_000 {
+        data.push_str(&format!("<urn:a{i}> <urn:left> {} .\n", i % 500));
+        data.push_str(&format!("<urn:b{i}> <urn:right> {} .\n", i % 500));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let first_branch = |filter: &str| {
+        let text = format!(
+            "PREFIX afn: <http://jena.apache.org/ARQ/function#> SELECT ?v WHERE {{ \
+             {{ ?a <urn:left> ?v . ?b <urn:right> ?v {filter} }} \
+             UNION {{ <urn:yes> <urn:cheap> ?v }} }} LIMIT 1"
+        );
+        let r = query(store.snapshot(), &text, &QueryOptions::default())
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(r.len(), 1, "{text}");
+        let plan = serde_json::to_string(r.plan()).unwrap();
+        let left = plan.find("urn:left").expect("the expensive branch");
+        let cheap = plan.find("urn:cheap").expect("the cheap branch");
+        left < cheap
+    };
+    assert!(
+        !first_branch(""),
+        "a plain UNION reads its cheap branch first"
+    );
+    assert!(!first_branch("FILTER(?v != 7)"));
+    for filter in [
+        "FILTER(afn:wait(0))",
+        "FILTER(afn:print(?v))",
+        "FILTER(EXISTS { ?v <urn:cheap> ?w })",
+        "BIND(IF(EXISTS { ?a <urn:cheap> ?w }, 1, 0) AS ?e)",
+        "FILTER(STRLEN(STRUUID()) > 0)",
+    ] {
+        assert!(first_branch(filter), "{filter} keeps the written order");
+    }
+}

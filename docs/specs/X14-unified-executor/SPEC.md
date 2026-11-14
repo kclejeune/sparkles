@@ -215,6 +215,101 @@ hierarchical budget of item 675 and the decoding twins of item 678 remain. Stage
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
+The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
+over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its
+scan in every mode. The planner deduplicates a DISTINCT below its ORDER BY whenever the
+query may spill, and the eager executor numbers the rows of that DISTINCT as the cursor
+does. The planner also sets the ripple join and the first-row index joins of an ASK or a
+`LIMIT 1` over a keyed join, and streams a filtered product's larger input. A cursor
+keyed join that held a small input and probed it measured slower than the ripple join,
+which keys each row once and uses that key both to index and to probe the row. A cursor
+FILTER without effects reads four times as many rows after each batch in which no row
+passes, up to eight cursor batches, so a filtered product under an ASK reads its pairs in
+batches as the eager executor's growing prefixes did. The result cache and sampled
+filters stay on under cursor accounting. Every ASK and every LIMIT without ORDER BY pulls
+its input through cursor operators with a demand of `offset + limit` rows, in eager
+execution through the eager context and in automatic execution, which streams every ASK
+without initial bindings. A LIMIT over one scan or a table of values, under projections,
+reads its rows directly, and so does the per-row evaluation of an EXISTS pattern of that
+shape, which item 829 leaves eager. A larger EXISTS pattern evaluated per row pulls its
+first solution. A LIMIT over an ORDER BY runs its input as before, since the sort reads
+it whole. A UNION under a LIMIT or an ASK orders its branches by their estimated cost to
+the first rows, from each branch's cost and estimated rows, when no branch calls an
+application function, a SERVICE or another operator with effects. `run_limited`,
+`execute_limited`, the first-work estimator, `limited_input`, `filtered_ask_admitted`,
+`order_ask` and `Dataset::ask_streaming_with` are gone, and the accounting mode is read
+in four places. The planner marks a LIMIT or an ASK to run its input whole, as a SELECT
+does, when exact index counts bound every operator of the input, and the rows an index
+join's probes read, to a cursor batch of 4,096 rows and its estimated cost past the first
+rows is below the 4,096 units that building cursor operators costs
+(`demand::runs_whole`). An input that evaluates a FILTER, a BIND, a keyed join's
+condition, a range scan's test or another expression is pulled, since an expression may
+form terms whose memory no row count bounds, and so is every input of a query with a
+budget of produced rows, which the consumer's rows count against too. A whole run that a
+row or memory budget refuses gives way to pulling the input (`exec::whole_or_refused`),
+because the bounds do not cover the server pool's headroom or what the query already
+holds. A LIMIT over a `spk:hasPredicate` scan reads the pattern reader directly, as one
+over a scan does. A join is bounded by the product of its inputs or, where an input that
+always binds a key meets a pattern with a constant predicate, by that input's rows times
+the pattern's most rows for one key, which the predicate's statistics bound. The eager
+LIMIT runs such an input whole, automatic execution keeps such an ASK eager, and the per-
+row test of an EXISTS pattern applies the same choice. The choice depends on the plan and
+the snapshot, never on the mode. `scan_limited` remains for the planner's two-row probe
+and the direct reads. A pulled limit charges its operators' batches and its copy of the
+plan to the query's ledger, which an eager query of a few rows did not take before, and
+the cursor's scan charges one decoded block. A path walk grows its charge a reservation
+step at a time and checks its output each time it doubles, and an eager query's empty
+charges do not take the ledger to trim its grant. A pulled `LIMIT 500` over the paths of
+300 people who know one other person each therefore takes 585 ledger operations rather
+than 3,233 in a release measurement, and the unit test's single cycle of 300 people takes
+fewer than 300 where it took 3,054. The decoded rows of a pulled result charge their
+terms a reservation step at a time, so `QueryResult::rows` over 500 rows of two columns
+takes fewer than 100 operations rather than about 4,000. A small pulled LIMIT over a join
+still takes 50 to 100, one group per batch and operator, as a streaming query does. A
+`PatternScan` of a constant subject hands out its predicates a batch at a time, and the
+cursor charges the pattern reader's decoded block. A cursor cross product now holds its
+smaller estimated input and streams the larger one, as an inner hash join does, so a
+LIMIT over a cross product with a short VALUES list holds the list rather than the other
+input's whole answer.
+
+The phase departs from its plan in three places. The UNION branch order is a choice of
+the planner's LIMIT and ASK arm in `demand.rs` on the branches' cost summaries, not a
+term of the join-order program in `joinorder.rs`. That program orders the operands of a
+join, while a UNION's branches are not joined and their order matters only to a consumer
+that stops early, so the choice belongs where the planner knows the demand. The ASK
+orientation, the ripple join and the first-row index joins apply to every slice of one
+row at offset zero, which covers a `LIMIT 1` as well as an ASK, rather than to the shapes
+the removed admission accepted. Both need one row, and a choice that depended on the
+admission would have kept the plan dependent on the mode. `scan_limited` stays, for the
+planner's two-row probe and for the direct reads of a LIMIT over one scan, because
+building cursor operators and a ledger for a read of a few rows costs more than the read.
+
+A LIMIT over an inner hash join now builds the hash index of one whole input, as the
+cursor does, where the removed eager limited join indexed a prefix of the limited input
+and ran again with eight times the demand until it had its rows. A `LIMIT 1` over the join
+of two 65,537-row inputs peaks at about 7 MB where it fit in a 6 MiB pool before. A
+first-rows join that reads both inputs a few rows at a time for small demand is
+[item 947](../../ROADMAP.md).
+
+A lane A/B on `atlas`, the benchmark host's hardware, timed a release loop of 15 ASK and
+LIMIT queries and three filtered products over generated people datasets of 300 and
+3,000, in eager and automatic execution, with builds before and after the item
+alternating over three passes. It measured a small pulled ASK and a `LIMIT 1` or `LIMIT
+10` over a join of 300-row patterns at 1.00 to 1.05 times the earlier build, a filtered
+or path LIMIT at 0.14 to 0.87 times, and a filtered product under an ASK or a `LIMIT 1`
+at 0.77 to 1.37 times. A pulled `LIMIT 1` or `LIMIT 10` over a join of 3,000-row patterns
+takes 1.16 to 1.18 times as long and a `LIMIT 500` 1.28 times, a false keyed ASK takes
+1.31 to 1.33 times over 300-row patterns and 1.12 to 1.13 times over 3,000-row patterns
+in eager execution, against 0.67 in automatic execution, and a three-pattern ASK and a
+`LIMIT` over `spk:hasPredicate` over 3,000 people take 1.05 to 1.07 times. These costs of
+building and charging cursor operators are [item 952](../../ROADMAP.md). A FILTER that
+reads ahead evaluates its condition on rows past its consumer's first solutions, so a
+memory budget that a row past them exceeds, such as one whose value decodes a long
+literal, refuses the query where reading at the consumer's demand would have answered.
+The scan FILTER's morsels read ahead in the same way. The `grow_input` switch turns off
+the generic FILTER's read- ahead and the growth of the scan FILTER's morsels, while a
+demand of 4,096 rows or more still reads a first morsel.
+
 Native SELECT output and standard solution responses of at most 65,536 rows admit and
 decode a complete row before serializing its cells. Row storage and decoded terms keep
 query credit until their payloads are freed. A required decode refusal returns its
@@ -876,3 +971,30 @@ instead of at the line's start, so item 696 follows it with `join_pairs`.
 The eager costs of 1% to 4% that stage 4 added to filters and aggregates, such as
 `subquery-agg` at 1.040 of 005df56d at 10.5M triples and `contains` at 1.036 at 1.05M
 triples, are unchanged, and item 682 holds them.
+
+### Checked result output
+
+The eager SELECT writers admit every decoded cell against the query's memory account
+before they allocate it, and each writer rebuilds the front-coded vocabulary keys of its
+cells in one buffer that it reuses for the whole answer. Each step of a rebuild compares
+the rebuilt key's length with the buffer's capacity and admits the key before the buffer
+grows. A refused growth leaves the buffer's allocation unchanged and returns the typed
+refusal.
+
+Roadmap item 763 measured what that check costs. On atlas at 100,000 people, with the
+server pinned to one CPU and `perf stat` counting its user-space work per request over
+three interleaved passes of matched release builds, the checked writer of c2b5d7cf ran
+4.2% more instructions than the unchecked writer of 6fba19d6 on `optional-chain`, 2.7%
+on `order-by-full` and 2.4% on `star-join`, and 7.90%, 4.05% and 3.86% more cycles. A
+diagnostic build without the per-step check ran 1.4%, 0.0% and 0.8% fewer instructions
+than 6fba19d6, so the check holds the instruction difference. The same build still ran
+6.1%, 4.3% and 3.0% more cycles, which makes it unlikely that one reservation per
+front-coded block would close the cycle difference, so that design was not built. Two
+repairs were built and reverted. The first shared the check with the copy's own growth
+check, and the second, 0ae09b0a, then copied the suffix into the checked room, which
+brought the instructions within 0.8% of 6fba19d6. Neither lowered the cycles. The
+second's final form, 0acba641, ran 1.3% more instructions than 6fba19d6 on
+`order-by-full`, and its server execution of that query took 2.6% and 3.2% longer than
+c2b5d7cf over the two runs, longer in every round. The checked writer also had 44% more
+branch misses than 6fba19d6 on `optional-chain`, and none of the builds changed that
+count, so item 763 looks there next.

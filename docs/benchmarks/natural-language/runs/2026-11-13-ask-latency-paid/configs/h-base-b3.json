@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "effort": "medium",
+  "requestTimeoutSecs": 120,
+  "askDeadlineSecs": 300,
+  "queryTimeoutSecs": 60,
+  "askTokenBudget": 100000,
+  "projectionMargin": 1.25,
+  "contextTokens": 200000,
+  "clarifications": "answer",
+  "profileStages": true,
+  "maxOutputTokens": 4096,
+  "priorCaseCostNanodollars": {
+    "claude-haiku-5-5": 15000000,
+    "claude-sonnet-5-5": 50000000
+  },
+  "binary": "/home/kclejeune/sparkles-ask-latency-318/bin/base-06ca04ef",
+  "binarySha256": "ee08975ef88417386f7de9b95374937e73e4a77f995e69c2e3b15344587aad2f",
+  "ledger": "/home/kclejeune/sparkles-ask-latency-318/ledger-anthropic/ledger.jsonl",
+  "out": "/home/kclejeune/sparkles-ask-latency-318/runs/h-base-b3",
+  "localCapNanodollars": 8000000000,
+  "carryover": {
+    "name": "fresh-20261113-item318",
+    "nanodollars": 0
+  },
+  "sets": [
+    {
+      "name": "qald",
+      "path": "/home/kclejeune/sparkles-ask-latency-318/sets/qald-b3.json",
+      "loc": "/home/kclejeune/sparkles-ask-paid-20261024/db/dbpedia.db",
+      "models": [
+        "claude-haiku-5-5"
+      ]
+    }
+  ]
+}

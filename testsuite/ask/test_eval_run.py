@@ -66,6 +66,22 @@ class LoadRun(unittest.TestCase):
         )
         self.assertEqual(self.load(run)["clarifications"], "score")
 
+    def test_stage_profiles_are_a_boolean_option(self):
+        self.assertTrue(self.load(dict(RUN, profileStages=True))["profileStages"])
+        for value in ("yes", 1, None):
+            with self.assertRaises(Invalid):
+                self.load(dict(RUN, profileStages=value))
+
+    def test_a_profiled_child_gets_only_the_stage_filter(self):
+        from evaluator import PROFILE_FILTER, leaf_environment
+
+        plain = leaf_environment({"SPARKLES_EVAL_GATE_TOKEN": "t"})
+        profiled = leaf_environment({"SPARKLES_EVAL_GATE_TOKEN": "t"}, profile=True)
+        self.assertNotIn("RUST_LOG", plain)
+        self.assertEqual(profiled.pop("RUST_LOG"), PROFILE_FILTER)
+        self.assertEqual(profiled, plain)
+        self.assertEqual(PROFILE_FILTER, "warn,sparkles::ask::profile=debug")
+
     def test_the_documented_example_loads(self):
         example = json.loads((HERE / "run.example.json").read_text())
         self.assertEqual(self.load(example)["askTokenBudget"], 100000)

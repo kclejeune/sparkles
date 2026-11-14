@@ -33,7 +33,9 @@ request or on every write, and the schema report counts what the data holds.
 * Materialization closes transitive relations, `rdfs:subClassOf`, `rdfs:subPropertyOf`
   and `owl:sameAs` with closure operators instead of joins. An operator condenses the
   relation's strongly connected components and works out each component's reachable
-  set once, and `owl:sameAs` closes its classes with union-find. OWL2Bench with 5
+  set once, and `owl:sameAs` closes its classes with union-find. An operator merges its
+  pairs into the derived facts in batches of four million, so a closure larger than the
+  facts derived so far does not wait in memory beside them. OWL2Bench with 5
   universities materializes under OWL 2 RL in 44 s at 9.5 GiB of RSS, and with 2 in 5 s
   instead of 53 s ([results](../benchmarks/reasoning/RESULTS.md#owl2bench)). The rules stay in the
   program, so explanations and incremental maintenance still name them, and a run
@@ -41,6 +43,24 @@ request or on every write, and the schema report counts what the data holds.
   is not monotonic, or one that reads lists and builds them in a rule head, evaluates
   every rule as a join. A run whose rules read lists and derive list facts through a
   property, such as a subproperty of `rdf:first`, starts again without the operators.
+* A rule body of three or more atoms is ordered from sampled bindings where that is
+  clearly cheaper than the order the statistics give. The planner follows up to 16
+  bindings through the facts the plan reads and counts each atom's candidates under
+  them, which matters where the rule itself binds a predicate or a class, as `prp-key`
+  does with the keyed class and its key property. On a benchmark worker the rules of
+  OWL2Bench with 5 universities take 29.9 s instead of 51.7 s at one thread and 9.6 s
+  instead of 12.6 s at 20
+  ([results](../benchmarks/reasoning/RESULTS.md#sampled-rule-body-planning)). A run
+  derives the same facts in either order. A rule in which a builtin binds a variable
+  that an atom also holds keeps the statistical order, and so does every rule while the
+  derived facts hold one that a deletion removed. Planning costs a few milliseconds per
+  run. Roadmap items 944 and 945 cover these two limits and that cost.
+* Derived facts live in a columnar tier, each fact one row by a dense id, with each
+  predicate's facts sorted by subject and by object. OWL2Bench with 5 universities holds
+  its 53 million derived facts in about 52 bytes each with the triple index, against about
+  135 in the hash lists before the tier. Full materializations take the time they took
+  before, and incremental runs on LUBM(100) are about 2% slower
+  ([roadmap item 938](../ROADMAP.md)).
 * Each iteration merges its results in parallel on a reasoning pool, half the cores by
   default with `serve --reason-threads`, that admits runs in arrival order. A run stops at
   50 million derived triples by default, and `sparkles infer --max-inferred`,
@@ -70,7 +90,10 @@ request or on every write, and the schema report counts what the data holds.
 * Query-time reasoning with `reasoning=demand` derives the facts a query's patterns need
   as it runs, from RDFS, RDFS simple, OWL 2 RL or a Jena rule file, without the inferred
   graph ([API.md](../API.md#query-time-reasoning), [F17](../specs/F17-query-time-reasoning.md#outcome)).
-  Jena backward rules answer this way. A demand transformation starts from the query's
+  Jena backward rules answer this way. `reasoning=auto` reads a fresh materialization
+  with the same profile and derives over a stale or absent one or for rules that
+  materialization skips, and the dataset's query-time setting makes it the default
+  ([API.md](../API.md#automatic-choice)). A demand transformation starts from the query's
   constants and bindings and specializes schema relations proven complete. Schema facts
   can follow from derived instance facts, including class and property declarations and
   equality between schema terms. Programs containing `makeTemp` run in one ordinary
@@ -743,10 +766,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   compaction without retained history, recompute everything. Diagnostic checks do not
   prove consistency, and datatype membership that cannot be decided remains unknown.
   Roadmap items 9 and 53.
-* Because the kept closure holds only derived facts, changes of 100 triples at 16 threads
-  over it take 1.6 to 2.3 times as long as with a closure that also holds the explicit
-  facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. Roadmap
-  item 113.
+* Because the kept closure holds only derived facts, OWL 2 RL changes of 100 to 10,000
+  triples over it take 1.2 to 2.3 times as long at one thread as with a closure that also
+  holds the explicit facts, on LUBM-style data. Roadmap item 941. The first change of 100 RDFS
+  triples to a part of the data takes 2.6 times as long. Roadmap item 942. RDFS undos and
+  repeated changes take 0.85 to 1.08 times as long on that data.
 * Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints not
   anchored at the focus node, in full on every write. Roadmap item 78.
 * ShEx keeps no typing when the process is killed or exits without closing the store, so
@@ -862,7 +886,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 113](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md),  [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

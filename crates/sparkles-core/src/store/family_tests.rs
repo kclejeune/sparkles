@@ -574,8 +574,38 @@ fn cohort_waits_cover_earlier_permits_only() {
         }
     });
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The waiter takes the gate's state mutex again after each `progress` call, so a
+    // later entry may find the mutex held for a moment. That is contention, not a
+    // refusal, so the entry waits for the mutex under a deadline instead of failing with
+    // `WriterBusy` as a `no_wait` entry would. Holding the mutex here until the
+    // `no_wait` entry has failed makes that moment happen on every run. A gate that held
+    // new permits back behind the cohort wait would still fail the entry at the deadline.
+    let (held_tx, held) = mpsc::channel();
+    let (release_tx, release) = mpsc::channel::<()>();
+    let holder = std::thread::spawn({
+        let gate = family.gate.clone();
+        move || {
+            gate.with_locked_state(|| {
+                held_tx.send(()).unwrap();
+                release.recv().unwrap();
+            })
+        }
+    });
+    held.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        family.gate.enter(&no_wait()),
+        Err(Error::WriterBusy)
+    ));
+    release_tx.send(()).unwrap();
     // later permits enter, and their lifetimes do not hold the waiter
-    let later = family.gate.enter(&no_wait()).unwrap();
+    let later = family
+        .gate
+        .enter(&WriteOptions {
+            deadline: Some(Instant::now() + Duration::from_secs(60)),
+            ..Default::default()
+        })
+        .unwrap();
+    holder.join().unwrap();
     assert!(done.try_recv().is_err());
     drop(earlier);
     done.recv_timeout(Duration::from_secs(5)).unwrap();

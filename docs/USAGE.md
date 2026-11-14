@@ -555,7 +555,7 @@ happens to materialized inferences, and the limits.
 | `--pattern-memory-mb N` | `1024` | Memory for the distinct predicate patterns while a bulk load or a compaction builds them. A generation that needs more is built without patterns, the reason is logged and kept in its `meta.json`, and queries read the permutations. A global flag. |
 | `--vocab-codec front\|fsst` | | How a bulk load or a full compaction stores the vocabulary. `front` front-codes the keys. `fsst` also compresses each key's suffix with FSST when that makes it shorter, with symbol tables in `vocab.fsst`, which makes the generation index format 4. Releases that read only format 3 cannot open it. Without the flag, a new database is front-coded and a compaction keeps the codec of the generation it replaces. A compaction asked for another codec rebuilds the generation in full. A global flag. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. Declared prefixes count toward the limit, and well-known ones do not. |
-| `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 135 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
+| `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 40 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 | `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use. |
 | `--reason-max-inferred N` | `50000000` | The derived triples a materialization may produce before it fails. Every run of the server has this limit, including automatic runs, and a request's `maxInferred` can ask for a lower one. A run that passes the limit fails with the rule that produced the most candidates and commits nothing. With `0`, runs have no limit, and only `ReasonOptions::max_memory` or the memory of the host stops a runaway rule. |
 | `--reason-max-derived N` | `1000000` | The facts one query may derive with `reasoning=demand`, not counting the magic facts of the demand transformation. A request's `maxDerived` can ask for fewer. A query that passes the limit fails with `422` and the code `reasoning-budget` ([API](API.md#query-time-reasoning)). With `0`, queries have no limit, and the query's timeout and memory budget stop a runaway derivation. |
@@ -4072,6 +4072,34 @@ setting when it opens the databases and every ten minutes while the session last
 `--no-scratch-expiry` turns that off for a session. A session has no default duration,
 so a dataset without the setting never expires its branches there.
 
+An agent that wants a scratch branch to last passes `keep: true` to `create_branch`, and
+the branch then never expires. A dataset can also cap the scratch branches each
+principal has and warn before a branch expires:
+
+```sh
+sparkles settings set org memory.scratchBranches.maxPerPrincipal=20
+sparkles settings set org memory.scratchBranches.notifyBefore=1d
+```
+
+With the cap, `create_branch` fails with `scratch-branch-limit` once the caller has 20
+scratch branches in the dataset, kept ones included. A merge leaves the branch and its
+mark in place, so the caller frees a place by deleting a branch, after merging it when
+its writes should stay, or an administrator frees one by clearing a mark.
+With the warning window, `list_branches`, the caller's `sparkles://org/branches`
+resource and the memory brief name the branches that expire within a day. On a server
+that expires branches, the `memory.review.pending` notification names those with
+unmerged commits, so a person can merge one or keep it. An administrator keeps a branch
+by clearing its scratch mark, which turns it into an ordinary branch:
+
+```sh
+curl -X PATCH -H 'content-type: application/json' -d '{"scratch": false}' \
+  http://localhost:3030/$/branches/org/scratch-notes
+```
+
+The two settings make the dataset's `memory.json` format 3, and a kept branch makes its
+`branches.json` format 3. Older releases refuse both files by their versions rather than
+misread them.
+
 MCP calls follow the server's rules. The rate limits of the `query` and `update` classes
 apply per dataset, as for `/{ds}/sparql` and `/{ds}/update`, and the memory budget is the
 smaller of `--mcp-query-memory-mb` and `--query-memory-mb`. A call may ask for up to the
@@ -5719,7 +5747,9 @@ iterated, closed with `close()`, used as a context manager, asked for stats and
 serialized directly. When a Python cursor fails, during iteration or in `serialize()`,
 its status becomes `failed` and every later `next()` raises `InvalidInputError`, so a
 loop cannot mistake it for a complete answer. `serialize()` responds to Ctrl-C as a
-query does. `Dataset.query` and `Dataset.select` still run eagerly, because their
+query does. Iteration decodes ahead of the row it returns, up to 255 further rows and
+until they pass one mebibyte of text. It holds those rows, about one mebibyte and one
+row at most, outside the query's memory budget until they are read. `Dataset.query` and `Dataset.select` still run eagerly, because their
 results are collected values whose iteration cannot fail. Node runs `query`, `select`,
 `construct` and `queryToStream` in automatic mode by default and accepts
 `execution: 'eager' | 'streaming' | 'auto'` in its query options. A streamed Node result
@@ -6366,6 +6396,7 @@ ds.add(Quad(alice, NamedNode("http://ex.org/p"), Literal(1)))   # a commit; True
 ds.extend(triples_or_quads)                       # many quads in one commit
 ds.remove(quad)
 quad in ds; len(ds); ds.named_graphs()
+ds.contains_all(quads)                            # a list of bool, one per quad
 
 for q in ds.quads_for_pattern(alice, None, None):  # None matches anything
     print(q.predicate, q.object, q.graph_name)
@@ -6380,7 +6411,10 @@ with ds.transaction() as tx:                       # commits at the end of the b
 
 `graph_name=None` matches every graph, and `DefaultGraph()` matches only the default
 graph. `quads_for_pattern` reads the snapshot it started on, in batches, so a large match
-is never held in memory at once. A transaction rolls back when its block raises, or when
+is never held in memory at once. `contains_all` answers many membership tests in one
+call. It takes any iterable of quads or triples and returns what `in` gives for each, in
+order and from one snapshot. A batch longer than 256 quads, or any batch on a dataset on
+disk, is answered without the GIL. A transaction rolls back when its block raises, or when
 it is garbage-collected without `commit()`. Queries on the dataset read the last commit,
 not the open transaction. A write on the dataset from the thread that holds the
 transaction raises `ConflictError` instead of waiting for itself. Writes from other
@@ -6740,6 +6774,13 @@ throws `JenaTransactionException`, as in TDB2, unless the dataset was opened wit
 `autocommit(true)`. Each such write is then a commit of its own, which is slow for many
 writes.
 
+`DatasetGraphSparkles.containsAll(quads)` answers many `contains` tests in one native
+call and returns a `BooleanArray` with the answer for each quad in order. A term that
+several quads share crosses once, and every answer is read from the thread's
+transaction, or from the newest commit outside one. `containsAll(graph, triples)` does
+the same for the triples of one graph. The whole batch is encoded into one request, so
+its memory grows with the batch.
+
 An iterator from `find` inside a transaction throws `JenaTransactionException` once the
 transaction has ended. Outside a transaction, an iterator reads the commit that was the
 newest when it was made. Close or exhaust iterators, because an open one keeps its
@@ -6944,7 +6985,9 @@ before calling a dataset operation that needs the writer lock.
 
 `load` accepts paths, RDF text, byte arrays, Node Readables and Web streams. `dump`
 returns a Web byte stream, and `dumpToFile` writes to a path. `match` streams RDF/JS
-quads, and `source()` returns an RDF/JS source for Comunica. Dataset administration is
+quads, and `source()` returns an RDF/JS source for Comunica. `has(quad)` tests one quad,
+and `hasAll(quads)` tests many in one call and resolves to an array of booleans in the
+order given, all read from the dataset's state at the call. Dataset administration is
 grouped under handles such as `snapshots`, `history`, `branches`, `indexes`,
 `reasoning`, `validation` and `settings`. The [engine package](../js/engine/README.md)
 documents the full API.

@@ -130,7 +130,7 @@ pub use compaction::{
 pub use definitions::{DefinitionFile, DefinitionSource};
 pub use deltas::{CommitDelta, DeltaPage, DeltaSubscription};
 pub use describe::DESCRIBE_FILE;
-pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
+pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, IdChange, StateMark, key_id};
 pub use diff_groups::{CHANGE_BYTES, ClassGroup, ClassGroups, MAX_GROUPS, ObjectGroup};
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
 #[cfg(feature = "failpoints")]

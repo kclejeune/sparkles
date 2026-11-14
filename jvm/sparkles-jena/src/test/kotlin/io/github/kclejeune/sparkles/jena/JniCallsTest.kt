@@ -55,6 +55,124 @@ class JniCallsTest {
         assertEquals(expected, SparklesJni.ENABLED)
     }
 
+    /**
+     * `containsAll` answers each quad as `contains` does, on the newest commit, in a read
+     * transaction and in a write transaction with changes that are not flushed, for
+     * quads that are there, quads that are not, patterns and repeated terms.
+     */
+    @Test
+    fun contains_all_answers_each_quad_as_contains_does() {
+        val dsg = filled(40)
+        val g = iri("g")
+        val blank = NodeFactory.createBlankNode("made-here")
+        val tagged = NodeFactory.createLiteralLang("chat", "fr")
+        val number = NodeFactory.createLiteralDT("7", org.apache.jena.datatypes.xsd.XSDDatatype.XSDinteger)
+        Txn.executeWrite(dsg) {
+            dsg.add(g, blank, iri("q"), tagged)
+            dsg.add(Quad.defaultGraphIRI, iri("s0"), iri("q"), number)
+        }
+        val quads = ArrayList<Quad>()
+        for (i in 0 until 40) {
+            val (s, p, v) = Triple(iri("s${i % 10}"), iri("p$i"), NodeFactory.createLiteralString("v$i"))
+            quads.add(Quad.create(Quad.defaultGraphIRI, s, p, v))
+            quads.add(Quad.create(g, s, p, v))
+            quads.add(Quad.create(Quad.defaultGraphNodeGenerated, s, p, v))
+            quads.add(Quad.create(Quad.unionGraph, s, p, v))
+            // a term the dataset does not know, in each position
+            quads.add(Quad.create(iri("unknown"), s, p, v))
+            quads.add(Quad.create(g, iri("unknown"), p, v))
+            quads.add(Quad.create(g, s, iri("unknown"), v))
+            quads.add(Quad.create(g, s, p, iri("unknown")))
+            // the subject of another quad
+            quads.add(Quad.create(g, iri("s${(i + 1) % 10}"), p, v))
+        }
+        quads.add(Quad.create(g, blank, iri("q"), tagged))
+        quads.add(Quad.create(Quad.defaultGraphIRI, blank, iri("q"), tagged))
+        quads.add(Quad.create(g, NodeFactory.createBlankNode("another"), iri("q"), tagged))
+        quads.add(Quad.create(Quad.defaultGraphIRI, iri("s0"), iri("q"), number))
+        quads.add(Quad.create(Quad.defaultGraphIRI, iri("s0"), iri("q"), NodeFactory.createLiteralString("7")))
+        // patterns, which `contains` takes too
+        quads.add(Quad.create(Node.ANY, iri("s0"), Node.ANY, Node.ANY))
+        quads.add(Quad.create(g, Node.ANY, iri("q"), Node.ANY))
+        quads.add(Quad.create(Quad.unionGraph, Node.ANY, iri("q"), number))
+        quads.add(Quad.create(Node.ANY, iri("unknown"), Node.ANY, Node.ANY))
+        // a literal where a subject belongs
+        quads.add(Quad.create(g, tagged, iri("q"), tagged))
+        quads.addAll(quads.take(9))
+
+        fun oneByOne() = BooleanArray(quads.size) { dsg.contains(quads[it]) }
+        fun check(where: String) {
+            val expected = oneByOne()
+            assertEquals(expected.toList(), dsg.containsAll(quads).toList(), where)
+            // every size of batch, the single quad included
+            for (n in listOf(1, 2, 9, 10)) {
+                assertEquals(expected.take(n), dsg.containsAll(quads.take(n)).toList(), "$where, $n quads")
+            }
+        }
+        check("outside a transaction")
+        val head = oneByOne()
+        assertEquals(listOf(true, true, true, true, false, false, false, false, false), head.take(9))
+        // the quads of the loop, the number, two patterns and the repeat of the first nine
+        assertTrue(head.count { it } >= 40 * 4 + 1 + 2 + 4)
+        assertTrue(head.count { !it } >= 40 * 5 + 5)
+        Txn.executeRead(dsg) { check("in a read transaction") }
+        dsg.begin(org.apache.jena.query.ReadWrite.WRITE)
+        try {
+            dsg.delete(g, iri("s0"), iri("p0"), NodeFactory.createLiteralString("v0"))
+            dsg.add(g, iri("unknown"), iri("p1"), NodeFactory.createLiteralString("v1"))
+            check("in a write transaction")
+            val inWrite = oneByOne()
+            assertFalse(inWrite[1])
+            assertTrue(inWrite[9 + 5])
+        } finally {
+            dsg.abort()
+            dsg.end()
+        }
+        assertEquals(head.toList(), dsg.containsAll(quads).toList())
+
+        // the triples of one graph, as the graph's own `contains` answers them
+        val triples = quads.take(90).map { it.asTriple() }
+        for (graph in listOf(g, Quad.defaultGraphIRI, Quad.unionGraph, iri("unknown"))) {
+            val view = dsg.getGraph(graph)
+            assertEquals(triples.map { view.contains(it) }, dsg.containsAll(graph, triples).toList(), "$graph")
+        }
+
+        assertEquals(0, dsg.containsAll(emptyList()).size)
+        assertEquals(0, dsg.containsAll(g, emptyList()).size)
+        dsg.close()
+        assertThrows(SparklesInvalidException::class.java) { dsg.containsAll(quads) }
+        assertThrows(SparklesInvalidException::class.java) { dsg.containsAll(emptyList()) }
+    }
+
+    /**
+     * A null array reaches an entry point only through reflection, since the Kotlin
+     * callers take a `ByteArray`. The entry point refuses it with the exception of a
+     * malformed request, and the JVM goes on.
+     */
+    @Test
+    fun a_null_array_is_refused_by_the_jni_calls() {
+        val dsg = filled(1)
+        assumeTrue(SparklesJni.CONTAINS)
+        val jni = Class.forName("io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni")
+        for (name in listOf("containsAllHead", "containsHead")) {
+            val method = jni.getDeclaredMethod(name, Long::class.javaPrimitiveType, ByteArray::class.java)
+            method.isAccessible = true
+            // the array is read before the handle, so no handle is needed to be refused
+            val thrown = assertThrows(java.lang.reflect.InvocationTargetException::class.java) {
+                method.invoke(null, 0L, null)
+            }
+            val failure = thrown.targetException
+            assertEquals("SparklesJniFailure", failure.javaClass.simpleName, name)
+            val toException = failure.javaClass.getDeclaredMethod("toException")
+            toException.isAccessible = true
+            val e = toException.invoke(failure) as FfiException.Engine
+            assertEquals(ErrorKind.MALFORMED, e.kind, name)
+        }
+        // the dataset answers afterwards
+        assertTrue(dsg.contains(Quad.defaultGraphIRI, iri("s0"), iri("p0"), NodeFactory.createLiteralString("v0")))
+        assertEquals(listOf(true), dsg.containsAll(listOf(Quad.create(iri("g"), iri("s0"), iri("p0"), NodeFactory.createLiteralString("v0")))).toList())
+    }
+
     @Test
     fun errors_and_panics_become_the_exceptions_uniffi_throws() {
         filled(1)

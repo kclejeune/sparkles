@@ -783,7 +783,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("quota.json", 1),
     ds("changelog.json", 1),
     ds("history.json", 2),
-    ds("branches.json", 2),
+    ds("branches.json", 3),
     ds("branch.json", 2),
     ds("queries.json", 1),
     ds("mappings.json", 1),
@@ -792,12 +792,13 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("validation-status.json", 1),
     ds("text.json", 1),
     named(ds("reasoning.json", 2), "reasoningFormat"),
+    named(ds("query-reasoning.json", 1), "queryReasoningFormat"),
     named(ds("rdfs.json", 1), "rdfsFormat"),
     named(ds("origin.json", 1), "originFormat"),
     ds("graphql.json", 1),
     named(ds("restore.json", 1), "restoreFormat"),
     ds("assistant.json", 1),
-    ds("memory.json", 2),
+    ds("memory.json", 3),
     ds("ingest.json", 1),
     ds("asks.json", 2),
     ds("query-suggestions.json", 1),
@@ -1054,10 +1055,16 @@ fn settings_max_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// The version a settings file's content is stamped with. It is the highest version
 /// this build writes, except that a file whose content an older release reads keeps
 /// that older version, so only a file that uses a newer feature is refused by older
-/// releases. `memory.json` is format 2 only when it holds `scratchBranches`.
+/// releases. `memory.json` is format 2 when it holds `scratchBranches` with `ttl` only,
+/// and format 3 when `scratchBranches` holds `maxPerPrincipal` or `notifyBefore`.
 fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
-    if s.name == "memory.json" && v.get("scratchBranches").is_none() {
-        return 1;
+    if s.name == "memory.json" {
+        let Some(sb) = v.get("scratchBranches") else {
+            return 1;
+        };
+        if sb.get("maxPerPrincipal").is_none() && sb.get("notifyBefore").is_none() {
+            return 2;
+        }
     }
     settings_max_format(s, v)
 }
@@ -1466,7 +1473,7 @@ mod tests {
     #[test]
     fn memory_format_two_needs_scratch_branches() {
         use serde_json::json;
-        assert_eq!(settings_file("memory.json").unwrap().writes, 2);
+        assert_eq!(settings_file("memory.json").unwrap().writes, 3);
         let mut plain = json!({"agentGraphs": ["urn:x:a/*"]});
         stamp_settings("memory.json", &mut plain);
         assert_eq!(plain["format"], 1, "older releases keep reading it");
@@ -1477,8 +1484,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["format"], 2);
         assert!(check_settings("memory.json", &v).is_ok());
-        let e = check_settings("memory.json", &json!({"format": 3})).unwrap_err();
+        let e = check_settings("memory.json", &json!({"format": 4})).unwrap_err();
         assert!(matches!(e, Error::Unsupported(_)), "{e}");
+    }
+
+    #[test]
+    fn memory_format_three_needs_scratch_limits_or_warnings() {
+        use serde_json::json;
+        for sb in [
+            json!({"maxPerPrincipal": 3}),
+            json!({"notifyBefore": "6h"}),
+            json!({"ttl": "1d", "maxPerPrincipal": 3, "notifyBefore": "6h"}),
+        ] {
+            let mut v = json!({"scratchBranches": sb});
+            stamp_settings("memory.json", &mut v);
+            assert_eq!(v["format"], 3, "{v}");
+            assert!(check_settings("memory.json", &v).is_ok());
+        }
+        // item 57's member alone stays readable by the release that reads format 2
+        let mut v = json!({"scratchBranches": {"ttl": "1d"}});
+        stamp_settings("memory.json", &mut v);
+        assert_eq!(v["format"], 2);
     }
 
     #[test]

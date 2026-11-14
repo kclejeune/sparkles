@@ -160,6 +160,88 @@ pub struct ClaimInput {
     pub attributed_author: NamedNode,
     pub scope: Scope,
     pub confidence: ConfidenceFacets,
+    /// The C27 validity record of this occurrence, written with the claim (spec C27
+    /// §4.4). `None` leaves its validity unknown.
+    pub validity: Option<ValidityInput>,
+}
+
+/// A C27 validity interval: half-open, with its two boundaries and the description of
+/// the normalization that interpreted the source time (spec C27 §2, §3 and §4.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidityInput {
+    pub start: BoundaryInput,
+    pub end: BoundaryInput,
+    pub normalization: NormalizationInput,
+}
+
+/// One endpoint of a validity interval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundaryInput {
+    /// A known endpoint whose instant lies between `earliest` and `latest`, both
+    /// inclusive `xsd:dateTime` values with an explicit offset.
+    Known {
+        earliest: Literal,
+        latest: Literal,
+        precision: NamedNode,
+        source_value: String,
+    },
+    /// An endpoint the source leaves undetermined. It is not unbounded.
+    Unknown { source_value: Option<String> },
+    /// An explicitly open endpoint: negative infinity at the start, positive at the end.
+    Unbounded { source_value: Option<String> },
+}
+
+/// The outcome of a source time's normalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NormalizationStatus {
+    Normalized,
+    Unresolved,
+    UnsupportedCalendar,
+    UnsupportedPrecision,
+    IndeterminateOrder,
+    NonexistentLocalTime,
+}
+
+impl NormalizationStatus {
+    /// The status's local name in the `vt:` namespace.
+    pub fn local(self) -> &'static str {
+        match self {
+            Self::Normalized => "Normalized",
+            Self::Unresolved => "Unresolved",
+            Self::UnsupportedCalendar => "UnsupportedCalendar",
+            Self::UnsupportedPrecision => "UnsupportedPrecision",
+            Self::IndeterminateOrder => "IndeterminateOrder",
+            Self::NonexistentLocalTime => "NonexistentLocalTime",
+        }
+    }
+}
+
+/// The choice made for an ambiguous local time in a daylight-saving fold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldChoice {
+    Earlier,
+    Later,
+}
+
+impl FoldChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Earlier => "earlier",
+            Self::Later => "later",
+        }
+    }
+}
+
+/// The run that interpreted a source time, recorded with each validity record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormalizationInput {
+    pub status: NormalizationStatus,
+    pub method: NamedNode,
+    pub method_version: String,
+    pub calendar: NamedNode,
+    pub timezone_policy: Option<String>,
+    pub tzdb_version: Option<String>,
+    pub fold_choice: Option<FoldChoice>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
