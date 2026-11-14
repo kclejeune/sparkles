@@ -673,3 +673,43 @@ fn forced_ask_probes_preserve_a_bounded_hash_cursor_for_repeated_keys() {
         }
     }
 }
+
+/// A keyed ASK answers from the first rows of its inputs although keying a large literal
+/// at the end of an input needs more scratch than the memory budget allows (review
+/// round 6).
+#[test]
+fn keyed_ask_answers_when_keying_the_held_input_would_exceed_its_budget() {
+    let store = Store::in_memory(StoreOptions::default());
+    let large = "z".repeat(1 << 20);
+    let mut data = String::new();
+    for side in ["left", "right"] {
+        data += &format!("<urn:{side}-first> <urn:{side}> \"a\" .\n");
+        for i in 1..2047 {
+            data += &format!("<urn:{side}{i}> <urn:{side}> \"x-{side}-{i:05}\" .\n");
+        }
+        data += &format!("<urn:{side}~last> <urn:{side}> \"{large}{side}\" .\n");
+    }
+    load(&store, data);
+    store.compact().unwrap();
+    let text = "ASK { ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y) }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(512 << 10),
+        ..options(4096, true)
+    };
+    let eager = query(store.snapshot(), text, &opts).unwrap();
+    assert!(eager.boolean);
+    let auto = query_execution(
+        store.snapshot(),
+        text,
+        &opts,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Ask(auto) = auto else {
+        panic!("automatic execution streams every ASK")
+    };
+    assert!(auto.result().boolean);
+    let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
+    assert_eq!(query(store.snapshot(), &select, &opts).unwrap().len(), 1);
+}
