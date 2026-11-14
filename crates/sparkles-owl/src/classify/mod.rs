@@ -481,6 +481,10 @@ pub struct Saturation {
     /// the invalidation does not follow: a context merged with an individual, a world, a
     /// key or a fact of a universal role
     entangled: bool,
+    /// whether the interner may hold the expressions of a removed axiom that is not
+    /// [`tier_neutral`], which a run that decides its tier over the interner would read
+    /// as present, so a run with axioms outside OWL 2 EL starts again
+    stale_tier: bool,
     /// whether the last run whose saturation ended found the ontology consistent
     consistent: bool,
     /// the contexts of conjunctions that the last run's Horn rules created
@@ -544,6 +548,44 @@ fn needs_full_run(ax: &AxiomKind) -> bool {
             Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
         )
     })
+}
+
+/// Whether the expressions of the axiom, once it is removed, leave nothing in a kept
+/// interner that a run's choice of tier reads. That choice looks for self restrictions,
+/// at-most restrictions, nominals, data and the top and bottom object properties among
+/// every expression the interner holds, so a removed axiom with any of them could keep
+/// Tier D from the axioms that remain. Class axioms and domains built from classes,
+/// intersections, unions, complements and existentials over other properties are
+/// neutral, and so are declarations and annotations.
+fn tier_neutral(ax: &AxiomKind) -> bool {
+    use ClassExpression as C;
+    fn plain(c: &ClassExpression) -> bool {
+        match c {
+            C::Class(_) => true,
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().all(plain),
+            C::ObjectComplementOf(c) => plain(c),
+            C::ObjectSomeValuesFrom(p, c) => {
+                let p = p.named();
+                *p != ObjectProperty::top() && *p != ObjectProperty::bottom() && plain(c)
+            }
+            _ => false,
+        }
+    }
+    match ax {
+        _ if !logical(ax) => true,
+        AxiomKind::Declaration(e) => !matches!(
+            e,
+            Entity::ObjectProperty(p) if *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
+        ),
+        AxiomKind::SubClassOf(a, b) => plain(a) && plain(b),
+        AxiomKind::EquivalentClasses(cs) | AxiomKind::DisjointClasses(cs) => cs.iter().all(plain),
+        AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
+        AxiomKind::ObjectPropertyDomain(p, c) => {
+            let p = p.named();
+            *p != ObjectProperty::top() && *p != ObjectProperty::bottom() && plain(c)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a change to the axiom affects the role table, which a run builds once.
@@ -843,6 +885,7 @@ impl Saturation {
             dirty: true,
             worlds: FxHashMap::default(),
             entangled: false,
+            stale_tier: false,
             consistent: true,
             dynamic: None,
             horn_tried: false,
@@ -1135,6 +1178,7 @@ impl Saturation {
     fn reset(&mut self) {
         self.index = None;
         self.interner = Interner::new();
+        self.stale_tier = false;
         self.ctx = Vec::new();
         self.dynamic = None;
     }
@@ -1504,29 +1548,6 @@ impl Saturation {
         self.dl_tried = false;
         self.partial_over = false;
         self.numeric_halt = false;
-        let changes = changes.filter(|_| !again);
-        let full = self.entangled
-            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)));
-        self.worlds.clear();
-        if full {
-            self.interner = Interner::new();
-            self.ctx = Vec::new();
-        }
-        // the premises of the changed axioms, read from the interner before the index of
-        // the new axioms is built
-        let premises = match changes {
-            Some(c) if !full => {
-                let mut scratch = Axioms::default();
-                for &k in c.added.iter().chain(c.removed) {
-                    index::normalize(k, &mut self.interner, &mut scratch);
-                }
-                Some(scratch)
-            }
-            _ => None,
-        };
-        // The old index is no longer read. Drop its handles before constructing the
-        // replacement, while cached contexts retain their shared numeric ledger.
-        self.index = None;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
@@ -1544,6 +1565,37 @@ impl Saturation {
             .flatten()
             .collect();
         poll(limits)?;
+        let changes = changes.filter(|_| !again);
+        // The run decides its tier over the interner, which keeps the expressions of
+        // removed axioms. One that a removal leaves and that the decision reads, such as
+        // a self restriction or the top property, could keep Tier D from the axioms that
+        // remain, so a run with axioms outside OWL 2 EL then starts again.
+        let stale =
+            self.stale_tier || changes.is_some_and(|c| c.removed.iter().any(|k| !tier_neutral(k)));
+        let full = self.entangled
+            || changes.is_none_or(|c| c.added.iter().chain(c.removed).any(|k| needs_full_run(k)))
+            || stale && !outside.is_empty() && !limits.el_only;
+        self.worlds.clear();
+        if full {
+            self.interner = Interner::new();
+            self.ctx = Vec::new();
+        }
+        self.stale_tier = stale && !full;
+        // the premises of the changed axioms, read from the interner before the index of
+        // the new axioms is built
+        let premises = match changes {
+            Some(c) if !full => {
+                let mut scratch = Axioms::default();
+                for &k in c.added.iter().chain(c.removed) {
+                    index::normalize(k, &mut self.interner, &mut scratch);
+                }
+                Some(scratch)
+            }
+            _ => None,
+        };
+        // The old index is no longer read. Drop its handles before constructing the
+        // replacement, while cached contexts retain their shared numeric ledger.
+        self.index = None;
         let (ax, mut ix, normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes, limits)?;
         drop(outside);
