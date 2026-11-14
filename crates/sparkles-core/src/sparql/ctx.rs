@@ -342,8 +342,8 @@ pub struct Optimizations {
     /// a streamed result writer decodes the terms of the next batch on the Rayon pool
     /// while it writes the current one
     pub decode_ahead: bool,
-    /// cursor operators that read their whole input before output, and filters over a
-    /// scan, read larger inputs as a long input goes on
+    /// cursor operators that read their whole input before output, and filters without
+    /// effects whose rows do not pass, read larger inputs as a long input goes on
     pub grow_input: bool,
     /// the predicates of a set of subjects, with the subjects having each, and
     /// `spk:hasPredicate` are read from the generation's predicate patterns

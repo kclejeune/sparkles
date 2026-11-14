@@ -713,3 +713,24 @@ fn keyed_ask_answers_when_keying_the_held_input_would_exceed_its_budget() {
     let select = text.replacen("ASK", "SELECT * WHERE", 1) + " LIMIT 1";
     assert_eq!(query(store.snapshot(), &select, &opts).unwrap().len(), 1);
 }
+
+/// Once one input of a keyed ASK has ended, the other input's rows are keyed as the
+/// probe reaches them, so a long literal after the first matching row is never keyed
+/// (review round 8).
+#[test]
+fn a_probe_only_batch_keys_no_row_past_the_first_match() {
+    let store = Store::in_memory(StoreOptions::default());
+    let large = "z".repeat(1 << 20);
+    let data = format!(
+        "<urn:left-first> <urn:left> \"a\" .\n<urn:left~last> <urn:left> \"{large}\" .\n\
+         <urn:right-only> <urn:right> \"a\" .\n"
+    );
+    load(&store, data);
+    store.compact().unwrap();
+    let text = "ASK { ?l <urn:left> ?x . ?r <urn:right> ?y FILTER(?x = ?y) }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(512 << 10),
+        ..options(4096, true)
+    };
+    assert!(query(store.snapshot(), text, &opts).unwrap().boolean);
+}

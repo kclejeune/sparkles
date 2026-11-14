@@ -1250,6 +1250,27 @@ mod tests {
         // one pair at a time took several operations for each of the 90,000 pairs
         assert!(ops < 5_000, "{ops} ledger operations");
     }
+
+    /// A FILTER that reads ahead checks its grown demand against the row limit before
+    /// each read, so it answers where reading at its consumer's demand answers (review
+    /// round 8).
+    #[test]
+    fn a_grown_filter_demand_that_no_longer_fits_the_row_limit_shrinks() {
+        use crate::sparql::{QueryOptions, query};
+        let store = Store::in_memory(StoreOptions::default());
+        let values: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        let text = format!(
+            "SELECT ?x WHERE {{ VALUES ?x {{ {} }} FILTER(?x >= 21) }} LIMIT 1",
+            values.join(" ")
+        );
+        let opts = QueryOptions {
+            max_rows: Some(32),
+            no_cache: true,
+            ..Default::default()
+        };
+        let r = query(store.snapshot(), &text, &opts).unwrap();
+        assert_eq!(r.len(), 1);
+    }
     /// A grant set after the first charge would leave that charge on the old grant,
     /// which debug builds refuse.
     #[test]

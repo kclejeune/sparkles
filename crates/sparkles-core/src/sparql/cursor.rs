@@ -2526,6 +2526,17 @@ struct Ahead {
 /// The most cursor batches a FILTER that reads ahead asks its input for at once.
 const AHEAD_BATCHES: usize = 8;
 
+/// Whether a FILTER may ask its input `child` for `rows` rows ahead of its demand: the
+/// read-ahead is on, the query has no budget of produced rows, and the rows fit the row
+/// limit and the memory headroom.
+fn ahead_fits(ctx: &Ctx, child: &Operator, rows: usize) -> bool {
+    let row_bytes = (child.vars.len() as u64 * 16).saturating_add(192);
+    ctx.opt.grow_input
+        && ctx.max_rows_produced == u64::MAX
+        && ctx.max_rows.saturating_sub(child.rows) >= rows
+        && ctx.memory_remaining() >= (rows as u64).saturating_mul(row_bytes).saturating_add(8192)
+}
+
 fn supported(kind: &Kind) -> bool {
     matches!(
         kind,
@@ -3228,6 +3239,10 @@ impl Operator {
             State::Ripple(ripple) => ripple.release_working_sets(),
             _ => {}
         }
+        if let Some(ahead) = &mut self.ahead {
+            ahead.pending = None;
+            ahead.at = 0;
+        }
         for child in &mut self.children {
             child.release_finished();
         }
@@ -3912,10 +3927,20 @@ impl Operator {
                     batch
                 }
                 State::Unary(node) => {
-                    let demand = self
-                        .ahead
-                        .as_ref()
-                        .map_or(cap, |ahead| ahead.demand.max(cap));
+                    // A grown demand is checked against the limits before every read, as
+                    // the child's rows and the free memory change between reads.
+                    let child = &self.children[0];
+                    let demand = match &mut self.ahead {
+                        Some(ahead) if ahead.demand > cap => {
+                            if ahead_fits(ctx, child, ahead.demand) {
+                                ahead.demand
+                            } else {
+                                ahead.demand = 0;
+                                cap
+                            }
+                        }
+                        _ => cap,
+                    };
                     let grown;
                     let input_options = if demand > cap {
                         let mut wider = options.clone();
@@ -3967,17 +3992,10 @@ impl Operator {
                         if b.table.is_empty() {
                             // Ask for four times as many rows next, when the query has
                             // no budget of produced rows and the rows fit its limits.
-                            let child = &self.children[0];
                             let next = demand
                                 .saturating_mul(4)
                                 .min(options.batch_rows.saturating_mul(AHEAD_BATCHES));
-                            let row_bytes = (child.vars.len() as u64 * 16).saturating_add(192);
-                            if ctx.opt.grow_input
-                                && ctx.max_rows_produced == u64::MAX
-                                && ctx.max_rows.saturating_sub(child.rows) >= next
-                                && ctx.memory_remaining()
-                                    >= (next as u64).saturating_mul(row_bytes).saturating_add(8192)
-                            {
+                            if ahead_fits(ctx, &self.children[0], next) {
                                 ahead.demand = next;
                             }
                         } else {

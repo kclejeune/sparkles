@@ -190,13 +190,20 @@ impl Ripple {
                 Some(held) => merge::append(ctx, held, &batch.table, 0..n)?,
                 None => side.held = Some(batch),
             }
-            // Each new row's key, which its probe uses too. Rows that no later row of
-            // the other input will meet are not indexed.
+            // Each new row's key, which its probe uses too, when the row is indexed.
+            // Rows that no later row of the other input will meet are not indexed, and
+            // their probe keys each row as it reaches it, so that it keys no row past
+            // the first matching pair.
             let index = !self.sides[1 - s].done;
             let key = self.key[s];
             let side = &mut self.sides[s];
             side.keys.truncate(start);
             let key_bytes = |rows: usize| (rows as u64).saturating_mul(KEY_BYTES);
+            let keyed_rows = if index {
+                start.saturating_add(n)
+            } else {
+                start
+            };
             // Reserve before the keys, the map or its row vectors can allocate. The
             // keys move to an exact capacity while their old storage stays charged.
             // Each u32 vector's geometric capacity is at most four times its populated
@@ -205,7 +212,7 @@ impl Ripple {
             // growth during the fill.
             if let Some(charge) = &mut side.charge {
                 let mut bytes = key_bytes(side.keys.capacity())
-                    .saturating_add(key_bytes(start.saturating_add(n)))
+                    .saturating_add(key_bytes(keyed_rows))
                     .saturating_add(map_bytes(side.keyed.capacity(), 32))
                     .saturating_add(side.position_bytes)
                     .saturating_add(1024);
@@ -216,7 +223,9 @@ impl Ripple {
                 }
                 charge.resize(bytes)?;
             }
-            side.keys.reserve_exact(n);
+            if index {
+                side.keys.reserve_exact(n);
+            }
             let Side {
                 held,
                 keys,
@@ -229,15 +238,12 @@ impl Ripple {
             if index {
                 keyed.reserve(n);
             }
-            for row in start..start + n {
+            for row in (start..start + n).take_while(|_| index) {
                 if row.is_multiple_of(1024) {
                     ctx.check()?;
                 }
                 let k = eq_key(ctx, held.cols[key][row])?;
                 keys.push(k);
-                if !index {
-                    continue;
-                }
                 match k {
                     EqKey::Unbound => {}
                     EqKey::Key(k) => {
@@ -279,12 +285,18 @@ impl Ripple {
         };
         let (s, o) = (probe.side, 1 - probe.side);
         let keys = &self.sides[s].keys;
+        let held = &self.sides[s].held.as_ref().expect("probed rows").table;
         let other = &self.sides[o];
         while probe.row < probe.end && pairs.len() < room {
             if probe.row.is_multiple_of(1024) {
                 ctx.check()?;
             }
-            let rows: &[u32] = match keys[probe.row] {
+            // a row of a batch that is only probed is keyed here, as the probe reaches it
+            let k = match keys.get(probe.row) {
+                Some(k) => *k,
+                None => eq_key(ctx, held.cols[self.key[s]][probe.row])?,
+            };
+            let rows: &[u32] = match k {
                 EqKey::Unbound => &[],
                 EqKey::Key(k) => other.keyed.get(&k).map_or(&[], Vec::as_slice),
                 EqKey::Loose => &other.loose,
