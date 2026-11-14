@@ -347,7 +347,10 @@ pub enum Item {
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
-    seen: Vec<Term>,
+    /// Where each term written in full at the top level starts, for the repeats of it.
+    /// A repeat reads the term again from there, so a batch without repeats, such as
+    /// a pattern, keeps no second copy of its terms.
+    seen: Vec<usize>,
     resolve: &'a dyn Fn(&str) -> Option<BlankNode>,
 }
 
@@ -411,16 +414,20 @@ impl<'a> Reader<'a> {
             UNION_GRAPH => Item::UnionGraph,
             REPEAT => {
                 let i = self.len()? as usize;
-                Item::Term(
-                    self.seen
-                        .get(i)
-                        .cloned()
-                        .ok_or_else(|| bad(format!("repeat of term {i}, which is not there")))?,
-                )
+                let at = *self
+                    .seen
+                    .get(i)
+                    .ok_or_else(|| bad(format!("repeat of term {i}, which is not there")))?;
+                let after = std::mem::replace(&mut self.pos, at);
+                let tag = self.byte()?;
+                let t = self.term_of(tag);
+                self.pos = after;
+                Item::Term(t?)
             }
             _ => {
+                let at = self.pos - 1;
                 let t = self.term_of(tag)?;
-                self.seen.push(t.clone());
+                self.seen.push(at);
                 Item::Term(t)
             }
         })
