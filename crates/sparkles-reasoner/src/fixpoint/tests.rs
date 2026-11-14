@@ -94,10 +94,19 @@ fn closure(base: &BTreeSet<T>) -> BTreeSet<String> {
 }
 
 fn shown(snap: &Snapshot, fp: &FixedPoint<RuleProgram>) -> BTreeSet<String> {
-    fp.facts()
+    shown_of(snap, &fp.program, fp.facts())
+}
+
+fn shown_of(
+    snap: &Snapshot,
+    program: &RuleProgram,
+    facts: Vec<(Triple, Record)>,
+) -> BTreeSet<String> {
+    facts
+        .into_iter()
         .map(|(t, _)| {
             t.iter()
-                .map(|&i| fp.program.term(snap, i).expect("a term").to_string())
+                .map(|&i| program.term(snap, i).expect("a term").to_string())
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -175,6 +184,13 @@ fn build(s: &Store, mode: Provenance) -> FixedPoint<RuleProgram> {
 
 #[test]
 fn rules_are_maintained_as_their_closure() {
+    for batch in [1usize, 3, 1024] {
+        maintained_as_closure(batch);
+    }
+}
+
+/// The one-step program with `batch` facts per batched call against the naive closure.
+fn maintained_as_closure(batch: usize) {
     for seed in 1..40u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let s = Store::in_memory(StoreOptions::default());
@@ -183,6 +199,7 @@ fn rules_are_maintained_as_their_closure() {
         apply(&s, &[], &init);
         model.extend(init);
         let mut fp = build(&s, Provenance::None);
+        fp.program.set_batch_len(batch);
         assert_eq!(
             shown(&s.snapshot(), &fp),
             closure(&model),
@@ -260,7 +277,7 @@ fn rule_witnesses_derive_their_triples() {
                 })
                 .collect();
             for (f, _) in fp.facts() {
-                let a = fp.annotation(f).expect("an annotation");
+                let a = fp.annotation(&f).expect("an annotation");
                 let Ann::Why(w) = a else {
                     panic!("not why");
                 };
@@ -371,7 +388,7 @@ fn repeated_premises_are_not_a_cycle() {
         ));
         let fp = program(&rules, &s, Provenance::why(), None)
             .unwrap_or_else(|e| panic!("{k} fillers: {e}"));
-        assert_eq!(fp.facts().count(), 3 + k);
+        assert_eq!(fp.facts().len(), 3 + k);
     }
 }
 
@@ -508,7 +525,7 @@ fn rule_witnesses_agree_with_the_reasoners() {
                 panic!("named nodes");
             };
             let t = oxrdf::Triple::new(sub, p, term(f[2]));
-            let Some(Ann::Why(w)) = fp.annotation(f) else {
+            let Some(Ann::Why(w)) = fp.annotation(&f) else {
                 panic!("not why");
             };
             let ours = w.supports[0].0.atoms();
@@ -532,4 +549,673 @@ fn rule_witnesses_agree_with_the_reasoners() {
         }
     }
     assert!(compared > 0);
+}
+
+// ---- the exact mode -----------------------------------------------------------------
+
+/// An [`IndexedStore`] that counts what the operator and the sinks reserve through it,
+/// and refuses past `cap`.
+#[derive(Default)]
+struct Counting {
+    inner: IndexedStore,
+    reserved: std::cell::Cell<u64>,
+    peak: std::cell::Cell<u64>,
+    cap: Option<u64>,
+}
+
+impl FactStore<Triple, Record> for Counting {
+    type Error = sparkles_core::Error;
+
+    fn contains(&self, f: &Triple) -> bool {
+        self.inner.contains(f)
+    }
+
+    fn record(&self, f: &Triple) -> Option<Record> {
+        self.inner.record(f)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn for_each(&self, visit: &mut dyn FnMut(&Triple, &Record)) {
+        self.inner.for_each(visit)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.inner.bytes()
+    }
+
+    fn insert(&mut self, f: Triple, r: Record) -> sparkles_core::Result<bool> {
+        self.inner.insert(f, r)
+    }
+
+    fn set_record(&mut self, f: Triple, r: Record) -> sparkles_core::Result<()> {
+        self.inner.set_record(f, r)
+    }
+
+    fn remove(&mut self, f: &Triple) -> sparkles_core::Result<bool> {
+        self.inner.remove(f)
+    }
+
+    fn clear(&mut self) {
+        self.inner.clear()
+    }
+
+    fn reserve(&self, bytes: u64) -> sparkles_core::Result<()> {
+        let now = self.reserved.get() + bytes;
+        if let Some(cap) = self.cap
+            && now > cap
+        {
+            return Err(sparkles_core::Error::BudgetExceeded(
+                sparkles_core::error::Budget {
+                    kind: sparkles_core::error::BudgetKind::Memory,
+                    limit: cap,
+                    requested: now,
+                },
+            ));
+        }
+        self.reserved.set(now);
+        self.peak.set(self.peak.get().max(now));
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        self.reserved.set(self.reserved.get() - bytes);
+    }
+}
+
+/// The rules of a [`RuleProgram`] in the operator's exact mode. Its proof is exact by
+/// construction: once per pass it derives, from the explicit facts of the new snapshot,
+/// every fact whose derived premises the store holds, and answers membership in that set,
+/// so no partial search is taken for a negative answer.
+struct Exact {
+    inner: RuleProgram,
+    /// insert the added facts and their consequences itself rather than leave it to the
+    /// operator
+    own_saturation: bool,
+    batch: usize,
+    cap: Option<u64>,
+    provable: Option<FxHashSet<Triple>>,
+}
+
+impl Exact {
+    fn new(rules: &str, own_saturation: bool, batch: usize) -> Exact {
+        let rules = parse_rules(rules).expect("rules");
+        Exact {
+            inner: RuleProgram::new(&rules).expect("program"),
+            own_saturation,
+            batch,
+            cap: None,
+            provable: None,
+        }
+    }
+
+    fn provable(&mut self, cx: &RuleCx, store: &Counting) -> sparkles_core::Result<()> {
+        if self.provable.is_some() {
+            return Ok(());
+        }
+        let mut set = IndexedStore::default();
+        let mut queue = Vec::new();
+        cx.new.for_each_quad_in(&[Id::DEFAULT_GRAPH.0], |q| {
+            let t = [q[0], q[1], q[2]];
+            if set.insert(t, Record::EXPLICIT)? {
+                queue.push(t);
+            }
+            Ok(())
+        })?;
+        let mut sink = Sink::unbounded();
+        while let Some(f) = queue.pop() {
+            self.inner
+                .instances_of(&set, &f, &|x| set.contains(x), &mut sink)?;
+            let found: Vec<(Triple, Record)> = sink.drain().collect();
+            for (g, r) in found {
+                if store.contains(&g) && set.insert(g, r)? {
+                    queue.push(g);
+                }
+            }
+        }
+        self.provable = Some(set.facts.keys().copied().collect());
+        Ok(())
+    }
+}
+
+impl Program for Exact {
+    type Fact = Triple;
+    type Record = Record;
+    type Cx<'c> = RuleCx<'c>;
+    type Error = sparkles_core::Error;
+    type Store = Counting;
+
+    const EXACT: bool = true;
+
+    fn new_store(&self) -> Counting {
+        Counting {
+            cap: self.cap,
+            ..Default::default()
+        }
+    }
+
+    fn batch_len(&self) -> usize {
+        self.batch
+    }
+
+    fn premises(&self, f: &Triple, r: &Record, out: &mut Vec<Triple>) {
+        self.inner.premises(f, r, out)
+    }
+
+    fn axioms(
+        &mut self,
+        cx: &mut RuleCx,
+        store: &Counting,
+        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+    ) -> sparkles_core::Result<()> {
+        self.inner.axioms(cx, &store.inner, out)
+    }
+
+    fn consequences(
+        &mut self,
+        _cx: &mut RuleCx,
+        store: &Counting,
+        _w: Which,
+        f: &Triple,
+        held: &dyn Fn(&Triple) -> bool,
+        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+    ) -> sparkles_core::Result<()> {
+        self.inner.instances_of(&store.inner, f, held, out)
+    }
+
+    fn prove(
+        &mut self,
+        cx: &mut RuleCx,
+        store: &Counting,
+        f: &Triple,
+        _held: &dyn Fn(&Triple) -> bool,
+    ) -> sparkles_core::Result<Option<Record>> {
+        self.provable(cx, store)?;
+        let yes = self.provable.as_ref().expect("computed").contains(f);
+        Ok(yes.then_some(Record::EXPLICIT))
+    }
+
+    fn broken(
+        &mut self,
+        _cx: &mut RuleCx,
+        _store: &Counting,
+        _recorded: &dyn Fn(&Triple) -> Option<Record>,
+        _out: &mut Vec<Triple>,
+    ) -> sparkles_core::Result<()> {
+        panic!("exact mode asks for no broken facts")
+    }
+
+    fn added(
+        &mut self,
+        cx: &mut RuleCx,
+        store: &Counting,
+        held: &dyn Fn(&Triple) -> bool,
+        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+    ) -> sparkles_core::Result<()> {
+        self.inner.added(cx, &store.inner, held, out)
+    }
+
+    fn prepare(
+        &mut self,
+        cx: &mut RuleCx,
+        store: &mut Counting,
+        frontier: &mut Vec<Triple>,
+    ) -> sparkles_core::Result<()> {
+        frontier.extend(cx.removed.iter().filter(|t| store.contains(t)));
+        Ok(())
+    }
+
+    fn saturate(
+        &mut self,
+        cx: &mut RuleCx,
+        store: &mut Counting,
+    ) -> sparkles_core::Result<Option<Vec<Triple>>> {
+        if !self.own_saturation {
+            return Ok(None);
+        }
+        let mut inserted = Vec::new();
+        let mut queue = Vec::new();
+        for t in cx.added {
+            if store.insert(*t, Record::EXPLICIT)? {
+                inserted.push(*t);
+                queue.push(*t);
+            }
+        }
+        let mut sink = Sink::unbounded();
+        while let Some(f) = queue.pop() {
+            self.inner
+                .instances_of(&store.inner, &f, &|x| store.contains(x), &mut sink)?;
+            let found: Vec<(Triple, Record)> = sink.drain().collect();
+            for (g, r) in found {
+                if store.insert(g, r)? {
+                    inserted.push(g);
+                    queue.push(g);
+                }
+            }
+        }
+        Ok(Some(inserted))
+    }
+
+    fn pass_end(&mut self, _cx: &mut RuleCx) -> sparkles_core::Result<()> {
+        self.provable = None;
+        Ok(())
+    }
+
+    fn annotate(
+        &mut self,
+        _cx: &mut RuleCx,
+        _store: &Counting,
+        mode: Provenance,
+        _f: &Triple,
+        _r: &Record,
+        _premises: &[&Ann],
+    ) -> sparkles_core::Result<Ann> {
+        Ok(Ann::derivation(mode, Vec::new()))
+    }
+
+    fn tick(&mut self, cx: &mut RuleCx) -> sparkles_core::Result<()> {
+        cx.control.check()
+    }
+
+    fn save(&self, w: &mut Writer, f: &Triple, r: &Record) -> sparkles_core::Result<()> {
+        self.inner.save(w, f, r)
+    }
+
+    fn load(&self, r: &mut Reader) -> sparkles_core::Result<(Triple, Record)> {
+        self.inner.load(r)
+    }
+}
+
+/// The snapshots and changes from commit `after` to the store's head.
+struct Delta {
+    d: DeltaSet,
+    added: Vec<Triple>,
+    removed: Vec<Triple>,
+    control: Control,
+}
+
+fn delta(s: &Store, after: u64) -> Delta {
+    let control = Control::none();
+    let d = DeltaSet::read(s, after, &control);
+    assert!(d.complete);
+    let (added, removed) = (triples(&d.added), triples(&d.removed));
+    Delta {
+        d,
+        added,
+        removed,
+        control,
+    }
+}
+
+fn exact_build(s: &Store, p: Exact) -> FixedPoint<Exact> {
+    let mut fp = FixedPoint::new(p);
+    let control = Control::none();
+    let snap = s.snapshot();
+    let mut cx = RuleCx {
+        new: snap.clone(),
+        old: snap,
+        added: &[],
+        removed: &[],
+        control: &control,
+    };
+    assert!(
+        !fp.program.inner.begin(&cx),
+        "no constant moves at the build"
+    );
+    fp.build(&mut cx, None).expect("build");
+    fp
+}
+
+/// Advance `fp` from commit `after`, and the consolidated change.
+fn exact_advance(
+    s: &Store,
+    fp: &mut FixedPoint<Exact>,
+    after: u64,
+) -> sparkles_core::Result<Option<Vec<(Triple, i64)>>> {
+    let x = delta(s, after);
+    let mut cx = RuleCx {
+        new: x.d.snapshot.clone(),
+        old: x.d.old().expect("old snapshot"),
+        added: &x.added,
+        removed: &x.removed,
+        control: &x.control,
+    };
+    if fp.program.inner.begin(&cx) {
+        // a rule constant entered the store: build again
+        fp.build(&mut cx, None)?;
+        return Ok(None);
+    }
+    let changes = fp.advance(&mut cx, None)?;
+    Ok(Some(fixpoint::consolidate(&changes)))
+}
+
+fn exact_shown(s: &Store, fp: &FixedPoint<Exact>) -> BTreeSet<String> {
+    shown_of(&s.snapshot(), &fp.program.inner, fp.facts())
+}
+
+/// The exact mode, with either saturation and several batch lengths, keeps the naive
+/// closure through random histories, and its consolidated change is the difference of
+/// the closures.
+#[test]
+fn the_exact_mode_is_maintained_as_its_closure() {
+    for (own, batch) in [(false, 1usize), (true, 1), (false, 3), (true, 1024)] {
+        for seed in 1..30u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5555);
+            let s = Store::in_memory(StoreOptions::default());
+            let mut model: BTreeSet<T> = BTreeSet::new();
+            let init: Vec<T> = (0..8).map(|_| rng.triple()).collect();
+            apply(&s, &[], &init);
+            model.extend(init);
+            let mut fp = exact_build(&s, Exact::new(RULES, own, batch));
+            assert_eq!(exact_shown(&s, &fp), closure(&model), "seed {seed}: build");
+            for step in 0..15 {
+                let after = s.snapshot().commit;
+                let mut del = Vec::new();
+                let mut ins = Vec::new();
+                for _ in 0..1 + rng.next(3) {
+                    if !model.is_empty() && rng.next(2) == 0 {
+                        let held: Vec<&T> = model.iter().collect();
+                        del.push(*held[rng.next(held.len() as u64) as usize]);
+                    } else {
+                        ins.push(rng.triple());
+                    }
+                }
+                apply(&s, &del, &ins);
+                for d in &del {
+                    model.remove(d);
+                }
+                model.extend(ins.iter().copied());
+                let before = exact_shown(&s, &fp);
+                let changes = exact_advance(&s, &mut fp, after).expect("advance");
+                let want = closure(&model);
+                let what = format!("own {own} batch {batch} seed {seed} step {step}");
+                assert_eq!(exact_shown(&s, &fp), want, "{what}");
+                assert_eq!(
+                    fp.store().reserved.get(),
+                    0,
+                    "{what}: reservations released"
+                );
+                let Some(changes) = changes else {
+                    continue;
+                };
+                let gone = before.difference(&want).count();
+                let came = want.difference(&before).count();
+                let removed = changes.iter().filter(|c| c.1 < 0).count();
+                let added = changes.iter().filter(|c| c.1 > 0).count();
+                assert_eq!((removed, added), (gone, came), "{what}");
+                assert!(changes.iter().all(|c| c.1.abs() == 1), "{what}");
+            }
+        }
+    }
+}
+
+const EX: &str = "http://ex/";
+
+fn ex(t: &str) -> String {
+    t.split(' ')
+        .map(|x| format!("<{EX}{x}>"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn change(s: &Store, del: &[&str], ins: &[&str]) {
+    let mut ops = Vec::new();
+    if !del.is_empty() {
+        let d: Vec<String> = del.iter().map(|t| format!("{} .", ex(t))).collect();
+        ops.push(format!("DELETE DATA {{ {} }}", d.join(" ")));
+    }
+    if !ins.is_empty() {
+        let i: Vec<String> = ins.iter().map(|t| format!("{} .", ex(t))).collect();
+        ops.push(format!("INSERT DATA {{ {} }}", i.join(" ")));
+    }
+    update(s, &ops.join(" ; "), &QueryOptions::default()).expect("update");
+}
+
+fn set(ts: &[&str]) -> BTreeSet<String> {
+    ts.iter().map(|t| ex(t)).collect()
+}
+
+/// Run `steps` of (deletions, insertions, the facts expected after) over `rules` in the
+/// exact mode with both saturations and in the one-step mode.
+fn cases(rules: &str, init: &[&str], steps: &[(&[&str], &[&str], &[&str])]) {
+    for own in [false, true] {
+        let s = Store::in_memory(StoreOptions::default());
+        change(&s, &[], init);
+        let mut fp = exact_build(&s, Exact::new(rules, own, 1));
+        let mut one = program(rules, &s, Provenance::None, None).expect("one-step build");
+        for (i, (del, ins, want)) in steps.iter().enumerate() {
+            let before = exact_shown(&s, &fp);
+            let after = s.snapshot().commit;
+            change(&s, del, ins);
+            let ch = exact_advance(&s, &mut fp, after).expect("advance");
+            let want = set(want);
+            assert_eq!(exact_shown(&s, &fp), want, "own {own} step {i}");
+            advance(&s, &mut one, after);
+            assert_eq!(shown(&s.snapshot(), &one), want, "one-step, step {i}");
+            let Some(ch) = ch else {
+                continue;
+            };
+            let gone = before.difference(&want).count();
+            let came = want.difference(&before).count();
+            let removed = ch.iter().filter(|c| c.1 < 0).count();
+            let added = ch.iter().filter(|c| c.1 > 0).count();
+            assert_eq!((removed, added), (gone, came), "own {own} step {i}: {ch:?}");
+        }
+    }
+}
+
+/// A fact that derives itself goes with its explicit support, reported once.
+#[test]
+fn a_self_supporting_fact_goes_once() {
+    cases(
+        "[aa: (?x <http://ex/p> ?y) -> (?x <http://ex/p> ?y)]",
+        &["a p b"],
+        &[(&["a p b"], &[], &[])],
+    );
+}
+
+/// Facts that derive each other go together when their explicit support goes.
+#[test]
+fn mutually_recursive_facts_go_together() {
+    cases(
+        "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+         [qp: (?x <http://ex/q> ?y) -> (?x <http://ex/p> ?y)]",
+        &["a p b"],
+        &[(&["a p b"], &[], &[])],
+    );
+}
+
+/// `A → B`, `B → A`, `C → B`: removing `A` keeps it through `C`, and removing `C`
+/// afterwards removes both, which a record of `B` taken from `A` would hide.
+#[test]
+fn an_exact_proof_leaves_no_cyclic_support() {
+    let rules = "[ab: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+                 [ba: (?x <http://ex/q> ?y) -> (?x <http://ex/p> ?y)]
+                 [cb: (?x <http://ex/r> ?y) -> (?x <http://ex/q> ?y)]";
+    cases(
+        rules,
+        &["a p b", "a r b"],
+        &[
+            (&["a p b"], &[], &["a p b", "a q b", "a r b"]),
+            (&["a r b"], &[], &[]),
+        ],
+    );
+}
+
+/// `A ← B`, `B ← A`, `A ← C` with `C` explicit: removing explicit `A` and `B` in either
+/// order keeps both, since a search blocked on the cycle is not a negative answer.
+#[test]
+fn a_cycle_blocked_search_is_not_a_negative_answer() {
+    let rules = "[ba: (?x <http://ex/q> ?y) -> (?x <http://ex/p> ?y)]
+                 [ab: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+                 [ca: (?x <http://ex/r> ?y) -> (?x <http://ex/p> ?y)]";
+    let all: &[&str] = &["a p b", "a q b", "a r b"];
+    cases(rules, all, &[(&["a p b", "a q b"], &[], all)]);
+    cases(rules, all, &[(&["a q b", "a p b"], &[], all)]);
+}
+
+/// An insertion alone derives new facts; an explicit fact that is also derived stays
+/// when it stops being explicit; an inserted fact supports a candidate of the deletion.
+#[test]
+fn insertions_and_explicit_derived_facts() {
+    let rules = "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+                 [rq: (?x <http://ex/r> ?y) -> (?x <http://ex/q> ?y)]
+                 [qs: (?x <http://ex/q> ?y) -> (?x <http://ex/s> ?y)]";
+    cases(
+        rules,
+        &["a p b", "a q b"],
+        &[
+            (
+                &[],
+                &["c p d"],
+                &["a p b", "a q b", "a s b", "c p d", "c q d", "c s d"],
+            ),
+            (
+                &["a q b"],
+                &[],
+                &["a p b", "a q b", "a s b", "c p d", "c q d", "c s d"],
+            ),
+            (
+                &["a p b"],
+                &["a r b"],
+                &["a r b", "a q b", "a s b", "c p d", "c q d", "c s d"],
+            ),
+            (
+                &[],
+                &[],
+                &["a r b", "a q b", "a s b", "c p d", "c q d", "c s d"],
+            ),
+        ],
+    );
+}
+
+/// A sink fails while one fact's consequences are produced, once the store refuses to
+/// grow, and the pass leaves no reservation behind.
+#[test]
+fn a_large_fan_out_fails_while_it_is_produced() {
+    let rules = "[f: (?x <http://ex/hub> ?y) (?z <http://ex/m> ?w) -> (?z <http://ex/out> ?w)]";
+    let members: Vec<String> = (0..4000).map(|i| format!("i{i} m j{i}")).collect();
+    let members: Vec<&str> = members.iter().map(String::as_str).collect();
+    for batch in [1usize, 1024] {
+        let s = Store::in_memory(StoreOptions::default());
+        change(&s, &[], &members);
+        let mut fp = exact_build(&s, Exact::new(rules, false, batch));
+        assert_eq!(
+            fp.store().reserved.get(),
+            0,
+            "batch {batch}: the build released"
+        );
+        fp.store_mut().cap = Some(64 << 10);
+        fp.store().peak.set(0);
+        let after = s.snapshot().commit;
+        change(&s, &[], &["a hub b"]);
+        let Err(e) = exact_advance(&s, &mut fp, after).map(|c| c.expect("advanced")) else {
+            panic!("batch {batch}: the fan-out fits");
+        };
+        let sparkles_core::Error::BudgetExceeded(b) = e else {
+            panic!("batch {batch}: {e:?}");
+        };
+        assert!(b.requested <= b.limit * 2, "batch {batch}: {b:?}");
+        assert!(fp.store().peak.get() <= 64 << 10, "batch {batch}");
+        assert_eq!(fp.store().reserved.get(), 0, "batch {batch}");
+    }
+}
+
+/// A one-step build whose instances outgrow `max_bytes` fails as they are produced.
+#[test]
+fn a_one_step_fan_out_fails_against_max_bytes() {
+    let rules = "[f: (?x <http://ex/hub> ?y) (?z <http://ex/m> ?w) -> (?z <http://ex/out> ?w)]";
+    let mut members: Vec<String> = (0..4000).map(|i| format!("i{i} m j{i}")).collect();
+    members.push("a hub b".into());
+    let members: Vec<&str> = members.iter().map(String::as_str).collect();
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, &[], &members);
+    let full = program(rules, &s, Provenance::None, None).expect("build");
+    let limit = full.bytes() * 2 / 3;
+    let Err(sparkles_core::Error::BudgetExceeded(b)) =
+        program(rules, &s, Provenance::None, Some(limit))
+    else {
+        panic!("the build fits");
+    };
+    assert_eq!(b.limit, limit);
+}
+
+/// An exact program keeps no annotations, and a one-step program may not saturate by
+/// itself.
+#[test]
+fn the_modes_refuse_what_they_cannot_keep() {
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, &[], &["a p b"]);
+    let mut fp = FixedPoint::new(Exact::new(
+        "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]",
+        false,
+        1,
+    ));
+    fp.set_provenance(Provenance::why());
+    let control = Control::none();
+    let snap = s.snapshot();
+    let mut cx = RuleCx {
+        new: snap.clone(),
+        old: snap,
+        added: &[],
+        removed: &[],
+        control: &control,
+    };
+    fp.program.inner.begin(&cx);
+    assert!(matches!(
+        fp.build(&mut cx, None),
+        Err(sparkles_core::Error::Invalid(_))
+    ));
+}
+
+/// The encoding of a fixed point of rules that this release wrote before the store moved
+/// into a program's choice still loads, with its annotations.
+#[test]
+fn an_earlier_checkpoint_still_loads() {
+    const DATA: &str =
+        "<http://ex/a> <http://ex/p> <http://ex/b> . <http://ex/b> <http://ex/p> <http://ex/c> .";
+    const RULES_: &str = "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]
+     [tr: (?x <http://ex/q> ?y) (?y <http://ex/q> ?z) -> (?x <http://ex/q> ?z)]
+     [nw: (?x <http://ex/q> ?y) -> (?x <http://ex/r> <http://ex/new>)]";
+    const HEX: &str = include_str!("checkpoint-fixture.hex");
+    let bytes: Vec<u8> = (0..HEX.trim().len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&HEX.trim()[i..i + 2], 16).expect("hex"))
+        .collect();
+    let s = store(DATA);
+    let want = program(RULES_, &s, Provenance::why(), None).expect("build");
+    let parsed = parse_rules(RULES_).expect("rules");
+    let mut back = FixedPoint::new(RuleProgram::new(&parsed).expect("program"));
+    back.set_provenance(Provenance::why());
+    let snap = s.snapshot();
+    RuleProgram::decode(&mut back, &bytes, &snap).expect("decode");
+    assert_eq!(shown(&snap, &back), shown(&snap, &want));
+    assert_eq!(annotated(&snap, &back), annotated(&snap, &want));
+    // and the restored state round-trips through this release's encoding
+    let again = RuleProgram::encode(&back, &snap).expect("encode");
+    let mut third = FixedPoint::new(RuleProgram::new(&parsed).expect("program"));
+    third.set_provenance(Provenance::why());
+    RuleProgram::decode(&mut third, &again, &snap).expect("decode");
+    assert_eq!(shown(&snap, &third), shown(&snap, &want));
+    assert_eq!(annotated(&snap, &third), annotated(&snap, &want));
+}
+
+/// Each fact's text with its annotation.
+fn annotated(
+    snap: &Snapshot,
+    fp: &FixedPoint<RuleProgram>,
+) -> std::collections::BTreeMap<String, Option<Ann>> {
+    fp.facts()
+        .into_iter()
+        .map(|(f, _)| {
+            let text = f
+                .iter()
+                .map(|&i| fp.program.term(snap, i).expect("a term").to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (text, fp.annotation(&f).cloned())
+        })
+        .collect()
 }
