@@ -22,9 +22,10 @@
 //! A body with a variable predicate is always sampled, since the greedy estimate of such
 //! an atom is a guess. A body whose predicates are all constants has estimates from the
 //! statistics of its relations, and is sampled only when those put its plan above
-//! [`LARGE_COST`] candidates. The planner then walks the greedy order with the sample
-//! first, and keeps it when the sample puts its cost below [`MIN_COST`] candidates, so
-//! that a plan that is cheap anyway pays for one walk and no search. Otherwise it searches as above, and its order replaces the
+//! [`LARGE_COST`] candidates. The planner then walks the greedy order with a sample of
+//! four bindings first, and keeps it when they put its cost below [`MIN_COST`]
+//! candidates, so that a plan that is cheap anyway pays for one short walk and no
+//! search. Otherwise it searches as above, and its order replaces the
 //! greedy order only when the sample puts its cost at no more than the greedy order's
 //! divided by [`SAVING`], and when it needs no order over the whole tier by subject or
 //! object that the greedy order does not. Bodies of fewer
@@ -41,6 +42,9 @@ use std::sync::atomic::AtomicU64;
 
 /// The bindings the sample keeps.
 pub(crate) const SAMPLE: usize = 16;
+/// The bindings of the first walk of the greedy order, which only decides whether the
+/// plan is large enough for a full sample and a search.
+const FIRST_SAMPLE: usize = 4;
 /// The candidates of the derived tier a probe reads for its facts.
 const VISIT: usize = 64;
 /// The places of a scan of the store that a binding's facts are sampled from. The facts
@@ -190,13 +194,13 @@ pub(crate) fn plan(g: &Graph, rule: &CRule, ranges: &[(u32, u32)]) -> Option<(Ve
         probes: FxHashMap::default(),
     };
     let chosen = (|| {
-        // the greedy order first: an order the sample finds cheap is kept without a
-        // search for another, which would cost more than it could save
-        let (_, greedy_cost) = walk.run(Some(&greedy_order));
-        if !search_all && greedy_cost < MIN_COST {
+        // the greedy order first, with a few bindings: an order they find cheap is kept
+        // without a search for another, which would cost more than it could save
+        if !search_all && walk.run(Some(&greedy_order), FIRST_SAMPLE).1 < MIN_COST {
             return None;
         }
-        let (order, cost) = walk.run(None);
+        let (_, greedy_cost) = walk.run(Some(&greedy_order), SAMPLE);
+        let (order, cost) = walk.run(None, SAMPLE);
         if order == greedy_order || cost * SAVING > greedy_cost {
             return None;
         }
@@ -250,8 +254,8 @@ impl Walk<'_> {
     /// Walk an order of the rule's atoms with a sample of its bindings: `forced` when
     /// given, and otherwise the order that places the atom with the fewest sampled
     /// candidates at each step. Returns the order and its cost, the candidates its steps
-    /// are estimated to visit.
-    fn run(&mut self, forced: Option<&[usize]>) -> (Vec<usize>, f64) {
+    /// are estimated to visit. The sample keeps `keep` bindings.
+    fn run(&mut self, forced: Option<&[usize]>, keep: usize) -> (Vec<usize>, f64) {
         let rule = self.rule;
         let mut bound = vec![false; rule.nvars];
         // the variables the sampled bindings have values of
@@ -294,7 +298,7 @@ impl Walk<'_> {
             // every binding of the prefix asks the atom once, and reads its candidates
             cost += card * fanout.max(1.0);
             card *= fanout;
-            sample = self.extend(i, &bound, &sample);
+            sample = self.extend(i, &bound, &sample, keep);
             let a = &rule.atoms[i];
             bind_atom(a, &mut bound);
             if !sample.is_empty() {
@@ -448,7 +452,13 @@ impl Walk<'_> {
     }
 
     /// The sample after atom `i`: bindings of `sample` extended by facts of the atom.
-    fn extend(&mut self, i: usize, bound: &[bool], sample: &[Vec<u64>]) -> Vec<Vec<u64>> {
+    fn extend(
+        &mut self,
+        i: usize,
+        bound: &[bool],
+        sample: &[Vec<u64>],
+        keep: usize,
+    ) -> Vec<Vec<u64>> {
         if sample.is_empty() {
             return Vec::new();
         }
@@ -457,7 +467,7 @@ impl Walk<'_> {
         let (lo, hi) = self.ranges[i];
         let hidden = !matches!(a.p, Slot::Const(_));
         // a few facts for each binding, and more when the bindings are few
-        let want = (2 * SAMPLE).div_ceil(sample.len()).clamp(1, SAMPLE);
+        let want = (2 * keep).div_ceil(sample.len()).clamp(1, keep);
         let mut out: Vec<Vec<u64>> = Vec::new();
         for b in sample {
             let (pattern, _) = Self::pattern(a, b, bound);
@@ -476,8 +486,8 @@ impl Walk<'_> {
                 }
             }
         }
-        if out.len() > SAMPLE {
-            let step = out.len().div_ceil(SAMPLE);
+        if out.len() > keep {
+            let step = out.len().div_ceil(keep);
             out = out.into_iter().step_by(step).collect();
         }
         out
