@@ -6,6 +6,14 @@ use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::{Profile, ReasonOptions, bench_derive, infer};
 use std::collections::BTreeSet;
+use std::sync::{Mutex, MutexGuard};
+
+/// The batch size of the closure operators is process-wide, so the tests that set it run
+/// one at a time.
+fn batch_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const PREFIXES: &str = "@prefix ex: <http://ex.org/> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
@@ -309,6 +317,73 @@ fn cliques_and_chains() {
             p.name()
         );
     }
+}
+
+/// An operator's pairs reach the graph in batches (roadmap item 865). With batches of a
+/// thousand pairs, a transitive chain of 300 classes, five transitive cliques and a
+/// `sameAs` clique of 150 nodes derive the facts the rules derive, in the order one merge
+/// of each closure gives them, so every fact keeps its id.
+#[test]
+fn batched_closures_keep_the_facts_and_their_order() {
+    let mut t = String::from("ex:home a owl:SymmetricProperty , owl:TransitiveProperty .\n");
+    for g in 0..5 {
+        for i in 0..20 {
+            t += &format!("ex:g{g}p{i} ex:home ex:g{g}p{} .\n", (i * 7 + 3) % 20);
+        }
+    }
+    for i in 0..300 {
+        t += &format!("ex:C{i} rdfs:subClassOf ex:C{} .\n", i + 1);
+    }
+    for i in 0..150 {
+        t += &format!("ex:s{i} owl:sameAs ex:s{} .\n", (i + 1) % 150);
+    }
+    t += "ex:x a ex:C0 .\n";
+    let s = store(&t);
+    let p = Profile::OwlRl;
+    let _one = batch_lock();
+    let (whole, _) = infer(s.snapshot(), &p, &options(true)).unwrap();
+    sparkles_reasoner::set_closure_batch(1000);
+    let batched = infer(s.snapshot(), &p, &options(true));
+    sparkles_reasoner::set_closure_batch(0);
+    let (batched, _) = batched.unwrap();
+    assert!(whole.len() > 60_000, "{} facts", whole.len());
+    assert_eq!(batched.len(), whole.len());
+    let first = batched.iter().zip(&whole).position(|(a, b)| a != b);
+    assert_eq!(
+        first, None,
+        "the batched run's facts differ from id {first:?} on"
+    );
+    let rules: BTreeSet<String> = facts(&s, &p, false);
+    let ours: BTreeSet<String> = batched.iter().map(|t| t.to_string()).collect();
+    assert_eq!(ours, rules);
+}
+
+/// An equivalence operator that meets two literals of equal value in a class gives its
+/// rules back before it emits a pair, so a clean class before that one is not merged
+/// first: with a batch of one pair, which would merge each pair at once, the run derives
+/// the same facts in the same order as with the default batch. The clean class's nodes
+/// get the lower term ids, so the operator visits it before the class with the literals.
+#[test]
+fn a_fallback_merges_nothing_first() {
+    let s = store(
+        "ex:a1 owl:sameAs ex:a2 . ex:a2 owl:sameAs ex:a3 . ex:a3 owl:sameAs ex:a4 .
+ex:z1 owl:sameAs \"1\"^^xsd:integer . ex:z1 owl:sameAs \"01\"^^xsd:integer .
+ex:x a ex:C .\n",
+    );
+    let p = Profile::OwlRl;
+    let _one = batch_lock();
+    let (whole, _) = infer(s.snapshot(), &p, &options(true)).unwrap();
+    sparkles_reasoner::set_closure_batch(1);
+    let single = infer(s.snapshot(), &p, &options(true));
+    sparkles_reasoner::set_closure_batch(0);
+    let (single, _) = single.unwrap();
+    assert_eq!(
+        single, whole,
+        "the batch of one merges a class before the fallback"
+    );
+    let rules: BTreeSet<String> = facts(&s, &p, false);
+    let ours: BTreeSet<String> = whole.iter().map(|t| t.to_string()).collect();
+    assert_eq!(ours, rules);
 }
 
 /// A rule program with `noValue` keeps the ordinary evaluation, whose result depends on

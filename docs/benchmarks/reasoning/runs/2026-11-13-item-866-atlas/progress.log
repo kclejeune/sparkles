@@ -1,0 +1,55 @@
+[20:13:11] build base9 88538906
+[20:21:09] build tip 75e7fb61
+[20:32:36] loading OWL2Bench(5)
+[20:32:36] generating LUBM(100)
+[20:33:27] loading LUBM(100)
+[20:34:09] materializing LUBM(100) full.db and minus.db with the base build
+owl2bench5-full-base9-t1-r1 rc=0 wall=1:47.35 rss_kib=9662764 millis=107088 load=3.58
+owl2bench5-full-tip-t1-r1 rc=0 wall=1:45.42 rss_kib=9701080 millis=105046 load=3.09
+owl2bench5-full-base9-t20-r1 rc=0 wall=0:54.19 rss_kib=9957880 millis=53918 load=5.29
+owl2bench5-full-tip-t20-r1 rc=0 wall=0:52.72 rss_kib=9920084 millis=52311 load=5.70
+lubm100-full-base9-t1-r1 rc=0 wall=0:37.77 rss_kib=3872052 millis=37719 load=4.60
+lubm100-full-tip-t1-r1 rc=0 wall=0:38.02 rss_kib=3616784 millis=37947 load=4.11
+lubm100-full-base9-t20-r1 rc=0 wall=0:17.05 rss_kib=4176752 millis=16992 load=5.12
+lubm100-full-tip-t20-r1 rc=0 wall=0:16.67 rss_kib=3844868 millis=16599 load=4.81
+lubm100-insert-base9-t20-r1 rc=0 wall=0:02.39 rss_kib=3048444 millis=1638 load=4.67
+lubm100-delete-base9-t20-r1 rc=0 wall=0:03.23 rss_kib=3402868 millis=2519 load=4.53
+lubm100-insert-tip-t20-r1 rc=0 wall=0:02.45 rss_kib=2562236 millis=1674 load=4.49
+lubm100-delete-tip-t20-r1 rc=0 wall=0:03.33 rss_kib=2620272 millis=2635 load=4.61
+owl2bench5-full-base9-t1-r2 rc=0 wall=1:44.23 rss_kib=9674984 millis=104026 load=3.42
+owl2bench5-full-tip-t1-r2 rc=0 wall=1:41.54 rss_kib=9705548 millis=101270 load=3.17
+owl2bench5-full-base9-t20-r2 rc=0 wall=0:51.85 rss_kib=9968364 millis=51621 load=5.25
+owl2bench5-full-tip-t20-r2 rc=0 wall=0:52.24 rss_kib=8887916 millis=51884 load=5.68
+lubm100-full-base9-t1-r2 rc=0 wall=0:37.52 rss_kib=3889376 millis=37461 load=4.64
+lubm100-full-tip-t1-r2 rc=0 wall=0:37.65 rss_kib=3707960 millis=37522 load=4.06
+lubm100-full-base9-t20-r2 rc=0 wall=0:16.86 rss_kib=4216216 millis=16806 load=3.90
+lubm100-full-tip-t20-r2 rc=0 wall=0:16.18 rss_kib=3868684 millis=16124 load=6.39
+lubm100-insert-base9-t20-r2 rc=0 wall=0:02.40 rss_kib=3077544 millis=1641 load=6.28
+lubm100-delete-base9-t20-r2 rc=0 wall=0:03.27 rss_kib=3386428 millis=2562 load=6.02
+lubm100-insert-tip-t20-r2 rc=0 wall=0:02.46 rss_kib=2504960 millis=1673 load=7.62
+lubm100-delete-tip-t20-r2 rc=0 wall=0:03.34 rss_kib=2653296 millis=2654 load=7.25
+owl2bench5-full-base9-t1-r3 rc=0 wall=1:43.83 rss_kib=9679496 millis=103633 load=3.83
+owl2bench5-full-tip-t1-r3 rc=0 wall=1:41.37 rss_kib=9711412 millis=101170 load=3.50
+owl2bench5-full-base9-t20-r3 rc=0 wall=0:51.09 rss_kib=9962356 millis=50843 load=4.07
+owl2bench5-full-tip-t20-r3 rc=0 wall=0:50.38 rss_kib=9916888 millis=50076 load=4.32
+lubm100-full-base9-t1-r3 rc=0 wall=0:37.26 rss_kib=3938948 millis=37197 load=3.74
+lubm100-full-tip-t1-r3 rc=0 wall=0:37.46 rss_kib=3688188 millis=37402 load=3.64
+lubm100-full-base9-t20-r3 rc=0 wall=0:16.56 rss_kib=4175004 millis=16509 load=4.64
+lubm100-full-tip-t20-r3 rc=0 wall=0:16.22 rss_kib=3906784 millis=16173 load=4.44
+lubm100-insert-base9-t20-r3 rc=0 wall=0:02.41 rss_kib=2983724 millis=1651 load=4.32
+lubm100-delete-base9-t20-r3 rc=0 wall=0:03.27 rss_kib=3300984 millis=2550 load=4.22
+lubm100-insert-tip-t20-r3 rc=0 wall=0:02.44 rss_kib=2521756 millis=1674 load=4.12
+lubm100-delete-tip-t20-r3 rc=0 wall=0:03.30 rss_kib=2653708 millis=2606 load=5.55
+owl2bench5-full-base9-t1-r4 rc=0 wall=1:42.22 rss_kib=9683156 millis=102029 load=3.78
+owl2bench5-full-tip-t1-r4 rc=0 wall=1:40.75 rss_kib=9709276 millis=100478 load=3.27
+owl2bench5-full-base9-t20-r4 rc=0 wall=0:50.76 rss_kib=9956780 millis=50522 load=5.97
+owl2bench5-full-tip-t20-r4 rc=0 wall=0:50.21 rss_kib=9909480 millis=49912 load=6.37
+lubm100-full-base9-t1-r4 rc=0 wall=0:37.35 rss_kib=3928228 millis=37295 load=4.94
+lubm100-full-tip-t1-r4 rc=0 wall=0:37.51 rss_kib=3697256 millis=37433 load=4.35
+lubm100-full-base9-t20-r4 rc=0 wall=0:16.51 rss_kib=4195940 millis=16453 load=4.29
+lubm100-full-tip-t20-r4 rc=0 wall=0:16.12 rss_kib=3885404 millis=16076 load=4.09
+lubm100-insert-base9-t20-r4 rc=0 wall=0:02.35 rss_kib=3038100 millis=1598 load=4.00
+lubm100-delete-base9-t20-r4 rc=0 wall=0:03.23 rss_kib=3257872 millis=2511 load=5.44
+lubm100-insert-tip-t20-r4 rc=0 wall=0:02.43 rss_kib=2512176 millis=1663 load=5.25
+lubm100-delete-tip-t20-r4 rc=0 wall=0:03.31 rss_kib=2643724 millis=2624 load=5.07
+[21:04:00] S9-DONE

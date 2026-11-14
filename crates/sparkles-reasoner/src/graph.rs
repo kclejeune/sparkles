@@ -1,19 +1,19 @@
 //! The facts the engine reads: an optional base tier (the input graphs, read from the
-//! store's index permutations, see [`crate::facts`]) and an in-memory, append-only tier of
-//! id-level triples with hash indexes.
+//! store's index permutations, see [`crate::facts`]) and the derived tier in memory
+//! ([`crate::tier`]), with a hash index from triple to fact id over the derived tier.
 //!
-//! Rows are numbered from 0. The base tier's facts are the rows `[0, offset)`, which are
+//! Facts are numbered from 0. The base tier's facts are the ids `[0, offset)`, which are
 //! not addressable one by one: an access reads the whole base tier or none of it. The
-//! in-memory rows follow from `offset` on. Semi-naive evaluation restricts any access path
-//! to a row range (`[lo, hi)`), so every index list holds rows in ascending order.
+//! derived facts follow from `offset` on, in the order of their first derivation.
+//! Semi-naive evaluation restricts any access path to an id range (`[lo, hi)`).
 //!
-//! The indexes are split into shards by a hash of their key, so that a merge of new facts
-//! deduplicates and fills them with one task per shard ([`Graph::merge`]). The merge gives
-//! rows in the order of its input, whatever the number of threads.
+//! The triple index is split into shards by a hash of the triple, so that a merge of new
+//! facts deduplicates and fills them with one task per shard ([`Graph::merge`]). The merge
+//! gives ids in the order of its input, whatever the number of threads.
 //!
-//! Incremental maintenance removes triples by marking their rows dead: a dead row stays
-//! in the index lists (evaluation skips it) but leaves the triple index, so the triple
-//! can be added again as a new row.
+//! Incremental maintenance removes triples by marking their facts dead: a dead fact stays
+//! in the tier's orders (evaluation skips it) but leaves the triple index, so the triple
+//! can be added again as a new fact.
 //!
 //! The graph's heap is charged to the run's [`Budget`] by capacity
 //! ([`Graph::heap_bytes`]). A buffer or table about to grow is charged its new
@@ -22,15 +22,15 @@
 
 use crate::budget::{Budget, BudgetFailure, Held, Meter, table_bytes, table_capacity, table_grown};
 use crate::facts::{Base, Memo, Probe, ProbeFilter};
+use crate::tier::{ROW, Tier};
 use hashbrown::HashTable;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
+use rustc_hash::FxHashSet;
 use std::hash::BuildHasher;
 use std::mem::size_of;
 use std::sync::Arc;
 
-pub(crate) type Triple = [u64; 3];
+pub(crate) use crate::tier::{Cands, Triple};
 
 const SHARDS: usize = 64;
 /// Batches smaller than this are merged on the calling thread.
@@ -40,95 +40,6 @@ const PAR_MIN: usize = 1 << 14;
 /// the input: a fact it forgot is emitted again and found in the base tier by the next
 /// merge's probe.
 pub(crate) const IN_BASE_SHARD: usize = 128;
-
-type List = SmallVec<[u32; 4]>;
-
-/// Rows by key; most keys of the per-subject and per-object indexes have a few rows,
-/// which fit without an allocation of their own.
-type Lists<K> = FxHashMap<K, List>;
-
-/// The heap of a list beyond the rows it keeps inline.
-#[inline]
-fn spill(cap: usize) -> usize {
-    if cap > 4 { cap * size_of::<u32>() } else { 0 }
-}
-
-fn lists_bytes<K>(m: &Lists<K>) -> usize {
-    table_bytes(m.capacity(), size_of::<(K, List)>())
-}
-
-/// Before a map with `len` keys and capacity `cap` takes one more key, the bytes of the
-/// table it would grow to (the old one is still allocated then, and is released once the
-/// new one holds the keys).
-#[inline]
-fn table_growth<K>(len: usize, cap: usize) -> usize {
-    if len < cap {
-        0
-    } else {
-        table_bytes(table_grown(cap, len, 1), size_of::<(K, List)>())
-    }
-}
-
-/// Push `r` onto list `e`. A list about to grow charges its new allocation to `m` first,
-/// and the old allocation is released once the new one holds the rows. `spilled` takes
-/// the change of the lists' heap.
-#[inline]
-fn push_row(
-    e: &mut List,
-    r: u32,
-    m: &mut Meter<'_>,
-    spilled: &mut isize,
-) -> Result<(), BudgetFailure> {
-    let cap = e.capacity();
-    if e.len() == cap {
-        m.add(spill((cap * 2).max(8)))?;
-        e.push(r);
-        m.sub(spill(cap));
-        *spilled += spill(e.capacity()) as isize - spill(cap) as isize;
-    } else {
-        e.push(r);
-    }
-    Ok(())
-}
-
-/// Append `rows` to list `e` with one copy, charging its growth first as
-/// [`push_row`] does (a list grows to the next power of two that holds them all).
-#[inline]
-fn extend_rows(
-    e: &mut List,
-    rows: &[u32],
-    m: &mut Meter<'_>,
-    spilled: &mut isize,
-) -> Result<(), BudgetFailure> {
-    let cap = e.capacity();
-    let want = e.len() + rows.len();
-    if want > cap {
-        m.add(spill(want.next_power_of_two()))?;
-        e.extend_from_slice(rows);
-        m.sub(spill(cap));
-        *spilled += spill(e.capacity()) as isize - spill(cap) as isize;
-    } else {
-        e.extend_from_slice(rows);
-    }
-    Ok(())
-}
-
-/// The entry of key `k` in `m`, charging to `meter` first the table it grows to when
-/// `k` is new and does not fit, and releasing the old table after the growth.
-#[inline]
-fn entry<'m, K: std::hash::Hash + Eq>(
-    m: &'m mut Lists<K>,
-    k: K,
-    meter: &mut Meter<'_>,
-) -> Result<&'m mut List, BudgetFailure> {
-    if m.len() == m.capacity() && !m.contains_key(&k) {
-        let old = lists_bytes(m);
-        meter.add(table_growth::<K>(m.len(), m.capacity()))?;
-        m.reserve(1);
-        meter.sub(old);
-    }
-    Ok(m.entry(k).or_default())
-}
 
 #[inline]
 fn hash3(t: &Triple) -> u64 {
@@ -147,155 +58,44 @@ fn shard3(t: &Triple) -> usize {
     mix(t[0] ^ t[1].rotate_left(21) ^ t[2].rotate_left(42))
 }
 
-#[inline]
-fn shard2(a: u64, b: u64) -> usize {
-    mix(a ^ b.rotate_left(29))
-}
-
-#[inline]
-fn shard1(a: u64) -> usize {
-    mix(a)
-}
-
 fn shards<T: Default>() -> Vec<T> {
     (0..SHARDS).map(|_| T::default()).collect()
 }
 
 pub(crate) struct Graph {
-    /// rows before this one are the base tier's
-    offset: u32,
     base: Option<Arc<Base>>,
-    /// the in-memory rows, from `offset` on
-    triples: Vec<Triple>,
-    /// the rows of the live triples, hashed by triple, by [`shard3`]
+    /// the derived facts, from `offset` on
+    tier: Tier,
+    /// the ids of the live derived triples, hashed by triple, by [`shard3`]
     index: Vec<HashTable<u32>>,
     /// facts a merge found in the base tier, by [`shard3`], so that evaluation does not
     /// emit them again: at most [`IN_BASE_SHARD`] per shard
     pub(crate) in_base: Vec<FxHashSet<Triple>>,
     live: usize,
-    /// by [`shard1`] of the predicate
-    by_p: Vec<Lists<u64>>,
-    /// by [`shard2`] of (predicate, subject) and (predicate, object)
-    by_ps: Vec<Lists<(u64, u64)>>,
-    by_po: Vec<Lists<(u64, u64)>>,
-    /// per predicate: distinct subjects / distinct objects of the in-memory rows
-    distinct_s: FxHashMap<u64, u32>,
-    distinct_o: FxHashMap<u64, u32>,
-    /// by [`shard1`] of the subject / object
-    by_s: Option<Vec<Lists<u64>>>,
-    by_o: Option<Vec<Lists<u64>>>,
-    /// one bit per dead in-memory row (empty while no row is dead)
-    dead: Vec<u64>,
-    dead_rows: u32,
-    /// the heap of the index lists beyond their inline rows
-    spilled: usize,
+    /// the first fact of a tail that [`merge_unindexed`](Self::merge_unindexed) appended
+    /// to the columns and the triple index but not to the orders yet
+    pending: Option<usize>,
     /// predicates of bookkeeping facts (the magic facts of a demand program) that atoms
     /// and `noValue` builtins with a variable predicate do not see
     hidden: Option<Arc<FxHashSet<u64>>>,
-    /// Returned only after every owned graph payload above has been destroyed.
+    /// the graph's heap, charged to the run's budget. Returned only after every owned
+    /// graph payload above has been destroyed.
     held: Held,
 }
 
 impl Default for Graph {
     fn default() -> Graph {
         Graph {
-            spilled: 0,
             held: Held::new(&Budget::unlimited()),
             hidden: None,
-            offset: 0,
             base: None,
-            triples: Vec::new(),
+            tier: Tier::new(0),
             index: shards(),
             in_base: shards(),
             live: 0,
-            by_p: shards(),
-            by_ps: shards(),
-            by_po: shards(),
-            distinct_s: FxHashMap::default(),
-            distinct_o: FxHashMap::default(),
-            by_s: None,
-            by_o: None,
-            dead: Vec::new(),
-            dead_rows: 0,
+            pending: None,
         }
     }
-}
-
-/// Candidate in-memory rows for one access.
-#[derive(Clone, Copy)]
-pub(crate) enum Cands<'a> {
-    Slice(&'a [u32]),
-    Range(u32, u32),
-}
-
-impl<'a> Cands<'a> {
-    pub const EMPTY: Cands<'static> = Cands::Slice(&[]);
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        match self {
-            Cands::Slice(s) => s.len(),
-            Cands::Range(a, b) => (b - a) as usize,
-        }
-    }
-    #[inline]
-    pub fn get(&self, i: usize) -> u32 {
-        match self {
-            Cands::Slice(s) => s[i],
-            Cands::Range(a, _) => a + i as u32,
-        }
-    }
-    /// The first `n` candidates and the rest.
-    pub fn split_at(self, n: usize) -> (Cands<'a>, Cands<'a>) {
-        let n = n.min(self.len());
-        match self {
-            Cands::Slice(s) => {
-                let (a, b) = s.split_at(n);
-                (Cands::Slice(a), Cands::Slice(b))
-            }
-            Cands::Range(a, b) => (Cands::Range(a, a + n as u32), Cands::Range(a + n as u32, b)),
-        }
-    }
-
-    pub fn chunks(self, n: usize) -> Vec<Cands<'a>> {
-        let n = n.max(1);
-        match self {
-            Cands::Slice(s) => s.chunks(n).map(Cands::Slice).collect(),
-            Cands::Range(a, b) => (a..b)
-                .step_by(n)
-                .map(|x| Cands::Range(x, (x + n as u32).min(b)))
-                .collect(),
-        }
-    }
-}
-
-#[inline]
-fn restrict(list: &[u32], lo: u32, hi: u32) -> &[u32] {
-    let a = if lo == 0 {
-        0
-    } else {
-        list.partition_point(|&x| x < lo)
-    };
-    let b = list.partition_point(|&x| x < hi);
-    &list[a..b.max(a)]
-}
-
-/// The new rows of one index shard, from the pieces of a merge.
-enum Fill<'a> {
-    P(&'a mut Lists<u64>, usize),
-    Ps(&'a mut Lists<(u64, u64)>, usize),
-    Po(&'a mut Lists<(u64, u64)>, usize),
-    S(&'a mut Lists<u64>, usize),
-    O(&'a mut Lists<u64>, usize),
-}
-
-/// Rows of a piece of new rows, by index kind and shard.
-struct Piece {
-    p: Vec<Vec<u32>>,
-    ps: Vec<Vec<u32>>,
-    po: Vec<Vec<u32>>,
-    s: Vec<Vec<u32>>,
-    o: Vec<Vec<u32>>,
 }
 
 impl Graph {
@@ -313,7 +113,7 @@ impl Graph {
 
     pub fn with_capacity(n: usize) -> Graph {
         let mut g = Graph::default();
-        g.triples.reserve(n);
+        g.tier.reserve_exact(n);
         for m in &mut g.index {
             *m = HashTable::with_capacity(n / SHARDS);
         }
@@ -324,7 +124,7 @@ impl Graph {
     /// [`with_capacity`](Self::with_capacity), charged to `budget` before it allocates.
     pub fn try_with_capacity(n: usize, budget: &Arc<Budget>) -> Result<Graph, BudgetFailure> {
         let bytes = n
-            .checked_mul(size_of::<Triple>())
+            .checked_mul(ROW)
             .and_then(|rows| {
                 (SHARDS * table_bytes(table_capacity(n / SHARDS), 4)).checked_add(rows)
             })
@@ -379,11 +179,10 @@ impl Graph {
         self.held.try_set(n)
     }
 
-    /// The heap of the in-memory tier, from the capacities of its buffers and tables:
-    /// the rows, the triple index, the cache of base facts, the index lists and their
-    /// heap beyond the inline rows, the per-predicate counts and the dead-row bits.
+    /// The heap of the derived tier, by the capacities of its buffers and tables: the
+    /// tier's columns, orders and bitmaps, the triple index and the cache of base facts.
     pub fn heap_bytes(&self) -> usize {
-        let mut n = self.triples.capacity() * size_of::<Triple>();
+        let mut n = self.tier.heap_bytes();
         n += self
             .index
             .iter()
@@ -394,35 +193,28 @@ impl Graph {
             .iter()
             .map(|s| table_bytes(s.capacity(), size_of::<Triple>()))
             .sum::<usize>();
-        n += self.by_p.iter().map(lists_bytes).sum::<usize>();
-        n += self.by_ps.iter().map(lists_bytes).sum::<usize>();
-        n += self.by_po.iter().map(lists_bytes).sum::<usize>();
-        for v in [&self.by_s, &self.by_o].into_iter().flatten() {
-            n += v.iter().map(lists_bytes).sum::<usize>();
-        }
-        n += table_bytes(self.distinct_s.capacity(), 16)
-            + table_bytes(self.distinct_o.capacity(), 16);
-        n += self.dead.capacity() * size_of::<u64>();
-        // the shard vectors themselves
-        n += Self::fixed_heap_bytes();
-        n + self.spilled
+        n + Self::fixed_heap_bytes()
     }
 
-    /// Make room for at least `want` more rows, in the rows' buffer and in each shard of
+    /// The heap of the shard vectors themselves.
+    fn fixed_heap_bytes() -> usize {
+        SHARDS * (size_of::<HashTable<u32>>() + size_of::<FxHashSet<Triple>>())
+    }
+
+    /// Make room for at least `want` more facts, in the columns and in each shard of
     /// the triple index, when there is less than `min` room. Growing them later copies the
-    /// rows and rehashes the index while a run waits, so a closure kept for small runs
+    /// facts and rehashes the index while a run waits, so a closure kept for small runs
     /// gets this room once, after its commit. The growth is charged before it is
     /// allocated, and a charge past the limit fails.
     pub fn try_reserve_rows(&mut self, min: usize, want: usize) -> Result<(), BudgetFailure> {
-        let (len, cap) = (self.triples.len(), self.triples.capacity());
+        let (len, cap) = (self.tier.count(), self.tier.capacity());
         if cap - len < min {
             let new = len + want.max(min);
-            self.held.try_grow(new * size_of::<Triple>())?;
-            self.triples.reserve_exact(new - len);
-            self.held.shrink(cap * size_of::<Triple>());
+            self.held.try_grow(new * ROW)?;
+            self.tier.reserve_exact(new - len);
+            self.held.shrink(cap * ROW);
         }
         let (min, want) = (min.div_ceil(SHARDS), want.div_ceil(SHARDS));
-        let off = self.offset;
         for s in 0..SHARDS {
             let t = &self.index[s];
             if t.capacity() - t.len() >= min {
@@ -431,32 +223,25 @@ impl Graph {
             let (old, len) = (t.capacity(), t.len());
             let to = table_grown(old, len, want.max(min));
             self.held.try_grow(table_bytes(to, size_of::<u32>()))?;
-            let triples = &self.triples;
-            self.index[s].reserve(to - len, |&r| hash3(&triples[(r - off) as usize]));
+            let tier = &self.tier;
+            self.index[s].reserve(to - len, |&r| hash3(&tier.triple(r)));
             self.held.shrink(table_bytes(old, size_of::<u32>()));
         }
         self.try_settle()
     }
 
-    /// A graph whose rows `[0, base.len)` are the base tier (at least one row, so that
+    /// A graph whose ids `[0, base.len)` are the base tier (at least one id, so that
     /// a base tier that grows later, see [`set_base`](Self::set_base), is still read).
     pub fn with_base(base: Arc<Base>) -> Graph {
         Graph {
-            offset: base.len().max(1),
+            tier: Tier::new(base.len().max(1)),
             base: Some(base),
             ..Graph::default()
         }
     }
 
-    fn fixed_heap_bytes() -> usize {
-        SHARDS
-            * (size_of::<HashTable<u32>>()
-                + size_of::<FxHashSet<Triple>>()
-                + 5 * size_of::<Lists<u64>>())
-    }
-
-    /// A graph over the same base tier and row numbers as this one, with room for `n`
-    /// in-memory rows, charged to `budget` before it allocates when `strict` (and
+    /// A graph over the same base tier and id numbers as this one, with room for `n`
+    /// derived facts, charged to `budget` before it allocates when `strict` (and
     /// otherwise even past the limit).
     pub fn try_like(
         &self,
@@ -471,18 +256,18 @@ impl Graph {
             g.charge_to(budget)?;
             g
         };
-        g.offset = self.offset;
+        g.tier.set_offset(self.offset());
         g.base = self.base.clone();
         Ok(g)
     }
 
     /// Replace the base tier by `base`, the input graphs of a later snapshot of the same
-    /// generation. The in-memory rows keep their numbers: the base tier stays the rows
-    /// before [`offset`](Self::offset), which are only read as a whole, so the new tier
-    /// may hold more facts than that. The cache of base facts that merges found is
-    /// emptied, since the new tier may not hold them.
+    /// generation. The derived facts keep their ids: the base tier stays the ids before
+    /// [`offset`](Self::offset), which are only read as a whole, so the new tier may hold
+    /// more facts than that. The cache of base facts that merges found is emptied, since
+    /// the new tier may not hold them.
     pub fn set_base(&mut self, base: Arc<Base>) -> Result<(), BudgetFailure> {
-        debug_assert!(self.base.is_some() && self.offset > 0);
+        debug_assert!(self.base.is_some() && self.offset() > 0);
         debug_assert!(
             self.base
                 .as_ref()
@@ -519,27 +304,43 @@ impl Graph {
         self.base.clone()
     }
 
-    /// The first in-memory row: the rows before it are the base tier.
+    /// The first derived id: the ids before it are the base tier.
     #[inline]
     pub fn offset(&self) -> u32 {
-        self.offset
+        self.tier.offset()
     }
 
     #[inline]
     pub fn len(&self) -> u32 {
-        self.offset + self.triples.len() as u32
+        self.tier.len()
     }
 
-    /// The in-memory rows, in row order.
+    /// The derived facts, dead ones included.
     #[inline]
-    pub fn derived(&self) -> &[Triple] {
-        &self.triples
+    pub fn derived_len(&self) -> usize {
+        self.tier.count()
     }
 
-    /// The triple of an in-memory row.
+    /// The derived facts in id order, dead ones included.
     #[inline]
-    pub fn triple(&self, row: u32) -> Triple {
-        self.triples[(row - self.offset) as usize]
+    pub fn facts(&self) -> impl Iterator<Item = Triple> + '_ {
+        self.tier.facts()
+    }
+
+    /// The derived facts from the `from`-th on, in id order.
+    pub fn facts_from(&self, from: usize) -> impl Iterator<Item = Triple> + '_ {
+        self.tier.facts_range(from, self.tier.count())
+    }
+
+    /// The `lo`-th to the `hi`-th derived facts, in id order.
+    pub fn facts_range(&self, lo: usize, hi: usize) -> impl Iterator<Item = Triple> + '_ {
+        self.tier.facts_range(lo, hi)
+    }
+
+    /// The triple of a derived fact.
+    #[inline]
+    pub fn triple(&self, id: u32) -> Triple {
+        self.tier.triple(id)
     }
 
     /// Add a triple; returns false if it was already present.
@@ -552,7 +353,7 @@ impl Graph {
     /// new triples. The base tier is not consulted: the caller adds facts that are not in
     /// it.
     pub fn add_batch(&mut self, ts: impl IntoIterator<Item = Triple>) -> usize {
-        let n = self.add_rows(ts, false);
+        let n = self.add_rows(ts, false, true, true);
         n.expect("charges that may pass the limit do not fail")
     }
 
@@ -562,36 +363,44 @@ impl Graph {
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
     ) -> Result<usize, BudgetFailure> {
-        self.add_rows(ts, true)
+        self.add_rows(ts, true, true, true)
     }
 
+    /// Protect the derived facts from id `floor` on from compaction, until the next call:
+    /// the engine sets it to the start of each iteration's delta, so that the runs the
+    /// iteration reads in part are never merged with older ones.
+    pub fn set_compaction_floor(&mut self, floor: u32) {
+        self.tier.set_compaction_floor(floor);
+    }
+
+    /// Add facts in one batch. A `batch` added between runs may be the delta a later run
+    /// starts from, so it lowers the compaction floor to its first id, and the engine's
+    /// merges set the floor themselves. Without `index`, the new facts wait for
+    /// [`index_pending`](Self::index_pending) to enter the orders.
     fn add_rows(
         &mut self,
         ts: impl IntoIterator<Item = Triple>,
         strict: bool,
+        batch: bool,
+        index: bool,
     ) -> Result<usize, BudgetFailure> {
-        let start = self.triples.len();
+        let start = self.tier.count();
         let budget = self.held.budget().clone();
         let mut m = Meter::new(&budget, strict);
         let r = (|| {
-            let Graph {
-                index,
-                triples,
-                offset,
-                ..
-            } = &mut *self;
-            let off = *offset;
+            let Graph { index, tier, .. } = &mut *self;
             for t in ts {
                 let h = hash3(&t);
                 let tbl = &mut index[shard3(&t)];
-                if tbl.find(h, |&r| triples[(r - off) as usize] == t).is_none() {
-                    if triples.len() == triples.capacity() {
-                        // the new buffer, while the old one is alive
-                        let old = triples.capacity();
+                if tbl.find(h, |&r| tier.eq(r, &t)).is_none() {
+                    m.add(tier.rel_growth(t[1]))?;
+                    if tier.count() == tier.capacity() {
+                        // the new buffers, while the old ones are alive
+                        let old = tier.capacity();
                         let next = (old * 2).max(16);
-                        m.add(next * size_of::<Triple>())?;
-                        triples.reserve_exact(next - triples.len());
-                        m.sub(old * size_of::<Triple>());
+                        m.add(next * ROW)?;
+                        tier.reserve_exact(next - tier.count());
+                        m.sub(old * ROW);
                     }
                     if tbl.len() == tbl.capacity() {
                         let old = table_bytes(tbl.capacity(), size_of::<u32>());
@@ -599,29 +408,37 @@ impl Graph {
                             table_grown(tbl.capacity(), tbl.len(), 1),
                             size_of::<u32>(),
                         ))?;
-                        tbl.reserve(1, |&r| hash3(&triples[(r - off) as usize]));
+                        tbl.reserve(1, |&r| hash3(&tier.triple(r)));
                         m.sub(old);
                     }
-                    let row = off + triples.len() as u32;
-                    triples.push(t);
-                    tbl.insert_unique(h, row, |&r| hash3(&triples[(r - off) as usize]));
+                    let id = tier.len();
+                    tier.push(t);
+                    tbl.insert_unique(h, id, |&r| hash3(&tier.triple(r)));
                 }
             }
             Ok(())
         })();
-        let new = self.triples.len() - start;
+        let new = self.tier.count() - start;
         self.live += new;
-        let r = r.and_then(|()| self.fill(start, &mut m));
+        let r = r.and_then(|()| self.index_from(start, index, &mut m));
+        if batch && new > 0 {
+            self.tier.lower_floor(self.offset() + start as u32);
+        }
         self.held.adopt(m.into_bytes());
         // after an error the graph is unusable, and settling would charge what was
         // allocated beyond the failed charge, past the limit
-        r?;
-        self.settle()?;
-        Ok(new)
+        let r = r.and_then(|()| {
+            if strict {
+                self.try_settle()
+            } else {
+                self.settle()
+            }
+        });
+        r.map(|()| new)
     }
 
     /// Merge the outputs of an iteration, in order: each triple that is not in the graph
-    /// yet, the base tier included, gets the next row, in the order of its first
+    /// yet, the base tier included, gets the next id, in the order of its first
     /// occurrence. Returns the number of new triples. Deduplication and the index updates
     /// run with one task per shard.
     ///
@@ -630,15 +447,58 @@ impl Graph {
     /// allocated; a charge past the limit fails the merge, and the graph is unusable
     /// after an error.
     pub fn merge(&mut self, outs: Vec<Vec<Triple>>, outs_held: Held) -> anyhow::Result<usize> {
-        let result = self.merge_charged(outs, outs_held)?;
-        self.settle()?;
-        Ok(result)
+        let n = self.merge_charged(outs, outs_held, true)?;
+        self.try_settle()?;
+        Ok(n)
+    }
+
+    /// [`merge`](Self::merge) of one batch of a larger whole, such as a closure that an
+    /// operator emits in batches: the new facts enter the columns and the triple index,
+    /// which deduplicates the next batch against them, and wait for
+    /// [`index_pending`](Self::index_pending) to enter the orders as one run per order,
+    /// as one merge of the whole would have added them. No probe may read the graph
+    /// before that, so the caller keeps it to itself meanwhile.
+    pub fn merge_unindexed(&mut self, out: Vec<Triple>, out_held: Held) -> anyhow::Result<usize> {
+        let n = self.merge_charged(vec![out], out_held, false)?;
+        self.try_settle()?;
+        Ok(n)
+    }
+
+    /// Sort the facts [`merge_unindexed`](Self::merge_unindexed) appended into their
+    /// relations' orders, charging the sort's scratch and the runs first.
+    pub fn index_pending(&mut self) -> Result<(), BudgetFailure> {
+        let Some(start) = self.pending.take() else {
+            return Ok(());
+        };
+        let budget = self.held.budget().clone();
+        let mut m = Meter::new(&budget, true);
+        let r = self.tier.index_new(start, &mut m);
+        self.held.adopt(m.into_bytes());
+        r?;
+        self.try_settle()
+    }
+
+    /// Index the facts from column index `start` on, or note them as pending.
+    fn index_from(
+        &mut self,
+        start: usize,
+        index: bool,
+        m: &mut Meter<'_>,
+    ) -> Result<(), BudgetFailure> {
+        if index {
+            debug_assert!(self.pending.is_none(), "a merge over an unindexed tail");
+            self.tier.index_new(start, m)
+        } else {
+            self.pending = Some(self.pending.map_or(start, |p| p.min(start)));
+            Ok(())
+        }
     }
 
     fn merge_charged(
         &mut self,
         mut outs: Vec<Vec<Triple>>,
         outs_held: Held,
+        index: bool,
     ) -> anyhow::Result<usize> {
         outs.retain(|o| !o.is_empty());
         let total: usize = outs.iter().map(Vec::len).sum();
@@ -646,7 +506,7 @@ impl Graph {
             || outs.len() >= u32::MAX as usize
             || outs.iter().any(|o| o.len() >= u32::MAX as usize)
         {
-            let n = self.try_add_batch(outs.into_iter().flatten())?;
+            let n = self.add_rows(outs.into_iter().flatten(), true, false, index)?;
             drop(outs_held);
             return Ok(n);
         }
@@ -698,7 +558,7 @@ impl Graph {
         let t_bucket = std::time::Instant::now();
         let base = self.base.clone();
         let buckets_ref = &buckets;
-        let (triples, off) = (&self.triples, self.offset);
+        let tier = &self.tier;
         let budget_ref = &*budget;
         // per shard: the first occurrence of each triple that is new, in position order,
         // those of them the base tier may hold, those whose predicate and object decide
@@ -725,10 +585,7 @@ impl Graph {
                             continue;
                         }
                         let hash = hash3(&t);
-                        if tbl
-                            .find(hash, |&r| triples[(r - off) as usize] == t)
-                            .is_some()
-                        {
+                        if tbl.find(hash, |&r| tier.eq(r, &t)).is_some() {
                             continue;
                         }
                         if let hashbrown::hash_table::Entry::Vacant(v) =
@@ -870,7 +727,7 @@ impl Graph {
         }
         let t_dedup = std::time::Instant::now();
         // the kept positions as a bitset with a running count per word: a position's
-        // rank among them is its new row
+        // rank among them is its new id
         let words = total.div_ceil(64);
         work.try_grow(words * (size_of::<u64>() + size_of::<u32>()))?;
         let mut bits = vec![0u64; words];
@@ -887,12 +744,20 @@ impl Graph {
             n += w.count_ones();
         }
         let new = n as usize;
-        let start = self.triples.len();
-        let first_row = self.len();
-        // the grown buffer of rows and index tables, while the old ones are alive
+        let start = self.tier.count();
+        let first_id = self.len();
+        // the grown columns and index tables, while the old ones are alive; the columns
+        // double at least, as `add_rows` grows them, since the operators merge a closure
+        // in batches
         let mut grow = 0;
-        if start + new > self.triples.capacity() {
-            grow += (start + new) * size_of::<Triple>();
+        let cap = self.tier.capacity();
+        let next = if start + new > cap {
+            (start + new).max(cap * 2)
+        } else {
+            cap
+        };
+        if next > cap {
+            grow += next * ROW;
         }
         for (tbl, ks) in self.index.iter().zip(&kept) {
             if tbl.len() + ks.len() > tbl.capacity() {
@@ -903,7 +768,9 @@ impl Graph {
             }
         }
         work.try_grow(grow)?;
-        self.triples.reserve_exact(new);
+        if next > cap {
+            self.tier.reserve_exact(next - start);
+        }
         let mut item = 0;
         for (i, &w) in bits.iter().enumerate() {
             let mut w = w;
@@ -912,27 +779,29 @@ impl Graph {
                 while p >= offsets[item + 1] {
                     item += 1;
                 }
-                self.triples.push(outs[item][p - offsets[item]]);
+                let t = outs[item][p - offsets[item]];
+                work.try_grow(self.tier.rel_growth(t[1]))?;
+                self.tier.push(t);
                 w &= w - 1;
             }
         }
         drop(outs);
         drop(outs_held);
-        // the new rows in the triple index
+        // the new facts in the triple index
         let (bits_ref, before_ref) = (&bits, &before);
-        let triples = &self.triples;
+        let tier = &self.tier;
         let gpos = |h: u64| offsets_ref[(h >> 32) as usize] + (h as u32) as usize;
         self.index
             .par_iter_mut()
             .zip(kept.par_iter())
             .for_each(|(tbl, ks)| {
-                let hasher = |&r: &u32| hash3(&triples[(r - off) as usize]);
+                let hasher = |&r: &u32| hash3(&tier.triple(r));
                 tbl.reserve(ks.len(), hasher);
                 for &h in ks {
                     let p = gpos(h);
                     let (w, b) = (p / 64, p % 64);
                     let r =
-                        first_row + before_ref[w] + (bits_ref[w] & ((1u64 << b) - 1)).count_ones();
+                        first_id + before_ref[w] + (bits_ref[w] & ((1u64 << b) - 1)).count_ones();
                     tbl.insert_unique(hasher(&r), r, hasher);
                 }
             });
@@ -940,7 +809,7 @@ impl Graph {
         drop(kept);
         self.live += new;
         let mut m = Meter::new(&budget, true);
-        let filled = self.fill(start, &mut m);
+        let filled = self.index_from(start, index, &mut m);
         work.adopt(m.into_bytes());
         filled?;
         tracing::trace!(
@@ -955,236 +824,44 @@ impl Graph {
         Ok(new)
     }
 
-    /// Add the in-memory rows from `start` (an index of `triples`) to the secondary
-    /// indexes, with one task per index shard when there are many. Growth is charged to
-    /// `m` (and its strictness) before it is allocated.
-    fn fill(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), BudgetFailure> {
-        let n = self.triples.len() - start;
-        if n == 0 {
-            return Ok(());
-        }
-        let first_row = self.offset + start as u32;
-        let new = &self.triples[start..];
-        let (with_s, with_o) = (self.by_s.is_some(), self.by_o.is_some());
-        let threads = if n < PAR_MIN {
-            1
-        } else {
-            rayon::current_num_threads().max(1)
-        };
-        let size = n.div_ceil(threads * 2).max(4096);
-        // the pieces: a row number per new row and index, in buffers that may double
-        let indexes = 3 + with_s as usize + with_o as usize;
-        m.add(
-            2 * n * indexes * size_of::<u32>()
-                + n.div_ceil(size) * indexes * SHARDS * size_of::<Vec<u32>>(),
-        )?;
-        let make = |(k, c): (usize, &[Triple])| {
-            let empty = || vec![Vec::new(); SHARDS];
-            let mut pc = Piece {
-                p: empty(),
-                ps: empty(),
-                po: empty(),
-                s: if with_s { empty() } else { Vec::new() },
-                o: if with_o { empty() } else { Vec::new() },
-            };
-            let at = first_row + (k * size) as u32;
-            for (j, t) in c.iter().enumerate() {
-                let r = at + j as u32;
-                pc.p[shard1(t[1])].push(r);
-                pc.ps[shard2(t[1], t[0])].push(r);
-                pc.po[shard2(t[1], t[2])].push(r);
-                if with_s {
-                    pc.s[shard1(t[0])].push(r);
-                }
-                if with_o {
-                    pc.o[shard1(t[2])].push(r);
-                }
-            }
-            pc
-        };
-        let pieces: Vec<Piece> = if threads == 1 {
-            new.chunks(size).enumerate().map(make).collect()
-        } else {
-            new.par_chunks(size).enumerate().map(make).collect()
-        };
-        let Graph {
-            offset,
-            triples,
-            by_p,
-            by_ps,
-            by_po,
-            by_s,
-            by_o,
-            distinct_s,
-            distinct_o,
-            ..
-        } = self;
-        let mut tasks: Vec<Fill<'_>> = Vec::with_capacity(SHARDS * 5);
-        for (s, m) in by_p.iter_mut().enumerate() {
-            tasks.push(Fill::P(m, s));
-        }
-        for (s, m) in by_ps.iter_mut().enumerate() {
-            tasks.push(Fill::Ps(m, s));
-        }
-        for (s, m) in by_po.iter_mut().enumerate() {
-            tasks.push(Fill::Po(m, s));
-        }
-        if let Some(v) = by_s {
-            for (s, m) in v.iter_mut().enumerate() {
-                tasks.push(Fill::S(m, s));
-            }
-        }
-        if let Some(v) = by_o {
-            for (s, m) in v.iter_mut().enumerate() {
-                tasks.push(Fill::O(m, s));
-            }
-        }
-        let triples: &[Triple] = triples;
-        let offset = *offset;
-        let t = |r: u32| triples[(r - offset) as usize];
-        let (budget, strict) = (m.budget(), m.strict());
-        // per task: whether it counts subjects, the predicates whose distinct subjects (or
-        // objects) grew and by how much, the change of the lists' heap beyond their inline
-        // rows, and the bytes it charged
-        type Filled = Result<(bool, Vec<(u64, u32)>, isize, usize), BudgetFailure>;
-        let run = |task: Fill<'_>| -> Filled {
-            let mut grew: FxHashMap<u64, u32> = FxHashMap::default();
-            let mut meter = Meter::new(budget, strict);
-            let mut spilled = 0isize;
-            let subjects = matches!(task, Fill::Ps(..));
-            match task {
-                Fill::P(m, s) => {
-                    for pc in &pieces {
-                        let rows = &pc.p[s];
-                        let mut i = 0;
-                        while i < rows.len() {
-                            let p = t(rows[i])[1];
-                            let mut j = i + 1;
-                            while j < rows.len() && t(rows[j])[1] == p {
-                                j += 1;
-                            }
-                            let e = entry(m, p, &mut meter)?;
-                            extend_rows(e, &rows[i..j], &mut meter, &mut spilled)?;
-                            i = j;
-                        }
-                    }
-                }
-                Fill::Ps(m, s) | Fill::Po(m, s) => {
-                    let col = if subjects { 0 } else { 2 };
-                    for pc in &pieces {
-                        let rows = if subjects { &pc.ps[s] } else { &pc.po[s] };
-                        for &r in rows {
-                            let x = t(r);
-                            let e = entry(m, (x[1], x[col]), &mut meter)?;
-                            if e.is_empty() {
-                                *grew.entry(x[1]).or_default() += 1;
-                            }
-                            push_row(e, r, &mut meter, &mut spilled)?;
-                        }
-                    }
-                }
-                Fill::S(m, s) => {
-                    for pc in &pieces {
-                        for &r in &pc.s[s] {
-                            let e = entry(m, t(r)[0], &mut meter)?;
-                            push_row(e, r, &mut meter, &mut spilled)?;
-                        }
-                    }
-                }
-                Fill::O(m, s) => {
-                    for pc in &pieces {
-                        for &r in &pc.o[s] {
-                            let e = entry(m, t(r)[2], &mut meter)?;
-                            push_row(e, r, &mut meter, &mut spilled)?;
-                        }
-                    }
-                }
-            }
-            Ok((
-                subjects,
-                grew.into_iter().collect(),
-                spilled,
-                meter.into_bytes(),
-            ))
-        };
-        let grown: Vec<Filled> = if threads == 1 {
-            tasks.into_iter().map(run).collect()
-        } else {
-            tasks.into_par_iter().map(run).collect()
-        };
-        let mut first_err = None;
-        let mut spilled = 0isize;
-        for g in grown {
-            let (subjects, g, sp, bytes) = match g {
-                Ok(x) => x,
-                Err(e) => {
-                    first_err.get_or_insert(e);
-                    continue;
-                }
-            };
-            m.adopt(bytes);
-            spilled += sp;
-            let d = if subjects {
-                &mut *distinct_s
-            } else {
-                &mut *distinct_o
-            };
-            for (p, k) in g {
-                *d.entry(p).or_default() += k;
-            }
-        }
-        self.spilled = (self.spilled as isize + spilled).max(0) as usize;
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
     #[cfg(test)]
     pub fn ensure_s_index(&mut self) {
         let _ = self.ensure_index(true, false);
     }
 
-    /// Build the per-subject (`subjects`) or per-object index if it is missing, its
-    /// growth charged before it is allocated: with `strict`, failing past the limit.
+    /// Build the order by subject (`subjects`) or by object over the whole derived tier
+    /// if it is missing, its growth charged before it is allocated: with `strict`,
+    /// failing past the limit.
     pub fn ensure_index(&mut self, subjects: bool, strict: bool) -> Result<(), BudgetFailure> {
-        let present = if subjects {
-            self.by_s.is_some()
-        } else {
-            self.by_o.is_some()
-        };
-        if present {
+        if self.tier.has_order(subjects) {
             return Ok(());
         }
         let budget = self.held.budget().clone();
         let mut meter = Meter::new(&budget, strict);
-        let mut spilled = 0isize;
-        let col = if subjects { 0 } else { 2 };
-        let mut v: Vec<Lists<u64>> = shards();
-        let r: Result<(), BudgetFailure> = (|| {
-            for (i, t) in self.triples.iter().enumerate() {
-                let e = entry(&mut v[shard1(t[col])], t[col], &mut meter)?;
-                push_row(e, self.offset + i as u32, &mut meter, &mut spilled)?;
-            }
-            Ok(())
-        })();
-        if r.is_ok() {
-            if subjects {
-                self.by_s = Some(v);
-            } else {
-                self.by_o = Some(v);
-            }
-            self.spilled = (self.spilled as isize + spilled).max(0) as usize;
-        }
+        let r = self.tier.ensure_order(subjects, &mut meter);
         self.held.adopt(meter.into_bytes());
         r?;
         self.settle()
     }
-    /// The row of a live in-memory triple.
+
+    /// The shape of the triple index, for the trace of an iteration: the sum of the
+    /// shards' capacities, the sum of their lengths, and the largest and the smallest
+    /// capacity of one shard.
+    pub fn index_shape(&self) -> (usize, usize, usize, usize) {
+        let caps = self.index.iter().map(|t| t.capacity());
+        (
+            caps.clone().sum(),
+            self.index.iter().map(|t| t.len()).sum(),
+            caps.clone().max().unwrap_or(0),
+            caps.min().unwrap_or(0),
+        )
+    }
+
+    /// The id of a live derived triple.
     #[inline]
     pub fn position(&self, t: &Triple) -> Option<u32> {
         self.index[shard3(t)]
-            .find(hash3(t), |&r| self.triple(r) == *t)
+            .find(hash3(t), |&r| self.tier.eq(r, t))
             .copied()
     }
 
@@ -1197,78 +874,78 @@ impl Graph {
                 .is_some_and(|b| b.contains(t).unwrap_or(false))
     }
 
-    /// Whether a triple is known: an in-memory fact, or one a merge found in the base
+    /// Whether a triple is known: a derived fact, or one a merge found in the base
     /// tier. Facts of the base tier that no merge met are not known.
     #[inline]
     pub fn known(&self, t: &Triple) -> bool {
         self.position(t).is_some() || (self.base.is_some() && self.in_base[shard3(t)].contains(t))
     }
 
-    /// Whether row `i` holds a live triple.
+    /// Whether id `i` holds a live fact.
     #[inline]
     pub fn alive(&self, i: u32) -> bool {
-        let Some(i) = i.checked_sub(self.offset) else {
-            return true;
-        };
-        self.dead
-            .get(i as usize / 64)
-            .is_none_or(|w| w & (1 << (i % 64)) == 0)
+        i < self.offset() || self.tier.alive(i)
     }
 
-    /// Mark the row of a live in-memory triple dead; returns false if the triple is not
-    /// live.
+    /// Mark a live derived triple dead; returns false if the triple is not live.
     pub fn kill(&mut self, t: &Triple) -> Result<bool, BudgetFailure> {
-        let Some(&row) = self.index[shard3(t)].find(hash3(t), |&r| {
-            self.triples[(r - self.offset) as usize] == *t
-        }) else {
+        let tier = &self.tier;
+        let Some(&i) = self.index[shard3(t)].find(hash3(t), |&r| tier.eq(r, t)) else {
             return Ok(false);
         };
-        let i = row - self.offset;
-        let w = i as usize / 64;
-        if self.dead.len() <= w {
-            let want = w
-                .checked_add(1)
-                .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
-            let cap = self.dead.capacity();
-            if want > cap {
-                let next = cap.checked_mul(2).unwrap_or(want).max(want).max(4);
-                let bytes = next.checked_mul(size_of::<u64>()).ok_or_else(|| {
-                    BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow)
-                })?;
-                self.held.try_grow(bytes)?;
-                self.dead.reserve_exact(next - self.dead.len());
-                self.held.shrink(cap * size_of::<u64>());
-                let excess = self.dead.capacity() - next;
-                self.held.try_grow(excess * size_of::<u64>())?;
-            }
-            self.dead.resize(want, 0);
-        }
-        // No row or index changes before its required dead-bit storage is backed.
+        // a few bits per fact, charged as they grow: no fact or index changes before
+        // the storage of its dead bit is backed
+        let (grow, old) = self.tier.dead_growth(i);
+        self.held.try_grow(grow)?;
+        let tier = &self.tier;
         self.index[shard3(t)]
-            .find_entry(hash3(t), |&r| {
-                self.triples[(r - self.offset) as usize] == *t
-            })
+            .find_entry(hash3(t), |&r| tier.eq(r, t))
             .expect("exclusive row stayed present")
             .remove();
-        self.dead[w] |= 1 << (i % 64);
-        self.dead_rows += 1;
+        self.tier.kill(i);
+        self.held.shrink(old);
         self.live -= 1;
         Ok(true)
     }
 
-    /// Number of dead rows.
+    /// Number of dead derived facts.
     pub fn dead_rows(&self) -> u32 {
-        self.dead_rows
+        self.tier.dead_rows()
     }
 
-    /// Number of live in-memory triples.
+    /// Number of live derived triples.
     pub fn live(&self) -> usize {
         self.live
     }
 
-    /// Candidate in-memory rows for a pattern with the given bound positions, restricted
-    /// to rows `[lo, hi)`. The result may be a superset (callers re-check every
-    /// component). The base tier's rows are read with [`Base::for_each`].
+    /// Whether derived fact `id` is flagged explicit (see [`crate::incremental::Closure`]).
+    #[inline]
+    pub fn flagged(&self, id: u32) -> bool {
+        id >= self.offset() && self.tier.flagged(id)
+    }
+
+    /// Flag derived fact `id` explicit or not, charging the growth of the flags before it
+    /// is allocated, and with `strict` failing when it does not fit.
+    pub fn set_flag_with(&mut self, id: u32, on: bool, strict: bool) -> Result<(), BudgetFailure> {
+        let (grow, old) = self.tier.flag_growth(id);
+        if grow > 0 {
+            if !on {
+                return Ok(());
+            }
+            if strict {
+                self.held.try_grow(grow)?;
+            } else {
+                self.held.grow(grow)?;
+            }
+        }
+        self.tier.set_flag(id, on);
+        self.held.shrink(old);
+        Ok(())
+    }
+
+    /// Candidate derived ids for a pattern with the given bound positions, restricted
+    /// to ids `[lo, hi)`. The result may be a superset (callers re-check every
+    /// component). The base tier's facts are read with [`Base::for_each`].
     pub fn cands(
         &self,
         s: Option<u64>,
@@ -1277,89 +954,59 @@ impl Graph {
         lo: u32,
         hi: u32,
     ) -> Cands<'_> {
-        let lo = lo.max(self.offset);
+        debug_assert!(self.pending.is_none(), "a probe over an unindexed tail");
+        let lo = lo.max(self.offset());
         if lo >= hi {
-            return Cands::EMPTY;
+            return Cands::empty();
         }
-        fn sl(v: Option<&SmallVec<[u32; 4]>>, lo: u32, hi: u32) -> Cands<'_> {
-            v.map_or(Cands::EMPTY, |l| Cands::Slice(restrict(l, lo, hi)))
+        if let (Some(s), Some(p), Some(o)) = (s, p, o) {
+            let t = [s, p, o];
+            return match self.index[shard3(&t)].find(hash3(&t), |&r| self.tier.eq(r, &t)) {
+                Some(i) if *i >= lo && *i < hi => Cands::ids(std::slice::from_ref(i)),
+                _ => Cands::empty(),
+            };
         }
-        let slice = |v| sl(v, lo, hi);
-        match (s, p, o) {
-            (Some(s), Some(p), Some(o)) => {
-                let t = [s, p, o];
-                match self.index[shard3(&t)].find(hash3(&t), |&r| self.triple(r) == t) {
-                    Some(i) if *i >= lo && *i < hi => Cands::Slice(std::slice::from_ref(i)),
-                    _ => Cands::EMPTY,
-                }
-            }
-            (Some(s), Some(p), None) => slice(self.by_ps[shard2(p, s)].get(&(p, s))),
-            (None, Some(p), Some(o)) => slice(self.by_po[shard2(p, o)].get(&(p, o))),
-            (None, Some(p), None) => slice(self.by_p[shard1(p)].get(&p)),
-            (Some(s), None, o) => match (&self.by_s, o, &self.by_o) {
-                (Some(m), _, _) => slice(m[shard1(s)].get(&s)),
-                (None, Some(o), Some(m)) => slice(m[shard1(o)].get(&o)),
-                _ => Cands::Range(lo, hi),
-            },
-            (None, None, Some(o)) => match &self.by_o {
-                Some(m) => slice(m[shard1(o)].get(&o)),
-                None => Cands::Range(lo, hi),
-            },
-            (None, None, None) => Cands::Range(lo, hi),
-        }
+        self.tier.cands(s, p, o, lo, hi)
     }
 
     /// Whether the range `[lo, hi)` includes the base tier.
     #[inline]
     pub fn reads_base(&self, lo: u32, hi: u32) -> bool {
-        self.base.is_some() && lo < self.offset && hi > 0
+        self.base.is_some() && lo < self.offset() && hi > 0
     }
 
-    /// The number of predicates of the in-memory rows.
+    /// The number of predicates of the derived facts.
     pub fn predicate_count(&self) -> usize {
-        self.by_p.iter().map(|m| m.len()).sum()
+        self.tier.predicate_count()
     }
 
-    /// Calls `f` with each predicate of an in-memory row from row `lo` on.
-    pub fn predicates_since(&self, lo: u32, mut f: impl FnMut(u64)) {
-        for m in &self.by_p {
-            for (&p, rows) in m {
-                if rows.last().is_some_and(|&r| r >= lo) {
-                    f(p);
-                }
-            }
-        }
+    /// Calls `f` with each predicate of a derived fact from id `lo` on.
+    pub fn predicates_since(&self, lo: u32, f: impl FnMut(u64)) {
+        self.tier.predicates_since(lo, f);
     }
 
     /// Number of triples with predicate `p` in `[lo, hi)` (an upper bound for the base
-    /// tier).
+    /// tier, and dead facts counted).
     pub fn count_p(&self, p: u64, lo: u32, hi: u32) -> usize {
+        debug_assert!(self.pending.is_none(), "a count over an unindexed tail");
         let base = match &self.base {
             Some(b) if self.reads_base(lo, hi) => b.count_p(p) as usize,
             _ => 0,
         };
-        base + self.by_p[shard1(p)]
-            .get(&p)
-            .map_or(0, |l| restrict(l, lo.max(self.offset), hi).len())
+        base + self.tier.count_p(p, lo, hi)
     }
 
-    /// The in-memory rows from row `lo` on whose predicate is hidden (magic facts), which
+    /// The derived facts from id `lo` on whose predicate is hidden (magic facts), which
     /// the limit of inferred facts does not count.
     pub fn hidden_rows(&self, lo: u32) -> usize {
         let Some(h) = &self.hidden else {
             return 0;
         };
-        let lo = lo.max(self.offset);
-        h.iter()
-            .map(|&p| {
-                self.by_p[shard1(p)]
-                    .get(&p)
-                    .map_or(0, |l| restrict(l, lo, self.len()).len())
-            })
-            .sum()
+        let len = self.len();
+        h.iter().map(|&p| self.tier.count_p(p, lo, len)).sum()
     }
 
-    /// The facts inferred from row `lo` on, without the hidden ones.
+    /// The facts inferred from id `lo` on, without the hidden ones.
     pub fn inferred_since(&self, lo: u32) -> usize {
         (self.len() - lo) as usize - self.hidden_rows(lo)
     }
@@ -1367,18 +1014,16 @@ impl Graph {
     /// (distinct subjects, distinct objects) of predicate `p`
     pub fn pstats(&self, p: u64) -> (u32, u32) {
         let (bs, bo) = self.base.as_ref().map_or((0, 0), |b| b.pstats(p));
+        let (ds, dos) = self.tier.pstats(p);
         (
-            (self.distinct_s.get(&p).copied().unwrap_or(0) as u64 + bs).clamp(1, u32::MAX as u64)
-                as u32,
-            (self.distinct_o.get(&p).copied().unwrap_or(0) as u64 + bo).clamp(1, u32::MAX as u64)
-                as u32,
+            (ds as u64 + bs).clamp(1, u32::MAX as u64) as u32,
+            (dos as u64 + bo).clamp(1, u32::MAX as u64) as u32,
         )
     }
 
     pub fn distinct_predicates(&self) -> usize {
         let base = self.base.as_ref().map_or(0, |b| b.distinct_predicates());
-        let mem: usize = self.by_p.iter().map(|m| m.len()).sum();
-        (base + mem).max(1)
+        (base + self.tier.predicate_count()).max(1)
     }
 
     /// The size of the base tier now (an upper bound), which [`set_base`](Self::set_base)
@@ -1390,22 +1035,22 @@ impl Graph {
     pub fn distinct_subjects(&self) -> usize {
         let base = self.base_len() / 4;
         let mem = self
-            .by_s
-            .as_ref()
-            .map_or(self.triples.len() / 4, |v| v.iter().map(|m| m.len()).sum());
+            .tier
+            .distinct_subjects()
+            .unwrap_or(self.tier.count() / 4);
         (base + mem).max(1)
     }
 
     pub fn distinct_objects(&self) -> usize {
         let base = self.base_len() / 4;
         let mem = self
-            .by_o
-            .as_ref()
-            .map_or(self.triples.len() / 4, |v| v.iter().map(|m| m.len()).sum());
+            .tier
+            .distinct_objects()
+            .unwrap_or(self.tier.count() / 4);
         (base + mem).max(1)
     }
 
-    /// Whether a live fact matching the pattern is among rows `< hi`.
+    /// Whether a live fact matching the pattern is among ids `< hi`.
     pub fn exists(
         &self,
         memo: &mut Memo,
@@ -1420,8 +1065,7 @@ impl Graph {
         {
             return true;
         }
-        let c = self.cands(s, p, o, 0, hi);
-        (0..c.len()).map(|i| c.get(i)).any(|r| {
+        self.cands(s, p, o, 0, hi).iter().any(|r| {
             if !self.alive(r) {
                 return false;
             }
@@ -1432,7 +1076,7 @@ impl Graph {
         })
     }
 
-    /// Whether `t` is a live fact among rows `< hi`.
+    /// Whether `t` is a live fact among ids `< hi`.
     pub fn holds_before(&self, memo: &mut Memo, t: &Triple, hi: u32) -> bool {
         self.position(t).is_some_and(|r| r < hi)
             || (self.reads_base(0, hi)
@@ -1442,7 +1086,9 @@ impl Graph {
                     .is_some_and(|b| b.contains_with(memo, t).unwrap_or(false)))
     }
 
-    /// The objects of `(s p ?)` among rows `< hi`, the base tier's first.
+    /// The objects of `(s p ?)` among ids `< hi`, the base tier's first and the derived
+    /// ones in id order, so that the earliest derived value comes first whatever order
+    /// the tier's runs hold them in.
     pub fn objects(&self, memo: &mut Memo, s: u64, p: u64, hi: u32) -> Vec<u64> {
         let mut out = Vec::new();
         if let Some(b) = &self.base
@@ -1453,17 +1099,21 @@ impl Graph {
                 true
             });
         }
-        let c = self.cands(Some(s), Some(p), None, 0, hi);
-        out.extend(
-            (0..c.len())
-                .map(|i| c.get(i))
-                .filter(|&i| self.alive(i))
-                .map(|i| self.triple(i)[2]),
-        );
+        let mut derived: Vec<(u32, u64)> = Vec::new();
+        for i in self.cands(Some(s), Some(p), None, 0, hi).iter() {
+            if self.alive(i) {
+                let t = self.triple(i);
+                if t[0] == s && t[1] == p {
+                    derived.push((i, t[2]));
+                }
+            }
+        }
+        derived.sort_unstable();
+        out.extend(derived.into_iter().map(|x| x.1));
         out
     }
 
-    /// Call `f` with each object of `(s p ?)` among rows `< hi` until it returns
+    /// Call `f` with each object of `(s p ?)` among ids `< hi` until it returns
     /// `Ok(false)`, or return the error of `f` or of a base-tier read.
     pub fn each_object(
         &self,
@@ -1476,7 +1126,7 @@ impl Graph {
         self.each_end(memo, Some(s), p, None, hi, 2, f)
     }
 
-    /// Call `f` with each subject of `(? p o)` among rows `< hi`, as
+    /// Call `f` with each subject of `(? p o)` among ids `< hi`, as
     /// [`Graph::each_object`] does.
     pub fn each_subject(
         &self,
@@ -1519,9 +1169,7 @@ impl Graph {
                 return r;
             }
         }
-        let c = self.cands(s, Some(p), o, 0, hi);
-        for i in 0..c.len() {
-            let r = c.get(i);
+        for r in self.cands(s, Some(p), o, 0, hi).iter() {
             if !self.alive(r) {
                 continue;
             }
@@ -1566,8 +1214,13 @@ impl Graph {
 mod tests {
     use super::*;
 
-    /// Growing a graph row by row from nothing charges each buffer once while it is
-    /// resized and not again after: the peak stays near the final heap.
+    fn rows(c: Cands<'_>) -> Vec<u32> {
+        c.iter().collect()
+    }
+
+    /// Growing a graph fact by fact from nothing charges each buffer once while it is
+    /// resized and not again after: the peak stays near the final heap, plus the keyed
+    /// entries of 16 bytes per new fact that sorting the batch's runs holds for a moment.
     #[test]
     fn add_rows_charges_the_final_buffers() {
         let b = Budget::unlimited();
@@ -1575,15 +1228,15 @@ mod tests {
         g.try_add_batch((0..100_000u64).map(|i| [i, 1, i + 7]))
             .unwrap();
         assert!(
-            b.peak() * 10 <= g.heap_bytes() * 13,
-            "peak {} over 1.3 times the heap {}",
+            b.peak() * 10 <= g.heap_bytes() * 19,
+            "peak {} over 1.9 times the heap {}",
             b.peak(),
             g.heap_bytes()
         );
     }
 
-    /// Room made ahead is charged, later rows fit it without growing the buffers, and a
-    /// reservation the budget refuses fails without a charge.
+    /// Room made ahead is charged, later facts fit it without growing the buffers, and
+    /// a reservation the budget refuses fails without a charge.
     #[test]
     fn reserved_rows_are_charged() {
         let b = Budget::unlimited();
@@ -1591,13 +1244,13 @@ mod tests {
         g.try_add_batch((0..10_000u64).map(|i| [i, 1, i + 7]))
             .unwrap();
         g.try_reserve_rows(1_000, 5_000).unwrap();
-        let cap = g.triples.capacity();
-        assert!(cap - g.triples.len() >= 5_000);
-        assert!(b.used() >= cap * size_of::<Triple>() + 5_000 * size_of::<u32>());
+        let cap = g.tier.capacity();
+        assert!(cap - g.tier.count() >= 5_000);
+        assert!(b.used() >= cap * ROW + 5_000 * size_of::<u32>());
         let shards: Vec<usize> = g.index.iter().map(|t| t.capacity()).collect();
         g.try_add_batch((0..1_000u64).map(|i| [i, 2, i + 7]))
             .unwrap();
-        assert_eq!(g.triples.capacity(), cap);
+        assert_eq!(g.tier.capacity(), cap);
         assert_eq!(
             g.index.iter().map(|t| t.capacity()).collect::<Vec<_>>(),
             shards
@@ -1605,7 +1258,7 @@ mod tests {
         // enough room already: nothing changes
         let used = b.used();
         g.try_reserve_rows(1_000, 5_000).unwrap();
-        assert_eq!((g.triples.capacity(), b.used()), (cap, used));
+        assert_eq!((g.tier.capacity(), b.used()), (cap, used));
 
         let tight = Budget::new(Some(4 << 20));
         let mut g = Graph::try_with_capacity(0, &tight).unwrap();
@@ -1628,19 +1281,24 @@ mod tests {
         assert!(!g.add([1, 10, 2]));
         assert_eq!(g.add_batch([[1, 10, 3], [2, 11, 3], [1, 10, 3]]), 2);
         assert_eq!(g.len(), 3);
-        assert_eq!(g.cands(Some(1), Some(10), None, 0, 3).len(), 2);
-        assert_eq!(g.cands(Some(1), Some(10), None, 1, 3).len(), 1);
+        assert_eq!(rows(g.cands(Some(1), Some(10), None, 0, 3)), [0, 1]);
+        assert_eq!(rows(g.cands(Some(1), Some(10), None, 1, 3)), [1]);
         assert_eq!(g.cands(None, Some(10), Some(3), 0, 1).len(), 0);
-        assert_eq!(g.cands(Some(2), Some(11), Some(3), 0, 3).len(), 1);
+        assert_eq!(rows(g.cands(Some(2), Some(11), Some(3), 0, 3)), [2]);
         assert_eq!(g.cands(Some(2), Some(11), Some(3), 0, 2).len(), 0);
-        // without the subject index the access falls back to a range scan
+        // without the order by subject the access falls back to a range scan
         assert_eq!(g.cands(Some(1), None, None, 0, 3).len(), 3);
         g.ensure_s_index();
-        assert_eq!(g.cands(Some(1), None, None, 0, 3).len(), 2);
+        assert_eq!(rows(g.cands(Some(1), None, None, 0, 3)), [0, 1]);
         g.add([1, 12, 4]);
-        assert_eq!(g.cands(Some(1), None, None, 0, 4).len(), 3);
+        assert_eq!(rows(g.cands(Some(1), None, None, 0, 4)), [0, 1, 3]);
+        // two runs hold the facts of predicate 10, with one subject between them
         assert_eq!(g.pstats(10), (1, 2));
         assert_eq!(g.count_p(10, 1, 4), 1);
+        assert_eq!(
+            g.facts().collect::<Vec<_>>(),
+            [[1, 10, 2], [1, 10, 3], [2, 11, 3], [1, 12, 4]]
+        );
     }
 
     #[test]
@@ -1649,14 +1307,17 @@ mod tests {
         g.add_batch([[1, 10, 2], [1, 10, 3]]);
         assert!(g.kill(&[1, 10, 2]).unwrap());
         assert!(!g.kill(&[1, 10, 2]).unwrap());
-        assert!(!g.alive(0) && g.alive(1) && g.alive(5));
+        assert!(!g.alive(0) && g.alive(1));
         assert_eq!(g.position(&[1, 10, 2]), None);
         assert_eq!(g.objects(&mut Memo::default(), 1, 10, 2), [3]);
-        // added again as a new row
+        // added again as a new fact
         assert!(g.add([1, 10, 2]));
         assert_eq!(g.position(&[1, 10, 2]), Some(2));
         assert_eq!(g.objects(&mut Memo::default(), 1, 10, 3), [3, 2]);
         assert_eq!((g.live(), g.dead_rows()), (2, 1));
+        assert!(!g.flagged(2));
+        g.set_flag_with(2, true, true).unwrap();
+        assert!(g.flagged(2) && !g.flagged(1));
     }
 
     #[test]
@@ -1678,7 +1339,8 @@ mod tests {
         assert_eq!(g.list(m, 3, first, rest, nil, g.len()), None, "not a list");
     }
 
-    /// A merge in parallel gives the rows of a merge on one thread.
+    /// A merge in parallel gives the ids of a merge on one thread, and the same
+    /// candidates for every probe.
     #[test]
     fn merge_matches_sequential() {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -1703,37 +1365,147 @@ mod tests {
                 .unwrap()
                 > PAR_MIN
         );
-        assert_eq!(a.derived(), b.derived());
-        for t in a.derived() {
-            assert_eq!(a.position(t), b.position(t));
+        assert_eq!(a.facts().collect::<Vec<_>>(), b.facts().collect::<Vec<_>>());
+        for t in a.facts() {
+            assert_eq!(a.position(&t), b.position(&t));
         }
-        let rows = |c: Cands<'_>| (0..c.len()).map(|i| c.get(i)).collect::<Vec<_>>();
+        let sorted = |c: Cands<'_>| {
+            let mut v = rows(c);
+            v.sort_unstable();
+            v
+        };
         for p in 0..7 {
             assert_eq!(
-                rows(a.cands(None, Some(p), None, 0, a.len())),
-                rows(b.cands(None, Some(p), None, 0, b.len()))
+                sorted(a.cands(None, Some(p), None, 0, a.len())),
+                sorted(b.cands(None, Some(p), None, 0, b.len()))
             );
-            assert_eq!(a.pstats(p), b.pstats(p));
+            assert_eq!(a.count_p(p, 0, a.len()), b.count_p(p, 0, b.len()));
             for s in 0..50 {
                 assert_eq!(
-                    rows(a.cands(Some(s), Some(p), None, 0, a.len())),
-                    rows(b.cands(Some(s), Some(p), None, 0, b.len()))
+                    sorted(a.cands(Some(s), Some(p), None, 0, a.len())),
+                    sorted(b.cands(Some(s), Some(p), None, 0, b.len()))
                 );
                 assert_eq!(
-                    rows(a.cands(None, Some(p), Some(s), 0, a.len())),
-                    rows(b.cands(None, Some(p), Some(s), 0, b.len()))
+                    sorted(a.cands(None, Some(p), Some(s), 0, a.len())),
+                    sorted(b.cands(None, Some(p), Some(s), 0, b.len()))
                 );
             }
         }
         a.ensure_s_index();
         for s in 0..50 {
             assert_eq!(
-                rows(a.cands(Some(s), None, None, 0, a.len())),
-                rows(b.cands(Some(s), None, None, 0, b.len()))
+                sorted(a.cands(Some(s), None, None, 0, a.len())),
+                sorted(b.cands(Some(s), None, None, 0, b.len()))
             );
         }
         // the charge follows the heap
         assert_eq!(b.held.bytes(), b.heap_bytes());
+    }
+
+    /// The probes of a graph built by several merges, whose orders hold several runs
+    /// and compact, give the facts a set of the same triples gives.
+    #[test]
+    fn runs_and_compactions_keep_every_probe() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut g = Graph::default();
+        let mut all: Vec<Triple> = Vec::new();
+        let mut bounds = vec![0u32];
+        for round in 0..30 {
+            let n = 1 + (next() % 3000) as usize;
+            let batch: Vec<Triple> = (0..n)
+                .map(|_| [next() % 400, next() % 5, next() % 400])
+                .collect();
+            // every other round is like an engine run: everything before it may compact
+            if round % 2 == 0 {
+                g.set_compaction_floor(u32::MAX);
+            }
+            g.add_batch(batch.iter().copied());
+            for t in batch {
+                if !all.contains(&t) {
+                    all.push(t);
+                }
+            }
+            bounds.push(g.len());
+            if round % 7 == 3 {
+                let victim = all[(next() as usize) % all.len()];
+                g.kill(&victim).unwrap();
+            }
+            assert_eq!(g.len() as usize, all.len());
+        }
+        let live: Vec<(u32, Triple)> = (0..g.len())
+            .filter(|&r| g.alive(r))
+            .map(|r| (r, g.triple(r)))
+            .collect();
+        let check =
+            |g: &Graph, s: Option<u64>, p: Option<u64>, o: Option<u64>, lo: u32, hi: u32| {
+                let mut want: Vec<u32> = live
+                    .iter()
+                    .filter(|(r, t)| {
+                        *r >= lo
+                            && *r < hi
+                            && s.is_none_or(|x| x == t[0])
+                            && p.is_none_or(|x| x == t[1])
+                            && o.is_none_or(|x| x == t[2])
+                    })
+                    .map(|x| x.0)
+                    .collect();
+                want.sort_unstable();
+                let mut got: Vec<u32> = g
+                    .cands(s, p, o, lo, hi)
+                    .iter()
+                    .filter(|&r| g.alive(r))
+                    .filter(|&r| {
+                        let t = g.triple(r);
+                        s.is_none_or(|x| x == t[0])
+                            && p.is_none_or(|x| x == t[1])
+                            && o.is_none_or(|x| x == t[2])
+                    })
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, want, "pattern {s:?} {p:?} {o:?} in [{lo}, {hi})");
+            };
+        for p in 0..5u64 {
+            for &(lo, hi) in &[
+                (0, g.len()),
+                (bounds[10], bounds[20]),
+                (bounds[29], g.len()),
+                (7, 4000),
+            ] {
+                check(&g, None, Some(p), None, lo, hi);
+                for s in (0..400).step_by(37) {
+                    check(&g, Some(s), Some(p), None, lo, hi);
+                    check(&g, None, Some(p), Some(s), lo, hi);
+                    check(&g, Some(s), Some(p), Some(s + 1), lo, hi);
+                }
+            }
+            assert_eq!(
+                g.count_p(p, bounds[10], bounds[20]),
+                live.iter()
+                    .filter(|(r, t)| t[1] == p && *r >= bounds[10] && *r < bounds[20])
+                    .count()
+                    + g.facts()
+                        .enumerate()
+                        .filter(|(r, t)| t[1] == p
+                            && (*r as u32) >= bounds[10]
+                            && (*r as u32) < bounds[20]
+                            && !g.alive(*r as u32))
+                        .count()
+            );
+        }
+        g.ensure_s_index();
+        g.ensure_index(false, false).unwrap();
+        for s in (0..400).step_by(23) {
+            check(&g, Some(s), None, None, 0, g.len());
+            check(&g, None, None, Some(s), 0, g.len());
+            check(&g, Some(s), None, Some(s), bounds[5], bounds[25]);
+        }
+        assert_eq!(g.held.bytes(), g.heap_bytes());
     }
 
     /// F16 review finding F6: the candidates of an identity rule are all facts of the
@@ -1784,7 +1556,7 @@ mod tests {
                     cap <= SHARDS * table_capacity(IN_BASE_SHARD),
                     "capacity {cap}"
                 );
-                assert!(g.derived().is_empty());
+                assert_eq!(g.derived_len(), 0);
             }
             assert!(all.iter().all(|t| g.contains(t)));
             assert!(g.heap_bytes() < 2 << 20, "{} bytes", g.heap_bytes());

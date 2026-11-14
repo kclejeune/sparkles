@@ -21,6 +21,8 @@ pub mod analysis;
 mod budget;
 mod builtins;
 mod closure;
+#[doc(hidden)]
+pub use closure::set_batch as set_closure_batch;
 mod demand;
 pub mod diagnostics;
 mod engine;
@@ -41,6 +43,7 @@ pub mod query;
 mod specialize;
 pub mod tables;
 mod terms;
+mod tier;
 pub mod whynot;
 mod witness;
 
@@ -766,8 +769,8 @@ fn default_geometry_changes(
 }
 
 impl Derivation {
-    fn derived(&self) -> &[[u64; 3]] {
-        self.graph.derived()
+    fn derived(&self) -> impl Iterator<Item = [u64; 3]> + '_ {
+        self.graph.facts()
     }
 
     /// Is this (possibly generalized) triple valid RDF?
@@ -777,7 +780,7 @@ impl Derivation {
 
     /// The derived facts.
     fn closure_len(&self) -> usize {
-        self.graph.derived().len()
+        self.graph.derived_len()
     }
 
     /// The closure, for incremental runs: the derivation's graph as it is, the input
@@ -980,12 +983,7 @@ fn materialize_admitted(
             w.generalized
         ))?;
     }
-    let generalized: FxHashSet<[u64; 3]> = d
-        .derived()
-        .iter()
-        .filter(|t| !d.valid(t))
-        .copied()
-        .collect();
+    let generalized: FxHashSet<[u64; 3]> = d.derived().filter(|t| !d.valid(t)).collect();
     let (rules, iterations, budget) = (d.rules, d.iterations, d.budget.clone());
     let (mut base_scans, threads) = (d.base_scans, d.threads);
     let (closure, witnesses) = match wanted_witnesses(opts)? {
@@ -1333,7 +1331,7 @@ fn write_full(
 ) -> anyhow::Result<Written> {
     let mut w = Written::default();
     let fact = size_of::<[Id; 3]>();
-    let n = d.derived().len();
+    let n = d.closure_len();
     // the new graph's triples and their set
     let mut held = Held::try_new(
         &d.budget,
@@ -1365,11 +1363,11 @@ fn write_full(
     // map local ids to store ids and collect the new graph content
     let mut new_triples: Vec<[Id; 3]> = Vec::with_capacity(n);
     for t in d.derived() {
-        if !d.valid(t) {
+        if !d.valid(&t) {
             w.generalized += 1;
             continue;
         }
-        new_triples.push(store_ids(txn, &d.terms, &mut w.stored, t)?);
+        new_triples.push(store_ids(txn, &d.terms, &mut w.stored, &t)?);
     }
 
     let new_set: FxHashSet<[Id; 3]> = new_triples.iter().copied().collect();
@@ -1860,7 +1858,7 @@ pub fn infer(
     })?;
     let mut out = Vec::new();
     for t in d.derived() {
-        if !d.valid(t) {
+        if !d.valid(&t) {
             continue;
         }
         let (Some(s), Some(Term::NamedNode(p)), Some(o)) =
@@ -1911,11 +1909,10 @@ pub fn bench_derive(
         derive(exec, snap, profile, &Extras::default(), &ids, opts)
     })?;
     derived();
-    let facts = d.derived();
     let (mut set, mut seq) = (0u64, maintain::FNV_START);
-    for t in facts {
+    for t in d.derived() {
         let mut h = maintain::FNV_START;
-        for x in t {
+        for x in &t {
             let s = d.terms.term(*x).map_or(String::new(), |t| t.to_string());
             h = maintain::fnv(s.as_bytes(), h);
             h = maintain::fnv(b"\0", h);
@@ -1923,7 +1920,7 @@ pub fn bench_derive(
         set = set.wrapping_add(h.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         seq = maintain::fnv(&h.to_le_bytes(), seq);
     }
-    Ok((facts.len(), d.iterations, set, seq))
+    Ok((d.closure_len(), d.iterations, set, seq))
 }
 
 #[cfg(test)]

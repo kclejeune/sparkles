@@ -107,10 +107,51 @@ operators' build, whose OWL 2 RL rule set also gained the missing rules of the P
 tables, which add 720 facts to each OWL2Bench run and 350 to LUBM(100). Within one build,
 `examples/lubm.rs` derived the same facts, with the same order-free digest, with and
 without the operators. OWL2Bench(10) exceeded the 14 GiB run limit with or without the operators, and with the
-operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally. Where
-that memory goes has not been profiled, and roadmap item 522 covers it. LUBM(100)
+operators it also ran out of a 28 GiB limit on a 32 GiB development host, wally. The
+profile of roadmap items 835 and 865 found where the memory of the 5-university run goes
+and bounded it, as the next paragraph records, and item 522 covers the 10-university run. LUBM(100)
 gains nothing, because its transitive relations are short and its time goes to the
 other rules.
+
+On wally, a 20-thread development host with 32 GiB, `sparkles infer --full --profile
+owl-rl --max-inferred 2e8` on OWL2Bench with 5 universities, two interleaved rounds per
+thread count against the build before the columnar derived tier (88538906), derived
+52,966,139 facts in six iterations with every build. The derived tier at 2ced03ad held
+them in 2,137 MB, 40 bytes per fact with the triple index, and the reasoner's budget
+peaked at 10.5 GB, 199 bytes per fact, in the closure operators' first step. With the
+operators' batched merges at f6264c44 the budget peaked at 4.2 GB, 80 bytes per fact, and
+the tier ended at 2,467 MB. The whole command's peak resident set stayed between 9.4 and
+10.9 GiB for every build, since the commit of the derived triples to the store follows
+the reasoning. Wall times at one thread were 70 and 67 s before the tier, 89 and 84 s with
+it and 89 and 85 s with the batches, and at 20 threads 38 and 34 s, 41 and 42 s, and 41
+and 38 s. With item 866's row of 24 bytes, 16-byte sort entries and digit sort, in two
+further rounds against the same base build, the wall times were 81 and 78 s against 75 and
+69 s at one thread and 39.0 and 37.6 s against 40.7 and 37.3 s at 20 threads, with the
+budget's peak at 4.6 GB, 87 bytes per fact, and the tier at 2,745 MB. LUBM(100) under
+`owl-rl` took 25.7 and 25.2 s against 24.8 and 24.7 s at one thread, 14.7 and 14.6 s
+against 14.3 and 14.1 s at 20 threads, and the insertion and deletion of every hundredth
+of its triples at 20 threads 2.2 and 3.0 s against 2.1 and 2.9 s.
+
+With the grouped head probes and exact distinct-key counts of item 866 at 75e7fb61, on
+atlas, an Intel Core i5-13500 like the benchmark host, in four interleaved rounds against
+the build before the tier with one thread pinned to one core or 20 threads, OWL2Bench(5)
+took 100.8 to 105.4 s against 102.2 to 107.4 s at one thread and 50.2 to 52.7 s against
+50.8 to 54.2 s at 20 threads. The tier before the grouped probes had taken 114.7 to
+116.0 s at one thread on the same host, and the rule `prp-symp`, whose probes of the
+triple index made most of that difference, took 7.0 s against 9.8 s. LUBM(100) under
+`owl-rl` took 37.5 to 38.0 s against 37.3 to 37.8 s at one thread and 16.1 to 16.7 s
+against 16.5 to 17.1 s at 20 threads. The insertion of every hundredth of its triples at
+20 threads took 2.43 to 2.46 s against 2.35 to 2.41 s and the deletion 3.30 to 3.34 s
+against 3.23 to 3.27 s, about 2% slower in every round, and the one-thread run 0.5%
+slower in every round, which roadmap item 938 investigates. The
+[run directory](runs/2026-11-13-item-866-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-13-item-866-atlas/env.txt), the
+[timings](runs/2026-11-13-item-866-atlas/results.txt), the
+[trace lines](runs/2026-11-13-item-866-atlas/trace-lines.txt) with each run's derived count,
+and the [earlier rounds](runs/2026-11-13-item-866-atlas/earlier-rounds.txt) of the tier
+before the grouped probes. Both builds derived 52,966,139 and 10,907,379 facts, the budget's peak on
+OWL2Bench(5) stayed at 4.6 GB and the tier ended at 2,746 MB. These are benchmark-worker
+measurements, and the benchmark host has not rerun them.
 
 ### Small incremental runs
 

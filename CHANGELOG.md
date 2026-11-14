@@ -695,6 +695,41 @@ CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
 
+The reasoner's derived facts live in a columnar tier (roadmap item 835). A fact's
+subject, object and predicate are one row of 24 bytes by fact id, each predicate keeps its
+ids in order, and each predicate's facts are sorted twice, by subject and by object, in
+runs with fence keys that a probe searches before it reads the keys of at most eight
+facts. A merge sorts its ids into each order as 16-byte entries, by digits when the batch
+is large and the pool has at most three threads, appends one run per order and compacts
+the older runs, and a relation with a quarter of its facts dead is rebuilt. A fact costs
+38 bytes in the tier beside its slot in the triple index, and OWL2Bench with 5
+universities measured 52 bytes per derived fact with the index, where the rows, hash
+lists and tables the tier replaces cost about 135 bytes.
+Full and incremental runs derive the same closures with the same fact ids as before.
+
+The closure operators merge their pairs into the derived tier in batches of four million
+(item 865). The step that closes a relation held every pair of the closure, with the
+merge's tables and buffers for all of them, beside the tier until the closure was
+complete, and on OWL2Bench with 5 universities that step, which emits 52 million pairs,
+set the run's peak. A batch now enters the tier's columns and triple index as soon as it
+is full, and the predicate's new facts are sorted into its orders once at the end, so the
+facts keep the ids one merge of the whole closure gave them. The reasoner's peak heap on
+that run fell from 199 to 72 bytes per derived fact, or 87 with the digit sort's second
+buffer. The tier's merges are faster than the hash lists were.
+
+Full materialization with the derived tier takes the time of the build before it (item
+866). A scan probes its candidates' heads in the triple index in groups of 16 when the
+rest of the rule's plan only checks them, so the cache misses of the probes overlap,
+where one candidate's work had grown past the core's reorder window and each probe waited
+alone. A scan goes back to one candidate at a time when a group's probes go unused. A
+run's probe searches a coarse fence first, and each order counts the distinct keys of its
+facts exactly, whatever runs hold them, where the sum over runs had changed a join order
+in the third iteration of OWL2Bench(5). On atlas, OWL2Bench(5) takes 101 to 105 s against
+102 to 107 s before the tier at one thread and 50 to 53 s against 51 to 54 s at 20
+threads, and LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s and 16.1 to 16.7 s
+against 16.5 to 17.1 s. LUBM(100) at one thread is 0.5% slower, and its incremental
+insertion and deletion about 2% slower (item 938).
+
 Notification channels deliver independently (item 46). Each channel has its own queue
 and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own
 deliveries. A channel's queue holds its share of 1,000 deliveries, at least 50, and a
