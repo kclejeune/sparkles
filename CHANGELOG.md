@@ -639,7 +639,7 @@ at 20 threads, its materialization takes 80.6 to 80.8 s against 102.5 to 102.8 s
 to 42.7 s against 45.5 to 49.2 s, and the rules of OWL2Bench(1) take 662 to 696 ms
 against 976 to 988 ms. The planner changes no plan of LUBM. The rules of LUBM(10) take
 4 ms longer at one thread, 0.4%, by the median of seven paired runs, which is attributed
-to planning (item 945), and LUBM(100) shows no difference. A run derives the same facts with either planner, in another
+to planning (item 945), and LUBM(100) shows no clear difference. A run derives the same facts with either planner, in another
 order, and setting `ReasonOptions::sampled_planning` to `false` keeps the greedy orders.
 Rules in which a builtin binds a variable that an atom also holds, and every rule while
 the derived tier holds a dead fact after a deletion, keep the greedy orders (item 944). The planner of item 487,
