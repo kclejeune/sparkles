@@ -1170,6 +1170,49 @@ mod tests {
         // two walks of 300 levels took about 3,000 operations with several per level
         assert!(ops < 300, "{ops} ledger operations");
     }
+    /// Decoding the rows of a pulled LIMIT charges its terms in steps rather than one
+    /// ledger operation per term.
+    #[test]
+    fn decoded_rows_of_a_pulled_limit_take_the_ledger_in_steps() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{QueryOptions, query};
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        // more people than a cursor batch, so the LIMIT pulls its join
+        for i in 0..5000 {
+            data.push_str(&format!(
+                "ex:p{i} ex:knows ex:p{} ; ex:name \"n{i}\" .\n",
+                (i * 7 + 1) % 5000
+            ));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            pool: Some(QueryPool::new(64 * MB)),
+            max_memory_bytes: Some(32 * MB),
+            no_cache: true,
+            ..Default::default()
+        };
+        let r = query(
+            store.snapshot(),
+            "SELECT ?p ?n WHERE { ?p ex:knows ?x . ?x ex:name ?n } LIMIT 500",
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(r.len(), 500);
+        let before = LEDGER_OPS.with(|n| n.get());
+        let rows = r.rows().unwrap();
+        let ops = LEDGER_OPS.with(|n| n.get()) - before;
+        assert_eq!(rows.len(), 500);
+        // a charge per term took about 4,000 operations
+        assert!(ops < 100, "{ops} ledger operations");
+    }
     /// A grant set after the first charge would leave that charge on the old grant,
     /// which debug builds refuse.
     #[test]

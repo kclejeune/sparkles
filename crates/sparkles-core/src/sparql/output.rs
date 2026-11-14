@@ -1,7 +1,7 @@
 //! Immutable decoded query output. The final physical owner retains both its
 //! payload and its original query credit. Borrowing does not transfer ownership;
 //! an independent bounded copy must be admitted by the receiving OutputBudget.
-use super::ctx::{Charge, Ctx, OutputCredit};
+use super::ctx::{Charge, Ctx, OutputCredit, TermCredit};
 use super::depth;
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -286,7 +286,7 @@ impl OutputBudget {
         &self,
         rows: usize,
         width: usize,
-        mut decode: impl FnMut(usize, usize, &Charge<'_>) -> Result<Option<Term>>,
+        mut decode: impl FnMut(usize, usize, &Stepped<'_, '_>) -> Result<Option<Term>>,
     ) -> Result<OwnedRows> {
         self.ctx.check()?;
         let count = rows.checked_mul(width).ok_or_else(|| self.overflow())?;
@@ -299,7 +299,19 @@ impl OutputBudget {
             .and_then(|n| n.checked_add(2 * std::mem::size_of::<usize>()))
             .and_then(|n| u64::try_from(n).ok())
             .ok_or_else(|| self.overflow())?;
-        let credit = self.ctx.charge(bytes)?;
+        let charge = self.ctx.charge(bytes)?;
+        // On the shared ledger, whose every charge takes its lock, the decoded terms
+        // are admitted a step ahead, and the credit returns to what they hold at the
+        // end. The fast account admits each term as it comes.
+        let credit = Stepped {
+            charge: &charge,
+            used: std::cell::Cell::new(bytes),
+            step: if self.ctx.has_ledger() {
+                self.ctx.reservation_step()
+            } else {
+                0
+            },
+        };
         // Partial payload storage drops before its actual admission on every error.
         let mut partial = PartialRows {
             terms: Vec::new(),
@@ -343,13 +355,15 @@ impl OutputBudget {
             }
         }
         self.ctx.check()?;
+        let used = credit.used.get();
+        charge.resize(used)?;
         Ok(OwnedRows {
             inner: Arc::new(RowsBacking {
                 terms: std::mem::take(&mut partial.terms),
                 rows,
                 width,
                 nesting: partial.nesting,
-                _credit: credit.into_output(&self.ctx),
+                _credit: charge.into_output(&self.ctx),
             }),
         })
     }
@@ -371,6 +385,58 @@ impl OutputBudget {
 
     fn overflow(&self) -> Error {
         self.ctx.memory_exceeded(u64::MAX)
+    }
+}
+
+/// The credit of the terms one [`OutputBudget`] decode admits: what they use, held on
+/// `charge` exactly or, with a `step`, up to a step ahead, so that a charge on the
+/// shared ledger takes its lock once a step rather than once a term.
+pub(super) struct Stepped<'c, 'a> {
+    charge: &'c Charge<'a>,
+    used: std::cell::Cell<u64>,
+    step: u64,
+}
+
+impl TermCredit for Stepped<'_, '_> {
+    fn ctx(&self) -> &Ctx {
+        TermCredit::ctx(self.charge)
+    }
+    fn add(&self, bytes: u64) -> Result<()> {
+        let used = self
+            .used
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| TermCredit::ctx(self).memory_exceeded(u64::MAX))?;
+        let held = self.charge.bytes();
+        if used > held {
+            let ahead = if self.step == 0 {
+                used
+            } else {
+                used.saturating_add(self.step)
+            };
+            // a step the budget refuses leaves room for exactly what is used
+            if ahead == used || self.charge.add(ahead - held).is_err() {
+                self.charge.add(used - held)?;
+            }
+        }
+        self.used.set(used);
+        Ok(())
+    }
+    fn bytes(&self) -> u64 {
+        self.used.get()
+    }
+    fn resize(&self, bytes: u64) -> Result<()> {
+        let used = self.used.get();
+        if bytes > used {
+            return TermCredit::add(self, bytes - used);
+        }
+        self.used.set(bytes);
+        // a step of slack stays held, and more than two goes back
+        let held = self.charge.bytes();
+        if held > bytes.saturating_add(self.step.saturating_mul(2)) {
+            self.charge.resize(bytes.saturating_add(self.step))?;
+        }
+        Ok(())
     }
 }
 

@@ -2295,9 +2295,9 @@ impl Ctx {
     /// pages and single terms use this route, so a simple literal takes over its
     /// reconstructed vocabulary key's allocation. The streaming writer reuses one
     /// scratch row through [`Ctx::output_term_into`] instead.
-    pub(super) fn output_term(&self, id: Id, row: &Charge<'_>) -> Result<Option<Term>> {
+    pub(super) fn output_term(&self, id: Id, row: &dyn TermCredit) -> Result<Option<Term>> {
         assert!(
-            std::ptr::eq(self, row.ctx),
+            std::ptr::eq(self, row.ctx()),
             "output credit belongs to its query"
         );
         self.check_memory_failure()?;
@@ -2468,7 +2468,7 @@ impl Ctx {
     /// A vocabulary key and its final simple literal share one physical allocation.
     /// Every capacity change stays on the actual output account, including realloc
     /// overlap. Other key kinds keep the admitted copy path while scratch is alive.
-    fn output_vocab_term(&self, id: u64, row: &Charge<'_>) -> Result<Option<Term>> {
+    fn output_vocab_term(&self, id: u64, row: &dyn TermCredit) -> Result<Option<Term>> {
         let base = row.bytes();
         let total = |old: usize, new: usize| {
             base.checked_add(old as u64)
@@ -2484,7 +2484,7 @@ impl Ctx {
         )
     }
 
-    fn output_owned_key(&self, mut key: Vec<u8>, row: &Charge<'_>) -> Result<Term> {
+    fn output_owned_key(&self, mut key: Vec<u8>, row: &dyn TermCredit) -> Result<Term> {
         self.check()?;
         let capacity = key.capacity() as u64;
         #[cfg(test)]
@@ -2540,8 +2540,8 @@ impl Ctx {
 
     /// The sorted bulk decoder already borrows a reconstructed key. Admit its
     /// actual owned representation before copying, under the same real context.
-    pub(super) fn output_key(&self, key: &[u8], storage: &Charge<'_>) -> Result<Term> {
-        if !std::ptr::eq(self, storage.ctx) {
+    pub(super) fn output_key(&self, key: &[u8], storage: &dyn TermCredit) -> Result<Term> {
+        if !std::ptr::eq(self, storage.ctx()) {
             return Err(Error::invalid(
                 "bulk output belongs to another query account",
             ));
@@ -3122,6 +3122,41 @@ pub struct Charge<'a> {
     bytes: std::cell::Cell<u64>,
     owner: std::cell::Cell<Option<u64>>,
 }
+/// What [`Ctx::output_term`] admits a decoded term's bytes on before it allocates them.
+/// It counts what the terms use, which [`TermCredit::resize`] sets, as a reused key
+/// buffer comes and goes.
+pub(super) trait TermCredit {
+    fn ctx(&self) -> &Ctx;
+    fn add(&self, bytes: u64) -> Result<()>;
+    /// What the terms use.
+    fn bytes(&self) -> u64;
+    /// Set what the terms use, admitting growth before it is allocated.
+    fn resize(&self, bytes: u64) -> Result<()>;
+}
+
+impl TermCredit for Charge<'_> {
+    fn ctx(&self) -> &Ctx {
+        self.ctx
+    }
+    fn add(&self, bytes: u64) -> Result<()> {
+        Charge::add(self, bytes)
+    }
+    fn bytes(&self) -> u64 {
+        Charge::bytes(self)
+    }
+    fn resize(&self, bytes: u64) -> Result<()> {
+        Charge::resize(self, bytes)
+    }
+}
+
+impl Ctx {
+    /// Whether the query keeps its memory on the shared ledger, whose every charge
+    /// takes a lock, rather than on its fast account.
+    pub(super) fn has_ledger(&self) -> bool {
+        self.memory.get().is_some()
+    }
+}
+
 impl Charge<'_> {
     pub(super) fn bytes(&self) -> u64 {
         self.bytes.get()
