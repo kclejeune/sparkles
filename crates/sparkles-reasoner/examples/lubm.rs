@@ -8,7 +8,7 @@
 //! cargo run --release -p sparkles-reasoner --example lubm -- infer /tmp/lubm/db10 rdfs
 //! cargo run --release -p sparkles-reasoner --example lubm -- materialize /tmp/lubm/db10 owl-rl
 //! cargo run --release -p sparkles-reasoner --example lubm -- keep /tmp/lubm/db10 rdfs 1000
-//! cargo run --release -p sparkles-reasoner --example lubm -- churn /tmp/lubm/db10 rdfs 100 10 40
+//! cargo run --release -p sparkles-reasoner --example lubm -- churn /tmp/lubm/db100 rdfs 100 100 40
 //! cargo run --release -p sparkles-reasoner --example lubm -- diag /tmp/lubm/db10
 //! ```
 //!
@@ -30,9 +30,10 @@
 //! its undo, the change again and a second undo, which leaves the dataset as it was. It
 //! reports the time of each incremental run in microseconds, with the commit, and the
 //! quartiles of each step over the rounds. The first round is the first change after the
-//! closure is kept, and each later round changes data that no earlier round read. `K` and
-//! `ROUNDS` can be lists such as `100,1000,10000` and `40,20,6`, which run one size after
-//! another over the same kept closure.
+//! closure is kept, and each round changes a university that no earlier round changed.
+//! `K` and `ROUNDS` can be lists such as `100,1000,10000` and `40,20,6`, which run one
+//! size after another over the same kept closure. `U` is at least the rounds of all sizes
+//! together, and at most the universities of the dataset.
 //! `LUBM_PERF_CONTROL` names a control FIFO of `perf record --control`, to which `churn`
 //! writes `enable` before the rounds and `disable` after them, so that a record started
 //! with `--delay=-1` holds the rounds without the full run.
@@ -186,6 +187,25 @@ fn run_options() -> ReasonOptions {
         closure_operators: std::env::var("SPARKLES_GENERIC_CLOSURES").as_deref() != Ok("1"),
         ..ReasonOptions::default()
     }
+}
+
+/// The universities that the rounds of `churn` change: one for each round of each size in
+/// `batches`, none of them twice, among the first `universities`. `None` when the rounds
+/// need more universities than that.
+fn fresh_universities(
+    batches: &[usize],
+    universities: usize,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut next = 0;
+    let ranges = batches
+        .iter()
+        .map(|&rounds| {
+            let range = next..next + rounds;
+            next = range.end;
+            range
+        })
+        .collect();
+    (next <= universities).then_some(ranges)
 }
 
 /// The pool the runs of `keep` and `churn` evaluate on: a reasoning pool of `threads`
@@ -413,6 +433,12 @@ fn main() {
             let universities: usize = args[5].parse().expect("universities");
             let batches = list(&args[6], "rounds");
             assert_eq!(sizes.len(), batches.len(), "a number of rounds for each K");
+            let fresh = fresh_universities(&batches, universities).unwrap_or_else(|| {
+                panic!(
+                    "{} rounds need as many universities, and U is {universities}",
+                    batches.iter().sum::<usize>()
+                )
+            });
             let store = Store::open(&db, StoreOptions::default()).unwrap();
             let threads = rayon::current_num_threads();
             let cache = Cache::new(usize::MAX);
@@ -454,17 +480,13 @@ fn main() {
                 }
             };
             let steps = ["change", "revert", "change-again", "revert-again"];
-            // each round of each size changes the next university
-            let mut next = 0;
-            for (&k, &rounds) in sizes.iter().zip(&batches) {
-                let sets: Vec<(Vec<Triple>, Vec<Triple>)> = (0..universities.min(rounds))
-                    .map(|u| change_sets((next + u) % universities, k))
-                    .collect();
-                next += sets.len();
+            // each round of each size changes a university of its own
+            for ((&k, &rounds), range) in sizes.iter().zip(&batches).zip(fresh) {
+                let sets: Vec<(Vec<Triple>, Vec<Triple>)> =
+                    range.map(|u| change_sets(u, k)).collect();
                 control("enable");
                 let mut times: Vec<Vec<u128>> = vec![Vec::new(); steps.len()];
-                for round in 0..rounds {
-                    let (del, add) = &sets[round % sets.len()];
+                for (round, (del, add)) in sets.iter().enumerate() {
                     let mut line = format!(
                         "churn {} threads={threads} k={k} round={round}",
                         profile.name()
@@ -533,5 +555,25 @@ fn main() {
             );
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fresh_universities;
+
+    #[test]
+    fn every_round_of_churn_changes_a_university_of_its_own() {
+        // one size
+        assert_eq!(fresh_universities(&[40], 100), Some(vec![0..40]));
+        assert_eq!(fresh_universities(&[40], 40), Some(vec![0..40]));
+        assert_eq!(fresh_universities(&[40], 10), None);
+        // several sizes do not share a university
+        assert_eq!(
+            fresh_universities(&[40, 20, 6], 100),
+            Some(vec![0..40, 40..60, 60..66])
+        );
+        assert_eq!(fresh_universities(&[40, 20, 6], 65), None);
+        assert_eq!(fresh_universities(&[], 0), Some(vec![]));
     }
 }
