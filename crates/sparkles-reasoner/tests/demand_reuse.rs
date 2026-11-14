@@ -378,12 +378,14 @@ fn a_premise_of_an_instance_left_out_derives_again() {
     let after = format!("{before} ex:x ex:trigger ex:y .");
     let r = case(&rules, before, change, &after, TYPES_OF_B);
     assert_eq!(r.cached, 0);
-    // a second query of the same commit reads the proof and anchors the view again
+    // At one commit, the first query makes the schema's table, the second reads it and
+    // makes the completeness proof, and the third reads both and anchors the view again.
     let s = store(before);
     let qr = reasoner(&rules);
     let o = demand(&qr);
     run(&s, TYPES_OF_B, &o);
     run(&s, "SELECT ?x { ?x a ex:D }", &o);
+    run(&s, "SELECT ?x { ?x a ex:C }", &o);
     update(&s, change);
     let expected = run(&store(&after), TYPES_OF_B, &demand(&reasoner(&rules)));
     assert_eq!(rows(&run(&s, TYPES_OF_B, &o)), rows(&expected));

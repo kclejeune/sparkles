@@ -297,10 +297,14 @@ pub(crate) fn specialize(
                     held.try_grow(rule_bytes(r))?;
                     dropped.push(r.clone_shallow());
                     written = true;
-                } else if seen_out.insert(rule_key(&s)) {
-                    held.try_grow(rule_bytes(&s))?;
-                    dropped_made += 1;
-                    dropped.push(s);
+                } else {
+                    let key = rule_key(&s);
+                    if !seen_out.contains(&key) {
+                        held.try_grow(rule_bytes(&s))?;
+                        seen_out.insert(key);
+                        dropped_made += 1;
+                        dropped.push(s);
+                    }
                 }
                 continue;
             }
@@ -318,15 +322,46 @@ pub(crate) fn specialize(
     })
 }
 
-/// An estimate of the bytes a compiled rule and the key that dedupes it hold.
+/// The bytes a compiled rule and the key that dedupes it hold, with every nested buffer
+/// at its capacity. A builtin's pattern is shared, so it is not counted.
 fn rule_bytes(r: &CRule) -> usize {
     use std::mem::size_of;
+    let slots = |n: usize| n * size_of::<Slot>();
+    let builtins: usize = r
+        .builtins
+        .iter()
+        .map(|b| {
+            size_of::<CBuiltin>()
+                + slots(b.args.capacity())
+                + (b.inputs.capacity() + b.outputs.capacity()) * size_of::<usize>()
+                // the key's copy of the arguments
+                + size_of::<(BuiltinKind, Vec<Slot>)>()
+                + slots(b.args.len())
+        })
+        .sum();
+    let heads: usize = r
+        .head
+        .iter()
+        .map(|h| {
+            let args = match h {
+                CHead::Triple(..) => 3,
+                CHead::Action(_, args) => args.capacity(),
+            };
+            size_of::<CHead>()
+                + slots(args)
+                + size_of::<(Option<crate::builtins::HeadAction>, Vec<Slot>)>()
+                + slots(args)
+        })
+        .sum();
     size_of::<CRule>()
-        + r.name.len()
-        + r.atoms.len() * (size_of::<Atom>() + size_of::<[Slot; 3]>())
-        + r.head.len() * (size_of::<CHead>() + 64)
-        + r.builtins.len() * (size_of::<CBuiltin>() + 64)
-        + 64
+        + size_of::<RuleKey>()
+        + r.name.capacity()
+        + r.atoms.capacity() * size_of::<Atom>()
+        + r.atoms.len() * size_of::<[Slot; 3]>()
+        + builtins
+        + heads
+        // the key set's entry and hash
+        + 16
 }
 
 /// A specialized rule as its atoms in a canonical order, its builtins and its head, so
@@ -546,6 +581,63 @@ mod tests {
         assert_eq!(written, 2);
         assert!(budget.used() > 0);
         drop(s);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// The charge for the instances left out counts each builtin's arguments, so a wide
+    /// builtin runs out of a small budget, and the charge is given back (Codex review
+    /// qtr-step2, round 4).
+    #[test]
+    fn a_wide_builtin_left_out_is_charged() {
+        let store =
+            sparkles_core::store::Store::in_memory(sparkles_core::store::StoreOptions::default());
+        let terms = Terms::new(store.snapshot());
+        let mut graph = Graph::with_capacity(0);
+        let subjects: Vec<u64> = (1000..1000 + MAX_BINDINGS as u64).collect();
+        graph.add_batch(subjects.iter().map(|&p| [p, 6, 7]));
+        let closed = Closed {
+            preds: subjects.iter().copied().chain([6]).collect(),
+            classes: FxHashSet::default(),
+            rdf_type: 1,
+        };
+        let mut args: Vec<Slot> = (0..1000).map(|i| Slot::Const(5000 + i)).collect();
+        args.push(Slot::Var(1));
+        let rule = CRule {
+            name: "wide producer".into(),
+            nvars: 2,
+            atoms: vec![Atom {
+                s: Slot::Var(0),
+                p: Slot::Const(6),
+                o: Slot::Const(7),
+            }],
+            builtins: vec![CBuiltin {
+                origin: 0,
+                kind: BuiltinKind::StrConcat,
+                args,
+                inputs: vec![],
+                outputs: vec![1],
+                regex: None,
+            }],
+            head: vec![CHead::Triple(
+                Slot::Const(30),
+                Slot::Var(0),
+                Slot::Const(31),
+            )],
+        };
+        // each instance holds two copies of 1,001 arguments, so 4,096 of them hold
+        // over 100 MiB
+        let budget = Budget::new(Some(16 << 20));
+        let r = specialize(
+            &[rule],
+            &closed,
+            &[],
+            &graph,
+            &terms,
+            &budget,
+            &AtomicBool::new(false),
+        );
+        assert!(r.is_err());
+        drop(r);
         assert_eq!(budget.used(), 0);
     }
 }
