@@ -46,7 +46,9 @@ fn store(universities: usize) -> Store {
         result_cache_bytes: 0,
         ..Default::default()
     });
-    let mut data = String::new();
+    // the predicate of the unrelated commits is in use from the start, so that no commit
+    // brings a predicate into use, which `rdf1` reads
+    let mut data = String::from("<urn:x:note> <urn:x:says> \"start\" .\n");
     for u in 0..universities {
         data.push_str(&lubm::university(u));
     }

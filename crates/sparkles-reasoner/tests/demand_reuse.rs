@@ -105,14 +105,15 @@ const SCHEMA: &str = "ex:C rdfs:subClassOf ex:B . ex:y a ex:C . ex:u ex:knows ex
 const TYPES_OF_B: &str = "SELECT ?x { ?x a ex:B }";
 
 /// A commit of facts that no rule reads or gives keeps the tables: the second query
-/// reads every table from the cache.
+/// reads every table from the cache. The predicate is in use before, so that `rdf1`, which
+/// gives `rdf:type rdf:Property` to every predicate in use, gives nothing new.
 #[test]
 fn an_unrelated_commit_keeps_the_tables() {
     let r = case(
         &Profile::OwlRl,
         SCHEMA,
-        "INSERT DATA { ex:y ex:note \"n\" }",
-        &format!("{SCHEMA} ex:y ex:note \"n\" ."),
+        "INSERT DATA { ex:y ex:knows ex:w }",
+        &format!("{SCHEMA} ex:y ex:knows ex:w ."),
         TYPES_OF_B,
     );
     assert!(
@@ -286,6 +287,74 @@ fn a_changed_list_derives_again() {
         "DELETE { ?l rdf:first ex:B2 } INSERT { ?l rdf:first ex:A } WHERE { ?l rdf:first ex:B2 }",
         "ex:I owl:intersectionOf ( ex:A ex:A ) . ex:z a ex:A .",
         "SELECT ?x { ?x a ex:I }",
+    );
+    assert_eq!(r.cached, 0);
+}
+
+/// A rule whose every head is a schema relation that the proof closed is left out of the
+/// specialized program, and what its body reads still changes the schema (Codex review
+/// qtr-step2 #1). The terms the change holds are all in the store before it.
+#[test]
+fn a_premise_of_a_schema_rule_derives_again() {
+    let rules = Profile::Rules(
+        "[edge: (?c <http://ex.org/edge> ?d) -> (?c rdfs:subClassOf ?d)]
+         [sco: (?c rdfs:subClassOf ?d) (?x rdf:type ?c) -> (?x rdf:type ?d)]"
+            .into(),
+    );
+    let before = "ex:C ex:edge ex:B . ex:z a ex:C . ex:x a ex:D .
+        ex:C rdfs:subClassOf ex:Top . ex:D rdfs:subClassOf ex:Top . ex:B rdfs:subClassOf ex:Top .";
+    let r = case(
+        &rules,
+        before,
+        "INSERT DATA { ex:D ex:edge ex:B }",
+        &format!("{before} ex:D ex:edge ex:B ."),
+        TYPES_OF_B,
+    );
+    assert_eq!(r.cached, 0);
+}
+
+/// A session of a later commit that reads an earlier commit's tables does not keep a
+/// table that holds a term the earlier commit lacked under that commit's key, where an
+/// earlier snapshot would read the term's id as unknown (Codex review qtr-step2 #2).
+#[test]
+fn a_later_term_is_not_kept_under_an_earlier_commit() {
+    let rules = Profile::Rules(
+        "[k: (?x <http://ex.org/p> ?y) -> (?x <http://ex.org/q> <http://ex.org/K>)]".into(),
+    );
+    let s = store("ex:a ex:p ex:b .");
+    let qr = reasoner(&rules);
+    let o = demand(&qr);
+    // the earlier commit's view anchors, and its snapshot stays readable
+    let first = run(&s, "SELECT ?x ?o { ?x ex:q ?o }", &o);
+    assert_eq!(rows(&first), vec!["<http://ex.org/a> <http://ex.org/K>"]);
+    let earlier = s.snapshot();
+    // the store gains the term in a graph the rules do not read
+    update(&s, "INSERT DATA { GRAPH ex:g { ex:z ex:r ex:K } }");
+    let bound = "SELECT ?x { ?x ex:q ex:K }";
+    assert_eq!(rows(&run(&s, bound, &o)), vec!["<http://ex.org/a>"]);
+    let again = query(earlier, bound, &o).unwrap();
+    assert_eq!(rows(&again), vec!["<http://ex.org/a>"]);
+}
+
+/// `rdf1` reads only which predicates are in use. A predicate that comes into use, or
+/// goes out of it, derives again, though no other rule reads it.
+#[test]
+fn a_predicate_in_use_or_not_derives_again() {
+    let q = "SELECT ?p { ?p a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> }";
+    let r = case(
+        &Profile::OwlRl,
+        SCHEMA,
+        "INSERT DATA { ex:y ex:note \"n\" }",
+        &format!("{SCHEMA} ex:y ex:note \"n\" ."),
+        q,
+    );
+    assert_eq!(r.cached, 0);
+    let r = case(
+        &Profile::OwlRl,
+        SCHEMA,
+        "DELETE DATA { ex:u ex:knows ex:v }",
+        "ex:C rdfs:subClassOf ex:B . ex:y a ex:C .",
+        q,
     );
     assert_eq!(r.cached, 0);
 }

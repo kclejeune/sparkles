@@ -405,6 +405,9 @@ pub(crate) struct Session {
     anchor_key: Option<(String, u64)>,
     /// the cache keys come from an anchor of another commit, whose tables answer this one
     anchored: bool,
+    /// under such an anchor, the length of its commit's delta vocabulary: a table with a
+    /// later term is not kept under the anchor's key
+    publish_limit: Option<u64>,
     warnings: WorkingWarnings,
     demands: Vec<Demand>,
     keys: Vec<Key>,
@@ -505,7 +508,7 @@ impl Session {
                 shared.digest,
             )
         });
-        let (schema_view, anchored) = match &anchor_key {
+        let (schema_view, publish_limit) = match &anchor_key {
             Some(key) => {
                 let own = format!(
                     "{}|{}|{}|{:?}",
@@ -514,10 +517,10 @@ impl Session {
                     snap.mask.as_ref().map_or("", |m| m.key.as_str()),
                     graphs
                 );
-                let (v, anchored) = crate::reuse::view_key(key, &snap, &graphs, own);
-                (Some(v), anchored)
+                let (v, known) = crate::reuse::view_key(key, &snap, &graphs, own, &*req.stop);
+                (Some(v), known)
             }
-            None => (None, false),
+            None => (None, None),
         };
         let view = schema_view.clone().filter(|_| !req.no_cache);
         Ok(Session {
@@ -533,7 +536,8 @@ impl Session {
             view,
             schema_view,
             anchor_key,
-            anchored,
+            anchored: publish_limit.is_some(),
+            publish_limit,
             warnings,
             demands: Vec::new(),
             keys: Vec::new(),
@@ -808,7 +812,7 @@ impl Session {
         let Some((table, _held)) = self.equality_table() else {
             return;
         };
-        tables::put(key, Arc::new(table));
+        self.publish(key, Arc::new(table));
     }
 
     /// This session's ids for the local terms of an equality table, by the table's ids,
@@ -1036,6 +1040,7 @@ impl Session {
     fn anchor_program(
         &self,
         rules: &[CRule],
+        left_out: Option<&demand::Closed>,
         vocab: &Vocab,
         rdf_type: u64,
         fresh: bool,
@@ -1052,8 +1057,20 @@ impl Session {
             self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest"))?,
             self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"))?,
         ];
+        // Specialization leaves out the rules whose every head is a relation of
+        // `left_out`, the relations proven complete, so their bodies are read as written:
+        // a change they read can change the schema (Codex review qtr-step2 #1).
+        let dropped = left_out.into_iter().flat_map(|closed| {
+            self.compiled.rules().iter().filter(move |r| {
+                r.head.iter().all(|h| {
+                    let (s, p, o) = demand::head_slots(h);
+                    matches!(h, CHead::Triple(..)) && closed.closes(&Atom { s, p, o })
+                })
+            })
+        });
         let schema = crate::specialize::closed(vocab, rdf_type);
-        let mut relevance = crate::reuse::Relevance::of(rules, &schema, &always, 1 << 16);
+        let mut relevance =
+            crate::reuse::Relevance::of(rules.iter().chain(dropped), &schema, &always, 1 << 16);
         relevance.key_locals(|id| self.terms.local_key(id));
         crate::reuse::anchor(
             key,
@@ -1097,7 +1114,7 @@ impl Session {
         });
         if roots.is_empty() || fresh_witnesses {
             let fresh = self.graph.as_ref().expect("graph made").derived_len() == 0;
-            self.anchor_program(self.compiled.rules(), &vocab, rdf_type, fresh)?;
+            self.anchor_program(self.compiled.rules(), None, &vocab, rdf_type, fresh)?;
             let program = self.transform(self.compiled.rules(), &self.keys, Pass::Plain)?;
             self.hide(&program.magic_preds);
             self.program = Some(program);
@@ -1131,7 +1148,7 @@ impl Session {
             let expanded = pre.stages.iter().map(|stage| stage.rules.len()).sum();
             if self.prefer_compact(expanded)? {
                 drop(pre);
-                self.anchor_program(self.compiled.rules(), &vocab, rdf_type, fresh)?;
+                self.anchor_program(self.compiled.rules(), None, &vocab, rdf_type, fresh)?;
                 let program = demand::compact_roots(&self.terms, &self.keys)
                     .map_err(|e| memory_error(e, "compact demand roots"))?;
                 self.hide(&program.magic_preds);
@@ -1351,7 +1368,7 @@ impl Session {
         let rules = rules.map_err(|e| memory_error(e, "the rules specialized to the schema"))?;
         let g = self.graph.as_ref().expect("graph made");
         let rules = crate::specialize::without_equality(rules.rules, same_as, g);
-        self.anchor_program(&rules, &vocab, rdf_type, fresh)?;
+        self.anchor_program(&rules, Some(closed), &vocab, rdf_type, fresh)?;
         let t2 = std::time::Instant::now();
         let program = self.transform(&rules, &self.keys, Pass::Closed(closed))?;
         tracing::debug!(
@@ -1523,13 +1540,28 @@ impl Session {
             }
             facts.push(*t);
         }
-        tables::put(
+        self.publish(
             key,
             Arc::new(Table {
                 chunks: vec![Arc::new(facts)],
                 keys,
             }),
         );
+    }
+
+    /// Keep `table` in the cache under `key`. Under an anchor of another commit, a table
+    /// that holds a term the anchor's commit did not know is not kept: the key names that
+    /// commit's view, whose sessions could not read the term's id (spec F17 §6.2).
+    fn publish(&self, key: tables::Key, table: Arc<Table>) {
+        if let Some(known) = self.publish_limit
+            && table.facts().any(|t| {
+                t.iter()
+                    .any(|&x| Id(x).tag() == Tag::Delta && Id(x).payload() >= known)
+            })
+        {
+            return;
+        }
+        tables::put(key, table);
     }
 
     /// The facts of a cached table in this session's ids.
@@ -1987,7 +2019,7 @@ impl ReasoningSession for Session {
                 });
                 for (_, _, key) in misses {
                     if let Some(k) = key {
-                        tables::put(k, table.clone());
+                        self.publish(k, table.clone());
                     }
                 }
             }

@@ -725,10 +725,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   `reasoning=auto` reads a materialization that can answer rather than compare costs per
   pattern. Roadmap item 910.
 * A view's tables carry over to another commit only while the rules cannot read or give
-  any quad that differs between them. The `rdfs` profile's `rdf1`, `rdfs4a` and `rdfs4b`
-  read every fact, as do `owl-rl`'s `eq-rep-*` rules once the data holds `owl:sameAs`, so
-  such views derive again after every commit to their input graphs. An anchor keeps a
-  clone of its commit's delta, which retains the key-set nodes that later writes replaced.
+  any quad that differs between them. The `rdfs` profile's `rdfs4a` and `rdfs4b` read
+  every fact, as do `owl-rl`'s `eq-rep-*` rules once the data holds `owl:sameAs`, so such
+  views derive again after every commit to their input graphs. `rdf1` reads which
+  predicates are in use, so a commit that brings a predicate into use or takes the last
+  quad of one away derives again. A table that a later commit's query derives under an
+  earlier commit's tables, and that holds a term the earlier commit lacked, is not kept.
+  An anchor keeps a clone of its commit's delta, which retains the key-set nodes that
+  later writes replaced.
 * Demand reasoning has per-query schema analysis and program setup costs. Schema
   completeness analysis can stream the visible inputs twice, including when schema
   tables are warm, and reserves a conservative workspace against the memory budget.

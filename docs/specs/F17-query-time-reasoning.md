@@ -1265,7 +1265,14 @@ the schema itself is unchanged.
   generation, access mask and input graphs when no quad that differs between them in the
   input graphs is a fact of the schema vocabulary, an RDF list fact or an `owl:sameAs`
   fact, and none unifies with an atom, a pattern a `noValue` or `listForAll` reads, or a
-  head of the specialized rules. Then the closure at `c2` is the closure at `c1` with the
+  head of the specialized rules or of the rules that specialization left out because
+  their every head is a relation the proof closed, such as a rule that turns an instance
+  fact into a `rdfs:subClassOf` fact. An atom whose predicate is a variable and whose
+  subject and object occur nowhere else in its rule, as in `rdf1`, reads only which
+  predicates are in use, so a differing quad passes it when its predicate has a stored
+  quad in the input graphs at both commits, which a bounded scan of the predicate's quads
+  finds. Under an access mask such an atom makes every differing quad relevant. Then the
+  closure at `c2` is the closure at `c1` with the
   differing quads taken out and put in, so the schema's table, the completeness proof of
   item 191, the equality stage table and every demand's table hold at `c2` what they held
   at `c1`. The argument is in the module's documentation. A relation that the session's
@@ -1280,17 +1287,23 @@ the schema itself is unchanged.
   rules' digest, with a clone of the commit's delta and the patterns of its rules. A later
   session looks up the anchor, walks the quads that differ between the two deltas with
   `Delta::changes_since`, and reads and writes the cache under the anchor's view key when
-  none is relevant. The walk passes over the key-set leaves that the deltas share, so it
-  costs a step per leaf of the delta's graph-first key set and a step per key of the leaves
-  that writes copied, and it gives up after 100,000 differing quads. Each anchor remembers
+  none is relevant. Such a session keeps no table that holds a term the anchor's commit
+  lacked, since a session of that commit could not read the term's id, and derives that
+  table again at each such commit. The walk passes over the key-set leaves that the deltas
+  share, so it costs a step per leaf of the delta's graph-first key set and a step per key
+  of the leaves that writes copied. It gives up after 100,000 differing quads, counting
+  those outside the input graphs, and it stops when the query is cancelled or runs out of
+  time. The leaves of both key sets are listed before the walk, a pointer each. Each anchor remembers
   its answer for its last 16 commits. A session whose anchor does not answer keys the cache
   by its own commit and becomes the anchor when it makes its program. At most 64 anchors
-  are kept, and `tables::clear` and a cache capacity of zero drop them.
+  are kept, and `tables::clear` and a cache capacity of zero drop them. An anchor is
+  registered under the anchors' lock only while the cache is on, so none outlives the
+  cache being turned off.
 * **Memory.** An anchor's delta shares its key-set nodes with later deltas until writes
   copy them, so it retains at most the delta's size, typically the nodes that later writes
   replaced. This trades memory for the time of the schema pass, the proof and the demand
   derivations after each commit that does not touch the rules' inputs.
-* **What does not reuse.** The `rdfs` profile's rules `rdf1`, `rdfs4a` and `rdfs4b` read
+* **What does not reuse.** The `rdfs` profile's rules `rdfs4a` and `rdfs4b` read
   every fact, as do the `eq-rep-*` rules of `owl-rl` once the view holds an `owl:sameAs`
   fact, so such a view's anchor answers no other commit. A commit that changes an input
   graph's membership changes the view key, and compaction changes the generation, so
@@ -1301,9 +1314,14 @@ runs it again and compares the answer with a fresh store of the changed data. A 
 of facts that no rule reads or gives, and a commit to a graph outside the inputs, read
 every table from the cache. An added premise, a deleted premise, a schema fact, a schema
 predicate the store lacked, a stored copy of a derived fact, a deleted stored fact that
-rules derive, a term a rule names, a first `owl:sameAs` fact, a fact a `noValue` tests and
-a changed RDF list each derive again. With the check replaced by one that always reuses,
-all ten of these fail, nine on the answer and the stored copy on its cache count.
+rules derive, a term a rule names, a first `owl:sameAs` fact, a fact a `noValue` tests, a
+changed RDF list, a premise of a rule that gives only `rdfs:subClassOf` facts, and a
+predicate coming into use or going out of it each derive again. With the check replaced
+by one that always reuses, the first ten of these fail, nine on the answer and the stored
+copy on its cache count. The last two failed against the first build of the check, which
+left out the rules that specialization drops. A further test runs a later commit's query
+under an anchor that lacks a term it reads and then the earlier commit's query, which
+read the later commit's table before such tables were kept back.
 `symmetric_difference` in `store/keyset.rs` is checked against a set difference on
 versions that share leaves, that split leaves and that share nothing.
 
