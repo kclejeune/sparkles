@@ -1228,11 +1228,10 @@ impl Vocab {
                 let id = (b * FC_BLOCK + at) as u64;
                 let e = self.entry::<F>(data, &mut pos, at == 0);
                 key.truncate(e.shared);
-                let suffix = &data[e.start..e.start + e.len];
                 // Growth admits the whole rebuilt key first.
-                if suffix.len() > key.capacity() - key.len() {
-                    reserve(key.len().saturating_add(suffix.len()))?;
-                    key.reserve_exact(suffix.len());
+                if e.len > key.capacity() - key.len() {
+                    reserve(key.len().saturating_add(e.len))?;
+                    key.reserve_exact(e.len);
                     #[cfg(any(test, feature = "failpoints"))]
                     crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
                         "checked-vocab-scratch-allocated",
@@ -1241,6 +1240,7 @@ impl Vocab {
                 }
                 // The check above leaves room for the suffix, so the copy needs no
                 // growth check of its own, which `extend_from_slice` would repeat.
+                let suffix = &data[e.start..e.start + e.len];
                 let len = key.len();
                 // SAFETY: `key.capacity() - len >= suffix.len()`, which the branch
                 // above establishes by finding the room or reserving it. `suffix`
@@ -3788,6 +3788,24 @@ mod tests {
                     let mut admitted = 0;
                     for &id in order {
                         let held = key.capacity();
+                        // A refused growth leaves the buffer as it was, so the
+                        // reservation comes before the allocation.
+                        let refused = if room {
+                            v.get_sorted_checked_in::<true, _>(
+                                &[id],
+                                &mut key,
+                                |_| Err(()),
+                                |_, _| Ok(()),
+                            )
+                        } else {
+                            v.get_sorted_checked_in::<false, _>(
+                                &[id],
+                                &mut key,
+                                |_| Err(()),
+                                |_, _| Ok(()),
+                            )
+                        };
+                        assert_eq!(key.capacity(), held, "growth before admission at {id}");
                         let mut reserved = false;
                         let reserve = |need: usize| {
                             assert!(need > held, "{need} fits the held {held} bytes");
@@ -3811,6 +3829,7 @@ mod tests {
                         if !reserved {
                             assert_eq!(key.capacity(), held);
                         }
+                        assert_eq!(refused.is_err(), reserved, "refusal at {id}");
                     }
                 }
             }
