@@ -1912,6 +1912,42 @@ fn new_column_cache(bytes: u64) -> ColumnCache {
     )
 }
 
+/// The slots of a [`ThreadCounts`].
+const COUNT_SLOTS: usize = 16;
+
+/// One slot of a [`ThreadCounts`], alone on its cache lines.
+#[derive(Default)]
+#[repr(align(128))]
+struct CountSlot(std::sync::atomic::AtomicU64);
+
+/// A count that threads add to in slots of their own, so that the readers of a warm
+/// block do not pass one cache line between their cores. Its value is the sum of the
+/// slots.
+#[derive(Default)]
+struct ThreadCounts([CountSlot; COUNT_SLOTS]);
+
+impl ThreadCounts {
+    #[inline]
+    fn add(&self, n: u64) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        thread_local! {
+            static SLOT: usize =
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % COUNT_SLOTS;
+        }
+        let slot = SLOT.with(|s| *s);
+        self.0[slot]
+            .0
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(&self) -> u64 {
+        self.0
+            .iter()
+            .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+}
+
 /// A store's view of the cache of decoded block columns. Hits and misses are the view's
 /// own. A view made by [`BlockCache::new`] owns its storage, and a view made by
 /// [`BlockCache::attach`] shares it with the other views of a [`SharedBlocks`].
@@ -1922,8 +1958,8 @@ pub struct BlockCache {
     /// the storage is shared with other views, so `bytes` and `entries` count the
     /// namespace's entries only
     shared: bool,
-    hits: std::sync::atomic::AtomicU64,
-    misses: std::sync::atomic::AtomicU64,
+    hits: ThreadCounts,
+    misses: ThreadCounts,
     /// decoded blocks are added (false: a read-through view, see [`BlockCache::read_through`])
     fill: bool,
     #[cfg(test)]
@@ -2071,8 +2107,7 @@ impl BlockCache {
                 *col = v;
                 continue;
             }
-            self.misses
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.misses.add(1);
             #[cfg(test)]
             if let Some(hook) = &self.decode_hook {
                 hook();
@@ -2113,7 +2148,7 @@ impl BlockCache {
     #[inline]
     fn count_hits(&self, n: u64) {
         if n > 0 {
-            self.hits.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            self.hits.add(n);
         }
     }
 
@@ -2195,8 +2230,7 @@ impl BlockCache {
                     v
                 }
                 None => {
-                    self.misses
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.misses.add(1);
                     #[cfg(test)]
                     if let Some(hook) = &self.decode_hook {
                         hook();
@@ -2236,8 +2270,7 @@ impl BlockCache {
             *col = self.cache.get(&self.key(idx, b, c, WHOLE))?;
             found += 1;
         }
-        self.hits
-            .fetch_add(found, std::sync::atomic::Ordering::Relaxed);
+        self.hits.add(found);
         Some(Block {
             cols,
             rows: idx.blocks[b].rows as usize,
@@ -2372,10 +2405,10 @@ impl BlockCache {
         u
     }
     pub fn hits(&self) -> u64 {
-        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+        self.hits.get()
     }
     pub fn misses(&self) -> u64 {
-        self.misses.load(std::sync::atomic::Ordering::Relaxed)
+        self.misses.get()
     }
 }
 
@@ -2897,9 +2930,7 @@ impl PermIndex {
                 *output = Col::from(whole[start..end].to_vec());
                 cache.count_hits(1);
             } else {
-                cache
-                    .misses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                cache.misses.add(1);
                 let metadata = &self.blocks[b];
                 let mut offset = usize::try_from(metadata.offset)
                     .ok()
