@@ -7,7 +7,7 @@ use sparkles_core::incr::DeltaSet;
 use sparkles_core::incr::fixpoint::FixedPoint;
 use sparkles_core::sparql::{QueryOptions, update::update};
 use sparkles_core::store::{Store, StoreOptions};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const RULES: &str = r#"
 [sc: (?x rdf:type ?c) (?c rdfs:subClassOf ?d) -> (?x rdf:type ?d)]
@@ -110,6 +110,34 @@ fn shown_of(
                 .collect::<Vec<_>>()
                 .join(" ")
         })
+        .collect()
+}
+
+/// Consolidated changes with their triples shown.
+fn change_map(
+    snap: &Snapshot,
+    program: &RuleProgram,
+    changes: &[(Triple, i64)],
+) -> BTreeMap<String, i64> {
+    changes
+        .iter()
+        .map(|(t, w)| {
+            let t = t
+                .iter()
+                .map(|&i| program.term(snap, i).expect("a term").to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (t, *w)
+        })
+        .collect()
+}
+
+/// The change from closure `before` to closure `after`.
+fn difference(before: &BTreeSet<String>, after: &BTreeSet<String>) -> BTreeMap<String, i64> {
+    before
+        .difference(after)
+        .map(|t| (t.clone(), -1))
+        .chain(after.difference(before).map(|t| (t.clone(), 1)))
         .collect()
 }
 
@@ -230,11 +258,15 @@ fn maintained_as_closure(batch: usize) {
             let Some(changes) = changes else {
                 continue;
             };
-            let gone = before.difference(&want).count();
-            let came = want.difference(&before).count();
-            let removed = changes.iter().filter(|c| c.weight < 0).count();
-            let added = changes.iter().filter(|c| c.weight > 0).count();
-            assert_eq!((removed, added), (gone, came), "seed {seed} step {step}");
+            assert!(
+                changes.iter().all(|c| c.weight.abs() == 1),
+                "seed {seed} step {step}"
+            );
+            assert_eq!(
+                change_map(&s.snapshot(), &fp.program, &fixpoint::consolidate(&changes)),
+                difference(&before, &want),
+                "seed {seed} step {step}"
+            );
         }
     }
 }
@@ -561,12 +593,15 @@ struct Counting {
     reserved: std::cell::Cell<u64>,
     peak: std::cell::Cell<u64>,
     cap: Option<u64>,
+    /// the membership lookups made
+    lookups: std::cell::Cell<u64>,
 }
 
 impl FactStore<Triple, Record> for Counting {
     type Error = sparkles_core::Error;
 
     fn contains(&self, f: &Triple) -> bool {
+        self.lookups.set(self.lookups.get() + 1);
         self.inner.contains(f)
     }
 
@@ -637,6 +672,12 @@ struct Exact {
     batch: usize,
     cap: Option<u64>,
     provable: Option<FxHashSet<Triple>>,
+    /// the first frontier sorted up (`true`) or down (`false`), or as the delta lists it
+    order: Option<bool>,
+    /// what the program's own saturation inserted in the pass
+    inserted: Vec<Triple>,
+    /// what the store had reserved when the first proof of a pass was asked
+    reserved_at_prove: Option<u64>,
 }
 
 impl Exact {
@@ -648,6 +689,9 @@ impl Exact {
             batch,
             cap: None,
             provable: None,
+            order: None,
+            inserted: Vec::new(),
+            reserved_at_prove: None,
         }
     }
 
@@ -708,7 +752,7 @@ impl Program for Exact {
         &mut self,
         cx: &mut RuleCx,
         store: &Counting,
-        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+        out: &mut Sink<'_, (Triple, Record), sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         self.inner.axioms(cx, &store.inner, out)
     }
@@ -720,7 +764,7 @@ impl Program for Exact {
         _w: Which,
         f: &Triple,
         held: &dyn Fn(&Triple) -> bool,
-        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+        out: &mut Sink<'_, (Triple, Record), sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         self.inner.instances_of(&store.inner, f, held, out)
     }
@@ -732,6 +776,9 @@ impl Program for Exact {
         f: &Triple,
         _held: &dyn Fn(&Triple) -> bool,
     ) -> sparkles_core::Result<Option<Record>> {
+        if self.reserved_at_prove.is_none() {
+            self.reserved_at_prove = Some(store.reserved.get());
+        }
         self.provable(cx, store)?;
         let yes = self.provable.as_ref().expect("computed").contains(f);
         Ok(yes.then_some(Record::EXPLICIT))
@@ -742,7 +789,7 @@ impl Program for Exact {
         _cx: &mut RuleCx,
         _store: &Counting,
         _recorded: &dyn Fn(&Triple) -> Option<Record>,
-        _out: &mut Vec<Triple>,
+        _out: &mut Sink<'_, Triple, sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         panic!("exact mode asks for no broken facts")
     }
@@ -752,28 +799,37 @@ impl Program for Exact {
         cx: &mut RuleCx,
         store: &Counting,
         held: &dyn Fn(&Triple) -> bool,
-        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+        out: &mut Sink<'_, (Triple, Record), sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         self.inner.added(cx, &store.inner, held, out)
     }
 
-    fn prepare(
+    fn frontier(
         &mut self,
         cx: &mut RuleCx,
-        store: &mut Counting,
-        frontier: &mut Vec<Triple>,
+        store: &Counting,
+        out: &mut Sink<'_, Triple, sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
-        frontier.extend(cx.removed.iter().filter(|t| store.contains(t)));
+        let mut removed: Vec<Triple> = cx
+            .removed
+            .iter()
+            .copied()
+            .filter(|t| store.contains(t))
+            .collect();
+        match self.order {
+            Some(true) => removed.sort_unstable(),
+            Some(false) => removed.sort_unstable_by(|a, b| b.cmp(a)),
+            None => {}
+        }
+        for t in removed {
+            out.push(t)?;
+        }
         Ok(())
     }
 
-    fn saturate(
-        &mut self,
-        cx: &mut RuleCx,
-        store: &mut Counting,
-    ) -> sparkles_core::Result<Option<Vec<Triple>>> {
+    fn saturate(&mut self, cx: &mut RuleCx, store: &mut Counting) -> sparkles_core::Result<bool> {
         if !self.own_saturation {
-            return Ok(None);
+            return Ok(false);
         }
         let mut inserted = Vec::new();
         let mut queue = Vec::new();
@@ -795,11 +851,25 @@ impl Program for Exact {
                 }
             }
         }
-        Ok(Some(inserted))
+        self.inserted = inserted;
+        Ok(true)
+    }
+
+    fn saturated(
+        &mut self,
+        _cx: &mut RuleCx,
+        _store: &Counting,
+        out: &mut Sink<'_, Triple, sparkles_core::Error>,
+    ) -> sparkles_core::Result<()> {
+        for t in std::mem::take(&mut self.inserted) {
+            out.push(t)?;
+        }
+        Ok(())
     }
 
     fn pass_end(&mut self, _cx: &mut RuleCx) -> sparkles_core::Result<()> {
         self.provable = None;
+        self.inserted = Vec::new();
         Ok(())
     }
 
@@ -940,12 +1010,12 @@ fn the_exact_mode_is_maintained_as_its_closure() {
                 let Some(changes) = changes else {
                     continue;
                 };
-                let gone = before.difference(&want).count();
-                let came = want.difference(&before).count();
-                let removed = changes.iter().filter(|c| c.1 < 0).count();
-                let added = changes.iter().filter(|c| c.1 > 0).count();
-                assert_eq!((removed, added), (gone, came), "{what}");
                 assert!(changes.iter().all(|c| c.1.abs() == 1), "{what}");
+                assert_eq!(
+                    change_map(&s.snapshot(), &fp.program.inner, &changes),
+                    difference(&before, &want),
+                    "{what}"
+                );
             }
         }
     }
@@ -979,29 +1049,37 @@ fn set(ts: &[&str]) -> BTreeSet<String> {
 
 /// Run `steps` of (deletions, insertions, the facts expected after) over `rules` in the
 /// exact mode with both saturations and in the one-step mode.
+/// Run `steps` with both saturations and the first frontier in either order, against the
+/// one-step program and the expected closures, comparing the consolidated changes with
+/// the difference of the closures.
 fn cases(rules: &str, init: &[&str], steps: &[(&[&str], &[&str], &[&str])]) {
     for own in [false, true] {
-        let s = Store::in_memory(StoreOptions::default());
-        change(&s, &[], init);
-        let mut fp = exact_build(&s, Exact::new(rules, own, 1));
-        let mut one = program(rules, &s, Provenance::None, None).expect("one-step build");
-        for (i, (del, ins, want)) in steps.iter().enumerate() {
-            let before = exact_shown(&s, &fp);
-            let after = s.snapshot().commit;
-            change(&s, del, ins);
-            let ch = exact_advance(&s, &mut fp, after).expect("advance");
-            let want = set(want);
-            assert_eq!(exact_shown(&s, &fp), want, "own {own} step {i}");
-            advance(&s, &mut one, after);
-            assert_eq!(shown(&s.snapshot(), &one), want, "one-step, step {i}");
-            let Some(ch) = ch else {
-                continue;
-            };
-            let gone = before.difference(&want).count();
-            let came = want.difference(&before).count();
-            let removed = ch.iter().filter(|c| c.1 < 0).count();
-            let added = ch.iter().filter(|c| c.1 > 0).count();
-            assert_eq!((removed, added), (gone, came), "own {own} step {i}: {ch:?}");
+        for order in [true, false] {
+            let what = format!("own {own} order {order}");
+            let s = Store::in_memory(StoreOptions::default());
+            change(&s, &[], init);
+            let mut p = Exact::new(rules, own, 1);
+            p.order = Some(order);
+            let mut fp = exact_build(&s, p);
+            let mut one = program(rules, &s, Provenance::None, None).expect("one-step build");
+            for (i, (del, ins, want)) in steps.iter().enumerate() {
+                let before = exact_shown(&s, &fp);
+                let after = s.snapshot().commit;
+                change(&s, del, ins);
+                let ch = exact_advance(&s, &mut fp, after).expect("advance");
+                let want = set(want);
+                assert_eq!(exact_shown(&s, &fp), want, "{what} step {i}");
+                advance(&s, &mut one, after);
+                assert_eq!(shown(&s.snapshot(), &one), want, "one-step, step {i}");
+                let Some(ch) = ch else {
+                    continue;
+                };
+                assert_eq!(
+                    change_map(&s.snapshot(), &fp.program.inner, &ch),
+                    difference(&before, &want),
+                    "{what} step {i}: {ch:?}"
+                );
+            }
         }
     }
 }
@@ -1044,8 +1122,9 @@ fn an_exact_proof_leaves_no_cyclic_support() {
     );
 }
 
-/// `A ← B`, `B ← A`, `A ← C` with `C` explicit: removing explicit `A` and `B` in either
-/// order keeps both, since a search blocked on the cycle is not a negative answer.
+/// `A ← B`, `B ← A`, `A ← C` with `C` explicit: removing explicit `A` and `B` keeps both
+/// with the first frontier in either order (`cases` runs both), since a search blocked on
+/// the cycle is not a negative answer.
 #[test]
 fn a_cycle_blocked_search_is_not_a_negative_answer() {
     let rules = "[ba: (?x <http://ex/q> ?y) -> (?x <http://ex/p> ?y)]
@@ -1053,7 +1132,6 @@ fn a_cycle_blocked_search_is_not_a_negative_answer() {
                  [ca: (?x <http://ex/r> ?y) -> (?x <http://ex/p> ?y)]";
     let all: &[&str] = &["a p b", "a q b", "a r b"];
     cases(rules, all, &[(&["a p b", "a q b"], &[], all)]);
-    cases(rules, all, &[(&["a q b", "a p b"], &[], all)]);
 }
 
 /// An insertion alone derives new facts; an explicit fact that is also derived stays
@@ -1111,6 +1189,7 @@ fn a_large_fan_out_fails_while_it_is_produced() {
         fp.store().peak.set(0);
         let after = s.snapshot().commit;
         change(&s, &[], &["a hub b"]);
+        fp.store().lookups.set(0);
         let Err(e) = exact_advance(&s, &mut fp, after).map(|c| c.expect("advanced")) else {
             panic!("batch {batch}: the fan-out fits");
         };
@@ -1120,7 +1199,33 @@ fn a_large_fan_out_fails_while_it_is_produced() {
         assert!(b.requested <= b.limit * 2, "batch {batch}: {b:?}");
         assert!(fp.store().peak.get() <= 64 << 10, "batch {batch}");
         assert_eq!(fp.store().reserved.get(), 0, "batch {batch}");
+        // the instances go into the sink as they are found, so the refusal comes before
+        // the rule's 4,000 bindings are all enumerated
+        let lookups = fp.store().lookups.get();
+        assert!(lookups < 2000, "batch {batch}: {lookups} lookups");
     }
+}
+
+/// The first frontier is reserved with the operator's other buffers: when the first
+/// proof is asked, the frontier of 4,000 removed facts and the table that makes it
+/// unique are both charged.
+#[test]
+fn the_first_frontier_is_reserved() {
+    let facts: Vec<String> = (0..4000).map(|i| format!("i{i} m j{i}")).collect();
+    let facts: Vec<&str> = facts.iter().map(String::as_str).collect();
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, &[], &facts);
+    let rules = "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]";
+    let mut fp = exact_build(&s, Exact::new(rules, false, 1));
+    let after = s.snapshot().commit;
+    change(&s, &facts, &[]);
+    exact_advance(&s, &mut fp, after).expect("advance");
+    assert_eq!(fp.len(), 0);
+    let frontier = 4096 * std::mem::size_of::<Triple>() as u64;
+    let seen = crate::budget::table_bytes(crate::budget::table_capacity(4000), 24) as u64;
+    let at = fp.program.reserved_at_prove.expect("a proof was asked");
+    assert!(at >= frontier + seen, "{at} under {}", frontier + seen);
+    assert_eq!(fp.store().reserved.get(), 0);
 }
 
 /// A one-step build whose instances outgrow `max_bytes` fails as they are produced.

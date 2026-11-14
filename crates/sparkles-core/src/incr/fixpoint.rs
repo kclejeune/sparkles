@@ -40,7 +40,8 @@
 //! exactly whether a fact follows from the base facts of the new snapshot through
 //! instances whose derived premises the store holds, as the reasoner's backward search
 //! does. A pass runs in rounds. [`Program::prepare`] applies the program's own preamble
-//! and gives the first frontier, the facts that the changes may have made unprovable. The
+//! and [`Program::frontier`] gives the first frontier, the facts that the changes may
+//! have made unprovable. The
 //! frontier is proved, the facts without a proof are dead, the heads of the instances at
 //! the old snapshot that read a dead fact are enumerated while the dead facts are still
 //! held, the dead facts leave the store, and the heads that the store still holds and
@@ -59,19 +60,27 @@
 //! fact counts one derivation, since a recursive fact has unboundedly many. A program in
 //! exact mode keeps no records, so it keeps no annotations.
 //!
-//! **Memory.** Producers write their instances into a [`Sink`], which reserves the bytes
-//! of each growth through the store before it grows and fails when the store refuses or
-//! the pass's `max_bytes` would be passed, so one fact with a large fan-out fails while it
-//! produces. The operator reserves its own frontiers, sets and change list through the
-//! store too, and releases every reservation when the pass ends, whether it succeeded or
-//! failed. A caller that keeps the returned changes charges them itself. A failed pass
-//! leaves the fixed point unusable until the next [`FixedPoint::build`].
+//! **Memory.** Producers write what they find into a [`Sink`], which reserves each new
+//! allocation through the store before it grows, and fails when the store refuses or
+//! `max_bytes` would be passed, so one fact with a large fan-out fails while it
+//! produces. Against `max_bytes` count the state, the program's scratch and the live
+//! allocation of the sink being filled, as they always have. The operator's other
+//! buffers, its frontiers, queues, sets, tables and change list, are reserved through the
+//! store only, which charges nothing for a [`HashStore`] and charges its run's budget for
+//! a program that keeps its own. Each reservation covers the allocation the collection
+//! will hold, including a hash table's buckets and control bytes, and both allocations
+//! while a buffer moves into a larger one. A buffer freed during a pass releases its
+//! reservation, and every reservation still held is released when the pass ends, whether
+//! it succeeded or failed. The returned changes are released with them, and a caller
+//! that keeps them charges them itself. A failed pass leaves the fixed point unusable
+//! until the next [`FixedPoint::build`].
 
 use super::pass::Which;
 use super::persist::{Reader, Writer};
 use super::prov::{Ann, Atom, Provenance};
 use crate::error::{Error, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
+use sparkles_budget::sizes::{table_bytes, table_grown};
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -190,62 +199,172 @@ impl<F: Copy + Eq + Hash, R: Copy> FactStore<F, R> for HashStore<F, R> {
     }
 }
 
-/// Where a producer writes the instances it finds: a buffer whose every growth is
-/// reserved through the store, and checked against the pass's memory limit, before it
-/// happens.
-pub struct Sink<'s, F, R, E> {
-    buf: Vec<(F, R)>,
-    reserve: Option<&'s dyn Fn(u64) -> std::result::Result<(), E>>,
-    /// the limit, and the bytes counted against it before the sink grew
-    max: Option<(u64, u64)>,
-    /// the bytes this sink reserved
-    reserved: u64,
+/// A collection whose next allocation can be sized before it grows.
+trait Buf {
+    /// The bytes of the allocation it holds.
+    fn alloc_bytes(&self) -> u64;
+    /// The bytes of the allocation it will hold once room for `add` more items is made,
+    /// or `None` when they fit.
+    fn grown(&self, add: usize) -> Option<u64>;
+    /// Make room for `add` more items.
+    fn grow(&mut self, add: usize);
 }
 
-impl<'s, F, R, E: From<Error>> Sink<'s, F, R, E> {
+/// The capacity a vector or deque of `cap` slots and `len` items grows to for `add`
+/// more: doubling, and at least 16 slots.
+fn vec_target(cap: usize, len: usize, add: usize) -> Option<usize> {
+    let need = len.saturating_add(add);
+    (need > cap).then(|| need.max(cap.saturating_mul(2)).max(16))
+}
+
+fn slots_bytes<T>(slots: usize) -> u64 {
+    (slots as u64).saturating_mul(size_of::<T>() as u64)
+}
+
+impl<T> Buf for Vec<T> {
+    fn alloc_bytes(&self) -> u64 {
+        slots_bytes::<T>(self.capacity())
+    }
+
+    fn grown(&self, add: usize) -> Option<u64> {
+        vec_target(self.capacity(), self.len(), add).map(slots_bytes::<T>)
+    }
+
+    fn grow(&mut self, add: usize) {
+        if let Some(to) = vec_target(self.capacity(), self.len(), add) {
+            self.reserve_exact(to - self.len());
+        }
+    }
+}
+
+impl<T> Buf for VecDeque<T> {
+    fn alloc_bytes(&self) -> u64 {
+        slots_bytes::<T>(self.capacity())
+    }
+
+    fn grown(&self, add: usize) -> Option<u64> {
+        vec_target(self.capacity(), self.len(), add).map(slots_bytes::<T>)
+    }
+
+    fn grow(&mut self, add: usize) {
+        if let Some(to) = vec_target(self.capacity(), self.len(), add) {
+            self.reserve_exact(to - self.len());
+        }
+    }
+}
+
+impl<T: Eq + Hash> Buf for FxHashSet<T> {
+    fn alloc_bytes(&self) -> u64 {
+        table_bytes(self.capacity(), size_of::<T>()) as u64
+    }
+
+    fn grown(&self, add: usize) -> Option<u64> {
+        let to = table_grown(self.capacity(), self.len(), add);
+        (to != self.capacity()).then(|| table_bytes(to, size_of::<T>()) as u64)
+    }
+
+    fn grow(&mut self, add: usize) {
+        self.reserve(add);
+    }
+}
+
+impl<K: Eq + Hash, V> Buf for FxHashMap<K, V> {
+    fn alloc_bytes(&self) -> u64 {
+        table_bytes(self.capacity(), size_of::<(K, V)>()) as u64
+    }
+
+    fn grown(&self, add: usize) -> Option<u64> {
+        let to = table_grown(self.capacity(), self.len(), add);
+        (to != self.capacity()).then(|| table_bytes(to, size_of::<(K, V)>()) as u64)
+    }
+
+    fn grow(&mut self, add: usize) {
+        self.reserve(add);
+    }
+}
+
+/// How a buffer charges its growth: a reservation through the store and its release.
+struct Acct<'s, E> {
+    reserve: &'s dyn Fn(u64) -> std::result::Result<(), E>,
+    release: &'s dyn Fn(u64),
+}
+
+impl<E> Clone for Acct<'_, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Copy for Acct<'_, E> {}
+
+/// Make room in `buf`, whose allocation holds `held` reserved bytes, for `add` more
+/// items: reserve the new allocation, grow, and release the old one, so that the
+/// reservation covers both while the items move. `limit` is a memory limit with the
+/// bytes counted against it beside this buffer.
+fn grow_charged<B: Buf, E: From<Error>>(
+    acct: Option<Acct<'_, E>>,
+    limit: Option<(u64, u64)>,
+    buf: &mut B,
+    held: &mut u64,
+    add: usize,
+) -> std::result::Result<(), E> {
+    let Some(new) = buf.grown(add) else {
+        return Ok(());
+    };
+    if let Some((limit, before)) = limit {
+        let requested = before.saturating_add(new);
+        if requested > limit {
+            return Err(over(limit, requested).into());
+        }
+    }
+    let Some(acct) = acct else {
+        buf.grow(add);
+        return Ok(());
+    };
+    (acct.reserve)(new)?;
+    buf.grow(add);
+    let actual = buf.alloc_bytes();
+    (acct.release)(*held);
+    *held = new;
+    // the reservation follows the allocation the collection reports
+    if actual < new {
+        (acct.release)(new - actual);
+        *held = actual;
+    } else if actual > new {
+        (acct.reserve)(actual - new)?;
+        *held = actual;
+    }
+    Ok(())
+}
+
+/// Where a producer writes what it finds: a buffer whose every growth is reserved
+/// through the store, and checked against the pass's memory limit, before it happens.
+pub struct Sink<'s, T, E> {
+    buf: Vec<T>,
+    acct: Option<Acct<'s, E>>,
+    /// the limit, and the bytes counted against it beside the sink
+    max: Option<(u64, u64)>,
+    /// the bytes reserved for the buffer's allocation
+    held: u64,
+}
+
+impl<'s, T, E: From<Error>> Sink<'s, T, E> {
     /// A sink that charges nothing, for a program's own use.
-    pub fn unbounded() -> Sink<'s, F, R, E> {
+    pub fn unbounded() -> Sink<'s, T, E> {
         Sink {
             buf: Vec::new(),
-            reserve: None,
+            acct: None,
             max: None,
-            reserved: 0,
+            held: 0,
         }
     }
 
-    fn charged(
-        buf: Vec<(F, R)>,
-        reserve: &'s dyn Fn(u64) -> std::result::Result<(), E>,
-        max: Option<(u64, u64)>,
-    ) -> Sink<'s, F, R, E> {
-        debug_assert!(buf.is_empty());
-        Sink {
-            buf,
-            reserve: Some(reserve),
-            max,
-            reserved: 0,
-        }
-    }
-
-    /// Add one instance, growing the buffer only once the growth is charged.
-    pub fn push(&mut self, f: F, r: R) -> std::result::Result<(), E> {
+    /// Add one item, growing the buffer only once the growth is charged.
+    pub fn push(&mut self, t: T) -> std::result::Result<(), E> {
         if self.buf.len() == self.buf.capacity() {
-            let cap = self.buf.capacity();
-            let want = (cap * 2).max(16);
-            let grow = ((want - cap) * size_of::<(F, R)>()) as u64;
-            if let Some((limit, before)) = self.max {
-                let requested = before + self.reserved + grow;
-                if requested > limit {
-                    return Err(over(limit, requested).into());
-                }
-            }
-            if let Some(reserve) = self.reserve {
-                reserve(grow)?;
-                self.reserved += grow;
-            }
-            self.buf.reserve_exact(want - cap);
+            grow_charged(self.acct, self.max, &mut self.buf, &mut self.held, 1)?;
         }
-        self.buf.push((f, r));
+        self.buf.push(t);
         Ok(())
     }
 
@@ -257,14 +376,14 @@ impl<'s, F, R, E: From<Error>> Sink<'s, F, R, E> {
         self.buf.is_empty()
     }
 
-    /// Take the instances found so far, leaving the buffer's capacity.
-    pub fn drain(&mut self) -> std::vec::Drain<'_, (F, R)> {
-        self.buf.drain(..)
+    /// The items found so far.
+    pub fn items(&self) -> &[T] {
+        &self.buf
     }
 
-    /// The buffer and the bytes reserved for it.
-    fn into_parts(self) -> (Vec<(F, R)>, u64) {
-        (self.buf, self.reserved)
+    /// Take the items found so far, leaving the buffer's capacity.
+    pub fn drain(&mut self) -> std::vec::Drain<'_, T> {
+        self.buf.drain(..)
     }
 }
 
@@ -315,7 +434,7 @@ pub trait Program {
         &mut self,
         cx: &mut Self::Cx<'_>,
         store: &Self::Store,
-        out: &mut Sink<'_, Self::Fact, Self::Record, Self::Error>,
+        out: &mut Sink<'_, (Self::Fact, Self::Record), Self::Error>,
     ) -> std::result::Result<(), Self::Error>;
 
     /// The instances at snapshot `w` that use derived fact `f` as a premise, with their
@@ -327,7 +446,7 @@ pub trait Program {
         w: Which,
         f: &Self::Fact,
         held: &dyn Fn(&Self::Fact) -> bool,
-        out: &mut Sink<'_, Self::Fact, Self::Record, Self::Error>,
+        out: &mut Sink<'_, (Self::Fact, Self::Record), Self::Error>,
     ) -> std::result::Result<(), Self::Error>;
 
     /// [`consequences`](Self::consequences) of each of `facts`.
@@ -338,7 +457,7 @@ pub trait Program {
         w: Which,
         facts: &[Self::Fact],
         held: &dyn Fn(&Self::Fact) -> bool,
-        out: &mut Sink<'_, Self::Fact, Self::Record, Self::Error>,
+        out: &mut Sink<'_, (Self::Fact, Self::Record), Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         for f in facts {
             self.consequences(cx, store, w, f, held, out)?;
@@ -380,7 +499,7 @@ pub trait Program {
         cx: &mut Self::Cx<'_>,
         store: &Self::Store,
         recorded: &dyn Fn(&Self::Fact) -> Option<Self::Record>,
-        out: &mut Vec<Self::Fact>,
+        out: &mut Sink<'_, Self::Fact, Self::Error>,
     ) -> std::result::Result<(), Self::Error>;
 
     /// The instances that use a base fact the changes added, with their derived
@@ -390,7 +509,7 @@ pub trait Program {
         cx: &mut Self::Cx<'_>,
         store: &Self::Store,
         held: &dyn Fn(&Self::Fact) -> bool,
-        out: &mut Sink<'_, Self::Fact, Self::Record, Self::Error>,
+        out: &mut Sink<'_, (Self::Fact, Self::Record), Self::Error>,
     ) -> std::result::Result<(), Self::Error>;
 
     /// The held facts whose recorded instance's base facts hold before and after the
@@ -400,33 +519,52 @@ pub trait Program {
         _cx: &mut Self::Cx<'_>,
         _store: &Self::Store,
         _recorded: &dyn Fn(&Self::Fact) -> Option<Self::Record>,
-        _out: &mut Vec<Self::Fact>,
+        _out: &mut Sink<'_, Self::Fact, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
 
-    /// Exact mode: apply the program's preamble to the store before anything is deleted,
-    /// and give the first frontier, the facts that the changes may have made
-    /// unprovable.
+    /// Exact mode: apply the program's preamble to the store before anything is deleted.
     fn prepare(
         &mut self,
         _cx: &mut Self::Cx<'_>,
         _store: &mut Self::Store,
-        _frontier: &mut Vec<Self::Fact>,
+    ) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Exact mode: the first frontier, the facts that the changes may have made
+    /// unprovable, after [`prepare`](Self::prepare).
+    fn frontier(
+        &mut self,
+        _cx: &mut Self::Cx<'_>,
+        _store: &Self::Store,
+        _out: &mut Sink<'_, Self::Fact, Self::Error>,
     ) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
 
     /// Exact mode: insert the added facts and everything that follows from them, and
-    /// return the facts inserted, or `None` to leave it to the operator, which inserts
-    /// the facts [`added`](Self::added) gives and follows
+    /// return `true`, or return `false` to leave it to the operator, which inserts the
+    /// facts [`added`](Self::added) gives and follows
     /// [`consequences`](Self::consequences) from every fact it inserts.
     fn saturate(
         &mut self,
         _cx: &mut Self::Cx<'_>,
         _store: &mut Self::Store,
-    ) -> std::result::Result<Option<Vec<Self::Fact>>, Self::Error> {
-        Ok(None)
+    ) -> std::result::Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    /// Exact mode, after [`saturate`](Self::saturate) returned `true`: the facts it
+    /// inserted.
+    fn saturated(
+        &mut self,
+        _cx: &mut Self::Cx<'_>,
+        _store: &Self::Store,
+        _out: &mut Sink<'_, Self::Fact, Self::Error>,
+    ) -> std::result::Result<(), Self::Error> {
+        Ok(())
     }
 
     /// A pass or a build ended, with success or not: drop what the program kept for it.
@@ -475,22 +613,28 @@ pub struct Change<F> {
 
 /// The change of membership that `changes` make, with each fact once and its weights
 /// summed, leaving out the facts whose weights cancel, such as a fact that an exact pass
-/// deleted and derived again. Annotations are not carried.
+/// deleted and derived again. Annotations are not carried. A sum past the range of
+/// `i64` saturates.
 pub fn consolidate<F: Copy + Eq + Hash>(changes: &[Change<F>]) -> Vec<(F, i64)> {
-    let mut sum: FxHashMap<F, i64> = FxHashMap::default();
+    let mut sum: FxHashMap<F, i128> = FxHashMap::default();
     let mut order = Vec::new();
     for c in changes {
         let e = sum.entry(c.fact).or_insert_with(|| {
             order.push(c.fact);
             0
         });
-        *e += c.weight;
+        *e += i128::from(c.weight);
     }
     order
         .into_iter()
         .filter_map(|f| {
             let w = sum[&f];
-            (w != 0).then_some((f, w))
+            (w != 0).then(|| {
+                (
+                    f,
+                    w.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+                )
+            })
         })
         .collect()
 }
@@ -524,55 +668,34 @@ pub fn atoms_of(a: &Ann) -> Vec<Atom> {
     }
 }
 
-/// The bytes that a pass reserved through the store, released when the pass ends.
+/// What a pass reserved through the store and has not released yet, released when the
+/// pass ends.
 #[derive(Default)]
 struct Charges {
-    reserved: u64,
+    live: u64,
 }
 
-impl Charges {
-    /// Make room in `v` for `add` more items, reserving the growth first.
-    fn room<T, E>(
-        &mut self,
-        reserve: &dyn Fn(u64) -> std::result::Result<(), E>,
-        v: &mut Vec<T>,
-        add: usize,
-    ) -> std::result::Result<(), E> {
-        let need = v.len() + add;
-        if need <= v.capacity() {
-            return Ok(());
-        }
-        let want = need.max(v.capacity() * 2).max(16);
-        let grow = ((want - v.capacity()) * size_of::<T>()) as u64;
-        reserve(grow)?;
-        self.reserved += grow;
-        v.reserve_exact(want - v.len());
-        Ok(())
-    }
+/// A buffer of a pass with the bytes reserved for its allocation. It grows only through
+/// [`FixedPoint::room`], and is read through `Deref`.
+struct Held<C> {
+    buf: C,
+    bytes: u64,
+}
 
-    /// Make room in `s` for `add` more items, reserving the growth first.
-    fn room_set<T: Eq + Hash, E>(
-        &mut self,
-        reserve: &dyn Fn(u64) -> std::result::Result<(), E>,
-        s: &mut FxHashSet<T>,
-        add: usize,
-    ) -> std::result::Result<(), E> {
-        let need = s.len() + add;
-        if need <= s.capacity() {
-            return Ok(());
+impl<C: Default> Default for Held<C> {
+    fn default() -> Self {
+        Held {
+            buf: C::default(),
+            bytes: 0,
         }
-        let want = need.max(s.capacity() * 2).max(16);
-        // a slot holds the item and a control byte, at a load of 7/8
-        let slot = size_of::<T>() as u64 + 1;
-        let grow = (want - s.capacity()) as u64 * slot * 8 / 7;
-        reserve(grow)?;
-        self.reserved += grow;
-        s.reserve(want - s.len());
-        Ok(())
     }
+}
 
-    fn take(&mut self, bytes: u64) {
-        self.reserved += bytes;
+impl<C> std::ops::Deref for Held<C> {
+    type Target = C;
+
+    fn deref(&self) -> &C {
+        &self.buf
     }
 }
 
@@ -644,13 +767,16 @@ impl<P: Program> FixedPoint<P> {
 
     /// The approximate memory of the state.
     pub fn bytes(&self) -> u64 {
-        self.store.bytes() + self.ann_bytes + self.ann.len() as u64 * 16
+        self.store
+            .bytes()
+            .saturating_add(self.ann_bytes)
+            .saturating_add(self.ann.len() as u64 * 16)
     }
 
-    /// What counts against `max_bytes` before a producer's sink grows: the state and the
+    /// What counts against `max_bytes` beside a producer's sink: the state and the
     /// program's scratch.
     fn used(&self) -> u64 {
-        self.bytes() + self.program.scratch_bytes()
+        self.bytes().saturating_add(self.program.scratch_bytes())
     }
 
     /// Check the budget every 4096 facts.
@@ -667,7 +793,7 @@ impl<P: Program> FixedPoint<P> {
         let Some(m) = max else {
             return Ok(());
         };
-        let used = self.used() + pending;
+        let used = self.used().saturating_add(pending);
         if used > m {
             return Err(over(m, used).into());
         }
@@ -684,40 +810,50 @@ impl<P: Program> FixedPoint<P> {
         Ok(())
     }
 
-    /// Run `body` as one pass: release what it reserved and tell the program it ended,
-    /// whether it succeeded or not.
+    /// Run `body` as one pass: refuse what the mode cannot keep, release what the pass
+    /// reserved and tell the program it ended, whether it succeeded or not.
     fn pass<T>(
         &mut self,
         cx: &mut P::Cx<'_>,
         body: impl FnOnce(&mut Self, &mut P::Cx<'_>, &mut Charges) -> std::result::Result<T, P::Error>,
     ) -> std::result::Result<T, P::Error> {
         let mut charges = Charges::default();
-        let out = body(self, cx, &mut charges);
-        self.store.release(charges.reserved);
+        let out = match self.refuse_annotations() {
+            Ok(()) => body(self, cx, &mut charges),
+            Err(e) => Err(e),
+        };
+        self.store.release(charges.live);
         let end = self.program.pass_end(cx);
         let out = out?;
         end?;
         Ok(out)
     }
 
-    /// Make room in `v` for `add` more items, reserving the growth through the store.
-    fn room<T>(
+    /// Make room in `h` for `add` more items, reserving the new allocation through the
+    /// store before it grows and releasing the old one after.
+    fn room<B: Buf>(
         &self,
         charges: &mut Charges,
-        v: &mut Vec<T>,
+        h: &mut Held<B>,
         add: usize,
     ) -> std::result::Result<(), P::Error> {
-        charges.room(&|b| self.store.reserve(b), v, add)
+        let store = &self.store;
+        let reserve = |b: u64| store.reserve(b);
+        let release = |b: u64| store.release(b);
+        let acct = Acct {
+            reserve: &reserve,
+            release: &release,
+        };
+        let before = h.bytes;
+        let res = grow_charged(Some(acct), None, &mut h.buf, &mut h.bytes, add);
+        charges.live = charges.live.saturating_sub(before).saturating_add(h.bytes);
+        res
     }
 
-    /// Make room in `s` for `add` more items, reserving the growth through the store.
-    fn room_set<T: Eq + Hash>(
-        &self,
-        charges: &mut Charges,
-        s: &mut FxHashSet<T>,
-        add: usize,
-    ) -> std::result::Result<(), P::Error> {
-        charges.room_set(&|b| self.store.reserve(b), s, add)
+    /// Free `h` and release its reservation.
+    fn free<C>(&self, charges: &mut Charges, h: Held<C>) {
+        self.store.release(h.bytes);
+        charges.live = charges.live.saturating_sub(h.bytes);
     }
 
     /// Insert `f` with record `r` when the store does not hold it. Returns whether it
@@ -735,34 +871,46 @@ impl<P: Program> FixedPoint<P> {
         Ok(true)
     }
 
-    /// Run `produce` with a sink that charges the store, reusing `buf`'s capacity, and
-    /// return the instances it found in `buf`. The sink's reservation is added to
-    /// `charges`.
-    fn produce(
+    /// Run `produce` with a sink over `buf`, which keeps its capacity and reservation, so
+    /// that what it finds is in `buf`. The sink's allocation counts against `max` beside
+    /// the state and the program's scratch, and is reserved through the store.
+    fn produce<T>(
         &mut self,
         cx: &mut P::Cx<'_>,
         max: Option<u64>,
         charges: &mut Charges,
-        buf: &mut Vec<(P::Fact, P::Record)>,
+        buf: &mut Held<Vec<T>>,
         produce: impl FnOnce(
             &mut P,
             &mut P::Cx<'_>,
             &P::Store,
-            &mut Sink<'_, P::Fact, P::Record, P::Error>,
+            &mut Sink<'_, T, P::Error>,
         ) -> std::result::Result<(), P::Error>,
     ) -> std::result::Result<(), P::Error> {
-        // the sink's growth counts against `max` beside the state and the scratch; the
-        // operator's other buffers are charged to the store, which a program with a
-        // budget of its own charges
         let before = self.used();
+        if let Some(m) = max {
+            let requested = before.saturating_add(buf.buf.alloc_bytes());
+            if buf.buf.capacity() > 0 && requested > m {
+                return Err(over(m, requested).into());
+            }
+        }
         let store = &self.store;
         let reserve = |b: u64| store.reserve(b);
-        // the buffer's capacity is already reserved: the sink grows from it
-        let mut sink = Sink::charged(std::mem::take(buf), &reserve, max.map(|m| (m, before)));
+        let release = |b: u64| store.release(b);
+        let held = buf.bytes;
+        let mut sink = Sink {
+            buf: std::mem::take(&mut buf.buf),
+            acct: Some(Acct {
+                reserve: &reserve,
+                release: &release,
+            }),
+            max: max.map(|m| (m, before)),
+            held,
+        };
         let res = produce(&mut self.program, cx, store, &mut sink);
-        let (b, reserved) = sink.into_parts();
-        *buf = b;
-        charges.take(reserved);
+        buf.buf = sink.buf;
+        buf.bytes = sink.held;
+        charges.live = charges.live.saturating_sub(held).saturating_add(buf.bytes);
         res
     }
 
@@ -776,40 +924,42 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max: Option<u64>,
         charges: &mut Charges,
-        mut queue: VecDeque<P::Fact>,
-        pending: &mut FxHashSet<P::Fact>,
-        proved: &mut Vec<P::Fact>,
-        added: &mut Vec<P::Fact>,
+        queue: &mut Held<VecDeque<P::Fact>>,
+        pending: &mut Held<FxHashSet<P::Fact>>,
+        proved: &mut Held<Vec<P::Fact>>,
+        added: &mut Held<Vec<P::Fact>>,
     ) -> std::result::Result<(), P::Error> {
         let n = self.program.batch_len().max(1);
-        let mut found = Vec::new();
-        let mut batch: Vec<P::Fact> = Vec::new();
+        let mut found: Held<Vec<(P::Fact, P::Record)>> = Held::default();
+        let mut batch: Held<Vec<P::Fact>> = Held::default();
         while !queue.is_empty() {
             self.program.tick(cx)?;
-            batch.clear();
+            batch.buf.clear();
             self.room(charges, &mut batch, n.min(queue.len()))?;
             while batch.len() < n
-                && let Some(f) = queue.pop_front()
+                && let Some(f) = queue.buf.pop_front()
             {
-                batch.push(f);
+                batch.buf.push(f);
             }
             {
-                let pend = &*pending;
+                let (pend, facts) = (&pending.buf, &batch.buf);
                 self.produce(cx, max, charges, &mut found, |p, cx, store, sink| {
                     p.consequences_batch(
                         cx,
                         store,
                         Which::New,
-                        &batch,
+                        facts,
                         &|x| store.contains(x) && !pend.contains(x),
                         sink,
                     )
                 })?;
             }
-            for (g, r) in std::mem::take(&mut found) {
-                self.take(g, r, max, charges, &mut queue, pending, proved, added)?;
+            for (g, r) in found.buf.drain(..) {
+                self.take(g, r, max, charges, queue, pending, proved, added)?;
             }
         }
+        self.free(charges, found);
+        self.free(charges, batch);
         Ok(())
     }
 
@@ -822,21 +972,23 @@ impl<P: Program> FixedPoint<P> {
         r: P::Record,
         max: Option<u64>,
         charges: &mut Charges,
-        queue: &mut VecDeque<P::Fact>,
-        pending: &mut FxHashSet<P::Fact>,
-        proved: &mut Vec<P::Fact>,
-        added: &mut Vec<P::Fact>,
+        queue: &mut Held<VecDeque<P::Fact>>,
+        pending: &mut Held<FxHashSet<P::Fact>>,
+        proved: &mut Held<Vec<P::Fact>>,
+        added: &mut Held<Vec<P::Fact>>,
     ) -> std::result::Result<(), P::Error> {
-        if pending.remove(&g) {
+        if pending.buf.remove(&g) {
             self.store.set_record(g, r)?;
             self.room(charges, proved, 1)?;
-            proved.push(g);
-            queue.push_back(g);
+            proved.buf.push(g);
         } else if self.insert_new(g, r, max)? {
             self.room(charges, added, 1)?;
-            added.push(g);
-            queue.push_back(g);
+            added.buf.push(g);
+        } else {
+            return Ok(());
         }
+        self.room(charges, queue, 1)?;
+        queue.buf.push_back(g);
         Ok(())
     }
 
@@ -847,7 +999,6 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max_bytes: Option<u64>,
     ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
-        self.refuse_annotations()?;
         self.pass(cx, |s, cx, charges| s.build_pass(cx, max_bytes, charges))
     }
 
@@ -860,35 +1011,46 @@ impl<P: Program> FixedPoint<P> {
         self.store.clear();
         self.ann.clear();
         self.ann_bytes = 0;
-        let mut found = Vec::new();
+        let mut found: Held<Vec<(P::Fact, P::Record)>> = Held::default();
         self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
             p.axioms(cx, store, sink)
         })?;
-        let mut queue: VecDeque<P::Fact> = VecDeque::new();
-        let mut order = Vec::new();
-        for (f, r) in std::mem::take(&mut found) {
+        let mut queue: Held<VecDeque<P::Fact>> = Held::default();
+        let mut order: Held<Vec<P::Fact>> = Held::default();
+        for (f, r) in found.buf.drain(..) {
             if self.insert_new(f, r, max_bytes)? {
                 self.room(charges, &mut order, 1)?;
-                queue.push_back(f);
-                order.push(f);
+                self.room(charges, &mut queue, 1)?;
+                queue.buf.push_back(f);
+                order.buf.push(f);
             }
         }
-        let mut pending = FxHashSet::default();
-        let mut proved = Vec::new();
+        self.free(charges, found);
+        let mut pending = Held::default();
+        let mut proved = Held::default();
         self.chase(
             cx,
             max_bytes,
             charges,
-            queue,
+            &mut queue,
             &mut pending,
             &mut proved,
             &mut order,
         )?;
-        let dirty: FxHashSet<P::Fact> = order.iter().copied().collect();
-        let anns = self.annotate(cx, &dirty, max_bytes)?;
-        let mut out = Vec::new();
+        self.free(charges, queue);
+        let anns = if self.mode.is_none() {
+            None
+        } else {
+            let mut dirty: Held<FxHashSet<P::Fact>> = Held::default();
+            self.room(charges, &mut dirty, order.len())?;
+            dirty.buf.extend(order.iter().copied());
+            let anns = self.annotate(cx, charges, &dirty, max_bytes)?;
+            self.free(charges, dirty);
+            anns
+        };
+        let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
         self.room(charges, &mut out, order.len())?;
-        for f in order {
+        for &f in order.iter() {
             let ann = match anns.as_ref() {
                 Some(m) => {
                     let a = m.get(&f).cloned().ok_or_else(|| {
@@ -899,14 +1061,14 @@ impl<P: Program> FixedPoint<P> {
                 }
                 None => None,
             };
-            out.push(Change {
+            out.buf.push(Change {
                 fact: f,
                 weight: 1,
                 ann,
             });
         }
         self.check(max_bytes, 0)?;
-        Ok(out)
+        Ok(out.buf)
     }
 
     fn store_ann(&mut self, f: P::Fact, a: Ann) {
@@ -926,32 +1088,37 @@ impl<P: Program> FixedPoint<P> {
 
     /// The annotations of the facts of `dirty` from their records, premises first; the
     /// other facts keep the annotations held. `None` without annotations. The
-    /// annotations made count against `max` with the state.
+    /// annotations made count against `max` with the state, and the walk's tables are
+    /// reserved through the store. The premises of one instance, which the program
+    /// lists, are not.
     fn annotate(
         &mut self,
         cx: &mut P::Cx<'_>,
+        charges: &mut Charges,
         dirty: &FxHashSet<P::Fact>,
         max: Option<u64>,
     ) -> std::result::Result<Option<FxHashMap<P::Fact, Ann>>, P::Error> {
         if self.mode.is_none() {
             return Ok(None);
         }
-        let mut done: FxHashMap<P::Fact, Ann> = FxHashMap::default();
+        let mut done: Held<FxHashMap<P::Fact, Ann>> = Held::default();
         let mut pending = 0u64;
         // a depth-first walk over the records: a frame is a fact and whether its
         // premises were scheduled, and `open` holds the facts whose premises are being
         // annotated, so meeting one of them again is a cycle of records
-        let mut open: FxHashSet<P::Fact> = FxHashSet::default();
-        let mut stack: Vec<(P::Fact, bool)> = Vec::new();
+        let mut open: Held<FxHashSet<P::Fact>> = Held::default();
+        let mut stack: Held<Vec<(P::Fact, bool)>> = Held::default();
+        let mut scheduled: Held<FxHashSet<P::Fact>> = Held::default();
         let mut prem = Vec::new();
         for &f in dirty {
             if done.contains_key(&f) {
                 continue;
             }
-            stack.push((f, false));
+            self.room(charges, &mut stack, 1)?;
+            stack.buf.push((f, false));
             while let Some(&(top, expanded)) = stack.last() {
                 if !expanded && done.contains_key(&top) {
-                    stack.pop();
+                    stack.buf.pop();
                     continue;
                 }
                 let r = self.store.record(&top).ok_or_else(|| {
@@ -960,49 +1127,61 @@ impl<P: Program> FixedPoint<P> {
                 prem.clear();
                 self.program.premises(&top, &r, &mut prem);
                 if !expanded {
-                    if !open.insert(top) {
+                    self.room(charges, &mut open, 1)?;
+                    if !open.buf.insert(top) {
                         return Err(
                             Error::Corrupt("a fixed point's records form a cycle".into()).into(),
                         );
                     }
-                    stack.last_mut().expect("the frame").1 = true;
-                    let mut scheduled: FxHashSet<P::Fact> = FxHashSet::default();
+                    stack.buf.last_mut().expect("the frame").1 = true;
+                    scheduled.buf.clear();
                     for p in &prem {
-                        if dirty.contains(p) && !done.contains_key(p) && scheduled.insert(*p) {
+                        if !dirty.contains(p) || done.contains_key(p) {
+                            continue;
+                        }
+                        self.room(charges, &mut scheduled, 1)?;
+                        if scheduled.buf.insert(*p) {
                             if open.contains(p) {
                                 return Err(Error::Corrupt(
                                     "a fixed point's records form a cycle".into(),
                                 )
                                 .into());
                             }
-                            stack.push((*p, false));
+                            self.room(charges, &mut stack, 1)?;
+                            stack.buf.push((*p, false));
                         }
                     }
                     continue;
                 }
-                let mut anns: Vec<&Ann> = Vec::with_capacity(prem.len());
-                for p in &prem {
-                    let a = done.get(p).or_else(|| self.ann.get(p)).ok_or_else(|| {
-                        Error::Corrupt(
-                            "a fixed point's record names a fact without annotation".into(),
-                        )
-                    })?;
-                    anns.push(a);
-                }
-                let a = self
-                    .program
-                    .annotate(cx, &self.store, self.mode, &top, &r, &anns)?;
-                pending += a.bytes() + 16;
-                done.insert(top, a);
-                open.remove(&top);
-                stack.pop();
+                let a = {
+                    let mut anns: Vec<&Ann> = Vec::with_capacity(prem.len());
+                    for p in &prem {
+                        let a = done.get(p).or_else(|| self.ann.get(p)).ok_or_else(|| {
+                            Error::Corrupt(
+                                "a fixed point's record names a fact without annotation".into(),
+                            )
+                        })?;
+                        anns.push(a);
+                    }
+                    self.program
+                        .annotate(cx, &self.store, self.mode, &top, &r, &anns)?
+                };
+                pending = pending.saturating_add(a.bytes() + 16);
+                self.room(charges, &mut done, 1)?;
+                done.buf.insert(top, a);
+                open.buf.remove(&top);
+                stack.buf.pop();
                 if done.len().is_multiple_of(4096) {
                     self.check(max, pending)?;
                 }
             }
         }
         self.check(max, pending)?;
-        Ok(Some(done))
+        self.free(charges, open);
+        self.free(charges, stack);
+        self.free(charges, scheduled);
+        // the table's reservation stays with the pass, which releases it at its end
+        Ok(Some(done.buf))
     }
 
     /// Apply the changes that the context lists, and return the change of the facts.
@@ -1011,7 +1190,6 @@ impl<P: Program> FixedPoint<P> {
         cx: &mut P::Cx<'_>,
         max_bytes: Option<u64>,
     ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
-        self.refuse_annotations()?;
         if P::EXACT {
             self.pass(cx, |s, cx, charges| s.advance_exact(cx, max_bytes, charges))
         } else {
@@ -1029,25 +1207,39 @@ impl<P: Program> FixedPoint<P> {
         charges: &mut Charges,
     ) -> std::result::Result<Vec<Change<P::Fact>>, P::Error> {
         let n = self.program.batch_len().max(1);
-        let mut frontier: Vec<P::Fact> = Vec::new();
-        self.program.prepare(cx, &mut self.store, &mut frontier)?;
-        let mut proved: FxHashSet<P::Fact> = FxHashSet::default();
-        let mut out: Vec<Change<P::Fact>> = Vec::new();
-        let mut verdicts: Vec<Option<P::Record>> = Vec::new();
-        let mut found = Vec::new();
-        let mut seen: FxHashSet<P::Fact> = FxHashSet::default();
+        self.program.prepare(cx, &mut self.store)?;
+        let mut frontier: Held<Vec<P::Fact>> = Held::default();
+        self.produce(
+            cx,
+            max_bytes,
+            charges,
+            &mut frontier,
+            |p, cx, store, sink| p.frontier(cx, store, sink),
+        )?;
+        let mut next: Held<Vec<P::Fact>> = Held::default();
+        let mut proved: Held<FxHashSet<P::Fact>> = Held::default();
+        let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
+        let mut verdicts: Held<Vec<Option<P::Record>>> = Held::default();
+        let mut found: Held<Vec<(P::Fact, P::Record)>> = Held::default();
+        let mut seen: Held<FxHashSet<P::Fact>> = Held::default();
+        let mut dead: Held<Vec<P::Fact>> = Held::default();
         loop {
             // the frontier, once each, without the facts gone or proved
-            seen.clear();
-            self.room_set(charges, &mut seen, frontier.len())?;
-            frontier.retain(|f| self.store.contains(f) && !proved.contains(f) && seen.insert(*f));
+            seen.buf.clear();
+            self.room(charges, &mut seen, frontier.len())?;
+            {
+                let (store, done, once) = (&self.store, &proved.buf, &mut seen.buf);
+                frontier
+                    .buf
+                    .retain(|f| store.contains(f) && !done.contains(f) && once.insert(*f));
+            }
             if frontier.is_empty() {
                 break;
             }
-            let mut dead: Vec<P::Fact> = Vec::new();
+            dead.buf.clear();
             for batch in frontier.chunks(n) {
                 self.program.tick(cx)?;
-                verdicts.clear();
+                verdicts.buf.clear();
                 self.room(charges, &mut verdicts, batch.len())?;
                 let store = &self.store;
                 self.program.prove_batch(
@@ -1055,7 +1247,7 @@ impl<P: Program> FixedPoint<P> {
                     store,
                     batch,
                     &|x| store.contains(x),
-                    &mut verdicts,
+                    &mut verdicts.buf,
                 )?;
                 if verdicts.len() != batch.len() {
                     return Err(Error::Corrupt(
@@ -1063,13 +1255,13 @@ impl<P: Program> FixedPoint<P> {
                     )
                     .into());
                 }
-                for (f, v) in batch.iter().zip(&verdicts) {
+                for (f, v) in batch.iter().zip(verdicts.iter()) {
                     if v.is_some() {
-                        self.room_set(charges, &mut proved, 1)?;
-                        proved.insert(*f);
+                        self.room(charges, &mut proved, 1)?;
+                        proved.buf.insert(*f);
                     } else {
                         self.room(charges, &mut dead, 1)?;
-                        dead.push(*f);
+                        dead.buf.push(*f);
                     }
                 }
             }
@@ -1078,66 +1270,77 @@ impl<P: Program> FixedPoint<P> {
             }
             // the heads of the instances that read a dead fact, while the dead facts are
             // still held
-            let mut next: Vec<P::Fact> = Vec::new();
+            next.buf.clear();
             for batch in dead.chunks(n) {
                 self.program.tick(cx)?;
                 self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
                     p.consequences_batch(cx, store, Which::Old, batch, &|x| store.contains(x), sink)
                 })?;
                 self.room(charges, &mut next, found.len())?;
-                next.extend(found.drain(..).map(|(g, _)| g));
+                next.buf.extend(found.buf.drain(..).map(|(g, _)| g));
             }
             self.room(charges, &mut out, dead.len())?;
-            for f in &dead {
+            for f in dead.iter() {
                 if self.store.remove(f)? {
-                    out.push(Change {
+                    out.buf.push(Change {
                         fact: *f,
                         weight: -1,
                         ann: None,
                     });
                 }
             }
-            frontier = next;
+            std::mem::swap(&mut frontier, &mut next);
         }
-        drop(seen);
-        drop(frontier);
-        let inserted = match self.program.saturate(cx, &mut self.store)? {
-            Some(v) => v,
-            None => {
-                self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
-                    p.added(cx, store, &|x| store.contains(x), sink)
-                })?;
-                let mut queue = VecDeque::new();
-                let mut inserted = Vec::new();
-                for (g, r) in std::mem::take(&mut found) {
-                    if self.insert_new(g, r, max_bytes)? {
-                        self.room(charges, &mut inserted, 1)?;
-                        inserted.push(g);
-                        queue.push_back(g);
-                    }
+        self.free(charges, seen);
+        self.free(charges, frontier);
+        self.free(charges, next);
+        self.free(charges, dead);
+        self.free(charges, verdicts);
+        self.free(charges, proved);
+        let mut inserted: Held<Vec<P::Fact>> = Held::default();
+        if self.program.saturate(cx, &mut self.store)? {
+            self.produce(
+                cx,
+                max_bytes,
+                charges,
+                &mut inserted,
+                |p, cx, store, sink| p.saturated(cx, store, sink),
+            )?;
+        } else {
+            self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
+                p.added(cx, store, &|x| store.contains(x), sink)
+            })?;
+            let mut queue: Held<VecDeque<P::Fact>> = Held::default();
+            for (g, r) in found.buf.drain(..) {
+                if self.insert_new(g, r, max_bytes)? {
+                    self.room(charges, &mut inserted, 1)?;
+                    inserted.buf.push(g);
+                    self.room(charges, &mut queue, 1)?;
+                    queue.buf.push_back(g);
                 }
-                let mut pending = FxHashSet::default();
-                let mut revived = Vec::new();
-                self.chase(
-                    cx,
-                    max_bytes,
-                    charges,
-                    queue,
-                    &mut pending,
-                    &mut revived,
-                    &mut inserted,
-                )?;
-                inserted
             }
-        };
+            let mut pending = Held::default();
+            let mut revived = Held::default();
+            self.chase(
+                cx,
+                max_bytes,
+                charges,
+                &mut queue,
+                &mut pending,
+                &mut revived,
+                &mut inserted,
+            )?;
+            self.free(charges, queue);
+        }
+        self.free(charges, found);
         self.room(charges, &mut out, inserted.len())?;
-        out.extend(inserted.into_iter().map(|f| Change {
+        out.buf.extend(inserted.buf.drain(..).map(|f| Change {
             fact: f,
             weight: 1,
             ann: None,
         }));
         self.check(max_bytes, 0)?;
-        Ok(out)
+        Ok(out.buf)
     }
 
     /// A pass of the one-step mode (see the module's documentation).
@@ -1150,62 +1353,65 @@ impl<P: Program> FixedPoint<P> {
         let n = self.program.batch_len().max(1);
         // 1. the broken facts, and every fact whose record depends on them, at the
         //    snapshot before the changes
-        let mut broken = Vec::new();
-        {
-            let store = &self.store;
-            self.program
-                .broken(cx, store, &|f| store.record(f), &mut broken)?;
-        }
-        let mut pending: FxHashSet<P::Fact> = FxHashSet::default();
-        let mut candidates: Vec<P::Fact> = Vec::new();
-        let mut found = Vec::new();
-        let mut batch: Vec<P::Fact> = Vec::new();
+        let mut broken: Held<Vec<P::Fact>> = Held::default();
+        self.produce(cx, max_bytes, charges, &mut broken, |p, cx, store, sink| {
+            p.broken(cx, store, &|f| store.record(f), sink)
+        })?;
+        let mut pending: Held<FxHashSet<P::Fact>> = Held::default();
+        let mut candidates: Held<Vec<P::Fact>> = Held::default();
+        let mut found: Held<Vec<(P::Fact, P::Record)>> = Held::default();
+        let mut batch: Held<Vec<P::Fact>> = Held::default();
         while !broken.is_empty() {
-            batch.clear();
+            batch.buf.clear();
             while batch.len() < n
-                && let Some(f) = broken.pop()
+                && let Some(f) = broken.buf.pop()
             {
                 if !self.store.contains(&f) || pending.contains(&f) {
                     continue;
                 }
-                self.room_set(charges, &mut pending, 1)?;
-                pending.insert(f);
+                self.room(charges, &mut pending, 1)?;
+                pending.buf.insert(f);
                 self.room(charges, &mut candidates, 1)?;
-                candidates.push(f);
+                candidates.buf.push(f);
                 self.room(charges, &mut batch, 1)?;
-                batch.push(f);
+                batch.buf.push(f);
             }
             if batch.is_empty() {
                 continue;
             }
             self.program.tick(cx)?;
-            self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
-                p.consequences_batch(cx, store, Which::Old, &batch, &|x| store.contains(x), sink)
-            })?;
-            for (g, r) in found.drain(..) {
+            {
+                let facts = &batch.buf;
+                self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
+                    p.consequences_batch(cx, store, Which::Old, facts, &|x| store.contains(x), sink)
+                })?;
+            }
+            for (g, r) in found.buf.drain(..) {
                 if self.store.record(&g) == Some(r) && !pending.contains(&g) {
                     self.room(charges, &mut broken, 1)?;
-                    broken.push(g);
+                    broken.buf.push(g);
                 }
             }
         }
-        let mut queue: VecDeque<P::Fact> = VecDeque::new();
-        let mut proved: Vec<P::Fact> = Vec::new();
-        let mut added: Vec<P::Fact> = Vec::new();
+        self.free(charges, broken);
+        self.free(charges, batch);
+        let mut queue: Held<VecDeque<P::Fact>> = Held::default();
+        let mut proved: Held<Vec<P::Fact>> = Held::default();
+        let mut added: Held<Vec<P::Fact>> = Held::default();
         // 2. a backward check of each candidate against the facts that hold
-        let mut verdicts: Vec<Option<P::Record>> = Vec::new();
+        let mut verdicts: Held<Vec<Option<P::Record>>> = Held::default();
         for chunk in candidates.chunks(n) {
             self.program.tick(cx)?;
-            verdicts.clear();
+            verdicts.buf.clear();
             self.room(charges, &mut verdicts, chunk.len())?;
             {
-                let (store, pend) = (&self.store, &pending);
+                let (store, pend) = (&self.store, &pending.buf);
                 self.program.prove_batch(
                     cx,
                     store,
                     chunk,
                     &|x| store.contains(x) && !pend.contains(x),
-                    &mut verdicts,
+                    &mut verdicts.buf,
                 )?;
             }
             if verdicts.len() != chunk.len() {
@@ -1214,24 +1420,26 @@ impl<P: Program> FixedPoint<P> {
                 )
                 .into());
             }
-            for (&f, v) in chunk.iter().zip(verdicts.drain(..)) {
+            for (&f, v) in chunk.iter().zip(verdicts.buf.drain(..)) {
                 if let Some(r) = v {
-                    pending.remove(&f);
+                    pending.buf.remove(&f);
                     self.store.set_record(f, r)?;
                     self.room(charges, &mut proved, 1)?;
-                    proved.push(f);
-                    queue.push_back(f);
+                    proved.buf.push(f);
+                    self.room(charges, &mut queue, 1)?;
+                    queue.buf.push_back(f);
                 }
             }
         }
+        self.free(charges, verdicts);
         // 3. the instances of the added base facts
         {
-            let pend = &pending;
+            let pend = &pending.buf;
             self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
                 p.added(cx, store, &|x| store.contains(x) && !pend.contains(x), sink)
             })?;
         }
-        for (g, r) in std::mem::take(&mut found) {
+        for (g, r) in found.buf.drain(..) {
             self.take(
                 g,
                 r,
@@ -1245,7 +1453,7 @@ impl<P: Program> FixedPoint<P> {
         }
         // 4. forward chaining from what was kept or derived; a program that saturates
         //    by itself would leave pending candidates unproved
-        if self.program.saturate(cx, &mut self.store)?.is_some() {
+        if self.program.saturate(cx, &mut self.store)? {
             return Err(Error::Invalid(
                 "a fixed point's program saturates by itself in one-step mode".into(),
             )
@@ -1255,68 +1463,97 @@ impl<P: Program> FixedPoint<P> {
             cx,
             max_bytes,
             charges,
-            queue,
+            &mut queue,
             &mut pending,
             &mut proved,
             &mut added,
         )?;
+        self.free(charges, queue);
         // 5. the candidates without a derivation
-        let mut out: Vec<Change<P::Fact>> = Vec::new();
-        for f in &candidates {
+        let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
+        for f in candidates.iter() {
             if pending.contains(f) {
                 self.store.remove(f)?;
                 let ann = self.drop_ann(f).map(|a| a.scaled(-1));
                 self.room(charges, &mut out, 1)?;
-                out.push(Change {
+                out.buf.push(Change {
                     fact: *f,
                     weight: -1,
                     ann,
                 });
             }
         }
+        self.free(charges, candidates);
+        self.free(charges, pending);
         if self.mode.is_none() {
             self.room(charges, &mut out, added.len())?;
-            out.extend(added.into_iter().map(|f| Change {
+            out.buf.extend(added.buf.drain(..).map(|f| Change {
                 fact: f,
                 weight: 1,
                 ann: None,
             }));
             self.check(max_bytes, 0)?;
-            return Ok(out);
+            return Ok(out.buf);
         }
         // the annotations of the facts whose records changed, of the facts whose
         // recorded base facts moved, and of every fact whose record depends on them
-        let mut dirty: FxHashSet<P::Fact> = proved.iter().chain(added.iter()).copied().collect();
-        let mut moved = Vec::new();
+        let mut dirty: Held<FxHashSet<P::Fact>> = Held::default();
+        self.room(
+            charges,
+            &mut dirty,
+            proved.len().saturating_add(added.len()),
+        )?;
+        dirty.buf.extend(proved.iter().chain(added.iter()).copied());
+        let mut moved: Held<Vec<P::Fact>> = Held::default();
+        self.produce(cx, max_bytes, charges, &mut moved, |p, cx, store, sink| {
+            p.moved(cx, store, &|f| store.record(f), sink)
+        })?;
+        let mut stack: Held<Vec<P::Fact>> = Held::default();
+        self.room(
+            charges,
+            &mut stack,
+            moved.len().saturating_add(proved.len()),
+        )?;
         {
             let store = &self.store;
-            self.program
-                .moved(cx, store, &|f| store.record(f), &mut moved)?;
+            stack.buf.extend(
+                moved
+                    .iter()
+                    .copied()
+                    .filter(|f| store.contains(f))
+                    .chain(proved.iter().copied()),
+            );
         }
-        let mut stack: Vec<P::Fact> = moved
-            .into_iter()
-            .filter(|f| self.store.contains(f))
-            .chain(proved.iter().copied())
-            .collect();
-        let mut seen: FxHashSet<P::Fact> = FxHashSet::default();
-        while let Some(f) = stack.pop() {
-            if !seen.insert(f) {
+        self.free(charges, moved);
+        let mut seen: Held<FxHashSet<P::Fact>> = Held::default();
+        while let Some(f) = stack.buf.pop() {
+            self.room(charges, &mut seen, 1)?;
+            if !seen.buf.insert(f) {
                 continue;
             }
-            dirty.insert(f);
+            self.room(charges, &mut dirty, 1)?;
+            dirty.buf.insert(f);
             self.program.tick(cx)?;
             self.produce(cx, max_bytes, charges, &mut found, |p, cx, store, sink| {
                 p.consequences(cx, store, Which::New, &f, &|x| store.contains(x), sink)
             })?;
-            for (g, r) in found.drain(..) {
+            for (g, r) in found.buf.drain(..) {
                 if self.store.record(&g) == Some(r) {
-                    stack.push(g);
+                    self.room(charges, &mut stack, 1)?;
+                    stack.buf.push(g);
                 }
             }
         }
-        let anns = self.annotate(cx, &dirty, max_bytes)?.unwrap_or_default();
-        let fresh: FxHashSet<P::Fact> = added.iter().copied().collect();
-        for f in dirty {
+        self.free(charges, stack);
+        self.free(charges, seen);
+        self.free(charges, found);
+        let anns = self
+            .annotate(cx, charges, &dirty, max_bytes)?
+            .unwrap_or_default();
+        let mut fresh: Held<FxHashSet<P::Fact>> = Held::default();
+        self.room(charges, &mut fresh, added.len())?;
+        fresh.buf.extend(added.iter().copied());
+        for &f in dirty.iter() {
             let Some(a) = anns.get(&f).cloned() else {
                 continue;
             };
@@ -1330,14 +1567,15 @@ impl<P: Program> FixedPoint<P> {
                 continue;
             }
             self.store_ann(f, a);
-            out.push(Change {
+            self.room(charges, &mut out, 1)?;
+            out.buf.push(Change {
                 fact: f,
                 weight,
                 ann: Some(d),
             });
         }
         self.check(max_bytes, 0)?;
-        Ok(out)
+        Ok(out.buf)
     }
 
     /// Write the facts with their records, then their annotations in the same order.
@@ -1388,3 +1626,7 @@ impl<P: Program> FixedPoint<P> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "fixpoint_unit_tests.rs"]
+mod tests;

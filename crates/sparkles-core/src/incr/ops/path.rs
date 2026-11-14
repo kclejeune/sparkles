@@ -333,14 +333,14 @@ impl Program for Closure {
         &mut self,
         p: &mut Pass,
         _store: &HashStore<Fact, Id>,
-        out: &mut Sink<'_, Fact, Id, Error>,
+        out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
         self.ensure(p);
         match self.start {
             Some(_) => {
                 if let Some(s) = self.cache.start {
                     for f in self.rows(p, Which::New, Some(s), None, Id::UNDEF)? {
-                        out.push(f, Id::UNDEF)?;
+                        out.push((f, Id::UNDEF))?;
                     }
                 }
             }
@@ -358,7 +358,7 @@ impl Program for Closure {
                             continue;
                         }
                         let g = s.g.map_or(Id::UNDEF, |gp| r[gp]);
-                        out.push([g, a, b], Id::UNDEF)?;
+                        out.push(([g, a, b], Id::UNDEF))?;
                     }
                 }
             }
@@ -373,11 +373,11 @@ impl Program for Closure {
         w: Which,
         f: &Fact,
         _held: &dyn Fn(&Fact) -> bool,
-        out: &mut Sink<'_, Fact, Id, Error>,
+        out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
         let [g, s, y] = *f;
         for &b in self.next(p, w, true, g, y)?.iter() {
-            out.push([g, s, b], y)?;
+            out.push(([g, s, b], y))?;
         }
         Ok(())
     }
@@ -406,7 +406,7 @@ impl Program for Closure {
         p: &mut Pass,
         _store: &HashStore<Fact, Id>,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
-        out: &mut Vec<Fact>,
+        out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
         for (g, a, b, old, new) in self.edges(p)? {
             if !old || new {
@@ -415,8 +415,8 @@ impl Program for Closure {
             for &s in self.starts(p, Which::Old, g, a)?.iter() {
                 let f = [g, s, b];
                 match recorded(&f) {
-                    Some(r) if r.is_undef() && s == a => out.push(f),
-                    Some(r) if r == a => out.push(f),
+                    Some(r) if r.is_undef() && s == a => out.push(f)?,
+                    Some(r) if r == a => out.push(f)?,
                     _ => {}
                 }
             }
@@ -429,7 +429,7 @@ impl Program for Closure {
         p: &mut Pass,
         _store: &HashStore<Fact, Id>,
         held: &dyn Fn(&Fact) -> bool,
-        out: &mut Sink<'_, Fact, Id, Error>,
+        out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
         for (g, a, b, old, new) in self.edges(p)? {
             if old || !new {
@@ -437,9 +437,9 @@ impl Program for Closure {
             }
             for &s in self.starts(p, Which::New, g, a)?.iter() {
                 if s == a {
-                    out.push([g, s, b], Id::UNDEF)?;
+                    out.push(([g, s, b], Id::UNDEF))?;
                 } else if held(&[g, s, a]) {
-                    out.push([g, s, b], a)?;
+                    out.push(([g, s, b], a))?;
                 }
             }
         }
@@ -451,7 +451,7 @@ impl Program for Closure {
         p: &mut Pass,
         _store: &HashStore<Fact, Id>,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
-        out: &mut Vec<Fact>,
+        out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
         for (g, a, b, old, new) in self.edges(p)? {
             if !(old && new) {
@@ -463,8 +463,8 @@ impl Program for Closure {
             for &s in self.starts(p, Which::New, g, a)?.iter() {
                 let f = [g, s, b];
                 match recorded(&f) {
-                    Some(r) if r.is_undef() && s == a => out.push(f),
-                    Some(r) if r == a => out.push(f),
+                    Some(r) if r.is_undef() && s == a => out.push(f)?,
+                    Some(r) if r == a => out.push(f)?,
                     _ => {}
                 }
             }

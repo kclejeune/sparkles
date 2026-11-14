@@ -153,10 +153,14 @@ impl IndexedStore {
         }
     }
 
-    /// The facts that match `pat` under `b`.
-    fn candidates(&self, pat: &[R; 3], b: &[Id; MAX_VARS]) -> Vec<Triple> {
+    /// The facts that match `pat` under `b`, read from the index without a copy.
+    fn candidates<'a>(
+        &'a self,
+        pat: &[R; 3],
+        b: &[Id; MAX_VARS],
+    ) -> Box<dyn Iterator<Item = Triple> + 'a> {
         if pat.iter().any(|r| matches!(r, R::Never)) {
-            return Vec::new();
+            return Box::new(std::iter::empty());
         }
         let (s, p, o) = (
             RuleProgram::value(&pat[0], b),
@@ -164,39 +168,38 @@ impl IndexedStore {
             RuleProgram::value(&pat[2], b),
         );
         match (s, p, o) {
-            (Some(s), Some(p), Some(o)) => {
-                if self.ps.get(&(p, s)).is_some_and(|x| x.contains(&o)) {
-                    vec![[s, p, o]]
-                } else {
-                    vec![]
-                }
-            }
-            (Some(s), Some(p), None) => self
-                .ps
-                .get(&(p, s))
-                .map(|x| x.iter().map(|&o| [s, p, o]).collect())
-                .unwrap_or_default(),
-            (None, Some(p), Some(o)) => self
-                .po
-                .get(&(p, o))
-                .map(|x| x.iter().map(|&s| [s, p, o]).collect())
-                .unwrap_or_default(),
-            (_, Some(p), _) => self
-                .by_p
-                .get(&p)
-                .map(|x| {
-                    x.iter()
-                        .filter(|(xs, xo)| s.is_none_or(|s| s == *xs) && o.is_none_or(|o| o == *xo))
-                        .map(|&(xs, xo)| [xs, p, xo])
-                        .collect()
-                })
-                .unwrap_or_default(),
-            (_, None, _) => self
-                .by_p
-                .iter()
-                .flat_map(|(&p, x)| x.iter().map(move |&(xs, xo)| [xs, p, xo]))
-                .filter(|t| s.is_none_or(|s| s == t[0]) && o.is_none_or(|o| o == t[2]))
-                .collect(),
+            (Some(s), Some(p), Some(o)) => Box::new(
+                self.ps
+                    .get(&(p, s))
+                    .is_some_and(|x| x.contains(&o))
+                    .then_some([s, p, o])
+                    .into_iter(),
+            ),
+            (Some(s), Some(p), None) => Box::new(
+                self.ps
+                    .get(&(p, s))
+                    .into_iter()
+                    .flat_map(move |x| x.iter().map(move |&o| [s, p, o])),
+            ),
+            (None, Some(p), Some(o)) => Box::new(
+                self.po
+                    .get(&(p, o))
+                    .into_iter()
+                    .flat_map(move |x| x.iter().map(move |&s| [s, p, o])),
+            ),
+            (_, Some(p), _) => Box::new(self.by_p.get(&p).into_iter().flat_map(move |x| {
+                x.iter()
+                    .filter(move |(xs, xo)| {
+                        s.is_none_or(|s| s == *xs) && o.is_none_or(|o| o == *xo)
+                    })
+                    .map(move |&(xs, xo)| [xs, p, xo])
+            })),
+            (_, None, _) => Box::new(
+                self.by_p
+                    .iter()
+                    .flat_map(|(&p, x)| x.iter().map(move |&(xs, xo)| [xs, p, xo]))
+                    .filter(move |t| s.is_none_or(|s| s == t[0]) && o.is_none_or(|o| o == t[2])),
+            ),
         }
     }
 }
@@ -434,22 +437,18 @@ impl RuleProgram {
         ])
     }
 
-    /// Every binding that extends `b` to match the patterns `rest` with held facts.
+    /// Give `emit` every binding that extends `b` to match the patterns `rest` with
+    /// held facts, one at a time, until it returns `true`. Returns whether it stopped.
     fn solve(
         store: &IndexedStore,
         pats: &[[R; 3]],
         rest: &mut Vec<usize>,
         b: [Id; MAX_VARS],
         held: &dyn Fn(&Triple) -> bool,
-        first: bool,
-        out: &mut Vec<[Id; MAX_VARS]>,
-    ) {
-        if first && !out.is_empty() {
-            return;
-        }
+        emit: &mut dyn FnMut(&[Id; MAX_VARS]) -> sparkles_core::Result<bool>,
+    ) -> sparkles_core::Result<bool> {
         let Some(&i) = rest.last() else {
-            out.push(b);
-            return;
+            return emit(&b);
         };
         rest.pop();
         for t in store.candidates(&pats[i], &b) {
@@ -458,10 +457,17 @@ impl RuleProgram {
             }
             let mut nb = b;
             if Self::bind(&pats[i], &t, &mut nb) {
-                Self::solve(store, pats, rest, nb, held, first, out);
+                match Self::solve(store, pats, rest, nb, held, emit) {
+                    Ok(false) => {}
+                    other => {
+                        rest.push(i);
+                        return other;
+                    }
+                }
             }
         }
         rest.push(i);
+        Ok(false)
     }
 
     fn explicit(cx: &RuleCx, w: Which, t: &Triple) -> sparkles_core::Result<bool> {
@@ -483,9 +489,8 @@ impl RuleProgram {
         store: &IndexedStore,
         f: &Triple,
         held: &dyn Fn(&Triple) -> bool,
-        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+        out: &mut Sink<'_, (Triple, Record), sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
-        let mut sols = Vec::new();
         for (ri, (body, head)) in self.resolved.iter().enumerate() {
             for i in 0..body.len() {
                 let mut b = [Id::UNDEF; MAX_VARS];
@@ -493,19 +498,20 @@ impl RuleProgram {
                     continue;
                 }
                 let mut rest: Vec<usize> = (0..body.len()).filter(|&j| j != i).collect();
-                sols.clear();
-                Self::solve(store, body, &mut rest, b, held, false, &mut sols);
-                for vars in &sols {
+                // each binding goes into the sink as it is found, so a large fan-out
+                // fails while it is produced
+                Self::solve(store, body, &mut rest, b, held, &mut |vars| {
                     let rec = Record {
                         rule: ri as u32,
                         vars: *vars,
                     };
                     for h in head {
                         if let Some(t) = Self::instance(h, vars) {
-                            out.push(t, rec)?;
+                            out.push((t, rec))?;
                         }
                     }
-                }
+                    Ok(false)
+                })?;
             }
         }
         Ok(())
@@ -523,7 +529,6 @@ impl RuleProgram {
         if Self::explicit(cx, Which::New, f)? {
             return Ok(Some(Record::EXPLICIT));
         }
-        let mut sols = Vec::new();
         for (ri, (body, head)) in self.resolved.iter().enumerate() {
             for h in head {
                 let mut b = [Id::UNDEF; MAX_VARS];
@@ -531,12 +536,15 @@ impl RuleProgram {
                     continue;
                 }
                 let mut rest: Vec<usize> = (0..body.len()).collect();
-                sols.clear();
-                Self::solve(store, body, &mut rest, b, held, true, &mut sols);
-                if let Some(vars) = sols.first() {
+                let mut first = None;
+                Self::solve(store, body, &mut rest, b, held, &mut |vars| {
+                    first = Some(*vars);
+                    Ok(true)
+                })?;
+                if let Some(vars) = first {
                     return Ok(Some(Record {
                         rule: ri as u32,
-                        vars: *vars,
+                        vars,
                     }));
                 }
             }
@@ -576,10 +584,10 @@ impl Program for RuleProgram {
         &mut self,
         cx: &mut RuleCx,
         _store: &IndexedStore,
-        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+        out: &mut Sink<'_, (Triple, Record), sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         cx.new.for_each_quad_in(&[Id::DEFAULT_GRAPH.0], |q| {
-            out.push([q[0], q[1], q[2]], Record::EXPLICIT)
+            out.push(([q[0], q[1], q[2]], Record::EXPLICIT))
         })
     }
 
@@ -590,7 +598,7 @@ impl Program for RuleProgram {
         _w: Which,
         f: &Triple,
         held: &dyn Fn(&Triple) -> bool,
-        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+        out: &mut Sink<'_, (Triple, Record), sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         self.instances_of(store, f, held, out)
     }
@@ -610,11 +618,11 @@ impl Program for RuleProgram {
         cx: &mut RuleCx,
         _store: &IndexedStore,
         recorded: &dyn Fn(&Triple) -> Option<Record>,
-        out: &mut Vec<Triple>,
+        out: &mut Sink<'_, Triple, sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         for t in cx.removed {
             if recorded(t).is_some_and(|r| r.is_explicit()) {
-                out.push(*t);
+                out.push(*t)?;
             }
         }
         Ok(())
@@ -625,10 +633,10 @@ impl Program for RuleProgram {
         cx: &mut RuleCx,
         _store: &IndexedStore,
         _held: &dyn Fn(&Triple) -> bool,
-        out: &mut Sink<'_, Triple, Record, sparkles_core::Error>,
+        out: &mut Sink<'_, (Triple, Record), sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
         for t in cx.added {
-            out.push(*t, Record::EXPLICIT)?;
+            out.push((*t, Record::EXPLICIT))?;
         }
         Ok(())
     }
