@@ -342,6 +342,21 @@ pub enum Item {
     Term(Term),
 }
 
+/// One item of an incoming batch whose reader keeps the batch's terms, such as a batch
+/// of probes: a term arrives once, and a repeat names it by its index among the terms
+/// written in full at the top level.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Indexed {
+    /// a wildcard
+    None,
+    DefaultGraph,
+    UnionGraph,
+    /// a term written in full, which takes the next index
+    First(Term),
+    /// the term at this index
+    Repeat(usize),
+}
+
 /// Reads the terms of an incoming batch. `resolve` maps a blank node label the caller
 /// sent to the stored label it stands for, if any (the binding's label table).
 pub struct Reader<'a> {
@@ -429,6 +444,30 @@ impl<'a> Reader<'a> {
                 let t = self.term_of(tag)?;
                 self.seen.push(at);
                 Item::Term(t)
+            }
+        })
+    }
+
+    /// The next item of the batch, for a caller that keeps the terms it has read. A
+    /// repeat is not decoded again.
+    pub fn indexed(&mut self) -> Result<Indexed, Malformed> {
+        let tag = self.byte()?;
+        Ok(match tag {
+            NONE => Indexed::None,
+            DEFAULT_GRAPH => Indexed::DefaultGraph,
+            UNION_GRAPH => Indexed::UnionGraph,
+            REPEAT => {
+                let i = self.len()? as usize;
+                if i >= self.seen.len() {
+                    return Err(bad(format!("repeat of term {i}, which is not there")));
+                }
+                Indexed::Repeat(i)
+            }
+            _ => {
+                let at = self.pos - 1;
+                let t = self.term_of(tag)?;
+                self.seen.push(at);
+                Indexed::First(t)
             }
         })
     }

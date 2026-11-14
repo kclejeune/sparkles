@@ -15,6 +15,7 @@ import org.apache.jena.rdf.model.ModelFactory
 import org.apache.jena.riot.RDFDataMgr
 import org.apache.jena.sparql.core.DatasetGraph
 import org.apache.jena.sparql.core.DatasetGraphFactory
+import org.apache.jena.sparql.core.Quad
 import org.apache.jena.sparql.core.Var
 import org.apache.jena.sparql.exec.QueryExec
 import org.apache.jena.sparql.util.Context
@@ -241,6 +242,14 @@ internal object BindingsBench {
         val model = ModelFactory.createModelForGraph(graph)
         val subjects = cfg.subjects.map(::iri)
         val probes = cfg.probes.map { (s, p, o) -> Triple.create(iri(s), iri(p), iri(o)) }
+
+        /** The probes of a batched lookup, `-Dsparkles.bench.batch` of them (64 by default). */
+        private val batchSize = Integer.getInteger("sparkles.bench.batch", 64)
+        private val batches: List<List<Triple>> = probes.indices.step(batchSize).map { at ->
+            (0 until batchSize).map { probes[(at + it) % probes.size] }
+        }
+
+        fun probeBatch(i: Int): List<Triple> = batches[i % batches.size]
         val name: Node = iri(FOAF_NAME)
         val nameProp = model.createProperty(FOAF_NAME)
         // -Dsparkles.bench.streaming=false measures eager execution, and true a cursor for
@@ -467,6 +476,18 @@ internal object BindingsBench {
                     st?.string?.length?.toLong() ?: 0L
                 }
                 "op-contains" -> if (ops.graph.contains(ops.probes[i % ops.probes.size])) 1L else 0L
+                // A batch of probes in one operation, whose time the report divides by the
+                // batch. Sparkles answers it in one call, and the other engines one by one.
+                "op-containsAll" -> {
+                    val batch = ops.probeBatch(i)
+                    var n = 0L
+                    if (dsg is DatasetGraphSparkles) {
+                        for (found in dsg.containsAll(Quad.defaultGraphIRI, batch)) if (found) n++
+                    } else {
+                        for (t in batch) if (ops.graph.contains(t)) n++
+                    }
+                    n
+                }
                 "op-find-s" -> {
                     var n = 0L
                     val it = ops.graph.find(s, Node.ANY, Node.ANY)
@@ -614,7 +635,7 @@ internal object BindingsBench {
                         repeat(n) { smallQuery(ops, c) }
                         per(n.toLong())
                     }
-                    "sq-select-o", "sq-ask", "op-getProperty", "op-contains", "op-find-s" -> {
+                    "sq-select-o", "sq-ask", "op-getProperty", "op-contains", "op-containsAll", "op-find-s" -> {
                         smallOp(ops, c.kind, 0)
                         mark()
                         for (i in 1..n) smallOp(ops, c.kind, i)

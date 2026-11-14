@@ -4,9 +4,9 @@ import java.nio.ByteBuffer
 
 /**
  * Hand-written JNI calls for the reads that small requests make most often (P04 §5.4):
- * beginning a read transaction, `contains`, `find` and its cursor's later batches, and
- * preparing and executing a query, each on the head snapshot or in a read transaction,
- * and freeing the read transactions, queries and cursors these make.
+ * beginning a read transaction, `contains` and its batched form, `find` and its cursor's
+ * later batches, and preparing and executing a query, each on the head snapshot or in a
+ * read transaction, and freeing the read transactions, queries and cursors these make.
  *
  * A UniFFI call through JNA costs a few microseconds of dispatch, status records and
  * buffer structures, and a method call also clones the object's handle in a call of its
@@ -27,7 +27,7 @@ import java.nio.ByteBuffer
  */
 public object SparklesJni {
     /** The entry points' version, which `jni_calls.rs` must return. */
-    private const val ABI_VERSION = 3
+    private const val ABI_VERSION = 4
 
     private val groups: Set<String> = System.getProperty("sparkles.jni")?.trim()?.lowercase().let { p ->
         when (p) {
@@ -101,6 +101,19 @@ public object SparklesJni {
         if (!CONTAINS) return t.contains(pattern)
         // counted native call
         return t.uniffiBorrowHandle { jni { containsRead(it, pattern) } }
+    }
+
+    /** The answers of a batch of probes, one byte per pattern, through JNI when the `contains` group is on. */
+    public fun containsAll(ds: FfiDataset, patterns: ByteArray): ByteArray {
+        if (!CONTAINS) return ds.containsAll(patterns)
+        // counted native call
+        return ds.uniffiBorrowHandle { jni { containsAllHead(it, patterns) } }
+    }
+
+    public fun containsAll(t: FfiReadTxn, patterns: ByteArray): ByteArray {
+        if (!CONTAINS) return t.containsAll(patterns)
+        // counted native call
+        return t.uniffiBorrowHandle { jni { containsAllRead(it, patterns) } }
     }
 
     public fun find(ds: FfiDataset, pattern: ByteArray, firstRows: Int): FindResult {
@@ -208,6 +221,8 @@ public object SparklesJni {
     @JvmStatic private external fun rdfsEnabledNative(dataset: Long): Boolean
     @JvmStatic private external fun containsHead(dataset: Long, pattern: ByteArray): Boolean
     @JvmStatic private external fun containsRead(txn: Long, pattern: ByteArray): Boolean
+    @JvmStatic private external fun containsAllHead(dataset: Long, patterns: ByteArray): ByteArray
+    @JvmStatic private external fun containsAllRead(txn: Long, patterns: ByteArray): ByteArray
     @JvmStatic private external fun findHead(dataset: Long, pattern: ByteArray, firstRows: Int, out: LongArray): ByteArray
     @JvmStatic private external fun findRead(txn: Long, pattern: ByteArray, firstRows: Int, out: LongArray): ByteArray
     @JvmStatic private external fun cursorNext(cursor: Long, maxRows: Int, out: LongArray): ByteArray

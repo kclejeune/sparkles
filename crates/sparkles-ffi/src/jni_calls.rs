@@ -30,7 +30,7 @@ use uniffi::{Handle, HandleAlloc, Lift, Lower};
 
 /// Changes when an entry point's signature changes; the Kotlin side checks it before it
 /// turns these calls on.
-const ABI_VERSION: jint = 3;
+const ABI_VERSION: jint = 4;
 
 type Env = *mut JNIEnv;
 
@@ -233,6 +233,36 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     call(env, false, || {
         let t = unsafe { borrow::<FfiReadTxn>(txn) };
         t.contains(unsafe { read_bytes(env, pattern) })
+    })
+}
+
+/// The answers of a batch of probes on the head snapshot, one byte per pattern.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_SparklesJni_containsAllHead(
+    env: Env,
+    _class: jclass,
+    dataset: jlong,
+    patterns: jbyteArray,
+) -> jbyteArray {
+    call(env, null_mut(), || {
+        let ds = unsafe { borrow::<FfiDataset>(dataset) };
+        let found = ds.contains_all(unsafe { read_bytes(env, patterns) })?;
+        Ok(unsafe { new_bytes(env, &found) })
+    })
+}
+
+/// The answers of a batch of probes in a read transaction, one byte per pattern.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_SparklesJni_containsAllRead(
+    env: Env,
+    _class: jclass,
+    txn: jlong,
+    patterns: jbyteArray,
+) -> jbyteArray {
+    call(env, null_mut(), || {
+        let t = unsafe { borrow::<FfiReadTxn>(txn) };
+        let found = t.contains_all(unsafe { read_bytes(env, patterns) })?;
+        Ok(unsafe { new_bytes(env, &found) })
     })
 }
 
