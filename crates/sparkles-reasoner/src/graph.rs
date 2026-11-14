@@ -393,7 +393,8 @@ impl Graph {
                 let h = hash3(&t);
                 let tbl = &mut index[shard3(&t)];
                 if tbl.find(h, |&r| tier.eq(r, &t)).is_none() {
-                    m.add(tier.rel_growth(t[1]))?;
+                    let (rel_grow, rel_old) = tier.rel_growth(t[1]);
+                    m.add(rel_grow)?;
                     if tier.count() == tier.capacity() {
                         // the new buffers, while the old ones are alive
                         let old = tier.capacity();
@@ -413,6 +414,7 @@ impl Graph {
                     }
                     let id = tier.len();
                     tier.push(t);
+                    m.sub(rel_old);
                     tbl.insert_unique(h, id, |&r| hash3(&tier.triple(r)));
                 }
             }
@@ -780,8 +782,10 @@ impl Graph {
                     item += 1;
                 }
                 let t = outs[item][p - offsets[item]];
-                work.try_grow(self.tier.rel_growth(t[1]))?;
+                let (rel_grow, rel_old) = self.tier.rel_growth(t[1]);
+                work.try_grow(rel_grow)?;
                 self.tier.push(t);
+                work.shrink(rel_old);
                 w &= w - 1;
             }
         }

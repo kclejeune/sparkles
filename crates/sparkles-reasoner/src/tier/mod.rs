@@ -490,31 +490,37 @@ impl Tier {
             .map(|r| [r.s, self.preds[r.ri as usize], r.o])
     }
 
-    /// The bytes the relations and their table grow by when a fact with predicate `p`
-    /// is pushed: none when the predicate has a relation.
+    /// The bytes of the relation and predicate buffers and of the table that a fact with
+    /// predicate `p` makes grow when it is pushed, and the bytes of the buffers they
+    /// replace: none when the predicate has a relation. A moving growth allocates the
+    /// new buffers while the old ones are alive, so the caller charges the first before
+    /// the push and releases the second after it.
     #[inline]
-    pub fn rel_growth(&self, p: u64) -> usize {
+    pub fn rel_growth(&self, p: u64) -> (usize, usize) {
         if self.rel_of.contains_key(&p) {
-            return 0;
+            return (0, 0);
         }
-        let mut n = 0;
+        let (mut grow, mut old) = (0, 0);
         if self.rels.len() == self.rels.capacity() {
-            n += self.rels.capacity().max(4) * size_of::<Rel>();
+            grow += (self.rels.capacity() * 2).max(4) * size_of::<Rel>();
+            old += self.rels.capacity() * size_of::<Rel>();
         }
         if self.preds.len() == self.preds.capacity() {
-            n += self.preds.capacity().max(4) * size_of::<u64>();
+            grow += (self.preds.capacity() * 2).max(4) * size_of::<u64>();
+            old += self.preds.capacity() * size_of::<u64>();
         }
         if self.rel_of.len() == self.rel_of.capacity() {
-            n += table_bytes(
+            grow += table_bytes(
                 crate::budget::table_grown(self.rel_of.capacity(), self.rel_of.len(), 1),
                 size_of::<(u64, u32)>(),
             );
+            old += table_bytes(self.rel_of.capacity(), size_of::<(u64, u32)>());
         }
-        n
+        (grow, old)
     }
 
     /// Append a fact; the caller indexes it ([`index_new`](Self::index_new)) and
-    /// charges [`rel_growth`](Self::rel_growth) first.
+    /// charges [`rel_growth`](Self::rel_growth) first and releases its old bytes after.
     #[inline]
     pub fn push(&mut self, t: Triple) {
         let ri = match self.rel_of.get(&t[1]) {
@@ -975,6 +981,28 @@ fn set_bit(bits: &mut Vec<u64>, i: usize, on: bool) {
 mod tests {
     use super::*;
     use crate::budget::Budget;
+
+    /// A fact with a new predicate charges the relation and predicate buffers it grows
+    /// in full, since a moving growth allocates them while the old ones are alive, and
+    /// returns the old ones' bytes for release after the push.
+    #[test]
+    fn a_new_predicate_charges_the_whole_grown_buffers() {
+        let mut t = Tier::new(0);
+        for p in 1..=4u64 {
+            t.push([1, p, 2]);
+        }
+        let (rels, preds) = (t.rels.capacity(), t.preds.capacity());
+        assert_eq!((t.rels.len(), t.preds.len()), (rels, preds));
+        let (grow, old) = t.rel_growth(5);
+        let full = (rels * 2) * size_of::<Rel>() + (preds * 2) * size_of::<u64>();
+        assert!(grow >= full, "{grow} < {full}");
+        assert!(old >= rels * size_of::<Rel>() + preds * size_of::<u64>());
+        assert_eq!(t.rel_growth(4), (0, 0));
+        t.push([1, 5, 2]);
+        assert!(
+            t.rels.capacity() * size_of::<Rel>() + t.preds.capacity() * size_of::<u64>() <= grow
+        );
+    }
 
     fn tier(ts: &[Triple]) -> Tier {
         let mut t = Tier::new(0);
