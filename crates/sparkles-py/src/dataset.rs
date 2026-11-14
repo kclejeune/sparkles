@@ -10,8 +10,8 @@ use crate::results::{
     PyPatchStats, PyQuadIterator, PyQuerySolutions, PyQueryTriples, PyUpdateStats,
 };
 use crate::terms::{
-    PyVariable, graph_from_py, graph_to_py, iri_from_py, named_node_from_py, opt, quad_from_py,
-    subject_from_py, term_from_py,
+    PyQuad, PyVariable, graph_from_py, graph_to_py, iri_from_py, named_node_from_py, opt,
+    quad_from_py, subject_from_py, term_from_py,
 };
 use crate::txn::{PyTransaction, WriterSlot};
 use crate::{admin, interrupt};
@@ -27,6 +27,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+/// The longest batch that `Dataset.contains_all` answers on a dataset in memory without
+/// giving up the GIL. Its lookups take a few tens of microseconds in all.
+const CONTAINS_ALL_INLINE: usize = 256;
 
 pub use sparkles::reasoning::INFERRED_GRAPH;
 
@@ -1061,13 +1065,65 @@ impl PyDataset {
     }
 
     fn __contains__(&self, py: Python<'_>, quad: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let q = quad_from_py(quad)?;
+        // A `Quad` is read where it is. Anything else is converted first, which raises
+        // for a wrong type before the dataset's state is looked at.
+        let borrowed = quad.cast::<PyQuad>().ok();
+        let owned = match borrowed {
+            Some(_) => None,
+            None => Some(quad_from_py(quad)?),
+        };
         let ds = self.ds(py)?;
         // a lookup in memory takes less time than giving up the GIL and taking it back
         if ds.store().root().is_none() {
-            return ds.contains(q.as_ref()).py(py);
+            return match (&borrowed, &owned) {
+                (Some(q), _) => ds.contains(q.get().inner.as_ref()),
+                (None, Some(q)) => ds.contains(q.as_ref()),
+                (None, None) => unreachable!("a quad is borrowed or converted"),
+            }
+            .py(py);
         }
+        let q = match owned {
+            Some(q) => q,
+            None => quad_from_py(quad)?,
+        };
         py.detach(|| ds.contains(q.as_ref())).py(py)
+    }
+
+    /// Whether each quad is in the dataset, in the order given. Every answer is read
+    /// from one snapshot, and the call enters the engine once for the whole batch.
+    fn contains_all(&self, py: Python<'_>, quads: &Bound<'_, PyAny>) -> PyResult<Vec<bool>> {
+        // A `Quad` is read where it is, and anything else is converted first.
+        enum Probe {
+            Borrowed(Py<PyQuad>),
+            Owned(Quad),
+        }
+        impl Probe {
+            fn quad(&self) -> oxrdf::QuadRef<'_> {
+                match self {
+                    Probe::Borrowed(q) => q.get().inner.as_ref(),
+                    Probe::Owned(q) => q.as_ref(),
+                }
+            }
+        }
+        let probes = quads
+            .try_iter()?
+            .map(|q| {
+                let q = q?;
+                Ok(match q.cast::<PyQuad>() {
+                    Ok(q) => Probe::Borrowed(q.clone().unbind()),
+                    Err(_) => Probe::Owned(quad_from_py(&q)?),
+                })
+            })
+            .collect::<PyResult<Vec<Probe>>>()?;
+        let ds = self.ds(py)?;
+        let answer = || ds.contains_all(probes.iter().map(Probe::quad));
+        // A few lookups in memory take less time than giving up the GIL and taking it
+        // back. A longer batch gives it up, so that other threads run meanwhile. The
+        // probes are dropped after the answer, with the GIL held.
+        if probes.len() <= CONTAINS_ALL_INLINE && ds.store().root().is_none() {
+            return answer().py(py);
+        }
+        py.detach(answer).py(py)
     }
 
     /// The number of quads.

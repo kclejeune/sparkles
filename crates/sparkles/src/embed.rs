@@ -112,6 +112,23 @@ pub fn count_in(snap: &Arc<Snapshot>, pattern: &QuadPattern) -> Result<u64> {
     Ok(n)
 }
 
+/// Whether `snap` has a quad. The default graph of the quad is the stored default graph,
+/// also on a snapshot that reads the default graph as the union of the named graphs. A
+/// probe for a term the snapshot does not know answers false without reading an index.
+pub fn contains_quad_in(snap: &Snapshot, quad: oxrdf::QuadRef<'_>) -> Result<bool> {
+    match crate::dataset::quad_ids(snap, quad) {
+        Some(ids) => snap.contains(&ids),
+        None => Ok(false),
+    }
+}
+
+/// The id of a term on `snap`, or `None` when the snapshot does not know the term, as a
+/// pattern read looks it up. A binding that probes many quads in one call looks each
+/// distinct term up once and passes the ids to [`Snapshot::contains`].
+pub fn term_id_in(snap: &Snapshot, term: oxrdf::TermRef<'_>) -> Option<Id> {
+    crate::lookup::term_id(snap, term)
+}
+
 /// Whether a pattern matches any quad on `snap`. Stops at the first match without
 /// decoding terms or counting the remaining matches, including in a union graph.
 pub fn contains_in(snap: &Arc<Snapshot>, pattern: &QuadPattern) -> Result<bool> {

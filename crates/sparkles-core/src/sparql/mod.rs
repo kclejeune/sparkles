@@ -1348,8 +1348,13 @@ pub fn select_star_order(q: &str, r: &mut QueryResult) -> Result<()> {
 
 fn is_select_star(q: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap())
-        .is_match(q)
+    // the expression needs a `*`, which most small queries do not have
+    q.contains('*')
+        && RE
+            .get_or_init(|| {
+                regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap()
+            })
+            .is_match(q)
 }
 
 fn select_star_columns_checked(

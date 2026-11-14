@@ -248,6 +248,23 @@ internal fun encodePattern(g: Node?, s: Node?, p: Node?, o: Node?): ByteArray {
     return w.buf.toByteArray()
 }
 
+/**
+ * Writes the patterns of a batch of probes one after another, each as [encodePattern]
+ * writes it. A term that an earlier pattern of the batch wrote is sent as a repeat.
+ */
+internal class PatternBatch(quads: Int) {
+    private val w = TermWriter(ByteBuf(maxOf(128, 16 * quads)))
+
+    fun add(g: Node?, s: Node?, p: Node?, o: Node?) {
+        w.graph(g)
+        w.slot(s)
+        w.slot(p)
+        w.slot(o)
+    }
+
+    fun toByteArray(): ByteArray = w.buf.toByteArray()
+}
+
 /** A batch of terms in the given order, `null` as tag 0. */
 internal fun encodeTerms(nodes: List<Node?>): ByteArray {
     val w = TermWriter(ByteBuf(64))

@@ -37,6 +37,7 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::{G, Key, O, P, Perm, S};
 use crate::io::{RdfSyntax, Source};
+use crate::lookup;
 use crate::reasoning::ReasoningRecord;
 use crate::sparql::rdfs::RdfsOnRead;
 use crate::sparql::update::UpdateStats;
@@ -44,7 +45,8 @@ use crate::sparql::{QueryKind, QueryOptions, QueryResult};
 use crate::store::{Snapshot, Store, StoreOptions, WriteTxn};
 use crate::write_guard::WriteGuard;
 use oxrdf::{
-    GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, QuadRef, Term, Triple, TripleRef,
+    GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad, QuadRef, Term,
+    Triple, TripleRef,
 };
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashSet;
@@ -1103,11 +1105,21 @@ impl Dataset {
     }
 
     pub fn contains(&self, quad: QuadRef<'_>) -> Result<bool> {
+        crate::embed::contains_quad_in(&self.inner.store.snapshot(), quad)
+    }
+
+    /// Whether each quad is in the dataset, in the order given. Every answer is read
+    /// from one snapshot, so the answers describe one state of the dataset, and a
+    /// binding crosses into the engine once for the whole batch.
+    pub fn contains_all<'a>(
+        &self,
+        quads: impl IntoIterator<Item = QuadRef<'a>>,
+    ) -> Result<Vec<bool>> {
         let snap = self.inner.store.snapshot();
-        match quad_ids(&snap, quad) {
-            Some(ids) => snap.contains(&ids),
-            None => Ok(false),
-        }
+        quads
+            .into_iter()
+            .map(|q| crate::embed::contains_quad_in(&snap, q))
+            .collect()
     }
 
     /// Number of quads in the dataset.
@@ -1909,23 +1921,28 @@ impl std::fmt::Debug for Solution {
 
 // ---------------------------------------------------------------------- matching ----
 
+// The ids of a pattern's terms come through `crate::lookup`, which remembers what the base
+// vocabulary answered for the terms a thread asked for last.
+
 fn subject_id(snap: &Snapshot, s: &NamedOrBlankNode) -> Option<Id> {
     match s {
-        NamedOrBlankNode::NamedNode(n) => snap.lookup_iri(n.as_str()),
+        NamedOrBlankNode::NamedNode(n) => lookup::iri_id(snap, n.as_str()),
         NamedOrBlankNode::BlankNode(b) => crate::store::parse_bnode_label(b.as_str()),
     }
 }
 
 pub(crate) fn quad_ids(snap: &Snapshot, q: QuadRef<'_>) -> Option<[Id; 4]> {
-    let q = q.into_owned();
     Some([
-        subject_id(snap, &q.subject)?,
-        snap.lookup_iri(q.predicate.as_str())?,
-        snap.lookup_term(&q.object)?,
-        match &q.graph_name {
-            GraphName::DefaultGraph => Id::DEFAULT_GRAPH,
-            GraphName::NamedNode(n) => snap.lookup_iri(n.as_str())?,
-            GraphName::BlankNode(b) => crate::store::parse_bnode_label(b.as_str())?,
+        match q.subject {
+            NamedOrBlankNodeRef::NamedNode(n) => lookup::iri_id(snap, n.as_str())?,
+            NamedOrBlankNodeRef::BlankNode(b) => crate::store::parse_bnode_label(b.as_str())?,
+        },
+        lookup::iri_id(snap, q.predicate.as_str())?,
+        lookup::term_id(snap, q.object)?,
+        match q.graph_name {
+            GraphNameRef::DefaultGraph => Id::DEFAULT_GRAPH,
+            GraphNameRef::NamedNode(n) => lookup::iri_id(snap, n.as_str())?,
+            GraphNameRef::BlankNode(b) => crate::store::parse_bnode_label(b.as_str())?,
         },
     ])
 }
@@ -1964,16 +1981,16 @@ pub(crate) fn scan_plan(
         bound[S] = Some(subject_id(snap, s)?.0);
     }
     if let Some(p) = predicate {
-        bound[P] = Some(snap.lookup_iri(p.as_str())?.0);
+        bound[P] = Some(lookup::iri_id(snap, p.as_str())?.0);
     }
     if let Some(o) = object {
-        bound[O] = Some(snap.lookup_term(o)?.0);
+        bound[O] = Some(lookup::term_id(snap, o.as_ref())?.0);
     }
     let default_is_union = snap.union_default_graph;
     let (graph_eq, named_only) = match graph {
         GraphSel::Default if default_is_union => (None, true),
         GraphSel::Default => (Some(Id::DEFAULT_GRAPH.0), false),
-        GraphSel::Named(n) => (Some(snap.lookup_iri(n.as_str())?.0), false),
+        GraphSel::Named(n) => (Some(lookup::iri_id(snap, n.as_str())?.0), false),
         GraphSel::Blank(b) => (Some(crate::store::parse_bnode_label(b.as_str())?.0), false),
         GraphSel::Union => (None, true),
         GraphSel::Any => (None, false),

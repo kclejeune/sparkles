@@ -1144,6 +1144,80 @@ retains both hashes, examples, every process sample and native provenance. The r
 `rustc` version is separate from the compiler that built the extension, and peak timed
 process RSS includes accumulated writes, so it is not a read-only memory measurement.
 
+### Per-call costs after the second pass
+
+A second look at item 33 profiled each call on a laptop at 105,302 triples with `perf`.
+The figures below come from atlas, on the same data. They compare builds of the source
+before and after the changes in six interleaved rounds of fresh processes pinned to
+four CPUs, and the spread of each case's rounds stayed under 5%.
+
+The search of the base vocabulary took 45% of `in` and 15% of a value lookup. Pattern
+reads now remember what the base vocabulary answered for the terms a thread asked for
+last, in 1,024 slots per thread that hold the whole key, and `in` reads a `Quad` where
+it is. `in` went from 0.95 to 0.50 µs, against 1.84 µs for pyoxigraph. A value lookup
+went from 1.84 to 1.65 µs against 1.21 µs, and a scan of a subject stayed at 9.3 to 9.4
+µs against 7.2 µs. The memo costs each thread that reads patterns about 115 KiB, and at
+most 320 KiB.
+
+The regular expression that renames generated variables in a result cache key took a
+fifth of a short property path query. A key that is all ASCII is now scanned by hand,
+and a key with other text still goes through the expression.
+`knows-reach` went from 26.4 to 20.2 µs. The `star-lookup`, `values-star` and
+`employee-docs` queries stayed within 1.5% of their earlier times. pyoxigraph was not
+run for `knows-reach` on atlas. On the laptop it took 19.0 µs against 15.7 µs for the
+changed build.
+
+A sync cursor handed out every row through the path of a fetch, which on Python's main
+thread is a helper thread. A fetch or a refill now decodes up to 255 further rows ahead
+in one detached call, stopping once they pass one mebibyte of text, and handing out a
+decoded row takes no work. A row on the main thread went from 2.75 to 1.61 µs, and a
+row on another thread from 1.71 to 1.40 µs, against 0.95 µs for a row of the eager
+`query`. The rows decoded ahead, about one mebibyte and one row at most, are held
+outside the query's memory budget until they are handed out. The async bridge decodes a
+batch in one detached call and no longer reads the plan with every batch. Its rows went
+from 2.07 to 1.92 µs, since the event loop's own work per row and the memory ledger
+dominate them.
+
+`Dataset.contains_all` answers a batch of membership tests in one call, from one
+snapshot. It reads a `Quad` where it is, and gives up the GIL for a batch longer than
+256 quads or a dataset on disk. On quads built beforehand, a probe in a batch of 64
+took 0.30 µs against 0.33 µs for `in`. With a `Quad` built for each probe, as the
+benchmark does, a probe took 0.47 µs against 0.50 µs for `in` and 1.84 µs for
+pyoxigraph. The batch saves little in Python because the lookup itself is most of an
+`in`, and the call is not.
+
+PyO3's reference pool takes a lock on every call into the extension once any call has
+released the GIL, which is 13% of a value lookup's samples and 20% of a subject scan's.
+A build with `--cfg pyo3_disable_reference_pool` has no pool. In interleaved runs on
+the laptop at a load of 34 to 38 it took 10% off `in`, 11% off a value lookup, 7% off a subject scan
+and 4% off a batched probe. It is not adopted, because without the pool a Python
+reference that is dropped while the GIL is not held aborts the process, and the
+extension has such drops. Five files of the test suite abort on that build:
+`test_dataset.py`, `test_file_object_loads.py`, `test_formats_tables_describe.py`,
+`test_handles.py` and `test_streaming.py`. The audit found these places, all in code
+that runs detached or on a thread of its own:
+
+* `PyFileReader` in `io.rs` holds the file object of a load, and the loader drops it
+  where it finishes, including on the thread that transcodes Jena's syntaxes.
+* `PyFileWriter` and `Output::File` in `io.rs` hold the file object of a dump or a
+  serialization and are dropped inside the detached write.
+* The reads and writes of those file objects wrap a Python exception in an I/O error,
+  which the engine may drop or pass between threads before it returns.
+* A stored query in `queries.rs` moves its dataset, its keyword arguments and its result
+  into the closure that `interrupt::controlled` runs.
+* A progress callback in `interrupt.rs` and the exception it raised are held by the
+  closure that an operation's thread calls.
+
+Adopting the build needs each of these wrapped so that its drop takes the GIL, the flag
+in every build of the extension, which are `scripts/py-test.sh`, the `py:build` task,
+`nix/python.nix`, the wheel workflow and the bindings benchmark, and the test suite run
+on the flagged build, where a drop that was missed aborts a test.
+
+Three costs remain under item 33. The reference pool's lock is the first. A cursor row
+passes the memory ledger once per cell, which is a third of its samples, where the
+result writers reserve once per row. The value lookup and the subject scan still trail
+pyoxigraph.
+
 ### Graph overview
 
 `Dataset.graph.groups(within, *, by=None, limit=None, at=None, ...)` binds the library's

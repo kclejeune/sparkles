@@ -254,6 +254,179 @@ fn write_read_and_query() {
     assert!(!ds.contains(pattern(G::Default, None, None, None)).unwrap());
 }
 
+/// Patterns one after another in one batch, as the JVM's writer sends a batch of probes:
+/// a term is written in full once and as a repeat of its position after that.
+fn probes(patterns: &[(G<'_>, Option<&Term>, Option<&Term>, Option<&Term>)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut seen: Vec<Term> = Vec::new();
+    let mut term = |b: &mut Vec<u8>, t: &Term| match seen.iter().position(|s| s == t) {
+        Some(i) => {
+            assert!(i < 128, "the test writes a repeat's position in one byte");
+            b.extend([crate::encode::REPEAT, i as u8]);
+        }
+        None => {
+            write_term(b, t, &|_| None);
+            seen.push(t.clone());
+        }
+    };
+    for (g, s, p, o) in patterns {
+        match g {
+            G::Any => b.push(NONE),
+            G::Default => b.push(DEFAULT_GRAPH),
+            G::Union => b.push(UNION_GRAPH),
+            G::Named(t) => term(&mut b, t),
+        }
+        for t in [s, p, o] {
+            match t {
+                None => b.push(NONE),
+                Some(t) => term(&mut b, t),
+            }
+        }
+    }
+    b
+}
+
+/// `contains_all` answers each pattern of a batch as `contains` answers it alone, on the
+/// head, in a read transaction and in a write transaction's view, whether a term is
+/// written in full or as a repeat.
+#[test]
+fn contains_all_answers_each_pattern_as_contains_does() {
+    let ds = FfiDataset::memory(opts(BlankNodeMode::Dataset));
+    let g = iri("g");
+    let x = bnode("jena-made-1");
+    let lit: Term = Literal::from(1).into();
+    let tagged: Term = Literal::new_language_tagged_literal_unchecked("chat", "fr").into();
+    let triple: Term = oxrdf::Triple::new(
+        NamedNode::new_unchecked("http://ex.org/s0"),
+        NamedNode::new_unchecked("http://ex.org/p"),
+        lit.clone(),
+    )
+    .into();
+    let w = ds.begin_write(None, true).unwrap().unwrap();
+    let mut b = Vec::new();
+    op(&mut b, true, None, &iri("s0"), &iri("p"), &lit);
+    op(&mut b, true, None, &iri("s1"), &iri("p"), &tagged);
+    op(&mut b, true, Some(&g), &iri("s0"), &iri("p"), &lit);
+    op(&mut b, true, Some(&g), &x, &iri("q"), &iri("o"));
+    op(&mut b, true, Some(&g), &iri("s1"), &iri("q"), &triple);
+    op(&mut b, true, Some(&x), &iri("s2"), &iri("p"), &iri("o"));
+    w.apply(b).unwrap();
+    w.commit().unwrap();
+
+    let default_iri: Term = NamedNode::new_unchecked(crate::encode::DEFAULT_GRAPH_IRI).into();
+    let union_iri: Term = NamedNode::new_unchecked(crate::encode::UNION_GRAPH_IRI).into();
+    let (s0, s1, s2, p, q, o) = (
+        iri("s0"),
+        iri("s1"),
+        iri("s2"),
+        iri("p"),
+        iri("q"),
+        iri("o"),
+    );
+    let missing = iri("missing");
+    let patterns = [
+        // quads that are there, in each kind of graph and with each kind of term
+        (G::Default, Some(&s0), Some(&p), Some(&lit)),
+        (G::Default, Some(&s1), Some(&p), Some(&tagged)),
+        (G::Named(&g), Some(&s0), Some(&p), Some(&lit)),
+        (G::Named(&g), Some(&x), Some(&q), Some(&o)),
+        (G::Named(&g), Some(&s1), Some(&q), Some(&triple)),
+        (G::Named(&x), Some(&s2), Some(&p), Some(&o)),
+        (G::Named(&default_iri), Some(&s0), Some(&p), Some(&lit)),
+        (G::Named(&union_iri), Some(&s1), Some(&q), Some(&triple)),
+        (G::Union, Some(&s0), Some(&p), Some(&lit)),
+        (G::Any, Some(&s1), Some(&p), Some(&tagged)),
+        // quads that are not: the other graph, and a term the dataset does not know in
+        // each position
+        (G::Named(&g), Some(&s1), Some(&p), Some(&tagged)),
+        (G::Default, Some(&x), Some(&q), Some(&o)),
+        (G::Union, Some(&s1), Some(&p), Some(&tagged)),
+        (G::Named(&missing), Some(&s0), Some(&p), Some(&lit)),
+        (G::Default, Some(&missing), Some(&p), Some(&lit)),
+        (G::Default, Some(&s0), Some(&missing), Some(&lit)),
+        (G::Default, Some(&s0), Some(&p), Some(&missing)),
+        (G::Named(&g), Some(&bnode("unknown")), Some(&q), Some(&o)),
+        // terms of a kind that cannot be in their position
+        (G::Default, Some(&lit), Some(&p), Some(&lit)),
+        (G::Default, Some(&s0), Some(&lit), Some(&lit)),
+        (G::Default, Some(&s0), Some(&x), Some(&lit)),
+        (G::Named(&lit), Some(&s0), Some(&p), Some(&lit)),
+        // patterns with wildcards
+        (G::Any, None, None, None),
+        (G::Named(&g), None, Some(&q), None),
+        (G::Union, Some(&s2), None, None),
+        (G::Default, Some(&s2), None, None),
+        (G::Any, Some(&missing), None, None),
+        // a repeat of the first quad
+        (G::Default, Some(&s0), Some(&p), Some(&lit)),
+    ];
+    let batch = probes(&patterns);
+    let alone = |contains: &dyn Fn(Vec<u8>) -> bool| -> Vec<u8> {
+        patterns
+            .iter()
+            .map(|(g, s, p, o)| {
+                let g = match g {
+                    G::Any => G::Any,
+                    G::Default => G::Default,
+                    G::Union => G::Union,
+                    G::Named(t) => G::Named(t),
+                };
+                u8::from(contains(pattern(g, *s, *p, *o)))
+            })
+            .collect()
+    };
+    let expected = alone(&|pat| ds.contains(pat).unwrap());
+    assert_eq!(ds.contains_all(batch.clone()).unwrap(), expected);
+    assert_eq!(
+        expected,
+        [
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1
+        ]
+    );
+    assert_eq!(ds.contains_all(Vec::new()).unwrap(), Vec::<u8>::new());
+
+    // a read transaction answers from its snapshot, and a write transaction from its view
+    let rt = ds.begin_read();
+    let w = ds.begin_write(None, true).unwrap().unwrap();
+    assert_eq!(
+        w.remove_matching(pattern(G::Default, None, None, None))
+            .unwrap(),
+        2
+    );
+    let in_write = alone(&|pat| w.contains(pat).unwrap());
+    assert_ne!(in_write, expected);
+    assert_eq!(w.contains_all(batch.clone()).unwrap(), in_write);
+    assert_eq!(rt.contains_all(batch.clone()).unwrap(), expected);
+    assert_eq!(ds.contains_all(batch.clone()).unwrap(), expected);
+    w.commit().unwrap();
+    assert_eq!(rt.contains_all(batch.clone()).unwrap(), expected);
+    assert_eq!(ds.contains_all(batch.clone()).unwrap(), in_write);
+
+    // a batch that ends inside a pattern, and a repeat of a term that is not there
+    let mut cut = batch.clone();
+    cut.pop();
+    assert!(ds.contains_all(cut).is_err());
+    assert!(ds.contains_all(vec![DEFAULT_GRAPH]).is_err());
+    assert!(
+        ds.contains_all(vec![crate::encode::REPEAT, 0, NONE, NONE, NONE])
+            .is_err()
+    );
+    // A repeat whose position is 2^64, written in ten bytes, names no term. It must not
+    // be read as position 0 with the upper bits dropped.
+    let mut overlong = Vec::new();
+    quad_items(&mut overlong, None, &s0, &p, &lit);
+    let first = overlong.len();
+    overlong.push(DEFAULT_GRAPH);
+    overlong.push(crate::encode::REPEAT);
+    overlong.extend([0x80; 9]);
+    overlong.push(0x02);
+    overlong.extend([crate::encode::REPEAT, 1, crate::encode::REPEAT, 2]);
+    assert!(ds.contains_all(overlong.clone()).is_err());
+    // the same batch with the position written in one byte is two probes
+    overlong.splice(first + 2..first + 12, [0]);
+    assert_eq!(ds.contains_all(overlong).unwrap(), vec![0, 0]);
+}
+
 #[test]
 fn blank_node_labels() {
     for mode in [BlankNodeMode::Dataset, BlankNodeMode::Transaction] {

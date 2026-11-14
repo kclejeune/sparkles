@@ -308,6 +308,32 @@ class FacadeTests(unittest.IsolatedAsyncioTestCase):
         await cursor.aclose()
         await dataset.aclose()
 
+    async def test_failed_cursor_close_keeps_the_plan_of_the_last_batch(self) -> None:
+        dataset = self.aio.Dataset()
+        cursor = await dataset.select_cursor("rows", batch_rows=2)
+        native = self.factory.datasets[0].last_cursor
+        plans = 0
+
+        def plan() -> dict[str, Any]:
+            nonlocal plans
+            plans += 1
+            return {"materializes": False, "fetches": native.fetches}
+
+        def close() -> None:
+            raise NativeInvalid("close failed")
+
+        native.plan = plan
+        self.assertEqual(await anext(cursor), "one")
+        self.assertEqual(await anext(cursor), "two")
+        # a batch reads the statistics that `status` uses, and not the plan
+        self.assertEqual(plans, 0)
+        self.assertEqual(cursor.status, "open")
+        native.close = close
+        with self.assertRaisesRegex(ValueError, "close failed"):
+            await cursor.aclose()
+        self.assertEqual(await cursor.plan(), {"materializes": False, "fetches": 1})
+        await dataset.aclose()
+
     async def test_async_cursor_context_early_break_preserves_caller_token(
         self,
     ) -> None:
