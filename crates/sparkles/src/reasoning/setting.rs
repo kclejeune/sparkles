@@ -233,6 +233,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "reasoning")]
     fn settings_are_checked() {
         let ok = QuerySetting {
             default: Some("auto".into()),

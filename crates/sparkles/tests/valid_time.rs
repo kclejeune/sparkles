@@ -981,7 +981,7 @@ mod availability {
                     "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{CLAIMS}> {{ ?s ?p ?o }} }}"
                 ))
                 .unwrap();
-            let nt: String = graph.triples.iter().map(|t| format!("{t} .\n")).collect();
+            let nt: String = graph.triples().iter().map(|t| format!("{t} .\n")).collect();
             assert!(nt.contains("valid-time:validDuring"), "{nt}");
             assert!(conforms(&nt), "{nt}");
         }
