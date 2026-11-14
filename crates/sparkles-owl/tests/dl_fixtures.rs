@@ -266,14 +266,13 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
     }
 }
 
-/// The counting cases that pass Tier D's bound on derived conclusions: each run, on one,
+/// The counting case that passes Tier D's bound on derived conclusions: each run, on one,
 /// four and eight threads and with either strategy, passes it and classifies again without
 /// counting, and these runs give one answer. `shiq-028` passes the bound with the order
-/// between number restrictions, which is the default, and without it. `shq-041` passes it
-/// only without the order, and `tests/dl_number_order.rs` holds its answer with the order.
+/// between number restrictions, which is the default, and without it.
 #[test]
 fn the_cases_past_the_bound_fall_back_on_every_schedule() {
-    for (stem, number_order) in [("shq-041", false), ("shiq-028", false), ("shiq-028", true)] {
+    for (stem, number_order) in [("shiq-028", false), ("shiq-028", true)] {
         let path = fixtures().join(format!("{stem}.ofn"));
         let doc = ofn_read::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mut classes: Vec<Class> = doc
@@ -320,6 +319,146 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
             1,
             "{stem}, order {number_order}: the answer depends on the schedule"
         );
+    }
+}
+
+/// The generated ontologies of roadmap item 897, whose number restrictions have compound
+/// qualifiers: `tests/fixtures/dl897/generate.py` wrote 300 with its default seed, and
+/// these are the 25 on which a run that gave such a qualifier no name reported an answer
+/// other than HermiT's as complete, with `qz-0202` and `qz-0082`, which finished then and
+/// pass the bound on derived conclusions now. Each of the 25 is taken whole within the
+/// default bound with HermiT's answer, on one thread, four and eight. `qz-0048` stays
+/// within the bound on one thread because a context gives way to the contexts it woke:
+/// the context of `C1` equates six successors under a maximum of three, and the
+/// successors' contexts find that `C0` has no model. The other two fall back on every
+/// schedule to an answer that HermiT entails.
+#[test]
+fn the_compound_qualifier_cases_give_hermits_answer_within_the_bound() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl897");
+    let mut cases: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".ofn") && n.matches('.').count() == 1)
+        })
+        .collect();
+    cases.sort();
+    assert_eq!(cases.len(), 27);
+    let mut failures = Vec::new();
+    for case in &cases {
+        let stem = case
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let past = ["qz-0082", "qz-0202"].contains(&stem);
+        let doc = ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
+        let mut classes: BTreeSet<String> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(c)) => Some(c.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        classes.insert(THING.to_string());
+        classes.insert(NOTHING.to_string());
+        let want = reference(
+            &std::fs::read_to_string(case.with_extension("hermit.ofn")).unwrap(),
+            &classes,
+        );
+        for threads in [1, 4, 8] {
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    counting: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let mut got = BTreeSet::new();
+            for a in &classes {
+                for b in &classes {
+                    if out
+                        .taxonomy
+                        .is_subclass(&Class::new(a.as_str()), &Class::new(b.as_str()))
+                    {
+                        got.insert((a.clone(), b.clone()));
+                    }
+                }
+            }
+            if out.stats.dl_over_budget != past {
+                failures.push(format!(
+                    "{stem} on {threads} threads: Tier D {} its bound",
+                    if past { "stayed in" } else { "passed" }
+                ));
+            }
+            if past {
+                if !got.is_subset(&want) {
+                    failures.push(format!("{stem} on {threads} threads: not entailed"));
+                }
+            } else if !k.excluded().is_empty() || got != want {
+                failures.push(format!("{stem} on {threads} threads: not HermiT's answer"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `shq-041` without the order between number restrictions finishes within the default
+/// bound with HermiT's answer, on one, four and eight threads and with either strategy,
+/// since a context gives way to the contexts it woke. Before, the run on one thread passed
+/// a bound of 8 million conclusions. `tests/dl_number_order.rs` holds its answer with the
+/// order.
+#[test]
+fn a_context_that_gives_way_keeps_shq_041_within_the_bound_without_the_order() {
+    let path = fixtures().join("shq-041.ofn");
+    let doc = ofn_read::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut classes: BTreeSet<String> = doc
+        .axioms
+        .iter()
+        .filter_map(|a| match &a.kind {
+            AxiomKind::Declaration(Entity::Class(c)) => Some(c.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    classes.insert(THING.to_string());
+    classes.insert(NOTHING.to_string());
+    let want = reference(
+        &std::fs::read_to_string(path.with_extension("hermit.ofn")).unwrap(),
+        &classes,
+    );
+    for threads in [1, 4, 8] {
+        for expansion in [Expansion::Cautious, Expansion::Eager] {
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    counting: true,
+                    number_order: false,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                !out.stats.dl_over_budget,
+                "{threads} threads, {expansion:?}: Tier D passed its bound"
+            );
+            assert!(k.excluded().is_empty(), "an axiom is left out");
+            let mut got = BTreeSet::new();
+            for a in &classes {
+                for b in &classes {
+                    if out
+                        .taxonomy
+                        .is_subclass(&Class::new(a.as_str()), &Class::new(b.as_str()))
+                    {
+                        got.insert((a.clone(), b.clone()));
+                    }
+                }
+            }
+            assert_eq!(got, want, "{threads} threads, {expansion:?}");
+        }
     }
 }
 

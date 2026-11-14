@@ -664,8 +664,8 @@ fn reference(text: &str, classes: &BTreeSet<String>) -> BTreeSet<(String, String
 /// classified with counting and the order on one thread and on four with the eager
 /// strategy. Every answer is among HermiT's subsumptions, a case taken whole within the
 /// bound has exactly HermiT's, and every case that stays in the bound without the order
-/// stays in it with the order. `shq-041` passes the bound without the order on every
-/// schedule and stays in it with the order, with HermiT's answer.
+/// stays in it with the order. `shq-041` stays in the bound with the order, with HermiT's
+/// answer, and `tests/dl_fixtures.rs` holds its answer without the order.
 #[test]
 fn the_fixtures_with_minimums_keep_their_answers_with_the_order() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
@@ -761,18 +761,21 @@ fn the_fixtures_with_minimums_keep_their_answers_with_the_order() {
                     failures.push(format!("{stem}: the order makes the run pass its bound"));
                 }
             }
-            if stem == "shq-041" && (!fell_off || fell || !whole) {
+            if stem == "shq-041" && (fell || !whole) {
                 failures.push(format!(
-                    "shq-041 on {threads} threads: without the order past the bound \
-                     {fell_off}, with it {fell}, whole {whole}"
+                    "shq-041 on {threads} threads: with the order past the bound {fell}, \
+                     whole {whole}"
                 ));
             }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(counted, 206);
-    assert!(
-        within_on > within_off,
-        "{within_on} cases within the bound with the order, {within_off} without"
+    // The order kept two more cases within the bound until a context gave way to the
+    // contexts it woke, which keeps the same two within it without the order.
+    assert_eq!(
+        (within_on, within_off),
+        (202, 202),
+        "the cases within the bound with the order and without it"
     );
 }
