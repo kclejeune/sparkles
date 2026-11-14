@@ -2008,7 +2008,7 @@ impl Index {
             a == b
         }
         let mut changed = vec![false; n];
-        for e in 0..n {
+        for (e, changed) in changed.iter_mut().enumerate() {
             let (a, b) = (&old.heads[e], &self.heads[e]);
             debug_assert_eq!(a.node, b.node);
             let sets = |ix: &Index, h: &Head, sets: &[Vec<Ex>]| -> Vec<Vec<Ex>> {
@@ -2024,7 +2024,7 @@ impl Index {
                 Node::Forall(_, f) => flag(old, f as usize) != flag(self, f as usize),
                 _ => false,
             };
-            changed[e] = a.node != b.node
+            *changed = a.node != b.node
                 || a.succ != b.succ
                 || filler
                 || flag(old, e) != flag(self, e)
