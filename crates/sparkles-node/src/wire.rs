@@ -186,7 +186,7 @@ pub struct TermTable {
     ascii: bool,
     entries: Vec<u32>,
     index: FxHashMap<Cell, u32>,
-    /// the entries of the engine ids that `quad_ids` decoded
+    /// the entries of the engine ids that `quad_ids` and `keyed` decoded
     ids: FxHashMap<u64, u32>,
     /// the entries of the datatype IRIs, which few batches have more than a handful of
     datatypes: Vec<(String, u32)>,
@@ -309,6 +309,21 @@ impl TermTable {
             };
         }
         Some(out)
+    }
+
+    /// The entry of the term that a query batch knows by `key`, decoded once per batch
+    /// with `decode`; 0 when the key has no term. Two keys can name equal terms, which
+    /// then have an entry each.
+    pub fn keyed(&mut self, key: u64, decode: impl FnOnce() -> Option<Term>) -> u32 {
+        if let Some(e) = self.ids.get(&key) {
+            return *e;
+        }
+        let e = match decode() {
+            Some(t) => self.term(&t),
+            None => 0,
+        };
+        self.ids.insert(key, e);
+        e
     }
 
     fn datatype(&mut self, iri: &str) -> u32 {

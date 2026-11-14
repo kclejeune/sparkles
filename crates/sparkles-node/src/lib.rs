@@ -1003,35 +1003,43 @@ fn pull(
             }
             continue;
         }
-        let row: Option<Vec<Option<Cell>>> = match &mut c.rows {
-            Rows::Streaming(state) => {
-                if state
-                    .batch
-                    .as_ref()
-                    .is_none_or(|batch| state.row == batch.len())
-                {
-                    state.batch = None;
-                    state.row = 0;
-                    state.batch = cursor_batch(
-                        state.cursor.next_batch(),
-                        &mut state.closed_by_cancel,
-                        close_requested,
-                        cancel,
-                    )?;
-                }
-                match &state.batch {
-                    None => None,
-                    Some(batch) => {
-                        let row = batch
-                            .row(state.row)?
-                            .into_iter()
-                            .map(|term| term.map(Cell::Term))
-                            .collect();
-                        state.row += 1;
-                        Some(row)
-                    }
-                }
+        if let Rows::Streaming(state) = &mut c.rows {
+            if state
+                .batch
+                .as_ref()
+                .is_none_or(|batch| state.row == batch.len())
+            {
+                state.batch = None;
+                state.row = 0;
+                state.batch = cursor_batch(
+                    state.cursor.next_batch(),
+                    &mut state.closed_by_cancel,
+                    close_requested,
+                    cancel,
+                )?;
             }
+            let Some(batch) = &state.batch else {
+                drained = true;
+                break;
+            };
+            // A term is decoded when its key is new to this batch's table and dropped
+            // once its text is in the table, as the eager rows are decoded. The table
+            // is bounded by `max_bytes`, so the term needs no place in the query's
+            // memory budget, which cost each cell a pass through the ledger.
+            width = batch.width();
+            for column in 0..width {
+                cells.push(match batch.key(state.row, column)? {
+                    Some(key) => table.keyed(key, || batch.transient_term(key)),
+                    None => 0,
+                });
+            }
+            state.row += 1;
+            c.pos += 1;
+            rows += 1;
+            continue;
+        }
+        let row: Option<Vec<Option<Cell>>> = match &mut c.rows {
+            Rows::Streaming(_) => unreachable!("streamed rows are read above"),
             Rows::Graph(state) => {
                 if state.batch.as_ref().is_none_or(|b| state.row == b.len()) {
                     state.batch = None;
