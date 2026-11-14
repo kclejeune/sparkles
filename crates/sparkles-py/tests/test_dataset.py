@@ -295,3 +295,67 @@ def test_apply_patch() -> None:
         ds.apply_patch('A "s" <urn:p> 1 .')
     with pytest.raises(TypeError):
         ds.apply_patch(42)  # type: ignore[arg-type]
+
+
+def test_contains_checks_the_type_before_the_dataset_state():
+    ds = Dataset()
+    ds.close()
+    with pytest.raises(TypeError):
+        object() in ds
+
+
+def _probes(ds):
+    """Quads that are there and quads that are not, with a triple and repeats."""
+    stored = list(ds)
+    unknown = NamedNode("urn:unknown")
+    probes = []
+    for q in stored:
+        probes.append(q)
+        probes.append(Quad(unknown, q.predicate, q.object, q.graph_name))
+        probes.append(Quad(q.subject, unknown, q.object, q.graph_name))
+        probes.append(Quad(q.subject, q.predicate, unknown, q.graph_name))
+        probes.append(Quad(q.subject, q.predicate, q.object, unknown))
+        probes.append(Triple(q.subject, q.predicate, q.object))
+        probes.append(q)
+    return probes
+
+
+@pytest.mark.parametrize("on_disk", [False, True])
+@pytest.mark.parametrize("copies", [1, 40])
+def test_contains_all_answers_each_quad_as_in_does(tmp_path, on_disk, copies):
+    """A short batch in memory is answered with the GIL held and a longer one, or one
+    on disk, without it, and each answers as `in` does."""
+    ds = Dataset(str(tmp_path / "db")) if on_disk else Dataset()
+    ds.load(
+        b"""<urn:a> <urn:p> <urn:b> .
+<urn:a> <urn:p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g> .
+<urn:a> <urn:p> "chat"@fr <urn:g> .
+_:x <urn:q> <<( <urn:a> <urn:p> <urn:b> )>> <urn:g> .
+""",
+        format="nq",
+    )
+    probes = _probes(ds) * copies
+    assert len(probes) == 28 * copies
+    answers = ds.contains_all(probes)
+    assert answers == [p in ds for p in probes]
+    assert sum(answers) == (4 * 2 + 1) * copies
+    # any iterable is read, and an empty one gives an empty answer
+    assert ds.contains_all(iter(probes)) == answers
+    assert ds.contains_all([]) == []
+    assert all(type(a) is bool for a in answers)
+
+
+def test_contains_all_refuses_what_is_not_a_quad_and_a_closed_dataset():
+    ds = Dataset()
+    q = Quad(NamedNode("a:s"), NamedNode("a:p"), Literal("x"))
+    ds.add(q)
+    with pytest.raises(TypeError):
+        ds.contains_all([q, object()])
+    with pytest.raises(TypeError):
+        ds.contains_all(42)  # type: ignore[arg-type]
+    ds.close()
+    # the type is checked before the dataset's state, as `in` checks it
+    with pytest.raises(TypeError):
+        ds.contains_all([object()])
+    with pytest.raises(InvalidInputError, match="closed"):
+        ds.contains_all([q])

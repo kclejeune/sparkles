@@ -113,7 +113,7 @@ def printable(text):
 
 
 def tool_check(profile):
-    """Resolve mbx and rustc through the job environment and refuse a pin mismatch by name.
+    """Resolve mbx, rustc and rustdoc through the job environment and refuse a pin mismatch by name.
 
     Boat jobs build with MBX in local-only mode, so the check also asks the pinned mbx
     for its effective remote URL and local budget and refuses a remote cache or token.
@@ -140,6 +140,9 @@ test "$store" = {store} || refuse "mbx cache directory is $store, pinned {store_
 command -v rustc >/dev/null || refuse 'rustc is not on the job PATH'
 version=$(rustc --version 2>/dev/null | awk '{{print $2}}') || true
 test "$version" = {rust} || refuse "rustc reports $version, pinned {rust} (RUSTUP_TOOLCHAIN=${{RUSTUP_TOOLCHAIN:-unset}})"
+command -v rustdoc >/dev/null || refuse 'rustdoc is not on the job PATH'
+version=$(rustdoc --version 2>/dev/null | awk '{{print $2}}') || true
+test "$version" = {rust} || refuse "rustdoc reports $version, pinned {rust}"
 """.format(pinned=shlex.quote(pinned),pinned_text=printable(pinned),
            mbx=shlex.quote(mbx),rust=shlex.quote(rust),
            total=shlex.quote(local['MBX_GC_MAX_TOTAL_SIZE']),floor=shlex.quote(local['MBX_GC_MIN_FREE_SIZE']),

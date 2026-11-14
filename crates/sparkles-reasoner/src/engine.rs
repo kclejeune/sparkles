@@ -15,9 +15,13 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(feature = "plan-probe")]
+pub(crate) mod planprobe;
+pub(crate) mod sampled;
+
 // ================================================================== compile ====
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Slot {
     Var(usize),
     Const(u64),
@@ -799,9 +803,9 @@ pub(crate) fn index_needs_with(rule: &CRule, steps: &[Step], prebound: &[usize])
 pub(crate) type Sink<'s> = dyn FnMut(&[Triple], &[Triple], &[u64]) -> bool + 's;
 
 /// Where the first step of a plan reads its candidates when the work is split.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum First<'a> {
-    /// in-memory rows
+    /// derived facts
     Rows(Cands<'a>),
     /// a share of a base-tier scan
     Base(BaseRange),
@@ -847,11 +851,19 @@ pub(crate) struct Eval<'a> {
     delta_since: Option<u32>,
     /// The current explicit atom path consumed a fact from that delta.
     matched_delta: bool,
+    /// for the rule's trace line: the rows visited, the facts matched, the head probes
+    /// and the delta probes
+    pub stats: [u64; 4],
     /// facts matched by the atoms of the current partial instance ([`Mode::Instances`])
     trail: smallvec::SmallVec<[Triple; 4]>,
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
     pub implicit: smallvec::SmallVec<[Triple; 2]>,
     stop: bool,
+    /// the head [`ahead`](Self::ahead) probed for the current candidate, and whether it
+    /// is known
+    probed: Option<(Triple, bool)>,
+    /// the heads probed by [`ahead`](Self::ahead) that an instance used
+    probes_used: u64,
     /// heads emitted so far ([`Mode::New`] and [`Mode::Existing`]), so that each goes
     /// out once
     seen: FxHashSet<Triple>,
@@ -942,9 +954,12 @@ impl<'a> Eval<'a> {
             mode,
             delta_since: None,
             matched_delta: false,
+            stats: [0; 4],
             trail: smallvec::SmallVec::new(),
             implicit: smallvec::SmallVec::new(),
             stop: false,
+            probed: None,
+            probes_used: 0,
             seen: FxHashSet::default(),
             err: None,
             visits: 0,
@@ -1258,19 +1273,197 @@ impl<'a> Eval<'a> {
                 .is_some_and(|b| b.lookups().is_some() && b.blocks(s, p, o) > 1)
     }
 
-    /// Match the atom of step `k` against in-memory rows.
+    /// Match the atom of step `k` against derived facts, in ascending id order, which the
+    /// order of first derivation of the heads follows.
     fn rows(&mut self, k: usize, atom: usize, b: &mut [u64], cands: Cands<'_>) {
-        for j in 0..cands.len() {
-            if self.aborted() {
-                return;
-            }
-            let row = cands.get(j);
-            if !self.g.alive(row) {
-                continue;
-            }
+        // one candidate has no probe to overlap, and a later check that rejects it would
+        // leave its probe unused
+        if cands.len() > 1
+            && let Some(head) = self.probe_ahead(k, atom, b)
+        {
+            self.rows_ahead(k, atom, b, cands, head);
+            return;
+        }
+        cands.try_each(|row| self.row(k, atom, b, row));
+    }
+
+    /// One candidate of [`rows`](Self::rows); false when the evaluation stops.
+    #[inline(always)]
+    fn row(&mut self, k: usize, atom: usize, b: &mut [u64], row: u32) -> bool {
+        if self.aborted() {
+            return false;
+        }
+        self.stats[0] += 1;
+        if self.g.alive(row) {
             let t = self.g.triple(row);
             self.fact(k, atom, b, t);
         }
+        true
+    }
+
+    /// The rule's head when the candidates of atom `atom`, step `k` of the plan, can probe
+    /// their heads ahead of the rest of the plan: forward chaining with no delta to admit
+    /// and no bindings to collect, one triple head, every variable of the head bound once
+    /// the atom matches a fact under the bindings `b`, at least one of them by the atom,
+    /// and the later steps atoms and builtins whose variables are all bound, which only
+    /// check the instance, such as `prp-symp`'s lookup of its symmetric property and its
+    /// `notLiteral` of the new subject. A later step that binds a
+    /// variable can join each candidate with many facts or with none, and a head probed
+    /// for a candidate it rejects is a probe the evaluation would not make. A probe only
+    /// reads the graph, which no evaluation changes, so its answer is the same whenever
+    /// it is asked.
+    fn probe_ahead(&self, k: usize, atom: usize, b: &[u64]) -> Option<[Slot; 3]> {
+        #[cfg(test)]
+        if AHEAD_OFF.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !matches!(self.mode, Mode::New)
+            || self.delta_since.is_some()
+            || self.collect_at.is_some()
+        {
+            return None;
+        }
+        let [CHead::Triple(s, p, o)] = self.rule.head.as_slice() else {
+            return None;
+        };
+        let a = &self.rule.atoms[atom];
+        let by_atom = |v: usize| [a.s, a.p, a.o].contains(&Slot::Var(v));
+        let bound = |x: Slot| !matches!(x, Slot::Var(v) if b[v] == 0 && !by_atom(v));
+        for step in &self.steps[k + 1..] {
+            let checks = match *step {
+                Step::Atom { atom, .. } => {
+                    let l = &self.rule.atoms[atom];
+                    [l.s, l.p, l.o].into_iter().all(bound)
+                }
+                Step::Builtin(j) => self.rule.builtins[j].args.iter().all(|&x| bound(x)),
+            };
+            if !checks {
+                return None;
+            }
+        }
+        let head = [*s, *p, *o];
+        let mut new = false;
+        for x in head {
+            if let Slot::Var(v) = x
+                && b[v] == 0
+            {
+                if !by_atom(v) {
+                    return None;
+                }
+                new = true;
+            }
+        }
+        new.then_some(head)
+    }
+
+    /// [`rows`](Self::rows) for an atom whose candidates [`probe_ahead`](Self::probe_ahead)
+    /// allows: they go in groups of [`AHEAD`].
+    fn rows_ahead(
+        &mut self,
+        k: usize,
+        atom: usize,
+        b: &mut [u64],
+        cands: Cands<'_>,
+        head: [Slot; 3],
+    ) {
+        let mut ids = [0u32; AHEAD];
+        let mut n = 0;
+        // one candidate at a time once a group's checks reject most of its probed heads,
+        // or its heads repeat so that few probes were made: the group then only adds work
+        let mut plain = false;
+        let go = cands.try_each(|row| {
+            if plain {
+                return self.row(k, atom, b, row);
+            }
+            ids[n] = row;
+            n += 1;
+            if n < AHEAD {
+                return true;
+            }
+            n = 0;
+            let used = self.probes_used;
+            let (go, matched, probes) = self.ahead(k, atom, b, &ids, head);
+            plain = 2 * self.probes_used.wrapping_sub(used) < u64::from(matched)
+                || 4 * probes < matched;
+            go
+        });
+        if go && n > 0 {
+            self.ahead(k, atom, b, &ids[..n], head);
+        }
+    }
+
+    /// A group of candidates of [`rows`](Self::rows): the heads of the ones that match the
+    /// atom are formed and probed in the triple index one after another, so that the
+    /// cache misses of the probes overlap instead of each waiting for the evaluation of
+    /// the candidate before, and then every candidate is evaluated in order as `rows`
+    /// would, its head's probe answered from the group. Returns false when the evaluation
+    /// stops, the number of candidates that matched the atom and the number of probes.
+    fn ahead(
+        &mut self,
+        k: usize,
+        atom: usize,
+        b: &mut [u64],
+        ids: &[u32],
+        [hs, hp, ho]: [Slot; 3],
+    ) -> (bool, u32, u32) {
+        debug_assert!(ids.len() <= AHEAD);
+        #[cfg(test)]
+        AHEAD_GROUPS.fetch_add(1, Ordering::Relaxed);
+        let g = self.g;
+        let a = &self.rule.atoms[atom];
+        let mut heads = [[0u64; 3]; AHEAD];
+        // the candidates that match the atom, and of those the ones whose head is known
+        let (mut matched, mut known) = (0u32, 0u32);
+        for (i, &row) in ids.iter().enumerate() {
+            if !g.alive(row) {
+                continue;
+            }
+            let t = g.triple(row);
+            if !matches!(a.p, Slot::Const(_)) && g.is_hidden(t[1]) {
+                continue;
+            }
+            let mut newly = [usize::MAX; 3];
+            let mut n = 0;
+            if unify(a.s, t[0], b, &mut newly, &mut n)
+                && unify(a.p, t[1], b, &mut newly, &mut n)
+                && unify(a.o, t[2], b, &mut newly, &mut n)
+            {
+                heads[i] = [self.val(hs, b), self.val(hp, b), self.val(ho, b)];
+                matched |= 1 << i;
+            }
+            for &v in &newly[..n] {
+                b[v] = 0;
+            }
+        }
+        // a head equal to the one probed before it takes that answer: a scan whose heads
+        // repeat, such as `rdf1`'s, probes each run of them once
+        let mut last: Option<(Triple, bool)> = None;
+        let mut probes = 0;
+        for (i, t) in heads.iter().enumerate().take(ids.len()) {
+            if matched & (1 << i) == 0 {
+                continue;
+            }
+            let is = match last {
+                Some((h, is)) if h == *t => is,
+                _ => {
+                    probes += 1;
+                    g.known(t)
+                }
+            };
+            last = Some((*t, is));
+            if is {
+                known |= 1 << i;
+            }
+        }
+        for (i, &row) in ids.iter().enumerate() {
+            self.probed = (matched & (1 << i) != 0).then(|| (heads[i], known & (1 << i) != 0));
+            if !self.row(k, atom, b, row) {
+                self.probed = None;
+                return (false, matched.count_ones(), probes);
+            }
+        }
+        self.probed = None;
+        (true, matched.count_ones(), probes)
     }
 
     /// Match the atom of step `k` against the base tier, or a share of its scan.
@@ -1387,7 +1580,11 @@ impl<'a> Eval<'a> {
             && unify(a.p, t[1], b, &mut newly, &mut n)
             && unify(a.o, t[2], b, &mut newly, &mut n);
         if ok {
+            self.stats[1] += 1;
             let previous_delta = self.matched_delta;
+            if self.delta_since.is_some() {
+                self.stats[3] += 1;
+            }
             self.matched_delta |= self.delta_fact(&t);
             if self.collecting() {
                 self.trail.push(t);
@@ -1436,6 +1633,27 @@ impl<'a> Eval<'a> {
                 .position(t)
                 .map_or_else(|| self.g.reads_base(since, self.end), |row| row >= since)
         })
+    }
+
+    /// Whether head `t` is known: the answer of [`ahead`](Self::ahead)'s probe when it
+    /// probed this head for the current candidate, and a probe otherwise.
+    #[inline]
+    fn known_head(&mut self, t: &Triple) -> bool {
+        match self.probed {
+            Some((h, known)) if h == *t => {
+                self.stats[2] += 1;
+                self.probes_used = self.probes_used.wrapping_add(1);
+                known
+            }
+            _ => self.probe_known(t),
+        }
+    }
+
+    /// [`Graph::known`], counted for the rule's trace line.
+    #[inline]
+    fn probe_known(&mut self, t: &Triple) -> bool {
+        self.stats[2] += 1;
+        self.g.known(t)
     }
 
     fn replay_consumed_delta(&mut self, bindings: &[u64]) -> bool {
@@ -1507,7 +1725,7 @@ impl<'a> Eval<'a> {
                                 Some(new) => new,
                                 None => return,
                             }
-                    } else if self.g.known(&t) {
+                    } else if self.known_head(&t) {
                         false
                     } else {
                         match self.see(t) {
@@ -1558,6 +1776,9 @@ pub(crate) struct Limits {
     /// evaluate transitive and equivalence rules with closure operators
     /// ([`crate::closure`]) when the program allows it
     pub closures: bool,
+    /// order rule bodies from sampled bindings ([`sampled`]) where the sample makes an
+    /// order clearly cheaper than the greedy one
+    pub sampled_planning: bool,
 }
 
 pub(crate) struct Outcome {
@@ -1610,7 +1831,7 @@ fn shares<'g>(
         );
     }
     let cands = g.cands(s, p, o, lo, hi);
-    if cands.len() > 0 {
+    if !cands.is_empty() {
         out.extend(
             cands
                 .chunks(CHUNK)
@@ -1624,6 +1845,21 @@ fn shares<'g>(
 /// The in-memory candidates a backward search reads before a long base-tier lookup (see
 /// [`Eval::rows_first`]).
 const ROWS_FIRST: usize = 64;
+
+/// Candidates per group of [`Eval::ahead`]: enough probes in flight to overlap their
+/// cache misses, few enough that the group's rows are still in the first-level cache
+/// when it is evaluated.
+const AHEAD: usize = 16;
+
+/// Tests turn [`Eval::probe_ahead`] off to compare its output with the evaluation one
+/// candidate at a time.
+#[cfg(test)]
+pub(crate) static AHEAD_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The groups [`Eval::ahead`] matched, for tests.
+#[cfg(test)]
+pub(crate) static AHEAD_GROUPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Bindings worked out up to plan step `d` before the work is split there.
 const MAX_SPLIT_BINDINGS: usize = 1 << 16;
@@ -1675,7 +1911,7 @@ fn split_at<'g>(
             );
             ev.collect_at = Some((d, MAX_SPLIT_BINDINGS));
             let mut b = vec![0u64; r.nvars];
-            ev.run(0, &mut b, *f);
+            ev.run(0, &mut b, f.clone());
             if let Some(e) = ev.err.take() {
                 return Err(e);
             }
@@ -1912,8 +2148,21 @@ pub(crate) fn plan_iteration(
     ds: u32,
     de: u32,
     candidates: Option<&[usize]>,
+    sampled: bool,
 ) -> Vec<(usize, Vec<Step>)> {
     let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
+    let started = std::time::Instant::now();
+    // the plans the sample changed, for the log
+    let mut changed = 0usize;
+    let mut plan = |r: &CRule, ranges: &[(u32, u32)]| -> Option<Vec<Step>> {
+        if sampled {
+            let (steps, by_sample) = sampled::plan(g, r, ranges)?;
+            changed += usize::from(by_sample);
+            Some(steps)
+        } else {
+            plan(r, ranges, Some(g))
+        }
+    };
     // a join with an atom whose constant predicate has no rows in its range is empty
     let empty = |r: &CRule, ranges: &[(u32, u32)], g: &Graph| {
         r.atoms.iter().zip(ranges).any(|(a, &(lo, hi))| match a.p {
@@ -1937,7 +2186,7 @@ pub(crate) fn plan_iteration(
             if empty(r, &ranges, g) {
                 continue;
             }
-            if let Some(p) = plan(r, &ranges, Some(g)) {
+            if let Some(p) = plan(r, &ranges) {
                 tasks.push((ri, p));
             }
             continue;
@@ -1949,7 +2198,7 @@ pub(crate) fn plan_iteration(
         if implicit_delta {
             let ranges = vec![(0, de); r.atoms.len()];
             if !empty(r, &ranges, g)
-                && let Some(p) = plan(r, &ranges, Some(g))
+                && let Some(p) = plan(r, &ranges)
             {
                 tasks.push((ri, p));
             }
@@ -1976,10 +2225,18 @@ pub(crate) fn plan_iteration(
             if empty(r, &ranges, g) {
                 continue;
             }
-            if let Some(p) = plan(r, &ranges, Some(g)) {
+            if let Some(p) = plan(r, &ranges) {
                 tasks.push((ri, p));
             }
         }
+    }
+    if sampled {
+        tracing::debug!(
+            plans = tasks.len(),
+            changed,
+            plan_us = started.elapsed().as_micros() as u64,
+            "sampled rule plans"
+        );
     }
     tasks
 }
@@ -2036,6 +2293,9 @@ pub(crate) fn run_observed(
     let mut refresh: Vec<usize> = Vec::new();
     loop {
         terms.analysis_round(iteration);
+        // the facts from `ds` on are this iteration's delta: a compaction must not merge
+        // their runs with older ones while the iteration reads them
+        g.set_compaction_floor(ds);
         if cancelled() {
             anyhow::bail!("reasoning cancelled");
         }
@@ -2076,6 +2336,7 @@ pub(crate) fn run_observed(
                 ds,
                 de,
                 candidates.as_ref().map(|(c, _)| c.as_slice()),
+                limits.sampled_planning,
             ),
             _ => {
                 let keep = |ri: &usize| {
@@ -2085,11 +2346,27 @@ pub(crate) fn run_observed(
                     Some((c, _)) => c.iter().copied().filter(keep).collect(),
                     None => (0..rules.len()).filter(keep).collect(),
                 };
-                plan_iteration(g, rules, naive, ds, de, Some(&list))
+                plan_iteration(
+                    g,
+                    rules,
+                    naive,
+                    ds,
+                    de,
+                    Some(&list),
+                    limits.sampled_planning,
+                )
             }
         };
         if !refresh.is_empty() {
-            tasks.extend(plan_iteration(g, rules, true, ds, de, Some(&refresh)));
+            tasks.extend(plan_iteration(
+                g,
+                rules,
+                true,
+                ds,
+                de,
+                Some(&refresh),
+                limits.sampled_planning,
+            ));
             refresh.clear();
         }
         for (ri, p) in &tasks {
@@ -2102,6 +2379,25 @@ pub(crate) fn run_observed(
                 g.ensure_index(false, true)
                     .map_err(|e| memory(e, iteration))?;
             }
+        }
+        #[cfg(feature = "plan-probe")]
+        if planprobe::enabled() {
+            // the orders the probe tries read the whole tier by subject and by object,
+            // which the run is charged for and keeps
+            g.ensure_index(true, true)
+                .map_err(|e| memory(e, iteration))?;
+            g.ensure_index(false, true)
+                .map_err(|e| memory(e, iteration))?;
+            planprobe::probe(
+                g,
+                rules,
+                terms,
+                &tasks,
+                iteration,
+                !(iteration == 0 && start.is_none()),
+                ds,
+                de,
+            );
         }
         // ---- split into parallel work items
         let gr: &Graph = g;
@@ -2183,6 +2479,14 @@ pub(crate) fn run_observed(
         } else {
             Vec::new()
         };
+        let item_stats: Vec<[AtomicUsize; 4]> = if timed {
+            rules
+                .iter()
+                .map(|_| std::array::from_fn(|_| AtomicUsize::new(0)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let t_eval = std::time::Instant::now();
         let results: Vec<Done> = work
             .par_iter()
@@ -2213,13 +2517,13 @@ pub(crate) fn run_observed(
                     ev.delta_since = Some(ds);
                 }
                 if item.b.is_empty() {
-                    ev.run(item.k, &mut vec![0u64; r.nvars], item.first);
+                    ev.run(item.k, &mut vec![0u64; r.nvars], item.first.clone());
                 }
                 for b in &item.b {
                     if ev.err.is_some() || abort.load(Ordering::Relaxed) {
                         break;
                     }
-                    ev.run(item.k, &mut b.clone(), item.first);
+                    ev.run(item.k, &mut b.clone(), item.first.clone());
                 }
                 let total = produced.fetch_add(ev.out.len(), Ordering::Relaxed) + ev.out.len();
                 if total > max_out || ev.err.is_some() {
@@ -2227,6 +2531,9 @@ pub(crate) fn run_observed(
                 }
                 if let Some(t) = t_item {
                     item_time[*ri].fetch_add(t.elapsed().as_micros() as usize, Ordering::Relaxed);
+                    for (s, v) in item_stats[*ri].iter().zip(ev.stats) {
+                        s.fetch_add(v as usize, Ordering::Relaxed);
+                    }
                 }
                 let (out, held) = ev.take_out();
                 (*ri, out, held, ev.err.take())
@@ -2252,9 +2559,21 @@ pub(crate) fn run_observed(
                 .filter(|x| x.0 > 0)
                 .collect();
             by_rule.sort_unstable_by(|a, b| b.cmp(a));
-            for (us, ri) in by_rule.into_iter().take(5) {
+            for (us, ri) in by_rule.into_iter().take(8) {
                 let items = work.iter().filter(|w| w.ri == ri).count();
-                tracing::trace!(iteration, rule = %rules[ri].name, ms = us / 1000, items, "rule time");
+                let [rows, facts, known, delta] =
+                    item_stats[ri].each_ref().map(|a| a.load(Ordering::Relaxed));
+                tracing::trace!(
+                    iteration,
+                    rule = %rules[ri].name,
+                    ms = us / 1000,
+                    items,
+                    rows,
+                    facts,
+                    known,
+                    delta,
+                    "rule time"
+                );
             }
         }
         // the first error in the order of the work items: a memory error as it is, with
@@ -2306,7 +2625,8 @@ pub(crate) fn run_observed(
         } else {
             String::new()
         };
-        // ---- merge
+        // ---- merge: the work items borrow the graph, and the merge changes it
+        drop(work);
         let eval_ms = t_iter.elapsed().as_millis() as u64;
         let t_merge = std::time::Instant::now();
         let before = g.len();
@@ -2342,10 +2662,14 @@ pub(crate) fn run_observed(
                 iteration = iteration + 1,
                 new = g.len() - closed,
                 close_ms = t_close.elapsed().as_millis() as u64,
+                used_bytes = limits.budget.used(),
+                peak_bytes = limits.budget.peak(),
+                tier_bytes = g.heap_bytes(),
                 "closure operators"
             );
         }
         iteration += 1;
+        let (index_cap, index_len, index_cap_max, index_cap_min) = g.index_shape();
         tracing::debug!(
             iteration,
             new,
@@ -2353,6 +2677,13 @@ pub(crate) fn run_observed(
             candidates,
             eval_ms,
             merge_ms = t_merge.elapsed().as_millis() as u64,
+            used_bytes = limits.budget.used(),
+            peak_bytes = limits.budget.peak(),
+            tier_bytes = g.heap_bytes(),
+            index_cap,
+            index_len,
+            index_cap_max,
+            index_cap_min,
             "reasoner iteration"
         );
         if g.inferred_since(base_len) > limits.max_inferred {
@@ -2372,6 +2703,14 @@ pub(crate) fn run_observed(
         ds = de;
         de = g.len();
     }
+    g.set_compaction_floor(u32::MAX);
+    tracing::debug!(
+        derived = g.len() - base_len,
+        tier_bytes = g.heap_bytes(),
+        peak_bytes = limits.budget.peak(),
+        rss_peak_kib = proc_status("VmHWM"),
+        "derived tier"
+    );
     Ok(Outcome {
         iterations: iteration,
     })
@@ -2519,6 +2858,87 @@ mod tests {
         }
         assert_eq!(held.bytes(), 1_000 * slot);
     }
+
+    /// The planner reads the distinct keys of the facts, not of the runs that hold them:
+    /// the same facts merged in one batch or in two plan the same join and give a list
+    /// link the same value. With per-run estimates, two runs of `P` counted 94 of its 100
+    /// subjects and the plan started at `Q`, which finds the other value first.
+    #[test]
+    fn statistics_follow_the_facts_not_the_runs() {
+        use sparkles_core::store::{Store, StoreOptions};
+        let t = Terms::new(Store::in_memory(StoreOptions::default()).snapshot());
+        let (p, q) = (1000, 1001);
+        let atom = |s, p, o| Atom { s, p, o };
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut got = Vec::new();
+                for split in [false, true] {
+                    let mut g = Graph::default();
+                    let ps: Vec<Triple> = (1..=100)
+                        .flat_map(|s| [[s, p, 10_000 + s * 10], [s, p, 10_001 + s * 10]])
+                        .collect();
+                    if split {
+                        g.add_batch(ps[..100].iter().copied());
+                        g.add_batch(ps[100..].iter().copied());
+                    } else {
+                        g.add_batch(ps);
+                    }
+                    g.add_batch(
+                        [[1, q, 10_011], [1, q, 10_010]]
+                            .into_iter()
+                            .chain(
+                                (2..=100).flat_map(|s| {
+                                    [[s, q, 10_000 + s * 10], [s, q, 10_001 + s * 10]]
+                                }),
+                            )
+                            .chain((2..=10).map(|s| [s, q, 999_999])),
+                    );
+                    g.add_batch([[999, t.rdf_rest, t.rdf_nil]]);
+                    let r = CRule {
+                        name: "list".into(),
+                        nvars: 1,
+                        builtins: vec![],
+                        atoms: vec![
+                            atom(Slot::Const(1), Slot::Const(p), Slot::Var(0)),
+                            atom(Slot::Const(1), Slot::Const(q), Slot::Var(0)),
+                        ],
+                        head: vec![CHead::Triple(
+                            Slot::Const(999),
+                            Slot::Const(t.rdf_first),
+                            Slot::Var(0),
+                        )],
+                    };
+                    assert_eq!(g.pstats(p), (100, 200), "split {split}");
+                    let lim = Limits {
+                        max_iterations: 10,
+                        max_inferred: 10_000,
+                        cancel: None,
+                        progress: None,
+                        budget: Budget::unlimited(),
+                        closures: false,
+                        sampled_planning: false,
+                    };
+                    run(&mut g, &[r], &t, &lim, None).unwrap();
+                    let list = g
+                        .list(
+                            &mut Memo::default(),
+                            999,
+                            t.rdf_first,
+                            t.rdf_rest,
+                            t.rdf_nil,
+                            g.len(),
+                        )
+                        .unwrap();
+                    got.push(list[0]);
+                }
+                assert_eq!(got[0], got[1], "{threads} threads");
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2602,8 +3022,9 @@ mod index_tests {
                     ds,
                     de,
                     candidates.as_ref().map(|(c, _)| c.as_slice()),
+                    false,
                 );
-                let every = plan_iteration(&g, &rules, naive, ds, de, None);
+                let every = plan_iteration(&g, &rules, naive, ds, de, None, false);
                 planned += every.len();
                 skipped += candidates
                     .as_ref()
@@ -2649,3 +3070,16 @@ mod index_tests {
 
 #[cfg(test)]
 mod compiler_credit_tests;
+
+/// A field of `/proc/self/status` in KiB, such as the peak resident set `VmHWM`, for
+/// the log, or zero where there is none.
+fn proc_status(field: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with(field))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}

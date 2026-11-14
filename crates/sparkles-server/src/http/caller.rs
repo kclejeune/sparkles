@@ -99,7 +99,7 @@ pub(crate) fn server_budgets(st: &AppState, timeout: Option<Duration>) -> Budget
 pub(crate) fn request_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     let view = ds
         .dataset
-        .stored_inference_view(reasoning_mode(params).reads_inferences());
+        .stored_inference_view(reasoning_mode(ds, params).reads_inferences());
     let mut request = QueryRequest::new(&ds.dataset)
         .with_reasoning(&view)
         .budgets(&server_budgets(st, Some(timeout_param(st, params))));

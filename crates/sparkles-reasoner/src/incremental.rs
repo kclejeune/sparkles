@@ -169,13 +169,12 @@ impl Bound {
 pub(crate) struct Closure {
     pub graph: Graph,
     pub terms: Terms,
-    /// one bit per row of the derived tier, from the graph's offset on: the row holds a
-    /// fact that counts as explicit
-    flags: Vec<u64>,
     /// the GeoSPARQL default geometries the closure holds as explicit facts, when they
     /// are known (see [`crate::default_geometry_changes`])
     pub defaults: Option<Defaults>,
-    /// Returned after flags and default-geometry payloads have been destroyed.
+    /// the heap of the closure's own buffers, charged to the budget of the graph. The
+    /// flags that mark derived facts explicit are the tier's. Returned after the
+    /// default-geometry payloads have been destroyed.
     flags_held: Held,
 }
 
@@ -253,7 +252,6 @@ impl Closure {
         Ok(Closure {
             graph,
             terms,
-            flags: Vec::new(),
             flags_held,
             defaults: None,
         })
@@ -279,8 +277,7 @@ impl Closure {
     }
 
     fn own_bytes(&self) -> usize {
-        self.flags.capacity() * size_of::<u64>()
-            + self.defaults.as_ref().map_or(0, Defaults::heap_bytes)
+        self.defaults.as_ref().map_or(0, Defaults::heap_bytes)
     }
 
     /// Charge the closure to `budget` from now on, or fail when it does not fit.
@@ -402,12 +399,7 @@ impl Closure {
     /// Whether row `row` of the derived tier is flagged explicit.
     #[inline]
     pub fn flagged(&self, row: u32) -> bool {
-        let Some(i) = row.checked_sub(self.graph.offset()) else {
-            return false;
-        };
-        self.flags
-            .get(i as usize / 64)
-            .is_some_and(|w| w & (1 << (i % 64)) != 0)
+        self.graph.flagged(row)
     }
 
     pub fn set_flag(&mut self, row: u32, on: bool) {
@@ -418,31 +410,7 @@ impl Closure {
     /// [`set_flag`](Self::set_flag), charging the growth of the flags before it is
     /// allocated, and with `strict` failing when it does not fit.
     pub fn set_flag_with(&mut self, row: u32, on: bool, strict: bool) -> Result<(), BudgetFailure> {
-        let i = row - self.graph.offset();
-        let w = i as usize / 64;
-        if self.flags.len() <= w {
-            if !on {
-                return Ok(());
-            }
-            let cap = self.flags.capacity();
-            if w + 1 > cap {
-                let new = (cap * 2).max(w + 1).max(4);
-                let bytes = (new - cap) * size_of::<u64>();
-                if strict {
-                    self.flags_held.try_grow(bytes)?;
-                } else {
-                    self.flags_held.grow(bytes)?;
-                }
-                self.flags.reserve_exact(new - self.flags.len());
-            }
-            self.flags.resize(w + 1, 0);
-        }
-        if on {
-            self.flags[w] |= 1 << (i % 64);
-        } else {
-            self.flags[w] &= !(1 << (i % 64));
-        }
-        Ok(())
+        self.graph.set_flag_with(row, on, strict)
     }
 
     /// Whether a fact of the closure is explicit: the base tier holds it when the
@@ -559,14 +527,13 @@ impl Closure {
         } else {
             graph.add_batch(live.iter().map(|x| x.0));
         }
-        let mut flags = vec![0u64; live.len().div_ceil(64)];
+        let first = graph.offset();
         for (r, (_, b)) in live.iter().enumerate() {
             if *b {
-                flags[r / 64] |= 1 << (r % 64);
+                graph.set_flag_with(first + r as u32, true, strict)?;
             }
         }
         self.graph = graph;
-        self.flags = flags;
         drop(live);
         drop(held);
         self.settle()?;
@@ -589,6 +556,9 @@ pub(crate) struct Update {
     pub held_beside: usize,
     /// semi-naive iterations of the insertion
     pub iterations: usize,
+    /// the wall time of the deletion and of the insertion, in microseconds
+    pub delete_micros: u64,
+    pub insert_micros: u64,
     /// the charge of the update's buffers that remain, `deleted` among them
     pub held: Option<Held>,
 }
@@ -643,9 +613,9 @@ pub(crate) fn update(
         let g = &c.graph;
         for p in [first, rest] {
             let rows = g.cands(None, Some(p), None, 0, g.len());
-            if (0..rows.len())
-                .map(|i| rows.get(i))
-                .any(|r| g.alive(r) && !c.flagged(r))
+            if rows
+                .iter()
+                .any(|r| g.alive(r) && g.triple(r)[1] == p && !c.flagged(r))
             {
                 return Err(Fallback("the rules read RDF lists that are derived".into()).into());
             }
@@ -667,6 +637,7 @@ pub(crate) fn update(
     }
 
     // ---- deletion
+    let started = std::time::Instant::now();
     held.try_grow(3 * removed.len() * size_of::<Triple>())?;
     let mut queue: Vec<Triple> = Vec::new();
     // the removed facts that were in the base tier: they join the derived tier as
@@ -780,6 +751,8 @@ pub(crate) fn update(
     }
 
     // ---- insertion
+    out.delete_micros = started.elapsed().as_micros() as u64;
+    let started = std::time::Instant::now();
     let start = c.graph.len();
     out.added_from = start;
     held.try_grow(std::mem::size_of_val(inserted))?;
@@ -817,6 +790,7 @@ pub(crate) fn update(
         }
     }
     drop(ins);
+    out.insert_micros = started.elapsed().as_micros() as u64;
     // the removed facts stay with the update
     out.held = Some(held);
     Ok(out)
@@ -1045,7 +1019,7 @@ fn consequences(
                 &limits.budget,
             );
             let mut b = vec![0u64; r.nvars];
-            ev.run(0, &mut b, Some(First::Rows(Cands::Slice(rows))));
+            ev.run(0, &mut b, Some(First::Rows(Cands::ids(rows))));
             if ev.err.is_none()
                 && let Err(e) = visit(std::mem::take(&mut ev.visits))
             {
@@ -1978,6 +1952,7 @@ pub(crate) mod tests {
             max_inferred: 10_000_000,
             budget: Budget::unlimited(),
             closures: false,
+            sampled_planning: false,
             cancel: None,
             progress: None,
         }
@@ -2195,6 +2170,53 @@ pub(crate) mod tests {
         }
         assert!(checked > 0, "seed {seed}: no lookup was remembered");
         (incremental, fallbacks)
+    }
+
+    /// A scan that probes its candidates' heads in groups derives the same facts with
+    /// the same ids as the evaluation one candidate at a time, for random
+    /// OWL RL and RDFS programs, with and without a limit of inferred facts that stops a
+    /// run partway through a group.
+    #[test]
+    fn grouped_head_probes_match_one_at_a_time() {
+        use std::sync::atomic::Ordering;
+        let run = |text: &str, base: &FxHashSet<Triple>, v: &Vocab, cap: usize, off: bool| {
+            let snap = set_default_graph(v, base);
+            let terms = Terms::new(snap.clone());
+            let rules = compiled(text, &terms);
+            let b = Base::new(snap, &[Id::DEFAULT_GRAPH]).unwrap();
+            let mut g = Graph::with_base(Arc::new(b));
+            let mut lim = limits();
+            lim.max_inferred = cap;
+            engine::AHEAD_OFF.store(off, Ordering::Relaxed);
+            let res = engine::run(&mut g, &rules, &terms, &lim, None);
+            engine::AHEAD_OFF.store(false, Ordering::Relaxed);
+            let facts: Vec<(Triple, bool)> = (g.offset()..g.len())
+                .map(|i| (g.triple(i), g.alive(i)))
+                .collect();
+            (
+                res.map(|o| o.iterations).map_err(|e| format!("{e:#}")),
+                facts,
+            )
+        };
+        let mut groups = 0;
+        for (text, owl) in [(crate::OWL_RL_RULES, true), (crate::RDFS_RULES, false)] {
+            for seed in 1..40u64 {
+                let v = Vocab::new();
+                let mut r = Rng(seed * 104_729 + 7);
+                let mut base: FxHashSet<Triple> = FxHashSet::default();
+                for _ in 0..60 {
+                    base.insert(v.triple(&mut r, owl));
+                }
+                for cap in [10_000_000, 1 + r.0 as usize % 200] {
+                    let before = engine::AHEAD_GROUPS.load(Ordering::Relaxed);
+                    let grouped = run(text, &base, &v, cap, false);
+                    groups += engine::AHEAD_GROUPS.load(Ordering::Relaxed) - before;
+                    let single = run(text, &base, &v, cap, true);
+                    assert_eq!(grouped, single, "seed {seed}, limit {cap}, owl {owl}");
+                }
+            }
+        }
+        assert!(groups > 1_000, "{groups}");
     }
 
     #[test]

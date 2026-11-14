@@ -88,6 +88,7 @@ mod enabled {
 
     pub(crate) fn params(
         st: &AppState,
+        ds: &crate::state::Dataset,
         params: &Params,
         headers: &HeaderMap,
     ) -> ApiResult<ShexParams> {
@@ -160,7 +161,7 @@ mod enabled {
             guard,
             schema_format,
             graph,
-            use_inferred: crate::http::reasoning_mode(params).reads_inferences(),
+            use_inferred: crate::http::reasoning_mode(ds, params).reads_inferences(),
             only_nonconformant,
             format,
             timeout: timeout_param(st, params),
@@ -356,7 +357,7 @@ mod enabled {
                 ));
             }
         }
-        let p = params(&st, &query, &headers)?;
+        let p = params(&st, &ds, &query, &headers)?;
         let at = super::super::history::at_param(&query)?;
         let guard = if p.guard {
             match ds.validation.read().clone() {

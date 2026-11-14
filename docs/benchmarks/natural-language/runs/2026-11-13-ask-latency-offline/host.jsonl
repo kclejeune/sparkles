@@ -1,0 +1,14 @@
+{"phase": "dry-base-single-r1", "when": "before", "utc": "2026-11-13T14:36:29Z", "loadavg": ["7.70", "6.37", "5.74"], "memAvailableGiB": 23.14, "cachedGiB": 19.98, "swapUsedGiB": 3.96}
+{"phase": "dry-base-single-r1", "when": "after", "utc": "2026-11-13T14:40:46Z", "loadavg": ["4.32", "4.88", "5.25"], "memAvailableGiB": 21.79, "cachedGiB": 19.33, "swapUsedGiB": 3.92}
+{"phase": "dry-cand-single-r1", "when": "before", "utc": "2026-11-13T14:40:46Z", "loadavg": ["4.32", "4.88", "5.25"], "memAvailableGiB": 21.79, "cachedGiB": 19.33, "swapUsedGiB": 3.92}
+{"phase": "dry-cand-single-r1", "when": "after", "utc": "2026-11-13T14:45:01Z", "loadavg": ["10.58", "5.78", "5.41"], "memAvailableGiB": 22.14, "cachedGiB": 20.17, "swapUsedGiB": 3.85}
+{"phase": "dry-cand-single-r2", "when": "before", "utc": "2026-11-13T14:45:01Z", "loadavg": ["10.58", "5.78", "5.41"], "memAvailableGiB": 22.12, "cachedGiB": 20.17, "swapUsedGiB": 3.85}
+{"phase": "dry-cand-single-r2", "when": "after", "utc": "2026-11-13T14:49:04Z", "loadavg": ["6.45", "5.73", "5.47"], "memAvailableGiB": 23.84, "cachedGiB": 21.89, "swapUsedGiB": 3.89}
+{"phase": "dry-base-single-r2", "when": "before", "utc": "2026-11-13T14:49:04Z", "loadavg": ["6.45", "5.73", "5.47"], "memAvailableGiB": 23.83, "cachedGiB": 21.89, "swapUsedGiB": 3.89}
+{"phase": "dry-base-single-r2", "when": "after", "utc": "2026-11-13T14:54:36Z", "loadavg": ["10.83", "7.63", "6.27"], "memAvailableGiB": 19.21, "cachedGiB": 17.62, "swapUsedGiB": 3.55}
+{"phase": "dry-base-batch", "when": "before", "utc": "2026-11-13T14:54:36Z", "loadavg": ["10.83", "7.63", "6.27"], "memAvailableGiB": 19.2, "cachedGiB": 17.62, "swapUsedGiB": 3.55}
+{"phase": "dry-base-batch", "when": "after", "utc": "2026-11-13T14:55:56Z", "loadavg": ["6.05", "6.93", "6.14"], "memAvailableGiB": 21.91, "cachedGiB": 18.34, "swapUsedGiB": 3.55}
+{"phase": "dry-cand-batch", "when": "before", "utc": "2026-11-13T14:55:56Z", "loadavg": ["6.05", "6.93", "6.14"], "memAvailableGiB": 21.91, "cachedGiB": 18.34, "swapUsedGiB": 3.55}
+{"phase": "dry-cand-batch", "when": "after", "utc": "2026-11-13T14:57:02Z", "loadavg": ["5.34", "6.49", "6.03"], "memAvailableGiB": 23.33, "cachedGiB": 19.03, "swapUsedGiB": 3.55}
+{"phase": "h-base-b1", "when": "before", "utc": "2026-11-13T14:57:51Z", "loadavg": ["3.74", "5.86", "5.84"], "memAvailableGiB": 20.27, "cachedGiB": 18.57, "swapUsedGiB": 3.54}
+{"phase": "h-base-b1", "when": "after", "utc": "2026-11-13T14:57:51Z", "loadavg": ["3.74", "5.86", "5.84"], "memAvailableGiB": 20.25, "cachedGiB": 18.59, "swapUsedGiB": 3.54}

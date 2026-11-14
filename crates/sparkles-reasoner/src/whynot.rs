@@ -285,8 +285,7 @@ fn matches(g: &Graph, pat: [Option<u64>; 3], cap: usize) -> anyhow::Result<(Vec<
         })?;
     }
     let c = g.cands(pat[0], pat[1], pat[2], 0, g.len());
-    for i in 0..c.len() {
-        let r = c.get(i);
+    for r in c.iter() {
         if !g.alive(r) {
             continue;
         }

@@ -1518,6 +1518,165 @@ the bound. The reviews found an uncharged table of predicate-object answers, the
 order of rows-first, a pair list whose capacity passed its charge and memos kept until a
 round ended, and each is fixed.
 
+**Changes of 100 triples and undos (item 113).** [ROADMAP](../ROADMAP.md) item 113 asked
+where the time of the two costs above goes. It named two options, an in-memory index of
+the input facts and per-thread counters in the block cache. The profiles of a warm change
+point elsewhere.
+
+**The measurement of item 113.** `keep` makes one change, one undo and one repeat in a
+process and reports whole milliseconds, so each figure above for 100 triples is one run of
+a few milliseconds. `examples/lubm.rs` has a second measurement, `churn`, which keeps one
+closure and then makes 40 changes of 100 triples, 20 of 1,000 and 6 of 10,000. Each change
+goes to a university that no earlier round changed and is followed by its undo, the change
+again and a second undo, and `churn` reports the median of each step in microseconds. The first step of a round is the first change of its university, and the three steps
+after it repeat the lookups that the first step made. A trace
+event with the target `sparkles_reasoner::timing` gives the time of each phase of a run.
+
+`keep` ran the reasoner on the global thread pool from the main thread, which hands each
+parallel section of a run to a worker and waits for it, where a server runs the reasoner on
+a reasoning pool. `keep` and `churn` now use a reasoning pool unless `LUBM_POOL=0` is set.
+On a laptop with 4 performance cores among its 16, an RDFS change of 100 triples, its undo
+and its repeat took 10.5, 7.0 and 6.3 ms from the main thread against 5.8, 3.8 and 2.9 ms
+on a pool. On atlas, which has forge's hardware, the two placements take the same time for
+RDFS, and OWL 2 RL undos take 9.0 ms from the main thread against 11.3 ms on a pool. The
+placement therefore does not explain the forge figures above, and
+[ROADMAP](../ROADMAP.md) item 943 asks which pool an embedded run should use.
+
+**What the profiles found.** Profiles of `churn` on the laptop and the phase times of the
+trace on atlas found four costs.
+
+* A run read the commits since its last run through the commit diff. The index of a
+  generation's log had an entry every 1,024 commits or mebibyte, so the read started up to
+  a mebibyte before the commit it wanted. The diff then turned every changed quad into
+  terms, and the run looked each term up again for the ids it works with. In an RDFS undo
+  of 1,000 triples at one thread, reading the changes and resolving them against the kept
+  closure took 5.1 ms of 18.7 ms.
+* Every incremental run parsed its profile's rules and compiled them to check that they
+  can be maintained incrementally. That took 0.3 ms for RDFS and 1.0 ms for OWL 2 RL,
+  about a tenth of a change of 100 triples.
+* The first change after a closure is kept decodes whole blocks of the store for lookups
+  whose answers the closure then remembers, and the decodes are 57% of its samples. The
+  first step of a round, which changes a university for the first time, takes about three
+  times as long as its undo for 100 RDFS triples at one thread.
+* The deletion's backward search, `Search::prove`, has 87% of the samples of a warm
+  OWL 2 RL change of 1,000 triples. A check of a fully bound atom probes the derived tier's
+  triple index and then the remembered lookups, where one table held both before the
+  follow-up, and `bind_head` returns its bindings by value, which puts 7% of the samples
+  in `memmove`.
+
+Reads of the block cache are under 2% of a warm change's samples on the laptop.
+
+**What item 113 built.**
+
+* The index of a generation's log holds the ends of its newest 64 commits beside its
+  sparse entries, so a read of the changes since a recent commit starts at that commit.
+* `Store::changed_ids` gives the net changes of some graphs in the commits after one
+  commit through a snapshot's commit, as quads of the snapshot's ids with whether each was
+  added. It reads the log of the snapshot's generation. It has no answer when that log
+  does not hold every one of those commits, which is the case across a bulk commit or a
+  compaction, after the generation was collected and in a store without a log. The plan
+  of the read and the open of the log share one hold of the history lock, so a collection
+  between them cannot fail the read.
+* An incremental run reads its changes through `changed_ids` first, and through the
+  commit diff as terms when the log has no answer. Both paths share the code that decides,
+  for several input graphs, whether a triple joined the union, left it or moved.
+* An incremental run keeps its parsed rules, with the result of the check, by the digest
+  of the rule text for the next runs. The kept sets stay in memory for the life of the
+  process and no run's budget counts them, so they are bounded at eight sets and 4 MiB by
+  an estimate of their parsed size. A larger set is parsed on every run as before.
+
+Three ideas were built and reverted, and the in-memory index of the input facts was not
+built. [PERFORMANCE-EXPERIMENTS](../PERFORMANCE-EXPERIMENTS.md#reasoning) records them. A
+changed range of the base tier read by segments and the first segment of a range read
+before its block measured no faster. Per-thread counters in the block cache measured no faster
+on the laptop. On atlas a first comparison, between builds that also held the first of
+those ideas, had them 2 to 8% faster in 11 of 12 cells at 16 threads. A second comparison
+of five rounds, between builds that differ only in the counters, had the undos and repeats
+with the counters at 0.997 of their time without them for RDFS and 0.987 for OWL 2 RL on
+the pool, between 0.95 and 1.05 by cell, and at 1.002 at one thread. The earlier
+advantage was not reproduced, so the counters were not adopted. The build before the follow-up, which keeps the input facts in memory, indicates what the
+index could gain on this workload, and that gain has not been measured.
+
+**Outcome of item 113.** The runs compare four builds of `examples/lubm.rs` with the same
+`churn` driver on atlas, an Intel Core i5-13500 with 20 hardware threads, on 2026-11-14.
+`a6179e58` is the build before the follow-up, on a dataset in index format 2, `88538906`
+the build before the derived tier, `925c07a7` the build before this work and `1590064b`
+this work. Each build ran three times per row, interleaved, alone on the host on a fresh
+copy of the LUBM-style dataset with 100 universities and 13.1 million triples, and the
+one-thread runs were pinned to CPUs 2 to 5. A cell gives the change, the undo, the change
+again and the second undo in milliseconds, each the median over the three processes of
+the process's median. The
+[run record](../benchmarks/reasoning/runs/2026-11-14-item-113-atlas/results.txt) has the
+ranges, and its
+[phase times](../benchmarks/reasoning/runs/2026-11-14-item-113-atlas/phases.txt) are the
+source of the phase figures in this section. The commits after `1590064b` change the example's default pool, bound the kept
+rule sets and put the read's plan and open under one lock, and were not measured again.
+These are benchmark-worker measurements, and the benchmark host has not rerun them.
+
+| Run | Before the follow-up | Before the derived tier | Before item 113 | Item 113 |
+|---|---|---|---|---|
+| RDFS, 100 triples, 1 thread | 3.0, 2.7, 2.7, 2.5 | 10.4, 3.7, 3.1, 2.9 | 9.4, 3.8, 3.3, 3.1 | 8.0, 2.7, 2.3, 2.1 |
+| RDFS, 1,000 triples, 1 thread | 15.9, 13.7, 14.5, 13.4 | 21.9, 17.3, 15.5, 15.0 | 23.4, 18.8, 17.1, 16.4 | 19.4, 14.0, 12.7, 11.7 |
+| RDFS, 10,000 triples, 1 thread | 123, 118, 124, 118 | 152, 150, 131, 131 | 163, 158, 139, 140 | 130, 127, 106, 105 |
+| OWL 2 RL, 100 triples, 1 thread | 6.0, 7.1, 5.3, 6.8 | 13.6, 12.1, 7.3, 9.6 | 14.0, 12.7, 7.9, 10.4 | 12.0, 10.7, 6.2, 8.7 |
+| OWL 2 RL, 1,000 triples, 1 thread | 30.7, 45.2, 29.5, 45.3 | 50.1, 83.3, 39.3, 69.2 | 53.2, 89.1, 42.4, 75.6 | 48.6, 83.3, 37.2, 69.3 |
+| OWL 2 RL, 10,000 triples, 1 thread | 236, 423, 232, 429 | 381, 950, 380, 811 | 412, 1,008, 399, 858 | 379, 957, 366, 823 |
+| RDFS, 100 triples, pool of 16 | 3.3, 2.6, 2.6, 2.5 | 5.8, 3.7, 2.9, 3.0 | 5.8, 3.7, 3.2, 3.1 | 5.5, 2.8, 2.1, 2.1 |
+| RDFS, 1,000 triples, pool of 16 | 15.1, 13.2, 14.1, 12.8 | 15.1, 14.9, 12.8, 13.5 | 16.6, 16.4, 13.9, 14.9 | 11.4, 10.6, 9.5, 9.9 |
+| RDFS, 10,000 triples, pool of 16 | 114, 106, 116, 106 | 92.3, 99.6, 89.1, 94.4 | 107, 105, 99.1, 103 | 79.3, 88.0, 77.4, 78.0 |
+| OWL 2 RL, 100 triples, pool of 16 | 5.8, 6.8, 5.1, 6.6 | 10.1, 11.0, 7.0, 9.9 | 10.3, 12.7, 7.2, 10.8 | 8.8, 11.3, 5.8, 10.2 |
+| OWL 2 RL, 1,000 triples, pool of 16 | 28.5, 42.1, 27.0, 42.2 | 32.1, 61.4, 29.3, 55.9 | 33.1, 60.2, 32.0, 55.7 | 27.2, 53.4, 24.3, 48.4 |
+| OWL 2 RL, 10,000 triples, pool of 16 | 228, 390, 223, 389 | 224, 440, 225, 409 | 235, 435, 223, 415 | 210, 411, 200, 367 |
+| RDFS, 100 triples, 16 threads from the main thread | 3.3, 2.6, 2.7, 2.5 | 5.7, 3.8, 3.1, 3.1 | 6.2, 3.6, 3.2, 3.1 | 5.3, 2.7, 2.1, 2.1 |
+| OWL 2 RL, 100 triples, 16 threads from the main thread | 5.8, 6.6, 5.0, 6.4 | 10.1, 9.6, 6.4, 8.2 | 10.2, 10.8, 6.9, 8.9 | 8.6, 9.0, 5.4, 7.3 |
+| RDFS, full run, 1 thread | 26.7 s | 24.0 s | 24.1 s | 24.5 s |
+| OWL 2 RL, full run, 1 thread | 44.0 s | 40.9 s | 40.7 s | 41.9 s |
+| RDFS, full run, pool of 16 | 15.7 s | 14.4 s | 14.5 s | 14.6 s |
+| OWL 2 RL, full run, pool of 16 | 21.7 s | 20.1 s | 20.1 s | 20.2 s |
+
+On this data and host, RDFS undos and repeated changes take 0.85 to 1.08 times their time
+before the follow-up at one thread and 0.67 to 1.05 times on the pool, where they took
+1.12 to 1.42 and 0.85 to 1.42 times before this work. The slowest cell is the undo of
+10,000 triples at one thread, 127 ms against 118 ms. The rules' own work did not get faster. In the undo of 1,000
+triples at one thread the deletion and the insertion take 9.2 ms against 4.4 ms before the
+follow-up, and the run is level because reading the changes and the closure takes 1.0 ms
+where it took 5.4 ms then and 5.1 ms before this work.
+
+Two costs remain. The first step of a round, the first change of a university, takes 2.6
+times its time before the follow-up for 100 RDFS triples at one thread and 1.7 times on
+the pool, which is [ROADMAP](../ROADMAP.md) item 942. OWL 2 RL changes take 1.2
+to 2.3 times their time before the follow-up at one thread and 0.9 to 1.7 times on the
+pool, against 1.4 to 2.4 and 1.0 to 1.9 times before this work, which is item 941. For
+OWL 2 RL the build before this work takes 1.03 to 1.09 times the time of the build before
+the derived tier at one thread, so most of the gap comes from the follow-up's reads of the
+base tier and not from the tier.
+
+The one-thread full run of this work's build is slower than the build before it in every
+round, 24.5 s against 24.1 s for RDFS and 41.9 s against 40.7 s for OWL 2 RL, which is
+1.7% and 3.0%. On the pool the OWL 2 RL run takes 20.2 s against 20.1 s. A full
+materialization runs none of the item's code beyond one entry per commit in the log's
+index, and on the laptop the build executes 0.4% more instructions in a one-thread
+OWL 2 RL run. The cause is not known. The slowdown is accepted with this item, and
+[ROADMAP](../ROADMAP.md) item 938 takes it up with the one-thread run it already
+investigates.
+
+Item 938 stays open. A change of 100,000 triples under OWL 2 RL at 20 threads, read back
+from the dataset, takes 5.86 to 5.99 s with this work against 6.25 to 6.40 s before it and
+5.69 to 5.96 s before the derived tier, so the read of the changes as ids recovers most
+of what the tier cost that run. A run without changes, which loads the kept closure into the tier, takes 1.82 s, against
+1.85 s before this work and 1.75 s before the tier.
+
+`changed_ids_agree_with_the_states` in `tests/diff.rs` of `sparkles-core` compares the ids
+of every range of random histories with the two materialized states, for four selections
+of graphs. `changed_ids_of_older_snapshots_and_collected_generations` covers snapshots
+older than the head, a cancelled read and snapshots whose generation was replaced or
+collected, and `changed_ids_survive_a_collection_of_their_generation` reads beside 150
+compactions. The incremental suites of `sparkles-reasoner` run every change through the
+new read. The reviews found that the kept rule sets had no bound on their size, that a
+collection between the plan and the open of `changed_ids` failed the read, that `churn`
+could go around its universities again, and a test that counted on the scheduler, and each
+is fixed.
+
 #### Reasoning engine workstream
 
 These phases belong to [ROADMAP](../ROADMAP.md) item 456, the reasoning engine workstream, whose primary spec is [F23](F23-reasoner-core/README.md). Each phase gets its own numbered item when it is ready to start.

@@ -38,13 +38,15 @@ const FSST_ROOM: usize = 64;
 /// Every key of a front-coded block, as a mask of [`Vocab::decode_block`].
 const ALL_KEYS: u32 = (1 << FC_BLOCK) - 1;
 
-/// How many bytes of key `i` of a front-coded FSST block a decode of the keys in
-/// `wanted` (a bit per key) needs, given the entry after it: all of a wanted key
+/// How many bytes of key `i` of a front-coded block a decode of the keys in `wanted`
+/// (a bit per key) needs, given the entry after it: all of a wanted key
 /// (`usize::MAX`), and of another key the bytes that the next key takes from it, its
 /// shared-prefix length. A key that gives the next no more than its own shared prefix
 /// is not decoded at all, and another only up to what the next takes, so a lookup of
-/// one key decodes little more than that key. The need of a key after the last wanted
-/// one does not arise, since decoding stops there.
+/// one key decodes little more than that key. This holds for plain and FSST suffixes
+/// alike, so a long key in the block is not rebuilt for a short neighbour (item 948).
+/// The need of a key after the last wanted one does not arise, since decoding stops
+/// there.
 #[inline(always)]
 fn lookahead(wanted: u32, i: usize, next: Option<Entry>) -> usize {
     match next {
@@ -944,8 +946,8 @@ impl Vocab {
             return;
         }
         let last = 31 - wanted.leading_zeros() as usize;
-        if !F || wanted == (2u32 << last) - 1 {
-            // every key decoded whole: front coding, and FSST when each key is wanted
+        if wanted == (2u32 << last) - 1 {
+            // every key up to the last is wanted, so each is decoded whole
             for i in 0..=last {
                 let e = self.entry::<F>(data, &mut pos, i == 0);
                 key.truncate(e.shared);
@@ -1221,31 +1223,43 @@ impl Vocab {
         // The steps below grow the buffer only through the reservations here, so its
         // capacity is read once, rather than through `key` at every step.
         let mut cap = key.capacity();
+        let mut e = self.entry::<F>(data, &mut pos, true);
         if !F {
-            // front coding rebuilds every key up to the last wanted one, in one pass
+            // plain suffixes: the same lookahead with a copy in place of a decode
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
-                let e = self.entry::<F>(data, &mut pos, at == 0);
-                let total = key.len().min(e.shared).saturating_add(e.len);
-                if total > cap {
-                    reserve(total)?;
-                    key.reserve_exact(total - key.len());
-                    cap = key.capacity();
-                    #[cfg(any(test, feature = "failpoints"))]
-                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
-                        "checked-vocab-scratch-allocated",
-                        key.capacity(),
-                    ));
+                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+                let nd = lookahead(mask, at, next);
+                if nd <= e.shared {
+                    key.truncate(nd);
+                } else {
+                    key.truncate(e.shared);
+                    let add = e.len.min(nd - e.shared);
+                    let total = key.len() + add;
+                    if total > cap {
+                        let total = total.max(self.scratch_capacity());
+                        reserve(total)?;
+                        key.reserve_exact(total - key.len());
+                        cap = key.capacity();
+                        #[cfg(any(test, feature = "failpoints"))]
+                        crate::algo::observe_projection(
+                            crate::algo::ProjectionEvent::Materialized(
+                                "checked-vocab-scratch-allocated",
+                                key.capacity(),
+                            ),
+                        );
+                    }
+                    key.extend_from_slice(&data[e.start..e.start + add]);
                 }
-                key.truncate(e.shared);
-                self.push_suffix::<F>(data, e, id, usize::MAX, key, true);
                 if mask >> at & 1 == 1 {
                     f(id, key)?;
+                }
+                if let Some(n) = next {
+                    e = n;
                 }
             }
             return Ok(());
         }
-        let mut e = self.entry::<F>(data, &mut pos, true);
         for at in 0..=last {
             let id = (b * FC_BLOCK + at) as u64;
             let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
@@ -1261,8 +1275,13 @@ impl Vocab {
                 let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
                 if total.saturating_add(room) > cap {
                     // an FSST suffix decodes fastest with room for eight symbols
-                    // past the key (`fsst::Table::decode_at`)
-                    let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
+                    // past the key (`fsst::Table::decode_at`). The buffer starts at the
+                    // unchecked decoder's size, so that a block's short keys, each
+                    // decoded up to the next key's shared prefix, do not grow it one
+                    // step at a time.
+                    let total = total
+                        .saturating_add(FSST_ROOM * usize::from(e.coded))
+                        .max(self.scratch_capacity());
                     reserve(total)?;
                     key.reserve_exact(total - key.len());
                     cap = key.capacity();
@@ -2087,11 +2106,7 @@ impl Vocab {
         for i in 0..=last {
             let id = (b * FC_BLOCK + i) as u64;
             let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
-            let nd = if F {
-                lookahead(wanted, i, next)
-            } else {
-                usize::MAX
-            };
+            let nd = lookahead(wanted, i, next);
             if nd > e.shared {
                 let add = if nd == usize::MAX {
                     self.suffix_len(data, e, id)
@@ -3299,28 +3314,20 @@ mod tests {
             );
             assert!(blocked.unwrap_err() > 32 << 10);
             assert!(!called);
-            // A front-coded block rebuilds the long key before the short one and
-            // reserves it first. An FSST-coded one decodes only the byte of it that the
-            // short key takes (item 108), so the long key costs nothing.
+            // Either codec decodes only the byte of the long key that the short key
+            // takes (items 108 and 948), so the long key costs nothing, and the buffer
+            // takes the unchecked decoder's first size.
             let mut most = 0;
             let got = v.get_with_checked(
                 1,
                 |need| {
                     most = most.max(need);
-                    if need > 1024 && fsst {
-                        Err(need)
-                    } else {
-                        Ok(())
-                    }
+                    if need > 1024 { Err(need) } else { Ok(()) }
                 },
                 |k| k.to_vec(),
             );
-            assert_eq!(got, Ok(Some(keys[1].clone())));
-            if fsst {
-                assert_eq!(most, 2);
-            } else {
-                assert!(most > 32 << 10);
-            }
+            assert_eq!(got, Ok(Some(keys[1].clone())), "fsst {fsst}");
+            assert_eq!(most, v.scratch_capacity(), "fsst {fsst}");
             let mut got = Vec::new();
             v.get_sorted_checked(
                 &[0, 1, 2, 15, u64::MAX],
@@ -3336,6 +3343,102 @@ mod tests {
                 v.get_with_checked(u64::MAX, |_| Err::<(), _>(()), |_| panic!("invalid key")),
                 Ok(None)
             );
+        }
+    }
+
+    /// A decode of a short key reserves about that key's length, not the length of a
+    /// long key before it in its block, on every decoding path and for both codecs
+    /// (item 948). The long keys share one byte with the short keys after them, so
+    /// that byte is all a decode of a short key needs of them.
+    #[test]
+    fn short_key_decodes_reserve_their_own_length() {
+        const LONG: usize = 64 << 10;
+        const SMALL: usize = 256;
+        let keys = [
+            format!("\"a{}", "x".repeat(LONG)).into_bytes(),
+            b"\"b".to_vec(),
+            format!("\"c{}", "y".repeat(LONG)).into_bytes(),
+            b"\"d".to_vec(),
+        ];
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let v = Vocab::open(dir.path()).unwrap();
+            assert_eq!(v.fsst.is_some(), fsst);
+            let most = std::cell::Cell::new(0usize);
+            let small = |need: usize| {
+                most.set(most.get().max(need));
+                if need > SMALL { Err(need) } else { Ok(()) }
+            };
+            for id in [1u64, 3] {
+                let want = Some(keys[id as usize].clone());
+                assert_eq!(
+                    v.get_with_checked(id, small, |k| k.to_vec()),
+                    Ok(want.clone()),
+                    "fsst {fsst}: checked {id}"
+                );
+                let mut key = Vec::new();
+                assert_eq!(
+                    v.get_with_checked_in(id, &mut key, small, |k| k.to_vec()),
+                    Ok(want.clone()),
+                    "fsst {fsst}: checked in {id}"
+                );
+                assert!(key.capacity() <= SMALL, "fsst {fsst}: {}", key.capacity());
+                assert_eq!(
+                    v.get_with_fallible(
+                        id,
+                        |n| small(n).map_err(|_| crate::Error::Cancelled),
+                        |k| k.to_vec()
+                    )
+                    .unwrap(),
+                    want.clone(),
+                    "fsst {fsst}: fallible {id}"
+                );
+                assert_eq!(
+                    v.get_with_controlled(
+                        id,
+                        |n| small(n).map_err(|_| crate::Error::Cancelled),
+                        |_| Ok(()),
+                        |k| k.to_vec()
+                    )
+                    .unwrap(),
+                    want.clone(),
+                    "fsst {fsst}: controlled {id}"
+                );
+                // the unchecked decoder grows its scratch only as far as the short key
+                for profile in [false, true] {
+                    let mut key = Vec::new();
+                    let mut got = None;
+                    let b = id as usize / FC_BLOCK;
+                    let wanted = 1 << (id as usize % FC_BLOCK);
+                    let f = |_, k: &[u8]| {
+                        got = Some(k.to_vec());
+                        false
+                    };
+                    if profile {
+                        v.decode_block::<true>(b, wanted, &mut key, f);
+                    } else {
+                        v.decode_block::<false>(b, wanted, &mut key, f);
+                    }
+                    assert_eq!(got, want, "fsst {fsst}: unchecked {id}");
+                    assert!(
+                        key.capacity() <= SMALL,
+                        "fsst {fsst}: unchecked scratch {}",
+                        key.capacity()
+                    );
+                }
+            }
+            // both short keys in one checked pass skip the long key between them
+            let mut got = Vec::new();
+            v.get_sorted_checked(&[1, 3], small, |id, k| {
+                got.push((id, k.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(got, vec![(1, keys[1].clone()), (3, keys[3].clone())]);
+            assert!(most.get() <= SMALL, "fsst {fsst}: reserved {}", most.get());
+            // a long key itself is still reserved whole
+            assert!(v.get_with_checked(2, small, |_| ()).unwrap_err() > LONG);
         }
     }
 
@@ -3740,6 +3843,88 @@ mod tests {
                 assert!(cap >= want.len());
                 assert_eq!(run(&mut key, None), Ok(()));
                 assert_eq!((key.as_ptr(), key.capacity()), (ptr, cap));
+            }
+        }
+    }
+
+    /// A writer reuses one rebuild buffer for every cell. Each growth of it is admitted
+    /// first, so its capacity never exceeds the largest reservation, and a step that
+    /// fits the buffer reserves nothing. Keys of varied lengths and shared prefixes are
+    /// decoded in several orders, for both codecs and with and without kept FSST room.
+    #[test]
+    fn reused_checked_buffer_grows_only_after_a_reservation() {
+        let mut keys: Vec<Vec<u8>> = (0..6 * FC_BLOCK)
+            .map(|i| {
+                let tail = "y".repeat((i * 37) % 300);
+                format!("<urn:reuse:{}:{i:04}{tail}", "seg/".repeat(i % 13)).into_bytes()
+            })
+            .collect();
+        keys.sort();
+        let n = keys.len() as u64;
+        let orders: [Vec<u64>; 3] = [
+            (0..n).collect(),
+            (0..n).rev().collect(),
+            (0..n).map(|i| (i * 7) % n).collect(),
+        ];
+        for fsst in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            write_codec(d.path(), &keys, fsst);
+            let v = Vocab::open(d.path()).unwrap();
+            assert_eq!(v.is_fsst(), fsst);
+            for room in [false, true] {
+                for order in &orders {
+                    let mut key = Vec::new();
+                    let mut admitted = 0;
+                    for &id in order {
+                        let held = key.capacity();
+                        // A refused growth leaves the buffer as it was, so the
+                        // reservation comes before the allocation.
+                        let refused = if room {
+                            v.get_sorted_checked_in::<true, _>(
+                                &[id],
+                                &mut key,
+                                |_| Err(()),
+                                |_, _| Ok(()),
+                            )
+                        } else {
+                            v.get_sorted_checked_in::<false, _>(
+                                &[id],
+                                &mut key,
+                                |_| Err(()),
+                                |_, _| Ok(()),
+                            )
+                        };
+                        assert_eq!(key.capacity(), held, "growth before admission at {id}");
+                        let mut reserved = false;
+                        // Each reservation grows the buffer to exactly what it admits, so
+                        // a later one in the same decode must exceed it.
+                        let mut fits = held;
+                        let reserve = |need: usize| {
+                            assert!(need > fits, "{need} fits the held {fits} bytes");
+                            fits = need;
+                            admitted = admitted.max(need);
+                            reserved = true;
+                            Ok::<_, ()>(())
+                        };
+                        let mut got = None;
+                        let f = |_, k: &[u8]| {
+                            got = Some(k.to_vec());
+                            Ok(())
+                        };
+                        if room {
+                            v.get_sorted_checked_in::<true, _>(&[id], &mut key, reserve, f)
+                        } else {
+                            v.get_sorted_checked_in::<false, _>(&[id], &mut key, reserve, f)
+                        }
+                        .unwrap();
+                        assert_eq!(got.as_ref(), Some(&keys[id as usize]));
+                        assert!(key.capacity() <= admitted, "unadmitted growth at {id}");
+                        if !reserved {
+                            assert_eq!(key.capacity(), held);
+                        }
+                        assert_eq!(refused.is_err(), reserved, "refusal at {id}");
+                    }
+                }
             }
         }
     }

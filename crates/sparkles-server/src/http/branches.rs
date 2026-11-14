@@ -630,7 +630,13 @@ pub(crate) fn branch_json(b: &BranchInfo) -> J {
             "generation": b.storage.generation,
         },
         "broken": b.broken,
-        "scratch": b.scratch.as_ref().map(|s| json!({ "creator": s.creator })),
+        "scratch": b.scratch.as_ref().map(|s| {
+            let mut j = json!({ "creator": s.creator });
+            if s.keep {
+                j["keep"] = true.into();
+            }
+            j
+        }),
     })
 }
 
@@ -810,7 +816,11 @@ async fn create_inner(
     // Failure ownership transfers from the authorized handler to its worker.
     *pending_failure = None;
     let info = blocking(move || {
-        let result: ApiResult<_> = ds.store.create_branch(&new, &o).map_err(Into::into);
+        let result: ApiResult<_> = {
+            // names change only under the lock the scratch-branch expiry deletes under
+            let _marks = crate::assist::SCRATCH_MARKS.lock();
+            ds.store.create_branch(&new, &o).map_err(Into::into)
+        };
         match &result {
             Ok(info) => crate::audit::dataset(
                 "branch_created",
@@ -844,7 +854,9 @@ async fn create_inner(
         .into_response())
 }
 
-/// `PATCH /$/branches/{ds}/{name}`: change `protected` or `note` (`null` removes it).
+/// `PATCH /$/branches/{ds}/{name}`: change `protected` or `note` (`null` removes it),
+/// rename the branch, or clear its scratch mark with `scratch: false` (C17 §5.7), which
+/// needs `admin` and turns a scratch branch into an ordinary one.
 pub(crate) async fn patch_branch(
     State(st): St,
     Path((name, branch)): Path<(String, String)>,
@@ -860,13 +872,23 @@ pub(crate) async fn patch_branch(
         .ok_or_else(|| invalid("invalid-branch", "the body is a JSON object"))?;
     if let Some(k) = obj
         .keys()
-        .find(|k| !matches!(k.as_str(), "protected" | "note" | "name"))
+        .find(|k| !matches!(k.as_str(), "protected" | "note" | "name" | "scratch"))
     {
         return Err(invalid(
             "invalid-branch",
-            format!("unknown field {k}: name, protected and note can change"),
+            format!("unknown field {k}: name, protected, note and scratch can change"),
         ));
     }
+    let unscratch = match obj.get("scratch") {
+        None => false,
+        Some(J::Bool(false)) => true,
+        Some(_) => {
+            return Err(invalid(
+                "invalid-branch",
+                "scratch: false, which clears the mark; the MCP tool create_branch makes scratch branches",
+            ));
+        }
+    };
     let rename = match obj.get("name") {
         None => None,
         Some(J::String(n)) if *n == branch => None,
@@ -884,7 +906,7 @@ pub(crate) async fn patch_branch(
         Some(J::String(s)) => Some(Some(s.clone())),
         Some(_) => return Err(invalid("invalid-branch", "note: a string or null")),
     };
-    if protected.is_some() {
+    if protected.is_some() || unscratch {
         check(&p, &name, &branch, Level::Admin, None)?;
     } else {
         check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
@@ -914,6 +936,8 @@ pub(crate) async fn patch_branch(
     let d = ds.clone();
     let (b, r) = (branch.clone(), rename.clone());
     let info = blocking(move || {
+        // a rename and a cleared mark take the lock the scratch-branch expiry deletes under
+        let _marks = crate::assist::SCRATCH_MARKS.lock();
         let b = match &r {
             Some(new) => d.dataset.rename_branch(&b, new)?.name,
             None => b,
@@ -923,6 +947,9 @@ pub(crate) async fn patch_branch(
         }
         if let Some(note) = note {
             d.store.set_branch_note(&b, note)?;
+        }
+        if unscratch && b != sparkles::branch::MAIN {
+            d.store.set_branch_scratch(&b, None)?;
         }
         Ok(d.store.branch_info(&b)?)
     })
@@ -1016,7 +1043,10 @@ async fn delete_branch_inner(
     let identity = ds.store.dataset_id();
     blocking(move || {
         let result = (|| -> ApiResult {
-            ds.dataset.delete_branch_with(&branch, &o)?;
+            {
+                let _marks = crate::assist::SCRATCH_MARKS.lock();
+                ds.dataset.delete_branch_with(&branch, &o)?;
+            }
             ds.branches.lock().remove(&branch);
             #[cfg(feature = "mcp")]
             crate::mcp::memory::pending::touch(&st, &name);

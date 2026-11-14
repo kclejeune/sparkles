@@ -815,12 +815,50 @@ impl NativeDataset {
         }
         let request = input::read(&self.handles, &text, &data).map_err(err)?;
         let snap = shared.ds.snapshot();
-        match request.contains(&snap, self.handles.epoch()).map_err(err)? {
+        match request
+            .contains(0, &snap, self.handles.epoch())
+            .map_err(err)?
+        {
             Some(found) => Ok(Some(found)),
             None => sparkles::embed::contains_in(&snap, &request.pattern(0).map_err(err)?)
                 .map(Some)
                 .map_err(err),
         }
+    }
+    /// Whether each quad of a request is in the dataset, all read from one snapshot,
+    /// as a bit array in the order of the request: bit `r % 32` of word `r / 32` is set
+    /// when quad `r` is there. The quads come in the binary form of `input.rs`, which
+    /// is read before the call returns.
+    ///
+    /// A request of up to `CONTAINS_ALL_INLINE` quads on a dataset in memory is answered
+    /// on the calling thread, as `contains_terms` answers one quad, since its lookups
+    /// take less time than a round trip through the pool. A longer request, and any
+    /// request on a dataset on disk, whose reads can wait for the device, is answered
+    /// on the pool through a promise.
+    #[napi(ts_return_type = "Uint32Array | Promise<Uint32Array>")]
+    pub fn contains_all_terms<'env>(
+        &self,
+        env: &'env napi::Env,
+        text: String,
+        data: Uint32ArraySlice<'_>,
+    ) -> napi::Result<Either<wire::Words, PromiseRaw<'env, wire::Words>>> {
+        let shared = self.get(false)?;
+        let request = input::read(&self.handles, &text, &data).map_err(err)?;
+        let epoch = self.handles.epoch();
+        // the state of the dataset at the call, also for an answer that the pool gives
+        let snap = shared.ds.snapshot();
+        if request.rows <= CONTAINS_ALL_INLINE && shared.ds.store().root().is_none() {
+            return request
+                .contains_all(&snap, epoch)
+                .map(|found| Either::A(found.into()))
+                .map_err(err);
+        }
+        env.spawn_future(async move {
+            blocking(move || request.contains_all(&snap, epoch))
+                .await
+                .map(wire::Words::from)
+        })
+        .map(Either::B)
     }
     #[napi]
     pub async fn matched(
@@ -1006,36 +1044,52 @@ fn pull(
             }
             continue;
         }
-        let row: Option<Vec<Option<Cell>>> = match &mut c.rows {
-            Rows::Streaming(state) => {
-                if state
-                    .batch
-                    .as_ref()
-                    .is_none_or(|batch| state.row == batch.len())
-                {
-                    state.batch = None;
-                    state.row = 0;
-                    state.batch = cursor_batch(
-                        state.cursor.next_batch(),
-                        &mut state.closed_by_cancel,
-                        close_requested,
-                        cancel,
-                    )?;
-                }
-                match &state.batch {
-                    None => None,
-                    Some(batch) => {
-                        let row = batch
-                            .row(state.row)?
-                            .values()
-                            .iter()
-                            .map(|term| term.clone().map(Cell::Term))
-                            .collect();
-                        state.row += 1;
-                        Some(row)
-                    }
-                }
+        if let Rows::Streaming(state) = &mut c.rows {
+            if state
+                .batch
+                .as_ref()
+                .is_none_or(|batch| state.row == batch.len())
+            {
+                state.batch = None;
+                state.row = 0;
+                state.batch = cursor_batch(
+                    state.cursor.next_batch(),
+                    &mut state.closed_by_cancel,
+                    close_requested,
+                    cancel,
+                )?;
+                table.next_query_batch();
             }
+            let Some(batch) = &state.batch else {
+                drained = true;
+                break;
+            };
+            // The first cell of a key in each batch of the query decodes its term, which
+            // asks the query's memory budget for it as every cell's decode did, and a
+            // refusal fails the wire batch. A later cell of the same key in the same
+            // query batch asks nothing: the reservation ends with the decode and the
+            // query does not run in between, so it would ask the same budget for the
+            // same term again.
+            width = batch.width();
+            for column in 0..width {
+                cells.push(match batch.key(state.row, column)? {
+                    // The table keeps its own copy of the term's text, so the handle
+                    // and its credit end with the decode.
+                    Some(key) => table.keyed(key, || {
+                        Ok(batch
+                            .term(state.row, column)?
+                            .map(|term| term.as_term().clone()))
+                    })?,
+                    None => 0,
+                });
+            }
+            state.row += 1;
+            c.pos += 1;
+            rows += 1;
+            continue;
+        }
+        let row: Option<Vec<Option<Cell>>> = match &mut c.rows {
+            Rows::Streaming(_) => unreachable!("streamed rows are read above"),
             Rows::Graph(state) => {
                 if state.batch.as_ref().is_none_or(|b| state.row == b.len()) {
                     state.batch = None;
@@ -1443,6 +1497,10 @@ impl NativeResult {
 /// How long `write` waits on the JavaScript thread for the answer of the transaction's
 /// thread before it returns a promise instead. P05 §1 allows a few microseconds there.
 const INLINE_WAIT: Duration = Duration::from_micros(10);
+/// The longest batch of `contains_all_terms` that a dataset in memory answers on the
+/// JavaScript thread. Its lookups take a few tens of microseconds in all, about what
+/// the round trip through the pool takes.
+const CONTAINS_ALL_INLINE: usize = 256;
 
 /// The answer of a write that the transaction's thread sends back: not there yet, there,
 /// or owed to a promise because the caller stopped waiting for it.

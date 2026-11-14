@@ -799,7 +799,13 @@ const INDEX_COMMITS: u64 = 1024;
 /// And for the first commit after this many bytes of log since the last entry.
 const INDEX_BYTES: u64 = 1 << 20;
 
-/// A sparse index of one generation's log (see the module documentation).
+/// The newest commits whose ends the index holds one by one, beside its sparse entries.
+const RECENT_COMMITS: usize = 64;
+
+/// A sparse index of one generation's log (see the module documentation), with the ends
+/// of the newest commits: a reader of the changes since a recent commit, such as an
+/// incremental materialization after each write, then starts at that commit and not up
+/// to [`INDEX_BYTES`] before it.
 #[derive(Clone, Debug)]
 pub(crate) struct WalIndex {
     /// ascending; the first is the generation's base
@@ -808,6 +814,8 @@ pub(crate) struct WalIndex {
     last: WalPoint,
     /// commits since the newest entry of `points`
     since: u64,
+    /// the ends of the newest commits noted, ascending, at most [`RECENT_COMMITS`]
+    recent: std::collections::VecDeque<WalPoint>,
 }
 
 impl WalIndex {
@@ -821,6 +829,7 @@ impl WalIndex {
             points: vec![p],
             last: p,
             since: 0,
+            recent: std::collections::VecDeque::new(),
         }
     }
 
@@ -830,6 +839,10 @@ impl WalIndex {
             return;
         }
         self.last = p;
+        if self.recent.len() == RECENT_COMMITS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(p);
         self.since += 1;
         let anchor = self.points.last().map_or(0, |a| a.offset);
         if self.since >= INDEX_COMMITS || p.offset - anchor >= INDEX_BYTES {
@@ -843,6 +856,10 @@ impl WalIndex {
     pub fn floor(&self, seq: u64) -> WalPoint {
         if self.last.seq <= seq {
             return self.last;
+        }
+        if self.recent.front().is_some_and(|p| p.seq <= seq) {
+            let i = self.recent.partition_point(|p| p.seq <= seq);
+            return self.recent[i - 1];
         }
         let i = self.points.partition_point(|p| p.seq <= seq);
         self.points[i.saturating_sub(1)]
@@ -1830,6 +1847,7 @@ mod tests {
             points: vec![base, first, second],
             last: second,
             since: 0,
+            recent: Default::default(),
         });
         assert_eq!(backward, second.offset - first.offset < first.offset);
         (root, store, path, first, second)
@@ -2058,7 +2076,10 @@ mod tests {
         assert_eq!(ix.floor(10), p(10, 0));
         assert_eq!(ix.floor(1033), p(10, 0));
         assert_eq!(ix.floor(1034), p(1034, 1024 * 66));
-        assert_eq!(ix.floor(2999), p(2058, 2048 * 66));
+        assert_eq!(ix.floor(2936), p(2058, 2048 * 66));
+        // the newest 64 commits are found one by one
+        assert_eq!(ix.floor(2937), p(2937, 2927 * 66));
+        assert_eq!(ix.floor(2999), p(2999, 2989 * 66));
         assert_eq!(ix.floor(5000), p(3000, 2990 * 66));
         // large transactions: a point per MiB
         let mut ix = WalIndex::new(0);
@@ -2073,6 +2094,10 @@ mod tests {
         ix.note(p(6, 200));
         assert_eq!(ix.floor(5).offset, 0);
         assert_eq!(ix.last(), p(6, 132));
+        // the newest commits are found one by one
+        ix.note(p(7, 264));
+        assert_eq!(ix.floor(6).offset, 132);
+        assert_eq!(ix.floor(7).offset, 264);
     }
 
     /// Every parser checks the frame its control records carry: a version this build

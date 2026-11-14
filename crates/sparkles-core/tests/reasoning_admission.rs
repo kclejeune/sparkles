@@ -53,7 +53,7 @@ impl ReasoningSession for RefusingSession {
             requested: 23,
         }))
     }
-    fn prepare(&mut self, _: &[Demand]) -> Result<Vec<DemandInfo>> {
+    fn prepare(&mut self, _: &[Demand], _: bool) -> Result<Vec<DemandInfo>> {
         self.calls.prepare.fetch_add(1, Ordering::SeqCst);
         Err(Error::invalid(
             "prepare must not follow intensional refusal",

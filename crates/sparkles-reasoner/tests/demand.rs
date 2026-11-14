@@ -1517,16 +1517,20 @@ fn schema_heavy_pattern(r: &mut Rng) -> String {
 }
 
 /// For small schema-heavy views, the solutions under `demand` equal those over an OWL RL
-/// materialization. Some of these views make equality expand into a large closure, so
-/// each query has a deadline: a query past it is counted and skipped, and the others
-/// must agree.
-#[test]
-fn schema_heavy_demand_answers_like_materialization() {
-    let seeds: Vec<u64> = match std::env::var("SCHEMA_HEAVY_SEEDS") {
-        Ok(v) => v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
-        Err(_) => SCHEMA_HEAVY_SEEDS.to_vec(),
+/// materialization. Some views make equality expand into a large closure, so each query
+/// runs under the reasoner's limit of derived facts, which counts work and stops the same
+/// queries on every host. Every query of the fixed seeds answers within it. A query of
+/// other seeds past it is counted and skipped, and the others must agree. Any other
+/// error fails the test. The fixed seeds run in three tests of three, in parallel.
+fn schema_heavy_demand_answers_like_materialization(part: usize) {
+    let (seeds, fixed): (Vec<u64>, bool) = match std::env::var("SCHEMA_HEAVY_SEEDS") {
+        Ok(v) if part == 0 => (
+            v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
+            false,
+        ),
+        Ok(_) => (Vec::new(), false),
+        Err(_) => (SCHEMA_HEAVY_SEEDS[3 * part..3 * part + 3].to_vec(), true),
     };
-    let deadline = std::time::Duration::from_secs(5);
     let (mut checked, mut skipped) = (0usize, 0usize);
     for seed in seeds {
         let mut r = Rng(seed * 6_700_417 + 3);
@@ -1541,28 +1545,50 @@ fn schema_heavy_demand_answers_like_materialization() {
         for _ in 0..8 {
             let q = format!("SELECT DISTINCT * {{ {} }}", schema_heavy_pattern(&mut r));
             let want = rows(&run(&s, &q, &materialized()));
-            let mut options = demand(&qr);
-            options.timeout = Some(deadline);
-            match query(s.snapshot(), &q, &options) {
+            match query(s.snapshot(), &q, &demand(&qr)) {
                 Ok(got) => {
                     checked += 1;
                     assert_eq!(rows(&got), want, "seed {seed}: {q}\n{ttl}");
                 }
-                Err(sparkles_core::Error::Timeout) => skipped += 1,
+                Err(sparkles_core::Error::Component(c))
+                    if c.code == sparkles_reasoner::query::BUDGET_CODE
+                        && c.message.contains(" derived facts ") =>
+                {
+                    skipped += 1
+                }
                 Err(e) => panic!("seed {seed}: {q}: {e}\n{ttl}"),
             }
         }
     }
-    eprintln!("schema-heavy differential: {checked} queries agree, {skipped} past the deadline");
+    eprintln!("schema-heavy differential: {checked} queries agree, {skipped} past the limit");
     assert!(
         checked >= 2 * skipped,
         "{checked} checked, {skipped} skipped"
     );
+    if fixed {
+        assert_eq!((checked, skipped), (24, 0));
+    }
+}
+
+#[test]
+fn schema_heavy_demand_answers_like_materialization_part_1_of_3() {
+    schema_heavy_demand_answers_like_materialization(0);
+}
+
+#[test]
+fn schema_heavy_demand_answers_like_materialization_part_2_of_3() {
+    schema_heavy_demand_answers_like_materialization(1);
+}
+
+#[test]
+fn schema_heavy_demand_answers_like_materialization_part_3_of_3() {
+    schema_heavy_demand_answers_like_materialization(2);
 }
 
 /// The seeds of [`schema_heavy_demand_answers_like_materialization`]: views whose queries
-/// finish within the deadline in a development build, among them 16 and 25, which found
-/// the derived meta type cases above. `SCHEMA_HEAVY_SEEDS=1,2,3` runs others.
+/// all answer within the reasoner's default limit of derived facts, among them 16 and 25,
+/// which found the derived meta type cases above. `SCHEMA_HEAVY_SEEDS=1,2,3` runs others
+/// in the first part.
 const SCHEMA_HEAVY_SEEDS: &[u64] = &[1, 3, 9, 15, 16, 17, 18, 24, 25];
 
 /// The equality stages' table is kept per view: the graphs a caller reads and the commit
@@ -1682,4 +1708,82 @@ fn equality_table_is_not_kept_for_programs_that_read_now() {
         seen.push(got[0].clone());
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// A later session of the same view reuses the schema completeness proof only when its
+/// schema holds the facts the proof read (spec F17, item 911). The schema pass can hold
+/// a generalized triple, here one with a literal subject, which the schema's table does
+/// not keep, so the session that reads the table proves again.
+#[test]
+fn a_cached_completeness_proof_needs_the_schema_rows_it_read() {
+    for (rules, ttl) in [
+        // the literal comes from an axiom
+        (
+            "[a: -> (ex:s ex:p 'lit')]
+             [b: (?s ex:p ?x) -> (?x rdfs:subClassOf ex:C)]
+             [c: (?x rdfs:subClassOf ex:C) -> (ex:answer ex:value ?x)]",
+            "ex:other ex:q ex:thing .",
+        ),
+        // the literal is stored
+        (
+            "[b: (?s ex:p ?x) -> (?x rdfs:subClassOf ex:C)]
+             [c: (?x rdfs:subClassOf ex:C) -> (ex:answer ex:value ?x)]",
+            "ex:s ex:p 'lit' .",
+        ),
+    ] {
+        let profile = Profile::Rules(format!("{PREFIXES}{rules}"));
+        let s = store(ttl);
+        materialize(&s, &profile, &ReasonOptions::default()).unwrap();
+        let q = "SELECT ?x { ex:answer ex:value ?x }";
+        let want = rows(&run(&s, q, &materialized()));
+        assert_eq!(want, vec!["\"lit\"".to_string()], "{rules}");
+        let qr = reasoner(&profile);
+        let mut options = demand(&qr);
+        options.no_cache = true;
+        for i in 0..3 {
+            assert_eq!(rows(&run(&s, q, &options)), want, "session {i}: {rules}");
+        }
+    }
+}
+
+/// An axiom the store already holds is not derived again into the query's answer when
+/// the schema pass seeds the axioms (spec F17, item 911), also when the store's base
+/// generation holds it and the default graph is an input of the reasoning.
+#[test]
+fn a_stored_axiom_is_answered_once() {
+    let s = store("rdf:nil rdf:type rdf:List . ex:a ex:p ex:b .");
+    s.compact().unwrap();
+    let q = "SELECT ?s { ?s rdf:type rdf:List }";
+    for profile in [Profile::Rdfs, Profile::OwlRl] {
+        let qr = reasoner(&profile);
+        let mut options = demand(&qr);
+        options.no_cache = true;
+        for i in 0..2 {
+            assert_eq!(
+                rows(&run(&s, q, &options)),
+                vec![format!("<{RDF}nil>")],
+                "{} session {i}",
+                profile.name()
+            );
+        }
+    }
+}
+
+/// An executed demand query makes no estimate of its patterns' cones, which EXPLAIN shows
+/// and `auto` reads (spec F17 Phase 1 decision 5, item 911): the walk costs about as much
+/// as a narrow derivation.
+#[test]
+fn only_explain_estimates_a_demand() {
+    let s = store("ex:Student rdfs:subClassOf ex:Person . ex:tom a ex:Student .");
+    let qr = reasoner(&Profile::Rdfs);
+    let q = "SELECT ?x { ?x a ex:Person }";
+    let r = run(&s, q, &demand(&qr));
+    assert_eq!(rows(&r), vec!["<http://ex.org/tom>"]);
+    let a = r.reasoning().unwrap();
+    let c = a.nodes[0].counters.as_ref().unwrap();
+    assert!(!c.contains_key("estimatedDerived"), "{c:?}");
+    let (_, plan) = explain(s.snapshot(), q, &demand(&qr)).unwrap();
+    assert_eq!(plan.children[0].operator, "Derive");
+    let c = plan.children[0].counters.as_ref().unwrap();
+    assert!(c.contains_key("estimatedDerived"), "{c:?}");
 }

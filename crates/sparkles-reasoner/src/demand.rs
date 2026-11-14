@@ -49,7 +49,7 @@ use crate::engine::{Atom, CBuiltin, CHead, CRule, Slot, Step};
 use crate::graph::Triple;
 use crate::terms::Terms;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -210,21 +210,225 @@ pub(crate) fn intensional(rules: &[CRule], a: (Slot, Slot, Slot)) -> bool {
 }
 
 /// The rules whose facts a pattern may read, through the rules whose heads give facts of
-/// their body atoms: the dependency cone of a demand before its program is made.
-pub(crate) fn cone(rules: &[CRule], a: (Slot, Slot, Slot)) -> BTreeSet<String> {
+/// what their bodies read: the dependency cone of a demand before its program is made, as
+/// the indices of the rules in the order the walk found them. A body reads its atoms, the
+/// pattern a `noValue` tests, the lists that list builtins and head actions walk, and the
+/// facts a `listForAll` tests.
+pub(crate) fn cone_indices(rules: &[CRule], terms: &Terms, a: (Slot, Slot, Slot)) -> Vec<usize> {
     let mut seen = vec![false; rules.len()];
     let mut todo = vec![a];
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
     while let Some(p) = todo.pop() {
         for (i, r) in rules.iter().enumerate() {
             if !seen[i] && r.head.iter().any(|h| unifies(p, head_slots(h))) {
                 seen[i] = true;
-                out.insert(r.name.clone());
+                out.push(i);
                 todo.extend(r.atoms.iter().map(|b| (b.s, b.p, b.o)));
+                for b in &r.builtins {
+                    if b.kind == BuiltinKind::NoValue {
+                        let arg = |k: usize| b.args.get(k).copied().unwrap_or(Slot::Any);
+                        todo.push((arg(0), arg(1), arg(2)));
+                    }
+                    for read in list_reads(b.kind, &b.args, None) {
+                        if let Read::Facts(s, p) = read {
+                            todo.push((s, p, Slot::Any));
+                        }
+                    }
+                }
+                if reads_lists(r) {
+                    for p in [terms.rdf_first, terms.rdf_rest] {
+                        todo.push((Slot::Any, Slot::Const(p), Slot::Any));
+                    }
+                }
             }
         }
     }
     out
+}
+
+/// The statistics of the input graphs that [`estimate_cone`] reads.
+pub(crate) trait ConeStats {
+    /// The facts of predicate `p` and their distinct subjects and objects.
+    fn predicate(&self, p: u64) -> (f64, f64, f64);
+    /// The facts of the input graphs, their distinct subjects and their distinct
+    /// predicates.
+    fn totals(&self) -> (f64, f64, f64);
+}
+
+/// How deep [`estimate_cone`] follows the atoms that rules give.
+const ESTIMATE_DEPTH: usize = 6;
+/// The largest estimate, so that products do not overflow to infinity.
+const ESTIMATE_CAP: f64 = 1e15;
+
+/// The facts a derivation for the pattern `a` is estimated to produce, with the
+/// positions `bound` bound (a constant of the pattern, or a seed), before the program is
+/// made (spec F17 §4.3). The estimate walks the dependency cone from the pattern. For
+/// each rule whose head gives the pattern, the body is joined in a greedy order, bound
+/// positions first, and each atom multiplies the join by the facts it matches per
+/// binding, from the statistics. The join's size counts as the facts the rule gives.
+/// A body atom that rules give is estimated in turn, with the positions the join has
+/// bound so far, once per rule and adornment, so recursion is counted once and the
+/// walk ends. The free-adornment strata (`noValue` patterns, equality) are among the
+/// atoms the cone reaches with no position bound.
+pub(crate) fn estimate_cone(
+    rules: &[CRule],
+    a: (Slot, Slot, Slot),
+    bound: [bool; 3],
+    stats: &dyn ConeStats,
+) -> f64 {
+    let mut seen: FxHashSet<(usize, u8)> = FxHashSet::default();
+    let (_, total) = estimate_pattern(rules, a, bound, stats, &mut seen, 0);
+    if total.is_finite() {
+        total.min(ESTIMATE_CAP)
+    } else {
+        ESTIMATE_CAP
+    }
+}
+
+/// The facts of the pattern itself that the rules give per binding of its bound
+/// positions, and every fact derived in its cone for them.
+fn estimate_pattern(
+    rules: &[CRule],
+    a: (Slot, Slot, Slot),
+    bound: [bool; 3],
+    stats: &dyn ConeStats,
+    seen: &mut FxHashSet<(usize, u8)>,
+    depth: usize,
+) -> (f64, f64) {
+    if depth > ESTIMATE_DEPTH {
+        return (0.0, 0.0);
+    }
+    let is_bound = |s: Slot, pos: usize| matches!(s, Slot::Const(_)) || bound[pos];
+    let adornment =
+        (is_bound(a.0, 0) as u8) | (is_bound(a.1, 1) as u8) << 1 | (is_bound(a.2, 2) as u8) << 2;
+    let mut own = 0.0;
+    let mut total = 0.0;
+    for (i, r) in rules.iter().enumerate() {
+        let Some(h) = r.head.iter().map(head_slots).find(|h| unifies(a, *h)) else {
+            continue;
+        };
+        if !seen.insert((i, adornment)) {
+            continue;
+        }
+        // the variables the head binds from the pattern's bound positions, and the
+        // constants the pattern fixes in the body
+        let mut vars = vec![false; r.nvars];
+        let mut consts: FxHashMap<usize, u64> = FxHashMap::default();
+        for (pos, hs) in [h.0, h.1, h.2].into_iter().enumerate() {
+            let Slot::Var(v) = hs else { continue };
+            let pattern = [a.0, a.1, a.2][pos];
+            if let Slot::Const(c) = pattern {
+                consts.insert(v, c);
+            }
+            if is_bound(pattern, pos) {
+                vars[v] = true;
+            }
+        }
+        let sub = |s: Slot| match s {
+            Slot::Var(v) => consts.get(&v).map_or(s, |c| Slot::Const(*c)),
+            s => s,
+        };
+        let mut left: Vec<Atom> = r
+            .atoms
+            .iter()
+            .map(|b| Atom {
+                s: sub(b.s),
+                p: sub(b.p),
+                o: sub(b.o),
+            })
+            .collect();
+        let mut size = 1.0f64;
+        while !left.is_empty() {
+            let score = |b: &Atom| {
+                let n = [b.s, b.p, b.o]
+                    .iter()
+                    .filter(|s| match s {
+                        Slot::Const(_) => true,
+                        Slot::Var(v) => vars.get(*v).copied().unwrap_or(false),
+                        Slot::Any => false,
+                    })
+                    .count();
+                (n, std::cmp::Reverse(atom_estimate(b, &vars, stats) as u64))
+            };
+            let k = (0..left.len())
+                .max_by_key(|&k| score(&left[k]))
+                .expect("atoms left");
+            let b = left.remove(k);
+            let mut per = atom_estimate(&b, &vars, stats);
+            // an atom that rules give derives its facts for the join's bindings, and
+            // the join reads the stored facts or the derived ones, whichever are more
+            let slots = (b.s, b.p, b.o);
+            if intensional(rules, slots) {
+                let bound_now = [b.s, b.p, b.o].map(|s| match s {
+                    Slot::Var(v) => vars.get(v).copied().unwrap_or(false),
+                    Slot::Const(_) => true,
+                    Slot::Any => false,
+                });
+                let (atom_own, atom_total) =
+                    estimate_pattern(rules, slots, bound_now, stats, seen, depth + 1);
+                total += (atom_total * size).min(ESTIMATE_CAP);
+                per = per.max(atom_own);
+            }
+            size = (size * per).min(ESTIMATE_CAP);
+            for s in [b.s, b.p, b.o] {
+                if let Slot::Var(v) = s
+                    && v < vars.len()
+                {
+                    vars[v] = true;
+                }
+            }
+        }
+        own += size;
+        total += size;
+        if total >= ESTIMATE_CAP {
+            return (own.min(ESTIMATE_CAP), ESTIMATE_CAP);
+        }
+    }
+    (own, total)
+}
+
+/// The stored facts an atom matches per binding of the variables `bound`, from the
+/// statistics, as the demand transformation's own estimate does: a constant predicate
+/// from its statistics, another by the facts per subject or per predicate of the store.
+fn atom_estimate(b: &Atom, bound: &[bool], stats: &dyn ConeStats) -> f64 {
+    let is = |s: Slot| match s {
+        Slot::Const(_) => true,
+        Slot::Var(v) => bound.get(v).copied().unwrap_or(false),
+        Slot::Any => false,
+    };
+    let (sb, pb, ob) = (is(b.s), is(b.p), is(b.o));
+    let (n, subjects, predicates) = stats.totals();
+    let n = n.max(1.0);
+    let fan = (n / subjects.max(1.0)).max(1.0);
+    let per_p = (n / predicates.max(1.0)).max(1.0);
+    match b.p {
+        Slot::Const(p) => {
+            let (cnt, ds, dos) = stats.predicate(p);
+            match (sb, ob) {
+                (true, true) => cnt.min(1.0),
+                (true, false) => (cnt / ds.max(1.0)).min(cnt),
+                (false, true) => (cnt / dos.max(1.0)).min(cnt),
+                (false, false) => cnt,
+            }
+        }
+        _ => match (sb, ob) {
+            (true, true) => 1.0,
+            (true, false) | (false, true) => {
+                if pb {
+                    fan
+                } else {
+                    fan * 4.0
+                }
+            }
+            (false, false) => {
+                if pb {
+                    per_p
+                } else {
+                    n * 2.0
+                }
+            }
+        },
+    }
 }
 
 pub(crate) fn clone_builtin(b: &CBuiltin) -> CBuiltin {
@@ -1192,6 +1396,7 @@ impl CRule {
 
 /// Facts a pass before a demand program derived in full: the schema. Their atoms ask for nothing and the rules that only give them are left
 /// out of the program.
+#[derive(Clone)]
 pub(crate) struct Closed {
     pub preds: FxHashSet<u64>,
     /// the classes whose `rdf:type` facts are complete
@@ -1422,11 +1627,117 @@ pub(crate) fn complete_schema(
     }))
 }
 
+/// The abstract facts of [`refine_schema`] by predicate, and its types by class. A fact
+/// with a wildcard predicate is a candidate of every atom, and a type with a wildcard
+/// class of every type atom. Those facts are listed once, beside the buckets, so that the
+/// index stays linear in the facts, within the workspace the refinement admits.
+struct AbstractIndex {
+    by_pred: FxHashMap<u64, Vec<usize>>,
+    by_class: FxHashMap<u64, Vec<usize>>,
+    any_pred: Vec<usize>,
+    any_class: Vec<usize>,
+    all: Vec<usize>,
+    rdf_type: u64,
+}
+
+impl AbstractIndex {
+    fn new(facts: &[[Option<u64>; 3]], rdf_type: u64) -> Self {
+        let mut ix = AbstractIndex {
+            by_pred: FxHashMap::default(),
+            by_class: FxHashMap::default(),
+            any_pred: Vec::new(),
+            any_class: Vec::new(),
+            all: (0..facts.len()).collect(),
+            rdf_type,
+        };
+        for (i, f) in facts.iter().enumerate() {
+            match f[1] {
+                None => ix.any_pred.push(i),
+                Some(p) => {
+                    ix.by_pred.entry(p).or_default().push(i);
+                    if p == rdf_type {
+                        match f[2] {
+                            Some(c) => ix.by_class.entry(c).or_default().push(i),
+                            None => ix.any_class.push(i),
+                        }
+                    }
+                }
+            }
+        }
+        // a wildcard predicate can be rdf:type with any class
+        ix.any_class.extend_from_slice(&ix.any_pred);
+        ix
+    }
+
+    /// The facts an atom of known predicate `p` and object `o` can match: those of its
+    /// bucket and those with a wildcard in its place.
+    fn candidates(&self, p: Option<u64>, o: Option<u64>) -> impl Iterator<Item = usize> + '_ {
+        let (bucket, wild): (&[usize], &[usize]) = match (p, o) {
+            (Some(p), Some(c)) if p == self.rdf_type => (
+                self.by_class.get(&c).map_or(&[], |v| v.as_slice()),
+                &self.any_class,
+            ),
+            (Some(p), _) => (
+                self.by_pred.get(&p).map_or(&[], |v| v.as_slice()),
+                &self.any_pred,
+            ),
+            (None, _) => (&self.all, &[]),
+        };
+        bucket.iter().chain(wild).copied()
+    }
+
+    /// The entries the index holds, which stay within a small multiple of the facts.
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.by_pred.values().map(Vec::len).sum::<usize>()
+            + self.by_class.values().map(Vec::len).sum::<usize>()
+            + self.any_pred.len()
+            + self.any_class.len()
+            + self.all.len()
+    }
+}
+
+/// The members of the abstract list whose head is `head`, followed through its
+/// `rdf:rest` links, or `None` when a link leads to a wildcard node, so that the caller
+/// takes the members of every list instead.
+fn list_members(
+    facts: &[[Option<u64>; 3]],
+    index: &AbstractIndex,
+    head: u64,
+    terms: &Terms,
+) -> Option<Vec<Option<u64>>> {
+    let mut members = Vec::new();
+    let mut seen = FxHashSet::default();
+    let mut nodes = vec![head];
+    while let Some(node) = nodes.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        for p in [terms.rdf_first, terms.rdf_rest] {
+            for i in index.candidates(Some(p), None) {
+                let f = facts[i];
+                if f[0] != Some(node) || f[1] != Some(p) {
+                    continue;
+                }
+                if p == terms.rdf_first {
+                    members.push(f[2]);
+                } else {
+                    nodes.push(f[2]?);
+                }
+            }
+        }
+    }
+    Some(members)
+}
+
 /// The finite abstraction keeps every schema/program constant, every predicate and
 /// every type class. Other instance positions become `None` (any term). Concrete
-/// instance rows are never inferred here. Unsupported tests are ignored and their
-/// outputs remain wildcards, so the model can only overestimate rule consequences.
-/// If either workspace cap is reached, retain the conservative dependency answer.
+/// instance rows are never inferred here. `equal`, `notEqual` and a `regex` with a
+/// constant pattern rule out bindings their known values fail. Other tests are ignored
+/// and their outputs remain wildcards, and a list's members are followed from its head
+/// only while every list link has a concrete node, so the model can only overestimate
+/// rule consequences. If either workspace cap is reached, retain the conservative
+/// dependency answer (spec F17, item 911).
 pub(crate) fn refine_schema(
     rules: &[CRule],
     vocab: &Vocab,
@@ -1437,8 +1748,8 @@ pub(crate) fn refine_schema(
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
     let rdf_type = closed.rdf_type;
-    const FACTS: usize = 4096;
-    const BINDINGS: usize = 1024;
+    const FACTS: usize = 1 << 14;
+    const BINDINGS: usize = 1 << 14;
     type Abstract = [Option<u64>; 3];
     fn visit(
         graph: &crate::graph::Graph,
@@ -1536,6 +1847,17 @@ pub(crate) fn refine_schema(
     }
     loop {
         let before = facts.len();
+        // The facts by predicate, and the types by class, so that an atom whose predicate
+        // or class is known visits only the facts it can match. A fact with a wildcard
+        // predicate or class matches every such atom, so it is listed with all of them.
+        let index = AbstractIndex::new(&facts, rdf_type);
+        // whether every list link has a known node, so that a list's members can be
+        // followed from its head rather than taken from every list
+        let concrete_lists = facts.iter().all(|f| match f[1] {
+            None => false,
+            Some(p) if p == terms.rdf_first || p == terms.rdf_rest => f[0].is_some(),
+            Some(_) => true,
+        });
         for r in rules {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
@@ -1545,7 +1867,13 @@ pub(crate) fn refine_schema(
                 let mut next = Vec::new();
                 let mut unique = FxHashSet::default();
                 for binding in &bindings {
-                    for fact in &facts {
+                    let known = |s: Slot| match s {
+                        Slot::Const(c) => Some(c),
+                        Slot::Var(v) => binding[v],
+                        Slot::Any => None,
+                    };
+                    for i in index.candidates(known(a.p), known(a.o)) {
+                        let fact = &facts[i];
                         if cancel.load(Ordering::Relaxed) {
                             return Ok(());
                         }
@@ -1596,12 +1924,27 @@ pub(crate) fn refine_schema(
                 let mut next = Vec::new();
                 let mut unique = FxHashSet::default();
                 for binding in &bindings {
-                    for fact in &facts {
+                    let head = match builtin.args.first() {
+                        Some(Slot::Const(c)) => Some(*c),
+                        Some(Slot::Var(v)) => binding[*v],
+                        _ => None,
+                    };
+                    let members = head
+                        .filter(|_| concrete_lists)
+                        .and_then(|h| list_members(&facts, &index, h, terms));
+                    let candidates: Box<dyn Iterator<Item = Option<u64>>> = match &members {
+                        Some(m) => Box::new(m.iter().copied()),
+                        None => Box::new(
+                            facts
+                                .iter()
+                                .filter(|f| f[1].is_none_or(|p| p == terms.rdf_first))
+                                .map(|f| f[2]),
+                        ),
+                    };
+                    for member in candidates {
+                        let fact = [None, Some(terms.rdf_first), member];
                         if cancel.load(Ordering::Relaxed) {
                             return Ok(());
-                        }
-                        if fact[1].is_some_and(|p| p != terms.rdf_first) {
-                            continue;
                         }
                         let slot = builtin.args[output];
                         let known = match slot {
@@ -1645,6 +1988,12 @@ pub(crate) fn refine_schema(
                         (BuiltinKind::Equal, [a, b]) => value(*a)
                             .zip(value(*b))
                             .is_some_and(|(a, b)| !crate::builtins::same_value(terms, a, b)),
+                        // a constant pattern that a known text does not match
+                        (BuiltinKind::Regex, [x, ..]) => b.regex.as_ref().is_some_and(|re| {
+                            value(*x)
+                                .and_then(|x| terms.lexical(x))
+                                .is_some_and(|text| !re.is_match(&text))
+                        }),
                         _ => false,
                     });
                 if impossible {
@@ -2113,6 +2462,45 @@ pub(crate) enum TransformError {
 mod schema_completeness_tests {
     use super::*;
 
+    /// The abstraction's index lists the facts with a wildcard predicate or class once,
+    /// not in every bucket, so that many buckets beside many wildcard facts stay linear
+    /// (spec F17, item 911), and an atom still meets every fact it can match.
+    #[test]
+    fn abstract_index_stays_linear_and_keeps_wildcard_candidates() {
+        let rdf_type = 7;
+        let n = 3000u64;
+        let mut facts: Vec<[Option<u64>; 3]> = Vec::new();
+        for i in 0..n {
+            facts.push([Some(10_000 + i), Some(20_000 + i), None]);
+            facts.push([Some(10_000 + i), None, Some(30_000)]);
+            facts.push([None, Some(rdf_type), Some(40_000 + i)]);
+        }
+        facts.push([None, Some(rdf_type), None]);
+        let ix = AbstractIndex::new(&facts, rdf_type);
+        assert!(
+            ix.entries() <= 4 * facts.len(),
+            "{} entries for {} facts",
+            ix.entries(),
+            facts.len()
+        );
+        let wild = facts.len() - 1;
+        let of = |p: Option<u64>, o: Option<u64>| ix.candidates(p, o).collect::<Vec<usize>>();
+        // a predicate's own fact and every wildcard predicate
+        let got = of(Some(20_005), None);
+        assert_eq!(got.len(), 1 + n as usize);
+        assert!(got.contains(&15) && got.contains(&16));
+        // a class's own type, the type of a wildcard class and every wildcard predicate
+        let got = of(Some(rdf_type), Some(40_005));
+        assert_eq!(got.len(), 2 + n as usize);
+        assert!(got.contains(&17) && got.contains(&wild) && got.contains(&1));
+        // an unknown class reads every type and every wildcard predicate
+        assert_eq!(of(Some(rdf_type), None).len(), 2 * n as usize + 1);
+        // an unknown predicate reads every fact
+        assert_eq!(of(None, None).len(), facts.len());
+        // a predicate without facts reads the wildcard predicates
+        assert_eq!(of(Some(99), None).len(), n as usize);
+    }
+
     fn rule(predicate: Slot, object: Slot, body: Vec<(u64, Slot)>) -> CRule {
         CRule {
             name: "schema dependency fixture".into(),
@@ -2322,7 +2710,8 @@ mod schema_completeness_tests {
     fn schema_completeness_abstract_caps_cancel_and_memory_leave_no_partial_proof() {
         let (terms, mut graph, mut closed) = abstract_fixture();
         closed.preds.insert(50);
-        graph.add_batch((1000..5100).map(|p| [9, p, 11]));
+        // more distinct predicates than the abstraction's cap of facts
+        graph.add_batch((1000..17_500).map(|p| [9, p, 11]));
         let budget = Budget::unlimited();
         refine_schema(
             &[],
@@ -2483,5 +2872,68 @@ mod schema_completeness_tests {
         assert!(budget.used() < before_drop);
         let _occupied = Held::try_new(&budget, budget.available()).unwrap();
         assert!(compact_roots(&terms, &[root]).is_err());
+    }
+
+    struct FlatStats;
+
+    impl ConeStats for FlatStats {
+        fn predicate(&self, p: u64) -> (f64, f64, f64) {
+            // predicate 9 has 1,000 facts over 100 subjects and 10 objects; predicate 11
+            // has 50 facts, one per subject and object
+            match p {
+                9 => (1000.0, 100.0, 10.0),
+                11 => (50.0, 50.0, 50.0),
+                _ => (0.0, 0.0, 0.0),
+            }
+        }
+        fn totals(&self) -> (f64, f64, f64) {
+            (1050.0, 100.0, 2.0)
+        }
+    }
+
+    /// The cone estimate multiplies each rule's body by the facts its atoms match per
+    /// binding, follows the atoms that rules give once per adornment, and shrinks with
+    /// bound positions (spec F17 §4.3).
+    #[test]
+    fn cone_estimates_follow_the_statistics_and_the_bound_positions() {
+        // (?x 9 ?y) -> (?x 10 ?y); (?x 10 ?y) -> (?x 20 ?y); (?x 20 ?y), (?x 11 ?z) -> (?x 30 ?z)
+        let mut join = rule(
+            Slot::Const(30),
+            Slot::Var(2),
+            vec![(20, Slot::Var(1)), (11, Slot::Var(2))],
+        );
+        join.nvars = 3;
+        let rules = vec![
+            rule(Slot::Const(10), Slot::Var(1), vec![(9, Slot::Var(1))]),
+            rule(Slot::Const(20), Slot::Var(1), vec![(10, Slot::Var(1))]),
+            join,
+        ];
+        let free = (Slot::Var(0), Slot::Const(30), Slot::Var(2));
+        let all = estimate_cone(&rules, free, [false; 3], &FlatStats);
+        // 1,000 facts of 10, as many of 20, and the join of 20 with 11: 1,000 × 1
+        assert!((3000.0..3100.0).contains(&all), "{all}");
+        let bound = estimate_cone(&rules, free, [true, false, false], &FlatStats);
+        // per subject: 10 facts of 9, so 10 of 10 and 20, and 10 × 1 of the join
+        assert!((30.0..31.0).contains(&bound), "{bound}");
+        assert!(bound < all);
+        let none = estimate_cone(
+            &rules,
+            (Slot::Var(0), Slot::Const(99), Slot::Var(2)),
+            [false; 3],
+            &FlatStats,
+        );
+        assert_eq!(none, 0.0);
+        // a recursive rule is counted once per adornment and the walk ends
+        let recursive = vec![
+            rule(Slot::Const(10), Slot::Var(1), vec![(9, Slot::Var(1))]),
+            rule(Slot::Const(10), Slot::Var(1), vec![(10, Slot::Var(1))]),
+        ];
+        let r = estimate_cone(
+            &recursive,
+            (Slot::Var(0), Slot::Const(10), Slot::Var(1)),
+            [false; 3],
+            &FlatStats,
+        );
+        assert!(r.is_finite() && r >= 1000.0, "{r}");
     }
 }

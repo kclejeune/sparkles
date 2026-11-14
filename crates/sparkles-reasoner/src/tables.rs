@@ -221,6 +221,13 @@ pub(crate) fn put(key: Key, table: Arc<Table>) {
     CACHE.put(key, table);
 }
 
+/// Whether the cache holds a table for `key`, without counting a hit or a miss and
+/// without marking the table used: the cost estimate of `auto` asks before a derivation
+/// decides whether to read the table (spec F17 §4.3).
+pub(crate) fn peek(key: &Key) -> bool {
+    CACHE.inner.lock().map.contains_key(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

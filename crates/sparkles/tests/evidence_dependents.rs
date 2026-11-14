@@ -137,6 +137,7 @@ fn claim(ds: &Dataset, source: &str) -> Target {
                 attributed_author: iri("urn:publisher"),
                 scope: Default::default(),
                 confidence: Default::default(),
+                validity: None,
             }],
             ..Default::default()
         },

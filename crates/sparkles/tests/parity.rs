@@ -809,6 +809,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("explainInference", "reasoning.explain", |ds| {
             ds.reasoning().explain(&any());
         }),
+        op!("getQueryReasoning", "reasoning.query.get", |ds| {
+            ds.query_reasoning();
+        }),
+        op!("setQueryReasoning", "reasoning.query.set", |ds| {
+            let _ = ds.set_query_reasoning(Some(sparkles::reasoning::QuerySetting::default()));
+        }),
+        op!("clearQueryReasoning", "reasoning.query.clear", |ds| {
+            let _ = ds.set_query_reasoning(None);
+        }),
         op!("getRdfs", "reasoning.rdfs.get", |ds| {
             ds.reasoning().rdfs().get();
         }),
@@ -1218,6 +1227,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.construct",
     "dataset.transaction",
     "dataset.quads",
+    "dataset.contains_all",
     "dataset.insert",
     "dataset.remove",
     "dataset.clone_to_with",
@@ -1253,6 +1263,7 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.construct("CONSTRUCT {} {}");
     ds.transaction(|_| Ok(()));
     ds.quads(None, None, None, None);
+    ds.contains_all([any::<oxrdf::QuadRef<'_>>()]);
     ds.insert(any());
     ds.remove(any());
     ds.branch("dev");

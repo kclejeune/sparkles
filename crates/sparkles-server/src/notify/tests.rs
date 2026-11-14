@@ -485,6 +485,116 @@ async fn memory_review_notifies_then_repeats() {
     );
 }
 
+/// Item 435: `memory.review.pending` names the scratch branches that expire within the
+/// dataset's `notifyBefore` and hold commits of their own, as a condition apart from the
+/// review branches, on a server that expires scratch branches.
+#[cfg(feature = "mcp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expiring_scratch_branches_with_commits_notify() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Flags {
+        #[command(flatten)]
+        mcp: crate::mcp::http::ServeArgs,
+    }
+    let rx = Receiver::start(vec![]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::new(
+        &dir.path().join("data"),
+        sparkles::store::StoreOptions::default(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    st.outbound.allow_private = true;
+    crate::settings::server::start(&mut st, None, &Default::default()).unwrap();
+    let args = ["serve", "--mcp", "--mcp-allow-update"];
+    st.mcp = Some(Arc::new(
+        Flags::parse_from(args).mcp.conf(&st).unwrap().unwrap(),
+    ));
+    let st = Arc::new(st);
+    st.set_phase(crate::obs::Phase::Ready);
+    let f = Fixture {
+        _dir: dir,
+        st: st.clone(),
+        app: crate::http::router(st),
+    };
+    let (s, v) = f
+        .patch(json!({
+            "enabled": true,
+            "channels": {"hook": {"type": "webhook", "url": rx.url()}},
+            "routes": {"memory.review.pending": ["hook"]},
+        }))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let ds = f.st.attach("org", DbType::Mem, None).unwrap();
+    let mark = |name: &str, keep| {
+        ds.dataset.create_branch(name, &Default::default()).unwrap();
+        ds.store
+            .set_branch_scratch(
+                name,
+                Some(sparkles::branch::Scratch {
+                    creator: "user:agent-7".into(),
+                    keep,
+                }),
+            )
+            .unwrap();
+    };
+    mark("idle", false);
+    mark("busy", false);
+    mark("kept", true);
+    for b in ["busy", "kept"] {
+        ds.dataset
+            .branch(b)
+            .unwrap()
+            .update("INSERT DATA { <urn:a> <urn:p> 1 }")
+            .unwrap();
+    }
+    let key = "memory.review.pending/org/scratch";
+    let now = Utc::now();
+    // without a window or a TTL nothing warns
+    assert_eq!(events::scratch_expiring(&f.st, "org", now), None);
+    let (s, v) = f
+        .send(
+            "PATCH",
+            "/$/settings/org/memory",
+            Some(json!({"scratchBranches": {"ttl": "10h", "notifyBefore": "2h"}})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // the branches expire in ten hours: outside the window
+    assert_eq!(events::scratch_expiring(&f.st, "org", now), None);
+    // seven hours on, `busy` is inside the window; `idle` has no commits of its own and
+    // `kept` never expires, so neither is named
+    let t = now + TimeDelta::hours(9);
+    assert_eq!(
+        events::scratch_expiring(&f.st, "org", t),
+        Some(Raised::Queued(vec!["hook".into()]))
+    );
+    assert!(is_active(&f.st, key));
+    // the review branches have a condition of their own
+    assert!(!is_active(&f.st, "memory.review.pending/org"));
+    assert_eq!(
+        events::scratch_expiring(&f.st, "org", t + TimeDelta::minutes(10)),
+        Some(Raised::Suppressed)
+    );
+    settled(&f.st, "hook", 1).await;
+    let got = rx.got();
+    let env: Value = serde_json::from_slice(&got[0].body).unwrap();
+    assert_eq!(env["type"], "memory.review.pending");
+    assert_eq!(env["dataset"], "org");
+    let data = &env["data"];
+    assert_eq!(data["count"], 1, "{env}");
+    assert_eq!(data["expiring"][0]["name"], "busy", "{env}");
+    assert_eq!(data["expiring"][0]["creator"], "user:agent-7");
+    assert_eq!(data["expiring"][0]["ahead"], 1);
+    assert_eq!(data["notifyBefore"], "2h");
+    assert!(env["summary"].as_str().unwrap().contains("busy"), "{env}");
+    // merged or deleted, the branch no longer warns and the condition clears
+    ds.dataset.delete_branch("busy", true).unwrap();
+    assert_eq!(events::scratch_expiring(&f.st, "org", t), None);
+    assert!(!is_active(&f.st, key));
+}
+
 /// A8: a failing backup policy notifies once per `repeatEvery`, and a success clears it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backup_failures_repeat_and_clear() {

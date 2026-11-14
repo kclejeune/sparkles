@@ -377,6 +377,7 @@ async fn a16_grants_limited_to_branches() {
             "other",
             Some(sparkles::branch::Scratch {
                 creator: "user:devs".into(),
+                keep: false,
             }),
         )
         .unwrap();
@@ -394,6 +395,7 @@ async fn a16_grants_limited_to_branches() {
             "other",
             Some(sparkles::branch::Scratch {
                 creator: "user:graphy".into(),
+                keep: false,
             }),
         )
         .unwrap();

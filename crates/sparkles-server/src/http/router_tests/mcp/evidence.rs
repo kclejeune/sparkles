@@ -478,6 +478,23 @@ async fn branch_selection_and_invalid_requests_write_nothing() {
     )
     .await;
     assert_eq!(tool_error(&invalid), "invalid-proposal");
+    // a validity record the profile's shapes refuse (spec C27 §4.4), and validity
+    // through open claim scope, answer as invalid proposals too
+    let mut overlapping = proposal();
+    overlapping["claims"][0]["validity"] = json!({
+        "start": {"kind":"known","earliest":"2026-01-01T00:00:00Z","latest":"2026-02-02T00:00:00Z",
+                  "precision":"urn:x-sparkles:valid-time:Day","sourceValue":"January"},
+        "end": {"kind":"known","earliest":"2026-02-01T00:00:00Z","latest":"2026-02-01T00:00:00Z",
+                "precision":"urn:x-sparkles:valid-time:Day","sourceValue":"1 February"},
+        "normalization": {"status":"normalized","method":"urn:method:dates","methodVersion":"1",
+                          "calendar":"urn:x-sparkles:valid-time:Gregorian"}});
+    let refused = invoke(&s, "evw", "propose_claims", overlapping).await;
+    assert_eq!(tool_error(&refused), "invalid-proposal");
+    let mut scoped = proposal();
+    scoped["claims"][0]["scope"] =
+        json!({"urn:x-sparkles:valid-time:validDuring":["<urn:period>"]});
+    let refused = invoke(&s, "evw", "propose_claims", scoped).await;
+    assert_eq!(tool_error(&refused), "invalid-proposal");
     let too_many = invoke(
         &s,
         "evw",

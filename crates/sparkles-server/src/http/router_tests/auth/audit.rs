@@ -339,6 +339,7 @@ fn item62_audit_scratch_expiry_uses_system_actor_after_actual_deletion() {
                 "audit-expire",
                 Some(sparkles::branch::Scratch {
                     creator: "user:alice".into(),
+                    keep: false,
                 }),
             )
             .unwrap();

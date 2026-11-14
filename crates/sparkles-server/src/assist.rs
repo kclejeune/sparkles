@@ -85,6 +85,12 @@ pub const MIN_SCRATCH_TTL: Duration = Duration::from_secs(60);
 pub const MAX_SCRATCH_TTL: Duration = Duration::from_secs(3650 * 86_400);
 /// The `ttl` that turns expiry off for a dataset whatever the server flag says.
 pub const SCRATCH_TTL_OFF: &str = "off";
+/// Held while the server creates, renames or deletes a branch, changes a scratch mark, or
+/// deletes an expired scratch branch, so the expiry never deletes a branch whose mark was
+/// cleared, or another branch that took its name, after it chose the branch.
+pub static SCRATCH_MARKS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+/// The largest `scratchBranches.maxPerPrincipal`, the number of branch ordinals.
+pub const MAX_SCRATCH_PER_PRINCIPAL: u32 = 65_535;
 
 /// `scratchBranches` of `memory.json` (spec C17 §5.7): when idle scratch branches
 /// expire. The setting is the dataset's value of what `--mcp-scratch-branch-ttl` sets for
@@ -97,9 +103,23 @@ pub struct ScratchBranches {
     /// server flag sets a duration; without it the flag decides
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
+    /// the most scratch branches one principal may have in the dataset, kept ones
+    /// included, from 1 to 65535; without it, only the dataset's branch limit applies
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_principal: Option<u32>,
+    /// how long before a scratch branch expires the brief, the branches resource and
+    /// `memory.review.pending` name it, from `1m` to `3650d`; without it, nothing warns
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_before: Option<String>,
 }
 
 impl ScratchBranches {
+    /// The warning window of `notifyBefore`, or `None` without one that validates.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn window(&self) -> Option<Duration> {
+        self.notify_before.as_deref().and_then(scratch_ttl)
+    }
+
     /// The dataset's choice: `None` leaves the decision to the server flag, `Some(None)`
     /// turns expiry off and `Some(Some(d))` expires after `d`.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
@@ -366,6 +386,22 @@ impl MemorySettings {
             return Err(format!(
                 "scratchBranches.ttl: {t:?} is not a duration from 1m to 3650d, such as 24h, or off"
             ));
+        }
+        if let Some(sb) = &self.scratch_branches {
+            if let Some(n) = sb.max_per_principal
+                && !(1..=MAX_SCRATCH_PER_PRINCIPAL).contains(&n)
+            {
+                return Err(format!(
+                    "scratchBranches.maxPerPrincipal: {n} is not from 1 to {MAX_SCRATCH_PER_PRINCIPAL}"
+                ));
+            }
+            if let Some(t) = &sb.notify_before
+                && scratch_ttl(t).is_none()
+            {
+                return Err(format!(
+                    "scratchBranches.notifyBefore: {t:?} is not a duration from 1m to 3650d, such as 6h"
+                ));
+            }
         }
         Ok(())
     }

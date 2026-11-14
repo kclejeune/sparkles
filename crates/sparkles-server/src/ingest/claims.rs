@@ -691,6 +691,7 @@ fn batch(src: &Source, c: Claims, control: &Control) -> Result<Batch, Failed> {
                 extraction: confidence,
                 ..Default::default()
             },
+            validity: None,
         });
         input.links.push(EvidenceLinkInput {
             version: RecordVersion::V1,

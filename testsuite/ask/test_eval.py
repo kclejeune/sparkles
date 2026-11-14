@@ -501,6 +501,39 @@ class Processes(unittest.TestCase):
         '    print(json.dumps({"id": line["id"], "outcome": "clarify"}), flush=True)\n'
     )
 
+    PROFILED_ASK = (
+        "import json,os,sys\n"
+        'if "ask" not in sys.argv:\n'
+        '    print(json.dumps({"head":{"vars":[]},"results":{"bindings":[]}}))\n'
+        "    raise SystemExit(0)\n"
+        "ok = (os.environ.get('RUST_LOG') == 'warn,sparkles::ask::profile=debug'\n"
+        "      and sys.argv[sys.argv.index('--log-format') + 1] == 'json')\n"
+        'out = {"outcome": "clarify"} if ok else {"outcome": "error", "error": {"code": "provider-unavailable"}}\n'
+        'if "--questions" not in sys.argv:\n'
+        "    print(json.dumps(out))\n"
+        "    raise SystemExit(0 if ok else 2)\n"
+        "for raw in sys.stdin:\n"
+        '    print(json.dumps(dict(out, id=json.loads(raw)["id"])), flush=True)\n'
+    )
+
+    def test_profiled_children_get_the_stage_filter_and_json_logs(self):
+        for n, (batch, profiled) in enumerate(
+            [(False, True), (True, True), (False, False), (True, False)]
+        ):
+            args = self.questions_fixture(["clarify"] * 2)
+            args.out = str(self.root / f"out-{n}")
+            args.batch = batch
+            args.profile_stages = profiled
+            self.fake_ask(args, self.PROFILED_ASK)
+            _, report = eval_ask.run_matrix(args)
+            self.assertTrue(report["complete"], report["error"])
+            # an unprofiled child gets neither the filter nor the JSON logs
+            self.assertEqual(
+                report["rows"][0]["failureStatuses"],
+                {} if profiled else {"provider_error": 2},
+                (batch, profiled),
+            )
+
     def test_a_batch_child_that_exits_with_lines_in_flight_ends_the_run(self):
         args = self.questions_fixture(["clarify"] * 3)
         args.batch = True

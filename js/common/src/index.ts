@@ -434,6 +434,11 @@ export function decodeTerm(term: WireTerm | RDF.Term, f: RDF.DataFactory = facto
   }
 }
 
+/** A variable's name without its leading `?` or `$`, when it has one. */
+function bareName(key: string) {
+  const first = key.charCodeAt(0);
+  return first === 63 || first === 36 ? key.slice(1) : key;
+}
 /** the map of every empty `Bindings`, which nothing changes */
 const noTerms = new Map<string, RDF.Term>();
 export class Bindings implements Iterable<[Variable, RDF.Term]> {
@@ -449,7 +454,7 @@ export class Bindings implements Iterable<[Variable, RDF.Term]> {
     return this.terms.size;
   }
   get(key: string | RDF.Variable) {
-    return this.terms.get(typeof key === 'string' ? key.replace(/^[?$]/, '') : key.value);
+    return this.terms.get(typeof key === 'string' ? bareName(key) : key.value);
   }
   has(key: string | RDF.Variable) {
     return this.get(key) !== undefined;
@@ -504,7 +509,7 @@ export class LazyBindings extends Bindings {
     return n;
   }
   override get(key: string | RDF.Variable) {
-    const i = this.names.indexOf(typeof key === 'string' ? key.replace(/^[?$]/, '') : key.value);
+    const i = this.names.indexOf(typeof key === 'string' ? bareName(key) : key.value);
     const cell = i >= 0 ? this.cell(i) : 0;
     return cell ? this.decode(cell) : undefined;
   }

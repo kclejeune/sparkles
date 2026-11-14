@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Bindings
+
+Calls that read a few quads cost less, as part of roadmap item 33. Pattern reads remember the base
+vocabulary's answers for the terms a thread asked for last, which nearly halves a Python
+`in` and takes 30% off a JVM `Graph.contains`, for about 115 KiB per thread
+that reads patterns. A result cache key that is all ASCII renames generated variables
+without a regular expression, which takes a quarter off a short property path query
+through Python. A streamed Node SELECT decodes each distinct term once per batch of the
+query and writes its text once per batch it sends, which takes the export of 105,302
+rows from 105 to 40 ms. A Python cursor decodes up to 255 further rows ahead in one
+detached call, held outside the query's memory budget until they are read, which takes
+a row on the main thread from 2.75 to 1.61 µs. The async cursor reads its plan when
+asked and on close. The figures are from atlas at 105,302 triples.
+
+Each binding answers many membership tests in one call. `Dataset.contains_all` in
+Python, `DatasetGraphSparkles.containsAll` on the JVM and `Dataset.hasAll` in Node take
+a batch of quads and return the answer of `in`, `contains` or `has` for each, in order
+and from one state of the dataset. On atlas at 105,302 triples, a probe in a batch
+of 64 took 0.31 µs on the JVM against 0.97 µs for a single call, and 0.31 µs in
+Node against 0.84 µs. In Python a batch saves about a tenth, since the lookup is most
+of an `in`.
+
 ### Valid time
 
 C27 Phase 1 is complete (roadmap item 341). An authenticated claim proposal records each
@@ -10,8 +32,14 @@ publishes it, and an as-known read with `at=time:` excludes revisions imported a
 its cutoff whatever their publication dates. Attempts to backdate availability through
 the proposal body, SPARQL Update, the Graph Store, RDF Patch or a load are refused
 before anything is written. A clone's root commit is no longer earlier than the commit
-it copies when the server clock runs behind. Validity intervals through the
-authenticated writer are roadmap item 925.
+it copies when the server clock runs behind.
+
+A claim proposal can carry the claim's validity record through `validity` on
+`POST /{ds}/claims`, the MCP tool `propose_claims` and `sparkles::evidence::propose`
+(roadmap item 925). The server stores it with the claim and refuses intervals that the
+valid-time shapes refuse, and claim scope no longer accepts valid-time predicates.
+Claims without validity keep their record and payload digests. `ClaimInput` has a new
+`validity` field, so Rust code that builds it field by field adds `validity: None`.
 
 ### Format
 
@@ -142,6 +170,19 @@ ms without it on one thread, where the entry above gives the times without steps
 than 10 ms take 9% longer in steps on one thread in sum and 4% longer on four, which
 roadmap item 950 follows. This is roadmap item 727.
 
+### Ask latency
+
+An ask whose question names an ambiguous mention now asks which one is meant before it
+reads the schema, the stored examples, the predicate use and the communities of the
+linked entities, which only a draft uses. With type hints the schema is still read
+first. A
+clarification arrives in about 0.45 s instead of 1.0 to 1.2 s from a fresh
+`sparkles ask` process on DBpedia, and in 0.15 s instead of 0.29 s from a running one.
+Draft prompts are unchanged. The `ground` event of a clarification lists the linked
+entities only, and its `usage.grounding` reports no schema terms or examples (roadmap
+item 318). `scripts/eval-ask --profile-stages` records the Ask stage diagnostics of
+each evaluation child.
+
 ### Compatibility
 
 The experimental Rust memory-admission API uses an opaque `ParentHandle` in place
@@ -218,6 +259,28 @@ captures the ledger at the captured commit, a restored dataset pauses its restor
 before it admits a claim and answers `jobs-recovering` while it does, and `POST
 /$/jobs/{ds}/recover` resumes selected paused runs. A clone starts with an empty ledger.
 The `hidden` visibility of the managed-graph registry stays reserved and refused.
+
+`reasoning=auto` chooses per pattern between the materialized inferences and derivation
+on demand (item 19, spec F17 Phase 2). A fresh materialization with the query-time
+profile, rules and inputs is read, a stale or absent one is derived around, a pattern
+whose rules include a Jena backward rule is derived, and EXPLAIN shows each pattern's
+source with estimated costs. A query over a fresh materialization whose rules hold no
+backward rule starts no reasoner session. `PUT /$/reason/{ds}/query` sets the
+dataset's query-time reasoning: the default mode of a query that names none, the profile
+and rules, the input graphs, a derivation budget and whether `auto` may read a stale
+materialization. `serve --query-reasoning NAME=PROFILE`, `sparkles infer --query-default
+MODE` and `sparkles query --reasoning auto` are the CLI's forms. The setting lives in
+`query-reasoning.json` with the version member `queryReasoningFormat`.
+
+Scratch branches of MCP agents have limits and warnings (item 435). `create_branch`
+takes `keep: true` for a branch that never expires. The memory settings gain
+`scratchBranches.maxPerPrincipal`, which caps the scratch branches each principal has in
+a dataset and refuses `create_branch` past it with `409 scratch-branch-limit`, and
+`scratchBranches.notifyBefore`, a window before expiry in which `list_branches` marks a
+branch `expiresSoon`, the new `sparkles://{ds}/branches` resource and the memory brief
+name it, and `memory.review.pending` names the ones with unmerged commits as a condition
+of its own. `PATCH /$/branches/{ds}/{name}` with `scratch: false` clears a scratch mark
+and needs `admin`.
 
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
@@ -773,6 +836,76 @@ view's rows against its query and records a forge baseline.
 CPU's performance counters, checks every result and records a forge baseline.
 
 ### Changed
+
+The reasoner's derived facts live in a columnar tier (roadmap item 835). A fact's
+subject, object and predicate are one row of 24 bytes by fact id, each predicate keeps its
+ids in order, and each predicate's facts are sorted twice, by subject and by object, in
+runs with fence keys that a probe searches before it reads the keys of at most eight
+facts. A merge sorts its ids into each order as 16-byte entries, by digits when the batch
+is large and the pool has at most three threads, appends one run per order and compacts
+the older runs, and a relation with a quarter of its facts dead is rebuilt. A fact costs
+38 bytes in the tier beside its slot in the triple index, and OWL2Bench with 5
+universities measured 52 bytes per derived fact with the index, where the rows, hash
+lists and tables the tier replaces cost about 135 bytes.
+Full and incremental runs derive the same closures with the same fact ids as before.
+
+The closure operators merge their pairs into the derived tier in batches of four million
+(item 865). The step that closes a relation held every pair of the closure, with the
+merge's tables and buffers for all of them, beside the tier until the closure was
+complete, and on OWL2Bench with 5 universities that step, which emits 52 million pairs,
+set the run's peak. A batch now enters the tier's columns and triple index as soon as it
+is full, and the predicate's new facts are sorted into its orders once at the end, so the
+facts keep the ids one merge of the whole closure gave them. The reasoner's peak heap on
+that run fell from 199 to 72 bytes per derived fact, or 87 with the digit sort's second
+buffer. The tier's merges are faster than the hash lists were.
+
+Full materialization with the derived tier takes the time of the build before it (item
+866). A scan probes its candidates' heads in the triple index in groups of 16 when the
+rest of the rule's plan only checks them, so the cache misses of the probes overlap,
+where one candidate's work had grown past the core's reorder window and each probe waited
+alone. A scan goes back to one candidate at a time when a group's probes go unused. A
+run's probe searches a coarse fence first, and each order counts the distinct keys of its
+facts exactly, whatever runs hold them, where the sum over runs had changed a join order
+in the third iteration of OWL2Bench(5). On atlas, OWL2Bench(5) takes 101 to 105 s against
+102 to 107 s before the tier at one thread and 50 to 53 s against 51 to 54 s at 20
+threads, and LUBM(100) takes 37.5 to 38.0 s against 37.3 to 37.8 s and 16.1 to 16.7 s
+against 16.5 to 17.1 s. LUBM(100) at one thread is 0.5% slower, and its incremental
+insertion and deletion about 2% slower (item 938).
+
+Rule bodies are ordered from sampled bindings (item 939). The greedy planner estimates an
+atom whose predicate or class the rule binds from averages, and in `prp-key` it joined a
+keyed class with itself before it read a key value. The planner now keeps up to 16
+bindings of the steps placed so far, counts each atom's candidates under them, and takes
+the sampled order when it is at least twice as cheap. On atlas the rules of OWL2Bench(5)
+take 29.9 s against 51.6 to 51.8 s at one thread and 9.5 to 9.7 s against 12.5 to 12.8 s
+at 20 threads, its materialization takes 80.6 to 80.8 s against 102.5 to 102.8 s and 42.5
+to 42.7 s against 45.5 to 49.2 s, and the rules of OWL2Bench(1) take 662 to 696 ms
+against 976 to 988 ms. The planner changes no plan of LUBM. The rules of LUBM(10) take
+4 ms longer at one thread, 0.4%, by the median of seven paired runs, which is attributed
+to planning (item 945), and LUBM(100) shows no clear difference. A run derives the same facts with either planner, in another
+order, and setting `ReasonOptions::sampled_planning` to `false` keeps the greedy orders.
+Rules in which a builtin binds a variable that an atom also holds, and every rule while
+the derived tier holds a dead fact after a deletion, keep the greedy orders (item 944). The planner of item 487,
+which ordered bodies from statistics, stays unadopted.
+
+RDFS undos and repeated changes over a kept closure take about the time they took when
+the closure also held the explicit facts (item 113). An incremental run of the reasoner read the
+commits since its last run through the commit diff, which started up to a mebibyte before
+the commit in the generation's log, turned every changed quad into terms and looked the
+terms up again. The index of a generation's log now holds the ends of its newest 64
+commits, the new `Store::changed_ids` gives the net changes of some graphs up to a
+snapshot as quads of that snapshot's ids, and an incremental run reads its changes
+through it when the log holds them. A run also keeps its parsed rules, with the check
+that they can be maintained incrementally, by the digest of the rule text. The kept sets
+stay with the process, at most eight sets and 4 MiB by an estimate of their parsed size. On atlas, on
+LUBM-style data with 100 universities, RDFS undos and repeated changes of 100 to 10,000
+triples take 0.85 to 1.08 times their time with the larger closure at one thread, where
+they took 1.12 to 1.42 times. OWL 2 RL changes still take 1.2 to 2.3 times at one thread
+(item 941), and the first change of a part of the data still takes about three times as long as its
+undo for 100 RDFS triples (item 942). `examples/lubm.rs` of the reasoner has a `churn` measurement of many
+changes over one kept closure, its `keep` and `churn` run on a reasoning pool as a
+server's runs do, and the trace event `sparkles_reasoner::timing` gives the time of each
+phase of a run.
 
 Notification channels deliver independently (item 46). Each channel has its own queue
 and delivery thread, so a webhook or ntfy server that hangs or fails delays only its own
@@ -2019,6 +2152,41 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 
 ### Fixed
 
+Query-time reasoning with `reasoning=demand` no longer derives about the whole OWL RL type
+closure for every query (roadmap item 911). The schema completeness proof gave up on
+LUBM's schema and left every schema relation open, so LUBM query 1 took about 3.2 s at
+10 universities. The proof's abstraction now scales, its result is kept
+for each schema table, the schema pass reads the profile's axioms, a session estimates a
+demand's cone only for EXPLAIN and `auto`, and specialization compares rules by their
+structure. Query 1 now takes 1.9 ms with OWL RL and 1.2 ms with RDFS, against 1.8 ms and
+1.3 ms before the proof. Other OWL RL queries remain up to 1.35 times slower than before
+the proof, which item 911 follows. A query that runs and reads no
+materialization leaves `estimatedDerived` out of its `Derive` nodes, and an EXPLAIN that
+does not run the query still gives it.
+
+Seven tests that failed batch gates on a loaded host, and passed on a quiet one, now give
+the same result on any host (roadmap items 451 and 667). Each failed on a wall-clock limit
+or a race and not on a wrong answer. Where a limit bounds the work, the tests count the work
+instead, as the JSON-LD probe test now counts the bytes it expands and the schema-heavy
+demand differential skips a query only past the reasoner's limit of derived facts. Where the
+time was the harness's own, the galloping index join test compares answers as interned term
+numbers, and its slowest part takes 13 s in place of 48 s on a quiet development laptop. The cohort test of the family gate
+enters under a deadline, and the cursor OPTIONAL plan test bypasses the result cache.
+
+A long term in the same vocabulary block as a query's short terms no longer decides
+whether the query runs within its memory budget (roadmap item 948). A lookup in a front-coded vocabulary without
+FSST rebuilt every earlier key of the term's 16-key block in full, so a 600,000-byte
+literal next to a short IRI was allocated and charged when only the IRI was wanted, and
+`SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY DESC(?s)` under a 1 MiB budget was refused
+before its first row although it never matched the literal. An eager decode allocated
+the same neighbour outside the budget. Each earlier key is now decoded only up to the
+bytes that the key after it takes, as FSST lookups already did, and a checked lookup
+starts its buffer at 64 bytes, or 192 with FSST, instead of growing it from nothing. On
+the instruction screen, 50,000 checked random lookups take 0.97 of their earlier
+instructions with front coding and 0.69 with FSST. A long key that shares a long prefix
+with the key after it is still decoded up to that prefix, and a checked lookup by key
+still rebuilds the keys before it in its block, which roadmap item 949 follows.
+
 Reading the `main` branch's information no longer holds the dataset's branch table while
 it waits for the main writer. The periodic history collector takes the writer and then
 the branch table, so a branch listing that ran during a collection could deadlock both,
@@ -2263,6 +2431,12 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+`branches.json` moves to format 3 while it lists a kept scratch branch, and returns to
+format 1 or 2 once none is kept. `memory.json` moves to format 3 while its
+`scratchBranches` holds `maxPerPrincipal` or `notifyBefore`, and stays format 2 with
+`ttl` alone. Older releases refuse both by their versions, so none of them expires a
+kept branch or serves a dataset with empty memory settings.
 
 The GraphRAG state `graphrag/state.json` moves to format version 3, which records the
 review policy of the last build and the claim and decision pairs each report read under

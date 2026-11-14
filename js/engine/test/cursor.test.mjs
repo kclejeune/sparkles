@@ -432,3 +432,120 @@ test(
     }
   },
 );
+
+test(
+  'a streamed term that the memory budget refuses fails the batch',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      const long = 'x'.repeat(2 << 20);
+      await ds.load(`<urn:s> <urn:p> "${long}" , "short" . <urn:t> <urn:p> "short" .`, {
+        format: 'ttl',
+      });
+      const q = 'SELECT ?o WHERE { ?s <urn:p> ?o }';
+      const read = async (options) => {
+        const values = [];
+        for await (const row of await ds.select(q, { execution: 'streaming', ...options }))
+          values.push(row.get('o').value.length);
+        return values.sort((a, b) => a - b);
+      };
+      // a term that repeats in the batch is decoded once and read by every row
+      assert.deepEqual(await read({}), [5, 5, 2 << 20]);
+      // the decoded literal does not fit in one mebibyte, so the stream fails
+      await assert.rejects(read({ maxMemoryBytes: 1 << 20 }), /memory/i);
+    } finally {
+      await ds.close();
+    }
+  },
+);
+
+test(
+  'a term decoded in an earlier batch of a streamed query asks the memory budget again',
+  { timeout: 30000 },
+  async () => {
+    // The three arms give three batches of the query inside one batch sent to
+    // JavaScript. The first arm's batch decodes its literal. The filter of the second
+    // arm holds several times the literal while its batch is read. When that arm reads
+    // the first arm's literal, the literal is a key that was decoded before, and
+    // decoding it for the second batch has to fit beside what the filter holds, as it
+    // does when the arms read three different literals and every cell is decoded. The
+    // lowest budget that reads the rows is therefore the same in both cases. A key that
+    // asked the budget only in its first batch would need one literal less.
+    const size = 64 << 10;
+    const q =
+      'SELECT ?o WHERE { { <urn:a> <urn:p> ?o } UNION ' +
+      '{ <urn:b> <urn:p> ?o FILTER(STRLEN(?o) + RAND() > 0) } UNION { <urn:c> <urn:p> ?o } }';
+    const lowestBudget = async (letters) => {
+      const ds = Dataset.memory();
+      try {
+        const [a, b, c] = [...letters].map((letter) => letter.repeat(size));
+        await ds.load(
+          `<urn:a> <urn:p> "${a}" . <urn:b> <urn:p> "${b}" . <urn:c> <urn:p> "${c}" .`,
+          { format: 'ttl' },
+        );
+        const read = async (maxMemoryBytes) => {
+          const lengths = [];
+          const rows = await ds.select(q, { execution: 'streaming', maxMemoryBytes });
+          for await (const row of rows) lengths.push(row.get('o').value.length);
+          return lengths;
+        };
+        const fits = async (maxMemoryBytes) => {
+          try {
+            await read(maxMemoryBytes);
+            return true;
+          } catch (error) {
+            assert.match(error.message, /memory budget/);
+            return false;
+          }
+        };
+        // a budget of one literal is refused, and one with room reads every row
+        let refused = size;
+        let enough = 8 << 20;
+        assert.equal(await fits(refused), false);
+        assert.deepEqual(await read(enough), [size, size, size]);
+        while (enough - refused > 1024) {
+          const middle = (refused + enough) >> 1;
+          if (await fits(middle)) enough = middle;
+          else refused = middle;
+        }
+        // the refusal just under the lowest budget does not depend on the run
+        for (let run = 0; run < 20; run++)
+          await assert.rejects(read(refused), /memory budget/, `run ${run}`);
+        return enough;
+      } finally {
+        await ds.close();
+      }
+    };
+    const repeated = await lowestBudget('xxx');
+    const distinct = await lowestBudget('xyz');
+    assert.ok(
+      Math.abs(repeated - distinct) <= size / 4,
+      `a repeated literal needs ${repeated} bytes and three literals need ${distinct}`,
+    );
+  },
+);
+
+test(
+  'a term that repeats across the batches of a streamed query is read by every row',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      let data = '';
+      for (let i = 0; i < 500; i++) data += `<urn:s${i}> <urn:p> "shared" ; <urn:q> ${i} . `;
+      await ds.load(data, { format: 'ttl' });
+      const q = 'SELECT ?s ?o ?n WHERE { ?s <urn:p> ?o ; <urn:q> ?n }';
+      // small query batches inside one wire batch, and one wire batch per query batch
+      for (const options of [{ batchSize: 4096 }, { batchSize: 7 }]) {
+        const rows = [];
+        for await (const row of await ds.select(q, { execution: 'streaming', ...options }))
+          rows.push([row.get('s').value, row.get('o').value, row.get('n').value]);
+        assert.equal(rows.length, 500);
+        assert.ok(rows.every(([s, o, n]) => o === 'shared' && s === `urn:s${n}`));
+      }
+    } finally {
+      await ds.close();
+    }
+  },
+);

@@ -74,6 +74,9 @@ DEFERRED = {
     "jobs.retry",
     "jobs.settings",
     "jobs.submit",
+    "reasoning.query.clear",
+    "reasoning.query.get",
+    "reasoning.query.set",
 }
 
 

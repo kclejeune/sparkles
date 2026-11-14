@@ -266,7 +266,7 @@ pub(crate) fn specialize(
             out.push(r.clone_shallow());
             continue;
         }
-        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut seen: FxHashSet<RuleKey> = FxHashSet::default();
         for c in collected {
             let vals: Vec<Option<u64>> = (0..r.nvars).map(|v| bound[v].then_some(c[v])).collect();
             let s = expand_lists(rest(r, &atoms, &builtins, &vals), g, terms);
@@ -274,24 +274,42 @@ pub(crate) fn specialize(
                 continue;
             }
             // the same rule from another binding, its atoms in another order
-            let mut atoms: Vec<String> = s.atoms.iter().map(|a| format!("{a:?}")).collect();
-            atoms.sort_unstable();
-            let key = format!(
-                "{:?}|{:?}|{:?}",
-                atoms,
-                s.builtins
-                    .iter()
-                    .map(|b| (b.kind, &b.args))
-                    .collect::<Vec<_>>(),
-                s.head
-            );
-            if seen.insert(key) {
+            if seen.insert(rule_key(&s)) {
                 made += 1;
                 out.push(s);
             }
         }
     }
     Ok(Specialized { rules: out })
+}
+
+/// A specialized rule as its atoms in a canonical order, its builtins and its head, so
+/// that the same rule from another binding, its atoms in another order, is made once.
+/// A structural key, rather than the rule's text, since every query specializes the
+/// rules again (spec F17, item 911).
+type RuleKey = (
+    Vec<[Slot; 3]>,
+    Vec<(crate::builtins::BuiltinKind, Vec<Slot>)>,
+    Vec<(Option<crate::builtins::HeadAction>, Vec<Slot>)>,
+);
+
+fn rule_key(r: &CRule) -> RuleKey {
+    let mut atoms: Vec<[Slot; 3]> = r.atoms.iter().map(|a| [a.s, a.p, a.o]).collect();
+    atoms.sort_unstable();
+    let builtins = r
+        .builtins
+        .iter()
+        .map(|b| (b.kind, b.args.clone()))
+        .collect();
+    let head = r
+        .head
+        .iter()
+        .map(|h| match h {
+            CHead::Triple(s, p, o) => (None, vec![*s, *p, *o]),
+            CHead::Action(a, args) => (Some(*a), args.clone()),
+        })
+        .collect();
+    (atoms, builtins, head)
 }
 
 /// `r` with each `listForAll(L, ?y, P)` whose list and predicate are constants replaced by

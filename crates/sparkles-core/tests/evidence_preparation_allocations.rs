@@ -143,6 +143,7 @@ fn input(kind: &str) -> EvidenceInput {
                 }),
                 ..ConfidenceFacets::default()
             },
+            validity: None,
         }),
         "evaluatedAt" => input.assessments.push(AssessmentInput {
             version: RecordVersion::V1,

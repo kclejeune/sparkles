@@ -1,0 +1,13 @@
+# The plans of each iteration and the plans that took the sampled order, with the digest of the derived facts and the digest of their order.
+# The measured binary (sha256 c117f5ba04555b9634fe5c05afac772b5e3ca400fa34674bc78b7e132397149b) on the development laptop, on the databases that were copied to atlas,
+# with RUST_LOG=sparkles_reasoner=debug SPARKLES_SAMPLED_PLANNING=1 RAYON_NUM_THREADS=16 lubm infer DB PROFILE. A snapshot plans the same way on every host.
+== lubm10 owl-rl
+plans=124 changed=0 plans=61 changed=0 plans=46 changed=0 plans=54 changed=0 plans=39 changed=0 derived=1038100 derived=1038100 digest=fc2c33692833331d order=01fb5c24649dc863 
+== lubm10 @long-bodies.rules
+plans=7 changed=0 plans=0 changed=0 derived=39667 derived=39667 digest=dc4cb1bbec2631bc order=c2cf6be22bed9ab3 
+== lubm100 owl-rl
+plans=124 changed=0 plans=61 changed=0 plans=46 changed=0 plans=54 changed=0 plans=39 changed=0 derived=10907379 derived=10907379 digest=e528a7b8adf9f841 order=7b4262619b030c3d 
+== lubm100 @long-bodies.rules
+plans=7 changed=0 plans=0 changed=0 derived=416960 derived=416960 digest=a9a59112c0794907 order=cea3912421dac993 
+== owl2bench1 owl-rl
+plans=137 changed=0 plans=89 changed=1 plans=74 changed=2 plans=82 changed=1 plans=65 changed=0 plans=57 changed=0 derived=1400688 derived=1400688 digest=6f8a2a5a61bfd567 order=a6da1566372f200e 

@@ -1,0 +1,46 @@
+# User rules with long bodies over LUBM data (roadmap item 487's second look).
+# Bodies of four to six atoms, with cycles, stars, chains, a selective constant and
+# one recursive rule. The atoms are written in an order a user might write them, not
+# in a good join order.
+@prefix ub: <http://swat.cse.lehigh.edu/onto/univ-bench.owl#> .
+@prefix ex: <http://example.org/long#> .
+
+# LUBM query 2 as a rule: a triangle of member, suborganization and degree.
+[tri: (?x rdf:type ub:GraduateStudent), (?y rdf:type ub:University), (?z rdf:type ub:Department),
+      (?x ub:memberOf ?z), (?z ub:subOrganizationOf ?y), (?x ub:undergraduateDegreeFrom ?y)
+      -> (?x ex:stayedAt ?y)]
+
+# LUBM query 9 as a rule: a student who takes a course of the advisor.
+[adv: (?x rdf:type ub:UndergraduateStudent), (?z rdf:type ub:Course), (?x ub:advisor ?y),
+      (?y ub:teacherOf ?z), (?x ub:takesCourse ?z)
+      -> (?x ex:taughtByAdvisor ?z)]
+
+# Two authors of one publication who work for one department.
+[coauth: (?p ub:publicationAuthor ?a), (?p ub:publicationAuthor ?b), notEqual(?a, ?b),
+         (?a ub:worksFor ?d), (?b ub:worksFor ?d)
+         -> (?a ex:coauthorColleague ?b)]
+
+# Two students of one course with one advisor.
+[mates: (?x ub:takesCourse ?c), (?y ub:takesCourse ?c), (?x ub:advisor ?a), (?y ub:advisor ?a),
+        notEqual(?x, ?y)
+        -> (?x ex:classmateOfAdvisee ?y)]
+
+# A chain that closes on the university of the advisor's doctorate.
+[home: (?s ub:advisor ?p), (?p ub:worksFor ?d), (?d ub:subOrganizationOf ?u),
+       (?p ub:doctoralDegreeFrom ?u)
+       -> (?s ex:advisorHomegrown ?u)]
+
+# A selective constant at the end of the body as written.
+[one: (?s ub:advisor ?p), (?p ub:worksFor ?d), (?s ub:memberOf ?d), (?p ub:teacherOf ?c),
+      (?s ub:takesCourse ?c), (?d ub:subOrganizationOf <http://www.University0.edu>)
+      -> (?s ex:closeTo ?p)]
+
+# Heads of departments with the students who take a course of a member of the department.
+[head: (?h ub:headOf ?d), (?t ub:worksFor ?d), (?t ub:teacherOf ?c), (?s ub:takesCourse ?c),
+       (?s rdf:type ub:GraduateStudent)
+       -> (?h ex:overseesGraduate ?s)]
+
+# A recursive rule over a derived relation with a star on two given ones.
+[reach: (?a ex:coauthorColleague ?b), (?b ex:coauthorColleague ?c), notEqual(?a, ?c),
+        (?a ub:worksFor ?d), (?c ub:worksFor ?d)
+        -> (?a ex:coauthorColleague ?c)]

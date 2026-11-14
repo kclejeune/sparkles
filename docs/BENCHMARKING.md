@@ -1024,8 +1024,9 @@ user-space instructions of the calling thread with the CPU's performance counter
 needs Linux and `kernel.perf_event_paranoid` at 2 or less, and it opens a counter on each
 core type of a hybrid Intel CPU and adds them. For a front-coded and an FSST-coded
 vocabulary of a store of 20,000 items, it counts opening the vocabulary, a
-full scan, decoding every seventh id in order, 50,000 random lookups by id, lookups of
-present and missing keys and prefix ranges. It also counts opening a store without a
+full scan, decoding every seventh id in order, 50,000 random lookups by id, the same
+lookups through the checked decoder that a cursor uses, lookups of present and missing
+keys and prefix ranges. It also counts opening a store without a
 write-ahead log and with 2,000 commits in it, and the difference, which is the cost of
 replaying them. Each case runs five times and reports the median, and the task runs the
 screen in five processes. `--items`, `--commits`, `--reps` and `--processes` change these

@@ -21,10 +21,11 @@ pub use primitives::{
 };
 
 pub use model::{
-    AssessmentInput, BlankAnchor, ClaimInput, ConfidenceFacets, EvidenceInput, EvidenceLinkInput,
-    EvidenceRefInput, EvidenceRefTarget, IdentityInput, IdentityRelation, PassageInput, RecordRef,
+    AssessmentInput, BlankAnchor, BoundaryInput, ClaimInput, ConfidenceFacets, EvidenceInput,
+    EvidenceLinkInput, EvidenceRefInput, EvidenceRefTarget, FoldChoice, IdentityInput,
+    IdentityRelation, NormalizationInput, NormalizationStatus, PassageInput, RecordRef,
     RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage, SourceMetadata,
-    SourceRevisionInput, SourceTimes, StoredFactRef,
+    SourceRevisionInput, SourceTimes, StoredFactRef, ValidityInput,
 };
 
 pub use prepare::{

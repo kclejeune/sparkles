@@ -732,6 +732,9 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
 | DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
+| GET    | `/$/reason/{ds}/query`       | *Extension.* The dataset's query-time reasoning setting ([Automatic choice](#automatic-choice)), with the status of the cache of derived tables for callers with the metrics permission. |
+| PUT    | `/$/reason/{ds}/query`       | *Extension.* Sets the query-time reasoning setting: the default mode, the profile and rules, the input graphs, the budget and the stale policy. `400` with the code `reasoning-setting` for a value outside its range, `403` on a read-only server. Returns the setting. |
+| DELETE | `/$/reason/{ds}/query`       | *Extension.* Removes the setting, so queries read the materialized inferences by default again. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | POST   | `/$/reason/{ds}/explain`     | *Extension.* Derivation trees for an inferred triple, from the facts the caller reads. See [Explanations](#explanations). |
 | GET | `/$/reason/{ds}/diff` | *Extension.* Read-only entailment changes between retained states under one program. See [Entailment diffs](#entailment-diffs). |
@@ -4740,7 +4743,7 @@ including `main`.
 | PATCH | `/$/branches/{ds}` | Sets `exemptPredicates`, the dataset's predicates exempt from conflicts. Needs `admin` on `main`. |
 | POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
-| PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
+| PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). `scratch: false` clears the mark of a [scratch branch](#memory-writes) and needs `admin`. |
 | DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. A branch that an [evidence hold](#evidence-holds) names is refused with `409 branch-held`, and `?releaseHolds=true`, which needs `admin` on the whole dataset, releases those holds first. Answers `204`. A caller whose grants are limited to some graphs may delete only the scratch branches it created. |
 | POST | `/$/branches/{ds}/{name}/relink` | Moves a linked branch onto `main`'s current index and answers the `RelinkResult`. See [Relinking](#relinking). |
 
@@ -5317,8 +5320,9 @@ between two `commit:` selectors never changes, so it gets a weak entity tag and 
 effect, so the net change is the symmetric difference of the changes between the two
 commits. Within the retained generations Sparkles reads only those log records,
 compactions included, and its memory grows with the quads that changed. That is
-`"log"`. A sparse index of each log says where every 1,024th commit ends, so a diff
-starts reading near its first commit. A bulk commit has no log records, and a collected
+`"log"`. A sparse index of each log says where every 1,024th commit ends, and where each
+of the newest 64 commits ends, so a diff starts reading near its first commit and at it
+when the commit is recent. A bulk commit has no log records, and a collected
 generation leaves a gap. Those stretches are compared state against state with a sorted
 merge, which reads both states in full. That is `"compare"`, and in-memory datasets
 always use it.
@@ -8572,7 +8576,7 @@ triples.
 The run needs the closure of the previous run, which includes the derived triples that
 are not valid RDF and so never reach the inferred graph. Each dataset of a server keeps
 it in memory after a run, up to `serve --reason-cache-triples` derived triples. The limit
-is 10 million by default, and a derived triple takes about 135 bytes. The kept closure
+is 10 million by default, and a derived triple takes about 40 bytes. The kept closure
 holds only the derived triples and reads the input graphs from the store's indexes. After a
 restart, and in `sparkles infer`, the run builds it again from the input graphs and the
 inferred graph of the recorded commit. A persistent dataset keeps the derived triples that
@@ -9178,8 +9182,8 @@ beyond the schema, where a materialization derives 10.9 million.
   facts follow only from triples the caller can see.
 * With [RDFS on read](#rdfs-on-read) set, `reasoning=demand` applies instead and EXPLAIN
   says so.
-* `reasoning=auto`, the cost-based choice between the inferred graph and derivation,
-  answers `400`. F17 Phase 2 specifies it, and it is not built.
+* `reasoning=auto` chooses per pattern between the inferred graph and derivation
+  ([Automatic choice](#automatic-choice)).
 * A DESCRIBE with `reasoning=demand` fails with `501` and the code `unsupported`, since
   the description reads facts that no pattern asks for. CONSTRUCT with the description's
   patterns gives the derived facts.
@@ -9199,6 +9203,72 @@ Queries that touch many facts derive them all. `?x a ub:Student` derives the typ
 every person, and such queries take tens to hundreds of times as long as over a
 materialization. [F17's Outcome](specs/F17-query-time-reasoning.md#outcome) has the LUBM
 measurements.
+
+### Automatic choice
+
+`reasoning=auto` reads the materialized inferences when they can answer and derives
+otherwise. The materialization can answer when it has the query-time profile, rules and
+input graphs, is fresh at the commit the query reads, and is readable by the caller. A
+materialization with another profile is never read, so a query that names
+`reasoningProfile` differently from the dataset's materialization derives everything. A
+stale materialization is not read either, so the answer of `auto` is never silently
+stale, and the query derives the facts its patterns need while the inferred graph is left
+out of its default graph. When the materialization can answer, every pattern reads it
+except a pattern whose rules include a Jena backward rule, which derives, since the
+materializer skips those rules. Both sources give facts of the same closure, so a query
+that reads some patterns and derives others answers as a fresh materialization would. A
+rule file with backward rules leaves the materialization out entirely, and every pattern
+derives, when a rule calls a builtin that reads facts outside its patterns (`noValue` or a
+list builtin), makes fresh or time-dependent terms (`makeTemp`, `makeSkolem` or `now`) or
+is unknown to Sparkles, or when a head holds a list action, a blank node or a functor. The
+materialization's answers could then differ from those of the whole program. Tests and
+functions whose results follow from their arguments, such as `notEqual` or `strConcat`,
+keep the materialization readable. A
+derived pattern still reads the inferred graph, so deriving where the materialization
+holds the facts would only add work. With `rdfs`, `rdfs-simple` and `owl-rl`, which have
+no backward rules, a query over a fresh materialization runs as `reasoning=materialized`
+does.
+
+* The response carries `Sparkles-Reasoning: auto; derived=…; tables=…; cached=…` when a
+  pattern was derived, and no such header when the inferred graph answered every pattern.
+  `Sparkles-Inferences` appears only when a stale materialization was read, which the
+  dataset's setting must allow.
+* EXPLAIN's `Reason` node says whether the materialization was fresh, stale or absent,
+  and each `Derive` node gives `source` (`materialized` or `derived`), `reason`, and, when
+  the materialization is read, the estimates `estimatedDerived`, `readCost` and
+  `deriveCost` from the pattern's dependency cone and the store's statistics. An EXPLAIN
+  that does not run the query gives `estimatedDerived` for every pattern.
+* `sparkles query --reasoning auto` takes the same `--profile`, `--rules` and
+  `--max-derived` as `demand`.
+
+The dataset's query-time reasoning setting (`PUT /$/reason/{ds}/query`) names the mode of
+a query that gives no `reasoning` parameter, the profile and rules that derive on demand,
+the input graphs, a budget and the policy for a stale materialization:
+
+```json
+{ "default": "auto",
+  "profile": "owl-rl",
+  "rules": null,
+  "inputs": { "ontologyGraphs": ["http://ex.org/onto"] },
+  "budget": { "maxDerived": 1000000, "maxMillis": null },
+  "stale": "derive" }
+```
+
+Every member is optional. Without `default`, queries read the materialized inferences as
+before. HTTP queries and `sparkles query` follow `default`, and library callers apply it
+with `Dataset::inference_view(Dataset::default_reasoning_mode())`, since
+`Dataset::query` reads the materialized inferences. Without `profile`, derivation uses the profile, rules and inputs of the last
+materialization, so `auto` compares like with like. `profile: "rules"` takes the Jena
+rule text in `rules`. `budget.maxDerived` applies when a query names no `maxDerived`,
+under the server's `--reason-max-derived`, and a derivation that runs longer than
+`budget.maxMillis` fails with `422` and the code `reasoning-budget`. `stale: "allow"`
+lets `auto` read a stale materialization, and the response then carries
+`Sparkles-Inferences`. `GET` returns the setting, with `tables`, the status of the
+process-wide cache of derived tables, for callers with the metrics permission. `DELETE`
+removes it. A persistent dataset keeps the setting in `query-reasoning.json`, with the
+version member `queryReasoningFormat`. `serve --query-reasoning NAME=PROFILE` sets a
+dataset's profile at startup, with `rules:FILE` for a Jena rules file, and
+`sparkles infer --loc DB --query-default auto` sets the default mode of a database.
 
 ## Write-time validation
 
@@ -10872,8 +10942,8 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` and both methods of `/$/vector/{ds}/{name}/projection` need `read` too. |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/query` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` and both methods of `/$/vector/{ds}/{name}/projection` need `read` too. |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/reason/{ds}/query` (PUT, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |
@@ -11766,8 +11836,8 @@ open-world when SERVICE is allowed. The common arguments are:
 | `read_chunks` | `rendition` (required), `from` (0), `count` (5, ≤ 20), `atCommit`, `timeoutSeconds` (30) | `{dataset, branch?, commit, rendition, length, total, chunks, next?, prefixes}`: chunks of a rendition in order with their offsets. |
 | `list_sources` | `graphs` (≤ 20), `limit` (50), `atCommit`, `timeoutSeconds` (30) | `{dataset, branch?, commit, sources: [{source, graph, title?, format?, digest?, rendition, length?, chunks, facts, lastIngestion?}], truncated, prefixes}`. |
 | `ingest_profile` | `name` (`default`), `timeoutSeconds` (30) | `{dataset, name, stored?, classes, predicates: [{iri, label?, object, datatypes?, languages?, ranges?}], shapes?, labelPredicate, language?, vocabulary?, keepText?, schema, prefixes}`: the vocabulary to extract in, with a JSON Schema for an extraction whose class and predicate members are enumerations. |
-| `list_branches` | none | `{dataset, branches: [{name, head, created, lastChange, upstream, from?, ahead, behind, protected, scratch, creator?, expires?, note?}]}`: the branches the caller may see, `main` first. `scratch` marks a branch made by `create_branch`, with its `creator` and, when the server expires idle scratch branches, the time it will expire. |
-| `create_branch` | `name` (required), `from` (`main`), `at` (a commit or selector of `from`), `note` | `{dataset, name, head, created, scratch: true, creator, from, expires?}`: a new [scratch branch](#memory-writes). |
+| `list_branches` | none | `{dataset, branches: [{name, head, created, lastChange, upstream, from?, ahead, behind, protected, scratch, creator?, keep?, expires?, expiresSoon?, note?}]}`: the branches the caller may see, `main` first. `scratch` marks a branch made by `create_branch`, with its `creator`, `keep` for a kept branch and, when the server expires idle scratch branches, the time it will expire. `expiresSoon` marks an expiry within the dataset's `memory.scratchBranches.notifyBefore`. |
+| `create_branch` | `name` (required), `from` (`main`), `at` (a commit or selector of `from`), `note`, `keep` (false) | `{dataset, name, head, created, scratch: true, creator, keep?, from, expires?}`: a new [scratch branch](#memory-writes). With `keep: true` it never expires. |
 | `merge_branch` | `source` (required), `target` (`main`), `dryRun` (true), `expect: {source, target}` (required with `dryRun: false`), `message`, `squash`, `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | A preview as for `sparql_update` with `mergeable`, `conflicts?`, `expect` and `merge` (the fields of [`GET /$/merge/{ds}`](#merges)), or the merge's report with `committed`. |
 | `delete_branch` | `name` (required), `force` (false) | `{dataset, deleted}`. A branch with commits its upstream does not have needs `force`. |
 
@@ -12083,6 +12153,40 @@ logs each deletion, and counts it in `sparkles_mcp_scratch_branches_expired_tota
 Branches made over HTTP, with the CLI or through the library are never expired. The
 flag is off by default.
 
+`create_branch` with `keep: true` makes a scratch branch that never expires. It keeps
+the rights of its creator over it, and it counts toward the creator's limit. A branch
+table that holds a kept branch is written as format 3 of `branches.json`, which an older
+release refuses rather than expire the branch, and the table returns to the older format
+once no listed branch is kept. A caller with `admin` on a branch clears its scratch mark
+with `PATCH /$/branches/{ds}/{name}` and the body `{"scratch": false}`. The branch then
+becomes an ordinary branch that never expires and that only grants without graph
+restrictions merge or delete. Clearing the mark of a branch that has none changes
+nothing, and the expiry never deletes a branch whose mark was cleared after it chose the
+branch.
+
+`memory.scratchBranches.maxPerPrincipal`, an integer from 1 to 65535, limits the scratch
+branches each principal has in the dataset, kept ones included. `create_branch` past the
+limit fails with `scratch-branch-limit` (409) and creates nothing. Branches made over
+HTTP and branches whose mark was cleared do not count. A merge keeps the source branch
+and its mark, so it frees no place, and deleting the branch does. The count and the creation run
+under one lock, so concurrent calls at the limit cannot both pass it.
+
+`memory.scratchBranches.notifyBefore`, a duration from `1m` to `3650d`, sets a warning
+window before expiry. A scratch branch that expires within it is marked `expiresSoon` in
+`list_branches`, listed under `expiring` in the caller's
+[`sparkles://{ds}/branches`](#resources-and-prompts) resource, and named on a
+`# scratch:` line of the [brief](#importing-agent-memory) and in its `expiringBranches` member.
+Those of them with commits of their own are proposals nobody merged, and on a server that
+expires scratch branches the `memory.review.pending` [event](#notifications) names them so that
+a person can merge them or clear their mark. Without the setting nothing warns.
+
+```json
+{ "scratchBranches": { "ttl": "7d", "maxPerPrincipal": 20, "notifyBefore": "1d" } }
+```
+
+A dataset with `maxPerPrincipal` or `notifyBefore` stores `memory.json` as format 3, and
+one with `ttl` alone stays format 2.
+
 `sparkles mcp --loc` opens the databases itself and has no server task. With
 `--allow-update` it applies the datasets' `memory.scratchBranches.ttl` once when it
 opens them, before the first call, and again every ten minutes while the session lasts.
@@ -12102,9 +12206,10 @@ caller with `write` on it:
 | `sparkles://{ds}/prefixes` | `application/sparql-query` | The dataset's prefixes as `PREFIX` lines. |
 | `sparkles://{ds}/queries/{name}` | `application/json` | The stored query: `{dataset, name, tool, version, description, query, parameters}`. |
 | `sparkles://{ds}/memory/review` | `application/json` | The [open review items](#open-review-items) of the dataset's memory inbox, the `review` member of the maintenance answer. Listed for a dataset with memory settings to a caller with `write` on it. |
+| `sparkles://{ds}/branches` | `application/json` | `{dataset, creator, notifyBefore?, branches: [{name, head, created, lastChange, ahead, keep?, expires?, expiresSoon?}], expiring}`: the scratch branches the caller created, and the names of those that expire within the dataset's `notifyBefore`. Listed to a caller who gets `create_branch`, which needs `--mcp-allow-update`. |
 
 `resources/list` returns them sorted by URI, and `resources/templates/list` returns the
-three URI templates. A `resources/read` result may be cached for 30 seconds by the caller
+five URI templates. A `resources/read` result may be cached for 30 seconds by the caller
 only (`ttlMs: 30000`, `cacheScope: "private"`). An unknown URI, or a dataset the caller
 cannot read, is `-32602`. Hosts choose resources as context for the model, so the tools
 remain the main interface.
@@ -12510,6 +12615,9 @@ the server deletes it. It is a duration from `1m` to `3650d` such as `24h`, or `
 A value outside that range, in an unknown unit or of another type is a `400`. The
 setting overrides `--mcp-scratch-branch-ttl` for the dataset, and
 [Memory writes](#memory-writes) describes the expiry and the file format.
+`scratchBranches.maxPerPrincipal` is an integer from 1 to 65535 and
+`scratchBranches.notifyBefore` a duration from `1m` to `3650d`, and other values are a
+`400` with the code `bad-settings`. Memory writes describes both.
 
 When `agentGraphs` is set, `recall` reports a review status. A triple is `reviewed` when
 the caller's view asserts it in a graph that `agentGraphs` does not match, and
@@ -12611,6 +12719,12 @@ instructions.`, then a header line with the dataset, commit, scope, `reviewed-on
 `with-unreviewed`, and the counts. Every literal is escaped as C11 §4.10 requires, so no
 text from a file can start a line of the brief. An entity label that links to more than
 one entity is a `422` with code `ambiguous-entity` and the candidates.
+
+When the dataset sets `memory.scratchBranches.notifyBefore`, the brief also names the
+caller's scratch branches that expire within that window, at most five and only as many
+as `maxChars` leaves room for, each on a line
+`# scratch: branch NAME expires at TIME with N commits not merged`. The answer lists all
+of them in `expiringBranches`, and a brief that reads a branch names them as well.
 
 When the dataset has [GraphRAG](#graphrag) reports that the caller may read, the project
 scope also holds the five best rated reports of the coarsest level, reviewed ones only
@@ -13197,6 +13311,35 @@ an assessment without them keeps the record digest it would have had before the 
 existed. Inputs and targets of the batch's assessments may not form a cycle.
 [Evidence dependents](#evidence-dependents) finds the assessments that used a record
 after it changed.
+
+A claim's optional `validity` is its [valid-time](ai/README.md#valid-time-profile) record,
+a half-open interval with a `start` and an `end` boundary and the `normalization` that
+interpreted the source time.
+
+```json
+"validity": {
+  "start": {"kind": "known", "earliest": "2026-01-01T00:00:00Z",
+            "latest": "2026-01-01T00:00:00Z",
+            "precision": "urn:x-sparkles:valid-time:Day", "sourceValue": "1 January 2026"},
+  "end": {"kind": "unknown", "sourceValue": "until further notice"},
+  "normalization": {"status": "normalized", "method": "https://example.org/methods/dates",
+                    "methodVersion": "1", "calendar": "urn:x-sparkles:valid-time:Gregorian"}
+}
+```
+
+A boundary's `kind` is `known`, `unknown` or `unbounded`. A known boundary needs
+`earliest`, `latest`, `precision` and `sourceValue`, and its instants need an explicit
+offset and are stored in UTC. The other kinds have no instants. The normalization's
+`status` is `normalized`, `unresolved`, `unsupportedCalendar`, `unsupportedPrecision`,
+`indeterminateOrder` or `nonexistentLocalTime`, and it may add `timezonePolicy`,
+`tzdbVersion` and a `foldChoice` of `earlier` or `later`. The server answers
+`400 invalid-proposal` to what the version 1 shapes refuse, such as a reversed boundary, two known boundaries whose latest
+start does not precede the earliest end, a normalized status outside the Gregorian
+calendar, or a fold choice without a timezone policy and database version. The record
+is written with the claim in the proposal graph under fragment IRIs of the claim and is
+covered by its record digest. A claim without it keeps the record and payload digests
+it would have had before the field existed. Claim `scope` cannot name `vt:` predicates, while an assessment's scope can, for
+example with `vt:expiresAt`.
 
 Source revisions, renditions and passages go to the
 [evidence settings'](#evidence-settings) source-record graph, identity proposals to an
@@ -14593,7 +14736,7 @@ server-wide events, and new members may appear in later versions.
 
 | Event | Fires when | `data` |
 |---|---|---|
-| `memory.review.pending` | The oldest open review branch of a dataset is older than the dataset's `memory.review.notifyAfter`. Repeats at most every `memory.review.repeatEvery`, or the kind's `repeatEvery`, until no review branch is open. | `open`, `oldest` with `branch`, `kind` and `created`, `branches` (at most 10), `notifyAfter`, `repeatEvery` |
+| `memory.review.pending` | The oldest open review branch of a dataset is older than the dataset's `memory.review.notifyAfter`. Repeats at most every `memory.review.repeatEvery`, or the kind's `repeatEvery`, until no review branch is open. A second condition of the same event fires when scratch branches with commits of their own expire within the dataset's `memory.scratchBranches.notifyBefore`, on a server that expires scratch branches. It repeats in the same way until no such branch is left. | `open`, `oldest` with `branch`, `kind` and `created`, `branches` (at most 10), `notifyAfter`, `repeatEvery`. For expiring scratch branches, `expiring` (at most 10) with `name`, `creator`, `expires` and `ahead`, `count`, `notifyBefore` and `repeatEvery`. |
 | `backup.failed` | A backup policy run ends `failed` or `partial`, ends `ok` with a failed retention, stops on an error, or cannot start when it is due, or a backup started by hand fails. Repeats at most every `repeatEvery` per policy, or per repository and dataset for a backup started by hand. A policy's condition clears when a run of it succeeds in full, and a backup started by hand clears when any backup of the dataset into the repository succeeds. | For a policy run, `policy`, `run`, `result`, `repository`, `failedDatasets` with `dataset` and `reason`, `consecutiveFailures`, and `retentionError` when retention failed. For a run that stopped or did not start, `policy`, `repository`, `stage` (`run` or `start`) and `error`. For a backup started by hand, `trigger: "manual"`, `dataset`, `repository` and `error`. |
 | `backup.verify.failed` | A verification fails or finds a backup in error. Repeats at most every `repeatEvery` per repository. It clears once every damaged backup has passed a verification at the same or a higher level or has been deleted, and every failed verification has been followed by one of the same scope that succeeded at the same or a higher level. | `repository`, `level`, `backups` in error, and `error` when the verification itself failed |
 | `backup.gc.failed` | A GC of a repository fails, or a policy cannot start its GC after retention. Repeats at most every `repeatEvery` per repository, until a GC of the repository that deletes succeeds. A dry run clears nothing. | `repository`, `stage` (`run` or `start`) and `error` |
