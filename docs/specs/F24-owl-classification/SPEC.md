@@ -3677,7 +3677,8 @@ enumeration that differs from its members, two values of a functional `xsd:doubl
 property and a string in an `xsd:boolean` range, and it has no closed-world cardinality
 check. The rooted run creates no contexts on the sample, because it refuses keys and
 functional data properties, and the sample's base vocabulary and the metrology library
-declare both. Items 970 to 978 record these gaps, the SWRL reader, the
+declare both. Item 768 takes the keys and functional data properties, and items 970 to
+977 record the other gaps, the SWRL reader, the
 lenient read that drops an `AllDisjointClasses` axiom with an undeclared member, the
 `all-disjoint-classes` check that passes its row limit on the sample, owl-reason's
 entailment outputs and an OML importer.
