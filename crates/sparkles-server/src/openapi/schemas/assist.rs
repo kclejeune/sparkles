@@ -2030,7 +2030,9 @@ fn memory(put: &mut dyn FnMut(&str, J)) {
                     })), "The retention of session graphs, off without it."),
                     "scratchBranches": with_desc(closed(&[], json!({
                         "ttl": with_desc(string(), "How long a scratch branch may sit idle before the server deletes it, from `1m` to `3650d`, such as `24h`. `off` keeps the dataset's scratch branches even when the server's `--mcp-scratch-branch-ttl` sets a duration. Without it, the server flag decides. A dataset with this member needs a release that reads `memory.json` format 2."),
-                    })), "When idle scratch branches expire. Written as `format` 2 of `memory.json`."),
+                        "maxPerPrincipal": with_desc(int(), "The most scratch branches one principal may have in the dataset, from 1 to 65535. Kept branches count. `create_branch` past it is refused with `409 scratch-branch-limit`. Without it, only the dataset's branch limit applies."),
+                        "notifyBefore": with_desc(string(), "How long before a scratch branch expires the brief, the `sparkles://{ds}/branches` resource and `list_branches` name it, from `1m` to `3650d`, such as `6h`. `memory.review.pending` names those of them with commits of their own. Without it, nothing warns."),
+                    })), "Limits, warnings and expiry of the scratch branches that MCP agents create. Written as `format` 2 of `memory.json` with `ttl` only, and as `format` 3 with `maxPerPrincipal` or `notifyBefore`."),
                 }),
             ),
             "The memory settings of a dataset.",
@@ -2556,6 +2558,7 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
                     "citations": array(any_object("One source of the facts.")),
                     "prefixes": any_object("The prefixes the compact terms use."),
                     "review": sref("ReviewCounts"),
+                    "expiringBranches": with_desc(array(any_object("A scratch branch with `name`, `head`, `created`, `lastChange`, `ahead`, `expires` and `expiresSoon`.")), "The caller's scratch branches that expire within the dataset's `memory.scratchBranches.notifyBefore`. The `# scratch:` lines of `text` name as many of them as `maxChars` leaves room for, at most five."),
                     "communities": with_desc(array(any_object("A report with `iri`, `community`, `title`, `summary`, `status` and `memberCount`.")), "In a project brief, the best rated reports of the coarsest level that the caller may read."),
                 }),
             ),

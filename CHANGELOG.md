@@ -184,6 +184,16 @@ materialization. `serve --query-reasoning NAME=PROFILE`, `sparkles infer --query
 MODE` and `sparkles query --reasoning auto` are the CLI's forms. The setting lives in
 `query-reasoning.json` with the version member `queryReasoningFormat`.
 
+Scratch branches of MCP agents have limits and warnings (item 435). `create_branch`
+takes `keep: true` for a branch that never expires. The memory settings gain
+`scratchBranches.maxPerPrincipal`, which caps the scratch branches each principal has in
+a dataset and refuses `create_branch` past it with `409 scratch-branch-limit`, and
+`scratchBranches.notifyBefore`, a window before expiry in which `list_branches` marks a
+branch `expiresSoon`, the new `sparkles://{ds}/branches` resource and the memory brief
+name it, and `memory.review.pending` names the ones with unmerged commits as a condition
+of its own. `PATCH /$/branches/{ds}/{name}` with `scratch: false` clears a scratch mark
+and needs `admin`.
+
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
 settings, and a build or refresh then reads the policy's output graph with the projection's
@@ -2310,6 +2320,12 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+`branches.json` moves to format 3 while it lists a kept scratch branch, and returns to
+format 1 or 2 once none is kept. `memory.json` moves to format 3 while its
+`scratchBranches` holds `maxPerPrincipal` or `notifyBefore`, and stays format 2 with
+`ttl` alone. Older releases refuse both by their versions, so none of them expires a
+kept branch or serves a dataset with empty memory settings.
 
 The GraphRAG state `graphrag/state.json` moves to format version 3, which records the
 review policy of the last build and the claim and decision pairs each report read under

@@ -41,6 +41,7 @@ fn dataset_with_scratch(st: &Arc<AppState>, name: &str, setting: Option<&str>) -
             "scratch",
             Some(Scratch {
                 creator: "agent".into(),
+                keep: false,
             }),
         )
         .unwrap();
@@ -152,6 +153,7 @@ async fn stdio_expires_on_open_and_then_on_a_cadence() {
             "scratch",
             Some(Scratch {
                 creator: "agent".into(),
+                keep: false,
             }),
         )
         .unwrap();

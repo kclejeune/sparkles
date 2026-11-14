@@ -4072,6 +4072,34 @@ setting when it opens the databases and every ten minutes while the session last
 `--no-scratch-expiry` turns that off for a session. A session has no default duration,
 so a dataset without the setting never expires its branches there.
 
+An agent that wants a scratch branch to last passes `keep: true` to `create_branch`, and
+the branch then never expires. A dataset can also cap the scratch branches each
+principal has and warn before a branch expires:
+
+```sh
+sparkles settings set org memory.scratchBranches.maxPerPrincipal=20
+sparkles settings set org memory.scratchBranches.notifyBefore=1d
+```
+
+With the cap, `create_branch` fails with `scratch-branch-limit` once the caller has 20
+scratch branches in the dataset, kept ones included. A merge leaves the branch and its
+mark in place, so the caller frees a place by deleting a branch, after merging it when
+its writes should stay, or an administrator frees one by clearing a mark.
+With the warning window, `list_branches`, the caller's `sparkles://org/branches`
+resource and the memory brief name the branches that expire within a day. On a server
+that expires branches, the `memory.review.pending` notification names those with
+unmerged commits, so a person can merge one or keep it. An administrator keeps a branch
+by clearing its scratch mark, which turns it into an ordinary branch:
+
+```sh
+curl -X PATCH -H 'content-type: application/json' -d '{"scratch": false}' \
+  http://localhost:3030/$/branches/org/scratch-notes
+```
+
+The two settings make the dataset's `memory.json` format 3, and a kept branch makes its
+`branches.json` format 3. Older releases refuse both files by their versions rather than
+misread them.
+
 MCP calls follow the server's rules. The rate limits of the `query` and `update` classes
 apply per dataset, as for `/{ds}/sparql` and `/{ds}/update`, and the memory budget is the
 smaller of `--mcp-query-memory-mb` and `--query-memory-mb`. A call may ask for up to the

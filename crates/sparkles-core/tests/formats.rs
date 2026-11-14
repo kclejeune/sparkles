@@ -499,7 +499,7 @@ fn a_refused_open_changes_no_files() {
         ("describe.json", serde_json::json!({"format": 2})),
         ("history.json", serde_json::json!({"format": 2})),
         ("quota.json", serde_json::json!({"format": 2})),
-        ("branches.json", serde_json::json!({"format": 3})),
+        ("branches.json", serde_json::json!({"format": 4})),
         (
             "rdfs.json",
             serde_json::json!({"rdfsFormat": 2, "graph": "default"}),

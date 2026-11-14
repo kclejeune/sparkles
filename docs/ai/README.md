@@ -47,7 +47,9 @@ build community reports.
   `merge_branch` and `delete_branch` manage scratch branches. Merges preview by default,
   need the previewed heads and refuse conflicts. `--mcp-scratch-branch-ttl` deletes idle
   scratch branches, and a dataset's `memory.scratchBranches.ttl` overrides it for that
-  dataset. `sparkles mcp --loc` applies the dataset setting as well.
+  dataset. `sparkles mcp --loc` applies the dataset setting as well. `create_branch`
+  takes `keep: true` for a branch that never expires, `maxPerPrincipal` caps each
+  principal's scratch branches, and `notifyBefore` names the branches that expire soon.
 * `link_entities` can include versioned evidence about the named types and literal
   labels retained for each candidate, with separate flags for display, per-entity and
   query limits. It reports values and counts from the caller's query view. Bounded text
@@ -263,8 +265,17 @@ retrieval quality, model accuracy or latency. Shared-profile independence, accep
 support ownership and dependent freshness remain planned. Roadmap items 81 and 340.
 
 Idle scratch branches expire after the dataset's `memory.scratchBranches.ttl`, over HTTP
-and in a `sparkles mcp --loc --allow-update` session. A limit per principal, warnings
-before a branch expires and a way to keep one branch remain planned. Roadmap item 435.
+and in a `sparkles mcp --loc --allow-update` session. A branch created with `keep: true`
+never expires, and an administrator turns a scratch branch into an ordinary one with
+`PATCH /$/branches/{ds}/{name}` and `{"scratch": false}`.
+`memory.scratchBranches.maxPerPrincipal` caps the scratch branches each principal has in
+the dataset, kept ones included. `memory.scratchBranches.notifyBefore` sets a window
+before expiry in which `list_branches`, the caller's `sparkles://{ds}/branches`
+resource and the memory brief name the branch, and in which the `memory.review.pending`
+notification names branches that hold unmerged commits. That notification fires only on
+a server that expires branches, so a `sparkles mcp --loc` session warns through
+`list_branches`, the resource and the brief alone. See
+[Memory writes](../API.md#memory-writes).
 
 ### Document ingestion
 
