@@ -148,6 +148,7 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         true
     }
 
+    #[inline]
     pub fn contains(&self, x: &T) -> bool {
         match &self.set {
             Some(set) => set.contains(x),
@@ -415,6 +416,35 @@ impl State {
             | Concl::HypL(..)
             | Concl::REdge(..)
             | Concl::RFact(..) => false,
+        }
+    }
+
+    /// Appends the messages of a run that the state does not hold, as [`State::holds`]
+    /// answers. The run's backward links mostly share their role, whose sources it looks
+    /// up once for each change of role, and its links take inlined probes of the
+    /// context's tables (roadmap item 889).
+    #[inline]
+    fn add_new(&self, run: &[Concl], out: &mut Vec<Concl>) {
+        let mut by: Option<(Role, Option<&Small<Ex>>)> = None;
+        for &c in run {
+            let held = match c {
+                Concl::Back(e, r) => {
+                    let srcs = match by {
+                        Some((s, srcs)) if s == r => srcs,
+                        _ => {
+                            let srcs = self.back.iter().find(|(s, _)| *s == r).map(|(_, v)| v);
+                            by = Some((r, srcs));
+                            srcs
+                        }
+                    };
+                    srcs.is_some_and(|v| v.contains(&e))
+                }
+                Concl::Fwd(r, f) => self.fwd.contains(&(r, f)),
+                _ => self.holds(&c),
+            };
+            if !held {
+                out.push(c);
+            }
         }
     }
 
@@ -1529,7 +1559,7 @@ impl<'a> Run<'a> {
         for d in runs {
             let run = &msgs[d.start as usize..d.end as usize];
             total += run.len();
-            t.extend(run.iter().filter(|c| !st.holds(c)));
+            st.add_new(run, &mut t);
         }
         let dropped = total - (t.len() - before);
         if dropped > 0 {
@@ -3469,6 +3499,60 @@ mod horn_accounting_tests {
                 }
             }
         }
+    }
+
+    /// The check of a run against a context's tables keeps exactly the messages that
+    /// [`State::holds`] does not answer, whatever the kinds and roles of the run and
+    /// whether the context's sets are lists or hash sets (roadmap item 889).
+    #[test]
+    fn the_check_of_a_run_keeps_what_holds_does_not_answer() {
+        let f = fixture();
+        let roles = [f.r, f.s, f.t];
+        let ids: Vec<Ex> = (0..40).collect();
+        let mut st = State {
+            init: true,
+            ..Default::default()
+        };
+        // a short list of sources by r, a hash set by s, none by t
+        for &e in &ids[..5] {
+            st.back_by(f.r).insert(e);
+        }
+        for &e in ids.iter().step_by(2) {
+            st.back_by(f.s).insert(e);
+        }
+        for &e in ids.iter().step_by(3) {
+            st.fwd.insert((f.r, e));
+        }
+        for &e in &ids[..7] {
+            st.subs.insert(e);
+        }
+        st.loops.push(f.s);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut run = Vec::new();
+        for _ in 0..2000 {
+            let e = ids[next(ids.len())];
+            let r = roles[next(roles.len())];
+            // runs of backward links by one role, as the flush sends them, mixed with
+            // the other kinds
+            let c = match next(8) {
+                0..=3 => Concl::Back(e, if next(4) == 0 { r } else { f.s }),
+                4 | 5 => Concl::Fwd(r, e),
+                6 => Concl::Sub(e),
+                _ => Concl::Loop(r),
+            };
+            run.push(c);
+        }
+        let want: Vec<Concl> = run.iter().copied().filter(|c| !st.holds(c)).collect();
+        assert!(!want.is_empty() && want.len() < run.len());
+        let mut got = Vec::new();
+        st.add_new(&run, &mut got);
+        assert_eq!(got, want);
     }
 
     /// The messages an outbox holds, by destination, in the order sent.
