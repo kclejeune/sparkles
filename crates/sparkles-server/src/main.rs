@@ -2080,6 +2080,11 @@ enum Cmd {
         /// materialized or false. Alone, it materializes nothing
         #[arg(long, value_name = "MODE", conflicts_with_all = ["clear", "status", "diff"])]
         query_default: Option<String>,
+        /// With --query-default: record --profile or --rules and the input graph options
+        /// as the dataset's query-time reasoning and materialize nothing, as a Jena rule
+        /// set in backward mode answers every query on demand (spec F17 §5.3)
+        #[arg(long, requires = "query_default", conflicts_with = "check")]
+        query_only: bool,
         /// Timeout of the checks, or of --why, in seconds
         #[arg(long)]
         timeout: Option<f64>,
@@ -4528,6 +4533,7 @@ fn run() -> Result<()> {
             closure,
             format,
             query_default,
+            query_only,
             timeout,
             data_graphs,
             ontology_graphs,
@@ -4618,10 +4624,38 @@ fn run() -> Result<()> {
                 use sparkles::reasoning::setting;
                 let mut s = setting::read(&loc).unwrap_or_default();
                 s.default = Some(mode.clone());
+                if query_only {
+                    if let Some(f) = &rules {
+                        s.profile = Some("rules".into());
+                        s.rules = Some(
+                            std::fs::read_to_string(f)
+                                .with_context(|| format!("reading {}", f.display()))?,
+                        );
+                    } else if let Some(p) = &profile {
+                        s.profile = Some(p.clone());
+                        s.rules = None;
+                    }
+                    if !data_graphs.is_empty() || !ontology_graphs.is_empty() {
+                        let graphs = |v: &[String]| {
+                            v.iter()
+                                .map(|g| sparkles_reasoner::GraphRef::parse(g))
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(|e| anyhow::anyhow!(e))
+                        };
+                        let mut i = sparkles_reasoner::Inputs::default();
+                        if !data_graphs.is_empty() {
+                            i.data_graphs = graphs(&data_graphs)?;
+                        }
+                        i.ontology_graphs = graphs(&ontology_graphs)?;
+                        s.inputs = Some(serde_json::to_value(&i)?);
+                    }
+                }
                 s.validate()?;
                 setting::write(&loc, Some(&s))?;
                 eprintln!("query-time reasoning default set to {mode}");
-                if profile.is_none() && rules.is_none() && !check && extras.is_empty() {
+                if query_only
+                    || (profile.is_none() && rules.is_none() && !check && extras.is_empty())
+                {
                     return Ok(());
                 }
             }

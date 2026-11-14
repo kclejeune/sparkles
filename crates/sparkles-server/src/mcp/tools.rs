@@ -495,6 +495,16 @@ enum Format {
     Json,
 }
 
+/// The `reasoning` argument of `sparql_query` and `explain_query`: a boolean, as the other
+/// tools take it, or a mode as the SPARQL endpoints' `reasoning` parameter names it
+/// (spec F17 §2.1).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub(super) enum ReasoningArg {
+    Flag(bool),
+    Mode(String),
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct SparqlQueryArgs {
@@ -507,7 +517,9 @@ pub(super) struct SparqlQueryArgs {
     offset: Option<u64>,
     exact_total: Option<bool>,
     timeout_seconds: Option<f64>,
-    reasoning: Option<bool>,
+    reasoning: Option<ReasoningArg>,
+    reasoning_profile: Option<String>,
+    max_derived: Option<u64>,
     at_commit: Option<u64>,
     at: Option<Value>,
 }
@@ -518,7 +530,9 @@ pub(super) struct ExplainArgs {
     pub(super) dataset: Option<String>,
     pub(super) query: String,
     pub(super) include_algebra: Option<bool>,
-    pub(super) reasoning: Option<bool>,
+    pub(super) reasoning: Option<ReasoningArg>,
+    pub(super) reasoning_profile: Option<String>,
+    pub(super) max_derived: Option<u64>,
     pub(super) at_commit: Option<u64>,
     pub(super) at: Option<Value>,
     /// `estimate` or `run` (C18 §9.6)
@@ -661,6 +675,59 @@ impl Tools<'_> {
     /// parameter: when the dataset has them and the argument is not false).
     pub(super) fn reasoning(ds: &Dataset, arg: Option<bool>) -> bool {
         arg != Some(false) && ds.reasoning.read().is_some()
+    }
+
+    /// The reasoning mode of a query tool's `reasoning` argument. An absent argument is
+    /// the dataset's query-time default, as over HTTP (spec F17 §2.2), and `true` and
+    /// `false` are `materialized` and no reasoning.
+    pub(super) fn reasoning_mode(
+        ds: &Dataset,
+        arg: Option<&ReasoningArg>,
+    ) -> Result<sparkles::reasoning::ReasoningMode, ToolError> {
+        use sparkles::reasoning::ReasoningMode;
+        match arg {
+            None => Ok(ds.dataset.default_reasoning_mode()),
+            Some(ReasoningArg::Flag(true)) => Ok(ReasoningMode::Materialized),
+            Some(ReasoningArg::Flag(false)) => Ok(ReasoningMode::Off),
+            Some(ReasoningArg::Mode(m)) => ReasoningMode::parse(m).ok_or_else(|| {
+                ToolError::bad_argument(format!(
+                    "reasoning must be true, false, \"materialized\", \"demand\" or \"auto\", not {m:?}"
+                ))
+            }),
+        }
+    }
+
+    /// Install the query-time reasoner of a demand or auto `mode` in `opts`, with the
+    /// profile and fact limit the call names, as the SPARQL endpoints do with
+    /// `reasoningProfile` and `maxDerived` (spec F17 §2.1). Other modes leave `opts`
+    /// as [`Tools::query_options`] made them.
+    pub(super) fn apply_demand(
+        &self,
+        ds: &Dataset,
+        mode: sparkles::reasoning::ReasoningMode,
+        profile: Option<&str>,
+        max_derived: Option<u64>,
+        opts: &mut QueryOptions,
+    ) -> Result<(), ToolError> {
+        if mode.demand().is_none() {
+            if profile.is_some() || max_derived.is_some() {
+                return Err(ToolError::bad_argument(
+                    "reasoningProfile and maxDerived apply to reasoning \"demand\" or \"auto\"",
+                ));
+            }
+            return Ok(());
+        }
+        let max = match max_derived {
+            None => None,
+            Some(0) => return Err(ToolError::bad_argument("maxDerived must be at least 1")),
+            Some(n) => Some(usize::try_from(n).unwrap_or(usize::MAX)),
+        };
+        let view = crate::http::demand_view(&self.server.state, ds, mode, profile, max)
+            .map_err(ToolError::from_api)?;
+        if let Some(view) = view {
+            view.apply(opts);
+        }
+        Ok(())
     }
 
     pub(super) fn query_options(
@@ -1252,7 +1319,8 @@ impl Tools<'_> {
         let names = prefixes.names();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
         let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
-        let reasoning = Self::reasoning(&ds, a.reasoning);
+        let mode = Self::reasoning_mode(&ds, a.reasoning.as_ref())?;
+        let reasoning = mode.reads_inferences() && ds.reasoning.read().is_some();
         let t0 = Instant::now();
         let mut parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1282,6 +1350,13 @@ impl Tools<'_> {
                 &prefix_map,
             )
             .map_err(|e| ctx.engine(e))?;
+        self.apply_demand(
+            &ds,
+            mode,
+            a.reasoning_profile.as_deref(),
+            a.max_derived,
+            &mut opts,
+        )?;
         opts.initial_bindings = bindings;
         let request = self
             .call
@@ -1315,10 +1390,17 @@ impl Tools<'_> {
                     .map_err(|e| ctx.engine(e))
             })
             .transpose()?;
+        let derived = r.reasoning().and_then(|a| a.header());
         let text = match r.kind {
             QueryKind::Ask => match format {
                 Format::Table => render::ask_table(snap.commit, r.boolean),
-                Format::Json => render::ask_json(&ds.name, snap.commit, r.boolean, elapsed_ms),
+                Format::Json => render::ask_json(
+                    &ds.name,
+                    snap.commit,
+                    r.boolean,
+                    elapsed_ms,
+                    derived.as_deref(),
+                ),
             },
             kind => {
                 let len = r.len();
@@ -1344,12 +1426,18 @@ impl Tools<'_> {
                     max_bytes,
                     max_chars,
                     elapsed_ms,
+                    reasoning: derived.as_deref(),
                 };
                 match format {
                     Format::Table => render::table(&page, &prefixes),
                     Format::Json => render::json(&page, &prefixes),
                 }
             }
+        };
+        // the table form says what query-time reasoning derived on a line of its own
+        let text = match (&derived, format) {
+            (Some(h), Format::Table) => format!("# reasoning: {h}\n{text}"),
+            _ => text,
         };
         Ok((Outcome::Text(text), whole))
     }
@@ -1387,9 +1475,10 @@ impl Tools<'_> {
             self.cfg().default_timeout()
         };
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let reasoning = Self::reasoning(&ds, a.reasoning);
+        let mode = Self::reasoning_mode(&ds, a.reasoning.as_ref())?;
+        let reasoning = mode.reads_inferences() && ds.reasoning.read().is_some();
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
-        let opts = self
+        let mut opts = self
             .query_options(
                 &ds.name,
                 crate::auth::Endpoint::Query,
@@ -1398,6 +1487,13 @@ impl Tools<'_> {
                 &prefix_map,
             )
             .map_err(|e| ctx.engine(e))?;
+        self.apply_demand(
+            &ds,
+            mode,
+            a.reasoning_profile.as_deref(),
+            a.max_derived,
+            &mut opts,
+        )?;
         let kind = query_type(&parsed);
         // a given plan is explained as it is, with the commit the client names
         if let Some(plan) = given {

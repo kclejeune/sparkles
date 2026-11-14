@@ -54,6 +54,8 @@ fn localized_analyzer(tag: &str) -> Option<&'static str> {
 }
 
 const REASONERS: &str = "http://jena.hpl.hp.com/2003/";
+/// The GenericRuleReasoner's rule mode, `jr:ruleMode`.
+const RULE_MODE: &str = "http://jena.hpl.hp.com/2003/RuleReasoner#ruleMode";
 
 fn t(l: &str) -> String {
     format!("{TEXT}{l}")
@@ -628,14 +630,22 @@ impl Converter<'_> {
                 );
                 return Model::Unsupported;
             }
-            self.only(g, m, place, &[&ja("baseModel"), &ja("reasoner")]);
+            self.only(g, m, place, &[&ja("baseModel"), &ja("reasoner"), RULE_MODE]);
+            // Jena's InfModel assembler configures the reasoner with the InfModel's own
+            // resource, so the GenericRuleReasoner reads its rule mode there
+            let rule_mode = g
+                .one(m, RULE_MODE)
+                .ok()
+                .flatten()
+                .and_then(lexical)
+                .map(String::from);
             if let Some(r) = g
                 .one(m, &ja("reasoner"))
                 .ok()
                 .flatten()
                 .and_then(as_subject)
             {
-                self.reasoner(g, &r, plan, place);
+                self.reasoner(g, &r, rule_mode.as_deref(), plan, place);
             } else {
                 self.report
                     .unsupported(place, "the ja:InfModel has no ja:reasoner");
@@ -704,6 +714,7 @@ impl Converter<'_> {
         &mut self,
         g: &ConfigGraph,
         r: &NamedOrBlankNode,
+        rule_mode: Option<&str>,
         plan: &mut DatasetPlan,
         place: &str,
     ) {
@@ -764,15 +775,43 @@ impl Converter<'_> {
                     );
                 } else {
                     reasoning.profile = None;
-                    self.report.converted(
-                        place,
-                        "the GenericRuleReasoner's rules: materialized with sparkles infer --rules \
-                         (backward rules are not materialized)",
-                    );
-                }
-                if !g.objects(r, &ja("mode")).is_empty() {
-                    self.report
-                        .approximated(place, "ja:mode: the rules are materialized forward");
+                    // Jena's rule modes (spec F17 §5.3): hybrid, the default, runs forward
+                    // rules ahead and backward rules on demand, which `auto` does over the
+                    // materialization. Backward runs every rule on demand.
+                    match rule_mode.unwrap_or("hybrid") {
+                        "forward" | "forwardRETE" => self.report.converted(
+                            place,
+                            "the GenericRuleReasoner's forward rules: materialized with \
+                             sparkles infer --rules, and queries read the materialization",
+                        ),
+                        "backward" => {
+                            reasoning.query_default = Some("demand");
+                            reasoning.demand_only = true;
+                            self.report.converted(
+                                place,
+                                "the GenericRuleReasoner's backward mode: every rule is \
+                                 evaluated on demand when a query runs (query-time default \
+                                 demand), and nothing is materialized",
+                            );
+                        }
+                        "hybrid" => {
+                            reasoning.query_default = Some("auto");
+                            self.report.converted(
+                                place,
+                                "the GenericRuleReasoner's hybrid mode: the forward rules are \
+                                 materialized with sparkles infer --rules, and queries read the \
+                                 materialization and derive the backward rules' facts on \
+                                 demand (query-time default auto)",
+                            );
+                        }
+                        other => self.report.unsupported(
+                            place,
+                            format!(
+                                "jr:ruleMode {other:?}: Jena accepts forward, forwardRETE, \
+                                 backward and hybrid"
+                            ),
+                        ),
+                    }
                 }
             }
             "" => self

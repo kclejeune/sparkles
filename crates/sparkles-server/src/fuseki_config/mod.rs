@@ -369,7 +369,36 @@ pub fn start(
         let ds = st
             .get(name)
             .with_context(|| format!("--fuseki-config: no dataset /{name}"))?;
-        if ds.reasoning.read().is_some() {
+        // the query-time default of the GenericRuleReasoner's rule mode (spec F17 §5.3),
+        // set once: a dataset whose setting names a default keeps it
+        if let Some(mode) = r.query_default
+            && ds
+                .dataset
+                .query_reasoning()
+                .is_none_or(|s| s.default.is_none())
+        {
+            let mut setting = ds.dataset.query_reasoning().unwrap_or_default();
+            setting.default = Some(mode.to_string());
+            if r.demand_only
+                && let Some(p) = rules
+            {
+                setting.profile = Some("rules".into());
+                setting.rules = Some(
+                    std::fs::read_to_string(p)
+                        .with_context(|| format!("reading {}", p.display()))?,
+                );
+                if !r.schema.is_empty() {
+                    setting.inputs = Some(serde_json::json!({
+                        "ontologyGraphs": [convert::SCHEMA_GRAPH],
+                    }));
+                }
+            }
+            ds.dataset
+                .set_query_reasoning(Some(setting))
+                .with_context(|| format!("--fuseki-config: the query-time reasoning of /{name}"))?;
+            tracing::info!("fuseki-config: /{name} answers queries with reasoning={mode}");
+        }
+        if r.demand_only || ds.reasoning.read().is_some() {
             continue;
         }
         let profile = match rules {

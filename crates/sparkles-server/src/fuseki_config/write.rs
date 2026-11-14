@@ -152,6 +152,12 @@ fn serve_script(plan: &Plan) -> String {
     s
 }
 
+/// The text of `load.sh`, for tests.
+#[cfg(test)]
+pub(super) fn load_script_text(plan: &Plan) -> String {
+    load_script(plan)
+}
+
 fn load_script(plan: &Plan) -> String {
     let mut s = String::from(
         "#!/bin/sh\n\
@@ -164,7 +170,7 @@ fn load_script(plan: &Plan) -> String {
     let mut any = false;
     for ds in &plan.datasets {
         if !ds.persistent(plan.mode) {
-            if ds.reasoning.is_some() {
+            if ds.reasoning.as_ref().is_some_and(|r| !r.demand_only) {
                 s.push_str(&format!(
                     "\n# /{0} is in memory: after loading data, materialize its inferences with\n\
                      # POST /$/reason/{0}.\n",
@@ -231,6 +237,14 @@ fn load_script(plan: &Plan) -> String {
                 cmd.push_str(&format!(
                     " --data-graph default --ontology-graph {SCHEMA_GRAPH}"
                 ));
+            }
+            // the query-time default of the rule mode (spec F17 §5.3); the backward mode
+            // records its rules for queries and materializes nothing
+            if let Some(mode) = r.query_default {
+                cmd.push_str(&format!(" --query-default {mode}"));
+                if r.demand_only {
+                    cmd.push_str(" --query-only");
+                }
             }
             lines.push(cmd);
         }

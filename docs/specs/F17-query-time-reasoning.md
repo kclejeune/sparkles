@@ -304,9 +304,11 @@ as `B1, B2 -> H` (`engine::flatten`). With query-time reasoning, the rule set's
 ### 5.3 The Fuseki converter
 
 G08's converter maps a `ja:InfModel` whose reasoner is `GenericRuleReasoner` with
-`ja:rulesFrom` to a dataset with the rule text, `profile: "rules"` and the query-time
-default `demand` for the backward and hybrid modes and `materialized` for the forward
-mode, and reports which it chose.
+`ja:rulesFrom` to a dataset with the rule text and `profile: "rules"`. Its query-time
+default is `auto` for the hybrid mode, which is Jena's default, `demand` for the
+backward mode, which then materializes nothing, and `materialized` for the forward
+mode. The converter reports which it chose. The Outcome records why hybrid maps to
+`auto`.
 
 ## 6. Tables
 

@@ -229,7 +229,19 @@ answer queries over the current data at once, so this is approximated.
 
 `ja:schema` on the reasoner is loaded into the graph `urn:x-sparkles:fuseki:schema` and
 passed to `infer` with `--ontology-graph`. Its base model is loaded as data, as in
-§5.2. Rule sets that use backward rules are materialized forward.
+§5.2.
+
+A GenericRuleReasoner's rule mode chooses the dataset's query-time reasoning
+([F17](F17-query-time-reasoning.md) §5.3). Jena reads `jr:ruleMode`
+(`http://jena.hpl.hp.com/2003/RuleReasoner#ruleMode`) from the configuration resource
+that its InfModel assembler passes, the `ja:InfModel` itself, and the converter reads it
+there.
+
+| `jr:ruleMode` | Sparkles |
+|---|---|
+| `hybrid`, or none, which is Jena's default | The rules are materialized, and the query-time default is `auto`. Queries read the materialization and derive the facts of backward rules on demand. |
+| `backward` | Nothing is materialized. `infer --query-default demand --query-only` records the rules as the dataset's query-time reasoning, and every query derives what it needs. |
+| `forward`, `forwardRETE` | The rules are materialized, and queries read the materialization. |
 
 ## 6. Users and access
 
@@ -439,6 +451,25 @@ custom operations and Java code (§1 non-goals and §9). Jetty's `OBF:` password
 decoded, although the obfuscation is reversible, so that the converter never handles a
 recoverable secret that the operator did not write in plain text. `ja:literalContent`
 is unsupported.
+
+### Rule modes and query-time reasoning
+
+Built for roadmap item 19 with [F17](F17-query-time-reasoning.md) Phase 2. Before it,
+every GenericRuleReasoner was materialized forward, and the converter reported a
+`ja:mode` that Jena does not read. The converter now reads `jr:ruleMode` from the
+`ja:InfModel`, where Jena's InfModel assembler passes it to the reasoner, and §5.5's
+table maps each mode to a query-time default. The hybrid mode, which is Jena's default,
+maps to `auto` rather than the `demand` that F17 §5.3 first named, since `auto` reads the
+materialization for the patterns forward rules answer and derives the facts of backward
+rules, as Jena's hybrid engine does. The backward mode materializes nothing and records
+the rules in the dataset's query-time setting. `load.sh` does that with the new
+`infer --query-default demand --query-only`, which records `--rules` or `--profile` and
+the input graph options without a run, and `serve --fuseki-config` does it with
+`Dataset::set_query_reasoning` at the first start of an in-memory dataset. A dataset whose
+setting already names a default keeps it. `--auto-reason` is left out when every
+inference model is backward, since nothing is materialized. An unknown `jr:ruleMode` is
+reported as unsupported. The test is `rule_modes_choose_the_query_time_default` in
+`fuseki_config/tests.rs`.
 
 ### Roadmap follow-ups (2026-10-12)
 

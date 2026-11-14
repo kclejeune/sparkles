@@ -359,6 +359,8 @@ pub struct QueryPage<'a> {
     pub max_bytes: usize,
     pub max_chars: usize,
     pub elapsed_ms: f64,
+    /// what query-time reasoning derived, as the `Sparkles-Reasoning` header gives it
+    pub reasoning: Option<&'a str>,
 }
 
 pub enum RowSource<'a> {
@@ -638,6 +640,8 @@ struct JsonDoc<'a> {
     terms_shortened: usize,
     prefixes: BTreeMap<String, String>,
     elapsed_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<&'a str>,
 }
 
 /// `format: "json"`: the compact JSON document, at most `max_bytes` long.
@@ -677,6 +681,7 @@ pub fn json(page: &QueryPage, prefixes: &Prefixes) -> String {
             terms_shortened: shortened,
             prefixes: prefix_map(prefixes, &used),
             elapsed_ms: page.elapsed_ms,
+            reasoning: page.reasoning,
         }
     };
     let fit = fit(page, rows.len(), |k, truncated| {
@@ -689,7 +694,13 @@ pub fn json(page: &QueryPage, prefixes: &Prefixes) -> String {
 }
 
 /// `format: "json"` for ASK.
-pub fn ask_json(dataset: &str, commit: u64, boolean: bool, elapsed_ms: f64) -> String {
+pub fn ask_json(
+    dataset: &str,
+    commit: u64,
+    boolean: bool,
+    elapsed_ms: f64,
+    reasoning: Option<&str>,
+) -> String {
     serde_json::to_string(&JsonDoc {
         dataset,
         commit,
@@ -704,6 +715,7 @@ pub fn ask_json(dataset: &str, commit: u64, boolean: bool, elapsed_ms: f64) -> S
         terms_shortened: 0,
         prefixes: BTreeMap::new(),
         elapsed_ms,
+        reasoning,
     })
     .unwrap_or_default()
 }
