@@ -159,7 +159,8 @@ check them against the W3C suites and Jena's own answers.
   once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
   scan or a table of values reads the rows directly. The planner runs a small input whole instead, as a SELECT
   does, when exact index counts show that none of its operators gives more rows than a
-  cursor batch of 4,096, it evaluates no FILTER or BIND, the query has no budget of
+  cursor batch of 4,096, it evaluates no FILTER or BIND other than the comparison of a
+  keyed join, the query has no budget of
   produced rows and its estimated cost past the first rows is below what building the
   cursor operators costs, which is about eight microseconds. A whole run that a row or
   memory budget refuses pulls the input instead. Automatic execution then
@@ -168,10 +169,8 @@ check them against the W3C suites and Jena's own answers.
   with the lowest estimated cost to the first rows first, unless a branch evaluates an
   EXISTS, an extension or application function, RAND, UUID or BNODE, or holds an
   operator such as SERVICE whose effects could observe the order. An ASK or a `LIMIT 1`
-  over a keyed join reads both inputs a few rows at a time, unless the input the join
-  would hold is estimated within a cursor batch and exact index counts keep it within
-  the query's row and memory budgets, in which case the join holds that input. A product
-  streams its larger input against the smaller one, which it holds.
+  over a keyed join that does not run whole reads both inputs a few rows at a time, and
+  over a product it streams the larger input against the smaller one, which it holds.
 * A LIMIT over an inner hash join builds the hash index of one whole input before its
   first row, so a `LIMIT 1` over the join of two inputs of 65,537 rows needs about 7 MB.
   A join that reads both inputs a few rows at a time for a small LIMIT is

@@ -11,22 +11,21 @@ mode. Every ASK and every LIMIT without ORDER BY pulls its input through cursor 
 that stop at the rows it needs, in eager and automatic execution as in streaming, so a
 filter or a join under a LIMIT reads its input once rather than in growing prefixes. The
 planner runs a small input whole instead, when exact index counts bound each of its
-operators to a cursor batch, it evaluates no expression and its estimated cost past the
-first rows is below the cost of building cursor operators, and an EXISTS pattern
-evaluated per row does the same. A whole run that a row or memory budget refuses pulls
-the input instead. An ASK or a `LIMIT 1` over a keyed join holds the input it would
-build, in place of reading both inputs alternately, only when that input is within a
-cursor batch and exact index counts keep it within the query's budgets. A LIMIT of no
-rows over a pattern scan reads no pattern. A
+operators to a cursor batch, it evaluates no expression but a keyed join's comparison and
+its estimated cost past the first rows is below the cost of building cursor operators,
+and an EXISTS pattern evaluated per row does the same. A whole run that a row or memory
+budget refuses pulls the input instead. An ASK or a `LIMIT 1` over a keyed join whose
+condition only compares terms runs whole over small inputs, and reads both inputs
+alternately over larger ones. A LIMIT of no rows over a pattern scan reads no pattern. A
 UNION under a LIMIT or an ASK reads its cheapest branch first in every mode. Automatic
 execution streams every ASK without initial bindings whose input does not run whole. A
 pattern scan's reader charges the patterns it decodes as they grow, and the decoded rows
-of a pulled result charge their terms in steps. A pulled limit takes the query's
-memory ledger, which a small eager LIMIT over anything but a scan or a table of values did
-not take before. A cursor cross product holds its smaller input and streams the larger
-one. A LIMIT over an inner hash join builds the index of one whole input, which takes
-more memory than the eager limited join it replaces when both inputs are large, and
-roadmap item 947 follows it up.
+of a pulled result charge their terms in steps. A pulled limit takes the query's memory
+ledger, which a small eager LIMIT over anything but a scan or a table of values did not
+take before. A cursor cross product holds its smaller input and streams the larger one. A
+LIMIT over an inner hash join builds the index of one whole input, which takes more
+memory than the eager limited join it replaces when both inputs are large, and roadmap
+item 947 follows it up.
 
 ### Valid time
 
