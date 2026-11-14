@@ -44,8 +44,16 @@ named counted no neighbour, and the run reported an answer that missed the restr
 consequences as complete. `A ⊑ ≥2 r.C`, `C ⊑ P`, `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` left `A`
 satisfiable. Counting those neighbours costs work on ontologies with such qualifiers, and
 the generated fixture `shiq-038` now passes the default bound of the counting run, at
-877,028 conclusions against 246,957, and classifies again without counting. The ORE 2015
+815,758 conclusions against 246,957, and classifies again without counting. The ORE 2015
 DL development set keeps its taxonomies, and no change of its times was observed. This is roadmap item 897.
+
+A context of the disjunctive rules that has processed 256 of its clauses in one activation
+gives way to the contexts its worker woke. On one thread a context that equated its
+successors under a maximum otherwise finished that work before a successor without a model
+could close it. A generated ontology of item 897 derives 29,625 conclusions on one thread
+where it derived 2,122,545, and seven of 750 generated ontologies come within the default
+bound of the counting run on one thread, with none leaving it. The fixture `shq-041`
+finishes without the order between number restrictions, where it passed any bound.
 
 ### Compatibility
 
