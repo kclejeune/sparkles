@@ -360,7 +360,7 @@ impl RuleData {
                         for p in &ps {
                             for o in &os {
                                 n = n.wrapping_add(1);
-                                if n % 4096 == 0 {
+                                if n.is_multiple_of(4096) {
                                     engine.check_limits()?;
                                 }
                                 emit([self.node(*s)?, self.node(*p)?, self.node(*o)?])?;
