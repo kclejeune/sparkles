@@ -384,7 +384,7 @@ async fn brief_names_expiring_scratch_branches() {
     assert_eq!(list[0]["name"], "w-1");
     assert_eq!(list[0]["ahead"], 1);
     // a brief that reads a branch, as the MCP `branch` argument selects, names them too
-    let call = Call {
+    let mut call = Call {
         arrived: std::time::Instant::now(),
         cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         request_id: "brief-on-branch".into(),
@@ -392,10 +392,11 @@ async fn brief_names_expiring_scratch_branches() {
         headers: None,
         held: None,
         grant: None,
+        preparation: None,
     };
     let args = json!({"dataset": "org", "scope": "project", "projectKey": "github.com/acme/shop"});
     let out = tokio::task::block_in_place(|| {
-        server.run_now("memory_brief", args.as_object().unwrap().clone(), &call)
+        server.run_now("memory_brief", args.as_object().unwrap().clone(), &mut call)
     });
     let v = match out {
         Ok(Outcome::Structured(v)) => v,

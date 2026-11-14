@@ -361,14 +361,16 @@ fn interned_answer(
     r: &QueryResult,
     terms: &mut rustc_hash::FxHashMap<Option<oxrdf::Term>, u32>,
 ) -> Vec<[u32; 4]> {
-    assert!(r.table.cols.len() <= 4, "{} columns", r.table.cols.len());
-    let mut v = vec![[u32::MAX; 4]; r.table.len()];
-    for (c, col) in r.table.cols.iter().enumerate() {
+    let table = r.table();
+    assert!(table.width() <= 4, "{} columns", table.width());
+    let mut v = vec![[u32::MAX; 4]; table.len()];
+    for (c, col) in table.columns().enumerate() {
         let mut ids = rustc_hash::FxHashMap::<crate::id::Id, u32>::default();
         for (row, &id) in v.iter_mut().zip(col.iter()) {
             row[c] = *ids.entry(id).or_insert_with(|| {
                 let next = terms.len() as u32;
-                *terms.entry(r.term(id)).or_insert(next)
+                let term = r.term(id).unwrap().map(|t| t.as_term().clone());
+                *terms.entry(term).or_insert(next)
             });
         }
     }
