@@ -2,7 +2,7 @@
 //! reference reasoner and the measurements of `docs/benchmarks/el-classification`.
 //!
 //! ```text
-//! el_classify [--threads N] [--counting] [--number-order] [--rooted] [--dl-work N] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
+//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax (`.ofn`, or any file that starts with `Prefix(` or
@@ -86,7 +86,7 @@ fn main() {
     let mut eager = false;
     let mut dl_work: Option<usize> = None;
     let mut counting = false;
-    let mut number_order = false;
+    let mut number_order = true;
     let mut rooted = false;
     let mut input = None;
     while let Some(a) = args.next() {
@@ -101,6 +101,7 @@ fn main() {
             "--eager" => eager = true,
             "--counting" => counting = true,
             "--number-order" => number_order = true,
+            "--no-number-order" => number_order = false,
             "--rooted" => rooted = true,
             "--dl-work" => dl_work = args.next().and_then(|v| v.parse().ok()),
             _ => input = Some(a),
@@ -108,7 +109,7 @@ fn main() {
     }
     let Some(input) = input else {
         eprintln!(
-            "usage: el_classify [--threads N] [--counting] [--number-order] [--rooted] [--dl-work N] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+            "usage: el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
         );
         std::process::exit(2);
     };

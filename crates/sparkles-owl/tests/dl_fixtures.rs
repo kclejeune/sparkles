@@ -268,10 +268,13 @@ fn the_counting_cases_with_many_successor_equalities_finish_in_tier_d() {
 
 /// The counting cases that pass Tier D's bound on derived conclusions: every run, on one
 /// thread or several and with either strategy, passes it and falls back to the Horn rules,
-/// so that the answer is the same for every schedule.
+/// so that the answer is the same for every schedule. `shiq-028` passes the bound with the
+/// order between number restrictions, which is the default, and without it. `shq-041`
+/// passes it only without the order, and `tests/dl_number_order.rs` holds its answer with
+/// the order.
 #[test]
 fn the_cases_past_the_bound_fall_back_on_every_schedule() {
-    for stem in ["shq-041", "shiq-028"] {
+    for (stem, number_order) in [("shq-041", false), ("shiq-028", false), ("shiq-028", true)] {
         let path = fixtures().join(format!("{stem}.ofn"));
         let doc = ofn_read::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mut classes: Vec<Class> = doc
@@ -293,12 +296,14 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
                         threads,
                         expansion,
                         counting: true,
+                        number_order,
                         ..Limits::default()
                     })
                     .unwrap();
                 assert!(
                     out.stats.dl_over_budget,
-                    "{stem} on {threads} threads, {expansion:?}: Tier D stayed in its bound"
+                    "{stem} on {threads} threads, {expansion:?}, order {number_order}: \
+                     Tier D stayed in its bound"
                 );
                 let mut got = BTreeSet::new();
                 for a in &classes {
@@ -314,7 +319,7 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
         assert_eq!(
             answers.len(),
             1,
-            "{stem}: the answer depends on the schedule"
+            "{stem}, order {number_order}: the answer depends on the schedule"
         );
     }
 }

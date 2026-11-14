@@ -135,9 +135,10 @@ const ROOTED_WORK_BOUND: usize = 1 << 19;
 /// discards, which the memory budget does not see. A run that counts over a real ontology
 /// either finishes in a few thousand conclusions or runs on past millions, so the bound
 /// is the time a run spends before it gives up counting, about 0.2 s on one thread for a
-/// small ontology. Of the 150 counting fixtures all but three derive at most 190,000
-/// conclusions on one thread, one derives 1.0 million, which [`Limits::dl_work`] lets a
-/// caller allow, and two pass any bound.
+/// small ontology. Of the 150 counting fixtures, with the order between number
+/// restrictions, 146 derive at most 63,000 conclusions on one thread and one derives
+/// 247,000. Two derive 392,000 and 1.3 million, which [`Limits::dl_work`] lets a caller
+/// allow, and one passes any bound.
 const DL_WORK_BOUND: usize = 1 << 18;
 
 /// The bound on the conclusions of the run that starts again without counting once the run
@@ -159,8 +160,9 @@ const HORN_MEMORY_FLOOR: usize = 1 << 30;
 const HORN_MEMORY_FACTOR: usize = 64;
 
 /// What bounds a run: the worker threads, a deadline, a memory budget and a cancellation
-/// check, and the rules it may use.
-#[derive(Clone, Default)]
+/// check, and the rules it may use. The default has every option off except
+/// [`number_order`](Limits::number_order).
+#[derive(Clone)]
 pub struct Limits {
     /// classify by the OWL 2 EL rules alone, as ELK does: the Horn rules of item 603
     /// never run, and every axiom outside OWL 2 EL is left out and reported, so the
@@ -213,15 +215,37 @@ pub struct Limits {
     /// ontology without individuals.
     pub rooted: bool,
     /// whether a run that counts without the root orders its number restrictions by
-    /// entailment (F24, "The order between number restrictions"), which is off by default
+    /// entailment (F24, "The order between number restrictions"), which is on by default
     /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
     /// `≥n s.G` when `m ≥ n`, `r ⊑ s` and `F ⊑ G` are told, and contradicts `≤k s.G` when
     /// `m > k`. The run tells itself these consequences of the ontology, and a context
     /// that holds a minimum does not make the witnesses of a minimum that it entails. The
     /// answers are those of a run without the order that finishes, and a run with it
     /// finishes on ontologies with many related cardinalities, such as the Protein
-    /// Ontology, where the run without it passes [`dl_work`](Limits::dl_work).
+    /// Ontology, where the run without it passes [`dl_work`](Limits::dl_work). A run
+    /// that passes the bound either way can spend longer before it does: ore_ont_6485 of
+    /// the ORE 2015 DL sample takes 576 ms with the order and 184 ms without it on one
+    /// thread. False turns the order off.
     pub number_order: bool,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            el_only: false,
+            threads: 0,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            partial: false,
+            expansion: Expansion::default(),
+            dl_work: None,
+            counting: false,
+            rooted: false,
+            number_order: true,
+        }
+    }
 }
 
 /// Which context the Succ rule of Tier D (roadmap item 603) gives a successor. Both

@@ -1,9 +1,9 @@
 //! The order between number restrictions of a run of Tier D that counts without the root
 //! (roadmap item 894, F24's "The order between number restrictions"), which
-//! `Limits::number_order` asks for: `≥m r.F` entails `≥n s.G` when `m ≥ n`, `r ⊑ s` and
-//! `F ⊑ G` are told, and contradicts `≤k s.G` when `m > k`. Each case classifies with the
-//! order on one thread and on eight and without it on one thread, and where the run
-//! without the order finishes its answer is the same.
+//! `Limits::number_order` controls and which is on by default: `≥m r.F` entails `≥n s.G`
+//! when `m ≥ n`, `r ⊑ s` and `F ⊑ G` are told, and contradicts `≤k s.G` when `m > k`. Each
+//! case classifies with the order on one thread and on eight and without it on one
+//! thread, and where the run without the order finishes its answer is the same.
 
 use sparkles_owl::classify::{Classification, Classifier, Expansion, Limits, Tier};
 use sparkles_owl::model::*;
@@ -158,6 +158,73 @@ fn an_inherited_cardinality_over_a_wider_filler_makes_no_second_group_of_witness
         "the run without the order stayed in its bound"
     );
     assert!(on.stats.dl_work < 1 << 12);
+}
+
+/// The order is on by default and applies to a run that counts. The inherited cardinality
+/// above finishes under the default limits with counting, as it does with the field set,
+/// and passes its bound when the field is false. Without counting the field changes
+/// nothing: both runs leave the cardinalities out, report the same axioms and give the
+/// same answer.
+#[test]
+fn the_order_is_on_by_default_and_the_field_turns_it_off() {
+    assert!(Limits::default().number_order);
+    let ax = axioms(&format!(
+        "SubClassOf(:A ObjectExactCardinality(6 :r :P))
+         SubClassOf(:B ObjectExactCardinality(6 :r :Q))
+         SubClassOf(:P :Q) SubClassOf(:A :B)
+         DisjointClasses(:NP :P)
+         SubClassOf(:D :A)
+         SubClassOf(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:Q :NP)))
+         {UNION}"
+    ));
+    let cs = classes(&ax);
+    let classify = |limits: Limits| {
+        let mut k = Classifier::of(&ax);
+        let out = k.classify(&limits).unwrap();
+        (out, k.excluded().len())
+    };
+    for threads in [1, 8] {
+        let (default, left) = classify(Limits {
+            threads,
+            counting: true,
+            ..Limits::default()
+        });
+        assert!(
+            !default.stats.dl_over_budget && default.complete && left == 0,
+            "the default run that counts passed its bound on {threads} threads"
+        );
+        assert!(default.taxonomy.is_subclass(&c("D"), &c("Nothing")));
+        assert_eq!(
+            pairs(&default, &cs),
+            pairs(&run(&ax, true, threads, None), &cs),
+            "the default differs from the order asked for on {threads} threads"
+        );
+        let (off, left) = classify(Limits {
+            threads,
+            counting: true,
+            number_order: false,
+            ..Limits::default()
+        });
+        assert!(
+            off.stats.dl_over_budget && left > 0,
+            "the run without the order stayed in its bound on {threads} threads"
+        );
+        assert!(!off.taxonomy.is_subclass(&c("D"), &c("Nothing")));
+    }
+    let (plain, left) = classify(Limits {
+        threads: 1,
+        ..Limits::default()
+    });
+    let (plain_off, left_off) = classify(Limits {
+        threads: 1,
+        number_order: false,
+        ..Limits::default()
+    });
+    assert!(!plain.stats.dl_over_budget && !plain_off.stats.dl_over_budget);
+    assert!(left > 0 && left == left_off);
+    assert_eq!(plain.stats.dl_work, plain_off.stats.dl_work);
+    assert_eq!(pairs(&plain, &cs), pairs(&plain_off, &cs));
+    assert!(!plain.taxonomy.is_subclass(&c("D"), &c("Nothing")));
 }
 
 /// `PR_000024883`'s shape: the same exact cardinality stated by two axioms, beside a
