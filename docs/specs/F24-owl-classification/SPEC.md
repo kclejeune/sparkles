@@ -162,6 +162,33 @@ restrictions against 188 ms without it on one thread. Item 950 follows the cost 
 ontologies that classify in a few milliseconds. A rooted run and a run with the eager
 strategy that counts take one thread with the option, which item 951 follows.
 
+Item 962 composes each pair of links into the least properties of a chain's result. The
+property hierarchy of the Horn rules is closed under inverses and every chain holds in its
+mirror image, so a symmetric transitive property, which is its own inverse, also had the
+transitivity of its inverse. The composition table then listed the property and its
+inverse for every pair of links, each composed link was derived by both, and both were
+composed again. A path of 60 classes by such a property derives 548,060 conclusions
+without the reduction and 72,284 with it, as many as the same path beside an unrelated
+pair of inverse properties. A link by a property counts for each of its superproperties in
+every rule, the table lists every pair of properties under a chain's operands, and a
+property that clashes with itself is empty, so the least properties lose no conclusion. Of
+equivalent properties the one with the smallest id stays, and the reduction reads each
+result's superproperty list once and polls the run's stop as it goes. Item 692 let the
+Horn rules take ore_ont_8737 and ore_ont_16744, whose inclusions under the top property
+had made the rules refuse both files, and both have one such property. On `atlas` on four
+threads ore_ont_8737 classifies with the Horn rules in 13.9 s with a peak estimate of 3.0
+GB, where it passed its budget of 7.05 GB and classified again by the EL rules alone in
+21.9 s, leaving its symmetric and inverse property axioms out. ore_ont_16744 takes 3.9 s
+against 26.2 s, with 412 million conclusions against 2.25 billion and a peak resident set
+of 3.0 against 9.6 GiB. In three further rounds of alternating order the item's build
+takes 13.4 s on ore_ont_8737 with the Horn rules against 13.7 s with the EL rules alone,
+and 3.80 s on ore_ont_16744 against 3.71 s, so the Horn rules now cost about what the EL
+rules cost on both files. The 210 files of the ORE 2015 DL development set that classify
+give the same taxonomies as before, and ore_ont_7192 passes the 13 GiB cap of the
+comparison on both builds. GO and ChEBI lite give the same taxonomies, and in six rounds
+of rotating order on one and four threads the reviewed build takes 0.981 to 1.019 times
+the base's time by median, within the spread of the rounds.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -647,11 +674,12 @@ of the memory in waiting messages. With the budget they classified in 4.2 s and 
 on four threads on the laptop, with the EL rules' answer. Item 693's chain selection
 below removed that composition, and both now finish with the Horn rules. The waiting
 messages count toward the budget, so a run near it depends on the schedule.
-ore_ont_16744 of that sample has a budget of 7.57 GB, and its Horn run on four threads on
-`atlas` peaked between 5.6 and 7.4 GB in the 11 of 16 runs that finished, over five
-versions of the classifier, and passed the budget in the other five, which then
+ore_ont_16744 of that sample has a budget of 7.57 GB, and before item 962 its Horn run on
+four threads on `atlas` peaked between 5.6 and 7.4 GB in the 11 of 16 runs that finished,
+over five versions of the classifier, and passed the budget in the other five, which then
 classified by the EL rules alone and reported the file's two Horn axioms as left out.
-All 16 taxonomies are the same bytes. Item 693 follows the file. On the
+All 16 taxonomies are the same bytes. Its symmetric transitive property composed each link
+twice, which item 962 removed, as the Outcome describes. On the
 benchmark host ore_ont_9663 takes 4.0 s and 1.0 GiB on one thread and 0.89 s and 1.4 GiB
 on eight, and ore_ont_14817 takes 2.2 s and 0.7 GiB and 0.46 s and 1.0 GiB. The EL rules
 alone take 0.77 and 0.68 s on one thread, and Konclude 0.7.0 took 8.9 to 9.7 s and 3.5
@@ -661,8 +689,8 @@ does not entail. On one thread the Horn rules still derive 52.0 million conclusi
 ore_ont_9663 and 29.4 million on ore_ont_14817, where the EL rules derive 18.5 and 20.8
 million, which item 693 follows. Of the files of the development set below that the
 rules accepted before item 692, none reaches the budget with item 693's rules, and no
-case of the differential test does. ore_ont_8737 and, in some runs, ore_ont_16744, which
-the rules accept since item 692, reach it. The largest Horn run among the files accepted
+case of the differential test does. ore_ont_8737 and ore_ont_16744, which the rules accept
+since item 692, stay within it since item 962. The largest Horn run among the files accepted
 before item 692, ore_ont_9855, classifies in 1.5 s on one thread on the benchmark host
 against 4.4 s with the rules of phase 3, with a peak resident set of 359 MiB.
 

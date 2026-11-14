@@ -618,8 +618,10 @@ axioms. The item's build takes them, and the Horn rules derive 3.8 billion concl
 the EL rules. On `ore_ont_8737`, 2.7 million axioms of the same kind, the Horn rules pass
 their budget and the run finishes by the EL rules in 34 s against 25 s. The build before
 the item classifies `ore_ont_16744` without the two inclusions in 51 s on the laptop, so
-this cost is the Horn rules' on large OBO files, which item 693 owns, and not the rules of
-individuals. Both files keep their taxonomies. The files whose axioms with anonymous
+this cost is the Horn rules' on large OBO files and not the rules of individuals. Both
+files keep their taxonomies. Their symmetric transitive property composed each link twice,
+which item 962 removed, as [symmetric transitive properties](#symmetric-transitive-properties-with-the-horn-rules)
+describes. The files whose axioms with anonymous
 individuals the reader leaves out, such as `ore_ont_5481` with 457,662 of them, spend 0.12
 to 0.27 s more in the index stage, where the Horn normalization now reads each of them
 before it refuses it, and item 869 follows this too.
@@ -1012,7 +1014,57 @@ Every side gave the same taxonomy on every file and thread count. On the laptop 
 2015 EL files, GO and ChEBI lite gave the base's taxonomies with b, commit fb894c98, on one and eight
 threads, and `ore_ont_8737` gave it on one, four, eight and twelve threads.
 
+### Symmetric transitive properties with the Horn rules
+
+Roadmap item 962 measured `ore_ont_8737` and `ore_ont_16744`, which item 692 let the Horn
+rules take. Each has one symmetric transitive property, which is its own inverse, and the
+Horn rules add the mirror image of each chain, so the transitivity of the property also
+held for its inverse, and each composed link was derived by the property and again by its
+inverse. The item's build composes each pair of links into the least properties of a
+chain's result. On `atlas` on four threads, three rounds of alternating order with three
+classifications per process gave the medians below. `ore_ont_8737` passed its budget of
+7.05 GB on the base and classified again by the EL rules alone, leaving its symmetric and
+inverse property axioms out, and the item's build classifies it with the Horn rules and
+every axiom. Its conclusions before are those of the EL rules' second run, and its peak
+resident set before is the failed Horn attempt's.
+
+| Ontology | Base ms | Item 962 ms | Ratio | Conclusions before | Conclusions after | Peak RSS before | Peak RSS after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `ore_ont_8737` | 21,876 | 13,911 | 0.64 | 1,255,023,809 | 1,285,835,615 | 10.4 GiB | 6.0 GiB |
+| `ore_ont_16744` | 26,204 | 3,857 | 0.15 | 2,247,028,043 | 411,819,306 | 9.6 GiB | 3.0 GiB |
+
+In three further rounds of alternating order the item's build takes 13.4 s on
+`ore_ont_8737` with the Horn rules against 13.7 s with the EL rules alone, and 3.80 s on
+`ore_ont_16744` against 3.71 s. The eight smaller files of the same family derive the same
+conclusions on both builds and classify in 10 to 39 ms by median.
+
+GO and ChEBI lite ran six rounds of rotating order with five classifications per process
+on one and four threads, against the reviewed build, commit 2fb430aa, whose reduction
+gives the same properties. The ratio is the median of the rounds' ratios. The three rounds
+of the first set had put ChEBI lite 4% slower on four threads with the same conclusions,
+which the six rounds did not reproduce.
+
+| Ontology | Threads | Base ms | Item 962 ms | Ratio | Range of the rounds |
+|---|---:|---:|---:|---:|---|
+| GO | 1 | 313.5 | 307.6 | 0.981 | 0.972 to 0.986 |
+| GO | 4 | 119.3 | 116.6 | 0.988 | 0.935 to 1.045 |
+| ChEBI lite | 1 | 1,080.8 | 1,084.9 | 1.006 | 0.992 to 1.016 |
+| ChEBI lite | 4 | 470.5 | 484.4 | 1.019 | 0.952 to 1.073 |
+
+GO and ChEBI lite give the same taxonomies on both builds. Every file of the ORE 2015 DL
+development set classified once by each build with its taxonomy. The 210 files that
+classify gave the same bytes on both, the reader refuses `ore_ont_9881`, and
+`ore_ont_7192` passed the comparison's 13 GiB cap on both builds. `ore_ont_9663` and
+`ore_ont_14817` take the disjunctive rules, whose failed attempt took 10 to 229 s per
+classification on both builds before the Horn rules answered, so their times are not
+compared here.
+
 ## Records
+
+The [record of item 962](runs/2026-11-14-horn-symmetric-atlas-78010ca4/record.json) holds
+every classification of the timing rounds, the sweep's reports and taxonomy hashes on both
+builds, the taxonomies of GO and ChEBI lite, the runs with and without the EL rules alone,
+the rounds on GO and ChEBI lite of the reviewed build and the scripts that ran on `atlas`.
 
 The [link products record](runs/2026-11-10-el-threads-atlas-bd924609/record.json) holds the
 runs of `ore_ont_8737` of every side on one, four and twelve threads, the Konclude runs, the

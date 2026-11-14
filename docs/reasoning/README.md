@@ -294,7 +294,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   caller's. A run that passes it classifies again by the EL rules alone, leaves the Horn
   axioms out and reports them, and sets `Stats::horn_over_budget`. No ontology measured
   reaches it, since a run composes only the property chains that a negative existential
-  restriction needs and unfolds the others by their automata. In an ontology
+  restriction needs and unfolds the others by their automata, and composes each pair of
+  links into the least properties of a chain's result, so that a symmetric transitive
+  property, which is its own inverse, derives each link once. In an ontology
   without individuals, data properties, self restrictions, reflexive properties or top
   properties, axioms that need case analysis, such as unions, complements and universal
   restrictions on the left, take the disjunctive rules of the consequence-based calculus
