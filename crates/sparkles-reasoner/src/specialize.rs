@@ -17,9 +17,11 @@
 //! `owl:intersectionOf` list. A rule whose schema join has more than [`MAX_BINDINGS`]
 //! bindings is kept as it is, and so is every rule after the program reaches
 //! [`MAX_RULES`] specialized rules. Its schema atoms still read the schema the pass
-//! derived.
+//! derived. The rules left out, which the reuse of tables across commits reads, are kept
+//! up to [`MAX_RULES`] instances, past which a rule as written stands for its instances,
+//! and the budget is charged for them.
 
-use crate::budget::{Budget, BudgetFailure};
+use crate::budget::{Budget, BudgetFailure, Held};
 use crate::builtins::BuiltinKind;
 use crate::demand::{Closed, Vocab, clone_builtin};
 use crate::engine::{self, Atom, CBuiltin, CHead, CRule, Eval, Mode, Slot};
@@ -197,6 +199,9 @@ pub(crate) struct Specialized {
     /// change their atoms read can change the schema, so the reuse of tables across
     /// commits reads them too (spec F17 §6.2).
     pub left_out: Vec<CRule>,
+    /// the budget's charge for `left_out`, which holds at most [`MAX_RULES`] instances
+    /// and the rules as written that stand for the instances past that bound
+    pub held: Held,
 }
 
 /// The rules of a demand program over the schema that `g` holds in full: each rule
@@ -215,6 +220,9 @@ pub(crate) fn specialize(
     let abort = AtomicBool::new(false);
     let mut out: Vec<CRule> = Vec::new();
     let mut dropped: Vec<CRule> = Vec::new();
+    let mut held = Held::new(budget);
+    let mut dropped_made = 0usize;
+    let mut seen_out: FxHashSet<RuleKey> = FxHashSet::default();
     let mut made = 0usize;
     let left_out = |r: &CRule| {
         r.head
@@ -226,6 +234,7 @@ pub(crate) fn specialize(
             break;
         }
         if left_out(r) {
+            held.try_grow(rule_bytes(r))?;
             dropped.push(r.clone_shallow());
             continue;
         }
@@ -274,11 +283,25 @@ pub(crate) fn specialize(
             continue;
         }
         let mut seen: FxHashSet<RuleKey> = FxHashSet::default();
+        // past the bound on the instances left out, the rule as written stands for the
+        // rest of them, since its atoms are more general
+        let mut written = false;
         for c in collected {
             let vals: Vec<Option<u64>> = (0..r.nvars).map(|v| bound[v].then_some(c[v])).collect();
             let s = expand_lists(rest(r, &atoms, &builtins, &vals), g, terms);
             if left_out(&s) {
-                dropped.push(s);
+                if written {
+                    continue;
+                }
+                if dropped_made >= MAX_RULES {
+                    held.try_grow(rule_bytes(r))?;
+                    dropped.push(r.clone_shallow());
+                    written = true;
+                } else if seen_out.insert(rule_key(&s)) {
+                    held.try_grow(rule_bytes(&s))?;
+                    dropped_made += 1;
+                    dropped.push(s);
+                }
                 continue;
             }
             // the same rule from another binding, its atoms in another order
@@ -291,7 +314,19 @@ pub(crate) fn specialize(
     Ok(Specialized {
         rules: out,
         left_out: dropped,
+        held,
     })
+}
+
+/// An estimate of the bytes a compiled rule and the key that dedupes it hold.
+fn rule_bytes(r: &CRule) -> usize {
+    use std::mem::size_of;
+    size_of::<CRule>()
+        + r.name.len()
+        + r.atoms.len() * (size_of::<Atom>() + size_of::<[Slot; 3]>())
+        + r.head.len() * (size_of::<CHead>() + 64)
+        + r.builtins.len() * (size_of::<CBuiltin>() + 64)
+        + 64
 }
 
 /// A specialized rule as its atoms in a canonical order, its builtins and its head, so
@@ -452,5 +487,65 @@ mod tests {
             (a[0].s, a[0].p, a[0].o),
             (Slot::Const(20), Slot::Const(21), Slot::Const(22))
         );
+    }
+
+    /// Past [`MAX_RULES`] instances left out, a rule as written stands for the rest of
+    /// its instances, so the list stays bounded and the reuse check reads atoms that are
+    /// only more general (Codex review qtr-step2, round 3).
+    #[test]
+    fn instances_left_out_stop_at_the_bound() {
+        let store =
+            sparkles_core::store::Store::in_memory(sparkles_core::store::StoreOptions::default());
+        let terms = Terms::new(store.snapshot());
+        let mut graph = Graph::with_capacity(0);
+        let subjects: Vec<u64> = (1000..1000 + MAX_BINDINGS as u64).collect();
+        graph.add_batch(subjects.iter().map(|&p| [p, 6, 7]));
+        let closed = Closed {
+            preds: subjects.iter().copied().chain([6]).collect(),
+            classes: FxHashSet::default(),
+            rdf_type: 1,
+        };
+        let rule = |k: u64| CRule {
+            name: format!("producer {k}"),
+            nvars: 1,
+            atoms: vec![
+                Atom {
+                    s: Slot::Var(0),
+                    p: Slot::Const(6),
+                    o: Slot::Const(7),
+                },
+                Atom {
+                    s: Slot::Const(20 + k),
+                    p: Slot::Const(21),
+                    o: Slot::Const(22),
+                },
+            ],
+            builtins: vec![],
+            head: vec![CHead::Triple(
+                Slot::Const(30),
+                Slot::Var(0),
+                Slot::Const(31),
+            )],
+        };
+        let n = MAX_RULES / MAX_BINDINGS + 2;
+        let rules: Vec<CRule> = (0..n as u64).map(rule).collect();
+        let budget = Budget::unlimited();
+        let s = specialize(
+            &rules,
+            &closed,
+            &[],
+            &graph,
+            &terms,
+            &budget,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(s.rules.is_empty());
+        let written = s.left_out.iter().filter(|r| r.atoms.len() == 2).count();
+        assert_eq!(s.left_out.len() - written, MAX_RULES);
+        assert_eq!(written, 2);
+        assert!(budget.used() > 0);
+        drop(s);
+        assert_eq!(budget.used(), 0);
     }
 }

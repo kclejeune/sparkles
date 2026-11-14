@@ -1268,7 +1268,9 @@ the schema itself is unchanged.
   head of the specialized rules or of the rules that specialization left out because
   their every head is a relation the proof closed, as written or once specialized to a
   binding of their schema atoms, such as a rule that turns an instance fact into a
-  `rdfs:subClassOf` fact. An atom whose predicate is a variable and whose
+  `rdfs:subClassOf` fact. Specialization keeps up to 20,000 such instances for the test,
+  charged to the query's memory budget, and past that bound a rule as written stands for
+  the rest of its instances, since its atoms are more general. An atom whose predicate is a variable and whose
   subject and object occur nowhere else in its rule, as in `rdf1`, reads only which
   predicates are in use, so a differing quad passes it when its predicate has a stored
   quad in the input graphs at both commits, which a bounded scan of the predicate's quads
@@ -1316,10 +1318,12 @@ of facts that no rule reads or gives, and a commit to a graph outside the inputs
 every table from the cache. An added premise, a deleted premise, a schema fact, a schema
 predicate the store lacked, a stored copy of a derived fact, a deleted stored fact that
 rules derive, a term a rule names, a first `owl:sameAs` fact, a fact a `noValue` tests, a
-changed RDF list, a premise of a rule that gives only `rdfs:subClassOf` facts, and a
-predicate coming into use or going out of it each derive again. With the check replaced
+changed RDF list, a premise of a rule that gives only `rdfs:subClassOf` facts, a premise
+of a rule instance that specialization left out, whether the anchoring session made the
+completeness proof or read it from the cache, and a predicate coming into use or going
+out of it each derive again. With the check replaced
 by one that always reuses, the first ten of these fail, nine on the answer and the stored
-copy on its cache count. The last two failed against the first build of the check, which
+copy on its cache count. The last three failed against the first build of the check, which
 left out the rules that specialization drops. A further test runs a later commit's query
 under an anchor that lacks a term it reads and then the earlier commit's query, which
 read the later commit's table before such tables were kept back.

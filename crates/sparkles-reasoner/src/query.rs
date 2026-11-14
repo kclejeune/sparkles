@@ -1359,10 +1359,14 @@ impl Session {
         }
         let rules = rules.map_err(|e| memory_error(e, "the rules specialized to the schema"))?;
         let g = self.graph.as_ref().expect("graph made");
-        let left_out = rules.left_out;
-        let rules = crate::specialize::without_equality(rules.rules, same_as, g);
+        let crate::specialize::Specialized {
+            rules,
+            left_out,
+            held,
+        } = rules;
+        let rules = crate::specialize::without_equality(rules, same_as, g);
         self.anchor_program(&rules, &left_out, &vocab, rdf_type, fresh)?;
-        drop(left_out);
+        drop((left_out, held));
         let t2 = std::time::Instant::now();
         let program = self.transform(&rules, &self.keys, Pass::Closed(closed))?;
         tracing::debug!(

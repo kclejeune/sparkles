@@ -359,13 +359,12 @@ fn a_predicate_in_use_or_not_derives_again() {
     assert_eq!(r.cached, 0);
 }
 
-/// A rule whose head predicate a schema atom binds to `rdfs:subClassOf` reads an instance
-/// fact, which changes the schema (Codex review qtr-step2, round 2). Here the producer's
-/// variable head keeps the schema open, so the program keeps the rule as written. The
-/// case where a proof closes the bound relation, and specialization leaves the instance
-/// out, is `a_rule_closed_once_specialized_is_kept_as_left_out` in `specialize.rs`.
+/// The proof closes `rdfs:subClassOf` while no trigger fact holds, so specialization binds
+/// `?p` and leaves the instance out. A trigger fact then derives again, whether the
+/// anchor came from a session that made the proof or one that read it from the cache
+/// (Codex review qtr-step2, round 3).
 #[test]
-fn a_premise_of_a_rule_specialized_into_the_schema_derives_again() {
+fn a_premise_of_an_instance_left_out_derives_again() {
     let rules = Profile::Rules(
         "[schema: (?p rdfs:subPropertyOf <http://ex.org/marker>)
                   (<http://ex.org/x> <http://ex.org/trigger> <http://ex.org/y>)
@@ -373,16 +372,19 @@ fn a_premise_of_a_rule_specialized_into_the_schema_derives_again() {
          [sco: (?c rdfs:subClassOf ?d) (?s rdf:type ?c) -> (?s rdf:type ?d)]"
             .into(),
     );
-    // a stored subclass of B gives the program a rule, so the query takes the
-    // specialized route
     let before = "rdfs:subClassOf rdfs:subPropertyOf ex:marker . ex:x a ex:C .
-        ex:seed ex:trigger ex:y . ex:B ex:note ex:C . ex:D rdfs:subClassOf ex:B . ex:w a ex:D .";
-    let r = case(
-        &rules,
-        before,
-        "INSERT DATA { ex:x ex:trigger ex:y }",
-        &format!("{before} ex:x ex:trigger ex:y ."),
-        TYPES_OF_B,
-    );
+        ex:D rdfs:subClassOf ex:B . ex:w a ex:D . ex:trigger ex:note ex:y .";
+    let change = "INSERT DATA { ex:x ex:trigger ex:y }";
+    let after = format!("{before} ex:x ex:trigger ex:y .");
+    let r = case(&rules, before, change, &after, TYPES_OF_B);
     assert_eq!(r.cached, 0);
+    // a second query of the same commit reads the proof and anchors the view again
+    let s = store(before);
+    let qr = reasoner(&rules);
+    let o = demand(&qr);
+    run(&s, TYPES_OF_B, &o);
+    run(&s, "SELECT ?x { ?x a ex:D }", &o);
+    update(&s, change);
+    let expected = run(&store(&after), TYPES_OF_B, &demand(&reasoner(&rules)));
+    assert_eq!(rows(&run(&s, TYPES_OF_B, &o)), rows(&expected));
 }
