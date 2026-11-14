@@ -128,8 +128,19 @@ and 6.5 times faster than Konclude 0.7.0 on four threads on `atlas` and 2.0 and 
 on one. ore_ont_6485 still passes the bound, and its classification with counting
 requested, the failed attempt and the run without counting together, takes 3.1 times as
 long with the order as without it, 576 ms against 184 ms on one thread. The default
-accepts that cost, and item 896 follows that file and the default of counting. The item also found that a counting run misses a maximum over a compound
-qualifier that no other axiom names, which is item 897, so counting stays off by default.
+accepts that cost, and item 896 follows that file and the default of counting.
+
+Item 897 gives each compound qualifier of a number restriction
+[a name of its own](#compound-qualifiers-of-number-restrictions) in a counting run. Before
+it, a maximum or one of item 728's clauses over an intersection or an existential
+restriction that no other axiom named counted no neighbour, and the run reported an answer
+that missed the restriction's consequences as complete. The reported cases and a generated
+ontology that was reported consistent now have HermiT's answers, and the 205 files of the
+ORE 2015 DL development set that give a taxonomy with counting give the same bytes as
+before. Counting the neighbours that were missed costs work. The fixture `shiq-038`
+derives 877,028 conclusions on one thread where it derived 246,957, so it passes the
+default bound of 262,144 and falls back there, and it finishes with HermiT's answer at a
+raised bound. Counting stays off by default until item 896.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
@@ -1200,9 +1211,8 @@ it the two versions of the Protein Ontology finish, as [its subsection](#the-ord
 records. The other three spend their attempt before they give up where the run without
 counting finishes. Item 728 replaced the clauses of every context and the hypothesis about
 the predecessor, as [its subsection](#item-728s-clauses-for-counting-over-definitions)
-records, item 894 added the order, and turning counting on is the work of item 896 for
-the cost that remains and of item 897 for a maximum over a compound qualifier, which a
-counting run misses. A run that counts when asked takes a number restriction that the Horn rules
+records, item 894 added the order, item 897 gave compound qualifiers their names, and
+turning counting on is the work of item 896 for the cost that remains. A run that counts when asked takes a number restriction that the Horn rules
 cannot take, a functional or inverse functional property, disjoint properties or an
 asymmetric property. The terms of a clause then include
 equalities of the successor terms and of a successor with the predecessor, and the order
@@ -2584,18 +2594,9 @@ set were measured with the order and are not kept, one name per compound express
 a name of its own for a negative existential restriction, as
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md) records.
 
-A counting run has a gap that this item found and does not close. The qualifier of a
-maximum or of item 728's clauses is not registered as a negative occurrence, so a compound
-qualifier that no other axiom names is never derived at a neighbour, and the maximum
-counts no neighbour. `A ⊑ ≥2 r.C`, `C ⊑ P`, `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` leave `A`
-satisfiable in a run that reports itself complete, with the order or without it, and so
-does a maximum over `∃s.C`. A generated ontology of the item's fuzzing, inconsistent
-through a maximum over an intersection, is reported consistent. Registering the qualifier
-in the index and in the unfolding gives HermiT's answer on both, but the registered
-existential restriction is also the positive one, which makes a successor term at each
-neighbour, and the fixture `shq-015` then passes its bound on one thread and not on four.
-The repair is a name of the qualifier's own and is item 897. Counting stays off by
-default.
+This item also found that a counting run missed a maximum over a compound qualifier
+that no other axiom names, with the order or without it, which
+[item 897 repairs](#compound-qualifiers-of-number-restrictions).
 
 The regressions are in `tests/dl_number_order.rs` and in the unit tests of `dl_norm.rs`
 and `dl_rules.rs`. Four hand cases pass the bound without the order and finish with it,
@@ -2616,9 +2617,81 @@ hierarchies, an equivalent, an inverse and a symmetric role, judged against Herm
 296 that HermiT finishes in 60 s, gives 264 equal and 31 sound answers with the order on
 one thread, 265 and 30 on four, and 238 equal and 57 sound without it. Every ontology
 that finishes without the order finishes with it. The one that differs, with the order
-and without it, is the ontology of the qualifier gap above. The fuzz also found the
+and without it, is the ontology of the qualifier gap above, which item 897 repairs. The fuzz also found the
 cardinality stated twice under a clause, which passed the bound with the order before a
 name beside its representative lost its own witnesses, and that ontology is a regression.
+
+#### Compound qualifiers of number restrictions
+
+This subsection records what item 897 delivers. The qualifier of a maximum `≤n r.F`, and
+of item 728's clause for a minimum or an exact cardinality in a negative position, is in
+a negative position. A neighbour is counted once it derives the qualifier's negative form
+`B` with `F ⊑ B`, through the qualified role `r_B`. For a class, a union, a complement and
+the other forms the normalization makes `B` an atom. For an intersection and an
+existential restriction it makes an expression, which the rules build only where the left
+side of an inclusion or the body of a clause names it. A qualifier is neither. So a
+neighbour that held `P` and `Q` never derived `P ⊓ Q`, and the maximum counted no
+neighbour unless another axiom happened to name the same expression. `A ⊑ ≥2 r.C`,
+`C ⊑ P`, `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` left `A` satisfiable in a run that reported
+itself complete, and so did a maximum over `∃s.C`.
+
+The normalization of a counting run now gives a compound qualifier a name.
+`dl_norm::Norm::qualifier` replaces an intersection by a fresh class `N` with the told
+inclusion `P ⊓ Q ⊑ N`. It replaces an existential restriction `∃s.F`, as a qualifier or
+within one, by a fresh class `N` with `F ⊑ ∀s⁻.N` in a run without the root. That is
+`∃s.F ⊑ N` in the form the calculus gives an existential restriction in a negative
+position, and the unfolding of universal restrictions carries it over a role that is not
+simple. The expression `∃s.F` itself is not used, because it is also the positive
+restriction. A context makes a successor term wherever it derives that expression, so a
+neighbour that derived it from a successor of its own would make a copy of that successor
+for the at-most rule to count. Registering the expression was tried first, and the
+fixture `shq-015` then passed its bound on one thread and not on four. With the name it
+derives 18,415 conclusions on one thread. A rooted run has no rule for a universal
+restriction over an inverse role beside a nominal and a maximum, so there the name is told
+above the expression, `∃s.F ⊑ N`, as an axiom of the ontology would state it.
+
+The names keep the answers of the ontology. Every model of the ontology extends to one of
+the normalized axioms by reading each name as its qualifier, and in every model of the
+normalized axioms the qualifier is below its name, so the maximum over the name gives the
+maximum over the qualifier and item 728's clause over the name gives the clause over the
+qualifier. This is the structural transformation of a negative position, which the
+normalization applies to every other expression.
+
+Counting the neighbours that were missed costs work on ontologies that have such
+qualifiers. Of the 150 counting fixtures, 26 derive a different number of conclusions on
+one thread at a bound of 8 million. `shiq-038` derives 877,028 where it derived 246,957,
+through a minimum of three over `∃r1.C3` in a negative position, so it now passes the
+default bound of 262,144 and classifies again without counting. It finishes with HermiT's
+answer at the raised bound of its test. `shiq-013` derives 102,896 against 62,548 and
+`shq-015` 18,415 against 12,188. No other fixture moves across the default bound, and
+item 729 follows `shiq-038`. The ORE 2015 DL development set has no cost. Its 205 files
+that give a taxonomy with counting on four threads on `atlas` give the same bytes as
+before, the two versions of the Protein Ontology classify in 375 and 382 ms against 380
+and 371 ms in single runs, and ore_ont_6485, ore_ont_14817 and ore_ont_9663 pass the bound
+as before.
+
+The regressions are in `tests/dl_tier_d.rs` and `tests/dl_nominals.rs`. They cover a
+maximum over an intersection, over an existential restriction on a simple, an inverse and
+a transitive role, over one within the other, item 728's clauses over an intersection, a
+predecessor that is in the qualifier, a qualifier that is also a positive restriction,
+the generated ontology that was reported consistent, and a rooted run over individuals.
+Each fails without the names. The fuzz of item 894 gives 265 equal and 31 sound answers on
+one thread and 266 and 30 on four, with no answer that differs from HermiT's, and the 68
+of its ontologies whose work changes all stay on the same side of the bound.
+
+A second fuzz generates 300 ontologies whose maximums, exact cardinalities and
+cardinalities in negative positions have compound qualifiers, over simple, inverse and
+transitive roles, and judges them against HermiT on the 295 that HermiT finishes in 60 s.
+Without the names 25 answers differ from HermiT's and are reported complete, 267 are equal
+and 3 are sound. With the names none differs. On one thread 291 are equal and 4 sound, and
+on four threads 292 and 3. Two ontologies that finished without the names now pass the
+default bound and classify again without counting, with a sound answer. One of them
+derives 2,280,861 conclusions on one thread where it derived 217, and the other passes a
+bound of 8 million where it derived 68. A third, whose answer was wrong before, derives
+2,122,545 conclusions on one thread and 4,811 on four, so it falls back on one thread
+and finishes on four. That difference between schedules is the subject of item 727, and
+the order in which a context meets a qualifier's name and the clauses that count it is a
+cost that item 729 follows with `shiq-038`.
 
 ### Nominals in the disjunctive rules
 
