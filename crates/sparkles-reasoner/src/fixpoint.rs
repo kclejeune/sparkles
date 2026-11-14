@@ -568,16 +568,22 @@ impl Program for RuleProgram {
         self.batch.max(1)
     }
 
-    fn premises(&self, _f: &Triple, r: &Record, out: &mut Vec<Triple>) {
+    fn premises(
+        &self,
+        _f: &Triple,
+        r: &Record,
+        out: &mut Sink<'_, Triple, sparkles_core::Error>,
+    ) -> sparkles_core::Result<()> {
         if r.is_explicit() {
-            return;
+            return Ok(());
         }
         let (body, _) = &self.resolved[r.rule as usize];
         for pat in body {
             if let Some(t) = Self::instance(pat, &r.vars) {
-                out.push(t);
+                out.push(t)?;
             }
         }
+        Ok(())
     }
 
     fn axioms(

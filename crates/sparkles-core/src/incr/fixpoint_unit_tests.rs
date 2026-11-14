@@ -9,15 +9,15 @@ use crate::store::{Store, StoreOptions};
 use std::cell::Cell;
 
 /// The program's own error, which the operator's errors convert into.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum Oops {
-    Core(String),
+    Core(Error),
     Mine,
 }
 
 impl From<Error> for Oops {
     fn from(e: Error) -> Oops {
-        Oops::Core(e.to_string())
+        Oops::Core(e)
     }
 }
 
@@ -111,6 +111,12 @@ struct Count<const X: bool> {
     ends: usize,
     /// claim to saturate by itself
     own: bool,
+    /// the facts below this are broken at every pass
+    broken: u32,
+    /// the scratch the program holds, which grows by `scratch_step` at each call of
+    /// `consequences`
+    scratch: u64,
+    scratch_step: u64,
 }
 
 impl<const X: bool> Count<X> {
@@ -124,6 +130,9 @@ impl<const X: bool> Count<X> {
             end_fails: false,
             ends: 0,
             own: false,
+            broken: 0,
+            scratch: 0,
+            scratch_step: 0,
         }
     }
 }
@@ -141,10 +150,16 @@ impl<const X: bool> Program for Count<X> {
         Tally::new(self.cap)
     }
 
-    fn premises(&self, _f: &u32, r: &u32, out: &mut Vec<u32>) {
+    fn premises(
+        &self,
+        _f: &u32,
+        r: &u32,
+        out: &mut Sink<'_, u32, Oops>,
+    ) -> std::result::Result<(), Oops> {
         if *r != AXIOM {
-            out.push(*r);
+            out.push(*r)?;
         }
+        Ok(())
     }
 
     fn axioms(
@@ -168,6 +183,7 @@ impl<const X: bool> Program for Count<X> {
         _held: &dyn Fn(&u32) -> bool,
         out: &mut Sink<'_, (u32, u32), Oops>,
     ) -> std::result::Result<(), Oops> {
+        self.scratch += self.scratch_step;
         if f + 1 < self.chain {
             out.push((f + 1, *f))?;
         }
@@ -192,8 +208,11 @@ impl<const X: bool> Program for Count<X> {
         _cx: &mut (),
         _store: &Tally,
         _recorded: &dyn Fn(&u32) -> Option<u32>,
-        _out: &mut Sink<'_, u32, Oops>,
+        out: &mut Sink<'_, u32, Oops>,
     ) -> std::result::Result<(), Oops> {
+        for n in 0..self.broken {
+            out.push(n)?;
+        }
         Ok(())
     }
 
@@ -254,6 +273,10 @@ impl<const X: bool> Program for Count<X> {
         Ok(())
     }
 
+    fn scratch_bytes(&self) -> u64 {
+        self.scratch
+    }
+
     fn load(&self, r: &mut Reader) -> Result<(u32, u32)> {
         let f = r.u64()? as u32;
         let rec = r.u64()? as u32;
@@ -268,8 +291,16 @@ fn a_programs_error_keeps_its_type() {
     let mut p = Count::<false>::new(1, 100);
     p.fail_at = Some(3);
     let mut fp = FixedPoint::new(p);
-    assert_eq!(fp.build(&mut (), None).unwrap_err(), Oops::Mine);
+    assert!(matches!(fp.build(&mut (), None), Err(Oops::Mine)));
     assert_eq!(fp.program.ends, 1);
+    assert_eq!(fp.store().reserved.get(), 0);
+    // and from a pass
+    let mut fp = FixedPoint::new(Count::<false>::new(4, 10));
+    fp.build(&mut (), None).expect("build");
+    fp.program.broken = 3;
+    fp.program.fail_at = Some(fp.program.ticks + 1);
+    assert!(matches!(fp.advance(&mut (), None), Err(Oops::Mine)));
+    assert_eq!(fp.program.ends, 2);
     assert_eq!(fp.store().reserved.get(), 0);
 }
 
@@ -283,7 +314,7 @@ fn every_pass_ends_once() {
     fp.advance(&mut (), None).expect("advance");
     assert_eq!(fp.program.ends, 2);
     fp.program.end_fails = true;
-    assert_eq!(fp.advance(&mut (), None).unwrap_err(), Oops::Mine);
+    assert!(matches!(fp.advance(&mut (), None), Err(Oops::Mine)));
     assert_eq!(fp.program.ends, 3);
 
     let mut exact = FixedPoint::new(Count::<true>::new(4, 10));
@@ -432,4 +463,70 @@ fn a_limit_near_the_top_refuses() {
         },
     ]);
     assert_eq!(w, vec![(1, i64::MAX)]);
+}
+
+/// A budget that the order and the queue pass refuses the build, and its reservations
+/// return.
+#[test]
+fn buffers_past_the_budget_are_refused() {
+    let mut p = Count::<false>::new(5000, 0);
+    // the sink of axioms fits, and the order and the queue beside it do not
+    p.cap = Some(120_000);
+    let mut fp = FixedPoint::new(p);
+    assert!(matches!(
+        fp.build(&mut (), None),
+        Err(Oops::Core(Error::BudgetExceeded(_)))
+    ));
+    assert_eq!(fp.store().reserved.get(), 0);
+    assert_eq!(fp.program.ends, 1);
+}
+
+/// The output of `broken` is charged as it is produced, and a refusal there returns
+/// every reservation.
+#[test]
+fn broken_facts_past_the_budget_are_refused() {
+    let mut fp = FixedPoint::new(Count::<false>::new(5000, 0));
+    fp.build(&mut (), None).expect("build");
+    fp.store_mut().cap = Some(10_000);
+    fp.program.broken = 5000;
+    let ticks = fp.program.ticks;
+    assert!(matches!(
+        fp.advance(&mut (), None),
+        Err(Oops::Core(Error::BudgetExceeded(_)))
+    ));
+    assert_eq!(
+        fp.program.ticks, ticks,
+        "refused before any candidate was checked"
+    );
+    assert_eq!(fp.store().reserved.get(), 0);
+}
+
+/// Scratch that grows while a producer fills a sink's retained capacity counts with
+/// that capacity: a build whose state and scratch fit `max_bytes` at its end still
+/// fails when its last sink did not fit beside them.
+#[test]
+fn scratch_grown_during_production_counts_with_the_sink() {
+    let mut p = Count::<false>::new(1, 200);
+    p.scratch_step = 1000;
+    let mut fp = FixedPoint::new(p);
+    fp.build(&mut (), None).expect("build");
+    let end = fp.bytes() + fp.program.scratch;
+    let mut p = Count::<false>::new(1, 200);
+    p.scratch_step = 1000;
+    let mut fp = FixedPoint::new(p);
+    assert!(matches!(
+        fp.build(&mut (), Some(end + 64)),
+        Err(Oops::Core(Error::BudgetExceeded(_)))
+    ));
+}
+
+/// A limit of `u64::MAX` refuses a count that would overflow it.
+#[test]
+fn the_top_limit_refuses_an_overflow() {
+    let mut v: Vec<u64> = Vec::new();
+    let mut held = 0;
+    let r: std::result::Result<(), Error> =
+        grow_charged(None, Some((u64::MAX, u64::MAX - 8)), &mut v, &mut held, 1);
+    assert!(matches!(r, Err(Error::BudgetExceeded(_))));
+    assert_eq!(v.capacity(), 0);
 }

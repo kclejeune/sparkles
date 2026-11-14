@@ -663,8 +663,9 @@ impl FactStore<Triple, Record> for Counting {
 /// The rules of a [`RuleProgram`] in the operator's exact mode. Its proof is exact by
 /// construction: once per pass it derives, from the explicit facts of the new snapshot,
 /// every fact whose derived premises the store holds, and answers membership in that set,
-/// so no partial search is taken for a negative answer.
-struct Exact {
+/// so no partial search is taken for a negative answer. `Rules<false>` runs the same
+/// rules in one-step mode with `RuleProgram`'s own proofs, over the counting store.
+struct Rules<const X: bool> {
     inner: RuleProgram,
     /// insert the added facts and their consequences itself rather than leave it to the
     /// operator
@@ -680,10 +681,13 @@ struct Exact {
     reserved_at_prove: Option<u64>,
 }
 
-impl Exact {
-    fn new(rules: &str, own_saturation: bool, batch: usize) -> Exact {
+type Exact = Rules<true>;
+type OneStep = Rules<false>;
+
+impl<const X: bool> Rules<X> {
+    fn new(rules: &str, own_saturation: bool, batch: usize) -> Rules<X> {
         let rules = parse_rules(rules).expect("rules");
-        Exact {
+        Rules {
             inner: RuleProgram::new(&rules).expect("program"),
             own_saturation,
             batch,
@@ -724,14 +728,14 @@ impl Exact {
     }
 }
 
-impl Program for Exact {
+impl<const X: bool> Program for Rules<X> {
     type Fact = Triple;
     type Record = Record;
     type Cx<'c> = RuleCx<'c>;
     type Error = sparkles_core::Error;
     type Store = Counting;
 
-    const EXACT: bool = true;
+    const EXACT: bool = X;
 
     fn new_store(&self) -> Counting {
         Counting {
@@ -744,7 +748,12 @@ impl Program for Exact {
         self.batch
     }
 
-    fn premises(&self, f: &Triple, r: &Record, out: &mut Vec<Triple>) {
+    fn premises(
+        &self,
+        f: &Triple,
+        r: &Record,
+        out: &mut Sink<'_, Triple, sparkles_core::Error>,
+    ) -> sparkles_core::Result<()> {
         self.inner.premises(f, r, out)
     }
 
@@ -774,8 +783,11 @@ impl Program for Exact {
         cx: &mut RuleCx,
         store: &Counting,
         f: &Triple,
-        _held: &dyn Fn(&Triple) -> bool,
+        held: &dyn Fn(&Triple) -> bool,
     ) -> sparkles_core::Result<Option<Record>> {
+        if !X {
+            return self.inner.prove(cx, &store.inner, f, held);
+        }
         if self.reserved_at_prove.is_none() {
             self.reserved_at_prove = Some(store.reserved.get());
         }
@@ -786,12 +798,13 @@ impl Program for Exact {
 
     fn broken(
         &mut self,
-        _cx: &mut RuleCx,
-        _store: &Counting,
-        _recorded: &dyn Fn(&Triple) -> Option<Record>,
-        _out: &mut Sink<'_, Triple, sparkles_core::Error>,
+        cx: &mut RuleCx,
+        store: &Counting,
+        recorded: &dyn Fn(&Triple) -> Option<Record>,
+        out: &mut Sink<'_, Triple, sparkles_core::Error>,
     ) -> sparkles_core::Result<()> {
-        panic!("exact mode asks for no broken facts")
+        assert!(!X, "exact mode asks for no broken facts");
+        self.inner.broken(cx, &store.inner, recorded, out)
     }
 
     fn added(
@@ -1323,4 +1336,73 @@ fn annotated(
             (text, fp.annotation(&f).cloned())
         })
         .collect()
+}
+
+/// A one-step pass stops a large fan-out while it is produced too: the refusal comes
+/// before the rule's 4,000 bindings are all enumerated, and every reservation returns.
+#[test]
+fn a_one_step_fan_out_stops_while_it_is_produced() {
+    let rules = "[f: (?x <http://ex/hub> ?y) (?z <http://ex/m> ?w) -> (?z <http://ex/out> ?w)]";
+    // a first hub puts the rule's constants in the store, so the pass advances
+    let mut members: Vec<String> = (0..4000).map(|i| format!("i{i} m j{i}")).collect();
+    members.push("c hub d".into());
+    let members: Vec<&str> = members.iter().map(String::as_str).collect();
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, &[], &members);
+    let mut fp = FixedPoint::new(OneStep::new(rules, false, 1));
+    {
+        let control = Control::none();
+        let snap = s.snapshot();
+        let mut cx = RuleCx {
+            new: snap.clone(),
+            old: snap,
+            added: &[],
+            removed: &[],
+            control: &control,
+        };
+        fp.program.inner.begin(&cx);
+        fp.build(&mut cx, None).expect("build");
+    }
+    fp.store_mut().cap = Some(64 << 10);
+    let after = s.snapshot().commit;
+    change(&s, &[], &["a hub b"]);
+    fp.store().lookups.set(0);
+    let x = delta(&s, after);
+    let mut cx = RuleCx {
+        new: x.d.snapshot.clone(),
+        old: x.d.old().expect("old snapshot"),
+        added: &x.added,
+        removed: &x.removed,
+        control: &x.control,
+    };
+    assert!(!fp.program.inner.begin(&cx));
+    assert!(matches!(
+        fp.advance(&mut cx, None),
+        Err(sparkles_core::Error::BudgetExceeded(_))
+    ));
+    let lookups = fp.store().lookups.get();
+    assert!(lookups < 2000, "{lookups} lookups");
+    assert_eq!(fp.store().reserved.get(), 0);
+}
+
+/// A first frontier that passes the store's budget is refused while it is listed, before
+/// any proof, and its reservations return.
+#[test]
+fn a_first_frontier_past_the_budget_is_refused() {
+    let facts: Vec<String> = (0..4000).map(|i| format!("i{i} m j{i}")).collect();
+    let facts: Vec<&str> = facts.iter().map(String::as_str).collect();
+    let s = Store::in_memory(StoreOptions::default());
+    change(&s, &[], &facts);
+    let rules = "[pq: (?x <http://ex/p> ?y) -> (?x <http://ex/q> ?y)]";
+    let mut fp = exact_build(&s, Exact::new(rules, false, 1));
+    // 2,048 triples of frontier fit, and 4,096 beside them do not
+    fp.store_mut().cap = Some(60_000);
+    let after = s.snapshot().commit;
+    change(&s, &facts, &[]);
+    assert!(matches!(
+        exact_advance(&s, &mut fp, after),
+        Err(sparkles_core::Error::BudgetExceeded(_))
+    ));
+    assert_eq!(fp.program.reserved_at_prove, None, "no proof was asked");
+    assert_eq!(fp.store().reserved.get(), 0);
 }

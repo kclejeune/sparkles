@@ -323,10 +323,11 @@ impl Program for Closure {
         HashStore::new(24 + 8 + 8)
     }
 
-    fn premises(&self, f: &Fact, r: &Id, out: &mut Vec<Fact>) {
+    fn premises(&self, f: &Fact, r: &Id, out: &mut Sink<'_, Fact, Error>) -> Result<()> {
         if !r.is_undef() {
-            out.push([f[0], f[1], *r]);
+            out.push([f[0], f[1], *r])?;
         }
+        Ok(())
     }
 
     fn axioms(

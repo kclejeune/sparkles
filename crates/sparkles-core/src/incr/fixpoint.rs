@@ -312,9 +312,9 @@ fn grow_charged<B: Buf, E: From<Error>>(
         return Ok(());
     };
     if let Some((limit, before)) = limit {
-        let requested = before.saturating_add(new);
-        if requested > limit {
-            return Err(over(limit, requested).into());
+        let requested = before.checked_add(new);
+        if requested.is_none_or(|r| r > limit) {
+            return Err(over(limit, requested.unwrap_or(u64::MAX)).into());
         }
     }
     let Some(acct) = acct else {
@@ -427,7 +427,12 @@ pub trait Program {
     }
 
     /// The derived premises of instance `r` of fact `f`.
-    fn premises(&self, f: &Self::Fact, r: &Self::Record, out: &mut Vec<Self::Fact>);
+    fn premises(
+        &self,
+        f: &Self::Fact,
+        r: &Self::Record,
+        out: &mut Sink<'_, Self::Fact, Self::Error>,
+    ) -> std::result::Result<(), Self::Error>;
 
     /// The instances whose premises are all base facts, at the new snapshot.
     fn axioms(
@@ -793,9 +798,9 @@ impl<P: Program> FixedPoint<P> {
         let Some(m) = max else {
             return Ok(());
         };
-        let used = self.used().saturating_add(pending);
-        if used > m {
-            return Err(over(m, used).into());
+        let used = self.used().checked_add(pending);
+        if used.is_none_or(|u| u > m) {
+            return Err(over(m, used.unwrap_or(u64::MAX)).into());
         }
         Ok(())
     }
@@ -888,11 +893,8 @@ impl<P: Program> FixedPoint<P> {
         ) -> std::result::Result<(), P::Error>,
     ) -> std::result::Result<(), P::Error> {
         let before = self.used();
-        if let Some(m) = max {
-            let requested = before.saturating_add(buf.buf.alloc_bytes());
-            if buf.buf.capacity() > 0 && requested > m {
-                return Err(over(m, requested).into());
-            }
+        if buf.buf.capacity() > 0 {
+            self.check(max, buf.buf.alloc_bytes())?;
         }
         let store = &self.store;
         let reserve = |b: u64| store.reserve(b);
@@ -911,7 +913,9 @@ impl<P: Program> FixedPoint<P> {
         buf.buf = sink.buf;
         buf.bytes = sink.held;
         charges.live = charges.live.saturating_sub(held).saturating_add(buf.bytes);
-        res
+        res?;
+        // the program's scratch may have grown while the sink filled its capacity
+        self.check(max, buf.buf.alloc_bytes())
     }
 
     /// The operator's own saturation: follow [`Program::consequences`] from every fact of
@@ -1088,9 +1092,8 @@ impl<P: Program> FixedPoint<P> {
 
     /// The annotations of the facts of `dirty` from their records, premises first; the
     /// other facts keep the annotations held. `None` without annotations. The
-    /// annotations made count against `max` with the state, and the walk's tables are
-    /// reserved through the store. The premises of one instance, which the program
-    /// lists, are not.
+    /// annotations made count against `max` with the state, and the walk's tables,
+    /// premises and references are reserved through the store.
     fn annotate(
         &mut self,
         cx: &mut P::Cx<'_>,
@@ -1109,7 +1112,7 @@ impl<P: Program> FixedPoint<P> {
         let mut open: Held<FxHashSet<P::Fact>> = Held::default();
         let mut stack: Held<Vec<(P::Fact, bool)>> = Held::default();
         let mut scheduled: Held<FxHashSet<P::Fact>> = Held::default();
-        let mut prem = Vec::new();
+        let mut prem: Held<Vec<P::Fact>> = Held::default();
         for &f in dirty {
             if done.contains_key(&f) {
                 continue;
@@ -1124,8 +1127,10 @@ impl<P: Program> FixedPoint<P> {
                 let r = self.store.record(&top).ok_or_else(|| {
                     Error::Corrupt("a fixed point annotates a fact it does not hold".into())
                 })?;
-                prem.clear();
-                self.program.premises(&top, &r, &mut prem);
+                prem.buf.clear();
+                self.produce(cx, max, charges, &mut prem, |p, _cx, _store, sink| {
+                    p.premises(&top, &r, sink)
+                })?;
                 if !expanded {
                     self.room(charges, &mut open, 1)?;
                     if !open.buf.insert(top) {
@@ -1135,7 +1140,7 @@ impl<P: Program> FixedPoint<P> {
                     }
                     stack.buf.last_mut().expect("the frame").1 = true;
                     scheduled.buf.clear();
-                    for p in &prem {
+                    for p in prem.iter() {
                         if !dirty.contains(p) || done.contains_key(p) {
                             continue;
                         }
@@ -1153,9 +1158,13 @@ impl<P: Program> FixedPoint<P> {
                     }
                     continue;
                 }
+                // the premises' annotations, reserved for the call that reads them
+                let refs = slots_bytes::<&Ann>(prem.len());
+                self.store.reserve(refs)?;
+                charges.live = charges.live.saturating_add(refs);
                 let a = {
                     let mut anns: Vec<&Ann> = Vec::with_capacity(prem.len());
-                    for p in &prem {
+                    for p in prem.iter() {
                         let a = done.get(p).or_else(|| self.ann.get(p)).ok_or_else(|| {
                             Error::Corrupt(
                                 "a fixed point's record names a fact without annotation".into(),
@@ -1166,6 +1175,8 @@ impl<P: Program> FixedPoint<P> {
                     self.program
                         .annotate(cx, &self.store, self.mode, &top, &r, &anns)?
                 };
+                self.store.release(refs);
+                charges.live = charges.live.saturating_sub(refs);
                 pending = pending.saturating_add(a.bytes() + 16);
                 self.room(charges, &mut done, 1)?;
                 done.buf.insert(top, a);
@@ -1180,6 +1191,7 @@ impl<P: Program> FixedPoint<P> {
         self.free(charges, open);
         self.free(charges, stack);
         self.free(charges, scheduled);
+        self.free(charges, prem);
         // the table's reservation stays with the pass, which releases it at its end
         Ok(Some(done.buf))
     }
