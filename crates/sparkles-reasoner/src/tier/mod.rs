@@ -111,6 +111,7 @@ impl<'a> Cands<'a> {
         }
     }
 
+    /// Add a piece. The ids of a filtered piece ascend.
     #[inline]
     pub(super) fn push_ids(&mut self, ids: &'a [u32], filtered: bool) {
         if !ids.is_empty() {
@@ -141,11 +142,29 @@ impl<'a> Cands<'a> {
         self.parts.iter().any(|p| matches!(p, Part::Ids(_, true)))
     }
 
-    /// The ids visited, exactly: [`len`](Self::len), or a count of the ids the range
-    /// admits when a piece is filtered by it.
+    /// The pieces without the ids the range leaves out. A filtered piece holds the ids
+    /// of one key in one run, which ascend, so the range admits one interval of it,
+    /// found by two searches and without a read of the ids between them.
+    fn admitted(&self) -> SmallVec<[Part<'a>; 4]> {
+        let (lo, hi) = (self.lo, self.hi);
+        self.parts
+            .iter()
+            .map(|p| match *p {
+                Part::Ids(s, true) => {
+                    let a = s.partition_point(|&id| id < lo);
+                    let b = s.partition_point(|&id| id < hi).max(a);
+                    Part::Ids(&s[a..b], false)
+                }
+                p => p,
+            })
+            .collect()
+    }
+
+    /// The ids visited, exactly: [`len`](Self::len), or the ids the range admits when a
+    /// piece is filtered by it.
     pub fn count(&self) -> usize {
         if self.filtered() {
-            self.iter().count()
+            self.admitted().iter().map(Part::len).sum()
         } else {
             self.len()
         }
@@ -153,22 +172,26 @@ impl<'a> Cands<'a> {
 
     /// Up to `n` of the ids visited, evenly spaced in their order. A relation's ids and
     /// the ids of a probe ascend, whatever runs hold them, so the same facts give the
-    /// same ids however they fall into runs.
+    /// same ids however they fall into runs, as long as no fact is dead: a dead fact
+    /// stays among the candidates until a compaction of its run drops it.
     pub fn spread(&self, n: usize) -> Vec<u32> {
         let n = n.max(1);
-        if self.filtered() {
-            let ids: Vec<u32> = self.iter().collect();
-            let step = ids.len().div_ceil(n).max(1);
-            return ids.into_iter().step_by(step).collect();
-        }
-        let len = self.len();
+        let parts = if self.filtered() {
+            self.admitted()
+        } else {
+            self.parts.clone()
+        };
+        let len: usize = parts.iter().map(Part::len).sum();
         let step = len.div_ceil(n).max(1);
-        (0..len).step_by(step).filter_map(|k| self.nth(k)).collect()
+        (0..len)
+            .step_by(step)
+            .filter_map(|k| Self::nth(&parts, k))
+            .collect()
     }
 
-    /// Candidate `k` in order, of candidates that no piece filters.
-    fn nth(&self, mut k: usize) -> Option<u32> {
-        for p in &self.parts {
+    /// Candidate `k` in order, of pieces that the range does not filter.
+    fn nth(parts: &[Part<'a>], mut k: usize) -> Option<u32> {
+        for p in parts {
             let n = p.len();
             if k < n {
                 return Some(match *p {

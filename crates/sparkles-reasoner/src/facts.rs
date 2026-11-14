@@ -75,6 +75,10 @@ pub(crate) struct Memo {
     next: usize,
     /// scans made through this memo, not yet added to the tier's count
     pub scans: u64,
+    /// the rows of the blocks' key ranges that the scans through this memo entered, an
+    /// upper bound of the rows they read, for the tests of bounded reads
+    #[cfg(test)]
+    pub rows: u64,
 }
 
 const MEMO_SLOTS: usize = 8;
@@ -598,12 +602,18 @@ impl Base {
         } else {
             let idx = snap.perm(perm);
             let (b0, b1) = idx.key_block_range(&lo, &hi);
+            #[cfg(test)]
+            let mut entered = 0u64;
             let mut rows_of = |blk: &Block, whole: bool, f: &mut dyn FnMut(Triple) -> bool| {
                 let (s, e) = if whole {
                     (0, blk.len())
                 } else {
                     blk.key_range(&lo, &hi)
                 };
+                #[cfg(test)]
+                {
+                    entered += (e - s) as u64;
+                }
                 let cols = &blk.cols;
                 (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f))
             };
@@ -630,6 +640,10 @@ impl Base {
                         }
                     }
                 }
+            }
+            #[cfg(test)]
+            {
+                memo.rows += entered;
             }
         }
         Ok(completed && last(cur, &mut f))
@@ -738,8 +752,11 @@ impl Base {
     /// pattern's facts: runs of facts from the starts of up to `starts` blocks of the
     /// pattern's scan at evenly spaced positions, so that the facts of a long scan come
     /// from along its length without a read of the blocks between them. `f` returns
-    /// whether it took the fact. A scan within one block gives its first facts, and each
-    /// start gives up after a few facts that `f` does not take.
+    /// whether it took the fact. A start reads the rows of its own block and no further,
+    /// so a sample decodes at most `starts` blocks, whatever share of their rows belongs
+    /// to other graphs or fails the pattern, and a start gives up after a few facts
+    /// that `f` does not take. Returns whether the sample read every fact of the
+    /// pattern, which a scan within one block does when it runs to its end.
     pub fn sample(
         &self,
         memo: &mut Memo,
@@ -747,9 +764,9 @@ impl Base {
         n: usize,
         starts: usize,
         mut f: impl FnMut(Triple) -> bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if n == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let (perm, lo, hi) = self.access(s, p, o);
         let idx = self.snap.perm(perm);
@@ -757,6 +774,7 @@ impl Base {
         let starts = (b1 - b0).clamp(1, starts.clamp(1, n));
         let multi = self.single().is_none();
         let mut taken = 0usize;
+        let mut whole = false;
         for k in 0..starts {
             let b = b0 + k * (b1 - b0) / starts;
             // the first key of the block, or of its first triple with several input
@@ -765,20 +783,27 @@ impl Base {
             if k > 0 && multi {
                 from[3] = 0;
             }
+            // the last key of the block, or of the scan in its last block
+            let to = if b + 1 < b1 {
+                idx.blocks[b].last.min(hi)
+            } else {
+                hi
+            };
             // what is left, over the starts that are left
             let quota = (n - taken).div_ceil(starts - k);
             let (mut got, mut offered) = (0usize, 0usize);
-            self.scan(memo, perm, from.max(lo), hi, [s, p, o], None, |t| {
+            let ended = self.scan(memo, perm, from.max(lo), to, [s, p, o], None, |t| {
                 offered += 1;
                 got += usize::from(f(t));
                 got < quota && offered < 4 * quota + 8
             })?;
+            whole = ended && k == 0 && to == hi;
             taken += got;
             if taken >= n {
                 break;
             }
         }
-        Ok(())
+        Ok(whole)
     }
 
     /// Whether a triple is a fact of the tier.
@@ -1002,10 +1027,6 @@ mod tests {
     use sparkles_core::io::{RdfFormat, Source};
     use sparkles_core::store::{Store, StoreOptions};
 
-    /// Reads of a few rows of a segmented generation decode segments, and give the facts
-    /// a scan of whole blocks gives, in the same order: every pattern of bound positions,
-    /// a probe of a fact and of a triple the tier may lack, with and without remembered
-    /// lookups.
     /// A pattern's count is the number of its facts with one input graph, and a sample
     /// of a scan that spans several blocks takes matching facts from along it.
     #[test]
@@ -1065,11 +1086,13 @@ mod tests {
         );
         let mut memo = Memo::default();
         let mut got = Vec::new();
-        base.sample(&mut memo, [None, Some(p), None], 8, 4, |t| {
-            got.push(t);
-            true
-        })
-        .unwrap();
+        let whole = base
+            .sample(&mut memo, [None, Some(p), None], 8, 4, |t| {
+                got.push(t);
+                true
+            })
+            .unwrap();
+        assert!(!whole);
         assert_eq!(got.len(), 8);
         assert!(got.iter().all(|t| t[1] == p && relation.contains(t)));
         let mut distinct = got.clone();
@@ -1080,12 +1103,25 @@ mod tests {
         assert_eq!(got[..2], relation[..2]);
         // a probe within one block: its facts, and no more than asked for
         let mut few = Vec::new();
-        base.sample(&mut memo, [Some(s), None, None], 2, 4, |t| {
-            few.push(t);
-            true
-        })
-        .unwrap();
+        let whole = base
+            .sample(&mut memo, [Some(s), None, None], 2, 4, |t| {
+                few.push(t);
+                true
+            })
+            .unwrap();
         assert_eq!(few, facts(Some(s), None, None)[..2]);
+        // it stopped at the two it was asked for, and a sample that reads to the end of
+        // a scan within one block says that it read every fact
+        assert!(!whole);
+        let mut all = Vec::new();
+        let whole = base
+            .sample(&mut memo, [Some(s), None, None], 100, 4, |t| {
+                all.push(t);
+                true
+            })
+            .unwrap();
+        assert!(whole);
+        assert_eq!(all, facts(Some(s), None, None));
         // facts the caller does not take do not count, and a start gives up after a few
         let mut offered = 0;
         base.sample(&mut memo, [None, Some(p), None], 8, 4, |_| {
@@ -1094,6 +1130,60 @@ mod tests {
         })
         .unwrap();
         assert!((1..=4 * (4 * 8 + 8)).contains(&offered), "{offered}");
+    }
+
+    /// A sample reads the block of each start and no further, whatever share of the
+    /// rows belongs to graphs that are not read. Two input graphs hold a few facts of a
+    /// predicate and a third graph, which is not an input, holds 400,000.
+    #[test]
+    fn a_sample_reads_one_block_per_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        let mut nq = String::new();
+        for i in 0..400_000u64 {
+            nq.push_str(&format!(
+                "<urn:s{i}> <urn:p> <urn:o{}> <urn:other> .\n",
+                i % 7
+            ));
+        }
+        for i in 0..6u64 {
+            nq.push_str(&format!(
+                "<urn:s{}> <urn:p> <urn:x> <urn:g{}> .\n",
+                i * 60_000,
+                i % 2
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let snap = store.snapshot();
+        let id = |iri: &str| snap.lookup_iri(iri).unwrap();
+        let p = id("urn:p").0;
+        let base = Base::new(snap.clone(), &[id("urn:g0"), id("urn:g1")]).unwrap();
+        let blocks = base.blocks(None, Some(p), None);
+        assert!(blocks >= 4, "{blocks}");
+        let mut every = Vec::new();
+        base.for_each(None, Some(p), None, |t| {
+            every.push(t);
+            true
+        })
+        .unwrap();
+        assert_eq!(every.len(), 6);
+        for starts in [1, 2] {
+            let mut memo = Memo::default();
+            let mut got = Vec::new();
+            let whole = base
+                .sample(&mut memo, [None, Some(p), None], 8, starts, |t| {
+                    got.push(t);
+                    true
+                })
+                .unwrap();
+            assert!(!whole);
+            assert!(got.iter().all(|t| every.contains(t)), "{got:?}");
+            // the rows of at most `starts` blocks of the predicate's, which hold the
+            // 400,006 rows of every graph
+            assert!(memo.rows > 0 && memo.rows <= 400_006 / 2, "{}", memo.rows);
+        }
     }
 
     #[test]

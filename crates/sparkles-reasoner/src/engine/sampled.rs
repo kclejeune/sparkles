@@ -34,8 +34,27 @@
 //! The sample is drawn at fixed places, so that a run plans the same way each time. In
 //! the derived tier those are evenly spaced candidates in the order of their ids, which
 //! is the same however the facts fall into runs, so the sampled orders follow the facts
-//! and not the runs, as the greedy planner's statistics do. In the store they are the
-//! starts of blocks along a scan, which are fixed for a snapshot.
+//! and not the runs, as the greedy planner's statistics do. That holds while no fact is
+//! dead. A dead fact stays among an order's candidates until a compaction of its run
+//! drops it, which depends on the runs, so a graph that holds dead facts, as an
+//! incremental run does after a deletion, keeps the greedy order of every body. In the
+//! store the places are the starts of blocks along a scan, which are fixed for a
+//! snapshot. The same quads in other blocks, after another sequence of loads or a
+//! compaction, can give another sample and another order.
+//!
+//! The order of a body's atoms changes the work of an evaluation and the order in which
+//! it derives its facts, and never the facts. One kind of rule is the exception, and it
+//! keeps the greedy order: a builtin checks a variable that is bound already by value,
+//! so that the integer 3 passes for the decimal 3.0, where an atom matches the term
+//! itself, and a variable that a builtin binds and an atom or another builtin also
+//! holds would be generated in one order and checked in another ([`order_matters`]).
+//!
+//! A plan's probes are bounded. A probe of the store reads one block of its scan at
+//! most, and a sample of a relation one block per start. A plan makes at most
+//! [`PROBES`] probes, and the facts they keep are charged to the run's memory budget,
+//! [`PROBE_BYTES`] each, until the plan is made. A plan that needs more probes, or
+//! more memory than the budget has left, or whose costs overflow, keeps the greedy
+//! order. The planner's scans of the store count in the run's scans.
 
 use super::*;
 use std::sync::atomic::AtomicU64;
@@ -69,6 +88,16 @@ pub(crate) const LARGE_COST: f64 = 2_000_000.0;
 /// at each step, some hundreds of index probes for a body of six atoms, which is the
 /// work of an evaluation of this size.
 pub(crate) const MIN_COST: f64 = 50_000.0;
+
+/// The probes one plan may make. The first walk, the walk of the greedy order and the
+/// search of a body of `n` atoms make at most `(4 + 16) * n + 16 * n * (n + 1) / 2`,
+/// which is under this for bodies of up to 14 atoms. A longer body that needs more
+/// keeps the greedy order.
+pub(crate) const PROBES: usize = 2048;
+/// The bytes a probe is charged to the run's memory budget, an upper bound of what it
+/// keeps: its entry in the plan's table and at most [`SAMPLE`] facts of 24 bytes in a
+/// buffer of up to twice that.
+pub(crate) const PROBE_BYTES: usize = 1024;
 
 /// Whether every body of [`MIN_ATOMS`] atoms or more is sampled and searched, whatever
 /// its plan costs, which a test sets.
@@ -170,11 +199,56 @@ fn atom_order(steps: &[Step]) -> Vec<usize> {
         .collect()
 }
 
+/// Whether the order of the rule's atoms can change what the rule derives. A builtin
+/// that is given a bound variable where it binds one checks the variable by value
+/// ([`Eval::bind_and_continue`]), so that the integer 3 passes for the decimal 3.0, and
+/// an atom matches the term itself. A variable that a builtin binds and that an atom or
+/// another builtin also holds is therefore generated in one order and checked in
+/// another, and the two can differ in the facts they derive and in the terms of those
+/// facts.
+pub(crate) fn order_matters(rule: &CRule) -> bool {
+    rule.builtins.iter().enumerate().any(|(j, f)| {
+        f.outputs.iter().any(|&v| {
+            let holds = |s: Slot| s == Slot::Var(v);
+            rule.atoms
+                .iter()
+                .any(|a| holds(a.s) || holds(a.p) || holds(a.o))
+                || rule
+                    .builtins
+                    .iter()
+                    .enumerate()
+                    .any(|(k, other)| k != j && other.outputs.contains(&v))
+        })
+    })
+}
+
+/// Whether an order of sampled cost `cost` replaces the greedy order of sampled cost
+/// `greedy`: when it costs at most the greedy order's cost divided by [`SAVING`]. Costs
+/// that overflowed, or that are not numbers, say nothing, and the greedy order stays.
+fn saves(cost: f64, greedy: f64) -> bool {
+    cost.is_finite() && greedy.is_finite() && cost * SAVING <= greedy
+}
+
 /// The plan of `rule` over `ranges`: the greedy planner's, or the sampled order when
 /// the sample makes it at least [`SAVING`] times cheaper. The flag says which.
 pub(crate) fn plan(g: &Graph, rule: &CRule, ranges: &[(u32, u32)]) -> Option<(Vec<Step>, bool)> {
+    plan_within(g, rule, ranges, PROBES)
+}
+
+/// [`plan`] with at most `probes` probes.
+fn plan_within(
+    g: &Graph,
+    rule: &CRule,
+    ranges: &[(u32, u32)],
+    probes: usize,
+) -> Option<(Vec<Step>, bool)> {
     let greedy = super::plan(rule, ranges, Some(g))?;
     if rule.atoms.len() < MIN_ATOMS {
+        return Some((greedy, false));
+    }
+    // a rule whose order can change its facts keeps the order it had, and a graph with
+    // dead facts has candidates that depend on its runs
+    if order_matters(rule) || g.dead_rows() > 0 {
         return Some((greedy, false));
     }
     let greedy_order = atom_order(&greedy);
@@ -192,6 +266,9 @@ pub(crate) fn plan(g: &Graph, rule: &CRule, ranges: &[(u32, u32)]) -> Option<(Ve
         ranges,
         memo: &mut memo,
         probes: FxHashMap::default(),
+        held: Held::new(g.budget()),
+        limit: probes,
+        spent: false,
     };
     let chosen = (|| {
         // the greedy order first, with a few bindings: an order they find cheap is kept
@@ -201,7 +278,9 @@ pub(crate) fn plan(g: &Graph, rule: &CRule, ranges: &[(u32, u32)]) -> Option<(Ve
         }
         let (_, greedy_cost) = walk.run(Some(&greedy_order), SAMPLE);
         let (order, cost) = walk.run(None, SAMPLE);
-        if order == greedy_order || cost * SAVING > greedy_cost {
+        // a walk that ran out of probes or of memory, or failed to read the store, has
+        // no estimate
+        if walk.spent || order == greedy_order || !saves(cost, greedy_cost) {
             return None;
         }
         let steps = steps_in_order(rule, ranges, &order)?;
@@ -248,6 +327,13 @@ struct Walk<'a> {
     /// bindings of the steps they have in common, and a step's facts extend the sample
     /// after its count chose it
     probes: FxHashMap<Pattern, std::rc::Rc<Probe>>,
+    /// the probes' charge to the run's memory budget, released when the plan is made
+    held: Held,
+    /// the probes the plan may make
+    limit: usize,
+    /// whether the plan ran out of probes or of memory, or a read of the store failed:
+    /// its probes are empty from then on, and it keeps the greedy order
+    spent: bool,
 }
 
 impl Walk<'_> {
@@ -360,6 +446,17 @@ impl Walk<'_> {
         if let Some(p) = self.probes.get(&(pattern, lo, hi)) {
             return p.clone();
         }
+        if !self.spent
+            && (self.probes.len() >= self.limit || self.held.try_grow(PROBE_BYTES).is_err())
+        {
+            self.spent = true;
+        }
+        if self.spent {
+            return std::rc::Rc::new(Probe {
+                count: 0.0,
+                facts: Vec::new(),
+            });
+        }
         let p = std::rc::Rc::new(self.probe_now(pattern, lo, hi));
         self.probes.insert((pattern, lo, hi), p.clone());
         p
@@ -381,7 +478,13 @@ impl Walk<'_> {
                 .cands(Some(s), Some(p), Some(o), lo, hi)
                 .iter()
                 .any(|id| g.alive(id))
-                || base.is_some_and(|b| b.contains_with(self.memo, &t).unwrap_or(false));
+                || base.is_some_and(|b| match b.contains_with(self.memo, &t) {
+                    Ok(held) => held,
+                    Err(_) => {
+                        self.spent = true;
+                        false
+                    }
+                });
             if held {
                 facts.push(t);
             }
@@ -419,10 +522,11 @@ impl Walk<'_> {
             };
             let want = SAMPLE - facts.len().min(SAMPLE / 2);
             let mut some = Vec::new();
-            let _ = base.sample(self.memo, [s, p, o], want, STORE_STARTS, |t| {
+            let read = base.sample(self.memo, [s, p, o], want, STORE_STARTS, |t| {
                 some.push(t);
                 true
             });
+            self.spent |= read.is_err();
             mix(&mut facts, some);
             return Probe {
                 count: derived + stored,
@@ -430,14 +534,24 @@ impl Walk<'_> {
             };
         }
         // a probe with a subject or an object: its first facts, which are all of them
-        // when they are few, and then the scan counted them
+        // when they are few, and then the scan counted them. A scan of several blocks
+        // is read in its first block alone, and the index counts it.
         let mut some = Vec::new();
-        let ended = base
-            .for_each_with(self.memo, s, p, o, |t| {
+        let read = if base.blocks(s, p, o) <= 1 {
+            base.for_each_with(self.memo, s, p, o, |t| {
                 some.push(t);
                 some.len() <= SAMPLE
             })
-            .unwrap_or(true);
+        } else {
+            base.sample(self.memo, [s, p, o], SAMPLE + 1, 1, |t| {
+                some.push(t);
+                true
+            })
+        };
+        let ended = read.unwrap_or_else(|_| {
+            self.spent = true;
+            true
+        });
         let stored = if ended {
             some.len() as f64
         } else {
@@ -736,6 +850,128 @@ mod tests {
         let (s, o) = index_needs(&r, &steps);
         let (gs, go) = index_needs(&r, &greedy);
         assert!((!s || gs) && (!o || go));
+    }
+
+    /// A graph that holds a dead fact keeps the greedy order, however its facts fall
+    /// into runs: an order's candidates count a dead fact until a compaction drops it.
+    #[test]
+    fn a_graph_with_dead_facts_keeps_the_greedy_order() {
+        let r = key_rule();
+        for batch in [usize::MAX, 97, 5000] {
+            let mut g = key_graph_in(400, batch);
+            let ranges = vec![(0, g.len()); r.atoms.len()];
+            assert!(plan(&g, &r, &ranges).unwrap().1, "batches of {batch}");
+            assert!(g.kill(&[20_000, TYPE, 2001]));
+            let (steps, by_sample) = plan(&g, &r, &ranges).unwrap();
+            assert!(!by_sample, "batches of {batch}");
+            assert_eq!(
+                atom_order(&steps),
+                atom_order(&super::super::plan(&r, &ranges, Some(&g)).unwrap())
+            );
+        }
+    }
+
+    /// A plan that runs out of probes, or whose probes the memory budget cannot hold,
+    /// keeps the greedy order, and the budget is charged nothing once the plan is made.
+    #[test]
+    fn a_plan_out_of_probes_or_memory_keeps_the_greedy_order() {
+        let r = key_rule();
+        let mut g = key_graph(400);
+        let ranges = vec![(0, g.len()); r.atoms.len()];
+        let greedy = atom_order(&super::super::plan(&r, &ranges, Some(&g)).unwrap());
+        assert!(plan(&g, &r, &ranges).unwrap().1);
+        let (steps, by_sample) = plan_within(&g, &r, &ranges, 20).unwrap();
+        assert!(!by_sample);
+        assert_eq!(atom_order(&steps), greedy);
+        // a budget with room for the graph and for ten probes
+        let used = g.budget().used();
+        let budget = Budget::new(Some(g.heap_bytes() + 10 * PROBE_BYTES));
+        g.set_budget(&budget).unwrap();
+        let before = budget.used();
+        let (steps, by_sample) = plan(&g, &r, &ranges).unwrap();
+        assert!(!by_sample, "used {used} of {before}");
+        assert_eq!(atom_order(&steps), greedy);
+        assert_eq!(budget.used(), before);
+        // and with room for all of them the plan is the sampled one, and its probes'
+        // charge is released
+        let budget = Budget::new(Some(g.heap_bytes() + PROBES * PROBE_BYTES));
+        g.set_budget(&budget).unwrap();
+        let before = budget.used();
+        assert!(plan(&g, &r, &ranges).unwrap().1);
+        assert_eq!(budget.used(), before);
+        assert!(budget.peak() > before);
+    }
+
+    /// Costs that overflowed, or that are not numbers, never replace the greedy order.
+    #[test]
+    fn costs_that_overflowed_keep_the_greedy_order() {
+        assert!(saves(10.0, 20.0));
+        assert!(saves(0.0, 1.0));
+        assert!(!saves(10.0, 19.0));
+        // the product of many large fanouts, in both orders or in one
+        assert!(!saves(f64::INFINITY, f64::INFINITY));
+        assert!(!saves(1.0, f64::INFINITY));
+        assert!(!saves(f64::INFINITY, 1.0));
+        // infinity times a fanout of zero
+        assert!(!saves(f64::NAN, 1.0));
+        assert!(!saves(1.0, f64::NAN));
+        assert!(!saves(f64::NAN, f64::NAN));
+    }
+
+    /// A variable that a builtin binds and an atom also holds makes the order matter,
+    /// and such a rule keeps the greedy order. A builtin that only tests its
+    /// arguments, or whose result goes to the head alone, does not.
+    #[test]
+    fn a_rule_whose_order_matters_keeps_the_greedy_order() {
+        use Slot::{Const, Var};
+        let builtin = |kind: BuiltinKind, args: Vec<Slot>| {
+            let var = |i: usize| match args[i] {
+                Var(v) => Some(v),
+                _ => None,
+            };
+            CBuiltin {
+                origin: 0,
+                kind,
+                inputs: kind
+                    .input_positions(args.len())
+                    .into_iter()
+                    .filter_map(var)
+                    .collect(),
+                outputs: kind
+                    .output_positions(args.len())
+                    .into_iter()
+                    .filter_map(var)
+                    .collect(),
+                args: args.clone(),
+                regex: None,
+            }
+        };
+        let mut r = key_rule();
+        assert!(!order_matters(&r));
+        // a test of two bound variables
+        r.builtins = vec![builtin(BuiltinKind::NotEqual, vec![Var(3), Var(5)])];
+        assert!(!order_matters(&r));
+        // a sum that goes to a variable of the head alone
+        r.nvars = 7;
+        r.builtins = vec![builtin(BuiltinKind::Sum, vec![Var(4), Const(1), Var(6)])];
+        assert!(!order_matters(&r));
+        let g = key_graph(400);
+        let ranges = vec![(0, g.len()); r.atoms.len()];
+        assert!(plan(&g, &r, &ranges).unwrap().1);
+        // two builtins that bind one variable
+        r.builtins
+            .push(builtin(BuiltinKind::Sum, vec![Var(4), Const(2), Var(6)]));
+        assert!(order_matters(&r));
+        // a sum that an atom reads: the key value of `?y` is the sum
+        r.nvars = 6;
+        r.builtins = vec![builtin(BuiltinKind::Sum, vec![Var(3), Const(1), Var(4)])];
+        assert!(order_matters(&r));
+        let (steps, by_sample) = plan(&g, &r, &ranges).unwrap();
+        assert!(!by_sample);
+        assert_eq!(
+            atom_order(&steps),
+            atom_order(&super::super::plan(&r, &ranges, Some(&g)).unwrap())
+        );
     }
 
     #[test]
