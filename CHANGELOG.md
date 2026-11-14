@@ -11,8 +11,9 @@ mode. Every ASK and every LIMIT without ORDER BY pulls its input through cursor 
 that stop at the rows it needs, in eager and automatic execution as in streaming, so a
 filter or a join under a LIMIT reads its input once rather than in growing prefixes. The
 planner runs a small input whole instead, when exact index counts bound each of its
-operators to a cursor batch and its estimated cost past the first rows is below the cost
-of building cursor operators, and an EXISTS pattern evaluated per row does the same. A
+operators to a cursor batch, it evaluates no expression and its estimated cost past the
+first rows is below the cost of building cursor operators, and an EXISTS pattern
+evaluated per row does the same. A
 UNION under a LIMIT or an ASK reads its cheapest branch first in every mode. Automatic
 execution streams every ASK without initial bindings whose input does not run whole. A
 pattern scan's reader charges the patterns it decodes as they grow, and the decoded rows

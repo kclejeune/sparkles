@@ -159,8 +159,9 @@ check them against the W3C suites and Jena's own answers.
   once the query has the rows it asks for. A LIMIT over a single scan or a table of values
   reads the rows directly. The planner runs a small input whole instead, as a SELECT
   does, when exact index counts show that none of its operators gives more rows than a
-  cursor batch of 4,096 and its estimated cost past the first rows is below what building
-  the cursor operators costs, which is about eight microseconds. Automatic execution then
+  cursor batch of 4,096, it evaluates no FILTER or BIND, the query has no budget of
+  produced rows and its estimated cost past the first rows is below what building the
+  cursor operators costs, which is about eight microseconds. Automatic execution then
   keeps such an ASK eager, and an EXISTS pattern evaluated per row runs whole by the same
   test. A UNION under such a LIMIT, or under an ASK, reads its branch
   with the lowest estimated cost to the first rows first, unless a branch evaluates an

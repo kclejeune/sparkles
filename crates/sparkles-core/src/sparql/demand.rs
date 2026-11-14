@@ -174,47 +174,45 @@ const WHOLE_ROWS: u64 = 4096;
 /// running a join of a few thousand rows whole costs.
 const PULL_COST: f64 = 4096.0;
 
-/// What evaluating an expression for one row costs in the planner's cost units, which
-/// count a filter's or a BIND's row as one. A comparison of strings costs about as much
-/// as reading a hundred rows, and one of small integers a few.
-const EXPR_COST: f64 = 16.0;
-
 /// Whether a LIMIT without ORDER BY, an ASK or the per-row test of an EXISTS pattern,
 /// which take `want` rows, runs its input `node` whole, as a SELECT does, rather than
 /// pulling its first rows through cursor operators. It does when the planner's cost
 /// of the whole input exceeds its cost of the first `want` rows by less than building
-/// and running cursor operators costs, so a small input runs whole and a selective
-/// filter over a larger one stops early. The input must also be small by upper bounds
-/// from exact index counts: no operator of it may give more rows than a cursor's batch,
-/// and together they stay within the query's row budgets and half its memory budget,
-/// so that running it whole fails no budget that pulling it would pass whatever the
-/// estimates. A scan is bounded by the rows of its prefix, a join by the product of its
-/// inputs or, where an input that always binds a key meets a pattern with a constant
-/// predicate, by the rows of that input times the most rows the pattern has for one
-/// key, which the predicate's statistics bound. The input must evaluate only
-/// expressions that it may evaluate for more rows than its consumer takes. The choice
-/// depends on the plan and the snapshot alone.
+/// and running cursor operators costs, so a small input runs whole and a larger one
+/// stops early. The input must also be small by upper bounds from exact index counts:
+/// no operator of it may give more rows than a cursor's batch, and together their rows
+/// stay within half the query's memory budget, so that running it whole fails no budget
+/// that pulling it would pass whatever the estimates. A scan is bounded by the rows of
+/// its prefix, a join by the product of its inputs or, where an input that always binds
+/// a key meets a pattern with a constant predicate, by the rows of that input times the
+/// most rows the pattern has for one key, which the predicate's statistics bound. An
+/// input that evaluates expressions, such as a FILTER or a BIND, is pulled, since an
+/// expression may form new terms whose memory no row count bounds, and so is every input
+/// of a query with a budget of produced rows, which the rows its consumer takes count
+/// against as well. The choice depends on the plan, the snapshot and the query's
+/// budgets, never on the execution mode.
 pub(super) fn runs_whole(ctx: &Ctx, node: &Node, want: usize) -> bool {
-    if ctx.calls_extensions || !node.cost.is_finite() || !plain(node, &mut MAX_NODES.clone()) {
+    if ctx.calls_extensions
+        || ctx.max_rows_produced != u64::MAX
+        || !node.cost.is_finite()
+        || !plain(node, &mut MAX_NODES.clone())
+    {
         return false;
     }
-    // the rows past the first `want` that running whole evaluates expressions for
-    let skipped = 1.0 - share(want as f64, node.est);
-    let more = node.cost - first_cost(node, want as f64, &mut MAX_NODES.clone())
-        + EXPR_COST * skipped * expression_rows(node, &mut MAX_NODES.clone());
+    let more = node.cost - first_cost(node, want as f64, &mut MAX_NODES.clone());
     if !more.is_finite() || more > PULL_COST {
         return false;
     }
-    let mut total = (0u64, 0u64);
-    upper_rows(ctx, node, &mut MAX_NODES.clone(), &mut total).is_some()
-        && total.0 <= ctx.max_rows_produced
-        && total.1 <= ctx.mem_limit / 2
+    let mut bytes = 0u64;
+    upper_rows(ctx, node, &mut MAX_NODES.clone(), &mut bytes).is_some()
+        && bytes <= ctx.mem_limit / 2
 }
 
-/// An upper bound of the rows `node` gives, when it and the bound of each operator
-/// below it are at most [`WHOLE_ROWS`] and the query's output row limit. Adds the
-/// rows and an estimate of their bytes to `total`.
-fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, total: &mut (u64, u64)) -> Option<u64> {
+/// An upper bound of the rows `node` gives, when it evaluates no expression and the
+/// bound of it and of each operator below it are at most [`WHOLE_ROWS`] and the query's
+/// output row limit. Adds an estimate of the bytes of the rows to `bytes`, with room for
+/// the index of a hash join and the growth of a table, as for the columns of every row.
+fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Option<u64> {
     if *left == 0 {
         return None;
     }
@@ -224,24 +222,22 @@ fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, total: &mut (u64, u64)) 
         Kind::Scan(spec) | Kind::RangeScan(spec, _) => scan_rows(ctx, spec)?,
         Kind::Values(table) => table.len() as u64,
         Kind::Empty => 0,
-        Kind::Project(_) | Kind::Filter(_) | Kind::Extend(..) | Kind::Distinct | Kind::Sort(_) => {
-            upper_rows(ctx, only()?, left, total)?
-        }
-        Kind::Slice { offset, limit, .. } => upper_rows(ctx, only()?, left, total)?
+        Kind::Project(_) | Kind::Distinct | Kind::Sort(_) => upper_rows(ctx, only()?, left, bytes)?,
+        Kind::Slice { offset, limit, .. } => upper_rows(ctx, only()?, left, bytes)?
             .saturating_sub(*offset as u64)
             .min(limit.map_or(u64::MAX, |l| l as u64)),
         Kind::Union => {
             let mut sum = 0u64;
             for branch in &node.children {
-                sum = sum.saturating_add(upper_rows(ctx, branch, left, total)?);
+                sum = sum.saturating_add(upper_rows(ctx, branch, left, bytes)?);
             }
             sum
         }
         Kind::Join { algo, .. } if node.children.len() == 2 => {
             let [a, b] = [&node.children[0], &node.children[1]];
             let (ra, rb) = (
-                upper_rows(ctx, a, left, total)?,
-                upper_rows(ctx, b, left, total)?,
+                upper_rows(ctx, a, left, bytes)?,
+                upper_rows(ctx, b, left, bytes)?,
             );
             let mut rows = ra.saturating_mul(rb);
             if *algo != JoinAlgo::Cross {
@@ -262,10 +258,10 @@ fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, total: &mut (u64, u64)) 
             }
             rows
         }
-        Kind::IndexJoin(spec) => {
+        Kind::IndexJoin(spec) if spec.probes.iter().all(|p| p.filter.is_empty()) => {
             // the input always binds the key, and each of its rows meets the rows of
             // every probe for its key
-            let mut rows = upper_rows(ctx, only()?, left, total)?;
+            let mut rows = upper_rows(ctx, only()?, left, bytes)?;
             for probe in &spec.probes {
                 let each = scan_rows(ctx, &probe.scan)?.min(
                     super::indexjoin::key_fanout(ctx, &probe.scan, spec.key).unwrap_or(u64::MAX),
@@ -279,30 +275,8 @@ fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, total: &mut (u64, u64)) 
     if rows > WHOLE_ROWS || rows > ctx.max_rows as u64 {
         return None;
     }
-    total.0 = total.0.saturating_add(rows);
-    total.1 = total
-        .1
-        .saturating_add(rows.saturating_mul(node.vars.len() as u64 * 8 + 16));
+    *bytes = bytes.saturating_add(rows.saturating_mul(node.vars.len() as u64 * 16 + 64));
     Some(rows)
-}
-
-/// The estimated rows that the filters, BINDs and filtered index joins of `node`
-/// evaluate expressions for when it runs whole.
-fn expression_rows(node: &Node, left: &mut usize) -> f64 {
-    if *left == 0 {
-        return f64::INFINITY;
-    }
-    *left -= 1;
-    let own = match &node.kind {
-        Kind::Filter(_) | Kind::Extend(..) => node.children.first().map_or(0.0, |c| c.est),
-        Kind::IndexJoin(spec) if spec.probes.iter().any(|p| !p.filter.is_empty()) => node.est,
-        _ => 0.0,
-    };
-    own + node
-        .children
-        .iter()
-        .map(|c| expression_rows(c, left))
-        .sum::<f64>()
 }
 
 /// The rows of a scan's prefix, which bound the rows of the scan whatever its graph
@@ -601,7 +575,7 @@ mod tests {
     /// The planner runs a small input whole, bounding a join by the most rows a
     /// pattern with a constant predicate has for one key, and pulls an input that is
     /// larger than a cursor batch, costs much more than its first rows or evaluates
-    /// expressions with effects.
+    /// expressions.
     #[test]
     fn small_limit_inputs_run_whole() {
         let small = people(300);
@@ -613,10 +587,14 @@ mod tests {
         // 300 rows each give a product of 90,000, but each person has one name
         assert!(whole(&small, &join.replace("LIMIT 10", "LIMIT 500")));
         assert!(!whole(&large, join), "5,000 rows exceed a batch");
-        // a string comparison for each of 300 rows costs more than the cursor
+        // an expression may form terms that no row count bounds
         assert!(!whole(
             &small,
             "SELECT ?p WHERE { ?p ex:knows ?x . ?x ex:name ?n FILTER(?n != \"n3\") } LIMIT 100"
+        ));
+        assert!(!whole(
+            &small,
+            "ASK { ?p ex:knows ?x . ?x ex:age ?a FILTER(?a + 1 = 8) }"
         ));
         // RAND gives other values when it runs for more rows
         assert!(!whole(
@@ -635,8 +613,9 @@ mod tests {
         ));
     }
 
-    /// A tight budget of produced rows keeps a small input pulled, since running it
-    /// whole produces more rows than its consumer takes.
+    /// A budget of produced rows keeps a small input pulled, since running it whole
+    /// produces more rows than its consumer takes, and the consumer's rows and earlier
+    /// work count against the same budget (review round 3).
     #[test]
     fn row_budgets_keep_a_small_input_pulled() {
         let small = people(300);
@@ -646,6 +625,75 @@ mod tests {
         };
         let text = "SELECT ?p ?n WHERE { ?p ex:knows ?x . ?x ex:name ?n } LIMIT 10";
         assert!(!whole_with(&small, text, &tight));
+        let ample = QueryOptions {
+            max_rows_produced: Some(1_000_000),
+            ..options()
+        };
+        assert!(!whole_with(&small, text, &ample));
         assert!(whole(&small, text));
+        // one row of each branch, which a whole run produces four of before the ASK's
+        // fifth, while pulling produces three
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:a> <urn:p> 1 .\n<urn:b> <urn:q> 1 .\n".to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let four = QueryOptions {
+            max_rows_produced: Some(4),
+            ..options()
+        };
+        let r = super::super::query(
+            store.snapshot(),
+            "ASK { { ?s <urn:p> 1 } UNION { ?s <urn:q> 1 } }",
+            &four,
+        )
+        .unwrap();
+        assert!(r.boolean);
+    }
+
+    /// An input that evaluates an expression is pulled, since the terms an expression
+    /// forms take memory that no row count bounds: a LIMIT 1 over a BIND that forms a
+    /// 64 KiB string for each of 100 rows answers within a 1 MiB budget in eager and
+    /// automatic execution (review round 3). A streaming cursor evaluates the BIND for
+    /// a batch of rows, as it did before.
+    #[test]
+    fn expressions_keep_a_small_input_pulled() {
+        use super::super::cursor::{CursorOptions, ExecutionMode, QueryExecution, query_execution};
+        let store = people(300);
+        let big = "x".repeat(64 << 10);
+        let values: String = (0..100).map(|i| format!("{i} ")).collect();
+        let text = format!(
+            "SELECT ?s WHERE {{ VALUES ?n {{ {values} }} BIND(CONCAT(STR(?n), \"{big}\") AS ?s) }} LIMIT 1"
+        );
+        let tight = QueryOptions {
+            max_memory_bytes: Some(1 << 20),
+            ..options()
+        };
+        for mode in [ExecutionMode::Eager, ExecutionMode::Auto] {
+            let rows = match query_execution(
+                store.snapshot(),
+                &text,
+                &tight,
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"))
+            {
+                QueryExecution::Select(mut c) => {
+                    let mut n = 0;
+                    while let Some(b) = c.next_batch().unwrap() {
+                        n += b.len();
+                    }
+                    n
+                }
+                QueryExecution::Eager(r) => r.result().len(),
+                _ => unreachable!("a SELECT"),
+            };
+            assert_eq!(rows, 1, "{mode:?}");
+        }
+        assert!(!whole_with(&store, &text, &tight));
     }
 }

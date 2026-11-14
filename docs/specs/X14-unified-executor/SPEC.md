@@ -236,9 +236,11 @@ the first-work estimator, `limited_input`, `filtered_ask_admitted`, `order_ask` 
 `Dataset::ask_streaming_with` are gone, and the accounting mode is read in four places.
 The planner marks a LIMIT or an ASK to run its input whole, as a SELECT does, when exact
 index counts bound every operator of the input to a cursor batch of 4,096 rows and its
-estimated cost past the first rows, with sixteen cost units for each row an expression is
-evaluated for, is below the 4,096 units that building cursor operators costs
-(`demand::runs_whole`). A join is bounded by the product of its inputs or, where an input
+estimated cost past the first rows is below the 4,096 units that building cursor
+operators costs (`demand::runs_whole`). An input that evaluates a FILTER, a BIND or
+another expression is pulled, since an expression may form terms whose memory no row
+count bounds, and so is every input of a query with a budget of produced rows, which
+the consumer's rows count against too. A join is bounded by the product of its inputs or, where an input
 that always binds a key meets a pattern with a constant predicate, by that input's rows
 times the pattern's most rows for one key, which the predicate's statistics bound. The
 eager LIMIT runs such an input whole, automatic execution keeps such an ASK eager, and
