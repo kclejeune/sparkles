@@ -637,9 +637,9 @@ the sampled order when it is at least twice as cheap. On atlas the rules of OWL2
 take 29.9 s against 51.6 to 51.8 s at one thread and 9.5 to 9.7 s against 12.5 to 12.8 s
 at 20 threads, its materialization takes 80.6 to 80.8 s against 102.5 to 102.8 s and 42.5
 to 42.7 s against 45.5 to 49.2 s, and the rules of OWL2Bench(1) take 662 to 696 ms
-against 976 to 988 ms. The planner changes no plan of LUBM. Its own work costs LUBM(10)
-4 ms at one thread, 0.4%, by the median of seven paired runs (item 945), and is not
-visible on LUBM(100). A run derives the same facts with either planner, in another
+against 976 to 988 ms. The planner changes no plan of LUBM. The rules of LUBM(10) take
+4 ms longer at one thread, 0.4%, by the median of seven paired runs, which is attributed
+to planning (item 945), and LUBM(100) shows no difference. A run derives the same facts with either planner, in another
 order, and setting `ReasonOptions::sampled_planning` to `false` keeps the greedy orders.
 Rules in which a builtin binds a variable that an atom also holds, and every rule while
 the derived tier holds a dead fact after a deletion, keep the greedy orders (item 944). The planner of item 487,

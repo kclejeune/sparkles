@@ -413,7 +413,7 @@ pinned thread, at `e66d8b70`, it found the following.
 |---|---|---|---|
 | OWL2Bench(1), `owl-rl` | 494 ms | 158 ms | `prp-key` falls from 334 ms to 0.4 ms. |
 | OWL2Bench(5), `owl-rl` | 30.7 s | 9.2 s at most | `prp-key` takes 21.6 s. Its longest plan outran the probe's budget. |
-| LUBM(10) and LUBM(100), `owl-rl` | 0.89 s and 11.12 s | The same times. | The probe found no faster order. |
+| LUBM(10) and LUBM(100), `owl-rl` | 0.89 s and 11.12 s | The probe found the same times. | The probe found no faster order. |
 | LUBM(10), user rules with bodies of four to six atoms | 286 ms | 228 ms | Two rules gain, and their candidate counts fall far less than their times. |
 | LUBM(100), the same rules | 4.14 s | 4.03 s | The probe did not try every order of the longest body. |
 
