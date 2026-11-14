@@ -291,7 +291,9 @@ fn keyed_join_answers_ask_in_a_cursor_and_eagerly() {
 
 #[test]
 fn keyed_ask_limits_the_large_input_when_a_small_prefix_already_matches() {
-    for (left, right) in [(1, 2048), (2048, 1)] {
+    // two inputs within a cursor batch whose held input exceeds the row limit still
+    // read both a few rows at a time (review round 5)
+    for (left, right) in [(1, 2048), (2048, 1), (2048, 2048)] {
         let store = Store::in_memory(StoreOptions::default());
         let mut data = String::new();
         for (rows, predicate) in [(left, "left"), (right, "right")] {

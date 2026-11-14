@@ -946,3 +946,27 @@ fn constant_subject_pulls_charge_no_subject_block() {
     let grown = cur.stats().mem_peak_bytes - before;
     assert!(grown < 45_000, "the pulls raised the peak by {grown} bytes");
 }
+
+/// A LIMIT of no rows over a pattern scan reads no pattern, so it charges no predicate
+/// list however many predicates its subject has (review round 5).
+#[test]
+fn a_limit_of_no_rows_reads_no_pattern() {
+    let peak = |predicates: usize| {
+        let s = Store::in_memory(StoreOptions::default());
+        let data: String = (0..predicates)
+            .map(|i| format!("<urn:s> <urn:p{i}> 1 .\n"))
+            .collect();
+        load(&s, &data, RdfFormat::Turtle);
+        let text = format!("{SPK}SELECT ?p WHERE {{ <urn:s> spk:hasPredicate ?p }} LIMIT 0");
+        let r = query(s.snapshot(), &text, &opts(Optimizations::ALL)).unwrap();
+        assert!(has_op(r.plan(), "PatternScan"));
+        assert_eq!(r.len(), 0);
+        r.mem_peak_bytes
+    };
+    let (one, many) = (peak(1), peak(3000));
+    // the list of 3,000 predicates alone is 24,000 bytes
+    assert!(
+        many < one + 8_000,
+        "one predicate peaked at {one} bytes and 3,000 at {many}"
+    );
+}

@@ -5,9 +5,10 @@
 //! have the rows they ask for, in every execution mode. The planner therefore makes the
 //! choices that suit a few rows here, so that one query has one plan whatever its mode.
 //! A UNION under such a limit reads its branches in order, so its cheapest branch to
-//! the first rows goes first. An ASK, or a LIMIT of one row, over a keyed join of two
-//! inputs larger than a cursor batch reads both a few rows at a time, and over a
-//! filtered product it streams the larger input against the smaller. A LIMIT or an ASK
+//! the first rows goes first. An ASK, or a LIMIT of one row, over a keyed join reads
+//! both inputs a few rows at a time unless the input it would hold is small and fits
+//! the query's budgets, and over a filtered product it streams the larger input against
+//! the smaller. A LIMIT or an ASK
 //! runs a small input whole when its operators would read their inputs whole anyway. A DISTINCT over an ORDER BY deduplicates below the sort
 //! when the query may spill.
 
@@ -71,22 +72,21 @@ fn below_projections(mut node: &mut Node) -> &mut Node {
     node
 }
 
-/// One row answers the query. A keyed join whose inputs are both estimated larger than a
-/// cursor batch reads both a few rows at a time, so that the first matching pair ends
-/// it. A keyed join with a smaller input holds that input, which costs at most a batch to
-/// read, and probes it about twice as fast as reading both inputs alternately when no
-/// pair matches. Either way a hash join in either input that would read one of its own
-/// inputs whole becomes an index join where it can. A filtered product streams its
-/// larger input against the smaller one, which it holds.
+/// One row answers the query. A keyed join reads both inputs a few rows at a time, so
+/// that the first matching pair ends it, unless the input it would hold, its second, is
+/// estimated within a cursor batch and fits the query's budgets by the bounds that
+/// [`holds_whole`] checks. Then it holds that input and probes it, which is about twice
+/// as fast as reading both inputs alternately when no pair matches. Either way a hash
+/// join in either input that would read one of its own inputs whole becomes an index
+/// join where it can. A filtered product streams its larger input against the smaller
+/// one, which it holds.
 fn orient_first_row(ctx: &Ctx, node: &mut Node) {
     let filtered = below_projections(node);
     if let Kind::KeyedJoin { ripple, .. } = &mut filtered.kind {
         let batch_rows = super::cursor::CursorOptions::default().batch_rows;
         *ripple = filtered.children.len() == 2
-            && filtered
-                .children
-                .iter()
-                .all(|input| input.est > batch_rows as f64);
+            && !(filtered.children[1].est <= batch_rows as f64
+                && holds_whole(ctx, &filtered.children[1]));
         for input in &mut filtered.children {
             first_rows(input, ctx, batch_rows);
         }
@@ -216,6 +216,20 @@ pub(super) fn runs_whole(ctx: &Ctx, node: &Node, want: usize) -> bool {
     }
     let mut bytes = 0u64;
     upper_rows(ctx, node, &mut MAX_NODES.clone(), &mut bytes).is_some()
+        && bytes <= ctx.mem_limit / 2
+}
+
+/// Whether a join may hold `input` whole in place of reading it a few rows at a time:
+/// exact index bounds keep it and every operator below it within a cursor batch and the
+/// query's row limit, their rows within half its memory budget, and the query has no
+/// budget of produced rows, which reading the input whole would count against. The
+/// bounds are those of [`runs_whole`].
+fn holds_whole(ctx: &Ctx, input: &Node) -> bool {
+    if ctx.calls_extensions || ctx.max_rows_produced != u64::MAX {
+        return false;
+    }
+    let mut bytes = 0u64;
+    upper_rows(ctx, input, &mut MAX_NODES.clone(), &mut bytes).is_some()
         && bytes <= ctx.mem_limit / 2
 }
 

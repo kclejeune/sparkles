@@ -219,11 +219,13 @@ The mode-independent plans of item 827 have shipped. `PatternScan` has a resumab
 cursor over the predicate patterns, which the eager scan shares, so `spk:hasPredicate`
 plans its scan in every mode. The planner deduplicates a DISTINCT below its ORDER BY
 whenever the query may spill, and the eager executor numbers the rows of that DISTINCT as
-the cursor does. The planner also sets the ripple join and the first-row index joins of an
-ASK or a `LIMIT 1` over a keyed join whose inputs are both estimated larger than the
-default cursor batch, and streams a filtered product's larger input. A keyed join with a
-smaller input holds it, since reading both inputs alternately probes about twice per row
-and took 1.7 to 1.8 times as long when no pair matched. The result cache and sampled filters stay on under
+the cursor does. The planner also sets the first-row index joins of an ASK or a `LIMIT 1`
+over a keyed join, and the ripple join unless the input the join would hold is estimated
+within the default cursor batch and the bounds of a whole run keep it within the query's
+row and memory budgets and the query has no budget of produced rows. The join then holds
+that input, since reading both inputs alternately probes about twice per row and took
+1.7 to 1.8 times as long when no pair matched. The planner streams a filtered product's
+larger input. The result cache and sampled filters stay on under
 cursor accounting. Every ASK and every LIMIT without ORDER BY pulls its input through
 cursor operators with a demand of `offset + limit` rows, in eager execution through the
 eager context and in automatic execution, which streams every ASK without initial

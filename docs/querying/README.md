@@ -168,8 +168,9 @@ check them against the W3C suites and Jena's own answers.
   with the lowest estimated cost to the first rows first, unless a branch evaluates an
   EXISTS, an extension or application function, RAND, UUID or BNODE, or holds an
   operator such as SERVICE whose effects could observe the order. An ASK or a `LIMIT 1`
-  over a keyed join of two inputs estimated larger than a cursor batch reads both a few
-  rows at a time, a keyed join with a smaller input holds that input, and a product
+  over a keyed join reads both inputs a few rows at a time, unless the input the join
+  would hold is estimated within a cursor batch and exact index counts keep it within
+  the query's row and memory budgets, in which case the join holds that input. A product
   streams its larger input against the smaller one, which it holds.
 * A LIMIT over an inner hash join builds the hash index of one whole input before its
   first row, so a `LIMIT 1` over the join of two inputs of 65,537 rows needs about 7 MB.

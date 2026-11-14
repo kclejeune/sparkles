@@ -349,6 +349,10 @@ pub(super) fn fill_scan(
     };
     let width = out.width();
     let want = max.saturating_sub(out.len());
+    if want == 0 {
+        // a LIMIT of no rows reads no pattern
+        return Ok(reader.done());
+    }
     let mut row = vec![Id::UNDEF; width];
     let mut push = |s: u64, p: u64| -> Result<()> {
         // the columns double as they fill: admit the next size's bytes before they grow,
