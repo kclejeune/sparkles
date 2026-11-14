@@ -3172,7 +3172,7 @@ mod small_tests {
         }
         assert_eq!(small.list.len(), want.len());
         assert!(small.contains(&T::EMPTY));
-        let keep = |x: &T| x.mix() % 3 != 0;
+        let keep = |x: &T| !x.mix().is_multiple_of(3);
         small.retain(keep);
         want.retain(keep);
         assert_eq!(small.list.len(), want.len());
