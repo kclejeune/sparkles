@@ -245,13 +245,13 @@ class _Cursor(Generic[_T]):
             if not self._pending:
                 native = self._native
 
-                def fetch() -> tuple[Any, dict[str, Any], dict[str, Any]]:
+                # The plan is read when it is asked for and when the cursor closes, so a
+                # batch brings only the statistics that `status` reads.
+                def fetch() -> tuple[Any, dict[str, Any]]:
                     rows = native._next_batch()
-                    return rows, native.stats(), native.plan()
+                    return rows, native.stats()
 
-                rows, self._stats, self._plan = await self._worker.call(
-                    fetch, self._token
-                )
+                rows, self._stats = await self._worker.call(fetch, self._token)
                 if rows is None:
                     self._busy = False
                     await self.aclose()

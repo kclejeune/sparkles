@@ -37,6 +37,72 @@ impl State {
             status
         }
     }
+
+    /// Whether the next row is in the batch already fetched, so that reading it runs no
+    /// part of the query.
+    fn buffered(&self) -> bool {
+        !self.serializing
+            && self.cursor.is_some()
+            && self.batch.as_ref().is_some_and(|b| self.row < b.len())
+    }
+
+    /// The next row, from the batch already fetched or from the cursor's next batch.
+    fn next_row(&mut self) -> sparkles::Result<Option<Vec<Option<oxrdf::Term>>>> {
+        if self.serializing {
+            return Err(sparkles::Error::invalid("the cursor is being serialized"));
+        }
+        let Some(mut cursor) = self.cursor.take() else {
+            if self.stats.status == CursorStatus::Failed {
+                return Err(failed(&self.stats));
+            }
+            return Ok(None);
+        };
+        let mut fetched = false;
+        let result: sparkles::Result<Option<Vec<Option<oxrdf::Term>>>> = (|| {
+            if self
+                .batch
+                .as_ref()
+                .is_none_or(|batch| self.row == batch.len())
+            {
+                self.batch = None;
+                self.row = 0;
+                fetched = true;
+                self.batch = cursor.next_batch()?;
+            }
+            let Some(batch) = &self.batch else {
+                return Ok(None);
+            };
+            let values = batch.row(self.row)?;
+            self.row += 1;
+            self.emitted += 1;
+            Ok(Some(values))
+        })();
+        // Record the outcome before anything else can fail, and keep the
+        // execution error as the one raised.
+        if let Err(error) = &result {
+            cursor.close();
+            self.batch = None;
+            self.stats = cursor.stats();
+            self.stats.status = CursorStatus::Failed;
+            self.stats.error = Some(error.to_string());
+            if let Ok(plan) = cursor.plan_json() {
+                self.plan = plan;
+            }
+        } else {
+            // A row of the batch already fetched leaves the cursor as it was, so the
+            // statistics recorded with that batch still hold.
+            if fetched {
+                let finished = cursor.status() != CursorStatus::Open
+                    && self.stats.status == CursorStatus::Open;
+                self.stats = cursor.stats();
+                if finished && let Ok(plan) = cursor.plan_json() {
+                    self.plan = plan;
+                }
+            }
+            self.cursor = Some(cursor);
+        }
+        result
+    }
 }
 
 /// The engine cursor operations that both Python wrappers share.
@@ -255,60 +321,25 @@ impl PyQueryCursor {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyQuerySolution>> {
-        let state = self.state.clone();
-        let values = interrupt::run(py, &self.cancel, move || {
-            let mut state = state
-                .try_lock()
-                .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
-            if state.serializing {
-                return Err(sparkles::Error::invalid("the cursor is being serialized"));
+        // A row of the batch already fetched is decoded here with the GIL held. It runs no
+        // part of the query and waits for nothing, and it takes less time than leaving
+        // the thread does. Only a fetch runs detached, where Ctrl-C can cancel it.
+        let ready = match self.state.try_lock() {
+            Ok(mut state) if state.buffered() => Some(state.next_row()),
+            _ => None,
+        };
+        let values = match ready {
+            Some(row) => row.py(py)?,
+            None => {
+                let state = self.state.clone();
+                interrupt::run(py, &self.cancel, move || {
+                    state
+                        .try_lock()
+                        .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?
+                        .next_row()
+                })?
             }
-            let Some(mut cursor) = state.cursor.take() else {
-                if state.stats.status == CursorStatus::Failed {
-                    return Err(failed(&state.stats));
-                }
-                return Ok(None);
-            };
-            let result: sparkles::Result<Option<Vec<Option<oxrdf::Term>>>> = (|| {
-                if state
-                    .batch
-                    .as_ref()
-                    .is_none_or(|batch| state.row == batch.len())
-                {
-                    state.batch = None;
-                    state.row = 0;
-                    state.batch = cursor.next_batch()?;
-                }
-                let Some(batch) = &state.batch else {
-                    return Ok(None);
-                };
-                let values = batch.row(state.row)?;
-                state.row += 1;
-                state.emitted += 1;
-                Ok(Some(values))
-            })();
-            // Record the outcome before anything else can fail, and keep the
-            // execution error as the one raised.
-            if let Err(error) = &result {
-                cursor.close();
-                state.batch = None;
-                state.stats = cursor.stats();
-                state.stats.status = CursorStatus::Failed;
-                state.stats.error = Some(error.to_string());
-                if let Ok(plan) = cursor.plan_json() {
-                    state.plan = plan;
-                }
-            } else {
-                let finished = cursor.status() != CursorStatus::Open
-                    && state.stats.status == CursorStatus::Open;
-                state.stats = cursor.stats();
-                if finished && let Ok(plan) = cursor.plan_json() {
-                    state.plan = plan;
-                }
-                state.cursor = Some(cursor);
-            }
-            result
-        })?;
+        };
         Ok(values.map(|values| PyQuerySolution::new(self.vars.clone(), values)))
     }
 
@@ -317,17 +348,16 @@ impl PyQueryCursor {
         let Some(first) = self.__next__(py)? else {
             return Ok(None);
         };
-        let remaining = py
-            .detach(|| {
-                let state = self
-                    .state
-                    .try_lock()
-                    .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
-                Ok(state
+        let remaining = self
+            .state
+            .try_lock()
+            .map(|state| {
+                state
                     .batch
                     .as_ref()
-                    .map_or(0, |batch| batch.len() - state.row))
+                    .map_or(0, |batch| batch.len() - state.row)
             })
+            .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))
             .py(py)?;
         let mut rows = Vec::with_capacity(remaining + 1);
         rows.push(Py::new(py, first)?);
@@ -445,6 +475,72 @@ impl GraphState {
             status
         }
     }
+
+    /// Whether the next quad is in the batch already fetched, so that reading it runs no
+    /// part of the query.
+    fn buffered(&self) -> bool {
+        !self.serializing
+            && self.cursor.is_some()
+            && self.batch.as_ref().is_some_and(|b| self.row < b.len())
+    }
+
+    /// The next quad, from the batch already fetched or from the cursor's next batch.
+    fn next_quad(&mut self) -> sparkles::Result<Option<oxrdf::Quad>> {
+        if self.serializing {
+            return Err(sparkles::Error::invalid("the cursor is being serialized"));
+        }
+        let Some(mut cursor) = self.cursor.take() else {
+            if self.stats.status == CursorStatus::Failed {
+                return Err(failed(&self.stats));
+            }
+            return Ok(None);
+        };
+        let mut fetched = false;
+        let result: sparkles::Result<Option<oxrdf::Quad>> = (|| {
+            if self
+                .batch
+                .as_ref()
+                .is_none_or(|batch| self.row == batch.len())
+            {
+                self.batch = None;
+                self.row = 0;
+                fetched = true;
+                self.batch = cursor.next_batch()?;
+            }
+            let Some(batch) = &self.batch else {
+                return Ok(None);
+            };
+            let values = batch.quads()[self.row].clone();
+            self.row += 1;
+            self.emitted += 1;
+            Ok(Some(values))
+        })();
+        // Record the outcome before anything else can fail, and keep the
+        // execution error as the one raised.
+        if let Err(error) = &result {
+            cursor.close();
+            self.batch = None;
+            self.stats = cursor.stats();
+            self.stats.status = CursorStatus::Failed;
+            self.stats.error = Some(error.to_string());
+            if let Ok(plan) = cursor.plan_json() {
+                self.plan = plan;
+            }
+        } else {
+            // A quad of the batch already fetched leaves the cursor as it was, so the
+            // statistics recorded with that batch still hold.
+            if fetched {
+                let finished = cursor.status() != CursorStatus::Open
+                    && self.stats.status == CursorStatus::Open;
+                self.stats = cursor.stats();
+                if finished && let Ok(plan) = cursor.plan_json() {
+                    self.plan = plan;
+                }
+            }
+            self.cursor = Some(cursor);
+        }
+        result
+    }
 }
 
 #[pyclass(module = "sparkles", name = "GraphCursor")]
@@ -531,60 +627,24 @@ impl PyGraphCursor {
     }
 
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let state = self.state.clone();
-        let values = interrupt::run(py, &self.cancel, move || {
-            let mut state = state
-                .try_lock()
-                .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
-            if state.serializing {
-                return Err(sparkles::Error::invalid("the cursor is being serialized"));
+        // As for a SELECT cursor, a quad of the batch already fetched is handed out here
+        // with the GIL held, and only a fetch runs detached.
+        let ready = match self.state.try_lock() {
+            Ok(mut state) if state.buffered() => Some(state.next_quad()),
+            _ => None,
+        };
+        let values = match ready {
+            Some(quad) => quad.py(py)?,
+            None => {
+                let state = self.state.clone();
+                interrupt::run(py, &self.cancel, move || {
+                    state
+                        .try_lock()
+                        .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?
+                        .next_quad()
+                })?
             }
-            let Some(mut cursor) = state.cursor.take() else {
-                if state.stats.status == CursorStatus::Failed {
-                    return Err(failed(&state.stats));
-                }
-                return Ok(None);
-            };
-            let result: sparkles::Result<Option<oxrdf::Quad>> = (|| {
-                if state
-                    .batch
-                    .as_ref()
-                    .is_none_or(|batch| state.row == batch.len())
-                {
-                    state.batch = None;
-                    state.row = 0;
-                    state.batch = cursor.next_batch()?;
-                }
-                let Some(batch) = &state.batch else {
-                    return Ok(None);
-                };
-                let values = batch.quads()[state.row].clone();
-                state.row += 1;
-                state.emitted += 1;
-                Ok(Some(values))
-            })();
-            // Record the outcome before anything else can fail, and keep the
-            // execution error as the one raised.
-            if let Err(error) = &result {
-                cursor.close();
-                state.batch = None;
-                state.stats = cursor.stats();
-                state.stats.status = CursorStatus::Failed;
-                state.stats.error = Some(error.to_string());
-                if let Ok(plan) = cursor.plan_json() {
-                    state.plan = plan;
-                }
-            } else {
-                let finished = cursor.status() != CursorStatus::Open
-                    && state.stats.status == CursorStatus::Open;
-                state.stats = cursor.stats();
-                if finished && let Ok(plan) = cursor.plan_json() {
-                    state.plan = plan;
-                }
-                state.cursor = Some(cursor);
-            }
-            result
-        })?;
+        };
         values
             .map(|quad| crate::terms::quad_to_py(py, quad))
             .transpose()
@@ -595,17 +655,16 @@ impl PyGraphCursor {
         let Some(first) = self.__next__(py)? else {
             return Ok(None);
         };
-        let remaining = py
-            .detach(|| {
-                let state = self
-                    .state
-                    .try_lock()
-                    .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))?;
-                Ok(state
+        let remaining = self
+            .state
+            .try_lock()
+            .map(|state| {
+                state
                     .batch
                     .as_ref()
-                    .map_or(0, |batch| batch.len() - state.row))
+                    .map_or(0, |batch| batch.len() - state.row)
             })
+            .map_err(|_| sparkles::Error::invalid("a cursor operation is in progress"))
             .py(py)?;
         let mut rows = Vec::with_capacity(remaining + 1);
         rows.push(first.unbind());

@@ -10,8 +10,8 @@ use crate::results::{
     PyPatchStats, PyQuadIterator, PyQuerySolutions, PyQueryTriples, PyUpdateStats,
 };
 use crate::terms::{
-    PyVariable, graph_from_py, graph_to_py, iri_from_py, named_node_from_py, opt, quad_from_py,
-    subject_from_py, term_from_py,
+    PyQuad, PyVariable, graph_from_py, graph_to_py, iri_from_py, named_node_from_py, opt,
+    quad_from_py, subject_from_py, term_from_py,
 };
 use crate::txn::{PyTransaction, WriterSlot};
 use crate::{admin, interrupt};
@@ -1058,9 +1058,15 @@ impl PyDataset {
     }
 
     fn __contains__(&self, py: Python<'_>, quad: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let q = quad_from_py(quad)?;
         let ds = self.ds(py)?;
-        // a lookup in memory takes less time than giving up the GIL and taking it back
+        // a lookup in memory takes less time than giving up the GIL and taking it back,
+        // and it reads a `Quad` where it is, without a copy of its terms
+        if ds.store().root().is_none()
+            && let Ok(q) = quad.cast::<PyQuad>()
+        {
+            return ds.contains(q.get().inner.as_ref()).py(py);
+        }
+        let q = quad_from_py(quad)?;
         if ds.store().root().is_none() {
             return ds.contains(q.as_ref()).py(py);
         }
