@@ -756,9 +756,13 @@ impl Tier {
                 let scratch = compact::sort_bytes(new.len());
                 meter.add(scratch + 2 * Run::bytes_for(new.len()))?;
                 // the keys no fact of the relation has had are new
-                let (run, fresh) = compact::sorted(new, &key_s, &|k| !rel.subj.holds(k, &key_s));
+                let (run, fresh) = compact::sorted(new, &key_s, rel.subj.is_new(), &|k| {
+                    !rel.subj.holds(k, &key_s)
+                });
                 rel.subj.push_charged(run, fresh, &mut meter)?;
-                let (run, fresh) = compact::sorted(new, &key_o, &|k| !rel.obj.holds(k, &key_o));
+                let (run, fresh) = compact::sorted(new, &key_o, rel.obj.is_new(), &|k| {
+                    !rel.obj.holds(k, &key_o)
+                });
                 rel.obj.push_charged(run, fresh, &mut meter)?;
                 meter.sub(scratch);
             }
@@ -805,9 +809,9 @@ impl Tier {
             let scratch = compact::sort_bytes(n);
             m.add(scratch + Run::bytes_for(n))?;
             let (run, fresh) = if subjects {
-                compact::sorted(&all, &key_s, &|k| !order.holds(k, &key_s))
+                compact::sorted(&all, &key_s, order.is_new(), &|k| !order.holds(k, &key_s))
             } else {
-                compact::sorted(&all, &key_o, &|k| !order.holds(k, &key_o))
+                compact::sorted(&all, &key_o, order.is_new(), &|k| !order.holds(k, &key_o))
             };
             order.push_charged(run, fresh, m)?;
             m.sub(scratch);

@@ -36,12 +36,24 @@ impl Run {
     /// A run over `(key1, id)` entries sorted by key and then id, which are read once:
     /// the buffers are made at the entries' number and never grow.
     pub fn from_sorted(entries: impl ExactSizeIterator<Item = (u64, u32)>) -> Run {
+        Run::from_sorted_counting(entries).0
+    }
+
+    /// [`from_sorted`](Self::from_sorted), with the number of distinct first keys.
+    pub fn from_sorted_counting(
+        entries: impl ExactSizeIterator<Item = (u64, u32)>,
+    ) -> (Run, usize) {
         let n = entries.len();
         let mut ids = Vec::with_capacity(n);
         let mut fence = Vec::with_capacity(n.div_ceil(FENCE));
         let mut coarse = Vec::with_capacity(n.div_ceil(FENCE * COARSE));
         let (mut lo, mut hi) = (u32::MAX, 0u32);
+        let (mut distinct, mut prev) = (0, None);
         for (i, (k, id)) in entries.enumerate() {
+            if prev != Some(k) {
+                distinct += 1;
+                prev = Some(k);
+            }
             if i % FENCE == 0 {
                 if i % (FENCE * COARSE) == 0 {
                     coarse.push(k);
@@ -53,13 +65,14 @@ impl Run {
             ids.push(id);
         }
         let (lo, hi) = if ids.is_empty() { (0, 0) } else { (lo, hi + 1) };
-        Run {
+        let run = Run {
             ids,
             fence,
             coarse,
             lo,
             hi,
-        }
+        };
+        (run, distinct)
     }
 
     /// The heap of a run of `n` entries built at that size.

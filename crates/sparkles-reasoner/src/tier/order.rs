@@ -92,6 +92,12 @@ impl Order {
         Ok(o)
     }
 
+    /// Whether the order has held no fact, so that every key of a merge is new to it.
+    #[inline]
+    pub fn is_new(&self) -> bool {
+        self.runs.is_empty() && self.ghosts.is_empty()
+    }
+
     /// Whether a fact the order has held had first key `k`: a run holds it, or a ghost.
     #[inline]
     pub fn holds(&self, k: u64, key1: &impl Fn(u32) -> u64) -> bool {
