@@ -1333,6 +1333,47 @@
     }
    },
    "metadata_note": "Manual record of roadmap item 818 on atlas: ore_ont_8737 of every side on one, four and twelve threads in two slots, Konclude 0.7.0 on the same host, the rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482, and the profiles and message counters taken on the laptop."
+  },
+  {
+   "run_id": "sha256-f1994661bb65b1e2caba9ada714c32c88b294ded50e6dce07510d7e0d984a2ff",
+   "path": "runs/2026-11-14-el-messages-atlas-1da472f2/record.json",
+   "sha256": "f1994661bb65b1e2caba9ada714c32c88b294ded50e6dce07510d7e0d984a2ff",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "ore_ont_8737 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on atlas",
+    "manifest": {
+     "sides": {
+      "base": "3a1b9b04, the lane's base, lane/dl-897-727 with item 818 and the main of batch 20",
+      "c3": "1da472f2, one copy of a run for all its destinations, the inlined check of a run and the batch applied in place, the lane's final saturation code",
+      "c4": "79b0c707, c3 with the open-addressing table of Small and the fix of review round 1, reverted in bfa3401b since it measured no faster"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify on stanley at each commit, stripped and copied to atlas",
+     "scripts": [
+      "slot889.sh.txt",
+      "ab.sh.txt",
+      "prof889.sh.txt",
+      "record889.py.txt"
+     ],
+     "profiles": "prof889.sh profiled base and c4 with their symbols kept, perf 7.3.1, cpu-clock:u at 999 Hz, ore_ont_8737 on four threads"
+    },
+    "settings": {
+     "memory_runs": "three rounds of rotating order, one el_classify process per side and thread count in a 13 GiB scope, no swap, no pinning, wall time, CPU time and peak RSS from GNU time",
+     "ab_runs": "ab.sh, six rounds of rotating order, five classifications per process, one-thread runs pinned to CPU 4 and the others to CPUs 0-11"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "atlas",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620
+     },
+     "method": "Every part ran under ~/lanes/.heavy.lock on atlas with no other benchmark or gate on the host. slot889.sh ran three rounds of one classification of ore_ont_8737 per side on 4, 12 and 1 threads, then ab.sh with six rounds of rotating order, one process per side, file and thread count with --repeat 5, whose median classification is the round's value. On every side the Horn attempt of ore_ont_8737 passes its memory budget and the classifier classifies again by the EL rules alone (roadmap item 962), so saturation_s is the saturation of that second run and classify_s includes the attempt. The stanley member holds the profiles, the interleaved rounds and the taxonomy sweep taken on the laptop while other work ran there, so only their shares, ratios and hashes are evidence.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "Manual record of roadmap item 889 on atlas: three rounds of ore_ont_8737 of every side on one, four and twelve threads, the rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482, the profiles on atlas, and the profiles, rounds and taxonomy sweeps taken on the laptop."
   }
  ]
 }

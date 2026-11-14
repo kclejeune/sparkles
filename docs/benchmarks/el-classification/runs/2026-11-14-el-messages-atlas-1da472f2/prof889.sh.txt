@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# prof889.sh SIDE...: a user-cycle profile of ore_ont_8737 on four threads per side on atlas, under the heavy lock,
+# with the flat report of each in prof/SIDE.txt. Ends with PROF-DONE.
+set -uo pipefail
+cd "$HOME/lanes/el-messages-889"
+exec 8> "$HOME/lanes/.heavy.lock"
+flock 8
+PERF=/nix/store/bw8frr0nk26m740a2mwaw5yi06mgxakb-perf-linux-7.3.1/bin/perf
+mkdir -p prof
+for s in "$@"; do
+  systemd-run --user --scope --quiet -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    $PERF record -q -e cpu-clock:u -F 999 -o prof/$s.data bin/$s --threads 4 data/dev/ore_ont_8737.owl > prof/$s.json 2>/dev/null
+  $PERF report -i prof/$s.data --no-children --sort sym --stdio -F overhead,sample,sym > prof/$s.txt 2>/dev/null
+  rm -f prof/$s.data
+done
+echo PROF-DONE

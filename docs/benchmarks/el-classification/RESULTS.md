@@ -1012,7 +1012,82 @@ Every side gave the same taxonomy on every file and thread count. On the laptop 
 2015 EL files, GO and ChEBI lite gave the base's taxonomies with b, commit fb894c98, on one and eight
 threads, and `ore_ont_8737` gave it on one, four, eight and twelve threads.
 
+### One copy of each run
+
+After item 818 a profile of `ore_ont_8737` on four threads put 28% of the user cycles on
+`atlas` in `Out::send`, which wrote each of a flush's products into the outbox once for
+every destination, 34% in the congested filter of `Run::deliver_new`, `State::holds` and
+`Small::contains`, and 8% in copies of to-do lists. Roadmap item 889 makes three changes.
+A flush writes each chunk of a group's products into the outbox once, and each
+destination's run header points at that copy. A congested delivery checks a run against
+the destination's tables in one inlined loop that looks up the sources of a backward
+link's role once for each change of role. An activation applies the batch it takes from
+its to-do list from the list's buffer instead of copying it reversed onto its own
+conclusions. Each destination receives the same messages in the same order as before.
+
+These measurements ran on `atlas` with no other benchmark or gate on the host and no swap
+in use. The base is commit 3a1b9b04, the lane is commit 1da472f2, and the lane with the
+table adds an open-addressing table for the sets of more than 16 members, commit 79b0c707,
+which was reverted. Three rounds of rotating order classified `ore_ont_8737` once per side
+and thread count in a scope with a 13 GiB cap. On every side the file's Horn attempt passes
+its memory budget and the classifier classifies again by the EL rules alone, which roadmap
+item 962 follows. The saturation is that second run's, while the classification, the CPU
+time and the peak resident set include the attempt. The table gives the medians of the
+rounds, and the largest peak.
+
+| Side | Threads | Saturation, s | Classification, s | CPU time, s | Peak resident set, GiB | Conclusions taken, billions |
+|---|---:|---:|---:|---:|---:|---:|
+| Base | 1 | 45.0 | 67.6 | 71 | 8.50 | 1.62 |
+| Lane | 1 | 24.6 | 40.2 | 43 | 8.52 | 1.62 |
+| Lane with the table | 1 | 24.5 | 40.9 | 44 | 8.49 | 1.62 |
+| Base | 4 | 13.7 | 22.2 | 88 | 10.29 | 1.28 |
+| Lane | 4 | 8.9 | 15.6 | 60 | 10.11 | 1.28 |
+| Lane with the table | 4 | 8.7 | 15.9 | 62 | 10.83 | 1.31 |
+| Base | 12 | 9.3 | 15.5 | 157 | 12.20 | 1.33 |
+| Lane | 12 | 7.4 | 13.4 | 127 | 12.19 | 1.33 |
+| Lane with the table | 12 | 7.6 | 13.4 | 123 | 12.29 | 1.31 |
+
+Every run gave the taxonomy of the base. The saturation takes 45% less time on one thread,
+35% less on four and 20% less on twelve, and on four and twelve threads it takes less time
+than Konclude 0.7.0's classification of the file on the same host, 9.5 to 9.7 s. In the
+profile of the lane on four threads on the laptop the sends take under 1% of the cycles,
+the filter 45%, the rules' inserts into the hash sets 13% and the copies 8%. The filter's
+cost is the three billion messages the saturation sends for 32 million conclusions, which
+roadmap item 956 follows.
+
+The same slot ran six interleaved rounds of GO, ChEBI lite, `ore_ont_3836` and
+`ore_ont_13482` on one, four and twelve threads, five classifications per process, the
+one-thread runs pinned to one CPU and the others to twelve. The table gives the median of
+the rounds in milliseconds and the ratios to the base.
+
+| File | Threads | Base, ms | Lane, ms | Lane / base | Lane with the table / base |
+|---|---:|---:|---:|---:|---:|
+| GO | 1 | 312.2 | 303.9 | 0.973 | 0.970 |
+| GO | 4 | 107.3 | 105.7 | 0.985 | 0.989 |
+| GO | 12 | 78.1 | 77.3 | 0.991 | 1.001 |
+| ChEBI lite | 1 | 1079.3 | 926.4 | 0.858 | 0.922 |
+| ChEBI lite | 4 | 452.4 | 415.6 | 0.919 | 0.962 |
+| ChEBI lite | 12 | 447.0 | 407.9 | 0.913 | 0.980 |
+| `ore_ont_3836` | 1 | 597.0 | 586.3 | 0.982 | 1.005 |
+| `ore_ont_3836` | 4 | 249.7 | 250.5 | 1.003 | 1.014 |
+| `ore_ont_3836` | 12 | 193.3 | 193.9 | 1.004 | 1.014 |
+| `ore_ont_13482` | 1 | 949.2 | 943.1 | 0.994 | 1.040 |
+| `ore_ont_13482` | 4 | 418.1 | 408.4 | 0.977 | 1.010 |
+| `ore_ont_13482` | 12 | 295.6 | 291.9 | 0.988 | 0.997 |
+
+The table measured no faster on `ore_ont_8737` and slower on ChEBI lite, `ore_ont_3836` and
+`ore_ont_13482`, so it was reverted, and
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md) records it. Every round gave
+the base's taxonomies. On the laptop the 298 ORE 2015 EL files, GO, ChEBI lite and
+`ore_ont_8737` gave the base's taxonomies on one and eight threads.
+
 ## Records
+
+The [message cost record](runs/2026-11-14-el-messages-atlas-1da472f2/record.json) holds the
+rounds of `ore_ont_8737` of every side on one, four and twelve threads, the rounds on GO,
+ChEBI lite, `ore_ont_3836` and `ore_ont_13482` with their taxonomy hashes, the profiles
+taken on `atlas`, the scripts that ran there, and the profiles, rounds and taxonomy sweeps
+taken on the laptop.
 
 The [link products record](runs/2026-11-10-el-threads-atlas-bd924609/record.json) holds the
 runs of `ore_ont_8737` of every side on one, four and twelve threads, the Konclude runs, the
