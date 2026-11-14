@@ -3466,9 +3466,10 @@ mod horn_accounting_tests {
             Concl::Back(f.root, f.t),
             Concl::Back(e2, f.t),
         ];
-        for batch in [true, false] {
+        for (batch, steps) in [(true, false), (false, false), (true, true)] {
             let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
-            let run = run(&f.ix, &ctx, &bounds);
+            let mut run = run(&f.ix, &ctx, &bounds);
+            run.steps = steps;
             run.batch.store(batch, Ordering::Relaxed);
             let (mut local, mut woke, mut outbox, mut marks) = (
                 Vec::new(),
@@ -3497,7 +3498,16 @@ mod horn_accounting_tests {
                 (f1, backs.to_vec()),
                 (f2, backs.to_vec()),
             ];
-            if batch {
+            if steps {
+                // a run in steps keeps a message for each destination, in the order the
+                // destinations took them one at a time
+                let each: Vec<(Ex, Concl)> = want
+                    .iter()
+                    .flat_map(|(to, msgs)| msgs.iter().map(move |&c| (*to, c)))
+                    .collect();
+                assert_eq!(outbox.steps, each);
+                assert!(outbox.msgs.is_empty());
+            } else if batch {
                 // one copy of the products and one of the backward links
                 assert_eq!(outbox.msgs.len(), products.len() + backs.len());
                 let mut by: Vec<(Ex, Vec<Concl>)> = Vec::new();
@@ -3537,9 +3547,11 @@ mod horn_accounting_tests {
         for &e in ids.iter().step_by(2) {
             st.back_by(f.s).insert(e);
         }
-        for &e in ids.iter().step_by(3) {
+        // a hash set of forward links by r
+        for &e in ids.iter().skip(1).step_by(2) {
             st.fwd.insert((f.r, e));
         }
+        assert!(st.fwd.set.is_some() && st.back[1].1.set.is_some());
         for &e in &ids[..7] {
             st.subs.insert(e);
         }
