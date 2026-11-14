@@ -170,10 +170,41 @@ threads, each run alone on a fresh copy of the dataset.
 format 2 dataset at commit 534a7ad3.*
 
 The kept closure leaves out the explicit facts, so it needs 41% and 47% of the 2,267 and
-2,654 MiB that a closure keeping them needs. Changes of 1,000 triples stay within 1.2 times
-their time with the larger closure, while changes of 100 triples at 16 threads and undos at
-1 thread take 1.3 to 2.3 times as long. [Roadmap](../../ROADMAP.md) item 113 follows up those
-slowdowns.
+2,654 MiB that a closure keeping them needs.
+
+`churn` of `examples/lubm.rs` makes many changes over one kept closure. Each change goes to
+data that no earlier change touched and is followed by its undo, the change again and a
+second undo. A process makes 40 changes of 100 triples, 20 of 1,000 and 6 of 10,000 on the
+same dataset. The table gives the medians of three interleaved rounds, each process alone
+on a fresh copy of the dataset, at one thread and on a reasoning pool of 16 threads.
+
+| Run | Change | Undo | Change again | Second undo |
+|---|---:|---:|---:|---:|
+| RDFS, 100 triples, 1 thread | 8.0 ms | 2.7 ms | 2.3 ms | 2.1 ms |
+| RDFS, 1,000 triples, 1 thread | 19.4 ms | 14.0 ms | 12.7 ms | 11.7 ms |
+| RDFS, 10,000 triples, 1 thread | 130 ms | 127 ms | 106 ms | 105 ms |
+| OWL 2 RL, 100 triples, 1 thread | 12.0 ms | 10.7 ms | 6.2 ms | 8.7 ms |
+| OWL 2 RL, 1,000 triples, 1 thread | 48.6 ms | 83.3 ms | 37.2 ms | 69.3 ms |
+| OWL 2 RL, 10,000 triples, 1 thread | 379 ms | 957 ms | 366 ms | 823 ms |
+| RDFS, 100 triples, pool of 16 | 5.5 ms | 2.8 ms | 2.1 ms | 2.1 ms |
+| RDFS, 1,000 triples, pool of 16 | 11.4 ms | 10.6 ms | 9.5 ms | 9.9 ms |
+| RDFS, 10,000 triples, pool of 16 | 79.3 ms | 88.0 ms | 77.4 ms | 78.0 ms |
+| OWL 2 RL, 100 triples, pool of 16 | 8.8 ms | 11.3 ms | 5.8 ms | 10.2 ms |
+| OWL 2 RL, 1,000 triples, pool of 16 | 27.2 ms | 53.4 ms | 24.3 ms | 48.4 ms |
+| OWL 2 RL, 10,000 triples, pool of 16 | 210 ms | 411 ms | 200 ms | 367 ms |
+
+*Measured on atlas, a benchmark worker with the benchmark host's hardware, on 2026-11-14
+at commit 1590064b. The benchmark host has not rerun these.*
+
+RDFS undos and repeated changes take 0.85 to 1.08 times their time with the larger closure
+at one thread and 0.67 to 1.05 times on the pool. OWL 2 RL changes take 1.2 to 2.3 times as
+long at one thread and 0.9 to 1.7 times on the pool, which [roadmap](../../ROADMAP.md)
+item 941 follows up. A change of 100 RDFS triples to data that no earlier run read takes
+2.6 times as long at one thread, which is item 942. The
+[run directory](runs/2026-11-14-item-113-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-14-item-113-atlas/env.txt), the
+[medians with their ranges](runs/2026-11-14-item-113-atlas/results.txt) and
+[every step's quartiles](runs/2026-11-14-item-113-atlas/steps.txt).
 
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.

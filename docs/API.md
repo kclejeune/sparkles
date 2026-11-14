@@ -5312,8 +5312,9 @@ between two `commit:` selectors never changes, so it gets a weak entity tag and 
 effect, so the net change is the symmetric difference of the changes between the two
 commits. Within the retained generations Sparkles reads only those log records,
 compactions included, and its memory grows with the quads that changed. That is
-`"log"`. A sparse index of each log says where every 1,024th commit ends, so a diff
-starts reading near its first commit. A bulk commit has no log records, and a collected
+`"log"`. A sparse index of each log says where every 1,024th commit ends, and where each
+of the newest 64 commits ends, so a diff starts reading near its first commit and at it
+when the commit is recent. A bulk commit has no log records, and a collected
 generation leaves a gap. Those stretches are compared state against state with a sorted
 merge, which reads both states in full. That is `"compare"`, and in-memory datasets
 always use it.
