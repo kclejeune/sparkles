@@ -22,7 +22,7 @@ use super::plan::{GraphFilter, PathEnd};
 use super::table::{Table, VarId};
 use crate::error::Result;
 use crate::id::Id;
-use crate::patterns::{Correction, PatternFile, Scope};
+use crate::patterns::{Correction, PairCursor, PatternFile, Scope};
 use spargebra::algebra::{AggregateExpression, AggregateFunction, Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern, Variable};
 use std::sync::Arc;
@@ -48,7 +48,7 @@ pub struct PatternUse {
 }
 
 impl PatternUse {
-    fn note(&self) -> String {
+    pub(super) fn note(&self) -> String {
         let mut s = format!("[predicate patterns, {} table", self.scope.name());
         if !self.corr.is_empty() {
             s.push_str(&format!(
@@ -318,20 +318,24 @@ pub(super) fn run_count(
     Ok((out, u.note()))
 }
 
-/// Run a [`PatternScanSpec`]: its variables' columns follow `vars`. With `limit`, it
-/// stops at that many rows. Also returns the EXPLAIN note and whether it stopped early.
-pub(super) fn run_scan(
+/// Read the next rows of a [`PatternScanSpec`] into `out`, whose columns follow its
+/// variables, until `out` has `max` rows or the scan ends, and return whether it ended.
+/// `reader` keeps the scan's place between calls: a constant subject reads its
+/// predicates on the first call, and a variable subject reads the table's pairs a block
+/// of subjects at a time. The eager executor reads every row in one call, and the
+/// cursor a batch at a time.
+pub(super) fn fill_scan(
     ctx: &Ctx,
     spec: &PatternScanSpec,
-    vars: &[VarId],
-    limit: Option<usize>,
-) -> Result<(Table, String, bool)> {
+    reader: &mut PairCursor,
+    out: &mut Table,
+    max: usize,
+) -> Result<bool> {
     let u = &spec.uses;
     let table = u
         .file
         .table(u.scope)
         .ok_or_else(|| crate::error::Error::Corrupt("pattern table missing".into()))?;
-    let mut out = Table::new(vars.to_vec());
     let sc = match spec.s {
         PathEnd::Var(v) => out.col_of(v),
         PathEnd::Const(_) => None,
@@ -340,23 +344,19 @@ pub(super) fn run_scan(
         PathEnd::Var(v) => out.col_of(v),
         PathEnd::Const(_) => None,
     };
-    let want = limit.unwrap_or(usize::MAX);
     let width = out.width();
-    let mut row = vec![Id::UNDEF; vars.len()];
-    let mut stopped = false;
-    // false once the limit is met
-    let mut emit = |s: u64, p: u64, out: &mut Table| -> Result<bool> {
-        if out.len() >= want {
-            stopped = true;
-            return Ok(false);
-        }
-        // the columns double as they fill: admit the next size's bytes before they
-        // grow, and the rows there are against the row limits
+    let want = max.saturating_sub(out.len());
+    let mut row = vec![Id::UNDEF; width];
+    let mut checked = Ok(());
+    let mut push = |s: u64, p: u64| {
+        // the columns double as they fill: admit the next size's bytes before they grow,
+        // and the rows there are against the row limits
         let n = out.len();
-        if n >= 4096 && n.is_power_of_two() {
-            ctx.check()?;
-            ctx.check_output_rows(n)?;
-            ctx.check_output_bytes(n.saturating_mul(2), width)?;
+        if checked.is_ok() && n >= 4096 && n.is_power_of_two() {
+            checked = ctx
+                .check()
+                .and_then(|()| ctx.check_output_rows(n))
+                .and_then(|()| ctx.check_output_bytes(n.saturating_mul(2), width));
         }
         if let Some(c) = sc {
             row[c] = Id(s);
@@ -365,35 +365,52 @@ pub(super) fn run_scan(
             row[c] = Id(p);
         }
         out.push_row(&row);
-        Ok(true)
     };
-    match (spec.s.clone(), spec.p.clone()) {
-        (PathEnd::Const(s), p) => {
-            let mut preds = Vec::new();
-            crate::patterns::predicates_of(table, &u.corr, s.0, &mut preds)?;
-            for q in preds {
-                if let PathEnd::Const(c) = p
-                    && c.0 != q
-                {
-                    continue;
+    match spec.s {
+        PathEnd::Const(s) => {
+            if !reader.done() {
+                let mut preds = Vec::new();
+                crate::patterns::predicates_of(table, &u.corr, s.0, &mut preds)?;
+                let only = match spec.p {
+                    PathEnd::Const(c) => Some(c.0),
+                    PathEnd::Var(_) => None,
+                };
+                // a subject has few predicates, read in one call
+                for q in preds {
+                    if only.is_none_or(|c| c == q) {
+                        push(s.0, q);
+                    }
                 }
-                if !emit(s.0, q, &mut out)? {
-                    break;
-                }
+                reader.finish();
             }
         }
-        (PathEnd::Var(_), p) => {
-            let only = match p {
-                PathEnd::Const(c) => Some(c.0),
-                PathEnd::Var(_) => None,
-            };
-            crate::patterns::for_each_pair(table, &u.corr, only, &|| ctx.check(), |s, q| {
-                emit(s, q, &mut out)
-            })?;
+        PathEnd::Var(_) => {
+            reader.fill(table, &u.corr, want, &|| ctx.check(), &mut push)?;
         }
     }
-    // the rows between the last power of two and the end, which a limited run returns
-    // without the eager executor's output check
+    checked?;
+    // the rows since the last power of two
     ctx.check_output(out.len(), out.width())?;
-    Ok((out, u.note(), stopped))
+    Ok(reader.done())
+}
+
+/// The reader of a [`PatternScanSpec`], for [`fill_scan`].
+pub(super) fn scan_reader(spec: &PatternScanSpec) -> PairCursor {
+    PairCursor::new(match spec.p {
+        PathEnd::Const(c) => Some(c.0),
+        PathEnd::Var(_) => None,
+    })
+}
+
+/// Run a [`PatternScanSpec`] whole: its variables' columns follow `vars`. Also returns
+/// the EXPLAIN note.
+pub(super) fn run_scan(
+    ctx: &Ctx,
+    spec: &PatternScanSpec,
+    vars: &[VarId],
+) -> Result<(Table, String)> {
+    let mut out = Table::new(vars.to_vec());
+    let mut reader = scan_reader(spec);
+    fill_scan(ctx, spec, &mut reader, &mut out, usize::MAX)?;
+    Ok((out, spec.uses.note()))
 }

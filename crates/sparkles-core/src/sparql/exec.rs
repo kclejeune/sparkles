@@ -1397,7 +1397,7 @@ fn run_node<'ctx>(
             t
         }
         Kind::PatternScan(spec) => {
-            let (t, nt, _) = super::patternplan::run_scan(ctx, spec, &n.vars, None)?;
+            let (t, nt) = super::patternplan::run_scan(ctx, spec, &n.vars)?;
             note = Some(nt);
             t
         }
@@ -2805,8 +2805,10 @@ fn run_limited<'ctx>(
             finish(t, Vec::new(), !truncated)
         }
         Kind::PatternScan(spec) => {
-            let (t, _, stopped) = super::patternplan::run_scan(ctx, spec, &n.vars, Some(want))?;
-            finish(Materialized::plain(t), Vec::new(), !stopped)
+            let mut t = Table::new(n.vars.clone());
+            let mut reader = super::patternplan::scan_reader(spec);
+            let complete = super::patternplan::fill_scan(ctx, spec, &mut reader, &mut t, want)?;
+            finish(Materialized::plain(t), Vec::new(), complete)
         }
         Kind::Project(vars) => {
             // Projection preserves row count, so one limited child run suffices.

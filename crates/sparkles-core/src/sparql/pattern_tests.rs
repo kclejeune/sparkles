@@ -674,10 +674,26 @@ fn cursors_run_pattern_plans_without_materializing() {
         let (slow, _) = rows(q, Optimizations::NONE, FallbackPolicy::AllowMaterialization);
         assert_eq!(fast, slow, "{q}");
     }
+    // the pairs stream from the patterns a batch at a time, corrected for the delta
+    let q = "SELECT ?s ?p WHERE { ?s spk:hasPredicate ?p }";
+    let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::RejectMaterialization);
+    assert!(plan.contains("PatternScan"), "{plan}");
+    let (slow, _) = rows(q, Optimizations::NONE, FallbackPolicy::AllowMaterialization);
+    assert_eq!(fast, slow);
+    // and a LIMIT stops the scan at the rows it asks for
     let q = "SELECT ?s ?p WHERE { ?s spk:hasPredicate ?p } LIMIT 5";
-    let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::AllowMaterialization);
-    assert!(!plan.contains("PatternScan"), "{plan}");
+    let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::RejectMaterialization);
     assert_eq!(fast.len(), 5);
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    fn find<'a>(p: &'a serde_json::Value, op: &str) -> Option<&'a serde_json::Value> {
+        if p["operator"]["operator"] == op {
+            return Some(p);
+        }
+        p["children"].as_array()?.iter().find_map(|c| find(c, op))
+    }
+    let scan = find(&plan, "PatternScan").unwrap_or_else(|| panic!("{plan}"));
+    assert_eq!(scan["operator"]["actualRows"], 5, "{plan}");
+    assert_eq!(scan["materializes"], false, "{plan}");
 }
 
 /// A partial compaction with patterns turned off writes none.

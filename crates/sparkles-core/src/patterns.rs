@@ -1294,89 +1294,174 @@ pub fn predicates_of(t: TableRef<'_>, corr: &Correction, s: u64, out: &mut Vec<u
     Ok(())
 }
 
-/// Visit every (subject, predicate) pair of the table corrected by `corr`, in subject
-/// order and then predicate order, or only those with predicate `only`.
-pub fn for_each_pair(
-    t: TableRef<'_>,
-    corr: &Correction,
+/// A resumable reader of the (subject, predicate) pairs of a table corrected by a
+/// delta, in subject order and then predicate order, or of those with one predicate.
+/// It decodes one block of subjects at a time and keeps its place between calls of
+/// [`PairCursor::fill`], so that a reader that wants a few pairs reads one block.
+#[derive(Default)]
+pub struct PairCursor {
     only: Option<u64>,
-    check: &dyn Fn() -> Result<()>,
-    mut f: impl FnMut(u64, u64) -> Result<bool>,
-) -> Result<()> {
-    // with one predicate: the patterns that hold it, found once
-    let holds: Option<Vec<bool>> = match only {
-        Some(p) => {
-            let mut v = vec![false; t.patterns() as usize];
+    /// With one predicate, whether each pattern holds it, found on the first fill.
+    holds: Option<Vec<bool>>,
+    /// The next block to decode.
+    block: u64,
+    /// The subjects of the last decoded block, with their pattern numbers.
+    rows: Vec<(u64, u32)>,
+    /// The next row of `rows`.
+    row: usize,
+    /// The next subject of the correction.
+    touched: usize,
+    /// The subject whose predicates `pending` holds from `pending_at` on.
+    subject: u64,
+    pending: Vec<u64>,
+    pending_at: usize,
+    /// Decoded patterns, the most frequent ones kept.
+    kept: Vec<Option<Vec<u64>>>,
+    done: bool,
+}
+
+impl PairCursor {
+    /// A reader of every pair, or only of those with predicate `only`.
+    pub fn new(only: Option<u64>) -> Self {
+        Self {
+            only,
+            ..Default::default()
+        }
+    }
+
+    /// Whether every pair has been read.
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    /// Mark every pair read, for a reader whose caller read them another way.
+    pub fn finish(&mut self) {
+        self.done = true;
+    }
+
+    /// Hand at most `max` further pairs to `f`, and return how many it handed. Fewer
+    /// than `max` means the table has no more, and [`PairCursor::done`] then holds.
+    /// `t` and `corr` must be those of every earlier call.
+    pub fn fill(
+        &mut self,
+        t: TableRef<'_>,
+        corr: &Correction,
+        max: usize,
+        check: &dyn Fn() -> Result<()>,
+        f: &mut dyn FnMut(u64, u64),
+    ) -> Result<usize> {
+        if let (Some(p), None) = (self.only, &self.holds) {
+            let mut holds = vec![false; t.patterns() as usize];
             let mut buf = Vec::new();
-            for (pid, x) in v.iter_mut().enumerate() {
+            for (pid, x) in holds.iter_mut().enumerate() {
                 if pid % 65536 == 65535 {
                     check()?;
                 }
                 t.pattern(pid as u32, &mut buf)?;
                 *x = buf.binary_search(&p).is_ok();
             }
-            Some(v)
+            self.holds = Some(holds);
         }
-        None => None,
-    };
-    let mut pats = Patterns::new(t);
-    // false once `f` asks to stop
-    let emit_now = |s: u64, now: &[u64], f: &mut dyn FnMut(u64, u64) -> Result<bool>| {
-        for &p in now {
-            if only.is_none_or(|o| o == p) && !f(s, p)? {
-                return Ok(false);
-            }
-        }
-        Ok::<bool, Error>(true)
-    };
-    let mut next = 0usize;
-    let touched = &corr.touched;
-    let mut n = 0u64;
-    let mut stopped = false;
-    t.for_each_until(|s, pid| {
-        n += 1;
-        if n.is_multiple_of(65536) {
-            check()?;
-        }
-        while let Some(x) = touched.get(next).filter(|x| x.subject < s) {
-            next += 1;
-            if !emit_now(x.subject, &x.now, &mut f)? {
-                stopped = true;
-                return Ok(false);
-            }
-        }
-        if let Some(x) = touched.get(next).filter(|x| x.subject == s) {
-            next += 1;
-            let go = emit_now(s, &x.now, &mut f)?;
-            stopped = !go;
-            return Ok(go);
-        }
-        match (&holds, only) {
-            (Some(h), Some(p)) => {
-                if h[pid as usize] && !f(s, p)? {
-                    stopped = true;
-                    return Ok(false);
+        let only = self.only;
+        let mut n = 0usize;
+        loop {
+            while self.pending_at < self.pending.len() {
+                if n == max {
+                    return Ok(n);
+                }
+                let p = self.pending[self.pending_at];
+                self.pending_at += 1;
+                if only.is_none_or(|o| o == p) {
+                    f(self.subject, p);
+                    n += 1;
                 }
             }
-            _ => {
-                for &p in pats.get(pid)? {
-                    if !f(s, p)? {
-                        stopped = true;
-                        return Ok(false);
+            if n == max || self.done {
+                return Ok(n);
+            }
+            if self.row == self.rows.len() {
+                if self.block < t.t.blocks {
+                    check()?;
+                    t.block(self.block, &mut self.rows)?;
+                    self.block += 1;
+                    self.row = 0;
+                    continue;
+                }
+                // the subjects of the delta after the last of the table
+                match corr.touched.get(self.touched) {
+                    Some(x) => {
+                        self.touched += 1;
+                        self.take(x.subject, &x.now);
+                    }
+                    None => self.done = true,
+                }
+                continue;
+            }
+            let (s, pid) = self.rows[self.row];
+            if let Some(x) = corr.touched.get(self.touched).filter(|x| x.subject <= s) {
+                self.touched += 1;
+                // a subject of the delta replaces the table's row for it
+                if x.subject == s {
+                    self.row += 1;
+                }
+                self.take(x.subject, &x.now);
+                continue;
+            }
+            self.row += 1;
+            match (&self.holds, only) {
+                (Some(h), Some(p)) => {
+                    if h.get(pid as usize).copied().unwrap_or(false) {
+                        if n == max {
+                            self.subject = s;
+                            self.pending.clear();
+                            self.pending.push(p);
+                            self.pending_at = 0;
+                            return Ok(n);
+                        }
+                        f(s, p);
+                        n += 1;
+                    }
+                }
+                _ => {
+                    let i = pid as usize;
+                    let preds: &[u64] = if i < KEPT_PATTERNS {
+                        if self.kept.len() <= i {
+                            self.kept.resize(i + 1, None);
+                        }
+                        if self.kept[i].is_none() {
+                            let mut v = Vec::new();
+                            t.pattern(pid, &mut v)?;
+                            self.kept[i] = Some(v);
+                        }
+                        self.kept[i].as_deref().unwrap_or_default()
+                    } else {
+                        t.pattern(pid, &mut self.pending)?;
+                        self.subject = s;
+                        self.pending_at = 0;
+                        continue;
+                    };
+                    let room = (max - n).min(preds.len());
+                    for &p in &preds[..room] {
+                        f(s, p);
+                    }
+                    n += room;
+                    if room < preds.len() {
+                        self.subject = s;
+                        self.pending.clear();
+                        self.pending.extend_from_slice(&preds[room..]);
+                        self.pending_at = 0;
                     }
                 }
             }
         }
-        Ok(true)
-    })?;
-    if !stopped {
-        for x in &touched[next..] {
-            if !emit_now(x.subject, &x.now, &mut f)? {
-                break;
-            }
-        }
     }
-    Ok(())
+
+    fn take(&mut self, subject: u64, now: &[u64]) {
+        self.subject = subject;
+        self.pending.clear();
+        self.pending.extend_from_slice(now);
+        self.pending_at = 0;
+    }
 }
 
 /// The subjects the delta may touch at most for a reader to correct the tables per
@@ -1787,13 +1872,74 @@ mod tests {
         let n = f.table(Scope::Named).unwrap();
         assert_eq!(count_all(n, &corr).unwrap(), vec![(30, 1000)]);
         let mut pairs = Vec::new();
-        for_each_pair(n, &corr, Some(30), &|| Ok(()), |s, p| {
-            pairs.push((s, p));
-            Ok(true)
-        })
-        .unwrap();
+        let mut reader = PairCursor::new(Some(30));
+        reader
+            .fill(n, &corr, usize::MAX, &|| Ok(()), &mut |s, p| {
+                pairs.push((s, p))
+            })
+            .unwrap();
+        assert!(reader.done());
         assert_eq!(pairs.len(), 1000);
         assert_eq!(pairs[0], (9, 30));
+        // read again a few pairs at a time, with subjects of a delta before, among and
+        // after the table's, one of them no longer a subject
+        let corr = Correction {
+            touched: vec![
+                Touched {
+                    subject: 1,
+                    base: None,
+                    now: vec![10, 40],
+                },
+                Touched {
+                    subject: 3,
+                    base: Some(0),
+                    now: vec![],
+                },
+                Touched {
+                    subject: 6,
+                    base: Some(1),
+                    now: vec![20, 30, 40],
+                },
+                Touched {
+                    subject: 9500,
+                    base: None,
+                    now: vec![10],
+                },
+            ],
+        };
+        let mut whole = Vec::new();
+        let mut reader = PairCursor::new(None);
+        reader
+            .fill(t, &corr, usize::MAX, &|| Ok(()), &mut |s, p| {
+                whole.push((s, p))
+            })
+            .unwrap();
+        assert_eq!(&whole[..5], &[(1, 10), (1, 40), (6, 20), (6, 30), (6, 40)]);
+        assert_eq!(whole.last(), Some(&(9500, 10)));
+        assert!(!whole.iter().any(|&(s, _)| s == 3));
+        for step in [1, 2, 7, 1024] {
+            let mut parts = Vec::new();
+            let mut reader = PairCursor::new(None);
+            let mut calls = 0;
+            while !reader.done() {
+                let got = reader
+                    .fill(t, &corr, step, &|| Ok(()), &mut |s, p| parts.push((s, p)))
+                    .unwrap();
+                assert!(got <= step);
+                calls += 1;
+            }
+            assert_eq!(parts, whole, "{step}");
+            assert!(calls >= whole.len() / step, "{step}");
+        }
+        let mut twenty = Vec::new();
+        let mut reader = PairCursor::new(Some(20));
+        while !reader.done() {
+            reader
+                .fill(t, &corr, 3, &|| Ok(()), &mut |s, p| twenty.push((s, p)))
+                .unwrap();
+        }
+        let expected: Vec<_> = whole.iter().copied().filter(|&(_, p)| p == 20).collect();
+        assert_eq!(twenty, expected);
     }
 
     #[test]

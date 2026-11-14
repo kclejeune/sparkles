@@ -556,3 +556,65 @@ fn a_restricted_scans_domain_is_seen_at_any_depth() {
         );
     }
 }
+
+/// The operators of the plan a query reports under `mode`, in tree order with their
+/// depth. A cursor plan names its operator inside an object.
+fn mode_shape(
+    s: &Store,
+    text: &str,
+    o: &QueryOptions,
+    mode: ExecutionMode,
+) -> Vec<(usize, String)> {
+    fn go(p: &serde_json::Value, d: usize, out: &mut Vec<(usize, String)>) {
+        let op = match &p["operator"] {
+            serde_json::Value::Object(o) => o["operator"].as_str().unwrap_or_default(),
+            other => other.as_str().unwrap_or_default(),
+        };
+        out.push((d, op.to_string()));
+        for c in p["children"].as_array().into_iter().flatten() {
+            go(c, d + 1, out);
+        }
+    }
+    let mut execution = query_execution(s.snapshot(), text, o, &CursorOptions::default(), mode)
+        .unwrap_or_else(|e| panic!("{text} under {mode:?}: {e}"));
+    if let QueryExecution::Select(cursor) = &mut execution {
+        while cursor.next_batch().unwrap().is_some() {}
+    }
+    let plan: serde_json::Value = serde_json::from_str(&execution.plan_json().unwrap()).unwrap();
+    let mut out = Vec::new();
+    go(&plan, 0, &mut out);
+    out
+}
+
+/// One plan for a query whatever the execution mode (item 827): a variable predicate
+/// read from the predicate patterns plans its scan the same way in every mode.
+#[test]
+fn a_variable_predicate_has_one_plan_in_every_mode() {
+    let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..2000 {
+        data.push_str(&format!(
+            "ex:s{i} ex:p{} {i} ; ex:q{} {i} .\n",
+            i % 5,
+            i % 3
+        ));
+    }
+    let s = store_with(&data, StoreOptions::default());
+    let o = QueryOptions {
+        no_cache: true,
+        ..opts()
+    };
+    for text in [
+        "SELECT ?s ?p WHERE { ?s <urn:x-sparkles:hasPredicate> ?p }",
+        "SELECT ?s ?p WHERE { ?s <urn:x-sparkles:hasPredicate> ?p } LIMIT 10",
+    ] {
+        let eager = mode_shape(&s, text, &o, ExecutionMode::Eager);
+        assert!(eager.iter().any(|(_, op)| op == "PatternScan"), "{eager:?}");
+        for mode in [ExecutionMode::Streaming, ExecutionMode::Auto] {
+            assert_eq!(
+                mode_shape(&s, text, &o, mode),
+                eager,
+                "{text} under {mode:?}"
+            );
+        }
+    }
+}

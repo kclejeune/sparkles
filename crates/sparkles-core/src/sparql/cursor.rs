@@ -2525,6 +2525,11 @@ enum State {
     Expand(Box<expand::Expand>),
     Walk(Box<walk::Walk>),
     Scan(Scan),
+    /// `spk:hasPredicate` read from the predicate patterns, a block of subjects at a time.
+    PatternScan {
+        spec: Box<super::patternplan::PatternScanSpec>,
+        reader: crate::patterns::PairCursor,
+    },
     Values {
         table: Table,
         at: usize,
@@ -2604,6 +2609,7 @@ fn supported(kind: &Kind) -> bool {
             | Kind::Filter(_)
             | Kind::Extend(..)
             | Kind::CountFilterScan { .. }
+            | Kind::PatternScan(_)
     )
 }
 
@@ -2936,6 +2942,10 @@ impl Operator {
             )));
         }
         let mut info = exec::describe_node(ctx, &node);
+        if let Kind::PatternScan(spec) = &node.kind {
+            // the table the scan reads, as the eager plan names it
+            info.description = format!("{} {}", info.description, spec.uses.note());
+        }
         if ctx.graphs.is_some() {
             info.redact();
         }
@@ -3213,6 +3223,10 @@ impl Operator {
             match &node.kind {
                 Kind::Scan(spec) => State::Scan(Scan::new(spec.clone(), None)),
                 Kind::RangeScan(spec, range) => State::Scan(Scan::new(spec.clone(), Some(range))),
+                Kind::PatternScan(spec) => State::PatternScan {
+                    reader: super::patternplan::scan_reader(spec),
+                    spec: spec.clone(),
+                },
                 Kind::Values(_) => {
                     let Kind::Values(table) = node.kind else {
                         unreachable!()
@@ -3816,6 +3830,13 @@ impl Operator {
                     let b = scan.next(ctx, &self.vars, cap)?;
                     self.done = scan.done();
                     b
+                }
+                State::PatternScan { spec, reader } => {
+                    let mut b = Buffer::new(ctx, &self.vars, cap)?;
+                    self.done =
+                        super::patternplan::fill_scan(ctx, spec, reader, &mut b.table, cap)?;
+                    b.reconcile()?;
+                    Some(b)
                 }
                 State::TopK(topk) => {
                     let b = topk.next(ctx, &mut self.children[0], options, cap)?;
