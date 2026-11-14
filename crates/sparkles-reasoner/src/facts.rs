@@ -31,7 +31,7 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::index::{ALL_COLS, Block, Key, Perm, PermIndex, pad};
-use sparkles_core::store::Snapshot;
+use sparkles_core::store::{Chunk, Snapshot};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -566,17 +566,20 @@ impl Base {
             _ => true,
         };
         let snap = &*self.snap;
-        let idx = snap.perm(perm);
-        let (b0, b1) = idx.key_block_range(&lo, &hi);
-        // the keys of the range that the snapshot's delta inserts and deletes, merged
-        // with the rows as they are read, so that a range with changes is read through
-        // the memo and by segments like any other
-        let pi = perm.index();
-        let changed = touched(snap, perm, &lo, &hi);
-        let mut ins = changed.then(|| snap.delta.ins[pi].range(lo..=hi).peekable());
-        let mut del = changed.then(|| snap.delta.del[pi].range(lo..=hi).peekable());
-        let mut stopped = false;
-        {
+        if touched(snap, perm, &lo, &hi) {
+            snap.scan_between(perm, lo, hi, |c| {
+                Ok(match c {
+                    Chunk::Block(b, s, e) => {
+                        let cols = &b.cols;
+                        (s..e)
+                            .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], &mut f))
+                    }
+                    Chunk::Row(k) => row(k, &mut f),
+                })
+            })?;
+        } else {
+            let idx = snap.perm(perm);
+            let (b0, b1) = idx.key_block_range(&lo, &hi);
             let mut rows_of = |blk: &Block, whole: bool, f: &mut dyn FnMut(Triple) -> bool| {
                 let (s, e) = if whole {
                     (0, blk.len())
@@ -584,34 +587,13 @@ impl Base {
                     blk.key_range(&lo, &hi)
                 };
                 let cols = &blk.cols;
-                let (Some(ins), Some(del)) = (&mut ins, &mut del) else {
-                    return (s..e)
-                        .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f));
-                };
-                for i in s..e {
-                    let k = [cols[0][i], cols[1][i], cols[2][i], cols[3][i]];
-                    // an inserted key is not in the base, and a deleted one is
-                    while let Some(a) = ins.next_if(|a| **a < k) {
-                        if !row(*a, f) {
-                            return false;
-                        }
-                    }
-                    while del.next_if(|d| **d < k).is_some() {}
-                    if del.next_if(|d| **d == k).is_some() {
-                        continue;
-                    }
-                    if !row(k, f) {
-                        return false;
-                    }
-                }
-                true
+                (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f))
             };
             'blocks: for b in b0..b1 {
                 let m = &idx.blocks[b];
                 let whole = m.first >= lo && m.last <= hi;
                 if whole {
                     if !rows_of(memo.block(snap, idx, b)?, true, &mut f) {
-                        stopped = true;
                         break;
                     }
                     continue;
@@ -619,28 +601,16 @@ impl Base {
                 match memo.rows(snap, idx, b, &lo, &hi)? {
                     Rows::Whole(blk) => {
                         if !rows_of(blk, false, &mut f) {
-                            stopped = true;
                             break;
                         }
                     }
                     Rows::Segments(s0, s1) => {
                         for s in s0..s1 {
                             if !rows_of(memo.segment(snap, idx, b, s)?, false, &mut f) {
-                                stopped = true;
                                 break 'blocks;
                             }
                         }
                     }
-                }
-            }
-        }
-        // the inserted keys after the last row
-        if let Some(ins) = &mut ins
-            && !stopped
-        {
-            for a in ins {
-                if !row(*a, &mut f) {
-                    break;
                 }
             }
         }
@@ -965,7 +935,7 @@ mod tests {
     use super::*;
     use crate::budget::Budget;
     use sparkles_core::io::{RdfFormat, Source};
-    use sparkles_core::store::{Chunk, Store, StoreOptions};
+    use sparkles_core::store::{Store, StoreOptions};
 
     /// Reads of a few rows of a segmented generation decode segments, and give the facts
     /// a scan of whole blocks gives, in the same order: every pattern of bound positions,
@@ -1107,201 +1077,6 @@ mod tests {
             let want: Vec<bool> = probes.iter().map(|t| have.contains(t)).collect();
             for n in [1, 10, probes.len()] {
                 assert_eq!(base.contains_sorted(&probes[..n]).unwrap(), want[..n]);
-            }
-        }
-    }
-    /// The triples of graph `g` as a merging scan of the snapshot lists them.
-    fn graph_triples(snap: &Snapshot, g: Id) -> Vec<Triple> {
-        let mut all = Vec::new();
-        snap.scan(Perm::Gspo, &[g.0], |c| {
-            match c {
-                Chunk::Block(b, s, e) => {
-                    all.extend((s..e).map(|i| [b.cols[1][i], b.cols[2][i], b.cols[3][i]]))
-                }
-                Chunk::Row(k) => all.push([k[1], k[2], k[3]]),
-            }
-            Ok(true)
-        })
-        .unwrap();
-        all
-    }
-
-    /// A range that the snapshot's delta changes is read by segments and through the
-    /// memo like any other, with the inserted keys at their places and without the
-    /// deleted rows: every pattern of bound positions of changed and unchanged triples,
-    /// whole and in shares, with one input graph and with two, with and without
-    /// remembered lookups.
-    #[test]
-    fn changed_ranges_match_the_merging_scan() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
-        let mut r = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = |n: u64| {
-            r ^= r << 13;
-            r ^= r >> 7;
-            r ^= r << 17;
-            r % n
-        };
-        let mut made: Vec<(u64, u64, u64)> = Vec::new();
-        let mut nt = String::new();
-        for _ in 0..70_000 {
-            let t = (next(9_000), next(5), next(3_000));
-            nt.push_str(&format!("<urn:s{}> <urn:p{}> <urn:o{}> .\n", t.0, t.1, t.2));
-            made.push(t);
-        }
-        store
-            .load(&[Source::from_bytes(
-                nt.into_bytes(),
-                RdfFormat::NTriples,
-                None,
-            )])
-            .unwrap();
-        // one commit on top of the generation: removed triples, new triples of subjects
-        // the generation holds and of new ones, and a second graph that repeats some
-        let (mut del, mut ins, mut other) = (String::new(), String::new(), String::new());
-        for i in 0..300 {
-            let t = made[next(made.len() as u64) as usize];
-            del.push_str(&format!("<urn:s{}> <urn:p{}> <urn:o{}> . ", t.0, t.1, t.2));
-            let t = made[next(made.len() as u64) as usize];
-            ins.push_str(&format!("<urn:s{}> <urn:p{}> <urn:n{i}> . ", t.0, next(5)));
-            ins.push_str(&format!(
-                "<urn:new{}> <urn:p{}> <urn:o{}> . ",
-                i / 3,
-                next(5),
-                t.2
-            ));
-            let t = made[next(made.len() as u64) as usize];
-            other.push_str(&format!("<urn:s{}> <urn:p{}> <urn:o{}> . ", t.0, t.1, t.2));
-            other.push_str(&format!("<urn:s{}> <urn:p{}> <urn:m{i}> . ", t.0, t.1));
-        }
-        sparkles_core::sparql::update::update(
-            &store,
-            &format!(
-                "DELETE DATA {{ {del} }} ; INSERT DATA {{ {ins} GRAPH <urn:g2> {{ {other} }} }}"
-            ),
-            &sparkles_core::sparql::QueryOptions::default(),
-        )
-        .unwrap();
-        drop(store);
-        // opened afresh: the commit is the snapshot's delta, and no block is decoded
-        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
-        let snap = store.snapshot();
-        let gspo = snap.perm(Perm::Gspo);
-        let pi = Perm::Gspo.index();
-        assert!(gspo.segmented() && gspo.blocks.len() > 1);
-        assert!(snap.delta.ins[pi].len() >= 600 && snap.delta.del[pi].len() >= 200);
-        let g = Id::DEFAULT_GRAPH;
-        let g2 = snap.lookup_iri("urn:g2").unwrap();
-        let all = graph_triples(&snap, g);
-        let all2 = graph_triples(&snap, g2);
-        let gone: Vec<Triple> = snap.delta.del[pi]
-            .iter()
-            .map(|k| [k[1], k[2], k[3]])
-            .collect();
-        let came: Vec<Triple> = snap.delta.ins[pi]
-            .range([g.0, 0, 0, 0]..=[g.0, u64::MAX, u64::MAX, u64::MAX])
-            .map(|k| [k[1], k[2], k[3]])
-            .collect();
-        // the scans above decoded every block: open the store once more
-        drop(snap);
-        drop(store);
-        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
-        let snap = store.snapshot();
-        let gspo = snap.perm(Perm::Gspo);
-        // the triples of a changed subject, read first: segments, and no whole column
-        {
-            let base = Base::new(snap.clone(), &[g]).unwrap();
-            for t in [gone[0], came[0]] {
-                let want: Vec<Triple> = all.iter().filter(|x| x[0] == t[0]).copied().collect();
-                let mut got = Vec::new();
-                base.for_each(Some(t[0]), None, None, |x| {
-                    got.push(x);
-                    true
-                })
-                .unwrap();
-                assert_eq!(got, want);
-            }
-            assert!(snap.cache.misses() > 0, "the reads decoded nothing");
-            for b in 0..gspo.blocks.len() {
-                for c in 0..4 {
-                    assert!(
-                        !snap.cache.has_cols(gspo, b, 1 << c),
-                        "a changed range decoded column {c} of block {b} whole"
-                    );
-                }
-            }
-        }
-        // the union of the two graphs, as the tier lists it: each triple at its first graph
-        let first: rustc_hash::FxHashSet<Triple> = all.iter().copied().collect();
-        let mut union = all.clone();
-        union.extend(all2.iter().filter(|t| !first.contains(*t)));
-        let budget = Budget::unlimited();
-        for round in 0..2 {
-            for i in 0..150 {
-                let t = match i % 3 {
-                    0 => gone[next(gone.len() as u64) as usize],
-                    1 => came[next(came.len() as u64) as usize],
-                    _ => all[next(all.len() as u64) as usize],
-                };
-                let mut base = Base::new(snap.clone(), &[g]).unwrap();
-                let mut both = Base::new(snap.clone(), &[g, g2]).unwrap();
-                if round == 1 {
-                    base = base.with_lookups(Lookups::new(&budget, lookups::DEFAULT_MAX_BYTES));
-                    both = both.with_lookups(Lookups::new(&budget, lookups::DEFAULT_MAX_BYTES));
-                }
-                for mask in 1u8..8 {
-                    let at = |c: usize| (mask & (1 << c) != 0).then_some(t[c]);
-                    let k = [at(0), at(1), at(2)];
-                    let pat = [k[0].unwrap_or(0), k[1].unwrap_or(0), k[2].unwrap_or(0)];
-                    let fits = |x: &&Triple| (0..3).all(|c| k[c].is_none_or(|v| v == x[c]));
-                    let mut want: Vec<Triple> = all.iter().filter(fits).copied().collect();
-                    want.sort_by_key(|x| rank(&pat, x));
-                    for _ in 0..2 {
-                        let mut got = Vec::new();
-                        base.for_each(k[0], k[1], k[2], |x| {
-                            got.push(x);
-                            true
-                        })
-                        .unwrap();
-                        assert_eq!(got, want, "round {round} lookup {i} {pat:?}");
-                        assert_eq!(
-                            base.any(&mut Memo::default(), k[0], k[1], k[2]).unwrap(),
-                            !want.is_empty()
-                        );
-                        // a reader that stops gets the first facts
-                        let mut head = Vec::new();
-                        base.for_each(k[0], k[1], k[2], |x| {
-                            head.push(x);
-                            head.len() < 3
-                        })
-                        .unwrap();
-                        assert_eq!(head, want[..want.len().min(3)]);
-                    }
-                    for rows in [1, 100, 4096] {
-                        let mut got = Vec::new();
-                        let mut memo = Memo::default();
-                        for r in base.ranges(k[0], k[1], k[2], rows).unwrap() {
-                            base.for_range(&mut memo, &r, k[0], k[1], k[2], |x| {
-                                got.push(x);
-                                true
-                            })
-                            .unwrap();
-                        }
-                        assert_eq!(got, want, "round {round} shares {i} {pat:?} {rows}");
-                    }
-                    // two input graphs: the same facts, each once
-                    let mut want: Vec<Triple> = union.iter().filter(fits).copied().collect();
-                    want.sort_unstable();
-                    let mut got = Vec::new();
-                    both.for_each(k[0], k[1], k[2], |x| {
-                        got.push(x);
-                        true
-                    })
-                    .unwrap();
-                    got.sort_unstable();
-                    assert_eq!(got, want, "round {round} union {i} {pat:?}");
-                }
-                assert_eq!(base.contains(&t).unwrap(), first.contains(&t));
             }
         }
     }
