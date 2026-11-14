@@ -3792,8 +3792,12 @@ mod tests {
                         };
                         assert_eq!(key.capacity(), held, "growth before admission at {id}");
                         let mut reserved = false;
+                        // Each reservation grows the buffer to exactly what it admits, so
+                        // a later one in the same decode must exceed it.
+                        let mut fits = held;
                         let reserve = |need: usize| {
-                            assert!(need > held, "{need} fits the held {held} bytes");
+                            assert!(need > fits, "{need} fits the held {fits} bytes");
+                            fits = need;
                             admitted = admitted.max(need);
                             reserved = true;
                             Ok::<_, ()>(())

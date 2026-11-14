@@ -890,13 +890,16 @@ Roadmap item 763 measured what that check costs. On atlas at 100,000 people, wit
 server pinned to one CPU and `perf stat` counting its user-space work per request over
 three interleaved passes of matched release builds, the checked writer of c2b5d7cf ran
 4.2% more instructions than the unchecked writer of 6fba19d6 on `optional-chain`, 2.7%
-on `order-by-full` and 2.4% on `star-join`, and 7.9%, 4.1% and 3.9% more cycles. A
+on `order-by-full` and 2.4% on `star-join`, and 7.90%, 4.05% and 3.86% more cycles. A
 diagnostic build without the per-step check ran 1.4%, 0.0% and 0.8% fewer instructions
 than 6fba19d6, so the check holds the instruction difference. The same build still ran
-6.1%, 4.3% and 3.0% more cycles. One reservation per front-coded block could save at most
-what that build saves, so it was not built. Two repairs that shared the check with the
-copy's own growth check, and then copied the suffix into the checked room, brought the
-instructions within 1% of 6fba19d6 without lowering the cycles, and `order-by-full` took
-about 2.3% more execution time, so they were reverted. The cycle difference follows 42%
-more branch misses on `optional-chain`, which none of the builds changed, and item 763
-now looks for them.
+6.1%, 4.3% and 3.0% more cycles, which makes it unlikely that one reservation per
+front-coded block would close the cycle difference, so that design was not built. Two
+repairs were built and reverted. The first shared the check with the copy's own growth
+check, and the second, 0ae09b0a, then copied the suffix into the checked room, which
+brought the instructions within 0.8% of 6fba19d6. Neither lowered the cycles. The
+second's final form, 0acba641, ran 1.3% more instructions than 6fba19d6 on
+`order-by-full`, and its server execution of that query took 2.6% and 3.2% longer than
+c2b5d7cf over the two runs, longer in every round. The checked writer also had 44% more
+branch misses than 6fba19d6 on `optional-chain`, and none of the builds changed that
+count, so item 763 looks there next.
