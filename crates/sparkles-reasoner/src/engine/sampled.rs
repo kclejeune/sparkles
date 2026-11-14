@@ -877,7 +877,7 @@ mod tests {
             let mut g = key_graph_in(400, batch);
             let ranges = vec![(0, g.len()); r.atoms.len()];
             assert!(plan(&g, &r, &ranges).unwrap().1, "batches of {batch}");
-            assert!(g.kill(&[20_000, TYPE, 2001]));
+            assert!(g.kill(&[20_000, TYPE, 2001]).unwrap());
             let (steps, by_sample) = plan(&g, &r, &ranges).unwrap();
             assert!(!by_sample, "batches of {batch}");
             assert_eq!(
