@@ -36,7 +36,7 @@ use crate::terms::Terms;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::id::Id;
-use sparkles_core::incr::fixpoint::{FactStore, FixedPoint, Program, Sink};
+use sparkles_core::incr::fixpoint::{Change, FactStore, FixedPoint, Program, Sink};
 use sparkles_core::incr::pass::Which;
 use sparkles_core::incr::persist::{Reader, Writer};
 use sparkles_core::incr::prov::{Ann, Provenance};
@@ -63,6 +63,15 @@ const MIN_VISITS: u64 = 1 << 20;
 /// when it started, so that a small closure is not materialized in full for a deletion
 /// of ordinary cost (see [`Bound`]).
 const MIN_HELD: usize = 64 << 20;
+
+/// The memory bound of a deletion, which a test of this thread can set.
+fn held_bound(n: usize) -> usize {
+    #[cfg(test)]
+    if let Some(m) = tests::HELD_BOUND.with(std::cell::Cell::get) {
+        return m;
+    }
+    n
+}
 
 /// The cost of the deletion of one update and its bound, past which the update gives
 /// way to a full run.
@@ -111,7 +120,7 @@ impl Bound {
         Bound::new(
             budget,
             facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS),
-            c.heap_bytes().max(MIN_HELD),
+            held_bound(c.heap_bytes().max(MIN_HELD)),
         )
     }
 
@@ -628,13 +637,18 @@ pub(crate) fn update<'a>(
         fp.advance(&mut cx, None)?
     };
     let mut out = cx.out;
+    // the operator released its charge of the changes with the pass, and they stay
+    // allocated until the removed facts are copied out of them
+    let change_bytes = changes.capacity() * size_of::<Change<Triple>>();
+    let mut held = Held::try_new(budget, change_bytes)?;
     // the removed facts stay with the update, charged before their buffer is allocated
     let n = changes.iter().filter(|ch| ch.weight < 0).count();
-    let held = Held::try_new(budget, n * size_of::<Triple>())?;
+    held.try_grow(n * size_of::<Triple>())?;
     out.deleted.reserve_exact(n);
     out.deleted
         .extend(changes.iter().filter(|ch| ch.weight < 0).map(|ch| ch.fact));
     drop(changes);
+    held.shrink(change_bytes);
     out.held = Some(held);
     Ok(out)
 }
@@ -908,8 +922,7 @@ impl<'a> Program for TierProgram<'a> {
         let bound = &*bound.get_or_insert_with(|| Bound::for_closure(c, budget));
         if rayon::current_num_threads() > 1 && facts.len() >= PAR_SEARCH {
             // the searches of a round are independent: see `prove_all`
-            let proved = prove_all(c, cx.rules, plans, abort, limits, bound, search, facts)?;
-            out.extend(proved.into_iter().map(|p| p.then_some(())));
+            prove_all(c, cx.rules, plans, abort, limits, bound, search, facts, out)?;
         } else {
             let scx = Cx {
                 c,
@@ -1445,7 +1458,9 @@ fn preferred_error(errs: impl Iterator<Item = anyhow::Error>) -> Option<anyhow::
 const PAR_SEARCH: usize = 2;
 
 /// Search for other proofs of `facts`, the distinct facts of one round of the deletion,
-/// in parallel, and return whether each has one, in the order of `facts`.
+/// in parallel, and push whether each has one to `out`, in the order of `facts`. `out`
+/// has room for them. Each chunk's answers are charged to its search until they are
+/// pushed.
 ///
 /// The searches of one round see the same live facts, since the round deletes its
 /// unprovable facts only after every search, and a search's answer does not depend on
@@ -1466,7 +1481,8 @@ fn prove_all(
     bound: &Bound,
     search: &mut Search,
     facts: &[Triple],
-) -> anyhow::Result<Vec<bool>> {
+    out: &mut Vec<Option<()>>,
+) -> anyhow::Result<()> {
     let budget = &limits.budget;
     let chunk = facts
         .len()
@@ -1487,7 +1503,12 @@ fn prove_all(
             .par_chunks(chunk)
             .map(|ch| {
                 let mut s = Search::new(budget);
-                let mut found = Vec::with_capacity(ch.len());
+                // the chunk's answers, charged before they are allocated
+                let mut found = Vec::new();
+                match s.held.try_grow(ch.len() * size_of::<bool>()) {
+                    Ok(()) => found.reserve_exact(ch.len()),
+                    Err(e) => s.err = Some(e.into()),
+                }
                 for &t in ch {
                     if s.err.is_some() || abort.load(Ordering::Relaxed) {
                         break;
@@ -1507,15 +1528,16 @@ fn prove_all(
     if let Some(e) = preferred_error(parts.iter_mut().filter_map(|p| p.1.err.take())) {
         return Err(e);
     }
-    let mut proved = Vec::with_capacity(facts.len());
     for (found, s) in parts {
-        proved.extend(found);
+        out.extend(found.iter().map(|&p| p.then_some(())));
+        // the answers' charge goes with the chunk's search
+        drop(found);
         search.absorb(s)?;
     }
     if cancelled(limits) {
         anyhow::bail!("reasoning cancelled");
     }
-    Ok(proved)
+    Ok(())
 }
 
 /// How deep the search recurses before it queues the facts it reaches instead.
@@ -2032,6 +2054,66 @@ pub(crate) mod tests {
     pub(crate) const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
     pub(crate) const OWL: &str = "http://www.w3.org/2002/07/owl#";
     pub(crate) const EX: &str = "http://ex.org/";
+
+    thread_local! {
+        /// The memory bound of the deletions this thread starts, in place of the closure's.
+        pub(crate) static HELD_BOUND: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// A removal whose search holds more than the deletion's memory bound stops the
+    /// operator's pass with the bound's [`Fallback`], which a run answers with a full
+    /// run, and the pass releases what it reserved.
+    #[test]
+    fn the_memory_bound_stops_a_pass_of_the_operator() {
+        let v = Vocab::new();
+        let id = |s: &str| v.iri[s];
+        let (sub, ty) = (id(&format!("{RDFS}subClassOf")), id(&format!("{RDF}type")));
+        let class = |i: usize| id(&format!("{EX}C{i}"));
+        let ind = |i: usize| id(&format!("{EX}i{i}"));
+        let mut base: FxHashSet<Triple> = FxHashSet::default();
+        for i in 0..5 {
+            base.insert([class(i), sub, class(i + 1)]);
+        }
+        for i in 0..8 {
+            base.insert([ind(i), ty, class(0)]);
+        }
+        let text = crate::RDFS_RULES;
+        for (bound, fails) in [(None, false), (Some(0), true)] {
+            let mut c = full(&v, text, &base);
+            let mut now = base.clone();
+            let removed = vec![[ind(0), ty, class(0)]];
+            now.remove(&removed[0]);
+            let snap = set_default_graph(&v, &now);
+            let moved = c.terms.rebase(snap.clone());
+            c.remap(&moved).unwrap();
+            if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
+                l.update(&[], &removed, crate::facts::rank);
+                c.put_lookups(l);
+            }
+            let rules = compiled(text, &c.terms);
+            let lim = limits();
+            let used = lim.budget.used();
+            HELD_BOUND.with(|b| b.set(bound));
+            let r = update(&mut c, &rules, &lim, &[], &removed, None);
+            HELD_BOUND.with(|b| b.set(None));
+            match r {
+                Err(e) => {
+                    assert!(fails, "{e:#}");
+                    let f = e.downcast_ref::<Fallback>().expect("a fallback");
+                    assert!(f.0.contains("held more than 0 bytes"), "{}", f.0);
+                    // the pass's reservations are back, beside what the closure grew by
+                    drop(c);
+                    assert!(lim.budget.used() <= used, "{} > {used}", lim.budget.used());
+                }
+                Ok(up) => {
+                    assert!(!fails, "the deletion stayed within no memory");
+                    assert!(up.deleted.contains(&removed[0]), "{:?}", up.deleted);
+                    assert_eq!(render(&c), render(&full(&v, text, &now)));
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_bound_counts_visits() {
