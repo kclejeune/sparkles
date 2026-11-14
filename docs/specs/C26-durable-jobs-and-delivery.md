@@ -622,6 +622,9 @@ write-ahead log does not name the commit that carries it, or when a damaged reco
 `control.log` has a complete record after it. Each of these contradicts property 1 or 3
 of §7.1. A gap explained by a commit that the replay would have dropped as a torn tail is
 refused the same way, since a later durable frame proves that commit was durable.
+The refusal leaves every file of the dataset as it was. The one entry a refused writable
+open can add is the empty delta vocabulary that opening a generation without one
+creates, which every reader takes for the absent file.
 Otherwise a damaged last record of `control.log` is a torn tail, which a writable open
 truncates as it truncates the write-ahead log. A process that stopped without
 synchronizing can leave bytes that only the page cache holds, so a writable open then

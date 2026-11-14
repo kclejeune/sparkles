@@ -32,8 +32,10 @@ const PAUSE_BATCH: usize = 256;
 /// the recovery, so a frame stays below `MAX_FRAME` whatever the principals' IRIs.
 const FRAME_BUDGET: usize = sparkles_core::control::MAX_FRAME / 4;
 
-/// What one run can add to a frame beyond [`FRAME_BUDGET`], with the frame's header,
-/// the operation headers and the epoch or recovery record.
+/// What one run can add to a frame beyond [`FRAME_BUDGET`], with the frame's header and
+/// the operation headers. The epoch and recovery records that end a frame have fixed
+/// fields and a label of at most `ledger::MAX_DIAGNOSTIC_CHARS` characters, far below
+/// the 1 MiB the assertion keeps for them.
 const RUN_BOUND: usize =
     2 * (sparkles_core::control::MAX_VALUE + sparkles_core::control::MAX_KEY) + (64 << 10);
 
@@ -671,7 +673,9 @@ impl Jobs {
                     id: Uuid::new_v4(),
                     source_dataset: origin.dataset,
                     capture_commit: origin.commit,
-                    capture_label: Some(origin.label).filter(|l| !l.is_empty()),
+                    // cut like a diagnostic, so the record stays small whatever the
+                    // backup's name
+                    capture_label: Some(ledger::redacted(&origin.label)).filter(|l| !l.is_empty()),
                     capture_ms: origin.time_ms,
                     checkpoint_seq: base.seq,
                     phase: RecoveryPhase::Pausing,

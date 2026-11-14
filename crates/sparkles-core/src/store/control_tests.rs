@@ -698,9 +698,11 @@ fn an_upgraded_log_needs_its_control_files() {
     integrity(open(&root));
 }
 
-/// A refused open does not leave behind a delta vocabulary it created.
+/// A refused open changes no file of the dataset. The one entry it may add is the empty
+/// delta vocabulary that a writable open of a generation without one creates, which
+/// every reader takes for the absent file.
 #[test]
-fn a_refused_open_creates_no_vocabulary() {
+fn a_refused_open_adds_at_most_an_empty_vocabulary() {
     let (_dir, root, s) = setup();
     transition(&s, &[("jobs/a", "1")], None).unwrap();
     let dvocab = s
@@ -715,6 +717,10 @@ fn a_refused_open_creates_no_vocabulary() {
     std::fs::remove_file(root.join(control::CHECKPOINT_FILE)).unwrap();
     let before = walkdir(&root);
     integrity(open(&root));
-    assert_eq!(before, walkdir(&root));
-    assert!(!dvocab.exists());
+    let mut after = walkdir(&root);
+    if dvocab.exists() {
+        assert_eq!(std::fs::metadata(&dvocab).unwrap().len(), 0);
+        after.retain(|p| p != &dvocab);
+    }
+    assert_eq!(before, after);
 }
