@@ -433,6 +433,144 @@ fn changed_ids_agree_with_the_states() {
     );
 }
 
+/// The ids of an older snapshot of the head's generation agree with its state. A cancelled
+/// read stops. A snapshot whose generation was replaced, or replaced and collected, has no
+/// ids to give, and that is no error.
+#[test]
+fn changed_ids_of_older_snapshots_and_collected_generations() {
+    use sparkles_core::id::Id;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            change_log: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    s.set_retention(keep_all()).unwrap();
+    let u = |q: &str| update(&s, q, &QueryOptions::default()).unwrap();
+    let mut snaps = vec![s.snapshot()];
+    for q in [
+        "INSERT DATA { <urn:a> <urn:p> 1 . GRAPH <urn:g1> { <urn:a> <urn:p> 2 } }",
+        "DELETE DATA { <urn:a> <urn:p> 1 } ; INSERT DATA { <urn:b> <urn:p> \"new\" }",
+        "INSERT DATA { <urn:a> <urn:p> 1 . GRAPH <urn:g1> { <urn:c> <urn:p> <urn:a> } }",
+        "DELETE DATA { GRAPH <urn:g1> { <urn:a> <urn:p> 2 } }",
+        "INSERT DATA { GRAPH <urn:g1> { <urn:a> <urn:p> 2 } }",
+    ] {
+        u(q);
+        snaps.push(s.snapshot());
+    }
+    let states: Vec<BTreeSet<String>> = (0..snaps.len()).map(|i| state(&s, i as u64)).collect();
+    for (b, snap) in snaps.iter().enumerate() {
+        assert_eq!(snap.commit, b as u64);
+        let ids: Vec<Id> = [Some(Id::DEFAULT_GRAPH), snap.lookup_iri("urn:g1")]
+            .into_iter()
+            .flatten()
+            .collect();
+        let line = |q: &[Id; 4]| nquads_line(&snap.quad_to_terms(q).expect("a stored quad"));
+        for a in 0..=b {
+            let got = s
+                .changed_ids(a as u64, snap, &ids, &DiffOptions::default())
+                .unwrap()
+                .unwrap_or_else(|| panic!("no ids for {a}..{b}, within the head's generation"));
+            let add: BTreeSet<String> = got.iter().filter(|c| c.1).map(|c| line(&c.0)).collect();
+            let rem: BTreeSet<String> = got.iter().filter(|c| !c.1).map(|c| line(&c.0)).collect();
+            assert_eq!(add.len() + rem.len(), got.len(), "{a}..{b}: a quad twice");
+            let want_add: BTreeSet<String> = states[b].difference(&states[a]).cloned().collect();
+            let want_rem: BTreeSet<String> = states[a].difference(&states[b]).cloned().collect();
+            assert_eq!(add, want_add, "added, {a}..{b}");
+            assert_eq!(rem, want_rem, "removed, {a}..{b}");
+        }
+    }
+    let old = &snaps[3];
+    let graphs = [Id::DEFAULT_GRAPH];
+    // a cancelled read
+    let cancelled = DiffOptions {
+        cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        ..Default::default()
+    };
+    let e = s.changed_ids(1, old, &graphs, &cancelled).err();
+    assert!(matches!(e, Some(Error::Cancelled)), "{e:?}");
+    // the generation is replaced and still retained: its log is read through another
+    // handle, whose ids are not promised to be the snapshot's
+    s.compact().unwrap();
+    let got = s.changed_ids(1, old, &graphs, &DiffOptions::default());
+    assert!(matches!(got, Ok(None)), "{got:?}");
+    // and collected
+    s.set_retention(Retention::default()).unwrap();
+    u("INSERT DATA { <urn:d> <urn:p> 4 }");
+    s.compact().unwrap();
+    assert!(
+        s.history().reconstructable.iter().all(|&(lo, _)| lo > 3),
+        "{:?}",
+        s.history().reconstructable
+    );
+    let got = s.changed_ids(1, old, &graphs, &DiffOptions::default());
+    assert!(matches!(got, Ok(None)), "{got:?}");
+}
+
+/// A read of the ids of a snapshot races the collection of its generation: the read gives
+/// the ids or none, and never an error.
+#[test]
+fn changed_ids_survive_a_collection_of_their_generation() {
+    use sparkles_core::id::Id;
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            change_log: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let done = AtomicBool::new(false);
+    let (mut read, mut none) = (0u64, 0u64);
+    std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                scope.spawn(|| {
+                    let (mut read, mut none) = (0u64, 0u64);
+                    while !done.load(Ordering::Relaxed) {
+                        let snap = s.snapshot();
+                        let after = snap.commit.saturating_sub(1);
+                        match s.changed_ids(
+                            after,
+                            &snap,
+                            &[Id::DEFAULT_GRAPH],
+                            &DiffOptions::default(),
+                        ) {
+                            Ok(Some(_)) => read += 1,
+                            Ok(None) => none += 1,
+                            Err(e) => panic!("{after}..{}: {e}", snap.commit),
+                        }
+                    }
+                    (read, none)
+                })
+            })
+            .collect();
+        for i in 0..150 {
+            for j in 0..2 {
+                update(
+                    &s,
+                    &format!("INSERT DATA {{ <urn:s{i}> <urn:p{j}> {i} }}"),
+                    &QueryOptions::default(),
+                )
+                .unwrap();
+            }
+            s.compact().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        for r in readers {
+            let (a, b) = r.join().unwrap();
+            read += a;
+            none += b;
+        }
+    });
+    assert!(read > 0 && none > 0, "read {read}, none {none}");
+}
+
 /// The graph term of a canonical N-Quads line, `None` for the default graph.
 fn snap_graph(line: &str) -> Option<String> {
     let body = line.trim_end().strip_suffix(" .").unwrap_or(line);
