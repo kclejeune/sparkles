@@ -1607,7 +1607,7 @@ it while its queries run.
   of its samples in the block cache lookup that each quad's index probe makes, 20% in
   reading the kept id of each term, 14% in reading the request and 17% in the
   JavaScript term table and encoder. A probe of a sorted batch that reads each index
-  block once is the step left for it.
+  block once is the step left for it, which is ROADMAP item 946.
 * **Release work** (item 58), designed in [X12](X12-release-engineering.md):
   * *npm publishing.* `node-packages.yml` builds and checks the packages, and publishing
     needs an explicitly enabled npm environment. Switching it on needs the npm scope,

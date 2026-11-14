@@ -493,8 +493,9 @@ no permit.
   transaction, and a single probe in its own transaction in 0.42 µs. A profile of the
   batch puts 27% of its samples in the index probe, most of it the block cache lookup
   that each quad makes, 14% in the lookup of term ids and 14% in the Kotlin writer. A
-  probe of a sorted batch that reads each block once is the step left for it. `find`
-  over several subjects in one call is not built.
+  probe of a sorted batch that reads each block once is the step left for it, which is
+  [ROADMAP](../../ROADMAP.md) item 946. `find` over several subjects in one call is not
+  built.
 * **JVM metrics** ([ROADMAP](../../ROADMAP.md) item 76). [FEATURES](../../FEATURES.md) lists no
   JVM metrics. The server's metrics are counted in `crates/sparkles-server/src/obs.rs` and
   are not reachable from the library, and the FFI exposes no dataset statistics. The
