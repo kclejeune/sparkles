@@ -282,7 +282,7 @@ pub fn record_inputs(
     let names = |g: Vec<sparkles_reasoner::GraphRef>| -> Vec<String> {
         g.iter().map(|g| g.as_str().to_string()).collect()
     };
-    if !r.default_only() || !r.imports.is_empty() {
+    if !r.default_only() || !r.imports.is_empty() || !r.also_read.is_empty() {
         record.input_graphs = Some(names(r.graphs.clone()));
         record.watched_graphs = Some(names(r.watched()));
         record.imports = r

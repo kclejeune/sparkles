@@ -127,7 +127,8 @@ pub enum Expr {
     SparqlCall {
         func: NamedNode,
         query: Box<Query>,
-        params: Vec<String>,
+        /// the variable of each parameter, and whether it is `sh:optional`
+        params: Vec<(String, bool)>,
         args: Vec<ExprId>,
     },
 }
@@ -369,7 +370,7 @@ impl Parser<'_> {
             Term::NamedNode(n) if n.as_ref() == sh::THIS => {
                 return Ok(self.push_expr(node, Expr::Var("focusNode".into())));
             }
-            Term::BlankNode(_) => {}
+            Term::BlankNode(_) if self.is_af_form(node) => {}
             _ => return self.expr(node),
         }
         if let Some(&id) = self.af_memo.get(node) {
@@ -389,6 +390,18 @@ impl Parser<'_> {
         Ok(id)
     }
 
+    /// Whether a blank node is one of the SHACL-AF 2017 forms, which [`Self::af_expr`]
+    /// reads, rather than a SHACL 1.2 expression.
+    fn is_af_form(&self, node: &Term) -> bool {
+        let preds = self.predicates(node);
+        if preds.iter().any(|p| {
+            [sh::PATH, sh::FILTER_SHAPE, sh::INTERSECTION, sh::UNION].contains(&p.as_ref())
+        }) {
+            return true;
+        }
+        matches!(&preds[..], [f] if self.g.is_instance(&Term::NamedNode(f.clone()), sh::SPARQL_FUNCTION))
+    }
+
     fn af_list(&mut self, head: &Term) -> Result<Vec<ExprId>> {
         let items = self.g.list(head)?;
         items.iter().map(|i| self.af_expr(i)).collect()
@@ -401,7 +414,18 @@ impl Parser<'_> {
         };
         if let Some(p) = self.single(node, sh::PATH)? {
             let path = PropertyPath::from_graph(&self.g, &p).context("sh:path")?;
-            return Ok(self.push_expr(node, Expr::PathValues { path, focus: nodes }));
+            let values = self.push_expr(node, Expr::PathValues { path, focus: None });
+            // the values of the path from each node of sh:nodes, in one list
+            return Ok(match nodes {
+                Some(n) => self.push_expr(
+                    node,
+                    Expr::FlatMap {
+                        nodes: Some(n),
+                        map: values,
+                    },
+                ),
+                None => values,
+            });
         }
         if let Some(shape) = self.single(node, sh::FILTER_SHAPE)? {
             let shape = self.shape(&shape).context("sh:filterShape")?;
@@ -436,7 +460,7 @@ impl Parser<'_> {
             None => bail!("the function {f} has no sh:select (sh:ask functions are not supported)"),
         };
         // parameters in the order of sh:order, then of the local names of their paths
-        let mut params: Vec<(f64, String)> = Vec::new();
+        let mut params: Vec<(f64, String, bool)> = Vec::new();
         for p in self.g.objects(&fnode, sh::PARAMETER) {
             let Some(Term::NamedNode(path)) = self.g.object(&p, sh::PATH) else {
                 bail!("a parameter of {f} has no IRI as its sh:path");
@@ -445,14 +469,19 @@ impl Parser<'_> {
                 Some(Term::Literal(l)) => l.value().parse::<f64>().unwrap_or(0.0),
                 _ => 0.0,
             };
+            let optional = matches!(
+                self.g.object(&p, sh::OPTIONAL),
+                Some(Term::Literal(l)) if matches!(l.value(), "true" | "1")
+            );
             let s = path.as_str();
             params.push((
                 order,
                 s[s.rfind(['#', '/']).map_or(0, |i| i + 1)..].to_string(),
+                optional,
             ));
         }
         params.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let params: Vec<String> = params.into_iter().map(|p| p.1).collect();
+        let params: Vec<(String, bool)> = params.into_iter().map(|p| (p.1, p.2)).collect();
         let prefixes = crate::sparql::prefixes(&self.g, &fnode);
         let query = sparkles_core::sparql::parse_query(&text, None, &prefixes)
             .map_err(|e| anyhow!("{e}"))

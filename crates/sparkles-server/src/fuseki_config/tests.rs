@@ -757,7 +757,12 @@ fn shacl_rules_reasoner() {
     );
 
     std::fs::write(&f, config("tosh:maxIterations 5")).unwrap();
-    let p = plan_for(&[f], &UserSource::default(), Mode::Files).unwrap();
+    let p = plan_for(
+        std::slice::from_ref(&f),
+        &UserSource::default(),
+        Mode::Files,
+    )
+    .unwrap();
     let r = p.datasets[0].reasoning.as_ref().unwrap();
     assert_eq!(
         r.profile.as_deref(),
@@ -768,4 +773,20 @@ fn shacl_rules_reasoner() {
         "{}",
         p.report.text()
     );
+
+    // a shapes graph IRI with a query string survives the profile's option syntax
+    let g = "http://example.org/shapes?a=1&b=50%25";
+    std::fs::write(
+        &f,
+        config("tosh:maxIterations 1").replace("urn:x:shapes", g),
+    )
+    .unwrap();
+    let p = plan_for(&[f], &UserSource::default(), Mode::Files).unwrap();
+    let r = p.datasets[0].reasoning.as_ref().unwrap();
+    let parsed: sparkles_reasoner::Profile = r.profile.as_deref().unwrap().parse().unwrap();
+    let sparkles_reasoner::Profile::ShaclAf(c) = parsed else {
+        panic!("{:?}", r.profile)
+    };
+    assert_eq!(c.shapes, vec![g.to_string()]);
+    assert!(c.one_pass);
 }

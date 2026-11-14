@@ -769,7 +769,11 @@ impl Converter<'_> {
                 let mut params = Vec::new();
                 for s in g.objects(r, SH_SHAPES_GRAPH) {
                     match iri(s) {
-                        Some(i) => params.push(format!("shapes={i}")),
+                        // the profile text's encoding of `%` and `&` in an option
+                        Some(i) => params.push(format!(
+                            "shapes={}",
+                            i.replace('%', "%25").replace('&', "%26")
+                        )),
                         None => self
                             .report
                             .unsupported(place, "sh:shapesGraph names no graph IRI"),

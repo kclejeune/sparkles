@@ -1192,6 +1192,18 @@ fn materialize_admitted(
                 return Err(e);
             }
         };
+        // the shapes graphs the rules came from make the inferences stale as well
+        let mut resolved = resolved.clone();
+        for g in &cfg.shapes {
+            let g = if g == sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI {
+                GraphRef::Default
+            } else {
+                GraphRef::Named(g.clone())
+            };
+            if !resolved.graphs.contains(&g) && !resolved.also_read.contains(&g) {
+                resolved.also_read.push(g);
+            }
+        }
         let done = Done {
             rule_groups: groups,
             rules: d.rules,
@@ -1468,31 +1480,47 @@ fn finish(
     done: Done,
     mut laps: Laps,
 ) -> anyhow::Result<ReasonReport> {
-    if opts
-        .cancel
-        .as_ref()
-        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-    {
-        anyhow::bail!("reasoning cancelled");
-    }
-    // a run that went over its limit fails before its commit, also when its charges are
-    // back under it now
-    done.budget.check_peak()?;
-    if let Some(context) = &opts.analysis {
-        if store.is_persistent() {
-            anyhow::bail!("analysis witnesses cannot be persisted");
+    let mut txn = txn;
+    let checked = (|| -> anyhow::Result<WorkingWarnings> {
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            anyhow::bail!("reasoning cancelled");
         }
-        if let Some(closure) = &done.closure {
-            context.capture_typings(closure.terms(), &done.generalized)?;
-        } else {
-            anyhow::bail!("analysis closure was unavailable before diagnostics capture");
+        // a run that went over its limit fails before its commit, also when its charges
+        // are back under it now
+        done.budget.check_peak()?;
+        if let Some(context) = &opts.analysis {
+            if store.is_persistent() {
+                anyhow::bail!("analysis witnesses cannot be persisted");
+            }
+            if let Some(closure) = &done.closure {
+                context.capture_typings(closure.terms(), &done.generalized)?;
+            } else {
+                anyhow::bail!("analysis closure was unavailable before diagnostics capture");
+            }
         }
-    }
-    // Required report storage must be admitted while the transaction can still
-    // roll back. Keep the complete warning owner alive through commit/transfer.
-    let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
-    warnings.extend_borrowed(done.warnings.as_slice())?;
-    done.budget.check_peak()?;
+        // Required report storage must be admitted while the transaction can still
+        // roll back. Keep the complete warning owner alive through commit/transfer.
+        let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
+        warnings.extend_borrowed(done.warnings.as_slice())?;
+        done.budget.check_peak()?;
+        Ok(warnings)
+    })();
+    let warnings = match checked {
+        Ok(w) => w,
+        Err(e) => {
+            // a shacl-af run interned the terms its rules computed: nothing commits them
+            if !done.rule_groups.is_empty()
+                && let Err(r) = txn.discard_terms()
+            {
+                tracing::error!("a failed shacl-af run could not remove its terms: {r}");
+            }
+            return Err(e);
+        }
+    };
     laps.lap("checks");
     let receipt = txn.commit()?;
     laps.lap("commit");

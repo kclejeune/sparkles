@@ -359,6 +359,9 @@ pub(crate) struct Engine<'a> {
     pub query_memory: Option<u64>,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
+    /// the queries node expressions have run, which keep the new blank nodes of each
+    /// apart ([`Engine::result_id`])
+    pub(crate) query_calls: std::sync::atomic::AtomicU64,
 }
 
 /// Members past which a list counts as ill-formed (a hostile list cannot exhaust memory).
@@ -432,6 +435,7 @@ impl<'a> Engine<'a> {
             max_expr_nodes: opts.max_expr_nodes,
             query_memory: opts.query_memory,
             collected: AtomicUsize::new(0),
+            query_calls: Default::default(),
         })
     }
 

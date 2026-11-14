@@ -69,7 +69,7 @@ impl ShaclAf {
     pub fn text(&self) -> String {
         let mut params = Vec::new();
         for s in &self.shapes {
-            params.push(format!("shapes={s}"));
+            params.push(format!("shapes={}", encode_option(s)));
         }
         if self.one_pass {
             params.push("mode=one-pass".into());
@@ -90,7 +90,7 @@ impl ShaclAf {
         for p in params.split('&').filter(|p| !p.is_empty()) {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
             match k {
-                "shapes" if !v.is_empty() => out.shapes.push(v.to_string()),
+                "shapes" if !v.is_empty() => out.shapes.push(decode_option(v)?),
                 "mode" => match v {
                     "one-pass" => out.one_pass = true,
                     "fixpoint" | "fixed-point" => out.one_pass = false,
@@ -105,6 +105,29 @@ impl ShaclAf {
         }
         Ok(out)
     }
+}
+
+/// An option value of the profile's text form, with `%` and `&` percent-encoded so that
+/// a graph IRI with a query string survives.
+pub fn encode_option(v: &str) -> String {
+    v.replace('%', "%25").replace('&', "%26")
+}
+
+fn decode_option(v: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let code = rest.get(i + 1..i + 3);
+        let byte = code.and_then(|c| u8::from_str_radix(c, 16).ok());
+        match byte {
+            Some(b) if b.is_ascii() => out.push(b as char),
+            _ => return Err(format!("a bad percent escape in '{v}'")),
+        }
+        rest = &rest[i + 3..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// One group of rules of a `shacl-af` run ([`crate::ReasonReport::rule_groups`]).
@@ -140,31 +163,39 @@ const OVERLAY_FACT_BYTES: usize = 7 * 64;
 struct Interner<'t, 's> {
     txn: &'t mut WriteTxn<'s>,
     /// the blank node of each (rule, template label, solution)
-    blanks: FxHashMap<(usize, String, Vec<u64>), Id>,
-    /// the blank nodes that computed terms named
-    labels: FxHashMap<String, Id>,
+    blanks: FxHashMap<(usize, String, Vec<Option<u64>>), Id>,
+    /// the blank nodes that computed terms named, by round, rule and label: a query
+    /// names its new blank nodes afresh in each execution, which the rule's evaluation
+    /// keeps apart by label, and in each round
+    labels: FxHashMap<(usize, usize, String), Id>,
 }
 
 impl Interner<'_, '_> {
-    fn id(&mut self, rule: usize, n: &Node) -> Result<u64> {
+    fn id(&mut self, round: usize, rule: usize, n: &Node) -> Result<u64> {
         Ok(match n {
             Node::Id(id) => id.0,
             Node::Term(Term::BlankNode(b)) => match parse_bnode_label(b.as_str()) {
                 Some(id) => id.0,
-                None => match self.labels.get(b.as_str()) {
-                    Some(id) => id.0,
-                    None => {
-                        let id = self.txn.new_bnode();
-                        self.labels.insert(b.as_str().to_string(), id);
-                        id.0
+                None => {
+                    let k = (round, rule, b.as_str().to_string());
+                    match self.labels.get(&k) {
+                        Some(id) => id.0,
+                        None => {
+                            let id = self.txn.new_bnode();
+                            self.labels.insert(k, id);
+                            id.0
+                        }
                     }
-                },
+                }
             },
             Node::Term(t) => self.txn.intern(t)?.0,
             Node::Blank { label, solution } => {
                 let mut key = Vec::with_capacity(solution.len());
                 for s in solution {
-                    key.push(self.id(rule, s)?);
+                    key.push(match s {
+                        Some(s) => Some(self.id(round, rule, s)?),
+                        None => None,
+                    });
                 }
                 let k = (rule, label.clone(), key);
                 match self.blanks.get(&k) {
@@ -218,11 +249,8 @@ pub(crate) fn derive(
     };
     let shapes = Shapes::for_rules(&snap, &shape_graphs, &[]).context("reading the shapes")?;
     let rules = shapes.rules().context("reading the SHACL rules")?;
-    // each query of a rule gets the run's memory budget, and the cancel flag that a
-    // deadline of the caller sets stops it
     let vopts = ValidateOptions {
         cancel: opts.cancel.clone(),
-        query_memory: opts.max_memory.map(|m| m as u64),
         ..Default::default()
     };
     let mut interner = Interner {
@@ -274,41 +302,58 @@ pub(crate) fn derive(
                     g.derived_len()
                 ),
             );
-            let data = RuleData::new(overlay.clone(), &shapes, Some(&iris[0]), &iris[1..], &vopts)?;
-            let mut found: Vec<[u64; 3]> = Vec::new();
+            // the queries of the round may use a quarter of what the run has left,
+            // reserved from its budget while they run, so that the run stays within it
+            let query_held = match opts.max_memory {
+                Some(_) => {
+                    let share = (budget.available() / 4).max(1 << 20);
+                    Some(Held::try_new(&budget, share)?)
+                }
+                None => None,
+            };
+            let data = RuleData::new(
+                overlay.clone(),
+                &shapes,
+                Some(&iris[0]),
+                &iris[1..],
+                &ValidateOptions {
+                    query_memory: query_held.as_ref().map(|h| h.bytes() as u64),
+                    ..vopts.clone()
+                },
+            )?;
+            let mut found: rustc_hash::FxHashSet<[u64; 3]> = Default::default();
             let mut found_held = Held::new(&budget);
+            let derived = g.derived_len();
             for ri in group.clone() {
                 let rule = &rules[ri];
-                let mut nodes: Vec<[Node; 3]> = Vec::new();
-                data.run(&shapes, rule, &mut |t| {
-                    nodes.push(t);
+                data.run(&shapes, rule, &mut |[s, p, o]| {
+                    let t = [
+                        interner.id(rounds, ri, &s)?,
+                        interner.id(rounds, ri, &p)?,
+                        interner.id(rounds, ri, &o)?,
+                    ];
+                    if !found.contains(&t) && !g.contains(&t) {
+                        if derived + found.len() >= opts.max_inferred {
+                            return Err(InferredLimitExceeded {
+                                limit: opts.max_inferred,
+                                context: format!(" (SHACL rules of order {order})"),
+                            }
+                            .into());
+                        }
+                        // the entry and its share of the table's slack
+                        found_held.try_grow(2 * size_of::<[u64; 3]>())?;
+                        found.insert(t);
+                    }
                     Ok(())
                 })
                 .with_context(|| format!("the SHACL rule {}", rule.node))?;
-                for [s, p, o] in &nodes {
-                    let t = [
-                        interner.id(ri, s)?,
-                        interner.id(ri, p)?,
-                        interner.id(ri, o)?,
-                    ];
-                    if !g.contains(&t) {
-                        found_held.try_grow(size_of::<[u64; 3]>())?;
-                        found.push(t);
-                    }
-                }
             }
             drop(data);
+            drop(query_held);
+            let mut found: Vec<[u64; 3]> = found.into_iter().collect();
             found.sort_unstable();
-            found.dedup();
             round += 1;
             rounds += 1;
-            if g.derived_len() + found.len() > opts.max_inferred {
-                return Err(InferredLimitExceeded {
-                    limit: opts.max_inferred,
-                    context: format!(" (SHACL rules of order {order})"),
-                }
-                .into());
-            }
             let added = g.try_add_batch(found.iter().copied())?;
             if added > 0 {
                 overlay_held.try_grow(added * OVERLAY_FACT_BYTES)?;

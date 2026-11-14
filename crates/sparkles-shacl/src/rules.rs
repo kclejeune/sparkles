@@ -240,9 +240,12 @@ pub enum Node {
     /// a term the rule computed, which the store does not have
     Term(Term),
     /// a blank node of a CONSTRUCT template, named by the template's label and the
-    /// solution's values of the query's variables: the same solution gives the same node,
-    /// so that a rule with blank nodes reaches a fixed point
-    Blank { label: String, solution: Vec<Node> },
+    /// solution's values of the query's variables, `None` where one is unbound: the same
+    /// solution gives the same node, so that a rule with blank nodes reaches a fixed point
+    Blank {
+        label: String,
+        solution: Vec<Option<Node>>,
+    },
 }
 
 /// The data graph rules read: a snapshot and the graphs that make up the data graph.
@@ -250,6 +253,8 @@ pub struct RuleData {
     data: DataGraph,
     ids: Vec<Id>,
     opts: ValidateOptions,
+    /// the CONSTRUCT queries run so far, which name the new blank nodes of each apart
+    executions: std::sync::atomic::AtomicU64,
 }
 
 impl RuleData {
@@ -268,7 +273,12 @@ impl RuleData {
             parallel: false,
             ..opts.clone()
         };
-        Ok(RuleData { data, ids, opts })
+        Ok(RuleData {
+            data,
+            ids,
+            opts,
+            executions: Default::default(),
+        })
     }
 
     fn node(&self, id: Id) -> Result<Node> {
@@ -322,6 +332,7 @@ impl RuleData {
                     let ss = engine.eval(*subject, f, &scope, &mut cx)?;
                     let ps = engine.eval(*predicate, f, &scope, &mut cx)?;
                     let mut seen = rustc_hash::FxHashSet::default();
+                    let mut n = 0u32;
                     for s in &ss {
                         if matches!(self.term_of(*s)?, Term::Literal(_)) {
                             continue;
@@ -331,6 +342,10 @@ impl RuleData {
                                 continue;
                             }
                             for o in &os {
+                                n = n.wrapping_add(1);
+                                if n % 4096 == 0 {
+                                    engine.check_limits()?;
+                                }
                                 if seen.insert([*s, *p, *o]) {
                                     emit([self.node(*s)?, self.node(*p)?, self.node(*o)?])?;
                                 }
@@ -359,11 +374,32 @@ impl RuleData {
         };
         let this = self.term_of(focus)?;
         let (table, ctx) = engine.run_query(query, &[("this", this)])?;
+        let exec = self
+            .executions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // a blank node the query made is new in each execution: its label is kept apart
+        // from those of the other executions of the rule
+        let fresh = |t: Term| -> Term {
+            match t {
+                Term::BlankNode(b)
+                    if sparkles_core::store::parse_bnode_label(b.as_str()).is_none() =>
+                {
+                    Term::BlankNode(oxrdf::BlankNode::new_unchecked(format!(
+                        "e{exec}x{}",
+                        b.as_str()
+                    )))
+                }
+                t => t,
+            }
+        };
         // a blank node is named by every variable of the solution, so that solutions
         // that differ only in a variable the template does not use still differ
         let all: Vec<(String, usize)> = table_vars(&table, &ctx);
         let mut seen = rustc_hash::FxHashSet::default();
         for row in 0..table.len() {
+            if row % 4096 == 4095 {
+                engine.check_limits()?;
+            }
             let value = |name: &str| -> Result<Option<Node>> {
                 if name == "this" {
                     return Ok(Some(Node::Id(focus)));
@@ -372,11 +408,11 @@ impl RuleData {
                     return Ok(None);
                 };
                 match Engine::result_term(&ctx, table.get(row, col)) {
-                    Some(t) => Ok(Some(self.node(self.data.resolve_shared(&t, true))?)),
+                    Some(t) => Ok(Some(self.node(self.data.resolve_shared(&fresh(t), true))?)),
                     None => Ok(None),
                 }
             };
-            let mut solution: Option<Vec<Node>> = None;
+            let mut solution: Option<Vec<Option<Node>>> = None;
             let mut node = |tp: &TermPattern| -> Result<Option<Node>> {
                 Ok(match tp {
                     TermPattern::Variable(v) => value(v.as_str())?,
@@ -388,11 +424,9 @@ impl RuleData {
                     }
                     TermPattern::BlankNode(b) => {
                         if solution.is_none() {
-                            let mut s = vec![Node::Id(focus)];
+                            let mut s = vec![Some(Node::Id(focus))];
                             for (n, _) in &all {
-                                s.push(value(n)?.unwrap_or(Node::Term(Term::Literal(
-                                    oxrdf::Literal::new_simple_literal(""),
-                                ))));
+                                s.push(value(n)?);
                             }
                             solution = Some(s);
                         }
@@ -445,14 +479,15 @@ impl RuleData {
     }
 }
 
-/// The named variables of a query's result table, with their columns, sorted by name.
+/// The variables of a query's result table that the query names, with their columns,
+/// sorted by name. The engine's own variables start with a space.
 fn table_vars(
     table: &sparkles_core::sparql::table::Table,
     ctx: &sparkles_core::sparql::Ctx,
 ) -> Vec<(String, usize)> {
     let mut out: Vec<(String, usize)> = (0..table.width())
         .map(|c| (ctx.var_name(table.vars[c]), c))
-        .filter(|(n, _)| !n.starts_with('_') && !n.is_empty())
+        .filter(|(n, _)| !n.starts_with(' ') && !n.is_empty())
         .collect();
     out.sort();
     out

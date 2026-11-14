@@ -68,6 +68,27 @@ impl Engine<'_> {
         self.data.resolve_shared(t, self.shapes.bnodes_in_store)
     }
 
+    /// A new number for a query a node expression runs ([`Self::result_id`]).
+    fn next_call(&self) -> u64 {
+        self.query_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The id of a term from the result of query `call`. A blank node the query made,
+    /// rather than one of the store, is new in each query, so its label is kept apart from
+    /// those of the other queries.
+    fn result_id(&self, t: &Term, call: u64) -> Id {
+        match t {
+            Term::BlankNode(b) if sparkles_core::store::parse_bnode_label(b.as_str()).is_none() => {
+                self.lit_id(&Term::BlankNode(oxrdf::BlankNode::new_unchecked(format!(
+                    "q{call}x{}",
+                    b.as_str()
+                ))))
+            }
+            t => self.lit_id(t),
+        }
+    }
+
     fn is_true(&self, id: Id) -> bool {
         matches!(self.data.term(id), Some(Term::Literal(l)) if l.datatype() == xsd::BOOLEAN && matches!(l.value(), "true" | "1"))
     }
@@ -459,27 +480,40 @@ impl Engine<'_> {
                 args,
                 ..
             } => {
-                let mut vals: Vec<Vec<Id>> = Vec::with_capacity(args.len());
-                for a in args {
+                // the nodes of each argument; an optional argument without any is unbound
+                let mut vals: Vec<Vec<Option<Id>>> = Vec::with_capacity(args.len());
+                for (a, (_, optional)) in args.iter().zip(params) {
                     let mut r = self.eval(*a, focus, scope, cx)?;
                     r.sort_unstable();
                     r.dedup();
                     if r.is_empty() {
-                        return Ok(Vec::new());
+                        if !*optional {
+                            return Ok(Vec::new());
+                        }
+                        vals.push(vec![None]);
+                    } else {
+                        vals.push(r.into_iter().map(Some).collect());
                     }
-                    vals.push(r);
                 }
-                // every combination of the arguments' nodes, the last argument fastest
+                // every combination of the arguments' nodes, the last argument fastest;
+                // each call gives the binding of its first solution
                 let mut out = Vec::new();
                 let mut at = vec![0usize; vals.len()];
                 loop {
                     self.check_limits()?;
                     let mut binds: Vec<(&str, Term)> = Vec::with_capacity(params.len());
-                    for (i, p) in params.iter().enumerate() {
-                        binds.push((p.as_str(), self.term(vals[i][at[i]])?));
+                    for (i, (p, _)) in params.iter().enumerate() {
+                        if let Some(v) = vals[i][at[i]] {
+                            binds.push((p.as_str(), self.term(v)?));
+                        }
                     }
                     let (table, ctx) = self.run_query(query, &binds)?;
-                    out.extend(self.table_column(&table, &ctx)?);
+                    if !table.is_empty()
+                        && table.width() > 0
+                        && let Some(t) = Self::result_term(&ctx, table.get(0, 0))
+                    {
+                        out.push(self.result_id(&t, self.next_call()));
+                    }
                     let mut i = vals.len();
                     loop {
                         if i == 0 {
@@ -514,10 +548,11 @@ impl Engine<'_> {
         if table.width() == 0 {
             return Ok(out);
         }
+        let call = self.next_call();
         for row in 0..table.len() {
             let id = table.get(row, 0);
             if let Some(t) = Self::result_term(ctx, id) {
-                out.push(self.lit_id(&t));
+                out.push(self.result_id(&t, call));
             }
         }
         Ok(out)

@@ -8,8 +8,8 @@ use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_reasoner::shacl_af::ShaclAf;
 use sparkles_reasoner::{
-    Cache, Extras, INFERRED_GRAPH, Incremental, Method, Profile, ReasonOptions, ReasonReport,
-    materialize_incremental, materialize_with,
+    Cache, Extras, GraphRef, INFERRED_GRAPH, Incremental, Method, Profile, ReasonOptions,
+    ReasonReport, materialize_incremental, materialize_with,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -21,6 +21,7 @@ const PREFIXES: &str = "@prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 @prefix spin: <http://spinrdf.org/spin#> .
 @prefix sp: <http://spinrdf.org/sp#> .
+@prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .
 ";
 
 fn store_of(ttl: &str) -> Store {
@@ -559,4 +560,198 @@ fn the_report_gives_the_round_cap_and_each_groups_rounds() {
         .map(|g| (g.order, g.rules, g.rounds))
         .collect();
     assert_eq!(groups, vec![(1.0, 1, 2), (2.0, 1, 2)]);
+}
+
+#[test]
+fn fresh_blank_nodes_of_two_executions_stay_apart() {
+    let s = store_of(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x, ex:y ; sh:rule [ a sh:SPARQLRule ;
+           sh:construct \"CONSTRUCT { $this <http://example.org/q> ?b } WHERE { BIND(BNODE() AS ?b) }\" ] .",
+    );
+    run(
+        &s,
+        ShaclAf {
+            one_pass: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let got = inferred(&s);
+    let objects: BTreeSet<&str> = got.iter().map(|t| t.rsplit(' ').next().unwrap()).collect();
+    assert_eq!(
+        objects.len(),
+        2,
+        "each focus node gets its own node: {got:?}"
+    );
+}
+
+#[test]
+fn fresh_blank_nodes_of_two_function_calls_stay_apart() {
+    let s = store_of(
+        "ex:fresh a sh:SPARQLFunction ; sh:parameter [ sh:path ex:arg ] ;
+           sh:select \"SELECT (BNODE() AS ?result) WHERE { }\" .
+         ex:S a sh:NodeShape ; sh:targetNode ex:x, ex:y ; sh:rule [ a sh:TripleRule ;
+           sh:subject sh:this ; sh:predicate ex:q ; sh:object [ ex:fresh ( sh:this ) ] ] .",
+    );
+    run(
+        &s,
+        ShaclAf {
+            one_pass: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let got = inferred(&s);
+    let objects: BTreeSet<&str> = got.iter().map(|t| t.rsplit(' ').next().unwrap()).collect();
+    assert_eq!(objects.len(), 2, "each call gives its own node: {got:?}");
+}
+
+#[test]
+fn a_variable_named_with_an_underscore_is_read() {
+    let s = store_of(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x ; sh:rule [ a sh:SPARQLRule ;
+           sh:construct \"CONSTRUCT { $this <http://example.org/q> ?_v } WHERE { $this <http://example.org/v> ?_v }\" ] .
+         ex:x ex:v 1 .",
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    assert_eq!(
+        inferred(&s),
+        set(&["x q \"1\"^^http://www.w3.org/2001/XMLSchema#integer"])
+    );
+}
+
+#[test]
+fn a_path_from_several_nodes_gives_the_values_of_each() {
+    let s = store_of(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x ; sh:rule [ a sh:TripleRule ;
+           sh:subject sh:this ; sh:predicate ex:friendName ;
+           sh:object [ sh:path ex:name ; sh:nodes [ sh:path ex:friend ] ] ] .
+         ex:x ex:friend ex:a, ex:b . ex:a ex:name \"A\" . ex:b ex:name \"B\" .",
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    assert_eq!(
+        inferred(&s),
+        set(&["x friendName \"A\"", "x friendName \"B\""])
+    );
+}
+
+#[test]
+fn a_shacl_1_2_expression_in_a_rule_is_not_a_cycle() {
+    let s = store_of(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x ; sh:rule [ a sh:TripleRule ;
+           sh:subject sh:this ; sh:predicate ex:friends ;
+           sh:object [ shnex:count [ shnex:pathValues ex:friend ] ] ] .
+         ex:x ex:friend ex:a, ex:b .",
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    assert_eq!(
+        inferred(&s),
+        set(&["x friends \"2\"^^http://www.w3.org/2001/XMLSchema#integer"])
+    );
+}
+
+#[test]
+fn an_optional_function_argument_may_be_empty() {
+    let s = store_of(
+        "ex:plus a sh:SPARQLFunction ;
+           sh:parameter [ sh:path ex:a ] ; sh:parameter [ sh:path ex:b ; sh:optional true ] ;
+           sh:select \"SELECT ($a + COALESCE($b, 0) AS ?result) WHERE { }\" .
+         ex:S a sh:NodeShape ; sh:targetNode ex:x ; sh:rule [ a sh:TripleRule ;
+           sh:subject sh:this ; sh:predicate ex:sum ;
+           sh:object [ ex:plus ( [ sh:path ex:v ] [ sh:path ex:missing ] ) ] ] .
+         ex:x ex:v 2 .",
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    assert_eq!(
+        inferred(&s),
+        set(&["x sum \"2\"^^http://www.w3.org/2001/XMLSchema#integer"])
+    );
+}
+
+#[test]
+fn a_function_call_gives_its_first_solution_only() {
+    let s = store_of(
+        "ex:least a sh:SPARQLFunction ; sh:parameter [ sh:path ex:arg ] ;
+           sh:select \"SELECT ?result WHERE { $arg <http://example.org/v> ?result } ORDER BY ?result\" .
+         ex:S a sh:NodeShape ; sh:targetNode ex:x ; sh:rule [ a sh:TripleRule ;
+           sh:subject sh:this ; sh:predicate ex:least ;
+           sh:object [ ex:least ( sh:this ) ] ] .
+         ex:x ex:v 3, 1, 2 .",
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    assert_eq!(
+        inferred(&s),
+        set(&["x least \"1\"^^http://www.w3.org/2001/XMLSchema#integer"])
+    );
+}
+
+#[test]
+fn an_unbound_variable_and_an_empty_string_name_different_blank_nodes() {
+    let s = store_of(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x ; sh:rule [ a sh:SPARQLRule ;
+           sh:construct \"CONSTRUCT { $this <http://example.org/q> _:b } WHERE { { BIND('' AS ?o) } UNION { } }\" ] .",
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    let got = inferred(&s);
+    assert_eq!(got.len(), 2, "{got:?}");
+}
+
+#[test]
+fn a_spin_rule_whose_variable_only_starts_with_this_runs_once() {
+    // ?thisOne is not ?this, so the rule is global and runs although ex:Thing has no
+    // instances
+    let s = store_of(
+        "ex:Thing spin:rule [ a sp:Construct ;
+           sp:text \"CONSTRUCT { ?thisOne a <http://example.org/Flagged> } WHERE { ?thisOne <http://example.org/p> ?o }\" ] .
+         ex:a ex:p 1 .",
+    );
+    run(&s, ShaclAf::default()).unwrap();
+    assert_eq!(inferred(&s), set(&["a a Flagged"]));
+}
+
+#[test]
+fn a_shapes_graph_iri_with_a_query_string_round_trips() {
+    let cfg = ShaclAf {
+        shapes: vec!["http://example.org/g?a=1&b=50%25".into()],
+        ..Default::default()
+    };
+    let text = cfg.text();
+    assert_eq!(text, "shacl-af?shapes=http://example.org/g?a=1%26b=50%2525");
+    assert_eq!(text.parse::<Profile>().unwrap(), Profile::ShaclAf(cfg));
+    assert!("shacl-af?shapes=urn:x%2".parse::<Profile>().is_err());
+}
+
+#[test]
+fn the_shapes_graphs_are_watched_with_the_inputs() {
+    let s = store_of("ex:x a ex:A .");
+    s.load(&[Source::from_bytes(
+        format!(
+            "{PREFIXES}ex:S a sh:NodeShape ; sh:targetClass ex:A ;
+               sh:rule [ a sh:TripleRule ; sh:subject sh:this ; sh:predicate ex:p ; sh:object 1 ] ."
+        )
+        .into_bytes(),
+        RdfFormat::Turtle,
+        Some(NamedNode::new("urn:x:shapes").unwrap()),
+    )])
+    .unwrap();
+    let r = run(
+        &s,
+        ShaclAf {
+            shapes: vec!["urn:x:shapes".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let inputs = r.inputs.as_ref().unwrap();
+    assert!(
+        inputs
+            .watched()
+            .contains(&GraphRef::Named("urn:x:shapes".into())),
+        "{inputs:?}"
+    );
+    assert!(
+        !inputs
+            .graphs
+            .contains(&GraphRef::Named("urn:x:shapes".into()))
+    );
 }

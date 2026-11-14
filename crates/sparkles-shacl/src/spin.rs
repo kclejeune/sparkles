@@ -112,7 +112,13 @@ pub fn translate(graph: &Graph, prefixes: &[(String, String)]) -> Result<Graph> 
         };
         let shape = fresh();
         let r = fresh();
-        let mentions_this = text.contains("?this") || text.contains("$this");
+        // a variable named this in the parsed query, not a word in a comment or a
+        // longer variable name
+        let full = format!("{head}{text}");
+        let parsed = sparkles_core::sparql::parse_query(&full, None, &[])
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| e.context(format!("the sp:text of the SPIN rule {rule}")))?;
+        let mentions_this = mentions_this(&parsed.to_string());
         let target = if mentions_this {
             sh::TARGET_CLASS
         } else {
@@ -125,8 +131,39 @@ pub fn translate(graph: &Graph, prefixes: &[(String, String)]) -> Result<Graph> 
         out.insert(&Triple::new(
             r,
             sh::CONSTRUCT,
-            Literal::new_simple_literal(format!("{head}{text}")),
+            Literal::new_simple_literal(full),
         ));
     }
     Ok(out)
+}
+
+/// Whether the text of a parsed query, in which every variable is written `?name`, uses
+/// the variable `this` outside its string literals and IRIs.
+fn mentions_this(q: &str) -> bool {
+    let b: Vec<char> = q.chars().collect();
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < b.len() {
+        match (quote, b[i]) {
+            (Some(_), '\\') => i += 1,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, c @ ('"' | '\'')) => quote = Some(c),
+            // an IRI, which a comparison's `<` never starts, since it is followed by a
+            // space or `=`
+            (None, '<')
+                if b.get(i + 1)
+                    .is_some_and(|n| !n.is_whitespace() && *n != '=') =>
+            {
+                quote = Some('>');
+            }
+            (None, '?') if b[i + 1..].starts_with(&['t', 'h', 'i', 's']) && !word(b.get(i + 5)) => {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
