@@ -762,7 +762,59 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
             "Domain scope: predicate IRIs to N-Triples terms. Profile, PROV-O and structural predicates are refused.",
         )
     };
+    let claim_terms = || {
+        with_desc(
+            json!({ "type": "object", "additionalProperties": array(string()) }),
+            "Domain scope: predicate IRIs to N-Triples terms. Profile, valid-time, PROV-O and structural predicates are refused. A claim's validity uses its validity member.",
+        )
+    };
     let date_time = |d: &str| with_desc(json!({ "type": "string", "format": "date-time" }), d);
+    let boundary = || {
+        with_desc(
+            closed(
+                &["kind"],
+                json!({
+                    "kind": string_enum(&["known", "unknown", "unbounded"]),
+                    "earliest": date_time("A known boundary's earliest possible instant, inclusive, with an explicit offset."),
+                    "latest": date_time("A known boundary's latest possible instant, inclusive, with an explicit offset."),
+                    "precision": iri("A known boundary's source precision, such as urn:x-sparkles:valid-time:Day."),
+                    "sourceValue": with_desc(string(), "The source's original expression. A known boundary requires it."),
+                }),
+            ),
+            "A known boundary has earliest, latest, precision and sourceValue. An unknown or unbounded boundary has no instants or precision.",
+        )
+    };
+    let validity = || {
+        with_desc(
+            closed(
+                &["start", "end", "normalization"],
+                json!({
+                    "start": boundary(),
+                    "end": boundary(),
+                    "normalization": closed(
+                        &["status", "method", "methodVersion", "calendar"],
+                        json!({
+                            "status": string_enum(&[
+                                "normalized",
+                                "unresolved",
+                                "unsupportedCalendar",
+                                "unsupportedPrecision",
+                                "indeterminateOrder",
+                                "nonexistentLocalTime",
+                            ]),
+                            "method": iri("The normalization method."),
+                            "methodVersion": with_desc(string(), "The method's version. It cannot be empty."),
+                            "calendar": iri("The calendar. Normalized values use urn:x-sparkles:valid-time:Gregorian."),
+                            "timezonePolicy": with_desc(string(), "The declared timezone policy. It cannot be empty."),
+                            "tzdbVersion": with_desc(string(), "The pinned timezone database version. It cannot be empty."),
+                            "foldChoice": with_desc(string_enum(&["earlier", "later"]), "The choice for an ambiguous local time. It requires timezonePolicy and tzdbVersion."),
+                        }),
+                    ),
+                }),
+            ),
+            "The claim's C27 validity record, a half-open interval written with the claim and covered by its record digest. The latest start must precede the earliest end of two known boundaries.",
+        )
+    };
     put(
         "EvidenceProposal",
         doc(
@@ -854,11 +906,12 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                             "kind": string_enum(&["reported", "observation", "hypothesis", "preference"]),
                             "polarity": string_enum(&["positive", "negative", "uncertain"]),
                             "author": iri("The attributed source author, not the authenticated caller."),
-                            "scope": terms(),
+                            "scope": claim_terms(),
                             "confidence": closed(
                                 &[],
                                 json!({ "source": confidence(), "extraction": confidence(), "analyst": confidence() }),
                             ),
+                            "validity": validity(),
                         }),
                     )),
                     "links": array(closed(

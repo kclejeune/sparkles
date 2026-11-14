@@ -276,7 +276,9 @@ mail addresses, shared infrastructure and organization roles retain their distin
 source meanings. An account does not become a person because its display name matches.
 
 The common predicate `vt:validDuring`, in `urn:x-sparkles:valid-time:`, attaches C27
-validity records. Recorded time, first availability, source publication and valid time
+validity records. A claim proposal carries its validity record as an optional member that
+the writer records with the claim, as [C27 §4.4](C27-valid-time-profiles.md#44-validity-records-through-the-authenticated-writer)
+specifies. Recorded time, first availability, source publication and valid time
 remain distinct. Missing validity means unknown validity, not an interval of all time.
 `vt:expiresAt` is a review or freshness deadline for current use. It does not end the
 underlying claim's valid-time interval or prove that the old claim is false.

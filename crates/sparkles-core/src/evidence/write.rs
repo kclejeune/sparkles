@@ -49,6 +49,7 @@ use super::{
     BlankAnchor, ClaimKind, Confidence, EvidenceRefTarget, EvidenceRelation, GraphIdentity,
     IdentityNamespace, MethodRef, Polarity, RecordKey, RecordKind, RecordRef, RenditionContent,
     Settings, Sha256Digest, SourceContent,
+    model::{BoundaryInput, ValidityInput},
 };
 use crate::access::{Preparation, Reservation};
 use crate::id::Id;
@@ -78,6 +79,10 @@ const LARGE: [&str; 2] = [
 
 pub(super) fn ev(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EV}{local}"))
+}
+
+fn vt(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("urn:x-sparkles:valid-time:{local}"))
 }
 
 pub(super) fn prov(local: &str) -> NamedNode {
@@ -291,6 +296,81 @@ impl Record {
 
     fn on(&mut self, s: &NamedNode, p: NamedNode, o: impl Into<Term>) {
         self.triples.push(Triple::new(s.clone(), p, o.into()));
+    }
+
+    /// The claim's C27 validity record (spec C27 §4.4): its interval, boundaries and
+    /// normalization as fragment IRIs of the claim, with known instants in UTC.
+    fn validity(&mut self, v: &ValidityInput) -> Result<()> {
+        let at = |fragment: &str| {
+            NamedNode::new_unchecked(format!("{}#{fragment}", self.subject.as_str()))
+        };
+        let (interval, start, end, normalization) = (
+            at("validity"),
+            at("validity-start"),
+            at("validity-end"),
+            at("validity-normalization"),
+        );
+        self.add(vt("validDuring"), interval.clone());
+        self.on(&interval, rdf_type(), vt("Interval"));
+        self.on(&interval, vt("start"), start.clone());
+        self.on(&interval, vt("end"), end.clone());
+        self.on(&interval, vt("normalization"), normalization.clone());
+        self.boundary(&start, &v.start)?;
+        self.boundary(&end, &v.end)?;
+        let n = &v.normalization;
+        self.on(&normalization, rdf_type(), vt("Normalization"));
+        self.on(&normalization, vt("status"), vt(n.status.local()));
+        self.on(&normalization, vt("method"), n.method.clone());
+        self.on(
+            &normalization,
+            vt("methodVersion"),
+            string(&n.method_version),
+        );
+        self.on(&normalization, vt("calendar"), n.calendar.clone());
+        if let Some(p) = &n.timezone_policy {
+            self.on(&normalization, vt("timezonePolicy"), string(p));
+        }
+        if let Some(v) = &n.tzdb_version {
+            self.on(&normalization, vt("tzdbVersion"), string(v));
+        }
+        if let Some(f) = n.fold_choice {
+            self.on(&normalization, vt("foldChoice"), string(f.as_str()));
+        }
+        Ok(())
+    }
+
+    fn boundary(&mut self, node: &NamedNode, b: &BoundaryInput) -> Result<()> {
+        self.on(node, rdf_type(), vt("Boundary"));
+        let source = match b {
+            BoundaryInput::Known {
+                earliest,
+                latest,
+                precision,
+                source_value,
+            } => {
+                self.on(node, vt("kind"), vt("Known"));
+                self.on(
+                    node,
+                    vt("earliest"),
+                    super::prepare::validity_utc(earliest)?,
+                );
+                self.on(node, vt("latest"), super::prepare::validity_utc(latest)?);
+                self.on(node, vt("precision"), precision.clone());
+                Some(source_value)
+            }
+            BoundaryInput::Unknown { source_value } => {
+                self.on(node, vt("kind"), vt("Unknown"));
+                source_value.as_ref()
+            }
+            BoundaryInput::Unbounded { source_value } => {
+                self.on(node, vt("kind"), vt("Unbounded"));
+                source_value.as_ref()
+            }
+        };
+        if let Some(value) = source {
+            self.on(node, vt("sourceValue"), string(value));
+        }
+        Ok(())
     }
 
     fn method(&mut self, method: &MethodRef) {
@@ -711,6 +791,9 @@ pub fn plan<'i>(
         r.confidence("sourceConfidence", claim.confidence.source.as_ref());
         r.confidence("extractionConfidence", claim.confidence.extraction.as_ref());
         r.confidence("analystConfidence", claim.confidence.analyst.as_ref());
+        if let Some(validity) = &claim.validity {
+            r.validity(validity)?;
+        }
         b.local.insert(claim.key.as_str(), iri);
         push(
             &mut records,

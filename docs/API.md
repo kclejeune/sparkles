@@ -13312,6 +13312,35 @@ existed. Inputs and targets of the batch's assessments may not form a cycle.
 [Evidence dependents](#evidence-dependents) finds the assessments that used a record
 after it changed.
 
+A claim's optional `validity` is its [valid-time](ai/README.md#valid-time-profile) record,
+a half-open interval with a `start` and an `end` boundary and the `normalization` that
+interpreted the source time.
+
+```json
+"validity": {
+  "start": {"kind": "known", "earliest": "2026-01-01T00:00:00Z",
+            "latest": "2026-01-01T00:00:00Z",
+            "precision": "urn:x-sparkles:valid-time:Day", "sourceValue": "1 January 2026"},
+  "end": {"kind": "unknown", "sourceValue": "until further notice"},
+  "normalization": {"status": "normalized", "method": "https://example.org/methods/dates",
+                    "methodVersion": "1", "calendar": "urn:x-sparkles:valid-time:Gregorian"}
+}
+```
+
+A boundary's `kind` is `known`, `unknown` or `unbounded`. A known boundary needs
+`earliest`, `latest`, `precision` and `sourceValue`, and its instants need an explicit
+offset and are stored in UTC. The other kinds have no instants. The normalization's
+`status` is `normalized`, `unresolved`, `unsupportedCalendar`, `unsupportedPrecision`,
+`indeterminateOrder` or `nonexistentLocalTime`, and it may add `timezonePolicy`,
+`tzdbVersion` and a `foldChoice` of `earlier` or `later`. The server answers
+`400 invalid-proposal` to what the version 1 shapes refuse, such as a reversed boundary, two known boundaries whose latest
+start does not precede the earliest end, a normalized status outside the Gregorian
+calendar, or a fold choice without a timezone policy and database version. The record
+is written with the claim in the proposal graph under fragment IRIs of the claim and is
+covered by its record digest. A claim without it keeps the record and payload digests
+it would have had before the field existed. Claim `scope` cannot name `vt:` predicates, while an assessment's scope can, for
+example with `vt:expiresAt`.
+
 Source revisions, renditions and passages go to the
 [evidence settings'](#evidence-settings) source-record graph, identity proposals to an
 identity graph, and the other records to the proposal graph. The caller needs update grants on every graph the batch writes, and

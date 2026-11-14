@@ -361,6 +361,7 @@ fn propose_by(
             attributed_author: author,
             scope: Default::default(),
             confidence: Default::default(),
+            validity: None,
         }],
         ..Default::default()
     };

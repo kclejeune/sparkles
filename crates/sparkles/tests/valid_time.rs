@@ -648,6 +648,7 @@ mod availability {
                 attributed_author: iri("urn:test:publisher"),
                 scope: Default::default(),
                 confidence: Default::default(),
+                validity: None,
             }],
             ..Default::default()
         }
@@ -910,5 +911,106 @@ mod availability {
         // time holds both and the millisecond before holds neither
         assert_eq!(claims_at(&ds, At::Time(MARCH)).len(), 2);
         assert!(claims_at(&ds, At::Time(MARCH - 1)).is_empty());
+    }
+
+    /// A validity record of 2100-01-01 to 2100-02-01 with its normalization.
+    fn january_validity() -> evidence::ValidityInput {
+        let known = |at: &str, source: &str| evidence::BoundaryInput::Known {
+            earliest: Literal::new_typed_literal(
+                at,
+                iri("http://www.w3.org/2001/XMLSchema#dateTime"),
+            ),
+            latest: Literal::new_typed_literal(
+                at,
+                iri("http://www.w3.org/2001/XMLSchema#dateTime"),
+            ),
+            precision: iri(&format!("{VT}Day")),
+            source_value: source.into(),
+        };
+        evidence::ValidityInput {
+            start: known("2100-01-01T01:00:00+01:00", "1 January 2100"),
+            end: known("2100-02-01T00:00:00Z", "1 February 2100"),
+            normalization: evidence::NormalizationInput {
+                status: evidence::NormalizationStatus::Normalized,
+                method: iri("urn:test:explicit-offset"),
+                method_version: "1".into(),
+                calendar: iri(&format!("{VT}Gregorian")),
+                timezone_policy: None,
+                tzdb_version: None,
+                fold_choice: None,
+            },
+        }
+    }
+
+    /// Validity proposed through the authenticated writer (spec C27 §4.4) is read by
+    /// the templates like ordinary profile RDF, conforms to the version 1 shapes and
+    /// stays out of states before the commit that published it.
+    #[test]
+    fn validity_records_through_the_writer_answer_the_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::open(dir.path()).unwrap();
+        let now = clock(&ds, JANUARY);
+        ds.update("INSERT DATA { GRAPH <urn:test:other> { <urn:test:a> <urn:test:b> 1 } }")
+            .unwrap();
+        configure(&ds);
+        now.store(MARCH, Ordering::SeqCst);
+        let mut input = import("advisory");
+        input.claims[0].validity = Some(january_validity());
+        let p = propose(&ds, &input).unwrap();
+        let claim = record_iri(&p, "claim");
+        // a January instant is definitely inside, and validity is reported at the head
+        // only, because the claim became available in March
+        assert_eq!(
+            claims_at(&ds, At::Head)
+                .get(claim.as_str())
+                .map(String::as_str),
+            Some("definite")
+        );
+        assert!(claims_at(&ds, At::Time(FEBRUARY)).is_empty());
+        // known instants are stored in UTC beside their source expressions
+        assert!(ds.query(&format!(
+            "ASK {{ GRAPH <{CLAIMS}> {{ <{c}> <{VT}validDuring> <{c}#validity> .
+                <{c}#validity> <{VT}start> ?s . ?s <{VT}earliest> \"2100-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> ;
+                <{VT}sourceValue> \"1 January 2100\" }} }}",
+            c = claim.as_str()
+        )).unwrap().boolean);
+        #[cfg(feature = "shacl")]
+        {
+            let graph = ds
+                .query(&format!(
+                    "CONSTRUCT {{ ?s ?p ?o }} WHERE {{ GRAPH <{CLAIMS}> {{ ?s ?p ?o }} }}"
+                ))
+                .unwrap();
+            let nt: String = graph.triples.iter().map(|t| format!("{t} .\n")).collect();
+            assert!(nt.contains("valid-time:validDuring"), "{nt}");
+            assert!(conforms(&nt), "{nt}");
+        }
+        // the same validity replays as the existing record
+        let again = propose(&ds, &input).unwrap();
+        assert!(
+            again.records.iter().all(|r| r.existing),
+            "{:?}",
+            again.records
+        );
+        // the record is immutable: the same occurrence with other validity conflicts
+        let head = ds.store().head_commit();
+        let mut other = import("advisory");
+        let mut changed = january_validity();
+        changed.end = evidence::BoundaryInput::Unbounded { source_value: None };
+        other.claims[0].validity = Some(changed);
+        assert_eq!(code(propose(&ds, &other)), "immutable-record-conflict");
+        // an interval the shapes refuse, and validity through open scope, write nothing
+        let mut bad = import("advisory-2");
+        let mut reversed = january_validity();
+        std::mem::swap(&mut reversed.start, &mut reversed.end);
+        bad.claims[0].validity = Some(reversed);
+        assert_eq!(code(propose(&ds, &bad)), "invalid");
+        let mut scoped = import("advisory-3");
+        scoped.claims[0].scope.insert(
+            format!("{VT}validDuring"),
+            vec![iri("urn:test:period").into()],
+        );
+        assert_eq!(code(propose(&ds, &scoped)), "invalid");
+        assert_eq!(ds.store().head_commit(), head);
     }
 }

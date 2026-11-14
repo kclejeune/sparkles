@@ -125,6 +125,9 @@ pub use sparkles_core::evidence::{
     RecordVersion, RenditionContent, RenditionInput, Scope, SourceContent, SourceLineage,
     SourceMetadata, SourceRevisionInput, SourceTimes,
 };
+pub use sparkles_core::evidence::{
+    BoundaryInput, FoldChoice, NormalizationInput, NormalizationStatus, ValidityInput,
+};
 
 // ------------------------------------------------------------ settings ------------
 
