@@ -577,80 +577,60 @@ impl Base {
         let mut del = changed.then(|| snap.delta.del[pi].range(lo..=hi).peekable());
         let mut stopped = false;
         {
-            let mut rows_of =
-                |blk: &Block, whole: bool, from: usize, f: &mut dyn FnMut(Triple) -> bool| {
-                    let (s, e) = if whole {
-                        (0, blk.len())
-                    } else {
-                        blk.key_range(&lo, &hi)
-                    };
-                    let s = s.max(from);
-                    let cols = &blk.cols;
-                    let (Some(ins), Some(del)) = (&mut ins, &mut del) else {
-                        return (s..e)
-                            .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f));
-                    };
-                    for i in s..e {
-                        let k = [cols[0][i], cols[1][i], cols[2][i], cols[3][i]];
-                        // an inserted key is not in the base, and a deleted one is
-                        while let Some(a) = ins.next_if(|a| **a < k) {
-                            if !row(*a, f) {
-                                return false;
-                            }
-                        }
-                        while del.next_if(|d| **d < k).is_some() {}
-                        if del.next_if(|d| **d == k).is_some() {
-                            continue;
-                        }
-                        if !row(k, f) {
+            let mut rows_of = |blk: &Block, whole: bool, f: &mut dyn FnMut(Triple) -> bool| {
+                let (s, e) = if whole {
+                    (0, blk.len())
+                } else {
+                    blk.key_range(&lo, &hi)
+                };
+                let cols = &blk.cols;
+                let (Some(ins), Some(del)) = (&mut ins, &mut del) else {
+                    return (s..e)
+                        .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f));
+                };
+                for i in s..e {
+                    let k = [cols[0][i], cols[1][i], cols[2][i], cols[3][i]];
+                    // an inserted key is not in the base, and a deleted one is
+                    while let Some(a) = ins.next_if(|a| **a < k) {
+                        if !row(*a, f) {
                             return false;
                         }
                     }
-                    true
-                };
-            // a kept closure's reader often stops at the first facts of a long range,
-            // which its lookups then remember
-            let lazy = self.lookups.is_some();
+                    while del.next_if(|d| **d < k).is_some() {}
+                    if del.next_if(|d| **d == k).is_some() {
+                        continue;
+                    }
+                    if !row(k, f) {
+                        return false;
+                    }
+                }
+                true
+            };
             'blocks: for b in b0..b1 {
                 let m = &idx.blocks[b];
                 let whole = m.first >= lo && m.last <= hi;
-                let held = memo.slot(idx.uid, b, WHOLE).is_some();
-                let span = if whole || held {
-                    None
-                } else {
-                    idx.read_span(&snap.cache, b, &lo, &hi, ALL_COLS)
-                };
-                if let Some((s0, s1)) = span {
-                    for s in s0..s1 {
-                        if !rows_of(memo.segment(snap, idx, b, s)?, false, 0, &mut f) {
-                            stopped = true;
-                            break 'blocks;
-                        }
+                if whole {
+                    if !rows_of(memo.block(snap, idx, b)?, true, &mut f) {
+                        stopped = true;
+                        break;
                     }
                     continue;
                 }
-                // the block is read whole. In the first block of such a reader's scan, the
-                // segment with the range's first rows is read alone before that: a reader
-                // that stops there has decoded a sixteenth of the block
-                let mut from = 0;
-                if lazy && b == b0 && !held {
-                    let start = if m.first >= lo { m.first } else { lo };
-                    if let Some((s0, _)) = idx.read_span(&snap.cache, b, &start, &start, ALL_COLS) {
-                        let seg = memo.segment(snap, idx, b, s0)?;
-                        let ends = seg.len() > 0 && seg.key(seg.len() - 1) >= hi;
-                        if !rows_of(seg, false, 0, &mut f) {
+                match memo.rows(snap, idx, b, &lo, &hi)? {
+                    Rows::Whole(blk) => {
+                        if !rows_of(blk, false, &mut f) {
                             stopped = true;
                             break;
                         }
-                        if ends {
-                            continue;
-                        }
-                        from = idx.segment_rows(b, s0).1;
                     }
-                }
-                if !rows_of(memo.block(snap, idx, b)?, whole, from, &mut f) {
-                    stopped = true;
-                    break;
+                    Rows::Segments(s0, s1) => {
+                        for s in s0..s1 {
+                            if !rows_of(memo.segment(snap, idx, b, s)?, false, &mut f) {
+                                stopped = true;
+                                break 'blocks;
+                            }
+                        }
+                    }
                 }
             }
         }
