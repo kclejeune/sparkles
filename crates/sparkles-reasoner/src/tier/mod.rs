@@ -135,6 +135,42 @@ impl<'a> Cands<'a> {
         self.parts.is_empty()
     }
 
+    /// The ids visited: counted when a piece is filtered by the range and the candidates
+    /// are at most `exact`, and [`len`](Self::len), an upper bound, otherwise.
+    pub fn count(&self, exact: usize) -> usize {
+        let len = self.len();
+        if len <= exact && self.parts.iter().any(|p| matches!(p, Part::Ids(_, true))) {
+            self.iter().count()
+        } else {
+            len
+        }
+    }
+
+    /// Up to `n` of the ids, evenly spaced over the candidates in their order.
+    pub fn spread(&self, n: usize) -> impl Iterator<Item = u32> + '_ {
+        let len = self.len();
+        let step = len.div_ceil(n.max(1)).max(1);
+        (0..len).step_by(step).filter_map(move |k| self.nth(k))
+    }
+
+    /// Candidate `k` in order, when the range admits it.
+    fn nth(&self, mut k: usize) -> Option<u32> {
+        for p in &self.parts {
+            let n = p.len();
+            if k < n {
+                return match *p {
+                    Part::Ids(s, filtered) => {
+                        let id = s[k];
+                        (!filtered || (id >= self.lo && id < self.hi)).then_some(id)
+                    }
+                    Part::Range(a, _) => Some(a + k as u32),
+                };
+            }
+            k -= n;
+        }
+        None
+    }
+
     /// The ids, in order.
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
@@ -924,6 +960,29 @@ mod tests {
 
     fn ids(c: Cands<'_>) -> Vec<u32> {
         c.iter().collect()
+    }
+
+    #[test]
+    fn spread_and_count_of_candidates() {
+        // 40 facts of one subject, and a range that admits every other one
+        let ts: Vec<Triple> = (0..40).map(|i| [1, 10, 100 + i]).collect();
+        let t = tier(&ts);
+        let all = t.cands(Some(1), Some(10), None, 0, 40);
+        assert_eq!(all.len(), 40);
+        assert_eq!(all.count(256), 40);
+        let picked: Vec<u32> = all.spread(4).collect();
+        assert_eq!(picked, [0, 10, 20, 30]);
+        // more asked for than there are: each once
+        assert_eq!(all.spread(100).count(), 40);
+        assert_eq!(Cands::empty().spread(4).count(), 0);
+        assert_eq!(Cands::range(5, 9).spread(2).collect::<Vec<_>>(), [5, 7]);
+        // a part of the range: the count is exact below the bound and `len` above it
+        let part = t.cands(Some(1), Some(10), None, 10, 20);
+        let exact = ids(part.clone()).len();
+        assert_eq!(exact, 10);
+        assert_eq!(part.count(256), exact);
+        assert!(part.count(0) >= exact);
+        assert!(part.spread(64).all(|id| (10..20).contains(&id)));
     }
 
     #[test]

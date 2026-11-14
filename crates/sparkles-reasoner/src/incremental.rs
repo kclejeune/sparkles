@@ -1897,6 +1897,7 @@ pub(crate) mod tests {
             max_inferred: 10_000_000,
             budget: Budget::unlimited(),
             closures: false,
+            sampled_planning: false,
             cancel: None,
             progress: None,
         }

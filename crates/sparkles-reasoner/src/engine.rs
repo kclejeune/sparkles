@@ -14,6 +14,9 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+pub(crate) mod planprobe;
+pub(crate) mod sampled;
+
 // ================================================================== compile ====
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1588,6 +1591,9 @@ pub(crate) struct Limits {
     /// evaluate transitive and equivalence rules with closure operators
     /// ([`crate::closure`]) when the program allows it
     pub closures: bool,
+    /// order rule bodies from sampled bindings ([`sampled`]) where the sample makes an
+    /// order clearly cheaper than the greedy one
+    pub sampled_planning: bool,
 }
 
 pub(crate) struct Outcome {
@@ -1957,8 +1963,21 @@ pub(crate) fn plan_iteration(
     ds: u32,
     de: u32,
     candidates: Option<&[usize]>,
+    sampled: bool,
 ) -> Vec<(usize, Vec<Step>)> {
     let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
+    let started = std::time::Instant::now();
+    // the plans the sample changed, for the log
+    let mut changed = 0usize;
+    let mut plan = |r: &CRule, ranges: &[(u32, u32)]| -> Option<Vec<Step>> {
+        if sampled {
+            let (steps, by_sample) = sampled::plan(g, r, ranges)?;
+            changed += usize::from(by_sample);
+            Some(steps)
+        } else {
+            plan(r, ranges, Some(g))
+        }
+    };
     // a join with an atom whose constant predicate has no rows in its range is empty
     let empty = |r: &CRule, ranges: &[(u32, u32)], g: &Graph| {
         r.atoms.iter().zip(ranges).any(|(a, &(lo, hi))| match a.p {
@@ -1982,7 +2001,7 @@ pub(crate) fn plan_iteration(
             if empty(r, &ranges, g) {
                 continue;
             }
-            if let Some(p) = plan(r, &ranges, Some(g)) {
+            if let Some(p) = plan(r, &ranges) {
                 tasks.push((ri, p));
             }
             continue;
@@ -1994,7 +2013,7 @@ pub(crate) fn plan_iteration(
         if implicit_delta {
             let ranges = vec![(0, de); r.atoms.len()];
             if !empty(r, &ranges, g)
-                && let Some(p) = plan(r, &ranges, Some(g))
+                && let Some(p) = plan(r, &ranges)
             {
                 tasks.push((ri, p));
             }
@@ -2021,10 +2040,18 @@ pub(crate) fn plan_iteration(
             if empty(r, &ranges, g) {
                 continue;
             }
-            if let Some(p) = plan(r, &ranges, Some(g)) {
+            if let Some(p) = plan(r, &ranges) {
                 tasks.push((ri, p));
             }
         }
+    }
+    if sampled {
+        tracing::debug!(
+            plans = tasks.len(),
+            changed,
+            plan_us = started.elapsed().as_micros() as u64,
+            "sampled rule plans"
+        );
     }
     tasks
 }
@@ -2121,6 +2148,7 @@ pub(crate) fn run_observed(
                 ds,
                 de,
                 candidates.as_ref().map(|(c, _)| c.as_slice()),
+                limits.sampled_planning,
             ),
             _ => {
                 let keep = |ri: &usize| {
@@ -2130,11 +2158,27 @@ pub(crate) fn run_observed(
                     Some((c, _)) => c.iter().copied().filter(keep).collect(),
                     None => (0..rules.len()).filter(keep).collect(),
                 };
-                plan_iteration(g, rules, naive, ds, de, Some(&list))
+                plan_iteration(
+                    g,
+                    rules,
+                    naive,
+                    ds,
+                    de,
+                    Some(&list),
+                    limits.sampled_planning,
+                )
             }
         };
         if !refresh.is_empty() {
-            tasks.extend(plan_iteration(g, rules, true, ds, de, Some(&refresh)));
+            tasks.extend(plan_iteration(
+                g,
+                rules,
+                true,
+                ds,
+                de,
+                Some(&refresh),
+                limits.sampled_planning,
+            ));
             refresh.clear();
         }
         for (ri, p) in &tasks {
@@ -2147,6 +2191,23 @@ pub(crate) fn run_observed(
                 g.ensure_index(false, true)
                     .map_err(|e| memory(e, iteration))?;
             }
+        }
+        if planprobe::enabled() {
+            g.ensure_index(true, true)
+                .map_err(|e| memory(e, iteration))?;
+            g.ensure_index(false, true)
+                .map_err(|e| memory(e, iteration))?;
+            planprobe::probe(
+                g,
+                rules,
+                terms,
+                &tasks,
+                iteration,
+                !(iteration == 0 && start.is_none()),
+                ds,
+                de,
+                limits,
+            );
         }
         // ---- split into parallel work items
         let gr: &Graph = g;
@@ -2669,6 +2730,7 @@ mod tests {
                         progress: None,
                         budget: Budget::unlimited(),
                         closures: false,
+                        sampled_planning: false,
                     };
                     run(&mut g, &[r], &t, &lim, None).unwrap();
                     let list = g
@@ -2770,8 +2832,9 @@ mod index_tests {
                     ds,
                     de,
                     candidates.as_ref().map(|(c, _)| c.as_slice()),
+                    false,
                 );
-                let every = plan_iteration(&g, &rules, naive, ds, de, None);
+                let every = plan_iteration(&g, &rules, naive, ds, de, None, false);
                 planned += every.len();
                 skipped += candidates
                     .as_ref()

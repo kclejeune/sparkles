@@ -331,6 +331,24 @@ impl Base {
 
     /// The permutation and the key range of a pattern.
     fn access(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> (Perm, Key, Key) {
+        let (perm, prefix, n) = self.prefix(s, p, o);
+        (perm, pad(&prefix[..n], 0), pad(&prefix[..n], u64::MAX))
+    }
+
+    /// The store's quads in the key range of a pattern: an upper bound of the tier's
+    /// facts that match it, as [`count_p`](Self::count_p) is of a predicate's, since a
+    /// pattern without a subject counts the quads of every graph and a pattern with a
+    /// subject and an object but no predicate counts the subject's.
+    pub fn count(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> u64 {
+        let (perm, prefix, n) = self.prefix(s, p, o);
+        if let (1, Some(p)) = (n, p) {
+            return self.count_p(p);
+        }
+        self.snap.count(perm, &prefix[..n]).unwrap_or(u64::MAX / 4)
+    }
+
+    /// The permutation and the key prefix of a pattern.
+    fn prefix(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> (Perm, [u64; 4], usize) {
         let (perm, prefix, n): (Perm, [u64; 4], usize) = match (self.single(), s, p, o) {
             (Some(g), Some(s), Some(p), Some(o)) => (Perm::Gspo, [g, s, p, o], 4),
             (Some(g), Some(s), Some(p), None) => (Perm::Gspo, [g, s, p, 0], 3),
@@ -344,7 +362,7 @@ impl Base {
             (_, None, None, Some(o)) => (Perm::Osp, [o, 0, 0, 0], 1),
             (_, None, None, None) => (Perm::Spo, [0; 4], 0),
         };
-        (perm, pad(&prefix[..n], 0), pad(&prefix[..n], u64::MAX))
+        (perm, prefix, n)
     }
 
     /// Visit the facts matching a pattern, in the order of the module documentation.
@@ -716,6 +734,53 @@ impl Base {
         Ok(out)
     }
 
+    /// Offers `f` facts that match a pattern until it has taken `n`, for a sample of the
+    /// pattern's facts: runs of facts from the starts of up to `starts` blocks of the
+    /// pattern's scan at evenly spaced positions, so that the facts of a long scan come
+    /// from along its length without a read of the blocks between them. `f` returns
+    /// whether it took the fact. A scan within one block gives its first facts, and each
+    /// start gives up after a few facts that `f` does not take.
+    pub fn sample(
+        &self,
+        memo: &mut Memo,
+        [s, p, o]: [Option<u64>; 3],
+        n: usize,
+        starts: usize,
+        mut f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let (perm, lo, hi) = self.access(s, p, o);
+        let idx = self.snap.perm(perm);
+        let (b0, b1) = idx.key_block_range(&lo, &hi);
+        let starts = (b1 - b0).clamp(1, starts.clamp(1, n));
+        let multi = self.single().is_none();
+        let mut taken = 0usize;
+        for k in 0..starts {
+            let b = b0 + k * (b1 - b0) / starts;
+            // the first key of the block, or of its first triple with several input
+            // graphs, whose graph column is last
+            let mut from = if k == 0 { lo } else { idx.blocks[b].first };
+            if k > 0 && multi {
+                from[3] = 0;
+            }
+            // what is left, over the starts that are left
+            let quota = (n - taken).div_ceil(starts - k);
+            let (mut got, mut offered) = (0usize, 0usize);
+            self.scan(memo, perm, from.max(lo), hi, [s, p, o], None, |t| {
+                offered += 1;
+                got += usize::from(f(t));
+                got < quota && offered < 4 * quota + 8
+            })?;
+            taken += got;
+            if taken >= n {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a triple is a fact of the tier.
     pub fn contains(&self, t: &Triple) -> anyhow::Result<bool> {
         self.contains_with(&mut Memo::default(), t)
@@ -941,6 +1006,96 @@ mod tests {
     /// a scan of whole blocks gives, in the same order: every pattern of bound positions,
     /// a probe of a fact and of a triple the tier may lack, with and without remembered
     /// lookups.
+    /// A pattern's count is the number of its facts with one input graph, and a sample
+    /// of a scan that spans several blocks takes matching facts from along it.
+    #[test]
+    fn counts_and_samples_of_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        let mut nt = String::new();
+        for i in 0..600_000u64 {
+            nt.push_str(&format!(
+                "<urn:s{}> <urn:p{}> <urn:o{}> .\n",
+                i / 3,
+                i % 3,
+                i % 500
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let id = |iri: &str| snap.lookup_iri(iri).unwrap().0;
+        let (s, p, o) = (id("urn:s7"), id("urn:p1"), id("urn:o22"));
+        let base = Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+        let facts = |s, p, o| {
+            let mut out = Vec::new();
+            base.for_each(s, p, o, |t| {
+                out.push(t);
+                true
+            })
+            .unwrap();
+            out
+        };
+        for pattern in [
+            (Some(s), Some(p), None),
+            (None, Some(p), Some(o)),
+            (None, Some(p), None),
+            (Some(s), None, None),
+            (None, None, None),
+            (Some(s), Some(p), Some(o)),
+        ] {
+            let (s, p, o) = pattern;
+            assert_eq!(
+                base.count(s, p, o),
+                facts(s, p, o).len() as u64,
+                "{pattern:?}"
+            );
+        }
+        // a relation of several blocks: eight facts from four places, not its first eight
+        let relation = facts(None, Some(p), None);
+        assert!(
+            base.blocks(None, Some(p), None) >= 4,
+            "{}",
+            base.blocks(None, Some(p), None)
+        );
+        let mut memo = Memo::default();
+        let mut got = Vec::new();
+        base.sample(&mut memo, [None, Some(p), None], 8, 4, |t| {
+            got.push(t);
+            true
+        })
+        .unwrap();
+        assert_eq!(got.len(), 8);
+        assert!(got.iter().all(|t| t[1] == p && relation.contains(t)));
+        let mut distinct = got.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 8);
+        assert_ne!(got, relation[..8]);
+        assert_eq!(got[..2], relation[..2]);
+        // a probe within one block: its facts, and no more than asked for
+        let mut few = Vec::new();
+        base.sample(&mut memo, [Some(s), None, None], 2, 4, |t| {
+            few.push(t);
+            true
+        })
+        .unwrap();
+        assert_eq!(few, facts(Some(s), None, None)[..2]);
+        // facts the caller does not take do not count, and a start gives up after a few
+        let mut offered = 0;
+        base.sample(&mut memo, [None, Some(p), None], 8, 4, |_| {
+            offered += 1;
+            false
+        })
+        .unwrap();
+        assert!((1..=4 * (4 * 8 + 8)).contains(&offered), "{offered}");
+    }
+
     #[test]
     fn segment_reads_match_whole_blocks() {
         let dir = tempfile::tempdir().unwrap();

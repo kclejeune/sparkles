@@ -13,6 +13,10 @@
 //!
 //! `RAYON_NUM_THREADS` sets the number of threads, and `SPARKLES_GENERIC_CLOSURES=1` makes
 //! `infer` evaluate transitive and equivalence rules as ordinary rules.
+//! `SPARKLES_SAMPLED_PLANNING=1` makes `infer` order rule bodies from sampled bindings.
+//! `SPARKLES_MAX_INFERRED=N` raises `infer`'s limit of derived triples, a profile of the
+//! form `@FILE` reads Jena rule text from a file, and `SPARKLES_PLAN_PROBE=1` makes
+//! `infer` time every atom order of each rule plan and print one line per plan.
 //! `SPARKLES_WITNESSES=N` makes `materialize` and `keep` keep up to `N` witnesses per fact
 //! (spec F18 §7.1) and report them. The peak heap counts every allocation
 //! of the process from the start of the run, so it includes the data the run returns.
@@ -165,6 +169,12 @@ fn change_sets(k: usize) -> (Vec<Triple>, Vec<Triple>) {
 fn run_options() -> ReasonOptions {
     ReasonOptions {
         closure_operators: std::env::var("SPARKLES_GENERIC_CLOSURES").as_deref() != Ok("1"),
+        sampled_planning: std::env::var("SPARKLES_SAMPLED_PLANNING").as_deref() == Ok("1"),
+        max_inferred: std::env::var("SPARKLES_MAX_INFERRED")
+            .ok()
+            .map_or(sparkles_reasoner::DEFAULT_MAX_INFERRED, |v| {
+                v.parse().expect("SPARKLES_MAX_INFERRED")
+            }),
         ..ReasonOptions::default()
     }
 }
@@ -253,7 +263,14 @@ fn main() {
         }
         "infer" | "materialize" => {
             let db = PathBuf::from(&args[2]);
-            let profile: Profile = args[3].parse().expect("profile");
+            // `@FILE` reads Jena rule text from a file
+            let profile: Profile = match args[3].strip_prefix('@') {
+                Some(file) => Profile::Rules(std::fs::read_to_string(file).expect("rule file")),
+                None => args[3].parse().expect("profile"),
+            };
+            if std::env::var("SPARKLES_PLAN_PROBE").as_deref() == Ok("1") {
+                sparkles_reasoner::bench_plan_probe(true);
+            }
             let store = Store::open(&db, StoreOptions::default()).unwrap();
             let snap = store.snapshot();
             let threads = rayon::current_num_threads();
