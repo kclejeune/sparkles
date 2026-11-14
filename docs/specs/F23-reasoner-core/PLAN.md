@@ -399,6 +399,12 @@ The gates of this phase are these. The TopBraid SHACL-AF test cases pass for tri
 SPARQL rules, a maintained `shacl-af` run equals a full run on the differential histories,
 and the W3C and Nemo gates are unchanged.
 
+Item 838 built the `shacl-af` profile as an evaluator that runs the rules per focus node,
+and TopBraid's rule tests pass. The compiled triple and SPARQL rules, their maintenance
+and the gate that a maintained run equals a full run are item 958, and SPIN's RDF syntax
+and template calls are item 959. The [design's outcome](SPEC.md#shacl-rules-and-spin)
+describes what the profile does.
+
 ### Phase 6, the native n-ary Datalog core, item 839
 
 `ir.rs` defines `Relation`, `Atom`, `Rule` and `Program` with strata, `parser.rs` and
