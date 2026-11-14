@@ -11,12 +11,12 @@
 //! deadline, cancellation and memory budget and a limit of derived facts.
 
 use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings, table_bytes, table_capacity};
-use crate::demand::{self, Key, KeyP, Pass, Program, TransformError, Vocab};
+use crate::demand::{self, ConeStats, Key, KeyP, Pass, Program, TransformError, Vocab};
 use crate::engine::{self, Atom, CHead, CRule, Slot};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::inputs::{self, Inputs};
-use crate::parser::Rule;
+use crate::parser::{Direction, Rule};
 use crate::tables::{self, Chunk, Table};
 use crate::terms::{LocalTerm, Terms};
 use crate::{Extras, InferredLimitExceeded, Profile};
@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::error::ComponentError;
 use sparkles_core::id::{Id, Tag};
+use sparkles_core::index::Perm;
 use sparkles_core::sparql::reasoning::{
     Demand, DemandInfo, DemandReport, DemandTerm, Derived, LocalTerm as OutTerm, ReasoningProvider,
     ReasoningSession, Report, SessionRequest,
@@ -139,6 +140,91 @@ impl QueryReasoner {
         &self.shared.extras
     }
 
+    /// The digest of the rules ([`crate::rules_digest`]), which a materialization with
+    /// the same rules records.
+    pub fn digest(&self) -> u64 {
+        self.shared.digest
+    }
+
+    /// Why the facts of a materialization of these rules cannot be read beside facts
+    /// derived for a query, when the rules hold a top-level backward rule (spec F17 §4.3
+    /// as built). The two sources agree only when the program is monotone and makes no
+    /// terms, so that the materialization, which skips the backward rules, holds a subset
+    /// of what the whole program derives. Any builtin outside the pure tests and functions
+    /// of their arguments therefore counts as a hazard: `noValue` and the list builtins
+    /// read facts the backward rules can add, so their answers can change, and `makeTemp`,
+    /// `makeSkolem` and `now` make terms that differ between the two runs. A head that
+    /// holds a blank-node constant, a functor or a list action does the same. An unknown
+    /// builtin counts as a hazard too. `None` when the two can be read together.
+    pub fn mixing_hazard(&self) -> Option<String> {
+        use crate::builtins::{BuiltinKind as B, HeadAction};
+        use crate::parser::{Clause, Node};
+        if !self.has_backward_rules() {
+            return None;
+        }
+        fn pure(kind: B) -> bool {
+            !matches!(
+                kind,
+                B::NoValue
+                    | B::MakeTemp
+                    | B::MakeSkolem
+                    | B::Now
+                    | B::ListMember
+                    | B::ListContains
+                    | B::ListNotContains
+                    | B::ListLength
+                    | B::ListEntry
+                    | B::ListForAll
+            )
+        }
+        fn makes_terms(n: &Node) -> bool {
+            matches!(
+                n,
+                Node::Const(oxrdf::Term::BlankNode(_)) | Node::Functor(..)
+            )
+        }
+        fn find(clauses: &[Clause], head: bool) -> Option<String> {
+            clauses.iter().find_map(|c| match c {
+                Clause::Builtin(b) if head => matches!(HeadAction::from_name(&b.name), Some(Ok(_)))
+                    .then(|| format!("calls {}", b.name)),
+                Clause::Builtin(b) => {
+                    (!B::from_name(&b.name).is_some_and(pure)).then(|| format!("calls {}", b.name))
+                }
+                Clause::Rule(r) => find(&r.body, false).or_else(|| find(&r.head, true)),
+                Clause::Triple(t) => (head
+                    && [&t.subject, &t.predicate, &t.object]
+                        .into_iter()
+                        .any(makes_terms))
+                .then(|| "makes a blank node or functor in its head".to_string()),
+            })
+        }
+        self.shared
+            .rules
+            .iter()
+            .find_map(|r| {
+                find(&r.body, false)
+                    .or_else(|| find(&r.head, true))
+                    .map(|b| (r, b))
+            })
+            .map(|(r, b)| {
+                format!(
+                    "rule '{}' {b}, so the materialization, which skips the backward rules, \
+                     cannot be read beside derived facts",
+                    r.label()
+                )
+            })
+    }
+
+    /// Whether the rules hold a top-level backward rule, whose facts a materialization
+    /// lacks since the materializer skips such rules (spec F17 §5.1). The profiles
+    /// `rdfs`, `rdfs-simple` and `owl-rl` hold none.
+    pub fn has_backward_rules(&self) -> bool {
+        self.shared
+            .rules
+            .iter()
+            .any(|r| r.direction == Direction::Backward)
+    }
+
     /// This reasoner as the provider [`QueryOptions::reasoning`] takes.
     ///
     /// [`QueryOptions::reasoning`]: sparkles_core::sparql::QueryOptions::reasoning
@@ -223,6 +309,46 @@ fn short(t: &Term) -> String {
         }
     }
     t.to_string()
+}
+
+/// The statistics of a snapshot for the cone estimate of a demand (spec F17 §4.3): the
+/// generation's predicate statistics with the delta's, over every graph, since the
+/// input graphs' share of the store is not known before the program runs.
+struct SnapStats<'a> {
+    snap: &'a Snapshot,
+}
+
+impl ConeStats for SnapStats<'_> {
+    fn predicate(&self, p: u64) -> (f64, f64, f64) {
+        let count = self
+            .snap
+            .predicate_count(Perm::Pso, &[p])
+            .unwrap_or_else(|| self.snap.estimate(Perm::Pso, &[p]));
+        let base = self.snap.generation.stats.predicate(p);
+        let delta = self.snap.delta.predicate(p);
+        let mut ds =
+            base.map_or(0, |s| s.distinct_subjects) + delta.map_or(0, |d| d.distinct_subjects);
+        let mut dos =
+            base.map_or(0, |s| s.distinct_objects) + delta.map_or(0, |d| d.distinct_objects);
+        // a store without statistics: every fact counts as its own subject and object
+        if ds == 0 {
+            ds = count;
+        }
+        if dos == 0 {
+            dos = count;
+        }
+        (count as f64, ds as f64, dos as f64)
+    }
+
+    fn totals(&self) -> (f64, f64, f64) {
+        let s = &self.snap.generation.stats;
+        let n = s.quads + self.snap.delta.inserts() as u64;
+        (
+            n as f64,
+            s.distinct_subjects.max(1) as f64,
+            s.distinct_predicates.max(1) as f64,
+        )
+    }
 }
 
 /// Which rows of a range of the derived tier [`Session::export_rows`] returns.
@@ -923,9 +1049,17 @@ impl Session {
             seeds: (0, 0),
         });
         let schema_from = self.graph.as_ref().expect("graph made").derived_len();
+        // A session prepared again holds the facts its earlier derivations gave, so its
+        // schema is more than a session of the view holds, and it keeps neither the
+        // schema's table nor a completeness proof for other sessions (spec F17, item
+        // 911). Facts a session adds of its own make the same difference.
+        let fresh = schema_from == 0;
         let mut lower_end = schema_from;
+        // the schema's table this session read, whose sessions share a proof
+        let mut table_read = None;
         if let Some(t) = key.as_ref().and_then(tables::get) {
             let facts = self.remap(&t)?;
+            table_read = Some(t);
             let g = self.graph.as_mut().expect("graph made");
             g.try_add_batch(facts)
                 .map_err(|e| memory_error(e, "the schema"))?;
@@ -958,13 +1092,42 @@ impl Session {
             // the patterns the schema rules' noValue reads are complete before stage zero
             // reads them (Codex review F17-P1 #3)
             self.run_lower(true, "the schema")?;
+            // The axioms, the facts of rules without a body, join the facts the pass
+            // reads as stored: a schema fact can follow from an axiom about an instance,
+            // such as `rdf:nil rdf:type rdf:List`, which the pass would otherwise miss
+            // and the completeness proof would then leave open (spec F17, item 911). An
+            // axiom the input graphs hold is left out: a batch is deduplicated against
+            // the derived facts only, and a derived copy of a stored fact would reach
+            // the answer twice, since the overlay takes derived facts as absent from
+            // the store.
+            let axioms = self
+                .rules
+                .iter()
+                .filter(|r| r.atoms.is_empty() && r.builtins.is_empty());
+            let mut seeds = seeds;
+            let base = self.graph.as_ref().expect("graph made").base_arc();
+            for r in axioms {
+                for h in &r.head {
+                    if let CHead::Triple(Slot::Const(s), Slot::Const(p), Slot::Const(o)) = *h {
+                        let stored = match &base {
+                            Some(b) => b
+                                .contains(&[s, p, o])
+                                .map_err(|e| component("reasoning-failed", format!("{e:#}")))?,
+                            None => false,
+                        };
+                        if !stored {
+                            seeds.push([s, p, o]);
+                        }
+                    }
+                }
+            }
             let g = self.graph.as_mut().expect("graph made");
             lower_end = g.derived_len();
             let start = g.len();
             g.try_add_batch(seeds)
                 .map_err(|e| memory_error(e, "the schema"))?;
             self.run(true, 0, start, "the schema")?;
-            if let Some(key) = key {
+            if let Some(key) = key.filter(|_| fresh) {
                 // the schema facts the lower stages gave belong to the schema, and their
                 // instance facts are derived again by the sessions that read the table
                 let closed = crate::specialize::closed(&vocab, rdf_type);
@@ -984,43 +1147,107 @@ impl Session {
         // complete. Keep that vocabulary for exposure independently of closure.
         self.closed = Some(crate::specialize::closed(&vocab, rdf_type));
         let same_as = self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"))?;
-        let flag = AtomicBool::new(false);
-        let (complete, stopped) = watched(&self.stop, &flag, || {
-            demand::complete_schema(
-                self.compiled.rules(),
-                &vocab,
-                rdf_type,
-                same_as,
-                &self.budget,
-                &flag,
-            )
-        });
-        if let Some(error) = stopped {
-            return Err(error);
-        }
-        let mut complete = complete
-            .map_err(|e| memory_error(e, "schema completeness"))?
-            .expect("an unstopped completeness analysis returns its result");
-        let flag = AtomicBool::new(false);
-        let (refined, stopped) = watched(&self.stop, &flag, || {
-            demand::refine_schema(
-                self.compiled.rules(),
-                &vocab,
-                &self.terms,
-                self.graph.as_ref().expect("graph made"),
-                &mut complete.closed,
-                &self.budget,
-                &flag,
-            )
-        });
-        if let Some(error) = stopped {
-            return Err(error);
-        }
-        refined.map_err(|e| match BudgetFailure::from_anyhow(&e) {
-            Some(error) => memory_error(error, "schema completeness"),
-            None => component("reasoning-failed", format!("{e:#}")),
-        })?;
-        let closed = &complete.closed;
+        // The proof reads the rules and the session's graph. A fresh session that read
+        // the schema's table holds the view's facts and that table's facts and nothing
+        // else, so every such session of the same table proves the same relations, and
+        // they share the proof of the first (spec F17, item 911). A session whose
+        // schema came from a pass of its own proves again: two passes can differ, as
+        // with rules that read `now`, and the table can lack a fact its pass held.
+        let proof_key = self
+            .schema_view
+            .as_ref()
+            .filter(|_| fresh && !self.added_facts)
+            .zip(table_read)
+            .map(|(v, t)| ((v.clone(), self.shared.digest), t));
+        // the analysis's admission lasts while its closure sets are in use
+        let mut _admission = None;
+        // the session's own closure sets, made from a cached proof or copied from the
+        // analysis, are charged while they are in use
+        let set_bytes = |n: usize| n.saturating_mul(64).saturating_add(256);
+        let mut _sets = None;
+        let closed_proof = match proof_key.as_ref().and_then(|(k, t)| proofs::get(k, t)) {
+            Some(proof) => {
+                _sets = Some(
+                    Held::try_new(
+                        &self.budget,
+                        set_bytes(proof.preds.len() + proof.classes.len()),
+                    )
+                    .map_err(|e| memory_error(e, "schema completeness"))?,
+                );
+                demand::Closed {
+                    preds: proof
+                        .preds
+                        .iter()
+                        .map(|t| self.id_of(t))
+                        .collect::<Result<_>>()?,
+                    classes: proof
+                        .classes
+                        .iter()
+                        .map(|t| self.id_of(t))
+                        .collect::<Result<_>>()?,
+                    rdf_type,
+                }
+            }
+            None => {
+                let flag = AtomicBool::new(false);
+                let (complete, stopped) = watched(&self.stop, &flag, || {
+                    demand::complete_schema(
+                        self.compiled.rules(),
+                        &vocab,
+                        rdf_type,
+                        same_as,
+                        &self.budget,
+                        &flag,
+                    )
+                });
+                if let Some(error) = stopped {
+                    return Err(error);
+                }
+                let mut complete = complete
+                    .map_err(|e| memory_error(e, "schema completeness"))?
+                    .expect("an unstopped completeness analysis returns its result");
+                let flag = AtomicBool::new(false);
+                let (refined, stopped) = watched(&self.stop, &flag, || {
+                    demand::refine_schema(
+                        self.compiled.rules(),
+                        &vocab,
+                        &self.terms,
+                        self.graph.as_ref().expect("graph made"),
+                        &mut complete.closed,
+                        &self.budget,
+                        &flag,
+                    )
+                });
+                if let Some(error) = stopped {
+                    return Err(error);
+                }
+                refined.map_err(|e| match BudgetFailure::from_anyhow(&e) {
+                    Some(error) => memory_error(error, "schema completeness"),
+                    None => component("reasoning-failed", format!("{e:#}")),
+                })?;
+                _sets = Some(
+                    Held::try_new(
+                        &self.budget,
+                        set_bytes(complete.closed.preds.len() + complete.closed.classes.len()),
+                    )
+                    .map_err(|e| memory_error(e, "schema completeness"))?,
+                );
+                let closed = complete.closed.clone();
+                if let Some((key, table)) = proof_key {
+                    let terms = |ids: &FxHashSet<u64>| -> Option<Vec<Term>> {
+                        ids.iter().map(|&x| self.terms.term(x)).collect()
+                    };
+                    if let (Some(preds), Some(classes)) =
+                        (terms(&closed.preds), terms(&closed.classes))
+                    {
+                        proofs::put(key, &table, proofs::Proof { preds, classes });
+                    }
+                }
+                _admission = Some(complete);
+                closed
+            }
+        };
+        let closed = &closed_proof;
         // RDF lists are read as stored unless a rule gives their facts
         let lists: Vec<u64> = ["first", "rest"]
             .into_iter()
@@ -1125,7 +1352,7 @@ impl Session {
 
     /// Derive every fact of `demands`, each with its constants alone.
     pub(crate) fn derive_all(&mut self, demands: &[Demand]) -> Result<()> {
-        self.prepare(demands)?;
+        self.prepare(demands, false)?;
         let seeds = (0..demands.len()).map(|d| (d, Vec::new())).collect();
         self.derive(seeds)?;
         Ok(())
@@ -1508,7 +1735,7 @@ impl ReasoningSession for Session {
         ))
     }
 
-    fn prepare(&mut self, demands: &[Demand]) -> Result<Vec<DemandInfo>> {
+    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
         self.demands = demands.to_vec();
         self.keys.clear();
         self.consts.clear();
@@ -1546,11 +1773,13 @@ impl ReasoningSession for Session {
             });
         }
         // the program is made at the first derivation, which a cached table may spare
+        let stats = SnapStats { snap: &self.snap };
         let infos = demands
             .iter()
             .zip(&self.keys)
             .zip(&self.consts)
-            .map(|((d, k), c)| {
+            .enumerate()
+            .map(|(i, ((d, k), c))| {
                 let pred = match &d.p {
                     DemandTerm::Const(t) => short(t),
                     _ => "?p".to_string(),
@@ -1560,11 +1789,41 @@ impl ReasoningSession for Session {
                     _ => Slot::Var(i),
                 };
                 let pattern = (slot(&d.s, 0), slot(&d.p, 1), slot(&d.o, 2));
+                let cone = demand::cone_indices(self.compiled.rules(), &self.terms, pattern);
+                // the materializer skips top-level backward rules (spec F17 §5.1), so a
+                // materialization lacks the facts of a cone that holds one
+                let materialized = !cone.iter().any(|&r| {
+                    self.shared
+                        .rules
+                        .get(self.compiled.infos()[r].parsed)
+                        .is_some_and(|p| p.direction == Direction::Backward)
+                });
+                let seeded = [
+                    matches!(d.s, DemandTerm::Seeded),
+                    false,
+                    matches!(d.o, DemandTerm::Seeded),
+                ];
+                // the estimate walks the cone against the statistics, which costs about
+                // as much as a narrow derivation, so it is made only when asked for
+                let estimate = if estimates {
+                    demand::estimate_cone(self.compiled.rules(), pattern, seeded, &stats)
+                } else {
+                    0.0
+                };
+                let cached = self.seeded[i] == Seeded::None
+                    && self.table_key(i, &[]).is_some_and(|key| tables::peek(&key));
+                let mut rules: Vec<String> = cone
+                    .iter()
+                    .map(|&r| self.compiled.rules()[r].name.clone())
+                    .collect();
+                rules.sort();
+                rules.dedup();
                 DemandInfo {
                     adornment: format!("{pred}^{}", k.adornment()),
-                    rules: demand::cone(self.compiled.rules(), pattern)
-                        .into_iter()
-                        .collect(),
+                    rules,
+                    estimate,
+                    materialized,
+                    cached,
                 }
             })
             .collect();
@@ -1995,7 +2254,7 @@ mod compact_tests {
             term("http://www.w3.org/1999/02/22-rdf-syntax-ns#List"),
         ];
         session
-            .prepare(&[crate::explain::demand_of(&target)])
+            .prepare(&[crate::explain::demand_of(&target)], false)
             .unwrap();
         session.ensure_program().unwrap();
         assert!(session.compact);
@@ -2057,7 +2316,7 @@ mod compact_tests {
                 )))
             });
             session
-                .prepare(&[crate::explain::demand_of(&target)])
+                .prepare(&[crate::explain::demand_of(&target)], false)
                 .unwrap();
             session.ensure_program().unwrap();
             assert!(
@@ -2324,5 +2583,105 @@ mod equality_workspace_tests {
             "allocated {peak} bytes at the peak, charged {}",
             held.bytes()
         );
+    }
+}
+
+/// The schema relations a session proved complete (spec F17, item 911), by view and rules
+/// digest, as the IRIs of the closed predicates and classes, since a session's ids of
+/// terms the store lacks are its own. A proof holds for the sessions that read the schema
+/// table it was made over, which it names, and a table made again gets a proof of its own.
+mod proofs {
+    use super::Table;
+    use oxrdf::Term;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex, Weak};
+
+    /// The views whose proofs are kept, the oldest dropped first.
+    const VIEWS: usize = 64;
+
+    pub(super) struct Proof {
+        pub preds: Vec<Term>,
+        pub classes: Vec<Term>,
+    }
+
+    type Key = (String, u64);
+
+    /// A proof and the table it was made over. The weak reference keeps the table's
+    /// allocation, though not its facts, so its address names no other table while the
+    /// proof is kept.
+    struct Entry {
+        key: Key,
+        table: Weak<Table>,
+        proof: Arc<Proof>,
+    }
+
+    static PROOFS: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
+
+    /// The proof made over `table`, the schema table of `key` this session read.
+    pub(super) fn get(key: &Key, table: &Arc<Table>) -> Option<Arc<Proof>> {
+        let proofs = PROOFS.lock().unwrap_or_else(|e| e.into_inner());
+        proofs
+            .iter()
+            .find(|e| e.key == *key && std::ptr::eq(e.table.as_ptr(), Arc::as_ptr(table)))
+            .map(|e| e.proof.clone())
+    }
+
+    /// Keep the proof made over `table`, in place of the view's proof over another table.
+    pub(super) fn put(key: Key, table: &Arc<Table>, proof: Proof) {
+        let mut proofs = PROOFS.lock().unwrap_or_else(|e| e.into_inner());
+        proofs.retain(|e| e.key != key);
+        if proofs.len() == VIEWS {
+            proofs.pop_front();
+        }
+        proofs.push_back(Entry {
+            key,
+            table: Arc::downgrade(table),
+            proof: Arc::new(proof),
+        });
+    }
+}
+
+#[cfg(test)]
+mod proof_cache_tests {
+    use super::Table;
+    use super::proofs::{Proof, get, put};
+    use std::sync::Arc;
+
+    fn table() -> Arc<Table> {
+        Arc::new(Table {
+            chunks: vec![Arc::new(vec![[1, 2, 3]])],
+            keys: Vec::new(),
+        })
+    }
+
+    fn proof() -> Proof {
+        Proof {
+            preds: Vec::new(),
+            classes: Vec::new(),
+        }
+    }
+
+    /// A proof answers the readers of the table it was made over and no other table of
+    /// its view, also after that table was dropped and another made in its place (spec
+    /// F17, item 911).
+    #[test]
+    fn a_proof_answers_only_the_readers_of_its_table() {
+        let key = ("proof-cache-test-view".to_string(), 7u64);
+        let first = table();
+        let other = table();
+        put(key.clone(), &first, proof());
+        assert!(get(&key, &first).is_some());
+        assert!(get(&key, &other).is_none());
+        assert!(get(&("another view".to_string(), 7), &first).is_none());
+        // the table made again after the cache dropped the first
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_none(), "the proof keeps no facts alive");
+        let again = table();
+        assert!(get(&key, &again).is_none());
+        // a proof over the new table takes the view's place
+        put(key.clone(), &again, proof());
+        assert!(get(&key, &again).is_some());
+        assert!(get(&key, &other).is_none());
     }
 }

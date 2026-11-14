@@ -732,6 +732,9 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
 | DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
+| GET    | `/$/reason/{ds}/query`       | *Extension.* The dataset's query-time reasoning setting ([Automatic choice](#automatic-choice)), with the status of the cache of derived tables for callers with the metrics permission. |
+| PUT    | `/$/reason/{ds}/query`       | *Extension.* Sets the query-time reasoning setting: the default mode, the profile and rules, the input graphs, the budget and the stale policy. `400` with the code `reasoning-setting` for a value outside its range, `403` on a read-only server. Returns the setting. |
+| DELETE | `/$/reason/{ds}/query`       | *Extension.* Removes the setting, so queries read the materialized inferences by default again. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | POST   | `/$/reason/{ds}/explain`     | *Extension.* Derivation trees for an inferred triple, from the facts the caller reads. See [Explanations](#explanations). |
 | GET | `/$/reason/{ds}/diff` | *Extension.* Read-only entailment changes between retained states under one program. See [Entailment diffs](#entailment-diffs). |
@@ -9179,8 +9182,8 @@ beyond the schema, where a materialization derives 10.9 million.
   facts follow only from triples the caller can see.
 * With [RDFS on read](#rdfs-on-read) set, `reasoning=demand` applies instead and EXPLAIN
   says so.
-* `reasoning=auto`, the cost-based choice between the inferred graph and derivation,
-  answers `400`. F17 Phase 2 specifies it, and it is not built.
+* `reasoning=auto` chooses per pattern between the inferred graph and derivation
+  ([Automatic choice](#automatic-choice)).
 * A DESCRIBE with `reasoning=demand` fails with `501` and the code `unsupported`, since
   the description reads facts that no pattern asks for. CONSTRUCT with the description's
   patterns gives the derived facts.
@@ -9200,6 +9203,72 @@ Queries that touch many facts derive them all. `?x a ub:Student` derives the typ
 every person, and such queries take tens to hundreds of times as long as over a
 materialization. [F17's Outcome](specs/F17-query-time-reasoning.md#outcome) has the LUBM
 measurements.
+
+### Automatic choice
+
+`reasoning=auto` reads the materialized inferences when they can answer and derives
+otherwise. The materialization can answer when it has the query-time profile, rules and
+input graphs, is fresh at the commit the query reads, and is readable by the caller. A
+materialization with another profile is never read, so a query that names
+`reasoningProfile` differently from the dataset's materialization derives everything. A
+stale materialization is not read either, so the answer of `auto` is never silently
+stale, and the query derives the facts its patterns need while the inferred graph is left
+out of its default graph. When the materialization can answer, every pattern reads it
+except a pattern whose rules include a Jena backward rule, which derives, since the
+materializer skips those rules. Both sources give facts of the same closure, so a query
+that reads some patterns and derives others answers as a fresh materialization would. A
+rule file with backward rules leaves the materialization out entirely, and every pattern
+derives, when a rule calls a builtin that reads facts outside its patterns (`noValue` or a
+list builtin), makes fresh or time-dependent terms (`makeTemp`, `makeSkolem` or `now`) or
+is unknown to Sparkles, or when a head holds a list action, a blank node or a functor. The
+materialization's answers could then differ from those of the whole program. Tests and
+functions whose results follow from their arguments, such as `notEqual` or `strConcat`,
+keep the materialization readable. A
+derived pattern still reads the inferred graph, so deriving where the materialization
+holds the facts would only add work. With `rdfs`, `rdfs-simple` and `owl-rl`, which have
+no backward rules, a query over a fresh materialization runs as `reasoning=materialized`
+does.
+
+* The response carries `Sparkles-Reasoning: auto; derived=…; tables=…; cached=…` when a
+  pattern was derived, and no such header when the inferred graph answered every pattern.
+  `Sparkles-Inferences` appears only when a stale materialization was read, which the
+  dataset's setting must allow.
+* EXPLAIN's `Reason` node says whether the materialization was fresh, stale or absent,
+  and each `Derive` node gives `source` (`materialized` or `derived`), `reason`, and, when
+  the materialization is read, the estimates `estimatedDerived`, `readCost` and
+  `deriveCost` from the pattern's dependency cone and the store's statistics. An EXPLAIN
+  that does not run the query gives `estimatedDerived` for every pattern.
+* `sparkles query --reasoning auto` takes the same `--profile`, `--rules` and
+  `--max-derived` as `demand`.
+
+The dataset's query-time reasoning setting (`PUT /$/reason/{ds}/query`) names the mode of
+a query that gives no `reasoning` parameter, the profile and rules that derive on demand,
+the input graphs, a budget and the policy for a stale materialization:
+
+```json
+{ "default": "auto",
+  "profile": "owl-rl",
+  "rules": null,
+  "inputs": { "ontologyGraphs": ["http://ex.org/onto"] },
+  "budget": { "maxDerived": 1000000, "maxMillis": null },
+  "stale": "derive" }
+```
+
+Every member is optional. Without `default`, queries read the materialized inferences as
+before. HTTP queries and `sparkles query` follow `default`, and library callers apply it
+with `Dataset::inference_view(Dataset::default_reasoning_mode())`, since
+`Dataset::query` reads the materialized inferences. Without `profile`, derivation uses the profile, rules and inputs of the last
+materialization, so `auto` compares like with like. `profile: "rules"` takes the Jena
+rule text in `rules`. `budget.maxDerived` applies when a query names no `maxDerived`,
+under the server's `--reason-max-derived`, and a derivation that runs longer than
+`budget.maxMillis` fails with `422` and the code `reasoning-budget`. `stale: "allow"`
+lets `auto` read a stale materialization, and the response then carries
+`Sparkles-Inferences`. `GET` returns the setting, with `tables`, the status of the
+process-wide cache of derived tables, for callers with the metrics permission. `DELETE`
+removes it. A persistent dataset keeps the setting in `query-reasoning.json`, with the
+version member `queryReasoningFormat`. `serve --query-reasoning NAME=PROFILE` sets a
+dataset's profile at startup, with `rules:FILE` for a Jena rules file, and
+`sparkles infer --loc DB --query-default auto` sets the default mode of a database.
 
 ## Write-time validation
 
@@ -10873,8 +10942,8 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` and both methods of `/$/vector/{ds}/{name}/projection` need `read` too. |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/query` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` and both methods of `/$/vector/{ds}/{name}/projection` need `read` too. |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/reason/{ds}/query` (PUT, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |

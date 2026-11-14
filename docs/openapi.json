@@ -20505,6 +20505,131 @@
         ],
         "type": "object"
       },
+      "QueryReasoningSetting": {
+        "description": "The dataset's query-time reasoning setting: the mode of a query that names none, the profile and rules that derive on demand, the input graphs, the budget of a derivation and the policy for a stale materialization.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-choice"
+        },
+        "properties": {
+          "budget": {
+            "properties": {
+              "maxDerived": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxMillis": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "default": {
+            "enum": [
+              "auto",
+              "demand",
+              "materialized",
+              "false"
+            ],
+            "type": "string"
+          },
+          "inputs": {
+            "description": "The input graphs, as a reasoning request names them.",
+            "properties": {
+              "dataGraphs": {
+                "description": "`default` or graph IRIs.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "imports": {
+                "enum": [
+                  "none",
+                  "dataset",
+                  "fetch"
+                ],
+                "type": "string"
+              },
+              "locationMapping": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "altName": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "altName"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "properties": {
+                        "altPrefix": {
+                          "type": "string"
+                        },
+                        "prefix": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "prefix",
+                        "altPrefix"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "ontologyGraphs": {
+                "description": "`default` or graph IRIs.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "profile": {
+            "enum": [
+              "rdfs",
+              "rdfs-simple",
+              "owl-rl",
+              "rules"
+            ],
+            "type": "string"
+          },
+          "queryReasoningFormat": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "rules": {
+            "description": "The Jena rule text of the profile `rules`.",
+            "type": "string"
+          },
+          "stale": {
+            "enum": [
+              "derive",
+              "allow"
+            ],
+            "type": "string"
+          },
+          "tables": {
+            "additionalProperties": true,
+            "description": "The process-wide cache of derived tables, for callers with the metrics permission (responses only).",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
       "QuotaRequest": {
         "description": "One of the two members; 0 means unlimited.",
         "properties": {
@@ -46868,6 +46993,178 @@
           "Reasoning"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/$/reason/{ds}/query": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-choice"
+        },
+        "operationId": "clearQueryReasoning",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryReasoningSetting"
+                }
+              }
+            },
+            "description": "The setting, now empty."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove the dataset's query-time reasoning setting",
+        "tags": [
+          "Reasoning"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-choice"
+        },
+        "operationId": "getQueryReasoning",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryReasoningSetting"
+                }
+              }
+            },
+            "description": "The setting."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "The dataset's query-time reasoning setting",
+        "tags": [
+          "Reasoning"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#automatic-choice"
+        },
+        "operationId": "setQueryReasoning",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryReasoningSetting"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryReasoningSetting"
+                }
+              }
+            },
+            "description": "The setting."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set the dataset's query-time reasoning",
+        "tags": [
+          "Reasoning"
+        ],
+        "x-sparkles-permission": "admin"
       }
     },
     "/$/repositories": {

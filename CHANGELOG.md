@@ -172,6 +172,18 @@ before it admits a claim and answers `jobs-recovering` while it does, and `POST
 /$/jobs/{ds}/recover` resumes selected paused runs. A clone starts with an empty ledger.
 The `hidden` visibility of the managed-graph registry stays reserved and refused.
 
+`reasoning=auto` chooses per pattern between the materialized inferences and derivation
+on demand (item 19, spec F17 Phase 2). A fresh materialization with the query-time
+profile, rules and inputs is read, a stale or absent one is derived around, a pattern
+whose rules include a Jena backward rule is derived, and EXPLAIN shows each pattern's
+source with estimated costs. A query over a fresh materialization whose rules hold no
+backward rule starts no reasoner session. `PUT /$/reason/{ds}/query` sets the
+dataset's query-time reasoning: the default mode of a query that names none, the profile
+and rules, the input graphs, a derivation budget and whether `auto` may read a stale
+materialization. `serve --query-reasoning NAME=PROFILE`, `sparkles infer --query-default
+MODE` and `sparkles query --reasoning auto` are the CLI's forms. The setting lives in
+`query-reasoning.json` with the version member `queryReasoningFormat`.
+
 Community reports can read a review policy's accepted projection (item 652). The
 `graphrag` settings member `reviewPolicy` names a review policy of the dataset's evidence
 settings, and a build or refresh then reads the policy's output graph with the projection's
@@ -2041,6 +2053,18 @@ writeback, direct log writes and the idle group bypass now always apply outside 
 (X14, item 478).
 
 ### Fixed
+
+Query-time reasoning with `reasoning=demand` no longer derives about the whole OWL RL type
+closure for every query (roadmap item 911). The schema completeness proof gave up on
+LUBM's schema and left every schema relation open, so LUBM query 1 took about 3.2 s at
+10 universities. The proof's abstraction now scales, its result is kept
+for each schema table, the schema pass reads the profile's axioms, a session estimates a
+demand's cone only for EXPLAIN and `auto`, and specialization compares rules by their
+structure. Query 1 now takes 1.9 ms with OWL RL and 1.2 ms with RDFS, against 1.8 ms and
+1.3 ms before the proof. Other OWL RL queries remain up to 1.35 times slower than before
+the proof, which item 911 follows. A query that runs and reads no
+materialization leaves `estimatedDerived` out of its `Derive` nodes, and an EXPLAIN that
+does not run the query still gives it.
 
 Reading the `main` branch's information no longer holds the dataset's branch table while
 it waits for the main writer. The periodic history collector takes the writer and then

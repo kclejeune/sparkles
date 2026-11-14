@@ -1683,3 +1683,81 @@ fn equality_table_is_not_kept_for_programs_that_read_now() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+/// A later session of the same view reuses the schema completeness proof only when its
+/// schema holds the facts the proof read (spec F17, item 911). The schema pass can hold
+/// a generalized triple, here one with a literal subject, which the schema's table does
+/// not keep, so the session that reads the table proves again.
+#[test]
+fn a_cached_completeness_proof_needs_the_schema_rows_it_read() {
+    for (rules, ttl) in [
+        // the literal comes from an axiom
+        (
+            "[a: -> (ex:s ex:p 'lit')]
+             [b: (?s ex:p ?x) -> (?x rdfs:subClassOf ex:C)]
+             [c: (?x rdfs:subClassOf ex:C) -> (ex:answer ex:value ?x)]",
+            "ex:other ex:q ex:thing .",
+        ),
+        // the literal is stored
+        (
+            "[b: (?s ex:p ?x) -> (?x rdfs:subClassOf ex:C)]
+             [c: (?x rdfs:subClassOf ex:C) -> (ex:answer ex:value ?x)]",
+            "ex:s ex:p 'lit' .",
+        ),
+    ] {
+        let profile = Profile::Rules(format!("{PREFIXES}{rules}"));
+        let s = store(ttl);
+        materialize(&s, &profile, &ReasonOptions::default()).unwrap();
+        let q = "SELECT ?x { ex:answer ex:value ?x }";
+        let want = rows(&run(&s, q, &materialized()));
+        assert_eq!(want, vec!["\"lit\"".to_string()], "{rules}");
+        let qr = reasoner(&profile);
+        let mut options = demand(&qr);
+        options.no_cache = true;
+        for i in 0..3 {
+            assert_eq!(rows(&run(&s, q, &options)), want, "session {i}: {rules}");
+        }
+    }
+}
+
+/// An axiom the store already holds is not derived again into the query's answer when
+/// the schema pass seeds the axioms (spec F17, item 911), also when the store's base
+/// generation holds it and the default graph is an input of the reasoning.
+#[test]
+fn a_stored_axiom_is_answered_once() {
+    let s = store("rdf:nil rdf:type rdf:List . ex:a ex:p ex:b .");
+    s.compact().unwrap();
+    let q = "SELECT ?s { ?s rdf:type rdf:List }";
+    for profile in [Profile::Rdfs, Profile::OwlRl] {
+        let qr = reasoner(&profile);
+        let mut options = demand(&qr);
+        options.no_cache = true;
+        for i in 0..2 {
+            assert_eq!(
+                rows(&run(&s, q, &options)),
+                vec![format!("<{RDF}nil>")],
+                "{} session {i}",
+                profile.name()
+            );
+        }
+    }
+}
+
+/// An executed demand query makes no estimate of its patterns' cones, which EXPLAIN shows
+/// and `auto` reads (spec F17 Phase 1 decision 5, item 911): the walk costs about as much
+/// as a narrow derivation.
+#[test]
+fn only_explain_estimates_a_demand() {
+    let s = store("ex:Student rdfs:subClassOf ex:Person . ex:tom a ex:Student .");
+    let qr = reasoner(&Profile::Rdfs);
+    let q = "SELECT ?x { ?x a ex:Person }";
+    let r = run(&s, q, &demand(&qr));
+    assert_eq!(rows(&r), vec!["<http://ex.org/tom>"]);
+    let a = r.ctx.reasoning.clone().unwrap();
+    let c = a.nodes[0].counters.as_ref().unwrap();
+    assert!(!c.contains_key("estimatedDerived"), "{c:?}");
+    let (_, plan) = explain(s.snapshot(), q, &demand(&qr)).unwrap();
+    assert_eq!(plan.children[0].operator, "Derive");
+    let c = plan.children[0].counters.as_ref().unwrap();
+    assert!(c.contains_key("estimatedDerived"), "{c:?}");
+}

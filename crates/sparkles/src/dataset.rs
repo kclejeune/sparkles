@@ -193,6 +193,8 @@ pub struct DatasetState {
     pub closure: sparkles_reasoner::Cache,
     /// RDFS on read, when set (`rdfs.json`)
     pub rdfs: RwLock<Option<Arc<RdfsOnRead>>>,
+    /// the query-time reasoning setting, when set (`query-reasoning.json`, spec F17 §2.2)
+    pub query_reasoning: RwLock<Option<crate::reasoning::QuerySetting>>,
     /// the installed write-time validation (`validation.json`)
     pub validation: RwLock<Option<WriteGuard>>,
     /// why the write guard that `validation.json` asks for is not installed
@@ -355,6 +357,7 @@ impl Dataset {
             }
         };
         let rdfs = crate::reasoning::rdfs::load(&store);
+        let query_reasoning = crate::reasoning::setting::load(&store);
         let queries = crate::stored::Catalog::open_or_broken(store.root());
         if let Some(e) = queries.broken() {
             tracing::error!(
@@ -422,6 +425,7 @@ impl Dataset {
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(opts.closure_cache_triples),
             rdfs: RwLock::new(rdfs),
+            query_reasoning: RwLock::new(query_reasoning),
             validation: RwLock::new(validation),
             guard_error: RwLock::new(guard_error),
             schema_cache: Mutex::new(Vec::new()),
@@ -563,33 +567,86 @@ impl Dataset {
         self.inner.reasoning.read().clone()
     }
 
+    /// The query-time reasoning setting (spec F17 §2.2), if any.
+    pub fn query_reasoning(&self) -> Option<crate::reasoning::QuerySetting> {
+        self.inner.query_reasoning.read().clone()
+    }
+
+    /// Set (or with `None` remove) the query-time reasoning setting, in memory and, for a
+    /// persistent dataset, in its directory. The setting is checked first.
+    pub fn set_query_reasoning(
+        &self,
+        setting: Option<crate::reasoning::QuerySetting>,
+    ) -> Result<()> {
+        if let Some(s) = &setting {
+            s.validate()?;
+        }
+        // one change at a time: the file and the setting in memory change together, and
+        // the file's temporary copy has one writer
+        let mut current = self.inner.query_reasoning.write();
+        if let Some(root) = self.inner.store.root() {
+            crate::reasoning::setting::write(root, setting.as_ref())?;
+        }
+        *current = setting;
+        Ok(())
+    }
+
+    /// The reasoning mode of a query that names none: the setting's default, else
+    /// materialized reasoning, which reads the inferred graph while the dataset has one.
+    /// HTTP queries and `sparkles query` follow it. [`Dataset::query`] and the other
+    /// query methods read the materialized inferences as before, and a caller follows the
+    /// setting with `inference_view(default_reasoning_mode())`.
+    pub fn default_reasoning_mode(&self) -> crate::reasoning::ReasoningMode {
+        self.inner
+            .query_reasoning
+            .read()
+            .as_ref()
+            .and_then(|s| s.default_mode())
+            .unwrap_or_default()
+    }
+
     /// The query-time reasoner of this dataset (spec F17), for
     /// [`QueryOptions::reasoning`] with `reasoner.provider()`. With `profile`, it has
-    /// that profile's rules. Without, it has the profile and the custom rules of the last
-    /// materialization, and fails when the dataset has none. Either way it reads the input
-    /// graphs of the last materialization (the default graph and its imports when there is
-    /// none), and the vocabularies of the last materialization when the profile is the
-    /// same. Backward rules of a custom rule set take part, which materialization skips.
+    /// that profile's rules. Without, it has the profile and rules of the query-time
+    /// setting, else those of the last materialization, and fails when the dataset has
+    /// neither. It reads the input graphs the setting names, else those of the last
+    /// materialization (the default graph and its imports when there is none), and the
+    /// vocabularies of the last materialization when the profile is the same. Backward
+    /// rules of a custom rule set take part, which materialization skips.
     #[cfg(feature = "reasoning")]
     pub fn query_reasoner(
         &self,
         profile: Option<sparkles_reasoner::Profile>,
     ) -> Result<sparkles_reasoner::query::QueryReasoner> {
         let record = self.reasoning_record();
-        let profile = match (profile, &record) {
+        let setting = self.query_reasoning();
+        let profile = match (
+            profile,
+            setting.as_ref().and_then(|s| s.profile().transpose()),
+        ) {
             (Some(p), _) => p,
-            (None, Some(r)) => r.profile()?,
-            (None, None) => {
-                return Err(Error::invalid(
-                    "query-time reasoning needs a profile: name one, or materialize the \
-                     dataset first so that its profile applies",
-                ));
-            }
+            (None, Some(p)) => p?,
+            (None, None) => match &record {
+                Some(r) => r.profile()?,
+                None => {
+                    return Err(Error::invalid(
+                        "query-time reasoning needs a profile: name one, set the dataset's \
+                         query-time reasoning, or materialize the dataset first so that its \
+                         profile applies",
+                    ));
+                }
+            },
         };
-        let (extras, inputs) = match &record {
-            Some(r) if r.profile == profile.name() => (r.extras()?, r.run_inputs()?),
-            Some(r) => (Default::default(), r.run_inputs()?),
-            None => (Default::default(), Default::default()),
+        let extras = match &record {
+            Some(r) if r.profile == profile.name() => r.extras()?,
+            _ => Default::default(),
+        };
+        let inputs = match setting.as_ref().and_then(|s| s.run_inputs().transpose()) {
+            Some(i) => i?,
+            None => match &record {
+                Some(r) => r.run_inputs()?,
+                None => Default::default(),
+            },
         };
         sparkles_reasoner::query::QueryReasoner::new(profile, &extras, inputs)
             .map_err(crate::handles::from_anyhow)

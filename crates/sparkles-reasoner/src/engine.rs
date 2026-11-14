@@ -21,7 +21,7 @@ pub(crate) mod sampled;
 
 // ================================================================== compile ====
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Slot {
     Var(usize),
     Const(u64),

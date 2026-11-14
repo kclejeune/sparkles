@@ -9,6 +9,8 @@
 #[cfg(feature = "reasoning")]
 pub mod analysis;
 #[cfg(feature = "reasoning")]
+pub mod auto;
+#[cfg(feature = "reasoning")]
 pub mod diff;
 pub mod explain;
 pub mod freshness;
@@ -20,6 +22,7 @@ pub mod mode;
 pub mod rdfs;
 #[cfg(feature = "reasoning")]
 pub mod run;
+pub mod setting;
 
 pub use freshness::{Freshness, ReasoningStatus, freshness, watched_graphs};
 pub use mode::{Demand, InferenceView, ReasoningMode};
@@ -28,6 +31,7 @@ pub use run::{
     Diagnostics, ReasonOutcome, ReasonRequest, diagnose, diagnose_with, incremental_since,
     record_inputs, recorded, run_info, run_text,
 };
+pub use setting::QuerySetting;
 /// The reasoner (feature `reasoning`): its profiles, extras, input graphs, reports and
 /// diagnostics, which the requests and results of [`run`] use.
 #[cfg(feature = "reasoning")]

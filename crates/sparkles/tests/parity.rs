@@ -809,6 +809,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("explainInference", "reasoning.explain", |ds| {
             ds.reasoning().explain(&any());
         }),
+        op!("getQueryReasoning", "reasoning.query.get", |ds| {
+            ds.query_reasoning();
+        }),
+        op!("setQueryReasoning", "reasoning.query.set", |ds| {
+            let _ = ds.set_query_reasoning(Some(sparkles::reasoning::QuerySetting::default()));
+        }),
+        op!("clearQueryReasoning", "reasoning.query.clear", |ds| {
+            let _ = ds.set_query_reasoning(None);
+        }),
         op!("getRdfs", "reasoning.rdfs.get", |ds| {
             ds.reasoning().rdfs().get();
         }),

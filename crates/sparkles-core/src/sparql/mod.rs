@@ -1441,11 +1441,17 @@ struct PreparedQuery {
 /// graph in the default graph and without RDFS on read (spec F17 §2.1, §4.4), and whether
 /// RDFS on read was set and does not apply.
 fn demand_options(opts: &QueryOptions) -> (Option<QueryOptions>, bool) {
-    if opts.reasoning.is_none() {
+    let Some(provider) = &opts.reasoning else {
         return (None, false);
-    }
+    };
+    // under `auto`, the inferred graph stays until the session finds that the
+    // materialization cannot answer (`reasoning::apply`)
     let o = QueryOptions {
-        default_graph_extra: Vec::new(),
+        default_graph_extra: if provider.auto() {
+            opts.default_graph_extra.clone()
+        } else {
+            Vec::new()
+        },
         rdfs: None,
         ..opts.clone()
     };
