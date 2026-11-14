@@ -52,9 +52,9 @@ request or on every write, and the schema report counts what the data holds.
   instead of 12.6 s at 20
   ([results](../benchmarks/reasoning/RESULTS.md#sampled-rule-body-planning)). A run
   derives the same facts in either order. A rule in which a builtin binds a variable
-  that an atom also holds keeps the statistical order, and so does every rule of an
-  incremental run after a deletion. Planning costs a few milliseconds per run. Roadmap
-  items 944 and 945.
+  that an atom also holds keeps the statistical order, and so does every rule while the
+  derived facts hold one that a deletion removed. Planning costs a few milliseconds per
+  run. Roadmap items 944 and 945 cover these two limits and that cost.
 * Derived facts live in a columnar tier, each fact one row by a dense id, with each
   predicate's facts sorted by subject and by object. OWL2Bench with 5 universities holds
   its 53 million derived facts in about 52 bytes each with the triple index, against about

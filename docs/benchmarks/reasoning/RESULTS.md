@@ -181,17 +181,26 @@ on a fresh copy of the database.
 | LUBM(10), long-body user rules | 1 | 375 to 383 ms | 376 to 417 ms | 7 |
 | LUBM(10), long-body user rules | 20 | 147 to 169 ms | 152 to 176 ms | 7 |
 
-Every pair derived the same facts, 52,966,139 on OWL2Bench(5), 1,400,688 on OWL2Bench(1),
-10,907,379 on LUBM(100) and 1,038,100 on LUBM(10), with equal digests. The sampled orders
-change plans on OWL2Bench only, where `prp-key` reads a key's value before it joins the
-keyed class with itself. On LUBM the planner keeps every greedy order, so the difference
-there is the cost of planning. It is about 4 ms on LUBM(10) at one thread, where six of
-the seven sampled runs took 930 to 936 ms and one took 970 ms, and roadmap item 945
-covers it. The peak heap of the rules' runs was equal within 3 MiB under OWL 2 RL, and
-with the long-body rules it was 806 against 791 MiB on LUBM(100) and 96 against 90 MiB
-on LUBM(10) at 20 threads. The
+Every pair of `infer` runs derived the same facts, with equal digests. Under OWL 2 RL
+they are 52,966,139 facts on OWL2Bench(5), 1,400,688 on OWL2Bench(1), 10,907,379 on
+LUBM(100) and 1,038,100 on LUBM(10), and the long-body rules derive 416,960 on LUBM(100)
+and 39,667 on LUBM(10). `materialize` prints no digest, and every pair of its runs
+inferred the same number of facts. The planner counts the plans that take a sampled
+order. On the same databases that count is zero in every iteration of the four LUBM
+workloads and four on OWL2Bench(1), as the
+[plan counts](runs/2026-11-14-item-939-atlas/plan-counts.txt) record, and `prp-key` is
+the rule that reads a key's value before it joins the keyed class with itself. The
+difference on LUBM is therefore taken to be the cost of planning. On LUBM(10) at one
+thread six of the seven sampled runs took 930 to 936 ms and one took 970 ms. The median
+of the seven paired differences is 4 ms and their mean 9 ms, and roadmap item 945 covers
+this cost. The highest peak heap of the sampled runs of a workload is within 3.1 MiB of
+that of the greedy runs under OWL 2 RL, where single pairs at 20 threads differ by up to
+13.7 MiB. With the long-body rules it is 805.9 against 790.6 MiB on LUBM(100) at one
+thread, 804.7 against 791.2 MiB at 20 threads, where one pair differs by 19.6 MiB, and
+95.6 against 90.2 MiB on LUBM(10) at 20 threads. The
 [run directory](runs/2026-11-14-item-939-atlas/run.sh.txt) holds the commands, the
-[host and build](runs/2026-11-14-item-939-atlas/env.txt), the timings of the
+[host and build](runs/2026-11-14-item-939-atlas/env.txt), the
+[rule file](runs/2026-11-14-item-939-atlas/long-bodies.rules), the timings of the
 [first](runs/2026-11-14-item-939-atlas/results-part1.txt) and the
 [second](runs/2026-11-14-item-939-atlas/results-part2.txt) part of the run and their
 [summary](runs/2026-11-14-item-939-atlas/summary.txt). These are benchmark-worker

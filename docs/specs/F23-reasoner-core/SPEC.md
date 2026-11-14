@@ -413,7 +413,7 @@ pinned thread, at `e66d8b70`, it found the following.
 |---|---|---|---|
 | OWL2Bench(1), `owl-rl` | 494 ms | 158 ms | `prp-key` falls from 334 ms to 0.4 ms. |
 | OWL2Bench(5), `owl-rl` | 30.7 s | 9.2 s at most | `prp-key` takes 21.6 s. Its longest plan outran the probe's budget. |
-| LUBM(10) and LUBM(100), `owl-rl` | 0.89 s and 11.12 s | The same | No order is faster. |
+| LUBM(10) and LUBM(100), `owl-rl` | 0.89 s and 11.12 s | The same times. | The probe found no faster order. |
 | LUBM(10), user rules with bodies of four to six atoms | 286 ms | 228 ms | Two rules gain, and their candidate counts fall far less than their times. |
 | LUBM(100), the same rules | 4.14 s | 4.03 s | The probe did not try every order of the longest body. |
 
@@ -426,7 +426,7 @@ greedy order only when the sample puts its cost at half the greedy order's or le
 only when it needs no order over the whole tier that the greedy order does not need.
 Three gates keep the cost of planning low. A body of fewer than three atoms keeps the
 greedy order. A body whose predicates are all constants is sampled only when the
-statistics put its plan above two million candidates. A walk of the greedy order with
+statistics put its plan at two million candidates or more. A walk of the greedy order with
 four bindings comes first, and a greedy order that it puts under 50,000 candidates is
 kept without a search. `ReasonOptions::sampled_planning` is on by default, and `false`
 keeps the greedy order of every body.
@@ -436,10 +436,11 @@ an evaluation and the order in which facts are derived, so fact ids can differ b
 the planners. Two cases keep the greedy order because another order could change more
 than that. A builtin checks a variable that is already bound by value, so that the
 integer 3 passes for the decimal 3.0, where an atom matches the term itself. A rule in
-which a builtin binds a variable that an atom or another builtin also holds therefore
-keeps the greedy order. A graph that holds dead facts keeps it too, as an incremental run
-does after a deletion, since an order counts a dead fact among its candidates until a
-compaction of its run drops it. Roadmap item 944 covers both. Query-time reasoning and
+which a builtin binds a variable that an atom also holds, or that another builtin also
+binds, therefore keeps the greedy order. Every rule keeps it while the derived tier holds
+a dead fact, which a deletion leaves when it removes a derived fact, since an order
+counts a dead fact among its candidates until a compaction of its run drops it. Roadmap
+item 944 covers both. Query-time reasoning and
 the maintenance of witnesses plan greedily as before.
 
 The sample is drawn at fixed places, so one snapshot plans the same way each time. In the
@@ -448,9 +449,14 @@ how the facts fall into runs. In the store they are the starts of blocks along a
 The same quads in other blocks, after another sequence of loads or a compaction, can give
 another sample and another order, which changes the time of a run and never its facts.
 
-Planning is bounded. A read of the store stops at the end of one block, and earlier once
-it has entered 4,096 rows, whatever share of the rows belongs to graphs that the run
-does not read. A plan makes at most 2,048 probes, and each is charged 1 KiB to the run's
+Planning is bounded. A read of the store ends with one block of the index at the latest,
+whatever share of the rows belongs to graphs that the run does not read. Within that
+block it has an allowance of 4,096 rows, counted in the pieces the scan delivers, which
+are blocks, segments and rows of the snapshot's delta. The read stops before the piece
+that follows the one that passed the allowance, so it can enter more rows than the
+allowance by the size of one piece. A scan that merges the delta decodes a piece before
+it delivers it, and it consumes deleted rows without delivering them, so it can decode
+more than it delivers. A plan makes at most 2,048 probes, and each is charged 1 KiB to the run's
 memory budget until the plan is made. A plan that needs more, that fails to read the
 store or whose costs overflow keeps the greedy order. The planner's scans count in a
 run's `base_scans`, so that count differs between the planners.
@@ -461,11 +467,15 @@ against 12.5 to 12.8 s at 20 threads. Its whole materialization takes 80.6 to 80
 against 102.5 to 102.8 s and 42.5 to 42.7 s against 45.5 to 49.2 s. The rules of
 OWL2Bench(1) take 662 to 696 ms against 976 to 988 ms at one thread. No plan of LUBM
 changes, and the rules of LUBM(100) take 14.51 to 14.55 s against 14.50 to 14.55 s at one
-thread. Planning itself costs a few milliseconds per run. It shows on LUBM(10) at one
-thread, where six of seven runs took 930 to 936 ms against 926 to 933 ms, about 4 ms or
-0.4%, and roadmap item 945 covers that cost. The peak heap is equal within 3 MiB on the
-OWL 2 RL runs and up to 15 MiB higher, 2%, on LUBM(100) with the long-body rules, which
-is the planner's working memory. Every pair derived the same facts. The
+thread. On LUBM the planner changed no plan, by its count of changed plans, so the
+difference there is taken to be the cost of planning. It shows on LUBM(10) at one thread,
+where six of seven sampled runs took 930 to 936 ms and one 970 ms against 926 to 933 ms.
+The median of the seven paired differences is 4 ms, 0.4%, and roadmap item 945 covers
+that cost. The highest peak heap of the sampled runs of a workload is within 3.1 MiB of
+that of the greedy runs under OWL 2 RL. With the long-body rules on LUBM(100) it is
+15.3 MiB higher at one thread, 805.9 against 790.6 MiB, and 13.5 MiB higher at 20
+threads. Every pair of `infer` runs derived the same facts by their digests, and every
+pair of materializations inferred the same number. The
 [results](../../benchmarks/reasoning/RESULTS.md#sampled-rule-body-planning) hold the
 table. These are benchmark-worker measurements of `a63916c0`, and neither the later
 commits of the item nor the benchmark host have repeated them.
