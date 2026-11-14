@@ -2300,8 +2300,7 @@ fn select_chains(roles: &Roles, told: &[(Vec<Role>, Role)], seeds: &[Role]) -> S
         }
     }
     for v in comp.values_mut() {
-        v.sort_unstable();
-        v.dedup();
+        minimal_roles(v, |r, s| roles.sub(r, s));
     }
     composed.sort_unstable();
     Selection {
@@ -2310,6 +2309,26 @@ fn select_chains(roles: &Roles, told: &[(Vec<Role>, Role)], seeds: &[Role]) -> S
         left,
         right,
     }
+}
+
+/// Keeps the least roles of `v`, the roles a chain composes a pair of links into, by
+/// `sub(r, s)` for r under s: a role under another of them stays in its place, and of
+/// equivalent roles the first does. A link by a role is one by each of its superroles to
+/// every rule, which reads a link's role through its superroles, and the composition
+/// table lists every pair of roles under a chain's operands. A symmetric transitive role
+/// is its own inverse, and the mirror image of its transitivity, which the Horn rules
+/// add, composed each link once by the role and once by its inverse (roadmap item 962).
+fn minimal_roles(v: &mut Vec<Role>, sub: impl Fn(Role, Role) -> bool) {
+    v.sort_unstable();
+    v.dedup();
+    if v.len() < 2 {
+        return;
+    }
+    let all = v.clone();
+    v.retain(|&t| {
+        !all.iter()
+            .any(|&u| u != t && sub(u, t) && (u < t || !sub(t, u)))
+    });
 }
 
 /// A set of expressions, as a flag for each.
@@ -2568,8 +2587,9 @@ fn roles(
         }
     }
     for v in comp.values_mut() {
-        v.sort_unstable();
-        v.dedup();
+        minimal_roles(v, |r, s| {
+            r == s || sup[r as usize].binary_search(&s).is_ok()
+        });
     }
     let mut reflexive: BTreeSet<Role> = BTreeSet::new();
     for &r in &ax.reflexive {

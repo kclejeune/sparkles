@@ -1166,3 +1166,115 @@ fn a_cancellation_polled_once_stops_a_horn_run_wherever_it_comes() {
         );
     }
 }
+
+/// A path of `n` classes by `r`, which is transitive, with `extra` beside it.
+fn transitive_path(n: usize, extra: &str) -> String {
+    let mut s = format!("TransitiveObjectProperty(:r)\n{extra}\n");
+    for i in 0..n {
+        s += &format!("SubClassOf(:A{i} ObjectSomeValuesFrom(:r :A{}))\n", i + 1);
+    }
+    s
+}
+
+#[test]
+fn a_symmetric_transitive_role_composes_each_link_once() {
+    // A symmetric role is its own inverse, and the mirror image of its transitivity is
+    // the transitivity of its inverse. The Horn rules composed each link of the path by
+    // the role and again by its inverse, and composed both again, so that a file of
+    // ORE 2015 with one such role passed the Horn budget (roadmap item 962). The path
+    // takes as many conclusions as with an unrelated inverse pair, which makes the run
+    // take the Horn rules too without changing the role.
+    let n = 60;
+    let (plain, ex) = run(&transitive_path(n, "InverseObjectProperties(:p :q)"));
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(plain.stats.tier, Tier::Horn);
+    for extra in [
+        "SymmetricObjectProperty(:r)",
+        // r and s are each other's inverse and equivalent, so that the four roles are one
+        "InverseObjectProperties(:r :s) EquivalentObjectProperties(:r :s)",
+    ] {
+        let (out, ex) = run(&transitive_path(n, extra));
+        assert!(ex.is_empty(), "{extra}: {ex:#?}");
+        assert_eq!(out.stats.tier, Tier::Horn, "{extra}");
+        assert_eq!(out.stats.conclusions, plain.stats.conclusions, "{extra}");
+    }
+}
+
+#[test]
+fn a_symmetric_transitive_role_reaches_the_instance_itself() {
+    // An instance of A0 has an r-successor in A1, which has the instance as an
+    // r-successor by symmetry, so that the instance is its own r-successor by
+    // transitivity and meets ∃r.A0 ⊑ B. An instance of A1 need not have a neighbour in
+    // A0.
+    let body = transitive_path(
+        3,
+        "SymmetricObjectProperty(:r)
+         SubClassOf(ObjectSomeValuesFrom(:r :A0) :B)
+         SubClassOf(ObjectSomeValuesFrom(:r :B) :C)",
+    );
+    check(
+        &body,
+        &[("A0", "B"), ("A0", "C")],
+        &[("A1", "B"), ("A2", "C"), ("A3", "B"), ("B", "A0")],
+    );
+    // the same through the inverse
+    let body = transitive_path(
+        3,
+        "SymmetricObjectProperty(:r)
+         SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r) :A0) :B)",
+    );
+    check(&body, &[("A0", "B")], &[("A2", "B"), ("A3", "B")]);
+    // and with the first link by a subrole of r
+    let body = transitive_path(
+        3,
+        "SymmetricObjectProperty(:r)
+         SubObjectPropertyOf(:t :r)
+         SubClassOf(ObjectSomeValuesFrom(:r :A0) :B)",
+    )
+    .replace(
+        "ObjectSomeValuesFrom(:r :A1)",
+        "ObjectSomeValuesFrom(:t :A1)",
+    );
+    check(&body, &[("A0", "B")], &[("A1", "B"), ("A3", "B")]);
+}
+
+#[test]
+fn a_composed_link_by_the_least_role_still_counts_for_its_superroles() {
+    // p ∘ q composes into r and into s, with r under s, so that a composed link is kept
+    // by r alone (roadmap item 962). The link still counts for s, through the chains and
+    // the negative existentials over s, and the chains over r still read it.
+    let path = "SubObjectPropertyOf(:r :s)
+         SubObjectPropertyOf(ObjectPropertyChain(:p :q) :r)
+         SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+         SubObjectPropertyOf(ObjectPropertyChain(:r :y) :t1)
+         SubObjectPropertyOf(ObjectPropertyChain(:s :y) :t2)
+         SubClassOf(:A ObjectSomeValuesFrom(:p :B))
+         SubClassOf(:B ObjectSomeValuesFrom(:q :C))
+         SubClassOf(:C ObjectSomeValuesFrom(:y :D))
+         SubClassOf(ObjectSomeValuesFrom(:r :C) :R)
+         SubClassOf(ObjectSomeValuesFrom(:s :C) :S)
+         SubClassOf(ObjectSomeValuesFrom(:t1 :D) :T1)
+         SubClassOf(ObjectSomeValuesFrom(:t2 :D) :T2)";
+    let yes = [("A", "R"), ("A", "S"), ("A", "T1"), ("A", "T2")];
+    let no = [("B", "R"), ("B", "T2"), ("C", "S")];
+    // with an unrelated inverse pair, which takes the Horn rules without firing them,
+    // with a universal, which fires them, and with a universal on the inverse of y,
+    // which reaches the end of the chain and is read through s
+    for extra in [
+        "InverseObjectProperties(:i :j)",
+        "SubClassOf(:X ObjectAllValuesFrom(:u :Y))",
+        "SubClassOf(:D ObjectAllValuesFrom(ObjectInverseOf(:y) :Dy))
+         SubClassOf(ObjectSomeValuesFrom(:s :Dy) :T3)",
+    ] {
+        let out = check(&format!("{path}\n{extra}"), &yes, &no);
+        assert_eq!(out.stats.tier, Tier::Horn, "{extra}");
+    }
+    check(
+        &format!(
+            "{path}\nSubClassOf(:D ObjectAllValuesFrom(ObjectInverseOf(:y) :Dy))
+             SubClassOf(ObjectSomeValuesFrom(:s :Dy) :T3)"
+        ),
+        &[("A", "T3"), ("C", "Dy")],
+        &[("B", "T3"), ("C", "T3")],
+    );
+}
