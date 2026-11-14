@@ -3381,6 +3381,7 @@ dependencies = [
  "smallvec",
  "sparkles-budget",
  "sparkles-core",
+ "sparkles-shacl",
  "thiserror 2.0.21",
  "tracing",
  "uuid",
