@@ -9176,7 +9176,12 @@ beyond the schema, where a materialization derives 10.9 million.
   and fails with `422` and the code `reasoning-rules`.
 * Derived tables are cached per snapshot, rules and view, so a repeated query reads them.
   `nocache=true` bypasses the tables but not the dataset's schema, which is derived once
-  per snapshot.
+  per snapshot. A later commit keeps the tables of the commit before it when none of the
+  quads it changed in the input graphs is a schema, RDF list or `owl:sameAs` fact or one
+  that the rules read or give, so the schema, its completeness proof and the tables are
+  not derived again after such a write. The `rdfs` profile reads every fact, as do the
+  equality rules of `owl-rl` once the data holds `owl:sameAs`, so those derive again after
+  every commit to the input graphs.
 * A derivation reads the caller's view, so protections that hide triples apply to it.
   Unlike materialized inferences, which callers with protections cannot read, derived
   facts follow only from triples the caller can see.

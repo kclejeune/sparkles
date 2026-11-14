@@ -98,7 +98,9 @@ request or on every write, and the schema report counts what the data holds.
   can follow from derived instance facts, including class and property declarations and
   equality between schema terms. Programs containing `makeTemp` run in one ordinary
   demand program with their normal lower stages. Derived tables are cached per snapshot
-  and view, and `maxDerived`, the deadline and the memory budget bound them. Tables that
+  and view, and a later commit keeps them when no quad it changed is one the rules read or
+  give or a schema, list or `owl:sameAs` fact. `maxDerived`, the deadline and the memory
+  budget bound them. Tables that
   contain generated blank nodes are not cached. A tiny positive feedback view whose
   schema expansion creates thousands of rules can use a bounded temporary closure of
   the original rules. This retains intermediate facts within the session and uses the
@@ -123,7 +125,11 @@ request or on every write, and the schema report counts what the data holds.
   options that read the selected data, the inferred data that incremental views read and
   the source of an explanation. A mode is read from the `reasoning` parameter of the HTTP
   endpoints, the `--reasoning` flag of `sparkles query` and the `reasoning` argument of
-  the MCP tools. `Auto` is refused until a cost-based choice exists.
+  the MCP tools `sparql_query` and `explain_query`.
+* The Fuseki converter maps a GenericRuleReasoner's `jr:ruleMode` to the dataset's
+  query-time default: `auto` for hybrid, Jena's default, `demand` with nothing
+  materialized for backward, and materialized reasoning for forward
+  ([G08](../specs/G08-fuseki-configuration.md#rule-modes-and-query-time-reasoning)).
 * Embedded query providers implement `ReasoningSession::intensional` with a
   `Result<bool>` return. Constant interning can refuse a memory reservation, and
   callers propagate that refusal before preparing demands. Implementations that
@@ -714,9 +720,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   that falls back reports the full run's peak memory and not the higher peak of the update
   it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
-  Derivation on demand has no cost-based choice against a materialization, no OWL 2 QL
-  rewriting, no reuse of tables across commits and no dataset setting, and Jena's hybrid
-  rules are flattened. Roadmap item 19.
+  Derivation on demand has no OWL 2 QL rewriting, Jena's hybrid rules are flattened, and
+  the UI's query page offers only materialized inferences or none. Roadmap item 19.
+  `reasoning=auto` reads a materialization that can answer rather than compare costs per
+  pattern. Roadmap item 910.
+* A view's tables carry over to another commit only while the rules cannot read or give
+  any quad that differs between them. The `rdfs` profile's `rdf1`, `rdfs4a` and `rdfs4b`
+  read every fact, as do `owl-rl`'s `eq-rep-*` rules once the data holds `owl:sameAs`, so
+  such views derive again after every commit to their input graphs. An anchor keeps a
+  clone of its commit's delta, which retains the key-set nodes that later writes replaced.
 * Demand reasoning has per-query schema analysis and program setup costs. Schema
   completeness analysis can stream the visible inputs twice, including when schema
   tables are warm, and reserves a conservative workspace against the memory budget.
