@@ -1,0 +1,20 @@
+[00:41:42] START
+[00:42:40] block infer lubm100 owl-rl t1 x6
+[00:46:59] block infer owl2bench5 owl-rl t1 x3
+[00:54:24] block infer owl2bench5 owl-rl t20 x4
+[02:06:09] START
+[02:07:08] block infer owl2bench5 owl-rl t20 x4
+[02:13:02] block infer lubm100 owl-rl t20 x6
+[02:15:01] block infer lubm10 owl-rl t1 x7
+[02:15:24] block infer lubm10 owl-rl t20 x7
+[02:15:37] block infer owl2bench1 owl-rl t1 x7
+[02:16:01] block infer owl2bench1 owl-rl t20 x7
+[02:16:19] block infer lubm100 long-bodies t1 x4
+[02:17:08] block infer lubm100 long-bodies t20 x5
+[02:17:22] block infer lubm10 long-bodies t1 x7
+[02:17:28] block infer lubm10 long-bodies t20 x7
+[02:17:32] block materialize lubm100 owl-rl t1 x3
+[02:21:38] block materialize lubm100 owl-rl t20 x3
+[02:23:31] block materialize owl2bench5 owl-rl t1 x2
+[02:29:38] block materialize owl2bench5 owl-rl t20 x3
+[02:34:08] AB-DONE
