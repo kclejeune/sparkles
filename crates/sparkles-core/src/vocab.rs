@@ -1228,6 +1228,42 @@ impl Vocab {
         // capacity is read once, rather than through `key` at every step.
         let mut cap = key.capacity();
         let mut e = self.entry::<F>(data, &mut pos, true);
+        if !F {
+            // plain suffixes: the same lookahead with a copy in place of a decode
+            for at in 0..=last {
+                let id = (b * FC_BLOCK + at) as u64;
+                let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
+                let nd = lookahead(mask, at, next);
+                if nd <= e.shared {
+                    key.truncate(nd);
+                } else {
+                    key.truncate(e.shared);
+                    let add = e.len.min(nd - e.shared);
+                    let total = key.len() + add;
+                    if total > cap {
+                        let total = total.max(self.scratch_capacity());
+                        reserve(total)?;
+                        key.reserve_exact(total - key.len());
+                        cap = key.capacity();
+                        #[cfg(any(test, feature = "failpoints"))]
+                        crate::algo::observe_projection(
+                            crate::algo::ProjectionEvent::Materialized(
+                                "checked-vocab-scratch-allocated",
+                                key.capacity(),
+                            ),
+                        );
+                    }
+                    key.extend_from_slice(&data[e.start..e.start + add]);
+                }
+                if mask >> at & 1 == 1 {
+                    f(id, key)?;
+                }
+                if let Some(n) = next {
+                    e = n;
+                }
+            }
+            return Ok(());
+        }
         for at in 0..=last {
             let id = (b * FC_BLOCK + at) as u64;
             let next = (at < last).then(|| self.entry::<F>(data, &mut pos, false));
@@ -1243,8 +1279,13 @@ impl Vocab {
                 let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
                 if total.saturating_add(room) > cap {
                     // an FSST suffix decodes fastest with room for eight symbols
-                    // past the key (`fsst::Table::decode_at`)
-                    let total = total.saturating_add(FSST_ROOM * usize::from(e.coded));
+                    // past the key (`fsst::Table::decode_at`). The buffer starts at the
+                    // unchecked decoder's size, so that a block's short keys, each
+                    // decoded up to the next key's shared prefix, do not grow it one
+                    // step at a time.
+                    let total = total
+                        .saturating_add(FSST_ROOM * usize::from(e.coded))
+                        .max(self.scratch_capacity());
                     reserve(total)?;
                     key.reserve_exact(total - key.len());
                     cap = key.capacity();
@@ -3273,7 +3314,8 @@ mod tests {
             assert!(blocked.unwrap_err() > 32 << 10);
             assert!(!called);
             // Either codec decodes only the byte of the long key that the short key
-            // takes (items 108 and 948), so the long key costs nothing.
+            // takes (items 108 and 948), so the long key costs nothing, and the buffer
+            // takes the unchecked decoder's first size.
             let mut most = 0;
             let got = v.get_with_checked(
                 1,
@@ -3284,7 +3326,7 @@ mod tests {
                 |k| k.to_vec(),
             );
             assert_eq!(got, Ok(Some(keys[1].clone())), "fsst {fsst}");
-            assert_eq!(most, 2, "fsst {fsst}");
+            assert_eq!(most, v.scratch_capacity(), "fsst {fsst}");
             let mut got = Vec::new();
             v.get_sorted_checked(
                 &[0, 1, 2, 15, u64::MAX],
