@@ -6367,6 +6367,7 @@ ds.add(Quad(alice, NamedNode("http://ex.org/p"), Literal(1)))   # a commit; True
 ds.extend(triples_or_quads)                       # many quads in one commit
 ds.remove(quad)
 quad in ds; len(ds); ds.named_graphs()
+ds.contains_all(quads)                            # a list of bool, one per quad
 
 for q in ds.quads_for_pattern(alice, None, None):  # None matches anything
     print(q.predicate, q.object, q.graph_name)
@@ -6381,7 +6382,10 @@ with ds.transaction() as tx:                       # commits at the end of the b
 
 `graph_name=None` matches every graph, and `DefaultGraph()` matches only the default
 graph. `quads_for_pattern` reads the snapshot it started on, in batches, so a large match
-is never held in memory at once. A transaction rolls back when its block raises, or when
+is never held in memory at once. `contains_all` answers many membership tests in one
+call. It takes any iterable of quads or triples and returns what `in` gives for each, in
+order and from one snapshot. A batch longer than 256 quads, or any batch on a dataset on
+disk, is answered without the GIL. A transaction rolls back when its block raises, or when
 it is garbage-collected without `commit()`. Queries on the dataset read the last commit,
 not the open transaction. A write on the dataset from the thread that holds the
 transaction raises `ConflictError` instead of waiting for itself. Writes from other
@@ -6741,6 +6745,13 @@ throws `JenaTransactionException`, as in TDB2, unless the dataset was opened wit
 `autocommit(true)`. Each such write is then a commit of its own, which is slow for many
 writes.
 
+`DatasetGraphSparkles.containsAll(quads)` answers many `contains` tests in one native
+call and returns a `BooleanArray` with the answer for each quad in order. A term that
+several quads share crosses once, and every answer is read from the thread's
+transaction, or from the newest commit outside one. `containsAll(graph, triples)` does
+the same for the triples of one graph. The whole batch is encoded into one request, so
+its memory grows with the batch.
+
 An iterator from `find` inside a transaction throws `JenaTransactionException` once the
 transaction has ended. Outside a transaction, an iterator reads the commit that was the
 newest when it was made. Close or exhaust iterators, because an open one keeps its
@@ -6945,7 +6956,9 @@ before calling a dataset operation that needs the writer lock.
 
 `load` accepts paths, RDF text, byte arrays, Node Readables and Web streams. `dump`
 returns a Web byte stream, and `dumpToFile` writes to a path. `match` streams RDF/JS
-quads, and `source()` returns an RDF/JS source for Comunica. Dataset administration is
+quads, and `source()` returns an RDF/JS source for Comunica. `has(quad)` tests one quad,
+and `hasAll(quads)` tests many in one call and resolves to an array of booleans in the
+order given, all read from the dataset's state at the call. Dataset administration is
 grouped under handles such as `snapshots`, `history`, `branches`, `indexes`,
 `reasoning`, `validation` and `settings`. The [engine package](../js/engine/README.md)
 documents the full API.

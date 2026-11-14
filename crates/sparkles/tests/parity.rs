@@ -1181,6 +1181,7 @@ const EXTRA_KEYS: &[&str] = &[
     "dataset.construct",
     "dataset.transaction",
     "dataset.quads",
+    "dataset.contains_all",
     "dataset.insert",
     "dataset.remove",
     "dataset.clone_to_with",
@@ -1216,6 +1217,7 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.construct("CONSTRUCT {} {}");
     ds.transaction(|_| Ok(()));
     ds.quads(None, None, None, None);
+    ds.contains_all([any::<oxrdf::QuadRef<'_>>()]);
     ds.insert(any());
     ds.remove(any());
     ds.branch("dev");
