@@ -862,6 +862,67 @@ impl Store {
         })
     }
 
+    /// The net changes of the graphs `graphs` in the commits after `after` through the
+    /// commit of `to`, as quads of ids of `to`'s generation with whether each was added,
+    /// read from that generation's log. `None` when that log does not hold every one of
+    /// those commits: across a bulk commit or a compaction, after the generation was
+    /// collected, and in a store without a log. [`diff`](Self::diff) then gives the
+    /// changes as terms.
+    ///
+    /// A caller that works with the ids of `to`, such as a materialization kept for the
+    /// state at `after`, needs no term of the changes: the log holds ids, and `diff`
+    /// turns each into its term. The removed quads come first, each group in the order
+    /// of its ids. Only the limits of `o` apply (`max_quads`, `cancel` and `deadline`).
+    pub fn changed_ids(
+        &self,
+        after: u64,
+        to: &Snapshot,
+        graphs: &[Id],
+        o: &DiffOptions,
+    ) -> Result<Option<Vec<([Id; 4], bool)>>> {
+        if self.history.is_none() || after > to.commit {
+            return Ok(None);
+        }
+        if after == to.commit {
+            return Ok(Some(Vec::new()));
+        }
+        let no = commit::generation_number(&to.generation.name);
+        let whole = Step::Log {
+            generation: no,
+            after,
+            through: to.commit,
+        };
+        if self.diff_plan(after, to.commit)? != [whole] {
+            return Ok(None);
+        }
+        let (generation, mut cursor) = self.open_log(no, after)?;
+        if !Arc::ptr_eq(&generation, &to.generation) {
+            return Ok(None);
+        }
+        let mut net: FxHashMap<[Id; 4], bool> = FxHashMap::default();
+        walk_wal(&mut cursor, after, to.commit, o, &mut |op, q| {
+            if !graphs.contains(&q[3]) {
+                return Ok(());
+            }
+            match net.entry(q) {
+                Entry::Occupied(e) => {
+                    e.remove();
+                }
+                Entry::Vacant(e) => {
+                    e.insert(op == WAL_INSERT);
+                    if net.len() & 0xFFFF == 0 {
+                        o.over(net.len() as u64)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        o.over(net.len() as u64)?;
+        let mut changes: Vec<([Id; 4], bool)> = net.into_iter().collect();
+        changes.sort_unstable_by_key(|(q, added)| (*added, [q[3].0, q[0].0, q[1].0, q[2].0]));
+        Ok(Some(changes))
+    }
+
     /// The changes between two commits from the change log, when the write-ahead logs
     /// cannot give them all (an end is no longer readable, or a bulk commit lies between
     /// them) and the change log records every commit between them. `None` otherwise.

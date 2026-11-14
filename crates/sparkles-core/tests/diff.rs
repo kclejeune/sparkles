@@ -292,6 +292,161 @@ fn random_histories_across_compactions_and_bulk_commits() {
     }
 }
 
+/// The changes of a generation's log as ids agree with the two materialized states, for
+/// every graph selection, and a range within the head's generation always has them.
+#[test]
+fn changed_ids_agree_with_the_states() {
+    use sparkles_core::id::Id;
+    for seed in [1, 2, 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                bulk_threshold: 6,
+                history_max_generations: 64,
+                change_log: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.set_retention(keep_all()).unwrap();
+        let mut r = Rng(seed * 104_729);
+        let log = random_history(&s, &mut r, 40, 6);
+        // the head's generation ends with several ordinary commits, some of which undo
+        // each other
+        let boundary = log
+            .iter()
+            .filter(|l| l.1 != Did::Update)
+            .map(|l| l.0)
+            .max()
+            .unwrap_or(0);
+        let u = |q: &str| update(&s, q, &QueryOptions::default()).unwrap();
+        u("INSERT DATA { <urn:x> <urn:p0> 1 . GRAPH <urn:g1> { <urn:x> <urn:p0> 2 } }");
+        u("DELETE DATA { <urn:x> <urn:p0> 1 } ; INSERT DATA { <urn:y> <urn:p1> \"new\" }");
+        u("INSERT DATA { <urn:x> <urn:p0> 1 . GRAPH <urn:g2> { <urn:z> <urn:p1> <urn:x> } }");
+        for _ in 0..10 {
+            let (a, b) = (quad(&mut r), quad(&mut r));
+            u(&format!("DELETE DATA {{ {a} }} ; INSERT DATA {{ {b} }}"));
+        }
+        let head = s.head_commit().seq;
+        let snap = s.snapshot();
+        let g = |n: &str| snap.lookup_iri(n);
+        let selections: [Vec<Option<Id>>; 4] = [
+            vec![Some(Id::DEFAULT_GRAPH)],
+            vec![g("urn:g1")],
+            vec![Some(Id::DEFAULT_GRAPH), g("urn:g1"), g("urn:g2")],
+            vec![],
+        ];
+        let line = |q: &[Id; 4]| nquads_line(&snap.quad_to_terms(q).expect("a stored quad"));
+        let after_last_rebuild = boundary;
+        let sb = state(&s, head);
+        let mut read = 0;
+        for a in 0..=head {
+            let sa = state(&s, a);
+            for sel in &selections {
+                let ids: Vec<Id> = sel.iter().flatten().copied().collect();
+                let got = s
+                    .changed_ids(a, &snap, &ids, &DiffOptions::default())
+                    .unwrap();
+                let Some(got) = got else {
+                    assert!(
+                        a < after_last_rebuild,
+                        "seed {seed}: no ids for {a}..{head}, within the head's generation"
+                    );
+                    continue;
+                };
+                read += 1;
+                let wanted = |l: &&String| {
+                    let q = snap_graph(l);
+                    ids.iter().any(|i| line_graph(&snap, *i) == q)
+                };
+                let want_add: BTreeSet<String> =
+                    sb.difference(&sa).filter(wanted).cloned().collect();
+                let want_rem: BTreeSet<String> =
+                    sa.difference(&sb).filter(wanted).cloned().collect();
+                let (mut add, mut rem) = (BTreeSet::new(), BTreeSet::new());
+                let mut seen_add = false;
+                for (q, added) in &got {
+                    assert!(ids.contains(&q[3]), "a quad of another graph");
+                    if *added {
+                        seen_add = true;
+                        assert!(add.insert(line(q)), "a quad added twice");
+                    } else {
+                        assert!(!seen_add, "removals come before additions");
+                        assert!(rem.insert(line(q)), "a quad removed twice");
+                    }
+                }
+                assert_eq!(add, want_add, "seed {seed}: added, {a}..{head} in {sel:?}");
+                assert_eq!(
+                    rem, want_rem,
+                    "seed {seed}: removed, {a}..{head} in {sel:?}"
+                );
+            }
+        }
+        assert!(
+            read >= 4 * 4,
+            "seed {seed}: {read} ranges read from the log"
+        );
+        // a state after the snapshot's, and a quad limit
+        assert!(
+            s.changed_ids(
+                head + 1,
+                &snap,
+                &[Id::DEFAULT_GRAPH],
+                &DiffOptions::default()
+            )
+            .unwrap()
+            .is_none()
+        );
+        let tight = DiffOptions {
+            max_quads: 1,
+            ..Default::default()
+        };
+        let e = s
+            .changed_ids(
+                head - 6,
+                &snap,
+                &[Id::DEFAULT_GRAPH, g("urn:g1").unwrap()],
+                &tight,
+            )
+            .err();
+        assert!(matches!(e, Some(Error::BudgetExceeded(_))), "{e:?}");
+    }
+    // a store without a log has no ids to give
+    let s = Store::in_memory(StoreOptions::default());
+    update(
+        &s,
+        "INSERT DATA { <urn:a> <urn:p> 1 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    assert!(
+        s.changed_ids(
+            0,
+            &snap,
+            &[sparkles_core::id::Id::DEFAULT_GRAPH],
+            &DiffOptions::default()
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+/// The graph term of a canonical N-Quads line, `None` for the default graph.
+fn snap_graph(line: &str) -> Option<String> {
+    let body = line.trim_end().strip_suffix(" .").unwrap_or(line);
+    body.rsplit(' ')
+        .next()
+        .filter(|g| g.starts_with("<urn:g"))
+        .map(str::to_string)
+}
+
+/// The graph term of graph id `g`, as [`snap_graph`] gives it.
+fn line_graph(snap: &sparkles_core::store::Snapshot, g: sparkles_core::id::Id) -> Option<String> {
+    (g != sparkles_core::id::Id::DEFAULT_GRAPH).then(|| snap.term(g).expect("a graph").to_string())
+}
+
 /// Read the change feed from `after` to the head in pages; checks each commit's changes
 /// against the diff of that one commit. Returns the commits read and how many were
 /// listed without their changes.
