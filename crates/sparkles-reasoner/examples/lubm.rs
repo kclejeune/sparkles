@@ -426,10 +426,17 @@ fn main() {
                 .unwrap();
                 (r, t.elapsed().as_micros())
             };
-            let (r, _) = run(None);
+            let (r, full) = run(None);
             let mut since = r.receipt.unwrap().commit.seq;
-            let (r, _) = run(Some(since));
+            let (r, settle) = run(Some(since));
             since = r.receipt.unwrap().commit.seq;
+            println!(
+                "churn {} threads={threads} full_ms={} settle_ms={} inferred={}",
+                profile.name(),
+                full / 1000,
+                settle / 1000,
+                r.inferred
+            );
             // a profiler started with its events off records the rounds only
             let control = |word: &str| {
                 if let Ok(path) = std::env::var("LUBM_PERF_CONTROL") {
