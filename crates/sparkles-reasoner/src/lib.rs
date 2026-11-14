@@ -876,6 +876,51 @@ pub(crate) fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Resul
     Ok(rules)
 }
 
+/// The rule sets that [`incremental_rules`] keeps.
+const KEPT_RULE_SETS: usize = 8;
+
+/// A rule set of [`incremental_rules`]: its digest, its rules, and why they cannot be
+/// maintained incrementally, if they cannot.
+type KeptRules = (u64, Arc<Vec<Rule>>, Option<String>);
+
+/// The rule sets of the incremental runs made last, by their digest ([`rules_digest`]).
+static INCREMENTAL_RULES: std::sync::Mutex<Vec<KeptRules>> = std::sync::Mutex::new(Vec::new());
+
+/// The parsed rules of a profile and its extras for an incremental run, and why they
+/// keep a materialization from being maintained incrementally, if they do
+/// ([`engine::incremental_blocker`]). Both follow from the rule text alone, which the
+/// digest covers, so they are kept for the next runs with the same digest: a run after
+/// each small write would otherwise parse the profile and compile it for the check
+/// every time, about a tenth of the time of a change of 100 triples.
+fn incremental_rules(
+    profile: &Profile,
+    extras: &Extras,
+    digest: u64,
+    snap: &Arc<Snapshot>,
+) -> anyhow::Result<(Arc<Vec<Rule>>, Option<String>)> {
+    let kept = |sets: &Vec<KeptRules>| {
+        sets.iter()
+            .find(|k| k.0 == digest)
+            .map(|k| (k.1.clone(), k.2.clone()))
+    };
+    if let Some(found) = kept(&INCREMENTAL_RULES.lock().unwrap_or_else(|e| e.into_inner())) {
+        return Ok(found);
+    }
+    let rules = Arc::new(profile_rules(profile, extras)?);
+    let terms = Terms::new(snap.clone());
+    let blocker = engine::compile(&rules, &terms, &mut Vec::new())
+        .iter()
+        .find_map(|r| engine::incremental_blocker(r, &terms));
+    let mut sets = INCREMENTAL_RULES.lock().unwrap_or_else(|e| e.into_inner());
+    if kept(&sets).is_none() {
+        if sets.len() == KEPT_RULE_SETS {
+            sets.remove(0);
+        }
+        sets.push((digest, rules.clone(), blocker.clone()));
+    }
+    Ok((rules, blocker))
+}
+
 /// A digest of everything that determines a materialization besides the data: the rule
 /// text of the profile and its vocabularies, and the switches of `extras`. An incremental
 /// run needs the previous run's digest to be the same.
@@ -1483,15 +1528,9 @@ fn update_closure(
     if since > snap.commit {
         return Err(Fallback("the store position moved backwards".into()).into());
     }
-    let rules = profile_rules(profile, extras)?;
-    {
-        let terms = Terms::new(snap.clone());
-        let mut w = Vec::new();
-        for r in engine::compile(&rules, &terms, &mut w) {
-            if let Some(why) = engine::incremental_blocker(&r, &terms) {
-                return Err(Fallback(why).into());
-            }
-        }
+    let (rules, blocker) = incremental_rules(profile, extras, digest, snap)?;
+    if let Some(why) = blocker {
+        return Err(Fallback(why).into());
     }
     let graphs = resolved.graph_set();
     if let Ok(r) = &raw {
