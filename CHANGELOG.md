@@ -2082,6 +2082,15 @@ the proof, which item 911 follows. A query that runs and reads no
 materialization leaves `estimatedDerived` out of its `Derive` nodes, and an EXPLAIN that
 does not run the query still gives it.
 
+Seven tests that failed batch gates on a loaded host, and passed on a quiet one, now give
+the same result on any host (roadmap items 451 and 667). Each failed on a wall-clock limit
+or a race and not on a wrong answer. Where a limit bounds the work, the tests count the work
+instead, as the JSON-LD probe test now counts the bytes it expands and the schema-heavy
+demand differential skips a query only past the reasoner's limit of derived facts. Where the
+time was the harness's own, the galloping index join test compares answers as interned term
+numbers, and its slowest part takes 13 s in place of 48 s on a quiet development laptop. The cohort test of the family gate
+enters under a deadline, and the cursor OPTIONAL plan test bypasses the result cache.
+
 Reading the `main` branch's information no longer holds the dataset's branch table while
 it waits for the main writer. The periodic history collector takes the writer and then
 the branch table, so a branch listing that ran during a collection could deadlock both,

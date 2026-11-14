@@ -1517,16 +1517,20 @@ fn schema_heavy_pattern(r: &mut Rng) -> String {
 }
 
 /// For small schema-heavy views, the solutions under `demand` equal those over an OWL RL
-/// materialization. Some of these views make equality expand into a large closure, so
-/// each query has a deadline: a query past it is counted and skipped, and the others
-/// must agree.
-#[test]
-fn schema_heavy_demand_answers_like_materialization() {
-    let seeds: Vec<u64> = match std::env::var("SCHEMA_HEAVY_SEEDS") {
-        Ok(v) => v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
-        Err(_) => SCHEMA_HEAVY_SEEDS.to_vec(),
+/// materialization. Some views make equality expand into a large closure, so each query
+/// runs under the reasoner's limit of derived facts, which counts work and stops the same
+/// queries on every host. Every query of the fixed seeds answers within it. A query of
+/// other seeds past it is counted and skipped, and the others must agree. Any other
+/// error fails the test. The fixed seeds run in three tests of three, in parallel.
+fn schema_heavy_demand_answers_like_materialization(part: usize) {
+    let (seeds, fixed): (Vec<u64>, bool) = match std::env::var("SCHEMA_HEAVY_SEEDS") {
+        Ok(v) if part == 0 => (
+            v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
+            false,
+        ),
+        Ok(_) => (Vec::new(), false),
+        Err(_) => (SCHEMA_HEAVY_SEEDS[3 * part..3 * part + 3].to_vec(), true),
     };
-    let deadline = std::time::Duration::from_secs(5);
     let (mut checked, mut skipped) = (0usize, 0usize);
     for seed in seeds {
         let mut r = Rng(seed * 6_700_417 + 3);
@@ -1541,28 +1545,50 @@ fn schema_heavy_demand_answers_like_materialization() {
         for _ in 0..8 {
             let q = format!("SELECT DISTINCT * {{ {} }}", schema_heavy_pattern(&mut r));
             let want = rows(&run(&s, &q, &materialized()));
-            let mut options = demand(&qr);
-            options.timeout = Some(deadline);
-            match query(s.snapshot(), &q, &options) {
+            match query(s.snapshot(), &q, &demand(&qr)) {
                 Ok(got) => {
                     checked += 1;
                     assert_eq!(rows(&got), want, "seed {seed}: {q}\n{ttl}");
                 }
-                Err(sparkles_core::Error::Timeout) => skipped += 1,
+                Err(sparkles_core::Error::Component(c))
+                    if c.code == sparkles_reasoner::query::BUDGET_CODE
+                        && c.message.contains(" derived facts ") =>
+                {
+                    skipped += 1
+                }
                 Err(e) => panic!("seed {seed}: {q}: {e}\n{ttl}"),
             }
         }
     }
-    eprintln!("schema-heavy differential: {checked} queries agree, {skipped} past the deadline");
+    eprintln!("schema-heavy differential: {checked} queries agree, {skipped} past the limit");
     assert!(
         checked >= 2 * skipped,
         "{checked} checked, {skipped} skipped"
     );
+    if fixed {
+        assert_eq!((checked, skipped), (24, 0));
+    }
+}
+
+#[test]
+fn schema_heavy_demand_answers_like_materialization_part_1_of_3() {
+    schema_heavy_demand_answers_like_materialization(0);
+}
+
+#[test]
+fn schema_heavy_demand_answers_like_materialization_part_2_of_3() {
+    schema_heavy_demand_answers_like_materialization(1);
+}
+
+#[test]
+fn schema_heavy_demand_answers_like_materialization_part_3_of_3() {
+    schema_heavy_demand_answers_like_materialization(2);
 }
 
 /// The seeds of [`schema_heavy_demand_answers_like_materialization`]: views whose queries
-/// finish within the deadline in a development build, among them 16 and 25, which found
-/// the derived meta type cases above. `SCHEMA_HEAVY_SEEDS=1,2,3` runs others.
+/// all answer within the reasoner's default limit of derived facts, among them 16 and 25,
+/// which found the derived meta type cases above. `SCHEMA_HEAVY_SEEDS=1,2,3` runs others
+/// in the first part.
 const SCHEMA_HEAVY_SEEDS: &[u64] = &[1, 3, 9, 15, 16, 17, 18, 24, 25];
 
 /// The equality stages' table is kept per view: the graphs a caller reads and the commit

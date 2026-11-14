@@ -511,11 +511,20 @@ fn masked(mut quads: Vec<oxrdf::Quad>) -> Vec<oxrdf::Quad> {
     quads
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The bytes of JSON-LD this thread has expanded, for the tests. Expansion is the
+    /// costly step of linting JSON-LD, so this counts the work of a lint without timing it.
+    static EXPANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The dataset of a JSON-LD document, expanded without fetching anything (relative IRIs
 /// resolve against a synthetic base); `None` when it cannot be, for example because a
 /// context is given by URL.
 fn jsonld_quads(text: &str) -> Option<Vec<oxrdf::Quad>> {
     let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    #[cfg(test)]
+    EXPANDED.with(|e| e.set(e.get() + body.len()));
     oxjsonld::JsonLdParser::new()
         .with_base_iri(crate::check::graph::RDF_BASE)
         .ok()?
@@ -533,6 +542,8 @@ fn jsonld_stream(
     mut each: impl FnMut(oxrdf::Quad),
 ) -> Result<bool, LintError> {
     let body = text.strip_prefix('\u{feff}').unwrap_or(text);
+    #[cfg(test)]
+    EXPANDED.with(|e| e.set(e.get() + body.len()));
     out_of_time(deadline)?;
     let Ok(parser) = oxjsonld::JsonLdParser::new().with_base_iri(crate::check::graph::RDF_BASE)
     else {
