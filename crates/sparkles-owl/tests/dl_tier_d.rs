@@ -64,32 +64,40 @@ fn classes(ax: &[Axiom]) -> Vec<Class> {
     cs.into_iter().collect()
 }
 
-/// Classifies at one and at eight threads, checks that the answers agree and that Tier D
-/// took every axiom, and returns one of them.
+/// Classifies at one and at eight threads, without the order between number restrictions
+/// and with it, which is the default, checks that the answers agree and that Tier D took
+/// every axiom, and returns one of the default. The order tells a contradiction between a
+/// minimum and a maximum that the rules for equalities of successors would otherwise
+/// derive, so the runs without it keep those rules under test.
 fn whole(body: &str) -> Classification {
     let ax = axioms(body);
     let cs = classes(&ax);
     let mut outs = Vec::new();
-    for threads in [1, 8] {
-        let mut k = Classifier::of(&ax);
-        let out = k
-            .classify(&Limits {
-                threads,
-                counting: true,
-                ..Limits::default()
-            })
-            .unwrap();
-        assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
-        assert_eq!(out.stats.tier, Tier::Disjunctive);
-        assert!(out.stats.clauses > 0, "Tier D took no clause");
-        assert!(out.complete);
-        outs.push(out);
+    for number_order in [false, true] {
+        for threads in [1, 8] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    counting: true,
+                    number_order,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+            assert!(out.stats.clauses > 0, "Tier D took no clause");
+            assert!(out.complete);
+            outs.push(out);
+        }
     }
-    assert_eq!(
-        pairs(&outs[0].taxonomy, &cs),
-        pairs(&outs[1].taxonomy, &cs),
-        "the answer depends on the threads"
-    );
+    for out in &outs[1..] {
+        assert_eq!(
+            pairs(&outs[0].taxonomy, &cs),
+            pairs(&out.taxonomy, &cs),
+            "the answer depends on the threads or on the order between number restrictions"
+        );
+    }
     outs.pop().unwrap()
 }
 
@@ -109,7 +117,8 @@ fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
     }
 }
 
-/// The limits of a run that counts, which is off by default.
+/// The limits of a run that counts, which is off by default, with the order between
+/// number restrictions, which such a run has by default.
 fn counting() -> Limits {
     Limits {
         counting: true,
@@ -1739,4 +1748,339 @@ fn a_short_product_with_wide_conclusions_is_charged_before_its_record_is_dropped
             out.stats.peak_memory
         ),
     }
+}
+
+/// `U ⊑ C ⊔ D`, the told union of item 894's regressions of restrictions over U.
+const TOLD_UNION: &str = "SubClassOf(:U ObjectUnionOf(:C :D))";
+
+#[test]
+fn a_union_filler_whose_cases_overlap_keeps_the_identity() {
+    // the cases C and D are not disjoint, so A's one successor may be in both and nothing
+    // makes it be: it is in E and need not be in C ⊓ D; H's successors are one, in C and D
+    // (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r)))
+             {TOLD_UNION} SubClassOf(:C :E) SubClassOf(:D :E)
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r :E))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :D)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :C)) SubClassOf(:H ObjectSomeValuesFrom(:r :D))
+             SubClassOf(:H ObjectMaxCardinality(1 :r)) {UNION}"
+        ),
+        &[("A", "F"), ("H", "G"), ("H", "F")],
+        &[("A", "G"), ("F", "A")],
+    );
+}
+
+#[test]
+fn two_witnesses_below_a_union_take_different_cases() {
+    // at most one r-successor in C and at most one in D, so the two witnesses of
+    // ≥2 r.U are one in C and one in D (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectMinCardinality(2 :r :U)) {TOLD_UNION} DisjointClasses(:C :D)
+             SubClassOf(:A ObjectMaxCardinality(1 :r :C)) SubClassOf(:A ObjectMaxCardinality(1 :r :D))
+             EquivalentClasses(:F ObjectIntersectionOf(ObjectSomeValuesFrom(:r :C) ObjectSomeValuesFrom(:r :D)))
+             SubClassOf(:B ObjectMinCardinality(2 :r :U)) SubClassOf(:B ObjectMaxCardinality(1 :r :C))
+             SubClassOf(:B ObjectAllValuesFrom(:r :C)) SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "F"), ("B", "E")],
+        &[("F", "A"), ("A", "E")],
+    );
+}
+
+#[test]
+fn two_cases_a_context_supports_independently_keep_their_equality() {
+    // A has r-successors in U ⊓ C and in U ⊓ D and at most one r-successor, so the two
+    // successors are equal and in the disjoint C and D, and A is unsatisfiable (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :C)))
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :D)))
+             SubClassOf(:A ObjectMaxCardinality(1 :r)) {TOLD_UNION} DisjointClasses(:C :D)
+             SubClassOf(:B ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r)))
+             SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "Nothing"), ("A", "E")],
+        &[("B", "E")],
+    );
+}
+
+#[test]
+fn two_cases_of_two_restrictions_whose_classes_overlap_are_equated() {
+    // the one successor is in C ⊔ D and in C ⊔ E with D and E disjoint, so it is in C,
+    // which needs the equality of the successors of two different restrictions (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectUnionOf(:C :D)))
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectUnionOf(:C :E)))
+             SubClassOf(:A ObjectMaxCardinality(1 :r)) DisjointClasses(:D :E)
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r :C)) {UNION}"
+        ),
+        &[("A", "F")],
+        &[("F", "A")],
+    );
+}
+
+#[test]
+fn a_conditional_inequality_certificate_holds_for_witnesses_below_a_union() {
+    // ≥2 r.U is conditional in A, and at most one r-successor equates its two witnesses,
+    // which their disjoint fillers refute: A is E (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectUnionOf(ObjectMinCardinality(2 :r :U) :E))
+             SubClassOf(:A ObjectMaxCardinality(1 :r)) {TOLD_UNION}
+             SubClassOf(:B ObjectUnionOf(ObjectMinCardinality(2 :r :U) :E))
+             SubClassOf(:B ObjectMaxCardinality(2 :r)) {UNION}"
+        ),
+        &[("A", "E")],
+        &[("B", "E")],
+    );
+}
+
+#[test]
+fn a_qualification_by_a_case_reaches_the_predecessor() {
+    // the successor of ∃r.U is a B in either case of U, which Pred reports to A, where at
+    // most one r.B equates it with the B-successor in G: the successor is in U and G
+    // (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r :B)))
+             {TOLD_UNION} SubClassOf(:C :B) SubClassOf(:D :B)
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :G)))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :B))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :G))) {UNION}"
+        ),
+        &[("A", "F")],
+        &[("F", "A")],
+    );
+}
+
+#[test]
+fn a_transitive_property_unfolds_under_a_case() {
+    // each case of the t-successor has a t-successor in E, and t is transitive, so A has
+    // one too; the maximum on s turns counting on (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:t :U) ObjectMaxCardinality(1 :s)))
+             {TOLD_UNION} TransitiveObjectProperty(:t)
+             SubClassOf(:C ObjectSomeValuesFrom(:t :E)) SubClassOf(:D ObjectSomeValuesFrom(:t :E))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:t :E))
+             SubClassOf(:A ObjectMaxCardinality(1 :s)) {UNION}"
+        ),
+        &[("A", "F")],
+        &[("F", "A")],
+    );
+}
+
+#[test]
+fn a_case_context_takes_another_case_and_an_exclusion_from_its_predecessors() {
+    // A and B both have ∃r.U conditionally, so its successor is hypothetical: A's
+    // universal puts A's successor in D, so the case C closes, and B's universal puts B's
+    // successor outside C (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectUnionOf(ObjectSomeValuesFrom(:r :U) :Q))
+             SubClassOf(:B ObjectUnionOf(ObjectSomeValuesFrom(:r :U) :Q))
+             {TOLD_UNION} DisjointClasses(:C :D) DisjointClasses(:C :X)
+             SubClassOf(:A ObjectAllValuesFrom(:r :D)) SubClassOf(:B ObjectAllValuesFrom(:r :X))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r :D))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r :C))
+             EquivalentClasses(:FQ ObjectUnionOf(:F :Q))
+             SubClassOf(:H ObjectMaxCardinality(1 :r)) {UNION}"
+        ),
+        &[("A", "FQ"), ("B", "FQ")],
+        &[("A", "F"), ("B", "F"), ("A", "G"), ("B", "G")],
+    );
+}
+
+#[test]
+fn disjoint_subroles_with_one_counted_successor_are_unsatisfiable() {
+    // the K-successors by r1 and r2 are one r-successor, which both disjoint roles then
+    // reach: the equality must carry both role edges (item 894, the merge's regression)
+    check(
+        &format!(
+            "SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r) DisjointObjectProperties(:r1 :r2)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :K)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :K))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :K))
+             SubClassOf(:B ObjectSomeValuesFrom(:r1 :K)) SubClassOf(:B ObjectSomeValuesFrom(:r2 :K))
+             SubClassOf(:B ObjectMaxCardinality(2 :r :K)) SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "Nothing"), ("A", "E")],
+        &[("B", "E")],
+    );
+}
+
+/// The mixed supports of item 894's design: A has an r-successor in U and the conditional
+/// ones `X ⊔ ∃r.(U ⊓ c₁)` and `Y ⊔ ∃r.(U ⊓ c₂)`, which the told chain from A to P3 derives
+/// later, with c₁ and c₂ the disjoint cases of U. At most one r-successor equates the two
+/// conditional successors under `X ⊔ Y ⊔ f₁ ≈ f₂`, so that the disjoint cases put A in
+/// `X ⊔ Y`.
+fn mixed_supports(x: &str, y: &str, c1: &str, c2: &str) {
+    check(
+        &format!(
+            "SubClassOf(:A ObjectIntersectionOf(ObjectSomeValuesFrom(:r :U) ObjectMaxCardinality(1 :r)))
+             {TOLD_UNION} DisjointClasses(:C :D)
+             SubClassOf(:A :P1) SubClassOf(:P1 :P2) SubClassOf(:P2 :P3)
+             SubClassOf(:P3 ObjectUnionOf(:{x} ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :{c1}))))
+             SubClassOf(:P3 ObjectUnionOf(:{y} ObjectSomeValuesFrom(:r ObjectIntersectionOf(:U :{c2}))))
+             EquivalentClasses(:W ObjectUnionOf(:{x} :{y})) {UNION}"
+        ),
+        &[("A", "W")],
+        &[("A", x), ("A", y), ("W", "A")],
+    );
+}
+
+#[test]
+fn source_and_independent_conditional_supports_of_two_cases_keep_the_product() {
+    // the product of the two conditional supports must stay, whichever arrives first:
+    // the two orders of the names give the two orders of arrival (item 894)
+    mixed_supports("X", "Y", "D", "C");
+    mixed_supports("Y", "X", "C", "D");
+}
+
+#[test]
+fn a_count_that_needs_three_terms_in_one_element_equates_all_three() {
+    // the one r-successor is the three witnesses at once, which two equalities of pairs
+    // do not show alone (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:r :B1)) SubClassOf(:A ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:A ObjectSomeValuesFrom(:r :B3)) SubClassOf(:A ObjectMaxCardinality(1 :r))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B2 :B3)))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B3)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B1)) SubClassOf(:H ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B3)) SubClassOf(:H ObjectMaxCardinality(2 :r))
+             {UNION}"
+        ),
+        &[("A", "F"), ("A", "G")],
+        &[("H", "F"), ("H", "G"), ("F", "A")],
+    );
+}
+
+#[test]
+fn an_equality_of_successors_that_certificates_refute_when_it_is_made_leaves_the_clause() {
+    // the two r-successors are in the disjoint C and D when the at-most rule and the lazy
+    // clause of ≥2 r ⊑ G would make them one: A is unsatisfiable and B is a G (item 894)
+    check(
+        &format!(
+            "DisjointClasses(:C :D)
+             SubClassOf(:A ObjectSomeValuesFrom(:r :C)) SubClassOf(:A ObjectSomeValuesFrom(:r :D))
+             SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:B ObjectSomeValuesFrom(:s :C)) SubClassOf(:B ObjectSomeValuesFrom(:s :D))
+             SubClassOf(ObjectMinCardinality(2 :s) :G)
+             SubClassOf(:K ObjectSomeValuesFrom(:s :C)) SubClassOf(:K ObjectSomeValuesFrom(:s :E))
+             SubClassOf(:E :Z) {UNION}"
+        ),
+        &[("A", "Nothing"), ("B", "G")],
+        &[("K", "G"), ("B", "Nothing")],
+    );
+}
+
+#[test]
+fn an_equality_of_successors_that_a_later_certificate_refutes_closes_the_context() {
+    // the successors of P and Q are equated first, and the case analysis of A puts P's in C
+    // only later, which meets Q's D in the one element: A is unsatisfiable under the
+    // at-most rule and a G under the lazy clause (item 894)
+    check(
+        &format!(
+            "DisjointClasses(:C :D) SubClassOf(:Q :D)
+             SubClassOf(:X ObjectAllValuesFrom(:r1 :C)) SubClassOf(:Y ObjectAllValuesFrom(:r1 :C))
+             SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r)
+             SubObjectPropertyOf(:r1 :s) SubObjectPropertyOf(:r2 :s)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:A ObjectUnionOf(:X :Y)) SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:B ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:B ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:B ObjectUnionOf(:X :Y)) SubClassOf(ObjectMinCardinality(2 :s) :G)
+             SubClassOf(:K ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:K ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:K ObjectUnionOf(:X :W)) {UNION}"
+        ),
+        &[("A", "Nothing"), ("B", "G")],
+        &[("K", "G"), ("B", "Nothing")],
+    );
+}
+
+#[test]
+fn two_overlapping_equalities_reach_the_element_of_all_three_successors() {
+    // at most one r.Q makes the successors of B1 and B2 one, at most one r.R those of B2
+    // and B3, so all three are one element, which neither maximum alone shows (item 894)
+    check(
+        &format!(
+            "SubClassOf(:B1 :Q) SubClassOf(:B2 :Q) SubClassOf(:B2 :R) SubClassOf(:B3 :R)
+             SubClassOf(:A ObjectSomeValuesFrom(:r :B1)) SubClassOf(:A ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:A ObjectSomeValuesFrom(:r :B3))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :Q)) SubClassOf(:A ObjectMaxCardinality(1 :r :R))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B3)))
+             EquivalentClasses(:G ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B1 :B2)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B1)) SubClassOf(:H ObjectSomeValuesFrom(:r :B2))
+             SubClassOf(:H ObjectSomeValuesFrom(:r :B3)) SubClassOf(:H ObjectMaxCardinality(1 :r :Q))
+             {UNION}"
+        ),
+        &[("A", "F"), ("A", "G"), ("H", "G")],
+        &[("H", "F"), ("F", "A")],
+    );
+}
+
+#[test]
+fn successors_equated_with_each_other_and_the_predecessor_give_it_their_facts() {
+    // K's s⁻-neighbours, its predecessor and the witnesses in B1 and B2, are one, so the
+    // predecessor is in B1 and B2 and in E, which their conjunction gives (item 894)
+    check(
+        &format!(
+            "SubClassOf(:A ObjectSomeValuesFrom(:s :K))
+             SubClassOf(:K ObjectSomeValuesFrom(ObjectInverseOf(:s) :B1))
+             SubClassOf(:K ObjectSomeValuesFrom(ObjectInverseOf(:s) :B2))
+             SubClassOf(:K ObjectMaxCardinality(1 ObjectInverseOf(:s)))
+             SubClassOf(ObjectIntersectionOf(:B1 :B2) :E)
+             SubClassOf(:L ObjectSomeValuesFrom(:s :K2))
+             SubClassOf(:K2 ObjectSomeValuesFrom(ObjectInverseOf(:s) :B1))
+             SubClassOf(:K2 ObjectSomeValuesFrom(ObjectInverseOf(:s) :B2))
+             SubClassOf(:K2 ObjectMaxCardinality(2 ObjectInverseOf(:s))) {UNION}"
+        ),
+        &[("A", "E"), ("A", "B1"), ("A", "B2")],
+        &[("L", "E"), ("L", "B1")],
+    );
+}
+
+#[test]
+fn one_element_of_two_successors_takes_a_conditional_fact_of_each() {
+    // the r1- and r2-successors are one, which is in C1 unless X and in C2 unless Y, so A
+    // is in X ⊔ Y ⊔ ∃r.E with E the conjunction of C1 and C2 (item 894)
+    check(
+        &format!(
+            "SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:A ObjectMaxCardinality(1 :r))
+             SubClassOf(:A ObjectUnionOf(:X ObjectAllValuesFrom(:r1 :C1)))
+             SubClassOf(:A ObjectUnionOf(:Y ObjectAllValuesFrom(:r2 :C2)))
+             EquivalentClasses(:E ObjectIntersectionOf(:C1 :C2))
+             EquivalentClasses(:W ObjectUnionOf(:X :Y ObjectSomeValuesFrom(:r :E))) {UNION}"
+        ),
+        &[("A", "W")],
+        &[("A", "X"), ("A", "Y"), ("W", "A")],
+    );
+}
+
+#[test]
+fn a_qualification_reaches_an_equated_successor_through_the_other_ones_role() {
+    // at most one t makes the r1- and r2-successors one, which A's universal on r1 puts in
+    // B, so at most one r.B makes it the r3-successor too: the one element is in Q and G
+    // (item 894)
+    check(
+        &format!(
+            "SubObjectPropertyOf(:r1 :t) SubObjectPropertyOf(:r2 :t)
+             SubObjectPropertyOf(:r1 :r) SubObjectPropertyOf(:r2 :r) SubObjectPropertyOf(:r3 :r)
+             SubClassOf(:A ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:A ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:A ObjectSomeValuesFrom(:r3 ObjectIntersectionOf(:B :G)))
+             SubClassOf(:A ObjectMaxCardinality(1 :t)) SubClassOf(:A ObjectAllValuesFrom(:r1 :B))
+             SubClassOf(:A ObjectMaxCardinality(1 :r :B))
+             EquivalentClasses(:F ObjectSomeValuesFrom(:r ObjectIntersectionOf(:Q :G)))
+             SubClassOf(:H ObjectSomeValuesFrom(:r1 :P)) SubClassOf(:H ObjectSomeValuesFrom(:r2 :Q))
+             SubClassOf(:H ObjectSomeValuesFrom(:r3 ObjectIntersectionOf(:B :G)))
+             SubClassOf(:H ObjectMaxCardinality(1 :t)) SubClassOf(:H ObjectMaxCardinality(1 :r :B))
+             {UNION}"
+        ),
+        &[("A", "F")],
+        &[("H", "F"), ("F", "A")],
+    );
 }

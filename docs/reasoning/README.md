@@ -329,8 +329,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   subsumptions it proved, with `Classification::complete` false, the classes it may have
   left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
   unknown, which leaves every class incomplete when unknown. The same rules can count, but
-  counting is off by default, since it finishes on none of the ORE 2015 DL development
-  files and only delays their answer. `Limits::counting` turns it on. Roadmap item 894.
+  counting is off by default. `Limits::counting` turns it on. A counting run without
+  individuals orders its number restrictions by entailment unless `Limits::number_order`,
+  which is on by default, is set to false. The run tells itself that `≥m r.F` entails
+  `≥n s.G` when `m ≥ n`, `r ⊑ s` and `F ⊑ G` are told and that it contradicts `≤k s.G`
+  when `m > k`, and a class that holds a minimum makes no witnesses for a minimum that it
+  entails. Its answers are those of a counting run that finishes without the order, and
+  it finishes on ontologies with many related cardinalities where that run passes its
+  bound. It keeps tables of the related restrictions, which raise the peak memory of the
+  two Protein Ontology files of the ORE 2015 DL sample by 4 to 19% over the run without
+  counting. A run that passes its bound with the order as without it can take longer to
+  do so. The classification of ore_ont_6485 of that sample with counting requested takes
+  3.1 times as long with the order, which roadmap item 896 follows. Items 896 and 897
+  follow the default of counting.
   Number restrictions, functional and inverse functional properties, disjoint properties
   and asymmetric properties then take equalities of successors, and a run that counts has
   a bound of 262,144 derived conclusions, `Limits::dl_work`. Without it those axioms are
@@ -804,13 +815,21 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   datatype checker with data cardinalities before they take data properties, and 10 of
   the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
   item 768.
-* Counting is off by default. With it on, it passes its bound of derived conclusions on
-  the five counting files of the ORE 2015 DL development set that the disjunctive rules
-  take, so those files get the answer without counting. On one thread on `atlas`, the
-  whole classification of ore_ont_6485 takes 190 ms with counting requested, the attempt
-  and the run without it together, against 11 ms without counting, where Konclude takes
-  18 ms on four threads, and the two versions of the Protein Ontology, ore_ont_6952 and
-  ore_ont_10140, take 1.1 s against 0.9 s. Roadmap items 894 and 729.
+* Counting is off by default. Five files of the ORE 2015 DL development set attempt
+  counting. With the order between number restrictions, which a counting run uses by
+  default, the two versions of the Protein Ontology, ore_ont_6952 and ore_ont_10140,
+  finish with counting and classify in 1.2 s on one thread and 0.4 s on four on `atlas`,
+  against 0.9 and 0.3 s without counting and 2.3 to 2.5 s for Konclude 0.7.0. The other
+  three pass the bound of derived conclusions and get the answer without counting. The
+  order makes the failed attempt of ore_ont_6485 dearer. Its classification with counting
+  requested, the attempt and the run without it together, takes 576 ms on one thread with
+  the order and 184 ms with `Limits::number_order` set to false, 3.1 times as long,
+  against 7 ms without counting and 40 ms for Konclude. Roadmap items 896 and 729.
+* A counting run misses a maximum cardinality whose qualifier is an intersection or an
+  existential restriction that no other axiom names, because it never derives the
+  qualifier at a neighbour, and it reports itself complete. `A ⊑ ≥2 r.C`, `C ⊑ P`,
+  `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` leave `A` satisfiable. A run without counting leaves the
+  maximum out and reports it. Roadmap item 897.
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times
   Konclude's speed. Roadmap item 712.

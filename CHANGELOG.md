@@ -63,6 +63,21 @@ stays off by default, since the three counting files of the ORE 2015 DL developm
 still pass its bound and classify again without it. This is roadmap item 728, and the
 calculus change that remains is item 894.
 
+A counting run of the disjunctive rules without individuals orders its number
+restrictions by entailment. `Limits::number_order` controls the order. It is on by
+default, it changes nothing in a run that does not count, and false turns it off. Each
+minimum cardinality in a positive position gets a name, the run tells itself that `≥m r.F` entails `≥n s.G` when
+`m ≥ n`, `r ⊑ s` and `F ⊑ G` are told and that it contradicts `≤k s.G` when `m > k`, and
+a context that holds a minimum makes no witnesses for a minimum that it entails. With it
+the two versions of the Protein Ontology in the ORE 2015 DL development set classify with
+counting and give HermiT's and Konclude's taxonomies, 6.3 and 6.5 times faster than
+Konclude 0.7.0 on four threads. ore_ont_6485 still passes the bound, and its
+classification with counting requested, the failed attempt and the run without counting
+together, takes 3.1 times as long with the order, 576 ms against 184 ms on one thread,
+which roadmap item 896 follows. A counting run misses a maximum over a compound qualifier
+that no other axiom names, which is item 897. Counting stays off by default.
+`el_classify` takes `--no-number-order` to turn the order off. This is roadmap item 894.
+
 ### Compatibility
 
 The experimental Rust memory-admission API uses an opaque `ParentHandle` in place

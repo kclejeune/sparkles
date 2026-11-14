@@ -103,6 +103,15 @@ pub struct DlIx {
     /// in a rooted run with counting, the existential restrictions of each minimum's
     /// holder, whose successor terms differ
     pub ne_of: FxHashMap<Ex, Vec<Ex>>,
+    /// whether the run orders its number restrictions, as [`super::dl_norm::DlAx::order`]
+    pub order: bool,
+    /// for a minimum's name, the names of the minimums that entail it, as
+    /// [`super::dl_norm::DlAx::blockers`]
+    pub blockers: FxHashMap<Ex, Box<[Ex]>>,
+    /// for a minimum's name that has witnesses of its own, their conjunction
+    pub witnesses: FxHashMap<Ex, Ex>,
+    /// by expression, whether it is a minimum's name, for the order of atoms
+    least: Vec<bool>,
 }
 
 impl DlIx {
@@ -234,6 +243,25 @@ impl DlIx {
             let q = qualified(&mut d, *s, *b);
             d.lazy.push((*k, q, head.clone().into_boxed_slice()));
         }
+        d.order = dl.order;
+        d.blockers = dl
+            .blockers
+            .iter()
+            .map(|(&h, v)| (h, v.clone().into_boxed_slice()))
+            .collect();
+        d.witnesses = dl
+            .least
+            .iter()
+            .filter_map(|&(g, w)| w.map(|w| (g, w)))
+            .collect();
+        if d.order {
+            d.least = vec![false; nodes];
+            for &(g, _) in &dl.least {
+                if let Some(x) = d.least.get_mut(g as usize) {
+                    *x = true;
+                }
+            }
+        }
         d.low = vec![false; nodes];
         for &h in &dl.low {
             if let Some(x) = d.low.get_mut(h as usize) {
@@ -351,6 +379,10 @@ impl DlIx {
             + self.consts.capacity() * 8
             + table_bytes(self.ne_of.capacity(), 32)
             + self.ne_of.values().map(|v| v.capacity() * 4).sum::<usize>()
+            + table_bytes(self.blockers.capacity(), 24)
+            + self.blockers.values().map(|v| v.len() * 4).sum::<usize>()
+            + table_bytes(self.witnesses.capacity(), 8)
+            + self.least.capacity()
     }
 
     /// The core of the successor that the EL rules give e.
@@ -364,6 +396,12 @@ impl DlIx {
     #[inline]
     pub fn is_low(&self, a: Ex) -> bool {
         self.root.is_none() && low_h() && self.low.get(a as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether `a` is the name of a minimum of a run that orders its number restrictions.
+    #[inline]
+    pub fn is_least(&self, a: Ex) -> bool {
+        self.least.get(a as usize).copied().unwrap_or(false)
     }
 
     /// Whether `me` is the root of a rooted run.
@@ -507,6 +545,10 @@ pub struct DlSt {
     choices: u32,
     /// in the root of a rooted run, its indexes by constant
     pub root: Option<Box<super::dl_root::RootSt>>,
+    /// with the order between number restrictions, the names of the minimums that hold
+    /// and wait for the context's units before they make their witnesses, since a minimum
+    /// that entails one of them makes its own; [`flush`] releases them
+    pending: Vec<Ex>,
 }
 
 impl DlSt {
@@ -531,11 +573,13 @@ impl DlSt {
                 .map(|h| h.len() * std::mem::size_of::<Lit>())
                 .sum::<usize>()
             + self.root.as_ref().map_or(0, |r| r.bytes())
+            + self.pending.capacity() * 4
     }
 
-    /// Whether the context has no clause waiting for the rules.
+    /// Whether the context has no clause waiting for the rules and no minimum waiting to
+    /// make its witnesses.
     pub fn is_idle(&self) -> bool {
-        self.store.is_idle()
+        self.store.is_idle() && self.pending.is_empty()
     }
 
     /// Whether the context holds the marker of `a`.
@@ -831,6 +875,26 @@ pub fn promote() -> bool {
 pub fn low_h() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_LOW_H").is_some_and(|v| v == "1"))
+}
+
+/// For the unit `d`, the name of a minimum that another can entail, the conjunction of
+/// its witnesses, which then waits in the context until the units are taken, [`flush`]
+/// releasing it (F24, "The order between number restrictions").
+pub fn defer(ix: &Index, st: &mut State, d: Ex) -> Option<Ex> {
+    let dx = ix.dl.as_deref()?;
+    if dx.blockers.is_empty() || !dx.blockers.contains_key(&d) {
+        return None;
+    }
+    let w = dx.witnesses.get(&d).copied()?;
+    ds(st).pending.push(d);
+    Some(w)
+}
+
+/// Whether the context holds, as a unit, a minimum that entails the minimum `d`.
+fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
+    dx.blockers
+        .get(&d)
+        .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
 }
 
 pub fn select_ground() -> bool {
@@ -1184,6 +1248,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
     body.retain(|l| !(l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom()))));
     // a literal that holds makes the clause redundant, and one that cannot leaves it
     let mut holds = false;
+    let cut = dx.order;
     head.retain(|&l| match l.kind() {
         X | Y | F if l.atom() == BOTTOM => false,
         X | F if l.atom() == TOP => {
@@ -1193,6 +1258,17 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: 
         X if st.subs.contains(&l.atom()) => {
             holds = true;
             true
+        }
+        // with the order between number restrictions, an atom disjoint with a unit of
+        // the context cannot hold: the Hyper conclusion with the unit and the
+        // disjointness, which subsumes the clause
+        X if cut
+            && ix
+                .disjoint_of(ix.head(l.atom()))
+                .iter()
+                .any(|set| st.disj.get(set).is_some_and(|&m| m != l.atom())) =>
+        {
+            false
         }
         F | RL if holds_succ(ix, dx, st, l) => {
             holds = true;
@@ -2417,6 +2493,26 @@ fn pred(
 /// of clauses processed.
 pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: usize) -> usize {
     let mut n = 0;
+    // the minimums that waited for the units make their witnesses now, unless the context
+    // holds a minimum that entails them
+    let waiting = st
+        .extra
+        .as_mut()
+        .and_then(|x| x.dl.as_deref_mut())
+        .map(|x| std::mem::take(&mut x.pending))
+        .unwrap_or_default();
+    for d in waiting {
+        if blocked(dix(ix), st, d) {
+            continue;
+        }
+        if let Some(&w) = dix(ix).witnesses.get(&d) {
+            out.me(Concl::Sub(w));
+            n += 1;
+        }
+    }
+    if n > 0 {
+        return n;
+    }
     let mut max: Vec<Lit> = Vec::new();
     while n < budget {
         if st.bottom {
@@ -2570,8 +2666,15 @@ fn process<S: Sink>(
                     _ => {}
                 }
                 found.rule = "told";
+                let skip = if blocked(dx, st, d) {
+                    dx.witnesses.get(&d).copied()
+                } else {
+                    None
+                };
                 for &t in ix.told_of(h) {
-                    found.push(with(&prem, Lit::x(t)));
+                    if Some(t) != skip {
+                        found.push(with(&prem, Lit::x(t)));
+                    }
                 }
                 found.rule = "conj";
                 for &(p, k) in ix.conj_of(h) {
@@ -2866,4 +2969,22 @@ pub fn record(
         })
         .collect();
     (complete, known)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A context whose minimum waits for the units has work left: a run that stops there
+    /// and answers in part must not report the context closed, since the minimum's
+    /// witnesses can still make it unsatisfiable.
+    #[test]
+    fn a_context_with_a_waiting_minimum_is_not_idle() {
+        let mut st = DlSt::default();
+        assert!(st.is_idle());
+        st.pending.push(7);
+        assert!(!st.is_idle());
+        st.pending.clear();
+        assert!(st.is_idle());
+    }
 }

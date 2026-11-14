@@ -115,6 +115,22 @@ without counting, so counting stays off by default, and the calculus change for 
 equality reasoning over conditional successors that remains is item 894, which also takes
 the design's third part, the witnesses' shared context.
 
+Item 894 delivers [the order between number restrictions](#the-order-between-number-restrictions)
+as the option `Limits::number_order`, which is on by default and applies to a run that
+counts. Its changes to the rules of the
+calculus, the cases of a union filler and the merge of successor terms, made no file
+classify and are not kept, and its exploration round stayed on paper. The order changes
+the clause set instead. A counting run without the root names each minimum, tells itself
+the entailments between minimums and their contradictions with maximums, and makes no
+witnesses for a minimum that a minimum of the context entails. With it ore_ont_6952 and
+ore_ont_10140 classify with counting on and give HermiT's and Konclude's taxonomies, 6.3
+and 6.5 times faster than Konclude 0.7.0 on four threads on `atlas` and 2.0 and 2.1 times
+on one. ore_ont_6485 still passes the bound, and its classification with counting
+requested, the failed attempt and the run without counting together, takes 3.1 times as
+long with the order as without it, 576 ms against 184 ms on one thread. The default
+accepts that cost, and item 896 follows that file and the default of counting. The item also found that a counting run misses a maximum over a compound
+qualifier that no other axiom names, which is item 897, so counting stays off by default.
+
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
 `GET /$/ontology/{ds}/classification` and the Rust, Python, Node.js and JVM read adapters
@@ -1216,12 +1232,15 @@ Counting is part of the same rules and is off by default. `Limits::counting` tur
 and `el_classify --counting` does the same. A run that does not count leaves the axioms
 that need counting out and reports them, and takes a minimum as the existential
 restriction it implies, so it costs what the classifier cost before counting. The reason
-is the cost on real ontologies, since no file of the ORE 2015 DL development set finishes
-with counting and the five that attempt it spend 2 to 30 times the time of the run
-without it before they give up where that run finishes. Item 728 replaced the clauses of
-every context and the hypothesis about the predecessor, as [its subsection](#item-728s-clauses-for-counting-over-definitions)
-records, and the three files still give up, so turning counting on is the work of item
-894, the calculus change for the equality reasoning that remains. A run that counts when asked takes a number restriction that the Horn rules
+is the cost on real ontologies. Five files of the ORE 2015 DL development set attempt
+counting. Without the order between number restrictions none of them finishes, and with
+it the two versions of the Protein Ontology finish, as [its subsection](#the-order-between-number-restrictions)
+records. The other three spend their attempt before they give up where the run without
+counting finishes. Item 728 replaced the clauses of every context and the hypothesis about
+the predecessor, as [its subsection](#item-728s-clauses-for-counting-over-definitions)
+records, item 894 added the order, and turning counting on is the work of item 896 for
+the cost that remains and of item 897 for a maximum over a compound qualifier, which a
+counting run misses. A run that counts when asked takes a number restriction that the Horn rules
 cannot take, a functional or inverse functional property, disjoint properties or an
 asymmetric property. The terms of a clause then include
 equalities of the successor terms and of a successor with the predecessor, and the order
@@ -1254,7 +1273,8 @@ with a bound of 4 million conclusions of its own, and sets `Stats::dl_counting_o
 as before. A run that does not count has no bound on its conclusions, only the memory
 budget. Of the 150 counting fixtures, all but three derive at most 190,000 conclusions on
 one thread, `shiq-046` derives 1.0 million and needs a raised `Limits::dl_work`, and
-`shq-041` and `shiq-028` pass any bound, item 729.
+`shiq-028` passes any bound, and `shq-041` passes any bound without the order between
+number restrictions and derives 17,844 conclusions with it, item 729.
 
 The bound has a limit that this section states plainly. Near it, the thread schedule can
 decide whether a run answers in full or falls back, since the clauses stored at the
@@ -1713,6 +1733,931 @@ the calculus change for the equality reasoning that remains, from published calc
 with the hypertableau's merging of equated terms and Kazakov and Klinov's exploration as
 the candidates named above, and its design precedes its code.
 
+#### Item 894's cases and merging for counting
+
+This subsection is the design of item 894, written before its code. It decides how a run
+that counts, without the root of a rooted run, takes the case analysis that a union filler
+puts into a successor, and it records what a replacement of the equality reasoning between
+two successor terms must satisfy before it can be a decision, so that ore_ont_6485,
+ore_ont_6952 and ore_ont_10140 classify with counting on. Rooted runs keep their rules,
+their order and their terms, and nothing here changes them. The design cites the calculus
+of Bate and others in JAIR 2018, the hypertableau calculus of Motik, Shearer and Horrocks
+in JAIR 2009, the nondeterministic consequence-based procedure of Kazakov and Klinov at DL
+2014 and the Horn-SHIQ calculus of Kazakov at IJCAI 2009, which [the Horn rules](#the-horn-rules)
+of this spec implement.
+
+The trace shows the cost that remains after item 728. The counting attempt on
+ore_ont_6485 at the bound of 262,144 conclusions, with item 728's clauses, derives 274,640
+conclusions and processes 73,403 clause records, where a record is a clause the store
+queued and the rules then took as a premise, and its clause ids show at least 76,781
+entries made across the contexts. The hypothetical successor of
+`∃hasSingleBondWith.HeteroAtom`, which fourteen predecessors share, derives 140,889 of the
+conclusions and processes 19,921 records. Of its derivations 109,560 resolve a case of the
+`HeteroAtom` union against a disjointness certificate of another case, in clauses whose
+bodies hold one to eight marker atoms after duplicates are removed, among them the role
+atoms of three bond properties and the hypothesis `HeteroAtom` in two spellings, as the
+class and as the conjunction that unfolds to it, and whose heads hold four to twelve
+literals, the union's remaining cases beside the literals over the predecessor. At the
+bound of four million conclusions, with the hypothetical successor keyed by its
+predecessor so that no context combines predecessors' markers, one EL successor context,
+the successor of a witness `∃r.b_i` whose fresh filler lies below the union, derives 1.9
+million paramodulations and 1.7 million at-most products over the conditional successor
+terms of the union's cases. The two costs have one shape. A context clause's body names
+the hypotheses under which its head holds, so a clause is the conclusion of one branch of
+a case analysis, and its head is the disjunction of the branches not yet taken. The
+deterministic calculus derives every branch's conclusion as a clause of its own, two
+spellings of one hypothesis give two clauses with different bodies that Definition 4's
+syntactic subset does not relate, and two orders of the same premises give the same clause
+twice as two attempts the store merges. An equality between two successor terms takes part
+in the Eq rule when it is the maximal literal of its clause, and the rule then rewrites each clause whose maximal literal is over the larger
+term into the equality's clause, each with the union of the two bodies and heads, and the
+rewritten clauses are premises of the at-most products and of the next equality. The
+hypertableau takes the same equality in one branch as the ≈-rule, which merges `s` into
+`t` by replacing `s` with `t` in every assertion after pruning `s`'s descendants, a rewrite
+of a few unit assertions. Kazakov and Klinov explore the branches of one context one at a
+time, with units on each branch and the common conclusions of all open branches as the
+entailed ones, and their Theorem 2 shows that a split of a disjunction into branches is
+sound for each element separately. Kazakov's Horn-SHIQ calculus takes two successors that
+an at-most restriction identifies as one successor whose filler is the conjunction of
+theirs and whose roles are both, and never writes an equality.
+
+The decision has two parts that are built, the cases and the witnesses' context, and a
+third that is specified and not decided, the merge.
+
+The first part gives each case of a union filler a successor of its own. With counting, an
+existential restriction `∃r.F` in a positive position whose filler `F` is a union
+`C_1 ⊔ … ⊔ C_k` in the ontology, or a fresh filler `b ⊑ F` of a witness of `H` or of a
+positive minimum below such a union, is normalized as the disjunction of one existential
+restriction per case, `∃r.(F ⊓ C_1) ⊔ … ⊔ ∃r.(F ⊓ C_k)` and
+`∃r.(b ⊓ C_1) ⊔ … ⊔ ∃r.(b ⊓ C_k)`, each with a fresh conjunction class and a function
+symbol of its own. The two forms are equivalent in every interpretation, since
+`∃r.(A ⊓ (C_1 ⊔ … ⊔ C_k))` is `∃r.(A ⊓ C_1) ⊔ … ⊔ ∃r.(A ⊓ C_k)` and
+`b ⊑ F ⊑ C_1 ⊔ … ⊔ C_k` makes `b` equal to `b ⊓ (C_1 ⊔ … ⊔ C_k)`, so the normalized
+ontology has the same models over the original signature once the fresh names are read as
+the conjunctions, and Theorems 8 and 9 give soundness and completeness as they do for the
+Table 1 translation, since only the set of DL-clauses changes and the rules do not. The
+case restrictions are conditional in the predecessor, since the clause that holds them is
+`k - 1` literals wider than the clause it replaces, so each lies in `K_2` of the Succ rule,
+and in `K_1` only where a context supports it as a unit, and its successor is what the
+engine's `target` makes today for the restriction. Under the cautious strategy a
+conditional case restriction gets a hypothetical successor context with an empty core and
+the filler, the case and the union as markers, a case restriction that a context supports
+as a unit gets its EL successor, and the eager strategy may give the context a core of the
+atoms that are certain, with the markers of `K_2` outside the core sent as they are today.
+What changes is which contexts exist and what each is sent. Each conditional case
+restriction has a hypothetical successor of its own, and the distributed clause itself sends it the filler,
+its own case and the union and never another case's existential restrictions. The Succ
+rule still sends every marker of `K_2` that holds of the term, from every predecessor that
+reaches the context and from the universal restrictions they carry, so a case's context
+can receive another case's marker from a predecessor whose universal restriction puts the
+successor in that case, or an exclusion marker that is disjoint with one of the cases, and
+the union clause `F → C_1 ⊔ … ⊔ C_k`, conditional on `F`'s marker, can then resolve more
+than once against disjointness certificates, each resolvent with the exclusion markers in
+its body and not redundant against the marker clause of the case. The saving of the part
+is therefore a measured hypothesis and not a guarantee, that the case contexts of the
+three files hold fewer cases' restrictions and resolve the union fewer times than the
+shared successor does, and the regressions include a restriction with two predecessors of
+which one sends another case through a universal restriction and one sends a marker
+disjoint with a case. The predecessor's clause carries the `k` alternatives, and the
+Succ rule makes up to `k` successor terms for the restriction, one per case, whose
+qualified-role literals are candidates of the at-most products. A product over two terms
+of two cases of one restriction is redundant under this lemma. If the two qualified-role
+premises both descend from one occurrence of the `k`-way clause `Γ_0 → Δ_0 ⊔ E_1 ⊔ … ⊔ E_k`,
+if each keeps in its head the alternatives of the clause other than its own case, and if
+each keeps `Γ_0` in its body, then the product's head holds `Δ_0` and every `E_i` and its
+body holds `Γ_0`, so the product contains the `k`-way clause up to redundancy by
+Definition 4 and the Elim rule drops it. A candidate of the at-most rule is a term with a
+list of supporting premises, and the products enumerate every combination of the
+candidates' supports, so the lemma certifies one combination and not a subset. The rule
+drops a subset before the bounds on the widest clause, the subsets and the payload count
+it only when two of its candidates have every pair of their supports covered by the lemma,
+with an occurrence of the `k`-way clause in the context's store as the witness of the
+redundancy, since then every product of the subset is redundant on arrival. A subset with
+a support outside the lemma, such as an independent conditional support `A → r_B(x, f_1)`
+beside the source-derived one, stays with its accounting, and only the individual
+conclusions the lemma covers are skipped. Every other product keeps its equality
+reasoning. In particular a case restriction that a context supports independently, as a
+unit or under a premise that has dropped the alternatives, is not covered, and neither are
+two cases of two different restrictions whose classes overlap, so an equality between
+terms of different cases can still be derived and the Eq, Ineq and Factor rules take it as
+before, and a regression holds source-derived and independent conditional supports of
+one candidate together. The part applies in runs that count and without the root, since those are the runs
+whose witnesses and hypothetical successors carry union fillers, and it applies to a union
+of pairwise disjoint classes and to any other union alike, since the identity does not
+need the disjointness. The witnesses of one restriction keep their pairwise disjoint
+fillers `b_i`, and the certificates of the inequalities are unchanged, since the
+inequality of two witnesses is between their fillers `b_i` and `b_j` and not between the
+cases. A union of more than sixteen cases keeps the former translation. That number is a
+heuristic that bounds the terms one restriction adds to a context, and it does not by
+itself keep a context within the at-most rule's bounds on the widest clause, the subsets
+and the payload, which stay as they are and are the measured quantities of this part,
+since sixteen candidates and a maximum of five give 3,003 subsets for one fixed candidate
+and pass the payload bound before any product is derived. The measurement records, for
+each of the three files, the terms per context, the subsets the lemma skips, the products
+derived and the work at the bound, under the former and the new translation.
+
+The second part is item 728's third part, the witnesses' shared context, as that design
+states it, applied after the first part, so that the `n` witnesses `∃r.b_i` of one case
+share one successor context per role, filler and case, with `b_i` kept in the term's core
+for the certificates and sent as a marker, and the unit path sends the marker as that
+design says. It targets ore_ont_6952 and ore_ont_10140, whose cost is the witnesses'
+repeated unfolding of the transitive properties, 156,882 of the 280,093 conclusions of the
+attempt, and not an equality. The first part is measured on the two files before this one
+is built, and this one is built when either file still falls back or still misses the
+speed gate after the first.
+
+The third part, the merge of two equated successor terms in place of the Eq rule, is
+specified here and not decided, since the review of this design found that the simple
+form of Kazakov's at-most rule over context clauses is not complete, and the item builds
+the first two parts and measures them before it returns to this part. The simple form
+derives from `Γ → Δ ⊔ f_1(x) ≈ f_2(x)`, where the terms are the successors of `∃r_1.K_1`
+and `∃r_2.K_2`, the clauses `Γ → Δ ⊔ ∃r_1.(K_1 ⊓ K_2)(x)` and `Γ → Δ ⊔ ∃r_2.(K_1 ⊓ K_2)(x)`.
+Each is entailed by the premises, so the form is sound, and it is not a replacement for
+the equality, because the two conclusions do not say that one element carries both role
+edges and both terms' accumulated facts. The ontology with `r_1 ⊑ r`, `r_2 ⊑ r`, `r_1` and
+`r_2` disjoint, `A ⊑ ∃r_1.K`, `A ⊑ ∃r_2.K` and `A ⊑ ≤1 r.K` has `A` unsatisfiable, which
+the Eq rule finds by rewriting one role literal onto the other term, and the simple form
+derives only `∃r_1.(K ⊓ K)` and `∃r_2.(K ⊓ K)`, which add nothing, while a shared context
+that takes both role markers derives the clash under both markers in its body, which the
+Pred rule cannot discharge for either term, since neither term carries both edges. This
+example is a regression of the item whatever form the part takes. A replacement must
+therefore carry the identity of the element. Its merged restriction is `∃(r_1 ⊓ r_2).(K_1 ⊓ K_2)`
+over the conjunction of the roles and of the fillers, as the Horn rules' successors carry
+a set of roles and a conjunction of classes, and its context must take every positive and
+negative fact of both terms, the certificates of their inequalities and the universal
+restrictions their predecessor sends, so that the model construction of Theorem 9 can map
+the term `f_1(t)` to the merged context in place of the rewrite `f_1(x) ⇒ f_2(x)` and find
+every clause over either term true there. Its fillers are canonical conjunctions over the
+finite set of the ontology's atoms, so that a merge of `K_1 ⊓ K_2` with `K_1` returns the
+restriction it has and a repeated merge makes no new name, and the number of merged
+restrictions is bounded by the subsets of those atoms and the role sets, which is the
+eager strategy's bound and exponential in the ontology, not by the pairs of the initial
+restrictions, since a merged restriction can merge again. Its function symbols take a
+global well-founded order compatible with that reuse, since a symbol that is below its
+inputs and reused for a merge with one of them cannot be below itself, and Definition 3
+needs the order on function symbols to be well founded. Its schema must say which equality
+of an at-most conclusion over a maximum above one it replaces and how the other equalities
+of that head and their dependencies survive, how it takes an equality that arrives through
+the Pred rule or through the Eq rule rather than through the Hyper rule directly, under
+what certificates the qualification of each term by the counting qualifier `B` holds when
+the term's filler does not imply `B` and the qualification comes from a conditional fact or
+a universal restriction, and how the Ineq and Factor rules keep their contribution to
+completeness once the equalities they consume no longer exist. Until a round of this
+design meets those requirements and its completeness argument is reviewed, the Eq rule
+stays for every equality, between two successor terms and between a successor and the
+predecessor alike, and the first two parts are the item's implementation. If the first
+two parts leave ore_ont_6485 past the bound or the speed gate, the item returns to this
+part or to the nondeterministic exploration of Kazakov and Klinov as the remaining paths,
+and the decision between them is a further round of this design.
+
+The acceptance is the gate of the roadmap row. The three files classify with counting on,
+with `Stats::dl_counting_over` and `Stats::dl_over_budget` false and every axiom that needs
+counting taken, within the speed target, which for ore_ont_6485 is a run of at most the 18
+ms of Konclude 0.7.0 on four threads and a goal of three to five times faster, and no
+development file of the ORE 2015 DL sample costs more than twice its run without counting.
+Each part is measured apart, behind a switch of the lane that the landing removes, on the
+three files and on the counting fixtures, with the conclusions derived, the clause records
+processed, the entries made and the contexts made under each setting, on one thread on
+`atlas` beside the run without counting. The development files, the generated fixtures
+with the 150 counting cases and the `shoi` and nominal fixtures keep their results against
+HermiT on one and four classifier workers under both strategies, which means the full
+taxonomy for every run that is taken whole and finishes, soundness and a reported fallback
+for the cases the suite already records as falling back, `shq-041` and `shiq-028` of item
+729 among them, and `shiq-046`'s raised work bound as it is, with no new timeout and no
+new fallback. Regressions cover a union filler whose cases are not disjoint, where the
+distribution is still the identity and a successor may be in two cases, a witness
+`≥2 r.(C ⊔ D)` with `C` and `D` disjoint and a maximum of one for each case, whose two
+witnesses must be free to take different cases, two case restrictions one context supports
+independently so that the lemma does not apply and the equality is derived, two cases of
+two different restrictions whose classes overlap, a conditional inequality certificate
+after the distribution, a qualification by DL4 that reaches the predecessor by Pred, the
+unfolding of a transitive property under a case, the rooted run's unchanged
+normalization, the disjoint-role example of the third part, and the two regressions of
+the shared witness context from item 728's design. The measured effect of each part is
+recorded here when the item ships, and a part that measures no faster is not kept and
+goes to PERFORMANCE-EXPERIMENTS.md.
+
+#### Item 894's decision between merging and exploration
+
+This subsection is the further round that the design above calls for when its first two
+parts leave ore_ont_6485 past the bound. It records what the first part measured and why
+the second was not built, shows where the three files' attempts spend their bound, and
+decides between merging two equated successor terms and the nondeterministic exploration
+of Kazakov and Klinov. The measurements are debug builds on one thread with the derivation
+trace's tallies by rule and by context, which count derivations and not time, at the
+default bound of 262,144 and at a work bound of 4,194,304.
+
+The first part, built behind a switch of the lane, does what it was meant to do in the
+contexts of the union's cases, where the derivations of the disj rule on ore_ont_6485 fall
+from 110,668 to 28,407, and it makes no file classify. ore_ont_6485's attempt spends the
+freed bound in the hypothetical successor of `∃hasSingleBondWith.CarbonAtom`, which 48
+predecessors share and which derives 100,421 Pred conclusions at the default bound, and
+spends the larger bound on lazy products, 245,820 of 594,991 derivations. The attempt on
+ore_ont_10140 is the same with and without the part and the attempt on ore_ont_6952 nearly
+so, since neither file has a union filler in the axioms that Tier D normalizes. On the
+generated fixtures the part adds work wherever it applies, because each case of a
+restriction is a successor term of its own and so a candidate of the at-most products.
+`shiq-013`, `shiq-045` and `sriq-010`, three of the six fixtures that classify within a
+raised bound, pass that bound and fall back, `shq-038` grows past 9 GiB, and fourteen more
+fixtures derive two to a hundred times as much. The decision below does not use the part,
+so it is not kept.
+
+The second part is not built. Its target was the witnesses' repeated unfolding of the
+transitive properties, 156,882 of 280,093 conclusions in a trace of ore_ont_6952 taken
+before item 728's clauses landed. With those clauses the attempts on ore_ont_6952 and
+ore_ont_10140 derive 3,350 and 3,698 unfoldings at the default bound, about one percent of
+their work, so the part cannot change their fallback.
+
+Every attempt stops at the work bound, which counts the derived conclusions and, at one
+per sixteen, the certificate clauses that the equality simplification reads. On
+ore_ont_6952 and ore_ont_10140 the largest rule at the default bound is again, with 46,709
+and 72,613 derivations. The rule derives once more every stored clause with an equality or
+an inequality of a successor term each time a new certificate of that term is processed,
+so that a certificate that comes after the clause still simplifies it. In the hottest
+context of ore_ont_6952, a protein complex with three successors of exact cardinalities
+over `has_component` beside the successors of its definition, the rule derives 46,709
+conclusions from 356 processed clauses at the default bound and 240,338 from 775 processed
+clauses at the larger one. A diagnostic build that reports each rederivation that changes
+the store found none among those 46,709, of which 46,617 are ones that the filter below
+skips. The count is between 0.37 and 0.40 times the square of the processed clauses, since
+each processed certificate derives every live equality clause over its term again and both
+sets grow as the context saturates, and each rederivation reads the certificates of both
+of its terms again, so the work grows faster than the square of the clauses. This is why
+the rule's cost grows with the bound and why a larger bound only stops the attempt at a
+context that has processed twice as many clauses. A filter that skips the rederivations
+that the new certificate cannot change, kept as an experiment and not adopted, removes all
+but 118 of them on ore_ont_6952 and all of them on ore_ont_10140. The attempts then spend
+the larger bound on paramodulation, 247,395 and 223,556 derivations, in contexts that have
+processed 1,681 and 2,276 clauses and are still deriving. ore_ont_6485's attempt without
+the first part derives 1,522,033 conclusions at the larger bound, 575,550 of them
+paramodulations and 127,945 rederivations, and 1,065,930 of them in one context. The three
+files therefore spend their bound on equality reasoning between successor terms, through
+the rederivation of the equality clauses that paramodulation makes and through
+paramodulation itself once the rederivation is filtered.
+
+The Eq rule makes this cost in two ways. It rewrites into the equality's clause every
+clause whose maximal literal is over the larger term, so that each equality clause
+multiplies the clauses over its terms, and the rewritten clauses, with the unions of the
+premises' bodies and heads, are premises of the next products and equalities. And since an
+equality is a literal of a stored clause, the certificates that refute it reach it only
+through the rederivation above. Merging, as Kazakov's Horn-SHIQ calculus merges two
+successors that an at-most restriction identifies, writes no equality between two
+successor terms. Without such equalities the again rule has no clause to derive again, no
+equality is rewritten into another, and the Factor and Ineq rules have nothing to take,
+which the merge gives by construction. The transfer rule below still combines each clause
+of a merged atom with each clause of a fact of a term it merges, so a merged term with `k`
+clauses of its atom and `l` clauses of facts of its terms can take `k × l` transfers, and
+a fact moves to every merged term whose atom holds and whose set contains its restriction.
+That is the shape of the paramodulations of one equality. Whether the transfers and the
+merged terms' contexts cost less than the paramodulation they replace is therefore a
+hypothesis of this design, which the traces above do not show and the measurement below
+decides.
+
+The exploration of Kazakov and Klinov instead keeps no disjunction and takes one branch of
+a context at a time. Its published calculus is for ALCHI, with no number restrictions, no
+equality, no transitive properties and no nominals, so it says nothing of an at-most
+restriction or of the predecessor's part in a count. Taking counting into it would mean
+merging two terms within a branch, as the hypertableau's ≈-rule does, which would be an
+extension of ours with a completeness argument of its own. It also replaces the store of
+context clauses that the Pred rule, the hypothetical successors, item 728's lazy clauses
+and item 804's rooted run are built on, so it is a new Tier D and not a rule of the
+present one. Both paths change the inference system behind Theorem 9 and need an argument
+of completeness. The merge's argument is given below, and it keeps every rule of the
+calculus except the equalities of the at-most conclusions.
+
+The decision is the merge. It changes the rule whose cost the traces measure and keeps the
+calculus, its contexts and its other rules. The exploration stays the remaining path if
+the merge's measurement fails, and the questions above about counting and completeness are
+the design work it would then need. The merge applies in runs that count without the root.
+Those runs have no nominals, no self restrictions and no reflexive roles, so no clause
+holds a loop `S(x, x)` or an equality of `x`, and every equality is `f(x) ≈ y` or `f(x) ≈
+g(x)` for successor terms `f(x)` and `g(x)`. Rooted runs keep the Eq rule for every
+equality.
+
+A merged term is named by the set `S` of the existential restrictions of the normalized
+ontology whose successor terms it merges, with the function symbol `m_S` and the merged
+atom `M_S`. A restriction `e` of the ontology has the set `{e}` and its own symbol `f_e`.
+The merge of two terms with the sets `S` and `T` is the term of `S ∪ T`, interned during
+the run in a table beside the Horn rules' table of conjunctions, so a merge with a term
+whose set contains the other's returns that term and a repeated merge makes no new symbol.
+The name is the set of restrictions and not a pair of unions of roles and fillers, since
+two different pairs can have one union, as `∃r.A` with `∃r.B` and `∃r.A` with `∃r.(A ⊓ B)`
+do, and the transfer below may move facts only from the terms of the restrictions in the
+set. A merged atom is a name of its own and never an existential restriction of the
+ontology, so the rules do not unfold it, and a merged term has the facts that the transfer
+and the calculus's other rules derive for it and no others. The merged symbols are bounded
+by the subsets of the ontology's existential restrictions, an exponential bound like that
+of the calculus's own contexts, so the run terminates. The function symbols are ordered by
+the size of their set, then by its sorted members. Each set names one symbol, so the order
+is total on finitely many symbols and well founded as Definition 3 requires, and a symbol
+is above every symbol whose set is a proper subset of its own. A merge that returns one of
+its inputs adds no symbol and no pair to the order. The context order places the merged
+atoms over `x` above the named classes, as it places every atom that the normalization
+makes, and no merged atom is a predecessor trigger, so condition 5 of Definition 3 holds
+as before.
+
+The at-most rule and item 728's lazy clauses are the only rules of these runs that would
+write an equality between two successor terms. No clause of the ontology holds one, since
+a minimum is normalized to witnesses with pairwise disjoint fillers. The Eq rule rewrites
+a successor term only into the predecessor once such equalities are gone, and the Pred
+rule of these runs sends only atoms and role atoms over the predecessor, so neither rule
+makes one. Where the at-most rule or a lazy clause would write `s(x) ≈ t(x)` for two
+successor terms with the sets `S` and `T`, it writes the merged atom `M_{S ∪ T}(x)`, which
+is the atom of the larger term when one set contains the other. Each equality of an
+at-most conclusion over a maximum above one becomes a merged atom of its own, and the
+conclusion's equalities with the predecessor, its other literals and its body stay as they
+are, so `Γ → Δ ∨ ⋁ s_i(x) ≈ s_j(x)` becomes `Γ → Δ ∨ ⋁ M_{S_i ∪ S_j}(x)` with `Δ`
+unchanged. A merged atom leaves the head when it is made if two of its terms have
+certificates of classes in one disjointness set under the clause's body and the rest of
+its head, as the equality leaves it today. The disjoint-role rule derives the clash of two
+disjoint roles over the merged term once both role literals are transferred, which decides
+the disjoint-role example above. Neither needs a later rederivation, since a certificate
+that arrives after the merged atom reaches the merged term through the transfer, and the
+clash in the merged term's context returns to the atom's clause through the Pred rule.
+
+The merged symbols are sound under definitions that add no consequence over the ontology's
+signature. Read `M_S(x)` as the statement that the terms `f_e(x)` of the restrictions `e`
+in `S` are one element, and `m_S(x)` as that element where `M_S(x)` holds. Where it does
+not, read `m_S(x)` as the element that corresponds to `f_e(x)`, for the least `e` in `S`,
+in another copy of the model. The disjoint union of a model with a copy of itself is again
+a model of the ontology, since these runs have no nominals, and no role relates an element
+to the other copy. The disjoint union of any model with its copy therefore has an
+expansion that satisfies the definitions, and it satisfies the same clauses over the
+ontology's signature as the model, so the definitions add no consequence there. A rule's
+conclusion is a consequence of the ontology with the definitions. A role literal of
+`m_S(x)` makes `M_S(x)` true, so an at-most conclusion's merged atom holds where its
+equality does, whether its terms are terms of the ontology's restrictions or merged terms,
+since the equality of `m_S(x)` with `f_e(x)` or with `m_T(x)` makes every term of `S ∪
+{e}` or of `S ∪ T` one element. A transfer holds since `M_T(x)` makes `f_e(x)`, for `e` in
+`T`, and `m_T(x)` one element, and the simplification by certificates holds since two
+terms in disjoint classes are two elements while `M_{S ∪ T}(x)` makes `m_S(x)` and
+`m_T(x)` one.
+
+The transfer rule gives the merged term the facts of the terms in its set, which the
+requirements above call the identity of the element. From a clause `Γ_1 → Δ_1 ∨ M_T(x)`
+whose maximal literal is the merged atom and a clause `Γ_2 → Δ_2 ∨ L(f_e(x))` with `e` in
+`T`, whose maximal literal `L` is a class atom over `f_e(x)` or a role literal between `x`
+and `f_e(x)` in either direction, it derives `Γ_1 ∧ Γ_2 → Δ_1 ∨ Δ_2 ∨ L(m_T(x))`. A unit's
+literals over `f_e(x)` take part in place, as they do in the Eq rule. These are the
+literals over a successor term that a clause of these runs holds apart from the equality
+`f_e(x) ≈ y`, which the transfer does not move and need not, as the argument below shows.
+A merged term's own facts do not move to a larger merged term, since the model below maps
+only the terms of the ontology's restrictions, so every transfer starts at a term
+`f_e(x)`. The context of a merged term thus takes every fact of its terms, their
+certificates among them, and the universal restrictions of the predecessor reach it
+through its transferred role literals. The Succ rule makes the merged term's successor
+context as it does for any successor term and sends it the transferred facts as markers.
+The merged terms are candidates of the at-most rule like any successor, through their
+transferred role literals, so a count that needs three terms in one element merges a
+merged term again.
+
+The completeness argument extends the proof of Theorem 9 in Appendix C. Appendix C.2
+builds the model fragment `R_t` from the ground clauses `N_t` of the context of a term
+`t`, and Appendix C.3 unfolds the context structure into the rewrite system `R`. Both
+constructions and Lemmas 13 to 28 rest on the forms of context clauses, on the order of
+Definition 3 and on the saturation under the Core, Eq, Ineq, Factor, Pred and Succ rules.
+The merged atoms are unary atoms over `x` and the merged symbols are function symbols of
+sort a, the order extends as above, and those rules are kept, so `R` is built as there and
+the lemmas hold, with the merged symbols in its Herbrand universe. The proof uses this
+productive interpretation and not an arbitrary model of the clauses, since in `R` every
+atom that is true in `R_t*` and whose terms `R` does not reduce is the maximal literal of
+a generative clause of `N_t` whose other literals Lemma 16 makes false, and such a clause
+is an instance of a context clause that can be a premise of the rules. Lemma 29 shows from
+the saturation under the Hyper rule that `R*` satisfies each clause of the ontology, and
+its proof holds unchanged for every clause except the at-most clause of DL4 and item 728's
+lazy clauses, which have its form with atoms over `x` added to the head and whose Hyper
+conclusions are changed. For these clauses the same proof gives a weaker property. If the
+body atoms over `t` and `S_B(t, u_i)` hold in `R*` for `n + 1` different neighbours `u_i`
+of `t` that `R` does not reduce, then Lemma 27 makes each of these atoms true in `R_t*`,
+the rule applies to the context clauses behind their generative clauses, and by Lemmas 18
+and 22 its conclusion is in `N_t` up to redundancy and true in `R_t*` while its premises'
+other literals are false. One of its head literals is therefore true. It is an atom over
+`t`, an equality of a `u_i` with the predecessor, which would reduce `u_i`, or a merged
+atom `M_{U_i ∪ U_j}(t)` of two of the successor terms, where `U_i` is the set of `u_i`.
+
+The qualification of a term by the counting qualifier `B` is the first clause of DL4 at
+that term, which Lemma 29 covers at a merged term as at any other term, whether its `B`
+comes from a conditional fact, from a universal restriction of the predecessor applied to
+a transferred role literal, or from the term's own context. So `S_B(t, m_T(t))` holds in
+`R*` when `S(t, m_T(t))` and `B(m_T(t))` do, and Lemma 27 makes it true in `R_t*`, where
+the weaker property reads it.
+
+The model is then the part of `R*` that the merged terms leave uncovered. A successor term
+`u` of `t` that `R` does not reduce, with the set `U`, is covered when `R*` makes `M_T(t)`
+true for a set `T` that strictly contains `U`, so the atom of a merged term never covers
+that term itself. For a covered term choose such a `T` that is maximal by inclusion. Then
+`m_T(t)` is not covered, since a true atom of a strictly larger set would contradict the
+choice, and since the sets are finite every covered term has such a representative. The
+interpretation `I` has as elements the terms that `R` does not reduce and that are reached
+from the constant `c` through successors that are not covered. Its atoms and role atoms
+are those of `R*` over these elements, and the value of a function symbol `f_e` at an
+element `t` is the normal form under `R` of `f_e(t)` when that term is not covered and of
+`m_T(t)` for the chosen `T` when it is. The representative occurs in `R_t`, since the
+transfer gives it the atoms of `f_e(t)`, so its normal form is an element of `I`.
+
+`I` satisfies the clauses of the ontology. A clause with no function symbol and no
+equality in its head, such as DL1, DL3, the first clause of DL4 and DL7 to DL9, holds in
+`I` since it holds in `R*` and `I` keeps the atoms of `R*` over a subset of the terms that
+`R` does not reduce, closed under predecessors, with the role atoms between neighbours as
+there. The at-least restrictions of these runs are witnesses with disjoint fillers, so the
+clauses of DL2 are `B_1(x) → S(x, f_e(x))` and `B_1(x) → B_2(f_e(x))`, and no clause of
+the ontology holds an inequality. At an element `t` with `B_1(t)` the proof of Lemma 29
+makes both atoms over `f_e(t)` true in `R_t*`. If `f_e(t)` is neither reduced nor covered,
+it is an element and both atoms hold of it. If `R` reduces `f_e(t)` to the predecessor,
+both hold of the predecessor as in Theorem 9. If `f_e(t)` is covered, each atom and the
+atom `M_T(t)` have generative clauses in `N_t`, the transfer of the context clauses behind
+them is in `N_t` up to redundancy and true in `R_t*`, and its other literals are false, so
+the atom holds of `m_T(t)` and of its normal form. For the at-most clause and a lazy
+clause, suppose that an element `t` with the body atoms and none of the head atoms over
+`t` had `n + 1` elements `u_i` with `S_B(t, u_i)` in `I`. Each is the predecessor of `t`
+or a successor that is not covered, and the weaker property makes `M_{U_i ∪ U_j}(t)` true
+for two of the successors. If `U_i ∪ U_j` strictly contains `U_i`, that atom covers `u_i`,
+and otherwise `U_j` is a proper subset of `U_i` and `M_{U_i}(t)` covers `u_j`. Either
+contradicts the choice of elements, so every count holds in `I`. `I` agrees with `R*` over
+`c`, so it does not satisfy the query clause, and the ontology does not entail it.
+
+The equalities and inequalities that remain need nothing more. An equality `f(x) ≈ y` of a
+stored clause needs no transfer. When `R` makes it true at `t`, `R` reduces `f(t)` to the
+predecessor, so the term is not covered and its value is the predecessor as in Theorem 9.
+A merged term that the at-most rule equates with the predecessor is reduced in the same
+way, and the terms it covers take the predecessor as their value, where the transferred
+atoms hold. When `R` makes the equality false, its clause holds in `R_t*` through another
+literal, and `I` need not keep the equality or its negation for a covered term, since `I`
+is checked against the clauses of the ontology and not against the context clauses, only
+the at-most and lazy clauses have equalities in their heads, and no clause of the ontology
+holds an inequality. The Ineq and Factor rules keep their part in Lemma 21 without work.
+Every equality of these runs is `f(x) ≈ y`, so two equalities of one term have one right
+side and Factor has no premise. No clause of the ontology holds an inequality, Factor is
+the only rule that makes one from equalities and the Eq rule makes one only from another,
+so no clause holds an inequality and Ineq has no premise. The Pred rule's trigger `x ≈ y`
+never fires, since no clause of these runs holds an equality of `x` and their Pred rule
+sends only clauses whose heads are atoms and role atoms over the predecessor.
+
+The merge is built behind a switch of the lane and measured on the three files at both
+bounds, with the tallies by rule and context above, on the generated fixtures and the
+`shoi` and nominal fixtures, before any timing on `atlas`. Beside the rule tallies the
+trace counts the transfer attempts, the transfers the store keeps, the transfers it
+already holds up to redundancy, the merged terms and their contexts, which test the
+hypothesis that the transfers cost less than the paramodulation they replace. The again
+rule then has no equality clause between successor terms to derive again, so its
+experimental filter stays unadopted. The acceptance is the row's, as the design above
+states it. The regressions add a count that needs three terms in one element, a merged
+atom refuted by certificates when it is made and one refuted by a certificate that arrives
+after it, made by the at-most rule and by a lazy clause, two true merged atoms whose sets
+overlap without a true atom of their union, a merged term equated with the predecessor, a
+merged term that takes a conditional fact of each term, and a qualification that reaches a
+merged term only through a transferred role literal and a universal restriction, beside
+the regressions above. If the merge leaves a file past the bound, the item returns to this
+round with the exploration.
+
+The merge was built as above behind a switch of the lane and measured, and it is not kept.
+It makes no file classify. The attempts of ore_ont_6485, ore_ont_6952 and ore_ont_10140 at
+the default bound derive 281,066, 186,129 and 242,027 conclusions and stop at the work
+bound, and at the larger bound they derive 562,845, 1,189,769 and 506,166, where
+ore_ont_6485 and ore_ont_10140 pass the at-most rule's width limit and ore_ont_6952 the
+work bound. The hypothesis holds for the part it names. The transfers are few, 21,086, 516
+and 270 at the default bound, of which the store keeps 8,696, 310 and 180, and the again
+rule and the paramodulation between successor terms are gone. The cost moves into the
+at-most rule and item 728's lazy clauses, which make 219,789, 168,148 and 219,295
+conclusions at the default bound and 499,544, 1,170,975 and 480,842 at the larger one.
+Each merged term is a candidate of the at-most products beside the terms in its set, and
+every at-most conclusion is a disjunction of merged atoms, four to six in the hottest
+context of ore_ont_6952, which the transfer carries into the role literals of the merged
+terms. In that context the 15 terms of the restrictions have one or two role literals each
+as premises and the 15 merged terms 2 to 20, so the products cross long lists of
+conditional premises, and one processed role literal of a merged term gives up to 12,768
+conclusions. The Eq rule rewrote an equated term into the other and so kept the candidates
+few, and the merge keeps every term and every merged term as a candidate. On ore_ont_6485
+the unions of these candidates make 15,284 merged terms at the default bound, 490 of
+them with a successor context. On the generated fixtures the merge gives no taxonomy that
+HermiT does not, and 42 of the 640 fixtures change, none for the better. Seven pass their
+bound and fall back, `shiq-006`, `shiq-013`, `shiq-036`, `shiq-045`, `shq-017`, `shq-047` and
+`sriq-010`, and the others derive 2 to 300 times as much, `shq-023` 145,915 conclusions in
+place of 684. The merge's code is reverted with an entry in PERFORMANCE-EXPERIMENTS.md, and
+its seven regressions stay in the Tier D suite, where the Eq rule passes them. The item
+returns to this round with the exploration, which the next subsection takes up.
+
+#### Item 894's exploration round
+
+This round takes up the nondeterministic exploration of Kazakov and Klinov after the merge
+left the three files past the bound, and weighs it against a narrower repair of the merge.
+It counts from the derivation traces what the contexts that spend the bound hold, states
+what counting inside a branch needs beyond the published calculus, and recommends how item
+894 ends. The traces come from debug builds of the reverted engine on one thread with
+counting, at the default bound, and for ore_ont_6952 and ore_ont_10140 also at a work bound
+of 4,194,304 with the again rule's experimental filter, so that those attempts reach the
+contexts behind the first one. The partition counts below read the processed clauses and
+the at-most and lazy conclusions of one context, as the trace holds them when the attempt
+stops, as ground clauses. An equality holds when its two terms are in one block of a
+partition of the successor terms, an atom over a successor term is read once per block, a
+successor term takes part only where its existential restriction holds, and the fillers of
+one minimum's witnesses are pairwise disjoint, as the normalization makes them. A partition
+counts when some values of the atoms satisfy every clause. These are exact counts for the
+clauses of each snapshot. They are not the branches of a finished exploration, since the
+ontology's other clauses and the neighbouring contexts can remove partitions or add choices.
+
+On both versions of the Protein Ontology the hottest context at the default bound is that
+of `PR_000024883`, a complex that the ontology defines as `PR_000024871` with exactly three
+components of `MOD_00041`. The context derives 55,040 of the attempt's 55,560 conclusions
+on ore_ont_6952 and 88,320 of 90,218 on ore_ont_10140. Its successor terms are the three
+witnesses of the minimum, a successor of `∃has_component.MOD_00041`, and the witnesses of
+three alternatives that the definitions of other classes put in its heads. The definition
+of `PR_000024901`, which allows at most two such components, gives the clauses that either
+the context holds that class or three more witnesses with pairwise disjoint fillers exist.
+Two other definitions give alternatives with four such witnesses, and the trace holds the
+at-most conclusion over each group of four with no literal besides the alternative's
+guard, so no partition admits either four-witness alternative. With `PR_000024901` true,
+3 partitions of ore_ont_6952's terms admit the context's clauses, in which the successor
+of the existential restriction joins one of the three witnesses, although the class's own
+maximum of two refutes them once its definition is applied. Without it, 18 partitions
+admit them, the 3! ways of merging the alternative's three witnesses with the minimum's
+three, times the 3 places of that successor. ore_ont_10140 also states the exact
+cardinality in a told `SubClassOf` axiom beside the definition, which gives the context a
+second group of three witnesses, so 18 partitions admit its clauses with `PR_000024901` and
+108 without it, 3! × 3! × 3. Every such partition has exactly three blocks. A search that
+merges a pair of the first four blocks while more than three remain, as the hypertableau's
+≈-rule follows the at-most clause, visits 49 nodes on ore_ont_6952 and 319 on ore_ont_10140
+and ends in the 18 and 108 partitions when it skips the pairs known to be different, and
+meets 138 and 948 more clashes when it tries them.
+
+The larger bound with the filter shows the contexts that follow. The attempt on
+ore_ont_6952 derives 161,338 conclusions in the context of `PR_000024923`, which has the
+same shape and the same counts of 3 and 18 partitions, 98,516 in that of `PR_000024883` and
+57,088 in that of `PR_000026735`. The attempt on ore_ont_10140 derives 231,936 of its
+233,068 conclusions in the context of `PR_000024883`. `PR_000026735` has exactly six
+components of `PR_P08034` and inherits exactly six components of `PR_000007997` from
+`PR_000026734`, and `PR_P08034` is a subclass of `PR_000007997`, so the six witnesses of
+each group must be the six of the other. 720 partitions admit the context's clauses, the
+perfect matchings of the two groups, and none with fewer merges, while its 55,466
+paramodulations had not saturated it when the attempt stopped. A census over the told
+axioms takes, for each class, the groups of its stated and inherited exact cardinalities
+over `has_component`, and for each pair of groups whose qualifiers are equal or related by
+told subsumption it counts the ways of mapping the smaller group one to one into the
+larger, then multiplies these counts. It finds 72 classes with such a pair in ore_ont_6952
+and 81 in ore_ont_10140. The largest products are 331,776 for `PR_000027411` and
+`PR_000027412`, which each have four pairs of groups of four, 720 for `PR_000026735` and
+`PR_000026737`, and 120 for `PR_000027403`. The products are counts of mappings and not
+measured searches, and they leave out the candidates' alternatives, which add groups as
+they do for `PR_000024883`.
+
+The two files therefore spend their bound on contexts whose clauses admit a few dozen to a
+few hundred partitions. The Eq rule and paramodulation derive clauses that hold in all of
+them together, through each combination of the terms' facts and equalities, and the merge
+derived them through the combinations of conditional premises of its merged terms. A
+branch of the exploration takes one partition at a time, with every fact of the branch
+unconditional. It stores no equality clause, so nothing is derived again when a
+certificate arrives, and an at-most step over `n + 1` present neighbours offers at most
+`n(n + 1)/2` merges of facts, with none of the products of conditional premise lists that
+gave the merge 12,768 conclusions from one role literal. The cost moves into the number of
+branches. A test that needs one open branch, such as a candidate that does not hold, can
+end in the first partition that survives. A candidate that holds in every branch, or the
+collection of the subsumers common to all branches that the paper's branch exploration
+performs, visits every branch unless the search avoids some. As an illustration that
+assumes the four pairs of groups of `PR_000027412` are independent matchings, a search that
+skips known-different pairs takes 64 merges to enumerate the 24 matchings of one pair, and
+enumerating all four while keeping the shared prefixes takes 64 × (1 + 24 + 24² + 24³) =
+923,200 merges. Dependency-directed backtracking, which HermiT adds to the hypertableau,
+skips choices that a clash does not depend on, and the paper reduces classification work
+through the taxonomy, but neither is shown here to remove that enumeration, and the round
+does not establish how an exploration would charge such work against the present bound.
+
+ore_ont_6485's attempt at the default bound derives 258,378 conclusions, 140,857 of them in
+the hypothetical successor of `∃r.HeteroAtom` over one of the bond roles, which 21
+predecessors share, and 29,424 in the hypothetical successor of a restriction over the same
+role whose filler is a name of the normalization, which 4 predecessors share. The first
+context spends its work on case analysis. The second's largest rule is paramodulation, with
+12,240 of its 29,424 derivations, over equalities of a successor term with the predecessor
+such as `y ≈ f(x)`, which the merge keeps. In the first, 109,560 derivations are the disj
+rule's, which takes the cases of unions such as `HeteroAtom`, a union of four classes one
+of which is the union of five halogens. It processes 19,901 clauses whose bodies hold one
+to five of 21 markers, the atoms over `x` that a predecessor can send, in 267 distinct
+sets. The second processes 4,843 clauses, 148 with one marker, 4,485 with two and 210 with
+three, out of 12 markers in 36 distinct sets. The present calculus thus keeps one context
+and conditions its clauses on the sets of markers. The exploration instead makes a
+successor a conjunction of its filler and the facts that one branch of one predecessor
+sends, so each hypothetical successor becomes one conjunction for each set of markers that
+a predecessor's branch sends, each with branches of its own. In the processed clauses of
+the predecessors' contexts when the attempt stops, every marker is sent under a condition,
+5 to 13 markers for each predecessor of the first successor and 10 for each predecessor of
+the second, so that snapshot allows up to 14,208 and 4,096 sets. A finished saturation
+could send more, and the conditions, inclusions and overlap between predecessors could make
+far fewer occur. The bond roles are symmetric, so a successor also counts its predecessor
+in its own exact cardinalities, and a conjunction must state whether the predecessor has
+each qualifier that counts it. The ontology's exact cardinalities over the bond roles have
+the seven qualifiers `OxygenAtom`, `BromineAtom`, `HalogenAtom`, `HydrogenAtom`,
+`CarbonAtom`, `Alkyl` and `OrganicGroup`. Under its told disjointness and inclusions, where
+`BromineAtom` is a halogen and `Alkyl` is a carbon atom and an organic group, they allow 13
+combinations for a predecessor, and the cardinalities of the classes of oxygen and
+nitrogen, with the qualifiers `HydrogenAtom`, `CarbonAtom` and `Alkyl`, allow 4. For this
+snapshot the conjunctions of the two successors are therefore at most 14,208 × 4 = 56,832
+and 4,096 × 13 = 53,248, against the 267 and 36 sets of markers that the calculus
+conditions on. The number that the predecessors' branches send in practice is known only
+from an implementation, so these figures show no pass and no failure.
+
+Counting inside a branch needs more than the published calculus, whose rules are for ALCHI
+without number restrictions or equality and whose implementation takes transitive roles
+through an encoding. First, the branch needs an at-most step over present neighbours with
+the hypertableau's merge, where two successors merged in a branch become the successor of
+the conjunction of both labels and keep their distinctness from the other witnesses and
+the roles that reach them. Second, the step needs the qualification of each counted
+neighbour. A neighbour whose label the branch does not decide needs a guess between the
+qualifier and its negation, in the way that the paper's R←∃ rule guesses between `H ⊑ ∃S.C`
+and `H ⊑ ∃R.(K ⊓ ¬C)`, so each counted qualifier can double the successor conjunctions.
+Third, a count over an inverse or symmetric role needs the predecessor's part. The
+successor conjunction must carry a guess of the predecessor's qualification, and the
+predecessor must refute the guesses that it does not satisfy, as the R←∀ rule does for
+universal restrictions. A merge of a successor's own successor with the predecessor sends
+facts back to the predecessor, which the guesses must also cover, and the backtracking of
+one local branch must stay independent of the others after such a merge. Fourth, the
+counts must follow the role hierarchy, counting a qualified neighbour once across the
+subroles that reach it, keep the simple-role restriction, and keep the transitive roles'
+encoding apart from the counted roles. Fifth, the extension needs a finite vocabulary of
+conjunctions and neighbour configurations for termination, and a proof that a set closed
+under the rules gives a model, extending the paper's Theorem 1 as Appendix C of Bate and
+others proves Theorem 9 for the disjunctive calculus with number restrictions. None of the
+sources that this round reads gives that proof. The exploration also replaces the store of
+context clauses that the Pred rule, the hypothetical successors, item 728's lazy clauses
+and item 804's rooted run are built on, so it is a new Tier D beside the present one.
+
+The narrower repair keeps the merge and changes what its at-most rule counts. In the
+merge's traces, a merged term is a candidate beside the terms that its set covers, and the
+session that measured it proposed that a product never take two candidates one of whose
+sets strictly contains the other's. The member sets of the merged terms follow from the
+filler facts that the transfer moves into them, since each witness has its own filler. In
+the merge's hottest context of ore_ont_6952, 108,839 of its 168,146 at-most and lazy
+conclusions at the default bound take such a pair, which leaves 59,307, and in that of
+ore_ont_10140, 69,929 of its 211,275 take one, which leaves 141,346. The products that
+remain are those of merged terms whose sets are incomparable, such as the merged terms of
+one witness of each group, whose number grows with the matchings above, and the merge's
+attempt on ore_ont_6952 at the larger bound derived 1,170,975 at-most and lazy conclusions
+without finishing. The repair has no demonstrated pass on ore_ont_6485. In the reverted
+engine, that file's hottest context spends its work on case analysis, which the merge does
+not change. Under the merge, that file's hottest context, the one of `AcylBromideGroup`,
+makes 219,761 at-most conclusions over maximums of one, and the attempt interns 15,284
+merged terms. A maximum of one merges any two incomparable candidates, so the repair does
+not stop those unions, while the share of comparable products that it removes there is not
+measured. Its completeness argument looks provable. Fix an element `t` of the model. A
+merged successor term of `t` that `R` does not reduce and that is reached through a true
+role literal has that literal from the transfer, which derives it only from a clause whose
+merged atom is then true, so the term covers every successor of `t` with a strictly smaller
+set. The successors of `t` that are elements, neither reduced nor covered, are thus
+pairwise incomparable, and the weaker property of Lemma 29 needs to hold only for `n + 1`
+such neighbours, which the restricted products still derive. A merged term that `R` reduces
+to the predecessor counts as the predecessor, as before, and a lazy clause keeps the atoms
+of its head, so the same contradiction applies when they are false. The argument would
+state this local restriction for each parent.
+
+The options rank as follows, with their expected cost. Closing item 894 at its measured
+outcome, with counting off by default and the axioms that need it left out and reported as
+they are now, costs a change to F24, the roadmap row and a follow-up item, and it leaves
+item 894's acceptance unmet, which is a scope decision for the maintainer. Item 603 already
+names saturation with a tableau as the path where the calculus cannot finish, and the
+partitions and conjunction counts above are what a follow-up item for counting by search
+would start from. The merge with the restricted products comes next. It costs one to two
+sessions, since the merge's code is one revert away and the change to the proof is small,
+and it is a bounded experiment whose snapshot leaves 35 and 67 percent of the at-most and
+lazy conclusions in the hottest contexts. It has no demonstrated pass on ore_ont_6485,
+where the reverted engine's hottest context spends its work on case analysis, so it is
+unlikely by itself to let counting be on by default. A split that builds the exploration
+for the two versions of the Protein Ontology costs a new Tier D with the counting extension
+above and its proof, and since ore_ont_6485 would still fall back, counting would stay off
+by default after it. Exploration for all three files costs the same with no demonstrated
+path for ore_ont_6485, whose snapshot alone allows tens of thousands of conjunctions for
+two successors. The round recommends closing the item, and treats the restricted merge as
+an optional experiment for the record rather than a path to the item's acceptance.
+
+#### The order between number restrictions
+
+This subsection records what item 894 delivers. The rounds above changed rules of the
+calculus and left the three files past the bound. This one changes the clause set that the
+normalization gives the calculus in a run that counts without the root, and no inference
+rule. `Limits::number_order` controls it. It is on by default, and false turns it off. It
+changes nothing without `Limits::counting`, in a rooted run, or in a run whose axioms need
+no counting, so a run with the default limits, which does not count, is unchanged. With
+it, ore_ont_6952 and ore_ont_10140 classify with counting on and give HermiT's and
+Konclude's taxonomies, and ore_ont_6485 still passes the bound, as the measurements below
+state.
+
+The traces of the earlier rounds show where the two versions of the Protein Ontology spend
+the bound. The normalization relates no two number restrictions. `PR_000026735` holds
+`=6 has_component.PR_P08034` and inherits `=6 has_component.PR_000007997`, with
+`PR_P08034 ⊑ PR_000007997` told, so its context makes twelve witnesses and the at-most rule
+searches their 720 matchings. `PR_000024883` holds `=3 has_component.MOD_00041`, and the
+definition of another class by `=2` over the same role and filler puts the alternative
+`≥3` with three witnesses of its own into the context's heads, which the context's maximum
+of three then matches with its own three. A minimum that the context already holds
+entails the second minimum in both cases, and the second group of witnesses adds nothing
+to any model.
+
+With the option, a minimum `≥n r.F` with `n ≥ 2` in a positive position becomes a fresh
+name `G` with the told inclusion `G ⊑ W`, where `W` is the conjunction of the `n`
+existential restrictions over fresh pairwise disjoint fillers below `F` that the
+normalization made before. The alternative `H` of item 728's clauses is such a minimum and
+gets a name in the same way. No rule builds `G` from the witnesses, so `G` holds only
+where an axiom or a clause states the minimum, and `G` ranks with `W` in the order of
+atoms. After the axioms are normalized, `dl_norm::number_order` closes the told role
+inclusions under reflexivity and transitivity, and closes the told class inclusions in the
+same way from each filler, with the operands of an intersection above it and `owl:Thing`
+and what the ontology tells of it above every filler. Each closure is a preorder of
+consequences of the ontology. A minimum `≥m r.F` then entails `≥n s.F'` when `m ≥ n`,
+`r ⊑ s` and `F ⊑ F'` are in the closures, and it contradicts a maximum `≤k s.B` when
+`m > k`, `r ⊑ s` and `F ⊑ B`. The normalization adds three kinds of relation from this.
+
+- The minimums of one bound, role and filler have a representative, the least name. Each
+  of the others is told equivalent to it and has it as its only blocker.
+- Between representatives, the name of a minimum is told to be below the name of each
+  minimum that it entails, and it is a blocker of that minimum. Two representatives that
+  entail each other, through equivalent roles or fillers, are told equivalent, and the
+  smaller name blocks the larger.
+- The name of a minimum and the holder `M` of a maximum that it contradicts are a
+  disjointness set, for the representative and for the names it stands for.
+
+A name that is told below one of its blockers keeps no inclusion into witnesses of its
+own. That is every name beside its representative and the larger name of two
+representatives that entail each other. Wherever such a name holds, as a unit or under a
+clause, the told inclusion gives the blocker under the same clause, and the blocker's
+witnesses are the name's.
+
+The blockers lie within a strict order, strict entailment and then the names, so they have
+no cycle. The normalization checks this, and a run would block nothing if a cycle showed.
+The relation is not transitive as stored, since a name that is not a representative has
+only its representative as a blocker. The relations are found through buckets of the
+minimums and the maximums by role and filler, so the cost is the size of the closures and
+not the square of the number of minimums. They number at most 1,048,576. Past that the
+rest are left out, which is sound and complete, since each is a consequence that the run
+can do without and a minimum without a blocker makes its witnesses. A name gets both
+inclusions to its representative and the blocker together or none of them. The closures
+poll the run's stop. The tables are charged to the estimates of `DlAx::bytes`,
+`DlIx::bytes` and `DlSt::bytes`. This memory buys the run's speed on ontologies with many
+related cardinalities, and on the two Protein Ontology files the peak resident memory with
+the order is 319 to 403 MiB against 267 to 343 MiB without counting.
+
+Two places in the engine read the tables. The first is blocking. A unit `G_2` that has
+blockers and witnesses of its own does not derive `W_2` with its other told subsumers.
+Its name waits in the context, in `DlSt::pending`, until the context has taken its units,
+which is when `dl_rules::flush` runs, and it then derives `W_2` unless the context holds
+as a unit a blocker of `G_2`. A clause `Γ → Δ ∨ G_2(x)` whose maximal literal is `G_2` skips the told
+step to `W_2` when the context holds such a unit, and takes it otherwise. A context with a
+waiting name is not idle, so a run that a deadline, a cancellation or the memory budget
+stops in that window reports the context's class incomplete. The second place is a cut.
+`dl_rules::derive` removes from the head of a derived clause an atom over `x` that is in a
+disjointness set with a unit of the context. The cut applies only in a run with the order,
+so a run without it derives what it derived before.
+
+The argument has a part for the clause set and a part for the two rules. Let `T` be the
+ontology after the structural transformation, with each positive minimum read as a
+minimum, and `O` the clause set of the run without the order, in which each such minimum
+is its conjunction of witnesses. `T` and `O` have the same consequences between the
+ontology's classes by Kazakov's Lemma 2, as before. Its argument does not extend an
+arbitrary model of `T`. It takes a model that refutes a subsumption, unravels it into a
+tree, and colours the neighbours of each element with the fresh fillers from the root
+down. An element's neighbours over a simple role are its predecessor and its successors,
+the predecessor carries at most one filler of a group when the element is reached, and
+the element is free in the fillers of its successors, so the colouring exists. Let `O⁺`
+be the clause set with the names, the inclusions `G ⊑ W` and the relations. In one
+direction every model of `O⁺` satisfies `T`, which the next paragraph shows for a weaker
+clause set. In the other direction, the coloured tree model becomes a model of `O⁺` when
+each `G` is read as the set of elements with `n` neighbours over `r` in `F`. Every such
+element has its witnesses by the colouring, the told inclusions between names hold because
+the closures hold in the model, and a name and a maximum's holder that it contradicts
+share no element. So `O⁺` has the consequences of `T` between the ontology's classes and
+no others.
+
+For blocking, let `O'` be `O⁺` with each clause `G_2(x) → W_2(x)` replaced by
+`G_2(x) → W_2(x) ∨ ⋁ G_1(x)` over the blockers `G_1` of `G_2`. `O⁺` entails `O'`, so `O'`
+is sound. `O'` also entails every consequence of `T` between the ontology's classes. In a
+model of `O'`, by induction on the blockers, which is well founded since they have no
+cycle and are finitely many, an element of `G_2` has `n` neighbours over `s` in `F'`. It
+either satisfies `W_2`, or it is in a blocker `G_1` for a minimum `≥m r.F`, has `m`
+neighbours over `r` in `F` by the induction, and these are neighbours over `s` in `F'`
+because the told inclusions are clauses of `O'`. So every model of `O'` satisfies each
+axiom of `T` that states a minimum, and the other clauses of `T` are in `O'`. A context of
+the blocked run is saturated for `O'` up to redundancy. Where a blocker holds as a unit,
+the Hyper conclusion `Γ → Δ ∨ W_2 ∨ ⋁ G_1` contains that unit's atom and is redundant.
+Where none holds when the step is taken, the run derives `Γ → Δ ∨ W_2`, which subsumes the
+conclusion. A blocker that becomes a unit after `W_2` was derived leaves sound clauses
+behind, and a unit is never withdrawn. For a name `G_2` that is told below a blocker
+`G_1`, the clause `G_2(x) → W_2(x) ∨ ⋁ G_1(x)` of `O'` is subsumed by the told clause
+`G_2(x) → G_1(x)`, so `O'` without it is the same clause set up to redundancy, and the run
+leaves the name's witnesses out everywhere. Without this, a cardinality that two axioms
+state made two groups of witnesses in a context that holds both only under a clause, such
+as a hypothetical successor, where no minimum is a unit and nothing was blocked. The
+paper's Theorem 9 holds for any set of DL-clauses and therefore for `O'`, with the order
+of atoms unchanged apart from the rank of the names. The cut is the Hyper conclusion of
+the clause, the unit and the disjointness set. It is a consequence of the context's
+clauses and it subsumes the clause it replaces.
+In a hypothetical successor and in a test context the units it reads are conclusions of
+that context, relative to its core, and never the markers of a hypothesis.
+
+An earlier form of the design shared the first `n` witnesses of a larger minimum with a
+smaller one over the same role and filler. That is unsound with inverse roles. An element
+whose predecessor is the third witness of the predecessor's minimum cannot count it as the
+first or second witness of its own `≥2`, since the fillers are disjoint, so `≥2 r.F ⊓ ≤2 r.F`
+at that element would be unsatisfiable when the predecessor is one of its two neighbours.
+The order shares no filler. A blocked minimum makes no witnesses at all, and the model
+reads its neighbours from the blocker's. A regression holds this case.
+
+The measurements are of commit 35fb0f31 on `atlas`, with one process at a time in a 13 GiB
+scope, as medians of five classifications in one process, and for Konclude 0.7.0 of three
+processes. The whole run is the wall time of one process, with reading the file. The
+taxonomies with the order equal HermiT 1.4.5.519's and Konclude's on both versions of the
+Protein Ontology, where HermiT takes 392 and 228 s on the laptop. Without counting each differs from
+them by four missing and four extra edges.
+
+| File | Threads | Without counting | Counting without the order | Counting with the order | Whole run with the order | Konclude, classification | Konclude, whole run |
+|---|---|---|---|---|---|---|---|
+| ore_ont_6952 | 1 | 875 ms | 1,039 ms, falls back | 1,154 ms | 1,313 ms | 2,336 ms | 3,169 ms |
+| ore_ont_6952 | 4 | 288 ms | 756 ms, falls back | 365 ms | 538 ms | 2,310 ms | 3,132 ms |
+| ore_ont_10140 | 1 | 913 ms | 1,107 ms, falls back | 1,178 ms | 1,404 ms | 2,510 ms | 3,694 ms |
+| ore_ont_10140 | 4 | 301 ms | 950 ms, falls back | 373 ms | 609 ms | 2,422 ms | 3,590 ms |
+| ore_ont_6485 | 1 | 7.0 ms | 184 ms, falls back | 576 ms, falls back | 609 ms | 40 ms | 55 ms |
+| ore_ont_6485 | 4 | 6.5 ms | 245 ms, falls back | 688 ms, falls back | 719 ms | 37 ms | 60 ms |
+
+On four threads the two Protein Ontology files classify 6.3 and 6.5 times faster than
+Konclude and their whole runs are 5.8 and 5.9 times faster. On one thread the
+classification is 2.0 and 2.1 times faster. The run with the order derives 23,282 and
+27,078 conclusions of the bound's 262,144 on one thread, and it costs 1.24 to 1.32 times
+the run without counting. On four threads it is also faster than the counting run
+without the order, which spends its attempt before it classifies again.
+
+The 207 development files of the ORE 2015 DL sample were classified with counting on
+four threads on `atlas`, without the order and with it, with 300 s and 13 GiB for each
+run. The reader refuses ore_ont_9881, and ore_ont_7192 passes the memory limit in both
+runs. The other 205 give a taxonomy in both runs, and the two taxonomies are the same
+bytes on 203 of them. The other two are ore_ont_6952 and ore_ont_10140, which fall back
+without the order and finish with it. Five files attempt counting, and ore_ont_6485,
+ore_ont_14817 and ore_ont_9663 pass the bound with the order as without it, in 646
+against 257 ms, 6.7 against 6.5 s and 3.8 against 4.1 s for the whole run. No run with
+the order passes its time where the run without it finishes. The runs are judged against
+HermiT's taxonomy for 67 files and against Konclude's for 135. Konclude cannot parse
+ore_ont_15516 and ore_ont_15993 and passes 300 s on ore_ont_7192, and the comparison
+passes its memory on ore_ont_10621, so those have no judgment. With the order 85 runs
+equal the reference and 117 leave axioms out and answer only entailed subsumptions,
+against 83 and 119 without it, and no run answers a subsumption that the reference does
+not entail.
+
+The order is on by default for a run that counts because of these measurements. Two more
+files of the sample, two more of the 206 fixtures and 26 more of the 296 generated
+ontologies below finish with it, none that finishes without it stops finishing, and no
+answer differs from a finished run without it. Its one measured cost is ore_ont_6485.
+
+ore_ont_6485 remains a measured limitation. Its counting attempt still passes the bound
+with the order, and the failed attempt is dearer. The classification with counting
+requested, which is the attempt and the run without counting together, takes 576 against
+184 ms on one thread on `atlas`, 3.1 times as long, and 688 against 245 ms on four. A
+caller for whom that attempt matters sets `Limits::number_order` to false. The order removes the cheap
+derivations of the disjointness rule, which fall from 110,800 to 1,078, and the bound is
+then spent on the universal rule and the qualified roles, which rise from 30,563 and
+10,036 derivations to 118,258 and 68,900 and cost more each. What remains is the
+alternative `H` of a definition `=n r.F ⊓ … ⊑ C`. A context with `n` qualified neighbours
+derives `y ∨ H` with `H` maximal and makes `n + 1` hypothetical witnesses. The file has
+nine such restrictions over the symmetric bond roles, and a witness has a known neighbour,
+its predecessor, so it derives the same alternatives. Three hypothetical successors
+derive 69,109, 63,521 and 58,201 of the attempt's 281,121 conclusions. Two ideas are
+untried. A minimum could be blocked by a strictly stronger one that holds under the same
+clause and not only as a unit. A positive `∃r.F` whose negative name the context already
+holds could stay unexpanded, which needs a proof that the name is witnessed in the model.
+Both, and the default of counting, are item 896. Two other changes to the clause
+set were measured with the order and are not kept, one name per compound expression and
+a name of its own for a negative existential restriction, as
+[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md) records.
+
+A counting run has a gap that this item found and does not close. The qualifier of a
+maximum or of item 728's clauses is not registered as a negative occurrence, so a compound
+qualifier that no other axiom names is never derived at a neighbour, and the maximum
+counts no neighbour. `A ⊑ ≥2 r.C`, `C ⊑ P`, `C ⊑ Q` and `A ⊑ ≤1 r.(P ⊓ Q)` leave `A`
+satisfiable in a run that reports itself complete, with the order or without it, and so
+does a maximum over `∃s.C`. A generated ontology of the item's fuzzing, inconsistent
+through a maximum over an intersection, is reported consistent. Registering the qualifier
+in the index and in the unfolding gives HermiT's answer on both, but the registered
+existential restriction is also the positive one, which makes a successor term at each
+neighbour, and the fixture `shq-015` then passes its bound on one thread and not on four.
+The repair is a name of the qualifier's own and is item 897. Counting stays off by
+default.
+
+The regressions are in `tests/dl_number_order.rs` and in the unit tests of `dl_norm.rs`
+and `dl_rules.rs`. Four hand cases pass the bound without the order and finish with it,
+the inherited cardinality over a wider filler, the cardinality stated twice, equivalent
+and wider roles, and recursive cardinalities over a symmetric role and an explicit
+inverse. The others cover the told contradiction with a maximum, fillers equivalent
+through `owl:Thing`, intersection and union qualifiers, unqualified minimums, unsatisfiable
+fillers, minimums under clauses, a refused axiom, every bound on the relations and the
+predecessor case above. One case runs with the default limits and counting, where it
+finishes, with the field set to false, where it passes the bound, and without counting,
+where the field changes nothing. The 206 fixtures of item 603 with a minimum or exact cardinality
+of two or more run with the order on one thread and on four with the eager strategy. Each
+answer is among HermiT's subsumptions, each case taken whole has exactly HermiT's, no case
+that stays in the bound without the order leaves it with the order, and two more stay in
+it on one thread. `shq-041` is one of the two gained, so of item 729's two fixtures
+`shiq-028` remains. A fuzz of 300 generated ontologies with related cardinalities, role
+hierarchies, an equivalent, an inverse and a symmetric role, judged against HermiT on the
+296 that HermiT finishes in 60 s, gives 264 equal and 31 sound answers with the order on
+one thread, 265 and 30 on four, and 238 equal and 57 sound without it. Every ontology
+that finishes without the order finishes with it. The one that differs, with the order
+and without it, is the ontology of the qualifier gap above. The fuzz also found the
+cardinality stated twice under a clause, which passed the bound with the order before a
+name beside its representative lost its own witnesses, and that ontology is a regression.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
@@ -1862,7 +2807,7 @@ The phase's gate is the `dl-o` stratum of the ORE 2015 DL development set, the n
 fixtures that need no counting and the hand cases. Of the six development files in `dl-o`,
 ore_ont_15803 and ore_ont_14924 have no data properties and both name the top object
 property. The other four use data properties and join the gate with item 768. The `dl-oiq`
-stratum needs counting and the Nom rule and joins the gate after item 894. The fixtures in
+stratum needs counting and the Nom rule and joins the gate after item 896. The fixtures in
 the gate are the 50 `shoi` cases, `sroiq-048` and the hand cases `nominal-disjunction`,
 `nominal-ripple`, `nominal-ripple-conditional`, `key-disjunction`, `top-forall` and
 `top-forall-conditional`, each on the rules that take it. Those hand cases that are Horn

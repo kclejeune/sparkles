@@ -1424,6 +1424,13 @@ impl<'a> Run<'a> {
     }
 
     fn halt(&self, why: u8) {
+        if super::dl_rules::tracing() {
+            eprintln!(
+                "TR HALT why={why} peak={} memory={}",
+                self.peak.load(Ordering::Relaxed),
+                self.memory.load(Ordering::Relaxed)
+            );
+        }
         let _ = self
             .stop
             .compare_exchange(STOP_NONE, why, Ordering::SeqCst, Ordering::SeqCst);
@@ -1962,8 +1969,15 @@ fn apply_rules<S: Sink, R: Rules>(
                 }
                 _ => {}
             }
+            let wait = if R::DISJ && matches!(h.node, Node::Fresh(_)) {
+                dl_rules::defer(ix, st, d)
+            } else {
+                None
+            };
             for &t in ix.told_of(h) {
-                out.me(Concl::Sub(t));
+                if Some(t) != wait {
+                    out.me(Concl::Sub(t));
+                }
             }
             for &(p, k) in ix.conj_of(h) {
                 if st.subs.contains(&p) {
