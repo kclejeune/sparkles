@@ -876,3 +876,27 @@ instead of at the line's start, so item 696 follows it with `join_pairs`.
 The eager costs of 1% to 4% that stage 4 added to filters and aggregates, such as
 `subquery-agg` at 1.040 of 005df56d at 10.5M triples and `contains` at 1.036 at 1.05M
 triples, are unchanged, and item 682 holds them.
+
+### Checked result output
+
+The eager SELECT writers admit every decoded cell against the query's memory account
+before they allocate it, and each writer rebuilds the front-coded vocabulary keys of its
+cells in one buffer that it reuses for the whole answer. Each step of a rebuild compares
+the rebuilt key's length with the buffer's capacity and admits the key before the buffer
+grows. A refused growth leaves the buffer's allocation unchanged and returns the typed
+refusal.
+
+Roadmap item 763 measured what that check costs. On atlas at 100,000 people, with the
+server pinned to one CPU and `perf stat` counting its user-space work per request over
+three interleaved passes of matched release builds, the checked writer of c2b5d7cf ran
+4.2% more instructions than the unchecked writer of 6fba19d6 on `optional-chain`, 2.7%
+on `order-by-full` and 2.4% on `star-join`, and 7.9%, 4.1% and 3.9% more cycles. A
+diagnostic build without the per-step check ran 1.4%, 0.0% and 0.8% fewer instructions
+than 6fba19d6, so the check holds the instruction difference. The same build still ran
+6.1%, 4.3% and 3.0% more cycles. One reservation per front-coded block could save at most
+what that build saves, so it was not built. Two repairs that shared the check with the
+copy's own growth check, and then copied the suffix into the checked room, brought the
+instructions within 1% of 6fba19d6 without lowering the cycles, and `order-by-full` took
+about 2.3% more execution time, so they were reverted. The cycle difference follows 42%
+more branch misses on `optional-chain`, which none of the builds changed, and item 763
+now looks for them.
