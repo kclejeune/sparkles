@@ -254,9 +254,12 @@ fn write_read_and_query() {
     assert!(!ds.contains(pattern(G::Default, None, None, None)).unwrap());
 }
 
+/// A probe's graph and its subject, predicate and object, each `None` for any.
+type Probe<'a> = (G<'a>, Option<&'a Term>, Option<&'a Term>, Option<&'a Term>);
+
 /// Patterns one after another in one batch, as the JVM's writer sends a batch of probes:
 /// a term is written in full once and as a repeat of its position after that.
-fn probes(patterns: &[(G<'_>, Option<&Term>, Option<&Term>, Option<&Term>)]) -> Vec<u8> {
+fn probes(patterns: &[Probe<'_>]) -> Vec<u8> {
     let mut b = Vec::new();
     let mut seen: Vec<Term> = Vec::new();
     let mut term = |b: &mut Vec<u8>, t: &Term| match seen.iter().position(|s| s == t) {
