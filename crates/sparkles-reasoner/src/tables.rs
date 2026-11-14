@@ -181,9 +181,12 @@ pub fn snapshot() -> CacheStats {
 
 /// Empty the cache.
 pub fn clear() {
-    let mut inner = CACHE.inner.lock();
-    inner.map.clear();
-    inner.bytes = 0;
+    {
+        let mut inner = CACHE.inner.lock();
+        inner.map.clear();
+        inner.bytes = 0;
+    }
+    crate::reuse::clear();
 }
 
 fn evict(inner: &mut Inner, cap: u64) {

@@ -349,6 +349,19 @@ pub struct DeltaPredicate {
 }
 
 impl Delta {
+    /// Call `f` with each quad whose presence differs between the views that this delta
+    /// and `other` give over one base generation, until `f` returns false, and say whether
+    /// `f` saw them all. A quad differs when one delta inserts it and the other does not,
+    /// or one deletes it and the other does not, so a quad can come twice, once from each.
+    /// The walk passes over the key-set leaves the two deltas share (see
+    /// [`KeySet::symmetric_difference`]), so two snapshots of one store compare in time
+    /// proportional to their deltas' leaves and the writes between them.
+    pub fn changes_since(&self, other: &Delta, mut f: impl FnMut(&[Id; 4]) -> bool) -> bool {
+        let i = Perm::Gspo.index();
+        self.ins[i].symmetric_difference(&other.ins[i], |k| f(&Perm::Gspo.to_quad(k)))
+            && self.del[i].symmetric_difference(&other.del[i], |k| f(&Perm::Gspo.to_quad(k)))
+    }
+
     /// Whether the inserted keys of `perm` (PSO or POS) hold one starting with `a, b`.
     fn ins_pair(&self, perm: Perm, a: u64, b: u64) -> bool {
         self.ins[perm.index()].intersects([a, b, 0, 0]..=[a, b, u64::MAX, u64::MAX])

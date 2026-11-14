@@ -4,8 +4,9 @@
 >
 > **Phases:** Demand derivation, Jena backward rules, tables cached per snapshot and
 > view, budgets and EXPLAIN are available, with `auto`, its cost model and the dataset
-> setting. Hybrid execution, OWL 2 QL rewriting, reuse across commits and the remaining
-> surfaces remain planned in Phase 2. Incremental maintenance through F13 and later
+> setting, reuse of tables across commits, the MCP argument and the Fuseki converter's
+> rule modes. Hybrid execution, OWL 2 QL rewriting and the UI selector remain planned in
+> Phase 2. Incremental maintenance through F13 and later
 > provenance remain planned in Phase 3.
 >
 > **User docs:** [Query-time reasoning](../API.md#query-time-reasoning) and
@@ -1141,8 +1142,9 @@ rewriting remain in Phase 2 of this spec, roadmap item 19.
 ### Phase 2: automatic choice and the dataset setting
 
 **Built** for roadmap item 19. `reasoning=auto` (§2.1, §4) and the dataset setting (§2.2)
-are available. Hybrid Jena rules (§5.2), OWL 2 QL rewriting (§7), reuse of tables across
-commits (§6.2), the MCP argument, the UI selector and the G08 mapping remain in Phase 2.
+are available. The sections after this one record the reuse of tables across commits
+(§6.2), the MCP argument and the G08 mapping. Hybrid Jena rules (§5.2), OWL 2 QL rewriting
+(§7) and the UI selector remain in Phase 2.
 
 * **The choice.** `crates/sparkles/src/reasoning/auto.rs` wraps the dataset's query-time
   reasoner. When a query starts, it decides for the snapshot the query reads whether the
@@ -1250,6 +1252,81 @@ hold in `auto_derives_what_the_materialization_cannot_hold`, the setting in
 `auto_does_not_mix_fresh_witnesses` and `auto_does_not_mix_lists_that_backward_rules_extend`,
 and the estimate in
 `cone_estimates_follow_the_statistics_and_the_bound_positions`.
+
+### Reuse of tables across commits
+
+**Built** for roadmap item 19 (§6.2), in `crates/sparkles-reasoner/src/reuse.rs`. §6.2
+keeps a table when no commit in between changed a predicate of its dependency cone. The
+build tests each changed quad instead, against the rules the session made its program
+from after specialization to the schema, which keeps more tables and states exactly when
+the schema itself is unchanged.
+
+* **The condition.** A view of one commit `c1` answers another commit `c2` of the same
+  generation, access mask and input graphs when no quad that differs between them in the
+  input graphs is a fact of the schema vocabulary, an RDF list fact or an `owl:sameAs`
+  fact, and none unifies with an atom, a pattern a `noValue` or `listForAll` reads, or a
+  head of the specialized rules. Then the closure at `c2` is the closure at `c1` with the
+  differing quads taken out and put in, so the schema's table, the completeness proof of
+  item 191, the equality stage table and every demand's table hold at `c2` what they held
+  at `c1`. The argument is in the module's documentation. A relation that the session's
+  proof left open keeps its schema atoms in the program, which only makes the test
+  stricter, so the guarantee of item 191 holds without a new proof. A constant of the rules
+  that the store did not hold at `c1`, which a pattern names by a local id, makes a
+  differing quad that holds the term relevant once the store has it. An earlier commit
+  whose delta vocabulary is shorter is never answered, since the tables can hold ids it
+  lacks.
+* **Anchors.** The session that makes a view's program, holding the view's facts and
+  nothing else, records the view as the anchor of its view without the commit and its
+  rules' digest, with a clone of the commit's delta and the patterns of its rules. A later
+  session looks up the anchor, walks the quads that differ between the two deltas with
+  `Delta::changes_since`, and reads and writes the cache under the anchor's view key when
+  none is relevant. The walk passes over the key-set leaves that the deltas share, so it
+  costs a step per leaf of the delta's graph-first key set and a step per key of the leaves
+  that writes copied, and it gives up after 100,000 differing quads. Each anchor remembers
+  its answer for its last 16 commits. A session whose anchor does not answer keys the cache
+  by its own commit and becomes the anchor when it makes its program. At most 64 anchors
+  are kept, and `tables::clear` and a cache capacity of zero drop them.
+* **Memory.** An anchor's delta shares its key-set nodes with later deltas until writes
+  copy them, so it retains at most the delta's size, typically the nodes that later writes
+  replaced. This trades memory for the time of the schema pass, the proof and the demand
+  derivations after each commit that does not touch the rules' inputs.
+* **What does not reuse.** The `rdfs` profile's rules `rdf1`, `rdfs4a` and `rdfs4b` read
+  every fact, as do the `eq-rep-*` rules of `owl-rl` once the view holds an `owl:sameAs`
+  fact, so such a view's anchor answers no other commit. A commit that changes an input
+  graph's membership changes the view key, and compaction changes the generation, so
+  neither reuses, as §6.2 says.
+
+**Tests.** `crates/sparkles-reasoner/tests/demand_reuse.rs` runs a query, commits a change,
+runs it again and compares the answer with a fresh store of the changed data. A commit
+of facts that no rule reads or gives, and a commit to a graph outside the inputs, read
+every table from the cache. An added premise, a deleted premise, a schema fact, a schema
+predicate the store lacked, a stored copy of a derived fact, a deleted stored fact that
+rules derive, a term a rule names, a first `owl:sameAs` fact, a fact a `noValue` tests and
+a changed RDF list each derive again. With the check replaced by one that always reuses,
+all ten of these fail, nine on the answer and the stored copy on its cache count.
+`symmetric_difference` in `store/keyset.rs` is checked against a set difference on
+versions that share leaves, that split leaves and that share nothing.
+
+### The MCP argument and the Fuseki converter
+
+**Built** for roadmap item 19 (§2.1, §5.3). The `reasoning` argument of the MCP tools
+`sparql_query` and `explain_query` takes a boolean or the mode names of the SPARQL
+endpoints, with `reasoningProfile` and `maxDerived`, which share the endpoints' cap through
+`http::demand_view`. An absent argument takes the dataset's query-time default. A query
+that derived facts says what it derived, in the table form's first line and the JSON
+form's `reasoning` member, as `Sparkles-Reasoning` says it over HTTP. The other MCP tools
+keep their boolean, since they read the materialization or the asserted data. The test is
+`query_tools_take_query_time_reasoning` in `mcp/phase3_tests.rs`.
+
+G08's converter reads the GenericRuleReasoner's `jr:ruleMode` from the `ja:InfModel`, where
+Jena's InfModel assembler passes it to the reasoner. §5.3 named `demand` for the hybrid
+mode, which is Jena's default. The maintainer chose `auto` instead, since `auto` reads the
+materialization for the patterns forward rules answer and derives the facts of backward
+rules, as Jena's hybrid engine does, and so keeps the materialization in use for most
+configurations. The backward mode maps to `demand` and materializes nothing, with the rules
+in the query-time setting, and the forward modes keep materialized reasoning. The
+[G08 Outcome](G08-fuseki-configuration.md#rule-modes-and-query-time-reasoning) records the
+files the converter writes.
 
 ### Roadmap follow-ups
 

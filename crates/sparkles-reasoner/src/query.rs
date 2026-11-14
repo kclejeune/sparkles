@@ -400,6 +400,11 @@ pub(crate) struct Session {
     /// the view key of the schema's table, which `nocache` does not bypass: like the
     /// compiled rules, the schema is the same for every query of the view
     schema_view: Option<String>,
+    /// the view without its commit and the rules' digest, which name the view's anchor
+    /// (spec F17 §6.2)
+    anchor_key: Option<(String, u64)>,
+    /// the cache keys come from an anchor of another commit, whose tables answer this one
+    anchored: bool,
     warnings: WorkingWarnings,
     demands: Vec<Demand>,
     keys: Vec<Key>,
@@ -487,15 +492,33 @@ impl Session {
             graphs.retain(|g| readable(*g));
         }
         let absent = graphs.contains(&Id::DEFAULT_GRAPH);
-        let schema_view = snap.cacheable.then(|| {
-            format!(
-                "{}|{}|{}|{:?}",
-                snap.generation.uid,
-                snap.commit,
-                snap.mask.as_ref().map_or("", |m| m.key.as_str()),
-                graphs
+        // The view without its commit names the anchor whose tables may answer this
+        // commit too (spec F17 §6.2): the session then keys the cache by the anchor's view.
+        let anchor_key = snap.cacheable.then(|| {
+            (
+                format!(
+                    "{}|{}|{:?}",
+                    snap.generation.uid,
+                    snap.mask.as_ref().map_or("", |m| m.key.as_str()),
+                    graphs
+                ),
+                shared.digest,
             )
         });
+        let (schema_view, anchored) = match &anchor_key {
+            Some(key) => {
+                let own = format!(
+                    "{}|{}|{}|{:?}",
+                    snap.generation.uid,
+                    snap.commit,
+                    snap.mask.as_ref().map_or("", |m| m.key.as_str()),
+                    graphs
+                );
+                let (v, anchored) = crate::reuse::view_key(key, &snap, &graphs, own);
+                (Some(v), anchored)
+            }
+            None => (None, false),
+        };
         let view = schema_view.clone().filter(|_| !req.no_cache);
         Ok(Session {
             shared,
@@ -509,6 +532,8 @@ impl Session {
             budget,
             view,
             schema_view,
+            anchor_key,
+            anchored,
             warnings,
             demands: Vec::new(),
             keys: Vec::new(),
@@ -1004,6 +1029,41 @@ impl Session {
     /// Specialize the rules to the schema (see [`crate::specialize`]), the first time a
     /// demand derives: the schema comes from the table cache or a pass of its own, and the
     /// query's program is made again over the specialized rules.
+    /// Make this session's view the anchor of later and earlier commits whose differing
+    /// quads `rules`, the rules its program is made from, cannot read or give (spec F17
+    /// §6.2). Only a session that holds the view's facts and nothing else yet anchors, as
+    /// only such a session keeps the schema's table: its rules are those of the view.
+    fn anchor_program(
+        &self,
+        rules: &[CRule],
+        vocab: &Vocab,
+        rdf_type: u64,
+        fresh: bool,
+    ) -> Result<()> {
+        if self.anchored || !fresh || self.added_facts || self.schema_view.is_none() {
+            return Ok(());
+        }
+        let Some(key) = self.anchor_key.clone() else {
+            return Ok(());
+        };
+        let iri = |s: &str| Term::NamedNode(oxrdf::NamedNode::new_unchecked(s));
+        let always = [
+            self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#first"))?,
+            self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest"))?,
+            self.id_of(&iri("http://www.w3.org/2002/07/owl#sameAs"))?,
+        ];
+        let schema = crate::specialize::closed(vocab, rdf_type);
+        let mut relevance = crate::reuse::Relevance::of(rules, &schema, &always, 1 << 16);
+        relevance.key_locals(|id| self.terms.local_key(id));
+        crate::reuse::anchor(
+            key,
+            &self.snap,
+            self.schema_view.clone().expect("checked"),
+            relevance,
+        );
+        Ok(())
+    }
+
     fn ensure_program(&mut self) -> Result<()> {
         if self.specialized {
             return Ok(());
@@ -1036,6 +1096,8 @@ impl Session {
                 .any(|b| b.kind == crate::builtins::BuiltinKind::MakeTemp)
         });
         if roots.is_empty() || fresh_witnesses {
+            let fresh = self.graph.as_ref().expect("graph made").derived_len() == 0;
+            self.anchor_program(self.compiled.rules(), &vocab, rdf_type, fresh)?;
             let program = self.transform(self.compiled.rules(), &self.keys, Pass::Plain)?;
             self.hide(&program.magic_preds);
             self.program = Some(program);
@@ -1069,6 +1131,7 @@ impl Session {
             let expanded = pre.stages.iter().map(|stage| stage.rules.len()).sum();
             if self.prefer_compact(expanded)? {
                 drop(pre);
+                self.anchor_program(self.compiled.rules(), &vocab, rdf_type, fresh)?;
                 let program = demand::compact_roots(&self.terms, &self.keys)
                     .map_err(|e| memory_error(e, "compact demand roots"))?;
                 self.hide(&program.magic_preds);
@@ -1288,6 +1351,7 @@ impl Session {
         let rules = rules.map_err(|e| memory_error(e, "the rules specialized to the schema"))?;
         let g = self.graph.as_ref().expect("graph made");
         let rules = crate::specialize::without_equality(rules.rules, same_as, g);
+        self.anchor_program(&rules, &vocab, rdf_type, fresh)?;
         let t2 = std::time::Instant::now();
         let program = self.transform(&rules, &self.keys, Pass::Closed(closed))?;
         tracing::debug!(
