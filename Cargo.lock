@@ -6083,6 +6083,7 @@ dependencies = [
  "smallvec",
  "sparkles-budget",
  "sparkles-core",
+ "sparkles-shacl",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

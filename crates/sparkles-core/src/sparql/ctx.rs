@@ -2127,6 +2127,17 @@ impl Ctx {
         }
     }
 
+    /// The label of the outside blank node that [`Ctx::intern_outside_term`] mapped to the
+    /// query's blank node labelled `label`, if it is one. The memo holds the outside nodes
+    /// of the query's arguments, so the scan is short.
+    pub fn outside_label(&self, label: &str) -> Option<String> {
+        self.outside_bnodes
+            .lock()
+            .iter()
+            .find(|(_, v)| id::bnode_label(v.payload()) == label)
+            .map(|(k, _)| k.clone())
+    }
+
     /// A blank node of this query for a label from outside it.
     fn outside_bnode(&self, label: &str) -> Id {
         let mut memo = self.outside_bnodes.lock();

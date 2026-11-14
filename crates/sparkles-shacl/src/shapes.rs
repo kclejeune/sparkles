@@ -342,6 +342,10 @@ pub struct Shapes {
     pub(crate) functions: Vec<CustomFn>,
     /// the property groups the shapes name with `sh:group`
     pub(crate) groups: FxHashMap<Term, GroupInfo>,
+    /// the SHACL-AF rules of the shapes graph (see [`crate::rules`])
+    pub(crate) rules: Vec<crate::rules::Rule>,
+    /// why the rules could not be read, which only a caller of [`Shapes::rules`] sees
+    pub(crate) rule_error: Option<String>,
 }
 
 impl Shapes {
@@ -770,22 +774,25 @@ pub(crate) struct Parser<'g> {
     components: Vec<std::sync::Arc<SparqlComponent>>,
     pub(crate) fns: FnIndex,
     pub(crate) expr_memo: FxHashMap<Term, ExprId>,
+    /// the SHACL-AF expressions of rules, which read blank nodes differently
+    pub(crate) af_memo: FxHashMap<Term, ExprId>,
     pub(crate) expr_stack: Vec<Term>,
 }
 
 impl<'g> Parser<'g> {
-    fn new(graph: &'g Graph) -> Parser<'g> {
+    pub(crate) fn new(graph: &'g Graph) -> Parser<'g> {
         Parser {
             g: G { g: graph },
             out: Shapes::default(),
             components: Vec::new(),
             fns: FnIndex::default(),
             expr_memo: FxHashMap::default(),
+            af_memo: FxHashMap::default(),
             expr_stack: Vec::new(),
         }
     }
 
-    fn parse(self, bnodes_in_store: bool) -> Result<Shapes> {
+    pub(crate) fn parse(self, bnodes_in_store: bool) -> Result<Shapes> {
         Ok(self.parse_with(bnodes_in_store, None)?.0)
     }
 
@@ -839,6 +846,10 @@ impl<'g> Parser<'g> {
         }
         for r in roots {
             self.shape(&r)?;
+        }
+        if let Err(e) = self.parse_rules() {
+            self.out.rules.clear();
+            self.out.rule_error = Some(format!("{e:#}"));
         }
         let expr = match expr {
             Some(node) => Some(

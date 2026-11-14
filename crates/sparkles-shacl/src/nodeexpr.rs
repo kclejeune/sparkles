@@ -121,6 +121,16 @@ pub enum Expr {
     Custom { func: usize, args: Vec<CallArg> },
     /// `shnex:arg`
     Arg(ArgKey),
+    /// a call of a `sh:SPARQLFunction` (SHACL Advanced Features §6.4), evaluated once
+    /// for each combination of its arguments' nodes, with the parameters pre-bound under
+    /// the local names of their paths
+    SparqlCall {
+        func: NamedNode,
+        query: Box<Query>,
+        /// the variable of each parameter, and whether it is `sh:optional`
+        params: Vec<(String, bool)>,
+        args: Vec<ExprId>,
+    },
 }
 
 /// A SPARQL query or expression of a node expression.
@@ -349,6 +359,155 @@ impl Parser<'_> {
         }
         let t = self.out.intern(node.clone());
         Ok(self.push_expr(node, Expr::Const(t)))
+    }
+
+    /// Parse a node expression in the syntax of SHACL Advanced Features (2017), which
+    /// rules use: `sh:this`, constants, `[ sh:path P ]` with an optional `sh:nodes`,
+    /// `sh:filterShape` with `sh:nodes`, `sh:intersection`, `sh:union` and calls of
+    /// `sh:SPARQLFunction`s. Any other blank node is read as a SHACL 1.2 expression.
+    pub(crate) fn af_expr(&mut self, node: &Term) -> Result<ExprId> {
+        match node {
+            Term::NamedNode(n) if n.as_ref() == sh::THIS => {
+                return Ok(self.push_expr(node, Expr::Var("focusNode".into())));
+            }
+            Term::BlankNode(_) if self.is_af_form(node) => {}
+            _ => return self.expr(node),
+        }
+        if let Some(&id) = self.af_memo.get(node) {
+            return Ok(id);
+        }
+        if self.expr_stack.contains(node) {
+            bail!("the node expression {node} contains itself");
+        }
+        if self.expr_stack.len() >= MAX_DEPTH {
+            bail!("node expressions nested more than {MAX_DEPTH} deep at {node}");
+        }
+        self.expr_stack.push(node.clone());
+        let r = stacker::maybe_grow(128 << 10, 4 << 20, || self.af_blank(node));
+        self.expr_stack.pop();
+        let id = r.with_context(|| format!("node expression {node}"))?;
+        self.af_memo.insert(node.clone(), id);
+        Ok(id)
+    }
+
+    /// Whether a blank node is one of the SHACL-AF 2017 forms, which [`Self::af_expr`]
+    /// reads, rather than a SHACL 1.2 expression.
+    fn is_af_form(&self, node: &Term) -> bool {
+        let preds = self.predicates(node);
+        if preds.iter().any(|p| {
+            [sh::PATH, sh::FILTER_SHAPE, sh::INTERSECTION, sh::UNION].contains(&p.as_ref())
+        }) {
+            return true;
+        }
+        matches!(&preds[..], [f] if self.g.is_instance(&Term::NamedNode(f.clone()), sh::SPARQL_FUNCTION))
+    }
+
+    fn af_list(&mut self, head: &Term) -> Result<Vec<ExprId>> {
+        let items = self.g.list(head)?;
+        items.iter().map(|i| self.af_expr(i)).collect()
+    }
+
+    fn af_blank(&mut self, node: &Term) -> Result<ExprId> {
+        let nodes = match self.single(node, sh::NODES)? {
+            Some(t) => Some(self.af_expr(&t)?),
+            None => None,
+        };
+        if let Some(p) = self.single(node, sh::PATH)? {
+            let path = PropertyPath::from_graph(&self.g, &p).context("sh:path")?;
+            let values = self.push_expr(node, Expr::PathValues { path, focus: None });
+            // the values of the path from each node of sh:nodes, in one list
+            return Ok(match nodes {
+                Some(n) => self.push_expr(
+                    node,
+                    Expr::FlatMap {
+                        nodes: Some(n),
+                        map: values,
+                    },
+                ),
+                None => values,
+            });
+        }
+        if let Some(shape) = self.single(node, sh::FILTER_SHAPE)? {
+            let shape = self.shape(&shape).context("sh:filterShape")?;
+            let nodes = nodes.ok_or_else(|| anyhow!("sh:filterShape needs sh:nodes"))?;
+            return Ok(self.push_expr(node, Expr::FilterShape { nodes, shape }));
+        }
+        if let Some(l) = self.single(node, sh::INTERSECTION)? {
+            let xs = self.af_list(&l)?;
+            return Ok(self.push_expr(node, Expr::Intersection(xs)));
+        }
+        if let Some(l) = self.single(node, sh::UNION)? {
+            let xs = self.af_list(&l)?;
+            let all = self.push_expr(node, Expr::Concat(xs));
+            return Ok(self.push_expr(node, Expr::Distinct(all)));
+        }
+        let preds = self.predicates(node);
+        if let [f] = &preds[..] {
+            let fnode = Term::NamedNode(f.clone());
+            if self.g.is_instance(&fnode, sh::SPARQL_FUNCTION) {
+                return self.sparql_call(node, f.clone());
+            }
+        }
+        self.expr(node)
+    }
+
+    /// A call of the `sh:SPARQLFunction` `f`, whose arguments are the list at `node`.
+    fn sparql_call(&mut self, node: &Term, f: NamedNode) -> Result<ExprId> {
+        let fnode = Term::NamedNode(f.clone());
+        let text = match self.single(&fnode, sh::SELECT)? {
+            Some(Term::Literal(l)) => l.value().to_string(),
+            Some(_) => bail!("the sh:select of {f} is not a string"),
+            None => bail!("the function {f} has no sh:select (sh:ask functions are not supported)"),
+        };
+        // parameters in the order of sh:order, then of the local names of their paths
+        let mut params: Vec<(f64, String, bool)> = Vec::new();
+        for p in self.g.objects(&fnode, sh::PARAMETER) {
+            let Some(Term::NamedNode(path)) = self.g.object(&p, sh::PATH) else {
+                bail!("a parameter of {f} has no IRI as its sh:path");
+            };
+            let order = match self.g.object(&p, sh::ORDER) {
+                Some(Term::Literal(l)) => l.value().parse::<f64>().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            let optional = matches!(
+                self.g.object(&p, sh::OPTIONAL),
+                Some(Term::Literal(l)) if matches!(l.value(), "true" | "1")
+            );
+            let s = path.as_str();
+            params.push((
+                order,
+                s[s.rfind(['#', '/']).map_or(0, |i| i + 1)..].to_string(),
+                optional,
+            ));
+        }
+        params.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let params: Vec<(String, bool)> = params.into_iter().map(|p| (p.1, p.2)).collect();
+        let prefixes = crate::sparql::prefixes(&self.g, &fnode);
+        let query = sparkles_core::sparql::parse_query(&text, None, &prefixes)
+            .map_err(|e| anyhow!("{e}"))
+            .with_context(|| format!("the sh:select of {f}"))?;
+        if !matches!(query, Query::Select { .. }) {
+            bail!("the sh:select of {f} is not a SELECT query");
+        }
+        crate::sparql::check_no_service(&query)?;
+        let list = self.g.object(node, f.as_ref()).expect("one predicate");
+        let args = self.af_list(&list)?;
+        if args.len() != params.len() {
+            bail!(
+                "{f} takes {} arguments, the call gives {}",
+                params.len(),
+                args.len()
+            );
+        }
+        Ok(self.push_expr(
+            node,
+            Expr::SparqlCall {
+                func: f,
+                query: Box::new(query),
+                params,
+                args,
+            },
+        ))
     }
 
     /// Is `node` a blank node that the node expression parser reads as a function?

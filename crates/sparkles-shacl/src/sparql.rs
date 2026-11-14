@@ -355,7 +355,11 @@ fn query_pattern(q: &Query) -> &GraphPattern {
     }
 }
 
-fn parse(text: &str, prefixes: &[(String, String)], prebound: &[String]) -> Result<Query> {
+pub(crate) fn parse(
+    text: &str,
+    prefixes: &[(String, String)],
+    prebound: &[String],
+) -> Result<Query> {
     let q = parse_query(text, None, prefixes)
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("invalid SHACL-SPARQL query:\n{text}"))?;
@@ -554,6 +558,9 @@ impl Engine<'_> {
         ctx.allow_service = false;
         ctx.forbid_service = true;
         ctx.deadline = self.deadline;
+        if let Some(m) = self.query_memory {
+            ctx.mem_limit = ctx.mem_limit.min(m);
+        }
         ctx.cancellation = self.cancellation.clone();
         if let Some(c) = &self.cancel {
             ctx.cancel = c.clone();
@@ -602,6 +609,14 @@ impl Engine<'_> {
             b.push(("shapesGraph", g));
         }
         Ok(b)
+    }
+
+    /// The term of a query result whose blank nodes are new in each query: a blank node
+    /// the query made, rather than one of the store or one it was given, gets a label
+    /// that starts with `tag`, which the caller makes unique per query. Blank nodes inside
+    /// triple terms are renamed the same way.
+    pub(crate) fn fresh_result_term(ctx: &Ctx, id: Id, tag: &str) -> Option<Term> {
+        Some(fresh_blank_nodes(ctx, Self::result_term(ctx, id)?, tag))
     }
 
     pub(crate) fn result_term(ctx: &Ctx, id: Id) -> Option<Term> {
@@ -782,6 +797,29 @@ impl Engine<'_> {
     }
 }
 
+/// `t` with the blank nodes of a query's result renamed ([`Engine::fresh_result_term`]).
+fn fresh_blank_nodes(ctx: &Ctx, t: Term, tag: &str) -> Term {
+    match t {
+        Term::BlankNode(b) if sparkles_core::store::parse_bnode_label(b.as_str()).is_none() => {
+            let label = ctx
+                .outside_label(b.as_str())
+                .unwrap_or_else(|| format!("{tag}x{}", b.as_str()));
+            Term::BlankNode(oxrdf::BlankNode::new_unchecked(label))
+        }
+        Term::Triple(tr) => {
+            let tr = *tr;
+            let subject = match fresh_blank_nodes(ctx, tr.subject.into(), tag) {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                _ => unreachable!("a subject stays a subject"),
+            };
+            let object = fresh_blank_nodes(ctx, tr.object, tag);
+            Term::Triple(Box::new(oxrdf::Triple::new(subject, tr.predicate, object)))
+        }
+        t => t,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::substitute_path;
@@ -910,5 +948,68 @@ mod tests {
         let (_, ctx) = engine.run_query(&query, &[]).unwrap();
         assert!(!ctx.allow_service);
         assert!(ctx.forbid_service);
+    }
+
+    #[test]
+    fn a_query_result_keeps_the_blank_nodes_it_was_given_and_renames_its_own() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let shapes = crate::Shapes::default();
+        let (data, ids) =
+            crate::data::DataGraph::new(store.snapshot(), None, &[], &[], &shapes).unwrap();
+        let engine =
+            crate::validate::Engine::new(&shapes, &data, ids, &crate::ValidateOptions::default())
+                .unwrap();
+        let query = sparkles_core::sparql::parse_query(
+            "SELECT ?given ?made WHERE { BIND($a AS ?given) BIND(BNODE() AS ?made) }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let given = oxrdf::Term::BlankNode(oxrdf::BlankNode::new_unchecked("q3xq0"));
+        let (table, ctx) = engine.run_query(&query, &[("a", given.clone())]).unwrap();
+        let col = |name: &str| {
+            (0..table.width())
+                .find(|&c| ctx.var_name(table.vars[c]) == name)
+                .unwrap()
+        };
+        let term = |c: usize| {
+            crate::validate::Engine::fresh_result_term(&ctx, table.get(0, c), "q9").unwrap()
+        };
+        assert_eq!(term(col("given")), given);
+        let oxrdf::Term::BlankNode(made) = term(col("made")) else {
+            panic!("not a blank node")
+        };
+        assert!(made.as_str().starts_with("q9x"), "{made}");
+
+        // and so do the blank nodes inside triple terms
+        let query = sparkles_core::sparql::parse_query(
+            "SELECT ?given ?made WHERE { BIND($t AS ?given) \
+             BIND(TRIPLE(BNODE(), <http://x/p>, 1) AS ?made) }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let triple = oxrdf::Term::Triple(Box::new(oxrdf::Triple::new(
+            oxrdf::BlankNode::new_unchecked("q3xq0"),
+            oxrdf::NamedNode::new_unchecked("http://x/p"),
+            oxrdf::BlankNode::new_unchecked("q3xq1"),
+        )));
+        let (table, ctx) = engine.run_query(&query, &[("t", triple.clone())]).unwrap();
+        let col = |name: &str| {
+            (0..table.width())
+                .find(|&c| ctx.var_name(table.vars[c]) == name)
+                .unwrap()
+        };
+        let term = |c: usize| {
+            crate::validate::Engine::fresh_result_term(&ctx, table.get(0, c), "q9").unwrap()
+        };
+        assert_eq!(term(col("given")), triple);
+        let oxrdf::Term::Triple(made) = term(col("made")) else {
+            panic!("not a triple term")
+        };
+        let oxrdf::NamedOrBlankNode::BlankNode(b) = &made.subject else {
+            panic!("not a blank node")
+        };
+        assert!(b.as_str().starts_with("q9x"), "{b}");
     }
 }

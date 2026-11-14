@@ -378,6 +378,7 @@ pub fn start(
             ),
             None => r
                 .profile
+                .as_deref()
                 .unwrap_or("rdfs")
                 .parse()
                 .map_err(|_| anyhow::anyhow!("unknown profile"))?,

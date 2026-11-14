@@ -40,6 +40,7 @@ mod maintain;
 pub mod parser;
 mod pool;
 pub mod query;
+pub mod shacl_af;
 mod specialize;
 pub mod tables;
 mod terms;
@@ -97,6 +98,9 @@ pub enum Profile {
     OwlRl,
     /// Jena rule text
     Rules(String),
+    /// SHACL Advanced Features rules, and SPIN rules, read from a shapes graph
+    /// ([`shacl_af`]); a materialization runs them, and nothing else does
+    ShaclAf(shacl_af::ShaclAf),
 }
 
 impl Profile {
@@ -106,6 +110,7 @@ impl Profile {
             Profile::RdfsSimple => "rdfs-simple",
             Profile::OwlRl => "owl-rl",
             Profile::Rules(_) => "rules",
+            Profile::ShaclAf(_) => "shacl-af",
         }
     }
 
@@ -116,10 +121,20 @@ impl Profile {
             Profile::RdfsSimple => RDFS_SIMPLE_RULES,
             Profile::OwlRl => OWL_RL_RULES,
             Profile::Rules(t) => t,
+            Profile::ShaclAf(_) => "",
         }
     }
 
     pub fn rules(&self) -> Result<Vec<Rule>, RuleParseError> {
+        if let Profile::ShaclAf(_) = self {
+            return Err(RuleParseError {
+                line: 0,
+                column: 0,
+                message: "the shacl-af profile reads its rules from a shapes graph, and only \
+                          a materialization runs them"
+                    .into(),
+            });
+        }
         parse_rules(self.text())
     }
 }
@@ -131,12 +146,21 @@ impl fmt::Display for Profile {
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unknown reasoning profile '{0}' (expected rdfs, rdfs-simple, owl-rl or owl)")]
+#[error("unknown reasoning profile '{0}' (expected rdfs, rdfs-simple, owl-rl, owl or shacl-af)")]
 pub struct UnknownProfile(pub String);
 
 impl FromStr for Profile {
     type Err = UnknownProfile;
     fn from_str(s: &str) -> Result<Profile, UnknownProfile> {
+        let (name, params) = s.trim().split_once('?').unwrap_or((s.trim(), ""));
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "shacl-af" | "shaclaf" | "shacl-rules"
+        ) {
+            return shacl_af::ShaclAf::parse_params(params)
+                .map(Profile::ShaclAf)
+                .map_err(|e| UnknownProfile(format!("{s}: {e}")));
+        }
         match s.trim().to_ascii_lowercase().as_str() {
             "rdfs" | "rdfs-full" => Ok(Profile::Rdfs),
             "rdfs-simple" | "rdfssimple" | "simple" => Ok(Profile::RdfsSimple),
@@ -309,6 +333,10 @@ pub struct ReasonReport {
     /// the witnesses the run built or updated, when [`ReasonOptions::witnesses`] asks
     /// for them
     pub witnesses: Option<WitnessReport>,
+    /// the round cap of a `shacl-af` run ([`shacl_af::ShaclAf::max_rounds`])
+    pub max_rounds: Option<usize>,
+    /// the groups of rules of a `shacl-af` run, in the order they ran, with their rounds
+    pub rule_groups: Vec<shacl_af::RuleGroup>,
 }
 
 /// How a run materialized.
@@ -1022,7 +1050,10 @@ pub fn rules_digest(profile: &Profile, extras: &Extras) -> u64 {
     let mut h = fnv(b"sparkles-reasoner closure 1\0", FNV_START);
     h = fnv(profile.name().as_bytes(), h);
     h = fnv(b"\0", h);
-    h = fnv(profile.text().as_bytes(), h);
+    h = match profile {
+        Profile::ShaclAf(c) => fnv(c.text().as_bytes(), h),
+        _ => fnv(profile.text().as_bytes(), h),
+    };
     for v in &extras.vocabularies {
         h = fnv(b"\0", h);
         h = fnv(v.text().as_bytes(), h);
@@ -1123,6 +1154,77 @@ fn materialize_admitted(
     };
     let digest = rules_digest(profile, extras);
     let mut fallback = None;
+    if let Profile::ShaclAf(cfg) = profile {
+        if inc.since.is_some() {
+            fallback = Some(
+                "SHACL-AF rules are materialized in full; their maintenance follows roadmap \
+                 item 958"
+                    .to_string(),
+            );
+        }
+        if !extras.vocabularies.is_empty() || extras.geo_default_geometry {
+            anyhow::bail!("the shacl-af profile takes no vocabularies or default geometries");
+        }
+        let ids = resolved.ids(&snap);
+        // the run interns the terms its rules compute in the transaction: a run that
+        // fails, is cancelled or passes its budget before the commit removes them again
+        let run = (|| -> anyhow::Result<_> {
+            let (d, groups) = shacl_af::derive(&mut txn, snap.clone(), cfg, &ids, opts)?;
+            laps.lap("derive");
+            progress(opts, 0.8, "writing inferred graph");
+            let mut warnings = WorkingWarnings::try_clone_from(d.warnings.as_slice(), &d.budget)?;
+            warnings.extend_borrowed(&inspected)?;
+            if wanted_witnesses(opts)?.is_some() {
+                warnings.push_fmt(format_args!(
+                    "the shacl-af profile keeps no witnesses of its inferences"
+                ))?;
+            }
+            let w = write_full(&mut txn, &snap, &d, opts)?;
+            laps.lap("write");
+            Ok((d, groups, warnings, w))
+        })();
+        let (d, groups, warnings, w) = match run {
+            Ok(r) => r,
+            Err(e) => {
+                if let Err(r) = txn.discard_terms() {
+                    tracing::error!("a failed shacl-af run could not remove its terms: {r}");
+                }
+                return Err(e);
+            }
+        };
+        // the shapes graphs the rules came from make the inferences stale as well
+        let mut resolved = resolved.clone();
+        for g in &cfg.shapes {
+            let g = if g == sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI {
+                GraphRef::Default
+            } else {
+                GraphRef::Named(g.clone())
+            };
+            if !resolved.graphs.contains(&g) && !resolved.also_read.contains(&g) {
+                resolved.also_read.push(g);
+            }
+        }
+        let done = Done {
+            rule_groups: groups,
+            rules: d.rules,
+            iterations: d.iterations,
+            budget: d.budget.clone(),
+            base_scans: d.base_scans,
+            threads: d.threads,
+            closure: None,
+            witnesses: None,
+            generalized: FxHashSet::default(),
+            generalized_saved: None,
+            written: w,
+            warnings,
+            method: Method::Full,
+            fallback,
+            changes: None,
+        };
+        return finish(
+            store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
+        );
+    }
     if let (Some(since), Some(raw)) = (inc.since, raw) {
         match update_closure(
             exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw,
@@ -1179,6 +1281,7 @@ fn materialize_admitted(
         None => (ClosureState::Derived(d), None),
     };
     let done = Done {
+        rule_groups: Vec::new(),
         rules,
         iterations,
         budget,
@@ -1328,6 +1431,8 @@ fn build_witnesses(
 
 /// A run's result before its commit.
 struct Done {
+    /// the groups of a `shacl-af` run
+    rule_groups: Vec<shacl_af::RuleGroup>,
     /// the closure, for the next incremental run
     closure: Option<ClosureState>,
     /// the witnesses of the closure's facts, when the run keeps them
@@ -1375,31 +1480,47 @@ fn finish(
     done: Done,
     mut laps: Laps,
 ) -> anyhow::Result<ReasonReport> {
-    if opts
-        .cancel
-        .as_ref()
-        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-    {
-        anyhow::bail!("reasoning cancelled");
-    }
-    // a run that went over its limit fails before its commit, also when its charges are
-    // back under it now
-    done.budget.check_peak()?;
-    if let Some(context) = &opts.analysis {
-        if store.is_persistent() {
-            anyhow::bail!("analysis witnesses cannot be persisted");
+    let mut txn = txn;
+    let checked = (|| -> anyhow::Result<WorkingWarnings> {
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            anyhow::bail!("reasoning cancelled");
         }
-        if let Some(closure) = &done.closure {
-            context.capture_typings(closure.terms(), &done.generalized)?;
-        } else {
-            anyhow::bail!("analysis closure was unavailable before diagnostics capture");
+        // a run that went over its limit fails before its commit, also when its charges
+        // are back under it now
+        done.budget.check_peak()?;
+        if let Some(context) = &opts.analysis {
+            if store.is_persistent() {
+                anyhow::bail!("analysis witnesses cannot be persisted");
+            }
+            if let Some(closure) = &done.closure {
+                context.capture_typings(closure.terms(), &done.generalized)?;
+            } else {
+                anyhow::bail!("analysis closure was unavailable before diagnostics capture");
+            }
         }
-    }
-    // Required report storage must be admitted while the transaction can still
-    // roll back. Keep the complete warning owner alive through commit/transfer.
-    let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
-    warnings.extend_borrowed(done.warnings.as_slice())?;
-    done.budget.check_peak()?;
+        // Required report storage must be admitted while the transaction can still
+        // roll back. Keep the complete warning owner alive through commit/transfer.
+        let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
+        warnings.extend_borrowed(done.warnings.as_slice())?;
+        done.budget.check_peak()?;
+        Ok(warnings)
+    })();
+    let warnings = match checked {
+        Ok(w) => w,
+        Err(e) => {
+            // a shacl-af run interned the terms its rules computed: nothing commits them
+            if !done.rule_groups.is_empty()
+                && let Err(r) = txn.discard_terms()
+            {
+                tracing::error!("a failed shacl-af run could not remove its terms: {r}");
+            }
+            return Err(e);
+        }
+    };
     laps.lap("checks");
     let receipt = txn.commit()?;
     laps.lap("commit");
@@ -1467,6 +1588,11 @@ fn finish(
         base_scans: done.base_scans,
         threads: done.threads,
         witnesses: witness_report,
+        max_rounds: match profile {
+            Profile::ShaclAf(c) => Some(c.max_rounds),
+            _ => None,
+        },
+        rule_groups: done.rule_groups,
     };
     tracing::info!(
         profile = %report.profile,
@@ -1808,6 +1934,7 @@ fn update_closure(
         ))?;
     }
     Ok(Done {
+        rule_groups: Vec::new(),
         budget,
         base_scans,
         threads,
@@ -2050,6 +2177,12 @@ pub fn infer(
     opts: &ReasonOptions,
 ) -> anyhow::Result<(Vec<Triple>, ReasonReport)> {
     let t0 = Instant::now();
+    if let Profile::ShaclAf(_) = profile {
+        anyhow::bail!(
+            "the shacl-af profile runs only in a materialization, whose write transaction \
+             holds the terms its rules compute"
+        );
+    }
     opts.inputs.validate()?;
     let resolved = inputs::resolve(&snap, &opts.inputs);
     let ids = resolved.ids(&snap);

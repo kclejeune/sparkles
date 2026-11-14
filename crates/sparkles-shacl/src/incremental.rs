@@ -660,9 +660,11 @@ impl Analyzer<'_, '_> {
                 out.extend(self.query_reads(&q.query, &[("this", at)])?);
                 Ok(None)
             }
-            Expr::InstancesOf(_) | Expr::NodesMatching(_) | Expr::Custom { .. } | Expr::Arg(_) => {
-                Err(Fallback::Sparql)
-            }
+            Expr::InstancesOf(_)
+            | Expr::NodesMatching(_)
+            | Expr::Custom { .. }
+            | Expr::Arg(_)
+            | Expr::SparqlCall { .. } => Err(Fallback::Sparql),
         }
     }
 

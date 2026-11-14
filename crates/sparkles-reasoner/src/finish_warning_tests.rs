@@ -78,6 +78,7 @@ fn invoke_finish(
         .lookup_iri(INFERRED_GRAPH)
         .map_or(0, |g| snap.scan_keys(Perm::Gspo, &[g.0]).unwrap().len());
     let done = Done {
+        rule_groups: Vec::new(),
         closure: None,
         witnesses: None,
         budget: budget.clone(),

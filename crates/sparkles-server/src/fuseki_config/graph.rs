@@ -21,7 +21,7 @@ pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub struct ConfigGraph {
     /// the file, for messages and relative paths
     pub path: PathBuf,
-    triples: Vec<Triple>,
+    pub(super) triples: Vec<Triple>,
     by_subject: HashMap<NamedOrBlankNode, Vec<usize>>,
 }
 

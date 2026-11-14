@@ -54,6 +54,9 @@ pub struct ValidateOptions {
     /// the output and the appended vector are both live and each worker thread of a
     /// parallel validation can hold one.
     pub max_expr_nodes: u64,
+    /// The memory budget of each SPARQL query that a constraint, a node expression or a
+    /// rule runs, in bytes. `None` keeps the query engine's default.
+    pub query_memory: Option<u64>,
 }
 
 /// The default of [`ValidateOptions::max_expr_nodes`].
@@ -87,6 +90,7 @@ impl Default for ValidateOptions {
             cancel: None,
             max_results: None,
             max_expr_nodes: DEFAULT_MAX_EXPR_NODES,
+            query_memory: None,
         }
     }
 }
@@ -351,8 +355,13 @@ pub(crate) struct Engine<'a> {
     max_results: Option<usize>,
     /// the most nodes one node expression evaluation may work through
     pub max_expr_nodes: u64,
+    /// the memory budget of each query ([`ValidateOptions::query_memory`])
+    pub query_memory: Option<u64>,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
+    /// the queries node expressions have run, which keep the new blank nodes of each
+    /// apart ([`Engine::result_id`])
+    pub(crate) query_calls: std::sync::atomic::AtomicU64,
 }
 
 /// Members past which a list counts as ill-formed (a hostile list cannot exhaust memory).
@@ -424,7 +433,9 @@ impl<'a> Engine<'a> {
             cancellation: opts.cancellation.clone(),
             max_results: opts.max_results,
             max_expr_nodes: opts.max_expr_nodes,
+            query_memory: opts.query_memory,
             collected: AtomicUsize::new(0),
+            query_calls: Default::default(),
         })
     }
 
@@ -555,7 +566,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Focus nodes of a shape's targets (distinct, in target order).
-    fn focus_nodes(&self, si: ShapeId) -> Result<Vec<Id>> {
+    pub(crate) fn focus_nodes(&self, si: ShapeId) -> Result<Vec<Id>> {
         let mut out = Vec::new();
         let mut seen = FxHashSet::default();
         for t in &self.shapes.shapes[si].targets {

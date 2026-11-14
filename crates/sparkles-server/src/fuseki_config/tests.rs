@@ -99,7 +99,7 @@ fn a4_inference() {
     let p = plan("examples/config-inference-1.ttl");
     let ds = &p.datasets[0];
     let r = ds.reasoning.as_ref().unwrap();
-    assert_eq!(r.profile, Some("owl-rl"));
+    assert_eq!(r.profile.as_deref(), Some("owl-rl"));
     assert!(ds.data[0].path.ends_with("Data/data.ttl"), "{:?}", ds.data);
     assert!(ds.persistent(Mode::Files));
     assert!(has(&p, Kind::Approximated, "OWLFBRuleReasoner"));
@@ -711,4 +711,82 @@ fn text_languages_follow_lucene() {
             serde_json::from_value(p.datasets[0].text.clone().unwrap()).unwrap();
         assert!(!c.languages.is_none());
     }
+}
+
+/// TopBraid's SHACL rules as a reasoner (`ja:reasonerURL sh:Rules`, Sparkles' own
+/// convention): the `shacl-af` profile with the shapes graph and the iteration setting,
+/// and a shapes graph that asks for its rules before validation is reported.
+#[test]
+fn shacl_rules_reasoner() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("config.ttl");
+    let config = |iterations: &str| {
+        format!(
+            "PREFIX fuseki: <http://jena.apache.org/fuseki#>\n\
+             PREFIX ja: <http://jena.hpl.hp.com/2005/11/Assembler#>\n\
+             PREFIX sh: <http://www.w3.org/ns/shacl#>\n\
+             PREFIX tosh: <http://topbraid.org/tosh#>\n\
+             [] a fuseki:Service ; fuseki:name \"ds\" ;\n\
+               fuseki:endpoint [ fuseki:operation fuseki:query ] ;\n\
+               fuseki:dataset [ a ja:RDFDataset ; ja:defaultGraph [ a ja:InfModel ;\n\
+                 ja:baseModel [ a ja:MemoryModel ] ;\n\
+                 ja:reasoner [ ja:reasonerURL sh:Rules ; sh:shapesGraph <urn:x:shapes> ;\n\
+                   {iterations} ] ] ] .\n\
+             <urn:x:shapes> sh:entailment sh:Rules .\n"
+        )
+    };
+    std::fs::write(&f, config("tosh:maxIterations 1")).unwrap();
+    let p = plan_for(
+        std::slice::from_ref(&f),
+        &UserSource::default(),
+        Mode::Files,
+    )
+    .unwrap();
+    let r = p.datasets[0].reasoning.as_ref().unwrap();
+    assert_eq!(
+        r.profile.as_deref(),
+        Some("shacl-af?shapes=urn:x:shapes&mode=one-pass")
+    );
+    let parsed: sparkles_reasoner::Profile = r.profile.as_deref().unwrap().parse().unwrap();
+    assert_eq!(parsed.name(), "shacl-af");
+    assert!(has(&p, Kind::Converted, "sh:Rules"), "{}", p.report.text());
+    assert!(
+        has(&p, Kind::Manual, "sh:entailment"),
+        "{}",
+        p.report.text()
+    );
+
+    std::fs::write(&f, config("tosh:maxIterations 5")).unwrap();
+    let p = plan_for(
+        std::slice::from_ref(&f),
+        &UserSource::default(),
+        Mode::Files,
+    )
+    .unwrap();
+    let r = p.datasets[0].reasoning.as_ref().unwrap();
+    assert_eq!(
+        r.profile.as_deref(),
+        Some("shacl-af?shapes=urn:x:shapes&max-rounds=5")
+    );
+    assert!(
+        has(&p, Kind::Approximated, "maxIterations 5"),
+        "{}",
+        p.report.text()
+    );
+
+    // a shapes graph IRI with a query string survives the profile's option syntax
+    let g = "http://example.org/shapes?a=1&b=50%25";
+    std::fs::write(
+        &f,
+        config("tosh:maxIterations 1").replace("urn:x:shapes", g),
+    )
+    .unwrap();
+    let p = plan_for(&[f], &UserSource::default(), Mode::Files).unwrap();
+    let r = p.datasets[0].reasoning.as_ref().unwrap();
+    let parsed: sparkles_reasoner::Profile = r.profile.as_deref().unwrap().parse().unwrap();
+    let sparkles_reasoner::Profile::ShaclAf(c) = parsed else {
+        panic!("{:?}", r.profile)
+    };
+    assert_eq!(c.shapes, vec![g.to_string()]);
+    assert!(c.one_pass);
 }

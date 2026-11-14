@@ -214,11 +214,11 @@ fn load_script(plan: &Plan) -> String {
                 ));
             }
             let mut cmd = format!("\"$SPARKLES\" infer --loc {}", sh(&db));
-            match (&dataset_files(ds).rules, r.profile) {
+            match (&dataset_files(ds).rules, r.profile.as_deref()) {
                 (Some(rules), _) => {
                     cmd.push_str(&format!(" --rules {}", sh(&rules.to_string_lossy())))
                 }
-                (None, Some(p)) => cmd.push_str(&format!(" --profile {p}")),
+                (None, Some(p)) => cmd.push_str(&format!(" --profile {}", sh(p))),
                 (None, None) => cmd.push_str(" --profile rdfs"),
             }
             if r.geo_vocab {
@@ -472,7 +472,10 @@ pub fn write_dataset_files(plan: &Plan, out: &Path, report: &mut Report) -> Resu
             }
             if r.profile.is_some() {
                 // a reasoner with both a profile and rules keeps the profile's rules too
-                text = format!("@include <{}> .\n{text}", r.profile.unwrap_or("rdfs"));
+                text = format!(
+                    "@include <{}> .\n{text}",
+                    r.profile.as_deref().unwrap_or("rdfs")
+                );
             }
             std::fs::write(out.join(p), text)?;
         }

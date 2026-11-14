@@ -12,6 +12,7 @@ plan-probe = []
 
 [dependencies]
 sparkles-core.workspace = true
+sparkles-shacl.workspace = true
 sparkles-budget.workspace = true
 oxrdf.workspace = true
 oxsdatatypes.workspace = true

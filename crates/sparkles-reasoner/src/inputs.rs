@@ -312,6 +312,10 @@ pub struct Resolved {
     pub graphs: Vec<GraphRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub imports: Vec<Import>,
+    /// graphs the run read besides its input graphs, such as the shapes graphs of the
+    /// `shacl-af` profile, whose changes also make the inferences stale
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_read: Vec<GraphRef>,
     #[serde(skip)]
     pub warnings: Vec<String>,
 }
@@ -321,6 +325,7 @@ impl Resolved {
     /// import that did not resolve would be read from.
     pub fn watched(&self) -> Vec<GraphRef> {
         let mut out: BTreeSet<GraphRef> = self.graphs.iter().cloned().collect();
+        out.extend(self.also_read.iter().cloned());
         for i in self.imports.iter().filter(|i| i.graph.is_none()) {
             out.insert(GraphRef::Named(i.iri.clone()));
             if let Some(l) = &i.location {

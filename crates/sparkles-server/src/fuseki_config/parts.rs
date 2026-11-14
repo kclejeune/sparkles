@@ -54,6 +54,13 @@ fn localized_analyzer(tag: &str) -> Option<&'static str> {
 }
 
 const REASONERS: &str = "http://jena.hpl.hp.com/2003/";
+/// The reasoner URL of SHACL rules, TopBraid's entailment IRI for them (`sh:Rules`).
+const SHACL_RULES: &str = "http://www.w3.org/ns/shacl#Rules";
+const SH_SHAPES_GRAPH: &str = "http://www.w3.org/ns/shacl#shapesGraph";
+pub(super) const SH_ENTAILMENT: &str = "http://www.w3.org/ns/shacl#entailment";
+pub(super) const SHACL_RULES_IRI: &str = SHACL_RULES;
+/// TopBraid's iteration count of `shaclinfer -maxiterations`, as a setting.
+const TOSH_MAX_ITERATIONS: &str = "http://topbraid.org/tosh#maxIterations";
 
 fn t(l: &str) -> String {
     format!("{TEXT}{l}")
@@ -340,7 +347,7 @@ impl Converter<'_> {
             r.geo_vocab |= inference;
             r.default_geometry |= default_geometry;
             if r.profile.is_none() && r.rule_files.is_empty() && r.rule_texts.is_empty() {
-                r.profile = Some("rdfs");
+                r.profile = Some("rdfs".into());
             }
             let what = match (inference, default_geometry) {
                 (true, true) => "the GeoSPARQL schema's RDFS inference and geo:hasDefaultGeometry",
@@ -729,14 +736,14 @@ impl Converter<'_> {
             .collect();
         match local.as_str() {
             "RDFSExptRuleReasoner" | "RDFSRuleReasoner" => {
-                reasoning.profile = Some("rdfs");
+                reasoning.profile = Some("rdfs".into());
                 self.report.converted(
                     place,
                     format!("the {local}: RDFS materialized (--profile rdfs)"),
                 );
             }
             "TransitiveReasoner" => {
-                reasoning.profile = Some("rdfs");
+                reasoning.profile = Some("rdfs".into());
                 self.report.approximated(
                     place,
                     "the TransitiveReasoner: RDFS materialized, which includes the transitive \
@@ -747,7 +754,7 @@ impl Converter<'_> {
             | "OWLMiniFBRuleReasoner"
             | "OWLMicroFBRuleReasoner"
             | "OWLReasoner" => {
-                reasoning.profile = Some("owl-rl");
+                reasoning.profile = Some("owl-rl".into());
                 self.report.approximated(
                     place,
                     format!(
@@ -755,6 +762,66 @@ impl Converter<'_> {
                          from Jena's OWL rule sets in coverage"
                     ),
                 );
+            }
+            SHACL_RULES => {
+                // Sparkles' own convention: neither Jena nor TopBraid defines a reasoner
+                // URL for SHACL rules, so this one is TopBraid's entailment IRI for them
+                let mut params = Vec::new();
+                for s in g.objects(r, SH_SHAPES_GRAPH) {
+                    match iri(s) {
+                        // the profile text's encoding of `%` and `&` in an option
+                        Some(i) => params.push(format!(
+                            "shapes={}",
+                            i.replace('%', "%25").replace('&', "%26")
+                        )),
+                        None => self
+                            .report
+                            .unsupported(place, "sh:shapesGraph names no graph IRI"),
+                    }
+                }
+                match g
+                    .one(r, TOSH_MAX_ITERATIONS)
+                    .ok()
+                    .flatten()
+                    .and_then(lexical)
+                    .map(|v| v.trim().parse::<usize>())
+                {
+                    None => {}
+                    Some(Ok(1)) => {
+                        params.push("mode=one-pass".into());
+                        self.report.converted(
+                            place,
+                            "tosh:maxIterations 1: each group of rules runs once (mode=one-pass)",
+                        );
+                    }
+                    Some(Ok(n)) if n > 1 => {
+                        params.push(format!("max-rounds={n}"));
+                        self.report.approximated(
+                            place,
+                            format!(
+                                "tosh:maxIterations {n}: each group of rules runs to its fixed \
+                                 point in at most {n} rounds, and a run that needs more fails \
+                                 rather than stopping with what it has"
+                            ),
+                        );
+                    }
+                    Some(_) => self
+                        .report
+                        .unsupported(place, "tosh:maxIterations is not a positive number"),
+                }
+                let profile = if params.is_empty() {
+                    "shacl-af".to_string()
+                } else {
+                    format!("shacl-af?{}", params.join("&"))
+                };
+                self.report.converted(
+                    place,
+                    format!(
+                        "the SHACL rules reasoner (sh:Rules, a Sparkles convention): SHACL-AF \
+                         and SPIN rules materialized (--profile {profile})"
+                    ),
+                );
+                reasoning.profile = Some(profile);
             }
             "GenericRuleReasoner" => {
                 if rule_files.is_empty() && rule_texts.is_empty() {

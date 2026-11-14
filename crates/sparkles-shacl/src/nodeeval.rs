@@ -68,6 +68,17 @@ impl Engine<'_> {
         self.data.resolve_shared(t, self.shapes.bnodes_in_store)
     }
 
+    /// A new number for a query a node expression runs ([`Self::result_id`]).
+    fn next_call(&self) -> u64 {
+        self.query_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The id of the result `id` of query `call` ([`Engine::fresh_result_term`]).
+    fn result_id(&self, ctx: &sparkles_core::sparql::Ctx, id: Id, call: u64) -> Option<Id> {
+        Self::fresh_result_term(ctx, id, &format!("q{call}")).map(|t| self.lit_id(&t))
+    }
+
     fn is_true(&self, id: Id) -> bool {
         matches!(self.data.term(id), Some(Term::Literal(l)) if l.datatype() == xsd::BOOLEAN && matches!(l.value(), "true" | "1"))
     }
@@ -453,6 +464,60 @@ impl Engine<'_> {
                 }
                 Ok(out)
             }
+            Expr::SparqlCall {
+                query,
+                params,
+                args,
+                ..
+            } => {
+                // the nodes of each argument; an optional argument without any is unbound
+                let mut vals: Vec<Vec<Option<Id>>> = Vec::with_capacity(args.len());
+                for (a, (_, optional)) in args.iter().zip(params) {
+                    let mut r = self.eval(*a, focus, scope, cx)?;
+                    r.sort_unstable();
+                    r.dedup();
+                    if r.is_empty() {
+                        if !*optional {
+                            return Ok(Vec::new());
+                        }
+                        vals.push(vec![None]);
+                    } else {
+                        vals.push(r.into_iter().map(Some).collect());
+                    }
+                }
+                // every combination of the arguments' nodes, the last argument fastest;
+                // each call gives the binding of its first solution
+                let mut out = Vec::new();
+                let mut at = vec![0usize; vals.len()];
+                loop {
+                    self.check_limits()?;
+                    let mut binds: Vec<(&str, Term)> = Vec::with_capacity(params.len());
+                    for (i, (p, _)) in params.iter().enumerate() {
+                        if let Some(v) = vals[i][at[i]] {
+                            binds.push((p.as_str(), self.term(v)?));
+                        }
+                    }
+                    let (table, ctx) = self.run_query(query, &binds)?;
+                    if !table.is_empty()
+                        && table.width() > 0
+                        && let Some(id) = self.result_id(&ctx, table.get(0, 0), self.next_call())
+                    {
+                        out.push(id);
+                    }
+                    let mut i = vals.len();
+                    loop {
+                        if i == 0 {
+                            return Ok(out);
+                        }
+                        i -= 1;
+                        at[i] += 1;
+                        if at[i] < vals[i].len() {
+                            break;
+                        }
+                        at[i] = 0;
+                    }
+                }
+            }
             Expr::Arg(key) => match scope.args.iter().find(|a| &a.key == key) {
                 Some(a) => {
                     let (expr, f, sc) = (a.expr, a.focus, a.scope.clone());
@@ -473,10 +538,10 @@ impl Engine<'_> {
         if table.width() == 0 {
             return Ok(out);
         }
+        let call = self.next_call();
         for row in 0..table.len() {
-            let id = table.get(row, 0);
-            if let Some(t) = Self::result_term(ctx, id) {
-                out.push(self.lit_id(&t));
+            if let Some(id) = self.result_id(ctx, table.get(row, 0), call) {
+                out.push(id);
             }
         }
         Ok(out)

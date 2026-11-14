@@ -160,6 +160,22 @@ pub struct RunInfo {
     /// threads the rules were evaluated on
     #[serde(default, skip_serializing_if = "is_zero")]
     pub threads: u64,
+    /// `shacl-af` runs: the most rounds a group of rules could take
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u64>,
+    /// `shacl-af` runs: the groups of rules in the order they ran, with their rounds
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_groups: Vec<RuleGroupInfo>,
+}
+
+/// A group of SHACL rules of equal shape and rule `sh:order`, and the rounds it took.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleGroupInfo {
+    pub shape_order: f64,
+    pub order: f64,
+    pub rules: u64,
+    pub rounds: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
