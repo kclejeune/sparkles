@@ -2298,12 +2298,13 @@ fn an_ontology_inconsistent_through_a_maximum_over_an_intersection() {
     assert_eq!(out.consistency, Consistency::Inconsistent);
 }
 
-/// An ontology in which `D` holds more disjunctions than a context processes before it
-/// gives way. `D` is below `X` through two of them, no `r`-successor is in `X`, and each
-/// `Q` has `D` as an `r`-successor, so every `Q` and `C` are unsatisfiable. `a`, `b` and
-/// `c` disjunctions stand before, between and after the two that give `X1` and `X`, which
-/// places the clause that gives `X`. `counts` adds a maximum cardinality that nothing
-/// uses, so that a run with counting has a bound on its conclusions.
+/// Builds an ontology in which `D` holds more disjunctions than a context processes
+/// before it gives way. The disjunction `U ⊔ V` puts `D` below `X`, no `r`-successor is
+/// in `X`, and each `Q` has `D` as an `r`-successor, so every `Q` and `C` are
+/// unsatisfiable. `a`, `b` and `c` disjunctions stand before the disjunction that gives
+/// `X1`, between it and the one that gives `X`, and after both, which places the clause
+/// that gives `X`. `counts` adds a maximum cardinality that nothing uses, so that a run
+/// with counting has a bound on its conclusions.
 fn gives_way(a: usize, b: usize, c: usize, counts: bool) -> Vec<Axiom> {
     let mut body = String::from(
         "SubClassOf(:C ObjectSomeValuesFrom(:r :D))
