@@ -10,7 +10,7 @@
 //! is made at the size [`sort_bytes`] or [`merge_bytes`] charges for and never grows.
 
 use super::run::Run;
-use crate::budget::{MemoryExceeded, Meter};
+use crate::budget::{BudgetFailure, Meter};
 use rayon::prelude::*;
 
 /// Batches smaller than this are sorted on the calling thread.
@@ -181,7 +181,7 @@ pub(crate) fn sorted_live(
     key: &(impl Fn(u32) -> u64 + Sync),
     keep: &(impl Fn(u32) -> bool + Sync),
     m: &mut Meter<'_>,
-) -> Result<(Run, usize, Vec<u64>), MemoryExceeded> {
+) -> Result<(Run, usize, Vec<u64>), BudgetFailure> {
     let mut e = sorted_entries(ids, key);
     let (keys, dead) =
         key_groups(&e, keep).fold((0, 0), |(n, d), (_, live)| (n + 1, d + usize::from(!live)));

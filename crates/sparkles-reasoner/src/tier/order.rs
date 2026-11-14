@@ -18,7 +18,7 @@
 
 use super::Cands;
 use super::run::Run;
-use crate::budget::{MemoryExceeded, Meter};
+use crate::budget::{BudgetFailure, Meter};
 use std::ops::Range;
 
 /// The most runs an order keeps below the compaction floor after a compaction and the
@@ -56,7 +56,7 @@ impl Order {
         r: Run,
         fresh: usize,
         m: &mut Meter<'_>,
-    ) -> Result<(), MemoryExceeded> {
+    ) -> Result<(), BudgetFailure> {
         if r.len() == 0 {
             return Ok(());
         }
@@ -80,7 +80,7 @@ impl Order {
         keys: usize,
         ghosts: Vec<u64>,
         m: &mut Meter<'_>,
-    ) -> Result<Order, MemoryExceeded> {
+    ) -> Result<Order, BudgetFailure> {
         let mut o = Order {
             ghosts,
             ..Order::default()
@@ -112,7 +112,7 @@ impl Order {
         dropped: &[u64],
         key1: &impl Fn(u32) -> u64,
         m: &mut Meter<'_>,
-    ) -> Result<(), MemoryExceeded> {
+    ) -> Result<(), BudgetFailure> {
         let runs = &self.runs;
         let gone = |k: &u64| !runs.iter().any(|r| r.holds(*k, key1));
         // counted first, so that the merged list is the only one made

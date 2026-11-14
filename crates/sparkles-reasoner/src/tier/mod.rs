@@ -30,7 +30,7 @@ pub(crate) mod compact;
 pub(crate) mod order;
 pub(crate) mod run;
 
-use crate::budget::{MemoryExceeded, Meter, table_bytes};
+use crate::budget::{BudgetFailure, Meter, table_bytes};
 use order::Order;
 use rayon::prelude::*;
 use run::Run;
@@ -644,11 +644,7 @@ impl Tier {
 
     /// Build the order by subject (`subjects`) or by object over the whole tier, its
     /// bytes charged to `m` before it is built.
-    pub fn ensure_order(
-        &mut self,
-        subjects: bool,
-        m: &mut Meter<'_>,
-    ) -> Result<(), MemoryExceeded> {
+    pub fn ensure_order(&mut self, subjects: bool, m: &mut Meter<'_>) -> Result<(), BudgetFailure> {
         if self.has_order(subjects) {
             return Ok(());
         }
@@ -681,7 +677,7 @@ impl Tier {
     /// Index the facts from row index `start` on: compact the runs each of their
     /// relations has below the floor, then append the new facts as one run per order,
     /// sorted. Growth is charged to `m` (and its strictness) before it is allocated.
-    pub fn index_new(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), MemoryExceeded> {
+    pub fn index_new(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), BudgetFailure> {
         let n = self.rows.len() - start;
         if n == 0 {
             return Ok(());
@@ -694,7 +690,7 @@ impl Tier {
         // the grouped ids, the two counting arrays and the tasks' results
         let scratch = n * size_of::<u32>()
             + 2 * (nrels + 1) * size_of::<usize>()
-            + nrels * size_of::<Result<usize, MemoryExceeded>>();
+            + nrels * size_of::<Result<usize, BudgetFailure>>();
         m.add(scratch)?;
         let mut counts = vec![0usize; nrels + 1];
         for r in &self.rows[start..] {
@@ -728,7 +724,7 @@ impl Tier {
         let counts = &counts;
         let t0 = std::time::Instant::now();
         // the bytes the task charged and the entries its compactions rewrote
-        let task = |(ri, rel): (usize, &mut Rel)| -> Result<(usize, usize), MemoryExceeded> {
+        let task = |(ri, rel): (usize, &mut Rel)| -> Result<(usize, usize), BudgetFailure> {
             let mut meter = Meter::new(budget, strict);
             let new = &grouped_ref[counts[ri]..counts[ri + 1]];
             let mut rewrote = 0;
@@ -768,7 +764,7 @@ impl Tier {
             }
             Ok((meter.into_bytes(), rewrote))
         };
-        let done: Vec<Result<(usize, usize), MemoryExceeded>> = if n < PAR_MIN {
+        let done: Vec<Result<(usize, usize), BudgetFailure>> = if n < PAR_MIN {
             rels.iter_mut().enumerate().map(task).collect()
         } else {
             rels.par_iter_mut().enumerate().map(task).collect()
@@ -839,7 +835,7 @@ fn compaction(
     key: &(impl Fn(u32) -> u64 + Sync),
     keep: &(impl Fn(u32) -> bool + Sync),
     m: &mut Meter<'_>,
-) -> Result<(usize, usize), MemoryExceeded> {
+) -> Result<(usize, usize), BudgetFailure> {
     let Some(which) = order.compaction(floor, all) else {
         return Ok((0, 0));
     };

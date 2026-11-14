@@ -1357,7 +1357,7 @@ mod tests {
         let e = sink
             .emit([1024, 1, 2])
             .expect_err("the growth does not fit");
-        assert!(e.is::<MemoryExceeded>(), "{e:#}");
+        assert!(e.is::<crate::budget::MemoryExceeded>(), "{e:#}");
         let budget = Budget::new(Some(3072 * size_of::<Triple>()));
         let mut g = Graph::default();
         let mut sink = Sink::new(&mut g, &budget, 0, usize::MAX);
