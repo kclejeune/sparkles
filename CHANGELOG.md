@@ -14,6 +14,14 @@ query and writes its text once per batch it sends. A Python cursor decodes up to
 further rows ahead in one detached call, held outside the query's memory budget until
 they are read, and the async cursor reads its plan when asked and on close.
 
+Each binding answers many membership tests in one call. `Dataset.contains_all` in
+Python, `DatasetGraphSparkles.containsAll` on the JVM and `Dataset.hasAll` in Node take
+a batch of quads and return the answer of `in`, `contains` or `has` for each, in order
+and from one state of the dataset. On a laptop at 105,302 triples, a probe in a batch
+of 64 took about 0.30 µs on the JVM against 0.81 µs for a single call, and 0.27 µs in
+Node against 0.71 µs. In Python a batch saves about a seventh, since the lookup is most
+of an `in`.
+
 ### OWL classification
 
 The Horn rules classify ontologies with individuals, functional data properties and top

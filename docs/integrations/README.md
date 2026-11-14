@@ -10,6 +10,12 @@ The engine is a Rust library, and the Python, JVM and Node.js packages embed the
 engine in process. Thread destruction preserves query callback family checks and
 the visibility limits of captured callback views.
 
+Each binding tests many quads for membership in one call. `Dataset::contains_all` in
+Rust, `Dataset.contains_all` in Python, `DatasetGraphSparkles.containsAll` on the JVM
+and `Dataset.hasAll` in Node.js answer a batch in the order given, from one state of the
+dataset. The Python, JVM and JavaScript sections of [USAGE](../USAGE.md#python) describe
+each call.
+
 Store shutdown finishes embedding record output even if a caller retains the
 Embedder. If a clean-close validation callback panics, shutdown first revokes
 retained writers and finishes pending output, then propagates the original unwind.

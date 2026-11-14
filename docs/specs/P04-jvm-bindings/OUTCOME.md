@@ -481,8 +481,19 @@ no permit.
   from about 1.2 to 0.8 µs against 0.49 µs for TIM. `getProperty` took about a tenth
   less, near 1.8 µs against 0.72 µs, within a spread that needs a quieter host to
   settle, and `find` on a subject did not change at 4.3 µs against 2.5 µs. The one JNI
-  entry point for a read outside a transaction exists. Batched calls remain, and need
-  an API decision.
+  entry point for a read outside a transaction exists.
+
+  `DatasetGraphSparkles.containsAll` is the batched call. It encodes a batch of quads
+  into one request, in which a shared term is sent once, and one native call returns a
+  byte for each quad. The native side looks the id of each distinct term up once and
+  probes the index by ids. In batches of 64 probes inside one read transaction, a probe
+  took about 0.30 µs against 0.81 µs for `Graph.contains` in a transaction of its own,
+  at a load of 7. TIM answered the same batch one by one in 0.15 µs each in one
+  transaction, and a single probe in its own transaction in 0.42 µs. A profile of the
+  batch puts 27% of its samples in the index probe, most of it the block cache lookup
+  that each quad makes, 14% in the lookup of term ids and 14% in the Kotlin writer. A
+  probe of a sorted batch that reads each block once is the step left for it. `find`
+  over several subjects in one call is not built.
 * **JVM metrics** ([ROADMAP](../../ROADMAP.md) item 76). [FEATURES](../../FEATURES.md) lists no
   JVM metrics. The server's metrics are counted in `crates/sparkles-server/src/obs.rs` and
   are not reachable from the library, and the FFI exposes no dataset statistics. The

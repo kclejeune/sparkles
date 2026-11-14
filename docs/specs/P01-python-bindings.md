@@ -1174,11 +1174,45 @@ detached call and no longer reads the plan with every batch. Its rows went from 
 2.2 to 2.1 µs, since the event loop's own work per row and the memory ledger dominate
 them. The cursor figures come from a busy host and need a rerun on a quiet one.
 
-Three costs remain under item 33. PyO3's reference pool takes a lock on every call into
-the extension once any call has released the GIL, which is 13% of a value lookup's samples
-and 20% of a subject scan's. A cursor row passes the memory ledger once per cell, which is
-a third of its samples, where the result writers reserve once per row. The value lookup
-and the subject scan still trail pyoxigraph.
+`Dataset.contains_all` answers a batch of membership tests in one call, from one
+snapshot. It reads a `Quad` where it is, and gives up the GIL for a batch longer than
+256 quads or a dataset on disk. On quads built beforehand, a probe of a batch took 0.23
+µs against 0.27 µs for `in`, at a load of 8. With a `Quad` built for each probe, as the
+benchmark does, a probe took 0.41 µs against 0.50 µs for `in` and 1.5 µs for pyoxigraph,
+at a load of 10. The batch saves little in Python because the lookup itself is most of
+an `in`, and the call is not.
+
+PyO3's reference pool takes a lock on every call into the extension once any call has
+released the GIL, which is 13% of a value lookup's samples and 20% of a subject scan's.
+A build with `--cfg pyo3_disable_reference_pool` has no pool. In interleaved runs at a
+load of 34 to 38 it took 10% off `in`, 11% off a value lookup, 7% off a subject scan
+and 4% off a batched probe. It is not adopted, because without the pool a Python
+reference that is dropped while the GIL is not held aborts the process, and the
+extension has such drops. Five files of the test suite abort on that build:
+`test_dataset.py`, `test_file_object_loads.py`, `test_formats_tables_describe.py`,
+`test_handles.py` and `test_streaming.py`. The audit found these places, all in code
+that runs detached or on a thread of its own:
+
+* `PyFileReader` in `io.rs` holds the file object of a load, and the loader drops it
+  where it finishes, including on the thread that transcodes Jena's syntaxes.
+* `PyFileWriter` and `Output::File` in `io.rs` hold the file object of a dump or a
+  serialization and are dropped inside the detached write.
+* The reads and writes of those file objects wrap a Python exception in an I/O error,
+  which the engine may drop or pass between threads before it returns.
+* A stored query in `queries.rs` moves its dataset, its keyword arguments and its result
+  into the closure that `interrupt::controlled` runs.
+* A progress callback in `interrupt.rs` and the exception it raised are held by the
+  closure that an operation's thread calls.
+
+Adopting the build needs each of these wrapped so that its drop takes the GIL, the flag
+in every build of the extension, which are `scripts/py-test.sh`, the `py:build` task,
+`nix/python.nix`, the wheel workflow and the bindings benchmark, and the test suite run
+on the flagged build, where a drop that was missed aborts a test.
+
+Three costs remain under item 33. The reference pool's lock is the first. A cursor row
+passes the memory ledger once per cell, which is a third of its samples, where the
+result writers reserve once per row. The value lookup and the subject scan still trail
+pyoxigraph.
 
 ### Graph overview
 
