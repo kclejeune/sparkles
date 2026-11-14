@@ -173,7 +173,7 @@ check them against the W3C suites and Jena's own answers.
   whose rows do not pass asks its input for four times as many rows each time, up to
   eight cursor batches, when the query has no budget of produced rows. It evaluates its
   condition on rows past the first solutions, so a memory budget that one of those rows
-  exceeds refuses the query, and the `grow_input` optimization switch turns the
+  exceeds refuses the query, and the `grow_input` optimization switch turns this
   read-ahead off. Pulled first rows still cost more than the eager path in some shapes,
   such as a `LIMIT 10` over a join of two 3,000-row patterns at about 1.17 times, which
   [roadmap item 952](../ROADMAP.md) follows up.
