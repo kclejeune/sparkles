@@ -112,18 +112,9 @@ fn an_attempt_past_its_bound_takes_the_answer_of_the_horn_rules() {
         assert!(out.taxonomy.is_subclass(&c("E"), &c("A")));
         assert_eq!(k.excluded().len(), 1, "{:?}", k.excluded());
         // the same answer as a run past its memory budget
-        let mut m = Classifier::of(&held);
-        let over = m
-            .classify(&Limits {
-                threads,
-                max_memory: Some(1),
-                ..Limits::default()
-            })
-            .ok();
-        if let Some(over) = over.filter(|o| o.stats.dl_over_budget) {
-            assert_eq!(over.taxonomy, out.taxonomy);
-            assert_eq!(m.excluded(), k.excluded());
-        }
+        let (m, over) = past_memory(&held, threads);
+        assert_eq!(over.taxonomy, out.taxonomy);
+        assert_eq!(m.excluded(), k.excluded());
         // a bound at what the run derives keeps the whole answer
         if threads == 1 {
             let mut k = Classifier::of(&held);
@@ -137,6 +128,48 @@ fn an_attempt_past_its_bound_takes_the_answer_of_the_horn_rules() {
         assert!(!out.stats.dl_attempt_over);
         assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
     }
+}
+
+/// A run over `held` that passes the memory budget of the disjunctive rules and gets the
+/// answer of the Horn rules, with its classifier: the least budget with which a run
+/// answers in full is found by bisection, and a budget a little below it lets the Horn
+/// rules answer.
+fn past_memory(held: &[Axiom], threads: usize) -> (Classifier, Classification) {
+    let run = |limit: usize| {
+        let mut k = Classifier::of(held);
+        let out = k.classify(&Limits {
+            threads,
+            max_memory: Some(limit),
+            ..Limits::default()
+        });
+        (k, out)
+    };
+    let full = |limit: usize| {
+        run(limit)
+            .1
+            .is_ok_and(|o| !o.stats.dl_over_budget && !o.stats.horn_over_budget)
+    };
+    let (mut low, mut high) = (0usize, 1usize << 30);
+    assert!(full(high));
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if full(mid) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    for less in 1..4096 {
+        let (k, out) = run(high - less);
+        if let Ok(out) = out
+            && out.stats.dl_over_budget
+            && !out.stats.horn_over_budget
+        {
+            assert!(!out.stats.dl_attempt_over);
+            return (k, out);
+        }
+    }
+    panic!("no budget below {high} lets the Horn rules answer");
 }
 
 #[test]

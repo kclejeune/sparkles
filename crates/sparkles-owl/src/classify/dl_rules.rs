@@ -556,10 +556,11 @@ impl DlRun {
     /// with their states, so the run counts only what it adds, and it counts its own
     /// conclusions. Its bound on derived conclusions counts those of the runs before it
     /// too, back to the last that started again, which derived the kept contexts' (roadmap
-    /// item 990). A run that starts again over the same axioms derives about as many as
-    /// the kept contexts and this run did together, and the contexts of removed axioms
-    /// still count, so a kept run passes the bound where one that starts again would or
-    /// sooner, up to the order of redundant derivations, and then starts again in full.
+    /// item 990), and a kept run past the bound starts again in full. The sum stands for
+    /// what a run that starts again over the same axioms would derive, and the contexts
+    /// of removed axioms still count in it, but it is not a bound on that: such a run
+    /// derives its redundant conclusions in another order and can derive more, so a kept
+    /// run can answer in full where a run that starts again falls back.
     pub fn begin_run(&mut self) {
         *self.stores.get_mut() = 0;
         self.carried = self.carried.saturating_add(*self.work.get_mut());

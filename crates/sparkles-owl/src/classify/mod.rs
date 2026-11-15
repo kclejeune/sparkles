@@ -229,10 +229,12 @@ pub struct Limits {
     /// `Some(0)` takes no bound. A run that keeps the contexts of the last run (roadmap
     /// item 753) counts the conclusions of the runs since the last one that started
     /// again with its own, and a run that passes the bound starts again in full, whose
-    /// answer is the one the caller gets. The run keeps the driver without steps
-    /// ([`dl_steps`](Limits::dl_steps)), so on several threads an ontology whose run
-    /// derives about the bound can answer in full on one schedule and fall back on
-    /// another.
+    /// answer is the one the caller gets. A run that starts again over the same axioms
+    /// can derive more than that sum, so a kept run can answer in full where such a run
+    /// falls back (F24, "Incremental native DL classification"). The run keeps the
+    /// driver without steps ([`dl_steps`](Limits::dl_steps)), so on several threads an
+    /// ontology whose run derives about the bound can answer in full on one schedule and
+    /// fall back on another.
     pub dl_attempt_work: Option<usize>,
     /// whether Tier D counts, which is off by default. A run that counts takes number
     /// restrictions, functional and inverse functional properties, disjoint properties and
