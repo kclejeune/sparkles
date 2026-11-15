@@ -1,0 +1,20 @@
+# The atlas measurement, from a copy of scripts/ at fcf8623a under SRC, with the binary and
+# Nemo that env.txt names. Each spec ran owl-rl and then rdfs on the same data.
+export SPARKLES=BIN/sparkles-faaddcdb SPARKLES_COMMIT=faaddcdb NMO=/nix/store/94ydj0qlbrklnblfi3i6fwci9wnr637m-nemo-0.10.1/bin/nmo
+export RUNS=3 THREADS=20 INCREMENTAL=0 MEM_MAX=13G RUN_TIMEOUT=3600 MAX_INFERRED=0
+flock ~/lanes/.heavy.lock sh -c '
+for spec in owl2bench-1 lubm-10 lubm-100 owl2bench-5; do
+  for p in owl-rl rdfs; do
+    PROFILE=$p SRC/scripts/rl-reference/bench.sh ${spec%-*} ${spec#*-} WORK/$spec
+  done
+done'
+
+# The same runs through the mise task, which builds the binary first:
+#   mise run bench:rl-reference lubm 100 --profile all --no-incremental
+
+# Each <suite>-<scale>-<profile>.json is that run's results/rl-reference.json, with every
+# timed run, the host, the versions and the configuration, and the aligned comparison's
+# counts and, for owl-rl, the core comparison's. Each <suite>-<scale>-<profile>.md is its
+# summary.md. Every timed run derived the closure check's count of triples, and round 1's
+# Sparkles runs on 1 and 20 threads were compared triple for triple with round 1's Nemo
+# closure, so correctness.verified is true in every file.
