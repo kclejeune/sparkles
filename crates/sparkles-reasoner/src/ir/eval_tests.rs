@@ -144,9 +144,7 @@ fn decode(t: &Terms, p: &Program, r: [u64; 3]) -> Fact {
 
 fn graph(t: &Terms, p: &Program, facts: &[Fact]) -> Graph {
     let mut g = Graph::default();
-    for f in facts {
-        g.add(row(t, p, f));
-    }
+    g.add_batch(facts.iter().map(|f| row(t, p, f)));
     g
 }
 
