@@ -140,6 +140,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(branches::SPARKLES_BRANCH_ID),
         crate::obs::X_REQUEST_ID.clone(),
         header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
+        SPARKLES_REASONING,
         header::HeaderName::from_static(history::SPARKLES_AT),
         header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
         header::HeaderName::from_static(dry_run::SPARKLES_DRY_RUN),

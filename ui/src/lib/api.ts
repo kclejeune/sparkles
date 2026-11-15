@@ -469,6 +469,8 @@ export type SparklesResult = {
   };
   /** From the `Sparkles-Inferences` header: the result used outdated inferences. */
   inferences?: InferencesNotice;
+  /** From the `Sparkles-Reasoning` header: what query-time reasoning derived. */
+  derivation?: Derivation;
   /** From the `Sparkles-At` headers: the state a query with `at` read. */
   at?: AtInfo;
 };
@@ -1200,7 +1202,14 @@ export type QueryOptions = {
    */
   execution?: 'eager' | 'auto' | 'streaming';
   timeout?: number;
-  reasoning?: boolean;
+  /**
+   * `reasoning=`: `false` reads the asserted data, `true` or `materialized` the
+   * materialized inferences, and `demand` or `auto` derive at query time (spec F17).
+   * Absent, the dataset's query-time default applies.
+   */
+  reasoning?: Reasoning;
+  /** `reasoningProfile=` of a `demand` or `auto` query; absent, the dataset's profile. */
+  reasoningProfile?: QueryTimeProfile;
   /** Bypass the server's result cache. */
   nocache?: boolean;
   /** Read a past state: `head`, `42`, `commit:42`, `time:<RFC 3339>`, `snapshot:NAME`. */
@@ -1216,8 +1225,38 @@ function queryParams(opts: QueryOptions): string {
   if (opts.execution) p.set('execution', opts.execution);
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  if (opts.reasoningProfile && (opts.reasoning === 'demand' || opts.reasoning === 'auto'))
+    p.set('reasoningProfile', opts.reasoningProfile);
   const s = p.toString();
   return s ? `?${s}` : '';
+}
+
+/** The modes of query-time reasoning that `reasoning=` names besides `true` and `false`. */
+export type ReasoningMode = 'materialized' | 'demand' | 'auto';
+/** A `reasoning=` value. */
+export type Reasoning = boolean | ReasoningMode;
+/** The profiles a `demand` or `auto` query can name with `reasoningProfile=`. */
+export type QueryTimeProfile = 'rdfs' | 'rdfs-simple' | 'owl-rl';
+
+/** What query-time reasoning derived, from the `Sparkles-Reasoning` header (spec F17 §2.3). */
+export type Derivation = {
+  mode: 'demand' | 'auto';
+  derived: number;
+  tables: number;
+  cached: number;
+};
+
+/** Reads `Sparkles-Reasoning: demand; derived=48211; tables=3; cached=2`. */
+export function parseReasoningHeader(v: string | null): Derivation | undefined {
+  if (!v) return undefined;
+  const [mode, ...params] = v.split(';').map((p) => p.trim());
+  if (mode !== 'demand' && mode !== 'auto') return undefined;
+  const num = (k: string) => {
+    const p = params.find((x) => x.startsWith(`${k}=`));
+    const n = p ? Number(p.slice(k.length + 1)) : NaN;
+    return Number.isFinite(n) ? n : 0;
+  };
+  return { mode, derived: num('derived'), tables: num('tables'), cached: num('cached') };
 }
 
 /** Run a query and get the rich UI result format (rows + timing + plan). */
@@ -1246,6 +1285,8 @@ export async function query(
   ) as SparklesResult;
   const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
   if (inferences) body.inferences = inferences;
+  const derivation = parseReasoningHeader(res.headers.get('Sparkles-Reasoning'));
+  if (derivation) body.derivation = derivation;
   const at = atInfo(res.headers);
   if (at) body.at = at;
   return normalizeResult(body);
@@ -1316,9 +1357,13 @@ export async function update(
 export function explain(
   ds: string,
   sparql: string,
-  opts: { reasoning?: boolean; signal?: AbortSignal } = {},
+  opts: { reasoning?: Reasoning; reasoningProfile?: QueryTimeProfile; signal?: AbortSignal } = {},
 ): Promise<ExplainResult> {
-  return json<ExplainResult>(`/${enc(ds)}/explain${queryParams({ reasoning: opts.reasoning })}`, {
+  const params = queryParams({
+    reasoning: opts.reasoning,
+    reasoningProfile: opts.reasoningProfile,
+  });
+  return json<ExplainResult>(`/${enc(ds)}/explain${params}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ query: sparql }).toString(),
@@ -3696,6 +3741,8 @@ export async function runStoredQuery(
   const body = (await res.json()) as SparklesResult;
   const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
   if (inferences) body.inferences = inferences;
+  const derivation = parseReasoningHeader(res.headers.get('Sparkles-Reasoning'));
+  if (derivation) body.derivation = derivation;
   const at = atInfo(res.headers);
   if (at) body.at = at;
   return normalizeResult(body);

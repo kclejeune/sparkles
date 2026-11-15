@@ -119,6 +119,33 @@ describe('query', () => {
     expect(r.meta.totalRows).toBe(0);
   });
 
+  it('sends a query-time mode with its profile and reads what it derived', async () => {
+    const calls = stubFetch(() => {
+      const r = jsonResponse({ queryType: 'SELECT', vars: ['x'], rows: [] });
+      r.headers.set('Sparkles-Reasoning', 'demand; derived=48211; tables=3; cached=2');
+      return r;
+    });
+    const r = await api.query('ds', 'SELECT ?x {}', {
+      reasoning: 'demand',
+      reasoningProfile: 'owl-rl',
+    });
+    expect(calls[0].url).toBe(
+      '/ds/sparql?execution=eager&reasoning=demand&reasoningProfile=owl-rl',
+    );
+    expect(r.derivation).toEqual({ mode: 'demand', derived: 48211, tables: 3, cached: 2 });
+    // a profile goes only with demand and auto
+    await api.query('ds', 'SELECT ?x {}', { reasoning: 'materialized', reasoningProfile: 'rdfs' });
+    expect(calls[1].url).toBe('/ds/sparql?execution=eager&reasoning=materialized');
+    expect(api.parseReasoningHeader('auto; derived=0; tables=1; cached=1')).toEqual({
+      mode: 'auto',
+      derived: 0,
+      tables: 1,
+      cached: 1,
+    });
+    expect(api.parseReasoningHeader('materialized')).toBeUndefined();
+    expect(api.parseReasoningHeader(null)).toBeUndefined();
+  });
+
   it('downloads leave the execution mode to the server', async () => {
     const calls = stubFetch(() => new Response('s\n<urn:a>\n'));
     await api.queryRaw('ds', 'SELECT ?s {}', 'text/tab-separated-values');

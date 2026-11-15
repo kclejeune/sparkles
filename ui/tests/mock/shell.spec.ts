@@ -144,7 +144,7 @@ test.describe('at 1440 pixels', () => {
     const options = page.getByRole('button', { name: /^Options\b/ });
     await expect(options).not.toContainText('no inferences');
     await options.click();
-    await page.getByRole('checkbox', { name: 'Use inferences' }).uncheck();
+    await page.getByRole('combobox', { name: 'Reasoning', exact: true }).selectOption('false');
     await page.keyboard.press('Escape');
     await expect(options).toContainText('no inferences');
   });
