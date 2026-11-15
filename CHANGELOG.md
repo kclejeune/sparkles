@@ -7,8 +7,8 @@
 `@hybrid jena .` in a rule text compiles a forward rule's nested backward rule
 `B1 -> [H <- B2]` into the query-time rule `H <- B1, B2` and leaves it out of the
 materialization, as Jena's hybrid engine runs it on demand, which completes roadmap item
-19's Phase 2. A rule with a functor term or a builtin that has a side effect or makes
-terms is refused. The Fuseki converter writes the directive for a GenericRuleReasoner in
+19's Phase 2. A rule that the split cannot state as Jena runs it is refused, such as one
+with a functor term, a builtin that has a side effect or makes terms, or `noValue`. The Fuseki converter writes the directive for a GenericRuleReasoner in
 the hybrid mode. On a rules file checked against Apache Jena 6.2.0, the materialization
 equals Jena's forward deductions and the query-time answers equal Jena's.
 

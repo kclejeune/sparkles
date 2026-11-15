@@ -140,3 +140,37 @@ fn a_split_that_a_query_time_rule_cannot_state_is_refused() {
         .unwrap_err();
     assert!(e.message.contains("@hybrid"), "{e}");
 }
+
+#[test]
+fn rules_the_split_would_evaluate_unlike_jena_are_refused() {
+    for (rule, why) in [
+        (
+            "[r: (<urn:a> <urn:t> <urn:b>) -> [(<urn:a> <urn:q> <urn:b>) <- noValue(<urn:a>, <urn:p>, <urn:b>)]]",
+            "noValue",
+        ),
+        (
+            "[o: (?a <urn:p> ?b) -> [m: (?a <urn:r> ?b) -> [(?a <urn:q> ?b) <- (?a <urn:s> ?b)]]]",
+            "nested inside a nested forward rule",
+        ),
+        (
+            "[r: (<urn:a> <urn:t> <urn:b>) -> [(?x <urn:q> <urn:b>) <- (<urn:a> <urn:s> <urn:b>)]]",
+            "?x",
+        ),
+        (
+            "[r: (?a <urn:p> ?b) -> [(?a <urn:q> ?t) <- makeInstance(?a, <urn:c>, ?t)]]",
+            "makeInstance",
+        ),
+        (
+            "[r: (?a <urn:p> ?b) -> drop(0), [(?a <urn:q> ?b) <- (?b <urn:r> ?a)]]",
+            "drop",
+        ),
+    ] {
+        let e = Profile::Rules(format!("@hybrid jena .\n{rule}"))
+            .rules()
+            .unwrap_err();
+        assert!(
+            e.message.contains("@hybrid jena") && e.message.contains(why),
+            "{e}"
+        );
+    }
+}

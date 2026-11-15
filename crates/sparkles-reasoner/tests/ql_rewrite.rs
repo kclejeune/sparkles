@@ -482,3 +482,29 @@ fn stored_and_rewritten_answers_give_the_rows_of_the_closure() {
         ]
     );
 }
+
+/// A row left to an unnamed individual is dropped when a branch that names more of the
+/// pattern's variables extends it, whether or not they share a variable.
+#[test]
+fn an_existential_row_gives_way_to_any_row_that_names_more() {
+    let ttl = format!("{A8} ex:ann ex:teaches ex:c1 , ex:c2 .");
+    let got = rows(&run(
+        &store(&ttl),
+        "SELECT (1 AS ?n) { ex:ann ex:teaches ?c }",
+        &ql(None),
+    ));
+    assert_eq!(got.len(), 2, "{got:?}");
+    let ttl = "ex:A a owl:Class . ex:B a owl:Class .
+               ex:p a owl:ObjectProperty . ex:q a owl:ObjectProperty .
+               ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ;
+                   owl:someValuesFrom owl:Thing ] .
+               ex:B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:q ;
+                   owl:someValuesFrom owl:Thing ] .
+               ex:a a ex:A , ex:B ; ex:p ex:b , ex:c .";
+    let got = rows(&run(
+        &store(ttl),
+        "SELECT ?s { ?s ex:p ?o . ?s ex:q ?v }",
+        &ql(None),
+    ));
+    assert_eq!(got, vec![format!("<{EX}a>"), format!("<{EX}a>")]);
+}

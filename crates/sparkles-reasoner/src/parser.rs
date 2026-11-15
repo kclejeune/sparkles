@@ -993,8 +993,9 @@ pub fn parse_rules(text: &str) -> Result<Vec<Rule>, RuleParseError> {
 /// top-level backward rule `H <- B1, B2`, which only query-time reasoning runs. The
 /// answers are those of Jena's hybrid engine, which adds `H <- B2` for each match of `B1`,
 /// without keeping the instantiated rules. A rule whose split cannot be stated this way is
-/// refused: a functor term, a builtin with a side effect or one that makes terms, or a
-/// backward rule nested deeper than a forward rule's head.
+/// refused: a functor term, a builtin with a side effect, one that makes terms or
+/// `noValue`, whose answer Jena's backward engine reads differently, a head variable that
+/// no body clause binds, or a backward rule nested deeper than a forward rule's head.
 fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
     fn refuse(r: &Rule, why: &str) -> RuleParseError {
         err(
@@ -1015,21 +1016,72 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
             Clause::Rule(r) => functor(&r.body) || functor(&r.head),
         })
     }
+    /// A builtin that has a side effect, makes terms, or reads the facts in a way that a
+    /// query-time fixpoint evaluates differently from Jena's backward engine.
     fn effect(clauses: &[Clause]) -> Option<String> {
         clauses.iter().find_map(|c| match c {
             Clause::Builtin(b)
                 if matches!(
                     b.name.as_str(),
-                    "print" | "drop" | "remove" | "hide" | "makeTemp" | "makeSkolem" | "now"
+                    "print"
+                        | "drop"
+                        | "remove"
+                        | "hide"
+                        | "makeTemp"
+                        | "makeSkolem"
+                        | "makeInstance"
+                        | "now"
+                        | "noValue"
                 ) =>
             {
                 Some(b.name.clone())
             }
+            Clause::Rule(r) => effect(&r.body).or_else(|| effect(&r.head)),
             _ => None,
         })
     }
+    /// Whether a backward rule is nested below a nested forward rule.
+    fn deep_backward(head: &[Clause]) -> bool {
+        head.iter().any(|c| match c {
+            Clause::Rule(i) if i.direction == Direction::Forward => {
+                i.head
+                    .iter()
+                    .any(|c| matches!(c, Clause::Rule(j) if j.direction == Direction::Backward))
+                    || deep_backward(&i.head)
+            }
+            _ => false,
+        })
+    }
+    fn vars(clauses: &[Clause], out: &mut std::collections::HashSet<String>) {
+        fn node(n: &Node, out: &mut std::collections::HashSet<String>) {
+            match n {
+                Node::Var(v) => {
+                    out.insert(v.clone());
+                }
+                Node::Functor(_, args) => args.iter().for_each(|a| node(a, out)),
+                _ => {}
+            }
+        }
+        for c in clauses {
+            match c {
+                Clause::Triple(t) => {
+                    [&t.subject, &t.predicate, &t.object]
+                        .into_iter()
+                        .for_each(|n| node(n, out));
+                }
+                Clause::Builtin(b) => b.args.iter().for_each(|n| node(n, out)),
+                Clause::Rule(_) => {}
+            }
+        }
+    }
     let mut out = Vec::with_capacity(rules.len());
     for r in rules {
+        if r.direction == Direction::Forward && deep_backward(&r.head) {
+            return Err(refuse(
+                &r,
+                "a backward rule is nested inside a nested forward rule",
+            ));
+        }
         let nested_backward = r
             .head
             .iter()
@@ -1037,6 +1089,13 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
         if r.direction != Direction::Forward || !nested_backward {
             out.push(r);
             continue;
+        }
+        // the whole rule is checked, the forward head it keeps as well as the split
+        if functor(&r.body) || functor(&r.head) {
+            return Err(refuse(&r, "it holds a functor term"));
+        }
+        if let Some(b) = effect(&r.body).or_else(|| effect(&r.head)) {
+            return Err(refuse(&r, &format!("it calls {b}")));
         }
         let outer: Vec<Clause> = r
             .body
@@ -1057,17 +1116,25 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
                     {
                         return Err(refuse(&r, "its backward rule holds a nested rule"));
                     }
-                    if functor(&outer) || functor(&inner.body) || functor(&inner.head) {
-                        return Err(refuse(&r, "it holds a functor term"));
-                    }
-                    if let Some(b) = effect(&outer).or_else(|| effect(&inner.body)) {
-                        return Err(refuse(&r, &format!("it calls {b}")));
-                    }
                     if inner.head.iter().any(|c| !matches!(c, Clause::Triple(_))) {
                         return Err(refuse(&r, "its backward rule's head is not a triple"));
                     }
                     let mut body = outer.clone();
                     body.extend(inner.body.iter().cloned());
+                    // a head variable that no body clause names would need Jena's goal
+                    // binding, which a bottom-up rule does not have
+                    let mut bound = std::collections::HashSet::new();
+                    let mut head_vars = std::collections::HashSet::new();
+                    vars(&body, &mut bound);
+                    vars(&inner.head, &mut head_vars);
+                    if let Some(v) = head_vars.iter().find(|v| !bound.contains(*v)) {
+                        return Err(refuse(
+                            &r,
+                            &format!(
+                                "its backward rule's head names ?{v}, which no body clause binds"
+                            ),
+                        ));
+                    }
                     made.push(Rule {
                         name: Some(
                             inner

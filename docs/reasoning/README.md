@@ -149,8 +149,9 @@ request or on every write, and the schema report counts what the data holds.
   materialization flattens such a rule into `B1, B2 -> H`. With `@hybrid jena .` in the
   rule text, the materialization keeps the forward head and the nested rule becomes the
   query-time rule `H <- B1, B2`, which `demand` and `auto` derive when a query asks. A
-  rule with a functor term or a builtin that has a side effect or makes terms cannot be
-  split this way and is refused with an error that names it
+  rule with a functor term, a builtin that has a side effect or makes terms, `noValue`,
+  a backward head variable that no body clause binds or a more deeply nested backward
+  rule cannot be split this way and is refused with an error that names it
   ([F17 §5.2](../specs/F17-query-time-reasoning.md#52-hybrid-rules)).
 * Embedded query providers implement `ReasoningSession::intensional` with a
   `Result<bool>` return. Constant interning can refuse a memory reservation, and

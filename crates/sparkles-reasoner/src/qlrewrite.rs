@@ -1227,10 +1227,11 @@ impl Rewriter<'_> {
             })
             .collect();
         let n = branches.len();
-        // a branch that gives every variable a value answers as the stored and derived
-        // facts would, and one that leaves a variable to an unnamed individual answers
-        // only where no such branch gives the same values with that variable named
-        let (mut full, mut partial): (Option<GraphPattern>, Option<GraphPattern>) = (None, None);
+        // the branches grouped by the variables they give a value: a branch that gives
+        // every variable one answers as the stored and derived facts would, and one that
+        // leaves some to unnamed individuals answers only where no branch that names more
+        // of them gives the same values to the ones it names
+        let mut groups: Vec<(Vec<u32>, GraphPattern)> = Vec::new();
         for q in &branches {
             let tp = |t: T, rw: &mut Self| -> TermPattern {
                 match t {
@@ -1275,31 +1276,44 @@ impl Rewriter<'_> {
                     expression,
                 };
             }
-            let slot = if q.bound_vars().len() == bgp.vars.len() {
-                &mut full
-            } else {
-                &mut partial
-            };
-            *slot = Some(match slot.take() {
-                None => branch,
-                Some(u) => GraphPattern::Union {
-                    left: Box::new(u),
-                    right: Box::new(branch),
+            let mut set: Vec<u32> = q.bound_vars().into_iter().collect();
+            set.sort_unstable();
+            match groups.iter_mut().find(|(s, _)| *s == set) {
+                Some((_, u)) => {
+                    let left = std::mem::replace(u, GraphPattern::Bgp { patterns: vec![] });
+                    *u = GraphPattern::Union {
+                        left: Box::new(left),
+                        right: Box::new(branch),
+                    };
+                }
+                None => groups.push((set, branch)),
+            }
+        }
+        let union_of = |ps: Vec<GraphPattern>| {
+            ps.into_iter().reduce(|l, r| GraphPattern::Union {
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        };
+        let mut parts = Vec::with_capacity(groups.len());
+        for (set, gp) in &groups {
+            // the groups that name every variable of this one and more
+            let wider: Vec<GraphPattern> = groups
+                .iter()
+                .filter(|(s, _)| s.len() > set.len() && set.iter().all(|v| s.contains(v)))
+                .map(|(_, g)| g.clone())
+                .collect();
+            parts.push(match union_of(wider) {
+                None => gp.clone(),
+                // NOT EXISTS reads the wider groups with this row's values, so a row that
+                // names nothing is dropped whenever a wider group has any row
+                Some(w) => GraphPattern::Filter {
+                    expr: Expression::Not(Box::new(Expression::Exists(Box::new(w)))),
+                    inner: Box::new(gp.clone()),
                 },
             });
         }
-        let union = match (full, partial) {
-            (Some(f), None) => f,
-            (None, Some(p)) => p,
-            (Some(f), Some(p)) => GraphPattern::Union {
-                left: Box::new(f.clone()),
-                right: Box::new(GraphPattern::Minus {
-                    left: Box::new(p),
-                    right: Box::new(f),
-                }),
-            },
-            (None, None) => unreachable!("the rewriting keeps the query it starts from"),
-        };
+        let union = union_of(parts).expect("the rewriting keeps the query it starts from");
         // each solution of the pattern's variables and blank nodes once, as matching the
         // stored and derived facts gives it, with the blank nodes then left out
         let mut gp = GraphPattern::Distinct {

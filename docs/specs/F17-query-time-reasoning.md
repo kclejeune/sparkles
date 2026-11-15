@@ -304,7 +304,10 @@ default as `B1, B2 -> H` (`engine::flatten`). With query-time reasoning, the rul
   no on-disk format changes. A rule this compilation cannot state is refused with an error
   that names it: one with a functor term, one that calls a builtin with a side effect or
   one that makes terms (`print`, `drop`, `remove`, `hide`, `makeTemp`, `makeSkolem`,
-  `now`), and one whose nested backward rule holds a rule of its own.
+  `makeInstance`, `now`), one that calls `noValue`, which Jena's backward engine reads
+  against different facts than a query-time fixpoint, one whose backward head names a
+  variable that no body clause binds, and one whose backward rule is nested more deeply
+  than a forward rule's head or holds a rule of its own.
 
 The option is the rule text's `@hybrid jena .` or `@hybrid materialize .` directive, so it
 travels with the text through the materialization's rules digest, the query-time setting
@@ -1426,9 +1429,11 @@ the `owl-ql` profile of the query-time setting and of `reasoningProfile`.
 3. A rewritten pattern keeps SPARQL's bag semantics, as §7 now says. Every branch keeps
    the names of the pattern's variables, and the union is `DISTINCT` over all of them and
    its blank nodes, which gives each solution once as matching the stored and derived
-   facts gives it. A branch that leaves a variable to an unnamed individual is subtracted
-   with `MINUS` from the branches that bind every variable, so it adds a row only where no
-   stored fact names that variable. A pattern that no inclusion changes keeps its form.
+   facts gives it. The branches are grouped by the variables they give a value, and a
+   group that leaves some to unnamed individuals keeps a row only where `NOT EXISTS`
+   finds no row of a group that names more of them with the same values, so it adds a row
+   only where no stored fact names those variables. A pattern that no inclusion changes
+   keeps its form.
    `lubm_answers_match_an_owl_2_rl_closure_of_the_ql_fragment` compares the rows of the 14
    LUBM queries, with their counts, against the closure, and
    `a_variable_bound_by_stored_facts_keeps_the_rows_of_plain_sparql` and
@@ -1482,9 +1487,9 @@ top-level backward rule `H <- B1, B2`. The materializer skips backward rules, an
 query-time reasoning, `auto`'s choice of the materialization and the check that mixes the
 two treat it as any backward rule. The directive lives in the rule text, so the rules
 digest of a materialization, the query-time setting and the Fuseki converter carry it
-without a new field or format. A rule with a functor term, a builtin with a side effect
-or one that makes terms, or a nested rule inside the backward rule is refused at parse
-time with an error that names the rule.
+without a new field or format. The rules that §5.2 lists are refused at parse time with
+an error that names the rule, and the whole rule is checked, the forward head it keeps as
+well as the split. `rules_the_split_would_evaluate_unlike_jena_are_refused` covers each.
 
 **Acceptance.** `tests/hybrid_rules.rs` runs `tests/hybrid/hybrid.rules` over
 `tests/hybrid/data.nt`. The materialization equals the forward deductions of Apache Jena
