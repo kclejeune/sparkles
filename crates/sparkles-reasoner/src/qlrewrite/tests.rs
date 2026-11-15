@@ -230,3 +230,36 @@ fn an_abandoned_rewriting_releases_its_memory() {
         .unwrap();
     assert_eq!(r.derive.len(), 20);
 }
+
+/// A copy of a branch is charged with the names of the variables its bindings give a
+/// value, which unification can leave in no triple pattern.
+#[test]
+fn a_copy_is_charged_with_the_names_it_binds() {
+    let t = tbox(&format!(
+        "@prefix ex: <{EX}> . @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+         ex:A a owl:Class . ex:p a owl:ObjectProperty . \
+         ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ; \
+         owl:someValuesFrom owl:Thing ] ."
+    ));
+    let long = "v".repeat(64 * 1024);
+    let q = parse(&format!(
+        "PREFIX ex: <{EX}> ASK {{ ?{long} ex:p ?o . ex:a ex:p ?o }}"
+    ));
+    // the reduced branch binds the long name and holds it in no pattern
+    let mut rw_bytes = 0;
+    let r = rewrite_query(&q, &[], &t, 1024, Some(u64::MAX), &|| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert!(!r.nodes.is_empty());
+    let b = Rendered {
+        patterns: vec![],
+        binds: vec![(
+            0,
+            Expression::NamedNode(NamedNode::new_unchecked(format!("{EX}a"))),
+        )],
+        bind_names: long.len(),
+    };
+    rw_bytes += b.bytes();
+    assert!(rw_bytes >= long.len(), "{rw_bytes}");
+}

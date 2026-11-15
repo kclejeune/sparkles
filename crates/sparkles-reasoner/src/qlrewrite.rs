@@ -1021,6 +1021,8 @@ fn reserved(iri: &str) -> bool {
 struct Rendered {
     patterns: Vec<TriplePattern>,
     binds: Vec<(u32, Expression)>,
+    /// the bytes of the names of the variables the bindings give a value
+    bind_names: usize,
 }
 
 impl Rendered {
@@ -1058,7 +1060,7 @@ impl Rendered {
             })
             .sum();
         let binds: usize = self.binds.iter().map(|(_, e)| expr(e) + 128).sum();
-        patterns + binds + 64
+        patterns + binds + self.bind_names + 64
     }
 }
 
@@ -1320,7 +1322,15 @@ impl Rewriter<'_> {
             }
             let mut set: Vec<u32> = q.bound_vars().into_iter().collect();
             set.sort_unstable();
-            let b = Rendered { patterns, binds };
+            let bind_names = binds
+                .iter()
+                .map(|(v, _)| names[*v as usize].as_str().len())
+                .sum();
+            let b = Rendered {
+                patterns,
+                binds,
+                bind_names,
+            };
             match groups.iter_mut().find(|(s, _)| *s == set) {
                 Some((_, g)) => g.push(b),
                 None => groups.push((set, vec![b])),
