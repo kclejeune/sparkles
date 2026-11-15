@@ -94,6 +94,14 @@ pub struct ServeArgs {
     /// Do not offer this MCP tool (repeatable)
     #[arg(long, value_name = "NAME")]
     pub mcp_disable_tool: Vec<String>,
+    /// Offer only the MCP tools of this profile: all (the default), explore, memory or
+    /// admin (repeatable; with --mcp-tools, the tools of both)
+    #[arg(long, value_name = "NAME")]
+    pub mcp_profile: Vec<String>,
+    /// Offer only these MCP tools, separated by commas (repeatable; with
+    /// --mcp-profile, the tools of both)
+    #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
+    pub mcp_tools: Vec<String>,
     /// MCP sessions of clients that use the `initialize` handshake, at once (0: no
     /// sessions; such clients are served without one)
     #[arg(long, value_name = "N", default_value_t = 256)]
@@ -144,6 +152,11 @@ impl ServeArgs {
                 );
             }
         }
+        let only = super::profiles::select(
+            &self.mcp_profile,
+            &self.mcp_tools,
+            ("--mcp-profile", "--mcp-tools"),
+        )?;
         for d in &self.mcp_dataset {
             if d.is_empty()
                 || !d
@@ -190,6 +203,8 @@ impl ServeArgs {
                     .iter()
                     .cloned()
                     .collect::<BTreeSet<_>>(),
+                profiles: self.mcp_profile.clone(),
+                only,
                 datasets: self.mcp_dataset.clone(),
                 stored_queries: !self.mcp_no_stored_queries,
                 task_after: std::time::Duration::from_millis(self.mcp_task_after_ms),

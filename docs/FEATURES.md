@@ -126,6 +126,9 @@ Connect agents through [MCP](ai/README.md#mcp-server), turn
 [cited memory](ai/README.md#agent-memory). Review
 [document ingestion](ai/README.md#document-ingestion) and build
 [GraphRAG community reports](ai/README.md#community-reports-graphrag).
+MCP [tool profiles](ai/README.md#mcp-server) load only the explore, memory or admin
+tools a session needs, and `search_semantic` embeds a question with the dataset's
+embedding provider and fuses the nearest entities with full-text search.
 MCP entity linking exposes bounded, versioned candidate evidence and can order label
 matches by use. Ask uses it for full choice identities and conservative ordering while
 retaining required clarification. Ask also grounds each question with the predicates

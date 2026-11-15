@@ -1010,7 +1010,7 @@ impl Tools<'_> {
 
     /// The predicate of the first vector index, by name, whose provider embeds query
     /// text.
-    pub(super) fn first_embedding(&self, ds: &crate::state::Dataset) -> Option<NamedNode> {
+    pub(crate) fn first_embedding(&self, ds: &crate::state::Dataset) -> Option<NamedNode> {
         let mut list = ds.dataset.indexes().vector().list();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         list.into_iter()

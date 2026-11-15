@@ -408,6 +408,84 @@ async fn endpoint_needs_the_flag() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
+/// `--mcp-profile` and `--mcp-tools` narrow the tools, the initialize result names the
+/// active set, a profile does not lift the write switch, and unknown names are refused
+/// with the valid ones (item 489).
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_profiles_narrow_the_tools() {
+    let s = open(
+        &["--mcp-profile", "explore", "--mcp-tools", "recall"],
+        false,
+    );
+    let names = tool_names(&s.app, &[]).await;
+    for t in ["sparql_query", "find_paths", "recall", "search_semantic"] {
+        assert!(names.contains(&t.to_string()), "{t}: {names:?}");
+    }
+    for t in [
+        "link_entities",
+        "assert_facts",
+        "sparql_update",
+        "list_branches",
+    ] {
+        assert!(!names.contains(&t.to_string()), "{t}: {names:?}");
+    }
+    let (_, init) = initialize(&s.app, &[]).await;
+    let set = &init.rpc()["result"]["capabilities"]["experimental"]["io.sparkles/toolSet"];
+    assert_eq!(set["profiles"], json!(["explore"]), "{set}");
+    // the server's set, of which the caller's listing leaves out graphql_query here
+    let offered: Vec<&str> = set["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert!(names.iter().all(|n| offered.contains(&n.as_str())), "{set}");
+    assert!(!offered.contains(&"link_entities"), "{set}");
+    // a tool outside the set is unknown
+    let r = modern(
+        &s.app,
+        "tools/call",
+        json!({"name": "link_entities", "arguments": {"mentions": [{"text": "Alice"}]}}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.rpc()["error"]["code"], -32602, "{}", r.body);
+    // the admin profile names sparql_update, which still needs --mcp-allow-update
+    let s = open(&["--mcp-profile", "admin"], false);
+    let names = tool_names(&s.app, &[]).await;
+    assert!(names.contains(&"list_branches".to_string()), "{names:?}");
+    assert!(!names.contains(&"sparql_update".to_string()), "{names:?}");
+    assert!(!names.contains(&"recall".to_string()), "{names:?}");
+    // the default reports every tool under `all`
+    let s = open(&[], false);
+    let (_, init) = initialize(&s.app, &[]).await;
+    let set = &init.rpc()["result"]["capabilities"]["experimental"]["io.sparkles/toolSet"];
+    assert_eq!(set["profiles"], json!(["all"]), "{set}");
+    let offered = set["tools"].as_array().unwrap();
+    for n in tool_names(&s.app, &[]).await {
+        assert!(offered.contains(&json!(n)), "{n}: {set}");
+    }
+    // unknown names
+    let dir = tempfile::tempdir().unwrap();
+    let st = AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    let refuse = |flags: &[&str]| {
+        let args = ["serve", "--mcp"].into_iter().chain(flags.iter().copied());
+        match Flags::parse_from(args).mcp.conf(&st) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("{flags:?} accepted"),
+        }
+    };
+    assert_eq!(
+        refuse(&["--mcp-profile", "nope"]),
+        "--mcp-profile: unknown profile 'nope' (profiles: all, explore, memory, admin)"
+    );
+    let e = refuse(&["--mcp-tools", "recall,nope"]);
+    assert!(
+        e.starts_with("--mcp-tools: unknown tool 'nope' (tools: list_datasets, "),
+        "{e}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_sessions() {
     let s = open(&[], false);
@@ -417,8 +495,15 @@ async fn legacy_sessions() {
     assert!(r.content_type().starts_with("text/event-stream"));
     let init = r.rpc();
     assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    let mut caps = init["result"]["capabilities"].clone();
+    let set = caps
+        .as_object_mut()
+        .unwrap()
+        .remove("experimental")
+        .unwrap();
+    assert_eq!(set["io.sparkles/toolSet"]["profiles"], json!(["all"]));
     assert_eq!(
-        init["result"]["capabilities"],
+        caps,
         json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true}, "tools": {"listChanged": true}})
     );
     let r = legacy(

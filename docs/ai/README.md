@@ -21,6 +21,13 @@ build community reports.
   describe resources, find paths, list commits and changes, run full-text and vector
   search, validate with SHACL and ShEx, draft shapes, compare schemas, format SPARQL and
   RDF, run graph algorithms, and run GraphQL. Each stored query is a tool of its own.
+* `search_semantic` embeds a question with the provider of the dataset's vector index,
+  a local model or a remote endpoint, and fuses the nearest entities with the full-text
+  ranking. It refuses with `no-embedder` when no index embeds query text.
+* Tool profiles let a session load only the tools it needs. `--profile` or
+  `--mcp-profile` selects `explore`, `memory` or `admin`, and `--tools` or `--mcp-tools`
+  names single tools ([API.md](../API.md#tool-profiles)). A profile only narrows the
+  tools, and the `initialize` result reports the active set.
 * `check_query` checks a query against the schema without running it,
   `similar_queries` finds stored queries for a question, `link_entities` maps names to
   entities, and `recall` returns the facts around a question with a citation for each.

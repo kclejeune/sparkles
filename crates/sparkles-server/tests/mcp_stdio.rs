@@ -278,3 +278,90 @@ fn stdio_deletes_idle_scratch_branches_of_a_dataset_setting() {
     assert_eq!(kept(None, &["--allow-update"]), ["main", "old"]);
     assert_eq!(kept(Some("off"), &["--allow-update"]), ["main", "old"]);
 }
+
+/// `sparkles mcp --profile` and `--tools` narrow the tools and the initialize result
+/// names the active set, and an unknown profile or tool stops the command with the
+/// valid names (item 489).
+#[test]
+fn stdio_tool_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("fixture.ttl");
+    std::fs::write(&data, FIXTURE).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+        .args([
+            "mcp",
+            "--name",
+            "t",
+            "--profile",
+            "memory",
+            "--tools",
+            "find_paths,list_commits",
+            "--data",
+        ])
+        .arg(&data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for msg in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "e2e", "version": "1"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ] {
+        writeln!(stdin, "{msg}").unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let lines: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let set = &lines[0]["result"]["capabilities"]["experimental"]["io.sparkles/toolSet"];
+    assert_eq!(set["profiles"], json!(["memory"]), "{set}");
+    let listed: Vec<&str> = lines[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    let offered = set["tools"].as_array().unwrap();
+    for t in &listed {
+        assert!(offered.contains(&json!(t)), "{t}: {set}");
+    }
+    assert!(!offered.contains(&json!("graph_algorithm")), "{set}");
+    for t in ["recall", "link_entities", "find_paths", "list_commits"] {
+        assert!(listed.contains(&t), "{t}: {listed:?}");
+    }
+    // without --allow-update the write tools of the profile stay out
+    for t in ["explain_query", "graph_algorithm", "assert_facts"] {
+        assert!(!listed.contains(&t), "{t}: {listed:?}");
+    }
+
+    let refused = |flags: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+            .args(["mcp", "--data"])
+            .arg(&data)
+            .args(flags)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{flags:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let e = refused(&["--profile", "nope"]);
+    assert!(
+        e.contains("--profile: unknown profile 'nope' (profiles: all, explore, memory, admin)"),
+        "{e}"
+    );
+    let e = refused(&["--mcp-tools", "nope"]);
+    assert!(
+        e.contains("--tools: unknown tool 'nope' (tools: list_datasets, "),
+        "{e}"
+    );
+}

@@ -1,12 +1,12 @@
 # C33: Agent platform controls
 
-> **Status:** planned.
+> **Status:** implemented in part. The tool profiles phase is built.
 >
 > **Roadmap:** [item 462](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
 > are named in their phase.
 
-The design covers mCP tool profiles, shape templates, an approval queue for agent updates, data-change resources, composite tools, branch handoff, framework adapters, in-process memory APIs and A2A skills.
+The design covers MCP tool profiles, shape templates, an approval queue for agent updates, data-change resources, composite tools, branch handoff, framework adapters, in-process memory APIs and A2A skills.
 
 ## Problem and goal
 
@@ -33,7 +33,7 @@ and a hybrid search tool that embeds query text, item 490.
 
 ## Candidate phases
 
-**MCP tool profiles.** Add `--mcp-tools` and `--mcp-profile` subsets such as explore, memory and admin. About 34 tools from an 80 KB schema source cost tokens every session and confuse small models. Roadmap item 489 holds this phase.
+**MCP tool profiles.** Add `--mcp-tools` and `--mcp-profile` subsets such as explore, memory and admin. About 34 tools from an 80 KB schema source cost tokens every session and confuse small models. Roadmap item 489 built this phase, as the [Outcome](#outcome) describes.
 
 **Shape template tool.** Return a JSON schema and example for `assert_facts` from a class's SHACL shapes. Well-formed writes become the default instead of a refusal loop. It depends on item 21.
 
@@ -85,4 +85,25 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-Nothing is built. [Item 462](../../ROADMAP.md) tracks the work.
+### MCP tool profiles (item 489, 2026-11-15)
+
+The first phase is built. `sparkles mcp --profile NAME` and `--tools a,b`, and
+`serve --mcp-profile` and `--mcp-tools`, narrow the tools a session sees. `sparkles mcp`
+also accepts the `--mcp-` spellings.
+
+* The profiles are defined once, in `crates/sparkles-server/src/mcp/profiles.rs`. They are
+  `all`, the default, `explore` for discovery, querying and search, `memory` for the
+  agent-memory tools, and `admin` for updates, branches, validation and reviews. A unit
+  test fails when a tool of the build belongs to no profile.
+* Several profiles and tool names give the union of their tools. An unknown profile or
+  tool stops the command with the list of valid names.
+* A profile only narrows the set. The write switches, the read-only server,
+  `--disable-tool`, the caller's grants and each tool's own conditions still decide what a
+  caller sees, which meets the first acceptance gate. Stored-query tools follow
+  `--no-stored-queries` and are not part of a profile.
+* The `initialize` and `server/discover` results carry the experimental capability
+  `io.sparkles/toolSet` with the profiles and the tools the server offers.
+* Tests cover the stdio command, the HTTP endpoint's flags, the capability, a tool
+  outside the set and the refusals.
+
+The other phases are not built, and [item 462](../../ROADMAP.md) tracks them.

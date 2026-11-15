@@ -214,6 +214,33 @@ impl Adapter {
     }
 }
 
+/// The experimental capability that names the active tool profiles and the tools the
+/// server offers (item 489).
+pub const TOOL_SET: &str = "io.sparkles/toolSet";
+
+impl Adapter {
+    /// `{profiles, tools}`: the profiles of `--profile` (`["all"]` without one) and the
+    /// tools the server offers, in `tools/list` order. A caller's `tools/list` holds
+    /// those of them that its grants allow, and its stored queries.
+    fn tool_set(&self) -> JsonObject {
+        let cfg = self.server.cfg();
+        let profiles: Vec<&str> = if cfg.profiles.is_empty() {
+            if cfg.only.is_some() {
+                Vec::new()
+            } else {
+                vec![super::profiles::ALL]
+            }
+        } else {
+            cfg.profiles.iter().map(String::as_str).collect()
+        };
+        let tools: Vec<&str> = self.tools.iter().map(|t| t.name.as_ref()).collect();
+        let mut o = JsonObject::new();
+        o.insert("profiles".into(), serde_json::json!(profiles));
+        o.insert("tools".into(), serde_json::json!(tools));
+        o
+    }
+}
+
 /// The sentence the instructions gain when `assert_facts` is offered.
 pub const WRITE_INSTRUCTIONS: &str =
     "Before writing, call link_entities, then write with assert_facts and dryRun first.";
@@ -227,22 +254,26 @@ fn context_error(e: ContextError) -> McpError {
 
 impl ServerHandler for Adapter {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(
-            ServerCapabilities::builder()
-                .enable_completions()
-                .enable_prompts()
-                .enable_resources()
-                .enable_resources_list_changed()
-                .enable_resources_subscribe()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .enable_tasks()
-                .build(),
-        )
-        .with_server_info(implementation())
-        .with_instructions(self.instructions())
-        // the newest version with an `initialize` handshake
-        .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_completions()
+            .enable_prompts()
+            .enable_resources()
+            .enable_resources_list_changed()
+            .enable_resources_subscribe()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .enable_tasks()
+            .build();
+        capabilities.experimental = Some(
+            [(TOOL_SET.to_string(), self.tool_set())]
+                .into_iter()
+                .collect(),
+        );
+        ServerConfig::new(capabilities)
+            .with_server_info(implementation())
+            .with_instructions(self.instructions())
+            // the newest version with an `initialize` handshake
+            .with_protocol_version(ProtocolVersion::V_2025_11_25)
     }
 
     /// The legacy handshake: as rmcp's, without `resources.subscribe`, which only
