@@ -645,6 +645,34 @@ struct Cq {
     binds: Vec<(u32, T)>,
 }
 
+impl Cq {
+    /// The variables of the pattern that the query gives a value: those its atoms hold,
+    /// and those bound to a constant or to a variable its atoms hold.
+    fn bound_vars(&self) -> FxHashSet<u32> {
+        let mut out: FxHashSet<u32> = FxHashSet::default();
+        for a in &self.atoms {
+            for t in a.terms() {
+                if let T::Var(v) = t {
+                    out.insert(v);
+                }
+            }
+        }
+        let held = out.clone();
+        for &(v, t) in &self.binds {
+            match t {
+                T::Const(_) => {
+                    out.insert(v);
+                }
+                T::Var(w) if held.contains(&w) => {
+                    out.insert(v);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 /// The variables and constants of one basic graph pattern.
 struct Bgp<'a> {
     tbox: &'a Tbox,
@@ -656,15 +684,19 @@ struct Bgp<'a> {
 }
 
 impl Bgp<'_> {
-    fn distinguished(&self, t: T) -> bool {
-        matches!(t, T::Var(v) if self.vars[v as usize].1)
-    }
-
-    /// `_` for a non-distinguished variable that occurs once, atoms sorted and each once.
+    /// Atoms and bindings sorted and each once. A variable keeps its name, so a branch
+    /// gives the query's variables the values its stored facts bind them to.
     fn normalize(&self, mut q: Cq) -> Cq {
-        // a repeated atom counts once, so a variable it alone holds is free
         q.atoms.sort_unstable();
         q.atoms.dedup();
+        q.binds.sort_unstable();
+        q.binds.dedup();
+        q
+    }
+
+    /// The terms of `q` that an existential inclusion can stand for (`_` of PerfectRef):
+    /// an unnamed term, or a non-distinguished variable that one atom of `q` holds once.
+    fn unbound_terms(&self, q: &Cq) -> FxHashSet<T> {
         let mut count: FxHashMap<u32, u32> = FxHashMap::default();
         for a in &q.atoms {
             for t in a.terms() {
@@ -673,21 +705,18 @@ impl Bgp<'_> {
                 }
             }
         }
-        for a in &mut q.atoms {
-            *a = a.map(|t| match t {
-                T::Var(v) if !self.vars[v as usize].1 && count.get(&v) == Some(&1) => T::Free,
-                t => t,
-            });
-        }
-        q.atoms.sort_unstable();
-        q.atoms.dedup();
-        q.binds.sort_unstable();
-        q.binds.dedup();
-        q
+        let mut out: FxHashSet<T> = count
+            .into_iter()
+            .filter(|&(v, n)| n == 1 && !self.vars[v as usize].1)
+            .map(|(v, _)| T::Var(v))
+            .collect();
+        out.insert(T::Free);
+        out
     }
 
-    /// The atoms that imply `a` under one inclusion (`gr` of PerfectRef).
-    fn implied(&self, a: Atom, out: &mut Vec<Atom>) {
+    /// The atoms that imply `a` under one inclusion (`gr` of PerfectRef), where `unbound`
+    /// holds the terms of the query that an existential can stand for.
+    fn implied(&self, a: Atom, unbound: &FxHashSet<T>, out: &mut Vec<Atom>) {
         let t = self.tbox;
         let from_basic = |b: Basic, x: T, out: &mut Vec<Atom>| match b {
             Basic::Class(c) => out.push(Atom::C(c, x)),
@@ -708,13 +737,13 @@ impl Bgp<'_> {
                         Atom::R(r.p, s, o)
                     });
                 }
-                if o == T::Free {
+                if unbound.contains(&o) {
                     let e = Basic::Exists(Role { p, inv: false });
                     for &b in t.concepts.get(&e).into_iter().flatten() {
                         from_basic(b, s, out);
                     }
                 }
-                if s == T::Free {
+                if unbound.contains(&s) {
                     let e = Basic::Exists(Role { p, inv: true });
                     for &b in t.concepts.get(&e).into_iter().flatten() {
                         from_basic(b, o, out);
@@ -760,10 +789,9 @@ impl Bgp<'_> {
                         sub.insert(v, c);
                         continue;
                     }
+                    // every variable of the query keeps its value in the branch
                     sub.insert(v, c);
-                    if self.vars[v as usize].1 {
-                        binds.push((v, c));
-                    }
+                    binds.push((v, c));
                 }
                 (T::Var(v), T::Var(w)) => {
                     let (bv, bw) = (self.values.get(&v), self.values.get(&w));
@@ -785,9 +813,7 @@ impl Bgp<'_> {
                         (v, w)
                     };
                     sub.insert(from, T::Var(to));
-                    if self.vars[from as usize].1 {
-                        binds.push((from, T::Var(to)));
-                    }
+                    binds.push((from, T::Var(to)));
                 }
             }
         }
@@ -882,9 +908,10 @@ impl Bgp<'_> {
                 }
                 Ok(())
             };
+            let unbound = self.unbound_terms(&q);
             for i in 0..q.atoms.len() {
                 implied.clear();
-                self.implied(q.atoms[i], &mut implied);
+                self.implied(q.atoms[i], &unbound, &mut implied);
                 for &a in &implied {
                     attempt()?;
                     let mut atoms = q.atoms.clone();
@@ -910,7 +937,8 @@ impl Bgp<'_> {
             }
         }
         // a branch that names a property of the normalization matches no stored fact, and
-        // a branch whose atoms hold another's, with the same bindings, adds no answer
+        // a branch whose atoms hold another's, with the same bindings and the same
+        // variables, adds no answer
         order.retain(|q| {
             !q.atoms.iter().any(|a| match a {
                 Atom::C(..) => false,
@@ -921,11 +949,13 @@ impl Bgp<'_> {
             .iter()
             .map(|q| q.atoms.iter().copied().collect())
             .collect();
+        let vars: Vec<FxHashSet<u32>> = order.iter().map(|q| q.bound_vars()).collect();
         let keep: Vec<bool> = (0..order.len())
             .map(|i| {
                 !(0..order.len()).any(|j| {
                     j != i
                         && order[j].binds == order[i].binds
+                        && vars[j] == vars[i]
                         && sets[j].len() < sets[i].len()
                         && sets[j].is_subset(&sets[i])
                 })
@@ -1179,21 +1209,30 @@ impl Rewriter<'_> {
                 )
             }
         };
-        // the distinguished variables, in the order the pattern names them
-        let dvars: Vec<Variable> = bgp
+        // each variable of the pattern under its own name, and each blank node under a
+        // variable of its own, the same in every branch
+        let mut names: Vec<Variable> = Vec::with_capacity(bgp.vars.len());
+        for (x, _) in &bgp.vars {
+            names.push(match x {
+                TermPattern::Variable(v) => v.clone(),
+                _ => self.fresh_var(),
+            });
+        }
+        let visible: Vec<Variable> = bgp
             .vars
             .iter()
-            .filter(|(_, d)| *d)
             .filter_map(|(x, _)| match x {
                 TermPattern::Variable(v) => Some(v.clone()),
                 _ => None,
             })
             .collect();
         let n = branches.len();
-        let mut union: Option<GraphPattern> = None;
+        // a branch that gives every variable a value answers as the stored and derived
+        // facts would, and one that leaves a variable to an unnamed individual answers
+        // only where no such branch gives the same values with that variable named
+        let (mut full, mut partial): (Option<GraphPattern>, Option<GraphPattern>) = (None, None);
         for q in &branches {
-            let mut names: FxHashMap<u32, TermPattern> = FxHashMap::default();
-            let mut tp = |t: T, rw: &mut Self| -> TermPattern {
+            let tp = |t: T, rw: &mut Self| -> TermPattern {
                 match t {
                     T::Const(c) => match &bgp.consts[c as usize] {
                         Term::NamedNode(n) => TermPattern::NamedNode(n.clone()),
@@ -1201,15 +1240,7 @@ impl Rewriter<'_> {
                         other => unreachable!("a constant of a pattern: {other}"),
                     },
                     T::Free => TermPattern::Variable(rw.fresh_var()),
-                    T::Var(v) => {
-                        if bgp.distinguished(t) {
-                            return bgp.vars[v as usize].0.clone();
-                        }
-                        names
-                            .entry(v)
-                            .or_insert_with(|| TermPattern::Variable(rw.fresh_var()))
-                            .clone()
-                    }
+                    T::Var(v) => TermPattern::Variable(names[v as usize].clone()),
                 }
             };
             let mut patterns = Vec::with_capacity(q.atoms.len());
@@ -1229,28 +1260,27 @@ impl Rewriter<'_> {
             }
             let mut branch = GraphPattern::Bgp { patterns };
             for &(v, t) in &q.binds {
-                let TermPattern::Variable(var) = bgp.vars[v as usize].0.clone() else {
-                    continue;
-                };
                 let expression = match t {
                     T::Const(c) => match &bgp.consts[c as usize] {
                         Term::NamedNode(n) => Expression::NamedNode(n.clone()),
                         Term::Literal(l) => Expression::Literal(l.clone()),
                         other => unreachable!("a constant of a pattern: {other}"),
                     },
-                    T::Var(w) => match &bgp.vars[w as usize].0 {
-                        TermPattern::Variable(w) => Expression::Variable(w.clone()),
-                        _ => continue,
-                    },
+                    T::Var(w) => Expression::Variable(names[w as usize].clone()),
                     T::Free => continue,
                 };
                 branch = GraphPattern::Extend {
                     inner: Box::new(branch),
-                    variable: var,
+                    variable: names[v as usize].clone(),
                     expression,
                 };
             }
-            union = Some(match union {
+            let slot = if q.bound_vars().len() == bgp.vars.len() {
+                &mut full
+            } else {
+                &mut partial
+            };
+            *slot = Some(match slot.take() {
                 None => branch,
                 Some(u) => GraphPattern::Union {
                     left: Box::new(u),
@@ -1258,13 +1288,32 @@ impl Rewriter<'_> {
                 },
             });
         }
-        let union = union.expect("the rewriting keeps the query it starts from");
-        let gp = GraphPattern::Distinct {
+        let union = match (full, partial) {
+            (Some(f), None) => f,
+            (None, Some(p)) => p,
+            (Some(f), Some(p)) => GraphPattern::Union {
+                left: Box::new(f.clone()),
+                right: Box::new(GraphPattern::Minus {
+                    left: Box::new(p),
+                    right: Box::new(f),
+                }),
+            },
+            (None, None) => unreachable!("the rewriting keeps the query it starts from"),
+        };
+        // each solution of the pattern's variables and blank nodes once, as matching the
+        // stored and derived facts gives it, with the blank nodes then left out
+        let mut gp = GraphPattern::Distinct {
             inner: Box::new(GraphPattern::Project {
                 inner: Box::new(union),
-                variables: dvars,
+                variables: names.clone(),
             }),
         };
+        if visible.len() < names.len() {
+            gp = GraphPattern::Project {
+                inner: Box::new(gp),
+                variables: visible,
+            };
+        }
         let mut counters = serde_json::Map::new();
         counters.insert("patterns".into(), patterns.len().into());
         counters.insert("branches".into(), n.into());

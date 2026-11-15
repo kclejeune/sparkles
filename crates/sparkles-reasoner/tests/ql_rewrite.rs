@@ -280,6 +280,10 @@ fn lubm_answers_match_an_owl_2_rl_closure_of_the_ql_fragment() {
             got.reasoning().unwrap().report.derived
         );
         equal += (rewritten.len() == reference.len()) as usize;
+        // the rows too, each as many times as the closure gives it
+        let closure_rows = rows(&run(&fragment, &q, &closure));
+        assert_eq!(rows(&got).len(), closure_rows.len(), "{name}: row counts");
+        assert_eq!(rows(&got), closure_rows, "{name}: rows");
     }
     assert_eq!(equal, 14, "every query agrees with the closure");
 }
@@ -394,4 +398,87 @@ fn the_rewriting_is_charged_to_the_memory_budget() {
     .err()
     .expect("the rewriting passes the memory budget");
     assert!(e.to_string().contains("the OWL 2 QL rewriting"), "{e}");
+}
+
+/// The rows of a result, sorted, each as many times as the result gives it.
+fn rows(r: &QueryResult) -> Vec<String> {
+    let mut v: Vec<String> = r
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|t| t.as_ref().map_or("UNDEF".into(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// The rows of `q` under `owl-rl` over a materialization of the store's own ontology.
+fn materialized_rows(ttl: &str, q: &str) -> Vec<String> {
+    let s = store(ttl);
+    materialize(&s, &Profile::OwlRl, &ReasonOptions::default()).unwrap();
+    let o = QueryOptions {
+        prefixes: vec![("ex".into(), EX.into())],
+        default_graph_extra: vec![INFERRED_GRAPH.into()],
+        ..Default::default()
+    };
+    rows(&run(&s, q, &o))
+}
+
+/// A variable that the query does not project but that stored facts bind keeps its
+/// values, so the rows are those of plain SPARQL and of the `owl-rl` modes.
+#[test]
+fn a_variable_bound_by_stored_facts_keeps_the_rows_of_plain_sparql() {
+    let ttl = "ex:p a owl:ObjectProperty . ex:q a owl:ObjectProperty .
+               ex:q rdfs:subPropertyOf ex:p . ex:a ex:p ex:b , ex:c .";
+    let q = "SELECT ?s { ?s ex:p ?o }";
+    let got = rows(&run(&store(ttl), q, &ql(None)));
+    assert_eq!(got, vec![format!("<{EX}a>"), format!("<{EX}a>")]);
+    assert_eq!(got, materialized_rows(ttl, q));
+    let n = run(
+        &store(ttl),
+        "SELECT (COUNT(?s) AS ?n) { ?s ex:p ?o }",
+        &ql(None),
+    );
+    assert_eq!(
+        rows(&n),
+        vec!["\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
+    );
+}
+
+/// A pattern answered partly from the stored facts and partly by a rewritten branch gives
+/// each solution once, as the `owl-rl` closure does, and an existential adds a row only
+/// where no stored fact names the variable.
+#[test]
+fn stored_and_rewritten_answers_give_the_rows_of_the_closure() {
+    let ttl = "ex:p a owl:ObjectProperty . ex:q a owl:ObjectProperty .
+               ex:q rdfs:subPropertyOf ex:p .
+               ex:a ex:p ex:b . ex:a ex:q ex:b , ex:c . ex:d ex:q ex:e .";
+    for q in [
+        "SELECT ?s { ?s ex:p ?o }",
+        "SELECT ?s ?o { ?s ex:p ?o }",
+        "SELECT ?s { ?s ex:p ?o . ?s ex:p ?o2 }",
+    ] {
+        let got = rows(&run(&store(ttl), q, &ql(None)));
+        assert_eq!(got, materialized_rows(ttl, q), "{q}");
+    }
+    let ttl = format!("{A8} ex:bob a ex:Professor ; ex:teaches ex:c1 , ex:c2 .");
+    let got = rows(&run(
+        &store(&ttl),
+        "SELECT ?x { ?x ex:teaches ?c }",
+        &ql(None),
+    ));
+    assert_eq!(
+        got,
+        vec![
+            format!("<{EX}ann>"),
+            format!("<{EX}bob>"),
+            format!("<{EX}bob>")
+        ]
+    );
 }
