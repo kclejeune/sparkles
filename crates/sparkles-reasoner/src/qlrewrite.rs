@@ -1023,6 +1023,45 @@ struct Rendered {
     binds: Vec<(u32, Expression)>,
 }
 
+impl Rendered {
+    /// An estimate of the bytes a copy of the branch holds, with its terms' strings.
+    fn bytes(&self) -> usize {
+        fn term(t: &TermPattern) -> usize {
+            match t {
+                TermPattern::NamedNode(n) => n.as_str().len(),
+                TermPattern::Literal(l) => {
+                    l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+                }
+                TermPattern::Variable(v) => v.as_str().len(),
+                TermPattern::BlankNode(b) => b.as_str().len(),
+                #[allow(unreachable_patterns)]
+                _ => 64,
+            }
+        }
+        fn expr(e: &Expression) -> usize {
+            match e {
+                Expression::NamedNode(n) => n.as_str().len(),
+                Expression::Literal(l) => l.value().len() + l.datatype().as_str().len(),
+                Expression::Variable(v) => v.as_str().len(),
+                _ => 64,
+            }
+        }
+        let patterns: usize = self
+            .patterns
+            .iter()
+            .map(|t| {
+                let p = match &t.predicate {
+                    NamedNodePattern::NamedNode(n) => n.as_str().len(),
+                    NamedNodePattern::Variable(v) => v.as_str().len(),
+                };
+                term(&t.subject) + p + term(&t.object) + 3 * 48
+            })
+            .sum();
+        let binds: usize = self.binds.iter().map(|(_, e)| expr(e) + 128).sum();
+        patterns + binds + 64
+    }
+}
+
 /// What became of one basic graph pattern.
 enum Outcome {
     /// no inclusion changes it
@@ -1337,13 +1376,17 @@ impl Rewriter<'_> {
                 self.max_union
             )));
         }
-        let per_copy = branches
-            .iter()
-            .map(|q| q.atoms.len() * 256 + q.binds.len() * 128 + 64)
-            .max()
-            .unwrap_or(0);
+        // the bytes of the copies, with the strings of their terms
+        let mut bytes = 0usize;
+        for (set, _) in &groups {
+            for (s, g) in &groups {
+                if s.len() > set.len() && set.iter().all(|v| s.contains(v)) {
+                    bytes = bytes.saturating_add(g.iter().map(Rendered::bytes).sum::<usize>());
+                }
+            }
+        }
         self.budget
-            .try_charge(copies.saturating_mul(per_copy))
+            .try_charge(bytes)
             .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
         let mut parts = Vec::with_capacity(groups.len());
         for (set, group) in &groups {

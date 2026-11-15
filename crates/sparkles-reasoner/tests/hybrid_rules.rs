@@ -191,3 +191,17 @@ fn a_head_variable_that_only_a_test_names_is_refused() {
     .rules()
     .unwrap();
 }
+
+#[test]
+fn a_builtin_output_binds_only_once_its_inputs_are_bound() {
+    for rule in [
+        "[r: (<urn:a> <urn:t> <urn:b>) -> [(<urn:a> <urn:q> ?x) <- sum(?x, 0, ?x)]]",
+        // an empty call is reported, not a panic
+        "[r: (<urn:a> <urn:t> <urn:b>) -> [(<urn:a> <urn:q> ?x) <- strConcat()]]",
+    ] {
+        let e = Profile::Rules(format!("@hybrid jena .\n{rule}"))
+            .rules()
+            .unwrap_err();
+        assert!(e.message.contains("?x"), "{e}");
+    }
+}

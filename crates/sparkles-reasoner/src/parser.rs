@@ -1074,22 +1074,44 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
             }
         }
     }
-    /// The variables a body binds: those of its triples and the outputs of its builtins.
+    /// The variables a body binds: those of its triples, and the outputs of each builtin
+    /// whose inputs are bound, until no more are.
     fn bound_by(clauses: &[Clause], out: &mut std::collections::HashSet<String>) {
         for c in clauses {
-            match c {
-                Clause::Triple(_) => vars(std::slice::from_ref(c), out),
-                Clause::Builtin(b) => {
-                    let outputs = crate::builtins::BuiltinKind::from_name(&b.name)
-                        .map(|k| k.output_positions(b.args.len()))
-                        .unwrap_or_default();
-                    for i in outputs {
-                        if let Some(Node::Var(v)) = b.args.get(i) {
-                            out.insert(v.clone());
-                        }
+            if let Clause::Triple(_) = c {
+                vars(std::slice::from_ref(c), out);
+            }
+        }
+        loop {
+            let before = out.len();
+            for c in clauses {
+                let Clause::Builtin(b) = c else { continue };
+                let n = b.args.len();
+                let Some(kind) = crate::builtins::BuiltinKind::from_name(&b.name) else {
+                    continue;
+                };
+                // an empty call binds nothing, and the compiler reports its arity
+                if n == 0 {
+                    continue;
+                }
+                let ready = kind
+                    .input_positions(n)
+                    .into_iter()
+                    .all(|i| match b.args.get(i) {
+                        Some(Node::Var(v)) => out.contains(v),
+                        _ => true,
+                    });
+                if !ready {
+                    continue;
+                }
+                for i in kind.output_positions(n) {
+                    if let Some(Node::Var(v)) = b.args.get(i) {
+                        out.insert(v.clone());
                     }
                 }
-                Clause::Rule(_) => {}
+            }
+            if out.len() == before {
+                break;
             }
         }
     }

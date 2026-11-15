@@ -546,3 +546,28 @@ fn copies_of_wider_branches_count_against_the_bound() {
     let warned = format!("{:?}", r.plan().warnings);
     assert!(warned.contains("copies"), "{warned}");
 }
+
+/// The copies of wider branches are charged with the strings of their terms.
+#[test]
+fn copies_are_charged_with_their_strings() {
+    let long = "x".repeat(64 * 1024);
+    let mut onto = String::from(
+        "ex:A a owl:Class . ex:p a owl:ObjectProperty .
+         ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ;
+             owl:someValuesFrom owl:Thing ] .\n",
+    );
+    for i in 0..100 {
+        onto.push_str(&format!(
+            "ex:q{i} a owl:ObjectProperty ; rdfs:subPropertyOf ex:p .\n"
+        ));
+    }
+    let o = QueryOptions {
+        max_memory_bytes: Some(4 << 20),
+        ..ql(None)
+    };
+    let q = format!("ASK {{ <{EX}{long}> ex:p ?o }}");
+    let e = query(store(&onto).snapshot(), &q, &o)
+        .err()
+        .expect("the copies pass the memory budget");
+    assert!(e.to_string().contains("the OWL 2 QL rewriting"), "{e}");
+}
