@@ -77,7 +77,7 @@ pub(crate) enum LowerError {
         rule: String,
     },
     /// a rule that reads lists and calls `makeTemp`, which a replay of its list reads
-    /// would fire again for old instances (roadmap 1005)
+    /// would fire again for old instances (roadmap 1006)
     TempOverLists {
         rule: String,
     },

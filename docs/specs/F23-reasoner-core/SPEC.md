@@ -336,7 +336,8 @@ analyses charge their graphs to the run's budget before they build them, from bo
 the program's size, and walk their components without recursion. The maintainer chose
 C24 §6.2's syntax subset in `parser.rs`, a Datalog-first restricted chase per stratum, the
 storage of relations of arity three and more behind tail handles, and stratified `noValue`
-in programs that use the IR, and null identity is still open.
+in programs that use the IR. Nulls are fresh blank nodes, a program in which a builtin
+input can carry a null is refused, and canonical null identities are roadmap item 1005.
 
 `crates/sparkles-reasoner/src/ir/lower.rs` lowers a program to the engine's rules. A
 relation fact is a row of the derived tier over the relation's key, a reserved id that no
