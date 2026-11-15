@@ -163,6 +163,18 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         }
     }
 
+    /// Replaces each member by `f` of it, which must keep distinct members distinct.
+    pub fn map(&mut self, f: impl Fn(T) -> T) {
+        for x in &mut self.list {
+            *x = f(*x);
+        }
+        if let Some(set) = &mut self.set {
+            let mapped: FxHashSet<T> = set.iter().map(|&x| f(x)).collect();
+            debug_assert_eq!(mapped.len(), self.list.len());
+            *set = mapped;
+        }
+    }
+
     pub fn bytes(&self) -> usize {
         self.list.capacity() * std::mem::size_of::<T>()
             + self
@@ -458,6 +470,79 @@ impl State {
         self.back.retain(|(_, v)| !v.list.is_empty());
     }
 
+    /// Removes what the state keeps of the contexts in `gone` as its predecessors,
+    /// which a run that clears them does before they register again (roadmap item
+    /// 753): their backward links and what the Horn rules were told of them.
+    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
+        self.drop_links_from(gone);
+        if let Some(x) = self.extra.as_mut() {
+            let h = &mut x.horn;
+            if h.pred_in.list.iter().any(|(m, _)| gone.contains(m)) {
+                h.pred_in.retain(|(m, _)| !gone.contains(m));
+            }
+            for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
+                if set.list.iter().any(|m| gone.contains(m)) {
+                    set.retain(|m| !gone.contains(m));
+                }
+            }
+            if let Some(d) = x.dl.as_deref_mut() {
+                d.drop_predecessors(gone);
+            }
+        }
+    }
+
+    /// Adds `delta` to every context id from `from` upward that the state names, the
+    /// ids of the contexts that a saturation creates above the index's, when the index
+    /// of the next run has `delta` more expressions (roadmap item 753). The subsumers,
+    /// the fillers and the roles are expressions and roles of the index and stay.
+    pub fn shift_contexts(&mut self, from: Ex, delta: Ex) {
+        let up = |e: Ex| if e >= from { e + delta } else { e };
+        for (_, srcs) in &mut self.back {
+            if srcs.list.iter().any(|&e| e >= from) {
+                srcs.map(up);
+            }
+        }
+        if self.fwd.list.iter().any(|&(_, f)| f >= from) {
+            self.fwd.map(|(r, f)| (r, up(f)));
+        }
+        if let Some(x) = self.extra.as_mut() {
+            debug_assert!(x.noms.is_empty() && x.links.is_empty());
+            if let Some(d) = x.dl.as_deref_mut() {
+                d.shift_contexts(from, delta);
+            }
+            if x.members.list.iter().any(|&e| e >= from) {
+                x.members.map(up);
+            }
+            let h = &mut x.horn;
+            debug_assert!(h.pending.is_empty() && h.merges.is_empty());
+            if h.succ.list.iter().any(|&(_, n)| n >= from) {
+                h.succ.map(|(r, n)| (r, up(n)));
+            }
+            if h.succ_in.list.iter().any(|&(n, _)| n >= from) {
+                h.succ_in.map(|(n, b)| (up(n), b));
+            }
+            if h.pred_in.list.iter().any(|&(m, _)| m >= from) {
+                h.pred_in.map(|(m, b)| (up(m), b));
+            }
+            for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
+                if set.list.iter().any(|&e| e >= from) {
+                    set.map(up);
+                }
+            }
+        }
+    }
+
+    /// Recomputes the members of the disjointness sets among the subsumers, whose
+    /// numbers the index of each run gives anew.
+    pub fn reindex_disjoint(&mut self, ix: &Index) {
+        self.disj.clear();
+        for &d in &self.subs {
+            for &s in ix.disjoint(d) {
+                self.disj.entry(s).or_insert(d);
+            }
+        }
+    }
+
     /// The sources of backward links by one role.
     #[inline]
     fn back_by(&mut self, r: Role) -> &mut Small<Ex> {
@@ -482,6 +567,15 @@ impl State {
                 self.disj.entry(s).or_insert(d);
             }
         }
+    }
+}
+
+impl Ctx {
+    /// Forgets the context's conclusions, so that the next saturation starts it again.
+    pub fn clear(&self) {
+        *self.st.lock() = State::default();
+        self.todo.lock().clear();
+        self.started.store(false, Ordering::Release);
     }
 }
 
@@ -1441,6 +1535,23 @@ impl Dynamic {
     /// The first id of the table's contexts.
     pub fn base(&self) -> Ex {
         self.base
+    }
+
+    /// Moves the table's contexts to the ids from `base` upward, when the index of the
+    /// next run has more expressions (roadmap item 753). The caller shifts the ids that
+    /// the kept states name ([`State::shift_contexts`]).
+    pub fn rebase(&mut self, base: Ex) {
+        debug_assert!(base >= self.base);
+        let delta = base - self.base;
+        if delta == 0 {
+            return;
+        }
+        self.base = base;
+        for shard in self.shards.iter_mut() {
+            for e in shard.get_mut().values_mut() {
+                *e += delta;
+            }
+        }
     }
 
     /// Whether the id is one of the table's contexts.

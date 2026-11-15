@@ -111,6 +111,22 @@ ordering.
 
 ### OWL classification
 
+A classification after an edit of class axioms keeps the contexts of a run with the Horn
+rules without individuals and of a run of the disjunctive rules without counting or a
+root (roadmap item 753). The run compares its index with the last one, clears the
+contexts that hold an expression whose rules differ and the contexts that reach them,
+and answers as a classification that starts again, which `tests/dl_incremental.rs`
+checks on generated ontologies, the fixtures of items 603 and 897 and ORE files on 1, 4
+and 8 threads. Other changes, Horn ontologies with individuals and runs with a bound on
+their derived conclusions start again, and so does a kept run that passes its memory
+budget. A classifier whose tier was decided over the expressions of a removed axiom,
+such as a self restriction that kept a union from the disjunctive rules, now decides it
+again. Items 953 and 955 follow the bounded runs and the steps a kept run repeats. In a
+development measurement on a laptop a run after a single-axiom edit of the Gene Ontology
+takes 143 ms against 219 ms for a classification that starts again on four threads, and
+6.4 against 42.8 ms on `ore_ont_12141` with the disjunctive rules. An edit that clears
+most contexts costs more than starting again, which item 954 follows.
+
 The Horn rules classify ontologies with individuals, functional data properties and top
 properties, in one saturation with the EL rules of individuals, with two rules over the
 predecessors of a context that stands for one element and a fact for a universal

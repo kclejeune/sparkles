@@ -254,6 +254,27 @@ pub struct Interner {
     fresh: u32,
     /// the fresh classes of the Horn normalization
     fresh_classes: u32,
+    /// the fresh classes each scope made, in the order it asked for them, with the run
+    /// that last opened the scope, so that a later run over the same interner gives the
+    /// scope the same classes (roadmap item 753)
+    scopes: FxHashMap<Scope, (Vec<u32>, u32)>,
+    /// the scope open now, with the number of fresh classes it has asked for
+    scope: Option<(Scope, usize)>,
+    /// the number of the run, which [`Interner::begin_run`] advances
+    run: u32,
+    /// the number of each axiom outside OWL 2 EL that a normalization opened a scope
+    /// for, with the run that last did, an owned copy of those axioms
+    scope_axioms: FxHashMap<AxiomKind, (u32, u32)>,
+    next_scope_axiom: u32,
+    /// the estimated bytes of [`Interner::scope_axioms`] and [`Interner::scopes`]
+    scope_bytes: usize,
+    /// the fresh role of each chain prefix, so that a later run over the same interner
+    /// gives the prefix the same role
+    prefix_roles: FxHashMap<(Role, Role), Role>,
+    /// the universals that the unfolding of a universal by an automaton made
+    /// ([`Interner::made_universal`]) and no normalization has named since, which a
+    /// later run over the same interner does not unfold again
+    made_universals: FxHashSet<Ex>,
     /// whether this is the interner of a chunk of a parallel normalization, which keeps
     /// intersections whole as [`Node::And`]
     chunk: bool,
@@ -264,6 +285,31 @@ pub struct Interner {
     /// the operands of [`Interner::ands`], counted twice, once for the table's key
     and_ops: usize,
 }
+
+/// What a run of fresh classes is made for, which names them across the runs over one
+/// interner (roadmap item 753).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// the Horn normalization of an axiom outside OWL 2 EL, by [`Interner::scope_axiom`]
+    Horn(u32),
+    /// the automaton states that the Horn rules unfold a universal or a negative
+    /// existential restriction into, by that expression
+    Unfold(Ex),
+    /// Tier D's normalization of an axiom outside OWL 2 EL, by
+    /// [`Interner::scope_axiom`]
+    Dl(u32),
+    /// the automaton states that Tier D's normalization unfolds a universal or a
+    /// negative existential restriction into, by that expression
+    DlUnfold(Ex),
+    /// the hypothetical successor of an existential restriction, by its expression
+    Hyp(Ex),
+}
+
+/// The estimated bytes of a scope's entry, its classes aside.
+const SCOPE_BYTES: usize = 48;
+
+/// The expressions that [`Index::changed`] compares between two polls of its stop.
+const POLL_CHANGED: usize = 4096;
 
 struct ValueInsertionPlan {
     vector_capacity: usize,
@@ -332,6 +378,8 @@ impl Interner {
             + self.roles.capacity() * 48
             + self.ands.len() * 80
             + self.and_ops * 4
+            + self.scope_bytes()
+            + self.prefix_roles.capacity() * 16
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
@@ -511,12 +559,39 @@ impl Interner {
             return e;
         }
         if let Some(&e) = self.map.get(&n) {
+            // a normalization names a universal that an automaton made, so it is
+            // unfolded from here on, as in a run that starts again
+            if !self.made_universals.is_empty() && matches!(n, Node::Forall(..)) {
+                self.made_universals.remove(&e);
+            }
             return e;
         }
         let e = self.nodes.len() as Ex;
         self.nodes.push(n);
         self.map.insert(n, e);
         e
+    }
+
+    /// The universal `∀r.x` of a transition of an automaton that unfolds a universal.
+    /// One that the interner did not hold is marked as made by an automaton, and a
+    /// run does not unfold a marked universal ([`Interner::made_by_automaton`]). A
+    /// run that starts again holds none of them when it chooses the universals to
+    /// unfold, and a kept interner holds those of the runs before.
+    pub fn made_universal(&mut self, r: Role, x: Ex) -> Ex {
+        let n = Node::Forall(r, x);
+        if let Some(&e) = self.map.get(&n) {
+            return e;
+        }
+        let e = self.nodes.len() as Ex;
+        self.nodes.push(n);
+        self.map.insert(n, e);
+        self.made_universals.insert(e);
+        e
+    }
+
+    /// Whether an automaton made the universal and no normalization has named it.
+    pub fn made_by_automaton(&self, e: Ex) -> bool {
+        self.made_universals.contains(&e)
     }
 
     pub fn get(&self, n: &Node) -> Option<Ex> {
@@ -699,10 +774,107 @@ impl Interner {
         self.role(RoleName::Fresh(self.fresh))
     }
 
-    /// A class that no axiom names, for the Horn normalization.
+    /// The fresh role of the chain prefix `left ∘ r`, the same in every run over this
+    /// interner.
+    pub fn prefix_role(&mut self, left: Role, r: Role) -> Role {
+        if let Some(&u) = self.prefix_roles.get(&(left, r)) {
+            return u;
+        }
+        let u = self.fresh_role();
+        self.prefix_roles.insert((left, r), u);
+        u
+    }
+
+    /// A class that no axiom names, for the Horn normalization. Inside a scope
+    /// ([`Interner::begin_scope`]) the k-th call gives the class that the k-th call of
+    /// the same scope gave in an earlier run over this interner, so that the contexts
+    /// kept from that run name the same classes. Outside a scope, and in a scope's
+    /// first run, each call makes a new class.
     pub fn fresh_class(&mut self) -> Ex {
+        if let Some((scope, at)) = self.scope.as_mut() {
+            let k = *at;
+            *at += 1;
+            let scope = *scope;
+            if let Some(&n) = self.scopes.get(&scope).and_then(|(made, _)| made.get(k)) {
+                return self.node(Node::Fresh(n));
+            }
+            self.fresh_classes += 1;
+            let n = self.fresh_classes;
+            let (made, _) = self.scopes.entry(scope).or_default();
+            debug_assert_eq!(made.len(), k);
+            made.push(n);
+            self.scope_bytes += 4;
+            return self.node(Node::Fresh(n));
+        }
         self.fresh_classes += 1;
         self.node(Node::Fresh(self.fresh_classes))
+    }
+
+    /// The estimated bytes of the scopes of fresh classes and their axioms, and of the
+    /// marks of the universals that automata made.
+    pub fn scope_bytes(&self) -> usize {
+        self.scope_bytes + self.made_universals.capacity() * 5
+    }
+
+    /// Starts a run's normalization: the scopes it opens are those the run keeps.
+    pub fn begin_run(&mut self) {
+        self.run += 1;
+        self.scope = None;
+    }
+
+    /// Opens a scope of fresh classes. A run opens each scope once at most.
+    pub fn begin_scope(&mut self, scope: Scope) {
+        debug_assert!(self.scope.is_none(), "a scope inside a scope");
+        let run = self.run;
+        let new = !self.scopes.contains_key(&scope);
+        let e = self.scopes.entry(scope).or_default();
+        e.1 = run;
+        if new {
+            self.scope_bytes += SCOPE_BYTES;
+        }
+        self.scope = Some((scope, 0));
+    }
+
+    pub fn end_scope(&mut self) {
+        self.scope = None;
+    }
+
+    /// The number of an axiom outside OWL 2 EL in the scopes of its fresh classes, the
+    /// same in every run over this interner that normalizes the axiom.
+    pub fn scope_axiom(&mut self, k: &AxiomKind) -> u32 {
+        let run = self.run;
+        if let Some((n, seen)) = self.scope_axioms.get_mut(k) {
+            *seen = run;
+            return *n;
+        }
+        let n = self.next_scope_axiom;
+        self.next_scope_axiom += 1;
+        self.scope_bytes += super::held_bytes_of(k) + 16;
+        self.scope_axioms.insert(k.clone(), (n, run));
+        n
+    }
+
+    /// Drops the scopes and the axioms that the run did not open, at the end of its
+    /// normalization.
+    pub fn end_run(&mut self) {
+        let run = self.run;
+        self.scope = None;
+        let mut freed = 0usize;
+        self.scope_axioms.retain(|k, (_, seen)| {
+            let keep = *seen == run;
+            if !keep {
+                freed += super::held_bytes_of(k) + 16;
+            }
+            keep
+        });
+        self.scopes.retain(|_, (made, seen)| {
+            let keep = *seen == run;
+            if !keep {
+                freed += SCOPE_BYTES + made.len() * 4;
+            }
+            keep
+        });
+        self.scope_bytes = self.scope_bytes.saturating_sub(freed);
     }
 
     /// The binary intersection of two expressions, with its operands ordered.
@@ -719,7 +891,7 @@ impl Interner {
 }
 
 /// The rules of the role hierarchy, the chains and the ranges.
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 pub struct Roles {
     /// for each role, its superroles with itself, sorted
     pub sup: Vec<Vec<Role>>,
@@ -1768,6 +1940,191 @@ impl Index {
         }
     }
 
+    /// Whether a later run may compare this index with its own
+    /// ([`Index::same_tables`]): it has no data, individuals, universal roles or keys,
+    /// with which that comparison always fails. A run over such an index keeps no
+    /// contexts for the next, which then holds no last index beside its own.
+    pub fn comparable(&self) -> bool {
+        self.roles.data_range.iter().all(|r| r.is_none())
+            && self.roles.functional.iter().all(|f| f.is_empty())
+            && self.vals.is_empty()
+            && self.neg_data.is_empty()
+            && self.universal.is_empty()
+            && self.keys.is_empty()
+            && self.nominals.is_empty()
+            && !self.nominal_selfs
+    }
+
+    /// Whether a context that a run over `old` saturated reads the same tables here
+    /// when it holds none of the expressions that [`Index::changed`] lists (roadmap
+    /// item 753): the tables that no expression keys are equal on the roles of `old`,
+    /// neither index has individuals, universal roles, keys or data, and both have the
+    /// Horn rules or neither, and Tier D or neither, where Tier D's tables are those
+    /// its expressions key ([`DlIx::keyed_by_expressions`](super::dl_rules::DlIx)).
+    /// Roles that `old` lacks may be new here, since a kept context holds no link by
+    /// them.
+    pub fn same_tables(&self, old: &Index) -> bool {
+        let (a, b) = (&old.roles, &self.roles);
+        let n = a.sup.len();
+        let prefix = |x: &[bool], y: &[bool]| y.len() >= x.len() && y[..x.len()] == *x;
+        let sorted = |v: &[(Role, Ex)]| {
+            let mut v = v.to_vec();
+            v.sort_unstable();
+            v
+        };
+        let comp_within = |x: &FxHashMap<(Role, Role), Vec<Role>>,
+                           y: &FxHashMap<(Role, Role), Vec<Role>>| {
+            x.iter()
+                .filter(|(k, _)| (k.0 as usize) < n && (k.1 as usize) < n)
+                .all(|(k, v)| y.get(k) == Some(v))
+        };
+        b.sup.len() >= n
+            && b.sup[..n] == a.sup[..]
+            && comp_within(&a.comp, &b.comp)
+            && comp_within(&b.comp, &a.comp)
+            && prefix(&a.right, &b.right)
+            && prefix(&a.left, &b.left)
+            && a.reflexive == b.reflexive
+            && b.range.len() >= a.range.len()
+            && b.range[..a.range.len()] == a.range[..]
+            && a.data_range.iter().all(|r| r.is_none())
+            && b.data_range.iter().all(|r| r.is_none())
+            && a.functional.iter().all(|f| f.is_empty())
+            && b.functional.iter().all(|f| f.is_empty())
+            && prefix(&a.empty, &b.empty)
+            && b.inv.len() >= a.inv.len()
+            && b.inv[..a.inv.len()] == a.inv[..]
+            && a.clash == b.clash
+            && sorted(&old.selfs) == sorted(&self.selfs)
+            && old.vals.is_empty()
+            && self.vals.is_empty()
+            && old.neg_data.is_empty()
+            && self.neg_data.is_empty()
+            && old.universal.is_empty()
+            && self.universal.is_empty()
+            && old.keys.is_empty()
+            && self.keys.is_empty()
+            && old.nominals.is_empty()
+            && self.nominals.is_empty()
+            && !old.nominal_selfs
+            && !self.nominal_selfs
+            && old.tops == self.tops
+            && old.horn.is_some() == self.horn.is_some()
+            && match (&old.dl, &self.dl) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.keyed_by_expressions() && b.keyed_by_expressions(),
+                _ => false,
+            }
+    }
+
+    /// For each expression of `old`, whether a context that holds it reads other rules
+    /// here than a run over `old` gave it (roadmap item 753): another successor, told
+    /// superexpressions, conjunctions, negative existential restrictions or
+    /// disjointness sets, as sets, or other flags of the Horn rules, on the expression
+    /// or, for a universal restriction, on its filler, and in a run of Tier D other
+    /// clauses with the expression in their body or another hypothetical successor.
+    /// `stop` is asked before each [`POLL_CHANGED`] expressions, and the answer is `None`
+    /// once it says to stop.
+    pub fn changed(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<Vec<bool>> {
+        let n = old.heads.len();
+        debug_assert!(self.heads.len() >= n);
+        // the disjointness sets of each index by their members, which name them in both
+        let members = |ix: &Index| -> Vec<Vec<Ex>> {
+            let mut sets: Vec<Vec<Ex>> = Vec::new();
+            for (e, h) in ix.heads.iter().enumerate() {
+                for &s in ix.disjoint_of(h) {
+                    if sets.len() <= s as usize {
+                        sets.resize(s as usize + 1, Vec::new());
+                    }
+                    sets[s as usize].push(e as Ex);
+                }
+            }
+            sets
+        };
+        // each set has one number in both indexes, so that an expression's sets compare
+        // without their members
+        let mut numbers: FxHashMap<Vec<Ex>, u32> = FxHashMap::default();
+        let mut numbered = |sets: Vec<Vec<Ex>>| -> Vec<u32> {
+            sets.into_iter()
+                .map(|members| {
+                    let next = numbers.len() as u32;
+                    *numbers.entry(members).or_insert(next)
+                })
+                .collect()
+        };
+        let old_sets = numbered(members(old));
+        let new_sets = numbered(members(self));
+        let flag = |ix: &Index, e: usize| -> u8 {
+            ix.horn
+                .as_ref()
+                .and_then(|h| h.flags.get(e).copied())
+                .unwrap_or(0)
+        };
+        fn same<T: Copy + Ord>(a: &[T], b: &[T]) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            if a == b {
+                return true;
+            }
+            let (mut a, mut b) = (a.to_vec(), b.to_vec());
+            a.sort_unstable();
+            b.sort_unstable();
+            a == b
+        }
+        let mut changed = vec![false; n];
+        for (e, changed) in changed.iter_mut().enumerate() {
+            if e % POLL_CHANGED == 0 && stop() {
+                return None;
+            }
+            let (a, b) = (&old.heads[e], &self.heads[e]);
+            debug_assert_eq!(a.node, b.node);
+            let sets = |ix: &Index, h: &Head, sets: &[u32]| -> Vec<u32> {
+                let mut v: Vec<u32> = ix
+                    .disjoint_of(h)
+                    .iter()
+                    .map(|&s| sets[s as usize])
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            let filler = match a.node {
+                Node::Forall(_, f) => flag(old, f as usize) != flag(self, f as usize),
+                _ => false,
+            };
+            *changed = a.node != b.node
+                || a.succ != b.succ
+                || filler
+                || flag(old, e) != flag(self, e)
+                || !same(old.told_of(a), self.told_of(b))
+                || !same(old.conj_of(a), self.conj_of(b))
+                || !same(old.exist_of(a), self.exist_of(b))
+                || (a.disj.len != 0 || b.disj.len != 0)
+                    && sets(old, a, &old_sets) != sets(self, b, &new_sets);
+        }
+        if stop() {
+            return None;
+        }
+        if let (Some(a), Some(b)) = (&old.dl, &self.dl) {
+            b.changed(a, &mut changed);
+        }
+        Some(changed)
+    }
+
+    /// The bytes that [`Index::changed`] allocates for the comparison with `old`,
+    /// roughly: a mark for each expression, the members of the disjointness sets of
+    /// both indexes with their lists, their entries in the table that numbers them and
+    /// their numbers, which for sets of two members is 48 bytes a member, and the keys
+    /// of the clauses of Tier D.
+    pub fn changed_scratch(&self, old: &Index) -> usize {
+        old.heads.len()
+            + (old.disjoint.len() + self.disjoint.len()) * 48
+            + match (&old.dl, &self.dl) {
+                (Some(a), Some(b)) => b.changed_scratch(a),
+                _ => 0,
+            }
+    }
+
     /// The bytes the index takes, roughly, the role table included.
     pub fn bytes(&self) -> usize {
         self.heads.capacity() * std::mem::size_of::<Head>()
@@ -2133,14 +2490,15 @@ fn horn_index(
         b.positive(e, it, ix);
     }
     // the universals on roles that chains reach, unfolded by the automata, each state a
-    // fresh class; the universals the automata make are not unfolded again
+    // fresh class; the universals the automata make are not unfolded again, in this
+    // run or in a later one over the same interner
     let mut flags = vec![0u8; it.nodes.len()];
     for (e, n) in it.nodes.iter().enumerate() {
         if let Node::Forall(r, f) = *n {
             if ix.is_universal(r) {
                 // a fact of a universal role, which `Index::build` lists
                 flags[e] |= super::horn::HornIx::GLOBAL;
-            } else if h.autos.contains_key(&r) {
+            } else if h.autos.contains_key(&r) && !it.made_by_automaton(e as Ex) {
                 flags[e] |= super::horn::HornIx::UNFOLDED;
                 unfold.push((e as Ex, r, f));
             }
@@ -2155,6 +2513,14 @@ fn horn_index(
     let mut made: Vec<Ex> = Vec::new();
     for (holder, r, f) in unfold {
         let a = autos.entry(r).or_insert_with(|| h.autos[&r].eps_free());
+        // a universal's holder is the universal, and a negative existential
+        // restriction's is its filler, which restrictions over other roles share, so
+        // the restriction names the scope
+        let key = match it.nodes[holder as usize] {
+            Node::Forall(t, c) if t == r && c == f => holder,
+            _ => f,
+        };
+        it.begin_scope(Scope::Unfold(key));
         let states: Vec<Ex> = (0..a.states)
             .map(|s| {
                 if s == a.start && !a.entered[s as usize] {
@@ -2166,6 +2532,7 @@ fn horn_index(
                 }
             })
             .collect();
+        it.end_scope();
         let start = states[a.start as usize];
         if start != holder {
             told.push((holder, start));
@@ -2176,7 +2543,7 @@ fn horn_index(
             }
         }
         for &(p, l, q) in &a.trans {
-            let x = it.node(Node::Forall(l, states[q as usize]));
+            let x = it.made_universal(l, states[q as usize]);
             made.push(x);
             if states[p as usize] != x {
                 told.push((states[p as usize], x));
@@ -2539,7 +2906,7 @@ fn roles(
                 left = match prefixes.get(&(left, r)) {
                     Some(&u) => u,
                     None => {
-                        let u = it.fresh_role();
+                        let u = it.prefix_role(left, r);
                         prefixes.insert((left, r), u);
                         binary.push((left, r, u));
                         u
