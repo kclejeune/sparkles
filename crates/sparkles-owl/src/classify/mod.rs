@@ -4427,6 +4427,47 @@ mod tests {
         assert!(matches!(horn(None, &|| true), Err(index::Halt::Stopped)));
         assert_eq!(horn(None, &|| false).ok(), Some(vec![true]));
     }
+
+    #[test]
+    fn the_horn_normalization_opens_no_scope_for_an_assertion_about_an_anonymous_individual() {
+        // roadmap item 869: the normalization refuses the assertions without reading
+        // them, so they take no scope and no copy, and the Horn axiom beside them is
+        // taken as before
+        let c = |n: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{n}")));
+        let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
+        let x = || Individual::Anonymous(AnonymousIndividual::new("x"));
+        let all = AxiomKind::SubClassOf(
+            c("A"),
+            ClassExpression::ObjectAllValuesFrom(r.clone(), Box::new(c("B"))),
+        );
+        let assertions = [
+            AxiomKind::ClassAssertion(c("A"), x()),
+            AxiomKind::ObjectPropertyAssertion(
+                r.clone(),
+                x(),
+                Individual::named("http://ex.org/a"),
+            ),
+            AxiomKind::ObjectPropertyAssertion(
+                r.clone(),
+                Individual::named("http://ex.org/a"),
+                x(),
+            ),
+            AxiomKind::NegativeObjectPropertyAssertion(r, x(), x()),
+        ];
+        let run = |axioms: &[&AxiomKind]| {
+            let mut it = Interner::new();
+            let mut ax = index::Axioms::default();
+            let taken = horn::normalize(axioms, &mut it, &mut ax, None, &|| false).unwrap();
+            (taken, it.scope_bytes())
+        };
+        let (alone, bytes) = run(&[&all]);
+        assert_eq!(alone, vec![true]);
+        let mut with: Vec<&AxiomKind> = assertions.iter().collect();
+        with.push(&all);
+        let (taken, with_bytes) = run(&with);
+        assert_eq!(taken, vec![false, false, false, false, true]);
+        assert_eq!(with_bytes, bytes, "the assertions hold no scope");
+    }
 }
 
 #[cfg(test)]
