@@ -1043,7 +1043,9 @@ impl Rendered {
         fn expr(e: &Expression) -> usize {
             match e {
                 Expression::NamedNode(n) => n.as_str().len(),
-                Expression::Literal(l) => l.value().len() + l.datatype().as_str().len(),
+                Expression::Literal(l) => {
+                    l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+                }
                 Expression::Variable(v) => v.as_str().len(),
                 _ => 64,
             }

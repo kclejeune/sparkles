@@ -263,3 +263,16 @@ fn a_copy_is_charged_with_the_names_it_binds() {
     rw_bytes += b.bytes();
     assert!(rw_bytes >= long.len(), "{rw_bytes}");
 }
+
+/// A literal binding's language tag is charged too.
+#[test]
+fn a_copy_is_charged_with_a_bound_literals_language() {
+    let tag = format!("x-{}", "abcdefgh-".repeat(4000).trim_end_matches('-'));
+    let lit = oxrdf::Literal::new_language_tagged_literal_unchecked("x", tag.as_str());
+    let b = Rendered {
+        patterns: vec![],
+        binds: vec![(0, Expression::Literal(lit))],
+        bind_names: 0,
+    };
+    assert!(b.bytes() >= tag.len(), "{}", b.bytes());
+}
