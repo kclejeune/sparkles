@@ -1132,6 +1132,31 @@ impl<'a> Eval<'a> {
         g.exists(&mut self.bmemo, s, p, o, self.end)
     }
 
+    /// Whether a visible fact of the relation with key `key` has the first column `c0`
+    /// (any when `None`) and a tail that equals `cols` where `cols` is not 0, the value of
+    /// a wildcard. Relation facts are derived, so only the derived tier is read.
+    pub fn tail_exists(&mut self, c0: Option<u64>, key: u64, cols: &[u64]) -> bool {
+        let (g, t) = (self.g, self.terms);
+        g.cands(c0, Some(key), None, 0, self.end).iter().any(|r| {
+            if !g.alive(r) {
+                return false;
+            }
+            let f = g.triple(r);
+            if f[1] != key || c0.is_some_and(|c| c != f[0]) {
+                return false;
+            }
+            t.tail(f[2]).is_some_and(|(k, tail)| {
+                let mut n = 0;
+                let same = k == key
+                    && tail.zip(cols).all(|(v, &c)| {
+                        n += 1;
+                        c == 0 || v == c
+                    });
+                same && n == cols.len()
+            })
+        })
+    }
+
     /// Whether the evaluation has stopped, for good.
     #[inline]
     pub fn stopped(&self) -> bool {
@@ -2286,7 +2311,10 @@ pub(crate) fn run_program(
     warnings: &mut crate::budget::WorkingWarnings,
 ) -> anyhow::Result<Outcome> {
     use crate::ir::lower::Shape;
-    let lowered = program.lower()?;
+    let lowered = program.lower(&limits.budget)?;
+    if lowered.shape != Shape::Jena {
+        g.set_relations();
+    }
     for &ri in &lowered.stratified_novalue {
         warnings.push_fmt(format_args!(
             "the noValue of rule '{}' reads complete lower strata, since the program has relations or negated atoms and runs by strata",

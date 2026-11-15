@@ -859,8 +859,10 @@ fn default_geometry_changes(
 }
 
 impl Derivation {
+    /// The derived triples, without the facts of declared relations (item 839), which
+    /// are rows of the derived tier but no RDF.
     fn derived(&self) -> impl Iterator<Item = [u64; 3]> + '_ {
-        self.graph.facts()
+        self.graph.facts().filter(|t| !ir::lower::is_key(t[1]))
     }
 
     /// Is this (possibly generalized) triple valid RDF?
@@ -2334,6 +2336,41 @@ pub fn bench_derive(
         seq = maintain::fnv(&h.to_le_bytes(), seq);
     }
     Ok((d.closure_len(), d.iterations, set, seq))
+}
+
+#[cfg(test)]
+mod derivation_tests {
+    use super::*;
+
+    /// Relation rows are not derived triples, so the write path neither writes them nor
+    /// counts them as generalized triples.
+    #[test]
+    fn relation_rows_are_no_derived_triples() {
+        let store = Store::in_memory(sparkles_core::store::StoreOptions::default());
+        let terms = Terms::new(store.snapshot());
+        let iri = |l: &str| {
+            let n = oxrdf::NamedNode::new_unchecked(format!("http://ex.org/{l}"));
+            terms.id_for(&n.into()).unwrap()
+        };
+        let mut graph = graph::Graph::default();
+        let triple = [iri("a"), iri("p"), iri("b")];
+        graph.add(triple);
+        graph.add([iri("a"), ir::lower::key(ir::RelId(0)), iri("b")]);
+        let budget = Budget::unlimited();
+        let d = Derivation {
+            graph,
+            terms,
+            rules: 0,
+            iterations: 0,
+            warnings: WorkingWarnings::new(&budget),
+            budget,
+            defaults: None,
+            base_scans: 0,
+            threads: 1,
+        };
+        assert_eq!(d.derived().collect::<Vec<_>>(), vec![triple]);
+        assert_eq!(d.derived().filter(|t| !d.valid(t)).count(), 0);
+    }
 }
 
 #[cfg(test)]

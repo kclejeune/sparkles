@@ -352,10 +352,10 @@ limits of inferred facts and iterations counted across the strata and a warning 
 Jena rule whose `noValue` is read by strata. Rules that read lists are replayed when list
 cells arrive, so a list cell can be an instance's only new premise. No frontend produces
 relations yet, so only the reasoner's tests reach this path, and incremental updates,
-demand, explanations and witnesses follow in later steps. On 8,000 random programs over
-relations of arities zero to five, triple atoms, recursion and negated atoms, the runs
-equal a naive stratified evaluator, and the decoded facts are the same at 1, 4 and 16
-threads.
+demand, explanations and witnesses follow in later steps. On about 800 random programs
+that stratify, over relations of arities zero to five, triple atoms, recursion and negated
+atoms with wildcards, the runs equal a naive stratified evaluator, and the decoded facts of
+a recursive program over tails are the same at 1, 4 and 16 threads.
 
 ### SHACL rules and SPIN
 

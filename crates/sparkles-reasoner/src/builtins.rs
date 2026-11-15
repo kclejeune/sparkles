@@ -367,6 +367,11 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             let opt = |i: usize| Some(ev.val(bi.args[i], b)).filter(|&v| v != 0);
             if bi.args.len() == 3 {
                 !ev.exists(opt(0), opt(1), opt(2))
+            } else if bi.args[2..].contains(&Slot::Any) {
+                // a tail with a wildcard: every fact of the relation is checked
+                let key = a(1);
+                let cols: smallvec::SmallVec<[u64; 8]> = (2..bi.args.len()).map(a).collect();
+                !ev.tail_exists(opt(0), key, &cols)
             } else {
                 let key = a(1);
                 let cols: smallvec::SmallVec<[u64; 8]> = (2..bi.args.len()).map(a).collect();

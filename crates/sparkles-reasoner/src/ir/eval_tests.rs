@@ -376,7 +376,9 @@ fn random_program(t: &Terms, seed: u64) -> Option<(Program, Vec<Fact>)> {
             let mut a = h.clone();
             for s in a.args.iter_mut() {
                 if let V(_) = s {
-                    *s = if vars.is_empty() {
+                    *s = if rng.below(4) == 0 {
+                        Any
+                    } else if vars.is_empty() {
                         C(n(1 + rng.below(2) as i64))
                     } else {
                         V(vars[rng.below(vars.len())])
@@ -891,6 +893,73 @@ fn jena_programs_run_unchanged() {
     engine::run_program(&mut b, &p, &t, &limits(), &mut w).unwrap();
     assert_eq!(a.facts().collect::<Vec<_>>(), b.facts().collect::<Vec<_>>());
     assert!(w.is_empty());
+    // the lowering keeps each builtin's occurrence, which analyses key fresh nodes by
+    let lowered = p.lower(&t.budget()).unwrap();
+    let origins = |rs: &[crate::engine::CRule]| -> Vec<Vec<usize>> {
+        rs.iter()
+            .map(|r| r.builtins.iter().map(|b| b.origin).collect())
+            .collect()
+    };
+    assert_eq!(origins(&lowered.strata[0]), origins(&compiled));
+    assert!(origins(&compiled).iter().flatten().any(|&o| o > 0));
+}
+
+/// A negated atom with a wildcard in its tail holds only when no fact of the relation
+/// matches its other columns.
+#[test]
+fn a_wildcard_in_a_negated_tail_matches_any_value() {
+    let t = terms();
+    let (rs, ids) = rels(&[1, 3, 1]);
+    let (a, r, out) = (ids[0], ids[1], ids[2]);
+    let rules = vec![rule(
+        "w",
+        vec![pos(rel(a, &[V(0)])), neg(rel(r, &[V(0), Any, C(n(3))]))],
+        vec![head(rel(out, &[V(0)]))],
+    )];
+    let p = program(&t, rs, rules);
+    let facts = vec![
+        (Some(0), vec![n(1)]),
+        (Some(0), vec![n(2)]),
+        (Some(1), vec![n(1), n(2), n(3)]),
+        (Some(1), vec![n(2), n(2), n(4)]),
+    ];
+    let got = run(&t, &p, &facts);
+    assert!(!got.contains(&(Some(2), vec![n(1)])), "{got:?}");
+    assert!(got.contains(&(Some(2), vec![n(2)])), "{got:?}");
+    assert_eq!(got, reference(&p, &facts));
+}
+
+/// The lowered rules are charged: a program whose IR fits a budget and whose rules split
+/// into many parts, each with the whole body, is refused when the parts do not fit.
+#[test]
+fn the_lowered_rules_are_charged() {
+    let t = terms();
+    let arities = [1u16; 12];
+    let (rs, ids) = rels(&arities);
+    let body: Vec<Literal> = (0..40)
+        .map(|i| pos(rel(ids[0], &[V(i % 4)])))
+        .chain([neg(rel(ids[1], &[V(0)]))])
+        .collect();
+    let heads: Vec<Head> = (2..12).map(|i| head(rel(ids[i], &[V(0)]))).collect();
+    let rules = vec![
+        rule("wide", body, heads),
+        rule(
+            "b",
+            vec![pos(rel(ids[0], &[V(0)]))],
+            vec![head(rel(ids[1], &[V(0)]))],
+        ),
+    ];
+    let budget = Budget::new(None);
+    let p = Program::new(rs, rules, &vocab(&t), &budget).unwrap();
+    let ir = budget.used();
+    assert!(ir > 0);
+    let all = p.lower(&budget).unwrap();
+    let lowered = budget.used() - ir;
+    assert!(lowered > ir, "{lowered} against {ir}");
+    drop(all);
+    let tight = Budget::new(Some(ir));
+    assert!(matches!(p.lower(&tight), Err(lower::LowerError::Memory(_))));
+    assert_eq!(tight.used(), 0);
 }
 
 /// An existential head and `makeTemp` in a rule that reads lists are refused by name.

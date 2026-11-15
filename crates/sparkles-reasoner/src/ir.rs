@@ -152,6 +152,9 @@ pub(crate) struct IBuiltin {
     pub inputs: SmallVec<[usize; 4]>,
     /// the variables the call binds
     pub outputs: SmallVec<[usize; 4]>,
+    /// the occurrence of a compiled Jena builtin in its program ([`CBuiltin::origin`]),
+    /// which the lowering keeps
+    pub origin: Option<usize>,
 }
 
 impl IBuiltin {
@@ -161,6 +164,7 @@ impl IBuiltin {
             args: SmallVec::from_slice(&b.args),
             inputs: SmallVec::from_slice(&b.inputs),
             outputs: SmallVec::from_slice(&b.outputs),
+            origin: Some(b.origin),
         }
     }
 
@@ -183,6 +187,7 @@ impl IBuiltin {
                 .iter()
                 .filter_map(var)
                 .collect(),
+            origin: None,
         }
     }
 }
