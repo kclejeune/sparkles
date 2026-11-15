@@ -1046,6 +1046,22 @@ struct Out<'r, 'a> {
     sent: usize,
     /// the conclusions of Tier D this activation derived
     work: usize,
+    /// the bytes the rules kept beside their conclusions that are not charged yet
+    /// ([`Sink::keep_data`])
+    kept: usize,
+}
+
+/// The bytes an activation keeps uncharged ([`Sink::keep_data`]) before it charges them.
+const KEEP_BATCH: usize = 16 << 10;
+
+impl Drop for Out<'_, '_> {
+    /// An activation charges what it kept and has not charged yet as it ends.
+    fn drop(&mut self) {
+        if self.kept > 0 {
+            let kept = std::mem::take(&mut self.kept);
+            let _ = self.reserve_data(kept);
+        }
+    }
 }
 
 /// Where a context's lists of forward links, propagations and backward links stood when
@@ -1203,6 +1219,12 @@ pub trait Sink {
     fn reserve_data(&mut self, _bytes: usize) -> bool {
         true
     }
+    /// Charges bytes that the rules keep beside their conclusions, whose charge may wait
+    /// for a batch, since the caller does not stop on its answer. A release nets against
+    /// what waits first.
+    fn keep_data(&mut self, bytes: usize) {
+        let _ = self.reserve_data(bytes);
+    }
     fn release_data(&mut self, _bytes: usize) {}
     fn data_overflow(&mut self) {}
 
@@ -1282,7 +1304,24 @@ impl Sink for Out<'_, '_> {
         self.run.peak.fetch_max(usize::MAX, Ordering::Relaxed);
         self.run.halt(STOP_MEMORY);
     }
+    /// The bytes wait in the activation until they pass [`KEEP_BATCH`] or it ends, so that
+    /// the rules that keep a little at a time do not each update the run's shared counts,
+    /// which four threads contend for.
+    fn keep_data(&mut self, bytes: usize) {
+        self.kept += bytes;
+        if self.kept >= KEEP_BATCH {
+            let kept = std::mem::take(&mut self.kept);
+            let _ = self.reserve_data(kept);
+        }
+    }
     fn release_data(&mut self, bytes: usize) {
+        // what waits uncharged comes off first, and only the rest leaves the count
+        let waiting = bytes.min(self.kept);
+        self.kept -= waiting;
+        let bytes = bytes - waiting;
+        if bytes == 0 {
+            return;
+        }
         // a caller releases what it reserved, and a reservation the overflow check refused
         // before it added anything is released as well, so the count stops at zero
         let _ = self
@@ -2358,6 +2397,7 @@ impl<'a> Run<'a> {
             pending: false,
             sent: 0,
             work: 0,
+            kept: 0,
         };
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
@@ -2529,6 +2569,8 @@ impl<'a> Run<'a> {
             t.extend(taken[at..].iter().rev());
             t.append(out.local);
         }
+        // the activation charges what it kept as it ends
+        drop(out);
         drop(st);
         ctx.active.store(false, Ordering::SeqCst);
         if !self.stopped() && (gave_way || !ctx.todo.lock().is_empty()) && self.mark(ctx) {
@@ -3467,6 +3509,57 @@ mod horn_accounting_tests {
         assert_eq!(run.queued.load(Ordering::Relaxed), 3);
     }
 
+    /// Data that the rules keep waits in the activation until it passes a batch or the
+    /// activation ends, a release nets against what waits first, and the run's count ends
+    /// at what was kept and not released.
+    #[test]
+    fn kept_data_waits_for_a_batch_and_a_release_nets_against_it() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let bounds = Bounds {
+            threads: 2,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            base_memory: 0,
+            peak_memory: 0,
+            dynamic: None,
+            dl: None,
+            partial: false,
+            steps: false,
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        let mut marks = Marks::default();
+        let (mut local, mut woke, mut outbox) = (Vec::new(), VecDeque::new(), Outbox::default());
+        let held = |run: &Run| run.memory.load(Ordering::Relaxed);
+        {
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut local,
+                woke: &mut woke,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            out.keep_data(100);
+            assert_eq!(held(out.run), 0);
+            out.release_data(60);
+            assert_eq!(held(out.run), 0);
+            out.keep_data(KEEP_BATCH);
+            assert_eq!(held(out.run), KEEP_BATCH + 40);
+            out.keep_data(8);
+            out.release_data(KEEP_BATCH);
+            assert_eq!(held(out.run), 48);
+            out.keep_data(24);
+        }
+        assert_eq!(held(&run), 72);
+    }
+
     /// A flush of a context's link products pairs what is new since the marks with
     /// everything and what is old only with what is new, each pair once, and sends the
     /// messages in one run per source or target (roadmap item 818).
@@ -3514,10 +3607,12 @@ mod horn_accounting_tests {
             pending: true,
             sent: 0,
             work: 0,
+            kept: 0,
         };
         let mut tally = Tally::default();
         assert!(run.flush_links(&st, &mut out, &mut tally));
         assert_eq!(out.sent, 6);
+        drop(out);
         let sent: Vec<(Ex, Vec<Concl>)> = outbox
             .runs
             .iter()
@@ -3554,6 +3649,7 @@ mod horn_accounting_tests {
             pending: true,
             sent: 0,
             work: 0,
+            kept: 0,
         };
         assert!(run.flush_links(&st, &mut out, &mut tally));
         assert_eq!(out.sent, 0);
@@ -3607,10 +3703,12 @@ mod horn_accounting_tests {
                 pending: true,
                 sent: 0,
                 work: 0,
+                kept: 0,
             };
             assert!(run.flush_links(&st, &mut out, &mut Tally::default()));
             // the messages to other contexts, the context's own aside
             assert_eq!(out.sent, 2 * 2 + 2 * 3);
+            drop(out);
             assert_eq!(local, products);
             let want = vec![
                 (e1, products.to_vec()),

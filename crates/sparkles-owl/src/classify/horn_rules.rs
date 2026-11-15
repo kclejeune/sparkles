@@ -196,14 +196,14 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     let roles = &ix.roles;
     let mut core = Vec::new();
     // the sort's entries are charged to the run's memory at each check of the bounds and
-    // at the end, so that the charge costs one reservation for 64 successors
+    // at the end, as data the activation keeps, whose charge the run's sink batches
     let mut charge = 0usize;
     while h.sorted < h.succ.list.len() {
         // a sort of many successors polls the run's bounds, and one that stops leaves
         // the rest unsorted, which the rules read as successors that no other dominates
         if h.sorted.is_multiple_of(64) {
             if charge > 0 {
-                let _ = out.reserve_data(std::mem::take(&mut charge));
+                out.keep_data(std::mem::take(&mut charge));
             }
             if !out.go_on() {
                 return;
@@ -285,7 +285,7 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
         }
     }
     if charge > 0 {
-        let _ = out.reserve_data(charge);
+        out.keep_data(charge);
     }
 }
 
@@ -378,7 +378,7 @@ impl Told {
             hs(st).told = t;
         }
         if self.1 > 0 {
-            let _ = out.reserve_data(self.1);
+            out.keep_data(self.1);
         }
     }
     /// Whether R6 has still to send `m` the core of `n`, which it records.
