@@ -2175,8 +2175,8 @@ impl Saturation {
         // the threads make them, so those runs take one thread instead, whose order is
         // fixed. The worlds and the taxonomy keep the caller's threads.
         // The bound of a run that neither counts nor is rooted (roadmap item 990) keeps the
-        // driver without steps, which takes 1.3 to 1.7 times less time on the attempts
-        // that finish on eight threads. Such an attempt either finishes well within its
+        // driver without steps, with which the attempts that finish on eight threads took
+        // 1.3 to 1.9 times less time than in steps on the laptop. Such an attempt either finishes well within its
         // bound or runs on far past it, so a schedule decides its outcome only for an
         // ontology near the bound, as it does for the memory budget.
         let fixed = limits.dl_steps
