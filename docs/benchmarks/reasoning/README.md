@@ -106,7 +106,7 @@ profile writes its databases, logs and results under a directory of its own name
   derived graphs is also compared triple for triple with that round's Nemo closure, so
   every thread count is checked whole. A run that disagrees stops the benchmark. A run
   that did not finish, and a check that therefore could not run, are listed in
-  `results/unverified.txt`, the summary then does not claim agreement for every run, and
+  `results/unverified.txt`. The summary then does not claim agreement for every run, and
   the runner exits with status 1 once it has written the results.
 - Incremental maintenance takes every hundredth data triple outside the RDF, RDFS and OWL
   vocabularies as the change. It inserts the change into the materialized store without
