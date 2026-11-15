@@ -54,13 +54,13 @@ impl Relations {
     /// Declare relation `name` of `arity`, or find it when it is declared with that arity.
     pub fn declare(&mut self, name: &str, arity: u16, hidden: bool) -> Result<RelId, IrError> {
         if name.is_empty() || name.starts_with(RESERVED) {
-            return Err(IrError::ReservedName(name.into()));
+            return Err(IrError::ReservedName);
         }
         if let Some(&id) = self.by_name.get(name) {
             let have = self.list[id.0 as usize].arity;
             if have != arity {
                 return Err(IrError::Redeclared {
-                    name: name.into(),
+                    relation: id,
                     arity: have,
                     again: arity,
                 });
@@ -256,11 +256,21 @@ impl Rule {
                 .any(|h| matches!(h, Head::Atom(a) if a.pred != Pred::Triple))
     }
 
-    pub(crate) fn var_name(&self, v: usize) -> String {
-        match self.vars.get(v) {
-            Some(n) if !n.is_empty() => format!("?{n}"),
-            _ => format!("?v{v}"),
-        }
+    fn var(&self, v: usize) -> VarName<'_> {
+        VarName(self, v)
+    }
+
+    /// Every variable the rule names, with where it is.
+    fn slots(&self) -> impl Iterator<Item = &Slot> + '_ {
+        let body = self.body.iter().flat_map(|l| match l {
+            Literal::Pos(a) | Literal::Neg(a) => a.args.iter(),
+            Literal::Builtin(b) => b.args.iter(),
+        });
+        let head = self.head.iter().flat_map(|h| match h {
+            Head::Atom(a) => a.args.iter(),
+            Head::Action(_, args) => args.iter(),
+        });
+        body.chain(head)
     }
 
     fn bytes(&self) -> usize {
@@ -322,105 +332,214 @@ impl Vocab {
     }
 }
 
-/// Why a program is refused.
+/// A variable of a rule, by its name when the frontend gave one.
+struct VarName<'a>(&'a Rule, usize);
+
+impl fmt::Display for VarName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.vars.get(self.1) {
+            Some(n) if !n.is_empty() => write!(f, "?{n}"),
+            _ => write!(f, "?v{}", self.1),
+        }
+    }
+}
+
+/// Why a program is refused. Rules, literals and variables are named by their indexes,
+/// and [`ProgramError::Invalid`] holds the message that names them, charged to the
+/// program's budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IrError {
-    ReservedName(String),
+    /// an empty name, or one in [`RESERVED`]
+    ReservedName,
     Redeclared {
-        name: String,
+        relation: RelId,
         arity: u16,
         again: u16,
     },
     TooMany,
     UnknownRelation {
-        rule: String,
+        rule: usize,
     },
     Arity {
-        rule: String,
-        relation: String,
+        rule: usize,
+        relation: Option<RelId>,
         arity: u16,
         got: usize,
     },
+    /// a variable number at or past the rule's `nvars`
+    BadVariable {
+        rule: usize,
+        var: usize,
+    },
     /// a variable that a head, a negated atom or a builtin needs and the body never binds
     Unsafe {
-        rule: String,
-        var: String,
+        rule: usize,
+        var: usize,
         place: &'static str,
     },
     /// an existential that the body binds too
     BoundExistential {
-        rule: String,
-        var: String,
+        rule: usize,
+        var: usize,
     },
     /// an existential in the predicate position of a triple head
     ExistentialPredicate {
-        rule: String,
-        var: String,
+        rule: usize,
+        var: usize,
     },
-    /// builtins whose inputs no order of the body binds
+    /// a builtin whose inputs no order of the body binds, with an input left unbound
     Unschedulable {
-        rule: String,
-        builtins: Vec<String>,
+        rule: usize,
+        literal: usize,
+        var: usize,
     },
     NegativeCycle(strata::NegativeCycle),
     NotWeaklyAcyclic(acyclic::Cycle),
 }
 
-impl fmt::Display for IrError {
+impl IrError {
+    /// The message of the error, which names the rules, literals and variables of
+    /// `rules` and the relations of `relations` that it points to.
+    pub fn display<'a>(
+        &'a self,
+        rules: &'a [Rule],
+        relations: &'a Relations,
+    ) -> impl fmt::Display + 'a {
+        Message(self, rules, relations)
+    }
+}
+
+struct Message<'a>(&'a IrError, &'a [Rule], &'a Relations);
+
+impl fmt::Display for Message<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IrError::ReservedName(n) if n.is_empty() => write!(f, "a relation needs a name"),
-            IrError::ReservedName(n) => {
-                write!(
-                    f,
-                    "relation name '{n}' is in the reserved namespace {RESERVED}"
-                )
-            }
-            IrError::Redeclared { name, arity, again } => write!(
+        let Message(e, rules, relations) = self;
+        let rule = |i: &usize| rules.get(*i).map_or("?", |r| r.name.as_str());
+        let rel = |r: &RelId| relations.get(*r).map_or("?", |r| &*r.name);
+        match e {
+            IrError::ReservedName => write!(
                 f,
-                "relation '{name}' is declared with arity {arity} and again with arity {again}"
+                "a relation needs a name outside the reserved namespace {RESERVED}"
+            ),
+            IrError::Redeclared {
+                relation,
+                arity,
+                again,
+            } => write!(
+                f,
+                "relation '{}' is declared with arity {arity} and again with arity {again}",
+                rel(relation)
             ),
             IrError::TooMany => write!(f, "too many relations"),
-            IrError::UnknownRelation { rule } => {
-                write!(f, "rule '{rule}' reads a relation that is not declared")
+            IrError::UnknownRelation { rule: r } => {
+                write!(
+                    f,
+                    "rule '{}' reads a relation that is not declared",
+                    rule(r)
+                )
             }
             IrError::Arity {
-                rule,
+                rule: r,
                 relation,
                 arity,
                 got,
+            } => match relation {
+                Some(x) => write!(
+                    f,
+                    "rule '{}': relation '{}' has arity {arity}, not {got}",
+                    rule(r),
+                    rel(x)
+                ),
+                None => write!(
+                    f,
+                    "rule '{}': a triple pattern has 3 terms, not {got}",
+                    rule(r)
+                ),
+            },
+            IrError::BadVariable { rule: r, var } => write!(
+                f,
+                "rule '{}': variable number {var} is past the rule's variables",
+                rule(r)
+            ),
+            IrError::Unsafe {
+                rule: r,
+                var,
+                place,
             } => write!(
                 f,
-                "rule '{rule}': relation '{relation}' has arity {arity}, not {got}"
+                "rule '{}': variable {} of {place} is not bound by a positive atom or a builtin of the body",
+                rule(r),
+                rules[*r].var(*var)
             ),
-            IrError::Unsafe { rule, var, place } => write!(
+            IrError::BoundExistential { rule: r, var } => write!(
                 f,
-                "rule '{rule}': variable {var} of {place} is not bound by a positive atom or a builtin of the body"
+                "rule '{}': existential variable {} is bound by the body",
+                rule(r),
+                rules[*r].var(*var)
             ),
-            IrError::BoundExistential { rule, var } => write!(
+            IrError::ExistentialPredicate { rule: r, var } => write!(
                 f,
-                "rule '{rule}': existential variable {var} is bound by the body"
+                "rule '{}': existential variable {} is in the predicate position of a head",
+                rule(r),
+                rules[*r].var(*var)
             ),
-            IrError::ExistentialPredicate { rule, var } => write!(
-                f,
-                "rule '{rule}': existential variable {var} is in the predicate position of a head"
-            ),
-            IrError::Unschedulable { rule, builtins } => write!(
-                f,
-                "rule '{rule}': no order of the body binds the inputs of {}",
-                builtins.join(", ")
-            ),
-            IrError::NegativeCycle(c) => c.fmt(f),
-            IrError::NotWeaklyAcyclic(c) => c.fmt(f),
+            IrError::Unschedulable {
+                rule: r,
+                literal,
+                var,
+            } => {
+                let kind = match rules[*r].body.get(*literal) {
+                    Some(Literal::Builtin(b)) => b.kind,
+                    _ => BuiltinKind::NoValue,
+                };
+                write!(
+                    f,
+                    "rule '{}': no order of the body binds input {} of builtin {kind:?}",
+                    rule(r),
+                    rules[*r].var(*var)
+                )
+            }
+            IrError::NegativeCycle(c) => {
+                write!(
+                    f,
+                    "the rules are not stratified: rule '{}' negates literal {} of its body, which depends on the rule's own conclusions through the rules ",
+                    rule(&c.rule),
+                    c.literal + 1
+                )?;
+                for (i, r) in c.rules.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "'{}'", rule(r))?;
+                }
+                Ok(())
+            }
+            IrError::NotWeaklyAcyclic(c) => {
+                write!(
+                    f,
+                    "the existential rules may not terminate: rule '{}' makes a new value at ",
+                    rule(&c.rule)
+                )?;
+                c.to.write(f, relations)?;
+                f.write_str(" from a value at ")?;
+                c.from.write(f, relations)?;
+                f.write_str(
+                    ", and new values there reach it again (the program is not weakly acyclic)",
+                )
+            }
         }
     }
 }
 
-/// A refused program: memory, or an error of the program.
+/// A refused program: memory, or an error of the program with its message.
 #[derive(Debug)]
 pub(crate) enum ProgramError {
     Memory(BudgetFailure),
-    Invalid(IrError),
+    Invalid {
+        error: IrError,
+        message: String,
+        _held: Held,
+    },
 }
 
 impl From<BudgetFailure> for ProgramError {
@@ -429,17 +548,41 @@ impl From<BudgetFailure> for ProgramError {
     }
 }
 
-impl From<IrError> for ProgramError {
-    fn from(e: IrError) -> Self {
-        ProgramError::Invalid(e)
-    }
-}
-
 impl fmt::Display for ProgramError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProgramError::Memory(e) => e.fmt(f),
-            ProgramError::Invalid(e) => e.fmt(f),
+            ProgramError::Invalid { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+impl ProgramError {
+    /// The refusal `error` of `rules`, with its message charged to `budget` before it is
+    /// formatted.
+    fn invalid(
+        error: IrError,
+        rules: &[Rule],
+        relations: &Relations,
+        budget: &Arc<Budget>,
+    ) -> Self {
+        let shown = error.display(rules, relations);
+        let len = match crate::budget::format_len(format_args!("{shown}")) {
+            Ok(len) => len,
+            Err(e) => return ProgramError::Memory(e),
+        };
+        let held = match Held::try_new_exact(budget, len) {
+            Ok(held) => held,
+            Err(e) => return ProgramError::Memory(e),
+        };
+        let mut message = String::with_capacity(len);
+        use fmt::Write;
+        write!(message, "{shown}").expect("formatting into a String");
+        drop(shown);
+        ProgramError::Invalid {
+            error,
+            message,
+            _held: held,
         }
     }
 }
@@ -463,9 +606,9 @@ impl fmt::Debug for Program {
 }
 
 impl Program {
-    /// Check `rules` over `relations` and stratify them. The program's rules, relations
-    /// and strata are charged to `budget` while it lives, and the analyses' working
-    /// memory while they run.
+    /// Check `rules` over `relations` and stratify them. The program's rules and
+    /// relations are charged to `budget` while it lives, its strata with them, and the
+    /// analyses' working memory while they run.
     ///
     /// A program that uses an IR feature (see [`Rule::uses_ir`]) and has a negation, a
     /// negated atom or a `noValue`, is refused when it does not stratify. A program of
@@ -484,20 +627,30 @@ impl Program {
             kept += r.bytes();
         }
         held.try_grow(kept)?;
-        for r in &rules {
-            check_rule(r, &relations)?;
+        let refuse = |e: IrError| ProgramError::invalid(e, &rules, &relations, budget);
+        for (i, r) in rules.iter().enumerate() {
+            match check_rule(i, r, &relations, budget) {
+                Ok(()) => {}
+                Err(Check::Memory(e)) => return Err(e.into()),
+                Err(Check::Invalid(e)) => return Err(refuse(e)),
+            }
         }
         let strata = strata::Strata::of(&rules, vocab, budget)?;
-        held.try_grow(strata.bytes())?;
         let ir = rules.iter().any(Rule::uses_ir);
         if ir
             && strata.has_negation
             && let Err(c) = &strata.stratified
         {
-            return Err(IrError::NegativeCycle(c.clone()).into());
+            return Err(refuse(IrError::NegativeCycle(c.clone())));
         }
         if rules.iter().any(|r| !r.exists.is_empty()) {
-            acyclic::check(&rules, &relations, vocab, budget)?;
+            match acyclic::check(&rules, vocab, budget) {
+                Ok(()) => {}
+                Err(acyclic::CheckError::Memory(e)) => return Err(e.into()),
+                Err(acyclic::CheckError::Cycle(c)) => {
+                    return Err(refuse(IrError::NotWeaklyAcyclic(c)));
+                }
+            }
         }
         Ok(Program {
             relations,
@@ -512,34 +665,68 @@ impl Program {
     }
 }
 
-/// The checks of one rule: the arities of its atoms, safety and an evaluation order.
-fn check_rule(r: &Rule, relations: &Relations) -> Result<(), IrError> {
+enum Check {
+    Memory(BudgetFailure),
+    Invalid(IrError),
+}
+
+impl From<BudgetFailure> for Check {
+    fn from(e: BudgetFailure) -> Self {
+        Check::Memory(e)
+    }
+}
+
+impl From<IrError> for Check {
+    fn from(e: IrError) -> Self {
+        Check::Invalid(e)
+    }
+}
+
+/// The checks of rule `ri`: its variable numbers, the arities of its atoms, safety and
+/// an evaluation order. Its working memory is charged to `budget` first.
+fn check_rule(
+    ri: usize,
+    r: &Rule,
+    relations: &Relations,
+    budget: &Arc<Budget>,
+) -> Result<(), Check> {
+    let vars_ok = |v: usize| v < r.nvars;
+    for s in r.slots() {
+        if let Slot::Var(v) = *s
+            && !vars_ok(v)
+        {
+            return Err(IrError::BadVariable { rule: ri, var: v }.into());
+        }
+    }
+    for l in &r.body {
+        if let Literal::Builtin(b) = l
+            && let Some(&v) = b.inputs.iter().chain(&b.outputs).find(|&&v| !vars_ok(v))
+        {
+            return Err(IrError::BadVariable { rule: ri, var: v }.into());
+        }
+    }
+    if let Some(&v) = r.exists.iter().find(|&&v| !vars_ok(v)) {
+        return Err(IrError::BadVariable { rule: ri, var: v }.into());
+    }
     let arity = |a: &IAtom| -> Result<(), IrError> {
         match a.pred {
             Pred::Triple if a.args.len() == 3 => Ok(()),
             Pred::Triple => Err(IrError::Arity {
-                rule: r.name.clone(),
-                relation: "the triple relation".into(),
+                rule: ri,
+                relation: None,
                 arity: 3,
                 got: a.args.len(),
             }),
-            Pred::Rel(id) => {
-                let Some(rel) = relations.get(id) else {
-                    return Err(IrError::UnknownRelation {
-                        rule: r.name.clone(),
-                    });
-                };
-                if rel.arity as usize == a.args.len() {
-                    Ok(())
-                } else {
-                    Err(IrError::Arity {
-                        rule: r.name.clone(),
-                        relation: rel.name.to_string(),
-                        arity: rel.arity,
-                        got: a.args.len(),
-                    })
-                }
-            }
+            Pred::Rel(id) => match relations.get(id) {
+                None => Err(IrError::UnknownRelation { rule: ri }),
+                Some(rel) if rel.arity as usize == a.args.len() => Ok(()),
+                Some(rel) => Err(IrError::Arity {
+                    rule: ri,
+                    relation: Some(id),
+                    arity: rel.arity,
+                    got: a.args.len(),
+                }),
+            },
         }
     };
     for l in &r.body {
@@ -554,36 +741,38 @@ fn check_rule(r: &Rule, relations: &Relations) -> Result<(), IrError> {
     }
     // the planner's fixpoint without statistics: positive atoms bind their variables,
     // and a builtin binds its outputs once its inputs are bound
+    let _scratch = Held::try_new_exact(
+        budget,
+        r.nvars * size_of::<bool>() + r.body.len() * size_of::<usize>(),
+    )?;
     let mut bound = vec![false; r.nvars];
-    let mark = |v: usize, bound: &mut Vec<bool>| {
-        if v >= bound.len() {
-            bound.resize(v + 1, false);
-        }
-        bound[v] = true;
-    };
     for l in &r.body {
         if let Literal::Pos(a) = l {
             for v in a.vars() {
-                mark(v, &mut bound);
+                bound[v] = true;
             }
         }
     }
-    let is = |v: usize, bound: &[bool]| bound.get(v).copied().unwrap_or(false);
-    let mut left: Vec<&IBuiltin> = r
-        .body
-        .iter()
-        .filter_map(|l| match l {
-            Literal::Builtin(b) => Some(b),
-            _ => None,
-        })
-        .collect();
+    let mut left: Vec<usize> = Vec::with_capacity(r.body.len());
+    left.extend(
+        r.body
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l, Literal::Builtin(_)))
+            .map(|(i, _)| i),
+    );
+    let builtin = |i: usize| match &r.body[i] {
+        Literal::Builtin(b) => b,
+        _ => unreachable!("only builtins are left"),
+    };
     loop {
         let before = left.len();
         let mut i = 0;
         while i < left.len() {
-            if left[i].inputs.iter().all(|&v| is(v, &bound)) {
-                for &v in &left[i].outputs {
-                    mark(v, &mut bound);
+            let b = builtin(left[i]);
+            if b.inputs.iter().all(|&v| bound[v]) {
+                for &v in &b.outputs {
+                    bound[v] = true;
                 }
                 left.swap_remove(i);
             } else {
@@ -594,33 +783,32 @@ fn check_rule(r: &Rule, relations: &Relations) -> Result<(), IrError> {
             break;
         }
     }
-    if !left.is_empty() {
+    if let Some(&li) = left.iter().min() {
+        let b = builtin(li);
+        let var = b.inputs.iter().copied().find(|&v| !bound[v]).unwrap_or(0);
         return Err(IrError::Unschedulable {
-            rule: r.name.clone(),
-            builtins: left.iter().map(|b| format!("{:?}", b.kind)).collect(),
-        });
+            rule: ri,
+            literal: li,
+            var,
+        }
+        .into());
     }
-    let unsafe_var = |v: usize, place: &'static str| IrError::Unsafe {
-        rule: r.name.clone(),
-        var: r.var_name(v),
+    let unsafe_var = |var: usize, place: &'static str| IrError::Unsafe {
+        rule: ri,
+        var,
         place,
     };
     for l in &r.body {
         if let Literal::Neg(a) = l
-            && let Some(v) = a.vars().find(|&v| !is(v, &bound))
+            && let Some(v) = a.vars().find(|&v| !bound[v])
         {
-            return Err(unsafe_var(v, "a negated atom"));
+            return Err(unsafe_var(v, "a negated atom").into());
         }
     }
-    for &v in &r.exists {
-        if is(v, &bound) {
-            return Err(IrError::BoundExistential {
-                rule: r.name.clone(),
-                var: r.var_name(v),
-            });
-        }
+    if let Some(&v) = r.exists.iter().find(|&&v| bound[v]) {
+        return Err(IrError::BoundExistential { rule: ri, var: v }.into());
     }
-    let free = |v: usize| !is(v, &bound) && !r.exists.contains(&v);
+    let free = |v: usize| !bound[v] && !r.exists.contains(&v);
     for h in &r.head {
         match h {
             Head::Atom(a) => {
@@ -628,21 +816,18 @@ fn check_rule(r: &Rule, relations: &Relations) -> Result<(), IrError> {
                     && let Slot::Var(v) = a.args[1]
                     && r.exists.contains(&v)
                 {
-                    return Err(IrError::ExistentialPredicate {
-                        rule: r.name.clone(),
-                        var: r.var_name(v),
-                    });
+                    return Err(IrError::ExistentialPredicate { rule: ri, var: v }.into());
                 }
                 if let Some(v) = a.vars().find(|&v| free(v)) {
-                    return Err(unsafe_var(v, "the head"));
+                    return Err(unsafe_var(v, "the head").into());
                 }
             }
             Head::Action(_, args) => {
                 for s in args {
                     if let Slot::Var(v) = *s
-                        && !is(v, &bound)
+                        && !bound[v]
                     {
-                        return Err(unsafe_var(v, "a head action"));
+                        return Err(unsafe_var(v, "a head action").into());
                     }
                 }
             }

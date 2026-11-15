@@ -91,8 +91,13 @@ fn program(rels: Relations, rules: Vec<Rule>) -> Result<Program, ProgramError> {
 }
 
 fn invalid(r: Result<Program, ProgramError>) -> IrError {
+    refusal(r).0
+}
+
+/// The error and the message of a refused program.
+fn refusal(r: Result<Program, ProgramError>) -> (IrError, String) {
     match r {
-        Err(ProgramError::Invalid(e)) => e,
+        Err(ProgramError::Invalid { error, message, .. }) => (error, message),
         Err(ProgramError::Memory(e)) => panic!("memory: {e}"),
         Ok(p) => panic!("accepted: {p:?}"),
     }
@@ -163,12 +168,12 @@ fn negative_cycles_are_refused_with_their_rules() {
         )],
     ));
     let IrError::NegativeCycle(c) = e else {
-        panic!("{e}")
+        panic!("{e:?}")
     };
-    assert_eq!(c.rule, "self");
-    assert_eq!(c.rules, vec!["self".to_string()]);
+    assert_eq!((c.rule, c.literal), (0, 1));
+    assert_eq!(c.rules, vec![0]);
     // through two relations
-    let e = invalid(program(
+    let (e, message) = refusal(program(
         rels,
         vec![
             rule(
@@ -184,11 +189,14 @@ fn negative_cycles_are_refused_with_their_rules() {
         ],
     ));
     let IrError::NegativeCycle(c) = e else {
-        panic!("{e}")
+        panic!("{e:?}")
     };
-    assert_eq!(c.rule, "one");
-    assert_eq!(c.rules, vec!["one".to_string(), "two".to_string()]);
-    assert!(c.to_string().contains("'one', 'two'"), "{c}");
+    assert_eq!(c.rule, 0);
+    assert_eq!(c.rules, vec![0, 1]);
+    assert!(
+        message.contains("rule 'one' negates literal 2") && message.contains("'one', 'two'"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -411,7 +419,7 @@ fn an_unrelated_negation_refuses_a_no_value_cycle() {
     let Err(c) = &p.strata.stratified else {
         panic!("a cycle")
     };
-    assert_eq!(c.rule, "r");
+    assert_eq!(c.rule, 0);
     let (rels, r) = relations(&[1, 1]);
     let mut more = cycle;
     more.push(rule(
@@ -421,7 +429,7 @@ fn an_unrelated_negation_refuses_a_no_value_cycle() {
     ));
     assert!(matches!(
         invalid(program(rels, more)),
-        IrError::NegativeCycle(c) if c.rule == "r"
+        IrError::NegativeCycle(c) if c.rule == 0
     ));
 }
 
@@ -446,7 +454,7 @@ fn a_relation_that_gives_its_own_blocker_is_refused() {
             ),
         ],
     ));
-    assert!(matches!(e, IrError::NegativeCycle(c) if c.rule == "make"));
+    assert!(matches!(e, IrError::NegativeCycle(c) if c.rule == 0));
 }
 
 #[test]
@@ -513,7 +521,7 @@ fn lists_and_list_for_all_are_dependencies() {
         ),
     ];
     let p = program(Relations::default(), rules).unwrap();
-    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == "build"));
+    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == 0));
     let rules = vec![
         rule(
             "tested",
@@ -527,7 +535,7 @@ fn lists_and_list_for_all_are_dependencies() {
         ),
     ];
     let p = program(Relations::default(), rules).unwrap();
-    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == "tested"));
+    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == 0));
 }
 
 #[test]
@@ -550,7 +558,7 @@ fn head_actions_give_their_predicate_and_read_lists() {
     ];
     let p = program(Relations::default(), rules).unwrap();
     // `n` negates what `map` gives, and `map` reads the lists `n` builds
-    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == "n"));
+    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == 1));
 }
 
 #[test]
@@ -740,7 +748,7 @@ fn strata_agree_with_the_demand_detector() {
     assert!(!crate::demand::negation_on_a_cycle(c.rules(), &t));
     let ir: Vec<Rule> = c.rules().iter().map(Rule::from_crule).collect();
     let p = Program::new(Relations::default(), ir, &v, &t.budget()).unwrap();
-    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == "n"));
+    assert!(matches!(&p.strata.stratified, Err(c) if c.rule == 1));
     // random programs over a few predicates and classes
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = |n: u64| {
@@ -795,8 +803,12 @@ fn strata_agree_with_the_demand_detector() {
 fn acyclic(rels: Relations, rules: Vec<Rule>) -> Result<(), String> {
     match program(rels, rules) {
         Ok(_) => Ok(()),
-        Err(ProgramError::Invalid(IrError::NotWeaklyAcyclic(c))) => Err(c.to_string()),
-        Err(e) => panic!("{e}"),
+        Err(ProgramError::Invalid {
+            error: IrError::NotWeaklyAcyclic(_),
+            message,
+            ..
+        }) => Err(message),
+        Err(e) => panic!("{e:?}"),
     }
 }
 
@@ -906,7 +918,7 @@ fn an_existential_predicate_is_refused() {
             &[1],
         )],
     ));
-    assert!(matches!(e, IrError::ExistentialPredicate { .. }), "{e}");
+    assert!(matches!(e, IrError::ExistentialPredicate { .. }), "{e:?}");
 }
 
 /// Rounds 1 and 2 of the review: builtins that make values, and list members, take part.
@@ -1002,15 +1014,16 @@ fn declarations_are_checked() {
     assert_eq!(
         rels.declare("a", 3, false).unwrap_err(),
         IrError::Redeclared {
-            name: "a".into(),
+            relation: a,
             arity: 2,
             again: 3
         }
     );
-    assert!(matches!(
+    assert_eq!(
         rels.declare("urn:x-sparkles:rel:a", 1, false),
-        Err(IrError::ReservedName(_))
-    ));
+        Err(IrError::ReservedName)
+    );
+    assert_eq!(rels.declare("", 1, false), Err(IrError::ReservedName));
     let unit = rels.declare("unit", 0, true).unwrap();
     assert_eq!(rels.get(unit).unwrap().arity, 0);
     let x = V(0);
@@ -1042,7 +1055,7 @@ fn declarations_are_checked() {
                 ..
             }
         ),
-        "{e}"
+        "{e:?}"
     );
 }
 
@@ -1056,8 +1069,8 @@ fn unsafe_and_unschedulable_rules_are_refused() {
         vec![head(IAtom::rel(r[1], &[y]))],
     );
     named.vars = vec!["x".into(), "y".into()];
-    let e = invalid(program(rels.clone(), vec![named]));
-    assert!(e.to_string().contains("?y of the head"), "{e}");
+    let (_, message) = refusal(program(rels.clone(), vec![named]));
+    assert!(message.contains("?y of the head"), "{message}");
     let e = invalid(program(
         rels.clone(),
         vec![rule(
@@ -1074,17 +1087,27 @@ fn unsafe_and_unschedulable_rules_are_refused() {
                 ..
             }
         ),
-        "{e}"
+        "{e:?}"
     );
-    let e = invalid(program(
-        rels.clone(),
-        vec![rule(
-            "input",
-            vec![pos(IAtom::rel(r[0], &[x])), bi(B::NotEqual, &[x, y])],
-            vec![head(IAtom::rel(r[1], &[x]))],
-        )],
-    ));
-    assert!(matches!(e, IrError::Unschedulable { .. }), "{e}");
+    let mut input = rule(
+        "input",
+        vec![pos(IAtom::rel(r[0], &[x])), bi(B::NotEqual, &[x, y])],
+        vec![head(IAtom::rel(r[1], &[x]))],
+    );
+    input.vars = vec!["x".into(), "y".into()];
+    let (e, message) = refusal(program(rels.clone(), vec![input]));
+    assert_eq!(
+        e,
+        IrError::Unschedulable {
+            rule: 0,
+            literal: 1,
+            var: 1
+        }
+    );
+    assert!(
+        message.contains("input ?y of builtin NotEqual"),
+        "{message}"
+    );
     // two builtins whose outputs feed each other
     let e = invalid(program(
         rels.clone(),
@@ -1098,7 +1121,7 @@ fn unsafe_and_unschedulable_rules_are_refused() {
             vec![head(IAtom::rel(r[1], &[y]))],
         )],
     ));
-    assert!(matches!(e, IrError::Unschedulable { .. }), "{e}");
+    assert!(matches!(e, IrError::Unschedulable { .. }), "{e:?}");
     let e = invalid(program(
         rels,
         vec![exists(
@@ -1110,7 +1133,7 @@ fn unsafe_and_unschedulable_rules_are_refused() {
             &[0],
         )],
     ));
-    assert!(matches!(e, IrError::BoundExistential { .. }), "{e}");
+    assert!(matches!(e, IrError::BoundExistential { .. }), "{e:?}");
 }
 
 // ----------------------------------------------------------------- budget ---
@@ -1167,4 +1190,122 @@ fn a_large_component_stratifies() {
     assert_eq!(p.strata.count, 1);
     assert_eq!(p.strata.stratified, Ok(()));
     assert!(budget.peak() < 96 << 20, "{}", budget.peak());
+}
+
+// ------------------------------------------------- review round 1 of the code ---
+
+/// A value a builtin computes from the frontier carries the frontier's positions, so the
+/// existential it feeds is a special edge from them: `R(x), makeSkolem(y, x) → ∃z S(y,
+/// z)` with `S(y, z) → R(z)` grows without end from `R(a)`.
+#[test]
+fn computed_frontier_values_keep_their_sources() {
+    let (rels, r) = relations(&[1, 2]);
+    let (x, y, z) = (V(0), V(1), V(2));
+    let make = exists(
+        rule(
+            "make",
+            vec![pos(IAtom::rel(r[0], &[x])), bi(B::MakeSkolem, &[y, x])],
+            vec![head(IAtom::rel(r[1], &[y, z]))],
+        ),
+        &[2],
+    );
+    let back = rule(
+        "back",
+        vec![pos(IAtom::rel(r[1], &[y, z]))],
+        vec![head(IAtom::rel(r[0], &[z]))],
+    );
+    let e = acyclic(rels.clone(), vec![make.clone(), back]).unwrap_err();
+    assert!(e.contains("rule 'make'"), "{e}");
+    // reading the computed value back, not the existential, terminates
+    let back = rule(
+        "back",
+        vec![pos(IAtom::rel(r[1], &[y, z]))],
+        vec![head(IAtom::rel(r[0], &[y]))],
+    );
+    let _ = acyclic(rels, vec![make, back]);
+}
+
+/// Variable numbers past `nvars` are refused before anything is sized by them, and the
+/// safety check's scratch is charged.
+#[test]
+fn the_safety_check_is_bounded_and_charged() {
+    let (rels, r) = relations(&[1]);
+    let mut bad = rule(
+        "bad",
+        vec![pos(IAtom::rel(r[0], &[V(0)]))],
+        vec![head(IAtom::rel(r[0], &[V(0)]))],
+    );
+    bad.nvars = 0;
+    assert_eq!(
+        invalid(program(rels.clone(), vec![bad])),
+        IrError::BadVariable { rule: 0, var: 0 }
+    );
+    let mut wide = rule(
+        "wide",
+        vec![pos(IAtom::rel(r[0], &[V(0)]))],
+        vec![head(IAtom::rel(r[0], &[V(0)]))],
+    );
+    wide.nvars = 1 << 20;
+    let budget = Budget::new(Some(256 << 10));
+    let got = Program::new(rels, vec![wide], &vocab(), &budget);
+    assert!(matches!(got, Err(ProgramError::Memory(_))), "{got:?}");
+    assert_eq!(budget.used(), 0);
+}
+
+/// Every analysis charges at least what it allocates, by the crate's counting allocator:
+/// the review's overlap of a normal and a special edge, a negative cycle through rules
+/// with long names, and many singleton components.
+#[test]
+fn the_analyses_charge_what_they_allocate() {
+    let (rels, r) = relations(&[1, 2]);
+    let x = V(0);
+    let charged = |rules: Vec<Rule>, rels: Relations| {
+        let budget = Budget::unlimited();
+        let (got, heap) =
+            crate::alloc_probe::peak_of(|| Program::new(rels, rules, &vocab(), &budget).map(drop));
+        assert!(
+            heap <= budget.peak(),
+            "heap {heap}, charged {}",
+            budget.peak()
+        );
+        got
+    };
+    // a builtin output an atom binds too, over 100 relations: a normal and a special
+    // edge for each pair of a body and a head position
+    let (mut many, m) = relations(&[1; 100]);
+    let pair = many.declare("pair", 2, false).unwrap();
+    let mut body: Vec<Literal> = (0..100).map(|i| pos(IAtom::rel(m[i], &[x]))).collect();
+    body.push(bi(B::Sum, &[x, C(500), x]));
+    let mut heads: Vec<Head> = (0..100).map(|i| head(IAtom::rel(m[i], &[x]))).collect();
+    heads.push(head(IAtom::rel(pair, &[x, V(1)])));
+    let overlap = exists(rule("overlap", body, heads), &[1]);
+    assert!(charged(vec![overlap], many).is_err());
+    // a negative cycle through rules with long names
+    let long = "n".repeat(100_000);
+    let cycle = vec![
+        rule(
+            &long,
+            vec![pos(IAtom::rel(r[0], &[x])), neg(IAtom::rel(r[1], &[x, x]))],
+            vec![head(IAtom::rel(r[1], &[x, x]))],
+        ),
+        rule(
+            &long,
+            vec![pos(IAtom::rel(r[1], &[x, x]))],
+            vec![head(IAtom::rel(r[0], &[x]))],
+        ),
+    ];
+    let got = charged(cycle, rels.clone());
+    assert!(matches!(got, Err(ProgramError::Invalid { .. })));
+    // many singleton components, each a strata of its own
+    let (y, n) = (V(1), 5_000u64);
+    let chain: Vec<Rule> = (0..n)
+        .map(|i| {
+            rule(
+                "c",
+                vec![pos(tri(x, 50, y)), bi(B::NoValue, &[x, C(100 + i), Any])],
+                vec![head(tri(x, 101 + i, y))],
+            )
+        })
+        .collect();
+    charged(chain, Relations::default()).unwrap();
 }

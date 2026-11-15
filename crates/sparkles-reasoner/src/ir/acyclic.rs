@@ -16,12 +16,16 @@
 //! a list builtin's list has the positions of `rdf:first` and `rdf:rest` subjects and of
 //! `rdf:rest` objects, the members `listMember` and `listEntry` give have the position of
 //! `rdf:first` objects, and `listForAll` reads the facts of an atom. Every other builtin
-//! output is a new value, an existential whose frontier is every body variable of its
-//! rule. A head action gives facts whose subject (`listMapAsSubject`) or object
+//! output is a new value made from its inputs, and `makeTemp`'s from every body position
+//! of its rule. A variable's sources are its own body positions, or for a new value the
+//! sources of the inputs it is made from, so a value a builtin computes from the frontier
+//! carries the frontier's positions. A new value in a head gets special edges from its
+//! sources, and an existential gets special edges from the sources of every other
+//! variable of its rule's head. A head action gives facts whose subject (`listMapAsSubject`) or object
 //! (`listMapAsObject`) is a list member, which flows from `rdf:first` objects. A program
 //! is weakly acyclic when no cycle passes a special edge.
 
-use super::{Head, IAtom, IrError, Literal, Pred, RelId, Relations, Rule, Vocab};
+use super::{Head, IAtom, Literal, Pred, RelId, Relations, Rule, Vocab};
 use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity};
 use crate::builtins::{BuiltinKind, HeadAction};
 use crate::engine::Slot;
@@ -30,30 +34,21 @@ use smallvec::SmallVec;
 use std::fmt;
 use std::sync::Arc;
 
-/// A cycle through a special edge: a value the rule makes at `to` from `from` can reach
-/// `from` again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A cycle through a special edge of rule `rule`: a value it makes at `to` from a value at
+/// `from` can reach `from` again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Cycle {
-    pub rule: String,
-    pub from: String,
-    pub to: String,
-}
-
-impl fmt::Display for Cycle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the existential rules may not terminate: rule '{}' makes a new value at {} from a value at {}, and new values at {} reach {} again (the program is not weakly acyclic)",
-            self.rule, self.to, self.from, self.to, self.from
-        )
-    }
+    pub rule: usize,
+    pub from: Position,
+    pub to: Position,
 }
 
 const S: u8 = 0;
 const O: u8 = 2;
 
+/// A position of the graph.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Position {
+pub(crate) enum Position {
     /// a column of a constant predicate
     Pred(u64, u8),
     /// a column of the facts a head with a variable predicate gives
@@ -130,8 +125,8 @@ impl Positions {
     }
 }
 
-fn bound(rules: &[Rule]) -> (usize, usize) {
-    let (mut positions, mut edges) = (8usize, 0usize);
+fn bound(rules: &[Rule]) -> (usize, usize, usize) {
+    let (mut positions, mut edges, mut scratch) = (8usize, 0usize, 0usize);
     for r in rules {
         let mut body = 0usize;
         let mut head = 0usize;
@@ -149,33 +144,40 @@ fn bound(rules: &[Rule]) -> (usize, usize) {
             };
         }
         positions += body + head;
-        edges += body * head + head;
+        // a normal edge, a special edge from a new value's sources and one to an
+        // existential, for each pair of a body and a head position, and a list member's edge
+        // for each head action
+        edges += 3 * body * head + head;
+        // the sources of each variable, at most one per body position, the frontier and
+        // the body and head lists
+        scratch = scratch.max((r.nvars + 2) * body + 2 * head);
     }
     // the bridges of every column to `ReadAll` and from `Any`
     edges += 3 * positions;
-    (positions, edges)
+    (positions, edges, scratch)
 }
 
 /// Check that `rules` are weakly acyclic, charging the position graph to `budget`.
-pub(crate) fn check(
-    rules: &[Rule],
-    relations: &Relations,
-    vocab: &Vocab,
-    budget: &Arc<Budget>,
-) -> Result<(), CheckError> {
-    let (positions, edges) = bound(rules);
+pub(crate) fn check(rules: &[Rule], vocab: &Vocab, budget: &Arc<Budget>) -> Result<(), CheckError> {
+    let (positions, edges, scratch) = bound(rules);
+    let nvars = rules.iter().map(|r| r.nvars).max().unwrap_or(0);
     let bytes = table_bytes(table_capacity(positions), size_of::<(Position, u32)>())
         + positions * size_of::<Position>()
         + edges * size_of::<(u32, u32, bool, u32)>()
-        + positions * super::strata::SCRATCH_PER_NODE;
+        + positions * super::strata::SCRATCH_PER_NODE
+        // the body and head lists, the sources and their vectors, the frontier and a
+        // source list being merged, with room for a vector's doubling
+        + 2 * scratch * size_of::<(usize, u32)>()
+        + nvars * size_of::<Vec<u32>>();
     let _held = Held::try_new_exact(budget, bytes)?;
     let mut g = Positions {
         ids: FxHashMap::with_capacity_and_hasher(positions, Default::default()),
         keys: Vec::with_capacity(positions),
         edges: Vec::with_capacity(edges),
     };
-    let mut body: Vec<(usize, u32)> = Vec::new();
-    let mut head: Vec<(usize, u32)> = Vec::new();
+    let mut body: Vec<(usize, u32)> = Vec::with_capacity(scratch);
+    let mut head: Vec<(usize, u32)> = Vec::with_capacity(scratch);
+    let mut sources: Vec<Vec<u32>> = Vec::with_capacity(nvars);
     // head positions whose values come from list members, with no body variable
     let mut members: Vec<u32> = Vec::new();
     for (ri, r) in rules.iter().enumerate() {
@@ -248,17 +250,64 @@ pub(crate) fn check(
         for &m in &members {
             g.edges.push((first_o, m, false, ri));
         }
-        let fresh = |v: usize| r.exists.contains(&v) || generated.contains(&v);
-        let in_head = |v: usize| head.iter().any(|&(w, _)| w == v);
-        for &(v, to) in &head {
-            if fresh(v) {
-                // a new value: from every position of the frontier, which for a builtin's
-                // output is every body variable
-                let all = generated.contains(&v);
-                for &(w, from) in &body {
-                    if all || (in_head(w) && !fresh(w)) {
-                        g.edges.push((from, to, true, ri));
+        // the sources of each variable: its body positions, and for a new value the
+        // sources of the inputs it is made from, through chains of builtins
+        sources.clear();
+        sources.resize_with(r.nvars, Vec::new);
+        for &(v, p) in &body {
+            sources[v].push(p);
+        }
+        let mut everything: Vec<u32> = body.iter().map(|&(_, p)| p).collect();
+        everything.sort_unstable();
+        everything.dedup();
+        for _ in 0..r.body.len() {
+            let mut grew = false;
+            for l in &r.body {
+                let Literal::Builtin(b) = l else { continue };
+                if selects(b.kind) || b.outputs.is_empty() {
+                    continue;
+                }
+                let mut from: Vec<u32> = if b.inputs.is_empty() {
+                    everything.clone()
+                } else {
+                    b.inputs
+                        .iter()
+                        .flat_map(|&v| sources[v].iter().copied())
+                        .collect()
+                };
+                from.sort_unstable();
+                from.dedup();
+                for &o in &b.outputs {
+                    let mut merged = from.clone();
+                    merged.extend(sources[o].iter().copied());
+                    merged.sort_unstable();
+                    merged.dedup();
+                    if merged.len() > sources[o].len() {
+                        sources[o] = merged;
+                        grew = true;
                     }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        // the sources of the head's values other than its existentials
+        let mut frontier: Vec<u32> = head
+            .iter()
+            .filter(|&&(w, _)| !r.exists.contains(&w))
+            .flat_map(|&(w, _)| sources[w].iter().copied())
+            .collect();
+        frontier.sort_unstable();
+        frontier.dedup();
+        for &(v, to) in &head {
+            if r.exists.contains(&v) {
+                for &from in &frontier {
+                    g.edges.push((from, to, true, ri));
+                }
+            } else if generated.contains(&v) {
+                for &from in &sources[v] {
+                    g.edges.push((from, to, true, ri));
                 }
             }
             for &(w, from) in &body {
@@ -284,6 +333,12 @@ pub(crate) fn check(
         g.edges.push((any, all, false, u32::MAX));
     }
     let n = g.keys.len();
+    // the charge holds only while the graph stays within its bounds
+    debug_assert!(
+        g.edges.len() <= edges && n <= positions,
+        "{} edges for {edges}, {n} positions for {positions}",
+        g.edges.len()
+    );
     g.edges.sort_unstable_by_key(|e| e.0);
     let mut offsets = Vec::with_capacity(n + 1);
     let mut e = 0;
@@ -304,27 +359,28 @@ pub(crate) fn check(
         .iter()
         .find(|e| e.2 && comp[e.0 as usize] == comp[e.1 as usize])
     {
-        let name = |p: Position| describe(p, relations);
         return Err(CheckError::Cycle(Cycle {
-            rule: rules[ri as usize].name.clone(),
-            from: name(g.keys[from as usize]),
-            to: name(g.keys[to as usize]),
+            rule: ri as usize,
+            from: g.keys[from as usize],
+            to: g.keys[to as usize],
         }));
     }
     Ok(())
 }
 
-fn describe(p: Position, relations: &Relations) -> String {
-    let col = |c: u8| if c == S { "subject" } else { "object" };
-    match p {
-        Position::Pred(p, c) => format!("the {} of predicate #{p}", col(c)),
-        Position::Any(c) => format!("the {} of a variable predicate's head", col(c)),
-        Position::ReadAll(c) => format!("the {} of a variable predicate's atom", col(c)),
-        Position::PredCol => "the predicate".into(),
-        Position::Rel(r, i) => match relations.get(r) {
-            Some(rel) => format!("column {} of relation '{}'", i + 1, rel.name),
-            None => format!("column {} of relation {}", i + 1, r.0),
-        },
+impl Position {
+    pub(super) fn write(&self, f: &mut fmt::Formatter<'_>, relations: &Relations) -> fmt::Result {
+        let col = |c: u8| if c == S { "subject" } else { "object" };
+        match *self {
+            Position::Pred(p, c) => write!(f, "the {} of predicate #{p}", col(c)),
+            Position::Any(c) => write!(f, "the {} of a variable predicate's head", col(c)),
+            Position::ReadAll(c) => write!(f, "the {} of a variable predicate's atom", col(c)),
+            Position::PredCol => f.write_str("the predicate"),
+            Position::Rel(r, i) => match relations.get(r) {
+                Some(rel) => write!(f, "column {} of relation '{}'", i + 1, rel.name),
+                None => write!(f, "column {} of relation {}", i + 1, r.0),
+            },
+        }
     }
 }
 
@@ -338,14 +394,5 @@ pub(crate) enum CheckError {
 impl From<BudgetFailure> for CheckError {
     fn from(e: BudgetFailure) -> Self {
         CheckError::Memory(e)
-    }
-}
-
-impl From<CheckError> for super::ProgramError {
-    fn from(e: CheckError) -> Self {
-        match e {
-            CheckError::Memory(e) => super::ProgramError::Memory(e),
-            CheckError::Cycle(c) => super::ProgramError::Invalid(IrError::NotWeaklyAcyclic(c)),
-        }
     }
 }

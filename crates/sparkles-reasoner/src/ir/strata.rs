@@ -34,33 +34,16 @@ const SPECIAL: u32 = 4;
 /// The bytes per node of the strata's scratch: the offsets and the strata of the
 /// components, Tarjan's index, low link, stack flag, component, stack and walk, and a
 /// component's members and header.
-pub(super) const SCRATCH_PER_NODE: usize = 96;
+pub(super) const SCRATCH_PER_NODE: usize = 128;
 
-/// A negation that depends on its own rule's head.
+/// A negation that depends on its own rule's head: the rule, the index of the negated
+/// literal in its body, and the rules whose heads are on the cycle's component, in
+/// program order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NegativeCycle {
-    /// the rule with the negated literal
-    pub rule: String,
-    /// the negated literal
-    pub literal: String,
-    /// the rules whose heads are on the cycle's component, in program order
-    pub rules: Vec<String>,
-}
-
-impl fmt::Display for NegativeCycle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the rules are not stratified: rule '{}' negates {}, which depends on the rule's own conclusions through the rules {}",
-            self.rule,
-            self.literal,
-            self.rules
-                .iter()
-                .map(|r| format!("'{r}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
+    pub rule: usize,
+    pub literal: usize,
+    pub rules: Vec<usize>,
 }
 
 /// A part of a rule: the heads that are evaluated together, and their stratum.
@@ -71,8 +54,7 @@ pub(crate) struct Part {
     pub stratum: u32,
 }
 
-/// The strata of a program.
-#[derive(Clone, Debug)]
+/// The strata of a program, charged to its budget while they live.
 pub(crate) struct Strata {
     /// the parts of every rule, in rule order and then by first head
     pub parts: Vec<Part>,
@@ -85,25 +67,22 @@ pub(crate) struct Strata {
     /// the rules whose `listNotContains`, `listLength` or `listForAll` reads list
     /// structure that a head of the program may give
     pub open_lists: Vec<usize>,
+    _held: Held,
+}
+
+impl fmt::Debug for Strata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Strata")
+            .field("parts", &self.parts)
+            .field("count", &self.count)
+            .field("stratified", &self.stratified)
+            .field("has_negation", &self.has_negation)
+            .field("open_lists", &self.open_lists)
+            .finish()
+    }
 }
 
 impl Strata {
-    pub(super) fn bytes(&self) -> usize {
-        let mut n = self.parts.capacity() * size_of::<Part>()
-            + self.open_lists.capacity() * size_of::<usize>();
-        for p in &self.parts {
-            if p.heads.spilled() {
-                n += p.heads.capacity() * size_of::<usize>();
-            }
-        }
-        if let Err(c) = &self.stratified {
-            n += c.rule.capacity() + c.literal.capacity();
-            n += c.rules.capacity() * size_of::<String>();
-            n += c.rules.iter().map(String::capacity).sum::<usize>();
-        }
-        n
-    }
-
     /// The stratum of each rule's parts, as `(rule, heads, stratum)`.
     pub fn of(
         rules: &[Rule],
@@ -369,27 +348,37 @@ impl Graph {
             &self.edges[a..b]
         };
         let (comp, order) = tarjan(n, |v| succ(v).iter().map(|e| e.1));
-        // the first negation on a cycle
-        let stratified = match self
+        // the output, charged before it is built: the parts with their heads, the open
+        // list readers and a cycle's rules
+        let cycle = self
             .negative
             .iter()
             .find(|e| comp[e.0 as usize] == comp[e.1 as usize])
-        {
+            .copied();
+        let mut out = self.parts.len() * size_of::<Part>() + rules.len() * size_of::<usize>();
+        for (_, _, heads) in &self.parts {
+            if heads.spilled() {
+                out += heads.len() * size_of::<usize>();
+            }
+        }
+        if cycle.is_some() {
+            out += self.parts.len() * size_of::<usize>();
+        }
+        let held = Held::try_new_exact(self._held.budget(), out)?;
+        // the first negation on a cycle
+        let stratified = match cycle {
             None => Ok(()),
-            Some(&(h, _, ri, li)) => {
+            Some((h, _, ri, li)) => {
                 let c = comp[h as usize];
-                let mut names: Vec<String> = Vec::new();
+                let mut names: Vec<usize> = Vec::with_capacity(self.parts.len());
                 for (pri, nodes, _) in &self.parts {
-                    if nodes.iter().any(|&x| comp[x as usize] == c)
-                        && names.last() != Some(&rules[*pri].name)
-                    {
-                        names.push(rules[*pri].name.clone());
+                    if nodes.iter().any(|&x| comp[x as usize] == c) && names.last() != Some(pri) {
+                        names.push(*pri);
                     }
                 }
-                let r = &rules[ri as usize];
                 Err(NegativeCycle {
-                    rule: r.name.clone(),
-                    literal: describe(&r.body[li as usize]),
+                    rule: ri as usize,
+                    literal: li as usize,
                     rules: names,
                 })
             }
@@ -409,10 +398,9 @@ impl Graph {
             }
             stratum[ci] = s;
         }
-        let parts: Vec<Part> = self
-            .parts
-            .iter()
-            .map(|(ri, nodes, heads)| Part {
+        let mut parts: Vec<Part> = Vec::with_capacity(self.parts.len());
+        parts.extend(self.parts.iter().map(|(ri, nodes, heads)| {
+            Part {
                 rule: *ri,
                 heads: heads.clone(),
                 stratum: nodes
@@ -420,10 +408,10 @@ impl Graph {
                     .map(|&h| stratum[comp[h as usize] as usize])
                     .max()
                     .unwrap_or(0),
-            })
-            .collect();
+            }
+        }));
         let count = parts.iter().map(|p| p.stratum + 1).max().unwrap_or(1);
-        let mut open_lists = Vec::new();
+        let mut open_lists = Vec::with_capacity(rules.len());
         if self.gives_lists {
             for (ri, r) in rules.iter().enumerate() {
                 let negative_list = r.body.iter().any(|l| {
@@ -444,6 +432,7 @@ impl Graph {
             stratified,
             has_negation: self.has_negation,
             open_lists,
+            _held: held,
         })
     }
 }
@@ -464,27 +453,6 @@ fn groups(r: &Rule) -> Vec<SmallVec<[usize; 2]>> {
         .collect()
 }
 
-fn describe(l: &Literal) -> String {
-    let args = |a: &[Slot]| {
-        a.iter()
-            .map(|s| match s {
-                Slot::Var(v) => format!("?v{v}"),
-                Slot::Const(c) => format!("#{c}"),
-                Slot::Any => "_".into(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    match l {
-        Literal::Pos(a) => format!("({})", args(&a.args)),
-        Literal::Neg(a) => match a.pred {
-            Pred::Triple => format!("not ({})", args(&a.args)),
-            Pred::Rel(r) => format!("not relation {}({})", r.0, args(&a.args)),
-        },
-        Literal::Builtin(b) => format!("{:?}({})", b.kind, args(&b.args)),
-    }
-}
-
 /// Tarjan's strongly connected components without recursion: the component of each node,
 /// and the components' members in the order Tarjan finds them, each after every
 /// component it reaches.
@@ -497,11 +465,11 @@ pub(super) fn tarjan<I: Iterator<Item = u32>>(
     let mut low = vec![0u32; n];
     let mut on = vec![false; n];
     let mut comp = vec![UNSEEN; n];
-    let mut stack: Vec<u32> = Vec::new();
-    let mut comps: Vec<Vec<u32>> = Vec::new();
+    let mut stack: Vec<u32> = Vec::with_capacity(n);
+    let mut comps: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut next = 0u32;
     // the depth-first walk: a node and the successors it has left to visit
-    let mut walk: Vec<(u32, I)> = Vec::new();
+    let mut walk: Vec<(u32, I)> = Vec::with_capacity(n);
     for root in 0..n as u32 {
         if index[root as usize] != UNSEEN {
             continue;
