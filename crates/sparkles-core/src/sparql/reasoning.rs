@@ -189,8 +189,15 @@ pub trait ReasoningProvider: Send + Sync {
     /// The query rewritten before planning, for the snapshot and view of `req`, or
     /// `None` when the provider rewrites nothing (spec F17 §7). The rewriting reads the
     /// provider's schema and not the query's data, and stops when `req.stop` fails.
-    fn rewrite(&self, query: &spargebra::Query, req: &SessionRequest) -> Result<Option<Rewritten>> {
-        let _ = (query, req);
+    /// `bound` names the variables that the query's initial bindings give a value, without
+    /// their sigil, which the planner substitutes into the rewritten query.
+    fn rewrite(
+        &self,
+        query: &spargebra::Query,
+        bound: &[String],
+        req: &SessionRequest,
+    ) -> Result<Option<Rewritten>> {
+        let _ = (query, bound, req);
         Ok(None)
     }
 }
@@ -752,7 +759,12 @@ pub(crate) fn rewrite(
     query: &spargebra::Query,
     opts: &QueryOptions,
 ) -> Result<Option<Rewritten>> {
-    provider.rewrite(query, &request(ctx, opts))
+    let bound: Vec<String> = opts
+        .initial_bindings
+        .iter()
+        .map(|(name, _)| name.trim_start_matches(['?', '$']).to_string())
+        .collect();
+    provider.rewrite(query, &bound, &request(ctx, opts))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1048,7 +1060,8 @@ fn apply_derive(
         })
     };
     if !execute {
-        let mut nodes = Vec::new();
+        // the Rewrite nodes come first, as in the executed form
+        let mut nodes = rewritten.map_or_else(Vec::new, |r| r.nodes.clone());
         let mut read = 0;
         for p in &pats {
             if let Some(d) = p.seeded.as_ref().map(|s| s.0).or(p.plain) {

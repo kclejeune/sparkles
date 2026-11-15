@@ -803,8 +803,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Inference is forward materialization, RDFS on read and derivation on demand.
   Jena's hybrid rules are flattened. Roadmap item 19.
 * OWL 2 QL rewriting leaves out reflexive properties, inclusions with `owl:Thing` on the
-  left and triples about undeclared properties, and its rewritten patterns read the
-  query's default graph, not the data of named input graphs. Roadmap item 985.
+  left, data existentials on the left with a datatype range and triples about undeclared
+  properties, and its rewritten patterns read the query's default graph, not the data of
+  named input graphs. It decides which variables are existential by name over the whole
+  query rather than by scope, and its fallback to the `owl-rl` rules can use axioms
+  outside OWL 2 QL. Roadmap item 985.
   `reasoning=auto` reads a materialization that can answer rather than compare costs per
   pattern. Roadmap item 910.
 * A view's tables carry over to another commit only while the rules cannot read or give

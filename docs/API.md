@@ -9228,17 +9228,26 @@ curl -G localhost:3030/ds/sparql --data-urlencode 'query=ASK { ex:ann ex:teaches
   under `COUNT(*)`. A distinguished variable is never bound to an unnamed individual. With
   `ex:Professor rdfs:subClassOf [ owl:onProperty ex:teaches ; owl:someValuesFrom
   owl:Thing ]` and `ex:ann a ex:Professor`, `ASK { ex:ann ex:teaches ?c }` is true and
-  `SELECT ?c { ex:ann ex:teaches ?c }` has no rows.
-* A rewritten pattern gives each answer of its distinguished variables once. A pattern
-  that no axiom changes is read as written.
+  `SELECT ?c { ex:ann ex:teaches ?c }` has no rows. A variable that an initial binding
+  gives a value is distinguished. The names are counted over the whole query, so a
+  variable local to a subquery is distinguished when another part of the query uses the
+  same name.
+* A rewritten pattern gives each answer of its distinguished variables once, so the
+  variables it treats as existential do not multiply its solutions. With `ex:q
+  rdfs:subPropertyOf ex:p` and two stored `ex:p` objects of `ex:a`, `SELECT ?s { ?s ex:p
+  ?o }` gives `ex:a` once, where the query without reasoning gives it twice. A pattern
+  that no axiom changes is read as written, with its multiplicities.
 * `budget.maxUnion` in the query-time setting bounds the branches of one pattern's
   rewriting, 1,024 by default. A pattern past it, and one the rewriting cannot express,
   such as one with a variable predicate or class or a predicate of the RDF, RDFS or OWL
   vocabularies, is derived with the `owl-rl` rules, and the response warns that answers
   that need unnamed individuals may be missing. Property paths are derived the same way,
-  and patterns inside `GRAPH` read the stored facts.
-* Axioms outside OWL 2 QL are ignored, and so are reflexive properties and inclusions
-  that involve `owl:Thing` on the left. A query's warnings count them, and `GET
+  with the same warning, and patterns inside `GRAPH` read the stored facts. The `owl-rl`
+  rules of this fallback read the whole ontology, so they can use axioms outside OWL 2 QL
+  that the rewriting ignores, such as a transitive property.
+* Axioms outside OWL 2 QL are ignored, and so are reflexive properties, inclusions
+  that involve `owl:Thing` on the left and data existentials on the left whose range is a
+  datatype other than `rdfs:Literal`. A query's warnings count them, and `GET
   /$/reason/{ds}/query` lists them under `owlQl` for the graphs the caller reads, with the
   number of axioms the rewriting reads and the terminology triples that map to no axiom,
   such as the `rdfs:subPropertyOf` triple of an undeclared property.
@@ -9304,8 +9313,9 @@ with `Dataset::inference_view(Dataset::default_reasoning_mode())`, since
 `Dataset::query` reads the materialized inferences. Without `profile`, derivation uses the profile, rules and inputs of the last
 materialization, so `auto` compares like with like. `profile: "rules"` takes the Jena
 rule text in `rules`. `budget.maxDerived` applies when a query names no `maxDerived`,
-under the server's `--reason-max-derived`, and a derivation that runs longer than
-`budget.maxMillis` fails with `422` and the code `reasoning-budget`. `budget.maxUnion`
+under the server's `--reason-max-derived`, and a derivation or an OWL 2 QL rewriting that
+runs longer than `budget.maxMillis` fails with `422` and the code `reasoning-budget`. The
+rewriting and the derivation of one query each have that allowance. `budget.maxUnion`
 bounds the OWL 2 QL rewriting of one pattern under `owl-ql`. `stale: "allow"`
 lets `auto` read a stale materialization, and the response then carries
 `Sparkles-Inferences`. `GET` returns the setting, with `tables`, the status of the

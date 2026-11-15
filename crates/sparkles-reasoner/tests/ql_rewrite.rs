@@ -283,3 +283,67 @@ fn lubm_answers_match_an_owl_2_rl_closure_of_the_ql_fragment() {
     }
     assert_eq!(equal, 14, "every query agrees with the closure");
 }
+
+/// Review findings of the rewriting: initial bindings, generated variables, repeated
+/// atoms, property paths and EXPLAIN of a query that also derives.
+#[test]
+fn an_initial_binding_makes_its_variable_distinguished() {
+    let s = store(A8);
+    let o = QueryOptions {
+        initial_bindings: vec![(
+            "c".into(),
+            oxrdf::NamedNode::new_unchecked(format!("{EX}none")).into(),
+        )],
+        ..ql(None)
+    };
+    assert!(!run(&s, "ASK { ex:ann ex:teaches ?c }", &o).boolean);
+}
+
+#[test]
+fn a_generated_variable_does_not_take_the_name_of_a_query_variable() {
+    let s = store(
+        "ex:A a owl:Class . ex:B a owl:Class . ex:p a owl:ObjectProperty .
+         ex:B rdfs:subClassOf ex:A . ex:a a ex:A . ex:s ex:p ex:b .",
+    );
+    let r = run(
+        &s,
+        "SELECT ?__ql1 { ?__ql1 a ex:A . ex:s ex:p ?o }",
+        &ql(None),
+    );
+    assert_eq!(answers(&r), vec![format!("<{EX}a>")]);
+}
+
+#[test]
+fn a_repeated_atom_still_takes_an_existential() {
+    let s = store(A8);
+    assert!(
+        run(
+            &s,
+            "ASK { ex:ann ex:teaches ?c . ex:ann ex:teaches ?c }",
+            &ql(None)
+        )
+        .boolean
+    );
+}
+
+#[test]
+fn a_property_path_warns_that_it_may_miss_unnamed_individuals() {
+    let s = store(&format!("{A8} ex:advises a owl:ObjectProperty ."));
+    let r = run(&s, "ASK { ex:ann (ex:teaches|ex:advises) ?c }", &ql(None));
+    let warned = format!("{:?}", r.plan().warnings);
+    assert!(warned.contains("property path"), "{warned}");
+}
+
+#[test]
+fn explain_of_a_query_that_also_derives_shows_its_rewriting() {
+    let s =
+        store("ex:A a owl:Class . ex:B a owl:Class . ex:B rdfs:subClassOf ex:A . ex:a a ex:B .");
+    let (_, plan) = sparkles_core::sparql::explain(
+        s.snapshot(),
+        "SELECT ?x { ?x a ex:A OPTIONAL { ?x ?p ?o } }",
+        &ql(None),
+    )
+    .unwrap();
+    let text = format!("{plan:?}");
+    assert!(text.contains("OWL 2 QL rewriting"), "{text}");
+}

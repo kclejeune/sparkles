@@ -22,9 +22,13 @@ fn rewritten(ttl: &str, q: &str, max: usize) -> Rewritten {
          ex:taughtBy a owl:ObjectProperty . ex:lectures a owl:ObjectProperty . \
          ex:headOf a owl:ObjectProperty . {ttl}"
     ));
-    rewrite_query(&parse(&format!("PREFIX ex: <{EX}> {q}")), &t, max, &|| {
-        Ok(())
-    })
+    rewrite_query(
+        &parse(&format!("PREFIX ex: <{EX}> {q}")),
+        &[],
+        &t,
+        max,
+        &|| Ok(()),
+    )
     .unwrap()
     .unwrap()
 }
@@ -175,7 +179,9 @@ fn unification_binds_distinguished_variables_again() {
     let q = parse(&format!(
         "PREFIX ex: <{EX}> SELECT ?y ?z {{ ex:a ex:r ?y . ex:a ex:r ?z }}"
     ));
-    let r = rewrite_query(&q, &t, 1024, &|| Ok(())).unwrap().unwrap();
+    let r = rewrite_query(&q, &[], &t, 1024, &|| Ok(()))
+        .unwrap()
+        .unwrap();
     let sse = r.query.to_sse();
     assert!(
         sse.contains("(extend ((?z ?y))") || sse.contains("(extend ((?y ?z))"),

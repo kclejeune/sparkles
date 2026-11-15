@@ -1384,8 +1384,10 @@ the `owl-ql` profile of the query-time setting and of `reasoningProfile`.
   `DISTINCT` over the projection of its distinguished variables of the union. EXPLAIN
   shows a `Rewrite` node per pattern with its branches, and the rewritten algebra.
 * **Limits.** `budget.maxUnion` counts the queries the procedure makes, before the
-  pruning, and the rewriting checks the query's stop function every 64 queries and while
-  it reads the terminology.
+  pruning, as each is made. The rewriting checks the query's stop function as it makes
+  queries and while it scans the terminology, and the scan charges only the triples of the
+  input graphs the caller reads. `budget.maxMillis` bounds the rewriting as it bounds a
+  derivation.
 
 **Decisions where this spec left the choice open.**
 
@@ -1395,24 +1397,34 @@ the `owl-ql` profile of the query-time setting and of `reasoningProfile`.
    materialization and behaves as `demand`.
 2. A variable is distinguished when the query uses it anywhere outside its pattern, which
    the count of its occurrences in the query's SSE form decides, and every variable is
-   when the query uses `COUNT(*)`. The count errs towards distinguished, which can only
-   withhold an answer that needs an unnamed individual. The projection that ASK wraps its
-   pattern in does not count.
+   when the query uses `COUNT(*)`. A variable of the query's initial bindings counts as
+   used. The count errs towards distinguished, which can only withhold an answer that
+   needs an unnamed individual, as it does for a variable local to a subquery whose name
+   another part of the query uses. Roadmap item 985 makes the analysis follow scope. The
+   projection that ASK wraps its pattern in does not count. Generated variables take
+   names the query does not use.
 3. A rewritten pattern gives each solution of its distinguished variables once, since
-   certain answers are a set and an existential variable has no named value to count. A
-   pattern that no inclusion changes keeps its form and its multiplicities.
+   certain answers are a set and an existential variable has no named value to count.
+   A variable that the query projects nowhere is existential even when the stored facts
+   name its values, so a rewritten pattern gives fewer rows than the same query without
+   reasoning when such a variable has several stored values. A pattern that no inclusion
+   changes keeps its form and its multiplicities.
 4. §7 sends a pattern past the bound to the `owl-rl` demand program. The same fallback
    takes a pattern that PerfectRef cannot express: a variable predicate or class, a class
    or property of the RDF, RDFS or OWL vocabularies, or an RDF-star term. Property paths
-   are derived as under `owl-rl`, and patterns inside `GRAPH` read the stored facts, as
-   demand derivation reads them.
+   are derived as under `owl-rl` with the same warning, and patterns inside `GRAPH` read
+   the stored facts, as demand derivation reads them. The fallback's `owl-rl` program
+   reads the whole ontology, so it can use axioms outside OWL 2 QL that the rewriting
+   ignores. Roadmap item 985 restricts it to the QL axioms.
 5. §7's check runs when the setting is read rather than on each change of an ontology
    graph. `GET` and `PUT /$/reason/{ds}/query` list the axioms outside the profile, those
    the rewriting does not use and the terminology triples that map to no axiom, for the
    graphs the caller reads, and every query's warnings count them. Roadmap item 985 covers
    a check recorded with each change.
 6. Reflexive properties and inclusions with `owl:Thing` on the left are not used, since a
-   union of patterns over the stored facts cannot name every individual. They are listed
+   union of patterns over the stored facts cannot name every individual. Data
+   existentials on the left with a datatype range other than `rdfs:Literal` need a
+   datatype filter that a branch of atoms cannot state, and are not used either. They are listed
    with the unused axioms. Roadmap item 985.
 7. The ontology comes from the input graphs, and the rewritten patterns read the query's
    default graph. The data of a named data graph is read only when the default graph is

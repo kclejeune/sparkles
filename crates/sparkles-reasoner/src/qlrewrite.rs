@@ -49,7 +49,7 @@ use sparkles_core::id::Id;
 use sparkles_core::index::Perm;
 use sparkles_core::sparql::exec::PlanInfo;
 use sparkles_core::sparql::reasoning::{Rewritten, SessionRequest};
-use sparkles_core::store::Snapshot;
+use sparkles_core::store::{Chunk, Snapshot};
 use sparkles_owl::model::{
     AxiomKind, ClassExpression as Ce, DataRange, ObjectPropertyExpression as Ope,
     SubObjectPropertyExpression,
@@ -415,43 +415,59 @@ impl Tbox {
         budget: &crate::budget::Budget,
     ) -> Result<Tbox> {
         let mut triples = Vec::new();
-        let mut keep = |keys: Vec<sparkles_core::index::Key>| -> Result<()> {
-            for (i, k) in keys.iter().enumerate() {
-                if i % 4096 == 0 {
-                    stop()?;
-                }
-                if i % 1024 == 0 {
-                    budget
-                        .try_charge(1024 * TRIPLE_BYTES)
-                        .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL axioms"))?;
-                }
-                let q = Perm::Pos.to_quad(k);
-                if !graphs.contains(&q[3]) {
-                    continue;
-                }
-                let (Some(s), Some(Term::NamedNode(p)), Some(o)) =
-                    (snap.term(q[0]), snap.term(q[1]), snap.term(q[2]))
-                else {
-                    continue;
-                };
-                let s = match s {
-                    Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
-                    Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
-                    _ => continue,
-                };
-                triples.push(oxrdf::Triple::new(s, p, o));
+        let (mut visited, mut kept) = (0usize, 0usize);
+        // each key as the scan visits it: the stop function and the budget are checked
+        // as the scan goes, and only the triples of the input graphs are charged
+        let mut each = |k: sparkles_core::index::Key| -> Result<()> {
+            visited += 1;
+            if visited.is_multiple_of(4096) {
+                stop()?;
             }
+            let q = Perm::Pos.to_quad(&k);
+            if !graphs.contains(&q[3]) {
+                return Ok(());
+            }
+            if kept.is_multiple_of(1024) {
+                budget
+                    .try_charge(1024 * TRIPLE_BYTES)
+                    .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL axioms"))?;
+            }
+            kept += 1;
+            let (Some(s), Some(Term::NamedNode(p)), Some(o)) =
+                (snap.term(q[0]), snap.term(q[1]), snap.term(q[2]))
+            else {
+                return Ok(());
+            };
+            let s = match s {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                _ => return Ok(()),
+            };
+            triples.push(oxrdf::Triple::new(s, p, o));
             Ok(())
+        };
+        let mut scan = |prefix: &[u64]| -> Result<()> {
+            snap.scan(Perm::Pos, prefix, |c| {
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            each(b.key(i))?;
+                        }
+                    }
+                    Chunk::Row(k) => each(k)?,
+                }
+                Ok(true)
+            })
         };
         for p in sparkles_owl::vocab::STRUCTURAL_PREDICATES {
             if let Some(id) = snap.lookup_iri(p) {
-                keep(snap.scan_keys(Perm::Pos, &[id.0])?)?;
+                scan(&[id.0])?;
             }
         }
         if let Some(ty) = snap.lookup_iri(oxrdf::vocab::rdf::TYPE.as_str()) {
             for c in sparkles_owl::vocab::STRUCTURAL_TYPES {
                 if let Some(id) = snap.lookup_iri(c) {
-                    keep(snap.scan_keys(Perm::Pos, &[ty.0, id.0])?)?;
+                    scan(&[ty.0, id.0])?;
                 }
             }
         }
@@ -628,6 +644,9 @@ impl Bgp<'_> {
 
     /// `_` for a non-distinguished variable that occurs once, atoms sorted and each once.
     fn normalize(&self, mut q: Cq) -> Cq {
+        // a repeated atom counts once, so a variable it alone holds is free
+        q.atoms.sort_unstable();
+        q.atoms.dedup();
         let mut count: FxHashMap<u32, u32> = FxHashMap::default();
         for a in &q.atoms {
             for t in a.terms() {
@@ -775,30 +794,43 @@ impl Bgp<'_> {
             }
             let q = order[next].clone();
             next += 1;
-            let mut found: Vec<Cq> = Vec::new();
+            // each query is kept as it is made, so the bound and the stop function hold
+            // while one query's replacements and reductions are made
+            let mut made = 0usize;
+            let mut add = |f: Cq, order: &mut Vec<Cq>| -> Result<bool> {
+                made += 1;
+                if made.is_multiple_of(256) {
+                    stop()?;
+                }
+                if !seen.contains(&f) {
+                    seen.insert(f.clone());
+                    order.push(f);
+                    if order.len() > max {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
             for i in 0..q.atoms.len() {
                 implied.clear();
                 self.implied(q.atoms[i], &mut implied);
                 for &a in &implied {
                     let mut atoms = q.atoms.clone();
                     atoms[i] = a;
-                    found.push(self.normalize(Cq {
+                    let f = self.normalize(Cq {
                         atoms,
                         binds: q.binds.clone(),
-                    }));
+                    });
+                    if !add(f, &mut order)? {
+                        return Ok(None);
+                    }
                 }
             }
             for i in 0..q.atoms.len() {
                 for j in i + 1..q.atoms.len() {
-                    if let Some(r) = self.reduce(&q, i, j) {
-                        found.push(r);
-                    }
-                }
-            }
-            for f in found {
-                if seen.insert(f.clone()) {
-                    order.push(f);
-                    if order.len() > max {
+                    if let Some(r) = self.reduce(&q, i, j)
+                        && !add(r, &mut order)?
+                    {
                         return Ok(None);
                     }
                 }
@@ -892,15 +924,23 @@ struct Rewriter<'a> {
     /// every variable is distinguished (`COUNT(*)`)
     all_distinguished: bool,
     fresh: usize,
+    /// a property path's warning has been given
+    path_warned: bool,
     derive: Vec<Vec<TriplePattern>>,
     nodes: Vec<PlanInfo>,
     warnings: Vec<String>,
 }
 
 impl Rewriter<'_> {
+    /// A variable the query does not name.
     fn fresh_var(&mut self) -> Variable {
-        self.fresh += 1;
-        Variable::new_unchecked(format!("__ql{}", self.fresh))
+        loop {
+            self.fresh += 1;
+            let name = format!("__ql{}", self.fresh);
+            if !self.counts.contains_key(&format!("?{name}")) {
+                return Variable::new_unchecked(name);
+            }
+        }
     }
 
     fn bgp(&mut self, patterns: &[TriplePattern]) -> Result<Outcome> {
@@ -1178,7 +1218,19 @@ impl Rewriter<'_> {
                 }
             },
             // a property path is derived by the owl-rl demand program
-            G::Path { .. } | G::Values { .. } => gp.clone(),
+            G::Path { .. } => {
+                if !self.path_warned {
+                    self.path_warned = true;
+                    self.warnings.push(
+                        "a property path is not rewritten under OWL 2 QL, so the owl-rl \
+                         demand program answered it, which may miss answers that need \
+                         unnamed individuals"
+                            .into(),
+                    );
+                }
+                gp.clone()
+            }
+            G::Values { .. } => gp.clone(),
             // the facts of named graphs and of remote services are read as stored, as
             // query-time reasoning reads them
             G::Graph { .. } | G::Service { .. } => gp.clone(),
@@ -1366,6 +1418,7 @@ impl Rewriter<'_> {
 /// DESCRIBE, which query-time reasoning refuses before it rewrites.
 pub fn rewrite_query(
     query: &Query,
+    bound: &[String],
     tbox: &Tbox,
     max_union: usize,
     stop: &dyn Fn() -> Result<()>,
@@ -1387,6 +1440,10 @@ pub fn rewrite_query(
     };
     let mut counts = FxHashMap::default();
     count_names(&sse, &mut counts, 1);
+    // a variable that an initial binding gives a value is used outside its pattern
+    for name in bound {
+        *counts.entry(format!("?{name}")).or_default() += 1;
+    }
     let mut rw = Rewriter {
         tbox,
         max_union,
@@ -1394,6 +1451,7 @@ pub fn rewrite_query(
         counts,
         all_distinguished: sse.contains("(count)") || sse.contains("(count distinct)"),
         fresh: 0,
+        path_warned: false,
         derive: Vec::new(),
         nodes: Vec::new(),
         warnings: tbox.warnings(),

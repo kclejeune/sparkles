@@ -287,13 +287,14 @@ impl ReasoningProvider for QueryReasoner {
     fn rewrite(
         &self,
         query: &spargebra::Query,
+        bound: &[String],
         req: &SessionRequest,
     ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
         if self.shared.profile != Profile::OwlQl {
             return Ok(None);
         }
         let tbox = crate::qlrewrite::tbox(req, &self.shared.inputs)?;
-        crate::qlrewrite::rewrite_query(query, &tbox, self.shared.max_union, &*req.stop)
+        crate::qlrewrite::rewrite_query(query, bound, &tbox, self.shared.max_union, &*req.stop)
     }
 }
 
