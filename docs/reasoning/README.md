@@ -78,7 +78,14 @@ request or on every write, and the schema report counts what the data holds.
   The maintenance compares its count and the run's charges with the allowance every 1,024
   instances, so it can pass the allowance by a few batches before it stops. The kept
   closure holds only the derived facts, which takes 41% to 47% of the memory of a closure
-  with the explicit facts on LUBM-style data.
+  with the explicit facts on LUBM-style data. The update is a pass of the fixed-point
+  operator that property paths in incremental views also use, in its exact mode, which
+  keeps no derivation records.
+* `ReasonOptions::inferred_change` makes an incremental run report what it committed to
+  the inferred graph, each added triple with weight `+1` and each removed one with weight
+  `-1`, in the ids of the snapshot that the report's receipt names. A full run, including
+  one that an incremental run fell back to, reports no change, and a reader then reads the
+  inferred graph again. The change is held in memory until the report is dropped.
 * A materialization reads the default graph unless data and ontology graphs are named,
   and follows `owl:imports` to graphs of the dataset through a Jena-style location
   mapping ([API.md](../API.md#input-graphs-and-imports)). With `imports: fetch`, missing

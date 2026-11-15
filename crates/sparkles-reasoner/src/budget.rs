@@ -650,74 +650,11 @@ impl Drop for Meter<'_> {
 
 // ------------------------------------------------------------ allocation sizes ----
 
-/// The buckets hashbrown allocates for a table that can hold `cap` items without
-/// growing (its `capacity()`).
-fn buckets(cap: usize) -> usize {
-    if cap == 0 {
-        0
-    } else if cap < 8 {
-        // tables of up to 8 buckets hold one item less than their buckets
-        (cap + 1).next_power_of_two()
-    } else {
-        // larger tables hold 7/8 of their buckets
-        (cap.saturating_mul(8) / 7).next_power_of_two()
-    }
-}
-
-/// The heap of a hashbrown table (`HashMap`, `HashSet` or `HashTable`) of capacity
-/// `cap` with elements (keys with values) of `elem` bytes: one element and one control
-/// byte per bucket, and a group of control bytes more.
-pub(crate) fn table_bytes(cap: usize, elem: usize) -> usize {
-    match buckets(cap) {
-        0 => 0,
-        b => b.saturating_mul(elem + 1).saturating_add(16),
-    }
-}
-
-/// The capacity a table of capacity `cap` and `len` items has after room for `add`
-/// more is reserved: unchanged when they fit, otherwise that of the smallest table
-/// holding `len + add` items and more than `cap` (hashbrown's growth rule).
-pub(crate) fn table_grown(cap: usize, len: usize, add: usize) -> usize {
-    let want = len.saturating_add(add);
-    if want <= cap {
-        return cap;
-    }
-    table_capacity(want.max(cap + 1))
-}
-
-/// The capacity of a table made for `items` items (hashbrown's `with_capacity`).
-pub(crate) fn table_capacity(items: usize) -> usize {
-    let b = match items {
-        0 => return 0,
-        1..4 => 4,
-        4..8 => 8,
-        n => (n.saturating_mul(8) / 7).next_power_of_two(),
-    };
-    if b < 8 { b - 1 } else { b / 8 * 7 }
-}
+pub(crate) use sparkles_budget::sizes::{table_bytes, table_capacity, table_grown};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The estimate of a table's heap is what hashbrown allocates: checked against
-    /// the capacities a `HashSet` reports as it grows.
-    #[test]
-    fn table_sizes_follow_hashbrown() {
-        let mut s: rustc_hash::FxHashSet<u64> = Default::default();
-        for i in 0..100_000u64 {
-            let (cap, len) = (s.capacity(), s.len());
-            s.insert(i);
-            if s.capacity() != cap {
-                assert_eq!(s.capacity(), table_grown(cap, len, 1), "at {i}");
-            }
-            assert!(buckets(s.capacity()) >= s.capacity());
-        }
-        assert_eq!(table_bytes(0, 8), 0);
-        assert_eq!(table_bytes(3, 8), 4 * 9 + 16);
-        assert_eq!(table_bytes(7, 8), 8 * 9 + 16);
-        assert_eq!(table_bytes(14, 8), 16 * 9 + 16);
-    }
 
     #[test]
     fn charges_fail_at_the_limit_and_track_the_peak() {

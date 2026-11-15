@@ -20,7 +20,7 @@
 //! exists, which is how the query engine evaluates them. Neither needs state: the nodes
 //! and graphs that the changed quads name are checked at both snapshots.
 
-use super::super::fixpoint::{self, Change, FixedPoint, Program};
+use super::super::fixpoint::{self, Change, FixedPoint, HashStore, NewStore, Program, Sink};
 use super::super::pass::{GraphSel, Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{AChanges, Ann, Atom, Provenance, Witness};
@@ -311,24 +311,39 @@ impl Closure {
     }
 }
 
+impl NewStore for Closure {
+    fn new_store(&self) -> HashStore<Fact, Id> {
+        // the key, the record and the map's slot overhead
+        HashStore::new(24 + 8 + 8)
+    }
+}
+
 impl Program for Closure {
     type Fact = Fact;
     type Record = Id;
     type Cx<'c> = Pass<'c>;
+    type Error = Error;
+    type Store = HashStore<Fact, Id>;
 
-    fn premises(&self, f: &Fact, r: &Id, out: &mut Vec<Fact>) {
+    fn premises(&self, f: &Fact, r: &Id, out: &mut Sink<'_, Fact, Error>) -> Result<()> {
         if !r.is_undef() {
-            out.push([f[0], f[1], *r]);
+            out.push([f[0], f[1], *r])?;
         }
+        Ok(())
     }
 
-    fn axioms(&mut self, p: &mut Pass, out: &mut Vec<(Fact, Id)>) -> Result<()> {
+    fn axioms(
+        &mut self,
+        p: &mut Pass,
+        _store: &HashStore<Fact, Id>,
+        out: &mut Sink<'_, (Fact, Id), Error>,
+    ) -> Result<()> {
         self.ensure(p);
         match self.start {
             Some(_) => {
                 if let Some(s) = self.cache.start {
                     for f in self.rows(p, Which::New, Some(s), None, Id::UNDEF)? {
-                        out.push((f, Id::UNDEF));
+                        out.push((f, Id::UNDEF))?;
                     }
                 }
             }
@@ -346,7 +361,7 @@ impl Program for Closure {
                             continue;
                         }
                         let g = s.g.map_or(Id::UNDEF, |gp| r[gp]);
-                        out.push(([g, a, b], Id::UNDEF));
+                        out.push(([g, a, b], Id::UNDEF))?;
                     }
                 }
             }
@@ -357,14 +372,15 @@ impl Program for Closure {
     fn consequences(
         &mut self,
         p: &mut Pass,
+        _store: &HashStore<Fact, Id>,
         w: Which,
         f: &Fact,
         _held: &dyn Fn(&Fact) -> bool,
-        out: &mut Vec<(Fact, Id)>,
+        out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
         let [g, s, y] = *f;
         for &b in self.next(p, w, true, g, y)?.iter() {
-            out.push(([g, s, b], y));
+            out.push(([g, s, b], y))?;
         }
         Ok(())
     }
@@ -372,6 +388,7 @@ impl Program for Closure {
     fn prove(
         &mut self,
         p: &mut Pass,
+        _store: &HashStore<Fact, Id>,
         f: &Fact,
         held: &dyn Fn(&Fact) -> bool,
     ) -> Result<Option<Id>> {
@@ -390,8 +407,9 @@ impl Program for Closure {
     fn broken(
         &mut self,
         p: &mut Pass,
+        _store: &HashStore<Fact, Id>,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
-        out: &mut Vec<Fact>,
+        out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
         for (g, a, b, old, new) in self.edges(p)? {
             if !old || new {
@@ -400,8 +418,8 @@ impl Program for Closure {
             for &s in self.starts(p, Which::Old, g, a)?.iter() {
                 let f = [g, s, b];
                 match recorded(&f) {
-                    Some(r) if r.is_undef() && s == a => out.push(f),
-                    Some(r) if r == a => out.push(f),
+                    Some(r) if r.is_undef() && s == a => out.push(f)?,
+                    Some(r) if r == a => out.push(f)?,
                     _ => {}
                 }
             }
@@ -412,8 +430,9 @@ impl Program for Closure {
     fn added(
         &mut self,
         p: &mut Pass,
+        _store: &HashStore<Fact, Id>,
         held: &dyn Fn(&Fact) -> bool,
-        out: &mut Vec<(Fact, Id)>,
+        out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
         for (g, a, b, old, new) in self.edges(p)? {
             if old || !new {
@@ -421,9 +440,9 @@ impl Program for Closure {
             }
             for &s in self.starts(p, Which::New, g, a)?.iter() {
                 if s == a {
-                    out.push(([g, s, b], Id::UNDEF));
+                    out.push(([g, s, b], Id::UNDEF))?;
                 } else if held(&[g, s, a]) {
-                    out.push(([g, s, b], a));
+                    out.push(([g, s, b], a))?;
                 }
             }
         }
@@ -433,8 +452,9 @@ impl Program for Closure {
     fn moved(
         &mut self,
         p: &mut Pass,
+        _store: &HashStore<Fact, Id>,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
-        out: &mut Vec<Fact>,
+        out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
         for (g, a, b, old, new) in self.edges(p)? {
             if !(old && new) {
@@ -446,8 +466,8 @@ impl Program for Closure {
             for &s in self.starts(p, Which::New, g, a)?.iter() {
                 let f = [g, s, b];
                 match recorded(&f) {
-                    Some(r) if r.is_undef() && s == a => out.push(f),
-                    Some(r) if r == a => out.push(f),
+                    Some(r) if r.is_undef() && s == a => out.push(f)?,
+                    Some(r) if r == a => out.push(f)?,
                     _ => {}
                 }
             }
@@ -458,6 +478,7 @@ impl Program for Closure {
     fn annotate(
         &mut self,
         p: &mut Pass,
+        _store: &HashStore<Fact, Id>,
         mode: Provenance,
         f: &Fact,
         r: &Id,
@@ -496,11 +517,6 @@ impl Program for Closure {
             ));
         }
         Ok((f, rec))
-    }
-
-    fn fact_bytes(&self) -> u64 {
-        // the key, the record and the map's slot overhead
-        24 + 8 + 8
     }
 
     fn scratch_bytes(&self) -> u64 {

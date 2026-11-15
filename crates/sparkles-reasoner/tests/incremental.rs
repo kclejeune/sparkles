@@ -1035,3 +1035,155 @@ fn the_consequences_of_a_deletion_stop_across_evaluations() {
     let why = r.fallback.as_deref().unwrap_or_default();
     assert!(why.starts_with("the deletion "), "{why}");
 }
+
+/// A run with the change of the inferred graph reported.
+fn run_reporting(s: &Store, p: &Profile, since: Option<u64>, cache: &Cache) -> ReasonReport {
+    materialize_incremental(
+        s,
+        p,
+        &Extras::default(),
+        Incremental {
+            since,
+            cache: Some(cache),
+        },
+        &ReasonOptions {
+            inferred_change: true,
+            ..ReasonOptions::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"))
+}
+
+/// The reported change of the inferred graph, as text, against the difference of the
+/// inferred graph before and after the run.
+fn check_change(
+    s: &Store,
+    r: &ReasonReport,
+    before: &BTreeSet<String>,
+    after: &BTreeSet<String>,
+    what: &str,
+) {
+    let Some(change) = &r.inferred_change else {
+        assert_eq!(
+            r.method,
+            Method::Full,
+            "{what}: an incremental run reports its change"
+        );
+        return;
+    };
+    assert_eq!(
+        r.method,
+        Method::Incremental,
+        "{what}: a full run reports no change"
+    );
+    let snap = s.snapshot();
+    assert_eq!(
+        r.receipt.as_ref().unwrap().commit.seq,
+        snap.commit,
+        "{what}: the change is in the ids of the committed snapshot"
+    );
+    let g = sparkles_core::id::Id::DEFAULT_GRAPH;
+    let (mut added, mut removed) = (BTreeSet::new(), BTreeSet::new());
+    for (t, w) in change {
+        let q = snap.quad_to_terms(&[t[0], t[1], t[2], g]).unwrap();
+        let text = Triple::new(q.subject, q.predicate, q.object).to_string();
+        let fresh = match w {
+            1 => added.insert(text),
+            -1 => removed.insert(text),
+            _ => panic!("{what}: weight {w}"),
+        };
+        assert!(fresh, "{what}: a triple twice in the change");
+    }
+    let want_added: BTreeSet<String> = after.difference(before).cloned().collect();
+    let want_removed: BTreeSet<String> = before.difference(after).cloned().collect();
+    assert_eq!(added, want_added, "{what}: added");
+    assert_eq!(removed, want_removed, "{what}: removed");
+    assert_eq!(
+        (r.inferred_added, r.inferred_removed),
+        (added.len() as u64, removed.len() as u64),
+        "{what}: counts"
+    );
+}
+
+#[test]
+fn the_reported_change_is_the_inferred_graph_s_difference() {
+    for (p, owl) in profiles() {
+        for seed in 1..5 {
+            let s = Store::in_memory(StoreOptions::default());
+            let cache = Cache::default();
+            let mut r = Rng(seed);
+            let first: Vec<Triple> = (0..30).map(|_| random_triple(&mut r, owl)).collect();
+            change(&s, &first, &[]);
+            let rep = run_reporting(&s, &p, None, &cache);
+            assert_eq!(rep.inferred_change, None, "{p}: a first run is a full one");
+            let mut since = rep.receipt.unwrap().commit.seq;
+            let mut inc = 0;
+            for step in 0..10 {
+                let now = base(&s);
+                let del: Vec<Triple> = (0..r.below(4))
+                    .filter(|_| !now.is_empty())
+                    .map(|_| now[r.below(now.len())].clone())
+                    .collect();
+                // some insertions make derived triples explicit
+                let derived: Vec<String> = inferred(&s).into_iter().collect();
+                let mut add: Vec<Triple> = (0..r.below(5))
+                    .map(|_| random_triple(&mut r, owl))
+                    .collect();
+                if !derived.is_empty() && r.below(2) == 0 {
+                    let pick = &derived[r.below(derived.len())];
+                    if let Some(t) = expected_triples(&s, &p)
+                        .into_iter()
+                        .find(|t| &t.to_string() == pick)
+                    {
+                        add.push(t);
+                    }
+                }
+                let before = inferred(&s);
+                change(&s, &add, &del);
+                let rep = run_reporting(&s, &p, Some(since), &cache);
+                let what = format!("{p} seed {seed} step {step}");
+                check(&s, &p, &rep, &what);
+                check_change(&s, &rep, &before, &inferred(&s), &what);
+                if rep.method == Method::Incremental {
+                    inc += 1;
+                }
+                since = rep.receipt.unwrap().commit.seq;
+            }
+            assert!(inc > 0, "{p} seed {seed}: no incremental run");
+        }
+    }
+}
+
+/// What a full run would write now, as triples.
+fn expected_triples(s: &Store, p: &Profile) -> Vec<Triple> {
+    infer(s.snapshot(), p, &ReasonOptions::default()).unwrap().0
+}
+
+#[test]
+fn a_derived_triple_made_explicit_leaves_the_reported_change() {
+    let s = Store::in_memory(StoreOptions::default());
+    ttl(
+        &s,
+        "ex:B rdfs:subClassOf ex:A . ex:x a ex:B . ex:y a ex:B .",
+    );
+    let p = Profile::Rdfs;
+    let cache = Cache::default();
+    let r = run_reporting(&s, &p, None, &cache);
+    let mut since = r.receipt.unwrap().commit.seq;
+    let a = t("ex:x", "rdf:type", "ex:A");
+    assert!(inferred(&s).contains(&a.to_string()));
+    // the derived triple becomes explicit: it leaves the inferred graph
+    let before = inferred(&s);
+    change(&s, std::slice::from_ref(&a), &[]);
+    let r = run_reporting(&s, &p, Some(since), &cache);
+    check_change(&s, &r, &before, &inferred(&s), "made explicit");
+    let change_text = |r: &ReasonReport| r.inferred_change.as_ref().map(Vec::len);
+    assert_eq!(change_text(&r), Some(1), "{:?}", r.inferred_change);
+    since = r.receipt.unwrap().commit.seq;
+    // and comes back when it stops being explicit
+    let before = inferred(&s);
+    change(&s, &[], &[a]);
+    let r = run_reporting(&s, &p, Some(since), &cache);
+    check_change(&s, &r, &before, &inferred(&s), "explicit again derived");
+    assert_eq!(change_text(&r), Some(1), "{:?}", r.inferred_change);
+}

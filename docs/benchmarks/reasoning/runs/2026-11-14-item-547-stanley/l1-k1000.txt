@@ -1,0 +1,30 @@
+plugin reasoner full_us=18268 inferred=36897
+plugin reasoner kept_facts=36897 kept_closure_mib=2.9 bytes_per_fact=81.5
+plugin operator build_us=99779 facts=170900 state_mib=43.3 bytes_per_fact=266.0 counted_mib=31.5
+plugin settle explicit=134003 operator_derived=36897 reasoner_inferred=36897
+plugin round=0 step=change reasoner_us=8778 method=incremental operator_us=490938
+plugin change explicit=134003 operator_derived=37476 reasoner_inferred=37476
+plugin round=0 step=revert reasoner_us=11889 method=incremental operator_us=1268020
+plugin revert explicit=134003 operator_derived=36897 reasoner_inferred=36897
+plugin round=1 step=change reasoner_us=11617 method=incremental operator_us=705970
+plugin change explicit=134003 operator_derived=37476 reasoner_inferred=37476
+plugin round=1 step=revert reasoner_us=12819 method=incremental operator_us=1483577
+plugin revert explicit=134003 operator_derived=36897 reasoner_inferred=36897
+plugin round=2 step=change reasoner_us=10969 method=incremental operator_us=677499
+plugin change explicit=134003 operator_derived=37476 reasoner_inferred=37476
+plugin round=2 step=revert reasoner_us=19424 method=incremental operator_us=1605542
+plugin revert explicit=134003 operator_derived=36897 reasoner_inferred=36897
+plugin round=3 step=change reasoner_us=9367 method=incremental operator_us=683785
+plugin change explicit=134003 operator_derived=37476 reasoner_inferred=37476
+plugin round=3 step=revert reasoner_us=15236 method=incremental operator_us=1547060
+plugin revert explicit=134003 operator_derived=36897 reasoner_inferred=36897
+plugin round=4 step=change reasoner_us=13442 method=incremental operator_us=653640
+plugin change explicit=134003 operator_derived=37476 reasoner_inferred=37476
+plugin round=4 step=revert reasoner_us=12390 method=incremental operator_us=1211885
+plugin revert explicit=134003 operator_derived=36897 reasoner_inferred=36897
+plugin round=5 step=change reasoner_us=11334 method=incremental operator_us=624979
+plugin change explicit=134003 operator_derived=37476 reasoner_inferred=37476
+plugin round=5 step=revert reasoner_us=14374 method=incremental operator_us=1526004
+plugin revert explicit=134003 operator_derived=36897 reasoner_inferred=36897
+plugin k=1000 rounds=6 change reasoner_median_us=11334 operator_median_us=677499
+plugin k=1000 rounds=6 revert reasoner_median_us=14374 operator_median_us=1526004

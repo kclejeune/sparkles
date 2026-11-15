@@ -260,8 +260,55 @@ as long at one thread, which is item 942. The
 [medians with their ranges](runs/2026-11-14-item-113-atlas/results.txt) and
 [every step's quartiles](runs/2026-11-14-item-113-atlas/steps.txt).
 
+The reasoner's maintenance runs as a program of the fixed-point operator of incremental
+views (roadmap item 837). On the same data and host, the build with the operator against
+the build before it gives the same inferred counts after every step. Its full runs take
+0.99 to 1.01 times as long. Its changes, undos and repeated changes take 0.99 to 1.00
+times as long by the geometric mean of each profile at one thread and on the pool, and
+every such step is within 1.06 times with ranges that overlap the earlier build's. The
+first change of each size after the closure is kept, one sample per process, takes 1.05
+times as long by the geometric mean of the OWL 2 RL steps on the pool, within ranges that
+overlap, which item 964 follows up. Changes of 100,000 triples to the closure of OWL 2 RL
+at 20 threads, read back from the dataset when undone, take 17.9 to 18.8 s against 17.8 to
+18.0 s and undo in 5.8 to 5.9 s in both builds. The
+[run directory](runs/2026-11-14-item-837-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-14-item-837-atlas/env.txt), the
+[medians with their ranges](runs/2026-11-14-item-837-atlas/results.txt) and the
+[large changes](runs/2026-11-14-item-837-atlas/keep-938.txt).
+
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.
+
+### The rule plug-in against the reasoner's maintenance
+
+`plugin` of `examples/lubm.rs` runs the RDFS rules without axioms or builtins two ways over
+the same dataset, through the reasoner with a kept closure and through `RuleProgram` on the
+fixed-point operator, which keeps a record for every fact and deletes by its one-step
+backward check. Each round removes `K` triples of a university and adds `K` new ones, then
+undoes the change. The reasoner's time includes the commit of its inferred graph, and the
+operator's includes the read of the change. Both closures had the same size after every
+step. The table gives the medians over the rounds.
+
+| Data | Change, reasoner | Change, operator | Undo, reasoner | Undo, operator |
+|---|---:|---:|---:|---:|
+| LUBM(1), 100 triples, 6 rounds | 31.8 ms | 133 ms | 23.0 ms | 347 ms |
+| LUBM(1), 1,000 triples, 6 rounds | 11.3 ms | 677 ms | 14.4 ms | 1,526 ms |
+| LUBM(10), 100 triples, 10 rounds | 4.7 ms | 705 ms | 4.6 ms | 1,325 ms |
+| LUBM(10), 1,000 triples, 10 rounds | 10.9 ms | 7,136 ms | 9.6 ms | 15,063 ms |
+
+*Measured on stanley, a development laptop shared with other builds, on 2026-11-14 at
+commit 4a5bcac9. The reasoner's small runs vary by several times between processes on
+this host.*
+
+The operator is 4 to 1,600 times slower, and the undo, which deletes the added triples'
+consequences through records, costs it about twice its change. The reasoner keeps 57 to
+82 bytes per derived fact. The operator holds the explicit triples beside the derived
+ones, 1.63 million facts for 339,224 derived on LUBM(10), at 206 to 266 bytes per fact,
+or about 1,000 bytes per derived fact. The reasoner's maintenance therefore moves onto
+the operator as an exact program over its own derived tier and evaluation, not through
+`RuleProgram`. The [run directory](runs/2026-11-14-item-547-stanley/run.sh.txt) holds the
+commands, the [host and build](runs/2026-11-14-item-547-stanley/env.txt) and each run's
+output, such as [LUBM(10) with 1,000 triples](runs/2026-11-14-item-547-stanley/l10-k1000.txt).
 
 ### Reasoner witnesses
 

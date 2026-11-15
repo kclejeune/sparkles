@@ -1,0 +1,7 @@
+#!/bin/sh
+# item 547: the reasoner's maintenance against RuleProgram on LUBM, binary lubm-4a5bcac9u
+C="systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue ./lubm-4a5bcac9u plugin"
+$C db1 100 6 1 > l1-k100.txt 2>&1
+$C db1 1000 6 1 > l1-k1000.txt 2>&1
+$C db10 100 10 10 > l10-k100.txt 2>&1
+$C db10 1000 10 10 > l10-k1000.txt 2>&1

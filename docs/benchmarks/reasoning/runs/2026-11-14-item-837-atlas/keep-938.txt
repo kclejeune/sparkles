@@ -1,0 +1,36 @@
+# base-r1.out
+keep owl-rl threads=20 full method=full source= ms=20057 inferred=12476225 peak_heap_mib=3196.4 reasoner_peak_mib=1707.6
+keep owl-rl threads=20 settle method=incremental source=store ms=1860 inferred=12476225 peak_heap_mib=1040.9 reasoner_peak_mib=1034.7
+keep owl-rl threads=20 kept_facts=12476225 kept_closure_mib=669.8
+keep owl-rl threads=20 change method=incremental source=memory ms=17951 inferred=12648747 peak_heap_mib=1492.4 reasoner_peak_mib=884.5
+keep owl-rl threads=20 revert method=incremental source=store ms=5799 inferred=12476225 peak_heap_mib=1311.7 reasoner_peak_mib=1249.7
+keep owl-rl threads=20 change-again method=incremental source=memory ms=20834 inferred=12648747 peak_heap_mib=1219.0 reasoner_peak_mib=1185.3
+keep owl-rl threads=20 revert-from-store method=incremental source=store ms=5987 inferred=12476225 peak_heap_mib=1274.8 reasoner_peak_mib=1249.7
+keep owl-rl threads=20 vm_hwm=4667456 kB
+# base-r2.out
+keep owl-rl threads=20 full method=full source= ms=19723 inferred=12476225 peak_heap_mib=3197.7 reasoner_peak_mib=1707.6
+keep owl-rl threads=20 settle method=incremental source=store ms=1919 inferred=12476225 peak_heap_mib=1040.1 reasoner_peak_mib=1034.7
+keep owl-rl threads=20 kept_facts=12476225 kept_closure_mib=669.8
+keep owl-rl threads=20 change method=incremental source=memory ms=17782 inferred=12648747 peak_heap_mib=1496.8 reasoner_peak_mib=891.8
+keep owl-rl threads=20 revert method=incremental source=store ms=5887 inferred=12476225 peak_heap_mib=1317.1 reasoner_peak_mib=1249.7
+keep owl-rl threads=20 change-again method=incremental source=memory ms=20901 inferred=12648747 peak_heap_mib=1217.9 reasoner_peak_mib=1185.5
+keep owl-rl threads=20 revert-from-store method=incremental source=store ms=5898 inferred=12476225 peak_heap_mib=1275.9 reasoner_peak_mib=1249.7
+keep owl-rl threads=20 vm_hwm=4684360 kB
+# p2-r1.out
+keep owl-rl threads=20 full method=full source= ms=20513 inferred=12476225 peak_heap_mib=3193.6 reasoner_peak_mib=1707.6
+keep owl-rl threads=20 settle method=incremental source=store ms=1818 inferred=12476225 peak_heap_mib=1042.1 reasoner_peak_mib=1034.7
+keep owl-rl threads=20 kept_facts=12476225 kept_closure_mib=669.8
+keep owl-rl threads=20 change method=incremental source=memory ms=17853 inferred=12648747 peak_heap_mib=1503.0 reasoner_peak_mib=888.0
+keep owl-rl threads=20 revert method=incremental source=store ms=5890 inferred=12476225 peak_heap_mib=1312.3 reasoner_peak_mib=1242.8
+keep owl-rl threads=20 change-again method=incremental source=memory ms=20198 inferred=12648747 peak_heap_mib=1217.8 reasoner_peak_mib=1173.9
+keep owl-rl threads=20 revert-from-store method=incremental source=store ms=6014 inferred=12476225 peak_heap_mib=1266.7 reasoner_peak_mib=1242.8
+keep owl-rl threads=20 vm_hwm=4478084 kB
+# p2-r2.out
+keep owl-rl threads=20 full method=full source= ms=19784 inferred=12476225 peak_heap_mib=3191.7 reasoner_peak_mib=1707.6
+keep owl-rl threads=20 settle method=incremental source=store ms=1848 inferred=12476225 peak_heap_mib=1046.7 reasoner_peak_mib=1034.7
+keep owl-rl threads=20 kept_facts=12476225 kept_closure_mib=669.8
+keep owl-rl threads=20 change method=incremental source=memory ms=18774 inferred=12648747 peak_heap_mib=1500.2 reasoner_peak_mib=881.7
+keep owl-rl threads=20 revert method=incremental source=store ms=5851 inferred=12476225 peak_heap_mib=1311.2 reasoner_peak_mib=1242.8
+keep owl-rl threads=20 change-again method=incremental source=memory ms=20665 inferred=12648747 peak_heap_mib=1221.8 reasoner_peak_mib=1173.8
+keep owl-rl threads=20 revert-from-store method=incremental source=store ms=5956 inferred=12476225 peak_heap_mib=1264.4 reasoner_peak_mib=1242.8
+keep owl-rl threads=20 vm_hwm=4602488 kB

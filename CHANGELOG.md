@@ -975,6 +975,15 @@ Rules in which a builtin binds a variable that an atom also holds, and every rul
 the derived tier holds a dead fact after a deletion, keep the greedy orders (item 944). The planner of item 487,
 which ordered bodies from statistics, stays unadopted.
 
+The reasoner's incremental maintenance runs on the fixed-point operator of incremental
+views (roadmap item 837). An update is one pass of the operator in a new exact mode, which
+keeps no derivation records, with the reasoner's derived tier as the operator's store and
+its backward search and semi-naive insertion as the program's methods. The operator takes
+facts in batches, reserves every buffer through its store before it grows, and reports
+its change as weighted facts. `ReasonOptions::inferred_change` reports the change that an
+incremental run commits to the inferred graph. `Program::new_store` moved to a
+`NewStore` trait, and `FactStore::clear` returns a result.
+
 RDFS undos and repeated changes over a kept closure take about the time they took when
 the closure also held the explicit facts (item 113). An incremental run of the reasoner read the
 commits since its last run through the commit diff, which started up to a mebibyte before
