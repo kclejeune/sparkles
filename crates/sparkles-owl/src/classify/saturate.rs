@@ -148,7 +148,9 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         true
     }
 
-    #[inline]
+    // always inlined, since the delivery of each conclusion asks it and an outlined call
+    // cost 4% of the instructions of ore_ont_8737 (item 710's lane)
+    #[inline(always)]
     pub fn contains(&self, x: &T) -> bool {
         match &self.set {
             Some(set) => set.contains(x),
