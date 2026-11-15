@@ -1301,19 +1301,21 @@ fn fold<S: Sink>(
             prune(&mut next);
         }
         acc = next;
-        // the step's tail is charged once it is large, as the record of a product's
-        // choices was, and the step's record, the unions it pruned and the last step's
-        // list leave the charge
+        // the step's record, the unions it pruned and the last step's list leave what is
+        // held, the part not yet charged first, and the step's tail is then charged once
+        // it is large, as the record of a product's choices was
+        let live: usize = acc.iter().map(bytes).sum();
+        let over = (charged + pending).saturating_sub(live);
+        let uncharged = over.min(pending);
+        pending -= uncharged;
+        let back = (over - uncharged).min(charged);
+        charged -= back;
+        out.release_data(back);
         if pending >= RECORD_SLACK {
             charged += pending;
             if !out.reserve_data(std::mem::take(&mut pending)) {
                 return stop(st, out, charged);
             }
-        }
-        let live: usize = acc.iter().map(bytes).sum();
-        if charged > live {
-            out.release_data(charged - live);
-            charged = live;
         }
     }
     for s in acc {
@@ -3499,6 +3501,37 @@ mod tests {
             "the drained list stays charged: unit {unit}, reserved {}, released {}",
             out.reserved, out.released
         );
+        assert_eq!(out.reserved, out.released);
+    }
+
+    /// A step that ends between two checks of the bounds drops its record from what it
+    /// has still to charge, so that the next step's check charges only what lives.
+    #[test]
+    fn a_step_drops_its_record_from_what_it_has_to_charge() {
+        let ix = index();
+        let mut st = State::default();
+        let four: Vec<Side> = (0..128)
+            .map(|k| side(&[4 * k + 1, 4 * k + 2, 4 * k + 3, 4 * k + 4]))
+            .collect();
+        let lists = vec![four, vec![side(&[])]];
+        let derive = |_: &Index, _: &mut State, _: Side, _: &mut Charges| {};
+        // the first step's 128 sides of four literals hold 10,240 bytes once its record
+        // goes, and the second step's record and list add as much again each
+        let mut out = Charges {
+            budget: Some(35_840),
+            ..Charges::default()
+        };
+        assert!(fold(
+            &ix,
+            &mut st,
+            &lists,
+            side(&[]),
+            "test",
+            false,
+            false,
+            &mut out,
+            &derive
+        ));
         assert_eq!(out.reserved, out.released);
     }
 
