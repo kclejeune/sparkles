@@ -190,6 +190,48 @@ taxonomies, and in six rounds of rotating order on one and four threads the revi
 takes 0.981 to 1.019 times the base's time by median, within the spread of the rounds, and
 item 968 follows ChEBI lite's 1.9% on four threads.
 
+Item 710 lets the Horn rules pass over a successor that another dominates, as the section
+[The Horn rules](#the-horn-rules) describes with its argument. A generated ontology of 15
+axioms that derived 210 million conclusions in 5.06 s on one thread on `atlas` derives 2.0
+million in 69 ms, and the 14,547 generated ontologies of the item's check derive 33 million
+conclusions in all against 1.19 billion. Item 969 found why the failed disjunctive attempt
+on ore_ont_9663 and ore_ont_14817 took from 10 s to more than 900 s. A product of the Pred
+rule takes one premise from each of its lists, and on ore_ont_14817 thousands of products
+had 100,000 to 1.4 million choices. A sample of 100 s of the attempt on four threads made
+804 million choices in products of 100,000 or more, of which 6.6% gave a union of literals
+not made before in the same product, and in the products small enough to check, 0.7% of
+those unions contained no other. How many premises each list holds when the inference
+runs depends on the order of the workers, so the attempt's length did too. A product that
+is not ground now forms its unions list after list. Each step keeps each union once and,
+up to 4,096 unions, only those that no other union of the step contains, and a last step
+past 4,096 unions derives them as it makes them.
+
+The argument for completeness is the store's subsumption. A union that contains another
+union of its step gives, with every choice from the later lists, a union that contains the
+other's union with the same choices. The conclusion it gives has every literal of the
+other's in its body and its head, and `derive` changes a conclusion by literal, by dropping
+body atoms that hold and head literals that cannot hold, and drops it when a literal holds.
+The conclusion of the larger union is then subsumed by that of the smaller, or dropped
+with it, and the store adds no clause that another subsumes and marks dead those that a new
+one subsumes. Ground products of a rooted run keep the enumeration, since the restriction
+on ground inferences filters their choices one by one. The steps' sets are charged to the
+memory budget and each step releases what it drops. Past 4,096 unions of the steps before
+the last, each further union counts toward a bound on derived conclusions, so a bounded
+run still stops a wide product within its bound. The counting fixtures keep their answers
+on every number of threads, and three more of them, `sriq-004` among them, finish within
+the counting bound. Of the generated Horn ontologies with a union that meets nothing
+beside them, 2,145 finish with counting on both builds, and seven more finish on this one,
+whose answers equal those of the Horn rules. On `atlas` on four
+threads three classifications of ore_ont_14817 take 19.9 to 38.9 s against 59.7 to 79.5 s,
+and on one thread on the laptop the build before passed a timeout of 900 s where this one
+finishes. The attempt still passes its budget before the Horn rules answer, which item 990
+follows. On the Horn files that the sort of successors does not prune, such as
+ore_ont_9855, ore_ont_8737 and GO, the build classifies in 1.01 to 1.06 times the base's
+time on `atlas`, which item 991 follows. The sort adds its entries' memory at each check
+of its bounds and at its end, and R6 its record's at the end of each rule. The run's sink
+holds what they add in the activation and charges it once it reaches 16 KiB and when the
+activation ends.
+
 Item 753 makes a run after an edit of class axioms
 [keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
 without individuals and of a run of the disjunctive rules that does not count, with the
@@ -772,6 +814,52 @@ Two further changes cut the cost of the Horn rules.
 - **Fillers no rule reads.** The rule for a successor passes over a filler that no rule
   takes as a premise and whose told subsumers every context holds. The rule for a
   universal restriction on an inverse still takes such a filler to the predecessors.
+
+R3 and R5 add a successor to a context and keep the successors it extends or merges, so
+a context with inverse properties, at-most restrictions and nested existential
+restrictions can collect many successors whose roles and cores others contain. Counted
+for every at-most restriction, each of them would take R6 to every predecessor, which
+would receive the successor's core and a link each time, and a few axioms would give
+millions of repeated subsumers and links. A successor by `r'` in `N'` dominates one by `r` in `N`
+when `r'` is under `r` and the core of `N` is part of the core of `N'`. A run of the
+Horn rules without individuals, universal properties or functional data properties
+passes over dominated successors. A context sorts its successors into those that another
+successor dominates and those that no other does, as they come when it has an at-most
+restriction and at the end of each activation when it has only universals, and R6 sends a
+predecessor the core of each successor once. Each core carries a signature of one bit for
+each of its expressions, so that most pairs of successors are told apart before their
+roles and cores are compared.
+
+The argument for completeness rests on one property of such a run. A context's
+subsumers, loops and at-most restrictions follow from its core and from what its
+successors send back, since the rules that read a predecessor send their conclusions to
+that predecessor. By induction on the derivations, a context whose core contains that of
+another derives every subsumer the other derives, and each successor of the other is
+dominated by one of its own. Domination is transitive and the successors of a context
+only grow, so at the end of the saturation every dominated successor is dominated by one
+that no other dominates. Each rule that passes over a dominated successor is then covered
+by an instance on the dominating successor.
+
+- **R3.** The universals on the superroles of `r` are on superroles of `r'` too, so the
+  extension of `N'` contains that of `N`, and R3 extends `N'`.
+- **R5.** The dominating successor holds every filler that `N` holds, so the at-most
+  restriction counts it. The union of the counted cores is the same, and a role clash of
+  `r` with another member is a clash of `r'`, since clashes hold for subroles. When `r'`
+  and the other member's role are one role, that role clashes with itself and is empty,
+  which already makes the context unsatisfiable.
+- **R6.** The predecessor receives the core of `N'`, which contains that of `N`, and a
+  link by the inverse of `r'`, which is under the inverse of `r`. A clash of the
+  predecessor's role with the inverse of `r` is one with the inverse of `r'`.
+- **The successor's own rules.** `N` keeps its link from the context and still runs its
+  rules, whose conclusions for the context `N'` also sends.
+
+A dominating successor can come into the counted members later than the one it dominates,
+when its context derives the filler later. The counting then runs R5 and R6 on it as on
+any new member. Runs with individuals keep every successor, since a context there can
+take conclusions from its predecessors, such as realness and singularity. A differential
+check compared the taxonomies of 14,547 generated ontologies of 8 to 18 axioms with the
+build before on one and eight threads, and of 2,145 of them, with a union that meets
+nothing beside them, with the disjunctive rules counting, and found no difference.
 
 Item 693 also fixed a gap in completeness that phase 3 left. A chain
 `r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of

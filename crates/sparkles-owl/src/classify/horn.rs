@@ -70,6 +70,9 @@ pub struct HornIx {
     pub flags: Vec<u8>,
     /// the first id of the contexts the saturation creates for conjunctions
     pub base: Ex,
+    /// whether the rules pass over a successor that another dominates, which a run
+    /// without individuals, universal roles or functional data roles does (item 710)
+    pub dominate: bool,
 }
 
 impl HornIx {

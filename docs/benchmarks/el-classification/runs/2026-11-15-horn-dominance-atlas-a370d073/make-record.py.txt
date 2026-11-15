@@ -1,0 +1,70 @@
+# make-record.py LANE DEST: builds the benchmark record of items 710 and 969 from the atlas
+# timing outputs and the laptop's taxonomy sweep
+import json, sys, os, glob
+lane, dest = sys.argv[1], sys.argv[2]
+keep = ['classifyMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
+        'outside', 'outsideTaken', 'conclusions', 'contexts', 'conjunctions', 'peakEstimatedBytes', 'peakRssKib', 'threads']
+def rep(p):
+    try: return json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: return None
+def runs(root, pattern):
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, pattern), recursive=True)):
+        d = rep(p)
+        out.append({'path': os.path.relpath(p, root), 'report': {k: d.get(k) for k in keep} if d else None})
+    return out
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+a = os.path.join(lane, 'atlas')
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'generated Horn ontologies g04281, g13278, g15813 and small-13278, GO 2026-07-26, ChEBI lite 256 and ORE 2015 files ore_ont_8737, ore_ont_16744, ore_ont_9855, ore_ont_3836, ore_ont_13482, ore_ont_4510, ore_ont_12901, ore_ont_14817 and ore_ont_9663 on atlas, and a taxonomy sweep of GO, ChEBI lite, 298 ORE 2015 EL files and 207 DL development files on the laptop',
+  'host': {'name': 'atlas', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+  'manifest': {
+    'sides': {'base': 'a22f6a35, the lane base (batch 24)',
+              'lane': '1ffed4a8, the dominated successors of item 710 and the least unions of item 969 with the first review fixes',
+              'tip': 'efca1c26, the lane after the cheaper sort of dominated successors, in timing2',
+              'final': 'a370d073, the lane tip with the charges of the sort batched in the activation, in timing_final as tip4; the sweep ran efca1c26, and the commits after it change only accounting and inlining'},
+    'build': 'mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas',
+    'binaries_sha256': {'final': 'bc12f701e79e682fd8a22a853a842617c2d2e1160496f312854d284beff972e9', 'base': '055a2e25d0238b1209bc6697c71a85bb58d131762d9d5cc26d60a4044f330438',
+                        'lane': '7376727ed5854bab74a45ad4b9751ff8f65b5516eca6bdca817f9007245d1e87'},
+    'scripts': ['timing.sh.txt', 'timing2.sh.txt', 'timing4.sh.txt', 'sweep.sh.txt', 'sweep2.sh.txt', 'summ.py.txt']},
+  'settings': {'threads': 'one and four in the rounds, four for the disjunctive attempts, one and eight in the sweep',
+               'scope': 'one process per run in a 13 GiB systemd scope without swap on atlas, a 12 GiB scope on the laptop',
+               'lock': 'the atlas parts ran under ~/lanes/.heavy.lock with no other benchmark or gate on the host'},
+  'method': 'timing.sh ran three rounds of alternating order of base and lane, one process per side, file and thread count with --repeat 5, then three rounds of each side on ore_ont_14817 and ore_ont_9663 on four threads with their wall times. timing2.sh ran four rounds of alternating order of base and tip on the Horn files, then three runs of the tip on the two disjunctive files, and timing4.sh ran the same with the final build. summ.py takes the median of every classification of a side and the median of the rounds ratios. The sweep classified each file once per side and thread count with its taxonomy on the laptop and compared the sorted taxonomies hashes.',
+  'timing': runs(os.path.join(a, 'timing-1ffed4a8'), '**/*.json'),
+  'timing_log': text(os.path.join(a, 'timing-1ffed4a8/log.txt')),
+  'timing2': runs(os.path.join(a, 'timing2-efca1c26'), '**/*.json'),
+  'timing2_log': text(os.path.join(a, 'timing2-efca1c26/log.txt')),
+  'timing_final': runs(os.path.join(a, 'timing4-a370d073'), '**/*.json'),
+  'timing_final_log': text(os.path.join(a, 'timing4-a370d073/log.txt')),
+  'sweep_host': 'stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB',
+  'sweep_base_and_c00e1cf2': text(os.path.join(lane, 'sweep/log.txt')),
+  'sweep_604accc7': text(os.path.join(lane, 'sweep/log2.txt')),
+  'sweep_tip': text(os.path.join(lane, 'sweep/log-lane11.txt')),
+  'laptop_diagnostics': {
+    'notes': text(os.path.join(lane, 'notes.md')),
+    'dedup_only_fold': 'a diagnostic build of fold that kept each union of a step once without dropping the unions that contain another derived 113 million conclusions on ore_ont_14817 on four threads on the laptop, against 21.7 million for the build that drops them, in about the same time',
+    'item_693': 'Horn rules alone with Tier D skipped by a diagnostic switch, one thread, laptop: ore_ont_14817 2.0 s (2.49 s on the base before item 710), ore_ont_9663 3.1 s, against 0.42 and 0.47 s for the EL rules alone; 70,702 and 98,557 conjunction contexts, all from R3; 12.3 and 21.0 million new subsumers against 2.0 and 1.5 million for the EL rules'},
+  'generated': {
+    'host': 'stanley, the laptop',
+    'generator': text(os.path.join(lane, 'gen/gen.py')),
+    'scan_script': text(os.path.join(lane, 'gen/scan.sh')),
+    'scan_totals': {'files': 14547, 'base_a22f6a35': {'conclusions': 1188748935, 'classify_ms': 44808.0},
+                    'lane_b453117a': {'conclusions': 33302144, 'classify_ms': 5915.9},
+                    'note': 'sums over one-thread runs of every generated file, from scan-base.txt and scan-lane2.txt'},
+    'horn_against_counting_script': text(os.path.join(lane, 'gen/dcmp.sh')),
+    'horn_against_counting': text(os.path.join(lane, 'gen/dcmp4.txt')),
+    'counting_two_builds_script': text(os.path.join(lane, 'gen/dd.sh')),
+    'counting_two_builds': text(os.path.join(lane, 'gen/dd-count.txt')),
+    'counting_note': 'dd-count.txt runs --counting on the base (first hash and report) and on the lane (second): 7 files pass the counting bound on the base and finish on the lane, and none goes the other way; dcmp4.txt has 2,145 files that finish with counting on the base with the Horn answer',
+    'seven_script': text(os.path.join(lane, 'gen/seven.sh')),
+    'seven_final': text(os.path.join(lane, 'gen/seven-a370d073.txt')),
+    'seven_note': 'seven.sh runs the final build a370d073 with --counting and with the Horn rules on the 7 files, with the normalization of dcmp.sh: each counting taxonomy equals the Horn one',
+    'fixtures': 'crates/sparkles-owl/tests/dl_steps.rs WITHIN 171 -> 174 and dl_number_order.rs (202, 202) -> (205, 204) in commit c00e1cf2: three more counting fixtures finish within the counting bound, sriq-004 among them, by tests/dl_steps.rs a_product_derives_only_its_least_unions'},
+  'hosts': {p: text(os.path.join(a, p)) for p in ['timing-1ffed4a8/before.txt', 'timing-1ffed4a8/after.txt', 'timing2-efca1c26/before.txt', 'timing2-efca1c26/after.txt', 'timing4-a370d073/before.txt', 'timing4-a370d073/after.txt']},
+}
+os.makedirs(dest, exist_ok=True)
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']), 'timing2', len(rec['timing2']))
