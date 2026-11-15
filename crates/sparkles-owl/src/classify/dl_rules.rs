@@ -1185,6 +1185,112 @@ const PRODUCT_POLL: usize = 256;
 /// product ends between two checks of the bounds; a larger tail is charged at the end.
 const RECORD_SLACK: usize = 64 * 1024;
 
+/// The most sides of one step of a product that [`fold`] keeps only where no other side
+/// of the step has a subset of their literals, which costs a comparison of each side with
+/// the sides kept before it.
+const FOLD_PRUNE: usize = 4096;
+
+/// Derives the conclusions of a product that is not ground (item 969): the union of one
+/// premise from every list with `base`, list after list. Each step keeps the unions it
+/// makes once, and, up to [`FOLD_PRUNE`] of them, only those that no other union of the
+/// step contains. A union that contains another gives only conclusions that the other's
+/// conclusions subsume, since the unions of both with the premises of the later lists
+/// contain each other in the same way, and the store keeps no clause that another
+/// subsumes. The products of the Pred rule on `ore_ont_14817` of ORE 2015 have up to a
+/// million choices whose unions are a few thousand sets of literals, of which a few dozen
+/// are least. The steps' sets are charged to the memory budget as they grow and released
+/// at the end. The answer is whether the run goes on.
+#[allow(clippy::too_many_arguments)]
+fn fold<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    lists: &[Vec<Side>],
+    mut base: Side,
+    rule: &'static str,
+    root: bool,
+    trace: bool,
+    out: &mut S,
+    derive: &impl Fn(&Index, &mut State, Side, &mut S),
+) -> bool {
+    let norm = |s: &mut Side| {
+        s.0.sort_unstable();
+        s.0.dedup();
+        s.1.sort_unstable();
+        s.1.dedup();
+    };
+    let bytes = |s: &Side| (s.0.capacity() + s.1.capacity()) * std::mem::size_of::<Lit>() + 48;
+    norm(&mut base);
+    let (mut charged, mut pending) = (0usize, 0usize);
+    let mut acc: Vec<Side> = vec![base];
+    let stop = |st: &mut State, out: &mut S, charged: usize| {
+        ds(st).store.interrupted = true;
+        out.release_data(charged);
+        false
+    };
+    for l in lists {
+        let mut seen: FxHashSet<Side> = FxHashSet::default();
+        let mut next: Vec<Side> = Vec::new();
+        for a in &acc {
+            for t in l {
+                if out.stopped() {
+                    return stop(st, out, charged);
+                }
+                let mut s = a.clone();
+                s.0.extend_from_slice(&t.0);
+                s.1.extend_from_slice(&t.1);
+                norm(&mut s);
+                if !seen.contains(&s) {
+                    // the step's record and its list hold the union
+                    pending += 2 * bytes(&s);
+                    seen.insert(s.clone());
+                    next.push(s);
+                }
+                let x = ds(st);
+                x.choices += 1;
+                if x.choices as usize >= PRODUCT_POLL {
+                    x.choices = 0;
+                    let go = if pending > 0 {
+                        charged += pending;
+                        out.reserve_data(std::mem::take(&mut pending))
+                    } else {
+                        out.go_on()
+                    };
+                    if !go {
+                        return stop(st, out, charged);
+                    }
+                }
+            }
+        }
+        drop(seen);
+        if next.len() <= FOLD_PRUNE {
+            prune(&mut next);
+        }
+        acc = next;
+    }
+    for s in acc {
+        if trace {
+            let lits = &out.dl().lits;
+            eprintln!(
+                "TR {} {rule} {} -> {}",
+                tr_ctx(st, root),
+                tr(ix, lits, &s.0),
+                tr(ix, lits, &s.1)
+            );
+        }
+        derive(ix, st, s, out);
+        let x = ds(st);
+        x.choices += 1;
+        if x.choices as usize >= PRODUCT_POLL {
+            x.choices = 0;
+            if !out.go_on() {
+                return stop(st, out, charged);
+            }
+        }
+    }
+    out.release_data(charged);
+    true
+}
+
 /// Derives what the rules found: the single conclusions, then each product's choices in
 /// the order of their lists, the last list fastest. The run's bounds are checked after
 /// every [`PRODUCT_POLL`] choices the context derives, counted across calls, and a stop of
@@ -1235,6 +1341,12 @@ pub(super) fn drain_with<S: Sink>(
     let dx = ix.dl.as_deref();
     let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
     for (lists, base, ground, rule) in found.prods {
+        if !ground {
+            if !fold(ix, st, &lists, base, rule, found.root, trace, out, &derive) {
+                return;
+            }
+            continue;
+        }
         let mut at = vec![0usize; lists.len()];
         // two choices whose premises share their literals merge to one conclusion, as
         // when one role premise fits two places of a Pred body or two needs share their
