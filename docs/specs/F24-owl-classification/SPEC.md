@@ -1185,6 +1185,39 @@ restriction, and the argument above is the whole of it. R7 needs both predecesso
 because `M_1 ⊑ X` for a subsumer `X` of `M_2` holds only when `M_2` has the instance that
 every instance of `M_1` equals. R8 concludes emptiness, which needs no instance.
 
+**A successor that holds an individual.** R3 and R5 link a context to the conjunction of a
+successor with the fillers of its universals, or of the successors an at-most restriction
+counts, and make a context for the conjunction. When the context is real and the
+conjunction holds an individual `a`, they send `a` the other members of the conjunction as
+subsumers and link the context to `a`'s own context, and make no context. The step is
+sound, since the context has an instance, the instance's successor is in the conjunction,
+and the only element of the conjunction is `a`, so `a` is in every member and the instance
+has `a` as the successor. It loses nothing, by the list of what reads the conjunction's
+context. That context would be real, as the successor of a real context, and would derive
+`a`, so the exchange above would give `a` its subsumers, its loops, its Horn successors
+and its backward links with what they know of each predecessor, and would give it `a`'s.
+The rules that read a successor are the EL rules over a backward link, R2 and R4, the
+`SuccIn` conclusion that R5 and R6 count, the `LinkTo` conclusion, the singular flag that
+a counted predecessor takes, and R7 and R8 at the successor, and each of them reads the
+successor's subsumers, loops, flags and backward links, which `a`'s context holds as the
+conjunction's would, with the context's link, its fillers and its realness among them.
+The context's own state differs only in the id of the successor it names, and a rule
+that reads that id reads the successor's core, which for `a`'s context is `a` and for the
+conjunction's is a set that holds `a`, so a later extension or merge of either holds `a`
+and takes the same step. A context that is not real keeps the conjunction, since what the
+conjunction holds is then true of `a` only where the context has an instance, which a
+world decides. To let the step apply from the first saturation, a run with the Horn rules
+over an ontology with individuals makes `owl:Thing` and each individual real when it
+initializes their contexts, where the rounds between the saturations did so before, and
+the rounds keep the facts of universal roles and the keys. A context that becomes real
+after R3 or R5 made a conjunction for one of its successors keeps the conjunction, which
+is then real and exchanges with its individual as before, so the conjunctions a run makes
+depend on the order of delivery while its answer does not. On the four assertion-heavy
+files of the development set, whose property assertions between individuals lie under
+universal restrictions and ranges of transitive properties, every conjunction but 44 to
+116 of 3,098 to 42,249 held an individual and was real, and each repeated its
+individual's closure.
+
 **Witnesses and worlds.** The reachability condition of the EL rules of individuals stays
 the mechanism that makes a conclusion that depends on a class having an instance hold
 only where it does. The rules that read whether a context is real are the exchange from
@@ -1211,8 +1244,9 @@ missed. The kinds are sufficient, by the list of rules that read realness, and n
 necessary, since `A ⊑ ∃r.{a}` with an inverse functional `r` alone makes `A` a witness
 whose world finds nothing. A cheaper criterion needs an argument of its own, which item
 868 holds. A run with the Horn rules marks the real contexts whenever the ontology has
-individuals, where a run of the EL rules does so only after a merge, a key or a universal
-role, because R7 reads the real predecessors of the global state.
+individuals, from the first saturation on, where a run of the EL rules does so only after
+a merge, a key or a universal role, because R7 reads the real predecessors of the global
+state and R3 and R5 read whether their own context is real.
 
 Each named class whose context reaches a witness is classified again in a world, as
 before, and the worlds extend to the conjunction contexts. The global table of
