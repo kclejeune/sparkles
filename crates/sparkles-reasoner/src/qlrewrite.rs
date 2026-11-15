@@ -813,7 +813,9 @@ impl Bgp<'_> {
         Some(self.normalize(Cq { atoms, binds }))
     }
 
-    /// PerfectRef from `q0`, or `None` when the rewriting passes `max` queries.
+    /// PerfectRef from `q0`, or `None` when the rewriting passes `max` queries. The
+    /// queries it keeps are charged to `budget` while it runs, and released when it
+    /// returns, whether it succeeds, passes the bound or fails.
     fn perfect_ref(
         &self,
         q0: Cq,
@@ -821,9 +823,28 @@ impl Bgp<'_> {
         stop: &dyn Fn() -> Result<()>,
         budget: &crate::budget::Budget,
     ) -> Result<Option<Vec<Cq>>> {
+        let mut charged = 0usize;
+        let r = self.perfect_ref_charged(q0, max, stop, budget, &mut charged);
+        budget.release(charged);
+        r
+    }
+
+    fn perfect_ref_charged(
+        &self,
+        q0: Cq,
+        max: usize,
+        stop: &dyn Fn() -> Result<()>,
+        budget: &crate::budget::Budget,
+        charged: &mut usize,
+    ) -> Result<Option<Vec<Cq>>> {
         let q0 = self.normalize(q0);
         let mut seen: FxHashSet<Cq> = FxHashSet::default();
         let mut order: Vec<Cq> = Vec::new();
+        let n = 2 * cq_bytes(&q0);
+        budget
+            .try_charge(n)
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        *charged += n;
         seen.insert(q0.clone());
         order.push(q0);
         let mut next = 0;
@@ -839,9 +860,11 @@ impl Bgp<'_> {
             // a query kept twice, in `seen` and `order`, is charged to the query's memory
             let mut add = |f: Cq, order: &mut Vec<Cq>| -> Result<bool> {
                 if !seen.contains(&f) {
+                    let n = 2 * cq_bytes(&f);
                     budget
-                        .try_charge(2 * cq_bytes(&f))
+                        .try_charge(n)
                         .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+                    *charged += n;
                     seen.insert(f.clone());
                     order.push(f);
                     if order.len() > max {

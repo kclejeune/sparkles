@@ -205,3 +205,28 @@ fn terminology_that_is_no_owl_axiom_is_reported() {
         r.warnings
     );
 }
+
+/// A rewriting that passes `budget.maxUnion` gives its memory back, so many such patterns
+/// fall back under a budget that each fits.
+#[test]
+fn an_abandoned_rewriting_releases_its_memory() {
+    let mut onto = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . ex:A a owl:Class . ",
+    );
+    for i in 0..12 {
+        onto.push_str(&format!("ex:C{i} a owl:Class ; rdfs:subClassOf ex:A . "));
+    }
+    let t = tbox(&onto);
+    let groups: Vec<String> = (0..20)
+        .map(|i| format!("{{ ?x{i} a ex:A . ?y{i} a ex:A }}"))
+        .collect();
+    let q = parse(&format!(
+        "PREFIX ex: <{EX}> SELECT * {{ {} }}",
+        groups.join(" UNION ")
+    ));
+    let r = rewrite_query(&q, &[], &t, 50, Some(64 * 1024), &|| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.derive.len(), 20);
+}
