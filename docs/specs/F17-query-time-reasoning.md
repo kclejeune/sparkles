@@ -1367,11 +1367,14 @@ files the converter writes.
 **Profile** select under demand and auto with the dataset's profile, `rdfs`, `rdfs-simple`
 and `owl-rl`. The page sends `reasoning` and `reasoningProfile` to `/{ds}/sparql`,
 `/{ds}/explain`, stored queries and downloads, and a download of a result uses the mode
-and profile the result ran with. The endpoints that take only a boolean, such as the Ask
-bar's checks, the diagnosis of an empty result, the facet panel and the graph lenses, get
-`true` for materialized, `false` for off and nothing for the query-time modes. They derive
-nothing, and without the parameter they read the materialized inferences when the dataset
-has them. Roadmap item 986 carries the query-time modes to them. A result that derived
+and profile the result ran with, which the page reads once when the query starts. The
+endpoints that take only a boolean, such as the Ask bar's checks, the diagnosis of an
+empty result and the facet panel, get `true` for materialized, `false` for off and nothing
+for the query-time modes. They derive nothing, and without the parameter they read the
+materialized inferences when the dataset has them. The graph lenses of a result read
+`/{ds}/sparql` with `reasoning` true or absent, so the dataset's query-time default
+applies to their reads rather than the result's mode and profile. Roadmap item 986 carries
+the result's mode and profile to these reads. A result that derived
 facts shows a badge from the `Sparkles-Reasoning` header, which the server now exposes to
 cross-origin pages. A result of `auto` that read a fresh materialization derived nothing
 and has no badge. Stored queries reserve `reasoningProfile`, `maxDerived` and

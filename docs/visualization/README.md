@@ -122,9 +122,10 @@ The SvelteKit UI is embedded in the server binary.
   dataset's profile. A result that derived facts shows a badge with the mode, the facts
   derived and the tables that came from the cache, read from the `Sparkles-Reasoning`
   header. The page remembers the choice per browser, and a download of a result uses the
-  reasoning the result ran with. The Ask bar's checks, the diagnosis of an empty result,
-  the facets and the graph lenses read the materialized inferences under the query-time
-  modes and derive nothing. Roadmap item 986.
+  reasoning the result ran with. Under the query-time modes the Ask bar's checks, the
+  diagnosis of an empty result and the facets read the materialized inferences and derive
+  nothing, and the graph lenses read with the dataset's default rather than the result's
+  mode. Roadmap item 986.
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.

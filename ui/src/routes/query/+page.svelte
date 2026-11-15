@@ -1600,7 +1600,10 @@
     const prevView = outcomes[tabId]?.view;
     const prevKind = outcomes[tabId]?.result?.queryType;
     const started = performance.now();
+    // the mode and profile are read once, so a choice changed while the query runs does
+    // not change what its result says it ran with
     const reasoning = reasoningFor(dsName);
+    const reasoningProfile = profileFor(reasoning);
     outcomes[tabId] = {
       status: 'running',
       ds: dsName,
@@ -1610,7 +1613,7 @@
       startedAt: started,
       controller,
       reasoning,
-      reasoningProfile: profileFor(reasoning),
+      reasoningProfile,
       ...(keepShown
         ? { result: keepShown.result, base: keepShown.base, baseFrom: keepShown.baseFrom }
         : {}),
@@ -1649,7 +1652,7 @@
         const opts = {
           send: limit,
           reasoning,
-          reasoningProfile: profileFor(reasoning),
+          reasoningProfile,
           at,
           signal: controller.signal,
         };
@@ -1697,7 +1700,7 @@
           startedAt: started,
           elapsed,
           reasoning,
-          reasoningProfile: profileFor(reasoning),
+          reasoningProfile,
           query: stored ? undefined : text,
         };
         lastShown[tabId] = outcomes[tabId];
