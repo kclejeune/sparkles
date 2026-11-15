@@ -27,6 +27,7 @@ fn rewritten(ttl: &str, q: &str, max: usize) -> Rewritten {
         &[],
         &t,
         max,
+        None,
         &|| Ok(()),
     )
     .unwrap()
@@ -179,7 +180,7 @@ fn unification_binds_distinguished_variables_again() {
     let q = parse(&format!(
         "PREFIX ex: <{EX}> SELECT ?y ?z {{ ex:a ex:r ?y . ex:a ex:r ?z }}"
     ));
-    let r = rewrite_query(&q, &[], &t, 1024, &|| Ok(()))
+    let r = rewrite_query(&q, &[], &t, 1024, None, &|| Ok(()))
         .unwrap()
         .unwrap();
     let sse = r.query.to_sse();

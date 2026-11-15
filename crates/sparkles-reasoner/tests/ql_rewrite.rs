@@ -347,3 +347,51 @@ fn explain_of_a_query_that_also_derives_shows_its_rewriting() {
     let text = format!("{plan:?}");
     assert!(text.contains("OWL 2 QL rewriting"), "{text}");
 }
+
+/// A variable of the initial bindings unifies only with its own value.
+#[test]
+fn a_unification_keeps_the_value_of_an_initial_binding() {
+    let s = store(
+        "ex:p a owl:ObjectProperty . ex:q a owl:ObjectProperty . ex:q rdfs:subPropertyOf ex:p .
+         ex:a ex:p ex:b .",
+    );
+    let bound = |v: &str| QueryOptions {
+        initial_bindings: vec![(
+            "c".into(),
+            oxrdf::NamedNode::new_unchecked(format!("{EX}{v}")).into(),
+        )],
+        ..ql(None)
+    };
+    let q = "ASK { ex:a ex:p ?c . ex:a ex:p ex:b }";
+    assert!(!run(&s, q, &bound("none")).boolean);
+    assert!(run(&s, q, &bound("b")).boolean);
+    let r = run(
+        &s,
+        "SELECT ?c { ex:a ex:p ?c . ex:a ex:p ex:b }",
+        &bound("b"),
+    );
+    assert_eq!(answers(&r), vec![format!("<{EX}b>")]);
+}
+
+/// The queries the rewriting keeps are charged to the query's memory budget.
+#[test]
+fn the_rewriting_is_charged_to_the_memory_budget() {
+    let mut onto = String::from("ex:A a owl:Class .\n");
+    for i in 0..30 {
+        onto.push_str(&format!("ex:C{i} a owl:Class ; rdfs:subClassOf ex:A .\n"));
+    }
+    let s = store(&onto);
+    let o = QueryOptions {
+        // past the terminology's charge, far below the rewriting's
+        max_memory_bytes: Some(4 << 20),
+        ..ql(Some(1_000_000))
+    };
+    let e = query(
+        s.snapshot(),
+        "SELECT * { ?a a ex:A . ?b a ex:A . ?c a ex:A . ?d a ex:A }",
+        &o,
+    )
+    .err()
+    .expect("the rewriting passes the memory budget");
+    assert!(e.to_string().contains("the OWL 2 QL rewriting"), "{e}");
+}

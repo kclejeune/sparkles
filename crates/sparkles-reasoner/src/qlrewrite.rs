@@ -379,6 +379,16 @@ impl Tbox {
 
     /// The TBox of the OWL 2 QL axioms among `triples`, the terminology of an ontology.
     pub fn from_triples(triples: Vec<oxrdf::Triple>) -> Tbox {
+        Tbox::from_triples_checked(triples, &|| Ok(())).expect("no stop function fails")
+    }
+
+    /// [`from_triples`](Self::from_triples), which checks `stop` between its phases and
+    /// while it maps the axioms.
+    fn from_triples_checked(
+        triples: Vec<oxrdf::Triple>,
+        stop: &dyn Fn() -> Result<()>,
+    ) -> Result<Tbox> {
+        stop()?;
         let ontology = sparkles_owl::read::read_graph(
             triples,
             sparkles_owl::ReadOptions {
@@ -386,8 +396,10 @@ impl Tbox {
                 ..Default::default()
             },
         );
+        stop()?;
         let part =
             sparkles_owl::profiles::partition(&ontology, sparkles_owl::profiles::Profile::Ql);
+        stop()?;
         let mut t = Tbox {
             unmapped: ontology.unmapped.len(),
             ..Default::default()
@@ -397,11 +409,15 @@ impl Tbox {
         for v in part.outside.iter().take(MAX_LISTED) {
             t.outside.push(v.message.clone());
         }
-        for ax in &part.inside {
+        for (i, ax) in part.inside.iter().enumerate() {
+            if i % 256 == 255 {
+                stop()?;
+            }
             t.axioms += 1;
             t.add_axiom(&ax.kind);
         }
-        t
+        stop()?;
+        Ok(t)
     }
 
     /// The TBox of the terminology in `graphs` of `snap`: the triples of the structural
@@ -472,7 +488,7 @@ impl Tbox {
             }
         }
         stop()?;
-        Ok(Tbox::from_triples(triples))
+        Tbox::from_triples_checked(triples, stop)
     }
 
     /// An estimate of the bytes the TBox holds.
@@ -635,6 +651,8 @@ struct Bgp<'a> {
     /// each variable as the query wrote it, and whether it is distinguished
     vars: Vec<(TermPattern, bool)>,
     consts: Vec<Term>,
+    /// the values of the variables of the query's initial bindings
+    values: FxHashMap<u32, Term>,
 }
 
 impl Bgp<'_> {
@@ -732,15 +750,36 @@ impl Bgp<'_> {
                 _ if x == y => {}
                 (T::Free, _) | (_, T::Free) => {}
                 (T::Const(_), T::Const(_)) => return None,
-                (T::Var(v), c @ T::Const(_)) | (c @ T::Const(_), T::Var(v)) => {
+                (T::Var(v), c @ T::Const(k)) | (c @ T::Const(k), T::Var(v)) => {
+                    // a variable of the initial bindings unifies only with its own value,
+                    // which the planner substitutes, so it needs no binding
+                    if let Some(value) = self.values.get(&v) {
+                        if *value != self.consts[k as usize] {
+                            return None;
+                        }
+                        sub.insert(v, c);
+                        continue;
+                    }
                     sub.insert(v, c);
                     if self.vars[v as usize].1 {
                         binds.push((v, c));
                     }
                 }
                 (T::Var(v), T::Var(w)) => {
-                    // bind a non-distinguished variable rather than a distinguished one
-                    let (from, to) = if !self.vars[w as usize].1 {
+                    let (bv, bw) = (self.values.get(&v), self.values.get(&w));
+                    if let (Some(a), Some(b)) = (bv, bw) {
+                        if a != b {
+                            return None;
+                        }
+                        // both take the same value from the planner
+                        sub.insert(v, T::Var(w));
+                        continue;
+                    }
+                    // bind a variable without an initial value to one with it, and a
+                    // non-distinguished variable rather than a distinguished one
+                    let (from, to) = if bw.is_some() {
+                        (v, w)
+                    } else if bv.is_some() || !self.vars[w as usize].1 {
                         (w, v)
                     } else {
                         (v, w)
@@ -780,6 +819,7 @@ impl Bgp<'_> {
         q0: Cq,
         max: usize,
         stop: &dyn Fn() -> Result<()>,
+        budget: &crate::budget::Budget,
     ) -> Result<Option<Vec<Cq>>> {
         let q0 = self.normalize(q0);
         let mut seen: FxHashSet<Cq> = FxHashSet::default();
@@ -796,13 +836,12 @@ impl Bgp<'_> {
             next += 1;
             // each query is kept as it is made, so the bound and the stop function hold
             // while one query's replacements and reductions are made
-            let mut made = 0usize;
+            // a query kept twice, in `seen` and `order`, is charged to the query's memory
             let mut add = |f: Cq, order: &mut Vec<Cq>| -> Result<bool> {
-                made += 1;
-                if made.is_multiple_of(256) {
-                    stop()?;
-                }
                 if !seen.contains(&f) {
+                    budget
+                        .try_charge(2 * cq_bytes(&f))
+                        .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
                     seen.insert(f.clone());
                     order.push(f);
                     if order.len() > max {
@@ -811,10 +850,20 @@ impl Bgp<'_> {
                 }
                 Ok(true)
             };
+            // every replacement and pair tried counts, unified or not
+            let mut tried = 0usize;
+            let mut attempt = || -> Result<()> {
+                tried += 1;
+                if tried.is_multiple_of(256) {
+                    stop()?;
+                }
+                Ok(())
+            };
             for i in 0..q.atoms.len() {
                 implied.clear();
                 self.implied(q.atoms[i], &mut implied);
                 for &a in &implied {
+                    attempt()?;
                     let mut atoms = q.atoms.clone();
                     atoms[i] = a;
                     let f = self.normalize(Cq {
@@ -828,6 +877,7 @@ impl Bgp<'_> {
             }
             for i in 0..q.atoms.len() {
                 for j in i + 1..q.atoms.len() {
+                    attempt()?;
                     if let Some(r) = self.reduce(&q, i, j)
                         && !add(r, &mut order)?
                     {
@@ -866,6 +916,14 @@ impl Bgp<'_> {
         }
         Ok(Some(out))
     }
+}
+
+/// An estimate of the bytes one query of the rewriting holds.
+fn cq_bytes(q: &Cq) -> usize {
+    q.atoms.len() * std::mem::size_of::<Atom>()
+        + q.binds.len() * std::mem::size_of::<(u32, T)>()
+        + std::mem::size_of::<Cq>()
+        + 32
 }
 
 /// The count of each variable and blank node in the SSE form of `text`, by name with its
@@ -919,6 +977,10 @@ struct Rewriter<'a> {
     tbox: &'a Tbox,
     max_union: usize,
     stop: &'a dyn Fn() -> Result<()>,
+    /// the query's memory budget, which the queries of the rewriting are charged to
+    budget: Arc<crate::budget::Budget>,
+    /// the values of the query's initial bindings, by variable name
+    bound: FxHashMap<String, Term>,
     /// the occurrences of each name in the whole query
     counts: FxHashMap<String, i64>,
     /// every variable is distinguished (`COUNT(*)`)
@@ -961,6 +1023,7 @@ impl Rewriter<'_> {
             tbox,
             vars: Vec::new(),
             consts: Vec::new(),
+            values: FxHashMap::default(),
         };
         let mut var_ix: FxHashMap<String, u32> = FxHashMap::default();
         let mut const_ix: FxHashMap<Term, u32> = FxHashMap::default();
@@ -1035,6 +1098,13 @@ impl Rewriter<'_> {
         if !affected {
             return Ok(Outcome::Unchanged);
         }
+        for (i, (x, _)) in bgp.vars.iter().enumerate() {
+            if let TermPattern::Variable(v) = x
+                && let Some(value) = self.bound.get(v.as_str())
+            {
+                bgp.values.insert(i as u32, value.clone());
+            }
+        }
         // a symbol the TBox does not know has no inclusion, so each gets its own
         let mut unknown: FxHashMap<NamedNode, u32> = FxHashMap::default();
         let mut extra: Vec<NamedNode> = Vec::new();
@@ -1065,7 +1135,7 @@ impl Rewriter<'_> {
             binds: Vec::new(),
         };
         let start = bgp.normalize(q0.clone());
-        let Some(branches) = bgp.perfect_ref(q0, self.max_union, self.stop)? else {
+        let Some(branches) = bgp.perfect_ref(q0, self.max_union, self.stop, &self.budget)? else {
             return Ok(Outcome::Derive(format!(
                 "its rewriting passed budget.maxUnion ({} branches)",
                 self.max_union
@@ -1418,9 +1488,10 @@ impl Rewriter<'_> {
 /// DESCRIBE, which query-time reasoning refuses before it rewrites.
 pub fn rewrite_query(
     query: &Query,
-    bound: &[String],
+    bound: &[(String, Term)],
     tbox: &Tbox,
     max_union: usize,
+    max_memory: Option<u64>,
     stop: &dyn Fn() -> Result<()>,
 ) -> Result<Option<Rewritten>> {
     // the projection that ASK wraps its pattern in names every variable, and none of them
@@ -1441,13 +1512,15 @@ pub fn rewrite_query(
     let mut counts = FxHashMap::default();
     count_names(&sse, &mut counts, 1);
     // a variable that an initial binding gives a value is used outside its pattern
-    for name in bound {
+    for (name, _) in bound {
         *counts.entry(format!("?{name}")).or_default() += 1;
     }
     let mut rw = Rewriter {
         tbox,
         max_union,
         stop,
+        budget: crate::budget::Budget::new(max_memory.map(|m| m.min(usize::MAX as u64) as usize)),
+        bound: bound.iter().cloned().collect(),
         counts,
         all_distinguished: sse.contains("(count)") || sse.contains("(count distinct)"),
         fresh: 0,

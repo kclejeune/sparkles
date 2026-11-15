@@ -189,12 +189,12 @@ pub trait ReasoningProvider: Send + Sync {
     /// The query rewritten before planning, for the snapshot and view of `req`, or
     /// `None` when the provider rewrites nothing (spec F17 §7). The rewriting reads the
     /// provider's schema and not the query's data, and stops when `req.stop` fails.
-    /// `bound` names the variables that the query's initial bindings give a value, without
-    /// their sigil, which the planner substitutes into the rewritten query.
+    /// `bound` gives the variables of the query's initial bindings, without their sigil,
+    /// with their values, which the planner substitutes into the rewritten query.
     fn rewrite(
         &self,
         query: &spargebra::Query,
-        bound: &[String],
+        bound: &[(String, Term)],
         req: &SessionRequest,
     ) -> Result<Option<Rewritten>> {
         let _ = (query, bound, req);
@@ -759,10 +759,10 @@ pub(crate) fn rewrite(
     query: &spargebra::Query,
     opts: &QueryOptions,
 ) -> Result<Option<Rewritten>> {
-    let bound: Vec<String> = opts
+    let bound: Vec<(String, Term)> = opts
         .initial_bindings
         .iter()
-        .map(|(name, _)| name.trim_start_matches(['?', '$']).to_string())
+        .map(|(name, t)| (name.trim_start_matches(['?', '$']).to_string(), t.clone()))
         .collect();
     provider.rewrite(query, &bound, &request(ctx, opts))
 }

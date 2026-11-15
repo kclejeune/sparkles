@@ -140,7 +140,7 @@ impl ReasoningProvider for AutoReasoner {
     fn rewrite(
         &self,
         query: &spargebra::Query,
-        bound: &[String],
+        bound: &[(String, oxrdf::Term)],
         req: &SessionRequest,
     ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
         self.inner.rewrite(query, bound, req)
@@ -250,7 +250,7 @@ impl ReasoningProvider for Limited {
     fn rewrite(
         &self,
         query: &spargebra::Query,
-        bound: &[String],
+        bound: &[(String, oxrdf::Term)],
         req: &SessionRequest,
     ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
         // the OWL 2 QL rewriting reads the terminology and can grow, so it has the same
@@ -262,7 +262,11 @@ impl ReasoningProvider for Limited {
             max_memory: req.max_memory,
             no_cache: req.no_cache,
         };
-        self.inner.rewrite(query, bound, &req)
+        let rewritten = self.inner.rewrite(query, bound, &req)?;
+        // the terminology's parsing has no checks of its own, so the allowance is checked
+        // once more before the rewritten query is planned
+        (req.stop)()?;
+        Ok(rewritten)
     }
 
     fn start(&self, mut req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
