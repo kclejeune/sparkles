@@ -529,6 +529,10 @@ pub struct DlRun {
     /// passes its budget, zero for no bound
     pub(super) work: AtomicUsize,
     work_limit: AtomicUsize,
+    /// the conclusions that the runs before this one derived since the last run that
+    /// started again, whose contexts this run keeps, and which its bound counts with its
+    /// own (roadmap item 990)
+    carried: usize,
     /// set once the run passes its bound on derived conclusions
     worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// set once an inference was too wide to make, which passes the bound whatever the
@@ -550,9 +554,15 @@ impl DlRun {
     /// Starts another run over the table of the last one, whose kept contexts name its
     /// clauses by id (roadmap item 753). The bytes of the kept contexts' stores count
     /// with their states, so the run counts only what it adds, and it counts its own
-    /// conclusions.
+    /// conclusions. Its bound on derived conclusions counts those of the runs before it
+    /// too, back to the last that started again, which derived the kept contexts' (roadmap
+    /// item 990). A run that starts again over the same axioms derives about as many as
+    /// the kept contexts and this run did together, and the contexts of removed axioms
+    /// still count, so a kept run passes the bound where one that starts again would or
+    /// sooner, up to the order of redundant derivations, and then starts again in full.
     pub fn begin_run(&mut self) {
         *self.stores.get_mut() = 0;
+        self.carried = self.carried.saturating_add(*self.work.get_mut());
         *self.work.get_mut() = 0;
         *self.work_limit.get_mut() = 0;
         *self.exhausted.get_mut() = false;
@@ -573,11 +583,12 @@ impl DlRun {
     pub(super) fn count(&self, n: usize) {
         self.work.fetch_add(n, Ordering::Relaxed);
     }
-    /// Whether `n` conclusions alone are more than the run's bound, and marks the run
-    /// past its bound when they are.
+    /// Whether `n` conclusions alone, with those of the runs whose contexts this one
+    /// keeps, are more than the run's bound, and marks the run past its bound when they
+    /// are.
     pub(super) fn past(&self, n: usize) -> bool {
         let l = self.work_limit.load(Ordering::Relaxed);
-        let past = l != 0 && n > l;
+        let past = l != 0 && self.carried.saturating_add(n) > l;
         if past {
             self.exhaust();
         }
@@ -594,11 +605,16 @@ impl DlRun {
     fn exhaust(&self) {
         self.exhausted.store(true, Ordering::Relaxed);
     }
-    /// Whether the run derived more conclusions than its bound.
+    /// Whether the run derived more conclusions than its bound, with those of the runs
+    /// whose contexts it keeps.
     pub fn over_work(&self) -> bool {
         let l = self.work_limit.load(Ordering::Relaxed);
         let over = l != 0
-            && (self.exhausted.load(Ordering::Relaxed) || self.work.load(Ordering::Relaxed) > l);
+            && (self.exhausted.load(Ordering::Relaxed)
+                || self
+                    .carried
+                    .saturating_add(self.work.load(Ordering::Relaxed))
+                    > l);
         if over {
             self.worked.store(true, Ordering::Relaxed);
         }
