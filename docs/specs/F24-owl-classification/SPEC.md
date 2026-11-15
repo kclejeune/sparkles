@@ -3746,6 +3746,38 @@ lenient read that drops an `AllDisjointClasses` axiom with an undeclared member,
 `all-disjoint-classes` check that passes its row limit on the sample, owl-reason's
 entailment outputs and an OML importer.
 
+A later run checked these stand-ins against openCAESAR's own pipeline. The sample's
+Gradle build ran with oml2owl 2.13.1, owl-reason 2.15.0 with Openllet 2.6.5 and
+metrology-vocabularies 7.4.0. Its OWL is the same theory as the survey's translation. In
+each of the 17 ontologies of the closure the two differ only in the declarations of
+imported entities, a `swrl:AtomList` type on each atom list of a rule, some annotations,
+the lexical forms of `xsd:double` values and a declaration of `owl:sameAs` as an object
+property, which the adapter writes for the rules whose heads are `sameAs` atoms. The
+translation also wrote seven `rdfs:subPropertyOf` statements between annotation
+properties of ISO 1087-1 that the adapter leaves out. The adapter's closure has 3,197
+distinct triples without its `owl:imports`. HermiT gives the same results on it as on the
+translation, and Openllet's entailments from the sample's `owlReason` task equal
+HermiT's. Both find the sample consistent with no unsatisfiable class, and Openllet's
+output holds the same 102 subclass pairs beside 85 reflexive ones, the same 307 named
+types and the same 268 property values, with no `sameAs` statement beyond the reflexive
+ones. `owl-reason` finds all thirteen probes inconsistent. It fails eleven of them as
+HermiT does, and it fails the two that HermiT finds consistent by its closed-world
+cardinality check, which passes them when it is turned off.
+
+On the adapter's closure Sparkles gives the survey's results. The classifier's taxonomy
+equals Openllet's with or without counting and the rooted option. `ontology reason` gives
+Openllet's 307 types and the 21 `swrl:Variable` types, OWL RL materialization gives the
+same types and misses the same 34 object property values, the five queries give the same
+answers, and the classifier keeps its eight agreements and its misses on the probes. The
+`all-disjoint-classes` check still passes its row limit. The rules file that the adapter
+writes with `generateRules` holds the adapter's four default rules and the six bundle
+rules of the survey's file, but it gives its prefixes as
+`@prefix oml: http://opencaesar.io/oml#` without angle brackets and writes prefixed names.
+Jena's parser reads it and derives 321 facts. The 16 more that it derived from the
+survey's file came from the translation's extra sub-property statements. Sparkles' rule
+parser refuses the adapter's file at its first line, and with the brackets added it
+derives exactly Jena's 321 facts. Item 1020 takes the bare namespace IRIs.
+
 ### Roadmap follow-ups
 
 #### Incremental native DL classification
