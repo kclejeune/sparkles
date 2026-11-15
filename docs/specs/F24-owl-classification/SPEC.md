@@ -224,19 +224,49 @@ beside them, 2,145 finish with counting on both builds, and seven more finish on
 whose answers equal those of the Horn rules. On `atlas` on four
 threads three classifications of ore_ont_14817 take 19.9 to 38.9 s against 59.7 to 79.5 s,
 and on one thread on the laptop the build before passed a timeout of 900 s where this one
-finishes. The attempt still passes its budget before the Horn rules answer, which item 990
-follows. On the Horn files that the sort of successors does not prune, such as
+finishes. The attempt still passed its budget before the Horn rules answered, until item
+990 bounded it. On the Horn files that the sort of successors does not prune, such as
 ore_ont_9855, ore_ont_8737 and GO, the build classifies in 1.01 to 1.06 times the base's
 time on `atlas`, which item 991 follows. The sort adds its entries' memory at each check
 of its bounds and at its end, and R6 its record's at the end of each rule. The run's sink
 holds what they add in the activation and charges it once it reaches 16 KiB and when the
 activation ends.
 
+Item 990 bounds the conclusions that a run of the disjunctive rules without counting or
+the rooted rules derives. `Limits::dl_attempt_work` takes 384 conclusions for each class
+of the signature by default, and at least 2,097,152. Past the bound the run ends and the
+Horn rules answer, as they do past the memory budget, with `Stats::dl_attempt_over` and
+`Stats::dl_over_budget` set. The bound is a count and not a memory figure, so the number
+of threads does not change it, and it grows with the classes, each of which has a context
+in the EL saturation. Of the ORE 2015 DL development set, 14 files attempt the rules and
+finish. Those with more than 5,461 classes, whose bound is above the floor, derive at
+most 212 conclusions per class, ore_ont_16680 the most with 6.9 million. ore_ont_9663,
+ore_ont_14817 and ore_ont_3215 pass their memory budget after 38, 49 and 791 million
+conclusions on eight threads on the laptop, 660, 830 and 14,400 per class. A bound
+relative to the conclusions of the EL saturation would not separate the two groups, since
+ore_ont_16680 finishes after 2.8 conclusions per conclusion of the EL rules alone and
+ore_ont_14817 passes its budget after 3.0. The largest attempt of the 2,166 generated
+ontologies of item 969 that have a union derives 536,000 conclusions, and the dl603 and
+dl897 fixtures derive at most 5,700, all within the floor. The bound keeps the driver
+without steps, since on eight threads on the laptop the steps made the attempts of
+ore_ont_5438, ore_ont_13103 and ore_ont_16680 1.7 to 1.9 times slower, which item 950
+follows. Near the bound a schedule can therefore decide whether a run on several threads
+answers in full. @@ATLAS@@ A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015
+EL files and the 207 DL development files once per build on one and eight threads. The
+993 pairs that both builds classified gave the same taxonomy bytes, and no file changed
+its tier. On one thread the base passed the 900 s timeout on ore_ont_9663, which this
+build classifies in 70 s with the answer both builds give on eight threads. Neither build
+answered on ore_ont_7192 within the sweep's limits, and the reader refuses ore_ont_9881. A
+kept run counts the conclusions of the runs before it, as
+[Incremental native DL classification](#incremental-native-dl-classification) describes,
+and item 1010 follows the edits after which a kept and a fresh run fall on two sides of the
+bound. Item 1011 follows the bound's form on other ontologies.
+
 Item 753 makes a run after an edit of class axioms
 [keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
 without individuals and of a run of the disjunctive rules that does not count, with the
 answer of a run that starts again. Horn runs with individuals stay with the item, and
-runs with a bound on their derived conclusions are item 953.
+runs that count, rooted runs and the run after a passed counting bound are item 953.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
@@ -1414,8 +1444,11 @@ stores and the table of clauses that contexts send each other count against it, 
 case analysis of one inference derives its choices one at a time and checks the bounds as
 it goes. A run without the partial flag that passes the budget classifies again with the
 Horn rules, leaves the axioms that need case analysis out and reports them, and sets
-`Stats::dl_over_budget`. ore_ont_3215 of the ORE 2015 DL sample, with 18,323 unions over a
-transitive property, needs this, item 713.
+`Stats::dl_over_budget`. A run that neither counts nor is rooted also has a bound on the
+conclusions it derives, `Limits::dl_attempt_work`, of 384 for each class of the signature
+and at least 2,097,152, past which it falls back in the same way and sets
+`Stats::dl_attempt_over` too (item 990). ore_ont_3215 of the ORE 2015 DL sample, with
+18,323 unions over a transitive property, needs this, item 713.
 
 Counting is part of the same rules and is off by default. `Limits::counting` turns it on,
 and `el_classify --counting` does the same. A run that does not count leaves the axioms
@@ -3847,9 +3880,12 @@ is a run of the disjunctive rules with the cautious strategy and without countin
 Both keep their contexts, the contexts of conjunctions or of tests, and for the
 disjunctive rules the table of the clauses that contexts sent one another. The other
 runs start again after every edit: Horn runs with individuals, which wait on items 590
-and 664, and runs with a bound on their derived conclusions, which a counting run, a
-rooted run and the run after a passed bound have and which item 953 follows, since that
-bound counts derivations in an order that a kept context would change.
+and 664, and runs whose bound on derived conclusions decides their rules, which a
+counting run, a rooted run and the run after a passed bound have and which item 953
+follows, since that bound counts derivations in an order that a kept context would
+change. The bound of a run of the disjunctive rules that neither counts nor is rooted,
+past which the Horn rules answer, is counted across kept runs instead, as described
+below.
 
 A run with changes holds the last index until the new one is built and compares the two
 by expression. An expression is changed when its successor, its told superexpressions,
@@ -3907,6 +3943,24 @@ comparison the run admits both indexes, the kept contexts, the clause table and 
 marks and queue of the invalidation against that budget. A run that
 its deadline or a cancellation stops leaves a classifier whose next run starts again.
 
+A run of the disjunctive rules that neither counts nor is rooted has a bound on the
+conclusions it derives, past which it ends and the Horn rules answer (item 990). A kept
+run counts the conclusions of every run since the last one that started again together
+with its own, and the conclusions of contexts that removed axioms left behind still
+count. A kept run that passes the bound starts again in full, as it does past its memory
+budget, and the caller gets the answer of that run, whose count starts from its own
+conclusions. The sum stands for what a run that starts again over the edited axioms
+would derive, but it does not bound it, since that run derives its redundant conclusions
+in another order. On one thread with a bound of 6, a run over five axioms with two unions
+derives 4 conclusions and the kept run after three more axioms 2, so it answers in full,
+while a run that starts again over the eight axioms derives 13 and the Horn rules answer.
+A kept and a fresh run therefore agree on whether the Horn rules answer only when their
+counts fall on the same side of the bound, which item 1010 follows. The attempts measured
+on real ontologies either finish far within the bound or run far past it, and a schedule
+already decides the outcome of a fresh run on several threads near the bound. A run past
+the bound costs one run that starts again, so a long sequence of edits that each derive
+much starts again once in a while.
+
 `tests/dl_incremental.rs` compares each run of a kept classifier with a classifier that
 starts again, in subsumptions, taxonomy, unsatisfiable classes, consistency,
 completeness and the axioms left out, on 1, 4 and 8 threads. It covers fixed edits that
@@ -3915,7 +3969,11 @@ successor sent back, random and seeded sequences over generated Horn and disjunc
 ontologies, removals and returns of axioms over the 640 fixtures of item 603 and the
 generated ontologies of item 897, the ORE files that `SPARKLES_ORE_DIR` names, a memory
 budget that only a kept run passes, with and without a large data value, cancellation and a deadline during a kept run, and
-the bound on kept state. `examples/incremental_classify.rs` times kept runs after
+the bound on kept state. `tests/dl_attempt.rs` checks on one thread, whose order fixes
+the counts, that a kept run past the bound of item 990 starts again in full and answers
+in full when a run that starts again keeps the bound, and that a kept and a fresh run
+over the ontology of the test give the same answer, with or without the Horn
+rules' fallback, at every bound from one conclusion to past what both derive. `examples/incremental_classify.rs` times kept runs after
 single-axiom edits against a classifier that starts again and checks their taxonomies.
 
 A kept run still normalizes every axiom and builds its index and its taxonomy again, so

@@ -156,7 +156,14 @@ on one thread on `atlas` derives 2.0 million in 69 ms. A product of the disjunct
 that is not ground forms its unions list after list and keeps only the least unions of each
 step of up to 4,096 unions (item 969), which takes three classifications of `ore_ont_14817` of ORE 2015 on four threads on
 `atlas` from 59.7 to 79.5 s down to 19.9 to 38.9 s. Three more counting fixtures finish
-within the counting bound. Item 990 follows the attempt that still passes its budget.
+within the counting bound.
+A run of the disjunctive rules without counting or the rooted rules ends once it has
+derived 384 conclusions for each class of the signature, and at least 2,097,152, and the
+Horn rules answer as they do past its memory budget (roadmap item 990).
+`Limits::dl_attempt_work` sets the bound and `Stats::dl_attempt_over` reports it. @@ATLASC@@
+The attempts that finish on the ORE 2015 DL development set stay far within the bound
+and give the same taxonomies. A run that keeps the contexts of the last one counts the
+conclusions of the runs since the last full run and starts again in full past the bound.
 The sort of successors charges its memory in batches and passes over most pairs by a
 signature of their cores, and files that it does not prune classify up to 6% slower, as
 `ore_ont_9855` does on four threads, which item 991 follows.
