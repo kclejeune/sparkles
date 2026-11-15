@@ -35,6 +35,7 @@ mod graph;
 mod hierarchy_tests;
 mod incremental;
 pub mod inputs;
+mod ir;
 mod lookups;
 mod maintain;
 pub mod parser;

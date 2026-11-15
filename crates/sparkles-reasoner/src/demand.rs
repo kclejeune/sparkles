@@ -625,7 +625,7 @@ fn no_value_demand(b: &CBuiltin, rdf_type: u64) -> (Key, [u64; 3]) {
 }
 
 /// What a builtin or head action reads outside the atoms of its rule.
-enum Read {
+pub(crate) enum Read {
     /// a list, whose head the builtin's first argument holds
     List,
     /// the facts with this subject and predicate (`listForAll`)
@@ -633,7 +633,11 @@ enum Read {
 }
 
 /// The reads of builtin `kind`, or of head action `action` when it is given, over `args`.
-fn list_reads(kind: BuiltinKind, args: &[Slot], action: Option<HeadAction>) -> Vec<Read> {
+pub(crate) fn list_reads(
+    kind: BuiltinKind,
+    args: &[Slot],
+    action: Option<HeadAction>,
+) -> Vec<Read> {
     use BuiltinKind::*;
     match action {
         Some(HeadAction::ListMapAsSubject) => return vec![Read::List],
@@ -2129,7 +2133,7 @@ pub(crate) fn transform(
 /// those of body atoms, of `noValue` patterns, of the facts a `listForAll` tests, and the
 /// `rdf:first` and `rdf:rest` of the lists that builtins and head actions read. A
 /// variable predicate stands for every predicate, and a variable class for every class.
-fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
+pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
     // the nodes that read or give every predicate, and every class; the others are
     // constant predicates and classes
     const READS_ALL: usize = 0;
