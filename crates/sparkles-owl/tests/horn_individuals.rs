@@ -465,3 +465,64 @@ fn a_real_context_keeps_the_conjunction_of_a_successor_without_an_individual() {
     );
     assert_eq!(out.stats.conjunctions, 1);
 }
+
+#[test]
+fn a_universal_over_a_loop_assertion_reaches_the_individual_itself() {
+    // a is its own r-successor, so a is in C, which is empty
+    let (out, ex) = run("ObjectPropertyAssertion(:r :a :a)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         SubClassOf(:C owl:Nothing)
+         SubClassOf(:D :D)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+    // and a takes what C gives when C is not empty
+    let out = check(
+        "ObjectPropertyAssertion(:r :a :a)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         ObjectPropertyAssertion(:s :a :e)
+         SubClassOf(:C ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))",
+        &[("Qe", "M")],
+        &[("M", "Qe")],
+    );
+    assert_eq!(out.stats.conjunctions, 0);
+}
+
+#[test]
+fn r5_at_an_individual_that_is_its_own_successor_takes_the_other_successor() {
+    // a has r to itself and to b and r is functional, so b is a, and a's universal
+    // over the conjunction that R5 would make reaches a itself
+    let out = check(
+        "ObjectPropertyAssertion(:r :a :a)
+         ObjectPropertyAssertion(:r :a :b)
+         FunctionalObjectProperty(:r)
+         ClassAssertion(:S :b)
+         ObjectPropertyAssertion(:s :a :e)
+         SubClassOf(:S ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))
+         EquivalentClasses(:Qa ObjectOneOf(:a))
+         EquivalentClasses(:Qb ObjectOneOf(:b))",
+        &[("Qe", "M"), ("Qa", "Qb"), ("Qb", "Qa"), ("Qa", "S")],
+        &[("M", "Qe")],
+    );
+    assert_eq!(out.stats.conjunctions, 0);
+}
+
+#[test]
+fn successors_by_several_roles_to_one_individual_take_the_universals_of_their_superrole() {
+    // a has r1 and r2 to b, both under s, and every s-successor of a is in C and in D
+    let out = check(
+        "SubObjectPropertyOf(:r1 :s)
+         SubObjectPropertyOf(:r2 :s)
+         ObjectPropertyAssertion(:r1 :a :b)
+         ObjectPropertyAssertion(:r2 :a :b)
+         ObjectPropertyAssertion(:r2 :a :d)
+         ClassAssertion(ObjectAllValuesFrom(:s :C) :a)
+         ClassAssertion(ObjectAllValuesFrom(:r1 :D) :a)
+         EquivalentClasses(:Qb ObjectOneOf(:b))
+         EquivalentClasses(:Qd ObjectOneOf(:d))",
+        &[("Qb", "C"), ("Qb", "D"), ("Qd", "C")],
+        &[("Qd", "D"), ("C", "Qb")],
+    );
+    assert_eq!(out.stats.conjunctions, 0);
+}

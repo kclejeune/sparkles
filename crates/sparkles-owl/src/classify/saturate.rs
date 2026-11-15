@@ -1267,6 +1267,12 @@ pub trait Sink {
     fn go_on(&self) -> bool {
         true
     }
+    /// whether the run goes on, after a check of its bounds that counts the messages the
+    /// sink has sent as waiting, for a rule whose one inference sends many messages
+    /// before the activation applies a conclusion
+    fn sent_go_on(&mut self) -> bool {
+        self.go_on()
+    }
     /// Counts `n` conclusions of Tier D for the run's bound on derived conclusions.
     fn worked(&mut self, n: usize) {
         self.dl().count(n);
@@ -1409,6 +1415,16 @@ impl Sink for Out<'_, '_> {
             return false;
         }
         self.run.check(0, 0, 0)
+    }
+
+    fn sent_go_on(&mut self) -> bool {
+        if self.run.steps && self.dl().past(self.work) {
+            return false;
+        }
+        // the messages count as waiting from here on, as they do when the activation
+        // counts them after a conclusion
+        let queued = std::mem::take(&mut self.sent) as isize;
+        self.run.check(0, 0, queued)
     }
 
     #[inline]
