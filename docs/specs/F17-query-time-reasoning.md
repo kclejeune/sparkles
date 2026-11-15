@@ -5,8 +5,8 @@
 > **Phases:** Demand derivation, Jena backward rules, tables cached per snapshot and
 > view, budgets and EXPLAIN are available, with `auto`, its cost model and the dataset
 > setting, reuse of tables across commits, the MCP argument and the Fuseki converter's
-> rule modes. Hybrid execution, OWL 2 QL rewriting and the UI selector remain planned in
-> Phase 2. Incremental maintenance through F13 and later
+> rule modes, and the UI selector. Hybrid execution and OWL 2 QL rewriting remain planned
+> in Phase 2. Incremental maintenance through F13 and later
 > provenance remain planned in Phase 3.
 >
 > **User docs:** [Query-time reasoning](../API.md#query-time-reasoning) and
@@ -1143,8 +1143,8 @@ rewriting remain in Phase 2 of this spec, roadmap item 19.
 
 **Built** for roadmap item 19. `reasoning=auto` (§2.1, §4) and the dataset setting (§2.2)
 are available. The sections after this one record the reuse of tables across commits
-(§6.2), the MCP argument and the G08 mapping. Hybrid Jena rules (§5.2), OWL 2 QL rewriting
-(§7) and the UI selector remain in Phase 2.
+(§6.2), the MCP argument, the G08 mapping and the UI selector. Hybrid Jena rules (§5.2)
+and OWL 2 QL rewriting (§7) remain in Phase 2.
 
 * **The choice.** `crates/sparkles/src/reasoning/auto.rs` wraps the dataset's query-time
   reasoner. When a query starts, it decides for the snapshot the query reads whether the
@@ -1359,6 +1359,24 @@ configurations. The backward mode maps to `demand` and materializes nothing, wit
 in the query-time setting, and the forward modes keep materialized reasoning. The
 [G08 Outcome](G08-fuseki-configuration.md#rule-modes-and-query-time-reasoning) records the
 files the converter writes.
+
+### The UI selector
+
+**Built** for roadmap item 19 (§2.1, §10). The query page's **Options** menu has a
+**Reasoning** select with the dataset default, off, materialized, demand and auto, and a
+**Profile** select under demand and auto with the dataset's profile, `rdfs`, `rdfs-simple`
+and `owl-rl`. The page sends `reasoning` and `reasoningProfile` to `/{ds}/sparql`,
+`/{ds}/explain`, stored queries and downloads. The endpoints that take only a boolean,
+such as the Ask bar's checks and the facet panel, get `true` for materialized, `false` for
+off and nothing for the query-time modes, which they read as the dataset's default. A
+result that derived facts shows a badge from the `Sparkles-Reasoning` header, which the
+server now exposes to cross-origin pages.
+
+The dataset default sends no `reasoning` parameter, where the page sent `true` before for
+a dataset with a materialization. A dataset whose query-time setting names a default now
+gets that default from the page, as from any client. A page saved with the inferences box
+cleared opens with **Off**. The test is `ui/tests/e2e/query-reasoning.spec.ts`, against a
+real server, with the parameter tests in `ui/src/lib/api.test.ts`.
 
 ### Roadmap follow-ups
 

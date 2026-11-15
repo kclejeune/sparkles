@@ -93,7 +93,9 @@ request or on every write, and the schema report counts what the data holds.
   Jena backward rules answer this way. `reasoning=auto` reads a fresh materialization
   with the same profile and derives over a stale or absent one or for rules that
   materialization skips, and the dataset's query-time setting makes it the default
-  ([API.md](../API.md#automatic-choice)). A demand transformation starts from the query's
+  ([API.md](../API.md#automatic-choice)). The UI's query page chooses the mode and the
+  profile in its **Options** menu ([query page](../visualization/README.md#query-page)).
+  A demand transformation starts from the query's
   constants and bindings and specializes schema relations proven complete. Schema facts
   can follow from derived instance facts, including class and property declarations and
   equality between schema terms. Programs containing `makeTemp` run in one ordinary
@@ -795,8 +797,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   that falls back reports the full run's peak memory and not the higher peak of the update
   it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
-  Derivation on demand has no OWL 2 QL rewriting, Jena's hybrid rules are flattened, and
-  the UI's query page offers only materialized inferences or none. Roadmap item 19.
+  Derivation on demand has no OWL 2 QL rewriting, and Jena's hybrid rules are flattened.
+  Roadmap item 19.
   `reasoning=auto` reads a materialization that can answer rather than compare costs per
   pattern. Roadmap item 910.
 * A view's tables carry over to another commit only while the rules cannot read or give

@@ -73,7 +73,7 @@ open('the selector derives on demand with the profile it names', async ({ page }
   url = await run(page);
   expect(url.searchParams.get('reasoning')).toBe('demand');
   expect(url.searchParams.get('reasoningProfile')).toBe('rdfs');
-  await expect(grid(page)).toContainText('/ann');
+  await expect(grid(page)).toContainText('ex:ann');
   await expect(grid(page).getByRole('row')).toHaveCount(2);
   const badge = page.locator('.badge.derivation');
   await expect(badge).toContainText(/^demand · \d+ derived · \d+\/\d+ cached$/);
@@ -90,7 +90,7 @@ open('the selector derives on demand with the profile it names', async ({ page }
   url = await run(page);
   expect(url.searchParams.get('reasoning')).toBe('auto');
   expect(url.searchParams.get('reasoningProfile')).toBe('rdfs');
-  await expect(grid(page)).toContainText('/ann');
+  await expect(grid(page)).toContainText('ex:ann');
   await expect(badge).toContainText(/^auto · /);
 
   // the plan of a demand query shows the derivation

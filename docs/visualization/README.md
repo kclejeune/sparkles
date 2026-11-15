@@ -111,8 +111,16 @@ The SvelteKit UI is embedded in the server binary.
 * The toolbar holds the query's kind and endpoint, **Examples**, **Saved** and
   **Options**, then the pattern pane, **Format**, **Explain** and **Run** at its end.
   **Options** holds the branch, the past state to read, the history slider, the row
-  limit and the inferences toggle, and its button names any of them that differ from
-  the default, including inferences left out on a dataset that reasons.
+  limit and the reasoning selector, and its button names any of them that differ from
+  the default.
+* The reasoning selector sends the query's `reasoning` parameter. **Dataset default**
+  sends none, so the dataset's query-time default applies. **Off** leaves out the
+  materialized inferences of a dataset that has them, **Materialized** reads them, and
+  **Demand** and **Auto** derive at query time ([API.md](../API.md#query-time-reasoning)).
+  Under **Demand** and **Auto** a **Profile** select names the rules, or leaves the
+  dataset's profile. A result that derived facts shows a badge with the mode, the facts
+  derived and the tables that came from the cache, read from the `Sparkles-Reasoning`
+  header. The page remembers the choice per browser.
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.

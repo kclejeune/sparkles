@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Query-time reasoning in the UI
+
+The query page's **Options** menu chooses the reasoning of a query as part of roadmap item
+19. Its selector sends `reasoning` as the dataset default, off, materialized, demand or
+auto, with a profile for the last two, and a result that derived facts shows what
+`Sparkles-Reasoning` reports. The server exposes that header to cross-origin pages.
+
 ### SHACL rules
 
 Roadmap item 838 adds the `shacl-af` reasoning profile, which materializes SHACL Advanced
