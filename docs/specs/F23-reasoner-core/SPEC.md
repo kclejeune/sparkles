@@ -352,8 +352,8 @@ stratum, and one with a negation by strata, each to its fixpoint before the next
 limits of inferred facts and iterations counted across the strata and a warning for each
 Jena rule whose `noValue` is read by strata. Rules that read lists are replayed when list
 cells arrive, so a list cell can be an instance's only new premise. No frontend produces
-relations yet, so only the reasoner's tests reach this path, and incremental updates,
-demand, explanations and witnesses follow in later steps. On about 800 random programs
+relations yet, so only the reasoner's tests reach this path and the ones below, and demand,
+why-not answers and explanations over the demand engine follow in a later step. On about 800 random programs
 that stratify, over relations of arities zero to five, triple atoms, recursion and negated
 atoms with wildcards, the runs equal a naive stratified evaluator, and the decoded facts of
 a recursive program over tails are the same at 1, 4 and 16 threads. Full runs of the
@@ -361,6 +361,29 @@ built-in profiles take as long as before, with the same facts and memory, and a 
 binds only a tail column of a 5-ary relation takes 30 times as long as over tuple triples,
 since it scans the relation until roadmap item 1004 orders the tail columns. The
 [reasoning results](../../benchmarks/reasoning/RESULTS.md) give the numbers.
+
+A program with relations and no negation is maintained incrementally by the fixed-point
+operator, with its lowered rules, and one with a negated atom runs in full on every update.
+Relation facts are never written, so an update of a closure read back from the dataset
+first rebuilds them. `ir/rebuild.rs` gives a program's relation part, its rules with
+relation heads and only those heads, stratified again, and runs it over the closure once
+the removed facts are candidates. Every rebuilt fact that depends on a removed fact is then
+a consequence of it, so the deletion stays exact, and the insertion evaluates from the
+first rebuilt row, so the triples that a relation fact supports through an inserted fact
+are derived. The rebuilt facts count against the update's limit of inferred facts, and the
+limit of iterations bounds the rebuild and the insertion each. A relation part that makes
+terms, through `makeTemp`, `makeSkolem` or a blank node in a head, a tuple head's columns
+included, falls back to a full run, since a rebuild makes other blank nodes. A search
+over the facts there are looks a tail up and never interns one, and when local terms
+move to store ids, the tails that hold them are interned again with the moved columns, so
+the relation rows move with their terms. The same rebuild over the input graphs, the
+inferred graph and the generalized facts gives explanations their relation facts, so an
+explanation does not depend on a kept closure. A relation fact is a node of its own in a
+tree, with the relation's name and the fact's columns, as F18 §3.2 describes. Witnesses
+pass through relation facts as through derived triples and count only triples, and a
+negated atom makes a rule's supports unknown, as `noValue` does. On 300 random
+programs over relations of arities zero to five, histories of six insertions and
+deletions each give a full run's closure at every step, kept in memory and read back.
 
 ### SHACL rules and SPIN
 
