@@ -2870,18 +2870,29 @@ pub(crate) fn run_from(
 /// Incremental maintenance needs rules whose instances depend on the facts their atoms
 /// match and on nothing else that can change: `noValue` is negation, `now` gives another
 /// value in each run, `makeTemp` / `makeSkolem` and blank node constants create fresh
-/// blank nodes in each run, head actions derive facts from lists their body never
-/// matches, and a `listForAll` reads facts that no atom of the rule matches unless a
+/// blank nodes in each run, a negated atom of item 839 is negation, head actions derive
+/// facts from lists their body never matches, and a `listForAll` reads facts that no atom of the rule matches unless a
 /// `listMember` and an atom over the same list cover them (as in `cls-int1`).
 pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
+    fn local_bnode(x: &Slot, terms: &Terms) -> bool {
+        match x {
+            Slot::Const(c) => {
+                sparkles_core::id::Id(*c).tag() == sparkles_core::id::Tag::Local
+                    && terms.kind(*c) == crate::terms::Kind::BNode
+            }
+            _ => false,
+        }
+    }
     use crate::builtins::BuiltinKind as B;
     for b in &r.builtins {
         let why = match b.kind {
             B::NoValue => "noValue is not monotonic",
             B::Now => "now gives a new value in each run",
             B::MakeTemp | B::MakeSkolem => "it creates blank nodes",
-            B::RelTail | B::RelTuple | B::RelAbsent => {
-                "relations and negated atoms are not maintained incrementally"
+            B::RelAbsent => "a negated atom is not monotonic",
+            // the columns of a relation head of arity 3 or more
+            B::RelTuple if b.args[2..].iter().any(|s| local_bnode(s, terms)) => {
+                "a blank node in the head is a new blank node in each run"
             }
             B::ListForAll if !list_for_all_covered(r, b) => {
                 "its listForAll reads facts that no atom of the rule matches"
@@ -2899,13 +2910,7 @@ pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
                 ));
             }
             CHead::Triple(s, p, o) => {
-                let bnode = [s, p, o].into_iter().any(|x| match x {
-                    Slot::Const(c) => {
-                        sparkles_core::id::Id(*c).tag() == sparkles_core::id::Tag::Local
-                            && terms.kind(*c) == crate::terms::Kind::BNode
-                    }
-                    _ => false,
-                });
+                let bnode = [s, p, o].into_iter().any(|x| local_bnode(x, terms));
                 if bnode {
                     return Some(format!(
                         "rule '{}': a blank node in the head is a new blank node in each run",

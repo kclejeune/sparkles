@@ -18,6 +18,7 @@ pub(crate) mod acyclic;
 #[cfg(test)]
 mod eval_tests;
 pub(crate) mod lower;
+pub(crate) mod rebuild;
 pub(crate) mod strata;
 #[cfg(test)]
 mod tests;

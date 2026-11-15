@@ -796,8 +796,71 @@ impl Terms {
     }
 
     /// Read terms from a later snapshot of the same generation. Local terms that the
-    /// store now has are returned with their store ids, for the caller to replace.
-    pub fn rebase(&mut self, snap: Arc<Snapshot>) -> FxHashMap<u64, u64> {
+    /// store now has are returned with their store ids, for the caller to replace, and so
+    /// is every relation tail whose columns hold one of them, with the handle of the tail
+    /// of the moved columns (item 839), so that a relation row moves with its terms. The
+    /// new tails are charged; past the limit the terms are unusable.
+    pub fn rebase(&mut self, snap: Arc<Snapshot>) -> Result<FxHashMap<u64, u64>, BudgetFailure> {
+        self.rebase_with(snap, FxHashMap::default())
+    }
+
+    /// [`rebase`](Self::rebase), where `seed` holds local ids that moved otherwise, such
+    /// as the blank nodes a run wrote, whose tails move too.
+    pub fn rebase_with(
+        &mut self,
+        snap: Arc<Snapshot>,
+        mut seed: FxHashMap<u64, u64>,
+    ) -> Result<FxHashMap<u64, u64>, BudgetFailure> {
+        seed.extend(self.rebase_keys(snap));
+        self.move_tails(&mut seed)?;
+        Ok(seed)
+    }
+
+    /// Re-intern the tails whose columns hold an id of `moved` with the moved columns, and
+    /// add each old handle and its new one to `moved`. The old tail leaves the map, as a
+    /// moved key does, and its handle stays in the table for the rows that still hold it.
+    fn move_tails(&self, moved: &mut FxHashMap<u64, u64>) -> Result<(), BudgetFailure> {
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let hit: Vec<(Vec<u8>, u64)> = {
+            let l = self.locals.read().unwrap();
+            let tails = l.map.iter().filter(|(k, _)| k.starts_with(TAIL));
+            let hit = tails.filter(|(k, _)| {
+                let (words, _) = k[TAIL.len()..].as_chunks::<8>();
+                words[1..]
+                    .iter()
+                    .any(|w| moved.contains_key(&u64::from_le_bytes(*w)))
+            });
+            // the keys are copied out, charged first
+            let n = hit.clone().count();
+            let bytes =
+                hit.clone().map(|(k, _)| k.len()).sum::<usize>() + n * size_of::<(Vec<u8>, u64)>();
+            let _held = Held::try_new_exact(&self.budget(), bytes)?;
+            hit.map(|(k, &h)| (k.clone(), h)).collect()
+        };
+        let mut freed = 0;
+        for (key, old) in hit {
+            let (words, _) = key[TAIL.len()..].as_chunks::<8>();
+            let rel = u64::from_le_bytes(words[0]);
+            let cols: smallvec::SmallVec<[u64; 8]> = words[1..]
+                .iter()
+                .map(|w| {
+                    let x = u64::from_le_bytes(*w);
+                    moved.get(&x).copied().unwrap_or(x)
+                })
+                .collect();
+            let new = self.try_tail(rel, &cols)?;
+            self.locals.write().unwrap().map.remove(&key);
+            freed += key.len();
+            moved.insert(old, new);
+        }
+        self.release(freed);
+        Ok(())
+    }
+
+    /// [`rebase`](Self::rebase) for the keyed local terms only.
+    fn rebase_keys(&mut self, snap: Arc<Snapshot>) -> FxHashMap<u64, u64> {
         self.snap = snap;
         let mut moved = FxHashMap::default();
         let mut l = self.locals.write().unwrap();

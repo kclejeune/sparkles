@@ -621,6 +621,29 @@ pub(crate) fn update<'a>(
     removed: &'a [Triple],
     before_delete: Option<BeforeDelete<'a>>,
 ) -> anyhow::Result<Update> {
+    update_with(c, rules, limits, inserted, removed, before_delete, None)
+}
+
+/// [`update`] of the closure of a lowered program with relations (item 839's plan,
+/// §12.2). `rules` are the program's lowered rules, and `rebuild` is its relation part
+/// when `c` lacks its relation facts, as a closure read back from the dataset does.
+///
+/// The relation facts are rebuilt once the removed facts are candidates, over the
+/// previous closure and the inserted facts, which the base tier already holds. Every
+/// rebuilt fact that depends on a removed fact is then a consequence of it, so the
+/// deletion stays exact, and the insertion evaluates from the first rebuilt row, so every
+/// rule instance with a relation premise is evaluated and the triples that relation facts
+/// support through inserted facts are derived. A part whose rules make terms falls back,
+/// since a rebuild would make other blank nodes than the stored ones.
+pub(crate) fn update_with<'a>(
+    c: &mut Closure,
+    rules: &'a [CRule],
+    limits: &'a Limits,
+    inserted: &'a [Triple],
+    removed: &'a [Triple],
+    before_delete: Option<BeforeDelete<'a>>,
+    rebuild: Option<&'a crate::ir::Program>,
+) -> anyhow::Result<Update> {
     let budget = &limits.budget;
     let mut cx = TierCx {
         rules,
@@ -628,6 +651,7 @@ pub(crate) fn update<'a>(
         inserted,
         removed,
         before_delete,
+        rebuild,
         out: Update::default(),
         started: std::time::Instant::now(),
     };
@@ -661,6 +685,9 @@ pub(crate) struct TierCx<'a> {
     inserted: &'a [Triple],
     removed: &'a [Triple],
     before_delete: Option<BeforeDelete<'a>>,
+    /// the relation part of a program whose closure lacks its relation facts (item 839),
+    /// which the update rebuilds first
+    rebuild: Option<&'a crate::ir::Program>,
     /// what the update reports, filled as its stages end
     out: Update,
     /// when the current stage started
@@ -785,6 +812,10 @@ pub(crate) struct TierProgram<'a> {
     del: Option<Deletion>,
     /// the first row the insertion added
     start: u32,
+    /// the first row of the rebuilt relation facts, from which the insertion evaluates,
+    /// and the facts the rebuild derived, which the insertion's limit of inferred facts
+    /// counts
+    rebuilt: Option<(u32, usize)>,
     /// whether the rules read RDF lists
     lists: bool,
     /// whether the deletion removed an RDF list fact
@@ -1012,6 +1043,23 @@ impl<'a> Program for TierProgram<'a> {
         }
         c.graph.try_add_batch(back)?;
         drop(back_held);
+        if let Some(part) = cx.rebuild {
+            let lowered = part.lower(budget)?;
+            if lowered
+                .strata
+                .iter()
+                .flatten()
+                .any(|r| crate::ir::rebuild::makes_terms(r, &c.terms))
+            {
+                return Err(
+                    Fallback("the relation facts make new terms and are not kept".into()).into(),
+                );
+            }
+            drop(lowered);
+            let lo = c.graph.len();
+            crate::ir::rebuild::rebuild_relations(&mut c.graph, part, &c.terms, cx.limits)?;
+            self.rebuilt = Some((lo, (c.graph.len() - lo) as usize));
+        }
         if let Some(f) = cx.before_delete.as_mut() {
             (*f)(c)?;
         }
@@ -1079,8 +1127,29 @@ impl<'a> Program for TierProgram<'a> {
             c.set_flag_with(r, true, true)?;
         }
         budget.check()?;
-        if c.graph.len() > start {
-            let o = engine::run(&mut c.graph, rules, &c.terms, limits, Some(start))?;
+        // after a rebuild, the relation facts are new to the rules too, and the rebuilt
+        // facts count against the limit of inferred facts with the insertion's
+        let from = self.rebuilt.map_or(start, |(lo, ..)| lo.min(start));
+        if c.graph.len() > from {
+            let narrowed;
+            // the limit of iterations bounds the rebuild and the insertion each, and the
+            // explicit rows the insertion appended count against neither limit
+            let limits = match self.rebuilt {
+                None => limits,
+                Some((_, facts)) => {
+                    narrowed = Limits {
+                        max_iterations: limits.max_iterations,
+                        max_inferred: limits.max_inferred.saturating_sub(facts),
+                        cancel: limits.cancel.clone(),
+                        progress: limits.progress.clone(),
+                        budget: limits.budget.clone(),
+                        closures: limits.closures,
+                        sampled_planning: limits.sampled_planning,
+                    };
+                    &narrowed
+                }
+            };
+            let o = engine::run(&mut c.graph, rules, &c.terms, limits, Some(from))?;
             cx.out.iterations = o.iterations;
             if self.lists && cx.out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
                 return Err(Fallback("an RDF list fact was derived".into()).into());
@@ -2085,7 +2154,7 @@ pub(crate) mod tests {
             let removed = vec![[ind(0), ty, class(0)]];
             now.remove(&removed[0]);
             let snap = set_default_graph(&v, &now);
-            let moved = c.terms.rebase(snap.clone());
+            let moved = c.terms.rebase(snap.clone()).unwrap();
             c.remap(&moved).unwrap();
             if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
                 l.update(&[], &removed, crate::facts::rank);
@@ -2645,7 +2714,7 @@ pub(crate) mod tests {
             }
             // the closure reads the input graphs of the new state, as an update does
             let snap = set_default_graph(&v, &base);
-            let moved = c.terms.rebase(snap.clone());
+            let moved = c.terms.rebase(snap.clone()).unwrap();
             c.remap(&moved).unwrap();
             // the remembered lookups take the changes in, as `maintain::previous` does
             if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {

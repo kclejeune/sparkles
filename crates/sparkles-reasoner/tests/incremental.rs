@@ -1187,3 +1187,116 @@ fn a_derived_triple_made_explicit_leaves_the_reported_change() {
     check_change(&s, &r, &before, &inferred(&s), "explicit again derived");
     assert_eq!(change_text(&r), Some(1), "{:?}", r.inferred_change);
 }
+
+/// A maintained OWL 2 RL closure over lists equals a full run after each step of a
+/// history of list edits (item 839's plan, §2): a cell added, removed and moved, and a
+/// tail that two lists share, beside ordinary insertions and deletions, with the closure
+/// kept in memory and read back from the dataset.
+#[test]
+fn a_maintained_history_of_list_edits_equals_full_runs() {
+    let rdf_nil = format!("{RDF}nil");
+    let nil = rdf_nil.as_str();
+    let first = "rdf:first";
+    let rest = "rdf:rest";
+    // ex:C0 is the intersection of the list ex:l0 = (C1 C2), ex:C5 the union of ex:m0, a
+    // chain ex:q0 is the list ex:k0 = (p0 p1), and a key of ex:C3 is the list ex:h0 = (p2)
+    let setup = vec![
+        t("ex:C0", "owl:intersectionOf", "ex:l0"),
+        t("ex:l0", first, "ex:C1"),
+        t("ex:l0", rest, "ex:l1"),
+        t("ex:l1", first, "ex:C2"),
+        t("ex:l1", rest, nil),
+        t("ex:C5", "owl:unionOf", "ex:m0"),
+        t("ex:m0", first, "ex:C4"),
+        t("ex:m0", rest, "ex:l1"),
+        t("ex:q0", "owl:propertyChainAxiom", "ex:k0"),
+        t("ex:k0", first, "ex:p0"),
+        t("ex:k0", rest, "ex:k1"),
+        t("ex:k1", first, "ex:p1"),
+        t("ex:k1", rest, nil),
+        t("ex:C3", "owl:hasKey", "ex:h0"),
+        t("ex:h0", first, "ex:p2"),
+        t("ex:h0", rest, nil),
+        t("ex:i0", "rdf:type", "ex:C1"),
+        t("ex:i0", "rdf:type", "ex:C2"),
+        t("ex:i1", "rdf:type", "ex:C4"),
+        t("ex:i0", "ex:p0", "ex:i1"),
+        t("ex:i1", "ex:p1", "ex:i2"),
+        t("ex:i3", "rdf:type", "ex:C3"),
+        t("ex:i4", "rdf:type", "ex:C3"),
+        t("ex:i3", "ex:p2", "ex:i5"),
+        t("ex:i4", "ex:p2", "ex:i5"),
+    ];
+    let steps: Vec<(&str, Vec<Triple>, Vec<Triple>)> = vec![
+        // a cell added at the end of the shared tail: (C1 C2 C6) and (C4 C2 C6)
+        (
+            "add a cell",
+            vec![
+                t("ex:l1", rest, "ex:l2"),
+                t("ex:l2", first, "ex:C6"),
+                t("ex:l2", rest, nil),
+                t("ex:i0", "rdf:type", "ex:C6"),
+            ],
+            vec![t("ex:l1", rest, nil)],
+        ),
+        (
+            "an ordinary insertion",
+            vec![t("ex:i6", "rdf:type", "ex:C0")],
+            vec![],
+        ),
+        // the cell removed again
+        (
+            "remove a cell",
+            vec![t("ex:l1", rest, nil)],
+            vec![
+                t("ex:l1", rest, "ex:l2"),
+                t("ex:l2", first, "ex:C6"),
+                t("ex:l2", rest, nil),
+            ],
+        ),
+        // the chain's second cell moved to a new node with another property
+        (
+            "move a cell",
+            vec![
+                t("ex:k0", rest, "ex:k2"),
+                t("ex:k2", first, "ex:p3"),
+                t("ex:k2", rest, nil),
+                t("ex:i1", "ex:p3", "ex:i7"),
+            ],
+            vec![t("ex:k0", rest, "ex:k1")],
+        ),
+        // the key grows a second property, which the individuals share
+        (
+            "grow a key",
+            vec![
+                t("ex:h0", rest, "ex:h1"),
+                t("ex:h1", first, "ex:p4"),
+                t("ex:h1", rest, nil),
+                t("ex:i3", "ex:p4", "ex:i8"),
+                t("ex:i4", "ex:p4", "ex:i8"),
+            ],
+            vec![t("ex:h0", rest, nil)],
+        ),
+        (
+            "an ordinary deletion",
+            vec![],
+            vec![t("ex:i0", "rdf:type", "ex:C2")],
+        ),
+    ];
+    let p = Profile::OwlRl;
+    for kept in [true, false] {
+        let (_d, s) = persistent();
+        let cache = Cache::default();
+        let cache = kept.then_some(&cache);
+        change(&s, &setup, &[]);
+        let rep = run(&s, &p, None, cache);
+        check(&s, &p, &rep, "first run");
+        let mut since = rep.receipt.unwrap().commit.seq;
+        for (what, add, del) in &steps {
+            change(&s, add, del);
+            let rep = run(&s, &p, Some(since), cache);
+            check(&s, &p, &rep, &format!("{what} (kept {kept})"));
+            since = rep.receipt.unwrap().commit.seq;
+        }
+    }
+}

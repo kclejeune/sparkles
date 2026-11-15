@@ -4,7 +4,7 @@
 //! ([`crate::sparql::rdfs::RdfsSchema::explain`]) both answer with these types, so the
 //! routes, the CLI and the MCP tool render one shape whatever produced it.
 
-use oxrdf::Term;
+use oxrdf::{NamedNode, Term};
 use std::collections::HashMap;
 
 /// What a node of a derivation is.
@@ -56,12 +56,39 @@ pub struct DerivationRead {
     pub read_at_head: bool,
 }
 
+/// A fact of a declared relation of a rule program (item 839), which a derivation tree
+/// shows as a node of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RelationAtom {
+    /// the relation's name
+    pub name: String,
+    /// the fact's columns, as many as the relation's arity
+    pub args: Vec<Term>,
+}
+
+impl RelationAtom {
+    /// The reserved IRI that stands for the relation in a relation node's `triple`.
+    pub fn iri(&self) -> NamedNode {
+        let mut s = String::from("urn:x-sparkles:rel:");
+        for b in self.name.bytes() {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                s.push(b as char);
+            } else {
+                s.push_str(&format!("%{b:02X}"));
+            }
+        }
+        NamedNode::new_unchecked(s)
+    }
+}
+
 /// One node of a derivation tree.
 #[derive(Clone, Debug)]
 pub struct Derivation {
     /// the node's number in the answer; a fact has one number in all the answer's trees,
     /// except that each tree's root has a number of its own
     pub id: u32,
+    /// the fact, or for a relation node the relation's reserved IRI
+    /// ([`RelationAtom::iri`]) in all three positions, which is no fact
     pub triple: [Term; 3],
     pub kind: DerivationKind,
     /// for an asserted node, the graph that holds the fact: `default` or an IRI. `None`
@@ -90,6 +117,11 @@ pub struct Derivation {
     pub missing: bool,
     /// The selected read of this subtree, retained when it is cut as a ref.
     pub read: Option<DerivationRead>,
+    /// for a node of a relation fact, the fact. Such a node is `derived`, an `axiom`, a
+    /// `ref` or `unexplained`, never `asserted`, since no graph holds a relation fact. A
+    /// `ref` relation node is expanded by a request with a larger depth, since no
+    /// request names a relation fact.
+    pub relation: Option<RelationAtom>,
 }
 
 impl Derivation {
@@ -109,6 +141,7 @@ impl Derivation {
             generalized: false,
             missing: false,
             read: None,
+            relation: None,
         }
     }
 
@@ -133,6 +166,7 @@ impl Derivation {
             generalized: false,
             missing: false,
             read: None,
+            relation: None,
         }
     }
 
@@ -147,6 +181,9 @@ impl Derivation {
                 .map(|(n, t)| n.len() + term_bytes(t))
                 .sum::<usize>()
             + self.builtins.iter().map(String::len).sum::<usize>()
+            + self.relation.as_ref().map_or(0, |r| {
+                r.name.len() + r.args.iter().map(term_bytes).sum::<usize>()
+            })
             + self
                 .premises
                 .iter()
@@ -177,11 +214,15 @@ pub enum Explained {
     NotFound,
 }
 
+/// What a node of an answer shares by: its triple and, for a relation node, its fact,
+/// since every relation node of one relation has the same triple.
+type NodeKey = ([Term; 3], Option<RelationAtom>);
+
 /// Number the nodes of `trees` in the answer's order, give a repeated fact the number it
 /// had first with `shared` set and no premises, and cut nodes deeper than `max_depth` as
 /// `ref` nodes. Each root keeps a number of its own.
 pub fn finish(trees: &mut [Derivation], max_depth: u32) {
-    let mut ids: HashMap<[Term; 3], u32> = HashMap::new();
+    let mut ids: HashMap<NodeKey, u32> = HashMap::new();
     let mut next = 0u32;
     for t in trees.iter_mut() {
         next += 1;
@@ -199,10 +240,11 @@ fn number(
     d: &mut Derivation,
     level: u32,
     max_depth: u32,
-    ids: &mut HashMap<[Term; 3], u32>,
+    ids: &mut HashMap<NodeKey, u32>,
     next: &mut u32,
 ) {
-    if let Some(&id) = ids.get(&d.triple) {
+    let key = (d.triple.clone(), d.relation.clone());
+    if let Some(&id) = ids.get(&key) {
         d.id = id;
         d.shared = true;
         d.premises.clear();
@@ -217,7 +259,7 @@ fn number(
         d.premises.clear();
         return;
     }
-    ids.insert(d.triple.clone(), d.id);
+    ids.insert(key, d.id);
     for p in &mut d.premises {
         number(p, level + 1, max_depth, ids, next);
     }

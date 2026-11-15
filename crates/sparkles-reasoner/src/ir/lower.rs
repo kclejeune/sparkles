@@ -43,6 +43,11 @@ pub(crate) fn is_key(p: u64) -> bool {
     p.wrapping_sub(KEY0) < 1 << 32
 }
 
+/// The relation whose key is `p`, when `p` is one.
+pub(crate) fn rel_of(p: u64) -> Option<RelId> {
+    is_key(p).then(|| RelId((p - KEY0) as u32))
+}
+
 /// How a program runs (§1.3's policy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Shape {
@@ -125,6 +130,20 @@ impl Program {
             Shape::Strata
         } else {
             Shape::Monotone
+        }
+    }
+
+    /// The IR rule of each rule [`lower`](Self::lower) gives, by stratum.
+    pub fn lowered_origins(&self) -> Vec<Vec<usize>> {
+        match self.shape() {
+            Shape::Jena | Shape::Monotone => vec![(0..self.rules.len()).collect()],
+            Shape::Strata => {
+                let mut v = vec![Vec::new(); self.strata.count as usize];
+                for part in &self.strata.parts {
+                    v[part.stratum as usize].push(part.rule);
+                }
+                v
+            }
         }
     }
 
