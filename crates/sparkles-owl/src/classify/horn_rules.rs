@@ -273,7 +273,14 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
                 cores.extend_from_slice(&h.cores[l.0 as usize..(l.0 + l.1) as usize]);
                 l.0 = at;
             }
-            out.release_data(4 * (h.cores.len() - cores.len()));
+            // the cores this sort has not charged yet come off what it has still to
+            // charge, and only the rest, charged before, is released
+            let freed = 4 * (h.cores.len() - cores.len());
+            let unpaid = freed.min(charge);
+            charge -= unpaid;
+            if freed > unpaid {
+                out.release_data(freed - unpaid);
+            }
             h.cores = cores;
         }
     }
@@ -1401,5 +1408,62 @@ mod tests {
         assert_eq!(h.cores.len(), 101);
         let kept = SORT_BYTES + h.dominated.list.len() * SORT_BYTES + 4 * h.cores.len();
         assert_eq!(out.reserved - out.released, kept);
+    }
+
+    /// A sink whose count, like the run's, stops at zero on a release.
+    struct Held(usize);
+
+    impl Sink for Held {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            self.0 += bytes;
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.0 = self.0.saturating_sub(bytes);
+        }
+        fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+            out.clear();
+            super::super::saturate::flatten(ix, e, out);
+        }
+    }
+
+    /// A compaction within one sort releases the cores that the sort has not charged
+    /// yet from what it has still to charge, so that a count that stops at zero ends at
+    /// what the sort keeps.
+    #[test]
+    fn a_compaction_within_one_sort_nets_its_release_against_the_charge() {
+        let mut it = Interner::new();
+        let cs: Vec<Ex> = (0..40)
+            .map(|k| it.class(&Class::new(format!("urn:dominate:c{k}"))))
+            .collect();
+        let conj = |it: &mut Interner, of: &[Ex]| {
+            of[1..]
+                .iter()
+                .fold(of[0], |a, &b| it.node(Node::Conj(a, b)))
+        };
+        // twenty conjunctions of two classes, ten of four, which dominate them, and the
+        // conjunction of all forty, which dominates those, come in one sort
+        let mut parts: Vec<Ex> = cs.chunks(2).map(|c| conj(&mut it, c)).collect();
+        parts.extend(cs.chunks(4).map(|c| conj(&mut it, c)).collect::<Vec<_>>());
+        parts.push(conj(&mut it, &cs));
+        let mut ix = Index::build(&Axioms::default(), &mut it, None, &|| false).unwrap();
+        ix.horn = Some(Box::new(HornIx {
+            flags: Vec::new(),
+            base: it.nodes.len() as Ex,
+            dominate: true,
+        }));
+        let mut st = State::default();
+        for &m in &parts {
+            hs(&mut st).succ.insert((0, m));
+        }
+        let mut out = Held(0);
+        sync(&ix, &mut st, &mut out);
+        let h = &st.extra.as_ref().unwrap().horn;
+        assert_eq!(h.live.len(), 1);
+        assert_eq!(h.cores.len(), 40, "the sort did not compact");
+        let kept = SORT_BYTES + h.dominated.list.len() * SORT_BYTES + 4 * h.cores.len();
+        assert_eq!(out.0, kept);
     }
 }
