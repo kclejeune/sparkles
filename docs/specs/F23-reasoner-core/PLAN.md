@@ -249,7 +249,35 @@ stratified negation for every relation, and aggregates in two steps, stratified 
 monotone in recursion second. Property chains and keys of any length, item 517, are its
 first consumers, through auxiliary relations over the list prefixes, so one rule covers
 every length and the demand programs lose the rules per length that the 50,000 cap
-counts. The Datalog surface syntax stays item 72 and is a frontend of the same IR.
+counts. The Datalog surface syntax of C24 §6.2, `.decl`, relation atoms, `not` and
+existential heads, is a frontend of the same IR in `parser.rs`, and item 72 keeps the
+`?-` queries, comparisons and JSON.
+
+A relation lives in the derived tier as rows of the tier's fixed width over a reserved
+key, so the triple relation's id space, semi-naive ranges, hash index, budget and limit
+of inferred facts hold for relation facts unchanged, and the fixed-point operator keeps
+its `Copy` fact. A fact `r(c0, c1)` of arity two is the row `(c0, key, c1)`, one of arity
+one or zero fills the missing columns with a sentinel, and one of arity three or more is
+`(c0, key, h)`, where `h` is the handle of its tail `c1 … cn-1`, interned with the run's
+local terms and charged to their budget. A new tail costs its key twice, about
+`16n + 10` bytes, with a map entry. The key is an id that no input can name, so a relation
+fact never matches an atom or a `noValue` with a variable predicate and is never written.
+A lowered relation atom is a triple atom with a constant predicate, which the planner
+estimates and orders from the key's statistics as it does any predicate. A join that binds
+only a column of the tail scans the relation and checks each tail until item 1004 builds
+an order per tail column, and demand adorns the lowered atom, so a bound tail column does
+not narrow a magic fact. The [design's outcome](SPEC.md#rule-ir) records the probe of a
+tail column against tuple triples.
+
+A program that uses a relation, a negated atom or an existential and has a negated atom
+or a `noValue` must stratify as a whole and runs by strata, each stratum to its fixpoint
+before the next. Its `noValue`s then read complete lower strata rather than
+the facts present when the rule fires, as Jena's forward engine reads them, and a run warns
+for each rule of Jena's form whose `noValue` is read that way, since a rules file that
+includes a profile with relations changes the meaning of its own `noValue` rules. A
+program of Jena rules alone keeps Jena's reading. The negative list builtins keep Jena's
+reading in every program. The existential rules run as a restricted chase, Datalog first
+and single-TGD-parallel, completed per stratum.
 
 ### Rule frontends translate to the IR
 
@@ -428,10 +456,13 @@ describes what the profile does.
 
 ### Phase 6, the native n-ary Datalog core, item 839
 
-`ir.rs` defines `Relation`, `Atom`, `Rule` and `Program` with strata, `parser.rs` and
-`engine::compile` become the Jena frontend over it, `tier/` takes arity-n runs, `plan_with`
-plans over several relations, a chase module checks weak acyclicity and later MFA and
-skolemizes existential heads, and `demand.rs` adorns n-ary atoms. Item 517 lands as its
+`ir.rs` defines `Relation`, `Atom`, `Rule` and `Program` with strata, `engine::compile`'s
+rules become the IR through the Jena frontend, and `parser.rs` gains C24 §6.2's
+relation syntax. `ir/lower.rs` lowers relations to rows of the derived tier over reserved
+keys with tail handles for arity three and more, `engine::run_program` runs a program by
+strata, `plan_with` plans lowered relation atoms as triple atoms, a chase module checks
+weak acyclicity and later MFA and runs the restricted chase, and `demand.rs` adorns
+lowered atoms. Item 517 lands as its
 first consumer, and the stratified aggregates and then the monotone aggregates in
 recursion follow as separate lanes. The IR can be defined as soon as Phase 1 lands, and the
 n-ary evaluation waits for Phase 4 so the maintainer sees one program shape.

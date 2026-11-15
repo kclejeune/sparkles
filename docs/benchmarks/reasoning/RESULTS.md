@@ -276,6 +276,20 @@ at 20 threads, read back from the dataset when undone, take 17.9 to 18.8 s again
 [medians with their ranges](runs/2026-11-14-item-837-atlas/results.txt) and the
 [large changes](runs/2026-11-14-item-837-atlas/keep-938.txt).
 
+The engine lowers programs with declared relations to its rules over the derived tier
+(roadmap item 839). On the same host, full in-memory derivations of LUBM(100) under OWL 2
+RL and RDFS and of OWL2Bench(5) under OWL 2 RL give the same derived facts by digest as
+the build before, take 0.99 to 1.01 times as long at one thread and at 20 threads, and
+keep the same peak heap and resident memory within 1.5%. LUBM(100) under OWL 2 RL at 20
+threads takes 1.013 times as long by the median, within ranges that overlap, which item
+1007 follows up. A join that binds only a column of a relation's tail scans the relation:
+on 200,000 facts of a 5-ary relation joined on its second column, the run takes 30 times
+as long as the same program over tuple nodes with one triple per column, while a binary
+relation joined on its object takes 0.6 times as long, and item 1004 adds the orders that
+remove the scan. The [run directory](runs/2026-11-15-item-839-atlas/run.sh.txt) holds the
+commands, the [host and builds](runs/2026-11-15-item-839-atlas/env.txt) and the
+[medians with their ranges](runs/2026-11-15-item-839-atlas/results.txt).
+
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.
 
