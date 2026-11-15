@@ -122,6 +122,34 @@ ORDER BY DESC(?contacts) ?name`,
   await shoot(page, 'query');
 });
 
+test('query-reasoning', async ({ page }) => {
+  const results = await run(
+    page,
+    `${PREFIX.ex}
+${PREFIX.rdfs}
+
+# Every organization, with the subclasses of ex:Organization derived on demand
+SELECT ?org ?name ?type
+WHERE {
+  ?org a ex:Organization ;
+       rdfs:label ?name ;
+       a ?type .
+  FILTER(?type != ex:Organization)
+}
+ORDER BY ?name`,
+    300,
+  );
+  await page.getByRole('button', { name: /^Options\b/ }).click();
+  await page.getByRole('combobox', { name: 'Reasoning', exact: true }).selectOption('demand');
+  await page.getByRole('combobox', { name: 'Reasoning profile' }).selectOption('rdfs');
+  await page.getByRole('button', { name: /^Run\b/ }).click();
+  await expect(page.locator('.badge.derivation')).toBeVisible();
+  await expect(results.getByRole('row').nth(3)).toBeVisible();
+  await page.getByRole('button', { name: /^Options\b/ }).click();
+  await expect(page.getByRole('combobox', { name: 'Reasoning profile' })).toBeVisible();
+  await shoot(page, 'query-reasoning');
+});
+
 test('graph', async ({ page }) => {
   const results = await run(
     page,

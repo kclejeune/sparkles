@@ -133,8 +133,9 @@ was measured and not adopted, and item 939 orders rule bodies from sampled bindi
 instead. The reasoner also records witnesses for F18 under item 416.
 The columnar derived tier, the first phase of the core, is built under item 835. The
 SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its maintenance in
-item 958 and SPIN's RDF syntax in item 959. The other core and convergence phases remain
-under [item 456](../../ROADMAP.md).
+item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core, the first
+phase of item 839, is built, and the engine does not evaluate it. The other core and
+convergence phases remain under [item 456](../../ROADMAP.md).
 
 ### Columnar derived tier
 
@@ -301,6 +302,41 @@ compaction policy that left an older run alone when it was under an eighth of th
 behind it saved the third iteration's 1.25 s and was not kept, since the distinct-key
 counts of that build summed over runs and the retained run changed a join order, and so
 derived ids, in the reviewer's reproduction.
+
+### Rule IR
+
+`crates/sparkles-reasoner/src/ir.rs` holds the program form of the n-ary core. A program
+is a set of rules over the triple relation and over declared relations, each with a name
+and an arity, whose bodies hold positive and negated atoms and builtins and whose heads may
+hold existential variables. The Jena frontend gives the IR of each compiled Jena rule as it
+is, so a Jena rule has no relation, negated atom or existential. A check of the program
+refuses an atom of the wrong arity, a variable that a head, a negated atom or a builtin
+needs and that the body never binds, and builtins whose inputs no order of the body binds.
+
+The strata follow the dependencies that demand's check for a negation on a cycle reads,
+with declared relations and negated atoms added. Every head of a rule depends on every read
+of the rule, list structure included. A rule with an existential or a `makeTemp` call is
+one part with all its heads, since its heads share the nodes it makes, and any other rule
+is evaluated in one part per head, each in its own stratum. A program that uses a
+relation, a negated atom or an existential must stratify, its `noValue`s included, while a
+program of Jena rules alone keeps Jena's reading of `noValue` and its strata are only
+reported. The negative list builtins `listNotContains`, `listLength` and `listForAll` read
+lists that a longer list can change, and the strata list the rules whose lists a head of
+the program may give, which for `owl-rl` holds `cls-int1`. On the rule sets of the demand
+tests that read `noValue` or lists and on 500 random programs the strata find a negation on a cycle exactly when
+demand's check does, apart from rules that make nodes for several heads, whose heads the
+strata keep together.
+
+A program with an existential must be weakly acyclic, after Fagin, Kolaitis, Miller and
+Popa. The positions of the triple relation are the subject and object of each constant
+predicate, with the facts of a head with a variable predicate flowing to every constant
+predicate, and list builtins and head actions read and give the positions of `rdf:first`
+and `rdf:rest`. A builtin output other than a list member counts as a new value. The
+analyses charge their graphs to the run's budget before they build them, from bounds of
+the program's size, and walk their components without recursion. The plan of the later
+phases, which lower the IR to the engine's rules over the derived tier, leaves the surface
+syntax, the chase's schedule and null identity, and the storage of relations of arity three
+and more open for the maintainer.
 
 ### SHACL rules and SPIN
 

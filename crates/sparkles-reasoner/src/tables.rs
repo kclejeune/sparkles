@@ -191,6 +191,7 @@ pub fn clear() {
         inner.bytes = 0;
     }
     crate::reuse::clear();
+    crate::qlrewrite::clear();
 }
 
 fn evict(inner: &mut Inner, cap: u64) {

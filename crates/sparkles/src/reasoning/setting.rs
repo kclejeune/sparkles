@@ -33,7 +33,8 @@ pub struct QuerySetting {
     /// absent, the dataset's queries read its materialized inferences as before
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    /// `rdfs`, `rdfs-simple`, `owl-rl` or `rules`; absent, the last materialization's
+    /// `rdfs`, `rdfs-simple`, `owl-rl`, `owl-ql` or `rules`; absent, the last
+    /// materialization's
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     /// the Jena rule text of the profile `rules`
@@ -65,6 +66,10 @@ pub struct Budget {
     /// the longest a query's derivation runs, in milliseconds
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_millis: Option<u64>,
+    /// the most branches of the OWL 2 QL rewriting of one basic graph pattern under the
+    /// `owl-ql` profile (spec F17 §7); absent, 1,024
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_union: Option<usize>,
 }
 
 impl Budget {
@@ -104,6 +109,9 @@ impl QuerySetting {
         }
         if self.budget.max_millis == Some(0) {
             return Err(Error::invalid("budget.maxMillis must be positive"));
+        }
+        if self.budget.max_union == Some(0) {
+            return Err(Error::invalid("budget.maxUnion must be positive"));
         }
         if let Some(i) = &self.inputs {
             #[cfg(feature = "reasoning")]
@@ -270,11 +278,21 @@ mod tests {
             bad(QuerySetting {
                 budget: Budget {
                     max_derived: Some(0),
-                    max_millis: None,
+                    ..Default::default()
                 },
                 ..Default::default()
             })
             .contains("maxDerived")
+        );
+        assert!(
+            bad(QuerySetting {
+                budget: Budget {
+                    max_union: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .contains("maxUnion")
         );
     }
 

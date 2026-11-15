@@ -654,6 +654,45 @@ impl Dataset {
             .map_err(crate::handles::from_anyhow)
     }
 
+    /// Under the `owl-ql` query-time profile (spec F17 §7), what the rewriting reads of
+    /// the ontology in the input graphs that `opts` reads at the head: the axioms of
+    /// OWL 2 QL, and those outside it or unused, which the rewriting ignores. `None`
+    /// when the dataset's query-time profile is another.
+    #[cfg(feature = "reasoning")]
+    pub fn owl_ql_status(&self, opts: &QueryOptions) -> Result<Option<serde_json::Value>> {
+        use crate::sparql::reasoning::SessionRequest;
+        let Some(setting) = self.query_reasoning() else {
+            return Ok(None);
+        };
+        if !matches!(setting.profile()?, Some(sparkles_reasoner::Profile::OwlQl)) {
+            return Ok(None);
+        }
+        let reasoner = self.query_reasoner(None)?;
+        let snap = self.snapshot();
+        let readable = opts.graphs.clone().filter(|a| !a.reads_all()).map(|a| {
+            let s = snap.clone();
+            Arc::new(move |g: crate::id::Id| a.readable_id(&s, g))
+                as Arc<dyn Fn(crate::id::Id) -> bool + Send + Sync>
+        });
+        let req = SessionRequest {
+            snap,
+            readable,
+            stop: Arc::new(|| Ok(())),
+            max_memory: opts.max_memory_bytes,
+            no_cache: false,
+        };
+        let Some(t) = reasoner.owl_ql_tbox(&req)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::json!({
+            "axioms": t.axioms,
+            "outsideCount": t.outside_count,
+            "outside": t.outside,
+            "unused": t.unused,
+            "unmapped": t.unmapped,
+        })))
+    }
+
     /// Where a clone was made from: the `origin.json` of a persistent clone, or what an
     /// in-memory clone keeps.
     pub fn origin(&self) -> Option<&serde_json::Value> {

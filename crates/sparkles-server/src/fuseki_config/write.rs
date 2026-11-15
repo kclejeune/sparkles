@@ -491,6 +491,10 @@ pub fn write_dataset_files(plan: &Plan, out: &Path, report: &mut Report) -> Resu
                     r.profile.as_deref().unwrap_or("rdfs")
                 );
             }
+            if r.hybrid_jena {
+                // Jena's hybrid mode runs a forward rule's nested backward rules on demand
+                text = format!("@hybrid jena .\n{text}");
+            }
             std::fs::write(out.join(p), text)?;
         }
     }

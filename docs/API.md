@@ -9143,7 +9143,7 @@ The design is in [F17](specs/F17-query-time-reasoning.md), and its
 rules of a profile, and the query does not read the inferred graph. A materialization is
 not needed. The rules are those of `rdfs`, `rdfs-simple` or `owl-rl`, chosen with
 `reasoningProfile`, or the profile of the dataset's last materialization when the request
-names none. Its Jena rules come from the rules of that materialization, and Jena backward
+names none. `owl-ql` rewrites the query instead ([OWL 2 QL rewriting](#owl-2-ql-rewriting)). Its Jena rules come from the rules of that materialization, and Jena backward
 rules (`head <- body`), which materialization skips, answer this way.
 
 ```sh
@@ -9209,6 +9209,57 @@ every person, and such queries take tens to hundreds of times as long as over a
 materialization. [F17's Outcome](specs/F17-query-time-reasoning.md#outcome) has the LUBM
 measurements.
 
+### OWL 2 QL rewriting
+
+`reasoningProfile=owl-ql` answers a query by rewriting it against the OWL 2 QL axioms of
+the input graphs, and derives nothing. Each basic graph pattern becomes a union of basic
+graph patterns over the stored facts, with the PerfectRef procedure, so subclasses,
+subproperties, inverse properties, domains, ranges and existential restrictions on the
+right of an inclusion answer through the stored facts. The union streams as any union
+does.
+
+```sh
+curl -G localhost:3030/ds/sparql --data-urlencode 'query=ASK { ex:ann ex:teaches ?c }' \
+  --data-urlencode reasoning=demand --data-urlencode reasoningProfile=owl-ql
+```
+
+* A variable is distinguished when the query uses it outside the pattern, in a
+  projection, a filter, another pattern or a CONSTRUCT template, and every variable is
+  under `COUNT(*)`. A distinguished variable is never bound to an unnamed individual. With
+  `ex:Professor rdfs:subClassOf [ owl:onProperty ex:teaches ; owl:someValuesFrom
+  owl:Thing ]` and `ex:ann a ex:Professor`, `ASK { ex:ann ex:teaches ?c }` is true and
+  `SELECT ?c { ex:ann ex:teaches ?c }` has no rows. A variable that an initial binding
+  gives a value is distinguished. The names are counted over the whole query, so a
+  variable local to a subquery is distinguished when another part of the query uses the
+  same name.
+* A rewritten pattern keeps SPARQL's bag semantics. A variable that stored facts bind
+  keeps its values even when the query does not project it, so the rows are those of
+  plain SPARQL over the stored and derived facts and of the `owl-rl` modes. With `ex:q
+  rdfs:subPropertyOf ex:p` and two stored `ex:p` objects of `ex:a`, `SELECT ?s { ?s ex:p
+  ?o }` gives `ex:a` twice. A solution that leaves a variable to an unnamed individual
+  counts once, and only where no stored fact names that variable. Such solutions are
+  checked with `NOT EXISTS` against the branches that name more variables, and the copies
+  of those branches count against `budget.maxUnion`.
+* `budget.maxUnion` in the query-time setting bounds the branches of one pattern's
+  rewriting, 1,024 by default. A pattern past it, and one the rewriting cannot express,
+  such as one with a variable predicate or class or a predicate of the RDF, RDFS or OWL
+  vocabularies, is derived with the `owl-rl` rules, and the response warns that answers
+  that need unnamed individuals may be missing. Property paths are derived the same way,
+  with the same warning, and patterns inside `GRAPH` read the stored facts. The `owl-rl`
+  rules of this fallback read the whole ontology, so they can use axioms outside OWL 2 QL
+  that the rewriting ignores, such as a transitive property.
+* Axioms outside OWL 2 QL are ignored, and so are reflexive properties, inclusions
+  that involve `owl:Thing` on the left and data existentials on the left whose range is a
+  datatype other than `rdfs:Literal`. A query's warnings count them, and `GET
+  /$/reason/{ds}/query` lists them under `owlQl` for the graphs the caller reads, with the
+  number of axioms the rewriting reads and the terminology triples that map to no axiom,
+  such as the `rdfs:subPropertyOf` triple of an undeclared property.
+* The ontology is read from the input graphs, and the rewritten patterns read the query's
+  default graph. EXPLAIN shows a `Rewrite` node per basic graph pattern with its number
+  of branches, and the rewritten algebra.
+* A materialization refuses `owl-ql`, so `auto` with it never reads a materialization and
+  behaves as `demand`.
+
 ### Automatic choice
 
 `reasoning=auto` reads the materialized inferences when they can answer and derives
@@ -9255,7 +9306,7 @@ the input graphs, a budget and the policy for a stale materialization:
   "profile": "owl-rl",
   "rules": null,
   "inputs": { "ontologyGraphs": ["http://ex.org/onto"] },
-  "budget": { "maxDerived": 1000000, "maxMillis": null },
+  "budget": { "maxDerived": 1000000, "maxMillis": null, "maxUnion": 1024 },
   "stale": "derive" }
 ```
 
@@ -9265,8 +9316,10 @@ with `Dataset::inference_view(Dataset::default_reasoning_mode())`, since
 `Dataset::query` reads the materialized inferences. Without `profile`, derivation uses the profile, rules and inputs of the last
 materialization, so `auto` compares like with like. `profile: "rules"` takes the Jena
 rule text in `rules`. `budget.maxDerived` applies when a query names no `maxDerived`,
-under the server's `--reason-max-derived`, and a derivation that runs longer than
-`budget.maxMillis` fails with `422` and the code `reasoning-budget`. `stale: "allow"`
+under the server's `--reason-max-derived`, and a derivation or an OWL 2 QL rewriting that
+runs longer than `budget.maxMillis` fails with `422` and the code `reasoning-budget`. The
+rewriting and the derivation of one query each have that allowance. `budget.maxUnion`
+bounds the OWL 2 QL rewriting of one pattern under `owl-ql`. `stale: "allow"`
 lets `auto` read a stale materialization, and the response then carries
 `Sparkles-Inferences`. `GET` returns the setting, with `tables`, the status of the
 process-wide cache of derived tables, for callers with the metrics permission. `DELETE`

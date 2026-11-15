@@ -863,12 +863,14 @@ impl Converter<'_> {
                         }
                         "hybrid" => {
                             reasoning.query_default = Some("auto");
+                            reasoning.hybrid_jena = true;
                             self.report.converted(
                                 place,
                                 "the GenericRuleReasoner's hybrid mode: the forward rules are \
                                  materialized with sparkles infer --rules, and queries read the \
                                  materialization and derive the backward rules' facts on \
-                                 demand (query-time default auto)",
+                                 demand (query-time default auto), with the backward rules \
+                                 nested in forward rules' heads among them (@hybrid jena)",
                             );
                         }
                         other => self.report.unsupported(
