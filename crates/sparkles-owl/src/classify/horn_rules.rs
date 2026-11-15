@@ -71,9 +71,12 @@ pub struct HornSt {
     pub same: Small<Ex>,
     /// the predecessors told that this context is singular
     pub told_singular: Small<Ex>,
-    /// the successors that no other successor dominates, with the place of each one's
-    /// core in `cores`, in a run without individuals (item 710)
-    pub live: Vec<(Role, Ex, u32, u32)>,
+    /// the successors that no other successor dominates, in a run without individuals
+    /// (item 710)
+    pub live: Vec<(Role, Ex)>,
+    /// the place of the core of each successor of `live` in `cores`, its length and its
+    /// signature
+    pub meta: Vec<(u32, u32, u64)>,
     /// the cores of the successors in `live`
     pub cores: Vec<Ex>,
     /// the successors that another successor dominates, which R3, R5 and R6 pass over
@@ -99,7 +102,8 @@ impl HornSt {
             + self.real_preds.bytes()
             + self.same.bytes()
             + self.told_singular.bytes()
-            + self.live.capacity() * 16
+            + self.live.capacity() * 8
+            + self.meta.capacity() * 16
             + self.cores.capacity() * 4
             + self.dominated.bytes()
             + self.told.bytes()
@@ -109,6 +113,7 @@ impl HornSt {
     /// successors in their order, for a state whose context ids change.
     pub fn forget_dominance(&mut self) {
         self.live = Vec::new();
+        self.meta = Vec::new();
         self.cores = Vec::new();
         self.dominated = Small::default();
         self.sorted = 0;
@@ -190,68 +195,99 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     }
     let roles = &ix.roles;
     let mut core = Vec::new();
+    // the sort's entries are charged to the run's memory at each check of the bounds and
+    // at the end, so that the charge costs one reservation for 64 successors
+    let mut charge = 0usize;
     while h.sorted < h.succ.list.len() {
         // a sort of many successors polls the run's bounds, and one that stops leaves
         // the rest unsorted, which the rules read as successors that no other dominates
-        if h.sorted.is_multiple_of(64) && !out.go_on() {
-            return;
+        if h.sorted.is_multiple_of(64) {
+            if charge > 0 {
+                let _ = out.reserve_data(std::mem::take(&mut charge));
+            }
+            if !out.go_on() {
+                return;
+            }
         }
         let (r, n) = h.succ.list[h.sorted];
         h.sorted += 1;
         out.core(ix, n, &mut core);
+        let sig = signature(&core);
         // the sort's entry for the successor, in `live` with its core or in `dominated`,
         // is charged to the run's memory as it is kept, and the cores that a compaction
         // drops are released; a run past its budget stops at its next check
         // past LIVE_MOST successors that no other dominates, a successor is compared with
         // none, so that the sort costs at most that many comparisons for each successor
         if h.live.len() >= LIVE_MOST {
-            let at = h.cores.len() as u32;
+            h.meta.push((h.cores.len() as u32, core.len() as u32, sig));
             h.cores.extend_from_slice(&core);
-            h.live.push((r, n, at, core.len() as u32));
-            let _ = out.reserve_data(SORT_BYTES + 4 * core.len());
+            h.live.push((r, n));
+            charge += SORT_BYTES + 4 * core.len();
             continue;
         }
         let cores = &h.cores;
         let of = |at: u32, len: u32| &cores[at as usize..(at + len) as usize];
-        if h.live
+        // a core is part of another only when its signature is part of the other's, which
+        // passes over most pairs before the roles and the cores are compared
+        if h.meta
             .iter()
-            .any(|&(r2, _, at, len)| roles.sub(r2, r) && subset(&core, of(at, len)))
+            .zip(&h.live)
+            .any(|(&(at, len, sig2), &(r2, _))| {
+                sig & !sig2 == 0 && roles.sub(r2, r) && subset(&core, of(at, len))
+            })
         {
             h.dominated.insert((r, n));
-            let _ = out.reserve_data(SORT_BYTES);
+            charge += SORT_BYTES;
             continue;
         }
-        let mut gone = Vec::new();
-        h.live.retain(|&(r2, n2, at, len)| {
-            let keep = !(roles.sub(r, r2) && subset(of(at, len), &core));
-            if !keep {
-                gone.push((r2, n2));
+        // the successors that the new one dominates leave `live`, keeping an entry in
+        // `dominated`, and their cores stay charged until a compaction drops them
+        let mut kept = 0;
+        for i in 0..h.live.len() {
+            let (r2, n2) = h.live[i];
+            let (at, len, sig2) = h.meta[i];
+            if sig2 & !sig == 0 && roles.sub(r, r2) && subset(of(at, len), &core) {
+                h.dominated.insert((r2, n2));
+            } else {
+                h.live[kept] = h.live[i];
+                h.meta[kept] = h.meta[i];
+                kept += 1;
             }
-            keep
-        });
-        // a successor that leaves `live` keeps an entry in `dominated`, and its core stays
-        // charged until a compaction drops it
-        for g in gone {
-            h.dominated.insert(g);
         }
-        let at = h.cores.len() as u32;
+        let left = kept < h.live.len();
+        h.live.truncate(kept);
+        h.meta.truncate(kept);
+        h.meta.push((h.cores.len() as u32, core.len() as u32, sig));
         h.cores.extend_from_slice(&core);
-        h.live.push((r, n, at, core.len() as u32));
-        let _ = out.reserve_data(SORT_BYTES + 4 * core.len());
-        // the cores of the successors that left `live` go once they take half the room
-        if h.cores.len() > 64
-            && h.cores.len() > 2 * h.live.iter().map(|l| l.3 as usize).sum::<usize>()
+        h.live.push((r, n));
+        charge += SORT_BYTES + 4 * core.len();
+        // the cores of the successors that left `live` go once they take half the room,
+        // which only a successor's leaving can bring about
+        if left
+            && h.cores.len() > 64
+            && h.cores.len() > 2 * h.meta.iter().map(|l| l.1 as usize).sum::<usize>()
         {
             let mut cores = Vec::with_capacity(h.cores.len() / 2);
-            for l in &mut h.live {
+            for l in &mut h.meta {
                 let at = cores.len() as u32;
-                cores.extend_from_slice(&h.cores[l.2 as usize..(l.2 + l.3) as usize]);
-                l.2 = at;
+                cores.extend_from_slice(&h.cores[l.0 as usize..(l.0 + l.1) as usize]);
+                l.0 = at;
             }
             out.release_data(4 * (h.cores.len() - cores.len()));
             h.cores = cores;
         }
     }
+    if charge > 0 {
+        let _ = out.reserve_data(charge);
+    }
+}
+
+/// A signature of a sorted core, one bit for each of its expressions, so that the core of
+/// a subset has a signature that is part of the other's.
+#[inline]
+fn signature(core: &[Ex]) -> u64 {
+    core.iter()
+        .fold(0, |s, &x| s | 1u64 << (x.wrapping_mul(0x9E37_79B1) >> 26))
 }
 
 /// The successors that no other dominates past which [`sync`] compares a successor with
@@ -276,22 +312,16 @@ fn members(ix: &Index, st: &State, s: Role, b: Ex) -> Vec<Member> {
     let roles = &ix.roles;
     let mut k: Vec<Member> = Vec::new();
     if let Some(x) = &st.extra {
-        let mut take = |r: Role, n: Ex| {
+        let h = &x.horn;
+        // the successors that a stopped sort left unsorted count as well
+        let (sorted, rest) = if dominates(ix) {
+            (&h.live[..], &h.succ.list[h.sorted..])
+        } else {
+            (&h.succ.list[..], &h.succ.list[..0])
+        };
+        for &(r, n) in sorted.iter().chain(rest) {
             if roles.sub(r, s) && held_succ(st, n, b) {
                 k.push(Member::Link(r, n));
-            }
-        };
-        if dominates(ix) {
-            // the successors that a stopped sort left unsorted count as well
-            for &(r, n, _, _) in &x.horn.live {
-                take(r, n);
-            }
-            for &(r, n) in &x.horn.succ.list[x.horn.sorted..] {
-                take(r, n);
-            }
-        } else {
-            for &(r, n) in &x.horn.succ.list {
-                take(r, n);
             }
         }
     }
@@ -326,30 +356,33 @@ fn preds(ix: &Index, st: &State, s: Role, b: Ex) -> Vec<(Ex, Role)> {
 const TOLD_BYTES: usize = 24;
 
 /// The pairs of a predecessor and a successor whose core R6 sent the predecessor, which
-/// a run that passes over dominated successors keeps so that it sends each core once.
-struct Told(Option<Small<(Ex, Ex)>>);
+/// a run that passes over dominated successors keeps so that it sends each core once,
+/// with the bytes of the pairs it recorded since it was taken.
+struct Told(Option<Small<(Ex, Ex)>>, usize);
 
 impl Told {
     fn take(ix: &Index, st: &mut State) -> Told {
-        Told(dominates(ix).then(|| std::mem::take(&mut hs(st).told)))
+        Told(dominates(ix).then(|| std::mem::take(&mut hs(st).told)), 0)
     }
-    fn put(self, st: &mut State) {
+    /// Puts the record back and charges the pairs it recorded to the run's memory, once
+    /// for all of them; a run past its budget stops at its next check.
+    fn put<S: Sink>(self, st: &mut State, out: &mut S) {
         if let Some(t) = self.0 {
             hs(st).told = t;
         }
+        if self.1 > 0 {
+            let _ = out.reserve_data(self.1);
+        }
     }
-    /// Whether R6 has still to send `m` the core of `n`. The pair it records is charged
-    /// to the run's memory, and a run past its budget sends the core as before.
-    fn first<S: Sink>(&mut self, m: Ex, n: Ex, out: &mut S) -> bool {
+    /// Whether R6 has still to send `m` the core of `n`, which it records.
+    fn first(&mut self, m: Ex, n: Ex) -> bool {
         let Some(t) = self.0.as_mut() else {
             return true;
         };
-        if t.contains(&(m, n)) {
+        if !t.insert((m, n)) {
             return false;
         }
-        if out.reserve_data(TOLD_BYTES) {
-            t.insert((m, n));
-        }
+        self.1 += TOLD_BYTES;
         true
     }
 }
@@ -397,9 +430,10 @@ pub fn succ<S: Sink>(
     for &b in &h.fills {
         out.send(n, Concl::PredIn(me, b));
     }
-    // R3 and R5 read the successors that no other dominates, which only a context with a
-    // universal or an at-most restriction sorts
-    if !h.all_roles.is_empty() || !h.atmost.is_empty() {
+    // R5 reads the successors that no other dominates as they come, so a context with an
+    // at-most restriction sorts them here; R3 reads them at the end of the activation,
+    // whose flush sorts them and passes over the dominated ones it finds pending
+    if !h.atmost.is_empty() {
         sync(ix, st, out);
         if is_dominated(ix, st, r, n) {
             return true;
@@ -471,7 +505,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
         if dominates(ix) {
             h.live
                 .iter()
-                .map(|&(r, n, _, _)| (r, n))
+                .copied()
                 .chain(h.succ.list[h.sorted..].iter().copied())
                 .collect()
         } else {
@@ -562,13 +596,16 @@ pub fn at_most<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, out:
     h.merges.push((s, b));
     sync(ix, st, out);
     let k = members(ix, st, s, b);
-    let mut told = Told::take(ix, st);
-    for (m, r1) in preds(ix, st, s, b) {
-        for &x in &k {
-            identify(ix, me, st, &mut told, m, r1, x, out);
+    let ps = preds(ix, st, s, b);
+    if !k.is_empty() && !ps.is_empty() {
+        let mut told = Told::take(ix, st);
+        for (m, r1) in ps {
+            for &x in &k {
+                identify(ix, me, st, &mut told, m, r1, x, out);
+            }
         }
+        told.put(st, out);
     }
-    told.put(st);
     counted_full(ix, me, st, None, out);
 }
 
@@ -576,11 +613,15 @@ pub fn at_most<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, out:
 /// with every predecessor.
 fn counted<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, x: Member, out: &mut S) {
     hs(st).merges.push((s, b));
+    let ps = preds(ix, st, s, b);
+    if ps.is_empty() {
+        return;
+    }
     let mut told = Told::take(ix, st);
-    for (m, r1) in preds(ix, st, s, b) {
+    for (m, r1) in ps {
         identify(ix, me, st, &mut told, m, r1, x, out);
     }
-    told.put(st);
+    told.put(st, out);
 }
 
 /// R5 at the end of an activation: every successor that `≤1 s.b` counts is one, so each
@@ -674,7 +715,7 @@ fn identify<S: Sink>(
                 return;
             }
             // a predecessor holds for good the core it was sent once
-            if told.first(m, n2, out) {
+            if told.first(m, n2) {
                 send_core(ix, m, n2, out);
             }
             if let Some(i) = roles.inv(r2) {
@@ -754,7 +795,7 @@ pub fn back<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &m
             }
         }
     }
-    told.put(st);
+    told.put(st, out);
 }
 
 /// `SuccIn(n, b)`: the successor n holds b.
@@ -814,7 +855,7 @@ pub fn pred_in<S: Sink>(ix: &Index, me: Ex, st: &mut State, m: Ex, b: Ex, out: &
             }
         }
     }
-    told.put(st);
+    told.put(st, out);
     true
 }
 
@@ -1289,9 +1330,11 @@ mod tests {
         let mut st = State::default();
         let mut told = Told::take(&ix, &mut st);
         let mut out = Checks::new(1);
-        assert!(told.first(cs[0], cs[1], &mut out));
-        assert!(!told.first(cs[0], cs[1], &mut out));
+        assert!(told.first(cs[0], cs[1]));
+        assert!(!told.first(cs[0], cs[1]));
+        told.put(&mut st, &mut out);
         assert_eq!(out.reserved, TOLD_BYTES);
+        assert_eq!(st.extra.as_ref().unwrap().horn.told.list.len(), 1);
     }
 
     /// A sort of many successors polls the run's bounds and stops when the run does, and
