@@ -3755,28 +3755,34 @@ the lexical forms of `xsd:double` values and a declaration of `owl:sameAs` as an
 property, which the adapter writes for the rules whose heads are `sameAs` atoms. The
 translation also wrote seven `rdfs:subPropertyOf` statements between annotation
 properties of ISO 1087-1 that the adapter leaves out. The adapter's closure has 3,197
-distinct triples without its `owl:imports`. HermiT gives the same results on it as on the
-translation, and Openllet's entailments from the sample's `owlReason` task equal
+distinct triples without its `owl:imports`. HermiT gives the same results on it as on
+the translation, and Openllet's entailments from the sample's `owlReason` task equal
 HermiT's. Both find the sample consistent with no unsatisfiable class, and Openllet's
 output holds the same 102 subclass pairs beside 85 reflexive ones, the same 307 named
 types and the same 268 property values, with no `sameAs` statement beyond the reflexive
-ones. `owl-reason` finds all thirteen probes inconsistent. It fails eleven of them as
-HermiT does, and it fails the two that HermiT finds consistent by its closed-world
-cardinality check, which passes them when it is turned off.
+ones. These entailment ontologies also declare each entity, give each individual an
+`owl:Thing` type and keep the 56 reflexive subproperty statements and the relation
+instances' `oml:hasSource` and `oml:hasTarget` values. They leave out the superclasses
+that are `owl:Thing`. `owl-reason` finds all thirteen probes inconsistent. It fails
+eleven of them as HermiT does, and it fails the two that HermiT finds consistent by its
+closed-world cardinality check, which passes them when it is turned off.
 
 On the adapter's closure Sparkles gives the survey's results. The classifier's taxonomy
-equals Openllet's with or without counting and the rooted option. `ontology reason` gives
-Openllet's 307 types and the 21 `swrl:Variable` types, OWL RL materialization gives the
-same types and misses the same 34 object property values, the five queries give the same
-answers, and the classifier keeps its eight agreements and its misses on the probes. The
-`all-disjoint-classes` check still passes its row limit. The rules file that the adapter
-writes with `generateRules` holds the adapter's four default rules and the six bundle
-rules of the survey's file, but it gives its prefixes as
-`@prefix oml: http://opencaesar.io/oml#` without angle brackets and writes prefixed names.
-Jena's parser reads it and derives 321 facts. The 16 more that it derived from the
-survey's file came from the translation's extra sub-property statements. Sparkles' rule
-parser refuses the adapter's file at its first line, and with the brackets added it
-derives exactly Jena's 321 facts. Item 1020 takes the bare namespace IRIs.
+equals Openllet's with or without counting and the rooted option. `ontology reason`
+gives Openllet's 307 types and the 21 `swrl:Variable` types, OWL RL materialization
+gives the same types and misses the same 34 object property values, and the five queries
+give the same answers. On the probes the classifier again finds the seven
+inconsistencies that need no rule, enumeration or OWL 2 DL datatype. It agrees with
+HermiT, and with Openllet's consistency check alone, that the two closed-world probes
+are consistent, and it misses the same four. The `all-disjoint-classes` check still
+passes its row limit. The rules file that the adapter writes with `generateRules` holds
+the adapter's four default rules and the six bundle rules of the survey's file, but it
+gives its prefixes as `@prefix oml: http://opencaesar.io/oml#` without angle brackets
+and writes prefixed names. Jena's parser reads it and derives 321 facts. The 16 more
+that it derived from the survey's file came from the translation's extra sub-property
+statements. Sparkles' rule parser refuses the adapter's file at its first line, and with
+the brackets added it derives exactly Jena's 321 facts. Item 1020 takes the bare
+namespace IRIs.
 
 ### Roadmap follow-ups
 
