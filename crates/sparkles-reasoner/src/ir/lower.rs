@@ -167,31 +167,27 @@ impl Program {
             origins.push(next);
             next += r.body.len() + r.head.len();
         }
-        // each rule is charged a bound of its size before it is built, and then keeps the
-        // charge of the size it keeps
-        let mut lower = |ri: usize, heads: &[usize]| -> Result<CRule, LowerError> {
-            let bound = lowered_bound(&self.rules[ri], heads);
-            held.try_grow(bound)?;
-            let rule = lower_rule(self, ri, heads, shape, origins[ri])?;
-            let kept = crule_bytes(&rule);
-            debug_assert!(kept <= bound, "{kept} > {bound}");
-            held.shrink(bound.saturating_sub(kept));
-            Ok(rule)
-        };
         match shape {
             Shape::Jena | Shape::Monotone => {
                 for (i, r) in self.rules.iter().enumerate() {
+                    // the indices of every head, scratch charged while they live
+                    let n = r.head.len() * size_of::<usize>();
+                    held.try_grow(n)?;
                     let heads: Vec<usize> = (0..r.head.len()).collect();
-                    strata[0].push(lower(i, &heads)?);
+                    let rule = lower_charged(self, &mut held, i, &heads, shape, origins[i]);
+                    drop(heads);
+                    held.shrink(n);
+                    strata[0].push(rule?);
                 }
             }
             Shape::Strata => {
                 for part in &self.strata.parts {
-                    strata[part.stratum as usize].push(lower(part.rule, &part.heads)?);
+                    let ri = part.rule;
+                    let rule = lower_charged(self, &mut held, ri, &part.heads, shape, origins[ri]);
+                    strata[part.stratum as usize].push(rule?);
                 }
             }
         }
-        drop(lower);
         drop(origins);
         held.shrink(self.rules.len() * size_of::<usize>());
         let novalue = |i: &usize| shape == Shape::Strata && jena_novalue(&self.rules[*i]);
@@ -205,6 +201,32 @@ impl Program {
             stratified_novalue,
             _held: held,
         })
+    }
+}
+
+/// Rule `ri` with the heads `heads` lowered, charged to `held`: a bound of its size before
+/// it is built, and then the size it keeps.
+fn lower_charged(
+    p: &Program,
+    held: &mut Held,
+    ri: usize,
+    heads: &[usize],
+    shape: Shape,
+    origin: usize,
+) -> Result<CRule, LowerError> {
+    let bound = lowered_bound(&p.rules[ri], heads);
+    held.try_grow(bound)?;
+    match lower_rule(p, ri, heads, shape, origin) {
+        Ok(rule) => {
+            let kept = crule_bytes(&rule);
+            debug_assert!(kept <= bound, "{kept} > {bound}");
+            held.shrink(bound.saturating_sub(kept));
+            Ok(rule)
+        }
+        Err(e) => {
+            held.shrink(bound);
+            Err(e)
+        }
     }
 }
 

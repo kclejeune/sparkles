@@ -2312,7 +2312,7 @@ pub(crate) fn run_program(
 ) -> anyhow::Result<Outcome> {
     use crate::ir::lower::Shape;
     let lowered = program.lower(&limits.budget)?;
-    if lowered.shape != Shape::Jena {
+    if lowered.shape != Shape::Jena || !program.relations.is_empty() {
         g.set_relations();
     }
     for &ri in &lowered.stratified_novalue {

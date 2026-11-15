@@ -144,6 +144,9 @@ fn decode(t: &Terms, p: &Program, r: [u64; 3]) -> Fact {
 
 fn graph(t: &Terms, p: &Program, facts: &[Fact]) -> Graph {
     let mut g = Graph::default();
+    if facts.iter().any(|f| f.0.is_some()) {
+        g.set_relations();
+    }
     g.add_batch(facts.iter().map(|f| row(t, p, f)));
     g
 }
@@ -982,6 +985,30 @@ fn the_lowered_rules_are_charged() {
             + l.stratified_novalue.capacity() * size_of::<usize>();
         assert_eq!(l.bytes(), kept);
     }
+}
+
+/// A program of triple rules alone over a graph that holds relation facts does not see
+/// them, whoever added them.
+#[test]
+fn triple_rules_beside_relation_facts_do_not_see_them() {
+    let t = terms();
+    let (rs, ids) = rels(&[2]);
+    let seen = n(200);
+    let any = rule(
+        "any",
+        vec![pos(IAtom::triple(V(0), V(1), V(2)))],
+        vec![head(tri(V(0), seen, V(2)))],
+    );
+    let p = program(&t, rs, vec![any]);
+    assert_eq!(p.shape(), lower::Shape::Jena);
+    let facts = vec![(Some(ids[0].0), vec![n(1), n(2)])];
+    // a graph that the program's run marks, and one that the caller marked
+    let mut g = Graph::default();
+    g.add_batch(facts.iter().map(|f| row(&t, &p, f)));
+    let mut w = WorkingWarnings::new(&t.budget());
+    engine::run_program(&mut g, &p, &t, &limits(), &mut w).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(run(&t, &p, &facts).len(), 1);
 }
 
 /// A rebuilt graph, such as a compaction makes, still hides the facts of relations.
