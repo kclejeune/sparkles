@@ -1266,8 +1266,15 @@ fn fold<S: Sink>(
                         // unpruned
                         if next.len() > FOLD_PRUNE {
                             streaming = true;
+                            // the list's copies leave the charge, the part not yet
+                            // charged first
+                            let freed: usize = next.iter().map(bytes).sum();
+                            let uncharged = freed.min(pending);
+                            pending -= uncharged;
+                            let back = (freed - uncharged).min(charged);
+                            charged -= back;
+                            out.release_data(back);
                             for s in std::mem::take(&mut next) {
-                                pending = pending.saturating_sub(bytes(&s));
                                 emit(ix, st, s, rule, root, trace, out, derive);
                             }
                         }
@@ -3320,6 +3327,8 @@ mod tests {
         work: usize,
         /// the work past which the run stops, as a bound on derived conclusions does
         limit: Option<usize>,
+        /// the bytes past which a reservation fails, as the memory budget does
+        budget: Option<usize>,
     }
 
     impl Sink for Charges {
@@ -3329,6 +3338,9 @@ mod tests {
         fn reserve_data(&mut self, bytes: usize) -> bool {
             self.reserved += bytes;
             self.go_on()
+                && self
+                    .budget
+                    .is_none_or(|b| self.reserved - self.released <= b)
         }
         fn release_data(&mut self, bytes: usize) {
             self.released += bytes;
@@ -3447,6 +3459,47 @@ mod tests {
         // the unions it built and charged are those it derived, not the 16.7 million of
         // the whole step
         assert!(out.reserved < 16 << 20, "{}", out.reserved);
+    }
+
+    /// A last step that turns to deriving its unions as it makes them releases the
+    /// charge of the list it drains, so that the charge follows the unions that live.
+    #[test]
+    fn a_streamed_last_step_releases_its_drained_list() {
+        let ix = index();
+        let wide = |n: Ex| vec![(1..=n).map(|a| side(&[a])).collect::<Vec<_>>()];
+        let run = |lists: &[Vec<Side>], out: &mut Charges| {
+            let mut st = State::default();
+            let derive = |_: &Index, _: &mut State, _: Side, _: &mut Charges| {};
+            fold(
+                &ix,
+                &mut st,
+                lists,
+                side(&[]),
+                "test",
+                false,
+                false,
+                out,
+                &derive,
+            )
+        };
+        // a step of 2,048 unions, which ends at a check of the bounds, charges each
+        // union's two copies, which gives the bytes of one copy
+        let mut out = Charges::default();
+        assert!(run(&wide(2048), &mut out));
+        let unit = out.reserved / 4096;
+        // 6,000 unions hold at most 8,194 copies at once, the two of the 4,097 kept
+        // before the step turns to deriving and one of each union after it
+        let mut out = Charges {
+            budget: Some(9000 * unit),
+            ..Charges::default()
+        };
+        let ok = run(&wide(6000), &mut out);
+        assert!(
+            ok,
+            "the drained list stays charged: unit {unit}, reserved {}, released {}",
+            out.reserved, out.released
+        );
+        assert_eq!(out.reserved, out.released);
     }
 
     /// A product's sets are charged once they pass the slack, also when the product has
