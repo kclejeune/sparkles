@@ -777,6 +777,34 @@ for its allowances and the editors.
   data conforms. `GET /$/schema/{ds}/shapes`, `sparkles schema --draft-shapes` and the MCP
   tool `draft_shapes` draft them, reading only the caller's visible graphs.
 
+### OML and openCAESAR models
+
+* openCAESAR's adapter writes an Ontological Modeling Language model as OWL 2 ontologies
+  with DL-safe SWRL rules, and a vocabulary bundle as disjointness axioms over its
+  concepts and relation entities. Sparkles reads that OWL form from files or from a
+  dataset that holds each ontology in the named graph of its IRI, and follows the imports
+  between those graphs. On openCAESAR's Kepler16b sample, the classifier's taxonomy
+  equals HermiT's, its named types of individuals equal HermiT's apart from types it
+  gives the SWRL rules' variables, and the classifier finds the
+  inconsistencies that the bundle's disjointness, keys, functional properties, universal
+  restrictions and property characteristics raise
+  ([F24](../specs/F24-owl-classification/SPEC.md#oml-and-opencaesar-models)).
+* `sparkles serve --fuseki-config` starts from an openCAESAR project's `.fuseki.ttl`,
+  with its in-memory dataset, union default graph, query timeout and SHACL endpoint. It
+  answers the requests that openCAESAR's `owl-load`, `owl-query` and `owl-shacl` send,
+  which are a Graph Store `PUT` of each ontology and of each entailment ontology into
+  the graph of its IRI, the project's queries on the `sparql` service and shapes posted
+  to `shacl?graph=default`. The queries then read the entailments that `owl-reason`
+  wrote, not Sparkles' own reasoning.
+* A Jena rules file in the form that the adapter writes with `generateRules`
+  materializes with `sparkles infer --rules` and derives the facts that Jena's rule
+  engine derives.
+* The SWRL rules are not read, so a reified relation's forward property and the facts of
+  an OML rule are not derived, and the OWL RL materialization answers a query that needs
+  them with fewer rows. Rule-derived inconsistencies, enumerations beside keys, OWL 2 DL
+  datatypes such as `xsd:double` and `xsd:boolean`, and openCAESAR's closed-world
+  cardinality check are not covered. The known gaps below name the roadmap items.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
@@ -966,6 +994,20 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   [item 954](../ROADMAP.md).
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
+* The ontology readers map SWRL rules in RDF to assertions about anonymous individuals,
+  and their variables to named individuals. Roadmap item 970. DL-safe SWRL rules do not
+  run in materialization, query-time reasoning or the classifier. Roadmap item 971.
+* A rooted run refuses keys over data properties and functional data properties, which
+  OML vocabularies declare for their identifiers, as the Kepler16b sample and its
+  metrology library do. Roadmap item 768. The classifier leaves out the literals and
+  ranges of datatypes outside OWL 2 EL, such as `xsd:double` and `xsd:boolean`. Roadmap
+  item 972.
+* A lenient read maps no axiom for an `owl:AllDisjointClasses` with an undeclared member
+  and reports no warning. Roadmap item 973. The `all-disjoint-classes` check of
+  `sparkles infer --check` passes its intermediate-row limit on a 55-member list with a
+  few thousand triples. Roadmap item 974.
+* openCAESAR's closed-world cardinality check, its entailment outputs and the OML
+  textual syntax have no counterpart. Roadmap items 975 to 977.
 
 ## Configuration and usage
 
@@ -986,7 +1028,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md),  [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 768](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md), [item 970](../ROADMAP.md), [item 971](../ROADMAP.md), [item 972](../ROADMAP.md), [item 973](../ROADMAP.md), [item 974](../ROADMAP.md), [item 975](../ROADMAP.md), [item 976](../ROADMAP.md), [item 977](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

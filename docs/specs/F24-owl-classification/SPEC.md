@@ -73,7 +73,7 @@ both directions.
 
 ## Provenance
 
-This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: ELK (Kazakov, Kroetzsch and Simancik JAR 2014), Snorocket, ROBOT reason, OWL API, HermiT, Openllet, Konclude, Protégé reasoner plugins, ROBOT, Protégé Explanation Workbench, OWL API BlackBox, Protégé debugger plugins and OWL repair. No code from another project is copied.
+This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: ELK (Kazakov, Kroetzsch and Simancik JAR 2014), Snorocket, ROBOT reason, OWL API, HermiT, Openllet, Konclude, Protégé reasoner plugins, ROBOT, Protégé Explanation Workbench, OWL API BlackBox, Protégé debugger plugins and OWL repair. The survey of OML models also reads the OML v2 specification and the Apache-2.0 source and documentation of openCAESAR's `owl-adapter` and `owl-tools`. No code from another project is copied.
 
 ## Outcome
 
@@ -3680,6 +3680,71 @@ Manchester, OBO or OBO Graphs JSON (item 686), and refuse
 `--prevent-invalid-references true` (item 687). `reason --reasoner emr` asserts
 named superclasses only, as ELK does, not the class expressions that ROBOT's expression
 materializing reasoner adds, which item 691 follows.
+
+### OML and openCAESAR models
+
+Item 967 surveyed what openCAESAR's analysis of Ontological Modeling Language models
+needs from Sparkles. The OML v2 specification gives the mapping to OWL 2 and SWRL as a
+table of correspondences, so the axiom-level mapping was read from the public source of
+openCAESAR's `oml2owl` adapter and its `owl-reason`, `owl-load`, `owl-query` and
+`owl-shacl` tools, which are Apache-2.0.
+
+In that mapping, each OML ontology becomes an OWL ontology with `owl:imports` for its
+imports. Concepts, aspects and relation entities become classes, with `SubClassOf`,
+`EquivalentClasses`, `HasKey` and an `ObjectOneOf` equivalence for an enumeration, and
+property restrictions become universal, existential, value, self and qualified
+cardinality restrictions as superclasses. A relation entity becomes a class with a
+forward object property and an optional inverse, with domains, ranges and the seven
+property characteristics, and a DL-safe SWRL rule derives the forward property from each
+relation instance's `oml:hasSource` and `oml:hasTarget`. OML rules become SWRL rules with
+class, data range, property, same-individual, different-individuals and `swrlb` builtin
+atoms. A vocabulary bundle adds a closure over the concepts and relation entities in its
+import scope. Their taxonomy is rooted at `owl:Thing` and made a tree by replacing the
+parents of every class with several parents with differences, written as
+`ObjectIntersectionOf(A ObjectComplementOf(B))`, and every set of siblings becomes a
+`DisjointClasses` axiom, or a `DisjointUnion` when asked. Description bundles add no
+axioms. `owl-reason` then runs Openllet on a description bundle, checks consistency and
+the satisfiability of every class outside the OML backbone, checks that every instance of
+a class with a told minimum, exact or existential restriction has enough entailed
+values, and writes the chosen entailments as ontologies. `owl-load` puts each ontology
+into the named graph of its IRI with Graph Store `PUT`, into a Fuseki dataset whose
+default graph is the union of its named graphs, and `owl-query` and `owl-shacl` post
+queries and shapes to it.
+
+The survey translated the Kepler16b sample and its metrology library by a
+re-implementation of this mapping, since the sample's Gradle build was not run, and
+wrote the Jena rules file in the adapter's form the same way. It compared Sparkles with
+HermiT 1.4.5.519 running `owl-reason`'s checks in place of Openllet, with Jena 6.2.0's
+rule engine on that rules file, and with Jena's `arq` on the sample's five queries over
+the asserted data and HermiT's entailments. The closure is 17 ontologies and 2,998
+triples, with 644 logical axioms, 42 SWRL rules, two keys and seven `DisjointClasses`
+axioms. The classifier's taxonomy equals HermiT's 102 subclass pairs with or without
+counting and the rooted option, and both find the sample consistent with no unsatisfiable
+class. `ontology reason` gives HermiT's 307 named types of named individuals and 21 more,
+the `swrl:Variable` types of the rule variables that the RDF reader takes for
+individuals. OWL RL materialization gives the same 307 types, an `rdfs:Resource` type for
+each of the 84 individuals, and 125 of HermiT's 159 object property values, missing only
+those that follow from SWRL rules. Four of the five queries
+equal the reference under OWL RL, materialized or on demand, and the `connections` query
+needs the rules. Sparkles' Jena rule engine derives exactly Jena's 337 facts from the
+rules file. `sparkles serve --fuseki-config` starts from the sample's own `.fuseki.ttl`.
+With the requests that `owl-load`, `owl-query` and `owl-shacl` send, made with `curl`, it
+stores the ontologies and HermiT's entailment graphs, answers the five queries as the
+reference does over them and answers the SHACL request.
+
+Thirteen probes each added one violation to the sample. The classifier agrees with
+HermiT on the eight that need disjointness from the closure, keys, asymmetry, universal
+restrictions, the closure's differences, functional properties and a functional string
+property. It misses a reflexive fact that a SWRL rule derives, an individual of an
+enumeration that differs from its members, two values of a functional `xsd:double`
+property and a string in an `xsd:boolean` range, and it has no closed-world cardinality
+check. The rooted run creates no contexts on the sample, because it refuses keys and
+functional data properties, and the sample's base vocabulary and the metrology library
+declare both. Item 768 takes the keys and functional data properties, and items 970 to
+977 record the other gaps, the SWRL reader, the
+lenient read that drops an `AllDisjointClasses` axiom with an undeclared member, the
+`all-disjoint-classes` check that passes its row limit on the sample, owl-reason's
+entailment outputs and an OML importer.
 
 ### Roadmap follow-ups
 
