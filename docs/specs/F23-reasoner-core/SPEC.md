@@ -333,10 +333,29 @@ predicate, with the facts of a head with a variable predicate flowing to every c
 predicate, and list builtins and head actions read and give the positions of `rdf:first`
 and `rdf:rest`. A builtin output other than a list member counts as a new value. The
 analyses charge their graphs to the run's budget before they build them, from bounds of
-the program's size, and walk their components without recursion. The plan of the later
-phases, which lower the IR to the engine's rules over the derived tier, leaves the surface
-syntax, the chase's schedule and null identity, and the storage of relations of arity three
-and more open for the maintainer.
+the program's size, and walk their components without recursion. The maintainer chose
+C24 §6.2's syntax subset in `parser.rs`, a Datalog-first restricted chase per stratum, the
+storage of relations of arity three and more behind tail handles, and stratified `noValue`
+in programs that use the IR, and null identity is still open.
+
+`crates/sparkles-reasoner/src/ir/lower.rs` lowers a program to the engine's rules. A
+relation fact is a row of the derived tier over the relation's key, a reserved id that no
+input can name, so relation facts share the tier's id space, semi-naive ranges, hash
+index, budget and limit of inferred facts, and the graph hides them from every atom and
+`noValue` with a variable predicate. The columns after the first of a fact of arity three
+or more are a tail, interned with the run's local terms, which a lowered body atom reads
+through a builtin and a lowered head interns through another. A negated atom is a builtin
+that is true when no fact before the iteration's end matches. `engine::run_program` runs
+a program of Jena rules alone as before, one with relations and no negation in one
+stratum, and one with a negation by strata, each to its fixpoint before the next, with the
+limits of inferred facts and iterations counted across the strata and a warning for each
+Jena rule whose `noValue` is read by strata. Rules that read lists are replayed when list
+cells arrive, so a list cell can be an instance's only new premise. No frontend produces
+relations yet, so only the reasoner's tests reach this path, and incremental updates,
+demand, explanations and witnesses follow in later steps. On 8,000 random programs over
+relations of arities zero to five, triple atoms, recursion and negated atoms, the runs
+equal a naive stratified evaluator, and the decoded facts are the same at 1, 4 and 16
+threads.
 
 ### SHACL rules and SPIN
 
