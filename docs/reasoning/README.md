@@ -924,10 +924,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   tree-shaped models. Roadmap item 867. Such an ontology may get a world for a class
   whose world finds nothing. Roadmap item 868.
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
-  rules on one thread and raise its peak resident set from 196 to 223 MiB. Two
-  Uberon-based ontologies of the ORE 2015 DL sample classify with the Horn rules in 2.2
-  and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap
-  item 693.
+  rules on one thread and raise its peak resident set from 196 to 223 MiB. On two
+  Uberon-based ontologies of the ORE 2015 DL sample the Horn rules take about five times
+  the EL rules' time, since each context of a conjunction derives its successor's
+  subsumers again. Roadmap item 693.
+* The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
+  passes its memory budget before the Horn rules answer. One of them classifies in 7.8
+  seconds on eight threads and 105 seconds on one on a laptop, almost all of it the
+  attempt. Roadmap item 990.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
   restrictions over a transitive symmetric role derives each link of the transitive
   closure once per intermediate class, so it sends three billion messages for 32 million

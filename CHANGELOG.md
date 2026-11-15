@@ -120,6 +120,15 @@ ordering.
 
 ### OWL classification
 
+A run of the Horn rules without individuals passes over a successor whose role and core
+another successor's contain, and sends a predecessor each successor's core once (roadmap
+item 710). A generated ontology of 15 axioms that derived 210 million conclusions in 5.1 s
+derives 2.0 million in 72 ms. A product of the disjunctive rules that is not ground forms
+its unions list after list and derives only the least ones (item 969), which takes the
+classification of `ore_ont_14817` of ORE 2015 from 14.6 to 7.8 s on eight threads and from
+more than 900 s to 105 s on one thread on a laptop. Three more counting fixtures finish
+within the counting bound. Item 990 follows the attempt that still passes its budget.
+
 A classification after an edit of class axioms keeps the contexts of a run with the Horn
 rules without individuals and of a run of the disjunctive rules without counting or a
 root (roadmap item 753). The run compares its index with the last one, clears the
