@@ -47,6 +47,19 @@ rec = {
     'notes': text(os.path.join(lane, 'notes.md')),
     'dedup_only_fold': 'a diagnostic build of fold that kept each union of a step once without dropping the unions that contain another derived 113 million conclusions on ore_ont_14817 on four threads on the laptop, against 21.7 million for the build that drops them, in about the same time',
     'item_693': 'Horn rules alone with Tier D skipped by a diagnostic switch, one thread, laptop: ore_ont_14817 2.0 s (2.49 s on the base before item 710), ore_ont_9663 3.1 s, against 0.42 and 0.47 s for the EL rules alone; 70,702 and 98,557 conjunction contexts, all from R3; 12.3 and 21.0 million new subsumers against 2.0 and 1.5 million for the EL rules'},
+  'generated': {
+    'host': 'stanley, the laptop',
+    'generator': text(os.path.join(lane, 'gen/gen.py')),
+    'scan_script': text(os.path.join(lane, 'gen/scan.sh')),
+    'scan_totals': {'files': 14547, 'base_a22f6a35': {'conclusions': 1188748935, 'classify_ms': 44808.0},
+                    'lane_b453117a': {'conclusions': 33302144, 'classify_ms': 5915.9},
+                    'note': 'sums over one-thread runs of every generated file, from scan-base.txt and scan-lane2.txt'},
+    'horn_against_counting_script': text(os.path.join(lane, 'gen/dcmp.sh')),
+    'horn_against_counting': text(os.path.join(lane, 'gen/dcmp4.txt')),
+    'counting_two_builds_script': text(os.path.join(lane, 'gen/dd.sh')),
+    'counting_two_builds': text(os.path.join(lane, 'gen/dd-count.txt')),
+    'counting_note': 'dd-count.txt runs --counting on the base (first hash and report) and on the lane (second): 7 files pass the counting bound on the base and finish on the lane, with the Horn answer of dcmp4.txt, and none goes the other way',
+    'fixtures': 'crates/sparkles-owl/tests/dl_steps.rs WITHIN 171 -> 174 and dl_number_order.rs (202, 202) -> (205, 204) in commit c00e1cf2: three more counting fixtures finish within the counting bound, sriq-004 among them, by tests/dl_steps.rs a_product_derives_only_its_least_unions'},
   'hosts': {p: text(os.path.join(a, p)) for p in ['timing-1ffed4a8/before.txt', 'timing-1ffed4a8/after.txt', 'timing2-efca1c26/before.txt', 'timing2-efca1c26/after.txt', 'timing4-a370d073/before.txt', 'timing4-a370d073/after.txt']},
 }
 os.makedirs(dest, exist_ok=True)
