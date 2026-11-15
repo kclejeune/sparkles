@@ -200,14 +200,15 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
         h.sorted += 1;
         out.core(ix, n, &mut core);
         // the sort's entry for the successor, in `live` with its core or in `dominated`,
-        // is charged to the run's memory, and a run past its budget stops at its next check
-        let _ = out.reserve_data(SORT_BYTES + 4 * core.len());
+        // is charged to the run's memory as it is kept, and the cores that a compaction
+        // drops are released; a run past its budget stops at its next check
         // past LIVE_MOST successors that no other dominates, a successor is compared with
         // none, so that the sort costs at most that many comparisons for each successor
         if h.live.len() >= LIVE_MOST {
             let at = h.cores.len() as u32;
             h.cores.extend_from_slice(&core);
             h.live.push((r, n, at, core.len() as u32));
+            let _ = out.reserve_data(SORT_BYTES + 4 * core.len());
             continue;
         }
         let cores = &h.cores;
@@ -217,6 +218,7 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
             .any(|&(r2, _, at, len)| roles.sub(r2, r) && subset(&core, of(at, len)))
         {
             h.dominated.insert((r, n));
+            let _ = out.reserve_data(SORT_BYTES);
             continue;
         }
         let mut gone = Vec::new();
@@ -227,12 +229,15 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
             }
             keep
         });
+        // a successor that leaves `live` keeps an entry in `dominated`, and its core stays
+        // charged until a compaction drops it
         for g in gone {
             h.dominated.insert(g);
         }
         let at = h.cores.len() as u32;
         h.cores.extend_from_slice(&core);
         h.live.push((r, n, at, core.len() as u32));
+        let _ = out.reserve_data(SORT_BYTES + 4 * core.len());
         // the cores of the successors that left `live` go once they take half the room
         if h.cores.len() > 64
             && h.cores.len() > 2 * h.live.iter().map(|l| l.3 as usize).sum::<usize>()
@@ -243,6 +248,7 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
                 cores.extend_from_slice(&h.cores[l.2 as usize..(l.2 + l.3) as usize]);
                 l.2 = at;
             }
+            out.release_data(4 * (h.cores.len() - cores.len()));
             h.cores = cores;
         }
     }
@@ -1220,10 +1226,22 @@ mod tests {
     use super::*;
     use crate::model::Class;
 
-    /// A sink that counts charges and lets the run go on for a number of checks.
+    /// A sink that counts charges and releases and lets the run go on for a number of
+    /// checks.
     struct Checks {
         reserved: usize,
-        left: usize,
+        released: usize,
+        left: std::cell::Cell<usize>,
+    }
+
+    impl Checks {
+        fn new(left: usize) -> Checks {
+            Checks {
+                reserved: 0,
+                released: 0,
+                left: std::cell::Cell::new(left),
+            }
+        }
     }
 
     impl Sink for Checks {
@@ -1233,8 +1251,13 @@ mod tests {
             self.reserved += bytes;
             true
         }
+        fn release_data(&mut self, bytes: usize) {
+            self.released += bytes;
+        }
         fn go_on(&self) -> bool {
-            self.left > 0
+            let left = self.left.get();
+            self.left.set(left.saturating_sub(1));
+            left > 0
         }
         fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
             out.clear();
@@ -1265,10 +1288,7 @@ mod tests {
         let (ix, cs) = index(2);
         let mut st = State::default();
         let mut told = Told::take(&ix, &mut st);
-        let mut out = Checks {
-            reserved: 0,
-            left: 1,
-        };
+        let mut out = Checks::new(1);
         assert!(told.first(cs[0], cs[1], &mut out));
         assert!(!told.first(cs[0], cs[1], &mut out));
         assert_eq!(out.reserved, TOLD_BYTES);
@@ -1283,21 +1303,60 @@ mod tests {
         for &c in &cs {
             hs(&mut st).succ.insert((0, c));
         }
-        let mut out = Checks {
-            reserved: 0,
-            left: 0,
-        };
+        // the run stops at the sort's third check, after it sorted 128 successors
+        let mut out = Checks::new(2);
         sync(&ix, &mut st, &mut out);
         let h = &st.extra.as_ref().unwrap().horn;
-        assert!(h.sorted < cs.len(), "the sort did not poll");
+        assert_eq!(h.sorted, 128, "the sort did not poll");
         assert_eq!(members(&ix, &st, 0, TOP).len(), cs.len());
-        let mut out = Checks {
-            reserved: 0,
-            left: 1,
-        };
+        let mut out = Checks::new(usize::MAX);
         sync(&ix, &mut st, &mut out);
         assert_eq!(st.extra.as_ref().unwrap().horn.sorted, cs.len());
         assert_eq!(members(&ix, &st, 0, TOP).len(), cs.len());
         assert!(out.reserved > 0);
+    }
+
+    /// The sort charges a dominated successor its entry alone, and a compaction releases
+    /// the cores it drops, so that the charge follows what the sort keeps.
+    #[test]
+    fn the_sort_charges_what_it_keeps() {
+        let mut it = Interner::new();
+        let cs: Vec<Ex> = (0..101)
+            .map(|k| it.class(&Class::new(format!("urn:dominate:c{k}"))))
+            .collect();
+        let conj = |it: &mut Interner, of: &[Ex]| {
+            of[1..]
+                .iter()
+                .fold(of[0], |a, &b| it.node(Node::Conj(a, b)))
+        };
+        let k = conj(&mut it, &cs[..100]);
+        let k2 = conj(&mut it, &cs);
+        let mut ix = Index::build(&Axioms::default(), &mut it, None, &|| false).unwrap();
+        ix.horn = Some(Box::new(HornIx {
+            flags: Vec::new(),
+            base: it.nodes.len() as Ex,
+            dominate: true,
+        }));
+        let mut st = State::default();
+        let mut out = Checks::new(usize::MAX);
+        for &c in &cs[..100] {
+            hs(&mut st).succ.insert((0, c));
+        }
+        sync(&ix, &mut st, &mut out);
+        assert_eq!(out.reserved, 100 * (SORT_BYTES + 4));
+        // owl:Thing's successor is dominated and takes its entry alone
+        hs(&mut st).succ.insert((0, TOP));
+        sync(&ix, &mut st, &mut out);
+        assert_eq!(out.reserved, 100 * (SORT_BYTES + 4) + SORT_BYTES);
+        // the conjunction of the hundred classes dominates them, and that of all of them
+        // dominates it, which compacts the cores
+        hs(&mut st).succ.insert((0, k));
+        hs(&mut st).succ.insert((0, k2));
+        sync(&ix, &mut st, &mut out);
+        let h = &st.extra.as_ref().unwrap().horn;
+        assert_eq!(h.live.len(), 1);
+        assert_eq!(h.cores.len(), 101);
+        let kept = SORT_BYTES + h.dominated.list.len() * SORT_BYTES + 4 * h.cores.len();
+        assert_eq!(out.reserved - out.released, kept);
     }
 }

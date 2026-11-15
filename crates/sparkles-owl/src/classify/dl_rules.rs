@@ -1200,7 +1200,8 @@ const FOLD_PRUNE: usize = 4096;
 /// million choices whose unions are a few thousand sets of literals, of which a few dozen
 /// are least. Past [`FOLD_PRUNE`] unions of the steps before the last, each further one
 /// counts as a derived conclusion for the run's bound, as each choice the product derives
-/// does, so that a bounded run does not build a wide product's steps unbounded. Each step's sets are charged to
+/// does, and a last step past that many derives its unions as it makes them, so that a
+/// bounded run does not build a wide product's steps unbounded. Each step's sets are charged to
 /// the memory budget as they grow, and what a step drops is released when it ends. The
 /// answer is whether the run goes on.
 #[allow(clippy::too_many_arguments)]
@@ -1232,6 +1233,7 @@ fn fold<S: Sink>(
     };
     let last = lists.len().saturating_sub(1);
     let mut built = 0usize;
+    let mut streaming = false;
     for (i, l) in lists.iter().enumerate() {
         let mut seen: FxHashSet<Side> = FxHashSet::default();
         let mut next: Vec<Side> = Vec::new();
@@ -1248,11 +1250,26 @@ fn fold<S: Sink>(
                     // the step's record and its list hold the union
                     pending += 2 * bytes(&s);
                     seen.insert(s.clone());
-                    next.push(s);
                     if i < last {
+                        next.push(s);
                         built += 1;
                         if built > FOLD_PRUNE {
                             out.worked(1);
+                        }
+                    } else if streaming {
+                        pending -= bytes(&s);
+                        emit(ix, st, s, rule, root, trace, out, derive);
+                    } else {
+                        next.push(s);
+                        // a last step past FOLD_PRUNE unions derives them as it makes
+                        // them, which counts each toward the bound, and leaves them
+                        // unpruned
+                        if next.len() > FOLD_PRUNE {
+                            streaming = true;
+                            for s in std::mem::take(&mut next) {
+                                pending = pending.saturating_sub(bytes(&s));
+                                emit(ix, st, s, rule, root, trace, out, derive);
+                            }
                         }
                     }
                 }
@@ -1293,16 +1310,7 @@ fn fold<S: Sink>(
         }
     }
     for s in acc {
-        if trace {
-            let lits = &out.dl().lits;
-            eprintln!(
-                "TR {} {rule} {} -> {}",
-                tr_ctx(st, root),
-                tr(ix, lits, &s.0),
-                tr(ix, lits, &s.1)
-            );
-        }
-        derive(ix, st, s, out);
+        emit(ix, st, s, rule, root, trace, out, derive);
         let x = ds(st);
         x.choices += 1;
         if x.choices as usize >= PRODUCT_POLL {
@@ -1314,6 +1322,30 @@ fn fold<S: Sink>(
     }
     out.release_data(charged);
     true
+}
+
+/// Derives one conclusion of [`fold`], with its line of the derivation trace.
+#[allow(clippy::too_many_arguments)]
+fn emit<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    s: Side,
+    rule: &'static str,
+    root: bool,
+    trace: bool,
+    out: &mut S,
+    derive: &impl Fn(&Index, &mut State, Side, &mut S),
+) {
+    if trace {
+        let lits = &out.dl().lits;
+        eprintln!(
+            "TR {} {rule} {} -> {}",
+            tr_ctx(st, root),
+            tr(ix, lits, &s.0),
+            tr(ix, lits, &s.1)
+        );
+    }
+    derive(ix, st, s, out);
 }
 
 /// Derives what the rules found: the single conclusions, then each product's choices in
@@ -3286,14 +3318,17 @@ mod tests {
         released: usize,
         releases: usize,
         work: usize,
+        /// the work past which the run stops, as a bound on derived conclusions does
+        limit: Option<usize>,
     }
 
     impl Sink for Charges {
         fn send(&mut self, _: Ex, _: Concl) {}
         fn me(&mut self, _: Concl) {}
+        // a reservation checks the bounds too, as the saturation's does
         fn reserve_data(&mut self, bytes: usize) -> bool {
             self.reserved += bytes;
-            true
+            self.go_on()
         }
         fn release_data(&mut self, bytes: usize) {
             self.released += bytes;
@@ -3301,6 +3336,9 @@ mod tests {
         }
         fn worked(&mut self, n: usize) {
             self.work += n;
+        }
+        fn go_on(&self) -> bool {
+            self.limit.is_none_or(|l| self.work <= l)
         }
     }
 
@@ -3370,6 +3408,45 @@ mod tests {
         assert_eq!(got.len(), 1 << 14);
         let built: usize = (1..14).map(|k| 1usize << k).sum();
         assert_eq!(out.work, built - FOLD_PRUNE);
+    }
+
+    /// A last step of more than [`FOLD_PRUNE`] unions derives them as it makes them, each
+    /// counted, so that a run with a bound on its derived conclusions stops it within the
+    /// bound instead of building every union first.
+    #[test]
+    fn a_wide_last_step_stops_at_the_bound() {
+        let ix = index();
+        let mut st = State::default();
+        let wide = |from: Ex| (from..from + 4096).map(|a| side(&[a])).collect::<Vec<_>>();
+        let lists = vec![wide(1), wide(10_000)];
+        let mut out = Charges {
+            limit: Some(20_000),
+            ..Charges::default()
+        };
+        let made = std::cell::Cell::new(0usize);
+        let derive = |_: &Index, _: &mut State, _: Side, out: &mut Charges| {
+            made.set(made.get() + 1);
+            out.worked(1);
+        };
+        assert!(!fold(
+            &ix,
+            &mut st,
+            &lists,
+            side(&[]),
+            "test",
+            false,
+            false,
+            &mut out,
+            &derive
+        ));
+        assert!(
+            made.get() <= 20_000 + PRODUCT_POLL + FOLD_PRUNE,
+            "{}",
+            made.get()
+        );
+        // the unions it built and charged are those it derived, not the 16.7 million of
+        // the whole step
+        assert!(out.reserved < 16 << 20, "{}", out.reserved);
     }
 
     /// A product's sets are charged once they pass the slack, also when the product has
