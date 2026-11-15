@@ -1309,3 +1309,60 @@ fn the_analyses_charge_what_they_allocate() {
         .collect();
     charged(chain, Relations::default()).unwrap();
 }
+
+/// Re-review of the code: a refusal keeps its message and its cycle's rules charged while
+/// it lives, and an analysis of many premises and heads stays within its charge.
+#[test]
+fn refusals_and_wide_rules_stay_charged() {
+    let (rels, r) = relations(&[1, 2]);
+    let x = V(0);
+    let cycle = vec![
+        rule(
+            "one",
+            vec![pos(IAtom::rel(r[0], &[x])), neg(IAtom::rel(r[1], &[x, x]))],
+            vec![head(IAtom::rel(r[1], &[x, x]))],
+        ),
+        rule(
+            "two",
+            vec![pos(IAtom::rel(r[1], &[x, x]))],
+            vec![head(IAtom::rel(r[0], &[x]))],
+        ),
+    ];
+    let budget = Budget::unlimited();
+    let got = Program::new(rels, cycle, &vocab(), &budget);
+    let Err(ProgramError::Invalid {
+        error: IrError::NegativeCycle(c),
+        message,
+        ..
+    }) = &got
+    else {
+        panic!("{got:?}")
+    };
+    assert!(budget.used() >= message.len() + c.rules.capacity() * size_of::<usize>());
+    drop(got);
+    assert_eq!(budget.used(), 0);
+    // 1,000 premises over distinct relations, a value computed from them, 1,000 heads
+    // of it and an existential
+    let mut many = Relations::default();
+    let ids: Vec<RelId> = (0..1_000)
+        .map(|i| many.declare(&format!("r{i}"), 1, false).unwrap())
+        .collect();
+    let q = many.declare("q", 1, false).unwrap();
+    let s2 = many.declare("s", 2, false).unwrap();
+    let y = V(1);
+    let mut body: Vec<Literal> = ids.iter().map(|&i| pos(IAtom::rel(i, &[x]))).collect();
+    body.push(bi(B::MakeSkolem, &[y, x]));
+    let mut heads: Vec<Head> = (0..1_000).map(|_| head(IAtom::rel(q, &[y]))).collect();
+    heads.push(head(IAtom::rel(s2, &[y, V(2)])));
+    let wide = exists(rule("wide", body, heads), &[2]);
+    let budget = Budget::unlimited();
+    let (got, heap) = crate::alloc_probe::peak_of(|| {
+        acyclic::check(std::slice::from_ref(&wide), &vocab(), &budget).is_ok()
+    });
+    assert!(got);
+    assert!(
+        heap <= budget.peak(),
+        "heap {heap}, charged {}",
+        budget.peak()
+    );
+}

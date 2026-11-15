@@ -125,8 +125,11 @@ impl Positions {
     }
 }
 
-fn bound(rules: &[Rule]) -> (usize, usize, usize) {
-    let (mut positions, mut edges, mut scratch) = (8usize, 0usize, 0usize);
+/// The bounds of the graph of `rules`: positions, edges, and the largest body list, head
+/// list and variable count of a rule.
+fn bound(rules: &[Rule]) -> (usize, usize, Scratch) {
+    let (mut positions, mut edges) = (8usize, 0usize);
+    let mut scratch = Scratch::default();
     for r in rules {
         let mut body = 0usize;
         let mut head = 0usize;
@@ -148,36 +151,76 @@ fn bound(rules: &[Rule]) -> (usize, usize, usize) {
         // existential, for each pair of a body and a head position, and a list member's edge
         // for each head action
         edges += 3 * body * head + head;
-        // the sources of each variable, at most one per body position, the frontier and
-        // the body and head lists
-        scratch = scratch.max((r.nvars + 2) * body + 2 * head);
+        scratch.body = scratch.body.max(body);
+        scratch.head = scratch.head.max(head);
+        scratch.vars = scratch.vars.max(r.nvars);
     }
     // the bridges of every column to `ReadAll` and from `Any`
     edges += 3 * positions;
     (positions, edges, scratch)
 }
 
+/// The largest body list, head list and variable count of a rule.
+#[derive(Default, Clone, Copy)]
+struct Scratch {
+    body: usize,
+    head: usize,
+    vars: usize,
+}
+
+impl Scratch {
+    /// The bytes of a rule's working lists: the body and head lists; each variable's
+    /// sources, a set of the rule's body positions that may double as it grows; four
+    /// lists of distinct body positions (all of them, a builtin's inputs, a merge, the
+    /// frontier) and the replaced sources a merge frees.
+    fn bytes(&self, positions: usize) -> usize {
+        let set = self.body * size_of::<u32>();
+        (self.body + self.head) * size_of::<(usize, u32)>()
+            + self.vars * (size_of::<Vec<u32>>() + 2 * set)
+            + 5 * set
+            // the marks of the positions a union has taken
+            + positions * size_of::<bool>()
+    }
+}
+
+/// Add the positions of `from` that `into` lacks, with `seen` marking `into`'s positions
+/// while it runs. `into` holds distinct positions of one rule's body, so it never holds
+/// more than the rule has.
+fn union(into: &mut Vec<u32>, from: impl Iterator<Item = u32>, seen: &mut [bool]) {
+    for &p in into.iter() {
+        seen[p as usize] = true;
+    }
+    for p in from {
+        if !std::mem::replace(&mut seen[p as usize], true) {
+            into.push(p);
+        }
+    }
+    for &p in into.iter() {
+        seen[p as usize] = false;
+    }
+}
+
 /// Check that `rules` are weakly acyclic, charging the position graph to `budget`.
 pub(crate) fn check(rules: &[Rule], vocab: &Vocab, budget: &Arc<Budget>) -> Result<(), CheckError> {
     let (positions, edges, scratch) = bound(rules);
-    let nvars = rules.iter().map(|r| r.nvars).max().unwrap_or(0);
     let bytes = table_bytes(table_capacity(positions), size_of::<(Position, u32)>())
         + positions * size_of::<Position>()
         + edges * size_of::<(u32, u32, bool, u32)>()
         + positions * super::strata::SCRATCH_PER_NODE
-        // the body and head lists, the sources and their vectors, the frontier and a
-        // source list being merged, with room for a vector's doubling
-        + 2 * scratch * size_of::<(usize, u32)>()
-        + nvars * size_of::<Vec<u32>>();
+        + scratch.bytes(positions);
     let _held = Held::try_new_exact(budget, bytes)?;
     let mut g = Positions {
         ids: FxHashMap::with_capacity_and_hasher(positions, Default::default()),
         keys: Vec::with_capacity(positions),
         edges: Vec::with_capacity(edges),
     };
-    let mut body: Vec<(usize, u32)> = Vec::with_capacity(scratch);
-    let mut head: Vec<(usize, u32)> = Vec::with_capacity(scratch);
-    let mut sources: Vec<Vec<u32>> = Vec::with_capacity(nvars);
+    let mut body: Vec<(usize, u32)> = Vec::with_capacity(scratch.body);
+    let mut head: Vec<(usize, u32)> = Vec::with_capacity(scratch.head);
+    let mut sources: Vec<Vec<u32>> = Vec::with_capacity(scratch.vars);
+    let mut seen: Vec<bool> = vec![false; positions];
+    let mut everything: Vec<u32> = Vec::with_capacity(scratch.body);
+    let mut from: Vec<u32> = Vec::with_capacity(scratch.body);
+    let mut frontier: Vec<u32> = Vec::with_capacity(scratch.body);
     // head positions whose values come from list members, with no body variable
     let mut members: Vec<u32> = Vec::new();
     for (ri, r) in rules.iter().enumerate() {
@@ -255,11 +298,10 @@ pub(crate) fn check(rules: &[Rule], vocab: &Vocab, budget: &Arc<Budget>) -> Resu
         sources.clear();
         sources.resize_with(r.nvars, Vec::new);
         for &(v, p) in &body {
-            sources[v].push(p);
+            union(&mut sources[v], std::iter::once(p), &mut seen);
         }
-        let mut everything: Vec<u32> = body.iter().map(|&(_, p)| p).collect();
-        everything.sort_unstable();
-        everything.dedup();
+        everything.clear();
+        union(&mut everything, body.iter().map(|&(_, p)| p), &mut seen);
         for _ in 0..r.body.len() {
             let mut grew = false;
             for l in &r.body {
@@ -267,25 +309,21 @@ pub(crate) fn check(rules: &[Rule], vocab: &Vocab, budget: &Arc<Budget>) -> Resu
                 if selects(b.kind) || b.outputs.is_empty() {
                     continue;
                 }
-                let mut from: Vec<u32> = if b.inputs.is_empty() {
-                    everything.clone()
+                from.clear();
+                if b.inputs.is_empty() {
+                    from.extend_from_slice(&everything);
                 } else {
-                    b.inputs
-                        .iter()
-                        .flat_map(|&v| sources[v].iter().copied())
-                        .collect()
-                };
-                from.sort_unstable();
-                from.dedup();
-                for &o in &b.outputs {
-                    let mut merged = from.clone();
-                    merged.extend(sources[o].iter().copied());
-                    merged.sort_unstable();
-                    merged.dedup();
-                    if merged.len() > sources[o].len() {
-                        sources[o] = merged;
-                        grew = true;
+                    for &v in &b.inputs {
+                        let (src, all) = (&sources[v], &mut from);
+                        union(all, src.iter().copied(), &mut seen);
                     }
+                }
+                for &o in &b.outputs {
+                    let before = sources[o].len();
+                    let mut merged = std::mem::take(&mut sources[o]);
+                    union(&mut merged, from.iter().copied(), &mut seen);
+                    grew |= merged.len() > before;
+                    sources[o] = merged;
                 }
             }
             if !grew {
@@ -293,13 +331,12 @@ pub(crate) fn check(rules: &[Rule], vocab: &Vocab, budget: &Arc<Budget>) -> Resu
             }
         }
         // the sources of the head's values other than its existentials
-        let mut frontier: Vec<u32> = head
-            .iter()
-            .filter(|&&(w, _)| !r.exists.contains(&w))
-            .flat_map(|&(w, _)| sources[w].iter().copied())
-            .collect();
-        frontier.sort_unstable();
-        frontier.dedup();
+        frontier.clear();
+        for &(w, _) in &head {
+            if !r.exists.contains(&w) {
+                union(&mut frontier, sources[w].iter().copied(), &mut seen);
+            }
+        }
         for &(v, to) in &head {
             if r.exists.contains(&v) {
                 for &from in &frontier {

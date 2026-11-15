@@ -559,7 +559,7 @@ impl fmt::Display for ProgramError {
 
 impl ProgramError {
     /// The refusal `error` of `rules`, with its message charged to `budget` before it is
-    /// formatted.
+    /// formatted, with the heap that `error` holds.
     fn invalid(
         error: IrError,
         rules: &[Rule],
@@ -571,7 +571,12 @@ impl ProgramError {
             Ok(len) => len,
             Err(e) => return ProgramError::Memory(e),
         };
-        let held = match Held::try_new_exact(budget, len) {
+        // the heap the error holds, which the error's charge covers from here on
+        let heap = match &error {
+            IrError::NegativeCycle(c) => c.rules.capacity() * size_of::<usize>(),
+            _ => 0,
+        };
+        let held = match Held::try_new_exact(budget, len + heap) {
             Ok(held) => held,
             Err(e) => return ProgramError::Memory(e),
         };
@@ -635,13 +640,17 @@ impl Program {
                 Err(Check::Invalid(e)) => return Err(refuse(e)),
             }
         }
-        let strata = strata::Strata::of(&rules, vocab, budget)?;
+        let mut strata = strata::Strata::of(&rules, vocab, budget)?;
         let ir = rules.iter().any(Rule::uses_ir);
-        if ir
-            && strata.has_negation
-            && let Err(c) = &strata.stratified
-        {
-            return Err(refuse(IrError::NegativeCycle(c.clone())));
+        if ir && strata.has_negation && strata.stratified.is_err() {
+            // the cycle moves into the error, which charges it before the strata release
+            // their charge of it
+            let Err(c) = std::mem::replace(&mut strata.stratified, Ok(())) else {
+                unreachable!("checked above")
+            };
+            let refused = refuse(IrError::NegativeCycle(c));
+            drop(strata);
+            return Err(refused);
         }
         if rules.iter().any(|r| !r.exists.is_empty()) {
             match acyclic::check(&rules, vocab, budget) {
