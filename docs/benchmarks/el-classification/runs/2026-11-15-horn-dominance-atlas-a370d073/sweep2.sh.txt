@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# sweep2.sh SIDE: taxonomies of SIDE (the tip build) against the base on the same files as sweep.sh,
+# on 1 and 8 threads. A base result that sweep.sh or the lane6 run already logged is reused, since bin/base is the
+# same binary; any other base run is made here. Results go to sweep/log-SIDE.txt.
+set -u
+side=$1
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693
+EL=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/el-files
+D753=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/incremental-dl-753/.artifacts/lanes/incremental-dl-753/data
+O=$L/sweep/out; mkdir -p $O
+LOG=$L/sweep/log-$side.txt
+files=$( { echo $D753/go.ofn; echo $D753/chebi_lite.ofn; ls $EL/*; ls $L/data/dev/*; } )
+one() {
+  local n=$1 t=$2 s=$3 f=$4
+  timeout 900 $L/bin/$s --threads $t --taxonomy $O/$n.$s.t$t.tax $f > $O/$n.$s.t$t.json 2> $O/$n.$s.t$t.err
+  local st=$?
+  local sha=$(LC_ALL=C sort $O/$n.$s.t$t.tax 2>/dev/null | sha256sum | cut -c1-16)
+  rm -f $O/$n.$s.t$t.tax
+  echo "$n $t $s $st $sha $(grep '^{' $O/$n.$s.t$t.json | jq -c '[.classifyMs[0],.tier,.conclusions,.conjunctions,.dlOverBudget,.hornOverBudget,.outside]')" >> $LOG
+}
+for f in $files; do
+  n=$(basename $f); n=${n%.*}
+  for t in 1 8; do
+    old=$(cat $L/sweep/log.txt $L/sweep/log2.txt | grep "^$n $t base " | grep -v " base 143 " | head -1)
+    if [ -n "$old" ]; then echo "$old" >> $LOG; else one $n $t base $f; fi
+    one $n $t $side $f
+  done
+done
+echo SWEEP-DONE >> $LOG

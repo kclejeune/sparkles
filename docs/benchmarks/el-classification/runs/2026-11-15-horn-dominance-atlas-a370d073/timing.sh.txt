@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# timing.sh: base a22f6a35 against the lane on the files the lane changes and on GO and ChEBI
+# lite, in interleaved rounds, one process per side, file and thread count. The caller holds
+# ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/horn-cost-693
+F=$HOME/lanes/horn-budget-962/files
+OUT=$D/out/timing; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/*; } > $OUT/before.txt
+small="$D/files/g04281.ofn $D/files/g13278.ofn $D/files/g15813.ofn $D/files/small-13278.ofn"
+big="$F/go.ofn $F/chebi_lite.ofn $F/ore_ont_8737.owl $F/ore_ont_16744.owl $F/ore_ont_9855.owl $HOME/lanes/el-cost-720/data/ore-el/ore_ont_3836.owl $HOME/lanes/el-cost-720/data/ore-el/ore_ont_13482.owl $F/ore_ont_4510.owl $F/ore_ont_12901.owl"
+for round in 1 2 3; do
+  order="base lane"; [ $((round % 2)) -eq 0 ] && order="lane base"
+  for f in $small $big; do
+    n=$(basename $f); n=${n%.*}
+    for t in 1 4; do
+      for tag in $order; do
+        mkdir -p $OUT/r$round/$tag
+        systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 $D/bin/$tag --threads $t --repeat 5 $f > $OUT/r$round/$tag/$n.t$t.json 2> $OUT/r$round/$tag/$n.t$t.err
+        echo "r$round $tag $n t$t status=$?" >> $OUT/log.txt
+      done
+    done
+  done
+done
+# the failed disjunctive attempt: three processes of each side on four threads, alternating
+for round in 1 2 3; do
+  order="base lane"; [ $((round % 2)) -eq 0 ] && order="lane base"
+  for n in ore_ont_14817 ore_ont_9663; do
+    for tag in $order; do
+      mkdir -p $OUT/dl/$tag
+      s=$(date +%s%N)
+      systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+        timeout 900 $D/bin/$tag --threads 4 $F/$n.owl > $OUT/dl/$tag/$n.r$round.json 2> $OUT/dl/$tag/$n.r$round.err
+      st=$?
+      echo "dl r$round $tag $n status=$st wall_ms=$(( ($(date +%s%N) - s) / 1000000 ))" >> $OUT/log.txt
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

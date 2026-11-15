@@ -192,8 +192,8 @@ item 968 follows ChEBI lite's 1.9% on four threads.
 
 Item 710 lets the Horn rules pass over a successor that another dominates, as the section
 [The Horn rules](#the-horn-rules) describes with its argument. A generated ontology of 15
-axioms that derived 210 million conclusions in 5.1 s on one thread on the laptop derives 2.0
-million in 72 ms, and the 14,547 generated ontologies of the item's check derive 33 million
+axioms that derived 210 million conclusions in 5.06 s on one thread on `atlas` derives 2.0
+million in 69 ms, and the 14,547 generated ontologies of the item's check derive 33 million
 conclusions in all against 1.19 billion. Item 969 found why the failed disjunctive attempt
 on ore_ont_9663 and ore_ont_14817 took from 10 s to more than 900 s. A product of the Pred
 rule takes one premise from each of its lists, and on ore_ont_14817 thousands of products
@@ -220,10 +220,15 @@ the last, each further union counts toward a bound on derived conclusions, so a 
 run still stops a wide product within its bound. The counting fixtures keep their answers
 on every number of threads, and three more of them, `sriq-004` among them, finish within
 the counting bound, as do seven of 2,145 generated Horn ontologies with a union that meets
-nothing beside them, whose answers equal those of the Horn rules. On the laptop on eight
-threads the classification of ore_ont_14817 takes 7.8 s against 14.6 s, and on one thread
-105 s, where the build before passed a timeout of 900 s. The attempt still passes its
-budget before the Horn rules answer, which item 990 follows.
+nothing beside them, whose answers equal those of the Horn rules. On `atlas` on four
+threads three classifications of ore_ont_14817 take 19.9 to 38.9 s against 59.7 to 79.5 s,
+and on one thread on the laptop the build before passed a timeout of 900 s where this one
+finishes. The attempt still passes its budget before the Horn rules answer, which item 990
+follows. On the Horn files that the sort of successors does not prune, such as
+ore_ont_9855, ore_ont_8737 and GO, the build classifies in 1.01 to 1.06 times the base's
+time on `atlas`, which item 991 follows. The sort and R6's record charge their memory to
+the run in batches of up to 16 KiB per activation, so the run's count lags by that much
+per worker until the activation ends.
 
 Item 753 makes a run after an edit of class axioms
 [keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
@@ -814,14 +819,17 @@ context and keep the successors it extends or merges, so a context collects many
 successors whose roles and cores others contain. Each of them counted for every at-most
 restriction, and R6 identified every pair of a counted successor and a predecessor and
 sent the predecessor the successor's core and a link each time. A generated ontology of
-15 axioms derived 210 million conclusions in 5.1 s on one thread, almost all of them
+15 axioms derived 210 million conclusions in 5.06 s on one thread on `atlas`, almost all of them
 repeated subsumers and links. A successor by `r'` in `N'` dominates one by `r` in `N`
 when `r'` is under `r` and the core of `N` is part of the core of `N'`. A run of the
 Horn rules without individuals, universal properties or functional data properties now
-passes over dominated successors. A context with a universal or an at-most restriction
-sorts its successors as they come into those that another successor dominates and those
-that no other does, and R6 sends a predecessor the core of each successor once. The
-generated ontology then derives 2.0 million conclusions in 72 ms.
+passes over dominated successors. A context sorts its successors into those that another
+successor dominates and those that no other does, as they come when it has an at-most
+restriction and at the end of each activation when it has only universals, and R6 sends a
+predecessor the core of each successor once. Each core carries a signature of one bit for
+each of its expressions, so that most pairs of successors are told apart before their
+roles and cores are compared. The generated ontology then derives 2.0 million conclusions
+in 69 ms.
 
 The argument for completeness rests on one property of such a run. A context's
 subsumers, loops and at-most restrictions follow from its core and from what its

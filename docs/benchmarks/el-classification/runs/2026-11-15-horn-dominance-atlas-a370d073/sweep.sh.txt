@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# sweep.sh: taxonomies of the base and the lane on the ORE 2015 EL files, GO, ChEBI lite and the
+# DL development set, on 1 and 8 threads, one process per side, file and thread count.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693
+EL=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/el-files
+D753=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/incremental-dl-753/.artifacts/lanes/incremental-dl-753/data
+O=$L/sweep/out; mkdir -p $O
+files=$( { echo $D753/go.ofn; echo $D753/chebi_lite.ofn; ls $EL/*; ls $L/data/dev/*; } )
+for f in $files; do
+  n=$(basename $f); n=${n%.*}
+  for t in 1 8; do
+    for side in base lane3; do
+      timeout 900 $L/bin/$side --threads $t --taxonomy $O/$n.$side.t$t.tax $f > $O/$n.$side.t$t.json 2> $O/$n.$side.t$t.err
+      st=$?
+      sha=$(LC_ALL=C sort $O/$n.$side.t$t.tax 2>/dev/null | sha256sum | cut -c1-16)
+      rm -f $O/$n.$side.t$t.tax
+      echo "$n $t $side $st $sha $(grep '^{' $O/$n.$side.t$t.json | jq -c '[.classifyMs[0],.tier,.conclusions,.conjunctions,.dlOverBudget,.hornOverBudget,.outside]')" >> $L/sweep/log.txt
+    done
+  done
+done
+echo SWEEP-DONE >> $L/sweep/log.txt

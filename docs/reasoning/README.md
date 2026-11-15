@@ -929,9 +929,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the EL rules' time, since each context of a conjunction derives its successor's
   subsumers again. Roadmap item 693.
 * The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
-  passes its memory budget before the Horn rules answer. One of them classifies in 7.8
-  seconds on eight threads and 105 seconds on one on a laptop, almost all of it the
-  attempt. Roadmap item 990.
+  passes its memory budget before the Horn rules answer. On four threads one of them
+  classifies in 20 to 39 seconds and the other in about 13, almost all of it the attempt.
+  Roadmap item 990.
+* Horn ontologies whose successors no other successor dominates classify up to 6% slower
+  than without the check for dominated successors, which costs more there than it saves.
+  Roadmap item 991.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
   restrictions over a transitive symmetric role derives each link of the transitive
   closure once per intermediate class, so it sends three billion messages for 32 million

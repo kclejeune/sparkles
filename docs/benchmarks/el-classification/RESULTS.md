@@ -1133,7 +1133,78 @@ answer. Their completed classifications took 10 to 229 s on both builds, the Hor
 run included, and one process of the base on `ore_ont_14817` passed the 900 s timeout, so
 their times are not compared here. Roadmap item 969 follows them.
 
+### Dominated successors and least unions
+
+Roadmap item 710 lets the Horn rules pass over a successor that another dominates, and item
+969 makes a product of the disjunctive rules derive only its least unions. On `atlas` four
+rounds of alternating order with five classifications per process compared the base,
+commit a22f6a35, with the items' build, commit a370d073. Each time below is the median of
+the 20 classifications of a side, and each ratio the median of the four rounds' ratios. The
+conclusions are those of the first round. The two generated ontologies come from the
+item's generator of Horn ontologies with inverse properties, at-most restrictions and
+nested existential restrictions.
+
+| Ontology | Threads | Base ms | Items 710 and 969 ms | Ratio | Conclusions before | Conclusions after |
+|---|---:|---:|---:|---:|---:|---:|
+| `g04281` | 1 | 5,062.5 | 69.4 | 0.014 | 209,787,104 | 1,959,164 |
+| `g04281` | 4 | 1,716.0 | 33.6 | 0.019 | 193,434,969 | 3,377,311 |
+| `g15813` | 1 | 2,980.4 | 49.0 | 0.016 | 115,478,502 | 1,791,747 |
+| `g15813` | 4 | 1,001.9 | 25.1 | 0.025 | 147,788,674 | 2,907,862 |
+
+The same rounds on the Horn files that the sort of successors does not prune, or prunes
+little, give the times below. The round ratios show the spread.
+
+| Ontology | Threads | Base ms | Items 710 and 969 ms | Ratio | Range of the rounds |
+|---|---:|---:|---:|---:|---|
+| GO | 1 | 301.2 | 305.0 | 1.012 | 1.011 to 1.013 |
+| GO | 4 | 117.4 | 120.0 | 1.025 | 1.016 to 1.048 |
+| ChEBI lite | 1 | 917.8 | 943.8 | 1.027 | 1.009 to 1.032 |
+| ChEBI lite | 4 | 426.4 | 425.1 | 0.998 | 0.980 to 1.040 |
+| `ore_ont_9855` | 1 | 1,408.2 | 1,478.6 | 1.050 | 1.046 to 1.051 |
+| `ore_ont_9855` | 4 | 492.3 | 527.6 | 1.062 | 1.040 to 1.097 |
+| `ore_ont_8737` | 1 | 24,477.5 | 25,162.8 | 1.030 | 1.021 to 1.033 |
+| `ore_ont_8737` | 4 | 8,221.8 | 8,558.3 | 1.031 | 1.022 to 1.071 |
+| `ore_ont_16744` | 1 | 8,235.9 | 8,308.6 | 1.009 | 1.008 to 1.010 |
+| `ore_ont_16744` | 4 | 2,762.4 | 2,720.7 | 0.997 | 0.986 to 1.004 |
+| `ore_ont_4510` | 1 | 925.4 | 944.3 | 1.021 | 1.013 to 1.023 |
+| `ore_ont_12901` | 1 | 609.2 | 625.5 | 1.029 | 1.019 to 1.030 |
+
+`ore_ont_9855` derives 21.2 million conclusions against 22.0 million on one thread, and the
+sort costs more than the conclusions it saves. GO derives 2,946,303 conclusions against
+2,948,787, and the other files the same conclusions on one thread. ChEBI lite runs none of the Horn rules that the items change, and on
+`ore_ont_8737` a pinned run on the laptop spends the extra instructions in the worker's
+loop, which the items do not change, so code layout accounts for part of these
+differences. Roadmap item 991 follows them. On four threads `ore_ont_4510` and
+`ore_ont_12901` vary from 0.83 to 1.29 between rounds and are left out of the table.
+
+The disjunctive attempts of `ore_ont_14817` and `ore_ont_9663` pass their budget before the
+Horn rules answer. Three processes of each build on four threads gave the classification
+times below, the attempt included.
+
+| Ontology | Base s | Items 710 and 969 s |
+|---|---|---|
+| `ore_ont_14817` | 59.7, 61.9, 79.5 | 19.9, 37.8, 38.9 |
+| `ore_ont_9663` | 14.7, 33.9, 44.6 | 12.5, 13.1, 13.3 |
+
+The attempt's length on `ore_ont_14817` still depends on the run, and Konclude 0.7.0
+classified the two files in 8.9 to 9.7 s on four threads on the laptop. Roadmap item 990
+follows the attempt.
+
+A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015 EL files and the 207
+files of the DL development set, 499 distinct files, once per build on one and eight
+threads with its taxonomy, against commit efca1c26, whose later commits change only the
+accounting of memory and the inlining of one function. The 993 pairs that both builds
+classified gave the same bytes. On one thread the base passed the 900 s timeout on
+`ore_ont_14817`, whose answer from the items' build equals both builds' answer on eight
+threads, and both builds passed it on `ore_ont_9663`. Both builds passed the 12 GiB cap on
+`ore_ont_7192` on eight threads, and the reader refuses `ore_ont_9881`.
+
 ## Records
+
+The [record of items 710 and 969](runs/2026-11-15-horn-dominance-atlas-a370d073/record.json)
+holds every classification of the rounds on `atlas` of the items' first build, of the build
+before the cheaper sort and of the final build, the disjunctive attempts of both builds,
+the sweep's taxonomy hashes from the laptop and the scripts that ran.
 
 The [record of item 962](runs/2026-11-14-horn-symmetric-atlas-78010ca4/record.json) holds
 every classification of the timing rounds, the sweep's reports and taxonomy hashes on both
