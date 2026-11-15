@@ -9237,7 +9237,9 @@ curl -G localhost:3030/ds/sparql --data-urlencode 'query=ASK { ex:ann ex:teaches
   plain SPARQL over the stored and derived facts and of the `owl-rl` modes. With `ex:q
   rdfs:subPropertyOf ex:p` and two stored `ex:p` objects of `ex:a`, `SELECT ?s { ?s ex:p
   ?o }` gives `ex:a` twice. A solution that leaves a variable to an unnamed individual
-  counts once, and only where no stored fact names that variable.
+  counts once, and only where no stored fact names that variable. Such solutions are
+  checked with `NOT EXISTS` against the branches that name more variables, and the copies
+  of those branches count against `budget.maxUnion`.
 * `budget.maxUnion` in the query-time setting bounds the branches of one pattern's
   rewriting, 1,024 by default. A pattern past it, and one the rewriting cannot express,
   such as one with a variable predicate or class or a predicate of the RDF, RDFS or OWL

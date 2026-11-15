@@ -1074,6 +1074,25 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
             }
         }
     }
+    /// The variables a body binds: those of its triples and the outputs of its builtins.
+    fn bound_by(clauses: &[Clause], out: &mut std::collections::HashSet<String>) {
+        for c in clauses {
+            match c {
+                Clause::Triple(_) => vars(std::slice::from_ref(c), out),
+                Clause::Builtin(b) => {
+                    let outputs = crate::builtins::BuiltinKind::from_name(&b.name)
+                        .map(|k| k.output_positions(b.args.len()))
+                        .unwrap_or_default();
+                    for i in outputs {
+                        if let Some(Node::Var(v)) = b.args.get(i) {
+                            out.insert(v.clone());
+                        }
+                    }
+                }
+                Clause::Rule(_) => {}
+            }
+        }
+    }
     let mut out = Vec::with_capacity(rules.len());
     for r in rules {
         if r.direction == Direction::Forward && deep_backward(&r.head) {
@@ -1125,7 +1144,7 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
                     // binding, which a bottom-up rule does not have
                     let mut bound = std::collections::HashSet::new();
                     let mut head_vars = std::collections::HashSet::new();
-                    vars(&body, &mut bound);
+                    bound_by(&body, &mut bound);
                     vars(&inner.head, &mut head_vars);
                     if let Some(v) = head_vars.iter().find(|v| !bound.contains(*v)) {
                         return Err(refuse(

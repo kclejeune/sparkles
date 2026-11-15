@@ -174,3 +174,20 @@ fn rules_the_split_would_evaluate_unlike_jena_are_refused() {
         );
     }
 }
+
+#[test]
+fn a_head_variable_that_only_a_test_names_is_refused() {
+    let e = Profile::Rules(
+        "@hybrid jena .\n[r: (<urn:a> <urn:t> <urn:b>) -> [(<urn:a> <urn:q> ?x) <- isLiteral(?x)]]"
+            .into(),
+    )
+    .rules()
+    .unwrap_err();
+    assert!(e.message.contains("?x"), "{e}");
+    // an output of a builtin binds its variable
+    Profile::Rules(
+        "@hybrid jena .\n[r: (?a <urn:n> ?n) -> [(?a <urn:m> ?m) <- sum(?n, 1, ?m)]]".into(),
+    )
+    .rules()
+    .unwrap();
+}

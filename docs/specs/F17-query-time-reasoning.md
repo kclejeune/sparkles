@@ -1432,8 +1432,13 @@ the `owl-ql` profile of the query-time setting and of `reasoningProfile`.
    facts gives it. The branches are grouped by the variables they give a value, and a
    group that leaves some to unnamed individuals keeps a row only where `NOT EXISTS`
    finds no row of a group that names more of them with the same values, so it adds a row
-   only where no stored fact names those variables. A pattern that no inclusion changes
-   keeps its form.
+   only where no stored fact names those variables. Inside `NOT EXISTS` a wider branch
+   tests the values that unification gave a variable the row already holds, rather than
+   binding it again. The copies of wider branches count against `budget.maxUnion`, past
+   which the pattern falls back as decision 4 says, and they are charged to the query's
+   memory budget. Each row of such a group evaluates its `NOT EXISTS` with the row's
+   values, which roadmap item 985 can make a single anti-join. A pattern that no inclusion
+   changes keeps its form.
    `lubm_answers_match_an_owl_2_rl_closure_of_the_ql_fragment` compares the rows of the 14
    LUBM queries, with their counts, against the closure, and
    `a_variable_bound_by_stored_facts_keeps_the_rows_of_plain_sparql` and

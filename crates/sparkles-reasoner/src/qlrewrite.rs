@@ -1016,6 +1016,13 @@ fn reserved(iri: &str) -> bool {
     [OWL, RDF, RDFS, XSD].iter().any(|ns| iri.starts_with(ns))
 }
 
+/// One branch of a rewritten pattern: its triple patterns, and the values unification
+/// gave the pattern's variables.
+struct Rendered {
+    patterns: Vec<TriplePattern>,
+    binds: Vec<(u32, Expression)>,
+}
+
 /// What became of one basic graph pattern.
 enum Outcome {
     /// no inclusion changes it
@@ -1231,7 +1238,7 @@ impl Rewriter<'_> {
         // every variable one answers as the stored and derived facts would, and one that
         // leaves some to unnamed individuals answers only where no branch that names more
         // of them gives the same values to the ones it names
-        let mut groups: Vec<(Vec<u32>, GraphPattern)> = Vec::new();
+        let mut groups: Vec<(Vec<u32>, Vec<Rendered>)> = Vec::new();
         for q in &branches {
             let tp = |t: T, rw: &mut Self| -> TermPattern {
                 match t {
@@ -1259,7 +1266,7 @@ impl Rewriter<'_> {
                     },
                 });
             }
-            let mut branch = GraphPattern::Bgp { patterns };
+            let mut binds: Vec<(u32, Expression)> = Vec::with_capacity(q.binds.len());
             for &(v, t) in &q.binds {
                 let expression = match t {
                     T::Const(c) => match &bgp.consts[c as usize] {
@@ -1270,46 +1277,92 @@ impl Rewriter<'_> {
                     T::Var(w) => Expression::Variable(names[w as usize].clone()),
                     T::Free => continue,
                 };
-                branch = GraphPattern::Extend {
-                    inner: Box::new(branch),
-                    variable: names[v as usize].clone(),
-                    expression,
-                };
+                binds.push((v, expression));
             }
             let mut set: Vec<u32> = q.bound_vars().into_iter().collect();
             set.sort_unstable();
+            let b = Rendered { patterns, binds };
             match groups.iter_mut().find(|(s, _)| *s == set) {
-                Some((_, u)) => {
-                    let left = std::mem::replace(u, GraphPattern::Bgp { patterns: vec![] });
-                    *u = GraphPattern::Union {
-                        left: Box::new(left),
-                        right: Box::new(branch),
-                    };
-                }
-                None => groups.push((set, branch)),
+                Some((_, g)) => g.push(b),
+                None => groups.push((set, vec![b])),
             }
         }
+        // a branch's bindings: `BIND` for a variable the branch gives its value, and a
+        // test of the value for one that the row of an outer `NOT EXISTS` already holds,
+        // since a substituted variable cannot be bound again
+        let render = |b: &Rendered, outer: &[u32]| -> GraphPattern {
+            let mut gp = GraphPattern::Bgp {
+                patterns: b.patterns.clone(),
+            };
+            for (v, e) in &b.binds {
+                let var = names[*v as usize].clone();
+                gp = if outer.contains(v) {
+                    GraphPattern::Filter {
+                        expr: Expression::SameTerm(
+                            Box::new(Expression::Variable(var)),
+                            Box::new(e.clone()),
+                        ),
+                        inner: Box::new(gp),
+                    }
+                } else {
+                    GraphPattern::Extend {
+                        inner: Box::new(gp),
+                        variable: var,
+                        expression: e.clone(),
+                    }
+                };
+            }
+            gp
+        };
         let union_of = |ps: Vec<GraphPattern>| {
             ps.into_iter().reduce(|l, r| GraphPattern::Union {
                 left: Box::new(l),
                 right: Box::new(r),
             })
         };
+        // the algebra the wider groups repeat is bounded like the branches: past
+        // `budget.maxUnion` branch copies the pattern falls back, and each copy is charged
+        let mut copies = 0usize;
+        for (set, _) in &groups {
+            for (s, g) in &groups {
+                if s.len() > set.len() && set.iter().all(|v| s.contains(v)) {
+                    copies += g.len();
+                }
+            }
+        }
+        if copies > self.max_union {
+            return Ok(Outcome::Derive(format!(
+                "the rows it leaves to unnamed individuals need {copies} copies of its \
+                 branches, past budget.maxUnion ({})",
+                self.max_union
+            )));
+        }
+        let per_copy = branches
+            .iter()
+            .map(|q| q.atoms.len() * 256 + q.binds.len() * 128 + 64)
+            .max()
+            .unwrap_or(0);
+        self.budget
+            .try_charge(copies.saturating_mul(per_copy))
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
         let mut parts = Vec::with_capacity(groups.len());
-        for (set, gp) in &groups {
+        for (set, group) in &groups {
+            (self.stop)()?;
+            let own = union_of(group.iter().map(|b| render(b, &[])).collect())
+                .expect("a group has a branch");
             // the groups that name every variable of this one and more
             let wider: Vec<GraphPattern> = groups
                 .iter()
                 .filter(|(s, _)| s.len() > set.len() && set.iter().all(|v| s.contains(v)))
-                .map(|(_, g)| g.clone())
+                .flat_map(|(_, g)| g.iter().map(|b| render(b, set)))
                 .collect();
             parts.push(match union_of(wider) {
-                None => gp.clone(),
+                None => own,
                 // NOT EXISTS reads the wider groups with this row's values, so a row that
                 // names nothing is dropped whenever a wider group has any row
                 Some(w) => GraphPattern::Filter {
                     expr: Expression::Not(Box::new(Expression::Exists(Box::new(w)))),
-                    inner: Box::new(gp.clone()),
+                    inner: Box::new(own),
                 },
             });
         }

@@ -508,3 +508,41 @@ fn an_existential_row_gives_way_to_any_row_that_names_more() {
     ));
     assert_eq!(got, vec![format!("<{EX}a>"), format!("<{EX}a>")]);
 }
+
+/// A wider branch's bindings are tests of a row's values inside NOT EXISTS, so a branch
+/// that unification bound to other constants does not drop the row.
+#[test]
+fn a_bound_wider_branch_keeps_rows_with_other_values() {
+    let ttl = "ex:A a owl:Class . ex:p a owl:ObjectProperty .
+               ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ;
+                   owl:someValuesFrom owl:Thing ] .
+               ex:a a ex:A . ex:c ex:p ex:d .";
+    let got = rows(&run(
+        &store(ttl),
+        "SELECT ?s { ?s ex:p ?o . ex:c ex:p ex:d }",
+        &ql(None),
+    ));
+    assert_eq!(got, vec![format!("<{EX}a>"), format!("<{EX}c>")]);
+}
+
+/// Copies of wider branches count against `budget.maxUnion`, past which the pattern
+/// falls back to the `owl-rl` demand program with a warning.
+#[test]
+fn copies_of_wider_branches_count_against_the_bound() {
+    let mut onto = String::new();
+    let mut q = String::from("ASK { ");
+    for i in 0..10 {
+        onto.push_str(&format!(
+            "ex:A{i} a owl:Class . ex:p{i} a owl:ObjectProperty .
+             ex:A{i} rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p{i} ;
+                 owl:someValuesFrom owl:Thing ] . ex:a a ex:A{i} .\n"
+        ));
+        q.push_str(&format!("ex:a ex:p{i} ?v{i} . "));
+    }
+    q.push('}');
+    // the owl-rl fallback cannot use the existentials, as its warning says
+    let r = run(&store(&onto), &q, &ql(Some(2048)));
+    assert!(!r.boolean);
+    let warned = format!("{:?}", r.plan().warnings);
+    assert!(warned.contains("copies"), "{warned}");
+}
