@@ -5,7 +5,7 @@
 > **Phases:** Demand derivation, Jena backward rules, tables cached per snapshot and
 > view, budgets and EXPLAIN are available, with `auto`, its cost model and the dataset
 > setting, reuse of tables across commits, the MCP argument and the Fuseki converter's
-> rule modes, and the UI selector. Hybrid execution and OWL 2 QL rewriting remain planned
+> rule modes, the UI selector and OWL 2 QL rewriting. Hybrid execution remains planned
 > in Phase 2. Incremental maintenance through F13 and later
 > provenance remain planned in Phase 3.
 >
@@ -1132,8 +1132,8 @@ demand program with its seeds fixed.
 The profile check that §7 and §10 place in `qlrewrite.rs` is F21's
 `sparkles_owl::profiles::partition` with OWL 2 QL, delivered with F21 Phase 2. It splits
 the ontology's axioms into those the QL grammar allows, which PerfectRef is to read, and
-the violations of the others, which the status is to list. The `owl-ql` mode and its
-rewriting remain in Phase 2 of this spec, roadmap item 19.
+the violations of the others, which the status lists. The rewriting reads `inside`, as
+[OWL 2 QL rewriting](#owl-2-ql-rewriting) records.
 
 ### Scope changes
 
@@ -1143,8 +1143,8 @@ rewriting remain in Phase 2 of this spec, roadmap item 19.
 
 **Built** for roadmap item 19. `reasoning=auto` (§2.1, §4) and the dataset setting (§2.2)
 are available. The sections after this one record the reuse of tables across commits
-(§6.2), the MCP argument, the G08 mapping and the UI selector. Hybrid Jena rules (§5.2)
-and OWL 2 QL rewriting (§7) remain in Phase 2.
+(§6.2), the MCP argument, the G08 mapping, the UI selector and OWL 2 QL rewriting (§7).
+Hybrid Jena rules (§5.2) remain in Phase 2.
 
 * **The choice.** `crates/sparkles/src/reasoning/auto.rs` wraps the dataset's query-time
   reasoner. When a query starts, it decides for the snapshot the query reads whether the
@@ -1360,12 +1360,88 @@ in the query-time setting, and the forward modes keep materialized reasoning. Th
 [G08 Outcome](G08-fuseki-configuration.md#rule-modes-and-query-time-reasoning) records the
 files the converter writes.
 
+### OWL 2 QL rewriting
+
+**Built** for roadmap item 19 (§7), in `crates/sparkles-reasoner/src/qlrewrite.rs`, with
+the `owl-ql` profile of the query-time setting and of `reasoningProfile`.
+
+* **The hook.** `ReasoningProvider::rewrite` gives a provider the parsed query and the
+  session request before planning, and the engine plans the query it returns. The
+  rewritten query names the basic graph patterns left for derivation, and the demand
+  path collects only those and the property paths. A query with none starts no session,
+  so its header reports `derived=0; tables=0`.
+* **The TBox.** The terminology of the input graphs is read by predicate, from the
+  structural predicates of OWL and RDFS and the `rdf:type` triples of their structural
+  types, and `sparkles-owl` maps it to axioms. F21's partition keeps the axioms of OWL 2
+  QL, and their positive inclusions are kept in DL-Lite_R form, with a fresh property for
+  each qualified existential on the right. The triples read are charged to the query's
+  memory budget, and the TBoxes of the last 8 generation, commit, view and input-graph
+  keys are kept, which `tables::clear` drops.
+* **The rewriting.** PerfectRef replaces atoms by the atoms that imply them and unifies
+  pairs of atoms until no new query appears. A distinguished variable that a unification
+  binds is bound again with `BIND`. A branch that names a fresh property is dropped, and
+  so is a branch whose atoms hold another's with the same bindings. A rewritten pattern is
+  `DISTINCT` over the projection of its distinguished variables of the union. EXPLAIN
+  shows a `Rewrite` node per pattern with its branches, and the rewritten algebra.
+* **Limits.** `budget.maxUnion` counts the queries the procedure makes, before the
+  pruning, and the rewriting checks the query's stop function every 64 queries and while
+  it reads the terminology.
+
+**Decisions where this spec left the choice open.**
+
+1. A materialization refuses `owl-ql`. Its rules for the patterns the rewriting leaves
+   are those of `owl-rl`, and a materialization under the other name would hold the same
+   facts while `auto` read it as a different profile. `auto` with `owl-ql` reads no
+   materialization and behaves as `demand`.
+2. A variable is distinguished when the query uses it anywhere outside its pattern, which
+   the count of its occurrences in the query's SSE form decides, and every variable is
+   when the query uses `COUNT(*)`. The count errs towards distinguished, which can only
+   withhold an answer that needs an unnamed individual. The projection that ASK wraps its
+   pattern in does not count.
+3. A rewritten pattern gives each solution of its distinguished variables once, since
+   certain answers are a set and an existential variable has no named value to count. A
+   pattern that no inclusion changes keeps its form and its multiplicities.
+4. §7 sends a pattern past the bound to the `owl-rl` demand program. The same fallback
+   takes a pattern that PerfectRef cannot express: a variable predicate or class, a class
+   or property of the RDF, RDFS or OWL vocabularies, or an RDF-star term. Property paths
+   are derived as under `owl-rl`, and patterns inside `GRAPH` read the stored facts, as
+   demand derivation reads them.
+5. §7's check runs when the setting is read rather than on each change of an ontology
+   graph. `GET` and `PUT /$/reason/{ds}/query` list the axioms outside the profile, those
+   the rewriting does not use and the terminology triples that map to no axiom, for the
+   graphs the caller reads, and every query's warnings count them. Roadmap item 985 covers
+   a check recorded with each change.
+6. Reflexive properties and inclusions with `owl:Thing` on the left are not used, since a
+   union of patterns over the stored facts cannot name every individual. They are listed
+   with the unused axioms. Roadmap item 985.
+7. The ontology comes from the input graphs, and the rewritten patterns read the query's
+   default graph. The data of a named data graph is read only when the default graph is
+   the union. Roadmap item 985.
+
+**Acceptance.** A8 holds in
+`a8_an_existential_answers_ask_and_not_a_distinguished_variable`
+(`crates/sparkles-reasoner/tests/ql_rewrite.rs`), which also shows that `owl-rl` answers
+the ASK false. `lubm_answers_match_an_owl_2_rl_closure_of_the_ql_fragment` writes the OWL
+2 QL axioms of LUBM's ontology back as triples, materializes them with `owl-rl` over one
+university, and finds the answers of all 14 LUBM queries under `owl-ql` over the whole
+ontology equal to that closure's, with nothing derived. The other tests there cover a
+union that gives each answer once, the fallback past the bound with its warning,
+cancellation and the refusal of a materialization, and the unit tests in
+`qlrewrite/tests.rs` cover inverses, subproperties, qualified existentials, the
+distinguished variables and the patterns left for derivation. `w3c_owl_ql.rs` runs the
+positive and negative entailment cases of the W3C OWL 2 test cases in the QL profile
+whose conclusions are facts about individuals, with `SPARKLES_OWL2_TESTS` set: three pass,
+and `New-Feature-ReflexiveProperty-001` is a known difference, decision 6. Fifteen cases
+conclude axioms, which only a classifier answers, or have no conclusion. Over HTTP,
+`owl_ql_rewriting_over_http` checks the setting's `owlQl` member, A8 and the refusal of a
+materialization. Item 794 compares the answers and times with Ontop.
+
 ### The UI selector
 
 **Built** for roadmap item 19 (§2.1, §10). The query page's **Options** menu has a
 **Reasoning** select with the dataset default, off, materialized, demand and auto, and a
-**Profile** select under demand and auto with the dataset's profile, `rdfs`, `rdfs-simple`
-and `owl-rl`. The page sends `reasoning` and `reasoningProfile` to `/{ds}/sparql`,
+**Profile** select under demand and auto with the dataset's profile, `rdfs`, `rdfs-simple`,
+`owl-rl` and `owl-ql`. The page sends `reasoning` and `reasoningProfile` to `/{ds}/sparql`,
 `/{ds}/explain`, stored queries and downloads, and a download of a result uses the mode
 and profile the result ran with, which the page reads once when the query starts. The
 endpoints that take only a boolean, such as the Ask bar's checks, the diagnosis of an

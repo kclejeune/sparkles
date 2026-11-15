@@ -60,6 +60,8 @@ struct Shared {
     digest: u64,
     max_derived: usize,
     max_iterations: usize,
+    /// the most branches of one basic graph pattern's OWL 2 QL rewriting
+    max_union: usize,
     warnings: Vec<String>,
 }
 
@@ -95,6 +97,7 @@ impl QueryReasoner {
                 // a linear chain of n nodes takes n iterations, so the limit of derived
                 // facts and the query's deadline bound the run instead
                 max_iterations: usize::MAX,
+                max_union: crate::qlrewrite::DEFAULT_MAX_UNION,
                 warnings,
             }),
         })
@@ -115,9 +118,46 @@ impl QueryReasoner {
                 digest: s.digest,
                 max_derived: n,
                 max_iterations: s.max_iterations,
+                max_union: s.max_union,
                 warnings: s.warnings.clone(),
             }),
         }
+    }
+
+    /// The same reasoner with at most `n` branches in the OWL 2 QL rewriting of one basic
+    /// graph pattern (`budget.maxUnion`, spec F17 §7). Only the `owl-ql` profile rewrites.
+    pub fn with_max_union(self, n: usize) -> QueryReasoner {
+        let s = &self.shared;
+        QueryReasoner {
+            shared: Arc::new(Shared {
+                profile: s.profile.clone(),
+                extras: s.extras.clone(),
+                rules: s.rules.clone(),
+                sources: s.sources.clone(),
+                geo_default: s.geo_default,
+                inputs: s.inputs.clone(),
+                digest: s.digest,
+                max_derived: s.max_derived,
+                max_iterations: s.max_iterations,
+                max_union: n.max(1),
+                warnings: s.warnings.clone(),
+            }),
+        }
+    }
+
+    /// The most branches of one basic graph pattern's OWL 2 QL rewriting.
+    pub fn max_union(&self) -> usize {
+        self.shared.max_union
+    }
+
+    /// Under `owl-ql`, the OWL 2 QL TBox of the input graphs that the caller of `req`
+    /// reads, with the axioms the rewriting ignores (spec F17 §7). `None` for the other
+    /// profiles.
+    pub fn owl_ql_tbox(&self, req: &SessionRequest) -> Result<Option<Arc<crate::qlrewrite::Tbox>>> {
+        if self.shared.profile != Profile::OwlQl {
+            return Ok(None);
+        }
+        crate::qlrewrite::tbox(req, &self.shared.inputs).map(Some)
     }
 
     /// The limit of derived facts per query.
@@ -241,6 +281,20 @@ impl ReasoningProvider for QueryReasoner {
     fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
         Ok(Box::new(Session::new(self.shared.clone(), req)?))
     }
+
+    /// Under `owl-ql`, the query rewritten against the OWL 2 QL axioms of the input
+    /// graphs the caller reads (spec F17 §7).
+    fn rewrite(
+        &self,
+        query: &spargebra::Query,
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
+        if self.shared.profile != Profile::OwlQl {
+            return Ok(None);
+        }
+        let tbox = crate::qlrewrite::tbox(req, &self.shared.inputs)?;
+        crate::qlrewrite::rewrite_query(query, &tbox, self.shared.max_union, &*req.stop)
+    }
 }
 
 impl QueryReasoner {
@@ -267,7 +321,7 @@ fn component(code: &str, msg: impl Into<String>) -> Error {
     Error::Component(Box::new(ComponentError::new("reasoner", code, msg)))
 }
 
-fn memory_error(e: BudgetFailure, what: &str) -> Error {
+pub(crate) fn memory_error(e: BudgetFailure, what: &str) -> Error {
     if let Some(core) = e.core_error() {
         return core;
     }

@@ -1236,7 +1236,7 @@ export type ReasoningMode = 'materialized' | 'demand' | 'auto';
 /** A `reasoning=` value. */
 export type Reasoning = boolean | ReasoningMode;
 /** The profiles a `demand` or `auto` query can name with `reasoningProfile=`. */
-export type QueryTimeProfile = 'rdfs' | 'rdfs-simple' | 'owl-rl';
+export type QueryTimeProfile = 'rdfs' | 'rdfs-simple' | 'owl-rl' | 'owl-ql';
 
 /** What query-time reasoning derived, from the `Sparkles-Reasoning` header (spec F17 §2.3). */
 export type Derivation = {

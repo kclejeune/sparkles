@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### OWL 2 QL rewriting
+
+The `owl-ql` query-time profile rewrites a query against the OWL 2 QL axioms of the
+input graphs with PerfectRef, as part of roadmap item 19. Each basic graph pattern
+becomes a union of patterns over the stored facts that streams, distinguished variables
+are never bound to unnamed individuals, and `budget.maxUnion` bounds the branches, past
+which the `owl-rl` demand program answers with a warning. The setting's `GET` lists the
+axioms outside the profile, a materialization refuses the profile, and the UI offers
+it. The answers of the 14 LUBM queries equal an OWL 2 RL closure of LUBM's OWL 2 QL
+fragment.
+
 ### Query-time reasoning in the UI
 
 The query page's **Options** menu chooses the reasoning of a query as part of roadmap item

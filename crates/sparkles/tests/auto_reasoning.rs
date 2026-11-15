@@ -303,6 +303,7 @@ fn the_setting_budget_bounds_a_derivation() {
         budget: sparkles::reasoning::setting::Budget {
             max_derived: Some(1),
             max_millis: None,
+            max_union: None,
         },
         ..Default::default()
     }))
@@ -324,6 +325,7 @@ fn the_setting_budget_bounds_a_derivation() {
         budget: sparkles::reasoning::setting::Budget {
             max_derived: None,
             max_millis: Some(0),
+            max_union: None,
         },
         ..Default::default()
     }))
@@ -477,6 +479,7 @@ fn concurrent_setting_changes_keep_memory_and_file_equal() {
                             budget: sparkles::reasoning::setting::Budget {
                                 max_derived: Some(1 + i * 10 + t),
                                 max_millis: None,
+                                max_union: None,
                             },
                             ..Default::default()
                         })

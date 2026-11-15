@@ -137,6 +137,14 @@ impl ReasoningProvider for AutoReasoner {
         .then_some(m)
     }
 
+    fn rewrite(
+        &self,
+        query: &spargebra::Query,
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
+        self.inner.rewrite(query, req)
+    }
+
     fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
         let materialization = self.materialization(&req);
         let inner = self.inner.start(req)?;
@@ -211,6 +219,14 @@ impl ReasoningProvider for Limited {
 
     fn reads_all(&self, req: &SessionRequest) -> Option<Materialization> {
         self.inner.reads_all(req)
+    }
+
+    fn rewrite(
+        &self,
+        query: &spargebra::Query,
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
+        self.inner.rewrite(query, req)
     }
 
     fn start(&self, mut req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {

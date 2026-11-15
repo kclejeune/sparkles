@@ -191,6 +191,7 @@
     { value: 'rdfs', label: 'RDFS' },
     { value: 'rdfs-simple', label: 'RDFS simple' },
     { value: 'owl-rl', label: 'OWL 2 RL' },
+    { value: 'owl-ql', label: 'OWL 2 QL' },
   ];
 
   const DEFAULT_QUERY = EXAMPLES[0].query;

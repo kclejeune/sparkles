@@ -93,7 +93,11 @@ request or on every write, and the schema report counts what the data holds.
   Jena backward rules answer this way. `reasoning=auto` reads a fresh materialization
   with the same profile and derives over a stale or absent one or for rules that
   materialization skips, and the dataset's query-time setting makes it the default
-  ([API.md](../API.md#automatic-choice)). The UI's query page chooses the mode and the
+  ([API.md](../API.md#automatic-choice)). The `owl-ql` profile rewrites a query against
+  the ontology's OWL 2 QL axioms with PerfectRef instead of deriving, so an existential
+  restriction answers a pattern whose variable the query does not use elsewhere, and a
+  rewriting past `budget.maxUnion` branches falls back to the `owl-rl` rules with a
+  warning ([API.md](../API.md#owl-2-ql-rewriting)). The UI's query page chooses the mode and the
   profile in its **Options** menu ([query page](../visualization/README.md#query-page)).
   A demand transformation starts from the query's
   constants and bindings and specializes schema relations proven complete. Schema facts
@@ -797,8 +801,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   that falls back reports the full run's peak memory and not the higher peak of the update
   it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
-  Derivation on demand has no OWL 2 QL rewriting, and Jena's hybrid rules are flattened.
-  Roadmap item 19.
+  Jena's hybrid rules are flattened. Roadmap item 19.
+* OWL 2 QL rewriting leaves out reflexive properties, inclusions with `owl:Thing` on the
+  left and triples about undeclared properties, and its rewritten patterns read the
+  query's default graph, not the data of named input graphs. Roadmap item 985.
   `reasoning=auto` reads a materialization that can answer rather than compare costs per
   pattern. Roadmap item 910.
 * A view's tables carry over to another commit only while the rules cannot read or give

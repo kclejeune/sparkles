@@ -1496,7 +1496,7 @@ fn prepare_query_input_policy(
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
 ) -> Result<PreparedQuery> {
-    let (pattern, dataset, base) = split(parsed);
+    let (_, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
     let (demand_opts, rdfs_skipped) = demand_options(opts);
     let mut ctx = make_ctx_input_policy(
@@ -1511,13 +1511,23 @@ fn prepare_query_input_policy(
         ctx.enable_cursor_accounting()?;
         ctx.deadline = opts.effective_deadline(started)?;
     }
+    // a provider that rewrites the query (OWL 2 QL, spec F17 §7) plans the rewritten one
+    let rewritten = match &opts.reasoning {
+        Some(provider) => {
+            reasoning::check_form(parsed)?;
+            reasoning::rewrite(&ctx, provider, parsed, opts)?
+        }
+        None => None,
+    };
+    let parsed = rewritten.as_ref().map_or(parsed, |r| &r.query);
+    let (pattern, _, _) = split(parsed);
     ctx.configure_extensions(pattern);
     if let Some(provider) = &opts.reasoning {
-        reasoning::check_form(parsed)?;
         reasoning::apply(
             &mut ctx,
             provider,
             pattern,
+            rewritten.as_ref(),
             opts,
             dataset,
             base,
@@ -1849,17 +1859,26 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let depth = depth::check_query(&parsed)?;
     depth::with_stack(depth, || {
-        let (pattern, dataset, base) = split(&parsed);
+        let (_, dataset, base) = split(&parsed);
         extensions::check_family(snap.dataset_id)?;
         let (demand_opts, rdfs_skipped) = demand_options(opts);
         let mut ctx = make_ctx(snap, demand_opts.as_ref().unwrap_or(opts), dataset, base)?;
+        let rewritten = match &opts.reasoning {
+            Some(provider) => {
+                reasoning::check_form(&parsed)?;
+                reasoning::rewrite(&ctx, provider, &parsed, opts)?
+            }
+            None => None,
+        };
+        let parsed = rewritten.as_ref().map_or(&parsed, |r| &r.query);
+        let (pattern, _, _) = split(parsed);
         ctx.configure_extensions(pattern);
         if let Some(provider) = &opts.reasoning {
-            reasoning::check_form(&parsed)?;
             reasoning::apply(
                 &mut ctx,
                 provider,
                 pattern,
+                rewritten.as_ref(),
                 opts,
                 dataset,
                 base,
@@ -1869,9 +1888,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         }
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
-        planner.source = Some(&parsed);
+        planner.source = Some(parsed);
         // the shape that execution plans: ASK as a slice of one solution
-        let kind = match &parsed {
+        let kind = match parsed {
             Query::Select { .. } => QueryKind::Select,
             Query::Ask { .. } => QueryKind::Ask,
             Query::Construct { .. } => QueryKind::Construct,

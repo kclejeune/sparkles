@@ -188,6 +188,10 @@ impl Dataset {
                     Some(n) => reasoner.with_max_derived(n),
                     None => reasoner,
                 };
+                let reasoner = match setting.as_ref().and_then(|s| s.budget.max_union) {
+                    Some(n) => reasoner.with_max_union(n),
+                    None => reasoner,
+                };
                 let provider: Arc<dyn ReasoningProvider> = match &mode {
                     ReasoningMode::Auto(_) => Arc::new(super::auto::AutoReasoner::new(
                         reasoner,
