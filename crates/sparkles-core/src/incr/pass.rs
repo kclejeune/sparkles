@@ -156,7 +156,7 @@ pub struct Pass<'a> {
     /// the estimates computed rather than found, for tests
     #[cfg(test)]
     pub estimated: std::cell::Cell<u64>,
-    ctx: Option<Ctx>,
+    ctx: Option<Arc<Ctx>>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
 }
@@ -420,9 +420,10 @@ impl<'a> Pass<'a> {
             c.allow_service = false;
             c.forbid_service = true;
             crate::sparql::restrict_ctx(&mut c, graphs.as_ref())?;
-            self.ctx = Some(c);
+            // Shared, so that an EXISTS pattern pulls only its first solution.
+            self.ctx = Some(c.into_shared());
         }
-        Ok(self.ctx.as_ref().expect("made above"))
+        Ok(self.ctx.as_deref().expect("made above"))
     }
 
     /// Evaluate `e` over rows of `schema` (circuit variables): the id of each value, or
