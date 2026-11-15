@@ -226,9 +226,10 @@ and on one thread on the laptop the build before passed a timeout of 900 s where
 finishes. The attempt still passes its budget before the Horn rules answer, which item 990
 follows. On the Horn files that the sort of successors does not prune, such as
 ore_ont_9855, ore_ont_8737 and GO, the build classifies in 1.01 to 1.06 times the base's
-time on `atlas`, which item 991 follows. The sort and R6's record charge their memory to
-the run in batches of up to 16 KiB per activation, so the run's count lags by that much
-per worker until the activation ends.
+time on `atlas`, which item 991 follows. The sort adds its entries' memory at each check
+of its bounds and at its end, and R6 its record's at the end of each rule. The run's sink
+holds what they add in the activation and charges it once it reaches 16 KiB and when the
+activation ends.
 
 Item 753 makes a run after an edit of class axioms
 [keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
@@ -813,23 +814,20 @@ Two further changes cut the cost of the Horn rules.
   takes as a premise and whose told subsumers every context holds. The rule for a
   universal restriction on an inverse still takes such a filler to the predecessors.
 
-Item 710 found why a few axioms with inverse properties, at-most restrictions and nested
-existential restrictions gave millions of conclusions. R3 and R5 add a successor to a
-context and keep the successors it extends or merges, so a context collects many
-successors whose roles and cores others contain. Each of them counted for every at-most
-restriction, and R6 identified every pair of a counted successor and a predecessor and
-sent the predecessor the successor's core and a link each time. A generated ontology of
-15 axioms derived 210 million conclusions in 5.06 s on one thread on `atlas`, almost all of them
-repeated subsumers and links. A successor by `r'` in `N'` dominates one by `r` in `N`
+R3 and R5 add a successor to a context and keep the successors it extends or merges, so
+a context with inverse properties, at-most restrictions and nested existential
+restrictions can collect many successors whose roles and cores others contain. Counted
+for every at-most restriction, each of them would take R6 to every predecessor, which
+would receive the successor's core and a link each time, and a few axioms would give
+millions of repeated subsumers and links. A successor by `r'` in `N'` dominates one by `r` in `N`
 when `r'` is under `r` and the core of `N` is part of the core of `N'`. A run of the
-Horn rules without individuals, universal properties or functional data properties now
+Horn rules without individuals, universal properties or functional data properties
 passes over dominated successors. A context sorts its successors into those that another
 successor dominates and those that no other does, as they come when it has an at-most
 restriction and at the end of each activation when it has only universals, and R6 sends a
 predecessor the core of each successor once. Each core carries a signature of one bit for
 each of its expressions, so that most pairs of successors are told apart before their
-roles and cores are compared. The generated ontology then derives 2.0 million conclusions
-in 69 ms.
+roles and cores are compared.
 
 The argument for completeness rests on one property of such a run. A context's
 subsumers, loops and at-most restrictions follow from its core and from what its

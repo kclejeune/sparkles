@@ -124,8 +124,8 @@ A run of the Horn rules without individuals passes over a successor whose role a
 another successor's contain, and sends a predecessor each successor's core once (roadmap
 item 710). A generated ontology of 15 axioms that derived 210 million conclusions in 5.1 s
 on one thread on `atlas` derives 2.0 million in 69 ms. A product of the disjunctive rules
-that is not ground forms its unions list after list and derives only the least ones (item
-969), which takes three classifications of `ore_ont_14817` of ORE 2015 on four threads on
+that is not ground forms its unions list after list and keeps only the least unions of each
+step of up to 4,096 unions (item 969), which takes three classifications of `ore_ont_14817` of ORE 2015 on four threads on
 `atlas` from 59.7 to 79.5 s down to 19.9 to 38.9 s. Three more counting fixtures finish
 within the counting bound. Item 990 follows the attempt that still passes its budget.
 The sort of successors charges its memory in batches and passes over most pairs by a

@@ -1136,11 +1136,12 @@ their times are not compared here. Roadmap item 969 follows them.
 ### Dominated successors and least unions
 
 Roadmap item 710 lets the Horn rules pass over a successor that another dominates, and item
-969 makes a product of the disjunctive rules derive only its least unions. On `atlas` four
+969 makes a product of the disjunctive rules keep only the least unions of each step of up
+to 4,096 unions. On `atlas` four
 rounds of alternating order with five classifications per process compared the base,
 commit a22f6a35, with the items' build, commit a370d073. Each time below is the median of
 the 20 classifications of a side, and each ratio the median of the four rounds' ratios. The
-conclusions are those of the first round. The two generated ontologies come from the
+conclusions are the median of the four processes' reports. The two generated ontologies come from the
 item's generator of Horn ontologies with inverse properties, at-most restrictions and
 nested existential restrictions.
 
@@ -1203,8 +1204,9 @@ threads, and both builds passed it on `ore_ont_9663`. Both builds passed the 12 
 
 The [record of items 710 and 969](runs/2026-11-15-horn-dominance-atlas-a370d073/record.json)
 holds every classification of the rounds on `atlas` of the items' first build, of the build
-before the cheaper sort and of the final build, the disjunctive attempts of both builds,
-the sweep's taxonomy hashes from the laptop and the scripts that ran.
+with the cheaper sort before its charges were batched and of the final build, the disjunctive attempts of both builds,
+the sweep's taxonomy hashes and the diagnostic notes from the laptop and the scripts that
+ran.
 
 The [record of item 962](runs/2026-11-14-horn-symmetric-atlas-78010ca4/record.json) holds
 every classification of the timing rounds, the sweep's reports and taxonomy hashes on both
