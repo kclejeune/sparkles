@@ -1,0 +1,22 @@
+| Run | threads | base ms (median, range) | tip ms (median, range) | tip/base | RSS tip/base | digests equal |
+|---|---|---|---|---|---|---|
+| lubm100-owl-rl | 1 | 16472 (16357-16605) | 16431 (16321-16685) | 0.997 | 0.986 | True |
+| lubm100-owl-rl | 20 | 3098 (3083-3142) | 3138 (3092-3185) | 1.013 | 0.996 | True |
+| lubm100-rdfs | 1 | 6060 (6043-6233) | 6054 (6042-6239) | 0.999 | 1.000 | True |
+| lubm100-rdfs | 20 | 1367 (1360-1445) | 1356 (1344-1384) | 0.992 | 1.001 | True |
+| owl2bench5-owl-rl | 1 | 29879 (29815-30012) | 29908 (26873-29952) | 1.001 | 0.999 | True |
+| owl2bench5-owl-rl | 20 | 9657 (9626-9737) | 9599 (9589-9715) | 0.994 | 0.999 | True |
+
+Tail-column probe, best of five runs per process, seconds:
+tail_column_probe arity=2 size=200000 relation_s=0.0034 triples_s=0.0057 ratio=0.595 derived=20000
+tail_column_probe arity=5 size=200000 relation_s=0.4654 triples_s=0.0158 ratio=29.484 derived=20000
+tail_column_probe arity=2 size=200000 relation_s=0.0034 triples_s=0.0058 ratio=0.582 derived=20000
+tail_column_probe arity=5 size=200000 relation_s=0.4653 triples_s=0.0156 ratio=29.801 derived=20000
+
+An earlier build of the phase, aa8f8840, checked relation keys on every variable-predicate fact and measured as follows; f016deb6 checks them only on graphs that hold relations.
+| Run | threads | base ms (median, range) | tip ms (median, range) | tip/base | RSS tip/base | digests equal |
+|---|---|---|---|---|---|---|
+| lubm100-owl-rl | 1 | 16382 (16343-16425) | 16688 (16661-16730) | 1.019 | 0.999 | True |
+| lubm100-owl-rl | 20 | 3118 (3067-3167) | 3099 (3071-3153) | 0.994 | 1.012 | True |
+| lubm100-rdfs | 1 | 6056 (6043-6085) | 6474 (6470-6519) | 1.069 | 0.999 | True |
+| lubm100-rdfs | 20 | 1342 (1327-1391) | 1398 (1331-1409) | 1.042 | 1.000 | True |

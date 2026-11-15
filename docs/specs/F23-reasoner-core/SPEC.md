@@ -356,7 +356,11 @@ relations yet, so only the reasoner's tests reach this path, and incremental upd
 demand, explanations and witnesses follow in later steps. On about 800 random programs
 that stratify, over relations of arities zero to five, triple atoms, recursion and negated
 atoms with wildcards, the runs equal a naive stratified evaluator, and the decoded facts of
-a recursive program over tails are the same at 1, 4 and 16 threads.
+a recursive program over tails are the same at 1, 4 and 16 threads. Full runs of the
+built-in profiles take as long as before, with the same facts and memory, and a join that
+binds only a tail column of a 5-ary relation takes 30 times as long as over tuple triples,
+since it scans the relation until roadmap item 1004 orders the tail columns. The
+[reasoning results](../../benchmarks/reasoning/RESULTS.md) give the numbers.
 
 ### SHACL rules and SPIN
 

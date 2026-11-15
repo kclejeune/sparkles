@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Item 839 Phase 2 gate on atlas, run under ~/lanes/.heavy.lock: base a22f6a35 against the
+# lane tip, LUBM(100) under owl-rl and rdfs and OWL2Bench(5) under owl-rl, full in-memory
+# derivations (lubm infer) at one thread on CPU 2 and at 20 threads on CPUs 0-19, ROUNDS
+# interleaved rounds with the arm order alternating, then the tail-column probe.
+set -uo pipefail
+D=$HOME/lanes/datalog-839
+OWL2=$HOME/lanes/derived-tier-835-data/owl2bench5/base.nt
+TIME=/run/current-system/sw/bin/time
+ROUNDS=${ROUNDS:-4}
+cd "$D" || exit 1
+mkdir -p logs data
+log() { echo "[$(date +%T)] $*" | tee -a progress2.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+B=$D/bin/lubm-base
+if [ ! -d data/lubm100.db ]; then
+  log "generating and loading LUBM(100)"
+  "$B" gen 100 data/lubm100 > data/gen.log 2>&1 || { log "gen failed"; exit 1; }
+  scope "$B" load data/lubm100 100 data/lubm100.db > data/load.log 2>&1 || { log "load failed"; exit 1; }
+fi
+if [ ! -d data/owl2bench5.db ]; then
+  log "loading OWL2Bench(5)"
+  scope "$B" loadfile data/owl2bench5.db "$OWL2" > data/load-owl2.log 2>&1 || { log "load failed"; exit 1; }
+fi
+timed() {
+  local name=$1 arm=$2 cpus=$3 threads=$4; shift 4
+  local rc=0
+  RAYON_NUM_THREADS=$threads SPARKLES_MAX_INFERRED=200000000 scope "$TIME" -v taskset -c "$cpus" "$D/bin/lubm-$arm" "$@" > "logs/$name.out" 2> "logs/$name.err" || rc=$?
+  local rss
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "logs/$name.err")
+  echo "$name rc=$rc rss_kib=$rss $(grep '^infer' "logs/$name.out") load=$(cut -d' ' -f1 /proc/loadavg)" | tee -a results2.txt progress2.log
+}
+for r in $(seq 1 "$ROUNDS"); do
+  if [ $((r % 2)) = 1 ]; then arms="base p2b"; else arms="p2b base"; fi
+  for job in lubm100:owl-rl lubm100:rdfs owl2bench5:owl-rl; do
+    suite=${job%%:*}; profile=${job#*:}
+    for t in 1 20; do
+      cpus=2; [ "$t" = 20 ] && cpus=0-19
+      for arm in $arms; do
+        timed "$suite-$profile-$arm-t$t-r$r" "$arm" "$cpus" "$t" infer "data/$suite.db" "$profile"
+      done
+    done
+  done
+done
+log "probe"
+for r in 1 2; do
+  PROBE_SIZE=200000 scope taskset -c 2 "$D/bin/probe-p2b" --ignored --exact ir::eval_tests::tail_column_probe --nocapture --test-threads 1 2>&1 | grep tail_column_probe | tee -a results2.txt progress2.log
+done
+log "DONE"
