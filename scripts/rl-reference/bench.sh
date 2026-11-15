@@ -133,11 +133,22 @@ exit $rc' capped "logs/$name.events")
   [ "$CAPPED_STATUS" = ok ]
 }
 
+# unverified NAME WHY: a run whose closure the benchmark did not check. The results say
+# so, and the script exits with 1 once they are written.
+UNVERIFIED=0
+unverified() {
+  UNVERIFIED=$((UNVERIFIED + 1))
+  echo "$1: $2" >> "$OUT/results/unverified.txt"
+  log "$1 is not verified, because $2"
+}
+
 # run NAME ROUND THREADS CMD...: one timed engine run, appended to the record. GNU time
 # inside the scope gives the wall time and the peak RSS of the run, whose largest process
 # is the engine. When COUNT_FILE names a file, its number of lines is the run's number of
 # derived triples. When EXPECT is set, a finished run must have derived EXPECT triples,
-# and the record marks whether it did. A run that did not stops the benchmark.
+# and the record marks whether it did. A run that did not stops the benchmark. A run that
+# did not finish, or that has no expected count, counts as unverified, unless REFERENCE
+# says that its closure is the reference of a later comparison triple for triple.
 run() {
   local name=$1 round=$2 threads=$3 rss wall rc=0
   shift 3
@@ -178,6 +189,11 @@ print(f"{entry['run']} round {rnd}, {threads} threads: {st}, {secs if secs is No
       f"peak RSS {int(rss) >> 10 if rss else '?'} MiB, {entry.get('derived_triples', '?')} derived triples")
 sys.exit(0 if agrees else 3)
 EOF
+  if [ "$LAST_STATUS" != ok ]; then
+    unverified "$name" "it ended with $LAST_STATUS"
+  elif [ -z "${EXPECT:-}" ] && [ -z "${REFERENCE:-}" ]; then
+    unverified "$name" "no count was expected of it"
+  fi
   [ "$rc" = 0 ] || die "$name derived $(tail -n 1 "$RECORD" | "$PYTHON" -I -c 'import json, sys; print(json.load(sys.stdin).get("derived_triples"))') triples, not $EXPECT"
   return 0
 }
@@ -238,11 +254,11 @@ nemo_run() {
 check_closure() {
   local db=$1 out=$2 enc=$3 name=$4
   if [ "$LAST_STATUS" != ok ]; then
-    log "the $name run ended with $LAST_STATUS, so its closure is not compared"
+    unverified "check-$name" "the run ended with $LAST_STATUS, so its closure is not compared"
     return 0
   fi
   if [ ! -f "$out/derived.nt" ]; then
-    log "Nemo's run for the $name check did not finish, so the closure is not compared"
+    unverified "check-$name" "Nemo's run for the check did not finish, so the closure is not compared"
     return 0
   fi
   "$SPARKLES" dump --loc "$db" --format nq --out "check-$name.nq" > "logs/check-$name.log" 2>&1 || die "dumping $db failed"
@@ -255,7 +271,7 @@ check_closure() {
 }
 
 # ------------------------------------------------------------------------- preparation
-rm -f "$RECORD"
+rm -f "$RECORD" results/unverified.txt results/check-*.json
 if [ "$INCREMENTAL" = 1 ]; then
   log "materializing the databases for the incremental runs"
   rm -rf full.db minus.db
@@ -277,26 +293,35 @@ for round in $(seq 1 "$RUNS"); do
     [ "$round" != 1 ] || check_closure run.db nemo-full "$WORK/enc-full" "full-t$t"
   done
   [ "$INCREMENTAL" = 1 ] || continue
-  nemo_run minus "$round" "$WORK/enc-minus"
+  # Round 1's Nemo closure of the data without the change, which the deletion of round 1
+  # is compared with triple for triple, gives the count that later rounds must derive.
+  REFERENCE=$([ "$round" != 1 ] || echo 1) nemo_run minus "$round" "$WORK/enc-minus" "${MINUS_DERIVED:-}"
+  if [ "$round" = 1 ] && [ "$LAST_STATUS" = ok ] && [ -f nemo-minus/derived.nt ]; then
+    MINUS_DERIVED=$(wc -l < nemo-minus/derived.nt)
+  fi
 
   rm -rf run.db
   cp -a --reflink=auto minus.db run.db
   "$SPARKLES" update --loc run.db --update "$WORK/insert.ru" > "logs/insert-update-r$round.log" 2>&1 || die "inserting the change failed"
   sync
-  run "sparkles-insert-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile "$PROFILE" --threads "$THREADS" --max-inferred "$MAX_INFERRED"
+  EXPECT=$DERIVED run "sparkles-insert-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile "$PROFILE" --threads "$THREADS" --max-inferred "$MAX_INFERRED"
   [ "$round" != 1 ] || check_closure run.db nemo-full "$WORK/enc-full" insert
 
   rm -rf run.db
   cp -a --reflink=auto full.db run.db
   "$SPARKLES" update --loc run.db --update "$WORK/delete.ru" > "logs/delete-update-r$round.log" 2>&1 || die "deleting the change failed"
   sync
-  run "sparkles-delete-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile "$PROFILE" --threads "$THREADS" --max-inferred "$MAX_INFERRED"
+  EXPECT=${MINUS_DERIVED:-} run "sparkles-delete-r$round" "$round" "$THREADS" "$SPARKLES" infer --loc run.db --profile "$PROFILE" --threads "$THREADS" --max-inferred "$MAX_INFERRED"
   [ "$round" != 1 ] || check_closure run.db nemo-minus "$WORK/enc-minus" delete
 done
 rm -rf run.db full.db minus.db nemo-full nemo-minus
 
 # ----------------------------------------------------------------------------- results
 SPARKLES_COMMIT=${SPARKLES_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2> /dev/null || true)}
+SCOPED=0
+if [ "${SCOPE:-1}" != 0 ] && command -v systemd-run > /dev/null; then SCOPED=1; fi
+KILL_AFTER=${KILL_AFTER:-30}
+export SCOPED KILL_AFTER
 "$PYTHON" -I - "$RECORD" results "$suite" "$scale" "$THREADS" "$SPARKLES" "$NMO" "$PROFILE" "$INCREMENTAL" \
   "$SPARKLES_COMMIT" "$WORK" << 'EOF'
 import hashlib, json, os, platform, statistics, subprocess, sys, time
@@ -326,7 +351,8 @@ def ram_mib():
                 return int(line.split()[1]) >> 10
     except OSError:
         return None
-correctness = {"aligned": compare}
+unverified = open("results/unverified.txt").read().splitlines() if os.path.exists("results/unverified.txt") else []
+correctness = {"aligned": compare, "verified": not unverified, "unverified": unverified}
 if os.path.exists("compare/core.json"):
     correctness["core"] = json.load(open("compare/core.json"))["differences"]["reference"]["total"]
 doc = {
@@ -340,7 +366,9 @@ doc = {
     "config": {"runs": max((r["round"] for r in runs), default=0), "threads": int(threads),
                "incremental": incremental == "1",
                "delta_every": int(os.environ.get("DELTA_EVERY", "100")),
-               "mem_max": os.environ.get("MEM_MAX", "24G"), "run_timeout": int(os.environ.get("RUN_TIMEOUT", "3600")),
+               "mem_max": os.environ.get("MEM_MAX", "24G"), "memory_scope": os.environ.get("SCOPED") == "1",
+               "run_timeout": int(os.environ.get("RUN_TIMEOUT", "3600")),
+               "kill_after": int(os.environ.get("KILL_AFTER", "30")),
                "max_inferred": int(os.environ.get("MAX_INFERRED", "0"))},
     "base_triples": count(f"{work}/base.nt"), "change_triples": count(f"{work}/delta.nt"),
     "derived_triples": compare["sparkles"],
@@ -364,10 +392,16 @@ for (name, t), rs in groups.items():
                 f"{max(rss) >> 10 if rss else ''} | {', '.join(map(str, derived))} |")
 with open(f"{out}/summary.md", "w") as f:
     f.write(f"# {'OWL 2 RL' if profile == 'owl-rl' else 'RDFS'} materialization, {suite}({scale})\n\n")
-    f.write(f"{doc['base_triples']} base triples, {doc['derived_triples']} derived triples, equal on both engines in "
-            f"every run. The change of the incremental runs has {doc['change_triples']} triples. "
+    agreement = ("equal on both engines in every run" if not unverified else
+                 f"equal on both engines in the runs checked, and {len(unverified)} runs or checks are unverified "
+                 "(results/unverified.txt)")
+    f.write(f"{doc['base_triples']} base triples, {doc['derived_triples']} derived triples, {agreement}. The change of the incremental runs has {doc['change_triples']} triples. "
             f"{doc['nemo']['version']} and {doc['sparkles']['version']} at {commit[:8] or 'an unknown commit'} on "
             f"{doc['host']['name']}.\n\n")
     f.write("\n".join(rows) + "\n")
 print(open(f"{out}/summary.md").read())
 EOF
+if [ "$UNVERIFIED" -gt 0 ]; then
+  echo "bench.sh: $UNVERIFIED runs or checks are unverified, see $OUT/results/unverified.txt" >&2
+  exit 1
+fi

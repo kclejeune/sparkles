@@ -19,12 +19,13 @@ reference. Its evaluation agreement allows benchmark results to be published onl
 an application to its vendor at least 30 days in advance, and not under its name without
 the vendor's approval, so its numbers cannot appear here.
 
-VLog is not a reference either, because no build of it can be pinned. Its project
-publishes source tags but no release binaries, nixpkgs has no package, and the build of
-its last release, 1.3.7, clones the default branch of its Trident dependency at build
-time, which in turn fetches its own dependencies the same way. A pinned build would have
-to fetch and patch each of those projects at a fixed commit, and the project has had no
-commit since July 2023.
+VLog is not a reference either, because it has no pinned build to run. Its project
+publishes source tags but no release binaries, and nixpkgs has no package. The build of
+its last release, 1.3.7, clones the default branch of its Trident dependency unless
+Trident is installed beforehand, and Trident clones its Kognac dependency the same way,
+so a pinned build means packaging both projects at fixed commits. The project's Docker
+image has only a `latest` tag, which was last pushed before release 1.3.6, so it names
+no release.
 
 Nemo has no built-in OWL 2 RL. `scripts/rl-reference/owl2rl.rls` writes the OWL 2 RL/RDF
 rules of [OWL 2 Profiles section 4.3](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules)
@@ -60,8 +61,11 @@ default graph as Sparkles stores it after the load, so both engines read the sam
 
 The `rdfs` profile has a reference of its own. `scripts/rl-reference/rdfs.rls` writes the
 RDFS entailment rules of [RDF 1.1 Semantics section 9.2.1](https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative)
-with the axiomatic triples that Sparkles' `rdfs` rule set states, and follows the
-conventions above, so it derives no generalized triple. The recommendation's axioms type
+with the axiomatic triples that Sparkles' `rdfs` rule set states. Like Sparkles, the
+program derives generalized triples, whose subject is a literal or whose predicate is a
+literal or blank node, and uses them as premises, but it writes only the RDF triples of
+the closure. A generalized triple can lead to an RDF one, as when a property's
+superproperty is a blank node with a domain. The recommendation's axioms type
 every container membership property `rdf:_n`, and the program states `rdf:_1` to `rdf:_3`
 and types those that the data uses, as Sparkles does. It leaves out rdfs1 and the
 datatype rules rdfD1 and rdfD2, which Sparkles' rule set also leaves out.
@@ -100,13 +104,18 @@ profile writes its databases, logs and results under a directory of its own name
 - Every timed full run must derive as many triples as the closure check found, which
   Sparkles reports and Nemo's output file holds. In the first round each of Sparkles'
   derived graphs is also compared triple for triple with that round's Nemo closure, so
-  every thread count is checked whole. A run that disagrees stops the benchmark.
+  every thread count is checked whole. A run that disagrees stops the benchmark. A run
+  that did not finish, and a check that therefore could not run, are listed in
+  `results/unverified.txt`, the summary then does not claim agreement for every run, and
+  the runner exits with status 1 once it has written the results.
 - Incremental maintenance takes every hundredth data triple outside the RDF, RDFS and OWL
   vocabularies as the change. It inserts the change into the materialized store without
   it and deletes it from the materialized store with it, and times `sparkles infer` after
   each update. Nemo has no incremental maintenance, so its baseline is a full run on the
   data after the update. The first round compares each maintained closure with Nemo's
-  closure of the same data. `--no-incremental` leaves these runs out.
+  closure of the same data. Each later round's insertion must derive as many triples as
+  the full closure, and its deletion and Nemo's run without the change as many as
+  Nemo's first closure without the change. `--no-incremental` leaves these runs out.
 - GNU time gives each run's wall time and peak resident memory, and each run has its own
   memory-limited systemd scope and a deadline. A run is recorded as out of memory only
   when the scope's `memory.events` records an out-of-memory kill in the scope. The
@@ -128,5 +137,6 @@ the differences, not with the size of the closure.
 
 The runner writes every run to `<profile>/results/rl-reference.json` in its working
 directory, with the host's processor, memory and kernel, the Sparkles binary's version,
-commit and SHA-256, Nemo's version and the run's configuration. It writes the medians to
+commit and SHA-256, Nemo's version and the run's configuration, including whether each
+run had a memory-limited scope. It writes the medians to
 `<profile>/results/summary.md`.
