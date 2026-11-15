@@ -126,6 +126,9 @@ The SvelteKit UI is embedded in the server binary.
   diagnosis of an empty result and the facets read the materialized inferences and derive
   nothing, and the graph lenses read with the dataset's default rather than the result's
   mode. Roadmap item 986.
+
+  ![The query page's Options menu with Demand reasoning and the RDFS profile, over a result whose badge reports 322 derived facts](../images/query-reasoning.png)
+
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.
