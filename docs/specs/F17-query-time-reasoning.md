@@ -1372,8 +1372,9 @@ endpoints that take only a boolean, such as the Ask bar's checks, the diagnosis 
 empty result and the facet panel, get `true` for materialized, `false` for off and nothing
 for the query-time modes. They derive nothing, and without the parameter they read the
 materialized inferences when the dataset has them. The graph lenses of a result read
-`/{ds}/sparql` with `reasoning` true or absent, so the dataset's query-time default
-applies to their reads rather than the result's mode and profile. Roadmap item 986 carries
+asserted edges from `/{ds}/sparql` with `reasoning=false` and check inferred edges with
+the parameter left out, so the dataset's default applies to that check rather than the
+result's mode and profile. Roadmap item 986 carries
 the result's mode and profile to these reads. A result that derived
 facts shows a badge from the `Sparkles-Reasoning` header, which the server now exposes to
 cross-origin pages. A result of `auto` that read a fresh materialization derived nothing
