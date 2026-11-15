@@ -61,7 +61,14 @@ pub(crate) enum LocalTerm {
     BNode,
     /// A rule-level constant, keyed by its original label rather than a session slot.
     RuleBNode(Vec<u8>),
+    /// The tail of a relation fact of arity 3 or more (item 839): its key, `\0tl`, the
+    /// relation's key and the columns after the first, as little-endian `u64`s. It has no
+    /// RDF term and is never written.
+    Tail(Vec<u8>),
 }
+
+/// The prefix of a tail's key.
+const TAIL: &[u8] = b"\0tl";
 
 #[derive(Default)]
 struct Locals {
@@ -112,6 +119,24 @@ impl LocalTable {
             self.segments[k].get_or_init(|| (0..(SEGMENT << k)).map(|_| OnceLock::new()).collect());
         let _ = seg[off].set(t);
     }
+}
+
+/// The length of a tail's key with `cols` columns.
+fn tail_len(cols: usize) -> Option<usize> {
+    cols.checked_add(1)?.checked_mul(8)?.checked_add(TAIL.len())
+}
+
+/// The key of a tail: [`TAIL`], the relation's key and the columns.
+fn tail_key(rel: u64, cols: &[u64]) -> Option<Vec<u8>> {
+    let n = tail_len(cols.len())?;
+    let mut key = Vec::new();
+    key.try_reserve_exact(n).ok()?;
+    key.extend_from_slice(TAIL);
+    key.extend_from_slice(&rel.to_le_bytes());
+    for c in cols {
+        key.extend_from_slice(&c.to_le_bytes());
+    }
+    Some(key)
 }
 
 /// Term context shared by all evaluation threads.
@@ -474,7 +499,10 @@ impl Terms {
                 } else {
                     0
                 };
-                let copy = matches!(term, LocalTerm::Key(_) | LocalTerm::RuleBNode(_));
+                let copy = matches!(
+                    term,
+                    LocalTerm::Key(_) | LocalTerm::RuleBNode(_) | LocalTerm::Tail(_)
+                );
                 let bytes = key
                     .len()
                     .checked_mul(1 + usize::from(copy))
@@ -507,6 +535,7 @@ impl Terms {
                 LocalTerm::Key(_) => LocalTerm::Key(key.clone()),
                 LocalTerm::RuleBNode(_) => LocalTerm::RuleBNode(key.clone()),
                 LocalTerm::BNode => LocalTerm::BNode,
+                LocalTerm::Tail(_) => LocalTerm::Tail(key.clone()),
             };
             self.table.set(n, value);
             l.len += 1;
@@ -572,6 +601,42 @@ impl Terms {
         self.local_keyed(Some(temporary), key, LocalTerm::BNode, true)
     }
 
+    /// The handle of the tail `cols` of a fact of the relation with key `rel`, interned
+    /// when it is new (item 839's plan, §10.2): its key, twice, its map entry and a new
+    /// segment of the table are charged first. The same tail always has the same handle
+    /// while the terms live, whichever thread interns it first.
+    pub fn try_tail(&self, rel: u64, cols: &[u64]) -> Result<u64, BudgetFailure> {
+        let overflow = || BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow);
+        let n = tail_len(cols.len()).ok_or_else(overflow)?;
+        let temporary = Held::try_new_exact(&self.budget(), n)?;
+        let key = tail_key(rel, cols).ok_or_else(overflow)?;
+        self.local_keyed(Some(temporary), key, LocalTerm::Tail(Vec::new()), true)
+    }
+
+    /// The handle of the tail `cols` of relation `rel` if it is interned.
+    pub fn find_tail(&self, rel: u64, cols: &[u64]) -> Option<u64> {
+        let key = tail_key(rel, cols)?;
+        self.locals.read().unwrap().map.get(&key).copied()
+    }
+
+    /// The relation key and the columns of the tail with handle `h`, or `None` when `h`
+    /// is not a tail.
+    pub fn tail(&self, h: u64) -> Option<(u64, impl Iterator<Item = u64> + '_)> {
+        let i = Id(h);
+        if i.tag() != Tag::Local {
+            return None;
+        }
+        let Some(LocalTerm::Tail(k)) = self.table.get(i.payload()) else {
+            return None;
+        };
+        let (words, _) = k[TAIL.len()..].as_chunks::<8>();
+        let (rel, cols) = words.split_first()?;
+        Some((
+            u64::from_le_bytes(*rel),
+            cols.iter().map(|c| u64::from_le_bytes(*c)),
+        ))
+    }
+
     /// A program-local blank constant cannot be recreated by inserting an RDF blank.
     pub fn is_rule_bnode(&self, id: u64) -> bool {
         Id(id).tag() == Tag::Local
@@ -606,7 +671,7 @@ impl Terms {
         match self.table.get(Id(id).payload()) {
             Some(LocalTerm::BNode | LocalTerm::RuleBNode(_)) => Kind::BNode,
             Some(LocalTerm::Key(k)) => key_kind(k),
-            None => Kind::Other,
+            Some(LocalTerm::Tail(_)) | None => Kind::Other,
         }
     }
 
@@ -654,6 +719,7 @@ impl Terms {
                     }
                     Term::BlankNode(BlankNode::new_unchecked(label))
                 }
+                LocalTerm::Tail(_) => return None,
             });
         }
         self.snap.term(i)
@@ -715,7 +781,7 @@ impl Terms {
         match i.tag() {
             Tag::Local => match self.local(id)? {
                 LocalTerm::Key(k) => Some(k),
-                LocalTerm::BNode | LocalTerm::RuleBNode(_) => None,
+                LocalTerm::BNode | LocalTerm::RuleBNode(_) | LocalTerm::Tail(_) => None,
             },
             Tag::Vocab | Tag::Delta => self.snap.key(i).map(|k| k.into_owned()),
             _ => self.snap.term(i).map(|t| id::term_key(&t)),

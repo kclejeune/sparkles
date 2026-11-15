@@ -1781,6 +1781,7 @@ pub(crate) struct Limits {
     pub sampled_planning: bool,
 }
 
+#[derive(Debug)]
 pub(crate) struct Outcome {
     pub iterations: usize,
 }
@@ -2059,8 +2060,15 @@ pub(crate) struct RuleIndex {
 }
 
 impl RuleIndex {
-    /// The index of `rules`, charged to `budget` before it is allocated.
-    pub(crate) fn new(rules: &[CRule], budget: &Arc<Budget>) -> Result<RuleIndex, BudgetFailure> {
+    /// The index of `rules`, charged to `budget` before it is allocated. With `lists`, the
+    /// ids of `rdf:first` and `rdf:rest`, a rule that reads lists is a candidate of the rows
+    /// of both, as [`plan_iteration_with`] replays it for them.
+    pub(crate) fn new_with(
+        rules: &[CRule],
+        budget: &Arc<Budget>,
+        lists: Option<(u64, u64)>,
+    ) -> Result<RuleIndex, BudgetFailure> {
+        let replays = |r: &CRule| lists.is_some() && crate::ir::lower::reads_lists(r);
         let always_rule = |r: &CRule| {
             r.atoms.iter().any(|a| !matches!(a.p, Slot::Const(_)))
                 || implicit_fact_reads(r).next().is_some()
@@ -2070,7 +2078,7 @@ impl RuleIndex {
             if always_rule(r) {
                 n_always += 1;
             } else {
-                n_pairs += r.atoms.len();
+                n_pairs += r.atoms.len() + 2 * usize::from(replays(r));
             }
         }
         let held = Held::try_new(
@@ -2090,6 +2098,10 @@ impl RuleIndex {
                 if let Slot::Const(p) = a.p {
                     pairs.push((p, ri));
                 }
+            }
+            if let Some((first, rest)) = lists.filter(|_| replays(r)) {
+                pairs.push((first, ri));
+                pairs.push((rest, ri));
             }
         }
         pairs.sort_unstable();
@@ -2140,8 +2152,12 @@ impl RuleIndex {
 }
 
 /// The plans of an iteration over the new rows `[ds, de)`: of every rule, or of the rules
-/// `candidates` names, which must hold every rule that has a plan.
-pub(crate) fn plan_iteration(
+/// `candidates` names, which must hold every rule that has a plan. With `lists`, the ids of `rdf:first` and `rdf:rest`, a rule
+/// that reads lists is planned over every fact in an iteration whose delta holds list
+/// cells, since a list cell can be the only new premise of its instance (item 839's plan,
+/// Phase 2).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_iteration_with(
     g: &Graph,
     rules: &[CRule],
     naive: bool,
@@ -2149,6 +2165,7 @@ pub(crate) fn plan_iteration(
     de: u32,
     candidates: Option<&[usize]>,
     sampled: bool,
+    lists: Option<(u64, u64)>,
 ) -> Vec<(usize, Vec<Step>)> {
     let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
     let started = std::time::Instant::now();
@@ -2194,7 +2211,7 @@ pub(crate) fn plan_iteration(
         // An uncovered listForAll also reads positive facts outside the
         // atoms. A relevant implicit delta must reconsider the whole body;
         // one full plan covers its ordinary atom deltas as well.
-        let implicit_delta = implicit_fact_delta(g, r, ds, de);
+        let implicit_delta = implicit_fact_delta(g, r, ds, de) || list_delta(g, r, ds, de, lists);
         if implicit_delta {
             let ranges = vec![(0, de); r.atoms.len()];
             if !empty(r, &ranges, g)
@@ -2251,6 +2268,72 @@ pub(crate) fn run(
     run_observed(g, rules, terms, limits, start, None)
 }
 
+/// Evaluate a program of the IR to its fixpoint (item 839's plan, §1.3 and §10.2). A
+/// program without an IR feature runs as Jena's rules do, in one stratum with Jena's
+/// `noValue`. One with relations and no negation runs its lowered rules in one stratum.
+/// One with an IR feature and a negation runs by strata, each stratum to its fixpoint
+/// before the next, so its negated atoms and its `noValue`s read complete lower strata,
+/// and a warning names each rule of Jena's form whose `noValue` is read that way. The
+/// strata share the run's limits: the inferred facts and the iterations count across
+/// them. In the lowered rules, a rule that reads lists is replayed when list cells
+/// arrive.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn run_program(
+    g: &mut Graph,
+    program: &crate::ir::Program,
+    terms: &Terms,
+    limits: &Limits,
+    warnings: &mut crate::budget::WorkingWarnings,
+) -> anyhow::Result<Outcome> {
+    use crate::ir::lower::Shape;
+    let lowered = program.lower()?;
+    for &ri in &lowered.stratified_novalue {
+        warnings.push_fmt(format_args!(
+            "the noValue of rule '{}' reads complete lower strata, since the program has relations or negated atoms and runs by strata",
+            program.rules[ri].name
+        ))?;
+    }
+    let lists = Some((terms.rdf_first, terms.rdf_rest));
+    match lowered.shape {
+        Shape::Jena => run(g, &lowered.strata[0], terms, limits, None),
+        Shape::Monotone => run_from(
+            g,
+            &lowered.strata[0],
+            terms,
+            limits,
+            None,
+            None,
+            Origin {
+                lists,
+                ..Origin::default()
+            },
+        ),
+        Shape::Strata => {
+            let base_len = g.len();
+            let mut iterations = 0;
+            for rules in &lowered.strata {
+                if rules.is_empty() {
+                    continue;
+                }
+                if limits
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::Relaxed))
+                {
+                    anyhow::bail!("reasoning cancelled");
+                }
+                let origin = Origin {
+                    base_len: Some(base_len),
+                    iterations,
+                    lists,
+                };
+                iterations = run_from(g, rules, terms, limits, None, None, origin)?.iterations;
+            }
+            Ok(Outcome { iterations })
+        }
+    }
+}
+
 /// Observe immutable merge boundaries for the bounded positive proof plan.
 /// With no observer this is exactly the ordinary evaluator.
 pub(crate) fn run_observed(
@@ -2259,11 +2342,37 @@ pub(crate) fn run_observed(
     terms: &Terms,
     limits: &Limits,
     start: Option<u32>,
-    mut boundary: Option<&mut dyn FnMut(u32)>,
+    boundary: Option<&mut dyn FnMut(u32)>,
 ) -> anyhow::Result<Outcome> {
-    let base_len = g.len();
+    run_from(g, rules, terms, limits, start, boundary, Origin::default())
+}
+
+/// Where a run of rules stands in a run of a program by strata (item 839's plan, §1.8):
+/// the length of the graph before the program's first stratum, which the limit of
+/// inferred facts counts from, and the iterations its lower strata took, which the limit
+/// of iterations counts with. With `lists`, the ids of `rdf:first` and `rdf:rest`, rules
+/// that read lists are replayed when list cells arrive ([`plan_iteration_with`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Origin {
+    pub base_len: Option<u32>,
+    pub iterations: usize,
+    pub lists: Option<(u64, u64)>,
+}
+
+/// [`run_observed`] from `origin`.
+pub(crate) fn run_from(
+    g: &mut Graph,
+    rules: &[CRule],
+    terms: &Terms,
+    limits: &Limits,
+    start: Option<u32>,
+    mut boundary: Option<&mut dyn FnMut(u32)>,
+    origin: Origin,
+) -> anyhow::Result<Outcome> {
+    let here = g.len();
+    let base_len = origin.base_len.unwrap_or(here).min(here);
     if let Some(note) = boundary.as_mut() {
-        note(base_len);
+        note(here);
     }
     let abort = AtomicBool::new(false);
     let cancelled = || {
@@ -2272,13 +2381,16 @@ pub(crate) fn run_observed(
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
     };
-    let mut iteration = 0usize;
-    let (mut ds, mut de) = (start.unwrap_or(0).min(base_len), base_len);
+    let mut iteration = origin.iterations;
+    let (mut ds, mut de) = (start.unwrap_or(0).min(here), here);
+    // the run's first iteration, which is naive without a start
+    let first_naive = |iteration: usize| iteration == origin.iterations && start.is_none();
     let memory = |e: BudgetFailure, iteration: usize| -> anyhow::Error {
         e.with_context(format!(" (in iteration {})", iteration + 1))
             .into()
     };
-    let index = RuleIndex::new(rules, &limits.budget).map_err(|e| memory(e, 0))?;
+    let index =
+        RuleIndex::new_with(rules, &limits.budget, origin.lists).map_err(|e| memory(e, 0))?;
     // an observer of merge boundaries needs every fact to follow from the facts before
     // its boundary in one rule step, which a closure does not
     let mut closures = if limits.closures && boundary.is_none() {
@@ -2320,7 +2432,7 @@ pub(crate) fn run_observed(
         }
         // ---- plans for this iteration
         let t_iter = std::time::Instant::now();
-        let naive = iteration == 0 && start.is_none();
+        let naive = first_naive(iteration);
         let candidates = if naive {
             None
         } else {
@@ -2329,7 +2441,7 @@ pub(crate) fn run_observed(
                 .map_err(|e| memory(e, iteration))?
         };
         let mut tasks = match &closures {
-            None if refresh.is_empty() => plan_iteration(
+            None if refresh.is_empty() => plan_iteration_with(
                 g,
                 rules,
                 naive,
@@ -2337,6 +2449,7 @@ pub(crate) fn run_observed(
                 de,
                 candidates.as_ref().map(|(c, _)| c.as_slice()),
                 limits.sampled_planning,
+                origin.lists,
             ),
             _ => {
                 let keep = |ri: &usize| {
@@ -2346,7 +2459,7 @@ pub(crate) fn run_observed(
                     Some((c, _)) => c.iter().copied().filter(keep).collect(),
                     None => (0..rules.len()).filter(keep).collect(),
                 };
-                plan_iteration(
+                plan_iteration_with(
                     g,
                     rules,
                     naive,
@@ -2354,11 +2467,12 @@ pub(crate) fn run_observed(
                     de,
                     Some(&list),
                     limits.sampled_planning,
+                    origin.lists,
                 )
             }
         };
         if !refresh.is_empty() {
-            tasks.extend(plan_iteration(
+            tasks.extend(plan_iteration_with(
                 g,
                 rules,
                 true,
@@ -2366,6 +2480,7 @@ pub(crate) fn run_observed(
                 de,
                 Some(&refresh),
                 limits.sampled_planning,
+                origin.lists,
             ));
             refresh.clear();
         }
@@ -2394,7 +2509,7 @@ pub(crate) fn run_observed(
                 terms,
                 &tasks,
                 iteration,
-                !(iteration == 0 && start.is_none()),
+                !first_naive(iteration),
                 ds,
                 de,
             );
@@ -2411,8 +2526,7 @@ pub(crate) fn run_observed(
             // a first step with few candidates followed by a large join runs on one
             // thread: then the bindings up to the next atom are worked out first, and the
             // work is split on that atom's candidates
-            let implicit_replay =
-                !(iteration == 0 && start.is_none()) && implicit_fact_delta(gr, r, ds, de);
+            let implicit_replay = !first_naive(iteration) && implicit_fact_delta(gr, r, ds, de);
             // Prefix bindings do not retain their consumed-delta bit. Replays
             // still shard first-atom candidates but traverse each binding whole.
             let deeper = (!implicit_replay && first.len() < split_min)
@@ -2513,7 +2627,13 @@ pub(crate) fn run_observed(
                 );
                 // Facts are immutable until the merge, so this is the same
                 // replay classification used for planning and work splitting.
-                if !(iteration == 0 && start.is_none()) && implicit_fact_delta(gr, r, ds, de) {
+                // a replay for list cells fires every instance it finds, since a list
+                // cell it reads may be the instance's only new premise and the
+                // consumed-delta filter does not see list cells
+                if !first_naive(iteration)
+                    && implicit_fact_delta(gr, r, ds, de)
+                    && !list_delta(gr, r, ds, de, origin.lists)
+                {
                     ev.delta_since = Some(ds);
                 }
                 if item.b.is_empty() {
@@ -2732,6 +2852,9 @@ pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
             B::NoValue => "noValue is not monotonic",
             B::Now => "now gives a new value in each run",
             B::MakeTemp | B::MakeSkolem => "it creates blank nodes",
+            B::RelTail | B::RelTuple | B::RelAbsent => {
+                "relations and negated atoms are not maintained incrementally"
+            }
             B::ListForAll if !list_for_all_covered(r, b) => {
                 "its listForAll reads facts that no atom of the rule matches"
             }
@@ -2790,6 +2913,15 @@ fn implicit_fact_builtins(r: &CRule) -> impl Iterator<Item = (&CBuiltin, Atom)> 
 
 pub(crate) fn implicit_fact_reads(r: &CRule) -> impl Iterator<Item = Atom> + '_ {
     implicit_fact_builtins(r).map(|(_, read)| read)
+}
+
+/// Whether rule `r` reads lists and the facts `[start, end)` hold list cells, when the run
+/// replays list reads (`lists` holds `rdf:first` and `rdf:rest`).
+fn list_delta(g: &Graph, r: &CRule, start: u32, end: u32, lists: Option<(u64, u64)>) -> bool {
+    lists.is_some_and(|(first, rest)| {
+        crate::ir::lower::reads_lists(r)
+            && (g.count_p(first, start, end) > 0 || g.count_p(rest, start, end) > 0)
+    })
 }
 
 fn implicit_fact_delta(g: &Graph, r: &CRule, start: u32, end: u32) -> bool {
@@ -3002,7 +3134,7 @@ mod index_tests {
             let mut r = Rng(seed * 7_919 + 1);
             let rules: Vec<CRule> = (0..1 + r.below(40)).map(|_| rule(&mut r)).collect();
             let budget = Budget::unlimited();
-            let index = RuleIndex::new(&rules, &budget).unwrap();
+            let index = RuleIndex::new_with(&rules, &budget, None).unwrap();
             let mut g = Graph::default();
             let n = r.below(200);
             g.add_batch((0..n).map(|_| [1 + r.below(8), 100 + r.below(12), 1 + r.below(8)]));
@@ -3015,7 +3147,7 @@ mod index_tests {
                 } else {
                     index.candidates(&g, ds, &budget).unwrap()
                 };
-                let indexed = plan_iteration(
+                let indexed = plan_iteration_with(
                     &g,
                     &rules,
                     naive,
@@ -3023,8 +3155,9 @@ mod index_tests {
                     de,
                     candidates.as_ref().map(|(c, _)| c.as_slice()),
                     false,
+                    None,
                 );
-                let every = plan_iteration(&g, &rules, naive, ds, de, None, false);
+                let every = plan_iteration_with(&g, &rules, naive, ds, de, None, false, None);
                 planned += every.len();
                 skipped += candidates
                     .as_ref()
@@ -3047,9 +3180,9 @@ mod index_tests {
         let mut r = Rng(17);
         let rules: Vec<CRule> = (0..400).map(|_| rule(&mut r)).collect();
         let tight = Budget::new(Some(64));
-        assert!(RuleIndex::new(&rules, &tight).is_err());
+        assert!(RuleIndex::new_with(&rules, &tight, None).is_err());
         let budget = Budget::unlimited();
-        let index = RuleIndex::new(&rules, &budget).unwrap();
+        let index = RuleIndex::new_with(&rules, &budget, None).unwrap();
         let after_index = budget.used();
         assert!(after_index > 0);
         let mut g = Graph::default();
@@ -3062,7 +3195,7 @@ mod index_tests {
         drop(index);
         assert_eq!(budget.used(), 0);
         let small = Budget::new(Some(1 << 20));
-        let index = RuleIndex::new(&rules, &small).unwrap();
+        let index = RuleIndex::new_with(&rules, &small, None).unwrap();
         let _rest = Held::try_new(&small, small.available()).unwrap();
         assert!(index.candidates(&g, 0, &small).is_err());
     }

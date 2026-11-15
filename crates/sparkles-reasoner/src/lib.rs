@@ -1652,6 +1652,9 @@ fn store_ids(
                     let id = match terms.local(x) {
                         Some(LocalTerm::Key(k)) => txn.intern_key(&k)?,
                         Some(LocalTerm::BNode | LocalTerm::RuleBNode(_)) => txn.new_bnode(),
+                        Some(LocalTerm::Tail(_)) => {
+                            anyhow::bail!("a relation tail {x:#x} reached the store")
+                        }
                         None => anyhow::bail!("dangling local term id {x:#x}"),
                     };
                     stored.insert(x, id);

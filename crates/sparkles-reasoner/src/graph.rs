@@ -105,10 +105,12 @@ impl Graph {
         self.hidden = (!preds.is_empty()).then_some(preds);
     }
 
-    /// Whether facts with predicate `p` are hidden from a variable predicate.
+    /// Whether facts with predicate `p` are hidden from a variable predicate: the facts
+    /// of declared relations, whose predicate is a relation's key, and the predicates of
+    /// [`set_hidden`](Self::set_hidden).
     #[inline]
     pub fn is_hidden(&self, p: u64) -> bool {
-        self.hidden.as_ref().is_some_and(|h| h.contains(&p))
+        crate::ir::lower::is_key(p) || self.hidden.as_ref().is_some_and(|h| h.contains(&p))
     }
 
     pub fn with_capacity(n: usize) -> Graph {

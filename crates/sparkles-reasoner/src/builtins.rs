@@ -47,6 +47,16 @@ pub(crate) enum BuiltinKind {
     GeoSfType,
     /// Sparkles: the GML type (`gml:Polygon`, …) of a `geo:gmlLiteral`'s root element
     GeoGmlType,
+    /// Item 839: `(?h, key, c1 … cn)` binds or checks the columns of the tail with handle
+    /// `?h` of the relation with that key. A lowered relation atom of arity 3 or more.
+    RelTail,
+    /// Item 839: `(?h, key, c1 … cn)` binds `?h` to the handle of the tail `c1 … cn`,
+    /// interning it. The head of a relation of arity 3 or more.
+    RelTuple,
+    /// Item 839: a negated atom, true when no fact before the iteration's end matches.
+    /// Its arguments are `(s, p, o)` for a lowered atom of arity 2 or less, and
+    /// `(c0, key, c1 … cn)` for one of arity 3 or more.
+    RelAbsent,
 }
 
 use BuiltinKind::*;
@@ -105,6 +115,8 @@ impl BuiltinKind {
             NoValue => n == 2 || n == 3,
             StrConcat | UriConcat | MakeTemp | MakeSkolem => n >= 1,
             Regex => n >= 2,
+            RelTail | RelTuple => n >= 4,
+            RelAbsent => n >= 3,
         }
     }
 
@@ -117,6 +129,8 @@ impl BuiltinKind {
             Regex => vec![0, 1],
             MakeTemp | Now => vec![],
             MakeSkolem => (1..n).collect(),
+            RelTail => vec![0, 1],
+            RelTuple => (1..n).collect(),
             _ => (0..n).collect(),
         }
     }
@@ -128,7 +142,8 @@ impl BuiltinKind {
             StrConcat | UriConcat => vec![n - 1],
             Regex => (2..n).collect(),
             MakeTemp => (0..n).collect(),
-            MakeSkolem | Now => vec![0],
+            MakeSkolem | Now | RelTuple => vec![0],
+            RelTail => (2..n).collect(),
             _ => vec![],
         }
     }
@@ -348,6 +363,19 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             let (s, p, o) = (opt(0), opt(1), opt(2));
             !ev.exists(s, p, o)
         }
+        RelAbsent => {
+            let opt = |i: usize| Some(ev.val(bi.args[i], b)).filter(|&v| v != 0);
+            if bi.args.len() == 3 {
+                !ev.exists(opt(0), opt(1), opt(2))
+            } else {
+                let key = a(1);
+                let cols: smallvec::SmallVec<[u64; 8]> = (2..bi.args.len()).map(a).collect();
+                match t.find_tail(key, &cols) {
+                    None => true,
+                    Some(h) => !ev.exists(opt(0), Some(key), Some(h)),
+                }
+            }
+        }
         ListContains | ListNotContains => {
             let (l, x) = (a(0), a(1));
             let found = ev
@@ -477,6 +505,28 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             bind_all(ev, &bi.args, &vals, k, b);
             return;
         }
+        RelTail => {
+            let (h, key) = (a(0), a(1));
+            let Some((k2, cols)) = t.tail(h) else {
+                return;
+            };
+            if k2 != key {
+                return;
+            }
+            let vals: smallvec::SmallVec<[u64; 8]> = cols.collect();
+            if vals.len() + 2 != bi.args.len() {
+                return;
+            }
+            bind_exact(ev, &bi.args[2..], &vals, k, b);
+            return;
+        }
+        RelTuple => {
+            let key = a(1);
+            let cols: smallvec::SmallVec<[u64; 8]> = (2..bi.args.len()).map(a).collect();
+            let h = charged!(ev, t.try_tail(key, &cols));
+            ev.bind_and_continue(bi.args[0], h, k, b);
+            return;
+        }
         MakeSkolem => {
             let inputs: Vec<u64> = (1..bi.args.len()).map(a).collect();
             let v = charged!(
@@ -558,6 +608,33 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
 }
 
 /// Bind several output slots at once, then continue.
+/// Bind each of `slots` to its value, or check it by id when it is bound, as an atom
+/// matches a fact, and continue the plan.
+fn bind_exact(ev: &mut Eval<'_>, slots: &[Slot], vals: &[u64], k: usize, b: &mut [u64]) {
+    let mut newly: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
+    let mut ok = true;
+    for (s, &v) in slots.iter().zip(vals) {
+        match *s {
+            Slot::Var(x) if b[x] == 0 => {
+                b[x] = v;
+                newly.push(x);
+            }
+            Slot::Var(x) => ok = b[x] == v,
+            Slot::Const(c) => ok = c == v,
+            Slot::Any => {}
+        }
+        if !ok {
+            break;
+        }
+    }
+    if ok {
+        ev.run(k + 1, b, None);
+    }
+    for x in newly {
+        b[x] = 0;
+    }
+}
+
 fn bind_all(ev: &mut Eval<'_>, slots: &[Slot], vals: &[u64], k: usize, b: &mut [u64]) {
     let mut newly = Vec::new();
     let mut ok = true;
