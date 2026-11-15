@@ -1,0 +1,2 @@
+<http://ex.org/hasParent> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Inverse> .
+<http://ex.org/x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Person> .

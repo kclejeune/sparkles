@@ -143,8 +143,13 @@
     baseFrom?: { ds: string; at: string };
     explain?: api.ExplainResult;
     updated?: { ms: number; result: api.UpdateResult | null };
-    /** Whether materialized inferences were included (null: dataset has none). */
-    reasoning?: boolean | null;
+    /**
+     * The `reasoning=` the query ran with: `false` without inferences, `true` with the
+     * materialized ones, a query-time mode, or none for the dataset's default.
+     */
+    reasoning?: api.Reasoning | null;
+    /** The `reasoningProfile=` the query ran with, for a download of its result. */
+    reasoningProfile?: api.QueryTimeProfile;
     error?: api.ApiError | Error;
     view: View;
     startedAt: number;
@@ -159,6 +164,36 @@
     whyOpen?: boolean;
   };
 
+  type ReasoningChoice = '' | 'false' | api.ReasoningMode;
+  type ProfileChoice = '' | api.QueryTimeProfile;
+  /** The reasoning selector's choices, with the `reasoning=` value each sends. */
+  const REASONING_CHOICES: { value: ReasoningChoice; label: string; title: string }[] = [
+    { value: '', label: 'Dataset default', title: "The dataset's query-time default" },
+    { value: 'false', label: 'Off', title: 'The asserted data alone (reasoning=false)' },
+    {
+      value: 'materialized',
+      label: 'Materialized',
+      title: 'The materialized inferences (reasoning=materialized)',
+    },
+    {
+      value: 'demand',
+      label: 'Demand',
+      title: 'Derive the facts the query needs while it runs (reasoning=demand)',
+    },
+    {
+      value: 'auto',
+      label: 'Auto',
+      title: 'Read a fresh materialization, else derive on demand (reasoning=auto)',
+    },
+  ];
+  const PROFILE_CHOICES: { value: ProfileChoice; label: string }[] = [
+    { value: '', label: 'Dataset profile' },
+    { value: 'rdfs', label: 'RDFS' },
+    { value: 'rdfs-simple', label: 'RDFS simple' },
+    { value: 'owl-rl', label: 'OWL 2 RL' },
+    { value: 'owl-ql', label: 'OWL 2 QL' },
+  ];
+
   const DEFAULT_QUERY = EXAMPLES[0].query;
   const STORE_KEY = 'sparkles.queryTabs';
   const FORMAT_ON_RUN_KEY = 'sparkles.formatOnRun';
@@ -171,6 +206,8 @@
     limit?: number;
     editorH?: number;
     inferences?: boolean;
+    reasoningMode?: ReasoningChoice;
+    reasoningProfile?: ProfileChoice;
   }>(STORE_KEY, {
     tabs: [],
     active: '',
@@ -183,8 +220,23 @@
   let activeId = $state(tabs.some((t) => t.id === saved.active) ? saved.active : tabs[0].id);
   let limit = $state(LIMITS.includes(saved.limit ?? 0) ? saved.limit! : 10_000);
   let editorH = $state(Math.min(Math.max(saved.editorH ?? 260, 120), 900));
-  /** Include materialized inferences (the server's `reasoning=` parameter). */
-  let inferences = $state(saved.inferences !== false);
+  /**
+   * The server's `reasoning=` parameter: empty for the dataset's default, `false` for the
+   * asserted data, or a mode (spec F17 §2.1). A page saved before the selector kept only
+   * whether to use inferences, and a cleared box reads as `false`.
+   */
+  let reasoningMode = $state<ReasoningChoice>(
+    REASONING_CHOICES.some((c) => c.value === saved.reasoningMode)
+      ? saved.reasoningMode!
+      : saved.inferences === false
+        ? 'false'
+        : '',
+  );
+  /** `reasoningProfile=` of a demand or auto query; empty for the dataset's profile. */
+  let reasoningProfile = $state<ProfileChoice>(
+    PROFILE_CHOICES.some((c) => c.value === saved.reasoningProfile) ? saved.reasoningProfile! : '',
+  );
+  const queryTime = $derived(reasoningMode === 'demand' || reasoningMode === 'auto');
   let outcomes = $state<Record<string, Outcome>>({});
   /**
    * The last result of each tab that reached the screen. While the slider moves, a read that
@@ -341,7 +393,11 @@
   /** The run options that differ from their defaults, on the Options button. */
   const optionsSummary = $derived(
     [
-      reasoningInfo && kind !== 'UPDATE' && !inferences ? 'no inferences' : '',
+      kind !== 'UPDATE' && reasoningMode
+        ? reasoningMode === 'false'
+          ? 'no inferences'
+          : `${reasoningMode}${queryTime && reasoningProfile ? ` ${reasoningProfile}` : ''}`
+        : '',
       app.queryBranch,
       app.queryAt ? `at ${app.queryAt}` : '',
       limit !== 10_000 ? `${fmtCompact(limit)} rows` : '',
@@ -452,12 +508,28 @@
       })
       .catch(() => {});
   });
-  /** `reasoning=` for a dataset: only sent when it has materialized inferences. */
-  const reasoningFor = (name: string | null | undefined) =>
-    app.datasets.find((d) => d.name === name)?.reasoning ? inferences : undefined;
+  /**
+   * `reasoning=` from the selector: none for the dataset's default, and `false` for Off,
+   * which also leaves out RDFS on read and the dataset's query-time default.
+   */
+  const reasoningFor = (_name?: string | null): api.Reasoning | undefined =>
+    reasoningMode === '' ? undefined : reasoningMode === 'false' ? false : reasoningMode;
+  /** `reasoningProfile=` of the selector's demand or auto mode. */
+  const profileFor = (r: api.Reasoning | null | undefined): api.QueryTimeProfile | undefined =>
+    (r === 'demand' || r === 'auto') && reasoningProfile ? reasoningProfile : undefined;
+  /** The materialized-inference flag of the endpoints that take only `true` or `false`. */
+  const inferencesOf = (r: api.Reasoning | null | undefined): boolean | undefined =>
+    r === false ? false : r === true || r === 'materialized' ? true : undefined;
 
   $effect(() => {
-    save(STORE_KEY, { tabs, active: activeId, limit, editorH, inferences });
+    save(STORE_KEY, {
+      tabs,
+      active: activeId,
+      limit,
+      editorH,
+      reasoningMode,
+      reasoningProfile,
+    });
   });
 
   // --- saved (stored) queries ------------------------------------------------------
@@ -632,7 +704,7 @@
       try {
         checked = await askApi.checkQuery(onBranch(name, branch), src.query, {
           terms: true,
-          reasoning: reasoningFor(name),
+          reasoning: inferencesOf(reasoningFor(name)),
         });
       } catch {
         // without terms nothing is proposed, and the dialog still opens
@@ -876,7 +948,7 @@
       toasts.push('error', 'Invalid At', (e as Error).message);
       return null;
     }
-    const reasoning = reasoningFor(name);
+    const reasoning = inferencesOf(reasoningFor(name));
     return {
       ...(at ? { at } : {}),
       ...(branch ? { branch } : {}),
@@ -1122,6 +1194,7 @@
         startedAt: performance.now(),
         elapsed: 0,
         reasoning: reasoningFor(name),
+        reasoningProfile: profileFor(reasoningFor(name)),
       };
       if (cols) gCols = cols;
       else autoPickColumns(o.result);
@@ -1255,7 +1328,7 @@
       const result = await askApi.checkQuery(dsTarget, text, {
         terms: true,
         explain: true,
-        reasoning: reasoningFor(dsName),
+        reasoning: inferencesOf(reasoningFor(dsName)),
         at,
       });
       next = { text, result };
@@ -1305,7 +1378,7 @@
       const result = await askApi.checkQuery(onBranch(name, branchParam(h.branch ?? '')), h.query, {
         terms: true,
         explain: true,
-        reasoning: reasoningFor(name),
+        reasoning: inferencesOf(reasoningFor(name)),
         ...(h.atCommit != null ? { atCommit: h.atCommit } : {}),
       });
       if (isNotAQuery(result)) {
@@ -1528,7 +1601,10 @@
     const prevView = outcomes[tabId]?.view;
     const prevKind = outcomes[tabId]?.result?.queryType;
     const started = performance.now();
+    // the mode and profile are read once, so a choice changed while the query runs does
+    // not change what its result says it ran with
     const reasoning = reasoningFor(dsName);
+    const reasoningProfile = profileFor(reasoning);
     outcomes[tabId] = {
       status: 'running',
       ds: dsName,
@@ -1538,6 +1614,7 @@
       startedAt: started,
       controller,
       reasoning,
+      reasoningProfile,
       ...(keepShown
         ? { result: keepShown.result, base: keepShown.base, baseFrom: keepShown.baseFrom }
         : {}),
@@ -1573,7 +1650,13 @@
               : `${dsTarget} in ${fmtMs(ms)}`,
         );
       } else {
-        const opts = { send: limit, reasoning, at, signal: controller.signal };
+        const opts = {
+          send: limit,
+          reasoning,
+          reasoningProfile,
+          at,
+          signal: controller.signal,
+        };
         const read = (o: api.QueryOptions, target = dsTarget) =>
           stored
             ? api.runStoredQuery(target, stored.name, stored.values, o)
@@ -1618,6 +1701,7 @@
           startedAt: started,
           elapsed,
           reasoning,
+          reasoningProfile,
           query: stored ? undefined : text,
         };
         lastShown[tabId] = outcomes[tabId];
@@ -1677,14 +1761,17 @@
     dsTarget: string,
     text: string,
     at: string | undefined,
-    reasoning: boolean | undefined,
+    reasoning: api.Reasoning | undefined,
   ) {
     const mine = () => outcomes[tabId]?.startedAt === started && outcomes[tabId]?.status === 'done';
     if (!mine()) return;
     outcomes[tabId].diagnosis = { state: 'loading' };
     let next: EmptyDiagnosis;
     try {
-      const d = await askApi.diagnoseQuery(dsTarget, text, { reasoning, at });
+      const d = await askApi.diagnoseQuery(dsTarget, text, {
+        reasoning: inferencesOf(reasoning),
+        at,
+      });
       next = { state: 'done', d };
     } catch {
       next = { state: 'error' };
@@ -1719,8 +1806,10 @@
     };
     outcomes[tabId] = { ...base, status: 'running', view: 'explain' } as Outcome;
     try {
+      const reasoning = reasoningFor(dsName);
       const ex = await api.explain(onBranch(dsName, branch), text, {
-        reasoning: reasoningFor(dsName),
+        reasoning,
+        reasoningProfile: profileFor(reasoning),
       });
       if (!owns()) return;
       outcomes[tabId] = {
@@ -2068,7 +2157,7 @@
         query: o.query,
         from: normalizeAt(timeFrom) ?? timeFrom,
         to: normalizeAt(app.queryAt) ?? undefined,
-        reasoning: o.reasoning ?? undefined,
+        reasoning: inferencesOf(o.reasoning),
       });
       if (serverDiff?.key === key) serverDiff = { key, status: 'done', data };
     } catch (e) {
@@ -2503,9 +2592,12 @@
     const dsBranch = outcome ? outcome.branch : branch;
     downloading = fmt.label;
     try {
-      const reasoning = outcome?.reasoning ?? reasoningFor(dsName);
+      // the result on screen is downloaded with the reasoning it ran with
+      const reasoning = outcome ? outcome.reasoning : reasoningFor(dsName);
+      const reasoningProfile = outcome ? outcome.reasoningProfile : profileFor(reasoning);
       const blob = await api.queryRaw(onBranch(dsName, dsBranch), active.query, fmt.accept, {
         reasoning: reasoning ?? undefined,
+        reasoningProfile,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -3033,7 +3125,7 @@
             class="btn sm options-toggle"
             aria-expanded={optionsOpen}
             aria-controls="run-options"
-            title="Branch, state, row limit and inferences"
+            title="Branch, state, row limit and reasoning"
             onclick={() => (optionsOpen = !optionsOpen)}
           >
             <Icon name="sliders" size={13} /> Options{#if optionsSummary}<span
@@ -3048,16 +3140,37 @@
             role="group"
             aria-label="Run options"
           >
-            {#if reasoningInfo && kind !== 'UPDATE'}
+            {#if kind !== 'UPDATE'}
               <label
-                class="limit inf form-row"
-                title="Include the {fmtInt(
-                  reasoningInfo.inferred,
-                )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
+                class="at form-row"
+                title={reasoningInfo
+                  ? `The dataset has ${fmtInt(reasoningInfo.inferred)} triples inferred by ${reasoningInfo.profile} reasoning. ${REASONING_CHOICES.find((c) => c.value === reasoningMode)?.title ?? ''}`
+                  : (REASONING_CHOICES.find((c) => c.value === reasoningMode)?.title ?? '')}
               >
-                <input type="checkbox" bind:checked={inferences} />
-                <span>Use inferences</span>
+                <span>Reasoning</span>
+                <select class="select sm" bind:value={reasoningMode} aria-label="Reasoning">
+                  {#each REASONING_CHOICES as c (c.value)}
+                    <option value={c.value} title={c.title}>{c.label}</option>
+                  {/each}
+                </select>
               </label>
+              {#if queryTime}
+                <label
+                  class="at form-row"
+                  title="The rules a demand or auto query derives with (reasoningProfile=)"
+                >
+                  <span>Profile</span>
+                  <select
+                    class="select sm"
+                    bind:value={reasoningProfile}
+                    aria-label="Reasoning profile"
+                  >
+                    {#each PROFILE_CHOICES as c (c.value)}
+                      <option value={c.value}>{c.label}</option>
+                    {/each}
+                  </select>
+                </label>
+              {/if}
             {/if}
             {#if branchList}
               <label
@@ -3501,6 +3614,16 @@
               class="badge"
               title="Ran with reasoning=false: materialized inferences were excluded"
               >no inferences</span
+            >
+          {/if}
+          {#if outcome.result?.derivation && outcome.view !== 'explain'}
+            {@const d = outcome.result.derivation}
+            <span
+              class="badge derivation mono"
+              title="Sparkles-Reasoning: {d.mode} reasoning derived {fmtInt(
+                d.derived,
+              )} facts in {fmtInt(d.tables)} tables, {fmtInt(d.cached)} of them from the cache"
+              >{d.mode} · {fmtCompact(d.derived)} derived · {d.cached}/{d.tables} cached</span
             >
           {/if}
           <span class="spacer"></span>
@@ -4097,7 +4220,7 @@
                 at={readAt(r.at)}
                 {prefixes}
                 drawn={facetDrawn}
-                reasoning={outcome.reasoning}
+                reasoning={inferencesOf(outcome.reasoning)}
                 onmatch={facetMatch}
                 onapply={applyFacets}
               >
@@ -4556,10 +4679,6 @@
   .badge.past {
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
-  }
-  .inf {
-    cursor: pointer;
-    white-space: nowrap;
   }
   .examples,
   .saved {

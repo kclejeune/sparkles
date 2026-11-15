@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Jena hybrid rules
+
+`@hybrid jena .` in a rule text compiles a forward rule's nested backward rule
+`B1 -> [H <- B2]` into the query-time rule `H <- B1, B2` and leaves it out of the
+materialization, as Jena's hybrid engine runs it on demand, which completes roadmap item
+19's Phase 2. A rule that the split cannot state as Jena runs it is refused, such as one
+with a functor term, a builtin that has a side effect or makes terms, or `noValue`. The Fuseki converter writes the directive for a GenericRuleReasoner in
+the hybrid mode. On a rules file checked against Apache Jena 6.2.0, the materialization
+equals Jena's forward deductions and the query-time answers equal Jena's.
+
+### OWL 2 QL rewriting
+
+The `owl-ql` query-time profile rewrites a query against the OWL 2 QL axioms of the
+input graphs with PerfectRef, as part of roadmap item 19. Each basic graph pattern
+becomes a union of patterns over the stored facts that streams, distinguished variables
+are never bound to unnamed individuals, and `budget.maxUnion` bounds the branches, past
+which the `owl-rl` demand program answers with a warning. The setting's `GET` lists the
+axioms outside the profile, a materialization refuses the profile, and the UI offers
+it. The answers of the 14 LUBM queries equal an OWL 2 RL closure of LUBM's OWL 2 QL
+fragment, row for row. A rewritten pattern keeps SPARQL's bag semantics, so a variable
+that stored facts bind keeps its values whether or not the query projects it.
+
+### Query-time reasoning in the UI
+
+The query page's **Options** menu chooses the reasoning of a query as part of roadmap item
+19. Its selector sends `reasoning` as the dataset default, off, materialized, demand or
+auto, with a profile for the last two, and a result that derived facts shows what
+`Sparkles-Reasoning` reports. The server exposes that header to cross-origin pages.
+
 ### SHACL rules
 
 Roadmap item 838 adds the `shacl-af` reasoning profile, which materializes SHACL Advanced

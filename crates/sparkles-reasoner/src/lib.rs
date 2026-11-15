@@ -39,6 +39,7 @@ mod lookups;
 mod maintain;
 pub mod parser;
 mod pool;
+pub mod qlrewrite;
 pub mod query;
 mod reuse;
 pub mod shacl_af;
@@ -97,6 +98,11 @@ pub enum Profile {
     Rdfs,
     RdfsSimple,
     OwlRl,
+    /// OWL 2 QL query rewriting (spec F17 §7): queries are rewritten against the OWL 2 QL
+    /// axioms of the input graphs, and a pattern the rewriting does not cover is derived
+    /// with the rules of [`Profile::OwlRl`]. Only query-time reasoning takes it; a
+    /// materialization refuses it.
+    OwlQl,
     /// Jena rule text
     Rules(String),
     /// SHACL Advanced Features rules, and SPIN rules, read from a shapes graph
@@ -110,6 +116,7 @@ impl Profile {
             Profile::Rdfs => "rdfs",
             Profile::RdfsSimple => "rdfs-simple",
             Profile::OwlRl => "owl-rl",
+            Profile::OwlQl => "owl-ql",
             Profile::Rules(_) => "rules",
             Profile::ShaclAf(_) => "shacl-af",
         }
@@ -120,7 +127,7 @@ impl Profile {
         match self {
             Profile::Rdfs => RDFS_RULES,
             Profile::RdfsSimple => RDFS_SIMPLE_RULES,
-            Profile::OwlRl => OWL_RL_RULES,
+            Profile::OwlRl | Profile::OwlQl => OWL_RL_RULES,
             Profile::Rules(t) => t,
             Profile::ShaclAf(_) => "",
         }
@@ -147,7 +154,9 @@ impl fmt::Display for Profile {
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unknown reasoning profile '{0}' (expected rdfs, rdfs-simple, owl-rl, owl or shacl-af)")]
+#[error(
+    "unknown reasoning profile '{0}' (expected rdfs, rdfs-simple, owl-rl, owl, owl-ql or shacl-af)"
+)]
 pub struct UnknownProfile(pub String);
 
 impl FromStr for Profile {
@@ -168,6 +177,7 @@ impl FromStr for Profile {
             "owl-rl" | "owlrl" | "owl" | "owl-mini" | "owlmini" | "owl-micro" | "owlmicro" => {
                 Ok(Profile::OwlRl)
             }
+            "owl-ql" | "owlql" | "owl2ql" | "ql" => Ok(Profile::OwlQl),
             _ => Err(UnknownProfile(s.to_string())),
         }
     }
@@ -1137,6 +1147,7 @@ pub fn materialize_incremental(
 ) -> anyhow::Result<ReasonReport> {
     extras.validate()?;
     opts.inputs.validate()?;
+    refuse_query_only(profile)?;
     let t0 = Instant::now();
     admitted(opts, |exec| {
         materialize_admitted(exec, store, profile, extras, inc, opts, t0)
@@ -2149,6 +2160,19 @@ pub fn materialize(
     materialize_with(store, profile, &Extras::default(), opts)
 }
 
+/// An error for a profile that only query-time reasoning runs: `owl-ql` answers queries
+/// by rewriting them, and its materialization would be that of `owl-rl` under another
+/// name, which `reasoning=auto` could not tell apart.
+pub fn refuse_query_only(profile: &Profile) -> anyhow::Result<()> {
+    if let Profile::OwlQl = profile {
+        anyhow::bail!(
+            "the owl-ql profile answers queries by rewriting them and is not materialized; \
+             set it as the query-time profile, or materialize with owl-rl"
+        );
+    }
+    Ok(())
+}
+
 /// Remove [`INFERRED_GRAPH`]. Returns the number of triples removed.
 pub fn clear(store: &Store) -> anyhow::Result<u64> {
     maintain::remove_saved(store);
@@ -2227,6 +2251,7 @@ pub fn infer(
     opts: &ReasonOptions,
 ) -> anyhow::Result<(Vec<Triple>, ReasonReport)> {
     let t0 = Instant::now();
+    refuse_query_only(profile)?;
     if let Profile::ShaclAf(_) = profile {
         anyhow::bail!(
             "the shacl-af profile runs only in a materialization, whose write transaction \

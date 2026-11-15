@@ -1,0 +1,13 @@
+# Jena hybrid rules: forward rules whose heads hold backward rules, a top-level backward
+# rule and a plain forward rule. Sparkles reads the file with "@hybrid jena ." before it.
+@prefix ex: <http://ex.org/> .
+
+# Jena's backward engine needs tabling for the symmetric rule, and Sparkles tables every
+# predicate and ignores the call
+[tabled: -> tableAll()]
+
+[sym: (?p rdf:type ex:Symmetric) -> [(?x ?p ?y) <- (?y ?p ?x)]]
+[inv: (?p ex:inverse ?q) -> [(?y ?q ?x) <- (?x ?p ?y)], (?q rdf:type ex:Inverse)]
+[anc0: (?a ex:ancestor ?b) <- (?a ex:parent ?b)]
+[anc: (?a ex:ancestor ?c) <- (?a ex:parent ?b), (?b ex:ancestor ?c)]
+[person: (?a ex:likes ?b) -> (?a rdf:type ex:Person)]

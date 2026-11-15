@@ -854,6 +854,24 @@ PREFIX jr:     <http://jena.hpl.hp.com/2003/RuleReasoner#>
         assert_eq!(infer.contains("--query-only"), demand_only, "{infer}");
         // only a materialization is run again after writes
         assert_eq!(p.server.auto_reason, !demand_only, "{mode:?}");
+        // the hybrid mode's rules run a forward rule's nested backward rules on demand
+        let hybrid = default == Some("auto");
+        assert_eq!(r.hybrid_jena, hybrid, "{mode:?}");
+        let out = dir.path().join(format!("out-{}", mode.unwrap_or("none")));
+        let mut p = p;
+        write::write_dir(&mut p, &out, false).unwrap();
+        let rules: Vec<String> = walk(&out)
+            .into_iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "rules"))
+            .map(|f| std::fs::read_to_string(f).unwrap())
+            .collect();
+        assert_eq!(rules.len(), 1, "{mode:?}");
+        assert_eq!(
+            rules[0].starts_with("@hybrid jena .\n"),
+            hybrid,
+            "{}",
+            rules[0]
+        );
     }
     let p = plan_of(Some("sideways"));
     assert!(
@@ -861,4 +879,18 @@ PREFIX jr:     <http://jena.hpl.hp.com/2003/RuleReasoner#>
         "{}",
         p.report.text()
     );
+}
+
+/// The files under `dir`.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
 }

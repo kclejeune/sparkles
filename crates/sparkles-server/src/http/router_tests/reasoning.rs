@@ -2138,3 +2138,71 @@ async fn a_hybrid_configuration_derives_before_a_materialization() {
     let hdr = h["sparkles-reasoning"].to_str().unwrap();
     assert!(hdr.starts_with("auto; derived="), "{hdr}");
 }
+
+/// OWL 2 QL rewriting over HTTP (spec F17 §7, A8): the setting takes the `owl-ql` profile,
+/// its `GET` lists the axioms outside the profile, a query is rewritten against the
+/// ontology, and a materialization refuses the profile.
+#[tokio::test]
+async fn owl_ql_rewriting_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("q", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "q",
+        "ex:Professor a owl:Class . ex:teaches a owl:ObjectProperty . \
+         ex:Professor rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:teaches ; \
+         owl:someValuesFrom owl:Thing ] . \
+         ex:knows a owl:ObjectProperty , owl:TransitiveProperty . \
+         ex:ann a ex:Professor .",
+    );
+    let app = router(st.clone());
+    let r = send(
+        &app,
+        Request::put("/$/reason/q/query")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"default":"demand","profile":"owl-ql"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let check = &r.json()["owlQl"];
+    assert_eq!(check["outsideCount"], 1, "{check}");
+    assert!(check["axioms"].as_u64().unwrap() >= 1, "{check}");
+    let ask = |q: &str| {
+        let app = app.clone();
+        let uri = format!(
+            "/q/sparql?query={}",
+            form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+        );
+        async move {
+            let (r, h) = send_h(
+                &app,
+                Request::get(uri)
+                    .header(header::ACCEPT, "application/sparql-results+json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            (r.json(), h)
+        }
+    };
+    let (body, h) = ask("ASK { <http://ex.org/ann> <http://ex.org/teaches> ?c }").await;
+    assert_eq!(body["boolean"], true, "{body}");
+    assert!(
+        h.get("sparkles-reasoning").is_some_and(|v| v
+            .to_str()
+            .unwrap()
+            .starts_with("demand; derived=0; tables=0")),
+        "{h:?}"
+    );
+    let (body, _) = ask("SELECT ?c { <http://ex.org/ann> <http://ex.org/teaches> ?c }").await;
+    assert_eq!(
+        body["results"]["bindings"].as_array().unwrap().len(),
+        0,
+        "{body}"
+    );
+    let r = post_json(&app, "/$/reason/q", r#"{"profile":"owl-ql"}"#).await;
+    assert!(r.status.is_client_error(), "{} {}", r.status, r.text());
+}

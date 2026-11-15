@@ -150,6 +150,22 @@ pub struct SessionRequest {
     pub no_cache: bool,
 }
 
+/// A query rewritten before it is planned, as OWL 2 QL rewriting does (spec F17 §7).
+/// The rewritten query reads the stored facts for the basic graph patterns the provider
+/// rewrote, and the derivation of the module documentation answers the others.
+#[derive(Clone, Debug)]
+pub struct Rewritten {
+    /// the query with its rewritten pattern
+    pub query: spargebra::Query,
+    /// the basic graph patterns left for derivation, as the query wrote them; a group
+    /// the walk of the rewritten pattern finds is derived only when it is one of these
+    pub derive: Vec<Vec<TriplePattern>>,
+    /// a `Rewrite` node per basic graph pattern, for EXPLAIN
+    pub nodes: Vec<PlanInfo>,
+    /// warnings for the response, such as axioms the rewriting ignored
+    pub warnings: Vec<String>,
+}
+
 /// A reasoner that derives facts for queries (see the module documentation).
 pub trait ReasoningProvider: Send + Sync {
     /// The mode and profile, for EXPLAIN, such as `demand, profile owl-rl`.
@@ -169,6 +185,20 @@ pub trait ReasoningProvider: Send + Sync {
     fn reads_all(&self, req: &SessionRequest) -> Option<Materialization> {
         let _ = req;
         None
+    }
+    /// The query rewritten before planning, for the snapshot and view of `req`, or
+    /// `None` when the provider rewrites nothing (spec F17 §7). The rewriting reads the
+    /// provider's schema and not the query's data, and stops when `req.stop` fails.
+    /// `bound` gives the variables of the query's initial bindings, without their sigil,
+    /// with their values, which the planner substitutes into the rewritten query.
+    fn rewrite(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<Rewritten>> {
+        let _ = (query, bound, req);
+        Ok(None)
     }
 }
 
@@ -618,6 +648,7 @@ pub(crate) fn apply(
     ctx: &mut Ctx,
     provider: &Arc<dyn ReasoningProvider>,
     pattern: &GraphPattern,
+    rewritten: Option<&Rewritten>,
     opts: &QueryOptions,
     dataset: Option<&QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
@@ -627,6 +658,65 @@ pub(crate) fn apply(
     let t0 = Instant::now();
     let mut collect = Collect::default();
     collect.walk(pattern);
+    let auto = provider.auto();
+    if let Some(r) = rewritten {
+        // a rewritten pattern reads the stored facts: only the groups the provider left
+        // for derivation, and the property paths, which no rewriting covers, are derived
+        collect.groups.retain(|g| r.derive.contains(g));
+        for w in &r.warnings {
+            ctx.warn(super::ctx::PlanWarning {
+                code: "reasoning",
+                message: w.clone(),
+            });
+        }
+        if collect.groups.is_empty() && collect.paths.is_empty() {
+            // nothing to derive: no session starts, and `auto` reads no materialization
+            // of another profile (§4.1)
+            let materialization = if auto {
+                drop_extra_graphs(ctx, &opts.default_graph_extra);
+                Materialization::Derive {
+                    reason: "the query-time profile rewrites the query".into(),
+                }
+            } else {
+                Materialization::NotRead
+            };
+            ctx.reasoning = Some(Arc::new(Applied {
+                label: provider.label(),
+                nodes: r.nodes.clone(),
+                rdfs_skipped,
+                millis: t0.elapsed().as_secs_f64() * 1000.0,
+                auto,
+                materialization,
+                ..Default::default()
+            }));
+            return Ok(());
+        }
+    }
+    let req = request(ctx, opts);
+    let reads_all = if auto && rewritten.is_none() {
+        provider.reads_all(&req)
+    } else {
+        None
+    };
+    apply_derive(
+        ctx,
+        provider,
+        opts,
+        dataset,
+        base,
+        rdfs_skipped,
+        execute,
+        collect,
+        req,
+        reads_all,
+        rewritten,
+        t0,
+    )
+}
+
+/// The request of a session for the query of `ctx`: its view, its stop check and its
+/// memory budget.
+pub(crate) fn request(ctx: &Ctx, opts: &QueryOptions) -> SessionRequest {
     let stop = {
         let cancel: Arc<AtomicBool> = ctx.cancel.clone();
         let cancellation = ctx.cancellation.clone();
@@ -652,18 +742,50 @@ pub(crate) fn apply(
         }
         _ => None,
     };
-    let req = SessionRequest {
+    SessionRequest {
         snap: ctx.snap.clone(),
         readable,
         stop,
         max_memory: opts.max_memory_bytes,
         no_cache: opts.no_cache,
-    };
+    }
+}
+
+/// The query rewritten by `provider` before it is planned, if the provider rewrites it
+/// (spec F17 §7).
+pub(crate) fn rewrite(
+    ctx: &Ctx,
+    provider: &Arc<dyn ReasoningProvider>,
+    query: &spargebra::Query,
+    opts: &QueryOptions,
+) -> Result<Option<Rewritten>> {
+    let bound: Vec<(String, Term)> = opts
+        .initial_bindings
+        .iter()
+        .map(|(name, t)| (name.trim_start_matches(['?', '$']).to_string(), t.clone()))
+        .collect();
+    provider.rewrite(query, &bound, &request(ctx, opts))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_derive(
+    ctx: &mut Ctx,
+    provider: &Arc<dyn ReasoningProvider>,
+    opts: &QueryOptions,
+    dataset: Option<&QueryDataset>,
+    base: Option<&oxiri::Iri<String>>,
+    rdfs_skipped: bool,
+    execute: bool,
+    collect: Collect,
+    req: SessionRequest,
+    reads_all: Option<Materialization>,
+    rewritten: Option<&Rewritten>,
+    t0: Instant,
+) -> Result<()> {
     let auto = provider.auto();
     // ---- under `auto`, a materialization that answers every pattern: the query reads
     // it as materialized reasoning does, and EXPLAIN alone starts a session to show the
     // estimates (spec F17 §4.3 as built)
-    let reads_all = if auto { provider.reads_all(&req) } else { None };
     if execute && let Some(materialization) = reads_all.clone() {
         ctx.reasoning = Some(Arc::new(Applied {
             label: provider.label(),
@@ -938,7 +1060,8 @@ pub(crate) fn apply(
         })
     };
     if !execute {
-        let mut nodes = Vec::new();
+        // the Rewrite nodes come first, as in the executed form
+        let mut nodes = rewritten.map_or_else(Vec::new, |r| r.nodes.clone());
         let mut read = 0;
         for p in &pats {
             if let Some(d) = p.seeded.as_ref().map(|s| s.0).or(p.plain) {
@@ -1061,7 +1184,7 @@ pub(crate) fn apply(
         }
     }
     let report = session.report();
-    let mut nodes = Vec::new();
+    let mut nodes = rewritten.map_or_else(Vec::new, |r| r.nodes.clone());
     let mut read = 0;
     for p in &pats {
         let chosen = match (&p.seeded, p.plain) {

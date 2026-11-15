@@ -80,3 +80,21 @@ async fn materialized_inferences_reach_http_and_stored_queries() {
     let (http, stored, _) = answers(&s, "&reasoning=false").await;
     assert_eq!((http, stored), (false, false));
 }
+
+/// A stored query's run takes the request parameters that the UI's query page sends with
+/// it, `execution`, `reasoningProfile` and `maxDerived`, without reading them as values of
+/// the query's parameters, and derives on demand with the profile they name.
+#[tokio::test]
+async fn stored_query_runs_take_the_query_time_reasoning_parameters() {
+    // DATA has ex:Student rdfs:subClassOf ex:Person and ex:alice a ex:Student
+    let s = server();
+    store_query(&s);
+    let (_, stored, _) = answers(&s, "&execution=eager").await;
+    assert!(!stored);
+    let (http, stored, _) = answers(
+        &s,
+        "&execution=eager&reasoning=demand&reasoningProfile=rdfs&maxDerived=1000",
+    )
+    .await;
+    assert_eq!((http, stored), (true, true));
+}
