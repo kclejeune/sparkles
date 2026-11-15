@@ -58,7 +58,10 @@ rec = {
     'horn_against_counting': text(os.path.join(lane, 'gen/dcmp4.txt')),
     'counting_two_builds_script': text(os.path.join(lane, 'gen/dd.sh')),
     'counting_two_builds': text(os.path.join(lane, 'gen/dd-count.txt')),
-    'counting_note': 'dd-count.txt runs --counting on the base (first hash and report) and on the lane (second): 7 files pass the counting bound on the base and finish on the lane, with the Horn answer of dcmp4.txt, and none goes the other way',
+    'counting_note': 'dd-count.txt runs --counting on the base (first hash and report) and on the lane (second): 7 files pass the counting bound on the base and finish on the lane, and none goes the other way; dcmp4.txt has 2,145 files that finish with counting on the base with the Horn answer',
+    'seven_script': text(os.path.join(lane, 'gen/seven.sh')),
+    'seven_final': text(os.path.join(lane, 'gen/seven-a370d073.txt')),
+    'seven_note': 'seven.sh runs the final build a370d073 with --counting and with the Horn rules on the 7 files, with the normalization of dcmp.sh: each counting taxonomy equals the Horn one',
     'fixtures': 'crates/sparkles-owl/tests/dl_steps.rs WITHIN 171 -> 174 and dl_number_order.rs (202, 202) -> (205, 204) in commit c00e1cf2: three more counting fixtures finish within the counting bound, sriq-004 among them, by tests/dl_steps.rs a_product_derives_only_its_least_unions'},
   'hosts': {p: text(os.path.join(a, p)) for p in ['timing-1ffed4a8/before.txt', 'timing-1ffed4a8/after.txt', 'timing2-efca1c26/before.txt', 'timing2-efca1c26/after.txt', 'timing4-a370d073/before.txt', 'timing4-a370d073/after.txt']},
 }

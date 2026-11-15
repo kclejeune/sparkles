@@ -219,8 +219,9 @@ memory budget and each step releases what it drops. Past 4,096 unions of the ste
 the last, each further union counts toward a bound on derived conclusions, so a bounded
 run still stops a wide product within its bound. The counting fixtures keep their answers
 on every number of threads, and three more of them, `sriq-004` among them, finish within
-the counting bound, as do seven of 2,145 generated Horn ontologies with a union that meets
-nothing beside them, whose answers equal those of the Horn rules. On `atlas` on four
+the counting bound. Of the generated Horn ontologies with a union that meets nothing
+beside them, 2,145 finish with counting on both builds, and seven more finish on this one,
+whose answers equal those of the Horn rules. On `atlas` on four
 threads three classifications of ore_ont_14817 take 19.9 to 38.9 s against 59.7 to 79.5 s,
 and on one thread on the laptop the build before passed a timeout of 900 s where this one
 finishes. The attempt still passes its budget before the Horn rules answer, which item 990
