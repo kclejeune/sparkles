@@ -1366,17 +1366,24 @@ files the converter writes.
 **Reasoning** select with the dataset default, off, materialized, demand and auto, and a
 **Profile** select under demand and auto with the dataset's profile, `rdfs`, `rdfs-simple`
 and `owl-rl`. The page sends `reasoning` and `reasoningProfile` to `/{ds}/sparql`,
-`/{ds}/explain`, stored queries and downloads. The endpoints that take only a boolean,
-such as the Ask bar's checks and the facet panel, get `true` for materialized, `false` for
-off and nothing for the query-time modes, which they read as the dataset's default. A
-result that derived facts shows a badge from the `Sparkles-Reasoning` header, which the
-server now exposes to cross-origin pages.
+`/{ds}/explain`, stored queries and downloads, and a download of a result uses the mode
+and profile the result ran with. The endpoints that take only a boolean, such as the Ask
+bar's checks, the diagnosis of an empty result, the facet panel and the graph lenses, get
+`true` for materialized, `false` for off and nothing for the query-time modes. They derive
+nothing, and without the parameter they read the materialized inferences when the dataset
+has them. Roadmap item 986 carries the query-time modes to them. A result that derived
+facts shows a badge from the `Sparkles-Reasoning` header, which the server now exposes to
+cross-origin pages. A result of `auto` that read a fresh materialization derived nothing
+and has no badge. Stored queries reserve `reasoningProfile`, `maxDerived` and
+`execution`, which their runs take as request parameters.
 
 The dataset default sends no `reasoning` parameter, where the page sent `true` before for
 a dataset with a materialization. A dataset whose query-time setting names a default now
-gets that default from the page, as from any client. A page saved with the inferences box
-cleared opens with **Off**. The test is `ui/tests/e2e/query-reasoning.spec.ts`, against a
-real server, with the parameter tests in `ui/src/lib/api.test.ts`.
+gets that default from the page, as from any client. **Off** always sends `false`, which
+also leaves out RDFS on read and a query-time default. A page saved with the inferences
+box cleared opens with **Off**. The tests are `ui/tests/e2e/query-reasoning.spec.ts`,
+against a real server, the parameter tests in `ui/src/lib/api.test.ts` and
+`stored_query_runs_take_the_query_time_reasoning_parameters` over HTTP.
 
 ### Roadmap follow-ups
 

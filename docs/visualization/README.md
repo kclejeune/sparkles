@@ -114,13 +114,17 @@ The SvelteKit UI is embedded in the server binary.
   limit and the reasoning selector, and its button names any of them that differ from
   the default.
 * The reasoning selector sends the query's `reasoning` parameter. **Dataset default**
-  sends none, so the dataset's query-time default applies. **Off** leaves out the
-  materialized inferences of a dataset that has them, **Materialized** reads them, and
-  **Demand** and **Auto** derive at query time ([API.md](../API.md#query-time-reasoning)).
+  sends none, so the dataset's query-time default applies. **Off** reads the asserted data
+  alone, without materialized inferences, RDFS on read or a query-time default.
+  **Materialized** reads the materialized inferences, and **Demand** and **Auto** derive
+  at query time ([API.md](../API.md#query-time-reasoning)).
   Under **Demand** and **Auto** a **Profile** select names the rules, or leaves the
   dataset's profile. A result that derived facts shows a badge with the mode, the facts
   derived and the tables that came from the cache, read from the `Sparkles-Reasoning`
-  header. The page remembers the choice per browser.
+  header. The page remembers the choice per browser, and a download of a result uses the
+  reasoning the result ran with. The Ask bar's checks, the diagnosis of an empty result,
+  the facets and the graph lenses read the materialized inferences under the query-time
+  modes and derive nothing. Roadmap item 986.
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.

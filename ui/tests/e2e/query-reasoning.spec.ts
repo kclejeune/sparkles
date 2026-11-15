@@ -33,6 +33,9 @@ ex:Professor rdfs:subClassOf ex:Person .
 open.beforeEach(async ({ page }) => {
   await page.addInitScript(
     ([query]) => {
+      // once per test: a reload keeps what the page saved
+      if (sessionStorage.getItem('seeded')) return;
+      sessionStorage.setItem('seeded', '1');
       localStorage.setItem('sparkles.dataset', 'query-reasoning');
       localStorage.setItem(
         'sparkles.queryTabs',
@@ -125,6 +128,31 @@ open('materialized and off send their values and leave the profile out', async (
   await page.keyboard.press('Escape');
   await expect(options(page)).toContainText('no inferences');
   url = await run(page);
-  // `false` matters only to a dataset with inferences to leave out, which this one lacks
-  expect(url.searchParams.has('reasoning')).toBe(false);
+  expect(url.searchParams.get('reasoning')).toBe('false');
 });
+
+open(
+  'off leaves out a query-time default that the dataset default applies',
+  async ({ page, request }) => {
+    const set = await request.put('/$/reason/query-reasoning/query', {
+      data: { default: 'demand', profile: 'rdfs' },
+    });
+    expect(set.ok(), await set.text()).toBe(true);
+    try {
+      await page.goto('/ui/query');
+      let url = await run(page);
+      expect(url.searchParams.has('reasoning')).toBe(false);
+      await expect(grid(page)).toContainText('ex:ann');
+      await expect(page.locator('.badge.derivation')).toContainText(/^demand · /);
+      await options(page).click();
+      await page.getByRole('combobox', { name: 'Reasoning', exact: true }).selectOption('false');
+      await page.keyboard.press('Escape');
+      url = await run(page);
+      expect(url.searchParams.get('reasoning')).toBe('false');
+      await expect(page.getByText(/^No results/).first()).toBeVisible();
+    } finally {
+      const r = await request.delete('/$/reason/query-reasoning/query');
+      expect(r.ok(), await r.text()).toBe(true);
+    }
+  },
+);

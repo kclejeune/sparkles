@@ -148,6 +148,8 @@
      * materialized ones, a query-time mode, or none for the dataset's default.
      */
     reasoning?: api.Reasoning | null;
+    /** The `reasoningProfile=` the query ran with, for a download of its result. */
+    reasoningProfile?: api.QueryTimeProfile;
     error?: api.ApiError | Error;
     view: View;
     startedAt: number;
@@ -506,15 +508,11 @@
       .catch(() => {});
   });
   /**
-   * `reasoning=` for a dataset, from the selector: none for the dataset's default, and
-   * `false` only when the dataset has materialized inferences to leave out.
+   * `reasoning=` from the selector: none for the dataset's default, and `false` for Off,
+   * which also leaves out RDFS on read and the dataset's query-time default.
    */
-  const reasoningFor = (name: string | null | undefined): api.Reasoning | undefined => {
-    if (reasoningMode === '') return undefined;
-    if (reasoningMode === 'false')
-      return app.datasets.find((d) => d.name === name)?.reasoning ? false : undefined;
-    return reasoningMode;
-  };
+  const reasoningFor = (_name?: string | null): api.Reasoning | undefined =>
+    reasoningMode === '' ? undefined : reasoningMode === 'false' ? false : reasoningMode;
   /** `reasoningProfile=` of the selector's demand or auto mode. */
   const profileFor = (r: api.Reasoning | null | undefined): api.QueryTimeProfile | undefined =>
     (r === 'demand' || r === 'auto') && reasoningProfile ? reasoningProfile : undefined;
@@ -1195,6 +1193,7 @@
         startedAt: performance.now(),
         elapsed: 0,
         reasoning: reasoningFor(name),
+        reasoningProfile: profileFor(reasoningFor(name)),
       };
       if (cols) gCols = cols;
       else autoPickColumns(o.result);
@@ -1611,6 +1610,7 @@
       startedAt: started,
       controller,
       reasoning,
+      reasoningProfile: profileFor(reasoning),
       ...(keepShown
         ? { result: keepShown.result, base: keepShown.base, baseFrom: keepShown.baseFrom }
         : {}),
@@ -1697,6 +1697,7 @@
           startedAt: started,
           elapsed,
           reasoning,
+          reasoningProfile: profileFor(reasoning),
           query: stored ? undefined : text,
         };
         lastShown[tabId] = outcomes[tabId];
@@ -2587,10 +2588,12 @@
     const dsBranch = outcome ? outcome.branch : branch;
     downloading = fmt.label;
     try {
-      const reasoning = outcome?.reasoning ?? reasoningFor(dsName);
+      // the result on screen is downloaded with the reasoning it ran with
+      const reasoning = outcome ? outcome.reasoning : reasoningFor(dsName);
+      const reasoningProfile = outcome ? outcome.reasoningProfile : profileFor(reasoning);
       const blob = await api.queryRaw(onBranch(dsName, dsBranch), active.query, fmt.accept, {
         reasoning: reasoning ?? undefined,
-        reasoningProfile: profileFor(reasoning),
+        reasoningProfile,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
