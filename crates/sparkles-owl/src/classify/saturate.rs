@@ -2412,6 +2412,17 @@ impl<'a> Run<'a> {
                 dl_root::init(self.ix, &mut st, &mut out);
             } else {
                 init(self.ix, me, &mut st, self.universal, &mut out);
+                // owl:Thing and the individuals have an instance in every model, which
+                // a run with the Horn rules reads from the start, so that R3 and R5 at
+                // a real context send an individual what its successor holds instead
+                // of creating a context for the conjunction (roadmap item 869)
+                if R::FULL
+                    && R::HORN
+                    && self.ix.has_individuals()
+                    && (me == TOP || matches!(self.ix.head(me).node, Node::Nominal(_)))
+                {
+                    out.me(Concl::Real);
+                }
             }
             ctx.started.store(true, Ordering::Release);
         }

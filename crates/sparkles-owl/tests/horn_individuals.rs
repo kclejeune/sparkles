@@ -365,3 +365,103 @@ fn r7_counts_the_context_itself_through_a_loop_with_a_qualified_filler() {
         &[("B", "M")],
     );
 }
+
+// Roadmap item 869: R3 and R5 at a real context send an individual what its successor
+// holds, where they made a context for the conjunction that held the individual.
+
+#[test]
+fn a_universal_over_an_assertion_reaches_the_individual_without_a_conjunction() {
+    // a has r to b and every r-successor of a is in C, so b is in C
+    let out = check(
+        "ObjectPropertyAssertion(:r :a :b)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         EquivalentClasses(:Q ObjectOneOf(:b))",
+        &[("Q", "C")],
+        &[("C", "Q")],
+    );
+    assert_eq!(out.stats.conjunctions, 0, "b takes C itself");
+}
+
+#[test]
+fn a_universal_follows_a_transitive_chain_of_assertions_without_conjunctions() {
+    // the universal follows the transitive role from a to b and on to d, and each
+    // individual in C gives its s-successor M, which a does not
+    let out = check(
+        "TransitiveObjectProperty(:r)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :b :d)
+         ObjectPropertyAssertion(:s :d :e)
+         ObjectPropertyAssertion(:s :b :f)
+         ObjectPropertyAssertion(:s :a :g)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         SubClassOf(:C ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))
+         EquivalentClasses(:Qf ObjectOneOf(:f))
+         EquivalentClasses(:Qg ObjectOneOf(:g))",
+        &[("Qe", "M"), ("Qf", "M")],
+        &[("Qg", "M"), ("M", "Qe")],
+    );
+    assert_eq!(
+        out.stats.conjunctions, 0,
+        "each individual takes the fillers itself"
+    );
+}
+
+#[test]
+fn r5_at_a_real_context_merges_into_the_individual_without_a_conjunction() {
+    // x has r to a and to b and r is functional, so a and b are one
+    let out = check(
+        "ObjectPropertyAssertion(:r :x :a)
+         ObjectPropertyAssertion(:r :x :b)
+         FunctionalObjectProperty(:r)
+         ClassAssertion(:P :a)
+         ClassAssertion(:S :b)
+         EquivalentClasses(:Qa ObjectOneOf(:a))
+         EquivalentClasses(:Qb ObjectOneOf(:b))",
+        &[("Qa", "Qb"), ("Qb", "Qa"), ("Qa", "S"), ("Qb", "P")],
+        &[("P", "Qa"), ("S", "P")],
+    );
+    assert_eq!(
+        out.stats.conjunctions, 0,
+        "the two individuals exchange what they hold"
+    );
+}
+
+#[test]
+fn a_real_context_that_is_no_individual_sends_its_universal_to_the_individual() {
+    // a's s-successor in D has an instance, whose r-successor is b, so b is in C; E has
+    // none that the ontology gives, so its universal says nothing of b
+    let out = check(
+        "ClassAssertion(ObjectSomeValuesFrom(:s :D) :a)
+         SubClassOf(:D ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(:D ObjectAllValuesFrom(:r :C))
+         SubClassOf(:E ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(:E ObjectAllValuesFrom(:r :F))
+         SubClassOf(:F ObjectAllValuesFrom(ObjectInverseOf(:r) :Z))
+         EquivalentClasses(:Q ObjectOneOf(:b))",
+        &[("Q", "C"), ("E", "Z")],
+        &[("Q", "F"), ("D", "Z"), ("Q", "Z")],
+    );
+    // E is not real, so its successor is the conjunction of b and F, and D's is too when
+    // its universal comes before the word that it is real
+    assert!(
+        (1..=2).contains(&out.stats.conjunctions),
+        "{} conjunctions",
+        out.stats.conjunctions
+    );
+}
+
+#[test]
+fn a_real_context_keeps_the_conjunction_of_a_successor_without_an_individual() {
+    // a's r-successor is in B and C, which no individual stands for
+    let out = check(
+        "ClassAssertion(ObjectSomeValuesFrom(:r :B) :a)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         SubClassOf(ObjectIntersectionOf(:B :C) :Y)
+         SubClassOf(:Y ObjectAllValuesFrom(ObjectInverseOf(:r) :Z))
+         EquivalentClasses(:Q ObjectOneOf(:a))",
+        &[("Q", "Z")],
+        &[("B", "Y"), ("B", "C")],
+    );
+    assert_eq!(out.stats.conjunctions, 1);
+}

@@ -30,7 +30,7 @@
 //! composed.
 
 use super::horn::HornIx;
-use super::index::{BOTTOM, Ex, Index, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, Small, State};
 use rustc_hash::FxHashMap;
 
@@ -461,7 +461,7 @@ pub fn succ<S: Sink>(
 
 /// R3: the successor by `r` in `n` with the fillers of the universals on the superroles
 /// of `r`.
-fn extend<S: Sink>(ix: &Index, fs: &[Ex], n: Ex, r: Role, out: &mut S) -> bool {
+fn extend<S: Sink>(ix: &Index, real: bool, fs: &[Ex], n: Ex, r: Role, out: &mut S) -> bool {
     if fs.is_empty() {
         return false;
     }
@@ -475,13 +475,36 @@ fn extend<S: Sink>(ix: &Index, fs: &[Ex], n: Ex, r: Role, out: &mut S) -> bool {
     if core == before {
         return false;
     }
-    let m = if core.len() == 1 {
-        core[0]
-    } else {
-        out.intern(&core)
+    let m = match named(ix, real, &core, out) {
+        Some(a) if a == n => return false,
+        Some(a) => a,
+        None if core.len() == 1 => core[0],
+        None => out.intern(&core),
     };
     out.me(Concl::Succ(r, m));
     true
+}
+
+/// The individual that stands for the conjunction `core` as a successor of a real
+/// context, when the core holds one (roadmap item 869). The context has an instance,
+/// whose successor in the conjunction is the individual, so the individual holds the
+/// rest of the core, which it is sent here, and the context links to the individual's
+/// own context where it would link to the conjunction's. The conjunction's context
+/// would be real and derive the individual, and the two would exchange everything they
+/// hold, so the link reads the same conclusions from either.
+fn named<S: Sink>(ix: &Index, real: bool, core: &[Ex], out: &mut S) -> Option<Ex> {
+    if !real {
+        return None;
+    }
+    let a = *core
+        .iter()
+        .find(|&&e| matches!(ix.head(e).node, Node::Nominal(_)))?;
+    for &e in core {
+        if e != a {
+            out.send(a, Concl::Sub(e));
+        }
+    }
+    Some(a)
 }
 
 /// R3 at the end of an activation, over the successors that came since the last call, or
@@ -527,6 +550,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
         todo.retain(|&(r, n)| !h.dominated.contains(&(r, n)));
     }
     h.dirty = false;
+    let real = st.real;
     // the fillers of the universals that apply to each role of the successors
     let roles = &ix.roles;
     // a short list for the few roles of most contexts, and a map beyond them
@@ -555,7 +579,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
         } else {
             many.entry(r).or_insert_with(|| of(r))
         };
-        sent |= extend(ix, fs, n, r, out);
+        sent |= extend(ix, real, fs, n, r, out);
     }
     sent
 }
@@ -689,10 +713,15 @@ fn merge_all<S: Sink>(ix: &Index, st: &mut State, s: Role, b: Ex, out: &mut S) -
     if cores.iter().all(|c| *c == u) {
         return false;
     }
-    let m = if u.len() == 1 { u[0] } else { out.intern(&u) };
+    let a = named(ix, st.real, &u, out);
+    let m = match a {
+        Some(a) => a,
+        None if u.len() == 1 => u[0],
+        None => out.intern(&u),
+    };
     let mut sent = false;
-    for (&(r, _), c) in links.iter().zip(&cores) {
-        if *c != u {
+    for (&(r, n), c) in links.iter().zip(&cores) {
+        if *c != u && a != Some(n) {
             out.me(Concl::Succ(r, m));
             sent = true;
         }
