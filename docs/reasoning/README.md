@@ -143,6 +143,15 @@ request or on every write, and the schema report counts what the data holds.
   query-time default: `auto` for hybrid, Jena's default, `demand` with nothing
   materialized for backward, and materialized reasoning for forward
   ([G08](../specs/G08-fuseki-configuration.md#rule-modes-and-query-time-reasoning)).
+  The hybrid mode's rule text starts with `@hybrid jena .`.
+* Jena's hybrid rules nest backward rules in a forward rule's head, as in
+  `(?p rdf:type ex:Symmetric) -> [(?x ?p ?y) <- (?y ?p ?x)]`. By default the
+  materialization flattens such a rule into `B1, B2 -> H`. With `@hybrid jena .` in the
+  rule text, the materialization keeps the forward head and the nested rule becomes the
+  query-time rule `H <- B1, B2`, which `demand` and `auto` derive when a query asks. A
+  rule with a functor term or a builtin that has a side effect or makes terms cannot be
+  split this way and is refused with an error that names it
+  ([F17 §5.2](../specs/F17-query-time-reasoning.md#52-hybrid-rules)).
 * Embedded query providers implement `ReasoningSession::intensional` with a
   `Result<bool>` return. Constant interning can refuse a memory reservation, and
   callers propagate that refusal before preparing demands. Implementations that
@@ -844,13 +853,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   that falls back reports the full run's peak memory and not the higher peak of the update
   it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
-  Jena's hybrid rules are flattened. Roadmap item 19.
+  Under `@hybrid jena` the query-time program evaluates forward and backward rules in one
+  fixpoint, so a forward rule reads what a backward rule derives at query time, where
+  Jena's forward engine does not.
 * OWL 2 QL rewriting leaves out reflexive properties, inclusions with `owl:Thing` on the
   left, data existentials on the left with a datatype range and triples about undeclared
   properties, and its rewritten patterns read the query's default graph, not the data of
-  named input graphs. It decides which variables are existential by name over the whole
-  query rather than by scope, and its fallback to the `owl-rl` rules can use axioms
-  outside OWL 2 QL. Roadmap item 985.
+  named input graphs. It decides which variables may stand for an unnamed individual by
+  name over the whole query rather than by scope, and its fallback to the `owl-rl` rules
+  can use axioms outside OWL 2 QL. Roadmap item 985.
   `reasoning=auto` reads a materialization that can answer rather than compare costs per
   pattern. Roadmap item 910.
 * A view's tables carry over to another commit only while the rules cannot read or give

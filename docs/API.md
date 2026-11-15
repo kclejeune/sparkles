@@ -9232,11 +9232,12 @@ curl -G localhost:3030/ds/sparql --data-urlencode 'query=ASK { ex:ann ex:teaches
   gives a value is distinguished. The names are counted over the whole query, so a
   variable local to a subquery is distinguished when another part of the query uses the
   same name.
-* A rewritten pattern gives each answer of its distinguished variables once, so the
-  variables it treats as existential do not multiply its solutions. With `ex:q
+* A rewritten pattern keeps SPARQL's bag semantics. A variable that stored facts bind
+  keeps its values even when the query does not project it, so the rows are those of
+  plain SPARQL over the stored and derived facts and of the `owl-rl` modes. With `ex:q
   rdfs:subPropertyOf ex:p` and two stored `ex:p` objects of `ex:a`, `SELECT ?s { ?s ex:p
-  ?o }` gives `ex:a` once, where the query without reasoning gives it twice. A pattern
-  that no axiom changes is read as written, with its multiplicities.
+  ?o }` gives `ex:a` twice. A solution that leaves a variable to an unnamed individual
+  counts once, and only where no stored fact names that variable.
 * `budget.maxUnion` in the query-time setting bounds the branches of one pattern's
   rewriting, 1,024 by default. A pattern past it, and one the rewriting cannot express,
   such as one with a variable predicate or class or a predicate of the RDF, RDFS or OWL

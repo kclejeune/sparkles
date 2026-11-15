@@ -1,12 +1,12 @@
 # F17: Query-time reasoning
 
-> **Status:** implemented in part, Phase 1 and the first part of Phase 2.
+> **Status:** implemented in part, Phases 1 and 2.
 >
 > **Phases:** Demand derivation, Jena backward rules, tables cached per snapshot and
 > view, budgets and EXPLAIN are available, with `auto`, its cost model and the dataset
 > setting, reuse of tables across commits, the MCP argument and the Fuseki converter's
-> rule modes, the UI selector and OWL 2 QL rewriting. Hybrid execution remains planned
-> in Phase 2. Incremental maintenance through F13 and later
+> rule modes, the UI selector, OWL 2 QL rewriting and Jena hybrid rules under
+> `@hybrid jena`. Incremental maintenance through F13 and later
 > provenance remain planned in Phase 3.
 >
 > **User docs:** [Query-time reasoning](../API.md#query-time-reasoning) and
@@ -292,20 +292,31 @@ Jena in these ways, which the user docs will list:
 
 ### 5.2 Hybrid rules
 
-A forward rule with backward rules in its head (`B1 -> [H <- B2]`) is materialized today
-as `B1, B2 -> H` (`engine::flatten`). With query-time reasoning, the rule set's
+A forward rule with backward rules in its head (`B1 -> [H <- B2]`) is materialized by
+default as `B1, B2 -> H` (`engine::flatten`). With query-time reasoning, the rule set's
 `hybrid` option chooses the split:
 
-- `"materialize"` (the default, today's behaviour) flattens as now.
-- `"jena"` materializes the forward part and adds, for each match of `B1`, the instantiated
-  backward rule `H <- B2` to the query-time program. The instantiated rules are kept with
-  the materialization, as Jena keeps the backward rules its RETE network generates, and
-  are updated by incremental runs like derived facts.
+- `materialize` (the default) flattens it.
+- `jena` materializes the forward part and compiles the nested rule into the top-level
+  backward rule `H <- B1, B2` of the query-time program, which the materialization leaves
+  out. The rule answers what Jena's instantiations of `H <- B2` for each match of `B1`
+  answer, with `B1` read when a query runs, so nothing is kept with the materialization and
+  no on-disk format changes. A rule this compilation cannot state is refused with an error
+  that names it: one with a functor term, one that calls a builtin with a side effect or
+  one that makes terms (`print`, `drop`, `remove`, `hide`, `makeTemp`, `makeSkolem`,
+  `now`), and one whose nested backward rule holds a rule of its own.
+
+The option is the rule text's `@hybrid jena .` or `@hybrid materialize .` directive, so it
+travels with the text through the materialization's rules digest, the query-time setting
+and the Fuseki converter. The query-time program evaluates every rule in one fixpoint, so
+a forward rule there also reads what a backward rule derives, where Jena's forward
+engine does not.
 
 ### 5.3 The Fuseki converter
 
 G08's converter maps a `ja:InfModel` whose reasoner is `GenericRuleReasoner` with
-`ja:rulesFrom` to a dataset with the rule text and `profile: "rules"`. Its query-time
+`ja:rulesFrom` to a dataset with the rule text and `profile: "rules"`, with `@hybrid jena .`
+before the text for the hybrid mode. Its query-time
 default is `auto` for the hybrid mode, which is Jena's default, `demand` for the
 backward mode, which then materializes nothing, and `materialized` for the forward
 mode. The converter reports which it chose. The Outcome records why hybrid maps to
@@ -364,7 +375,12 @@ the atoms that imply it under the ontology's inclusions, and atoms are unified w
 reduction makes them equal. Existential axioms (`owl:someValuesFrom` on the right of an
 inclusion) let a pattern match individuals with an unnamed successor, as the procedure
 defines. Variables that are projected, or used in a filter, are distinguished and are not
-bound to unnamed successors.
+bound to unnamed successors. A rewritten pattern keeps SPARQL's bag semantics. A variable
+that is not projected but that a stored triple binds stays an ordinary variable, so the
+pattern gives the rows of plain SPARQL and of the `owl-rl` modes, each solution once as
+matching the stored and derived facts would give it. Only a variable left to an unnamed
+successor, which no stored triple binds, has no value, and such a solution counts once and
+only when no stored fact names that variable for the same values of the others.
 
 The rewriting can grow exponentially in the number of atoms. It is bounded by
 `budget.maxUnion` (1,024 branches by default). A pattern whose rewriting passes the bound
@@ -430,7 +446,7 @@ rules including top-level backward rules; stratified `noValue`; equality as a lo
 stratum; `reasoning=demand`; tables cached per snapshot and view; budgets; EXPLAIN;
 the CLI; the library API. It needs F16 Phase 1's base tier, or builds it.
 
-**Phase 2 (M).** `auto` and its cost model, the dataset setting, `hybrid: "jena"`, OWL 2
+**Phase 2 (M).** `auto` and its cost model, the dataset setting, `@hybrid jena`, OWL 2
 QL rewriting, reuse of tables across commits, the MCP argument, the UI and the G08
 mapping.
 
@@ -485,6 +501,8 @@ gets them. Neither reads the inferred graph.
 ex:teaches ; owl:someValuesFrom owl:Thing ]` and `ex:ann a ex:Professor`, the query
 `ASK { ex:ann ex:teaches ?c }` returns `true` under `owl-ql`, and
 `SELECT ?c { ex:ann ex:teaches ?c }` returns no rows, because `?c` is distinguished.
+With `ex:bob a ex:Professor ; ex:teaches ex:c1 , ex:c2` added, `SELECT ?x { ?x ex:teaches
+?c }` returns `ex:bob` twice, as plain SPARQL does, and `ex:ann` once.
 
 **A9. Table reuse.** Two runs of LUBM query 6 on one snapshot: the second reports
 `cached=` equal to `tables=`. After an insert of a triple whose predicate is outside the
@@ -1380,8 +1398,8 @@ the `owl-ql` profile of the query-time setting and of `reasoningProfile`.
 * **The rewriting.** PerfectRef replaces atoms by the atoms that imply them and unifies
   pairs of atoms until no new query appears. A distinguished variable that a unification
   binds is bound again with `BIND`. A branch that names a fresh property is dropped, and
-  so is a branch whose atoms hold another's with the same bindings. A rewritten pattern is
-  `DISTINCT` over the projection of its distinguished variables of the union. EXPLAIN
+  so is a branch whose atoms hold another's with the same bindings and variables. A
+  rewritten pattern is `DISTINCT` over its variables and blank nodes, as decision 3 says. EXPLAIN
   shows a `Rewrite` node per pattern with its branches, and the rewritten algebra.
 * **Limits.** `budget.maxUnion` counts the queries the procedure makes, before the
   pruning, as each is made. The rewriting checks the query's stop function as it makes
@@ -1400,15 +1418,21 @@ the `owl-ql` profile of the query-time setting and of `reasoningProfile`.
    when the query uses `COUNT(*)`. A variable of the query's initial bindings counts as
    used. The count errs towards distinguished, which can only withhold an answer that
    needs an unnamed individual, as it does for a variable local to a subquery whose name
-   another part of the query uses. Roadmap item 985 makes the analysis follow scope. The
-   projection that ASK wraps its pattern in does not count. Generated variables take
+   another part of the query uses. Since a rewritten pattern keeps every variable a stored
+   triple binds, the name count decides only which variables may stand for an unnamed
+   individual, and roadmap item 985 makes that follow scope. The projection that ASK wraps
+   its pattern in does not count. Generated variables take
    names the query does not use.
-3. A rewritten pattern gives each solution of its distinguished variables once, since
-   certain answers are a set and an existential variable has no named value to count.
-   A variable that the query projects nowhere is existential even when the stored facts
-   name its values, so a rewritten pattern gives fewer rows than the same query without
-   reasoning when such a variable has several stored values. A pattern that no inclusion
-   changes keeps its form and its multiplicities.
+3. A rewritten pattern keeps SPARQL's bag semantics, as §7 now says. Every branch keeps
+   the names of the pattern's variables, and the union is `DISTINCT` over all of them and
+   its blank nodes, which gives each solution once as matching the stored and derived
+   facts gives it. A branch that leaves a variable to an unnamed individual is subtracted
+   with `MINUS` from the branches that bind every variable, so it adds a row only where no
+   stored fact names that variable. A pattern that no inclusion changes keeps its form.
+   `lubm_answers_match_an_owl_2_rl_closure_of_the_ql_fragment` compares the rows of the 14
+   LUBM queries, with their counts, against the closure, and
+   `a_variable_bound_by_stored_facts_keeps_the_rows_of_plain_sparql` and
+   `stored_and_rewritten_answers_give_the_rows_of_the_closure` cover the cases.
 4. §7 sends a pattern past the bound to the `owl-rl` demand program. The same fallback
    takes a pattern that PerfectRef cannot express: a variable predicate or class, a class
    or property of the RDF, RDFS or OWL vocabularies, or an RDF-star term. Property paths
@@ -1447,6 +1471,30 @@ and `New-Feature-ReflexiveProperty-001` is a known difference, decision 6. Fifte
 conclude axioms, which only a classifier answers, or have no conclusion. Over HTTP,
 `owl_ql_rewriting_over_http` checks the setting's `owlQl` member, A8 and the refusal of a
 materialization. Item 794 compares the answers and times with Ontop.
+
+### Hybrid rules
+
+**Built** for roadmap item 19 (§5.2), in `split_hybrid` of
+`crates/sparkles-reasoner/src/parser.rs`. The maintainer chose to compile the nested rule
+rather than keep instantiated rules with the materialization, so `@hybrid jena .` in the
+rule text turns `B1 -> [H <- B2]` into the forward rule with its other head clauses and the
+top-level backward rule `H <- B1, B2`. The materializer skips backward rules, and
+query-time reasoning, `auto`'s choice of the materialization and the check that mixes the
+two treat it as any backward rule. The directive lives in the rule text, so the rules
+digest of a materialization, the query-time setting and the Fuseki converter carry it
+without a new field or format. A rule with a functor term, a builtin with a side effect
+or one that makes terms, or a nested rule inside the backward rule is refused at parse
+time with an error that names the rule.
+
+**Acceptance.** `tests/hybrid_rules.rs` runs `tests/hybrid/hybrid.rules` over
+`tests/hybrid/data.nt`. The materialization equals the forward deductions of Apache Jena
+6.2.0's GenericRuleReasoner in the HYBRID mode, and the query-time answers for each
+predicate equal what Jena's model answers, both as `tests/hybrid/JenaHybrid.java` wrote
+them. Without the directive the nested rule is materialized, and a functor or `makeTemp`
+in a split rule is refused. `rule_modes_choose_the_query_time_default` checks that the
+Fuseki converter writes `@hybrid jena .` for the hybrid mode only. Every rule runs in one
+query-time fixpoint, so a forward rule there reads what a backward rule derives, which
+Jena's forward engine does not, and the reasoning guide lists the difference.
 
 ### The UI selector
 
