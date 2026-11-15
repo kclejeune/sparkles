@@ -480,6 +480,9 @@ impl State {
             if h.pred_in.list.iter().any(|(m, _)| gone.contains(m)) {
                 h.pred_in.retain(|(m, _)| !gone.contains(m));
             }
+            if h.told.list.iter().any(|(m, _)| gone.contains(m)) {
+                h.told.retain(|(m, _)| !gone.contains(m));
+            }
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
                 if set.list.iter().any(|m| gone.contains(m)) {
                     set.retain(|m| !gone.contains(m));
@@ -515,6 +518,7 @@ impl State {
             }
             let h = &mut x.horn;
             debug_assert!(h.pending.is_empty() && h.merges.is_empty());
+            h.forget_dominance();
             if h.succ.list.iter().any(|&(_, n)| n >= from) {
                 h.succ.map(|(r, n)| (r, up(n)));
             }
@@ -523,6 +527,9 @@ impl State {
             }
             if h.pred_in.list.iter().any(|&(m, _)| m >= from) {
                 h.pred_in.map(|(m, b)| (up(m), b));
+            }
+            if h.told.list.iter().any(|&(m, n)| m >= from || n >= from) {
+                h.told.map(|(m, n)| (up(m), up(n)));
             }
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
                 if set.list.iter().any(|&e| e >= from) {

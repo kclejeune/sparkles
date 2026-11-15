@@ -71,6 +71,18 @@ pub struct HornSt {
     pub same: Small<Ex>,
     /// the predecessors told that this context is singular
     pub told_singular: Small<Ex>,
+    /// the successors that no other successor dominates, with the place of each one's
+    /// core in `cores`, in a run without individuals (item 710)
+    pub live: Vec<(Role, Ex, u32, u32)>,
+    /// the cores of the successors in `live`
+    pub cores: Vec<Ex>,
+    /// the successors that another successor dominates, which R3, R5 and R6 pass over
+    pub dominated: Small<(Role, Ex)>,
+    /// the successors of `succ` that `live` and `dominated` sort, from the first
+    pub sorted: usize,
+    /// `(M, N)`: R6 sent the predecessor M the core of the successor N, in a run that
+    /// passes over dominated successors
+    pub told: Small<(Ex, Ex)>,
 }
 
 impl HornSt {
@@ -87,6 +99,19 @@ impl HornSt {
             + self.real_preds.bytes()
             + self.same.bytes()
             + self.told_singular.bytes()
+            + self.live.capacity() * 16
+            + self.cores.capacity() * 4
+            + self.dominated.bytes()
+            + self.told.bytes()
+    }
+
+    /// Forgets which successors dominate which, which [`sync`] finds again from the
+    /// successors in their order, for a state whose context ids change.
+    pub fn forget_dominance(&mut self) {
+        self.live = Vec::new();
+        self.cores = Vec::new();
+        self.dominated = Small::default();
+        self.sorted = 0;
     }
 }
 
@@ -122,14 +147,118 @@ fn held_own(st: &State, b: Ex) -> bool {
     b == TOP || st.subs.contains(&b)
 }
 
+/// Whether the run passes over dominated successors: a run of the Horn rules without
+/// individuals, universal roles or functional data roles, whose contexts derive what their
+/// cores and successors give (F24, "The Horn rules", item 710).
+#[inline]
+fn dominates(ix: &Index) -> bool {
+    ix.horn.as_ref().is_some_and(|h| h.dominate)
+}
+
+/// Whether the sorted `a` is a subset of the sorted `b`.
+fn subset(a: &[Ex], b: &[Ex]) -> bool {
+    if a.len() > b.len() {
+        return false;
+    }
+    let mut j = 0;
+    for &x in a {
+        while j < b.len() && b[j] < x {
+            j += 1;
+        }
+        if j == b.len() || b[j] != x {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
+/// Sorts the successors that came since the last call into those that another successor
+/// dominates and those that no other does (item 710). A successor by `r'` in `n'`
+/// dominates one by `r` in `n` when `r'` is under `r` and the core of `n` is part of that
+/// of `n'`: every rule that reads the second derives from the first what it would derive
+/// from the second, or more. A successor that a new one dominates leaves `live`, and one
+/// that a successor in `live` dominates when it comes goes to `dominated` at once.
+fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
+    if !dominates(ix) {
+        return;
+    }
+    let Some(x) = st.extra.as_mut() else { return };
+    let h = &mut x.horn;
+    if h.sorted == h.succ.list.len() {
+        return;
+    }
+    let roles = &ix.roles;
+    let mut core = Vec::new();
+    while h.sorted < h.succ.list.len() {
+        let (r, n) = h.succ.list[h.sorted];
+        h.sorted += 1;
+        out.core(ix, n, &mut core);
+        let cores = &h.cores;
+        let of = |at: u32, len: u32| &cores[at as usize..(at + len) as usize];
+        if h.live
+            .iter()
+            .any(|&(r2, _, at, len)| roles.sub(r2, r) && subset(&core, of(at, len)))
+        {
+            h.dominated.insert((r, n));
+            continue;
+        }
+        let mut gone = Vec::new();
+        h.live.retain(|&(r2, n2, at, len)| {
+            let keep = !(roles.sub(r, r2) && subset(of(at, len), &core));
+            if !keep {
+                gone.push((r2, n2));
+            }
+            keep
+        });
+        for g in gone {
+            h.dominated.insert(g);
+        }
+        let at = h.cores.len() as u32;
+        h.cores.extend_from_slice(&core);
+        h.live.push((r, n, at, core.len() as u32));
+        // the cores of the successors that left `live` go once they take half the room
+        if h.cores.len() > 64
+            && h.cores.len() > 2 * h.live.iter().map(|l| l.3 as usize).sum::<usize>()
+        {
+            let mut cores = Vec::with_capacity(h.cores.len() / 2);
+            for l in &mut h.live {
+                let at = cores.len() as u32;
+                cores.extend_from_slice(&h.cores[l.2 as usize..(l.2 + l.3) as usize]);
+                l.2 = at;
+            }
+            h.cores = cores;
+        }
+    }
+}
+
+/// Whether a dominated successor, which [`sync`] sorted, is the one by `r` in `n`.
+fn is_dominated(ix: &Index, st: &State, r: Role, n: Ex) -> bool {
+    dominates(ix)
+        && st
+            .extra
+            .as_ref()
+            .is_some_and(|x| x.horn.dominated.contains(&(r, n)))
+}
+
 /// The successors that `≤1 S.B` counts.
 fn members(ix: &Index, st: &State, s: Role, b: Ex) -> Vec<Member> {
     let roles = &ix.roles;
     let mut k: Vec<Member> = Vec::new();
     if let Some(x) = &st.extra {
-        for &(r, n) in &x.horn.succ.list {
+        let mut take = |r: Role, n: Ex| {
             if roles.sub(r, s) && held_succ(st, n, b) {
                 k.push(Member::Link(r, n));
+            }
+        };
+        if dominates(ix) {
+            debug_assert_eq!(x.horn.sorted, x.horn.succ.list.len());
+            for &(r, n, _, _) in &x.horn.live {
+                take(r, n);
+            }
+        } else {
+            for &(r, n) in &x.horn.succ.list {
+                take(r, n);
             }
         }
     }
@@ -158,6 +287,24 @@ fn preds(ix: &Index, st: &State, s: Role, b: Ex) -> Vec<(Ex, Role)> {
         }
     }
     out
+}
+
+/// The pairs of a predecessor and a successor whose core R6 sent the predecessor, which
+/// a run that passes over dominated successors keeps so that it sends each core once.
+struct Told(Option<Small<(Ex, Ex)>>);
+
+impl Told {
+    fn take(ix: &Index, st: &mut State) -> Told {
+        Told(dominates(ix).then(|| std::mem::take(&mut hs(st).told)))
+    }
+    fn put(self, st: &mut State) {
+        if let Some(t) = self.0 {
+            hs(st).told = t;
+        }
+    }
+    fn first(&mut self, m: Ex, n: Ex) -> bool {
+        self.0.as_mut().is_none_or(|t| t.insert((m, n)))
+    }
 }
 
 /// Sends a context the conjunction that `n` stands for.
@@ -203,6 +350,15 @@ pub fn succ<S: Sink>(
     for &b in &h.fills {
         out.send(n, Concl::PredIn(me, b));
     }
+    // R3 and R5 read the successors that no other dominates, which only a context with a
+    // universal or an at-most restriction sorts
+    if !h.all_roles.is_empty() || !h.atmost.is_empty() {
+        sync(ix, st, out);
+        if is_dominated(ix, st, r, n) {
+            return true;
+        }
+    }
+    let h = hs(st);
     if !h.dirty && h.all_roles.iter().any(|&s| roles.sub(r, s)) {
         h.pending.push((r, n));
     }
@@ -253,6 +409,8 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
     if !h.dirty && h.pending.is_empty() && h.merges.is_empty() {
         return false;
     }
+    sync(ix, st, out);
+    let h = &mut st.extra.as_mut().expect("the context's Horn state").horn;
     let mut sent = false;
     let mut merges = std::mem::take(&mut h.merges);
     merges.sort_unstable();
@@ -261,12 +419,21 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
         sent |= merge_all(ix, st, s, b, out);
     }
     let h = &mut st.extra.as_mut().expect("the context's Horn state").horn;
-    let todo: Vec<(Role, Ex)> = if h.dirty {
+    let mut todo: Vec<(Role, Ex)> = if h.dirty {
         h.pending.clear();
-        h.succ.list.to_vec()
+        if dominates(ix) {
+            h.live.iter().map(|&(r, n, _, _)| (r, n)).collect()
+        } else {
+            h.succ.list.to_vec()
+        }
     } else {
         std::mem::take(&mut h.pending)
     };
+    // a dominated successor's extension is dominated by that of the successor that
+    // dominates it, which R3 extends as well
+    if dominates(ix) && !h.dominated.list.is_empty() {
+        todo.retain(|&(r, n)| !h.dominated.contains(&(r, n)));
+    }
     h.dirty = false;
     // the fillers of the universals that apply to each role of the successors
     let roles = &ix.roles;
@@ -342,12 +509,15 @@ pub fn at_most<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, out:
     }
     h.atmost.push((s, b));
     h.merges.push((s, b));
+    sync(ix, st, out);
     let k = members(ix, st, s, b);
+    let mut told = Told::take(ix, st);
     for (m, r1) in preds(ix, st, s, b) {
         for &x in &k {
-            identify(ix, me, st, m, r1, x, out);
+            identify(ix, me, st, &mut told, m, r1, x, out);
         }
     }
+    told.put(st);
     counted_full(ix, me, st, None, out);
 }
 
@@ -355,9 +525,11 @@ pub fn at_most<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, out:
 /// with every predecessor.
 fn counted<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, x: Member, out: &mut S) {
     hs(st).merges.push((s, b));
+    let mut told = Told::take(ix, st);
     for (m, r1) in preds(ix, st, s, b) {
-        identify(ix, me, st, m, r1, x, out);
+        identify(ix, me, st, &mut told, m, r1, x, out);
     }
+    told.put(st);
 }
 
 /// R5 at the end of an activation: every successor that `≤1 s.b` counts is one, so each
@@ -430,7 +602,16 @@ fn merge_all<S: Sink>(ix: &Index, st: &mut State, s: Role, b: Ex, out: &mut S) -
 }
 
 /// R6: the predecessor `m`, by `r1`, and the successor `x` are one.
-fn identify<S: Sink>(ix: &Index, me: Ex, st: &State, m: Ex, r1: Role, x: Member, out: &mut S) {
+fn identify<S: Sink>(
+    ix: &Index,
+    me: Ex,
+    st: &State,
+    told: &mut Told,
+    m: Ex,
+    r1: Role,
+    x: Member,
+    out: &mut S,
+) {
     let roles = &ix.roles;
     match x {
         Member::Link(r2, n2) => {
@@ -440,7 +621,10 @@ fn identify<S: Sink>(ix: &Index, me: Ex, st: &State, m: Ex, r1: Role, x: Member,
                 out.me(Concl::Loop(r2));
                 return;
             }
-            send_core(ix, m, n2, out);
+            // a predecessor holds for good the core it was sent once
+            if told.first(m, n2) {
+                send_core(ix, m, n2, out);
+            }
             if let Some(i) = roles.inv(r2) {
                 if roles.clashes(r1, i) || roles.clashes(i, r1) {
                     out.send(m, Concl::Sub(BOTTOM));
@@ -497,19 +681,28 @@ pub fn fill<S: Sink>(ix: &Index, me: Ex, st: &mut State, b: Ex, out: &mut S) {
 /// R6 runs for the fillers the source holds, `owl:Thing` and those it told the context
 /// of through an earlier link.
 pub fn back<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &mut S) {
+    if st.extra.as_ref().is_some_and(|x| !x.horn.atmost.is_empty()) {
+        sync(ix, st, out);
+    }
     let Some(x) = &st.extra else { return };
     for &b in &x.horn.fills {
         out.send(e, Concl::SuccIn(me, b));
     }
     let roles = &ix.roles;
     let Some(i) = roles.inv(r) else { return };
+    if x.horn.atmost.is_empty() {
+        return;
+    }
+    let mut told = Told::take(ix, st);
+    let x = st.extra.as_ref().expect("the context's Horn state");
     for &(s, b) in &x.horn.atmost {
         if roles.sub(i, s) && held_pred(st, e, b) {
             for y in members(ix, st, s, b) {
-                identify(ix, me, st, e, r, y, out);
+                identify(ix, me, st, &mut told, e, r, y, out);
             }
         }
     }
+    told.put(st);
 }
 
 /// `SuccIn(n, b)`: the successor n holds b.
@@ -517,8 +710,12 @@ pub fn succ_in<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, b: Ex, out: &
     if !hs(st).succ_in.insert((n, b)) {
         return false;
     }
+    if !hs(st).atmost.is_empty() {
+        sync(ix, st, out);
+    }
     let roles = &ix.roles;
-    let h = hs(st);
+    let dom = dominates(ix);
+    let h: &HornSt = hs(st);
     let found: Vec<(Role, Role)> = h
         .atmost
         .iter()
@@ -527,7 +724,9 @@ pub fn succ_in<S: Sink>(ix: &Index, me: Ex, st: &mut State, n: Ex, b: Ex, out: &
             h.succ
                 .list
                 .iter()
-                .filter(move |&&(r, n2)| n2 == n && roles.sub(r, s))
+                .filter(move |&&(r, n2)| {
+                    n2 == n && roles.sub(r, s) && !(dom && h.dominated.contains(&(r, n2)))
+                })
                 .map(move |&(r, _)| (s, r))
         })
         .collect();
@@ -542,6 +741,9 @@ pub fn pred_in<S: Sink>(ix: &Index, me: Ex, st: &mut State, m: Ex, b: Ex, out: &
     if !hs(st).pred_in.insert((m, b)) {
         return false;
     }
+    if !hs(st).atmost.is_empty() {
+        sync(ix, st, out);
+    }
     let roles = &ix.roles;
     let atmost: Vec<Role> = hs(st)
         .atmost
@@ -549,16 +751,18 @@ pub fn pred_in<S: Sink>(ix: &Index, me: Ex, st: &mut State, m: Ex, b: Ex, out: &
         .filter(|&&(_, b2)| b2 == b)
         .map(|&(s, _)| s)
         .collect();
+    let mut told = Told::take(ix, st);
     for s in atmost {
         let k = members(ix, st, s, b);
         for (r1, srcs) in &st.back {
             if srcs.contains(&m) && roles.inv(*r1).is_some_and(|i| roles.sub(i, s)) {
                 for &x in &k {
-                    identify(ix, me, st, m, *r1, x, out);
+                    identify(ix, me, st, &mut told, m, *r1, x, out);
                 }
             }
         }
     }
+    told.put(st);
     true
 }
 
