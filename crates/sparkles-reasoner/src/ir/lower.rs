@@ -65,6 +65,14 @@ pub(crate) struct Lowered {
     _held: Held,
 }
 
+impl Lowered {
+    /// The bytes charged for the lowered rules.
+    #[cfg(test)]
+    pub fn bytes(&self) -> usize {
+        self._held.bytes()
+    }
+}
+
 /// The first origin of the builtins that no compiled Jena rule gave an origin, above any
 /// that a compiled program numbers.
 const ORIGIN_BASE: usize = 1 << 40;
@@ -125,7 +133,6 @@ impl Program {
     pub fn lower(&self, budget: &Arc<Budget>) -> Result<Lowered, LowerError> {
         let shape = self.shape();
         let mut held = Held::new(budget);
-        let mut stratified_novalue = Vec::new();
         for r in &self.rules {
             if !r.exists.is_empty() {
                 return Err(LowerError::Existential {
@@ -133,50 +140,65 @@ impl Program {
                 });
             }
         }
+        // the rules of each stratum, which the outer vectors are allocated for exactly
+        let count = match shape {
+            Shape::Jena | Shape::Monotone => 1,
+            Shape::Strata => self.strata.count as usize,
+        };
+        held.try_grow(count * (size_of::<Vec<CRule>>() + size_of::<usize>()))?;
+        let mut sizes = vec![0usize; count];
+        match shape {
+            Shape::Jena | Shape::Monotone => sizes[0] = self.rules.len(),
+            Shape::Strata => {
+                for part in &self.strata.parts {
+                    sizes[part.stratum as usize] += 1;
+                }
+            }
+        }
+        held.try_grow(sizes.iter().sum::<usize>() * size_of::<CRule>())?;
+        let mut strata: Vec<Vec<CRule>> = sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
+        drop(sizes);
+        held.shrink(count * size_of::<usize>());
         // the first origin of each rule's builtins that have none
+        held.try_grow(self.rules.len() * size_of::<usize>())?;
         let mut origins = Vec::with_capacity(self.rules.len());
         let mut next = ORIGIN_BASE;
         for r in &self.rules {
             origins.push(next);
             next += r.body.len() + r.head.len();
         }
+        // each rule is charged a bound of its size before it is built, and then keeps the
+        // charge of the size it keeps
         let mut lower = |ri: usize, heads: &[usize]| -> Result<CRule, LowerError> {
-            held.try_grow(lowered_bytes(self, &self.rules[ri], heads))?;
-            lower_rule(self, ri, heads, shape, origins[ri])
+            let bound = lowered_bound(&self.rules[ri], heads);
+            held.try_grow(bound)?;
+            let rule = lower_rule(self, ri, heads, shape, origins[ri])?;
+            let kept = crule_bytes(&rule);
+            debug_assert!(kept <= bound, "{kept} > {bound}");
+            held.shrink(bound.saturating_sub(kept));
+            Ok(rule)
         };
-        let strata = match shape {
+        match shape {
             Shape::Jena | Shape::Monotone => {
-                let mut rules = Vec::new();
                 for (i, r) in self.rules.iter().enumerate() {
                     let heads: Vec<usize> = (0..r.head.len()).collect();
-                    rules.push(lower(i, &heads)?);
+                    strata[0].push(lower(i, &heads)?);
                 }
-                vec![rules]
             }
             Shape::Strata => {
-                let mut strata: Vec<Vec<CRule>> =
-                    (0..self.strata.count).map(|_| Vec::new()).collect();
                 for part in &self.strata.parts {
-                    let r = &self.rules[part.rule];
                     strata[part.stratum as usize].push(lower(part.rule, &part.heads)?);
-                    let novalue = r.body.iter().any(
-                        |l| matches!(l, Literal::Builtin(b) if b.kind == BuiltinKind::NoValue),
-                    );
-                    if novalue && !r.uses_ir() && stratified_novalue.last() != Some(&part.rule) {
-                        stratified_novalue.push(part.rule);
-                    }
                 }
-                strata
             }
-        };
-        held.try_grow(
-            (strata.len() * size_of::<Vec<CRule>>())
-                + strata
-                    .iter()
-                    .map(|s| s.capacity() * size_of::<CRule>())
-                    .sum::<usize>()
-                + stratified_novalue.capacity() * size_of::<usize>(),
-        )?;
+        }
+        drop(lower);
+        drop(origins);
+        held.shrink(self.rules.len() * size_of::<usize>());
+        let novalue = |i: &usize| shape == Shape::Strata && jena_novalue(&self.rules[*i]);
+        let n = (0..self.rules.len()).filter(novalue).count();
+        held.try_grow(n * size_of::<usize>())?;
+        let mut stratified_novalue = Vec::with_capacity(n);
+        stratified_novalue.extend((0..self.rules.len()).filter(novalue));
         Ok(Lowered {
             shape,
             strata,
@@ -186,46 +208,80 @@ impl Program {
     }
 }
 
-/// The heap of rule `r` lowered with the heads `heads`, an upper bound: its atoms, its
-/// builtins with their arguments, inputs and outputs, one tail builtin per atom and head of
-/// arity 3 or more, and its heads.
-fn lowered_bytes(p: &Program, r: &Rule, heads: &[usize]) -> usize {
-    let arity = |a: &IAtom| a.args.len() + 2;
+/// Whether `r` is a rule of Jena's form with a `noValue`.
+fn jena_novalue(r: &Rule) -> bool {
+    !r.uses_ir()
+        && r.body
+            .iter()
+            .any(|l| matches!(l, Literal::Builtin(b) if b.kind == BuiltinKind::NoValue))
+}
+
+/// The heap a lowered rule keeps: its name, its atoms, its builtins with their arguments,
+/// inputs and outputs, and its heads with their arguments.
+pub(crate) fn crule_bytes(r: &CRule) -> usize {
+    let builtins: usize = r
+        .builtins
+        .iter()
+        .map(|b| {
+            b.args.capacity() * size_of::<Slot>()
+                + (b.inputs.capacity() + b.outputs.capacity()) * size_of::<usize>()
+        })
+        .sum();
+    let heads: usize = r
+        .head
+        .iter()
+        .map(|h| match h {
+            CHead::Action(_, args) => args.capacity() * size_of::<Slot>(),
+            CHead::Triple(..) => 0,
+        })
+        .sum();
+    r.name.capacity()
+        + r.atoms.capacity() * size_of::<Atom>()
+        + r.builtins.capacity() * size_of::<CBuiltin>()
+        + r.head.capacity() * size_of::<CHead>()
+        + builtins
+        + heads
+}
+
+/// A bound of [`crule_bytes`] for rule `r` lowered with the heads `heads`: an atom per
+/// positive literal, a builtin per body literal and per head, each with the arguments of
+/// a whole lowered atom and as many inputs and outputs, and the heads.
+fn lowered_bound(r: &Rule, heads: &[usize]) -> usize {
     let mut atoms = 0;
     let mut builtins = 0;
     let mut slots = 0;
+    let args = |a: &IAtom| a.args.len().max(2) + 1;
     for l in &r.body {
         match l {
             Literal::Pos(a) => {
                 atoms += 1;
-                builtins += usize::from(matches!(a.pred, Pred::Rel(_)) && a.args.len() > 2);
-                slots += 2 * arity(a);
+                builtins += 1;
+                slots += args(a);
             }
             Literal::Neg(a) => {
                 builtins += 1;
-                slots += 2 * arity(a);
+                slots += args(a);
             }
             Literal::Builtin(b) => {
                 builtins += 1;
-                slots += b.args.len() + b.inputs.len() + b.outputs.len();
+                slots += b.args.len();
             }
         }
     }
     for &h in heads {
         match &r.head[h] {
             Head::Atom(a) => {
-                builtins += usize::from(matches!(a.pred, Pred::Rel(_)) && a.args.len() > 2);
-                slots += 2 * arity(a);
+                builtins += 1;
+                slots += args(a);
             }
-            Head::Action(_, args) => slots += args.len(),
+            Head::Action(_, a) => slots += a.len(),
         }
     }
-    let _ = p;
-    r.name.capacity()
+    r.name.len()
         + atoms * size_of::<Atom>()
         + builtins * size_of::<CBuiltin>()
         + heads.len() * size_of::<CHead>()
-        + slots * size_of::<Slot>()
+        + slots * (size_of::<Slot>() + 2 * size_of::<usize>())
 }
 
 /// The slots of the lowered atom `a`: the triple's, and the tail's columns for a relation
@@ -258,16 +314,13 @@ fn builtin(kind: BuiltinKind, args: Vec<Slot>, origin: usize) -> CBuiltin {
         Slot::Var(v) => Some(v),
         _ => None,
     };
-    let inputs = kind
-        .input_positions(args.len())
-        .iter()
-        .filter_map(var)
-        .collect();
-    let outputs = kind
-        .output_positions(args.len())
-        .iter()
-        .filter_map(var)
-        .collect();
+    let exact = |positions: Vec<usize>| -> Vec<usize> {
+        let mut v = Vec::with_capacity(positions.iter().filter_map(var).count());
+        v.extend(positions.iter().filter_map(var));
+        v
+    };
+    let inputs = exact(kind.input_positions(args.len()));
+    let outputs = exact(kind.output_positions(args.len()));
     CBuiltin {
         origin,
         kind,
@@ -292,8 +345,29 @@ fn lower_rule(
         nvars += 1;
         Slot::Var(nvars - 1)
     };
-    let mut atoms = Vec::new();
-    let mut builtins = Vec::new();
+    let pos = r
+        .body
+        .iter()
+        .filter(|l| matches!(l, Literal::Pos(_)))
+        .count();
+    let tails = |a: &IAtom| usize::from(matches!(a.pred, Pred::Rel(_)) && a.args.len() > 2);
+    let calls = r
+        .body
+        .iter()
+        .map(|l| match l {
+            Literal::Pos(a) => tails(a),
+            _ => 1,
+        })
+        .sum::<usize>()
+        + heads
+            .iter()
+            .map(|&h| match &r.head[h] {
+                Head::Atom(a) => tails(a),
+                Head::Action(..) => 0,
+            })
+            .sum::<usize>();
+    let mut atoms = Vec::with_capacity(pos);
+    let mut builtins = Vec::with_capacity(calls);
     for (li, l) in r.body.iter().enumerate() {
         let origin = first_origin + li;
         match l {
@@ -304,7 +378,8 @@ fn lower_rule(
                     Some((k, cols)) => {
                         let h = fresh();
                         atoms.push(Atom { s, p: pr, o: h });
-                        let mut args = vec![h, Slot::Const(k)];
+                        let mut args = Vec::with_capacity(2 + cols.len());
+                        args.extend([h, Slot::Const(k)]);
                         args.extend(cols);
                         builtins.push(builtin(BuiltinKind::RelTail, args, origin));
                     }
@@ -315,7 +390,8 @@ fn lower_rule(
                 let args = match tail {
                     None => vec![s, pr, o],
                     Some((k, cols)) => {
-                        let mut args = vec![s, Slot::Const(k)];
+                        let mut args = Vec::with_capacity(2 + cols.len());
+                        args.extend([s, Slot::Const(k)]);
                         args.extend(cols);
                         args
                     }
@@ -338,7 +414,8 @@ fn lower_rule(
                     Some((k, cols)) => {
                         let h = fresh();
                         head.push(CHead::Triple(s, pr, h));
-                        let mut args = vec![h, Slot::Const(k)];
+                        let mut args = Vec::with_capacity(2 + cols.len());
+                        args.extend([h, Slot::Const(k)]);
                         args.extend(cols);
                         builtins.push(builtin(BuiltinKind::RelTuple, args, origin));
                     }

@@ -958,6 +958,43 @@ fn the_lowered_rules_are_charged() {
     let tight = Budget::new(Some(ir));
     assert!(matches!(p.lower(&tight), Err(lower::LowerError::Memory(_))));
     assert_eq!(tight.used(), 0);
+    // the charge is what the lowered rules keep, for these and for `not R() → S()`,
+    // whose lowered builtin has more arguments than its atom
+    let (rs2, ids2) = rels(&[0, 0]);
+    let small = rule(
+        "n",
+        vec![neg(rel(ids2[0], &[]))],
+        vec![head(rel(ids2[1], &[]))],
+    );
+    let p2 = program(&t, rs2, vec![small]);
+    for p in [&p, &p2] {
+        let b = Budget::new(None);
+        let l = p.lower(&b).unwrap();
+        let kept: usize = l
+            .strata
+            .iter()
+            .flatten()
+            .map(lower::crule_bytes)
+            .sum::<usize>()
+            + l.strata.len() * size_of::<Vec<crate::engine::CRule>>()
+            + l.strata.iter().map(|s| s.capacity()).sum::<usize>()
+                * size_of::<crate::engine::CRule>()
+            + l.stratified_novalue.capacity() * size_of::<usize>();
+        assert_eq!(l.bytes(), kept);
+    }
+}
+
+/// A rebuilt graph, such as a compaction makes, still hides the facts of relations.
+#[test]
+fn a_rebuilt_graph_hides_relation_facts() {
+    let mut g = Graph::default();
+    let k = key(RelId(0));
+    assert!(!g.is_hidden(k));
+    g.set_relations();
+    assert!(g.is_hidden(k));
+    let h = g.try_like(0, &Budget::unlimited(), true).unwrap();
+    assert!(h.is_hidden(k));
+    assert!(!h.is_hidden(n(5)));
 }
 
 /// An existential head and `makeTemp` in a rule that reads lists are refused by name.

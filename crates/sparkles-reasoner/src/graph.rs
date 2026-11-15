@@ -278,6 +278,10 @@ impl Graph {
         };
         g.tier.set_offset(self.offset());
         g.base = self.base.clone();
+        // a rebuild, such as a compaction's, copies relation rows with the live rows
+        if self.relations {
+            g.set_relations();
+        }
         Ok(g)
     }
 
