@@ -828,7 +828,14 @@ const LEFT_EMPTY: &str = "the left side produced no rows";
 /// value tables) bypass it; everything else is looked up and stored.
 /// This legacy raw facade returns caller-owned, uncredited storage. Internal
 /// bounded consumers retain execute_materialized's actual owner instead.
-pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
+///
+/// The context is shared first when it was not, as [`Ctx::into_shared`] shares it, so
+/// that a LIMIT, an ASK or an EXISTS pattern in `n` reads its input only to the rows it
+/// needs whoever built the context (item 980).
+pub fn execute(ctx: &std::sync::Arc<Ctx>, n: &Node) -> Result<(Table, PlanInfo)> {
+    if ctx.shared().is_none() {
+        ctx.attach_owner();
+    }
     let (output, info) = execute_materialized(ctx, n)?;
     Ok((output.table, info))
 }
@@ -9597,6 +9604,7 @@ mod paid_eager_producer_tests {
             sorted: Vec::new(),
         };
         let node = Node::leaf(Kind::Values(table), vec![0], 1.0, "raw facade".into());
+        let ctx = std::sync::Arc::new(ctx);
         let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
         let (table, _) = execute(&ctx, &node).unwrap();
         assert_eq!(table.cols, [vec![Id::UNDEF]]);

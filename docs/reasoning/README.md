@@ -78,7 +78,14 @@ request or on every write, and the schema report counts what the data holds.
   The maintenance compares its count and the run's charges with the allowance every 1,024
   instances, so it can pass the allowance by a few batches before it stops. The kept
   closure holds only the derived facts, which takes 41% to 47% of the memory of a closure
-  with the explicit facts on LUBM-style data.
+  with the explicit facts on LUBM-style data. The update is a pass of the fixed-point
+  operator that property paths in incremental views also use, in its exact mode, which
+  keeps no derivation records.
+* `ReasonOptions::inferred_change` makes an incremental run report what it committed to
+  the inferred graph, each added triple with weight `+1` and each removed one with weight
+  `-1`, in the ids of the snapshot that the report's receipt names. A full run, including
+  one that an incremental run fell back to, reports no change, and a reader then reads the
+  inferred graph again. The change is held in memory until the report is dropped.
 * A materialization reads the default graph unless data and ontology graphs are named,
   and follows `owl:imports` to graphs of the dataset through a Jena-style location
   mapping ([API.md](../API.md#input-graphs-and-imports)). With `imports: fetch`, missing
@@ -450,11 +457,18 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the top object property, is used as far as the calculus goes and reported as partial.
   Every answer is entailed, and it is complete for named classes when nothing is reported.
   For eligible EL additions and removals, the classifier keeps its contexts and saturates
-  again only those the changes can reach. Horn and disjunctive classifications rebuild
-  after edits. Their incremental maintenance is planned. Roadmap item 753 under item 603.
-  A change to the property hierarchy, chains, reflexivity or ranges, to an axiom
-  with an individual, a data property, a datatype or a key, and any change after a run
-  that took that step or an axiom outside OWL 2 EL, saturates everything again. A run stops at its deadline, its
+  again only those the changes can reach. A classification with the Horn rules of an
+  ontology without individuals, and one with the disjunctive rules that does not count,
+  keep their contexts in the same way. After an edit of class axioms the next run clears
+  the contexts that hold an expression whose rules changed, with the contexts that reach
+  them, and its answer is that of a classification that starts again. A change to the
+  property hierarchy, chains, reflexivity or ranges, an
+  axiom with an individual, a data property, a datatype, a key or a self restriction, and
+  a change that moves the ontology to other rules, saturates everything again. So does
+  any change to a Horn ontology with individuals, to a counting or a rooted run, and to a
+  disjunctive run with the eager strategy. Roadmap items 753 and 953. A kept classification holds
+  the last index beside the new one while it compares them, and starts again once it
+  keeps more than twice the expressions of its last full run. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
   closure, saturates and builds the taxonomy. Integer, decimal and rational literals
   use exact arbitrary-precision values, so equal reduced fractions and equivalent
@@ -496,9 +510,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   taxonomy that graph held, and records PROV-O provenance on the graph's ontology
   header. The dataset keeps its last classification of an ontology for callers who read
   every graph, so a compatible same-commit call can reuse a retained result. At a later
-  commit, eligible EL additions and removals reuse affected contexts. Horn and
-  disjunctive runs rebuild after edits, and affected-module reuse is planned. Roadmap
-  item 753 under item 603. Finer invalidation for EL individual, merge, key and world
+  commit, eligible EL additions and removals reuse affected contexts, as do edits of
+  class axioms in Horn ontologies without individuals and in disjunctive runs that do
+  not count. Horn runs with individuals and counting or rooted runs rebuild after edits.
+  Roadmap items 753 and 953 under item 603. Finer invalidation for EL individual, merge, key and world
   changes is open. Roadmap item 664. Same-commit reuse is separate from incremental
   reclassification. That kept state holds the classifier's contexts, index
   and taxonomy in memory while the dataset is open and reads the axioms of the open
@@ -775,6 +790,34 @@ for its allowances and the editors.
   data conforms. `GET /$/schema/{ds}/shapes`, `sparkles schema --draft-shapes` and the MCP
   tool `draft_shapes` draft them, reading only the caller's visible graphs.
 
+### OML and openCAESAR models
+
+* openCAESAR's adapter writes an Ontological Modeling Language model as OWL 2 ontologies
+  with DL-safe SWRL rules, and a vocabulary bundle as disjointness axioms over its
+  concepts and relation entities. Sparkles reads that OWL form from files or from a
+  dataset that holds each ontology in the named graph of its IRI, and follows the imports
+  between those graphs. On openCAESAR's Kepler16b sample, the classifier's taxonomy
+  equals HermiT's, its named types of individuals equal HermiT's apart from types it
+  gives the SWRL rules' variables, and the classifier finds the
+  inconsistencies that the bundle's disjointness, keys, functional properties, universal
+  restrictions and property characteristics raise
+  ([F24](../specs/F24-owl-classification/SPEC.md#oml-and-opencaesar-models)).
+* `sparkles serve --fuseki-config` starts from an openCAESAR project's `.fuseki.ttl`,
+  with its in-memory dataset, union default graph, query timeout and SHACL endpoint. It
+  answers the requests that openCAESAR's `owl-load`, `owl-query` and `owl-shacl` send,
+  which are a Graph Store `PUT` of each ontology and of each entailment ontology into
+  the graph of its IRI, the project's queries on the `sparql` service and shapes posted
+  to `shacl?graph=default`. The queries then read the entailments that `owl-reason`
+  wrote, not Sparkles' own reasoning.
+* A Jena rules file in the form that the adapter writes with `generateRules`
+  materializes with `sparkles infer --rules` and derives the facts that Jena's rule
+  engine derives.
+* The SWRL rules are not read, so a reified relation's forward property and the facts of
+  an OML rule are not derived, and the OWL RL materialization answers a query that needs
+  them with fewer rows. Rule-derived inconsistencies, enumerations beside keys, OWL 2 DL
+  datatypes such as `xsd:double` and `xsd:boolean`, and openCAESAR's closed-world
+  cardinality check are not covered. The known gaps below name the roadmap items.
+
 ## Known gaps
 
 These limits name the roadmap items that address them. Current priorities and
@@ -955,11 +998,36 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   proofs.
 * A classification runs within one request's deadline and is not kept up to date as
   commits land. Roadmap item 589.
-* Native Horn and disjunctive classifications rebuild after axiom insertions and
-  deletions. Incremental maintenance with safe full fallback and measured edit latency
-  and retained memory is planned. Roadmap [item 753](../ROADMAP.md) under item 603.
+* A Horn classification of an ontology with individuals, keys or data restrictions
+  rebuilds after every axiom insertion and deletion. Roadmap
+  [item 753](../ROADMAP.md) under item 603.
+* A classification that counts and a rooted one rebuild after every edit, since the
+  bound on their derived conclusions depends on the order of the derivations. Roadmap
+  [item 953](../ROADMAP.md).
+* A disjunctive classification with the eager strategy rebuilds after every edit.
+  Roadmap [item 753](../ROADMAP.md).
+* A classification that keeps its contexts after an edit still normalizes every axiom
+  and builds its index and its taxonomy again, which bounds what a small edit saves.
+  Roadmap [item 955](../ROADMAP.md).
+* An edit that clears most contexts of a kept classification costs more than a
+  classification that starts again, by the comparison of the two indexes. Roadmap
+  [item 954](../ROADMAP.md).
 * A classification with the assertions saturates everything on each run, since the
   dataset keeps only classifications of the terminology. Roadmap item 590.
+* The ontology readers map SWRL rules in RDF to assertions about anonymous individuals,
+  and their variables to named individuals. Roadmap item 970. DL-safe SWRL rules do not
+  run in materialization, query-time reasoning or the classifier. Roadmap item 971.
+* A rooted run refuses keys over data properties and functional data properties, which
+  OML vocabularies declare for their identifiers, as the Kepler16b sample and its
+  metrology library do. Roadmap item 768. The classifier leaves out the literals and
+  ranges of datatypes outside OWL 2 EL, such as `xsd:double` and `xsd:boolean`. Roadmap
+  item 972.
+* A lenient read maps no axiom for an `owl:AllDisjointClasses` with an undeclared member
+  and reports no warning. Roadmap item 973. The `all-disjoint-classes` check of
+  `sparkles infer --check` passes its intermediate-row limit on a 55-member list with a
+  few thousand triples. Roadmap item 974.
+* openCAESAR's closed-world cardinality check, its entailment outputs and the OML
+  textual syntax have no counterpart. Roadmap items 975 to 977.
 
 ## Configuration and usage
 
@@ -980,7 +1048,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md),  [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 768](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 953](../ROADMAP.md), [item 954](../ROADMAP.md), [item 955](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md), [item 970](../ROADMAP.md), [item 971](../ROADMAP.md), [item 972](../ROADMAP.md), [item 973](../ROADMAP.md), [item 974](../ROADMAP.md), [item 975](../ROADMAP.md), [item 976](../ROADMAP.md), [item 977](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

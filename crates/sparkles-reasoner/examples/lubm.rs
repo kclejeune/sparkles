@@ -49,6 +49,16 @@
 //! thread instead, where each parallel section of a run is handed to a worker and waited
 //! for, which for changes of 100 triples at 16 threads costs more than the sections save.
 //!
+//! `plugin DB K ROUNDS [U]` compares the reasoner's maintenance with the rule plug-in of the
+//! fixed-point operator (`RuleProgram`, item 547) on the RDFS rules of [`PLUGIN_RULES`],
+//! which both run: a full run and a build, the bytes of the kept closure and of the
+//! operator's state per fact, and `ROUNDS` rounds that each remove `K` triples of one
+//! of the first `U` universities, one after another, and add `K` new ones, then undo the
+//! change. Each step times the reasoner's
+//! incremental run with a kept closure, which includes the commit of its inferred graph,
+//! and the operator's pass, which includes the read of the change. The closures are
+//! compared by size after every step.
+//!
 //! `diag` runs the check `literal-not-in-datatype` twice on the same snapshot and reports
 //! the time and the peak heap of each run.
 
@@ -67,6 +77,31 @@ use std::time::Instant;
 
 #[path = "common/lubm.rs"]
 mod lubm;
+
+/// The RDFS rules without axioms or builtins, which the reasoner and `RuleProgram` both
+/// run, for `plugin`.
+const PLUGIN_RULES: &str = "
+[rdfs2: (?p rdfs:domain ?c) (?x ?p ?y) -> (?x rdf:type ?c)]
+[rdfs3: (?p rdfs:range ?c) (?x ?p ?y) -> (?y rdf:type ?c)]
+[rdfs5: (?p rdfs:subPropertyOf ?q) (?q rdfs:subPropertyOf ?r) -> (?p rdfs:subPropertyOf ?r)]
+[rdfs7: (?p rdfs:subPropertyOf ?q) (?x ?p ?y) -> (?x ?q ?y)]
+[rdfs9: (?c rdfs:subClassOf ?d) (?x rdf:type ?c) -> (?x rdf:type ?d)]
+[rdfs11: (?c rdfs:subClassOf ?d) (?d rdfs:subClassOf ?e) -> (?c rdfs:subClassOf ?e)]
+";
+
+/// The triples of the default graph among `q`.
+fn default_triples(q: &[[sparkles_core::id::Id; 4]]) -> Vec<sparkles_reasoner::fixpoint::Triple> {
+    q.iter()
+        .filter(|x| x[3] == sparkles_core::id::Id::DEFAULT_GRAPH)
+        .map(|x| [x[0], x[1], x[2]])
+        .collect()
+}
+
+/// The median of `v`, which it sorts.
+fn median(v: &mut [u128]) -> u128 {
+    v.sort_unstable();
+    v.get(v.len() / 2).copied().unwrap_or(0)
+}
 
 struct Counting;
 
@@ -406,12 +441,12 @@ fn main() {
             };
             let (r, peak) = run(None, Some(&cache));
             line("full", &r, peak);
-            let mut since = r.receipt.unwrap().commit.seq;
+            let mut since = r.receipt.as_ref().unwrap().commit.seq;
             // the full run's commit rebuilt the generation, so its closure is not kept: a
             // run without changes keeps it
             let (r, peak) = run(Some(since), Some(&cache));
             line("settle", &r, peak);
-            since = r.receipt.unwrap().commit.seq;
+            since = r.receipt.as_ref().unwrap().commit.seq;
             let kept = cache.kept().map_or(0, |k| k.0);
             let with = CURRENT.load(Ordering::Relaxed);
             cache.clear();
@@ -422,21 +457,21 @@ fn main() {
                 mib(closure)
             );
             let (r, _) = run(Some(since), Some(&cache));
-            since = r.receipt.unwrap().commit.seq;
+            since = r.receipt.as_ref().unwrap().commit.seq;
             change(&store, &add, &del);
             let (r, peak) = run(Some(since), Some(&cache));
             line("change", &r, peak);
-            since = r.receipt.unwrap().commit.seq;
+            since = r.receipt.as_ref().unwrap().commit.seq;
             // the same changes again, undone and redone, with the kept closure and the
             // blocks the first change read
             change(&store, &del, &add);
             let (r, peak) = run(Some(since), Some(&cache));
             line("revert", &r, peak);
-            since = r.receipt.unwrap().commit.seq;
+            since = r.receipt.as_ref().unwrap().commit.seq;
             change(&store, &add, &del);
             let (r, peak) = run(Some(since), Some(&cache));
             line("change-again", &r, peak);
-            since = r.receipt.unwrap().commit.seq;
+            since = r.receipt.as_ref().unwrap().commit.seq;
             cache.clear();
             change(&store, &del, &add);
             let (r, peak) = run(Some(since), None);
@@ -483,9 +518,9 @@ fn main() {
                 (r, t.elapsed().as_micros())
             };
             let (r, full) = run(None);
-            let mut since = r.receipt.unwrap().commit.seq;
+            let mut since = r.receipt.as_ref().unwrap().commit.seq;
             let (r, settle) = run(Some(since));
-            since = r.receipt.unwrap().commit.seq;
+            since = r.receipt.as_ref().unwrap().commit.seq;
             println!(
                 "churn {} threads={threads} full_ms={} settle_ms={} inferred={}",
                 profile.name(),
@@ -519,7 +554,7 @@ fn main() {
                             change(&store, del, add);
                         }
                         let (r, us) = run(Some(since));
-                        since = r.receipt.unwrap().commit.seq;
+                        since = r.receipt.as_ref().unwrap().commit.seq;
                         let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
                         assert!(
                             r.method.as_str() == "incremental" && source == "memory",
@@ -549,6 +584,142 @@ fn main() {
                         q(1.0)
                     );
                 }
+            }
+        }
+        "plugin" => {
+            use sparkles_core::incr::DeltaSet;
+            use sparkles_core::incr::fixpoint::FixedPoint;
+            use sparkles_core::task::Control;
+            use sparkles_reasoner::fixpoint::{RuleCx, RuleProgram};
+            let db = PathBuf::from(&args[2]);
+            let k: usize = args[3].parse().expect("triples");
+            let rounds: usize = args[4].parse().expect("rounds");
+            let universities: usize = args.get(5).map_or(1, |u| u.parse().expect("universities"));
+            let store = Store::open(&db, StoreOptions::default()).unwrap();
+            let profile = Profile::Rules(PLUGIN_RULES.to_string());
+            let cache = Cache::new(usize::MAX);
+            let opts = ReasonOptions::default();
+            let run = |since: Option<u64>, cache: Option<&Cache>| -> (ReasonReport, u128) {
+                let t = Instant::now();
+                let r = materialize_incremental(
+                    &store,
+                    &profile,
+                    &Extras::default(),
+                    Incremental { since, cache },
+                    &opts,
+                )
+                .unwrap();
+                (r, t.elapsed().as_micros())
+            };
+            let explicit = || {
+                let snap = store.snapshot();
+                let mut n = 0u64;
+                snap.for_each_quad_in(&[sparkles_core::id::Id::DEFAULT_GRAPH.0], |_| {
+                    n += 1;
+                    Ok(())
+                })
+                .unwrap();
+                n
+            };
+            let (r, us) = run(None, Some(&cache));
+            println!("plugin reasoner full_us={us} inferred={}", r.inferred);
+            let mut since = r.receipt.as_ref().unwrap().commit.seq;
+            let (r, _) = run(Some(since), Some(&cache));
+            since = r.receipt.as_ref().unwrap().commit.seq;
+            let kept = cache.kept().map_or(0, |k| k.0);
+            let with = CURRENT.load(Ordering::Relaxed);
+            cache.clear();
+            let closure = with.saturating_sub(CURRENT.load(Ordering::Relaxed));
+            let (r, _) = run(Some(since), Some(&cache));
+            since = r.receipt.as_ref().unwrap().commit.seq;
+            println!(
+                "plugin reasoner kept_facts={kept} kept_closure_mib={:.1} bytes_per_fact={:.1}",
+                mib(closure),
+                closure as f64 / kept.max(1) as f64
+            );
+            let rules = sparkles_reasoner::parse_rules(PLUGIN_RULES).expect("rules");
+            let control = Control::none();
+            let before = CURRENT.load(Ordering::Relaxed);
+            let t = Instant::now();
+            let mut fp = FixedPoint::new(RuleProgram::new(&rules).expect("program"));
+            {
+                let snap = store.snapshot();
+                let mut cx = RuleCx {
+                    new: snap.clone(),
+                    old: snap,
+                    added: &[],
+                    removed: &[],
+                    control: &control,
+                };
+                fp.program.begin(&cx);
+                fp.build(&mut cx, None).expect("build");
+            }
+            let built = t.elapsed().as_micros();
+            let state = CURRENT.load(Ordering::Relaxed).saturating_sub(before);
+            println!(
+                "plugin operator build_us={built} facts={} state_mib={:.1} bytes_per_fact={:.1} counted_mib={:.1}",
+                fp.len(),
+                mib(state),
+                state as f64 / fp.len().max(1) as f64,
+                mib(fp.bytes() as usize)
+            );
+            let check = |fp: &FixedPoint<RuleProgram>, r: &ReasonReport, what: &str| {
+                let base = explicit();
+                // the operator holds the explicit triples with the derived ones
+                let derived = fp.len() as u64 - base;
+                println!(
+                    "plugin {what} explicit={base} operator_derived={derived} reasoner_inferred={}",
+                    r.inferred
+                );
+            };
+            check(&fp, &r, "settle");
+            let mut times: Vec<(&str, Vec<u128>, Vec<u128>)> = vec![
+                ("change", Vec::new(), Vec::new()),
+                ("revert", Vec::new(), Vec::new()),
+            ];
+            for round in 0..rounds {
+                let (del, add) = change_sets(round % universities, k);
+                for (step, (a, d)) in [(&add, &del), (&del, &add)].into_iter().enumerate() {
+                    let after = store.snapshot().commit;
+                    change(&store, a, d);
+                    let t = Instant::now();
+                    let delta = DeltaSet::read(&store, after, &control);
+                    assert!(delta.complete);
+                    let (added, removed) = (
+                        default_triples(&delta.added),
+                        default_triples(&delta.removed),
+                    );
+                    let mut cx = RuleCx {
+                        new: delta.snapshot.clone(),
+                        old: delta.old().expect("old snapshot"),
+                        added: &added,
+                        removed: &removed,
+                        control: &control,
+                    };
+                    if fp.program.begin(&cx) {
+                        fp.build(&mut cx, None).expect("build");
+                    } else {
+                        fp.advance(&mut cx, None).expect("advance");
+                    }
+                    let op = t.elapsed().as_micros();
+                    let (r, us) = run(Some(since), Some(&cache));
+                    since = r.receipt.as_ref().unwrap().commit.seq;
+                    times[step].1.push(us);
+                    times[step].2.push(op);
+                    println!(
+                        "plugin round={round} step={} reasoner_us={us} method={} operator_us={op}",
+                        times[step].0,
+                        r.method.as_str()
+                    );
+                    check(&fp, &r, times[step].0);
+                }
+            }
+            for (step, mut reasoner, mut operator) in times {
+                println!(
+                    "plugin k={k} rounds={rounds} {step} reasoner_median_us={} operator_median_us={}",
+                    median(&mut reasoner),
+                    median(&mut operator)
+                );
             }
         }
         "diag" => {

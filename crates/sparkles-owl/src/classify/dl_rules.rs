@@ -286,6 +286,71 @@ impl DlIx {
         d
     }
 
+    /// Whether every table of the run that a kept context reads is keyed by an
+    /// expression that the context holds, so that [`DlIx::changed`] finds what an edit
+    /// changes for it (roadmap item 753): a run without counting, a root or the order
+    /// between number restrictions, whose tables by qualified role, of at-most
+    /// restrictions, disjoint roles and minimums are empty.
+    pub fn keyed_by_expressions(&self) -> bool {
+        !self.counting
+            && !self.order
+            && self.root.is_none()
+            && self.consts.is_empty()
+            && self.quals.is_empty()
+            && self.atmosts.is_empty()
+            && self.lazy.is_empty()
+            && self.rdis.is_empty()
+            && self.ne_of.is_empty()
+            && self.blockers.is_empty()
+            && self.witnesses.is_empty()
+    }
+
+    /// Marks in `changed`, which covers the expressions of `old`, each expression that
+    /// keys other rules here than in `old`: one in the body of a clause that only one of
+    /// the two has, one with another hypothetical successor or successor core, and one
+    /// that the order of atoms ranks differently.
+    /// The bytes that [`DlIx::changed`] allocates for the comparison with `old`,
+    /// roughly: a key for each clause of both, with a copy of its head.
+    pub fn changed_scratch(&self, old: &DlIx) -> usize {
+        let keys = |d: &DlIx| {
+            d.clauses
+                .iter()
+                .map(|(_, h)| 56 + h.len() * 4)
+                .sum::<usize>()
+        };
+        keys(old) + keys(self)
+    }
+
+    pub fn changed(&self, old: &DlIx, changed: &mut [bool]) {
+        type Key<'a> = (&'a [Ex], Vec<Ex>);
+        fn keys(d: &DlIx) -> FxHashSet<Key<'_>> {
+            d.clauses
+                .iter()
+                .map(|(b, h)| {
+                    let mut h = h.to_vec();
+                    h.sort_unstable();
+                    h.dedup();
+                    (&**b, h)
+                })
+                .collect()
+        }
+        let (a, b) = (keys(old), keys(self));
+        for (body, _) in a.symmetric_difference(&b) {
+            for &e in body.iter() {
+                if let Some(c) = changed.get_mut(e as usize) {
+                    *c = true;
+                }
+            }
+        }
+        for (e, c) in changed.iter_mut().enumerate() {
+            let e = e as Ex;
+            *c |= self.hyp.get(&e) != old.hyp.get(&e)
+                || self.cores.get(&e) != old.cores.get(&e)
+                || self.is_low(e) != old.is_low(e)
+                || self.is_least(e) != old.is_least(e);
+        }
+    }
+
     /// The roles whose literals can hold over a successor term, closed upwards. A term's
     /// literals are its existential restriction's role, the qualified roles `S_B` whose S
     /// is above a carried role, their inverses when S's inverse is, and the roles of the
@@ -482,6 +547,16 @@ impl DlRun {
     pub fn bytes(&self) -> usize {
         self.table.bytes() + self.lits.bytes() + self.stores.load(Ordering::Relaxed)
     }
+    /// Starts another run over the table of the last one, whose kept contexts name its
+    /// clauses by id (roadmap item 753). The bytes of the kept contexts' stores count
+    /// with their states, so the run counts only what it adds, and it counts its own
+    /// conclusions.
+    pub fn begin_run(&mut self) {
+        *self.stores.get_mut() = 0;
+        *self.work.get_mut() = 0;
+        *self.work_limit.get_mut() = 0;
+        *self.exhausted.get_mut() = false;
+    }
     pub(super) fn grow(&self, bytes: usize) {
         self.stores.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -611,6 +686,62 @@ impl DlSt {
     pub fn has_hyp(&self, a: Ex) -> bool {
         self.hyps.contains(&a)
     }
+
+    /// Whether a marker or a stored clause of the context, dead or not, names an
+    /// expression that `changed` marks, or one it does not cover (roadmap item 753).
+    /// Every rule reads the index by the atoms and the successor terms of its premises,
+    /// and a premise is a unit of the context, a marker or a clause its store took, so a
+    /// context that names no marked expression here or among its units made no inference
+    /// that the changed rules give or take. A clause the store subsumed on arrival was a
+    /// premise of none. The equalities and the interned literals of runs that count or
+    /// have a root are not read, and count as marked.
+    pub fn names_changed(&self, changed: &[bool]) -> bool {
+        let hit = |e: Ex| changed.get(e as usize).copied().unwrap_or(true);
+        self.hyps.iter().any(|&a| hit(a))
+            || self.store.clauses.iter().any(|s| {
+                s.c.body().iter().chain(s.c.head()).any(|l| match l.kind() {
+                    X | Y => hit(l.atom()),
+                    F => hit(l.fun()) || hit(l.atom()),
+                    RL => hit(l.fun()),
+                    RY => false,
+                    _ => true,
+                })
+            })
+    }
+
+    /// Removes the contexts in `gone` from the predecessors that registered, which
+    /// register again when a run saturates them again (roadmap item 753).
+    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
+        self.dpreds.retain(|(u, _)| !gone.contains(u));
+    }
+
+    /// Adds `delta` to every context id from `from` upward that the state names, as
+    /// [`State::shift_contexts`] does for the rest of the state.
+    pub fn shift_contexts(&mut self, from: Ex, delta: Ex) {
+        let up = |e: Ex| if e >= from { e + delta } else { e };
+        for (u, _) in &mut self.dpreds {
+            *u = up(*u);
+        }
+        for (_, v) in &mut self.edges {
+            *v = up(*v);
+        }
+        if self.pred_in.keys().any(|&v| v >= from) {
+            self.pred_in = std::mem::take(&mut self.pred_in)
+                .into_iter()
+                .map(|(v, c)| (up(v), c))
+                .collect();
+            self.pred_seen = std::mem::take(&mut self.pred_seen)
+                .into_iter()
+                .map(|(v, c)| (up(v), c))
+                .collect();
+        }
+        if self.sent.iter().any(|&(v, _)| v >= from) {
+            self.sent = std::mem::take(&mut self.sent)
+                .into_iter()
+                .map(|(v, a)| (up(v), a))
+                .collect();
+        }
+    }
 }
 
 /// The bit that marks the class a test context's core denies.
@@ -622,6 +753,18 @@ pub fn test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> Ex {
     let mut core = vec![x];
     core.extend(bs.iter().map(|&b| b | NEG));
     d.intern(&core)
+}
+
+/// Whether the run has made the test context of whether `x` is below one of `bs`.
+pub fn has_test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> bool {
+    let mut core = vec![x];
+    core.extend(bs.iter().map(|&b| b | NEG));
+    d.find(&core).is_some()
+}
+
+/// The class that a test context with the core `core` tests.
+pub fn tested_class(core: &[Ex]) -> Option<Ex> {
+    core.iter().copied().find(|&m| m & NEG == 0)
 }
 
 /// Starts a test context: its core, `owl:Thing` and the class it denies.

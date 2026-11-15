@@ -168,10 +168,21 @@ gains batched forms of `consequences` and `prove`, with the per-fact forms as de
 because a rule engine over sorted runs evaluates a batch of facts in one merge, and it
 gains a program-owned fact store, so the reasoner's tier replaces the operator's hash map
 of facts for that program while the path closure keeps its own. The toy `RuleProgram`
-retires once the measurement of item 547 is recorded. Property paths in views and the
+stops being a candidate for the reasoner once the measurement of item 547 is recorded,
+and stays as the interface's test of the one-step mode with rules. Property paths in views and the
 reasoner's rules then share one operator, one `Record` type and one `Footprint` type, and
 the reasoner's pass emits the derived tier's change as a Z-set that a view's circuit reads
 beside the commit's own changes, which is what item 221 needs.
+
+The core reaches the reasoner in two steps, records last. Item 837 runs the reasoner first
+as a program of the operator's exact mode, which keeps no records. Its first frontier is
+the removed explicit facts, each round proves its frontier exactly with `Search::prove`
+and enumerates the consequences of the facts without a proof, and the insertion is the
+engine's semi-naive run from the inserted facts, as `incremental.rs` maintained the
+closure before. A closure read back from the dataset has no records until item 556
+persists them, so the exact mode stays for those closures in any case. Records arrive
+after item 837 with item 836, which installs each exact proof's derivations as records and
+adds the record-driven `broken` beside the exact mode.
 
 The transitive and equivalence relations are maintained by their operators inside this
 core. A relation's facts record the predecessor on their path, a deletion breaks the facts
@@ -279,6 +290,14 @@ record-free search and the plug-in's about 144 bytes per fact, its key, record, 
 three index entries, against the tier's. It is routine, and it runs beside the first
 phase.
 
+The [reasoning results](../../benchmarks/reasoning/RESULTS.md#the-rule-plug-in-against-the-reasoners-maintenance)
+record item 547's measurement, made on a development host with the change sets of
+`examples/lubm.rs`, since the differences it found are far larger than a host's. On
+LUBM(1) and LUBM(10) the plug-in's changes and undos of 100 and 1,000 triples took 4 to
+1,600 times as long as the reasoner's, and it kept about 1,000 bytes per derived fact
+against the tier's 57 to 82, because it holds the explicit triples too. Phase 4 therefore
+builds the reasoner's program on the tier's own evaluation.
+
 Item 791's published numbers come from `bench:rl-reference lubm 100` and
 `owl2bench 1` to `5` on atlas and then forge, published in the reasoning results, so
 every later phase has a baseline per scale. It is routine.
@@ -354,10 +373,12 @@ incremental runs falls, and the full runs are no slower than Phase 1 on atlas.
 ### Phase 4, the shared maintenance core, item 837
 
 `crates/sparkles-core/src/incr/fixpoint.rs` gains the batched `consequences` and
-`prove`, the program-owned fact store and the Z-set change output. `fixpoint.rs` in the
-reasoner replaces `RuleProgram` with the engine's `Program` over the tier, `incremental.rs`
-becomes that program's `prove` and `consequences`, `lib.rs::update_closure` calls
-`FixedPoint::advance`, and `maintain::Cache` keeps a `FixedPoint`. The closure operators
+`prove`, the program-owned fact store and the Z-set change output. `incremental.rs`
+holds the engine's `Program` over the tier, whose `prove` and `consequences` are the
+search and the consequence step it had, and `lib.rs::update_closure` maintains the closure
+through `FixedPoint::advance`. The operator wraps the closure that a run reads, from
+`maintain::Cache` or from the dataset, for one pass, since the exact mode keeps nothing
+else between passes, so `maintain::Cache` keeps the closure as before. The closure operators
 become operator-maintained relations of the program, which is item 521's second half.
 `incr/footprint.rs`'s `Footprint` replaces the reasoner's watched graphs in `inputs.rs`
 and the schema reads of `demand.rs` and `query.rs`, and `InferredFootprint` goes.
@@ -375,7 +396,7 @@ routine against the differential tests.
 The gates of this phase are these. Every differential test of both frameworks passes,
 including `fixpoint_tests.rs` for path views. The maintained closures after insertion and
 deletion on LUBM(1) and OWL2Bench(1) equal Nemo's. The small incremental runs and
-`bench:lubm`'s incremental runs are no slower than Phase 3 on atlas, and the deletion of
+`bench:lubm`'s incremental runs are no slower than before the phase on atlas, and the deletion of
 the item 798 clique stays incremental. No full-run fallback remains for changed lists, nor
 for stratified `noValue` under its option, each with a test that fell back
 before.
@@ -438,8 +459,10 @@ that the interpretive dispatch is not the dominant cost it was assumed to be.
 
 Phases 0, 1 and 2 start together, since item 547 and the reference numbers are
 measurements, Phase 2 changes the demand engine and a new operator mode, and Phase 1
-changes the tier under the engine. Phase 3 follows Phase 1. Phase 4 follows Phase 3 and
-the measurement of item 547. Phase 5's triple rules, SPIN and N3 can start after Phase 1
+changes the tier under the engine. Phase 3 follows Phase 1 and Phase 4's exact program.
+Phase 4 follows the measurement of item 547 and starts before Phase 3, with the reasoner
+on the operator's exact mode without records, and Phase 3 then adds the records to that
+program. Phase 5's triple rules, SPIN and N3 can start after Phase 1
 and run beside Phases 3 and 4, and its general `sh:SPARQLRule` bodies follow Phase 4.
 Phase 6's IR can start after Phase 1 and its evaluation after Phase 4. Items 518 and 520
 are independent routine lanes at any time. A lane that touches `engine.rs` and `graph.rs`

@@ -4,6 +4,8 @@
 //! and transfer owned leases, but cannot release somebody else's contribution.
 //! Reservation credit bounds an estimate of engine allocations, not process RSS.
 
+pub mod sizes;
+
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};

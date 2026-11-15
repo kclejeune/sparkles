@@ -36,10 +36,15 @@ use crate::terms::Terms;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::id::Id;
+use sparkles_core::incr::fixpoint::{Change, FactStore, FixedPoint, Program, Sink};
+use sparkles_core::incr::pass::Which;
+use sparkles_core::incr::persist::{Reader, Writer};
+use sparkles_core::incr::prov::{Ann, Provenance};
 use sparkles_core::store::Snapshot;
+use std::marker::PhantomData;
 use std::mem::size_of;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A run that cannot be maintained incrementally and must materialize in full.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -58,6 +63,15 @@ const MIN_VISITS: u64 = 1 << 20;
 /// when it started, so that a small closure is not materialized in full for a deletion
 /// of ordinary cost (see [`Bound`]).
 const MIN_HELD: usize = 64 << 20;
+
+/// The memory bound of a deletion, which a test of this thread can set.
+fn held_bound(n: usize) -> usize {
+    #[cfg(test)]
+    if let Some(m) = tests::HELD_BOUND.with(std::cell::Cell::get) {
+        return m;
+    }
+    n
+}
 
 /// The cost of the deletion of one update and its bound, past which the update gives
 /// way to a full run.
@@ -106,7 +120,7 @@ impl Bound {
         Bound::new(
             budget,
             facts.saturating_mul(VISITS_PER_FACT).max(MIN_VISITS),
-            c.heap_bytes().max(MIN_HELD),
+            held_bound(c.heap_bytes().max(MIN_HELD)),
         )
     }
 
@@ -589,211 +603,560 @@ pub(crate) type BeforeDelete<'a> = &'a mut dyn FnMut(&mut Closure) -> anyhow::Re
 /// except for explicit facts the store does not hold, such as default geometries, which
 /// the derived tier holds flagged.
 ///
+/// The update is one pass of the fixed-point operator of F13 §4.3 in exact mode, with
+/// [`TierProgram`] as its program and the closure's derived tier as its store
+/// ([`TierStore`]).
+///
 /// Returns [`Fallback`] (as the error) when the rules read RDF lists and a list fact is
 /// derivation. The closure is unusable after any error.
 ///
 /// `before_delete` is called once the closure holds every fact of the previous closure
 /// and the removed explicit facts as candidates, before anything is deleted: the
 /// witnesses of [`crate::witness`] read there which facts the removed ones reach.
-pub(crate) fn update(
+pub(crate) fn update<'a>(
     c: &mut Closure,
-    rules: &[CRule],
-    limits: &Limits,
-    inserted: &[Triple],
-    removed: &[Triple],
-    before_delete: Option<BeforeDelete<'_>>,
+    rules: &'a [CRule],
+    limits: &'a Limits,
+    inserted: &'a [Triple],
+    removed: &'a [Triple],
+    before_delete: Option<BeforeDelete<'a>>,
 ) -> anyhow::Result<Update> {
-    let lists = rules.iter().any(engine::reads_lists);
-    let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
-    let is_list = |t: &Triple| t[1] == first || t[1] == rest;
-    if lists {
-        if inserted.iter().chain(removed).any(is_list) {
-            return Err(Fallback("an RDF list changed and the rules read lists".into()).into());
+    let budget = &limits.budget;
+    let mut cx = TierCx {
+        rules,
+        limits,
+        inserted,
+        removed,
+        before_delete,
+        out: Update::default(),
+        started: std::time::Instant::now(),
+    };
+    let changes = {
+        let store = TierStore::new(c, budget);
+        let mut fp = FixedPoint::with_store(TierProgram::default(), store);
+        fp.advance(&mut cx, None)?
+    };
+    let mut out = cx.out;
+    // the operator released its charge of the changes with the pass, and they stay
+    // allocated until the removed facts are copied out of them
+    let change_bytes = changes.capacity() * size_of::<Change<Triple>>();
+    let mut held = Held::try_new(budget, change_bytes)?;
+    // the removed facts stay with the update, charged before their buffer is allocated
+    let n = changes.iter().filter(|ch| ch.weight < 0).count();
+    held.try_grow(n * size_of::<Triple>())?;
+    out.deleted.reserve_exact(n);
+    out.deleted
+        .extend(changes.iter().filter(|ch| ch.weight < 0).map(|ch| ch.fact));
+    drop(changes);
+    held.shrink(change_bytes);
+    out.held = Some(held);
+    Ok(out)
+}
+
+/// What one update of a closure reads, and what it reports, as the context of a
+/// [`TierProgram`].
+pub(crate) struct TierCx<'a> {
+    rules: &'a [CRule],
+    limits: &'a Limits,
+    inserted: &'a [Triple],
+    removed: &'a [Triple],
+    before_delete: Option<BeforeDelete<'a>>,
+    /// what the update reports, filled as its stages end
+    out: Update,
+    /// when the current stage started
+    started: std::time::Instant,
+}
+
+/// The derived tier of a closure as the store of the fixed-point operator.
+///
+/// The facts it holds are the live rows of the derived tier: the derived facts, the
+/// removed explicit facts held as candidates, and the flagged rows. The base tier's
+/// facts are not held here, and the program reads them in its own evaluation. The
+/// operator's reservations are charged to the run's budget through one [`Held`], which
+/// returns what it kept unused when the update ends.
+pub(crate) struct TierStore<'a> {
+    pub c: &'a mut Closure,
+    held: Mutex<Held>,
+}
+
+impl<'a> TierStore<'a> {
+    pub fn new(c: &'a mut Closure, budget: &Arc<Budget>) -> TierStore<'a> {
+        TierStore {
+            c,
+            held: Mutex::new(Held::new(budget)),
         }
-        let g = &c.graph;
-        for p in [first, rest] {
-            let rows = g.cands(None, Some(p), None, 0, g.len());
-            if rows
-                .iter()
-                .any(|r| g.alive(r) && g.triple(r)[1] == p && !c.flagged(r))
-            {
-                return Err(Fallback("the rules read RDF lists that are derived".into()).into());
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        // a panic while the lock was held leaves a count that is still the charge
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl FactStore<Triple, ()> for TierStore<'_> {
+    type Error = anyhow::Error;
+
+    fn contains(&self, f: &Triple) -> bool {
+        self.c.graph.position(f).is_some()
+    }
+
+    fn record(&self, f: &Triple) -> Option<()> {
+        self.contains(f).then_some(())
+    }
+
+    fn len(&self) -> usize {
+        self.c.graph.live()
+    }
+
+    fn for_each(&self, visit: &mut dyn FnMut(&Triple, &())) {
+        let g = &self.c.graph;
+        for r in g.offset()..g.len() {
+            if g.alive(r) {
+                visit(&g.triple(r), &());
             }
         }
     }
-    let mut out = Update::default();
-    let budget = &limits.budget;
-    // the closure, the run's changes and the maintenance state are charged to the run
-    // before they are used, also when nothing is inserted
-    budget.check()?;
-    let mut held = Held::new(budget);
 
-    // the inserted facts the derived tier holds are explicit from the start, as the base
-    // tier's copies of them are
-    for t in inserted {
-        if let Some(r) = c.graph.position(t) {
-            c.set_flag_with(r, true, true)?;
-        }
+    fn bytes(&self) -> u64 {
+        self.c.heap_bytes() as u64
     }
 
-    // ---- deletion
-    let started = std::time::Instant::now();
-    held.try_grow(3 * removed.len() * size_of::<Triple>())?;
-    let mut queue: Vec<Triple> = Vec::new();
-    // the removed facts that were in the base tier: they join the derived tier as
-    // candidates, and stay there when they still follow
-    let mut back: Vec<Triple> = Vec::new();
-    for t in removed {
-        match c.graph.position(t) {
-            Some(r) => c.set_flag(r, false),
-            None => back.push(*t),
+    fn insert(&mut self, f: Triple, _r: ()) -> anyhow::Result<bool> {
+        if self.contains(&f) {
+            return Ok(false);
         }
-        queue.push(*t);
+        Ok(self.c.graph.try_add_batch([f])? > 0)
     }
-    c.graph.try_add_batch(back)?;
-    if let Some(f) = before_delete {
-        f(c)?;
+
+    fn set_record(&mut self, _f: Triple, _r: ()) -> anyhow::Result<()> {
+        Ok(())
     }
-    if !queue.is_empty() {
-        let plans = Plans::new(&mut c.graph, rules)?;
-        held.try_grow(plans.bytes)?;
-        // after the plans, which a full run needs too
-        let bound = Bound::for_closure(c, budget);
-        let mut search = Search::new(budget);
-        let abort = AtomicBool::new(false);
-        // the facts removed so far, charged as their buffer grows, and the queue
-        let mut deleted = Held::new(budget);
-        let mut queue_held = Held::new(budget);
-        while !queue.is_empty() {
+
+    fn remove(&mut self, f: &Triple) -> anyhow::Result<bool> {
+        Ok(self.c.graph.kill(f)?)
+    }
+
+    fn clear(&mut self) -> anyhow::Result<()> {
+        let mut live = Held::try_new(self.c.graph.budget(), self.len() * size_of::<Triple>())?;
+        let mut all = Vec::with_capacity(self.len());
+        self.for_each(&mut |t, _| all.push(*t));
+        for t in &all {
+            self.c.graph.kill(t)?;
+        }
+        drop(all);
+        live.shrink(live.bytes());
+        Ok(())
+    }
+
+    fn reserve(&self, bytes: u64) -> anyhow::Result<()> {
+        let n = usize::try_from(bytes).map_err(|_| anyhow::anyhow!("a reservation past usize"))?;
+        Ok(self.held().try_grow(n)?)
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut h = self.held();
+        let n = usize::try_from(bytes).unwrap_or(usize::MAX).min(h.bytes());
+        h.shrink(n);
+    }
+}
+
+/// The reasoner's rules over a closure as a program of the fixed-point operator in exact
+/// mode: the backward/forward algorithm of the module's documentation, with the
+/// operator running its rounds.
+///
+/// [`Program::prepare`] flags the inserted facts the derived tier holds, moves the
+/// removed explicit facts into the derived tier as candidates, and calls the witness
+/// hook. The first frontier is the removed explicit facts. [`Program::prove_batch`] is
+/// one round of [`Search::prove`], in parallel through [`prove_all`], under the bound of
+/// [`Bound`], [`Program::consequences_batch`] at the old snapshot is [`consequences`] of
+/// the dead facts, and a removal kills the row. [`Program::saturate`] appends the inserted
+/// facts that no row holds as flagged rows, runs the rules semi-naively from them, and
+/// drops the inserted facts the base tier holds from the derived tier, and
+/// [`Program::saturated`] lists the live rows it added.
+///
+/// The operator's changes are those of the derived tier's live rows, as the update
+/// reported them before: a removed fact that no longer follows is a removal, and a row
+/// that the insertion added and that is live at its end is an addition. A derived fact
+/// that becomes explicit leaves the derived tier for the base tier without a change.
+#[derive(Default)]
+pub(crate) struct TierProgram<'a> {
+    /// the deletion's state, made by `prepare` when facts were removed and dropped when
+    /// the pass ends
+    del: Option<Deletion>,
+    /// the first row the insertion added
+    start: u32,
+    /// whether the rules read RDF lists
+    lists: bool,
+    /// whether the deletion removed an RDF list fact
+    list_deleted: bool,
+    _store: PhantomData<TierStore<'a>>,
+}
+
+/// What the deletion of one update keeps across its rounds.
+struct Deletion {
+    plans: Plans,
+    /// the plans' charge
+    _plans_held: Held,
+    /// made by the first round, once the first frontier is held
+    bound: Option<Bound>,
+    search: Search,
+    abort: AtomicBool,
+}
+
+impl TierProgram<'_> {
+    fn deletion(&mut self) -> anyhow::Result<&mut Deletion> {
+        self.del
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("a deletion round of an update that removed nothing"))
+    }
+}
+
+impl<'a> Program for TierProgram<'a> {
+    type Fact = Triple;
+    type Record = ();
+    type Cx<'c> = TierCx<'c>;
+    type Error = anyhow::Error;
+    type Store = TierStore<'a>;
+
+    const EXACT: bool = true;
+
+    fn batch_len(&self) -> usize {
+        // a round is one batch: its searches are independent and run in parallel
+        usize::MAX
+    }
+
+    fn premises(
+        &self,
+        _f: &Triple,
+        _r: &(),
+        _out: &mut Sink<'_, Triple, anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn axioms(
+        &mut self,
+        _cx: &mut TierCx<'_>,
+        _store: &TierStore<'a>,
+        _out: &mut Sink<'_, (Triple, ()), anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("a closure is built by a full run, not by the fixed-point operator")
+    }
+
+    fn consequences(
+        &mut self,
+        cx: &mut TierCx<'_>,
+        store: &TierStore<'a>,
+        w: Which,
+        f: &Triple,
+        held: &dyn Fn(&Triple) -> bool,
+        out: &mut Sink<'_, (Triple, ()), anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        self.consequences_batch(cx, store, w, std::slice::from_ref(f), held, out)
+    }
+
+    fn consequences_batch(
+        &mut self,
+        cx: &mut TierCx<'_>,
+        store: &TierStore<'a>,
+        w: Which,
+        facts: &[Triple],
+        _held: &dyn Fn(&Triple) -> bool,
+        out: &mut Sink<'_, (Triple, ()), anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        if !matches!(w, Which::Old) {
+            anyhow::bail!("an update inserts through its own saturation");
+        }
+        let c: &Closure = store.c;
+        let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
+        if self.lists && facts.iter().any(|t| t[1] == first || t[1] == rest) {
+            self.list_deleted = true;
+        }
+        let d = self.deletion()?;
+        let Some(bound) = d.bound.as_ref() else {
+            anyhow::bail!("the consequences of facts that no round decided");
+        };
+        let _held = consequences_into(
+            c,
+            cx.rules,
+            &d.plans,
+            facts,
+            cx.limits,
+            Some(bound),
+            &mut |t| out.push((t, ())),
+        )?;
+        Ok(())
+    }
+
+    fn prove(
+        &mut self,
+        cx: &mut TierCx<'_>,
+        store: &TierStore<'a>,
+        f: &Triple,
+        held: &dyn Fn(&Triple) -> bool,
+    ) -> anyhow::Result<Option<()>> {
+        let mut v = Vec::with_capacity(1);
+        self.prove_batch(cx, store, std::slice::from_ref(f), held, &mut v)?;
+        Ok(v.pop().flatten())
+    }
+
+    fn prove_batch(
+        &mut self,
+        cx: &mut TierCx<'_>,
+        store: &TierStore<'a>,
+        facts: &[Triple],
+        _held: &dyn Fn(&Triple) -> bool,
+        out: &mut Vec<Option<()>>,
+    ) -> anyhow::Result<()> {
+        let c: &Closure = store.c;
+        let limits = cx.limits;
+        let budget = &limits.budget;
+        let Deletion {
+            plans,
+            bound,
+            search,
+            abort,
+            ..
+        } = self.deletion()?;
+        // after the plans and the first frontier, as the deletion starts
+        let bound = &*bound.get_or_insert_with(|| Bound::for_closure(c, budget));
+        if rayon::current_num_threads() > 1 && facts.len() >= PAR_SEARCH {
+            // the searches of a round are independent: see `prove_all`
+            prove_all(c, cx.rules, plans, abort, limits, bound, search, facts, out)?;
+        } else {
+            let scx = Cx {
+                c,
+                rules: cx.rules,
+                plans,
+                abort,
+                cancel: limits.cancel.as_deref(),
+                budget,
+                bound,
+                known: None,
+            };
+            for &t in facts {
+                let proved = search.prove(&scx, t);
+                if let Some(e) = search.err.take() {
+                    return Err(e);
+                }
+                out.push(proved.then_some(()));
+            }
+            // the round's blocks are not kept until the next round
+            search.memo = Memo::default();
+        }
+        Ok(())
+    }
+
+    fn broken(
+        &mut self,
+        _cx: &mut TierCx<'_>,
+        _store: &TierStore<'a>,
+        _recorded: &dyn Fn(&Triple) -> Option<()>,
+        _out: &mut Sink<'_, Triple, anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn added(
+        &mut self,
+        _cx: &mut TierCx<'_>,
+        _store: &TierStore<'a>,
+        _held: &dyn Fn(&Triple) -> bool,
+        _out: &mut Sink<'_, (Triple, ()), anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn prepare(&mut self, cx: &mut TierCx<'_>, store: &mut TierStore<'a>) -> anyhow::Result<()> {
+        let c = &mut *store.c;
+        let (rules, budget) = (cx.rules, &cx.limits.budget);
+        self.lists = rules.iter().any(engine::reads_lists);
+        let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
+        let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+        if self.lists {
+            if cx.inserted.iter().chain(cx.removed).any(is_list) {
+                return Err(Fallback("an RDF list changed and the rules read lists".into()).into());
+            }
+            let g = &c.graph;
+            for p in [first, rest] {
+                let rows = g.cands(None, Some(p), None, 0, g.len());
+                if rows
+                    .iter()
+                    .any(|r| g.alive(r) && g.triple(r)[1] == p && !c.flagged(r))
+                {
+                    return Err(Fallback("the rules read RDF lists that are derived".into()).into());
+                }
+            }
+        }
+        // the closure, the run's changes and the maintenance state are charged to the run
+        // before they are used, also when nothing is inserted
+        budget.check()?;
+        // the inserted facts the derived tier holds are explicit from the start, as the
+        // base tier's copies of them are
+        for t in cx.inserted {
+            if let Some(r) = c.graph.position(t) {
+                c.set_flag_with(r, true, true)?;
+            }
+        }
+        // ---- deletion
+        cx.started = std::time::Instant::now();
+        // the removed facts that were in the base tier: they join the derived tier as
+        // candidates, and stay there when they still follow
+        let back_held = Held::try_new(budget, std::mem::size_of_val(cx.removed))?;
+        let mut back: Vec<Triple> = Vec::with_capacity(cx.removed.len());
+        for t in cx.removed {
+            match c.graph.position(t) {
+                Some(r) => c.set_flag(r, false),
+                None => back.push(*t),
+            }
+        }
+        c.graph.try_add_batch(back)?;
+        drop(back_held);
+        if let Some(f) = cx.before_delete.as_mut() {
+            (*f)(c)?;
+        }
+        if !cx.removed.is_empty() {
+            let plans = Plans::new(&mut c.graph, rules)?;
+            let plans_held = Held::try_new(budget, plans.bytes)?;
+            self.del = Some(Deletion {
+                plans,
+                _plans_held: plans_held,
+                bound: None,
+                search: Search::new(budget),
+                abort: AtomicBool::new(false),
+            });
+        }
+        Ok(())
+    }
+
+    fn frontier(
+        &mut self,
+        cx: &mut TierCx<'_>,
+        _store: &TierStore<'a>,
+        out: &mut Sink<'_, Triple, anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        for t in cx.removed {
+            out.push(*t)?;
+        }
+        Ok(())
+    }
+
+    fn saturate(&mut self, cx: &mut TierCx<'_>, store: &mut TierStore<'a>) -> anyhow::Result<bool> {
+        let c = &mut *store.c;
+        let limits = cx.limits;
+        let (rules, budget) = (cx.rules, &limits.budget);
+        if let Some(d) = self.del.take() {
+            cx.out.checked = d.search.checked;
+            if let Some(b) = &d.bound {
+                cx.out.visited = b.visits();
+                cx.out.held_beside = b.peak_held();
+            }
+            drop(d);
             if cancelled(limits) {
                 anyhow::bail!("reasoning cancelled");
             }
-            let mut dead: Vec<Triple> = Vec::new();
-            let mut step = Held::try_new(
-                budget,
-                queue.len() * size_of::<Triple>()
-                    + table_bytes(table_grown(0, 0, queue.len()), size_of::<Triple>()),
-            )?;
-            let mut seen: FxHashSet<Triple> =
-                FxHashSet::with_capacity_and_hasher(queue.len(), Default::default());
-            if rayon::current_num_threads() > 1 && queue.len() >= PAR_SEARCH {
-                // the searches of a round are independent: see `prove_all`
-                let facts: Vec<Triple> = queue.drain(..).filter(|t| seen.insert(*t)).collect();
-                dead = prove_all(
-                    c,
-                    rules,
-                    &plans,
-                    &abort,
-                    limits,
-                    &bound,
-                    &mut search,
-                    &facts,
-                )?;
-            } else {
-                let cx = Cx {
-                    c: &*c,
-                    rules,
-                    plans: &plans,
-                    abort: &abort,
-                    cancel: limits.cancel.as_deref(),
-                    budget,
-                    bound: &bound,
-                    known: None,
-                };
-                for t in queue.drain(..) {
-                    if seen.insert(t) && !search.prove(&cx, t) {
-                        dead.push(t);
-                    }
-                    if let Some(e) = search.err.take() {
-                        return Err(e);
-                    }
-                }
-                // the round's blocks are not kept until the next round
-                search.memo = Memo::default();
+            if self.list_deleted {
+                return Err(Fallback("a derived RDF list fact was removed".into()).into());
             }
-            if dead.is_empty() {
-                break;
+        }
+        let (first, rest) = (c.terms.rdf_first, c.terms.rdf_rest);
+        let is_list = |t: &Triple| t[1] == first || t[1] == rest;
+        // ---- insertion
+        cx.out.delete_micros = cx.started.elapsed().as_micros() as u64;
+        cx.started = std::time::Instant::now();
+        let inserted = cx.inserted;
+        let start = c.graph.len();
+        self.start = start;
+        cx.out.added_from = start;
+        let mut held = Held::try_new(budget, std::mem::size_of_val(inserted))?;
+        let fresh: Vec<Triple> = inserted
+            .iter()
+            .filter(|t| c.graph.position(t).is_none())
+            .copied()
+            .collect();
+        c.graph.try_add_batch(fresh)?;
+        for r in start..c.graph.len() {
+            c.set_flag_with(r, true, true)?;
+        }
+        budget.check()?;
+        if c.graph.len() > start {
+            let o = engine::run(&mut c.graph, rules, &c.terms, limits, Some(start))?;
+            cx.out.iterations = o.iterations;
+            if self.lists && cx.out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
+                return Err(Fallback("an RDF list fact was derived".into()).into());
             }
-            let (next, next_held) = consequences(c, rules, &plans, &dead, limits, Some(&bound))?;
-            queue = next;
-            step.absorb(next_held);
-            for t in &dead {
+        }
+        // the inserted facts that the base tier holds leave the derived tier, found with
+        // one sorted pass over the base tier
+        held.try_grow(std::mem::size_of_val(inserted) + inserted.len())?;
+        let mut ins: Vec<Triple> = inserted.to_vec();
+        ins.sort_unstable();
+        ins.dedup();
+        let in_base = match c.graph.base() {
+            Some(b) => b.contains_sorted(&ins)?,
+            None => vec![false; ins.len()],
+        };
+        for (t, _) in ins.iter().zip(in_base).filter(|x| x.1) {
+            if let Some(r) = c.graph.position(t) {
+                c.set_flag(r, false);
                 c.graph.kill(t)?;
             }
-            queue.retain(|t| c.graph.position(t).is_some() && !search.proved.contains(t));
-            // the new buffer is charged before it is allocated, and the old one is
-            // released once it holds the facts
-            let (len, cap) = (out.deleted.len(), out.deleted.capacity());
-            let need = len + dead.len();
-            if need > cap {
-                let new = need.max(cap * 2);
-                deleted.try_grow(new * size_of::<Triple>())?;
-                out.deleted.reserve_exact(new - len);
-                deleted.shrink(cap * size_of::<Triple>());
-            }
-            out.deleted.extend(dead);
-            drop(seen);
-            // the next queue keeps its charge, the previous one's is released
-            queue_held = step.split(queue.capacity() * size_of::<Triple>());
-            drop(step);
         }
-        drop(queue_held);
-        out.checked = search.checked;
-        out.visited = bound.visits();
-        out.held_beside = bound.peak_held();
-        held.absorb(deleted);
-        if cancelled(limits) {
-            anyhow::bail!("reasoning cancelled");
-        }
-        if lists && out.deleted.iter().any(is_list) {
-            return Err(Fallback("a derived RDF list fact was removed".into()).into());
-        }
+        drop(ins);
+        drop(held);
+        cx.out.insert_micros = cx.started.elapsed().as_micros() as u64;
+        Ok(true)
     }
 
-    // ---- insertion
-    out.delete_micros = started.elapsed().as_micros() as u64;
-    let started = std::time::Instant::now();
-    let start = c.graph.len();
-    out.added_from = start;
-    held.try_grow(std::mem::size_of_val(inserted))?;
-    let fresh: Vec<Triple> = inserted
-        .iter()
-        .filter(|t| c.graph.position(t).is_none())
-        .copied()
-        .collect();
-    c.graph.try_add_batch(fresh)?;
-    for r in start..c.graph.len() {
-        c.set_flag_with(r, true, true)?;
-    }
-    budget.check()?;
-    if c.graph.len() > start {
-        let o = engine::run(&mut c.graph, rules, &c.terms, limits, Some(start))?;
-        out.iterations = o.iterations;
-        if lists && out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
-            return Err(Fallback("an RDF list fact was derived".into()).into());
+    fn saturated(
+        &mut self,
+        _cx: &mut TierCx<'_>,
+        store: &TierStore<'a>,
+        out: &mut Sink<'_, Triple, anyhow::Error>,
+    ) -> anyhow::Result<()> {
+        let g = &store.c.graph;
+        for r in self.start..g.len() {
+            if g.alive(r) {
+                out.push(g.triple(r))?;
+            }
         }
+        Ok(())
     }
-    // the inserted facts that the base tier holds leave the derived tier, found with one
-    // sorted pass over the base tier
-    held.try_grow(std::mem::size_of_val(inserted) + inserted.len())?;
-    let mut ins: Vec<Triple> = inserted.to_vec();
-    ins.sort_unstable();
-    ins.dedup();
-    let in_base = match c.graph.base() {
-        Some(b) => b.contains_sorted(&ins)?,
-        None => vec![false; ins.len()],
-    };
-    for (t, _) in ins.iter().zip(in_base).filter(|x| x.1) {
-        if let Some(r) = c.graph.position(t) {
-            c.set_flag(r, false);
-            c.graph.kill(t)?;
+
+    fn pass_end(&mut self, _cx: &mut TierCx<'_>) -> anyhow::Result<()> {
+        self.del = None;
+        Ok(())
+    }
+
+    fn annotate(
+        &mut self,
+        _cx: &mut TierCx<'_>,
+        _store: &TierStore<'a>,
+        _mode: Provenance,
+        _f: &Triple,
+        _r: &(),
+        _premises: &[&Ann],
+    ) -> anyhow::Result<Ann> {
+        anyhow::bail!("the reasoner's maintenance keeps no annotations")
+    }
+
+    fn tick(&mut self, cx: &mut TierCx<'_>) -> anyhow::Result<()> {
+        if cancelled(cx.limits) {
+            anyhow::bail!("reasoning cancelled");
         }
+        Ok(())
     }
-    drop(ins);
-    out.insert_micros = started.elapsed().as_micros() as u64;
-    // the removed facts stay with the update
-    out.held = Some(held);
-    Ok(out)
+
+    fn save(&self, w: &mut Writer, f: &Triple, _r: &()) -> sparkles_core::Result<()> {
+        for x in f {
+            w.u64(*x);
+        }
+        Ok(())
+    }
+
+    fn load(&self, r: &mut Reader) -> sparkles_core::Result<(Triple, ())> {
+        Ok(([r.u64()?, r.u64()?, r.u64()?], ()))
+    }
 }
 
 /// How many facts DRed would delete before deriving the survivors again: every fact with
@@ -963,6 +1326,27 @@ fn consequences(
     limits: &Limits,
     bound: Option<&Bound>,
 ) -> anyhow::Result<(Vec<Triple>, Held)> {
+    let mut out = Vec::new();
+    let mut held = consequences_into(c, rules, plans, dead, limits, bound, &mut |t| {
+        out.push(t);
+        Ok(())
+    })?;
+    held.try_grow(out.capacity() * size_of::<Triple>())?;
+    Ok((out, held))
+}
+
+/// [`consequences`], giving each distinct head to `push` once. The returned charge is
+/// what the heads' evaluation still holds, nothing once the heads are given.
+#[allow(clippy::too_many_arguments)]
+fn consequences_into(
+    c: &Closure,
+    rules: &[CRule],
+    plans: &Plans,
+    dead: &[Triple],
+    limits: &Limits,
+    bound: Option<&Bound>,
+    push: &mut dyn FnMut(Triple) -> anyhow::Result<()>,
+) -> anyhow::Result<Held> {
     let g = &c.graph;
     let rows: Vec<u32> = dead.iter().filter_map(|t| g.position(t)).collect();
     let mut work: Vec<(usize, usize, Vec<u32>)> = Vec::new();
@@ -1039,19 +1423,19 @@ fn consequences(
         b.add(0)?;
     }
     // the heads, deduplicated
-    held.try_grow(
-        n * size_of::<Triple>() + table_bytes(table_grown(0, 0, n), size_of::<Triple>()),
-    )?;
+    held.try_grow(table_bytes(table_grown(0, 0, n), size_of::<Triple>()))?;
     let mut seen: FxHashSet<Triple> = FxHashSet::with_capacity_and_hasher(n, Default::default());
-    let mut out = Vec::with_capacity(n);
     // the errors were taken above
     for (h, hh, _) in heads {
-        out.extend(h.into_iter().filter(|t| seen.insert(*t)));
+        for t in h {
+            if seen.insert(t) {
+                push(t)?;
+            }
+        }
         drop(hh);
     }
     drop(seen);
-    let keep = held.split(out.capacity() * size_of::<Triple>());
-    Ok((out, keep))
+    Ok(held.split(0))
 }
 
 /// The error that parallel work of the deletion returns: the first [`Fallback`], since a
@@ -1074,7 +1458,9 @@ fn preferred_error(errs: impl Iterator<Item = anyhow::Error>) -> Option<anyhow::
 const PAR_SEARCH: usize = 2;
 
 /// Search for other proofs of `facts`, the distinct facts of one round of the deletion,
-/// in parallel, and return those without one, in the order of `facts`.
+/// in parallel, and push whether each has one to `out`, in the order of `facts`. `out`
+/// has room for them. Each chunk's answers are charged to its search until they are
+/// pushed.
 ///
 /// The searches of one round see the same live facts, since the round deletes its
 /// unprovable facts only after every search, and a search's answer does not depend on
@@ -1095,7 +1481,8 @@ fn prove_all(
     bound: &Bound,
     search: &mut Search,
     facts: &[Triple],
-) -> anyhow::Result<Vec<Triple>> {
+    out: &mut Vec<Option<()>>,
+) -> anyhow::Result<()> {
     let budget = &limits.budget;
     let chunk = facts
         .len()
@@ -1116,7 +1503,12 @@ fn prove_all(
             .par_chunks(chunk)
             .map(|ch| {
                 let mut s = Search::new(budget);
-                let mut found = Vec::with_capacity(ch.len());
+                // the chunk's answers, charged before they are allocated
+                let mut found = Vec::new();
+                match s.held.try_grow(ch.len() * size_of::<bool>()) {
+                    Ok(()) => found.reserve_exact(ch.len()),
+                    Err(e) => s.err = Some(e.into()),
+                }
                 for &t in ch {
                     if s.err.is_some() || abort.load(Ordering::Relaxed) {
                         break;
@@ -1136,15 +1528,16 @@ fn prove_all(
     if let Some(e) = preferred_error(parts.iter_mut().filter_map(|p| p.1.err.take())) {
         return Err(e);
     }
-    let mut dead = Vec::new();
-    for (ch, (found, s)) in facts.chunks(chunk).zip(parts) {
-        dead.extend(ch.iter().zip(&found).filter(|x| !*x.1).map(|x| *x.0));
+    for (found, s) in parts {
+        out.extend(found.iter().map(|&p| p.then_some(())));
+        // the answers' charge goes with the chunk's search
+        drop(found);
         search.absorb(s)?;
     }
     if cancelled(limits) {
         anyhow::bail!("reasoning cancelled");
     }
-    Ok(dead)
+    Ok(())
 }
 
 /// How deep the search recurses before it queues the facts it reaches instead.
@@ -1662,6 +2055,66 @@ pub(crate) mod tests {
     pub(crate) const OWL: &str = "http://www.w3.org/2002/07/owl#";
     pub(crate) const EX: &str = "http://ex.org/";
 
+    thread_local! {
+        /// The memory bound of the deletions this thread starts, in place of the closure's.
+        pub(crate) static HELD_BOUND: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// A removal whose search holds more than the deletion's memory bound stops the
+    /// operator's pass with the bound's [`Fallback`], which a run answers with a full
+    /// run, and the pass releases what it reserved.
+    #[test]
+    fn the_memory_bound_stops_a_pass_of_the_operator() {
+        let v = Vocab::new();
+        let id = |s: &str| v.iri[s];
+        let (sub, ty) = (id(&format!("{RDFS}subClassOf")), id(&format!("{RDF}type")));
+        let class = |i: usize| id(&format!("{EX}C{i}"));
+        let ind = |i: usize| id(&format!("{EX}i{i}"));
+        let mut base: FxHashSet<Triple> = FxHashSet::default();
+        for i in 0..5 {
+            base.insert([class(i), sub, class(i + 1)]);
+        }
+        for i in 0..8 {
+            base.insert([ind(i), ty, class(0)]);
+        }
+        let text = crate::RDFS_RULES;
+        for (bound, fails) in [(None, false), (Some(0), true)] {
+            let mut c = full(&v, text, &base);
+            let mut now = base.clone();
+            let removed = vec![[ind(0), ty, class(0)]];
+            now.remove(&removed[0]);
+            let snap = set_default_graph(&v, &now);
+            let moved = c.terms.rebase(snap.clone());
+            c.remap(&moved).unwrap();
+            if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
+                l.update(&[], &removed, crate::facts::rank);
+                c.put_lookups(l);
+            }
+            let rules = compiled(text, &c.terms);
+            let lim = limits();
+            let used = lim.budget.used();
+            HELD_BOUND.with(|b| b.set(bound));
+            let r = update(&mut c, &rules, &lim, &[], &removed, None);
+            HELD_BOUND.with(|b| b.set(None));
+            match r {
+                Err(e) => {
+                    assert!(fails, "{e:#}");
+                    let f = e.downcast_ref::<Fallback>().expect("a fallback");
+                    assert!(f.0.contains("held more than 0 bytes"), "{}", f.0);
+                    // the pass's reservations are back, beside what the closure grew by
+                    drop(c);
+                    assert!(lim.budget.used() <= used, "{} > {used}", lim.budget.used());
+                }
+                Ok(up) => {
+                    assert!(!fails, "the deletion stayed within no memory");
+                    assert!(up.deleted.contains(&removed[0]), "{:?}", up.deleted);
+                    assert_eq!(render(&c), render(&full(&v, text, &now)));
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_bound_counts_visits() {
         let budget = Budget::unlimited();
@@ -2067,6 +2520,63 @@ pub(crate) mod tests {
     /// Random changes, each followed by an incremental run checked against a full run.
     /// Some steps undo the previous one, and some reach their state through an earlier
     /// commit, so the remembered lookups take in several commits at once.
+    /// The change an update reports against the closures around it: a derived fact
+    /// that was not in the old closure is an addition, a fact of the old closure that no
+    /// longer holds is a removal, an addition is a live derived fact, and a removed fact
+    /// either no longer holds or was derived again.
+    #[allow(clippy::too_many_arguments)]
+    fn check_change(
+        c: &Closure,
+        up: &Update,
+        before: &FxHashSet<Triple>,
+        base: &FxHashSet<Triple>,
+        inserted: &[Triple],
+        removed: &[Triple],
+        what: &str,
+    ) {
+        let after: FxHashSet<Triple> = c.live().filter(|x| !x.1).map(|x| x.0).collect();
+        let holds = |t: &Triple| after.contains(t) || base.contains(t);
+        // the explicit facts before the update
+        let old_base =
+            |t: &Triple| (base.contains(t) && !inserted.contains(t)) || removed.contains(t);
+        let added: FxHashSet<Triple> = up.added(c).collect();
+        let deleted: FxHashSet<Triple> = up.deleted.iter().copied().collect();
+        assert_eq!(deleted.len(), up.deleted.len(), "{what}: a removal twice");
+        for t in after.difference(before) {
+            if !old_base(t) {
+                assert!(
+                    added.contains(t),
+                    "{what}: {t:?} appeared without an addition"
+                );
+            }
+        }
+        for t in before.iter().chain(removed) {
+            if !holds(t) {
+                assert!(deleted.contains(t), "{what}: {t:?} went without a removal");
+            }
+        }
+        for t in &added {
+            assert!(after.contains(t), "{what}: {t:?} added but not derived");
+        }
+        for t in &deleted {
+            // a run's changes are net, and a fact this generator removes and inserts again
+            // is reported removed while the base tier holds it again, as before the operator
+            if inserted.contains(t) && removed.contains(t) {
+                continue;
+            }
+            assert!(
+                !holds(t) || added.contains(t),
+                "{what}: {t:?} removed but still held (derived {}, explicit {}, inserted {}, \
+                 removed {}, before {})",
+                after.contains(t),
+                base.contains(t),
+                inserted.contains(t),
+                removed.contains(t),
+                before.contains(t)
+            );
+        }
+    }
+
     fn differential(text: &str, owl: bool, lists: bool, seed: u64, steps: usize) -> (usize, usize) {
         let v = Vocab::new();
         let mut r = Rng(seed);
@@ -2145,10 +2655,15 @@ pub(crate) mod tests {
             let what = format!("seed {seed} step {step}");
             checked += check_lookups(&c, &snap, &what);
             let rules = compiled(text, &c.terms);
+            let derived = |c: &Closure| -> FxHashSet<Triple> {
+                c.live().filter(|x| !x.1).map(|x| x.0).collect()
+            };
+            let before = derived(&c);
             match update(&mut c, &rules, &limits(), &inserted, &removed, None) {
-                Ok(_) => {
+                Ok(up) => {
                     incremental += 1;
                     checked += check_lookups(&c, &snap, &what);
+                    check_change(&c, &up, &before, &base, &inserted, &removed, &what);
                 }
                 Err(e) => {
                     assert!(e.downcast_ref::<Fallback>().is_some(), "{e:#}");

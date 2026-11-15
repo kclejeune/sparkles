@@ -73,7 +73,7 @@ both directions.
 
 ## Provenance
 
-This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: ELK (Kazakov, Kroetzsch and Simancik JAR 2014), Snorocket, ROBOT reason, OWL API, HermiT, Openllet, Konclude, Protégé reasoner plugins, ROBOT, Protégé Explanation Workbench, OWL API BlackBox, Protégé debugger plugins and OWL repair. No code from another project is copied.
+This design derives from Sparkles' existing specs and code. Its phases also draw on the published papers, standards and public documentation of these sources: ELK (Kazakov, Kroetzsch and Simancik JAR 2014), Snorocket, ROBOT reason, OWL API, HermiT, Openllet, Konclude, Protégé reasoner plugins, ROBOT, Protégé Explanation Workbench, OWL API BlackBox, Protégé debugger plugins and OWL repair. The survey of OML models also reads the OML v2 specification and the Apache-2.0 source and documentation of openCAESAR's `owl-adapter` and `owl-tools`. No code from another project is copied.
 
 ## Outcome
 
@@ -189,6 +189,12 @@ passes the 13 GiB cap of the comparison on both builds. GO and ChEBI lite give t
 taxonomies, and in six rounds of rotating order on one and four threads the reviewed build
 takes 0.981 to 1.019 times the base's time by median, within the spread of the rounds, and
 item 968 follows ChEBI lite's 1.9% on four threads.
+
+Item 753 makes a run after an edit of class axioms
+[keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
+without individuals and of a run of the disjunctive rules that does not count, with the
+answer of a run that starts again. Horn runs with individuals stay with the item, and
+runs with a bound on their derived conclusions are item 953.
 
 The bounded named-class read phase of items 588 and 622, and the availability route
 of item 726, publish an immutable completed result beside the incremental saturation.
@@ -350,9 +356,9 @@ additions and removals gives the taxonomy of a full run.
 
 This reuse applies to eligible EL edits. Normalization with Horn or disjunctive axioms
 currently clears the contexts and marks the run entangled, so a later edited source
-rebuilds those runs. Reusing the completed result at the same commit is separate from
-incremental maintenance. Item 753 delivers item 603's affected-module incremental DL
-requirement, as [the follow-up](#incremental-native-dl-classification) describes.
+rebuilds those runs, unless the run is one that
+[keeps its contexts](#incremental-native-dl-classification). Reusing the completed
+result at the same commit is separate from incremental maintenance.
 
 **Bounds.** A run stops at its deadline, at a cancellation and when the estimated memory
 passes the budget. The deadline and the cancellation are checked while the axioms are
@@ -389,8 +395,10 @@ inferred read is refused, since a classification reads the asserted axioms. The 
 keeps its last classification of an ontology for callers who read every graph, without
 assertions, keyed by the graphs, imports and mode. A compatible classification at the
 same commit answers from the retained result. At a later commit eligible EL additions
-and removals reuse affected contexts, while Horn and disjunctive runs rebuild after
-edits. Item 753 covers incremental native DL maintenance under item 603, and item 664
+and removals reuse affected contexts, as do edits of class axioms after a Horn run
+without individuals and a disjunctive run that does not count, while the other Horn and
+disjunctive runs rebuild after edits. Item 753 covers incremental native DL maintenance
+under item 603, and item 664
 covers the EL individual, merge, key and world invalidation gaps. One kept classification
 runs at a time, and a second caller waits for it under
 its own deadline. The dataset keeps the saturation and the ontology it read, whose axioms
@@ -3673,18 +3681,190 @@ Manchester, OBO or OBO Graphs JSON (item 686), and refuse
 named superclasses only, as ELK does, not the class expressions that ROBOT's expression
 materializing reasoner adds, which item 691 follows.
 
+### OML and openCAESAR models
+
+Item 967 surveyed what openCAESAR's analysis of Ontological Modeling Language models
+needs from Sparkles. The OML v2 specification gives the mapping to OWL 2 and SWRL as a
+table of correspondences, so the axiom-level mapping was read from the public source of
+openCAESAR's `oml2owl` adapter and its `owl-reason`, `owl-load`, `owl-query` and
+`owl-shacl` tools, which are Apache-2.0.
+
+In that mapping, each OML ontology becomes an OWL ontology with `owl:imports` for its
+imports. Concepts, aspects and relation entities become classes, with `SubClassOf`,
+`EquivalentClasses`, `HasKey` and an `ObjectOneOf` equivalence for an enumeration, and
+property restrictions become universal, existential, value, self and qualified
+cardinality restrictions as superclasses. A relation entity becomes a class with a
+forward object property and an optional inverse, with domains, ranges and the seven
+property characteristics, and a DL-safe SWRL rule derives the forward property from each
+relation instance's `oml:hasSource` and `oml:hasTarget`. OML rules become SWRL rules with
+class, data range, property, same-individual, different-individuals and `swrlb` builtin
+atoms. A vocabulary bundle adds a closure over the concepts and relation entities in its
+import scope. Their taxonomy is rooted at `owl:Thing` and made a tree by replacing the
+parents of every class with several parents with differences, written as
+`ObjectIntersectionOf(A ObjectComplementOf(B))`, and every set of siblings becomes a
+`DisjointClasses` axiom, or a `DisjointUnion` when asked. Description bundles add no
+axioms. `owl-reason` then runs Openllet on a description bundle, checks consistency and
+the satisfiability of every class outside the OML backbone, checks that every instance of
+a class with a told minimum, exact or existential restriction has enough entailed
+values, and writes the chosen entailments as ontologies. `owl-load` puts each ontology
+into the named graph of its IRI with Graph Store `PUT`, into a Fuseki dataset whose
+default graph is the union of its named graphs, and `owl-query` and `owl-shacl` post
+queries and shapes to it.
+
+The survey translated the Kepler16b sample and its metrology library by a
+re-implementation of this mapping, since the sample's Gradle build was not run, and
+wrote the Jena rules file in the adapter's form the same way. It compared Sparkles with
+HermiT 1.4.5.519 running `owl-reason`'s checks in place of Openllet, with Jena 6.2.0's
+rule engine on that rules file, and with Jena's `arq` on the sample's five queries over
+the asserted data and HermiT's entailments. The closure is 17 ontologies and 2,998
+triples, with 644 logical axioms, 42 SWRL rules, two keys and seven `DisjointClasses`
+axioms. The classifier's taxonomy equals HermiT's 102 subclass pairs with or without
+counting and the rooted option, and both find the sample consistent with no unsatisfiable
+class. `ontology reason` gives HermiT's 307 named types of named individuals and 21 more,
+the `swrl:Variable` types of the rule variables that the RDF reader takes for
+individuals. OWL RL materialization gives the same 307 types, an `rdfs:Resource` type for
+each of the 84 individuals, and 125 of HermiT's 159 object property values, missing only
+those that follow from SWRL rules. Four of the five queries
+equal the reference under OWL RL, materialized or on demand, and the `connections` query
+needs the rules. Sparkles' Jena rule engine derives exactly Jena's 337 facts from the
+rules file. `sparkles serve --fuseki-config` starts from the sample's own `.fuseki.ttl`.
+With the requests that `owl-load`, `owl-query` and `owl-shacl` send, made with `curl`, it
+stores the ontologies and HermiT's entailment graphs, answers the five queries as the
+reference does over them and answers the SHACL request.
+
+Thirteen probes each added one violation to the sample. The classifier agrees with
+HermiT on the eight that need disjointness from the closure, keys, asymmetry, universal
+restrictions, the closure's differences, functional properties and a functional string
+property. It misses a reflexive fact that a SWRL rule derives, an individual of an
+enumeration that differs from its members, two values of a functional `xsd:double`
+property and a string in an `xsd:boolean` range, and it has no closed-world cardinality
+check. The rooted run creates no contexts on the sample, because it refuses keys and
+functional data properties, and the sample's base vocabulary and the metrology library
+declare both. Item 768 takes the keys and functional data properties, and items 970 to
+977 record the other gaps, the SWRL reader, the
+lenient read that drops an `AllDisjointClasses` axiom with an undeclared member, the
+`all-disjoint-classes` check that passes its row limit on the sample, owl-reason's
+entailment outputs and an OML importer.
+
 ### Roadmap follow-ups
 
 #### Incremental native DL classification
 
 Item 753 delivers item 603's affected-module maintenance for axiom insertions and
-deletions. It first covers supported Horn and disjunctive constructs and extends
-eligibility with later phases of item 603. Dependencies must cover normalized rules,
-Horn conjunction contexts, disjunctive test contexts and taxonomy consequences,
-including consequences whose last support was removed. An edit with untracked effects
-must fall back to fresh full classification, including global role or chain changes,
-tier transitions and new constructs without complete dependency tracking. An affected
-module can be the whole ontology, and case analysis retains its exponential worst case.
+deletions in two kinds of run. The first is a run with the Horn rules whose index has no
+individuals, universal properties, keys or data. It includes a run whose Horn
+normalization gives the index no rule that can fire, such as a pair of inverse
+properties beside OWL 2 EL axioms in ChEBI, which the EL rules then saturate. The second
+is a run of the disjunctive rules with the cautious strategy and without counting or a root.
+Both keep their contexts, the contexts of conjunctions or of tests, and for the
+disjunctive rules the table of the clauses that contexts sent one another. The other
+runs start again after every edit: Horn runs with individuals, which wait on items 590
+and 664, and runs with a bound on their derived conclusions, which a counting run, a
+rooted run and the run after a passed bound have and which item 953 follows, since that
+bound counts derivations in an order that a kept context would change.
+
+A run with changes holds the last index until the new one is built and compares the two
+by expression. An expression is changed when its successor, its told superexpressions,
+its conjunctions, its negative existential restrictions or its disjointness sets differ,
+when a Horn flag on it or on a universal's filler differs, and for the disjunctive rules
+when a clause with the expression in its body exists in only one index or its
+hypothetical successor, its successor's core or its rank in the order of atoms differs.
+A context is cleared when it holds a changed expression. For the Horn rules its
+subsumers are what it holds. For the disjunctive rules they are its units, its markers
+and every literal of every clause its store took, including the clauses a later one
+subsumed, since each premise of an inference is one of these and the rules read the
+index by the atoms and successor terms of their premises. The run also clears every
+source of a backward link into a cleared context and every predecessor that registered
+with one, since a predecessor holds what its successors sent back, and the class of a
+cleared test that had held. Kept contexts drop the cleared ones from their predecessors,
+which register again and are answered again. The tables that no expression keys, the
+property hierarchy, chains, ranges and inverses, must be equal on the properties of the
+last index, or the run starts again.
+
+The fresh classes of a normalization are named by scope, so that a later run over the
+same interner gives the same axiom, unfolded universal or hypothetical successor the
+same classes. The interner keeps a copy of each axiom outside OWL 2 EL as the key of its
+scope, which the retained bytes count. The scope of an unfolding is the universal or the
+negative existential restriction it unfolds, since two restrictions over different
+properties can share a filler. The Horn rules unfold every universal of the interner
+over a property that chains reach, and the unfolding makes universals over its fresh
+classes that a run does not unfold again. The interner marks those, so that a later run
+over it does not unfold them either, and a normalization that names one removes the
+mark. Without the mark each run gave them new classes and cleared every context that
+held one, which was about half the contexts of the Gene Ontology after any edit.
+
+A kept run of the Horn rules leaves each kept context as a run that starts again would.
+A kept run of the disjunctive rules does not. Its fresh classes have other ids and so
+another order, and a kept successor holds the markers that cleared predecessors sent,
+with the clauses they gave. Its answer is still that of a run that starts again. Each
+kept clause follows from the edited ontology with its context's core, by the argument
+above, and a marker is a tautology, so the context structure is sound for the edited
+ontology in the sense of Definition 6 of Bate and others. The saturation then closes
+every context under the rules. Theorem 9 of that paper gives completeness for every
+context structure to which no rule applies, and the paper notes that the claim does not
+depend on the expansion strategy that built the structure. The tests of candidate
+subsumers are refutations in contexts of their own, and each run computes the
+candidates of every class again, so a kept test answers at once.
+
+A run starts again with a new interner in these cases, which is the safe full rebuild.
+The change is to an axiom other than a class axiom or a domain over classes,
+intersections, unions, complements and object restrictions, while axioms outside OWL 2
+EL are in play. The rules that the edited ontology needs differ from the last run's, or
+the options that select rules do. The tables that no expression keys differ. The run
+keeps more than twice the expressions, the conjunctions or tests, or the clauses of the
+table that the last full run had, plus 4,096. A kept run that stops on its memory budget
+also starts again in full before a lower tier takes over, since the last index and the
+contexts that nothing reaches count against the budget of a kept run alone. Before the
+comparison the run admits both indexes, the kept contexts, the clause table and the
+marks and queue of the invalidation against that budget. A run that
+its deadline or a cancellation stops leaves a classifier whose next run starts again.
+
+`tests/dl_incremental.rs` compares each run of a kept classifier with a classifier that
+starts again, in subsumptions, taxonomy, unsatisfiable classes, consistency,
+completeness and the axioms left out, on 1, 4 and 8 threads. It covers fixed edits that
+take away the last support of a subsumption, of a test that held and of a clause that a
+successor sent back, random and seeded sequences over generated Horn and disjunctive
+ontologies, removals and returns of axioms over the 640 fixtures of item 603 and the
+generated ontologies of item 897, the ORE files that `SPARKLES_ORE_DIR` names, a memory
+budget that only a kept run passes, with and without a large data value, cancellation and a deadline during a kept run, and
+the bound on kept state. `examples/incremental_classify.rs` times kept runs after
+single-axiom edits against a classifier that starts again and checks their taxonomies.
+
+A kept run still normalizes every axiom and builds its index and its taxonomy again, so
+an edit saves the saturation of the kept contexts and not those steps, which item 955
+follows. The memory tradeoff is the last index beside the new one during the
+comparison, the copies of the axioms outside OWL 2 EL, and the expressions, tests and
+clauses that nothing reaches until the run starts again.
+
+The figures below are development measurements on a laptop that ran other work, with
+`examples/incremental_classify.rs`, and are not benchmark-host results. Each file takes
+20 removals of one class axiom, each followed by its return, and the time of a kept run
+after a removal is compared with a classifier that starts again over the same axioms,
+both as medians. The taxonomies are equal after every run.
+
+| Ontology | Rules | Four threads, kept against full | One thread, kept against full |
+|---|---|---|---|
+| `ore_ont_12141`, 440 contexts | Disjunctive | 6.4 against 42.8 ms | 3.9 against 91.8 ms |
+| `ore_ont_6485`, 215 contexts | Disjunctive | 0.67 against 3.5 ms | 0.64 against 8.5 ms |
+| Five other ORE 2015 DL files | Disjunctive | 1.2 to 2.4 times faster | 1.1 to 2.0 times faster |
+| Eleven ORE 2015 DL files | Horn | 1.1 to 2.0 times faster | 1.1 to 2.3 times faster |
+| Gene Ontology, 54,692 contexts | Horn | 143 against 219 ms | 147 against 540 ms |
+| ChEBI lite, 238,151 contexts | Horn, no rule fires | 530 against 981 ms | 743 against 1,921 ms |
+
+The median edit clears one to three contexts on the two large files and on most of the
+ORE files. On the Gene Ontology a kept run saturates in 0.4 ms where a full run takes
+120 ms on four threads, and spends 93 ms on the normalization, the index and the
+comparison against 52 ms in a full run, and 30 ms on the taxonomy in both. An edit that
+clears most contexts therefore costs more than a run that starts again: the removal
+that clears 331 of the 440 contexts of `ore_ont_12141` takes 94 ms on one thread, where
+the full runs take 80 to 95 ms. Item 954 follows the cost of the comparison. A counting
+run of `ore_ont_6485` keeps nothing and takes the time of a full run.
+
+The retained state after the 20 edits is within 3% of the state after the first run,
+151 against 147 MB for the Gene Ontology and 653 against 636 MB for ChEBI lite. The
+peak of a kept run on four threads is 1.3 to 1.45 times that of the first run, 212
+against 147 MB for the Gene Ontology and 863 against 651 MB for ChEBI lite, since the
+run holds the last index and the chunks of the parallel normalization at once.
 
 Item 590 owns assertion retention and item 664 owns EL individual, merge, key and world
 invalidation. Coordinate their dependency records before making those changes eligible

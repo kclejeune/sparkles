@@ -1691,7 +1691,7 @@ mod tests {
                 right,
             );
             let eager = context(u64::MAX, None);
-            let mut expected = rows(&exec::execute(&eager, &node).unwrap().0);
+            let mut expected = rows(&exec::execute_materialized(&eager, &node).unwrap().0.table);
             expected.sort();
             for place in [None, Some(&spill)] {
                 let ctx = context(352 << 10, place);
@@ -2105,7 +2105,8 @@ mod tests {
                             values(right.clone(), n, 2, heavy, false),
                         );
                         let eager = context(u64::MAX, None);
-                        let mut expected = rows(&exec::execute(&eager, &node).unwrap().0);
+                        let mut expected =
+                            rows(&exec::execute_materialized(&eager, &node).unwrap().0.table);
                         expected.sort();
                         let caps: &[usize] = if heavy { &[512] } else { &[1, 7, 512] };
                         for &cap in caps {

@@ -453,6 +453,9 @@ fn run_op(
             }
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
+            // Shared as query preparation shares a context, so that a LIMIT, an ASK or
+            // an EXISTS in the WHERE clause pulls its input only to the rows it needs.
+            let ctx = ctx.into_shared();
             let plan_depth = super::depth::check_plan(node.depth())?;
             let executed = super::depth::with_stack(plan_depth, || {
                 super::exec::execute_materialized(&ctx, &node)
