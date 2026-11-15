@@ -990,9 +990,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A Horn classification of an ontology with individuals, keys or data restrictions
   rebuilds after every axiom insertion and deletion. Roadmap
   [item 753](../ROADMAP.md) under item 603.
-* A classification that counts, a rooted one and a disjunctive one with the eager strategy rebuild
-  after every edit, since the bound on their derived conclusions depends on the order
-  of the derivations. Roadmap [item 953](../ROADMAP.md).
+* A classification that counts and a rooted one rebuild after every edit, since the
+  bound on their derived conclusions depends on the order of the derivations. Roadmap
+  [item 953](../ROADMAP.md).
+* A disjunctive classification with the eager strategy rebuilds after every edit.
+  Roadmap [item 753](../ROADMAP.md).
 * A classification that keeps its contexts after an edit still normalizes every axiom
   and builds its index and its taxonomy again, which bounds what a small edit saves.
   Roadmap [item 955](../ROADMAP.md).
@@ -1035,7 +1037,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 768](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md), [item 970](../ROADMAP.md), [item 971](../ROADMAP.md), [item 972](../ROADMAP.md), [item 973](../ROADMAP.md), [item 974](../ROADMAP.md), [item 975](../ROADMAP.md), [item 976](../ROADMAP.md), [item 977](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 768](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 953](../ROADMAP.md), [item 954](../ROADMAP.md), [item 955](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md), [item 970](../ROADMAP.md), [item 971](../ROADMAP.md), [item 972](../ROADMAP.md), [item 973](../ROADMAP.md), [item 974](../ROADMAP.md), [item 975](../ROADMAP.md), [item 976](../ROADMAP.md), [item 977](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.
