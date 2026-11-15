@@ -191,9 +191,25 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     let roles = &ix.roles;
     let mut core = Vec::new();
     while h.sorted < h.succ.list.len() {
+        // a sort of many successors polls the run's bounds, and one that stops leaves
+        // the rest unsorted, which the rules read as successors that no other dominates
+        if h.sorted.is_multiple_of(64) && !out.go_on() {
+            return;
+        }
         let (r, n) = h.succ.list[h.sorted];
         h.sorted += 1;
         out.core(ix, n, &mut core);
+        // the sort's entry for the successor, in `live` with its core or in `dominated`,
+        // is charged to the run's memory, and a run past its budget stops at its next check
+        let _ = out.reserve_data(SORT_BYTES + 4 * core.len());
+        // past LIVE_MOST successors that no other dominates, a successor is compared with
+        // none, so that the sort costs at most that many comparisons for each successor
+        if h.live.len() >= LIVE_MOST {
+            let at = h.cores.len() as u32;
+            h.cores.extend_from_slice(&core);
+            h.live.push((r, n, at, core.len() as u32));
+            continue;
+        }
         let cores = &h.cores;
         let of = |at: u32, len: u32| &cores[at as usize..(at + len) as usize];
         if h.live
@@ -232,6 +248,14 @@ fn sync<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     }
 }
 
+/// The successors that no other dominates past which [`sync`] compares a successor with
+/// none of them.
+const LIVE_MOST: usize = 512;
+
+/// The bytes of a successor's entry in [`HornSt::live`] or [`HornSt::dominated`], without
+/// its core.
+const SORT_BYTES: usize = 24;
+
 /// Whether a dominated successor, which [`sync`] sorted, is the one by `r` in `n`.
 fn is_dominated(ix: &Index, st: &State, r: Role, n: Ex) -> bool {
     dominates(ix)
@@ -252,8 +276,11 @@ fn members(ix: &Index, st: &State, s: Role, b: Ex) -> Vec<Member> {
             }
         };
         if dominates(ix) {
-            debug_assert_eq!(x.horn.sorted, x.horn.succ.list.len());
+            // the successors that a stopped sort left unsorted count as well
             for &(r, n, _, _) in &x.horn.live {
+                take(r, n);
+            }
+            for &(r, n) in &x.horn.succ.list[x.horn.sorted..] {
                 take(r, n);
             }
         } else {
@@ -289,6 +316,9 @@ fn preds(ix: &Index, st: &State, s: Role, b: Ex) -> Vec<(Ex, Role)> {
     out
 }
 
+/// The bytes a pair of [`Told`] takes in its list and its hash set.
+const TOLD_BYTES: usize = 24;
+
 /// The pairs of a predecessor and a successor whose core R6 sent the predecessor, which
 /// a run that passes over dominated successors keeps so that it sends each core once.
 struct Told(Option<Small<(Ex, Ex)>>);
@@ -302,8 +332,19 @@ impl Told {
             hs(st).told = t;
         }
     }
-    fn first(&mut self, m: Ex, n: Ex) -> bool {
-        self.0.as_mut().is_none_or(|t| t.insert((m, n)))
+    /// Whether R6 has still to send `m` the core of `n`. The pair it records is charged
+    /// to the run's memory, and a run past its budget sends the core as before.
+    fn first<S: Sink>(&mut self, m: Ex, n: Ex, out: &mut S) -> bool {
+        let Some(t) = self.0.as_mut() else {
+            return true;
+        };
+        if t.contains(&(m, n)) {
+            return false;
+        }
+        if out.reserve_data(TOLD_BYTES) {
+            t.insert((m, n));
+        }
+        true
     }
 }
 
@@ -422,7 +463,11 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
     let mut todo: Vec<(Role, Ex)> = if h.dirty {
         h.pending.clear();
         if dominates(ix) {
-            h.live.iter().map(|&(r, n, _, _)| (r, n)).collect()
+            h.live
+                .iter()
+                .map(|&(r, n, _, _)| (r, n))
+                .chain(h.succ.list[h.sorted..].iter().copied())
+                .collect()
         } else {
             h.succ.list.to_vec()
         }
@@ -602,6 +647,7 @@ fn merge_all<S: Sink>(ix: &Index, st: &mut State, s: Role, b: Ex, out: &mut S) -
 }
 
 /// R6: the predecessor `m`, by `r1`, and the successor `x` are one.
+#[allow(clippy::too_many_arguments)]
 fn identify<S: Sink>(
     ix: &Index,
     me: Ex,
@@ -622,7 +668,7 @@ fn identify<S: Sink>(
                 return;
             }
             // a predecessor holds for good the core it was sent once
-            if told.first(m, n2) {
+            if told.first(m, n2, out) {
                 send_core(ix, m, n2, out);
             }
             if let Some(i) = roles.inv(r2) {
@@ -1164,5 +1210,94 @@ pub fn counted_full<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex
     if is_singular(st) {
         propagate_singular(ix, st, out);
         r7(ix, me, st, only, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::horn::HornIx;
+    use super::super::index::{Axioms, Interner, Node};
+    use super::*;
+    use crate::model::Class;
+
+    /// A sink that counts charges and lets the run go on for a number of checks.
+    struct Checks {
+        reserved: usize,
+        left: usize,
+    }
+
+    impl Sink for Checks {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            self.reserved += bytes;
+            true
+        }
+        fn go_on(&self) -> bool {
+            self.left > 0
+        }
+        fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+            out.clear();
+            super::super::saturate::flatten(ix, e, out);
+        }
+    }
+
+    /// An index of `n` classes whose Horn rules pass over dominated successors.
+    fn index(n: usize) -> (Index, Vec<Ex>) {
+        let mut it = Interner::new();
+        let cs: Vec<Ex> = (0..n)
+            .map(|k| it.class(&Class::new(format!("urn:dominate:c{k}"))))
+            .collect();
+        let _ = it.node(Node::Top);
+        let mut ix = Index::build(&Axioms::default(), &mut it, None, &|| false).unwrap();
+        ix.horn = Some(Box::new(HornIx {
+            flags: Vec::new(),
+            base: it.nodes.len() as Ex,
+            dominate: true,
+        }));
+        (ix, cs)
+    }
+
+    /// R6 records each pair of a predecessor and a successor whose core it sent, and the
+    /// record is charged to the run's memory (item 710).
+    #[test]
+    fn the_record_of_sent_cores_is_charged() {
+        let (ix, cs) = index(2);
+        let mut st = State::default();
+        let mut told = Told::take(&ix, &mut st);
+        let mut out = Checks {
+            reserved: 0,
+            left: 1,
+        };
+        assert!(told.first(cs[0], cs[1], &mut out));
+        assert!(!told.first(cs[0], cs[1], &mut out));
+        assert_eq!(out.reserved, TOLD_BYTES);
+    }
+
+    /// A sort of many successors polls the run's bounds and stops when the run does, and
+    /// the successors it left unsorted still count for the at-most restrictions.
+    #[test]
+    fn a_sort_of_successors_stops_with_the_run() {
+        let (ix, cs) = index(300);
+        let mut st = State::default();
+        for &c in &cs {
+            hs(&mut st).succ.insert((0, c));
+        }
+        let mut out = Checks {
+            reserved: 0,
+            left: 0,
+        };
+        sync(&ix, &mut st, &mut out);
+        let h = &st.extra.as_ref().unwrap().horn;
+        assert!(h.sorted < cs.len(), "the sort did not poll");
+        assert_eq!(members(&ix, &st, 0, TOP).len(), cs.len());
+        let mut out = Checks {
+            reserved: 0,
+            left: 1,
+        };
+        sync(&ix, &mut st, &mut out);
+        assert_eq!(st.extra.as_ref().unwrap().horn.sorted, cs.len());
+        assert_eq!(members(&ix, &st, 0, TOP).len(), cs.len());
+        assert!(out.reserved > 0);
     }
 }
