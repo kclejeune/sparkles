@@ -495,3 +495,54 @@ fn integer_sums_do_not_depend_on_the_order_of_their_rows() {
         answers[1]
     );
 }
+
+/// A group whose rows take more than the whole memory budget lands, with all of its rows,
+/// in one partition, and the pass that reads that partition takes it whole. Its running
+/// state stays small, so the answer is the eager one. A group whose own state, such as a
+/// DISTINCT set or a GROUP_CONCAT text, exceeds the budget cannot be split and fails.
+#[test]
+fn a_group_larger_than_its_partition_is_aggregated_whole() {
+    let s = Store::in_memory(StoreOptions::default());
+    let small = 20_000;
+    let big = 300_000;
+    let n = small * 3 + big;
+    let data = (0..n)
+        .map(|i| {
+            let k = (i * 7919) % n;
+            if k < big {
+                format!("<urn:s:{}> <urn:p> {} .\n", small / 2, 1000 + k)
+            } else {
+                let k = k - big;
+                format!("<urn:s:{}> <urn:p> {} .\n", k % small, k % 97)
+            }
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT ?s (COUNT(*) AS ?n) (SUM(?v) AS ?sum) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) \
+             (AVG(?v) AS ?avg) (SAMPLE(?v) AS ?any) { ?s <urn:p> ?v } GROUP BY ?s";
+    let expected = eager(&s, q);
+    assert_eq!(expected.len(), small);
+    let count = format!("value: \"{}\"", big + 3);
+    assert!(
+        expected.iter().any(|r| r.contains(&count)),
+        "the large group's count {count}"
+    );
+    match run(&s, q, MEMORY, None) {
+        Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory),
+        other => panic!(
+            "expected a memory budget error, got {:?}",
+            other.map(|r| r.0.len())
+        ),
+    }
+    let (rows, plan) = run(&s, q, MEMORY, Some(spill.clone())).unwrap();
+    assert_eq!(rows, expected);
+    assert!(plan.contains("\"spillPasses\""), "{plan}");
+    assert_eq!(spill.reserved_bytes(), 0);
+}
