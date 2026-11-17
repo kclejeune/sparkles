@@ -420,7 +420,7 @@ struct SharedBatch {
 }
 
 /// A decoded block that shared batches hand out, with the charge of its decoded columns,
-/// which lasts while any of the batches is held.
+/// which lasts while the scan reads the block or any of the batches is held.
 struct SharedBlock {
     block: crate::index::Block,
     _charge: OwnedCharge,
@@ -4156,9 +4156,16 @@ struct Scan {
 /// block and runs the same way under every budget. A scan that kept its block charged
 /// it at a whole block's columns, about 1 MiB, from its first read on, and a query that
 /// had room for that charge could then be refused memory that a smaller budget, under
-/// which the scan seeked each batch, left free (roadmap item 1039). The batches that
-/// [`Scan::next_shared`] hands out keep the block itself, so they are charged by its
-/// decoded columns while any of them is held.
+/// which the scan seeked each batch, left free (roadmap item 1039).
+///
+/// [`Scan::next_shared`] hands out batches that keep the block itself, charged by its
+/// decoded columns. Only the root of a cursor asks for them, and only with room for a
+/// whole block's columns. While it reads such a block, the scan keeps the block and its
+/// charge between reads too, so a writer that drops each batch before it pulls the next
+/// does not charge the block again for every batch. The charge ends when the scan
+/// leaves the block, reads it as owned rows, or ends, and when the last batch handed out
+/// from it drops. A cursor stopped inside such a block keeps it charged until the cursor
+/// is closed.
 struct BaseScan {
     /// read-ahead over the blocks of the current range
     ahead: crate::index::ReadAhead,
@@ -4172,9 +4179,8 @@ struct BaseScan {
     wanted: crate::index::ColMask,
     row: usize,
     row_end: usize,
-    /// the block that the batches handed out hold with its charge, and its position and
-    /// columns; it ends when the last of them drops
-    shared: Option<(usize, crate::index::ColMask, std::sync::Weak<SharedBlock>)>,
+    /// the block being read with its charge, while the scan hands out batches that keep it
+    shared: Option<Arc<SharedBlock>>,
 }
 
 impl BaseScan {
@@ -4203,6 +4209,7 @@ impl BaseScan {
     fn clear_block(&mut self) {
         self.block = None;
         self.parked = None;
+        self.shared = None;
     }
 
     /// Remember the block being read by a handle that does not keep it, once per block.
@@ -4218,18 +4225,6 @@ impl BaseScan {
     fn park(&mut self) {
         self.remember_block();
         self.block = None;
-    }
-
-    /// The block being read, with its charge, while a batch handed out from it is held.
-    fn held_shared(&self) -> Option<Arc<SharedBlock>> {
-        if self.block.is_some() || self.parked.is_none() {
-            return None;
-        }
-        let (block, wanted, shared) = self.shared.as_ref()?;
-        if (*block, *wanted) != (self.next - 1, self.wanted) {
-            return None;
-        }
-        shared.upgrade()
     }
 
     /// Take back the block of the last read, from the cache or by decoding it again.
@@ -4322,9 +4317,7 @@ impl Scan {
             return Ok(SharedAttempt::Unsupported);
         }
         let mut base = self.base.take().expect("checked base scan");
-        // A batch of the block being read that is still held keeps the block, so the
-        // scan takes it from there.
-        let held = base.held_shared();
+        let held = base.shared.clone();
         let result = if held.is_some() {
             Ok(())
         } else {
@@ -4409,6 +4402,7 @@ impl Scan {
             let end = base.row_end.min(base.row.saturating_add(cap));
             if !exec::block_passes(&self.spec, block, base.row, end) {
                 // No row of the batch was consumed: the owned path resumes from it.
+                base.shared = None;
                 return Ok(SharedAttempt::Unsupported);
             }
             // The batches of one block share it and one charge of its decoded columns,
@@ -4438,7 +4432,7 @@ impl Scan {
                         block: base.block.take().expect("loaded immutable block"),
                         _charge: charge,
                     });
-                    base.shared = Some((base.next - 1, base.wanted, Arc::downgrade(&shared)));
+                    base.shared = Some(shared.clone());
                     shared
                 }
             };
@@ -4603,6 +4597,8 @@ impl Scan {
         }
         if self.reads_base(ctx) {
             let mut base = self.base.take().expect("checked base scan");
+            // Owned rows do not keep the block, so its charge for shared batches ends.
+            base.shared = None;
             let result = base
                 .unpark(ctx, ctx.snap.perm(self.spec.perm))
                 .and_then(|()| self.next_base(ctx, vars, cap, &mut base));
@@ -5213,7 +5209,8 @@ mod tests {
     }
 
     /// Cost per batch of a scan over three blocks: shared batches of 4,096 rows with each
-    /// held while the next is taken, as the response writer does, then owned batches of
+    /// held while the next is taken, as the response writer does with more than one Rayon
+    /// worker, and with each dropped first, as it does with one, then owned batches of
     /// 4,096 rows and of whole blocks. Run with --ignored --nocapture in release.
     #[cfg(unix)]
     #[test]
@@ -5241,7 +5238,7 @@ mod tests {
             dedup: false,
             src: None,
         };
-        let shared = |passes: usize| {
+        let shared = |passes: usize, keep: bool| {
             let started = Instant::now();
             let mut batches = 0u64;
             for _ in 0..passes {
@@ -5251,7 +5248,9 @@ mod tests {
                     match scan.next_shared(&ctx, &[var], 4096).unwrap() {
                         SharedAttempt::Ready(Some(batch)) => {
                             batches += 1;
-                            held = Some(batch);
+                            if keep {
+                                held = Some(batch);
+                            }
                         }
                         SharedAttempt::Ready(None) => break,
                         _ => panic!("declined"),
@@ -5291,7 +5290,8 @@ mod tests {
             }
             eprintln!("BEST {name} {best:.1} ns per batch, {BLOCK_ROWS} rows a block");
         };
-        best("shared-4096", &shared, 2000);
+        best("shared-4096", &|p| shared(p, true), 2000);
+        best("shared-turn", &|p| shared(p, false), 2000);
         best("owned-4096", &|p| owned(p, 4096), 500);
         best("owned-block", &|p| owned(p, BLOCK_ROWS), 100);
     }
@@ -5762,6 +5762,63 @@ mod tests {
         assert!(
             cursor.ctx.live_bytes() < block,
             "the finished scans still hold their blocks: live {}",
+            cursor.ctx.live_bytes()
+        );
+    }
+
+    /// A root scan that hands out shared batches keeps the block it reads, charged, while
+    /// a writer drops each batch before it pulls the next, charges it once per block, and
+    /// gives the charge back when the cursor stops inside the block (item 1039).
+    #[test]
+    fn root_scan_keeps_its_shared_block_charged_until_the_cursor_stops() {
+        use crate::index::BLOCK_ROWS;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions {
+            result_cache_bytes: 0,
+            ..StoreOptions::default()
+        });
+        let data = (0..BLOCK_ROWS + 4_000)
+            .map(|i| format!("<urn:s{i}> <urn:name> \"n{i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let options = CursorOptions {
+            batch_rows: 1_000,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(
+            store.snapshot(),
+            "SELECT ?s ?v WHERE { ?s <urn:name> ?v }",
+            &QueryOptions::default(),
+            &options,
+        )
+        .unwrap();
+        let baseline = cursor.ctx.live_bytes();
+        let block = BLOCK_ROWS as u64 * 32 + 512;
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let batch = cursor.next_batch().unwrap().unwrap();
+            assert!(matches!(batch.inner.buffer, BatchBuffer::Shared(_)));
+            drop(batch);
+            held.push(cursor.ctx.live_bytes() - baseline);
+        }
+        // The scan reads two columns of the block, 16 bytes a row.
+        assert!(
+            held[0] >= BLOCK_ROWS as u64 * 8 && held[0] <= block,
+            "the block's charge between batches: {held:?}"
+        );
+        assert!(held.iter().all(|&h| h == held[0]), "{held:?}");
+        cursor.close();
+        assert!(
+            cursor.ctx.live_bytes() <= baseline,
+            "the stopped cursor kept {} bytes over {baseline}",
             cursor.ctx.live_bytes()
         );
     }
