@@ -585,12 +585,14 @@ pub struct WeakBlock {
 impl WeakBlock {
     /// The block, if every one of its columns is still held elsewhere.
     pub fn upgrade(&self) -> Option<Block> {
-        let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
-        for (to, from) in cols.iter_mut().zip(&self.cols) {
-            *to = Col(from.upgrade()?);
-        }
+        let [a, b, c, d] = &self.cols;
         Some(Block {
-            cols,
+            cols: [
+                Col(a.upgrade()?),
+                Col(b.upgrade()?),
+                Col(c.upgrade()?),
+                Col(d.upgrade()?),
+            ],
             rows: self.rows,
         })
     }

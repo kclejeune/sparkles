@@ -4186,24 +4186,40 @@ impl BaseScan {
         }
     }
 
-    /// Keep the block between reads without holding it.
+    /// Start reading `block`, and remember a handle on it that does not keep it, for the
+    /// reads that follow.
+    fn set_block(&mut self, block: crate::index::Block) {
+        self.parked = Some(block.downgrade());
+        self.block = Some(block);
+    }
+
+    /// The block is read to its end, or has none of the rows asked for.
+    fn clear_block(&mut self) {
+        self.block = None;
+        self.parked = None;
+    }
+
+    /// Let go of the block between reads. The handle made when it was loaded stays.
     fn park(&mut self) {
-        if let Some(block) = self.block.take() {
-            self.parked = Some(block.downgrade());
-        }
+        self.block = None;
     }
 
     /// Take back the block of the last read, from the cache or by decoding it again.
     fn unpark(&mut self, ctx: &Ctx, index: &crate::index::PermIndex) -> Result<()> {
+        if self.block.is_some() {
+            return Ok(());
+        }
         let Some(parked) = &self.parked else {
             return Ok(());
         };
-        let block = match parked.upgrade() {
+        self.block = Some(match parked.upgrade() {
             Some(block) => block,
-            None => ctx.snap.cache.get_cols(index, self.next - 1, self.wanted)?,
-        };
-        self.parked = None;
-        self.block = Some(block);
+            None => {
+                let block = ctx.snap.cache.get_cols(index, self.next - 1, self.wanted)?;
+                self.parked = Some(block.downgrade());
+                block
+            }
+        });
         Ok(())
     }
 }
@@ -4343,10 +4359,10 @@ impl Scan {
                 };
                 base.next += 1;
                 base.wanted = wanted;
-                base.block = Some(block);
+                base.set_block(block);
             }
             if base.row == base.row_end {
-                base.block = None;
+                base.clear_block();
                 continue;
             }
             let block = base.block.as_ref().expect("loaded immutable block");
@@ -4398,7 +4414,7 @@ impl Scan {
             };
             base.row = end;
             if base.row == base.row_end {
-                base.block = None;
+                base.clear_block();
                 if base.next == base.end {
                     self.at += 1;
                     base.next = 0;
@@ -4513,7 +4529,7 @@ impl Scan {
                 };
                 base.next += 1;
                 base.wanted = wanted;
-                base.block = Some(block);
+                base.set_block(block);
             }
             let block = base.block.as_ref().unwrap();
             let end = base.row_end.min(base.row + cap - out.table.len);
@@ -4532,7 +4548,7 @@ impl Scan {
                 }
             }
             if base.row == base.row_end {
-                base.block = None;
+                base.clear_block();
             }
         }
         if !exact && !out.table.is_empty() {
