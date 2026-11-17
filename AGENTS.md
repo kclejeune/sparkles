@@ -140,6 +140,28 @@ worktree, such as `.artifacts/lanes/<name>/brief.md`. The agent reports results 
 parent, writes long results to a file, and starts no agents of its own unless the brief
 assigns that.
 
+Every turn of an agent re-reads its whole context, so context size and the number of
+turns spent waiting set most of the cost of a lane. Four rules follow from this.
+
+- The coordinator owns long waits. A lane does not wait inside its own session on a
+  batch gate, a benchmark-host or benchmark-worker timing run, GitHub Actions or another
+  job expected to run past about 45 minutes. It commits, records in its resume file what
+  it is waiting on, where the log is and what marks completion, and returns. The
+  coordinator watches the job with a background command and starts a fresh agent from
+  the resume file when the result is in.
+- A lane checks a shorter wait with bounded commands a few minutes apart, often enough
+  that its prompt cache stays warm. A longer wait that it cannot hand back runs as a
+  background command that notifies on completion, so the agent spends no turns polling.
+- A lane is checkpointed and continued by a fresh agent once its context passes about
+  150k to 200k tokens, at a natural boundary such as a clean review or a finished phase.
+  The checkpoint is a committed tip and a short resume file that names the next steps,
+  the open decisions and the live jobs. An agent idle for more than an hour is replaced
+  by a fresh one from its resume file instead of being resumed, unless its context is
+  small.
+- The coordinator assembles and gates batches in its own session. Merging the ready
+  lanes, premerge, the gate and the screen are mostly waiting, so they run as background
+  commands, and an agent is started only to fix a failure.
+
 For a remote agent, record sandbox, conversation and prompt IDs with its source,
 environment version, branch, resource deadline and snapshot identity when applicable.
 Attach the self-contained brief, and confirm subscription authentication before its
