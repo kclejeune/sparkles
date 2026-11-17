@@ -626,6 +626,43 @@ read-only store, listed the model as `present` and a model of an absent snapshot
 is playing a guitar." first (0.67) for the search text "someone strumming a guitar",
 with 188 MB resident.
 
+**Candle 0.11.1** (roadmap item 1048). Candle 0.11.1 depends on tokenizers 0.23 with
+the `fancy-regex` engine and on zip 9, so the move removed zip 7 and its advisories from
+the build and added no C or C++ code. The NomicBERT and Qwen3 encoders stay this crate's
+own. Candle 0.11 brought two runtime changes that the crate works around.
+
+* Elementwise operations of 65,536 elements or more run on a process-wide pool of
+  Candle's own, which ignores the embedding pool's thread count, nice value and release
+  hook. `confine_candle_threads` sets `CANDLE_NUM_THREADS=1`, which leaves that pool
+  without threads, and the server calls it first in `main`.
+* Each matrix product asks for a thread count, and without `RAYON_NUM_THREADS` Candle
+  derives it from the performance cores of a hybrid processor or else from the physical
+  cores, which `num_cpus` counts by reading `/proc/cpuinfo` on every call. On `atlas`,
+  an Intel host with 20 threads and no hybrid capacity list, that raised the query
+  latency of all-MiniLM-L6-v2 from 3.7 ms to 12.5 ms and of nomic-embed-text-v1.5 from
+  57 ms to 73 ms. `confine_candle_threads` also sets `CANDLE_CPU_MASK` to the CPUs the
+  process may use, at most its available parallelism, which Candle reads once and which
+  gives the count Candle 0.9 used. `RAYON_NUM_THREADS` stays unset, because the server
+  sizes its query pool on a hybrid processor only when the operator has not set it.
+
+The vectors of all-MiniLM-L6-v2, nomic-embed-text-v1.5 and Qwen3-Embedding-0.6B, in f32
+and bf16 where the model allows it, for seven texts as queries and as documents, match
+0.9.2's within 3.5e-6 per component, and the ignored tests pass. `embed-bench` on
+`atlas`, four interleaved rounds of each build with a copy of the old build as a
+control, gave these medians. The control stayed within 1% of the old build except for
+the Qwen3 query latency, which a further eight balanced runs of each build measured.
+
+| Model | dtype | Threads | Documents per s, 0.9.2 / 0.11.1 | Query p50, 0.9.2 / 0.11.1 |
+|---|---|---|---|---|
+| all-MiniLM-L6-v2 | f32 | 4 | 74.6 / 90.5 | 3.9 / 3.7 ms |
+| nomic-embed-text-v1.5 | f32 | 2 | 11.8 / 12.0 | 56.9 / 56.7 ms |
+| nomic-embed-text-v1.5 | bf16 | 2 | 11.6 / 11.9 | 40.5 / 40.3 ms |
+| Qwen3-Embedding-0.6B | bf16 | 4 | 4.87 / 5.00 | 251 / 249 ms |
+
+With its own pool left running, Candle 0.11.1 embedded all-MiniLM-L6-v2 documents at
+119 per second, but on threads outside the embedding pool's limit and priority. Item 1051
+covers using that pool within the configured thread count.
+
 **Deferred.**
 
 * The Models section of the UI's settings does not show the local models' state. The
