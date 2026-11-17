@@ -252,10 +252,9 @@
 </svelte:element>
 
 <style>
-  /* a row's hover fill reaches into the gutter, so its text lines up with the group's heading */
   .erows {
     list-style: none;
-    margin: 0 -4px 0 -8px;
+    margin: 0;
     padding: 0;
     display: grid;
     gap: 2px;
