@@ -574,7 +574,42 @@ pub struct Block {
     rows: usize,
 }
 
+/// A handle on the columns of a [`Block`] that does not keep them in memory. A reader
+/// that pauses inside a block keeps one between reads, so the block stays only while the
+/// block cache or another reader holds it.
+pub struct WeakBlock {
+    cols: [std::sync::Weak<Box<[u64]>>; 4],
+    rows: usize,
+}
+
+impl WeakBlock {
+    /// The block, if every one of its columns is still held elsewhere.
+    pub fn upgrade(&self) -> Option<Block> {
+        let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
+        for (to, from) in cols.iter_mut().zip(&self.cols) {
+            *to = Col(from.upgrade()?);
+        }
+        Some(Block {
+            cols,
+            rows: self.rows,
+        })
+    }
+}
+
 impl Block {
+    /// A handle on the columns that does not keep them in memory.
+    pub fn downgrade(&self) -> WeakBlock {
+        WeakBlock {
+            cols: std::array::from_fn(|c| Arc::downgrade(&self.cols[c].0)),
+            rows: self.rows,
+        }
+    }
+
+    /// The bytes of the decoded columns.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.cols.iter().map(|c| c.len() as u64 * 8).sum()
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.rows
