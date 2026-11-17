@@ -1,6 +1,7 @@
 //! A cursor scan over an immutable snapshot keeps its place inside an index block
-//! between batches without charging the block to the query, so a larger memory budget
-//! never refuses a query that a smaller one answers (roadmap item 1039). A scan that kept
+//! between batches without charging the block to the query, so a scan inside a plan no
+//! longer makes a larger memory budget refuse a query that a smaller one answers
+//! (roadmap item 1039). A scan that kept
 //! its block charged it at a whole block's columns, about 1 MiB, once the budget had room
 //! for it, and the rest of the query then had about 1 MiB less than under a slightly
 //! smaller budget, under which the scan took no block.
@@ -73,7 +74,9 @@ fn run(store: &Store, query: &str, kib: u64, mode: ExecutionMode) -> Result<(u64
         }
         QueryExecution::Eager(result) => {
             let (rows, peak) = (result.result().len() as u64, result.result().mem_peak_bytes);
-            result.into_result().rows().map_err(|e| e.to_string())?;
+            for i in 0..rows as usize {
+                std::hint::black_box(result.result().row(i).map_err(|e| e.to_string())?);
+            }
             Ok((rows, peak))
         }
         _ => Err("not a SELECT".into()),
@@ -161,9 +164,12 @@ fn full_block_scan_answers_at_every_larger_budget() {
     }
 }
 
-/// A scan at the root hands out its block's rows without copying them while the block's
-/// charge fits, and copies them otherwise, so its answers too are monotone in the
-/// budget. Its peak grows where the batches start to hold the block.
+/// A scan at the root hands out its block's rows without copying them when room for a
+/// whole block's columns is left, and copies them otherwise. Its peak grows where the
+/// batches start to hold the block. Short values leave the decoding of each row room
+/// beside the block, so the answers of this scan are monotone in the budget. A large
+/// enough value can still be refused under a budget at which a copy would answer, which
+/// roadmap item 1051 holds.
 #[test]
 fn root_scan_answers_at_every_larger_budget() {
     let store = fixture(2 * BLOCK_ROWS + 4_000);
@@ -173,6 +179,53 @@ fn root_scan_answers_at_every_larger_budget() {
             "SELECT ?s ?v WHERE { ?s <urn:name> ?v }",
             mode,
             (192..=2_048).step_by(128),
+            false,
+        );
+        assert!(answered > 0, "{mode:?}");
+    }
+}
+
+/// 40,000 subjects with one value each, the first a literal of 300 KiB.
+fn large_literal() -> Store {
+    let store = Store::in_memory(StoreOptions {
+        result_cache_bytes: 0,
+        ..StoreOptions::default()
+    });
+    let mut data = String::new();
+    for i in 0..40_000 {
+        let value = if i == 0 {
+            "x".repeat(300 << 10)
+        } else {
+            format!("v{i}")
+        };
+        data.push_str(&format!("<urn:s{i}> <urn:p> \"{value}\" .\n"));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    store.compact().unwrap();
+    store
+}
+
+/// A root scan whose first value is a literal of 300 KiB, read row by row. The decoding
+/// of that literal needs memory beside the batch, so sharing a block takes room for a
+/// whole block's columns while it charges only the columns it decoded. A cursor that
+/// shared from a smaller room was refused at 960 and 1,024 KiB, where a copy of the rows
+/// answered at 896 KiB. One that charged a whole block was refused at 1,216 and
+/// 1,280 KiB.
+#[test]
+fn root_scan_decoding_a_large_literal_answers_at_every_larger_budget() {
+    let store = large_literal();
+    for mode in [ExecutionMode::Streaming, ExecutionMode::Auto] {
+        let answered = monotone(
+            &store,
+            "SELECT ?s ?v WHERE { ?s <urn:p> ?v }",
+            mode,
+            (640..=2_048).step_by(64),
             false,
         );
         assert!(answered > 0, "{mode:?}");

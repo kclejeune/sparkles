@@ -1191,8 +1191,8 @@ fn batches_admitted(options: &CursorOptions) -> bool {
 /// decoded index block whose rows the root hands out without copying them. A scan
 /// inside the plan charges no block, which the block cache keeps between its reads
 /// (roadmap item 1039), and the root copies rows when the block's charge does not fit.
-/// Automatic execution streams a plain scan for the speed of the uncopied batches, so
-/// its admission counts the block, and the test of whether a cursor fits does not.
+/// Automatic admission counts the block, and the eager memory retry does not (see
+/// [`cursor_fits`]).
 fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions, shared_block: bool) -> u64 {
     let cap = options
         .batch_rows
@@ -1274,23 +1274,35 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
 /// smaller input, the key set of the NOT EXISTS and one row per group.
 fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
     let eager = largest_output_bytes(node);
-    eager.is_finite() && eager * 2.0 > admission_room(ctx) && cursor_fits(ctx, node, kind, options)
+    eager.is_finite()
+        && eager * 2.0 > admission_room(ctx)
+        && cursor_fits(ctx, node, kind, options, true)
 }
 
 /// Whether a cursor over `node` can run without spill: the query is a SELECT over an
 /// immutable snapshot, every operator streams natively, and the state the cursor keeps,
 /// with its batch headroom, is expected to fit in half of the memory the query may use.
 /// Automatic admission asks this when eager execution is expected not to fit, and the
-/// eager memory retry asks it when eager execution has failed, so both send the same
-/// plans to a cursor without spill (roadmap items 91 and 96).
-fn cursor_fits(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
+/// eager memory retry asks it when eager execution has failed, so both send the plans
+/// that fit to a cursor without spill (roadmap items 91 and 96). Admission counts the
+/// decoded block of uncopied batches in the headroom (`shared_block`), as it did when
+/// every scan charged one, so that it keeps eager the plans it kept eager. The retry
+/// does not, since a scan charges no block (roadmap item 1039) and the cursor copies
+/// rows when a block's charge does not fit, and its alternative is the eager failure.
+fn cursor_fits(
+    ctx: &Ctx,
+    node: &Node,
+    kind: QueryKind,
+    options: &CursorOptions,
+    shared_block: bool,
+) -> bool {
     kind == QueryKind::Select
         && ctx.snap.delta.is_empty()
         && batches_admitted(options)
         && streams_natively(ctx, node)
         && {
             let state = cursor_state_bytes(ctx, node);
-            let headroom = cursor_headroom(ctx, node, options, false) as f64;
+            let headroom = cursor_headroom(ctx, node, options, shared_block) as f64;
             state.is_finite() && state * 2.0 + headroom <= admission_room(ctx)
         }
 }
@@ -1730,7 +1742,7 @@ fn fits_without_spill(
 ) -> bool {
     let options = within_first_deadline(options, started);
     super::prepare_query(snapshot.clone(), parsed, &options, None, None)
-        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor))
+        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor, false))
 }
 
 /// `options` with a relative timeout turned into the deadline of the run that started
@@ -4358,9 +4370,13 @@ impl Scan {
                 None => {
                     let bytes = block.decoded_bytes() + 512;
                     // Leave room for consumers' decoding scratch and an owned fallback.
+                    // The room asked for is a whole block's columns, whatever this block
+                    // decoded, so that sharing starts at the budgets it always did and
+                    // never holds more than it did there.
                     let output_bytes =
                         cap as u64 * (vars.len() as u64 * 8 + 16) + ctx.nvars() as u64 * 16 + 4096;
-                    if ctx.memory_remaining() < bytes.saturating_add(output_bytes) {
+                    let room = crate::index::BLOCK_ROWS as u64 * 32 + 512;
+                    if ctx.memory_remaining() < room.saturating_add(output_bytes) {
                         return Ok(SharedAttempt::Unsupported);
                     }
                     let Ok(charge) = OwnedCharge::new(ctx, bytes) else {
@@ -5333,26 +5349,14 @@ mod tests {
                 ..options
             }
         ));
-        let mut low = prepare(
+        let low = prepare(
             store.snapshot(),
             &QueryOptions {
                 max_memory_bytes: Some(1_000_000),
                 ..Default::default()
             },
         );
-        // Under a budget without room for an uncopied block, a scan that eager execution
-        // holds stays eager...
-        low.node.est = AUTO_SCAN_ROWS;
         assert!(!auto_streaming(
-            &low.ctx,
-            &low.node,
-            low.kind,
-            &Default::default()
-        ));
-        // ...and one that it cannot hold streams with copied batches, since the scan
-        // itself charges no block (item 1039).
-        low.node.est = 1_000_000.0;
-        assert!(auto_streaming(
             &low.ctx,
             &low.node,
             low.kind,

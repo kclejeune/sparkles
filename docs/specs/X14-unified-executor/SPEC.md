@@ -755,12 +755,17 @@ so that the scan reads whole blocks, streaming execution refused the count from 
 a read and keeps a `WeakBlock` of its columns between reads, which the block cache keeps
 alive, and it decodes the block again at its row when the cache has dropped it. The
 batches that the cursor root hands out without copying share one charge of the block's
-decoded columns, taken at hand-out and ended with the last of them, and the root copies
-rows when that charge does not fit. `cursor_headroom` counts a block only for the
-admission of a plain scan, whose speed comes from those uncopied batches, and not in
-`cursor_fits`. The tests in `tests/scan_block_budget.rs` check that each mode's answers
-are monotone in the budget on both fixtures and on a root scan, and that the scan's peak
-does not step by a block. A cursor over a read-through snapshot, which keeps no blocks,
+decoded columns, taken at hand-out and ended with the last of them. The root shares a
+block only when the memory left covers a whole block's columns and one batch, as it did,
+and copies rows otherwise, so it never holds more than it did under the same budget.
+`cursor_headroom` and `cursor_fits` count a block for automatic admission, which keeps
+eager the plans it kept eager, and not for the eager memory retry, whose alternative is
+the eager failure. The tests in `tests/scan_block_budget.rs` check that each mode's
+answers are monotone in the budget on both fixtures, that the scan's peak does not step
+by a block, and that root scans answer at every larger budget, one of them decoding a
+literal of 300 KiB. A root scan that shares its block can still be refused the decoding
+of a term larger than the room the block leaves, under a budget at which a copy would
+answer, and roadmap item 1051 holds that. A cursor over a read-through snapshot, which keeps no blocks,
 decodes its current block again for each batch, and no cursor query reads such a
 snapshot.
 
