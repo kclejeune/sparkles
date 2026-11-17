@@ -460,6 +460,77 @@ fn a_range_on_an_asserted_property_reaches_the_individual() {
 }
 
 #[test]
+fn an_asserted_successor_under_a_range_is_the_individual_itself() {
+    // r(a, b) under range(r) = C links a to b's own context, which holds C, and makes
+    // no context for {b} ⊓ C, so the run has the contexts of the one that asserts C(b)
+    let rest = [
+        ax(AxiomKind::ObjectPropertyAssertion(
+            ope("r"),
+            ind("a"),
+            ind("b"),
+        )),
+        Axiom::equivalent_classes([ce("X"), some("s", c("C"))]),
+        sub(c("Y"), ClassExpression::ObjectHasValue(ope("s"), ind("b"))),
+    ];
+    let mut ranged = vec![ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C")))];
+    ranged.extend(rest.iter().cloned());
+    let mut asserted = vec![ax(AxiomKind::ClassAssertion(ce("C"), ind("b")))];
+    asserted.extend(rest.iter().cloned());
+    let (a, b) = (run(&ranged), run(&asserted));
+    assert!(a.taxonomy.is_subclass(&c("Y"), &c("X")));
+    assert!(b.taxonomy.is_subclass(&c("Y"), &c("X")));
+    assert_eq!(a.stats.contexts, b.stats.contexts);
+}
+
+#[test]
+fn a_restriction_to_an_individual_under_a_class_puts_it_in_the_range_only_with_an_instance() {
+    // A ⊑ ∃r.{b} with range(r) = C says nothing of b while A may be empty, so Y ⊑ ∃s.{b}
+    // is not under X ≡ ∃s.C, and A itself is under ∃r.C ≡ W
+    let class = [
+        ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
+        sub(c("A"), ClassExpression::ObjectHasValue(ope("r"), ind("b"))),
+        Axiom::equivalent_classes([ce("X"), some("s", c("C"))]),
+        Axiom::equivalent_classes([ce("W"), some("r", c("C"))]),
+        sub(c("Y"), ClassExpression::ObjectHasValue(ope("s"), ind("b"))),
+    ];
+    let out = run(&class);
+    assert!(out.consistent);
+    assert!(!out.taxonomy.is_subclass(&c("Y"), &c("X")));
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("W")));
+    // the assertion r(a, b) beside it puts b in C, and the class keeps its link
+    let mut both = class.to_vec();
+    both.push(ax(AxiomKind::ObjectPropertyAssertion(
+        ope("r"),
+        ind("a"),
+        ind("b"),
+    )));
+    let out = run(&both);
+    assert!(out.consistent);
+    assert!(out.taxonomy.is_subclass(&c("Y"), &c("X")));
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("W")));
+    // an empty range makes the assertion inconsistent, and the class alone only empty
+    let empty = |with: bool| {
+        let mut v = vec![
+            ax(AxiomKind::ObjectPropertyRange(ope("r"), ce("C"))),
+            sub(c("C"), Class::nothing()),
+            sub(c("A"), ClassExpression::ObjectHasValue(ope("r"), ind("b"))),
+        ];
+        if with {
+            v.push(ax(AxiomKind::ObjectPropertyAssertion(
+                ope("r"),
+                ind("a"),
+                ind("b"),
+            )));
+        }
+        run(&v)
+    };
+    let out = empty(false);
+    assert!(out.consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(!empty(true).consistent);
+}
+
+#[test]
 fn a_range_reached_through_has_value_reaches_the_individual() {
     // Z(a) and Z ⊑ ∃r.{b} give r(a, b), so b is in range(r) = C and Y ⊑ ∃s.{b} ⊑ X
     let mut k = Classifier::of(&[

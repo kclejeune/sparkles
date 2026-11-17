@@ -1,0 +1,11 @@
+# phases.py OUT FILE...: medians over the rounds of the index, saturation and taxonomy stages of the
+# last classification of each process, per arm, with the per-round ratio of tip to base
+import json, sys, glob, statistics as st
+out = sys.argv[1]
+for f in sys.argv[2:]:
+    for arm in ('base', 'tip', 'tipb1'):
+        ds = []
+        for p in sorted(glob.glob(f"{out}/r*/{arm}/{f}.json")):
+            ds.append(json.loads([l for l in open(p) if l.startswith('{')][-1]))
+        g = lambda k: st.median(d[k] for d in ds)
+        print(f"{f:18} {arm:6} classify {st.median(c for d in ds for c in d['classifyMs']):9.1f} index {g('indexMs'):8.1f} sat {g('saturationMs'):9.1f} tax {g('taxonomyMs'):7.1f} read {g('readMs'):8.1f} ctx {g('contexts'):9.0f} concl {g('conclusions'):12.0f} perround {' '.join('%.1f' % st.median(d['classifyMs']) for d in ds)}")

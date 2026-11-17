@@ -1,0 +1,54 @@
+# tables.py TIMING T9663: the tables of the results section. A time is the median of every
+# classification of an arm over the rounds, a ratio the median of the rounds' ratios of medians.
+import json, sys, glob, statistics as st
+out, t9 = sys.argv[1], sys.argv[2]
+rows = {}
+for p in glob.glob(f"{out}/r*/*/*.json"):
+    r, tag, f = p.split('/')[-3:]
+    rows[(f[:-5], tag, r)] = json.loads([l for l in open(p) if l.startswith('{')][-1])
+rounds = sorted({k[2] for k in rows})
+side = lambda f, t: [rows[(f, t, r)] for r in rounds if (f, t, r) in rows]
+ms = lambda f, t: st.median(c for d in side(f, t) for c in d['classifyMs'])
+def rats(f, a, b):
+    return [st.median(rows[(f, a, r)]['classifyMs']) / st.median(rows[(f, b, r)]['classifyMs'])
+            for r in rounds if (f, a, r) in rows and (f, b, r) in rows]
+med = lambda f, t, k: st.median(d[k] for d in side(f, t))
+name = lambda n: {'go': 'GO', 'chebi_lite': 'ChEBI lite'}.get(n, f'`{n}`')
+four = ['ore_ont_4510', 'ore_ont_12901', 'ore_ont_14375', 'ore_ont_10951']
+def table(files, a='tip', b='base', counts=False):
+    for n in files:
+        for t in (1, 4):
+            f = f'{n}.t{t}'; rs = rats(f, a, b)
+            extra = ''
+            if counts:
+                extra = f" {med(f, b, 'contexts'):,.0f} | {med(f, a, 'contexts'):,.0f} | {med(f, b, 'conclusions'):,.0f} | {med(f, a, 'conclusions'):,.0f} |" if t == 1 else ' | | | |'
+            print(f"| {name(n)} | {t} | {ms(f, b):,.1f} | {ms(f, a):,.1f} | {st.median(rs):.3f} | {min(rs):.3f} to {max(rs):.3f} |{extra}")
+print('four files'); table(four, counts=True)
+print('el rules')
+for n in four:
+    for t in (1, 4):
+        f = f'{n}.t{t}'; e = rats(f, 'tip-el', 'base-el'); hb = rats(f, 'base', 'base-el'); ht = rats(f, 'tip', 'tip-el')
+        c = f"{med(f, 'base-el', 'conclusions'):,.0f} | {med(f, 'tip-el', 'conclusions'):,.0f}" if t == 1 else ' | '
+        print(f"| {name(n)} | {t} | {ms(f, 'base-el'):,.1f} | {ms(f, 'tip-el'):,.1f} | {st.median(e):.3f} | {min(e):.3f} to {max(e):.3f} | {st.median(hb):.2f} | {st.median(ht):.2f} | {min(ht):.2f} to {max(ht):.2f} | {c} |")
+print('movers'); table(['ore_ont_9654', 'ore_ont_4572', 'ore_ont_6132', 'ore_ont_10754', 'ore_ont_11378', 'ore_ont_9151', 'ore_ont_9855'], counts=True)
+print('same'); table(['go', 'chebi_lite', 'ore_ont_16744', 'ore_ont_8737', 'ore_ont_1370', 'ore_ont_4755', 'ore_ont_5481', 'ore_ont_10073'])
+print('prototype'); table(four + ['ore_ont_9654', 'ore_ont_4572', 'ore_ont_9151', 'go', 'chebi_lite', 'ore_ont_1370', 'ore_ont_4755', 'ore_ont_5481', 'ore_ont_10073'], a='tipb1', b='tip')
+print('saturation and rss, one thread')
+for n in four + ['go', 'chebi_lite', 'ore_ont_16744', 'ore_ont_8737', 'ore_ont_1370', 'ore_ont_9654']:
+    f = f'{n}.t1'
+    print(n, ' '.join(f"{a}: sat {med(f, a, 'saturationMs'):.1f} idx {med(f, a, 'indexMs'):.1f} rss {max(d['peakRssKib'] for d in side(f, a)) / 1024:.0f} MiB" for a in ('base', 'tip', 'tipb1')))
+# ore_ont_9663 and ore_ont_14817 on the build before item 869 against the build with it
+r9 = {}
+for p in glob.glob(f"{t9}/r*/*/*.json"):
+    r, tag, f = p.split('/')[-3:]
+    try: r9[(f[:-5], tag, int(r[1:]))] = json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: print('unreadable', p)
+print('pre869 against 869')
+for f in sorted({k[0] for k in r9}):
+    rs = sorted({k[2] for k in r9 if k[0] == f})
+    a = [r9[(f, 'pre869', r)]['classifyMs'][0] / 1000 for r in rs]; b = [r9[(f, 'base', r)]['classifyMs'][0] / 1000 for r in rs]
+    q = [y / x for x, y in zip(a, b)]
+    sa = [r9[(f, 'pre869', r)]['saturationMs'] / 1000 for r in rs]; sb = [r9[(f, 'base', r)]['saturationMs'] / 1000 for r in rs]
+    ra = [x - y for x, y in zip(a, sa)]; rb = [x - y for x, y in zip(b, sb)]
+    ca = [r9[(f, 'pre869', r)]['conclusions'] for r in rs]; cb = [r9[(f, 'base', r)]['conclusions'] for r in rs]
+    print(f"{f} n={len(rs)} pre869 median {st.median(a):.2f} ({min(a):.2f} to {max(a):.2f}) with869 median {st.median(b):.2f} ({min(b):.2f} to {max(b):.2f}) ratio median {st.median(q):.3f} ({min(q):.3f} to {max(q):.3f}) slower in {sum(x > 1 for x in q)} of {len(q)}; last saturation {st.median(sa):.2f} against {st.median(sb):.2f}; rest {st.median(ra):.2f} against {st.median(rb):.2f} ({st.median(rb)/st.median(ra):.3f}); conclusions {st.median(ca):,.0f} ({min(ca):,}-{max(ca):,}) against {st.median(cb):,.0f} ({min(cb):,}-{max(cb):,}); tiers {set(r9[(f,'pre869',r)]['tier'] for r in rs)} {set(r9[(f,'base',r)]['tier'] for r in rs)} dlOver {set(r9[(f,'base',r)]['dlOverBudget'] for r in rs)} attemptOver {set(r9[(f,'base',r)]['dlAttemptOver'] for r in rs)}")

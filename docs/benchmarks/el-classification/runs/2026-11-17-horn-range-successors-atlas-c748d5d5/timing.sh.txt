@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# timing.sh: batch/29 (7506edf5, bin/base) against the lane tip (bin/tip) and the tip with the
+# realness prototype (bin/tipb1) in interleaved rounds, one process per arm, file and thread
+# count, with the EL rules alone of base and tip on the four assertion-heavy files. The caller
+# holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/horn-cost-1025
+F=$HOME/lanes/horn-budget-962/files
+OUT=$D/out/timing; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/base $D/bin/tip $D/bin/tipb1; } > $OUT/before.txt
+files="ore_ont_4510.owl ore_ont_12901.owl ore_ont_14375.owl ore_ont_10951.owl ore_ont_5481.owl ore_ont_10073.owl ore_ont_1370.owl ore_ont_4755.owl ore_ont_11378.owl ore_ont_9151.owl go.ofn chebi_lite.ofn ore_ont_9855.owl ore_ont_8737.owl ore_ont_9654.owl ore_ont_4572.owl ore_ont_6132.owl ore_ont_10754.owl ore_ont_16744.owl"
+one() { # round arm name threads rep file [flag]
+  mkdir -p $OUT/r$1/$2
+  systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    timeout 900 $D/bin/${2%-el} ${7:-} --threads $4 --repeat $5 $6 > $OUT/r$1/$2/$3.t$4.json 2> $OUT/r$1/$2/$3.t$4.err
+  echo "r$1 $2 $3 t$4 status=$?" >> $OUT/log.txt
+}
+for round in 1 2 3 4; do
+  order="base tip tipb1"; [ $((round % 2)) -eq 0 ] && order="tipb1 tip base"
+  for f in $files; do
+    n=${f%.*}
+    for t in 1 4; do
+      rep=5; case $n in ore_ont_8737|ore_ont_9654) rep=2;; ore_ont_16744) rep=1;; esac
+      for arm in $order; do one $round $arm $n $t $rep $F/$f; done
+      case $n in ore_ont_4510|ore_ont_12901|ore_ont_14375|ore_ont_10951)
+        elorder="base tip"; [ $((round % 2)) -eq 0 ] && elorder="tip base"
+        for arm in $elorder; do one $round $arm-el $n $t 5 $F/$f --el-only; done;;
+      esac
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

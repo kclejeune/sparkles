@@ -537,13 +537,12 @@ impl Sends {
     }
 
     /// Gives the context itself a conclusion, once in a flush. The conclusions wait in
-    /// the activation's own list, which no bound counts, and several at-most
-    /// restrictions or successors by several roles give the context the same ones. The
-    /// list then takes each member of the cores and each filler that the context reads
-    /// once, each loop once, and one link for each pair of a role and a target of R5.
-    /// Those pairs can still be as many as the at-most restrictions times the roles,
-    /// when each restriction merges its successors into a target of its own, which
-    /// roadmap item 1026 follows.
+    /// the activation's own list, which no bound counts, and successors by several roles
+    /// give the context the same ones. The list then takes each member of the cores and
+    /// each filler that the context reads once, each loop once, and one link for each
+    /// pair of a role and the target of R5. A flush merges the successors of one at-most
+    /// restriction and leaves the others to the next, so the pairs are those of one
+    /// restriction (roadmap item 1026).
     fn me<S: Sink>(&mut self, c: Concl, out: &mut S) {
         if self.own.insert(c) {
             out.me(c);
@@ -594,11 +593,22 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
     merges.dedup();
     // what the flush sent the context itself, and whether the run stopped at a send
     let mut sends = Sends::new(me);
-    for (s, b) in merges {
-        sent |= merge_all(ix, st, s, b, &mut sends, out);
+    let mut merges = merges.into_iter();
+    while let Some((s, b)) = merges.next() {
+        let gave = merge_all(ix, st, s, b, &mut sends, out);
         // a run that stopped keeps nothing of the flush
         if sends.stop {
-            return sent;
+            return sent | gave;
+        }
+        // The conclusions R5 gives the context wait in the activation's own list, which
+        // no bound counts. One restriction gives at most a link for each successor it
+        // counts and the members of their cores, which the context's state holds and
+        // the run has charged. The other restrictions and R3 wait until the activation
+        // has applied them, so the list never holds the links of every restriction at
+        // once (roadmap item 1026).
+        if gave {
+            hs(st).merges.extend(merges);
+            return true;
         }
     }
     let h = &mut st.extra.as_mut().expect("the context's Horn state").horn;
@@ -1632,6 +1642,74 @@ mod tests {
         expected.sort();
         assert_eq!(out.local, expected);
         assert!(out.sent.is_empty());
+    }
+
+    /// A flush merges the successors of one at-most restriction and leaves the others
+    /// pending, so the activation's own list holds the links of one restriction and not
+    /// of all of them (item 1026).
+    #[test]
+    fn a_flush_gives_the_context_the_links_of_one_merge_at_a_time() {
+        const RESTRICTIONS: u32 = 5;
+        let mut it = Interner::new();
+        let cs: Vec<Ex> = (0..RESTRICTIONS)
+            .map(|k| it.class(&Class::new(format!("urn:named:c{k}"))))
+            .collect();
+        let ns: Vec<Ex> = (0..RESTRICTIONS)
+            .map(|k| {
+                it.nominal(&crate::model::NamedIndividual::new(format!(
+                    "urn:named:n{k}"
+                )))
+            })
+            .collect();
+        let me = it.class(&Class::new("urn:named:me"));
+        let _ = it.node(Node::Top);
+        let mut ix = Index::build(&Axioms::default(), &mut it, None, &|| false).unwrap();
+        ix.horn = Some(Box::new(HornIx {
+            flags: Vec::new(),
+            base: it.nodes.len() as Ex,
+            dominate: false,
+        }));
+        // each role has an at-most restriction of its own, with an individual and a class
+        // as its successors, so each restriction merges into a target of its own
+        let mut st = State {
+            real: true,
+            ..State::default()
+        };
+        let h = hs(&mut st);
+        for k in 0..RESTRICTIONS {
+            h.succ.insert((k, ns[k as usize]));
+            h.succ.insert((k, cs[k as usize]));
+            h.atmost.push((k, TOP));
+            h.merges.push((k, TOP));
+        }
+        let mut given: Vec<Concl> = Vec::new();
+        for k in 0..RESTRICTIONS {
+            let mut out = Recorded {
+                sent: Vec::new(),
+                local: Vec::new(),
+                checks: 0,
+                left: usize::MAX,
+            };
+            assert!(flush(&ix, me, &mut st, &mut out));
+            // one link to the individual of the restriction, which takes the class
+            assert_eq!(out.local.len(), 1, "flush {k}");
+            assert_eq!(out.sent.len(), 1, "flush {k}");
+            assert_eq!(hs(&mut st).merges.len() as u32, RESTRICTIONS - 1 - k);
+            given.extend(out.local);
+        }
+        let mut expected: Vec<Concl> = (0..RESTRICTIONS)
+            .map(|k| Concl::Succ(k, ns[k as usize]))
+            .collect();
+        given.sort();
+        expected.sort();
+        assert_eq!(given, expected);
+        let mut out = Recorded {
+            sent: Vec::new(),
+            local: Vec::new(),
+            checks: 0,
+            left: usize::MAX,
+        };
+        assert!(!flush(&ix, me, &mut st, &mut out));
     }
 
     /// R6 records each pair of a predecessor and a successor whose core it sent, and the

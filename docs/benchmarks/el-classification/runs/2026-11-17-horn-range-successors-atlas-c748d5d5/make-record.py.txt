@@ -1,0 +1,66 @@
+# make-record.py LANE DEST: builds the benchmark record of items 1025 and 1026 from the atlas timing
+# outputs, the rounds of ore_ont_9663 before and with item 869, the laptop's taxonomy sweep and the
+# laptop's counts by commit and pinned instruction counts
+import json, sys, os, glob, shutil
+lane, dest = sys.argv[1], sys.argv[2]
+keep = ['classifyMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget', 'dlAttemptOver',
+        'outside', 'outsideTaken', 'conclusions', 'contexts', 'conjunctions', 'peakEstimatedBytes', 'peakRssKib', 'threads']
+def rep(p):
+    try: return json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: return None
+def runs(root, pattern):
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, pattern), recursive=True)):
+        d = rep(p)
+        out.append({'path': os.path.relpath(p, root), 'report': {k: d.get(k) for k in keep} if d else None})
+    return out
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+def shas(t):
+    return {l.split()[1].split('/')[-1]: l.split()[0] for l in (text(os.path.join(t, 'before.txt')) or '').splitlines() if '/bin/' in l}
+t = os.path.join(lane, 'atlas', 'timing'); t9 = os.path.join(lane, 'atlas', 't9663')
+heads = {n: (text(os.path.join(lane, 'bin', n + '.head')) or '').split()[0] for n in ['base', 'a1', 'tip', 'tipb1', 'pre869']}
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'ORE 2015 DL development files ore_ont_4510, ore_ont_12901, ore_ont_14375, ore_ont_10951, ore_ont_5481, ore_ont_10073, ore_ont_1370, ore_ont_4755, ore_ont_11378, ore_ont_9151, ore_ont_9855, ore_ont_8737, ore_ont_9654, ore_ont_4572, ore_ont_6132, ore_ont_10754, ore_ont_16744, ore_ont_9663 and ore_ont_14817, GO 2026-07-26 and ChEBI lite 256 on atlas, and a taxonomy sweep of GO, ChEBI lite, 298 ORE 2015 EL files and 207 DL development files on the laptop',
+  'host': {'name': 'atlas', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+  'manifest': {
+    'sides': {'base': '7506edf5, the lane base (batch 29), which holds items 990 and 869',
+              'tip': 'c748d5d5, the reviewed build of items 1025 and 1026',
+              'a1': '07820015, item 1025 alone, used on the laptop only',
+              'tipb1': 'c748d5d5 with b1.patch.txt applied, a prototype that was not kept, built in a second worktree',
+              'base-el and tip-el': 'the base and the tip with --el-only, on the four assertion-heavy files',
+              'pre869': 'be684ce5, the parent of the merge of item 869, which holds item 990'},
+    'build': 'mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas',
+    'commits': heads,
+    'binaries_sha256': {**shas(t), **shas(t9)},
+    'scripts': ['timing.sh.txt', 't9663.sh.txt', 'summ.py.txt', 'phases.py.txt', 'tables.py.txt', 'sweep.sh.txt', 't7192.sh.txt', 'make-record.py.txt', 'b1.patch.txt']},
+  'settings': {'threads': 'one and four in the rounds, one and eight in the sweep, one in the counts by commit and the instruction counts',
+               'scope': 'one process per run in a 13 GiB systemd scope without swap on atlas, an 8 GiB scope with 2 GiB of swap in the sweep on the laptop',
+               'lock': 'every atlas part ran under ~/lanes/.heavy.lock, in turns with another lane'},
+  'method': 'timing.sh ran four rounds of alternating order of base, tip and tipb1, one process per arm, file and thread count with --repeat 5, 2 for ore_ont_8737 and ore_ont_9654 and 1 for ore_ont_16744, and in each round the base and the tip with --el-only on the four assertion-heavy files. summ.py and tables.py take the median of every classification of an arm and the median of the rounds ratios of medians, and phases.py the medians of the stages of the last classification of each process. t9663.sh ran sixteen rounds of alternating order of pre869 and base on ore_ont_9663 and ore_ont_14817 on four threads and four rounds on ore_ont_9663 on one thread, one process with one classification a side, with the hash of the taxonomy. The sweep classified each entry of its input list once per side and thread count with its taxonomy on the laptop, with a timeout of 300 s, and compared the hashes of the sorted taxonomies. Eight files are in the EL set and in the development set, so they are two entries and ran twice. t7192.sh ran ore_ont_7192 once per side on one thread in a 14 GiB scope on the laptop, since the 8 GiB scope of the sweep kills both builds on it. The prototype tipb1 fails the unit test a_horn_successor_of_a_real_source_learns_the_source_is_real_in_either_order of the crate, which counts the Real message it removes, so it is kept as a patch and not as a commit.',
+  'timing': runs(t, 'r*/*/*.json'),
+  'timing_log': text(os.path.join(t, 'log.txt')),
+  'timing_summary': text(os.path.join(lane, 'atlas', 'summary.txt')),
+  'timing_tables': text(os.path.join(lane, 'atlas', 'tables.md')),
+  'hosts': {p: text(os.path.join(t, p)) for p in ['before.txt', 'after.txt']},
+  't9663': runs(t9, 'r*/*/*.json'),
+  't9663_log': text(os.path.join(t9, 'log.txt')),
+  't9663_hosts': {p: text(os.path.join(t9, p)) for p in ['before.txt', 'after.txt']},
+  't9663_note': 'each line of the log gives the round, the side, the file, the thread count, the exit status and the first 16 hex digits of the SHA-256 of the taxonomy. Rounds 1 to 16 ran four threads and rounds 17 to 20 ore_ont_9663 on one thread. The load average at the start was 3.7 from the other lane job that had just ended.',
+  'sweep_host': 'stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB',
+  'sweep': {str(i): text(os.path.join(lane, f'sweep/log-tip.{i}.txt')) for i in range(3)},
+  'sweep_note': 'each line gives the file, the thread count, the side, the exit status, the first 16 hex digits of the SHA-256 of the sorted taxonomy and [classify ms, tier, conclusions, conjunctions, dlOverBudget, hornOverBudget, axioms outside, unsatisfiable, consistency]. The three parts cover every third file. Eight files are in the EL set and the development set and ran twice. Status 137 is the kill at the 8 GiB scope and status 101 the reader refusing the file. The laptop ran other work, so the sweep times are not measurements.',
+  'laptop_diagnostics': {
+    'counts_by_commit': text(os.path.join(lane, 'out/by-commit.txt')),
+    'pinned_instructions': text(os.path.join(lane, 'out/instructions.txt')),
+    'ore_ont_7192_one_thread': text(os.path.join(lane, 'out/7192/log.txt')),
+    'ore_ont_7192_note': 'ore_ont_7192 on one thread on the base and the tip in a 14 GiB scope with 2 GiB of swap under the laptop heavy lock, one process each, with the fields of the sweep and the peak resident set in KiB. Both give the taxonomy hash 116564162182aa0f, which the record of item 869 has for its builds, with 80,580,920 conclusions and hornOverBudget true. The laptop ran other work, so the times are not a comparison.',
+    'kinds_ore_ont_4510': 'a diagnostic build of 07820015, one thread, laptop: the Horn rules derive 2.48 million conclusions against 1.15 million for the EL rules alone. The extra are five subsumers that every context takes from owl:Thing (an at-most restriction of BFO_0000052, two universal restrictions of roles that are not simple and their two automaton states), 300 thousand, Real 334 thousand and RealBack 214 thousand, automaton states 103 thousand, 218 thousand further repeats of existential restrictions and Succ 40 thousand. The base made 13,547 contexts of an individual with the range of BFO_0000052.',
+    'ore_ont_16744_one_thread': 'in the sweep ore_ont_16744 read 10.1 s on the base against 19.7 s on the tip on one thread with the same 592,208,319 conclusions. Run alone on the laptop it took 6.98 and 6.84 s on the base, 6.80 and 6.80 s on the tip and 6.89 s on 07820015, so the sweep figure was the load of the laptop. The atlas rounds hold its measurement.'},
+}
+os.makedirs(dest, exist_ok=True)
+for src in ['atlas/timing.sh', 'atlas/t9663.sh', 'atlas/summ.py', 'atlas/phases.py', 'atlas/tables.py', 'sweep/sweep.sh', 't7192.sh', 'atlas/make-record.py', 'bin/tipb1.patch']:
+    shutil.copyfile(os.path.join(lane, src), os.path.join(dest, ('b1.patch' if src.endswith('tipb1.patch') else os.path.basename(src)) + '.txt'))
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']), 't9663', len(rec['t9663']), 'binaries', rec['manifest']['binaries_sha256'], heads)

@@ -295,9 +295,57 @@ on one and eight threads, as the
 [benchmark report](../../benchmarks/el-classification/RESULTS.md#conjunctions-with-an-individual)
 records with the files that pass its limits on both builds. The flush of R3 and R5 keeps
 what it gives its own context, so that the context takes each conclusion once, and counts
-what it sends an individual against the run's bounds. R5 can still give a context one
-link for each pair of a role and a target before a bound counts them, as it did before,
-which item 1026 follows.
+what it sends an individual against the run's bounds. R5 could still give a context one
+link for each pair of a role and a target before a bound counted them, as it did before,
+which item 1026 ends.
+
+Item 1025 measured what the Horn rules with individuals still derived beyond the EL rules
+on the four files, and most of it was not the Horn rules' exchange. The files are
+Phenoscape knowledge bases whose property `BFO_0000052` is functional and has a range,
+in a run with the Horn rules also through the domain of its inverse. The index gave each
+assertion over it the context of the individual and the range as its successor, 13,547
+contexts on `ore_ont_4510`, and each derived its individual and repeated the individual's
+closure, under the EL rules as well. The index now gives the restriction of an assertion
+the individual's own context and tells the individual the range, as
+[the EL classifier](#the-owl-2-el-classifier) argues for individuals and
+[the Horn rules with individuals](#the-horn-rules-with-individuals) describe for the Horn
+run. In four rounds of alternating order on `atlas` the four files classify in 0.60 to
+0.63 times the base's time on one thread and 0.72 to 0.92 times on four, `ore_ont_4510`
+in 240 against 401 ms on one thread with 2.48 against 6.08 million conclusions, and the
+EL rules alone classify them in 0.65 to 0.71 times and 0.63 to 0.85 times. The Horn rules
+then take 1.8 to 2.0 times the EL rules' time on one thread, against 2.0 to 2.1 times on
+the base in the same rounds. On four threads they take 1.5 to 2.0 times, against 1.4 to
+1.7 times, since the EL rules gain more there. Six further files of the development set
+with such assertions classify in 0.45 to 0.84 times the time on one thread,
+`ore_ont_9654` in 3.1 against 5.4 s. On `ore_ont_4510` the Horn rules still derive 2.48
+million conclusions against 1.15 million for the EL rules alone on one thread. A
+diagnostic build on the laptop counted the difference as five subsumers that every
+context takes from `owl:Thing`, 300 thousand conclusions, the two conclusions that tell a
+successor it is real, 548 thousand, the states of the automata, 103 thousand, 218
+thousand further repeats of existential restrictions and 40 thousand successors. Item
+1025 keeps that remainder and the conjunctions of a class that is equivalent to an
+individual. A prototype in which a successor learns that it is real from one conclusion
+in place of two took 1.4 to 1.9% off the four files on one thread and was not kept, as
+[the experiments page](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
+
+Item 1026 bounds what R5 gives a context before the activation applies it. A flush merges
+the successors of one at-most restriction and leaves the other restrictions and R3
+pending, as [the Horn rules](#the-horn-rules) describe, so the activation's own list
+holds the links of one restriction. `ore_ont_9855` then makes 15,774 conjunction
+contexts against 15,866 and derives 20.8 against 21.1 million conclusions on one thread.
+A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015 EL files and the 207
+files of the development set with the base and with both items on one and eight threads,
+and the 994 pairs that both builds classified gave the same taxonomy bytes, as the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#assertions-under-a-range)
+records with the files that pass its limits. GO, `ore_ont_1370`, `ore_ont_16744` and
+ChEBI lite, which derive the same conclusions on both builds, are 2.3, 1.6, 1.5 and 0.9%
+slower on one thread on `atlas` in every round, and item 1028 follows that. Item 1025
+also timed `ore_ont_9663` against the build before item 869 now that item 990 bounds its
+attempt. Over sixteen processes a side on four threads the build with item 869 takes a
+median of 8.75 against 8.17 s and is slower in 12 rounds, and on one thread 76.3 against
+75.8 s with the same conclusions in each of four rounds. Almost all of the difference is
+outside the Horn rules' final saturation, in time that holds the attempt of the
+disjunctive rules, which item 869 does not change. Item 1027 follows it.
 
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
@@ -341,7 +389,9 @@ a time, and workers count their conclusions and memory locally and add them to t
 shared totals in batches. Property chains are binarized, and transitivity is the
 chain of a property with itself. A range is pushed into the filler of each existential
 restriction on the property, which is complete under the range restriction of OWL 2 EL
-(Profiles §2.2.6). A chain that breaks that restriction is left out. The taxonomy groups
+(Profiles §2.2.6). A restriction to an individual that an assertion tells is the
+exception, which the paragraph on individuals below describes. A chain that breaks the
+range restriction is left out. The taxonomy groups
 the classes by mutual subsumption and computes direct superclasses by transitive
 reduction, by greedy minimization or, for a class with more than 32 direct superclasses,
 by marking the classes above each candidate. The subsumers, the equivalence classes and
@@ -411,7 +461,14 @@ real. A context that derives `{a}` registers with `a`'s context and
 takes every subsumer `a` has and gets later. A real context that derives `{a}` also gives
 `a` every subsumer it has, which merges the two. A link by `r` from a context with `{a}`
 to one with `{a}` is a loop by `r`, a loop meets the range of its role, and a link by a
-role under the bottom property derives `owl:Nothing`. What a context that is not real
+role under the bottom property derives `owl:Nothing`. A restriction `∃r.{b}` that is told
+of an individual, which a property assertion `r(a, b)` is, puts `b` in the range of `r`,
+since `a` has an instance in every model. The index tells `b` the range and gives the
+restriction `b`'s own context as its successor, wherever the restriction occurs, where
+the context of `{b}` with the range would derive `b` and repeat everything `b` holds
+(item 1025). A restriction `∃r.{b}` that only classes hold keeps the context of `{b}`
+with the range, since `b` is in the range only where one of those classes has an
+instance. What a context that is not real
 knows of `a` holds only where its root has an instance. This is the reachability
 condition of the completion rule CR6 of EL++, which Kazakov, Krötzsch and Simančík (KR
 2012) show breaks goal-directed EL procedures. After the saturation, a context that is not
@@ -888,7 +945,16 @@ Two further changes cut the cost of the Horn rules.
 
 - **Merging by at-most restrictions.** At the end of its activation, a context merges
   every successor that an at-most restriction counts into one conjunction of their
-  classes. Merging pairs created a context for each subset on the way.
+  classes. Merging pairs created a context for each subset on the way. A flush merges
+  the successors of one restriction and leaves the other restrictions and R3 pending
+  until the activation has applied what the merge gave the context. The activation's own
+  list, which no bound counts, then holds at most a link for each successor that the
+  restriction counts, the members of their cores and the loops, all of which the
+  context's charged state bounds, where it held the links of every restriction at once
+  (item 1026). When two restrictions count overlapping successors, a run can make other
+  intermediate conjunctions than one that merged for both at once, so its statistics and
+  a budget outcome near a threshold can differ, while a finished saturation gives the
+  same answer.
 - **Fillers no rule reads.** The rule for a successor passes over a filler that no rule
   takes as a premise and whose told subsumers every context holds. The rule for a
   universal restriction on an inverse still takes such a filler to the predecessors.
@@ -1312,6 +1378,16 @@ files of the development set, whose property assertions between individuals lie 
 universal restrictions and ranges of transitive properties, every conjunction but 44 to
 116 of 3,098 to 42,249 held an individual and was real, and each repeated its
 individual's closure.
+
+**An assertion under a range.** A domain of `r⁻` is a range of `r` in a run with the Horn
+rules, so an assertion `r(a, b)` over a role with either had the context of `{b}` with
+the range as its successor. That context derived `b` and exchanged with `b` as every
+context that holds an individual does. It also took `b`'s Horn successors, so where `b`
+is a predecessor that an at-most restriction of a singular context counts, the context
+was a second such predecessor and R7 identified it with `b`. Every subsumer of `b` then
+went three ways. The index links the restriction of an assertion to `b`'s own context
+and tells `b` the range, as [the EL classifier](#the-owl-2-el-classifier) argues for
+individuals, so the run makes none of these contexts (item 1025).
 
 **Witnesses and worlds.** The reachability condition of the EL rules of individuals stays
 the mechanism that makes a conclusion that depends on a class having an instance hold

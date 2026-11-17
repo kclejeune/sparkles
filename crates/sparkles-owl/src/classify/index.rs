@@ -2197,6 +2197,21 @@ impl Index {
         }
         ix.vals = it.copy_values()?;
         ix.numeric_ledger = it.ranges.ledger.clone();
+        // An individual has an instance in every model, so a told `{a} ⊑ ∃r.{b}`, which
+        // a property assertion `r(a, b)` is, puts `b` in the range of `r`. The index
+        // tells `b` the range and gives the restriction `b`'s own context as its
+        // successor, where the context of `{b} ⊓ range` would derive `b` and repeat
+        // everything `b` holds (roadmap item 1025). The same restriction under a class
+        // gets that successor too, which holds the range by the told subsumption.
+        for &(a, c) in &ax.subs {
+            if let Node::Nominal(_) = it.nodes[a as usize]
+                && let Node::Exist(r, f) = it.nodes[c as usize]
+                && let Node::Nominal(_) = it.nodes[f as usize]
+                && ix.roles.range.get(r as usize).copied().flatten().is_some()
+            {
+                b.asserted.insert(c);
+            }
+        }
         for &(a, c) in &ax.subs {
             b.positive(c, it, &mut ix);
             if a != c {
@@ -2756,8 +2771,12 @@ struct Builder {
     /// negative data restrictions: the role, the range and the expression
     neg_data: Vec<(Role, u32, Ex)>,
     succ: Vec<(Ex, Ex)>,
-    /// the told subsumers of positive data restrictions and empty roles
+    /// the told subsumers of positive data restrictions and empty roles, and the ranges
+    /// of the individuals that an assertion gives a role's successor
     told: Vec<(Ex, Ex)>,
+    /// the existential restrictions `∃r.{b}` that are told of an individual, over a
+    /// role with a range
+    asserted: FxHashSet<Ex>,
 }
 
 impl Builder {
@@ -2804,6 +2823,15 @@ impl Builder {
                     self.told.push((e, BOTTOM));
                 }
                 let succ = match ix.roles.range.get(r as usize).copied().flatten() {
+                    // an individual has the successor, which is the filler's individual
+                    // and so in the range
+                    Some(range) if self.asserted.contains(&e) => {
+                        self.positive(range, it, ix);
+                        if f != range {
+                            self.told.push((f, range));
+                        }
+                        f
+                    }
                     Some(range) => {
                         self.positive(range, it, ix);
                         it.conj(f, range)

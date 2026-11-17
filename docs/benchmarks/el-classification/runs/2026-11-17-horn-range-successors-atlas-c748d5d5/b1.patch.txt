@@ -1,0 +1,71 @@
+diff --git a/crates/sparkles-owl/src/classify/horn_rules.rs b/crates/sparkles-owl/src/classify/horn_rules.rs
+index 5d5bc689..1e61b9af 100644
+--- a/crates/sparkles-owl/src/classify/horn_rules.rs
++++ b/crates/sparkles-owl/src/classify/horn_rules.rs
+@@ -430,7 +430,6 @@ pub fn succ<S: Sink>(
+     // a real context's successors are real (roadmap item 692); the EL rule sent `Real`
+     // to a successor it created
+     if st.real && !sent {
+-        out.send(n, Concl::Real);
+         out.send(n, Concl::RealBack(me));
+     }
+     let h = hs(st);
+diff --git a/crates/sparkles-owl/src/classify/saturate.rs b/crates/sparkles-owl/src/classify/saturate.rs
+index c31835ba..5674255c 100644
+--- a/crates/sparkles-owl/src/classify/saturate.rs
++++ b/crates/sparkles-owl/src/classify/saturate.rs
+@@ -2770,9 +2770,12 @@ fn apply_rules<S: Sink, R: Rules>(
+                         out.me(Concl::Fwd(r, succ));
+                     }
+                     if R::FULL && st.real {
+-                        out.send(succ, Concl::Real);
++                        // in a run with the Horn rules the successor learns that it is
++                        // real from the predecessor's realness, in one message
+                         if R::HORN {
+                             out.send(succ, Concl::RealBack(me));
++                        } else {
++                            out.send(succ, Concl::Real);
+                         }
+                     }
+                     if R::HORN {
+@@ -2963,7 +2966,15 @@ fn apply_rules<S: Sink, R: Rules>(
+             }
+             new
+         }
+-        Concl::RealBack(m) if R::HORN && R::FULL => horn_rules::real_back(ix, me, st, m, out),
++        Concl::RealBack(m) if R::HORN && R::FULL => {
++            let new = horn_rules::real_back(ix, me, st, m, out);
++            // a real predecessor's instance has a successor here, or is this context's
++            // element, so the context is real
++            if new && !st.real {
++                apply_real(ix, me, st, out);
++            }
++            new
++        }
+         Concl::Singular if R::HORN && R::FULL => {
+             let new = !st.extra.as_ref().is_some_and(|x| x.horn.counted);
+             horn_rules::singular(ix, me, st, true, out);
+@@ -3036,16 +3047,16 @@ fn apply_real<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool
+         }
+         return true;
+     }
+-    for &s in &st.subs {
+-        if let Node::Exist(..) = ix.head(s).node {
+-            out.send(ix.head(s).succ, Concl::Real);
++    // in a run with the Horn rules every successor is among the Horn successors, which
++    // learn that they are real from this context's realness below
++    if ix.horn.is_none() {
++        for &s in &st.subs {
++            if let Node::Exist(..) = ix.head(s).node {
++                out.send(ix.head(s).succ, Concl::Real);
++            }
+         }
+     }
+     if let Some(x) = &st.extra {
+-        // the successors the Horn rules made (roadmap item 692)
+-        for &(_, n) in &x.horn.succ.list {
+-            out.send(n, Concl::Real);
+-        }
+         for &n in &x.noms {
+             for &s in &st.subs {
+                 out.send(n, Concl::Sub(s));
