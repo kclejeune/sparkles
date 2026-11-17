@@ -112,9 +112,16 @@ impl Saturation {
                 ..Default::default()
             });
         }
-        let (bottom, subsumers) = self
+        let (bottom, mut subsumers) = self
             .named_subsumers(q)
             .unwrap_or((q == BOTTOM, vec![q, TOP]));
+        if self.reduced {
+            // the made-up classes of item 805's reductions take no part in the answer,
+            // whose direct superclasses are those among the visible ones
+            subsumers.retain(|&e| {
+                class_of(e).is_none_or(|k| !k.as_str().starts_with(super::dl_reduce::PREFIX))
+            });
+        }
         if bottom {
             let mut eq: Vec<Class> = named
                 .iter()

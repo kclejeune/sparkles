@@ -778,3 +778,102 @@ fn without_the_rooted_run_keys_and_the_universal_property_are_left_as_they_are()
     let out = k.classify(&Limits::default()).unwrap();
     no_internal_names(&k, &out, &[Class::thing()]);
 }
+
+#[test]
+fn the_names_of_axioms_the_rewriting_drops_stay_in_the_signature() {
+    // a key without two individuals, a tautology over the universal property and a
+    // minimum of none over it make nothing, but their classes and individuals stay
+    for (body, class) in [
+        ("HasKey(:K (:p) ())", "K"),
+        (
+            "SubClassOf(:A ObjectMinCardinality(0 owl:topObjectProperty :Q))",
+            "Q",
+        ),
+    ] {
+        let mut k = Classifier::of(&axioms(body));
+        let out = k.classify(&rooted_limits()).unwrap();
+        let plain = Classifier::of(&axioms(body))
+            .classify(&Limits::default())
+            .unwrap();
+        assert!(k.describe(&c(class)).is_some(), "{body}");
+        let has = |t: &sparkles_owl::classify::Taxonomy| {
+            t.nodes().iter().any(|n| n.classes.contains(&c(class)))
+        };
+        assert!(has(&out.taxonomy), "{body}");
+        assert!(has(&plain.taxonomy), "{body}");
+    }
+    let mut k = Classifier::of(&axioms(
+        "ObjectPropertyAssertion(owl:topObjectProperty :a :b)",
+    ));
+    k.classify(&rooted_limits()).unwrap();
+    let names: Vec<String> = k
+        .describe(&Class::thing())
+        .unwrap()
+        .instances
+        .iter()
+        .map(|i| i.as_str().to_string())
+        .collect();
+    assert_eq!(names, [format!("{EX}a"), format!("{EX}b")]);
+}
+
+#[test]
+fn a_description_keeps_its_direct_superclasses_beside_the_classes_of_a_key() {
+    // the value c of the key is a Q, below the class that marks the values of b
+    let mut k = Classifier::of(&axioms(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)
+         EquivalentClasses(:Q ObjectOneOf(:c))",
+    ));
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert!(out.stats.clauses > 0);
+    let d = k.describe(&c("Q")).unwrap();
+    assert_eq!(d.superclasses, [Class::thing()]);
+    assert_eq!(d.direct_superclasses, [Class::thing()]);
+}
+
+#[test]
+fn a_stopped_run_of_rewritten_axioms_reports_the_original_axioms() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // the maximum in the key's class leaves axioms of the rewriting out without counting
+    let ax = axioms(
+        "HasKey(ObjectMaxCardinality(2 :q) (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)",
+    );
+    for n in [10, 20, 30, 1000] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        let mut k = Classifier::of(&ax);
+        let _ = k.classify(&Limits {
+            rooted: true,
+            threads: 1,
+            cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= n)),
+            ..Limits::default()
+        });
+        let excluded = format!("{:?}", k.excluded());
+        assert!(!excluded.contains(INTERNAL), "{n}: {excluded}");
+    }
+}
+
+#[test]
+fn the_statistics_count_the_original_axioms_outside_el() {
+    let ax = axioms(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)",
+    );
+    let out = Classifier::of(&ax).classify(&rooted_limits()).unwrap();
+    assert!(out.stats.clauses > 0);
+    // the union is the only axiom outside OWL 2 EL
+    assert_eq!(out.stats.outside_el.horn, 0);
+    assert_eq!(out.stats.outside_el.disjunctive, 1);
+    assert_eq!(out.stats.outside_el.taken, 1);
+}

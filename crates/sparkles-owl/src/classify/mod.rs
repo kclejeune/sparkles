@@ -1808,26 +1808,31 @@ impl Saturation {
             // the interner of an earlier run holds names and individuals that decide the
             // tiers, so the rewritten axioms start from nothing
             self.reset();
+            // the rewritten axioms are held beside the caller's for the run
+            let red_bytes: usize = red.axioms.iter().map(held_bytes_of).sum();
             self.hide_internal = true;
-            let r = self.run_once(&all, None, held_bytes, limits, with_taxonomy);
+            let r = self.run_once(&all, None, held_bytes + red_bytes, limits, with_taxonomy);
             self.hide_internal = false;
             match r {
                 Ok(Some(mut r)) if self.dl_tried => {
+                    red.restore(axioms, &mut self.excluded);
                     r.2.added = axioms.len();
-                    let restore = red.restore(axioms);
-                    for e in &mut self.excluded {
-                        e.axiom = restore(&e.axiom);
-                    }
-                    self.excluded.sort();
-                    self.excluded.dedup();
+                    let tier = r.2.tier;
+                    r.2.outside_el = red.outside_el(axioms, &self.excluded);
+                    r.2.tier = tier;
                     self.reduced = true;
                     return Ok(r);
                 }
                 Err(e) => {
+                    // the report of a run that stopped still names the original axioms
+                    red.restore(axioms, &mut self.excluded);
                     self.reduced = true;
                     return Err(e);
                 }
-                _ => self.reset(),
+                _ => {
+                    red.restore(axioms, &mut self.excluded);
+                    self.reset();
+                }
             }
         }
         // after a run of rewritten axioms, whose made-up names and hub individual the

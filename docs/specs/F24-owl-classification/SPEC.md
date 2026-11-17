@@ -3538,7 +3538,9 @@ than the first and each key property `r_j`, the axiom `{b} ⊓ C ⊑ ∀r_j.V_jb
 values of b when b is a C. For each pair of distinct named individuals a and b, each key
 property `r_j` and each named individual c, the axiom `{a} ⊓ ∃r_j.({c} ⊓ V_jb) ⊑ M_jab`
 marks that a has a named value of b, and `{a} ⊓ C ⊓ M_1ab ⊓ … ⊓ M_mab ⊑ {b}` makes them
-equal. The fresh classes make this a conservative extension. A model of the ontology
+equal. A key whose class is not a name gets a fresh class equivalent to it, so that the
+axioms hold the name and not copies of the expression. The fresh classes make this a
+conservative extension. A model of the ontology
 extends to them, with `V_jb` the `r_j`-values of b when b is a C and empty otherwise, and
 `M_jab` the set `{a}` when a has a named `r_j`-value in `V_jb`. A model of the rewritten
 axioms satisfies the key, since two named instances of C that share a named value for each
@@ -3576,7 +3578,9 @@ self restriction, functionality, asymmetry, irreflexivity or disjointness of the
 property itself has no replacement, and the ontology is then not rewritten. Neither is an
 ontology that names an entity with the prefix `urn:sparkles:internal:` of the fresh names,
 and a rewritten run that does not take the disjunctive rules starts again on the original
-axioms. Both cases give the default answer. The universal property links every context
+axioms. Both cases give the default answer. The classes and individuals of an axiom that
+the rewriting drops stay in the signature, and the statistics count the original axioms
+outside OWL 2 EL. The universal property links every context
 to h, and on the generated ontologies above every run that passed the bound had the
 universal property, which item 1061 follows with the cost of ground reasoning in each
 context.

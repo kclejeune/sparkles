@@ -32,7 +32,9 @@
 //! description's instances. The axioms the rewriting makes stand for the original axioms in
 //! the run's report.
 
+use super::Excluded;
 use super::dl;
+use super::index::Gap;
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::FxHashMap;
@@ -70,15 +72,52 @@ impl Reduction {
         all
     }
 
-    /// The original axiom that a rewritten one stands for, or the axiom itself.
-    pub fn restore(&self, axioms: &[&AxiomKind]) -> impl Fn(&AxiomKind) -> AxiomKind + use<> {
-        let by: FxHashMap<AxiomKind, AxiomKind> = self
-            .axioms
+    /// Puts the original axioms in place of the rewritten ones that the run's report
+    /// holds. The lookup holds only the report's axioms, so it costs memory in proportion
+    /// to the report and not to the rewriting.
+    pub fn restore(&self, axioms: &[&AxiomKind], excluded: &mut Vec<Excluded>) {
+        if excluded.is_empty() {
+            return;
+        }
+        let mut origin: FxHashMap<AxiomKind, Option<usize>> =
+            excluded.iter().map(|e| (e.axiom.clone(), None)).collect();
+        let mut open = origin.len();
+        for (k, &i) in self.axioms.iter().zip(&self.origin) {
+            if open == 0 {
+                break;
+            }
+            if let Some(slot @ None) = origin.get_mut(k) {
+                *slot = Some(i);
+                open -= 1;
+            }
+        }
+        for e in excluded.iter_mut() {
+            if let Some(Some(i)) = origin.get(&e.axiom) {
+                e.axiom = axioms[*i].clone();
+            }
+        }
+        excluded.sort();
+        excluded.dedup();
+    }
+
+    /// What the original axioms outside OWL 2 EL need, for the run's statistics, with the
+    /// report of the axioms the run left out.
+    pub fn outside_el(&self, axioms: &[&AxiomKind], excluded: &[Excluded]) -> dl::OutsideEl {
+        let mut out = dl::OutsideEl::default();
+        let mut seen: BTreeSet<&AxiomKind> = BTreeSet::new();
+        for k in axioms {
+            if super::logical(k) && !crate::profiles::el_axiom(k).is_empty() && seen.insert(k) {
+                out.add(dl::shape(k));
+            }
+        }
+        let left: BTreeSet<&AxiomKind> = excluded
             .iter()
-            .zip(&self.origin)
-            .map(|(k, &i)| (k.clone(), axioms[i].clone()))
+            .filter(|e| matches!(e.gap, Gap::Outside { .. }))
+            .map(|e| &e.axiom)
+            .filter(|k| seen.contains(k))
             .collect();
-        move |k| by.get(k).cloned().unwrap_or_else(|| k.clone())
+        out.taken = seen.len() - left.len();
+        out
     }
 }
 
@@ -362,6 +401,18 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
             if cx.used && !before {
                 first_use.get_or_insert(i);
             }
+            // a class expression other than a name is named once, so that the many
+            // axioms of the key hold a name and not a copy of the expression
+            let c = match c {
+                ClassExpression::Class(_) => c,
+                c => {
+                    let name = ClassExpression::Class(Class::new(format!("{PREFIX}k{keys}")));
+                    out.axioms
+                        .push(AxiomKind::EquivalentClasses([name.clone(), c].into()));
+                    out.origin.push(i);
+                    name
+                }
+            };
             let made = key(keys, &c, &rs, &inds);
             keys += 1;
             out.origin.extend(std::iter::repeat_n(i, made.len()));
@@ -402,6 +453,32 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
             out.axioms.push(k);
             out.origin.push(i);
         }
+    }
+    // the classes and individuals of the replaced axioms stay in the signature, though the
+    // rewriting may drop them
+    let mut sig = Signature::default();
+    let mut at: FxHashMap<Entity, usize> = FxHashMap::default();
+    for (i, k) in axioms.iter().enumerate() {
+        if out.replaced[i] {
+            let mut one = Signature::default();
+            one.axiom(k);
+            for e in one.0 {
+                at.entry(e.clone()).or_insert(i);
+                sig.0.insert(e);
+            }
+        }
+    }
+    for e in sig.0 {
+        let k = match &e {
+            Entity::Class(c) => AxiomKind::Declaration(Entity::Class(c.clone())),
+            Entity::NamedIndividual(n) => AxiomKind::ClassAssertion(
+                ClassExpression::Class(Class::thing()),
+                Individual::Named(n.clone()),
+            ),
+            _ => continue,
+        };
+        out.axioms.push(k);
+        out.origin.push(at[&e]);
     }
     out.replaced.iter().any(|r| *r).then_some(out)
 }
