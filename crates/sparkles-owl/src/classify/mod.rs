@@ -76,6 +76,7 @@ mod dl;
 mod dl_clause;
 mod dl_eq;
 mod dl_norm;
+mod dl_reduce;
 mod dl_root;
 mod dl_rules;
 mod horn;
@@ -573,6 +574,12 @@ pub struct Saturation {
     /// set while a run classifies again without the rooted rules, past a rooted run's
     /// bound on derived conclusions, which leaves the axioms outside OWL 2 EL out
     no_rooted: bool,
+    /// set while a run classifies the axioms that item 805's reductions made, so that the
+    /// classes they made up stay out of the taxonomy
+    hide_internal: bool,
+    /// whether the last run classified rewritten axioms, which the next run's changes
+    /// do not describe
+    reduced: bool,
     /// whether the current run of Tier D is rooted and whether it counts, for the
     /// fallback its bound on derived conclusions takes
     dl_rooted: bool,
@@ -1077,6 +1084,8 @@ impl Saturation {
             skip_dl: false,
             no_counting: false,
             no_rooted: false,
+            hide_internal: false,
+            reduced: false,
             dl_rooted: false,
             dl_counted: false,
             dl_attempt: false,
@@ -1693,6 +1702,9 @@ impl Saturation {
         // that the decision reads would keep a later run over this interner from Tier D.
         // A run whose rules take it starts again anyway, as `entangled` says.
         self.stale_tier |= mark.passed(&self.interner);
+        if self.hide_internal {
+            self.interner.hide_prefix(dl_reduce::PREFIX);
+        }
         ax.classes.extend(self.interner.met_classes());
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
@@ -1779,6 +1791,39 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        if limits.rooted
+            && !self.no_rooted
+            && !limits.el_only
+            && !self.skip_dl
+            && let Some(red) = dl_reduce::plan(axioms, limits.max_memory)
+        {
+            // item 805: keys over object properties and the universal property go through
+            // class axioms over fresh names, which a run that does not take Tier D leaves
+            // to the run without them
+            let all = red.all(axioms);
+            self.hide_internal = true;
+            let r = self.run_once(&all, None, held_bytes, limits, with_taxonomy);
+            self.hide_internal = false;
+            match r {
+                Ok(Some(r)) if self.dl_tried => {
+                    let restore = red.restore(axioms);
+                    for e in &mut self.excluded {
+                        e.axiom = restore(&e.axiom);
+                    }
+                    self.excluded.sort();
+                    self.excluded.dedup();
+                    self.reduced = true;
+                    return Ok(r);
+                }
+                Err(e) => {
+                    self.reduced = true;
+                    return Err(e);
+                }
+                _ => self.reset(),
+            }
+        }
+        let was = std::mem::take(&mut self.reduced);
+        let changes = changes.filter(|_| !was);
         if let Some(r) = self.run_once(axioms, changes, held_bytes, limits, with_taxonomy)? {
             return Ok(r);
         }

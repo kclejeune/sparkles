@@ -156,7 +156,6 @@ fn an_equality_of_individuals_carries_their_role_facts() {
 }
 
 #[test]
-#[ignore = "needs the key reduction of item 805"]
 fn a_key_makes_two_individuals_with_a_shared_named_value_one() {
     // a and b are K and share the p-value c, so the key makes them one and b is a G
     check(
@@ -486,4 +485,94 @@ fn a_rooted_run_counts_the_neighbours_in_a_compound_qualifier() {
         let out = rooted(&body, true, &[]);
         assert_eq!(out.consistency, consistency, "{qualifier} with {more:?}");
     }
+}
+
+#[test]
+fn a_key_with_a_disjunction_of_its_class_still_merges_the_individuals() {
+    // a is a K or an E, which is below K, so a is a K, and a and b share the r-value o
+    check(
+        "HasKey(:K (:r) ())
+         SubClassOf(:E :K)
+         ClassAssertion(ObjectUnionOf(:K :E) :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:r :a :o)
+         ObjectPropertyAssertion(:r :b :o)
+         ClassAssertion(:G :a)
+         EquivalentClasses(:D ObjectOneOf(:b))",
+        &[("D", "G"), ("D", "K")],
+        &[("G", "D")],
+    );
+}
+
+#[test]
+fn keys_are_a_taxonomy_with_no_class_of_the_reduction() {
+    let out = rooted(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)",
+        false,
+        &[],
+    );
+    for n in out.taxonomy.nodes() {
+        for cl in &n.classes {
+            assert!(
+                !cl.as_str().starts_with("urn:sparkles:internal:"),
+                "{}",
+                cl.as_str()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_universal_property_in_a_universal_restriction_reaches_every_element() {
+    // A has no p-successor, but ∀top.B makes every element a B, and a B is a C
+    check(
+        "SubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty :B))
+         ClassAssertion(:A :a)
+         EquivalentClasses(:D ObjectOneOf(:b))
+         SubClassOf(:B :C)",
+        &[("D", "B"), ("D", "C")],
+        &[("B", "D")],
+    );
+}
+
+#[test]
+fn a_universal_restriction_over_the_universal_property_is_conditional() {
+    // F is an A with an r-successor that is not a B, which ∀top.B forbids
+    let out = rooted(
+        "SubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty :B))
+         SubClassOf(:E ObjectSomeValuesFrom(:r ObjectComplementOf(:B)))
+         EquivalentClasses(:F ObjectIntersectionOf(:A :E))",
+        false,
+        &[],
+    );
+    assert!(out.taxonomy.is_unsatisfiable(&c("F")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("E")));
+}
+
+#[test]
+fn a_subproperty_of_the_universal_property_is_dropped() {
+    check(
+        "SubObjectPropertyOf(:r owl:topObjectProperty)
+         SubClassOf(:A ObjectSomeValuesFrom(:r :B))
+         SubClassOf(ObjectSomeValuesFrom(:r :B) :C)",
+        &[("A", "C")],
+        &[("C", "A")],
+    );
+}
+
+#[test]
+fn an_existential_over_the_universal_property_reaches_a_nominal() {
+    // every element sees o, so every element is a C
+    check(
+        "ClassAssertion(:B :o)
+         SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :B) :C)
+         SubClassOf(:A :A)",
+        &[("A", "C")],
+        &[("C", "A")],
+    );
 }
