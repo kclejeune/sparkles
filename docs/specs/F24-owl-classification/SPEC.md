@@ -232,6 +232,15 @@ of its bounds and at its end, and R6 its record's at the end of each rule. The r
 holds what they add in the activation and charges it once it reaches 16 KiB and when the
 activation ends.
 
+Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
+individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
+timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
+the laptop. Twenty-seven files have witnesses, 1 to 160 of them with 1 to 470 classes
+classified again in a world, and their worlds take 89 ms of the 2,839 ms that the 27
+files classify in, and at most 17.4 ms on one file, `ore_ont_9151`. The item closed
+without a change, since a criterion with an argument of its own would save less than
+that.
+
 Item 753 makes a run after an edit of class axioms
 [keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
 without individuals and of a run of the disjunctive rules that does not count, with the
@@ -1259,8 +1268,9 @@ second kind, since `A` is not real in the global saturation, derives no individu
 reaches no context that does, so without it `A` would get no world and `A ⊑ {b}` would be
 missed. The kinds are sufficient, by the list of rules that read realness, and not
 necessary, since `A ⊑ ∃r.{a}` with an inverse functional `r` alone makes `A` a witness
-whose world finds nothing. A cheaper criterion needs an argument of its own, which item
-868 holds. A run with the Horn rules marks the real contexts whenever the ontology has
+whose world finds nothing. A cheaper criterion would need an argument of its own and is
+not built, since the worlds cost little on the files measured, as the
+[Outcome](#outcome) records for item 868. A run with the Horn rules marks the real contexts whenever the ontology has
 individuals, from the first saturation on, where a run of the EL rules does so only after
 a merge, a key or a universal role, because R7 reads the real predecessors of the global
 state and R3 and R5 read whether their own context is real.
@@ -1329,7 +1339,7 @@ worlds is at most the number of named classes, and each can approach a Horn satu
 its own, so the Horn budget counts them, and the scans of R7 and R8 over a singular
 context's predecessors, which are quadratic in their number, poll the run's stop as the
 long rules do. `Stats` gains no count of the witnesses and the worlds, since the API
-compatibility check guards the struct, and item 868 adds the count it needs. An ontology without
+compatibility check guards the struct. An ontology without
 individuals, functional data properties or top properties runs the code it ran before,
 which the EL identity gate checks byte for byte, and the Horn files without individuals of
 the development set are checked the same way. The Horn files with individuals were
@@ -1374,8 +1384,8 @@ discusses.
 
 **Out of scope.** Enumerations of several individuals in a positive position need case
 analysis and stay with the rooted run. At-least restrictions above one beside
-individuals are item 867, a cheaper witness criterion is item 868, and chains through the
-top property stay in item 663. Anonymous individuals stay with the reader's rules. Data cardinalities
+individuals are item 867, and chains through the top property stay in item 663. A cheaper
+witness criterion is not built. Anonymous individuals stay with the reader's rules. Data cardinalities
 and keys over data properties beside the disjunctive rules stay with item 768, counting
 with item 728 and incremental runs after a change with item 753.
 

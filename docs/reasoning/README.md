@@ -946,8 +946,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 664.
 * In an ontology with individuals, the Horn rules leave out an at-least restriction
   above one and report it, since the unfolding they use elsewhere is argued for
-  tree-shaped models. Roadmap item 867. Such an ontology may get a world for a class
-  whose world finds nothing. Roadmap item 868.
+  tree-shaped models. Roadmap item 867.
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
   rules on one thread and raise its peak resident set from 196 to 223 MiB. On two
   Uberon-based ontologies of the ORE 2015 DL sample the Horn rules take about five times
