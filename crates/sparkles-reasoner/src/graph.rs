@@ -78,6 +78,11 @@ pub(crate) struct Graph {
     /// predicates of bookkeeping facts (the magic facts of a demand program) that atoms
     /// and `noValue` builtins with a variable predicate do not see
     hidden: Option<Arc<FxHashSet<u64>>>,
+    /// whether the graph may hold the facts of declared relations (item 839), which
+    /// [`set_relations`](Self::set_relations) says
+    relations: bool,
+    /// whether a predicate can be hidden: `hidden` is set or `relations` holds
+    hides: bool,
     /// the graph's heap, charged to the run's budget. Returned only after every owned
     /// graph payload above has been destroyed.
     held: Held,
@@ -88,6 +93,8 @@ impl Default for Graph {
         Graph {
             held: Held::new(&Budget::unlimited()),
             hidden: None,
+            relations: false,
+            hides: false,
             base: None,
             tier: Tier::new(0),
             index: shards(),
@@ -103,12 +110,25 @@ impl Graph {
     /// predicate is a variable.
     pub fn set_hidden(&mut self, preds: Arc<FxHashSet<u64>>) {
         self.hidden = (!preds.is_empty()).then_some(preds);
+        self.hides = self.relations || self.hidden.is_some();
     }
 
-    /// Whether facts with predicate `p` are hidden from a variable predicate.
+    /// Say that the graph may hold the facts of declared relations, which every atom and
+    /// `noValue` with a variable predicate must then skip. A run of a program with
+    /// relations sets it before it adds a relation fact, and a graph without it pays one
+    /// branch per fact of a variable predicate, as before relations existed.
+    pub fn set_relations(&mut self) {
+        self.relations = true;
+        self.hides = true;
+    }
+
+    /// Whether facts with predicate `p` are hidden from a variable predicate: the facts
+    /// of declared relations, whose predicate is a relation's key, when the graph may hold
+    /// them, and the predicates of [`set_hidden`](Self::set_hidden).
     #[inline]
     pub fn is_hidden(&self, p: u64) -> bool {
-        self.hidden.as_ref().is_some_and(|h| h.contains(&p))
+        self.hides
+            && (crate::ir::lower::is_key(p) || self.hidden.as_ref().is_some_and(|h| h.contains(&p)))
     }
 
     pub fn with_capacity(n: usize) -> Graph {
@@ -258,6 +278,10 @@ impl Graph {
         };
         g.tier.set_offset(self.offset());
         g.base = self.base.clone();
+        // a rebuild, such as a compaction's, copies relation rows with the live rows
+        if self.relations {
+            g.set_relations();
+        }
         Ok(g)
     }
 
