@@ -663,7 +663,7 @@ always ran the new build right after another Qwen3 run.
 | Qwen3-Embedding-0.6B | bf16 | 4 | 4.87 / 5.00 | 251 / 249 ms |
 
 With its own pool left running, Candle 0.11.1 embedded all-MiniLM-L6-v2 documents at
-119 per second, but on threads outside the embedding pool's limit and priority. Item 1051
+119 per second, but on threads outside the embedding pool's limit and priority. Item 1052
 covers using that pool within the configured thread count.
 
 **Deferred.**
