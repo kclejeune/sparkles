@@ -389,7 +389,9 @@ a time, and workers count their conclusions and memory locally and add them to t
 shared totals in batches. Property chains are binarized, and transitivity is the
 chain of a property with itself. A range is pushed into the filler of each existential
 restriction on the property, which is complete under the range restriction of OWL 2 EL
-(Profiles §2.2.6). A chain that breaks that restriction is left out. The taxonomy groups
+(Profiles §2.2.6). A restriction to an individual that an assertion tells is the
+exception, which the paragraph on individuals below describes. A chain that breaks the
+range restriction is left out. The taxonomy groups
 the classes by mutual subsumption and computes direct superclasses by transitive
 reduction, by greedy minimization or, for a class with more than 32 direct superclasses,
 by marking the classes above each candidate. The subsumers, the equivalence classes and
