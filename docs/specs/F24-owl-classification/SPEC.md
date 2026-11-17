@@ -243,10 +243,10 @@ everything with `b`. R3 and R5 at a real context now send the individual the oth
 members of the conjunction and link to the individual's own context, as
 [a successor that holds an individual](#the-horn-rules-with-individuals) argues. In four
 rounds of alternating order on `atlas` the four files classify in 0.38 to 0.49 times the
-base's time on one thread and 0.47 to 0.63 times on four, `ore_ont_4510` in 406 against
+base's time on one thread and 0.47 to 0.62 times on four, `ore_ont_4510` in 406 against
 945 ms on one thread, with 116 conjunction contexts against 42,249 and 6.1 against 19.2
 million conclusions. The Horn rules then take 2.0 to 2.2 times the EL rules' time on one
-thread, against 4.3 to 5.6 times before, and item 1025 follows that remainder. The Horn
+thread, against 4.2 to 5.6 times before, and item 1025 follows that remainder. The Horn
 normalization also passes over an assertion about an anonymous individual before it
 opens a scope for it, which takes 136 to 251 ms off the index stage of the four files
 whose 243,972 to 457,662 such axioms the reader leaves out. GO, ChEBI lite, the 298 ORE
@@ -264,7 +264,8 @@ individuals, whose worlds can find nothing. A diagnostic build counted the witne
 timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
 the laptop, with a limit of 120 s. The reader refuses one file and two pass the limit.
 Of the other 204, 27 have witnesses, 1 to 160 of them with 1 to 470 classes
-classified again in a world, and their worlds take 89 ms of the 2,839 ms that the 27
+classified again in a world. The time from their first witness to the end of the run,
+which holds the worlds and the build's own counting, is 89 ms of the 2,839 ms that the 27
 files classify in, and at most 17.4 ms on one file, `ore_ont_9151`. The item closed
 without a change, since a criterion with an argument of its own would save less than
 that.

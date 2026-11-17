@@ -1265,9 +1265,9 @@ four files below hold 243,972 to 457,662 of them.
 The index stage takes 136 to 251 ms less, and the processes peak at 356 to 586 MiB on
 one thread against 472 to 702 MiB. The conclusions do not change.
 
-The same rounds ran two files of the development set whose worlds take the longest,
-which take the disjunctive rules, and four files in which no conjunction holds an
-individual. `ore_ont_8737` had two classifications per process.
+The same rounds ran two files of the development set with witnesses, whose worlds take up to
+15 and 17 ms and which take the disjunctive rules, and four files in which no conjunction
+holds an individual. `ore_ont_8737` had two classifications per process.
 
 | Ontology | Threads | Base ms | Item 869 ms | Ratio | Range of the rounds |
 |---|---:|---:|---:|---:|---|
@@ -1317,8 +1317,9 @@ both files and do not separate the builds. Roadmap item 990 follows the attempt,
 row keeps these times.
 
 A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015 EL files and the 207
-files of the DL development set, 499 distinct files, once per build on one and eight
-threads with its taxonomy, in a 10 GiB scope with a timeout of 300 s. The 991 pairs of a
+files of the DL development set, 499 distinct files, with both builds on one and eight
+threads with its taxonomy, in a 10 GiB scope with a timeout of 300 s. Eight files are in
+both sets and ran twice. The 991 pairs of a
 file and a thread count that both builds classified gave the same bytes. The reader
 refuses `ore_ont_9881`. `ore_ont_14817`, `ore_ont_9663` and `ore_ont_3215` pass the timeout
 on one thread on both builds. With a timeout of 900 s on `atlas` both builds classify
