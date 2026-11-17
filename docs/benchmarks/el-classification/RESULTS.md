@@ -610,7 +610,8 @@ more, and eight take more than 1.6 times. Three of the eight finish under 6 ms, 
 against 0.5. Four files with 7,856 to 114,957 property assertions, `ore_ont_4510`,
 `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`, take 2.5 to 3.6 times the base and
 stay under half a second: the rules create 3,147 to 42,249 conjunction contexts and derive
-6.6 to 9.6 times the conclusions, which roadmap item 869 follows. The eighth,
+6.6 to 9.6 times the conclusions, most of which item 869 removed, as
+[conjunctions that hold an individual](#conjunctions-with-an-individual) describes. The eighth,
 `ore_ont_16744`, has 3.3 million axioms with RO relations and names the top property in two
 tautological property inclusions, which made the build before the item refuse its two Horn
 axioms. The item's build takes them, and the Horn rules derive 3.8 billion conclusions in
@@ -624,7 +625,7 @@ which item 962 removed, as [symmetric transitive properties](#symmetric-transiti
 describes. The files whose axioms with anonymous
 individuals the reader leaves out, such as `ore_ont_5481` with 457,662 of them, spend 0.12
 to 0.27 s more in the index stage, where the Horn normalization now reads each of them
-before it refuses it, and item 869 follows this too.
+before it refuses it, which item 869 removed too.
 
 | Ontology | EL rules ms | Item 692 ms | Ratio | Conclusions before | Conclusions after |
 |---|---:|---:|---:|---:|---:|

@@ -149,6 +149,22 @@ ordering.
 
 ### OWL classification
 
+With the Horn rules, a universal restriction or an at-most restriction at a context that
+has an instance sends an individual among the context's successors what the successor
+must hold. Before, the rules made a context for the conjunction of the individual and
+the fillers, which derived the individual's subsumers again (roadmap item 869). On
+`atlas` four ORE 2015 DL files with 7,856 to 114,957 property assertions classify in 0.38
+to 0.49 times the time on one thread and 0.47 to 0.63 times on four, `ore_ont_4510` in 406
+instead of 945 ms on one thread. Their taxonomies and those of GO, ChEBI lite, the 298 ORE
+2015 EL files and the DL development set are unchanged. The Horn normalization passes
+over assertions about anonymous individuals, which the reader leaves out, and the index
+stage of four files with 243,972 to 457,662 of them takes 136 to 251 ms less. The Horn
+rules still take about twice the EL rules' time on the four files, which item 1025
+follows, and item 1026 follows the links that an at-most restriction gives a context
+before a bound counts them. A cheaper criterion for the witnesses of a Horn run with
+individuals was measured and not built, since the worlds it would spare take at most
+17.4 ms on a file of the development set (item 868).
+
 A run of the Horn rules without individuals passes over a successor whose role and core
 another successor's contain, and sends a predecessor each successor's core once (roadmap
 item 710). A generated ontology of 15 axioms that derived 210 million conclusions in 5.1 s

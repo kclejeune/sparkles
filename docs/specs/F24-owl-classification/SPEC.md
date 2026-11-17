@@ -232,10 +232,38 @@ of its bounds and at its end, and R6 its record's at the end of each rule. The r
 holds what they add in the activation and charges it once it reaches 16 KiB and when the
 activation ends.
 
+Item 869 found where the Horn rules with individuals spend their time on four files of
+the ORE 2015 DL development set with 7,856 to 114,957 property assertions,
+`ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`. A diagnostic build
+counted no witness on them, so their worlds are not the cost. All but 44 to 116 of their
+conjunction contexts held an individual and were real. R3 made the conjunction of `b`
+and a filler for each assertion `r(a, b)` under a universal restriction or the range of a
+transitive property, and that context derived `b`'s closure again and then exchanged
+everything with `b`. R3 and R5 at a real context now send the individual the other
+members of the conjunction and link to the individual's own context, as
+[a successor that holds an individual](#the-horn-rules-with-individuals) argues. In four
+rounds of alternating order on `atlas` the four files classify in 0.38 to 0.49 times the
+base's time on one thread and 0.47 to 0.63 times on four, `ore_ont_4510` in 406 against
+945 ms on one thread, with 116 conjunction contexts against 42,249 and 6.1 against 19.2
+million conclusions. The Horn rules then take 2.0 to 2.2 times the EL rules' time on one
+thread, against 4.3 to 5.6 times before, and item 1025 follows that remainder. The Horn
+normalization also passes over an assertion about an anonymous individual before it
+opens a scope for it, which takes 136 to 251 ms off the index stage of the four files
+whose 243,972 to 457,662 such axioms the reader leaves out. GO, ChEBI lite, the 298 ORE
+2015 EL files and the files of the development set keep their taxonomies byte for byte
+on one and eight threads, as the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#conjunctions-with-an-individual)
+records with the files that pass its limits on both builds. The flush of R3 and R5 keeps
+what it gives its own context, so that the context takes each conclusion once, and counts
+what it sends an individual against the run's bounds. R5 can still give a context one
+link for each pair of a role and a target before a bound counts them, as it did before,
+which item 1026 follows.
+
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
 timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
-the laptop, of which 204 classify within its 120 s. Twenty-seven files have witnesses, 1 to 160 of them with 1 to 470 classes
+the laptop, with a limit of 120 s. The reader refuses one file and two pass the limit.
+Of the other 204, 27 have witnesses, 1 to 160 of them with 1 to 470 classes
 classified again in a world, and their worlds take 89 ms of the 2,839 ms that the 27
 files classify in, and at most 17.4 ms on one file, `ore_ont_9151`. The item closed
 without a change, since a criterion with an argument of its own would save less than
