@@ -286,6 +286,183 @@ impl Nfa {
     }
 }
 
+/// How far a run reduces the automata that unfold its universals (roadmap item 693):
+/// 0 leaves them as the ε-closure gives them, 1 merges the states that accept the same
+/// words by the same transitions, 2 also drops a transition that another from the same
+/// state to the same target covers by a superrole, and 3, the default, first drops the
+/// transitions by roles that no link or loop of the run can have. `SPARKLES_HORN_AUTOMATA`
+/// sets it, for the comparison of the forms.
+pub fn reduction() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("SPARKLES_HORN_AUTOMATA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+    })
+}
+
+impl EpsFree {
+    /// Reduces the automaton without changing what its states stand for in an unfolding.
+    /// A state stands for the universal over every word it accepts, and a universal on a
+    /// role holds on the role's subroles, so two reductions keep each state's meaning.
+    ///
+    /// * States that are final alike and have the same transitions to the same states,
+    ///   up to this merge, accept the same words and become one state. The merge is the
+    ///   coarsest one of this kind.
+    /// * With `covered`, a transition by `l` to a state goes when the same source has a
+    ///   transition to the same state by a role that `l` is under: every link by `l` is
+    ///   a link by that role, so the other transition's universal reaches every element
+    ///   this one's would. Of two transitions by equivalent roles the one with the lower
+    ///   id stays.
+    ///
+    /// The two alternate until neither applies, since a dropped transition can make two
+    /// states alike. `sub(r, s)` says whether `r` is under `s`.
+    pub fn reduce(&mut self, covered: bool, sub: &dyn Fn(Role, Role) -> bool) {
+        loop {
+            let merged = self.merge_alike();
+            let dropped = covered && self.drop_covered(sub);
+            if !merged && !dropped {
+                break;
+            }
+        }
+    }
+
+    /// Merges the states of the coarsest partition whose blocks are final alike and have
+    /// the same transitions into the same blocks, and says whether any merged.
+    fn merge_alike(&mut self) -> bool {
+        let n = self.states as usize;
+        let mut out: Vec<Vec<(Role, u32)>> = vec![Vec::new(); n];
+        for &(p, l, q) in &self.trans {
+            out[p as usize].push((l, q));
+        }
+        let mut block: Vec<u32> = self.finals.iter().map(|&f| f as u32).collect();
+        let mut blocks = 0usize;
+        loop {
+            let mut ids: FxHashMap<(u32, Vec<(Role, u32)>), u32> = FxHashMap::default();
+            let mut next = Vec::with_capacity(n);
+            for s in 0..n {
+                let mut sig: Vec<(Role, u32)> = out[s]
+                    .iter()
+                    .map(|&(l, q)| (l, block[q as usize]))
+                    .collect();
+                sig.sort_unstable();
+                sig.dedup();
+                let k = ids.len() as u32;
+                next.push(*ids.entry((block[s], sig)).or_insert(k));
+            }
+            let stable = ids.len() == blocks;
+            blocks = ids.len();
+            block = next;
+            if stable {
+                break;
+            }
+        }
+        if blocks == n {
+            return false;
+        }
+        // the blocks in the order of their first states, so that the start stays first
+        // when it was
+        let mut finals = vec![false; blocks];
+        for s in 0..n {
+            finals[block[s] as usize] = self.finals[s];
+        }
+        let mut trans: Vec<(u32, Role, u32)> = self
+            .trans
+            .iter()
+            .map(|&(p, l, q)| (block[p as usize], l, block[q as usize]))
+            .collect();
+        trans.sort_unstable();
+        trans.dedup();
+        self.start = block[self.start as usize];
+        self.states = blocks as u32;
+        self.finals = finals;
+        self.trans = trans;
+        self.mark();
+        true
+    }
+
+    /// Drops the transitions that another from the same state to the same target covers
+    /// by a superrole, and says whether any went.
+    fn drop_covered(&mut self, sub: &dyn Fn(Role, Role) -> bool) -> bool {
+        let before = self.trans.len();
+        let all = self.trans.clone();
+        // the transitions are sorted by source, so those of one source are a run
+        self.trans.retain(|&(p, l, q)| {
+            let at = all.partition_point(|t| t.0 < p);
+            !all[at..]
+                .iter()
+                .take_while(|t| t.0 == p)
+                .any(|&(_, l2, q2)| q2 == q && l2 != l && sub(l, l2) && !(sub(l2, l) && l < l2))
+        });
+        if self.trans.len() == before {
+            return false;
+        }
+        self.mark();
+        true
+    }
+
+    /// Drops the transitions by roles that `live` does not hold of, the transitions into
+    /// states that reach no final state, and the states the start no longer reaches.
+    /// `live(l)` says whether a universal on `l` can apply to anything, which it cannot
+    /// when no link or loop of the run is under `l` or under its inverse. A universal by
+    /// such a role is vacuous, and a state that reaches no final state stands for a
+    /// universal with no consequence.
+    pub fn prune(&mut self, live: &dyn Fn(Role) -> bool) {
+        let n = self.states as usize;
+        self.trans.retain(|&(_, l, _)| live(l));
+        let mut useful = self.finals.clone();
+        loop {
+            let mut grew = false;
+            for &(p, _, q) in &self.trans {
+                if useful[q as usize] && !useful[p as usize] {
+                    useful[p as usize] = true;
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        self.trans.retain(|&(_, _, q)| useful[q as usize]);
+        let mut id: Vec<Option<u32>> = vec![None; n];
+        let mut order = vec![self.start];
+        id[self.start as usize] = Some(0);
+        let mut at = 0;
+        while at < order.len() {
+            let p = order[at];
+            for &(x, _, q) in &self.trans {
+                if x == p && id[q as usize].is_none() {
+                    id[q as usize] = Some(order.len() as u32);
+                    order.push(q);
+                }
+            }
+            at += 1;
+        }
+        self.finals = order.iter().map(|&s| self.finals[s as usize]).collect();
+        self.trans = self
+            .trans
+            .iter()
+            .filter_map(|&(p, l, q)| Some((id[p as usize]?, l, id[q as usize]?)))
+            .collect();
+        self.trans.sort_unstable();
+        self.start = 0;
+        self.states = order.len() as u32;
+        self.mark();
+    }
+
+    /// Marks the states that a transition enters and those that one leaves.
+    fn mark(&mut self) {
+        let n = self.states as usize;
+        self.entered = vec![false; n];
+        self.left = vec![false; n];
+        for &(p, _, q) in &self.trans {
+            self.left[p as usize] = true;
+            self.entered[q as usize] = true;
+        }
+    }
+}
+
 impl Nfa {
     fn state(&mut self) -> u32 {
         self.states += 1;

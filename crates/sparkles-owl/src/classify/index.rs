@@ -2542,8 +2542,34 @@ fn horn_index(
     // the universals the transitions make, which the rules apply even when one is a
     // universal that is unfolded too
     let mut made: Vec<Ex> = Vec::new();
+    // the roles that a link or a loop of the run can have: those of the links, the results
+    // of the chains the run composes, and the roles of the loops with their inverses
+    let live_roles: Option<Vec<Role>> = selection.as_ref().map(|sel| {
+        let mut v = links.clone();
+        v.extend(sel.comp.values().flatten().copied());
+        v.extend(ix.roles.reflexive.iter().copied());
+        v.extend(it.nodes.iter().filter_map(|n| match *n {
+            Node::SelfLoop(r) => Some(r),
+            _ => None,
+        }));
+        let invs: Vec<Role> = v.iter().filter_map(|&r| ix.roles.inv(r)).collect();
+        v.extend(invs);
+        v.sort_unstable();
+        v.dedup();
+        v
+    });
     for (holder, r, f) in unfold {
-        let a = autos.entry(r).or_insert_with(|| h.autos[&r].eps_free());
+        let a = autos.entry(r).or_insert_with(|| {
+            let rs = &ix.roles;
+            let lr = live_roles
+                .as_ref()
+                .map(|v| move |l: Role| v.iter().any(|&x| rs.sub(x, l)));
+            reduced(
+                &h.autos[&r],
+                &ix.roles,
+                lr.as_ref().map(|f| f as &dyn Fn(Role) -> bool),
+            )
+        });
         // a universal's holder is the universal, and a negative existential
         // restriction's is its filler, which restrictions over other roles share, so
         // the restriction names the scope
@@ -2600,6 +2626,26 @@ fn horn_index(
         base: it.nodes.len() as Ex,
         dominate: false,
     }
+}
+
+/// The automaton of a role without ε-transitions, reduced as
+/// [`super::horn::reduction`] says.
+fn reduced(
+    a: &super::horn::Nfa,
+    roles: &Roles,
+    live: Option<&dyn Fn(Role) -> bool>,
+) -> super::horn::EpsFree {
+    let mut a = a.eps_free();
+    let level = super::horn::reduction();
+    if level > 2
+        && let Some(live) = live
+    {
+        a.prune(live);
+    }
+    if level > 0 {
+        a.reduce(level > 1, &|r, s| roles.sub(r, s));
+    }
+    a
 }
 
 /// The chains a run with the Horn rules composes, and the roles whose negative
