@@ -154,7 +154,7 @@ results separately from conversation events.
 | Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Terra or Claude Sonnet 5.5 |
 | Substantive planning, dependencies, validation gates and difficult consults | GPT-6.1 Sol or Claude Opus 5.5 |
 | Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
-| Second-look lanes and consults at critical decisions | Claude Fable 5.2 or GPT-6 Astra, preferring the family the stalled lane or consulting session does not use |
+| Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
 | Implementation of a well-defined plan and routine fixes | GPT-6.1 Terra or Claude Sonnet 5.5 |
 | Code review and finding validation | Prefer GPT-6.1 Sol for difficult work and GPT-6.1 Terra for straightforward work. Claude Opus 5.5 or Sonnet 5.5 may review when appropriate. |
 | Mechanical tasks with an exact rule | A plain script. |
@@ -180,9 +180,10 @@ limits. Opus adds an independent perspective on difficult work. Model availabili
 quota pressure must not lower the required standard of reasoning or verification, and
 review always uses a separate agent, even when it runs the author's model.
 
-Codex runs GPT-6.1 Sol and Terra at high effort for every task. Claude Opus runs at
-medium effort by default, and at high effort for the judgment-sensitive work above and
-for validating findings and planning fixes on that work.
+Codex runs GPT-6.1 Sol and Terra at high effort for every task, and GPT-6 Astra at high
+effort when it takes a second-look lane or a consult at a critical decision. Claude Opus
+runs at medium effort by default, and at high effort for the judgment-sensitive work
+above and for validating findings and planning fixes on that work.
 
 A plain script takes a mechanical task with an exact rule, such as an exact renumbering
 or fixtures from a fixed format. Haiku or Luna takes a task that is clearly mechanical
@@ -203,22 +204,22 @@ no clear reason, or before stopping a phase early or declaring a gate unmeetable
 consult decides whether to provide a bounded plan or transfer implementation to Sol
 or Opus. The final report lists each consult.
 
-A session of any model consults a second strong model at critical decision points
-before it commits to a path. These are an on-disk format or durability ordering, a
+A Sol or Opus session consults a second strong model at critical decision points
+before it commits to a path, and chooses that model from the second-look row of the
+table. The critical decision points are an on-disk format or durability ordering, a
 planner or executor cost decision, an open API or behaviour question, a change of
 approach after a failed design, closing or deferring an item, and declaring a gate
 unmeetable. The consult goes to an advisor tool when the session has one, or otherwise
-to a read-only agent on a different model family from the session's own, with the
-question, the relevant files and what has been tried. When no other family is
-available, the consult goes to a separate read-only session of the strongest available
-model. A consult shares the session's
-framing, so it never replaces an independent review or a second-look lane. The final
-report lists each consult and whether its advice was followed.
+to a read-only agent with the question, the relevant files and what has been tried. A
+Terra or Sonnet worker still consults Sol or Opus as described above, and that Sol or
+Opus consult applies this rule in turn. A consult shares the session's framing, so it
+never replaces an independent review or a second-look lane. The final report lists
+each consult and whether its advice was followed.
 
 When the implementing lane has made no significant progress on a hard problem, the
-coordinator starts an independent second-look lane on a strong model from a different
-family or tier than the stalled lane's. Typical signs are designs that measure as
-failures, review rounds that keep finding new defects of the same kind, a recommendation
+coordinator starts an independent second-look lane on a model chosen from the
+second-look row of the table. Typical signs are designs that measure as failures,
+review rounds that keep finding new defects of the same kind, a recommendation
 to close or defer an item for lack of a path, or a long-open item whose attempts have
 not moved it. The second-look lane gets its own worktree and branch, the full record of
 what was tried, and a brief that asks it to test the earlier conclusions rather than
