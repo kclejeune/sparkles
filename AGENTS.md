@@ -161,9 +161,10 @@ results separately from conversation events.
 | Easy tasks that need a lot of context, such as exploration, broad file scans, searches across many files and log triage | Claude Haiku 5.5 or GPT-6 Luna. |
 
 The table is the assignment policy, and it holds whatever model the orchestrator runs.
-Work defaults to Sol or Opus. Terra or Sonnet takes a task only when it is easy or its
-plan fixes every step, and Haiku or Luna takes easy work whose cost is mostly the context
-it must read.
+Work defaults to Sol or Opus. Terra or Sonnet takes a task only when it is nearly
+trivial or its plan fixes every step, and Haiku or Luna takes easy work whose cost is
+mostly the context it must read.
+
 A coordinating session delegates substantive plans, dependency decisions and validation
 strategy instead of taking them on because it controls the session. A plan names the
 files and behaviour, edge cases, regression checks, acceptance gates and dependencies
@@ -173,10 +174,11 @@ Work that needs substantial judgment includes a refactor whose shape is unclear,
 whose cause is unknown, an open behaviour or API decision, crash durability or WAL
 ordering, concurrency beyond a parallel iterator, an on-disk format, planner or executor
 cost decisions, and `unsafe` code. Its validating planner normally implements it to keep
-the code and reasoning context, and may hand a clearly specified routine portion to a
-cheaper worker with the required checks. A loader for a documented format, a conformance
-phase fixed by its test suite and a binding that mirrors an existing API are usually
-routine.
+the code and reasoning context, and may hand a portion to Terra or Sonnet only when its plan
+fixes every step and names the required checks. A loader for a documented format, a
+conformance phase fixed by its test suite and a binding that mirrors an existing API
+need no substantial judgment, but they still go to Sol or Opus unless their plan fixes
+every step.
 
 Prefer Sol for reviews, to preserve Claude usage limits. Opus adds an independent
 perspective on difficult work. Model availability or
@@ -189,11 +191,11 @@ runs at medium effort by default, and at high effort for the judgment-sensitive 
 above and for validating findings and planning fixes on that work.
 
 A plain script takes a mechanical task with an exact rule, such as an exact renumbering
-or fixtures from a fixed format. Haiku or Luna takes a task that is clearly mechanical
-but too loosely defined to script without the script becoming a task of its own, such as
-triaging logs, applying a consistent edit across files in varying contexts or sweeping a
-report. They also suit broad scans that find and flag patterns across files, and
-exploration that locates code for another agent. Each task states its rule, its output
+or fixtures from a fixed format. Haiku or Luna takes a task only when it is easy and its
+cost is mostly the context it must read. Examples are exploration that locates code for
+another agent, broad scans and searches that find and flag patterns across many files,
+triaging long logs and sweeping a large report. A mechanical edit that is awkward to
+script but needs little context goes to a script or to Sol or Opus. Each task states its rule, its output
 format and how the result will be checked before it starts. If the check fails twice,
 move the task to Sol or Opus. Haiku and Luna do not rewrite documentation prose,
 touch engine, durability, concurrency, planner or performance code, or review and
@@ -248,8 +250,8 @@ No lane lands without review, and each step picks its model from the table above
    docs to update and the commands that verify it. It also records serious problems the
    review missed.
 3. **The assigned worker implements.** The validating planner normally implements
-   judgment-sensitive repairs itself, and a cheaper worker can execute a well-defined
-   routine plan. The worker reports what it did for each item.
+   judgment-sensitive repairs itself, and Terra or Sonnet can execute a plan only
+   when it fixes every step. The worker reports what it did for each item.
 4. **Re-review.** An independent reviewer checks the fix commits and the validating
    agent validates the findings again. The lane merges once this comes back clean.
 
