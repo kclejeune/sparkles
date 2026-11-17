@@ -722,25 +722,28 @@ evaluation reads runs for inputs of more than 16,384 rows in both modes, and sma
 inputs read their values through the value cache. Each decoded column's slots are
 charged before it is decoded, with the distinct values it decodes on the way, and its
 values after. A column whose charge does not fit gives that charge back and is left to the
-rows. The comparison of two string columns through cached lexicographic floors stays off
-for cursor batches, because the floors reconstruct strings without reserving the
-decoding, which only an eager query may do.
+rows. The comparison of two string columns through cached lexicographic floors serves
+eager tables and cursor batches of at least 4,096 rows alike. A floor reads its string's
+key, the key before it and, for a string that other strings extend, the search for the
+first of them inside the decoding envelope, so a cursor reserves those reads on the
+ledger, and a refused read fails the comparison with the refusal it recorded.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
-calls of `streams()`, formerly `is_cursor()`, outside tests and fails above its bound,
-which each step lowered. It was 26 after the regular expressions, 17 after per-value
-reuse, 7 after the sort keys and is 6 after the decoded columns. Three are the planning and
-routing choices that stage 6 removes, in `plan.rs`, `unionpush.rs` and `cursor.rs`. The
-fourth accumulates an EXISTS key set across a cursor's batches, which an eager table
-builds in one batch. The fifth lets a cursor's decoding envelope refuse on the ledger,
-because eager callers of `term` and `value` cannot report a refusal and decode without
-the envelope instead. The sixth keeps cursors from the string floors above, until those
-reconstruct with the decoding admitted. `CursorMemory` is gone, and a context in cursor accounting differs
+reads of the accounting mode outside tests and fails above its bound. A read is a call of
+`streams()` or `accounting()`, a use of either `Accounting` variant or a direct read of
+the `streams` field outside its accessors. The bound is 7. The first read is the routing
+of `query_execution_with_plan` in `cursor.rs`. The second accumulates an EXISTS key set
+across a cursor's batches, which an eager table builds in one batch. The third lets a
+cursor's decoding envelope refuse on the ledger, because eager callers of `term` and
+`value` cannot report a refusal and decode without the envelope instead. The other four
+read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
+without an owner may keep retained state uncharged, whether an empty release trims the
+ledger and whether a finished query's pool contribution shrinks. `CursorMemory` is gone, and a context in cursor accounting differs
 from an eager one only by its `streams` flag, its ledger retention and its deadline. The
 result cache and sampled filters stay off for cursors, since they are planning choices
-that stage 6 makes independent of the mode. Item 678 holds the two decoding twins
-that remain, the string floors and the dictionary pre-decode of a cursor batch, which
-`decode_for` does not yet serve.
+that stage 6 makes independent of the mode. Item 678 holds the decoding twin that
+remains, the dictionary pre-decode of a cursor batch, which `decode_for` does not yet
+serve.
 
 ### One join-kernel library
 

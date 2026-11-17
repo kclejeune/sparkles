@@ -5621,6 +5621,10 @@ fn evaluate_mask(
 /// The rows from which [`string_order_mask`] replaces decoding both columns.
 const STRING_ORDER_ROWS: usize = 4096;
 
+/// The masks [`string_order_mask`] has built (for tests that a query reaches it).
+#[cfg(test)]
+static STRING_ORDER_MASKS: AtomicUsize = AtomicUsize::new(0);
+
 /// The rows whose values the first test of [`string_order_mask`] reads.
 const STRING_ORDER_SAMPLE: usize = 64;
 
@@ -5632,8 +5636,9 @@ const STRING_FLOOR_ENTRIES: usize = 1 << 20;
 /// each string's floor ([`Ctx::string_floor`]), computed once per distinct id in a cache
 /// of each worker, so neither column is decoded. A row with another kind of value is
 /// evaluated as the generic filter would. `None` when the table is small or its first
-/// rows hold other values, so that the generic filter decodes the columns instead, and
-/// in a cursor.
+/// rows hold other values, so that the generic filter decodes the columns instead. The
+/// floors decode inside the envelope in both accounting modes, and a refused floor
+/// fails the mask with the refusal it recorded.
 fn string_order_mask(
     ctx: &Ctx,
     t: &Table,
@@ -5646,16 +5651,15 @@ fn string_order_mask(
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
         return Ok(None);
     };
-    // A cursor's batch would reconstruct the floors of its strings without reserving
-    // the decoding, which only an eager query may do. Its rows compare their two keys
-    // directly instead (see `val_cmp`), with the decoding admitted.
-    if n < STRING_ORDER_ROWS || ctx.streams() {
+    if n < STRING_ORDER_ROWS {
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
     let sample = n.min(STRING_ORDER_SAMPLE);
     if !(0..sample).all(|i| ctx.string_floor(xs[i]).is_some() && ctx.string_floor(ys[i]).is_some())
     {
+        // a refused floor is not another kind of value
+        ctx.check_memory_failure()?;
         return Ok(None);
     }
     let threads = rayon::current_num_threads().max(1);
@@ -5723,6 +5727,10 @@ fn string_order_mask(
             .map(|i| test(&mut cache, i))
             .collect::<Result<Vec<bool>>>()?
     };
+    // A refused floor took its row to the generic test, so the mask must not stand.
+    ctx.check_memory_failure()?;
+    #[cfg(test)]
+    STRING_ORDER_MASKS.fetch_add(1, AtomicOrdering::Relaxed);
     Ok(Some(keep))
 }
 
@@ -9840,5 +9848,218 @@ mod paid_eager_producer_tests {
         );
         drop(output);
         assert_eq!(ctx.live_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod string_order_tests {
+    use super::*;
+    use crate::error::BudgetKind;
+    use crate::id::Tag;
+    use crate::io::Source;
+    use crate::store::{Store, StoreOptions};
+    use oxrdfio::RdfFormat;
+
+    /// Words over a small alphabet, so that many are prefixes of others.
+    fn words() -> Vec<String> {
+        let mut out = vec![String::new()];
+        for len in 1..=4 {
+            let mut next = Vec::new();
+            for w in out.iter().filter(|w| w.chars().count() == len - 1) {
+                for c in ['a', 'b', 'é'] {
+                    next.push(format!("{w}{c}"));
+                }
+            }
+            out.extend(next);
+        }
+        out
+    }
+
+    /// A store of the words, a few other terms and one string longer than the budget of
+    /// the refusal case, with the ids of each in that order.
+    fn store(long: &str) -> (Store, Vec<Id>) {
+        let words = words();
+        let mut nt = String::new();
+        for (i, w) in words.iter().enumerate() {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"{w}\" .\n"));
+        }
+        let extra = [
+            "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string(),
+            "\"ab\"@en".to_string(),
+            "<urn:iri>".to_string(),
+            format!("\"{long}\""),
+        ];
+        for (k, v) in extra.iter().enumerate() {
+            nt.push_str(&format!("<urn:z:{k}> <urn:p> {v} .\n"));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let mut ids: Vec<Id> = words
+            .iter()
+            .map(|w| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(w).into())
+                    .unwrap()
+            })
+            .collect();
+        ids.push(
+            snap.lookup_term(
+                &oxrdf::Literal::new_typed_literal("5", oxrdf::vocab::xsd::INTEGER).into(),
+            )
+            .unwrap(),
+        );
+        ids.push(
+            snap.lookup_term(
+                &oxrdf::Literal::new_language_tagged_literal("ab", "en")
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap(),
+        );
+        ids.push(
+            snap.lookup_term(&oxrdf::NamedNode::new("urn:iri").unwrap().into())
+                .unwrap(),
+        );
+        ids.push(
+            snap.lookup_term(&oxrdf::Literal::new_simple_literal(long).into())
+                .unwrap(),
+        );
+        assert!(
+            ids[..words.len()]
+                .iter()
+                .chain(ids.last())
+                .all(|id| id.tag() == Tag::Vocab)
+        );
+        drop(snap);
+        (s, ids)
+    }
+
+    /// The product of `ids` with itself, strings first, as two columns, and a local
+    /// string in one row.
+    fn product(ctx: &Ctx, ids: &[Id]) -> (Table, VarId, VarId) {
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let local = ctx.intern_value(&Value::Str("local".into()));
+        let mut t = Table::new(vec![x, y]);
+        for &a in ids {
+            for &b in ids {
+                t.push_row(&[a, b]);
+            }
+        }
+        t.push_row(&[local, ids[1]]);
+        (t, x, y)
+    }
+
+    fn cmp(x: VarId, y: VarId, op: super::super::expr::CmpOp) -> Expr {
+        Expr::Cmp(Box::new(Expr::Var(x)), Box::new(Expr::Var(y)), op)
+    }
+
+    /// A cursor's batch takes the comparison through the vocabulary floors as an eager
+    /// table does, with the same mask as the generic filter that decodes every row.
+    #[test]
+    fn cursor_batches_order_strings_through_their_floors_as_eager_tables_do() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = store("long");
+        assert!(ids.len() * ids.len() > STRING_ORDER_ROWS);
+        for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+            let mut masks = Vec::new();
+            for cursor in [false, true] {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (t, x, y) = product(&ctx, &ids);
+                let e = cmp(x, y, op);
+                let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("cursor {cursor}: the floors apply"));
+                let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic, "cursor {cursor} {op:?}");
+                masks.push(mask);
+            }
+            assert_eq!(masks[0], masks[1], "{op:?}");
+        }
+    }
+
+    /// A streamed `FILTER(?x < ?y)` over a product of stored strings reaches the floors
+    /// in a batch and keeps the rows the eager query keeps.
+    #[test]
+    fn a_streamed_string_comparison_matches_the_eager_query() {
+        use crate::sparql::{CursorOptions, QueryOptions, query, select_cursor};
+        let (s, ids) = store("long");
+        assert!(ids.len() * ids.len() > STRING_ORDER_ROWS);
+        let q = "SELECT ?a ?b WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x < ?y) }";
+        let options = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let text = |t: &Option<oxrdf::Term>| t.as_ref().map(|t| t.to_string());
+        let mut eager: Vec<_> = query(s.snapshot(), q, &options)
+            .unwrap()
+            .rows()
+            .unwrap()
+            .iter()
+            .map(|r| r.values().iter().map(text).collect::<Vec<_>>())
+            .collect();
+        eager.sort();
+        let before = STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed);
+        let cursor_options = CursorOptions {
+            batch_rows: 1 << 16,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(s.snapshot(), q, &options, &cursor_options).unwrap();
+        let mut streamed = Vec::new();
+        while let Some(batch) = cursor.next_batch().unwrap() {
+            for row in 0..batch.len() {
+                streamed.push(
+                    batch
+                        .row(row)
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .map(text)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        assert!(
+            STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed) > before,
+            "a batch reaches the floors"
+        );
+        streamed.sort();
+        assert!(!eager.is_empty());
+        assert_eq!(streamed, eager);
+    }
+
+    /// A cursor reserves the keys its floors read, so a string longer than the budget
+    /// fails the mask with a memory refusal, while an eager table reads it unchecked.
+    #[test]
+    fn a_refused_floor_fails_the_cursor_mask() {
+        use super::super::expr::CmpOp;
+        // It sorts after the other strings, so the sample's keys do not reach it.
+        let (s, ids) = store(&"ÿ".repeat(1 << 19));
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 4 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let (t, x, y) = product(&ctx, &ids);
+            let e = cmp(x, y, CmpOp::Lt);
+            let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+            if cursor {
+                assert!(
+                    matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                    "{outcome:?}"
+                );
+            } else {
+                assert!(outcome.unwrap().is_some());
+            }
+        }
     }
 }

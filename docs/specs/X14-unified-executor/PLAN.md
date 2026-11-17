@@ -234,14 +234,16 @@ recorded in its report and do not block stage 5.
 Give the string floors of `string_order_mask` a checked decoding so that cursor batches
 compare two string columns through them as eager tables do, and merge
 `cursor_dictionary_values` into `decode_for`. The bounded-reads test then counts every
-read of the mode, which it does not do today. Its unit becomes a read of the `streams`
-field outside its accessors, which covers the method calls it counts now and the three
-direct reads in `cursor_owner`, `retained_charge` and `shrink_retained`. After item 678
-the expected sites are the mode branch of `query_execution_with_plan`, `has_predicate`,
-`limited_input`, the EXISTS key set accumulated across batches in `exists::prepare`,
-`envelope_refuses` and the three direct reads, eight in all, and the test's bound is
-eight with the string floors gone. The test must fail at the old bound before the change.
-This is routine work with the design's text as its specification.
+read of the mode, which it did not do before. A read is a call of `streams()` or
+`accounting()`, a use of either `Accounting` variant or a direct read of the `streams`
+field outside its accessors, which adds four direct reads to the method calls it counted.
+These are in `cursor_owner`, `retained_charge`, `release_live` and `shrink_retained`.
+Item 827 removed the reads in `has_predicate` and `limited_input` that an earlier draft
+of this section listed. Before the change the test counts eight sites, the mode branch of
+`query_execution_with_plan`, the EXISTS key set accumulated across batches in
+`exists::prepare`, `envelope_refuses`, `string_order_mask` and the four direct reads.
+With the string floors gone the bound is seven, and the test fails at that bound before
+the change. This is routine work with the design's text as its specification.
 
 ## Stage 5: shared kernels
 
@@ -434,10 +436,10 @@ and sampled filters planning choices that do not depend on the mode. The result 
 serves a cursor's subtree when the subtree is materialized anyway, and sampled filters
 prepare their samples once per plan. EXPLAIN then prints one plan for a query whatever
 the mode, which `plan_fidelity_tests.rs` checks, with a spill-configured DISTINCT over
-ORDER BY among its cases. After item 827 the mode is read in six places, the mode branch
-of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
-`envelope_refuses` and the three direct reads in `ctx.rs`, and the bounded-reads test's
-bound is six. The merge removes the rest.
+ORDER BY among its cases. After items 827 and 678 the mode is read in seven places, the
+mode branch of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
+`envelope_refuses` and the four direct reads in `ctx.rs`, and the bounded-reads test's
+bound is seven. The merge removes the rest.
 
 The phase then routes every ASK and unordered LIMIT through pull demand. A streaming
 request already pulls its ASK through the cursor, so the change is that automatic and
@@ -749,4 +751,4 @@ The maintainer took these answers, and the phases above follow them.
    before it lands. The merge also runs the full matrix on atlas before it lands, since
    it deletes the eager executor and atlas has forge's hardware.
 9. The bounded-reads test counts direct reads of the mode flag as well as `streams()`
-   calls, so its bound is eight after item 678 and six after item 827.
+   calls, so its bound is seven after items 827 and 678.
