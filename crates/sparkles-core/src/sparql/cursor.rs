@@ -1173,7 +1173,7 @@ pub(super) fn auto_streaming(
     if !(scanned || grouped(ctx, node)) {
         return false;
     }
-    let headroom = cursor_headroom(ctx, node, options);
+    let headroom = cursor_headroom(ctx, node, options, true);
     kind == QueryKind::Select
         && ctx.snap.delta.is_empty()
         && batches_admitted(options)
@@ -1187,8 +1187,13 @@ fn batches_admitted(options: &CursorOptions) -> bool {
 }
 
 /// The memory a cursor over `node` needs besides the state its operators keep: one
-/// index block of input, one batch of output and the query's variables.
-fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions) -> u64 {
+/// batch of output and the query's variables, and with `shared_block` the charge of the
+/// decoded index block whose rows the root hands out without copying them. A scan
+/// inside the plan charges no block, which the block cache keeps between its reads
+/// (roadmap item 1039), and the root copies rows when the block's charge does not fit.
+/// Automatic execution streams a plain scan for the speed of the uncopied batches, so
+/// its admission counts the block, and the test of whether a cursor fits does not.
+fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions, shared_block: bool) -> u64 {
     let cap = options
         .batch_rows
         .min(options.batch_bytes / node.vars.len().max(1).saturating_mul(8));
@@ -1201,7 +1206,12 @@ fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions) -> u64 {
     // A projection can be narrower than its scan. Admission must leave room for the
     // scan's input batches as well as the result.
     let row_bytes = (width(node) as u64).saturating_mul(8).saturating_add(16);
-    (crate::index::BLOCK_ROWS as u64 * 32 + 512)
+    let block = if shared_block {
+        crate::index::BLOCK_ROWS as u64 * 32 + 512
+    } else {
+        0
+    };
+    block
         .saturating_add((cap as u64).saturating_mul(row_bytes))
         .saturating_add((ctx.nvars() as u64).saturating_mul(16))
         .saturating_add(4096)
@@ -1280,7 +1290,7 @@ fn cursor_fits(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions)
         && streams_natively(ctx, node)
         && {
             let state = cursor_state_bytes(ctx, node);
-            let headroom = cursor_headroom(ctx, node, options) as f64;
+            let headroom = cursor_headroom(ctx, node, options, false) as f64;
             state.is_finite() && state * 2.0 + headroom <= admission_room(ctx)
         }
 }
@@ -5323,14 +5333,26 @@ mod tests {
                 ..options
             }
         ));
-        let low = prepare(
+        let mut low = prepare(
             store.snapshot(),
             &QueryOptions {
                 max_memory_bytes: Some(1_000_000),
                 ..Default::default()
             },
         );
+        // Under a budget without room for an uncopied block, a scan that eager execution
+        // holds stays eager...
+        low.node.est = AUTO_SCAN_ROWS;
         assert!(!auto_streaming(
+            &low.ctx,
+            &low.node,
+            low.kind,
+            &Default::default()
+        ));
+        // ...and one that it cannot hold streams with copied batches, since the scan
+        // itself charges no block (item 1039).
+        low.node.est = 1_000_000.0;
+        assert!(auto_streaming(
             &low.ctx,
             &low.node,
             low.kind,
