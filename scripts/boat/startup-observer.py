@@ -381,7 +381,7 @@ def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,r
             seen=window_seen or seen
             # A window that held only at or after the deadline starts no probe.
             if not quiet or clock()>=deadline:break
-            attempts+=1;result=run_probe()
+            attempts+=1;result=run_probe(max(0.0,deadline-clock()))
             after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
             need(after==before,'startup manifest changed during qualification')
             rows,busy=scan()
@@ -394,4 +394,4 @@ def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,r
 
 def qualify_with_startup_lock(payload):
     home=Path.home();uid=os.getuid();token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat'
-    return qualify_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],lambda:probe(payload),manager_reader=lambda rows,left:user_manager(rows,uid,left))
+    return qualify_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],lambda left:probe(payload,left),manager_reader=lambda rows,left:user_manager(rows,uid,left))

@@ -357,7 +357,7 @@ def read_memory(cg):
         ancestor=ancestor.parent
     return Path('/proc/meminfo').read_text(),ancestors
 
-def probe(payload):
+def probe(payload,left=None):
     uid=os.getuid();home=Path.home();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'worker user')
     pins=payload['pins'];s=payload['release']['snapshot_continuity'];tag=payload['operation_tag'];unit=tag+'-metadata.service'
     need(os.uname().machine=='x86_64','architecture')
@@ -368,6 +368,11 @@ def probe(payload):
     raw=command(['systemctl','--user','show',unit,'--property=MemoryMax,MemorySwapMax,RuntimeMaxUSec,TimeoutStopUSec,KillMode,OOMPolicy,MainPID,InvocationID,ControlGroup'])
     properties=dict(x.split('=',1) for x in raw.decode().splitlines() if '=' in x)
     validate_runtime(unit,os.getpid(),cgline,maxmem,maxswap,properties)
+    # Check parent capacity, excluding the deliberately smaller metadata service. A refused
+    # headroom is read again before any source or manifest is observed, so that a wait never
+    # leaves them unwatched, and never past the ``left`` seconds the caller's phase has.
+    boot=lambda:time.clock_gettime(time.CLOCK_BOOTTIME)
+    memory,ancestors=settled_memory(lambda:read_memory(cg),boot,time.sleep,unit_limit() if left is None else min(unit_limit(),boot()+left))
     token=home/'.config/mbx/remote-token';tm=token_metadata(token,uid);denied=(tm['device'],tm['inode'])
     state=home/'.local/state/sparkles-boat';new=Path(pins['installed_bundle']);old=Path(pins['retained_old_bundle'])
     directories=[directory(p,uid) for p in [home,state,new,old,Path(profile()['startup_repositories']['default']),Path(profile()['startup_repositories']['retained'])]]
@@ -401,8 +406,6 @@ def probe(payload):
         sources[str(repo)]={'before':first,'after':last};checks[str(repo)]={'status':check['status'],'installed_bindings':check['installed_bindings']}
         if stale is not None:sources[str(repo)]['stat_only_status']=status_evidence(stale)
     after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024);need(after==before,'manifest changed during checker')
-    # Check parent capacity, excluding the deliberately smaller metadata service.
-    memory,ancestors=settled_memory(lambda:read_memory(cg),lambda:time.clock_gettime(time.CLOCK_BOOTTIME),time.sleep,unit_limit())
     for row in ancestors:row.pop('memory.stat',None)
     disk={}
     for root in [home,home/'.local/share/mbx',Path(profile()['startup_repositories']['default']),Path(profile()['startup_repositories']['retained'])]:

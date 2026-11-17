@@ -43,7 +43,8 @@ the kernel cannot reclaim. A worker restored from its snapshot holds 1.4 to 2.2 
 it at qualification, about 0.9 GiB of which is the provider's restore filesystem, and
 part of that is transient while files are restored. A reading that is refused only
 because the headroom is short is therefore read again every 2 seconds for up to 60
-seconds, and never past the last 40 seconds of the metadata unit's runtime. A later
+seconds, before the probe observes any source, and never past the qualification phase's
+120-second bound or the last 40 seconds of the metadata unit's runtime. A later
 reading admits only when the reading before it admitted too, so one low reading never
 admits, and the first reading that admits ends the wait at once. A missing or malformed
 `memory.stat` is not read again. The readings are recorded with the qualification, or
@@ -55,7 +56,7 @@ from `scripts/remote-screen.sh` and a screen build from `scripts/nsc-build-host.
 `BOAT_JOB_MEMORY_GIB` in `scripts/boat/metadata-probe.py` holds the figure, and a test
 checks that each of these caps matches it. The worker's user slice allows no swap, so a
 job has none whatever its `MemorySwapMax` says. The largest single user is the rustc
-that builds the server's unit-test binary, which reaches about 11.2 GiB.
+that builds the server's unit-test binary, which reaches about 11.4 GiB.
 
 `admit` resolves `mbx` and `rustc` through the same environment that jobs receive. That
 environment puts the pinned mise MBX install on PATH, selects the pinned Rust toolchain

@@ -456,7 +456,7 @@ cache = { enabled = true, command_inputs = [
 description = "All Rust tests with cargo-nextest (unit, W3C SPARQL + SHACL suites when the Jena checkout is present), then the doctests"
 depends = ["ui:build"]
 # The first step builds the server's unit-test binary on its own. It and the server binary
-# that the integration tests run each compile the whole server crate, at about 11.2 GiB and
+# that the integration tests run each compile the whole server crate, at about 11.4 GiB and
 # 8.3 GiB of rustc memory, and nextest would build them at the same time. Building them one
 # after the other halves the peak at the cost of a few minutes. nextest does not run
 # doctests, so `mbx test --doc` runs them afterwards.

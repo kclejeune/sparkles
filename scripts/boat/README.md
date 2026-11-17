@@ -63,8 +63,10 @@ capacity, token metadata and metadata-service closure checks must pass afterward
 different manifest is refused rather than adopted automatically.
 
 The metadata probe's memory check admits a 12 GiB job. A headroom refusal alone is read
-again every 2 seconds for at most 60 seconds, bounded by the metadata unit's own clock, and
-admits only on two readings in a row after a refusal. The readings are kept as
+again every 2 seconds for at most 60 seconds, and admits only on two readings in a row after
+a refusal. The check runs before any source or manifest is observed, so a wait never leaves
+them unwatched. The wait ends with the time the qualification phase has left and with the
+metadata unit's own clock. The readings are kept as
 `memory_series` in the qualification's `memory_bytes` or in the phase's refusal evidence.
 [Remote executors](../../docs/REMOTE-EXECUTORS.md) describes the figures.
 

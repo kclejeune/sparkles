@@ -1268,7 +1268,7 @@ class QualificationWait(unittest.TestCase):
             self.scans.append(clock.now());current['rows']=readers[min(len(self.scans)-1,len(readers)-1)];return current['rows']
         def exe_reader(pid):
             row=current['rows'].get(pid);return None if row is None else ('fs',row.get('exe',row['comm']))
-        def run_probe():
+        def run_probe(left=None):
             self.probes.append((clock.now(),len(self.scans)))
             if probe:probe()
             return {'qualified':True}
@@ -1342,7 +1342,7 @@ class QualificationWait(unittest.TestCase):
         def rows():
             if after[0]:after[0]=False;return child
             return clean
-        def run_probe():
+        def run_probe(left=None):
             probes.append(clock.now());after[0]=True;return {'qualified':True}
         with self.assertRaises(self.O['Refusal']) as caught:
             self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
@@ -1357,11 +1357,29 @@ class QualificationWait(unittest.TestCase):
         def rows():
             if after[0]:after[0]=False;return child
             return clean
-        def run_probe():
+        def run_probe(left=None):
             probes.append(clock.now());clock.pause(50);after[0]=True;return {'qualified':True}
         with self.assertRaises(self.O['Refusal']):
             self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
         self.assertTrue(all(t<self.O['QUALIFY_SECONDS'] for t in probes));self.assertEqual(len(probes),3)
+
+    def test_each_probe_is_given_the_time_left_in_the_phase(self):
+        clean=self.trees['w6-3'][0];lefts=[]
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock()
+        def run_probe(left):
+            lefts.append((clock.now(),left));return {'qualified':True}
+        self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,lambda:clean,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
+        (at,left),=lefts
+        self.assertGreater(left,0);self.assertLess(left,self.O['QUALIFY_SECONDS'])
+        # Qualification's own deadline is the probe's, so a memory wait never ends after it.
+        source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
+        self.assertIn('boot()+left',source)
+
+    def test_the_memory_wait_comes_before_every_source_observation(self):
+        source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
+        body=source[source.index('def probe(payload'):]
+        self.assertLess(body.index('settled_memory('),body.index('startup_source('))
+        self.assertLess(body.index('settled_memory('),body.index("'toolchain.json'"))
 
     def test_a_manifest_change_refuses_at_once(self):
         clean=self.trees['w6-3'][0]
@@ -1455,14 +1473,14 @@ class QualificationWait(unittest.TestCase):
             if clock.now()>=113:clock.pause(2)
             return manager
         with self.assertRaises(self.O['Refusal']) as caught:
-            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,lambda:probes.append(clock.now()) or {'qualified':True},rows,clock.now,clock.pause,manager_reader,lambda pid:('fs','bash'))
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,lambda left:probes.append(clock.now()) or {'qualified':True},rows,clock.now,clock.pause,manager_reader,lambda pid:('fs','bash'))
         self.assertEqual(probes,[]);self.assertEqual(str(caught.exception),'startup not quiescent before tools')
         self.assertTrue(all(0<left<=self.O['QUALIFY_SECONDS'] and abs(now+left-self.O['QUALIFY_SECONDS'])<1e-9 for now,left in lefts))
 
     def test_the_bootstrap_lock_is_held_through_every_attempt(self):
         import fcntl
         clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279);held=[]
-        def probe():
+        def probe(left=None):
             fd=os.open(self.state/'bootstrap.lock',os.O_RDWR)
             try:
                 try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);held.append(False)
