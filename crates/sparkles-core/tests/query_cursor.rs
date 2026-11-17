@@ -13,6 +13,11 @@ use std::sync::{
 };
 use std::time::Duration;
 
+// The test-only reference evaluator (roadmap item 512), the oracle of the seeded
+// differential queries.
+#[path = "support/reference/mod.rs"]
+mod reference;
+
 // Explicit application-model copies for semantic comparisons only. Retained
 // ownership regressions below keep their real OwnedTerm/OwnedRow handles.
 trait ApplicationQueryRows {
@@ -2644,7 +2649,8 @@ const VARS: [&str; 4] = ["?a", "?b", "?c", "?d"];
 /// How a generated query fixes the order of its solutions.
 enum Order {
     None,
-    /// ORDER BY on these projected variables, so equal keys may come in any order.
+    /// ORDER BY on these projected variables, each `?v` or `DESC(?v)`, so equal keys may
+    /// come in any order.
     Vars(Vec<String>),
     /// ORDER BY on an expression, compared as a bag.
     Expr,
@@ -2982,7 +2988,7 @@ impl Gen {
                 let keys: Vec<String> = (0..n)
                     .map(|i| projected[(first + i) % projected.len()].clone())
                     .collect();
-                let text = keys
+                let keys: Vec<String> = keys
                     .iter()
                     .map(|k| {
                         if self.rng.below(2) == 0 {
@@ -2991,9 +2997,8 @@ impl Gen {
                             k.clone()
                         }
                     })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (format!(" ORDER BY {text}"), Order::Vars(keys))
+                    .collect();
+                (format!(" ORDER BY {}", keys.join(" ")), Order::Vars(keys))
             }
         };
         let limit = (self.rng.below(3) == 0).then(|| self.rng.below(6));
@@ -3095,8 +3100,9 @@ fn compare(shape: &Shape, vars: &[String], expected: &Rows, got: &Rows, unsliced
             let keys: Vec<usize> = keys
                 .iter()
                 .map(|k| {
+                    let k = k.trim_start_matches("DESC(").trim_end_matches(')');
                     vars.iter()
-                        .position(|v| format!("?{v}") == *k || v == k)
+                        .position(|v| format!("?{v}") == k || v == k)
                         .unwrap()
                 })
                 .collect();
@@ -3118,23 +3124,237 @@ fn compare(shape: &Shape, vars: &[String], expected: &Rows, got: &Rows, unsliced
     }
 }
 
-/// Run `seeds` generated queries against one view of the data and compare cursor
-/// answers at several batch sizes with the eager answer.
-fn differential(name: &str, snapshot: &Arc<Snapshot>, opts: &QueryOptions, seeds: u64) {
+/// A term with a number in its canonical form, since SPARQL leaves the lexical form of a
+/// computed number to the implementation.
+fn canonical(t: &Option<Term>) -> String {
+    match t {
+        Some(Term::Literal(l)) => match reference::value::numeric(l) {
+            Some(n) => format!("{:?}", n.to_literal()),
+            None => format!("{l:?}"),
+        },
+        t => format!("{t:?}"),
+    }
+}
+
+/// The quads of a snapshot, for the reference evaluator.
+fn snapshot_quads(snapshot: &Snapshot) -> Vec<oxrdf::Quad> {
+    let mut out = Vec::new();
+    snapshot
+        .for_each_quad(|q| {
+            out.push(snapshot.quad_to_terms(q).expect("a stored quad decodes"));
+            Ok(())
+        })
+        .unwrap();
+    out
+}
+
+/// The reference evaluator's answer to a differential query.
+struct Expected {
+    vars: Vec<String>,
+    rows: Rows,
+    notes: reference::Notes,
+    /// The answer without the query's LIMIT and OFFSET, when it has them.
+    unsliced: Option<(Rows, reference::Notes)>,
+}
+
+impl Expected {
+    /// Whether the reference's rows are the only answer that the specification allows
+    /// and that the reference evaluates exactly.
+    fn exact(notes: &reference::Notes) -> bool {
+        !notes.chose && !notes.min_max_error && !notes.distinct_over_blank_nodes
+    }
+}
+
+fn reference_select(
+    oracle: &reference::Reference,
+    q: &str,
+    context: &str,
+) -> (Vec<String>, Rows, reference::Notes) {
+    match oracle.run_noting_choices(q, None) {
+        Ok((reference::Answer::Select { variables, rows }, notes)) => (variables, rows, notes),
+        other => panic!("{context}, reference: {other:?}: {q}"),
+    }
+}
+
+fn canonical_bag(rows: &Rows) -> Vec<Vec<String>> {
+    let mut b: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(canonical).collect())
+        .collect();
+    b.sort();
+    b
+}
+
+/// Compare an engine answer with the reference evaluator's. Where the reference's
+/// answer is exact, the rows must match as a bag. Where only the answer without the
+/// slice is exact, the rows must be as many and come from it. The order that ORDER BY
+/// fixes is checked in every case.
+fn compare_with_reference(
+    shape: &Shape,
+    vars: &[String],
+    got: &Rows,
+    expected: &Expected,
+    what: &str,
+) {
+    let q = &shape.query;
+    let ref_vars = &expected.vars;
+    let ref_rows = &expected.rows;
+    let columns: Vec<usize> = ref_vars
+        .iter()
+        .map(|v| {
+            vars.iter()
+                .position(|x| x == v)
+                .unwrap_or_else(|| panic!("{what} lacks {v}: {q}"))
+        })
+        .collect();
+    assert_eq!(vars.len(), ref_vars.len(), "{what} columns: {q}");
+    let got: Rows = got
+        .iter()
+        .map(|row| columns.iter().map(|&i| row[i].clone()).collect())
+        .collect();
+    if Expected::exact(&expected.notes) {
+        assert_eq!(
+            canonical_bag(&got),
+            canonical_bag(ref_rows),
+            "{what} against the reference: {q}"
+        );
+    } else if let Some((all, notes)) = &expected.unsliced
+        && Expected::exact(notes)
+        && !expected.notes.min_max_error
+        && !expected.notes.distinct_over_blank_nodes
+    {
+        assert_eq!(
+            got.len(),
+            ref_rows.len(),
+            "{what} row count against the reference: {q}"
+        );
+        let mut pool = canonical_bag(all);
+        for row in canonical_bag(&got) {
+            let i = pool.iter().position(|r| *r == row).unwrap_or_else(|| {
+                panic!("{what}: row {row:?} outside the reference's unsliced answer: {q}")
+            });
+            pool.remove(i);
+        }
+    }
+    if let Order::Vars(keys) = &shape.order {
+        // ORDER BY ?v or DESC(?v): no row may follow a row that the specification
+        // puts strictly after it
+        let keys: Vec<(usize, bool)> = keys
+            .iter()
+            .map(|k| {
+                let desc = k.starts_with("DESC(");
+                let name = k.trim_start_matches("DESC(").trim_end_matches(')');
+                let name = name.trim_start_matches('?');
+                (ref_vars.iter().position(|v| v == name).unwrap(), desc)
+            })
+            .collect();
+        let before = |a: &[Option<Term>], b: &[Option<Term>]| {
+            for &(k, desc) in &keys {
+                let mut o = reference::value::spec_order(a[k].as_ref(), b[k].as_ref());
+                if desc {
+                    o = o.map(std::cmp::Ordering::reverse);
+                }
+                match o {
+                    Some(std::cmp::Ordering::Less) => return true,
+                    Some(std::cmp::Ordering::Equal) => {}
+                    _ => return false,
+                }
+            }
+            false
+        };
+        for i in 0..got.len() {
+            for j in i + 1..got.len() {
+                assert!(
+                    !before(&got[j], &got[i]),
+                    "{what}: row {j} belongs before row {i}: {q}"
+                );
+            }
+        }
+    }
+}
+
+/// Run `seeds` generated queries against one view of the data and compare the eager
+/// answer and cursor answers at several batch sizes with the answer of the reference
+/// evaluator over `quads`, the quads the view shows. The cursor answers are also
+/// compared with the eager one, including how each breaks ties.
+fn differential(
+    name: &str,
+    snapshot: &Arc<Snapshot>,
+    opts: &QueryOptions,
+    seeds: u64,
+    quads: Vec<oxrdf::Quad>,
+) {
     let seeds = std::env::var("SPARKLES_CURSOR_SEEDS")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(seeds);
+    let oracle =
+        reference::Reference::new(quads.clone()).with_union_default(snapshot.union_default_graph);
+    // Where MIN or MAX reads an error, the engine passes over it, which the roadmap item
+    // on aggregate errors keeps open against the specification's reading, so those
+    // queries compare with that reading.
+    let passing = reference::Reference::new(quads)
+        .with_union_default(snapshot.union_default_graph)
+        .passing_over_min_max_errors();
+    // SPARKLES_REFERENCE_KEEP_GOING reports every disagreement with the reference
+    // before failing, for triage.
+    let keep_going = std::env::var_os("SPARKLES_REFERENCE_KEEP_GOING").is_some();
+    let disagreements = std::cell::Cell::new(0);
+    let (mut open, mut sliced, mut min_max, mut blank) = (0, 0, 0, 0);
     for seed in 1..=seeds {
         let shape = Gen::new(seed).query();
         let q = &shape.query;
+        let context = format!("{name} seed {seed}");
+        let (mut rvars, mut rrows, mut notes) = reference_select(&oracle, q, &context);
+        let mut unsliced = shape
+            .unsliced
+            .as_ref()
+            .map(|u| reference_select(&oracle, u, &context));
+        if notes.min_max_error || unsliced.as_ref().is_some_and(|u| u.2.min_max_error) {
+            min_max += 1;
+            (rvars, rrows, notes) = reference_select(&passing, q, &context);
+            unsliced = shape
+                .unsliced
+                .as_ref()
+                .map(|u| reference_select(&passing, u, &context));
+        }
+        let unsliced = unsliced.map(|(_, rows, notes)| (rows, notes));
+        if !Expected::exact(&notes) {
+            if notes.distinct_over_blank_nodes {
+                blank += 1;
+            } else if unsliced.as_ref().is_some_and(|(_, n)| Expected::exact(n)) {
+                sliced += 1;
+            } else {
+                open += 1;
+            }
+        }
+        let reference = Expected {
+            vars: rvars,
+            rows: rrows,
+            notes,
+            unsliced,
+        };
         let (vars, expected) = eager(snapshot.clone(), q, opts);
+        let check = |got: &Rows, what: &str| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compare_with_reference(&shape, &vars, got, &reference, what)
+            }));
+            if let Err(e) = result {
+                eprintln!("{name} seed {seed}, {what}");
+                disagreements.set(disagreements.get() + 1);
+                if !keep_going {
+                    std::panic::resume_unwind(e);
+                }
+            }
+        };
+        check(&expected, "eager");
         let unsliced = shape
             .unsliced
             .as_ref()
             .map(|u| eager(snapshot.clone(), u, opts).1);
         for rows in [1, 2, 3, 4096] {
             let got = streamed(snapshot.clone(), q, opts, rows, &vars);
+            check(&got, &format!("cursor of {rows} rows"));
             let message = format!("{name} seed {seed}, {rows} rows");
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 compare(&shape, &vars, &expected, &got, unsliced.as_ref())
@@ -3145,6 +3365,17 @@ fn differential(name: &str, snapshot: &Arc<Snapshot>, opts: &QueryOptions, seeds
             }
         }
     }
+    eprintln!(
+        "{name}: of {seeds} queries, {sliced} are compared through their unsliced answer, \
+         {open} have rows that the specification leaves open, {blank} count distinct \
+         solutions with blank nodes, and {min_max} read an error in MIN or MAX and compare \
+         with the reading that passes over it"
+    );
+    assert_eq!(
+        disagreements.get(),
+        0,
+        "{name}: disagreements with the reference"
+    );
 }
 
 /// The triples the differential queries read, drawn from a fixed seed.
@@ -3195,7 +3426,8 @@ fn random_queries_agree_between_cursor_and_eager_on_a_compacted_base() {
     s.compact().unwrap();
     let snapshot = s.snapshot();
     assert!(snapshot.delta.is_empty());
-    differential("compacted", &snapshot, &Default::default(), SEEDS);
+    let quads = snapshot_quads(&snapshot);
+    differential("compacted", &snapshot, &Default::default(), SEEDS, quads);
 }
 
 /// The same over a base with a pending delta of inserts and deletes.
@@ -3217,7 +3449,8 @@ fn random_queries_agree_between_cursor_and_eager_over_a_pending_delta() {
     .unwrap();
     let snapshot = s.snapshot();
     assert!(!snapshot.delta.is_empty());
-    differential("delta", &snapshot, &Default::default(), SEEDS);
+    let quads = snapshot_quads(&snapshot);
+    differential("delta", &snapshot, &Default::default(), SEEDS, quads);
 }
 
 /// The same over data that spans several index blocks. Copies of each triple in named
@@ -3247,7 +3480,8 @@ fn random_queries_agree_between_cursor_and_eager_across_index_blocks() {
     s.compact().unwrap();
     let snapshot = s.snapshot();
     assert!(snapshot.perm(sparkles_core::index::Perm::Pso).blocks.len() > 1);
-    differential("blocks", &snapshot, &Default::default(), SEEDS / 3);
+    let quads = snapshot_quads(&snapshot);
+    differential("blocks", &snapshot, &Default::default(), SEEDS / 3, quads);
 }
 
 /// The same through a view that hides some triples, which reads a masked snapshot, over
@@ -3306,7 +3540,29 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
                 .unwrap()
                 .len()
     );
-    differential("masked", &snapshot, &opts, SEEDS);
+    // The protection hides the <urn:p> triples of the subjects typed <urn:Hidden>. The
+    // reference reads the quads that remain, which a plain scan through the view must
+    // also return.
+    let all = snapshot_quads(&snapshot);
+    let hidden_subjects: Vec<oxrdf::NamedOrBlankNode> = all
+        .iter()
+        .filter(|q| {
+            q.predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                && q.object == Term::NamedNode(oxrdf::NamedNode::new_unchecked("urn:Hidden"))
+        })
+        .map(|q| q.subject.clone())
+        .collect();
+    let visible: Vec<oxrdf::Quad> = all
+        .into_iter()
+        .filter(|q| !(q.predicate.as_str() == "urn:p" && hidden_subjects.contains(&q.subject)))
+        .collect();
+    assert_eq!(
+        query(snapshot.clone(), "SELECT * WHERE { ?s ?p ?o }", &opts)
+            .unwrap()
+            .len(),
+        visible.len()
+    );
+    differential("masked", &snapshot, &opts, SEEDS, visible);
 }
 
 /// An operator without a cursor implementation materializes only itself. Its inputs
@@ -4986,4 +5242,116 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         assert_eq!(bag(all(c)), expected, "merge_left_join {merge}");
         assert_eq!(bag(eager.application_rows()), expected);
     }
+}
+
+/// The reference evaluator's own cases: the choices that it notes, the scope of the
+/// solution that LATERAL substitutes, BNODE across a join and its sort order.
+#[test]
+fn reference_evaluator_notes_open_choices_and_keeps_scopes() {
+    let s = Store::in_memory(StoreOptions::default());
+    load_triples(
+        &s,
+        &[
+            "<urn:s:0> <urn:p> <urn:a>".into(),
+            "<urn:s:0> <urn:p> <urn:b>".into(),
+            "<urn:a> <urn:p> <urn:c>".into(),
+            "<urn:b> <urn:p> <urn:c>".into(),
+        ],
+    );
+    let snap = s.snapshot();
+    let oracle = reference::Reference::new(snapshot_quads(&snap));
+    let run = |q: &str| reference_select(&oracle, q, "reference");
+    let int = |n: i32| Some(Term::Literal(oxrdf::Literal::from(n)));
+
+    // two solution numbers of BNODE do not make the sides of a join incompatible
+    let (_, rows, _) =
+        run("SELECT * WHERE { { BIND(BNODE(\"x\") AS ?a) } { BIND(BNODE(\"y\") AS ?b) } }");
+    assert_eq!(rows.len(), 1);
+    let (_, rows, _) =
+        run("SELECT * WHERE { { BIND(BNODE(\"x\") AS ?a) } LATERAL { BIND(BNODE(\"y\") AS ?b) } }");
+    assert_eq!(rows.len(), 1);
+
+    // a sub-SELECT's own ?a is not the ?a that LATERAL substitutes
+    let (_, rows, _) = run(
+        "SELECT ?c WHERE { VALUES ?a { <urn:none> } LATERAL { SELECT ?c WHERE { ?a <urn:p> ?c } } }",
+    );
+    assert_eq!(rows.len(), 4);
+
+    // MIN and MAX over an error follow the order of ORDER BY, and say so
+    let (_, rows, notes) =
+        run("SELECT (MIN(?x) AS ?n) (MAX(?x) AS ?m) WHERE { VALUES ?x { UNDEF 1 2 } }");
+    assert_eq!(rows, vec![vec![None, int(2)]]);
+    assert!(notes.min_max_error && !notes.chose);
+    let passing = reference::Reference::new(snapshot_quads(&snap)).passing_over_min_max_errors();
+    let (_, rows, _) = reference_select(
+        &passing,
+        "SELECT (MIN(?x) AS ?n) (MAX(?x) AS ?m) WHERE { VALUES ?x { UNDEF 1 2 } }",
+        "reference",
+    );
+    assert_eq!(rows, vec![vec![int(1), int(2)]]);
+
+    // the middle of a path sequence arrives as a blank node, which COUNT(DISTINCT *)
+    // cannot tell from one of a basic graph pattern
+    let (_, rows, notes) = run(
+        "SELECT (COUNT(DISTINCT *) AS ?n) (COUNT(*) AS ?m) WHERE { <urn:s:0> <urn:p>/<urn:p> ?d }",
+    );
+    assert_eq!(rows, vec![vec![int(1), int(2)]]);
+    assert!(notes.distinct_over_blank_nodes);
+
+    // a slice through keys that ORDER BY leaves unordered is a choice, and one through
+    // ordered keys is not
+    let (_, _, notes) = run("SELECT ?x WHERE { VALUES ?x { 1 \"a\" } } ORDER BY ?x LIMIT 1");
+    assert!(notes.chose);
+    let (_, rows, notes) = run(
+        "SELECT ?x WHERE { VALUES ?x { 2 1 \"1\"^^<http://www.w3.org/2001/XMLSchema#decimal> } } ORDER BY ?x LIMIT 1",
+    );
+    assert!(notes.chose, "1 and 1.0 tie, and the cut falls between them");
+    assert_eq!(rows.len(), 1);
+    let (_, _, notes) = run(
+        "SELECT ?x WHERE { VALUES ?x { 2 1 \"1\"^^<http://www.w3.org/2001/XMLSchema#decimal> } } ORDER BY ?x LIMIT 2",
+    );
+    assert!(!notes.chose, "the cut between the tie and 2 is fixed");
+    let (_, rows, notes) = run("SELECT ?x WHERE { VALUES ?x { 3 1 2 } } ORDER BY DESC(?x) LIMIT 2");
+    assert_eq!(rows, vec![vec![int(3)], vec![int(2)]]);
+    assert!(!notes.chose);
+    let (_, _, notes) = run("SELECT (SAMPLE(?x) AS ?s) WHERE { VALUES ?x { 1 2 } }");
+    assert!(notes.chose);
+
+    // the sort order is transitive across numbers, strings and other literals
+    let terms: Vec<Option<Term>> = [
+        "1",
+        "\"2.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>",
+        "\"2001\"^^<http://www.w3.org/2001/XMLSchema#gYear>",
+        "\"NaN\"^^<http://www.w3.org/2001/XMLSchema#double>",
+        "\"a\"",
+        "\"a\"@en",
+        "<urn:x>",
+        "true",
+        "\"2001-01-01T00:00:00\"^^<http://www.w3.org/2001/XMLSchema#dateTime>",
+        "\"2001-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>",
+    ]
+    .iter()
+    .map(|t| {
+        let (_, rows, _) = run(&format!("SELECT ?x WHERE {{ VALUES ?x {{ {t} }} }}"));
+        rows[0][0].clone()
+    })
+    .collect();
+    use reference::value::{spec_order, total_order};
+    for a in &terms {
+        for b in &terms {
+            if let Some(o) = spec_order(a.as_ref(), b.as_ref())
+                && o.is_ne()
+            {
+                assert_eq!(total_order(a.as_ref(), b.as_ref()), o, "{a:?} {b:?}");
+            }
+            for c in &terms {
+                let (x, y, z) = (a.as_ref(), b.as_ref(), c.as_ref());
+                if total_order(x, y).is_le() && total_order(y, z).is_le() {
+                    assert!(total_order(x, z).is_le(), "{a:?} {b:?} {c:?}");
+                }
+            }
+        }
+    }
+    // NaN is unordered against a number
+    assert_eq!(spec_order(terms[3].as_ref(), terms[0].as_ref()), None);
 }

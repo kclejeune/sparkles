@@ -16,9 +16,12 @@
 //! and `xsd:dateTime` ones.
 //!
 //! Where the specification leaves an answer open, the evaluator picks one valid answer
-//! and says so in [`value::spec_order`], which returns `None` for the pairs of terms that
-//! ORDER BY leaves unordered. A comparison with an engine must allow every answer that
-//! the specification allows.
+//! and says so. [`value::spec_order`] returns `None` for the pairs of terms that ORDER BY
+//! leaves unordered, and [`Reference::run_noting_choices`] reports in [`Notes`] whether
+//! the answer depended on such a choice. That happens when a slice cuts between rows that the
+//! specification does not order strictly, and when MIN, MAX, SAMPLE or GROUP_CONCAT pick
+//! among values that it does not order. A comparison with an engine must allow every
+//! answer that the specification allows.
 //!
 //! The file is included by `#[path]` into each test crate that uses it, so it carries
 //! `allow(dead_code)`.
@@ -128,6 +131,7 @@ impl GraphData {
 pub struct Reference {
     quads: Vec<Quad>,
     union_default: bool,
+    pass_min_max_errors: bool,
     now: DateTime,
 }
 
@@ -142,6 +146,7 @@ impl Reference {
         Reference {
             quads,
             union_default: false,
+            pass_min_max_errors: false,
             now: DateTime::now(),
         }
     }
@@ -153,12 +158,30 @@ impl Reference {
         self
     }
 
+    /// Make MIN and MAX pass over the errors among their values, a reading other than
+    /// the specification's, which [`Notes::min_max_error`] describes. A test may compare
+    /// with it where the difference is tracked as an open question.
+    pub fn passing_over_min_max_errors(mut self) -> Reference {
+        self.pass_min_max_errors = true;
+        self
+    }
+
     pub fn quads(&self) -> &[Quad] {
         &self.quads
     }
 
     /// Parse and evaluate `text`.
     pub fn run(&self, text: &str, base: Option<&str>) -> Result<Answer, Error> {
+        self.run_noting_choices(text, base)
+            .map(|(answer, _)| answer)
+    }
+
+    /// Parse and evaluate `text`, with the [`Notes`] on its answer.
+    pub fn run_noting_choices(
+        &self,
+        text: &str,
+        base: Option<&str>,
+    ) -> Result<(Answer, Notes), Error> {
         let mut parser = SparqlParser::new();
         if let Some(b) = base {
             parser = parser
@@ -168,11 +191,17 @@ impl Reference {
         let query = parser
             .parse_query(text)
             .map_err(|e| Error::Parse(e.to_string()))?;
-        self.evaluate(&query)
+        self.evaluate_noting_choices(&query)
     }
 
     /// Evaluate a parsed query.
     pub fn evaluate(&self, query: &Query) -> Result<Answer, Error> {
+        self.evaluate_noting_choices(query)
+            .map(|(answer, _)| answer)
+    }
+
+    /// Evaluate a parsed query, with the [`Notes`] on its answer.
+    pub fn evaluate_noting_choices(&self, query: &Query) -> Result<(Answer, Notes), Error> {
         let (dataset, pattern, base) = match query {
             Query::Select {
                 dataset,
@@ -225,10 +254,13 @@ impl Reference {
                 Query::Describe { .. } => unsupported("DESCRIBE"),
             }
         };
-        run().map_err(|f| match f {
+        let answer = run().map_err(|f| match f {
             Fail::Unsupported(m) => Error::Unsupported(m),
             Fail::Type => Error::Unsupported("an expression error outside any expression".into()),
-        })
+        })?;
+        let mut notes = ev.notes.get();
+        notes.chose = ev.chose.get();
+        Ok((answer, notes))
     }
 }
 
@@ -264,6 +296,51 @@ pub(crate) struct Evaluator<'a> {
     pub bnodes: RefCell<HashMap<(u64, String), BlankNode>>,
     pub fresh: Cell<u64>,
     pub rng: Cell<u64>,
+    /// Whether the evaluation made a choice that the specification leaves open.
+    pub chose: Cell<bool>,
+    pub notes: Cell<Notes>,
+}
+
+/// What an evaluation noted about its answer beside the answer itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Notes {
+    /// The specification allows other answers, because the evaluator made a choice
+    /// that it leaves open.
+    pub chose: bool,
+    /// MIN or MAX read an error. The evaluator follows the specification's definition,
+    /// which sorts the values in the order of ORDER BY, where an error sorts first, so
+    /// MIN is an error and MAX passes over it. Jena makes both an error, and other
+    /// readings pass over it in both.
+    pub min_max_error: bool,
+    /// `COUNT(DISTINCT *)` counted solutions of a pattern with blank nodes. Section
+    /// 18.2.2.4 joins the two halves of a path sequence on a fresh variable, which is in
+    /// the solutions, while a blank node of a basic graph pattern is not. The parser
+    /// writes both as blank nodes, so the evaluator cannot tell them apart and leaves
+    /// both out.
+    pub distinct_over_blank_nodes: bool,
+}
+
+/// Solutions in ORDER BY order, with the sort key of each and the direction of each
+/// key: what a slice needs to tell whether its cut is one the specification fixes.
+struct Keyed {
+    solutions: Vec<Solution>,
+    keys: Option<(Vec<Vec<Option<Term>>>, Vec<bool>)>,
+}
+
+/// Whether the specification puts the key `a` strictly before `b`.
+fn strictly_before(a: &[Option<Term>], b: &[Option<Term>], descending: &[bool]) -> bool {
+    for ((x, y), desc) in a.iter().zip(b).zip(descending) {
+        let mut o = value::spec_order(x.as_ref(), y.as_ref());
+        if *desc {
+            o = o.map(std::cmp::Ordering::reverse);
+        }
+        match o {
+            Some(std::cmp::Ordering::Less) => return true,
+            Some(std::cmp::Ordering::Equal) => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Where a pattern is evaluated: the active graph and the solution that a LATERAL join
@@ -274,7 +351,8 @@ pub(crate) struct Cx<'c> {
 }
 
 /// Whether a variable is one of the evaluator's own: the blank nodes of a basic graph
-/// pattern and the solution number that BNODE reads. Such a variable is never in scope.
+/// pattern, which an RDF instance mapping binds and a solution mapping does not, and the
+/// solution number that BNODE reads.
 pub(crate) fn is_hidden(v: &Variable) -> bool {
     v.as_str().starts_with(':')
 }
@@ -363,6 +441,8 @@ impl<'a> Evaluator<'a> {
             bnodes: RefCell::new(HashMap::new()),
             fresh: Cell::new(0),
             rng: Cell::new(0x9e37_79b9_7f4a_7c15),
+            chose: Cell::new(false),
+            notes: Cell::new(Notes::default()),
         }
     }
 
@@ -549,48 +629,9 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(out)
             }
-            GraphPattern::OrderBy { inner, expression } => {
-                let sols = self.eval(inner, cx)?;
-                let mut keyed = Vec::new();
-                for s in sols {
-                    let mut keys = Vec::new();
-                    for o in expression {
-                        let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
-                        keys.push(self.soft(self.expr(e, cx, &s))?);
-                    }
-                    keyed.push((keys, s));
-                }
-                keyed.sort_by(|(a, _), (b, _)| {
-                    for (i, o) in expression.iter().enumerate() {
-                        let mut c = total_order(a[i].as_ref(), b[i].as_ref());
-                        if matches!(o, OrderExpression::Desc(_)) {
-                            c = c.reverse();
-                        }
-                        if c.is_ne() {
-                            return c;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-                Ok(keyed.into_iter().map(|(_, s)| s).collect())
-            }
-            GraphPattern::Project { inner, variables } => Ok(self
-                .eval(inner, cx)?
-                .into_iter()
-                .map(|s| {
-                    s.into_iter()
-                        .filter(|(k, _)| variables.contains(k))
-                        .collect()
-                })
-                .collect()),
-            GraphPattern::Distinct { inner } => {
-                let mut seen = HashSet::new();
-                Ok(self
-                    .eval(inner, cx)?
-                    .into_iter()
-                    .filter(|s| seen.insert(s.clone()))
-                    .collect())
-            }
+            GraphPattern::OrderBy { .. }
+            | GraphPattern::Project { .. }
+            | GraphPattern::Distinct { .. } => Ok(self.eval_keyed(p, cx)?.solutions),
             // REDUCED may drop duplicates and need not, and this one keeps them
             GraphPattern::Reduced { inner } => self.eval(inner, cx),
             GraphPattern::Slice {
@@ -598,12 +639,30 @@ impl<'a> Evaluator<'a> {
                 start,
                 length,
             } => {
-                let sols = self.eval(inner, cx)?;
-                let it = sols.into_iter().skip(*start);
-                Ok(match length {
-                    Some(n) => it.take(*n).collect(),
-                    None => it.collect(),
-                })
+                let Keyed { solutions, keys } = self.eval_keyed(inner, cx)?;
+                let n = solutions.len();
+                let from = (*start).min(n);
+                let to = length.map_or(n, |l| from.saturating_add(l).min(n));
+                // A cut is fixed when every row before it either equals every row after
+                // it or comes strictly before it in the order.
+                let visible_rows: Vec<Solution> = solutions.iter().map(visible).collect();
+                for cut in [from, to] {
+                    if cut == 0 || cut == n {
+                        continue;
+                    }
+                    let fixed = (0..cut).all(|i| {
+                        (cut..n).all(|j| {
+                            visible_rows[i] == visible_rows[j]
+                                || keys
+                                    .as_ref()
+                                    .is_some_and(|(k, d)| strictly_before(&k[i], &k[j], d))
+                        })
+                    });
+                    if !fixed {
+                        self.chose.set(true);
+                    }
+                }
+                Ok(solutions.into_iter().skip(from).take(to - from).collect())
             }
             GraphPattern::Group {
                 inner,
@@ -615,6 +674,101 @@ impl<'a> Evaluator<'a> {
             GraphPattern::SemiJoin { .. } => unsupported("SEMIJOIN (Jena)"),
             GraphPattern::AntiJoin { .. } => unsupported("ANTIJOIN (Jena)"),
             GraphPattern::Unfold { .. } => unsupported("UNFOLD (Jena)"),
+        }
+    }
+
+    /// Evaluate ORDER BY, and the projection and DISTINCT above it, keeping the sort
+    /// keys for a slice. Any other pattern has no keys.
+    fn eval_keyed(&self, p: &GraphPattern, cx: &Cx) -> R<Keyed> {
+        match p {
+            GraphPattern::OrderBy { inner, expression } => {
+                let sols = self.eval(inner, cx)?;
+                let mut keyed = Vec::new();
+                for s in sols {
+                    let mut keys = Vec::new();
+                    for o in expression {
+                        let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                        keys.push(self.soft(self.expr(e, cx, &s))?);
+                    }
+                    keyed.push((keys, s));
+                }
+                let descending: Vec<bool> = expression
+                    .iter()
+                    .map(|o| matches!(o, OrderExpression::Desc(_)))
+                    .collect();
+                keyed.sort_by(|(a, _), (b, _)| {
+                    for (i, desc) in descending.iter().enumerate() {
+                        let mut c = total_order(a[i].as_ref(), b[i].as_ref());
+                        if *desc {
+                            c = c.reverse();
+                        }
+                        if c.is_ne() {
+                            return c;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                let (keys, solutions) = keyed.into_iter().unzip();
+                Ok(Keyed {
+                    solutions,
+                    keys: Some((keys, descending)),
+                })
+            }
+            GraphPattern::Project { inner, variables } => {
+                // A sub-SELECT's variables that it does not project are its own, so the
+                // solution that a LATERAL join or EXISTS substitutes stops at them.
+                let env: Solution = cx
+                    .env
+                    .iter()
+                    .filter(|(v, _)| variables.contains(v))
+                    .map(|(v, t)| (v.clone(), t.clone()))
+                    .collect();
+                let inner_cx = Cx {
+                    graph: cx.graph,
+                    env: &env,
+                };
+                let mut k = self.eval_keyed(inner, &inner_cx)?;
+                k.solutions = k
+                    .solutions
+                    .into_iter()
+                    .map(|s| {
+                        s.into_iter()
+                            .filter(|(k, _)| variables.contains(k))
+                            .collect()
+                    })
+                    .collect();
+                Ok(k)
+            }
+            GraphPattern::Distinct { inner } => {
+                let Keyed { solutions, keys } = self.eval_keyed(inner, cx)?;
+                let mut first: HashMap<Solution, usize> = HashMap::new();
+                let mut kept = Vec::new();
+                for (i, s) in solutions.iter().enumerate() {
+                    match first.get(&visible(s)) {
+                        None => {
+                            first.insert(visible(s), i);
+                            kept.push(i);
+                        }
+                        // Which copy DISTINCT keeps is open, and it places the row
+                        // differently when the copies have different keys.
+                        Some(&f) => {
+                            if let Some((k, _)) = &keys
+                                && k[f] != k[i]
+                            {
+                                self.chose.set(true);
+                            }
+                        }
+                    }
+                }
+                Ok(Keyed {
+                    solutions: kept.iter().map(|&i| solutions[i].clone()).collect(),
+                    keys: keys.map(|(k, d)| (kept.iter().map(|&i| k[i].clone()).collect(), d)),
+                })
+            }
+            _ => Ok(Keyed {
+                solutions: self.eval(p, cx)?,
+                keys: None,
+            }),
         }
     }
 
@@ -767,6 +921,9 @@ impl<'a> Evaluator<'a> {
         object: &TermPattern,
         cx: &Cx,
     ) -> R<Vec<Solution>> {
+        // The parser has already rewritten a sequence at the top of the pattern into two
+        // triple patterns joined on a fresh blank node, as section 18.2.2.4 does with a
+        // fresh variable, and the inverse of an IRI into a swapped triple pattern.
         // The endpoints that the pattern fixes, which the zero-length paths need as
         // nodes even when the graph does not hold them.
         let fixed = |p: &TermPattern, cx: &Cx| -> Option<Term> {
@@ -842,6 +999,14 @@ impl<'a> Evaluator<'a> {
         let (name, expr, distinct) = match a {
             AggregateExpression::CountSolutions { distinct } => {
                 let n = if *distinct {
+                    if members
+                        .iter()
+                        .any(|m| m.keys().any(|k| k.as_str().starts_with(":bnode:")))
+                    {
+                        let mut notes = self.notes.get();
+                        notes.distinct_over_blank_nodes = true;
+                        self.notes.set(notes);
+                    }
                     members.iter().map(visible).collect::<HashSet<_>>().len()
                 } else {
                     members.len()
@@ -898,7 +1063,18 @@ impl<'a> Evaluator<'a> {
                 }
             }
             AggregateFunction::Min | AggregateFunction::Max => {
-                if has_error {
+                // Min and Max sort the values in the order of ORDER BY, where an error
+                // sorts with the unbound values, first. So an error is the minimum, and
+                // the maximum passes over it.
+                if has_error && !self.data.pass_min_max_errors {
+                    let mut notes = self.notes.get();
+                    notes.min_max_error = true;
+                    self.notes.set(notes);
+                }
+                if has_error
+                    && !self.data.pass_min_max_errors
+                    && matches!(name, AggregateFunction::Min)
+                {
                     return Ok(None);
                 }
                 let mut best: Option<&Term> = None;
@@ -916,9 +1092,30 @@ impl<'a> Evaluator<'a> {
                         }
                     });
                 }
+                // the choice is open when another value is not strictly worse
+                if let Some(b) = best {
+                    let worse = if matches!(name, AggregateFunction::Min) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                    if terms
+                        .iter()
+                        .any(|t| t != b && value::spec_order(Some(t), Some(b)) != Some(worse))
+                    {
+                        self.chose.set(true);
+                    }
+                }
                 best.cloned()
             }
-            AggregateFunction::Sample => terms.first().cloned(),
+            AggregateFunction::Sample => {
+                // any element of the values, an error among them
+                if terms.iter().any(|t| Some(t) != terms.first()) || has_error && !terms.is_empty()
+                {
+                    self.chose.set(true);
+                }
+                terms.first().cloned()
+            }
             AggregateFunction::GroupConcat { separator } => {
                 if has_error {
                     return Ok(None);
@@ -931,6 +1128,10 @@ impl<'a> Evaluator<'a> {
                         Term::NamedNode(n) => n.as_str().to_string(),
                         _ => return Ok(None),
                     });
+                }
+                // the order of the values is open
+                if terms.iter().any(|t| Some(t) != terms.first()) {
+                    self.chose.set(true);
                 }
                 // the result is a plain string, whatever the languages of the values
                 Some(string_term(parts.join(&sep)))
