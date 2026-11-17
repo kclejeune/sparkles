@@ -381,9 +381,10 @@ fn n1_nested_footnotes_end() {
 }
 
 // Re-review N5: a deflate bomb whose header says the part is 1 KiB. Since zip 9 the
-// reader itself refuses to inflate past the declared size, so the part is reported as
-// corrupt after about 1 KiB, and the bounded read (`take(cap + 1)`) stays as the second
-// bound. Either way the conversion fails without unpacking the bomb.
+// reader refuses to inflate past the declared size, so the part is reported as corrupt
+// after about 1 KiB. The bounded read (`take(cap + 1)`) in the package reader stays as
+// defence in depth that no test reaches, since a declared size over the cap is refused
+// before the read and one under it is enforced by zip.
 #[test]
 fn a_deflate_bomb_with_a_lying_header_stops_at_the_part_limit() {
     let _g = serial();
