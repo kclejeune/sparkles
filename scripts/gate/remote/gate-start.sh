@@ -18,10 +18,12 @@
 #   --note        a line to record in progress.log before the run is queued
 #   --min-free-gib  on a Boat worker, the free space the run needs after the cleanup (default 110)
 #
-# The memory cap is the smaller of 24G and the host's RAM less 2G, with 2G of swap.
-# GATE_MEMORY_MAX overrides it. The default number of compile jobs is the cap in GiB less
-# one, halved, from 2 to 8, which gives 6 at a 13G cap and 8 at a 24G cap. A Rust test build
-# at 4 jobs peaked at about 9 GiB of process memory.
+# The memory cap is the smaller of 24G and the host's RAM less 2G, with 2G of swap, and
+# GATE_MEMORY_MAX overrides it. On a Boat worker the cap is the 12G job that qualification
+# admits, and GATE_MEMORY_MAX can only lower it there. The default number of compile jobs
+# is the cap in GiB less one, halved, from 2 to 8, which gives 5 at a 12G cap, 6 at a 13G
+# cap and 8 at a 24G cap. A Rust test build at 4 jobs peaked at about 9 GiB of process
+# memory.
 set -euo pipefail
 # The worktree, the out directory and everything the run writes are private to the user, as
 # on a laptop with the usual umask. A host whose login umask is 002 would otherwise create
@@ -170,10 +172,25 @@ if [ -n "$note" ]; then echo "$(date -u +%FT%TZ) $note" >> "$out/progress.log"; 
 total_g=$(awk '$1 == "MemTotal:" { print int($2 / 1048576) }' /proc/meminfo)
 mem_g=$((total_g - 2))
 [ "$mem_g" -gt 24 ] && mem_g=24
+# Qualification admits a Boat worker for a job of BOAT_JOB_MEMORY_GIB in
+# scripts/boat/metadata-probe.py, so a run there takes that cap and no more.
+boat_mem_g=12
+[ "$executor" != boat ] || mem_g=$boat_mem_g
 mem=${mem_g}G
 if [ -n "${GATE_MEMORY_MAX:-}" ]; then
   mem=$GATE_MEMORY_MAX
   case $mem in *G) mem_g=${mem%G} ;; esac
+  if [ "$executor" = boat ]; then
+    case $mem in [1-9]G | [1-9][0-9]G) ;; *)
+      echo "GATE_MEMORY_MAX on a Boat worker must be a whole number of G, not $mem" >&2
+      exit 2
+      ;;
+    esac
+    if [ "$mem_g" -gt "$boat_mem_g" ]; then
+      echo "GATE_MEMORY_MAX=$mem is over the ${boat_mem_g}G job that Boat qualification admits" >&2
+      exit 2
+    fi
+  fi
 fi
 if [ -z "$cargo_jobs" ]; then
   cargo_jobs=$(((mem_g - 1) / 2))

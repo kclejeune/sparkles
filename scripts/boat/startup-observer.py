@@ -255,6 +255,7 @@ def own_cgroup_memory(unit,proc_cgroup=Path('/proc/self/cgroup'),root=Path('/sys
         return {'source':'cgroup','cgroup':line[3:],'memory_peak':int(peak),'swap_peak':int(swap)}
     except Exception as error:return {'source':'unavailable','reason_code':reason_code(error)}
 
+MEMORY_SERIES_MAX=64
 def run_phase(payload,observe,qualify,clock=time.monotonic):
     """One remote phase's result. Every refusal carries a bounded reason code."""
     started=clock()
@@ -264,6 +265,10 @@ def run_phase(payload,observe,qualify,clock=time.monotonic):
         # A source drift names each recorded field beside the observed one.
         drift=drift_evidence(getattr(error,'source_drift',None))
         if drift is not None:result['source_drift']=drift
+        # A refused memory headroom names every reading it took.
+        if isinstance(getattr(error,'memory_series',None),list):result['memory_series']=error.memory_series[:MEMORY_SERIES_MAX]
+        # A busy refusal names the startup work it last saw, bounded like a checkpoint's.
+        if isinstance(getattr(error,'unallowed',None),list):result.update(unallowed=error.unallowed[:UNALLOWED_MAX],unallowed_count=error.unallowed_count)
     closed=result.get('startup_closed')is True if payload['phase']!='metadata' else result.get('qualified')is True
     if not closed:result.setdefault('reason_code','unreported')
     result['elapsed_seconds']=round(clock()-started,3)
@@ -286,14 +291,107 @@ def observe_startup(payload):
     result.update({'memory_max':'536870912','swap_max':'0','loaded_properties':properties,'memory_events':events})
     return result
 
-def qualify_with_startup_lock(payload):
-    home=Path.home();uid=os.getuid();token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat';tracked=set()
+# The provider's agent service runs short shells of the worker's uid in the first
+# minutes after a resume, such as bash, or bash running bash and sudo, observed on
+# bx_gy2ytgh8 in ops/w1-7 at 146 s of uptime. A shell with children counts as startup
+# work, so a single scan before and after the probe refused four qualifications
+# (w3-1, w5-1, w6-3, w1-7) whose manifests had not changed for days. The metadata phase
+# therefore waits for QUIET_SECONDS of consecutive scans that find no startup work
+# before each probe, and runs the probe again when the scan after it finds some.
+# It holds the bootstrap lock through every attempt, so no bootstrap can run
+# meanwhile. A manifest that differs from its first read refuses at once. An
+# accepted probe always lies between a quiet window and a clean scan. One tracked set
+# spans the whole phase, so a descendant of startup work stays startup work after its
+# parents exit, wherever it is reparented. The one exception is the agent's own shell
+# or sudo, the session processes allowed only by their children (SESSION_CHILDREN).
+# An identity is releasable only when the scan that first tracked it found it refused
+# for its children alone and could read the device and inode of its executable. It
+# leaves the set only while its name and executable are the ones it had then and it is
+# again an allowed session process. Its former descendants stay in the set, and a
+# process renamed to bash or sudo, or one whose executable has changed, is never released. No probe starts
+# QUALIFY_SECONDS or more after the phase began, inside the metadata unit's 240
+# seconds, the user-manager query gets only the time left, and a refusal keeps the
+# last busy inventory.
+QUIET_SECONDS=5
+QUALIFY_SECONDS=120
+QUALIFY_ATTEMPTS=6
+SCAN_PAUSE=0.5
+
+def with_inventory(error,seen):
+    """The refusal with the bounded inventory of the last startup work seen.
+
+    Each caller names its reason as a literal Refusal, so the controller's
+    packet_refusals() knows it."""
+    rows,busy=seen if seen is not None else ({},[])
+    error.unallowed=unallowed_inventory(rows,busy);error.unallowed_count=len(busy)
+    return error
+
+def exe_identity(pid,proc=Path('/proc')):
+    """The device and inode of the process's executable, or None when it cannot be read."""
+    try:s=os.stat(proc/str(pid)/'exe');return (s.st_dev,s.st_ino)
+    except OSError:return None
+
+def refused_for_children_only(pid,rows,manager):
+    """Whether this agent shell or sudo is an allowed session process apart from its children."""
+    if rows[pid]['comm'] not in SESSION_CHILDREN:return False
+    return provider_session(pid,{p:r for p,r in rows.items() if r['ppid']!=pid},manager)
+
+def release_idle_session(tracked,releasable,rows,manager,exe_reader=exe_identity):
+    """Drop from ``tracked`` the releasable agent shells and sudos that are allowed session processes again.
+
+    ``releasable`` maps each such identity to the name and executable identity it had
+    when it was first tracked. An executable that differs or cannot be read keeps it."""
+    for (pid,start),(comm,exe) in list(releasable.items()):
+        row=rows.get(pid)
+        if row is None or row['start']!=start:releasable.pop((pid,start));continue
+        if row['comm']==comm and provider_session(pid,rows,manager) and exe_reader(pid)==exe:
+            tracked.discard((pid,start));releasable.pop((pid,start))
+
+def quiet_window(scan,clock,pause,deadline,seconds=QUIET_SECONDS):
+    """Wait, within the deadline, until consecutive scans find no startup work for ``seconds``.
+
+    Returns True and None when the window held before the deadline, otherwise False
+    and the last busy scan, if any."""
+    since=None;seen=None
+    while clock()<deadline:
+        rows,busy=scan()
+        if busy:since=None;seen=(rows,busy)
+        elif since is None:since=clock()
+        elif clock()-since>=seconds:return clock()<deadline,seen
+        pause(min(SCAN_PAUSE,max(0.0,deadline-clock())))
+    return False,seen
+
+def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows,left:None,exe_reader=exe_identity):
+    """The metadata probe between a quiet startup window and a clean scan, under the bootstrap lock."""
+    deadline=clock()+QUALIFY_SECONDS;seen=None;attempts=0;tracked=set();releasable={}
+    def scan():
+        rows=rows_reader();left=deadline-clock();manager=manager_reader(rows,left) if left>0 else None
+        release_idle_session(tracked,releasable,rows,manager,exe_reader)
+        known=set(tracked);busy=foreign_startup(rows,launcher,probe_pid,tracked,manager)
+        for pid,start in tracked-known:
+            if pid in rows and rows[pid]['start']==start and refused_for_children_only(pid,rows,manager):
+                exe=exe_reader(pid)
+                if exe is not None:releasable[(pid,start)]=(rows[pid]['comm'],exe)
+        return rows,busy
     with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
         before,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
-        need(before['sha256']==payload['pins']['saved_toolchain_manifest_sha256'],'qualification manifest pin')
-        rows=process_rows();need(not foreign_startup(rows,payload['launcher_identity'],os.getpid(),tracked,user_manager(rows,uid)),'startup not quiescent before tools')
-        result=probe(payload)
-        after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
-        rows=process_rows();need(after==before and not foreign_startup(rows,payload['launcher_identity'],os.getpid(),tracked,user_manager(rows,uid)),'startup/source drift during qualification')
-        result.update({'startup_closed':True,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','actual_toolchain_manifest':{'path':str(state/'toolchain.json'),'sha256':before['sha256']},'runtime_env_file':None})
-        return result
+        need(before['sha256']==expected_manifest,'qualification manifest pin')
+        while attempts<QUALIFY_ATTEMPTS:
+            quiet,window_seen=quiet_window(scan,clock,pause,deadline)
+            seen=window_seen or seen
+            # A window that held only at or after the deadline starts no probe.
+            if not quiet or clock()>=deadline:break
+            attempts+=1;result=run_probe(max(0.0,deadline-clock()))
+            after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
+            need(after==before,'startup manifest changed during qualification')
+            rows,busy=scan()
+            if not busy:
+                result.update({'startup_closed':True,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','actual_toolchain_manifest':{'path':str(state/'toolchain.json'),'sha256':before['sha256']},'runtime_env_file':None,'qualification_attempts':attempts})
+                return result
+            seen=(rows,busy)
+        if attempts==0:raise with_inventory(Refusal('startup not quiescent before tools'),seen)
+        raise with_inventory(Refusal('startup work during qualification'),seen)
+
+def qualify_with_startup_lock(payload):
+    home=Path.home();uid=os.getuid();token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat'
+    return qualify_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],lambda left:probe(payload,left),manager_reader=lambda rows,left:user_manager(rows,uid,left))

@@ -277,6 +277,155 @@ class MemoryAdmission(unittest.TestCase):
         with self.assertRaises(mp.Refusal):mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),rows)
 
 
+class BoatJobMemory(unittest.TestCase):
+    """Qualification admits a job of BOAT_JOB_MEMORY_GIB, and every Boat job unit has that cap."""
+    def test_the_headroom_and_its_refusal_follow_the_job_figure(self):
+        mp=metadata_probe();g=mp.BOAT_JOB_MEMORY_GIB
+        self.assertEqual(g,12)
+        self.assertEqual(mp.JOB_HEADROOM,g*2**30+512*2**20+2**30)
+        source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
+        self.assertIn(f"'insufficient host headroom for proposed{g}GiB job'",source)
+
+    def test_every_boat_job_cap_is_the_admitted_job(self):
+        import re
+        g=metadata_probe().BOAT_JOB_MEMORY_GIB;scripts=Path(__file__).resolve().parents[1]
+        ci=(scripts/'remote-ci.sh').read_text()
+        boat=ci[ci.index('executor=boat'):ci.index('executor=ssh')]
+        self.assertEqual(re.findall(r'memory_max=(\S+)',boat),[f'{g}G'])
+        screen=(scripts/'remote-screen.sh').read_text()
+        self.assertEqual(set(re.findall(r'MemoryMax=(\S+)',screen)),{f'{g}G'})
+        gate=(scripts/'gate/remote/gate-start.sh').read_text()
+        self.assertEqual(re.findall(r'^boat_mem_g=(\S+)$',gate,re.M),[str(g)])
+        build=(scripts/'nsc-build-host.sh').read_text()
+        self.assertEqual(re.findall(r'SPARKLES_NSC_BUILD_MEMORY_MAX=(\S+?)\s',build),[f'{g}G'])
+
+    def test_the_admission_edge(self):
+        mp=metadata_probe();total=16768798720
+        def meminfo(nonreclaimable):
+            return meminfo_text({'MemTotal':total//1024,'MemAvailable':(total-nonreclaimable)//1024,'AnonPages':nonreclaimable//1024})
+        mp.memory_admission(meminfo(total-mp.JOB_HEADROOM),[])
+        with self.assertRaises(mp.Refusal) as e:mp.memory_admission(meminfo(total-mp.JOB_HEADROOM+1024),[])
+        self.assertEqual(str(e.exception),'insufficient host headroom for proposed12GiB job')
+        # A restored worker measured 1.4 to 2.03 GiB at the probe and was refused at 2.12 GiB.
+        mp.memory_admission(meminfo(int(2.0*2**30)),[])
+        with self.assertRaises(mp.HeadroomRefusal):mp.memory_admission(meminfo(int(2.3*2**30)),[])
+
+
+def kib(gib):
+    return int(gib*2**20)*1024
+
+
+class ResampledMemory(unittest.TestCase):
+    """A refused headroom is read again for a bounded time, and nothing else is."""
+    TOTAL=16768798720
+    def reading(self,nonreclaimable,**kw):
+        host=meminfo_text({'MemTotal':self.TOTAL//1024,'MemAvailable':(self.TOTAL-nonreclaimable)//1024,'AnonPages':nonreclaimable//1024})
+        return host,kw.get('ancestors',[])
+
+    def run_series(self,values,limit=1000.0,**kw):
+        """Run settled_memory over readings of the given host figures, a second per pause, and return what it did."""
+        mp=metadata_probe();now=[0.0];reads=[];sleeps=[]
+        def read():
+            reads.append(now[0]);return values[min(len(reads)-1,len(values)-1)] if not callable(values) else values(len(reads))
+        def pause(seconds):sleeps.append(seconds);now[0]+=seconds
+        try:result=mp.settled_memory(read,lambda:now[0],pause,limit,**kw)
+        except mp.Refusal as error:result=error
+        return mp,result,reads,sleeps
+
+    def test_a_first_reading_that_admits_reads_once_and_never_waits(self):
+        mp=metadata_probe();ok=self.reading(kib(1.5))
+        mp,memory,reads,sleeps=self.run_series([ok])
+        self.assertEqual((reads,sleeps),([0.0],[]))
+        self.assertEqual([x['admitted'] for x in memory[0]['memory_series']],[True])
+
+    def test_a_transient_excess_that_settles_admits_on_two_readings_in_a_row(self):
+        gib=2**30;high=self.reading(kib(2.6));low=self.reading(kib(1.5))
+        mp,(memory,_),reads,sleeps=self.run_series([high,high,low,low])
+        self.assertEqual(reads,[0.0,2.0,4.0,6.0])
+        series=memory['memory_series']
+        self.assertEqual([x['admitted'] for x in series],[False,False,True,True])
+        self.assertEqual([x['at'] for x in series],[0.0,2.0,4.0,6.0])
+        self.assertEqual(series[0]['host_nonreclaimable'],kib(2.6))
+
+    def test_one_low_reading_between_high_ones_does_not_admit(self):
+        gib=2**30;high=self.reading(kib(2.6));low=self.reading(kib(1.5))
+        mp,error,reads,sleeps=self.run_series([high,low,high,high,high],limit=8.0)
+        self.assertIsInstance(error,mp.HeadroomRefusal)
+        self.assertEqual(str(error),'insufficient host headroom for proposed12GiB job')
+        self.assertEqual([x['admitted'] for x in error.memory_series],[False,True,False,False,False])
+
+    def test_a_worker_that_stays_over_refuses_when_the_window_ends(self):
+        high=self.reading(kib(2.6))
+        mp,error,reads,sleeps=self.run_series([high])
+        self.assertEqual(str(error),'insufficient host headroom for proposed12GiB job')
+        self.assertLessEqual(reads[-1],mp.MEMORY_RESAMPLE_SECONDS)
+        self.assertGreater(reads[-1],mp.MEMORY_RESAMPLE_SECONDS-mp.MEMORY_RESAMPLE_INTERVAL)
+        self.assertEqual(len(error.memory_series),len(reads))
+        self.assertTrue(all(row['admitted'] is False for row in error.memory_series))
+
+    def test_the_window_ends_with_the_units_clock(self):
+        high=self.reading(kib(2.6))
+        mp,error,reads,sleeps=self.run_series([high],limit=5.0)
+        self.assertEqual(reads,[0.0,2.0,4.0])
+        # The unit keeps PROBE_RESERVE seconds of its RuntimeMax.
+        self.assertEqual(mp.unit_limit(started=100.0),100.0+mp.PROBE_RUNTIME-mp.PROBE_RESERVE)
+        self.assertLess(mp.PROBE_RESERVE,mp.PROBE_RUNTIME-mp.MEMORY_RESAMPLE_SECONDS)
+
+    def test_a_pause_that_runs_past_the_window_ends_it_without_another_reading(self):
+        low=self.reading(kib(1.5));high=self.reading(kib(2.6))
+        # A refusal at 0, a pause that ends at 5 and a limit of 4, with an admitting reading ready.
+        mp=metadata_probe();now=[0.0];reads=[]
+        def read():reads.append(now[0]);return [high,low,low][len(reads)-1]
+        def pause(seconds):now[0]+=5.0
+        with self.assertRaises(mp.HeadroomRefusal) as caught:mp.settled_memory(read,lambda:now[0],pause,4.0)
+        self.assertEqual(reads,[0.0]);self.assertEqual([x['admitted'] for x in caught.exception.memory_series],[False])
+        # A pause that ends inside the window reads again.
+        reads.clear();now[0]=0.0
+        def short(seconds):now[0]+=3.0
+        with self.assertRaises(mp.HeadroomRefusal):mp.settled_memory(read,lambda:now[0],short,4.0)
+        self.assertEqual(reads,[0.0,3.0])
+
+    def test_an_expired_limit_takes_the_first_reading_only(self):
+        low=self.reading(kib(1.5));high=self.reading(kib(2.6))
+        mp,(memory,_),reads,sleeps=self.run_series([low],limit=-1.0)
+        self.assertEqual((reads,sleeps),([0.0],[]))
+        mp,error,reads,sleeps=self.run_series([high],limit=-1.0)
+        self.assertIsInstance(error,mp.HeadroomRefusal);self.assertEqual((reads,sleeps),([0.0],[]))
+        self.assertEqual(len(error.memory_series),1)
+
+    def test_a_structural_refusal_reads_once_and_never_waits(self):
+        gib=2**30;mp=metadata_probe()
+        bad_host=('MemTotal: 16000000 kB\n',[])
+        stat=cgroup_stat(gib,gib,0,current=2*gib)
+        rows=lambda **extra:[{'path':'/sys/fs/cgroup/user.slice','memory.max':str(16*gib),**extra}]
+        for name,value in [('meminfo',bad_host),('no stat',(meminfo_text({'MemTotal':self.TOTAL//1024,'AnonPages':1}),rows())),
+                           ('bad stat',(meminfo_text({'MemTotal':self.TOTAL//1024,'AnonPages':1}),rows(**{'memory.stat':'file 1'})))]:
+            with self.subTest(name):
+                mp,error,reads,sleeps=self.run_series([value])
+                self.assertIsInstance(error,mp.Refusal);self.assertNotIsInstance(error,mp.HeadroomRefusal)
+                self.assertEqual((len(reads),sleeps),(1,[]))
+
+    def test_an_ancestor_over_its_headroom_is_read_again_too(self):
+        gib=2**30;mp=metadata_probe()
+        def ancestors(anon):
+            stat=cgroup_stat(anon,gib,0,current=anon+gib+100*2**20)
+            return [{'path':'/sys/fs/cgroup/user.slice','memory.max':str(16*gib),'memory.stat':stat}]
+        host=self.reading(gib)[0]
+        values=[(host,ancestors(3*gib)),(host,ancestors(gib)),(host,ancestors(gib))]
+        mp,(memory,_),reads,sleeps=self.run_series(values)
+        self.assertEqual([x['admitted'] for x in memory['memory_series']],[False,True,True])
+        self.assertEqual(memory['memory_series'][0]['ancestor_nonreclaimable'],3*gib+100*2**20)
+
+    def test_the_refused_series_reaches_the_phase_result_and_its_evidence(self):
+        mp,error,reads,sleeps=self.run_series([self.reading(kib(2.6))],limit=3.0)
+        self.assertEqual(len(error.memory_series),2)
+        row=controller.phase_evidence({'memory_series':error.memory_series+['x',{'at':'no','host_nonreclaimable':-1}]})
+        self.assertEqual([x['admitted'] for x in row['evidence']['memory_series']],[False,False,False])
+        self.assertEqual(row['evidence']['memory_series'][-1]['host_nonreclaimable'],None)
+        self.assertIn('insufficient host headroom for proposed12GiB job',controller.packet_refusals())
+        self.assertIn('ancestor memory headroom',controller.packet_refusals())
+
+
 class LifetimeExtension(unittest.TestCase):
     """An explicit, receipted extension of one running qualified worker."""
     def setUp(self):
@@ -1096,6 +1245,274 @@ class ProviderSessionTrees(unittest.TestCase):
                 rows=copy.deepcopy(self.rows);change(rows);self.assertEqual(self.busy(rows),expected)
         # Without the system manager's own identity, its children are not allowed.
         self.assertIn(14086,self.busy(manager=None))
+
+
+class QualificationWait(unittest.TestCase):
+    """The metadata phase's wait for the provider agent's post-resume shells.
+
+    The trees are the diagnostics that the controller took about a second after the
+    refusals of ops/w3-1, ops/w5-1, ops/w6-3 and ops/w1-7. Only w1-7's tree still shows
+    the offender. In the other three it had already ended, so their tests add a
+    transient child to the agent shell that the tree does show, which is a
+    reconstruction."""
+    def setUp(self):
+        self.O=controls.OBSERVER;self.O['bind_profile'](controls.synthetic_profile())
+        d=json.loads((Path(__file__).parent/'fixtures/boat-qualify-refusals.json').read_text())
+        self.trees={}
+        for op,t in d['trees'].items():
+            rows={r['pid']:dict(r,group=r['pid']) for r in t['rows']}
+            self.trees[op]=(rows,{'pid':t['probe'],'start':rows[t['probe']]['start']},t['probe'],tuple(t['manager']))
+        self.dir=tempfile.TemporaryDirectory(prefix='boat-qualify-wait-');self.addCleanup(self.dir.cleanup)
+        self.state=Path(self.dir.name);(self.state/'bootstrap.lock').touch(mode=0o600)
+        self.manifest=self.state/'toolchain.json';self.manifest.write_text('ASCII_MANIFEST');self.manifest.chmod(0o600)
+        self.expected=hashlib.sha256(self.manifest.read_bytes()).hexdigest()
+
+    def busy(self,op,rows=None):
+        tree,launcher,probe,manager=self.trees[op]
+        return {x['pid'] for x in self.O['foreign_startup'](tree if rows is None else rows,launcher,probe,set(),manager)}
+
+    def without(self,op,*pids):
+        rows=copy.deepcopy(self.trees[op][0])
+        for pid in pids:del rows[pid]
+        return rows
+
+    def with_child(self,op,parent,comm='sleep',uid=1000,pid=99001):
+        rows=copy.deepcopy(self.trees[op][0]);rows[pid]={'pid':pid,'ppid':parent,'uid':uid,'comm':comm,'start':rows[parent]['start']+1,'group':pid}
+        return rows
+
+    def qualify(self,op,readers,probe=None,exe=None):
+        """Runs qualify_at with one tree per scan, the last one repeating.
+
+        A process's executable identity is its row's 'exe' field, or its name when the row
+        has none, as of the latest scan; ``exe`` overrides the reader."""
+        _,launcher,probe_pid,manager=self.trees[op];clock=controls.Clock();self.scans=[];self.probes=[];current={}
+        def rows():
+            self.scans.append(clock.now());current['rows']=readers[min(len(self.scans)-1,len(readers)-1)];return current['rows']
+        def exe_reader(pid):
+            row=current['rows'].get(pid);return None if row is None else ('fs',row.get('exe',row['comm']))
+        def run_probe(left=None):
+            self.probes.append((clock.now(),len(self.scans)))
+            if probe:probe()
+            return {'qualified':True}
+        return self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,exe or exe_reader)
+
+    def test_the_recorded_trees(self):
+        # w1-7 still shows the agent's shell running a shell that runs sudo.
+        self.assertEqual(self.busy('w1-7'),{10872,10916,10927})
+        self.assertEqual(self.busy('w1-7',self.without('w1-7',10872,10916,10927)),set())
+        # In w6-3 and w5-1 the offender had already ended, leaving a childless agent shell.
+        self.assertEqual(self.busy('w6-3'),set());self.assertEqual(self.busy('w5-1'),set())
+        self.assertEqual(self.busy('w6-3',self.with_child('w6-3',67279)),{67279,99001})
+        self.assertEqual(self.busy('w5-1',self.with_child('w5-1',31555)),{31555,99001})
+        # w3-1 was refused before its probe, with an agent shell 12 s old.
+        self.assertEqual(self.busy('w3-1'),set());self.assertEqual(self.busy('w3-1',self.with_child('w3-1',9009)),{9009,99001})
+
+    def test_w3_1_waits_before_its_first_probe(self):
+        clean=self.trees['w3-1'][0];child=self.with_child('w3-1',9009)
+        q=self.qualify('w3-1',[child]*4+[clean])
+        self.assertEqual(q['qualification_attempts'],1);self.assertEqual(len(self.probes),1)
+        self.assertGreaterEqual(self.probes[0][0]-self.scans[4],self.O['QUIET_SECONDS'])
+
+    def test_w1_7_waits_for_the_agent_command_to_end(self):
+        busy=self.trees['w1-7'][0];clean=self.without('w1-7',10872,10916,10927)
+        q=self.qualify('w1-7',[busy]*20+[clean])
+        self.assertTrue(q['startup_closed']);self.assertEqual(q['qualification_attempts'],1)
+        # The probe ran once, after a quiet window that began only when the command ended.
+        self.assertEqual(len(self.probes),1);self.assertGreaterEqual(self.probes[0][0]-self.scans[20],self.O['QUIET_SECONDS'])
+
+    def test_a_shell_busy_after_the_probe_reruns_it(self):
+        for op,shell in (('w6-3',67279),('w5-1',31555),('w3-1',9009)):
+            with self.subTest(op):
+                clean=self.trees[op][0];child=self.with_child(op,shell)
+                # Quiet window, probe, then a transient child, then the shell is childless again.
+                readers=[clean]*11+[child]+[clean]
+                q=self.qualify(op,readers)
+                self.assertEqual(q['qualification_attempts'],2);self.assertEqual(len(self.probes),2)
+                # The second probe followed its own full quiet window after the busy scan.
+                self.assertGreaterEqual(self.probes[1][0]-self.scans[12],self.O['QUIET_SECONDS'])
+
+    def test_persistent_startup_work_refuses_with_its_inventory(self):
+        busy=self.trees['w1-7'][0]
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w1-7',[busy])
+        self.assertEqual(str(caught.exception),'startup not quiescent before tools');self.assertEqual(self.probes,[])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{10872,10916,10927});self.assertEqual(caught.exception.unallowed_count,3)
+        self.assertLessEqual(self.scans[-1],self.O['QUALIFY_SECONDS'])
+        # The phase result keeps that inventory, so the controller's refusal record names it.
+        def qualify(payload):self.qualify('w1-7',[busy])
+        result,closed=self.O['run_phase']({'phase':'metadata'},None,qualify)
+        self.assertFalse(closed);self.assertEqual(result['reason_code'],'refusal:startup not quiescent before tools')
+        self.assertEqual(result['unallowed_count'],3)
+        row=controller.phase_evidence(result)['unallowed'];self.assertEqual({x['comm'] for x in row},{'bash','sudo'})
+        self.assertEqual(controller.remote_reason(result['reason_code']),result['reason_code'])
+
+    def test_a_refused_memory_headroom_keeps_its_readings_in_the_phase_result(self):
+        now=[0.0]
+        high=(meminfo_text({'MemTotal':16375784,'MemAvailable':1,'AnonPages':kib(2.6)//1024}),[])
+        def qualify(payload):
+            def pause(seconds):now[0]+=seconds
+            self.O['settled_memory'](lambda:high,lambda:now[0],pause,now[0]+5.0)
+        result,closed=self.O['run_phase']({'phase':'metadata'},None,qualify)
+        self.assertFalse(closed);self.assertEqual(result['reason_code'],'refusal:insufficient host headroom for proposed12GiB job')
+        self.assertEqual(controller.remote_reason(result['reason_code']),result['reason_code'])
+        self.assertEqual([x['at'] for x in result['memory_series']],[0.0,2.0,4.0])
+        self.assertEqual(len(controller.phase_evidence(result)['evidence']['memory_series']),3)
+
+    def test_work_after_every_probe_refuses_within_the_bound(self):
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279)
+        # The child appears in every scan that follows a probe.
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock();probes=[];after=[False]
+        def rows():
+            if after[0]:after[0]=False;return child
+            return clean
+        def run_probe(left=None):
+            probes.append(clock.now());after[0]=True;return {'qualified':True}
+        with self.assertRaises(self.O['Refusal']) as caught:
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
+        self.assertEqual(str(caught.exception),'startup work during qualification')
+        self.assertEqual(len(probes),self.O['QUALIFY_ATTEMPTS']);self.assertLess(probes[-1],self.O['QUALIFY_SECONDS'])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{67279,99001})
+        self.assertEqual(controller.remote_reason('refusal:startup work during qualification'),'refusal:startup work during qualification')
+
+    def test_a_slow_probe_stops_new_attempts_at_the_bound(self):
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279);clock_holder={}
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock();probes=[];after=[False]
+        def rows():
+            if after[0]:after[0]=False;return child
+            return clean
+        def run_probe(left=None):
+            probes.append(clock.now());clock.pause(50);after[0]=True;return {'qualified':True}
+        with self.assertRaises(self.O['Refusal']):
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
+        self.assertTrue(all(t<self.O['QUALIFY_SECONDS'] for t in probes));self.assertEqual(len(probes),3)
+
+    def test_each_probe_is_given_the_time_left_in_the_phase(self):
+        clean=self.trees['w6-3'][0];lefts=[]
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock()
+        def run_probe(left):
+            lefts.append((clock.now(),left));return {'qualified':True}
+        self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,lambda:clean,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
+        (at,left),=lefts
+        self.assertGreater(left,0);self.assertLess(left,self.O['QUALIFY_SECONDS'])
+        # The deadline is fixed on entry, before anything the probe does first.
+        source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
+        body=source[source.index('def probe(payload'):]
+        self.assertLess(body.index('boot()+left'),body.index('validate_runtime('))
+        self.assertLess(body.index('boot()+left'),body.index("command(['systemctl'"))
+        self.assertEqual(body.count('boot()+left'),1)
+
+    def test_the_memory_wait_comes_before_every_source_observation(self):
+        source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
+        body=source[source.index('def probe(payload'):]
+        self.assertLess(body.index('settled_memory('),body.index('startup_source('))
+        self.assertLess(body.index('settled_memory('),body.index("'toolchain.json'"))
+
+    def test_a_manifest_change_refuses_at_once(self):
+        clean=self.trees['w6-3'][0]
+        def rewrite():self.manifest.write_text('ASCII_MANIFEST_CHANGED')
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[clean],rewrite)
+        self.assertEqual(str(caught.exception),'startup manifest changed during qualification');self.assertEqual(len(self.probes),1)
+        self.assertEqual(controller.remote_reason('refusal:startup manifest changed during qualification'),'refusal:startup manifest changed during qualification')
+        # A manifest other than the pin refuses before any scan or probe.
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[clean])
+        self.assertEqual(str(caught.exception),'qualification manifest pin');self.assertEqual(self.scans,[])
+
+    def test_an_installer_under_the_agent_shell_still_refuses(self):
+        for comm,uid in (('apt-get',0),('rustup',1000),('mise',1000)):
+            with self.subTest(comm):
+                with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[self.with_child('w6-3',67279,comm,uid)])
+                self.assertEqual(str(caught.exception),'startup not quiescent before tools');self.assertEqual(self.probes,[])
+
+    def add(self,rows,pid,ppid,comm,uid=1000):
+        rows[pid]={'pid':pid,'ppid':ppid,'uid':uid,'comm':comm,'start':rows[ppid]['start']+1 if ppid in rows else 1,'group':pid};return rows
+
+    def test_a_reparented_descendant_of_an_agent_command_stays_startup_work(self):
+        # Review round 16, finding 1. The agent shell runs sudo, sh and a root tar. The
+        # shell, sudo and sh then exit or go idle and tar is reparented to pid 1, where
+        # neither its uid nor its name would count it. It stays tracked until it ends.
+        tree=self.trees['w6-3'][0]
+        busy=self.add(self.add(self.add(copy.deepcopy(tree),99001,67279,'sudo'),99002,99001,'sh',0),99003,99002,'tar',0)
+        orphan=copy.deepcopy(tree);orphan[99003]=dict(busy[99003],ppid=1)
+        self.assertEqual(self.busy('w6-3',orphan),set())
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[busy,orphan])
+        self.assertEqual(str(caught.exception),'startup not quiescent before tools');self.assertEqual(self.probes,[])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{99003})
+        # Once tar ends, the idle agent shell is released and the phase qualifies.
+        q=self.qualify('w6-3',[busy]+[orphan]*10+[tree])
+        self.assertEqual(q['qualification_attempts'],1);self.assertGreaterEqual(self.probes[0][0]-self.scans[11],self.O['QUIET_SECONDS'])
+        # The same descendant appearing after a probe holds off the next one too.
+        q=self.qualify('w6-3',[tree]*11+[busy]+[orphan]*10+[tree])
+        self.assertEqual(q['qualification_attempts'],2);self.assertGreaterEqual(self.probes[1][0]-self.scans[22],self.O['QUIET_SECONDS'])
+
+    def test_only_the_agent_shell_and_sudo_are_released(self):
+        # A session-named process under startup work stays tracked after it is reparented,
+        # where its name and chain alone would allow it.
+        tree=self.trees['w6-3'][0]
+        busy=self.add(self.add(copy.deepcopy(tree),99001,67279,'apt-get',0),99002,99001,'pulseaudio')
+        orphan=copy.deepcopy(tree);orphan[99002]=dict(busy[99002],ppid=1)
+        self.assertEqual(self.busy('w6-3',orphan),set())
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[busy,orphan])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{99002})
+
+    def test_a_process_renamed_to_the_agent_shell_is_not_released(self):
+        # Review round 16, second pass. A python3 under the agent service is tracked, then
+        # renames itself to bash with the same pid and start; it stays startup work.
+        tree=self.trees['w6-3'][0]
+        busy=self.add(copy.deepcopy(tree),99001,4714,'python3')
+        renamed=copy.deepcopy(busy);renamed[99001]['comm']='bash'
+        self.assertEqual(self.busy('w6-3',renamed),set())
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[busy,renamed])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{99001});self.assertEqual(self.probes,[])
+        # A tracked agent shell that renames itself is not released either.
+        child=self.with_child('w6-3',67279);idle=copy.deepcopy(tree);idle[67279]=dict(idle[67279],comm='sudo')
+        with self.assertRaises(self.O['Refusal']):self.qualify('w6-3',[child,idle])
+        # The agent shell itself is released once its child ends.
+        q=self.qualify('w6-3',[child]+[tree]);self.assertEqual(q['qualification_attempts'],1)
+
+    def test_an_agent_shell_that_runs_exec_is_not_released(self):
+        # Review round 16, third pass. The agent shell runs a child, which ends, and then
+        # execs another program that keeps the name bash. It stays startup work.
+        tree=self.trees['w6-3'][0];child=self.with_child('w6-3',67279)
+        execd=copy.deepcopy(tree);execd[67279]=dict(execd[67279],exe='tar')
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[child,execd])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{67279});self.assertEqual(self.probes,[])
+        # An executable that cannot be read when the shell is first tracked keeps it tracked.
+        with self.assertRaises(self.O['Refusal']):self.qualify('w6-3',[child,tree],exe=lambda pid:None)
+        # So does one that cannot be read when it would be released.
+        reads=[]
+        def flaky(pid):
+            reads.append(pid);return ('fs','bash') if len(reads)==1 else None
+        with self.assertRaises(self.O['Refusal']):self.qualify('w6-3',[child,tree],exe=flaky)
+        # The real reader names the executable by device and inode.
+        self.assertEqual(self.O['exe_identity'](os.getpid()),(os.stat('/proc/self/exe').st_dev,os.stat('/proc/self/exe').st_ino))
+        self.assertIsNone(self.O['exe_identity'](2**22+12345))
+
+    def test_no_probe_starts_at_or_after_the_bound(self):
+        # Review round 16, finding 2. A slow user-manager query moves a quiet window past
+        # the bound; no probe may start then, and each query gets only the time left.
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279)
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock();probes=[];lefts=[];scans=[0]
+        def rows():
+            scans[0]+=1;return child if clock.now()<113 else clean
+        def manager_reader(r,left):
+            lefts.append((clock.now(),left))
+            if clock.now()>=113:clock.pause(2)
+            return manager
+        with self.assertRaises(self.O['Refusal']) as caught:
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,lambda left:probes.append(clock.now()) or {'qualified':True},rows,clock.now,clock.pause,manager_reader,lambda pid:('fs','bash'))
+        self.assertEqual(probes,[]);self.assertEqual(str(caught.exception),'startup not quiescent before tools')
+        self.assertTrue(all(0<left<=self.O['QUALIFY_SECONDS'] and abs(now+left-self.O['QUALIFY_SECONDS'])<1e-9 for now,left in lefts))
+
+    def test_the_bootstrap_lock_is_held_through_every_attempt(self):
+        import fcntl
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279);held=[]
+        def probe(left=None):
+            fd=os.open(self.state/'bootstrap.lock',os.O_RDWR)
+            try:
+                try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);held.append(False)
+                except BlockingIOError:held.append(True)
+            finally:os.close(fd)
+        q=self.qualify('w6-3',[clean]*11+[child]+[clean],probe)
+        self.assertEqual(q['qualification_attempts'],2);self.assertEqual(held,[True,True])
 
 class WatchIO(ExtendIO):
     """The fixture's warm operation with a scripted worker job-closure check."""

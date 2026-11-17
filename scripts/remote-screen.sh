@@ -125,6 +125,8 @@ screen_launch() {
     runtime=$((expiry - 30 - $(date +%s)))
     [ "$runtime" -gt 0 ] || return
     text="$(screen_expiry_guard "$SCREEN_UNIT" "$expiry") $text"
+    # The cap is the job that qualification admits, BOAT_JOB_MEMORY_GIB in
+    # scripts/boat/metadata-probe.py.
     screen_exec "systemd-run --user --unit=$SCREEN_UNIT --collect -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=$runtime -p TimeoutStopSec=30 bash -c $(printf '%q' "$text")"
   fi
 }

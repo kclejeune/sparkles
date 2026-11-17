@@ -437,6 +437,25 @@ class Admission(unittest.TestCase):
         self.assertNotIn('MBX_REMOTE_TOKEN_FILE=',build)
         self.assertIn('MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE; do',build)
 
+    def test_a_boat_gate_has_the_cap_that_qualification_admits(self):
+        """A gate on a Boat worker runs at the admitted job's cap, which GATE_MEMORY_MAX can only lower."""
+        text=(ROOT/'scripts/gate/remote/gate-start.sh').read_text()
+        block=text[text.index('total_g=$(awk'):text.index('mode=selected')]
+        with tempfile.TemporaryDirectory() as d:
+            meminfo=Path(d)/'meminfo'
+            def run(executor,total_kib,override=None):
+                meminfo.write_text(f'MemTotal: {total_kib} kB\n')
+                script='set -euo pipefail\nexecutor=%s\ncargo_jobs=\n'%executor+block.replace('/proc/meminfo',str(meminfo))+'echo "$mem $cargo_jobs"\n'
+                env={k:v for k,v in os.environ.items() if k!='GATE_MEMORY_MAX'}
+                if override is not None:env['GATE_MEMORY_MAX']=override
+                return subprocess.run(['bash','-c',script],env=env,capture_output=True,text=True,timeout=30)
+            worker=16375784
+            for executor,total,override,want in [('boat',worker,None,'12G 5'),('ssh',worker,None,'13G 6'),('ssh',32*1048576,None,'24G 8'),
+                                                 ('boat',worker,'9G','9G 4'),('ssh',worker,'20G','20G 8')]:
+                r=run(executor,total,override);self.assertEqual((r.returncode,r.stdout.strip()),(0,want),(executor,override,r.stderr))
+            for override in ['13G','24G','12000M','G']:
+                r=run('boat',worker,override);self.assertEqual(r.returncode,2,(override,r.stdout));self.assertIn('GATE_MEMORY_MAX',r.stderr)
+
     def test_gate_start_makes_its_files_private_whatever_the_login_umask(self):
         """A worker whose login umask is 002 still gets a gate worktree, out directory and unit at umask 022."""
         text=(ROOT/'scripts/gate/remote/gate-start.sh').read_text();lines=text.splitlines()

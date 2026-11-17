@@ -456,8 +456,8 @@ cache = { enabled = true, command_inputs = [
 description = "All Rust tests with cargo-nextest (unit, W3C SPARQL + SHACL suites when the Jena checkout is present), then the doctests"
 depends = ["ui:build"]
 # The first step builds the server's unit-test binary on its own. It and the server binary
-# that the integration tests run each compile the whole server crate, at about 10 GB and
-# 9 GB of rustc memory, and nextest would build them at the same time. Building them one
+# that the integration tests run each compile the whole server crate, at about 11.4 GiB and
+# 8.3 GiB of rustc memory, and nextest would build them at the same time. Building them one
 # after the other halves the peak at the cost of a few minutes. nextest does not run
 # doctests, so `mbx test --doc` runs them afterwards.
 # SPARKLES_CHANGED_PACKAGES, which `scripts/ci.sh --changed BASE` sets, narrows the run to
@@ -1665,10 +1665,13 @@ flag "--profile <path>" required=#true help="private independently admitted prof
 flag "--release <path>" required=#true help="private reviewed finite release"
 '''
 run = '''
+# The controller runs under the system Python, found by its absolute path since a systemd unit
+# needs one. Hosts without /usr/bin/python3, such as NixOS, use the resolved python3 on PATH.
+py=/usr/bin/python3; [ -x "$py" ] || py=$(readlink -f "$(command -v python3)")
 systemd-run --user --wait --pipe --unit="$usage_unit" --property=Type=exec \
   --property=MemoryMax=512M --property=MemorySwapMax=0 --property=RuntimeMaxSec=2700 \
   --property=TimeoutStopSec=30 --property=KillMode=control-group --property=OOMPolicy=continue \
-  /usr/bin/python3 -I -B "$PWD/scripts/boat/controller.py" run \
+  "$py" -I -B "$PWD/scripts/boat/controller.py" run \
   --owned-worker "$usage_worker" --profile "$usage_profile" --release "$usage_release"
 '''
 
@@ -1692,10 +1695,11 @@ run = '''
 set --
 # shellcheck disable=SC2154 # usage_local_unit is a list of unit names
 for unit in ${usage_local_unit:-}; do set -- "$@" --local-unit "$unit"; done
+py=/usr/bin/python3; [ -x "$py" ] || py=$(readlink -f "$(command -v python3)")
 systemd-run --user --unit="$usage_unit" --collect --property=Type=exec \
   --property=MemoryMax=256M --property=MemorySwapMax=0 --property=RuntimeMaxSec=43500 \
   --property=TimeoutStopSec=30 --property=KillMode=control-group --property=OOMPolicy=continue \
-  /usr/bin/python3 -I -B "$PWD/scripts/boat/controller.py" closure-watch \
+  "$py" -I -B "$PWD/scripts/boat/controller.py" closure-watch \
   --operation "$usage_operation" --lead "$usage_lead" "$@"
 '''
 

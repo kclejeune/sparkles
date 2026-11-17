@@ -109,6 +109,13 @@ class RemoteCI(unittest.TestCase):
         # The job removed its worktree and kept its results.
         self.assertFalse((self.home / 'gate' / ('wt-' + name)).exists())
 
+    def test_a_boat_job_has_the_cap_that_qualification_admits(self):
+        # The worker's own GATE_MEMORY_MAX does not raise a Boat job over the admitted job.
+        r = self.run_ci('--base', 'origin/main', GATE_MEMORY_MAX='20G')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        log = self.log.read_text()
+        self.assertIn('prop MemoryMax=12G', log); self.assertNotIn('MemoryMax=20G', log)
+
     @unittest.skipUnless(shutil.which('zsh'), 'zsh is not installed')
     def test_a_host_whose_login_shell_is_zsh_starts_the_job_and_forwards_its_settings(self):
         # An ssh host runs the start command in its login shell, which is zsh on wally.

@@ -62,6 +62,14 @@ including first bootstrap. Actual bootstrap-lock, descendant, tool, manifest, so
 capacity, token metadata and metadata-service closure checks must pass afterward. A
 different manifest is refused rather than adopted automatically.
 
+The metadata probe's memory check admits a 12 GiB job. A headroom refusal alone is read
+again every 2 seconds for at most 60 seconds, and admits only on two readings in a row after
+a refusal. The check runs before any source or manifest is observed, so a wait never leaves
+them unwatched. The wait ends with the time the qualification phase has left and with the
+metadata unit's own clock. The readings are kept as
+`memory_series` in the qualification's `memory_bytes` or in the phase's refusal evidence.
+[Remote executors](../../docs/REMOTE-EXECUTORS.md) describes the figures.
+
 ## Startup closure
 
 The startup observer treats a process of the worker's uid as startup work, apart from
@@ -92,6 +100,29 @@ counts as a restore in progress. Every pause and the user-manager query are cut 
 time left before the observation deadline, and a closure seen after it does not count. The observer
 refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
 `startup_busy:state_restore_in_progress` when that was the last thing it saw.
+
+The metadata phase applies the same process rule around its probe. The provider's agent
+service runs short shells in the first minutes after a resume, and a shell with children
+counts as startup work, so one scan before and one after the probe refused workers whose
+manifest had not changed. The phase therefore takes the bootstrap lock once and holds it
+through every attempt. Before each probe it waits for five seconds of consecutive scans
+that find no startup work, and when the scan after the probe finds some, it waits and
+probes again. One tracked set spans the whole phase, so a descendant of startup work
+stays startup work after its parents exit, wherever it is reparented. Only the agent's
+shell and sudo, which are allowed by their children, can leave the set. One leaves it
+when the scan that first tracked it refused it for its children alone, and it is again
+an allowed session process with the name and the executable, by device and inode, that
+it had then. Its former descendants stay in the set. A process renamed to bash or sudo,
+one whose executable has changed since, and one whose executable cannot be read never
+leave it. The session rule itself still goes by name and chain, so a childless process
+named bash under the agent service passes whatever its executable is, in this phase as
+in the startup phase. A manifest that
+differs from its first read refuses at once with no retry. No probe starts 120 seconds or
+more after the phase began, the user-manager query gets only the time left, and at most
+six probes run, inside the metadata unit's 240 seconds. The
+phase refuses with `startup not quiescent before tools` when no quiet window held, and
+with `startup work during qualification` when startup work followed the last probe. Both
+refusals keep the bounded inventory of the startup work last seen.
 
 ## Phase unit health
 
