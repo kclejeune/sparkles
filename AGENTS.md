@@ -151,16 +151,19 @@ results separately from conversation events.
 
 | Role | Model |
 |---|---|
-| Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Terra or Claude Sonnet 5.5 |
+| Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Sol or Claude Opus 5.5 |
 | Substantive planning, dependencies, validation gates and difficult consults | GPT-6.1 Sol or Claude Opus 5.5 |
 | Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
 | Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
-| Implementation of a well-defined plan and routine fixes | GPT-6.1 Terra or Claude Sonnet 5.5 |
-| Code review and finding validation | Prefer GPT-6.1 Sol for difficult work and GPT-6.1 Terra for straightforward work. Claude Opus 5.5 or Sonnet 5.5 may review when appropriate. |
+| Easy, nearly trivial tasks and the execution of a plan that fixes every step | GPT-6.1 Terra or Claude Sonnet 5.5 |
+| Code review and finding validation | Prefer GPT-6.1 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
 | Mechanical tasks with an exact rule | A plain script. |
-| Broader mechanical tasks, file scans and exploration | Claude Haiku 5.5 or GPT-6 Luna. |
+| Easy tasks that need a lot of context, such as exploration, broad file scans, searches across many files and log triage | Claude Haiku 5.5 or GPT-6 Luna. |
 
 The table is the assignment policy, and it holds whatever model the orchestrator runs.
+Work defaults to Sol or Opus. Terra or Sonnet takes a task only when it is easy or its
+plan fixes every step, and Haiku or Luna takes easy work whose cost is mostly the context
+it must read.
 A coordinating session delegates substantive plans, dependency decisions and validation
 strategy instead of taking them on because it controls the session. A plan names the
 files and behaviour, edge cases, regression checks, acceptance gates and dependencies
@@ -175,8 +178,8 @@ cheaper worker with the required checks. A loader for a documented format, a con
 phase fixed by its test suite and a binding that mirrors an existing API are usually
 routine.
 
-Prefer Sol and Terra for reviews where they suit the work, to preserve Claude usage
-limits. Opus adds an independent perspective on difficult work. Model availability or
+Prefer Sol for reviews, to preserve Claude usage limits. Opus adds an independent
+perspective on difficult work. Model availability or
 quota pressure must not lower the required standard of reasoning or verification, and
 review always uses a separate agent, even when it runs the author's model.
 
@@ -192,7 +195,7 @@ triaging logs, applying a consistent edit across files in varying contexts or sw
 report. They also suit broad scans that find and flag patterns across files, and
 exploration that locates code for another agent. Each task states its rule, its output
 format and how the result will be checked before it starts. If the check fails twice,
-move the task to Terra or Sonnet. Haiku and Luna do not rewrite documentation prose,
+move the task to Sol or Opus. Haiku and Luna do not rewrite documentation prose,
 touch engine, durability, concurrency, planner or performance code, or review and
 validate findings.
 
