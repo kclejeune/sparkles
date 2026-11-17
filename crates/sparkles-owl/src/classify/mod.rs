@@ -165,7 +165,7 @@ const DL_ATTEMPT_FLOOR: usize = 1 << 21;
 
 /// The bound on the conclusions of a run of Tier D without counting or the rooted rules,
 /// per class of the signature, which the EL saturation gives a context each, above
-/// [`DL_ATTEMPT_FLOOR`]. Of the ORE 2015 DL development set's 14 attempts that finish,
+/// [`DL_ATTEMPT_FLOOR`]. Of the ORE 2015 DL development set's 12 attempts that finish,
 /// those above the floor derive at most 212 conclusions per class, ore_ont_16680 with 6.9
 /// million. The three that pass their memory budget, ore_ont_9663, ore_ont_14817 and
 /// ore_ont_3215, derive 38 to 791 million first, 660 to 14,400 per class, in 10 to 88 s

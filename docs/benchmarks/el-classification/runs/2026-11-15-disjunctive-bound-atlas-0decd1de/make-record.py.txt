@@ -2,7 +2,7 @@
 # the laptop's distribution of the attempts' conclusions and the laptop's taxonomy sweep
 import json, sys, os, glob
 lane, dest = sys.argv[1], sys.argv[2]
-keep = ['classifyMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
+keep = ['classifyMs', 'indexMs', 'saturationMs', 'dlTestingMs', 'dlTests', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
         'dlAttemptOver', 'dlWork', 'dlContexts', 'dlStored', 'outside', 'conclusions', 'contexts', 'classes',
         'peakEstimatedBytes', 'peakRssKib', 'threads']
 def rep(p):

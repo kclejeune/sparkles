@@ -1234,7 +1234,8 @@ and their rounds' ratios range from 0.60 to 2.46, so they are left out of the ta
 files derive the same conclusions on both builds on one thread, and on four the counts of
 both builds vary by schedule within the same range. On `ore_ont_6952`, `ore_ont_10140` and
 `ore_ont_11460` the extra time is in the saturation outside the attempt's tests, which take
-under 10 ms and derive under 20,000 conclusions. On one thread on `wally`, an Intel Core
+under 10 ms by the reports' `dlTestingMs`, and the attempts derive under 20,000
+conclusions. On one thread on `wally`, an Intel Core
 i7-12800H, three rounds of the base, the item's build and that build with
 `--dl-attempt-work 0` gave the ratios below, each the ratio of the medians of 15
 classifications. The build is as slow without the bound, so the check of the bound is not

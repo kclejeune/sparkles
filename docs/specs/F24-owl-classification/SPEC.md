@@ -238,7 +238,7 @@ of the signature by default, and at least 2,097,152. Past the bound the run ends
 Horn rules answer, as they do past the memory budget, with `Stats::dl_attempt_over` and
 `Stats::dl_over_budget` set. The bound is a count and not a memory figure, so the number
 of threads does not change it, and it grows with the classes, each of which has a context
-in the EL saturation. Of the ORE 2015 DL development set, 14 files attempt the rules and
+in the EL saturation. Of the ORE 2015 DL development set, 12 files attempt the rules and
 finish. Those with more than 5,461 classes, whose bound is above the floor, derive at
 most 212 conclusions per class, ore_ont_16680 the most with 6.9 million. ore_ont_9663,
 ore_ont_14817 and ore_ont_3215 pass their memory budget after 38, 49 and 791 million
@@ -1501,8 +1501,9 @@ run passes the bound too, the run starts again without counting. That run leaves
 axioms that need counting out and reports them, as the classifier did before it counted,
 with a bound of 4 million conclusions of its own, and sets `Stats::dl_counting_over` and
 `Stats::dl_over_budget`. A run that passes the second bound falls back to the Horn rules
-as before. A run that does not count has no bound on its conclusions, only the memory
-budget. Of the 150 counting fixtures, all but four derive at most 21,747 conclusions on
+as before. Any other run that neither counts nor is rooted has the bound of item 990,
+`Limits::dl_attempt_work`, past which the Horn rules answer without a repeat on one thread
+or a run without counting, as [Outcome](#outcome) describes. Of the 150 counting fixtures, all but four derive at most 21,747 conclusions on
 one thread. `sriq-004` derives 369,367, `shiq-038` 815,758 and `shiq-046` 1.1 million, and
 these need a raised `Limits::dl_work`. `shiq-028` passes any bound, which item 729
 follows. `shq-041` derives 17,844 conclusions with the order between number restrictions
@@ -3042,16 +3043,20 @@ remains between schedules is the subject of item 727.
 
 This subsection records what item 727 delivers. `Limits::dl_steps`, which is on by
 default, makes every saturation of the disjunctive rules proceed in steps in a run that
-has a bound on its derived conclusions. With it such a run derives the same conclusions,
+has one of the three bounds below on its derived conclusions. With it such a run derives the same conclusions,
 passes or keeps its bound on them, and so answers in full or falls back, in the same way
 on every number of threads and every schedule. The memory budget, the deadline and a
 cancellation still stop a run when their checks see them, and the Horn rules' fallback on
 their memory budget is unchanged.
 
-Three runs have the bound. They are a run that counts, the run that starts again without
+Three runs have such a bound. They are a run that counts, the run that starts again without
 counting after it passed the bound, and a rooted run. A run that counts is one that
-`Limits::counting` allows on an ontology with an axiom that needs counting. A run of the
-disjunctive rules without the bound finishes with the same answer on every schedule, so
+`Limits::counting` allows on an ontology with an axiom that needs counting. Any other run
+of the disjunctive rules has the bound of item 990, past which the Horn rules answer. That
+bound keeps the driver without steps, since the steps made the attempts that finish up to
+1.9 times slower on eight threads on the laptop, so near it a schedule can decide whether a run on several threads
+answers in full, as it can for the memory budget. A run of the disjunctive rules without
+any bound finishes with the same answer on every schedule, so
 the steps would change only its cost, and it keeps the driver without steps whatever the
 option says. Counting and the root are off by default, so a classification under the
 default limits runs as it did before this item. `dl_steps: false`, and `--no-dl-steps`
