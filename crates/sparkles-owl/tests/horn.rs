@@ -1278,3 +1278,35 @@ fn a_composed_link_by_the_least_role_still_counts_for_its_superroles() {
         &[("B", "T3"), ("C", "T3")],
     );
 }
+
+#[test]
+fn successors_that_others_dominate_take_no_rule_of_their_own() {
+    // nine axioms of a generated ontology (roadmap item 710): R3 and R5 give each context
+    // successors whose roles and cores others' contain, and R5 and R6 counted every one of
+    // them with every predecessor, so that the run derived 158,656 conclusions. A successor
+    // that another dominates adds nothing to the rules, which pass over it, and R6 sends a
+    // predecessor each core once
+    let body = "EquivalentClasses(:A0 ObjectSomeValuesFrom(:r2 ObjectSomeValuesFrom(:r2 :A7)))
+         SubClassOf(:A2 :A7)
+         SubClassOf(:A0 ObjectMaxCardinality(1 :r1 :A0))
+         SubClassOf(:A2 ObjectSomeValuesFrom(ObjectInverseOf(:r2) ObjectSomeValuesFrom(ObjectInverseOf(:r1) :A3)))
+         SubClassOf(:A7 ObjectAllValuesFrom(ObjectInverseOf(:r2) :A2))
+         EquivalentClasses(:A1 ObjectSomeValuesFrom(:r0 :A2))
+         SubObjectPropertyOf(:r2 ObjectInverseOf(:r0))
+         SubObjectPropertyOf(:r0 :r2)
+         InverseObjectProperties(:r0 :r1)";
+    // HermiT's answer
+    let out = check(
+        body,
+        &[
+            ("A0", "A1"),
+            ("A1", "A2"),
+            ("A2", "A0"),
+            ("A0", "A3"),
+            ("A0", "A7"),
+        ],
+        &[("A3", "A7"), ("A7", "A3"), ("A7", "A0"), ("A3", "A0")],
+    );
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert!(out.stats.conclusions < 20_000, "{}", out.stats.conclusions);
+}

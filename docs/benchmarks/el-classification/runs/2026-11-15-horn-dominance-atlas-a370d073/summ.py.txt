@@ -1,0 +1,30 @@
+# summ.py OUT [SIDE]: medians per file, thread count and side of the timing rounds, the median of the
+# rounds' ratios with their range, and the disjunctive attempts' wall times
+import json, sys, glob, re, statistics as st
+out = sys.argv[1]; side = sys.argv[2] if len(sys.argv) > 2 else 'lane'; rows = {}
+for p in glob.glob(f"{out}/r*/*/*.json"):
+    r, tag, f = p.split('/')[-3:]
+    try: d = json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: continue
+    rows[(f[:-5], tag, r)] = d
+keys = sorted({(k[0]) for k in rows})
+print(f"{'file':22} {'base ms':>10} {'lane ms':>10} {'ratio':>6} {'range':>13} {'concl base':>13} {'concl lane':>13} {'rss b':>6} {'rss l':>6} tier")
+for f in keys:
+    b = [c for (ff, t, r), d in rows.items() if ff == f and t == 'base' for c in d['classifyMs']]
+    l = [c for (ff, t, r), d in rows.items() if ff == f and t == side for c in d['classifyMs']]
+    if not b or not l: continue
+    rats = []
+    for r in sorted({k[2] for k in rows}):
+        if (f, 'base', r) in rows and (f, side, r) in rows:
+            rats.append(st.median(rows[(f, side, r)]['classifyMs']) / st.median(rows[(f, 'base', r)]['classifyMs']))
+    db = [d for (ff, t, r), d in rows.items() if ff == f and t == 'base']
+    dl = [d for (ff, t, r), d in rows.items() if ff == f and t == side]
+    print(f"{f:22} {st.median(b):10.1f} {st.median(l):10.1f} {st.median(rats):6.3f} {min(rats):6.3f}-{max(rats):6.3f} {st.median(d['conclusions'] for d in db):13.0f} {st.median(d['conclusions'] for d in dl):13.0f} {max(d['peakRssKib'] for d in db)/2**20:6.2f} {max(d['peakRssKib'] for d in dl)/2**20:6.2f} {db[0]['tier']}/{dl[0]['tier']}")
+print()
+for line in open(f"{out}/log.txt"):
+    if line.startswith('dl '):
+        print(line.strip())
+for p in sorted(glob.glob(f"{out}/dl/*/*.json")):
+    try: d = json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: print(p, 'no report'); continue
+    print(p.split('/')[-2], p.split('/')[-1], d['classifyMs'], d['tier'], d['conclusions'], d.get('dlOverBudget'), round(d['peakRssKib']/2**20, 2))

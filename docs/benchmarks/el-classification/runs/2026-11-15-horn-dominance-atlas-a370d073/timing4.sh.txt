@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# timing4.sh: base a22f6a35 against the final lane tip on the Horn-rule files, in interleaved rounds,
+# one process per side, file and thread count, then three runs of the tip on the files whose
+# disjunctive attempt fails. The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/horn-cost-693
+F=$HOME/lanes/horn-budget-962/files
+OUT=$D/out/timing4; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/base $D/bin/tip4; } > $OUT/before.txt
+files="$D/files/g04281.ofn $D/files/g15813.ofn $F/go.ofn $F/chebi_lite.ofn $F/ore_ont_9855.owl $F/ore_ont_8737.owl $F/ore_ont_16744.owl $F/ore_ont_4510.owl $F/ore_ont_12901.owl"
+for round in 1 2 3 4; do
+  order="base tip4"; [ $((round % 2)) -eq 0 ] && order="tip4 base"
+  for f in $files; do
+    n=$(basename $f); n=${n%.*}
+    for t in 1 4; do
+      for tag in $order; do
+        mkdir -p $OUT/r$round/$tag
+        systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 $D/bin/$tag --threads $t --repeat 5 $f > $OUT/r$round/$tag/$n.t$t.json 2> $OUT/r$round/$tag/$n.t$t.err
+        echo "r$round $tag $n t$t status=$?" >> $OUT/log.txt
+      done
+    done
+  done
+done
+for round in 1 2 3; do
+  for n in ore_ont_14817 ore_ont_9663; do
+    mkdir -p $OUT/dl/tip4
+    s=$(date +%s%N)
+    systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+      timeout 900 $D/bin/tip4 --threads 4 $F/$n.owl > $OUT/dl/tip4/$n.r$round.json 2> $OUT/dl/tip4/$n.r$round.err
+    echo "dl r$round tip4 $n status=$? wall_ms=$(( ($(date +%s%N) - s) / 1000000 ))" >> $OUT/log.txt
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

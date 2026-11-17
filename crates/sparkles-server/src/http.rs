@@ -140,6 +140,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(branches::SPARKLES_BRANCH_ID),
         crate::obs::X_REQUEST_ID.clone(),
         header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
+        SPARKLES_REASONING,
         header::HeaderName::from_static(history::SPARKLES_AT),
         header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
         header::HeaderName::from_static(dry_run::SPARKLES_DRY_RUN),
@@ -5426,6 +5427,8 @@ async fn reason(
             )
         })?
     };
+    sparkles_reasoner::refuse_query_only(&profile)
+        .map_err(|e| err_code(StatusCode::BAD_REQUEST, "reasoning-profile", e.to_string()))?;
     task_start_check(&st, None, &name)?;
     let task = crate::reasoning::start_reason(
         &st,
@@ -5567,20 +5570,24 @@ async fn reason_query_set(
     setting
         .validate()
         .map_err(|e| err_code(StatusCode::BAD_REQUEST, "reasoning-setting", e.to_string()))?;
-    let ds2 = ds.clone();
-    blocking(move || Ok(ds2.dataset.set_query_reasoning(Some(setting))?)).await?;
-    Ok(Json(query_setting_json(&ds, &p)))
+    let st2 = st.clone();
+    blocking(move || {
+        ds.dataset.set_query_reasoning(Some(setting))?;
+        Ok(Json(query_setting_json(Some(&*st2), &ds, &p)))
+    })
+    .await
 }
 
 /// `GET /$/reason/{ds}/query`: the query-time reasoning setting, with the status of the
-/// cache of derived tables for callers with the metrics permission.
+/// cache of derived tables for callers with the metrics permission, and under `owl-ql`
+/// the profile check of the ontology the caller reads.
 async fn reason_query_get(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    Ok(Json(query_setting_json(&ds, &p)))
+    blocking(move || Ok(Json(query_setting_json(Some(&*st), &ds, &p)))).await
 }
 
 /// `DELETE /$/reason/{ds}/query`: queries read the materialized inferences again, and
@@ -5596,13 +5603,14 @@ async fn reason_query_clear(
     let ds = dataset(&st, &name)?;
     let ds2 = ds.clone();
     blocking(move || Ok(ds2.dataset.set_query_reasoning(None)?)).await?;
-    Ok(Json(query_setting_json(&ds, &p)))
+    Ok(Json(query_setting_json(None, &ds, &p)))
 }
 
 /// The query-time reasoning setting as `GET /$/reason/{ds}/query` answers it: the
-/// setting's members, and `tables`, the process-wide cache of derived tables, for a
-/// caller with the metrics permission.
-fn query_setting_json(ds: &Dataset, p: &Principal) -> J {
+/// setting's members, `tables`, the process-wide cache of derived tables, for a caller
+/// with the metrics permission, and, with `st`, `owlQl`, the axioms the OWL 2 QL
+/// rewriting reads and ignores in the graphs the caller reads.
+fn query_setting_json(st: Option<&AppState>, ds: &Dataset, p: &Principal) -> J {
     let mut body = ds
         .dataset
         .query_reasoning()
@@ -5613,6 +5621,18 @@ fn query_setting_json(ds: &Dataset, p: &Principal) -> J {
     {
         body["tables"] = tables;
     }
+    // under owl-ql, the profile check of the ontology the caller can read (spec F17 §7)
+    #[cfg(feature = "reasoning")]
+    if let Some(st) = st {
+        let opts = CallerContext::for_caller(st, ds, p).read_options();
+        match ds.dataset.owl_ql_status(&opts) {
+            Ok(Some(check)) => body["owlQl"] = check,
+            Ok(None) => {}
+            Err(e) => body["owlQl"] = json!({ "error": e.to_string() }),
+        }
+    }
+    #[cfg(not(feature = "reasoning"))]
+    let _ = st;
     body
 }
 

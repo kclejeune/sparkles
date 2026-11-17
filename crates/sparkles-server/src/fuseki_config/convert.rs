@@ -70,6 +70,9 @@ pub struct Reasoning {
     /// The backward mode answers every query on demand, so nothing is materialized and
     /// the query-time setting carries the rules.
     pub demand_only: bool,
+    /// The hybrid mode's rule text starts with `@hybrid jena .`, so a forward rule's
+    /// nested backward rules run at query time and not in the materialization (F17 §5.2).
+    pub hybrid_jena: bool,
 }
 
 /// The graph the files of a reasoner's `ja:schema` are loaded into.

@@ -101,5 +101,8 @@ describe('saving', () => {
     expect(saveProblems('ok', [{ ...row, name: 'timeout' }])).toEqual([
       '?timeout is a reserved name.',
     ]);
+    // the request parameters of query-time reasoning and execution, as the server reserves
+    for (const name of ['reasoningProfile', 'maxDerived', 'execution'])
+      expect(saveProblems('ok', [{ ...row, name }])).toEqual([`?${name} is a reserved name.`]);
   });
 });

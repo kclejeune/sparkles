@@ -303,6 +303,7 @@ fn the_setting_budget_bounds_a_derivation() {
         budget: sparkles::reasoning::setting::Budget {
             max_derived: Some(1),
             max_millis: None,
+            max_union: None,
         },
         ..Default::default()
     }))
@@ -324,6 +325,7 @@ fn the_setting_budget_bounds_a_derivation() {
         budget: sparkles::reasoning::setting::Budget {
             max_derived: None,
             max_millis: Some(0),
+            max_union: None,
         },
         ..Default::default()
     }))
@@ -477,6 +479,7 @@ fn concurrent_setting_changes_keep_memory_and_file_equal() {
                             budget: sparkles::reasoning::setting::Budget {
                                 max_derived: Some(1 + i * 10 + t),
                                 max_millis: None,
+                                max_union: None,
                             },
                             ..Default::default()
                         })
@@ -493,4 +496,24 @@ fn concurrent_setting_changes_keep_memory_and_file_equal() {
         s.query_reasoning_format = 0;
     }
     assert_eq!(live, on_disk);
+}
+
+/// `budget.maxMillis` bounds the OWL 2 QL rewriting, which a query answered by the
+/// rewriting alone runs without starting a session.
+#[test]
+fn the_time_budget_bounds_the_owl_ql_rewriting() {
+    use sparkles::reasoning::auto::Limited;
+    use sparkles::reasoning::reasoner::query::QueryReasoner;
+    use sparkles::reasoning::reasoner::{Extras, Inputs};
+    let (_dir, ds) = open();
+    let r = QueryReasoner::new(Profile::OwlQl, &Extras::default(), Inputs::default()).unwrap();
+    let opts = QueryOptions {
+        reasoning: Some(std::sync::Arc::new(Limited::new(r.provider(), 0))),
+        ..Default::default()
+    };
+    let e = match ds.query_with("ASK { ?x a <http://ex.org/B> }", &opts) {
+        Err(e) => e,
+        Ok(_) => panic!("a budget of 0 ms did not stop the rewriting"),
+    };
+    assert_eq!(e.code(), "reasoning-budget", "{e}");
 }

@@ -100,7 +100,13 @@ request or on every write, and the schema report counts what the data holds.
   Jena backward rules answer this way. `reasoning=auto` reads a fresh materialization
   with the same profile and derives over a stale or absent one or for rules that
   materialization skips, and the dataset's query-time setting makes it the default
-  ([API.md](../API.md#automatic-choice)). A demand transformation starts from the query's
+  ([API.md](../API.md#automatic-choice)). The `owl-ql` profile rewrites a query against
+  the ontology's OWL 2 QL axioms with PerfectRef instead of deriving, so an existential
+  restriction answers a pattern whose variable the query does not use elsewhere, and a
+  rewriting past `budget.maxUnion` branches falls back to the `owl-rl` rules with a
+  warning ([API.md](../API.md#owl-2-ql-rewriting)). The UI's query page chooses the mode and the
+  profile in its **Options** menu ([query page](../visualization/README.md#query-page)).
+  A demand transformation starts from the query's
   constants and bindings and specializes schema relations proven complete. Schema facts
   can follow from derived instance facts, including class and property declarations and
   equality between schema terms. Programs containing `makeTemp` run in one ordinary
@@ -137,6 +143,16 @@ request or on every write, and the schema report counts what the data holds.
   query-time default: `auto` for hybrid, Jena's default, `demand` with nothing
   materialized for backward, and materialized reasoning for forward
   ([G08](../specs/G08-fuseki-configuration.md#rule-modes-and-query-time-reasoning)).
+  The hybrid mode's rule text starts with `@hybrid jena .`.
+* Jena's hybrid rules nest backward rules in a forward rule's head, as in
+  `(?p rdf:type ex:Symmetric) -> [(?x ?p ?y) <- (?y ?p ?x)]`. By default the
+  materialization flattens such a rule into `B1, B2 -> H`. With `@hybrid jena .` in the
+  rule text, the materialization keeps the forward head and the nested rule becomes the
+  query-time rule `H <- B1, B2`, which `demand` and `auto` derive when a query asks. A
+  rule with a functor term, a builtin that has a side effect or makes terms, `noValue`,
+  a backward head variable that no body clause binds or a more deeply nested backward
+  rule cannot be split this way and is refused with an error that names it
+  ([F17 §5.2](../specs/F17-query-time-reasoning.md#52-hybrid-rules)).
 * Embedded query providers implement `ReasoningSession::intensional` with a
   `Result<bool>` return. Constant interning can refuse a memory reservation, and
   callers propagate that refusal before preparing demands. Implementations that
@@ -790,9 +806,10 @@ for its allowances and the editors.
   with DL-safe SWRL rules, and a vocabulary bundle as disjointness axioms over its
   concepts and relation entities. Sparkles reads that OWL form from files or from a
   dataset that holds each ontology in the named graph of its IRI, and follows the imports
-  between those graphs. On openCAESAR's Kepler16b sample, the classifier's taxonomy
-  equals HermiT's, its named types of individuals equal HermiT's apart from types it
-  gives the SWRL rules' variables, and the classifier finds the
+  between those graphs. On the OWL that openCAESAR's build writes for its Kepler16b
+  sample, the classifier's taxonomy equals the one that `owl-reason` gets from Openllet.
+  Its named types of individuals equal Openllet's apart from types it gives the SWRL
+  rules' variables, and the classifier finds the
   inconsistencies that the bundle's disjointness, keys, functional properties, universal
   restrictions and property characteristics raise
   ([F24](../specs/F24-owl-classification/SPEC.md#oml-and-opencaesar-models)).
@@ -803,9 +820,10 @@ for its allowances and the editors.
   the graph of its IRI, the project's queries on the `sparql` service and shapes posted
   to `shacl?graph=default`. The queries then read the entailments that `owl-reason`
   wrote, not Sparkles' own reasoning.
-* A Jena rules file in the form that the adapter writes with `generateRules`
-  materializes with `sparkles infer --rules` and derives the facts that Jena's rule
-  engine derives.
+* The rule parser refuses the Jena rules file that the adapter writes with
+  `generateRules`, because its `@prefix` lines give the namespace IRIs without angle
+  brackets. Once the brackets are added, `sparkles infer --rules` derives the facts that
+  Jena's rule engine derives from the file.
 * The SWRL rules are not read, so a reified relation's forward property and the facts of
   an OML rule are not derived, and the OWL RL materialization answers a query that needs
   them with fewer rows. Rule-derived inconsistencies, enumerations beside keys, OWL 2 DL
@@ -838,8 +856,15 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   that falls back reports the full run's peak memory and not the higher peak of the update
   it abandoned, which is roadmap item 816.
 * Inference is forward materialization, RDFS on read and derivation on demand.
-  Derivation on demand has no OWL 2 QL rewriting, Jena's hybrid rules are flattened, and
-  the UI's query page offers only materialized inferences or none. Roadmap item 19.
+  Under `@hybrid jena` the query-time program evaluates forward and backward rules in one
+  fixpoint, so a forward rule reads what a backward rule derives at query time, where
+  Jena's forward engine does not.
+* OWL 2 QL rewriting leaves out reflexive properties, inclusions with `owl:Thing` on the
+  left, data existentials on the left with a datatype range and triples about undeclared
+  properties, and its rewritten patterns read the query's default graph, not the data of
+  named input graphs. It decides which variables may stand for an unnamed individual by
+  name over the whole query rather than by scope, and its fallback to the `owl-rl` rules
+  can use axioms outside OWL 2 QL. Roadmap item 985.
   `reasoning=auto` reads a materialization that can answer rather than compare costs per
   pattern. Roadmap item 910.
 * A view's tables carry over to another commit only while the rules cannot read or give
@@ -924,10 +949,17 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   tree-shaped models. Roadmap item 867. Such an ontology may get a world for a class
   whose world finds nothing. Roadmap item 868.
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
-  rules on one thread and raise its peak resident set from 196 to 223 MiB. Two
-  Uberon-based ontologies of the ORE 2015 DL sample classify with the Horn rules in 2.2
-  and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap
-  item 693.
+  rules on one thread and raise its peak resident set from 196 to 223 MiB. On two
+  Uberon-based ontologies of the ORE 2015 DL sample the Horn rules take about five times
+  the EL rules' time, since each context of a conjunction derives its successor's
+  subsumers again. Roadmap item 693.
+* The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
+  passes its memory budget before the Horn rules answer. On four threads one of them
+  classifies in 20 to 39 seconds and the other in about 13, almost all of it the attempt.
+  Roadmap item 990.
+* Horn ontologies whose successors no other successor dominates classify up to 6% slower
+  than without the check for dominated successors, which costs more there than it saves.
+  Roadmap item 991.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
   restrictions over a transitive symmetric role derives each link of the transitive
   closure once per intermediate class, so it sends three billion messages for 32 million
@@ -1017,6 +1049,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   few thousand triples. Roadmap item 974.
 * openCAESAR's closed-world cardinality check, its entailment outputs and the OML
   textual syntax have no counterpart. Roadmap items 975 to 977.
+* The Jena rule parser refuses an `@prefix` whose namespace IRI has no angle brackets,
+  which Jena's parser accepts and openCAESAR's adapter writes. Roadmap item 1020.
 
 ## Configuration and usage
 

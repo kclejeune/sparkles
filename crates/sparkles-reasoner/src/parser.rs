@@ -461,6 +461,8 @@ struct Parser {
     /// position of the end of input (for EOF errors)
     eof: (usize, usize),
     depth: usize,
+    /// `@hybrid jena`: nested backward rules become query-time rules (spec F17 §5.2)
+    hybrid_jena: bool,
 }
 
 const MAX_INCLUDE_DEPTH: usize = 8;
@@ -506,12 +508,14 @@ impl Parser {
                     match d.as_str() {
                         "@prefix" => self.parse_prefix(&t)?,
                         "@include" => self.parse_include(&t, out)?,
+                        "@hybrid" => self.parse_hybrid()?,
                         other => {
                             return Err(err(
                                 t.line,
                                 t.col,
                                 format!(
-                                    "unknown directive '{other}' (expected @prefix or @include)"
+                                    "unknown directive '{other}' (expected @prefix, @include or \
+                                     @hybrid)"
                                 ),
                             ));
                         }
@@ -558,6 +562,33 @@ impl Parser {
         Ok(())
     }
 
+    /// `@hybrid jena .` or `@hybrid materialize .`
+    fn parse_hybrid(&mut self) -> Result<(), RuleParseError> {
+        let t = self.next()?;
+        let mode = match &t.tok {
+            Tok::Word(w) => w.trim_end_matches('.').to_string(),
+            _ => String::new(),
+        };
+        self.hybrid_jena = match mode.as_str() {
+            "jena" => true,
+            "materialize" => false,
+            _ => {
+                return Err(err(
+                    t.line,
+                    t.col,
+                    format!(
+                        "expected jena or materialize after @hybrid, found {}",
+                        t.tok
+                    ),
+                ));
+            }
+        };
+        if self.peek_tok() == Some(&Tok::Dot) {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
     fn parse_include(&mut self, at: &Token, out: &mut Vec<Rule>) -> Result<(), RuleParseError> {
         let t = self.next()?;
         let name = match &t.tok {
@@ -598,6 +629,7 @@ impl Parser {
             prefixes: default_prefixes(),
             eof: (0, 0),
             depth: self.depth + 1,
+            hybrid_jena: false,
         };
         sub.parse_all(out).map_err(|e| {
             err(
@@ -946,9 +978,225 @@ pub fn parse_rules(text: &str) -> Result<Vec<Rule>, RuleParseError> {
         prefixes: default_prefixes(),
         eof,
         depth: 0,
+        hybrid_jena: false,
     };
     let mut out = Vec::new();
     p.parse_all(&mut out)?;
+    if p.hybrid_jena {
+        out = split_hybrid(out)?;
+    }
+    Ok(out)
+}
+
+/// The rules of `@hybrid jena` (spec F17 §5.2): a forward rule `B1 -> [H <- B2]` keeps
+/// its other head clauses for materialization, and its nested backward rule becomes the
+/// top-level backward rule `H <- B1, B2`, which only query-time reasoning runs. The
+/// answers are those of Jena's hybrid engine, which adds `H <- B2` for each match of `B1`,
+/// without keeping the instantiated rules. A rule whose split cannot be stated this way is
+/// refused: a functor term, a builtin with a side effect, one that makes terms or
+/// `noValue`, whose answer Jena's backward engine reads differently, a head variable that
+/// no body clause binds, or a backward rule nested deeper than a forward rule's head.
+fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
+    fn refuse(r: &Rule, why: &str) -> RuleParseError {
+        err(
+            r.line,
+            1,
+            format!(
+                "rule '{}': @hybrid jena cannot make a query-time rule of it, since {why}",
+                r.label()
+            ),
+        )
+    }
+    fn functor(clauses: &[Clause]) -> bool {
+        clauses.iter().any(|c| match c {
+            Clause::Triple(t) => [&t.subject, &t.predicate, &t.object]
+                .into_iter()
+                .any(|n| matches!(n, Node::Functor(..))),
+            Clause::Builtin(b) => b.args.iter().any(|n| matches!(n, Node::Functor(..))),
+            Clause::Rule(r) => functor(&r.body) || functor(&r.head),
+        })
+    }
+    /// A builtin that has a side effect, makes terms, or reads the facts in a way that a
+    /// query-time fixpoint evaluates differently from Jena's backward engine.
+    fn effect(clauses: &[Clause]) -> Option<String> {
+        clauses.iter().find_map(|c| match c {
+            Clause::Builtin(b)
+                if matches!(
+                    b.name.as_str(),
+                    "print"
+                        | "drop"
+                        | "remove"
+                        | "hide"
+                        | "makeTemp"
+                        | "makeSkolem"
+                        | "makeInstance"
+                        | "now"
+                        | "noValue"
+                ) =>
+            {
+                Some(b.name.clone())
+            }
+            Clause::Rule(r) => effect(&r.body).or_else(|| effect(&r.head)),
+            _ => None,
+        })
+    }
+    /// Whether a backward rule is nested below a nested forward rule.
+    fn deep_backward(head: &[Clause]) -> bool {
+        head.iter().any(|c| match c {
+            Clause::Rule(i) if i.direction == Direction::Forward => {
+                i.head
+                    .iter()
+                    .any(|c| matches!(c, Clause::Rule(j) if j.direction == Direction::Backward))
+                    || deep_backward(&i.head)
+            }
+            _ => false,
+        })
+    }
+    fn vars(clauses: &[Clause], out: &mut std::collections::HashSet<String>) {
+        fn node(n: &Node, out: &mut std::collections::HashSet<String>) {
+            match n {
+                Node::Var(v) => {
+                    out.insert(v.clone());
+                }
+                Node::Functor(_, args) => args.iter().for_each(|a| node(a, out)),
+                _ => {}
+            }
+        }
+        for c in clauses {
+            match c {
+                Clause::Triple(t) => {
+                    [&t.subject, &t.predicate, &t.object]
+                        .into_iter()
+                        .for_each(|n| node(n, out));
+                }
+                Clause::Builtin(b) => b.args.iter().for_each(|n| node(n, out)),
+                Clause::Rule(_) => {}
+            }
+        }
+    }
+    /// The variables a body binds: those of its triples, and the outputs of each builtin
+    /// whose inputs are bound, until no more are.
+    fn bound_by(clauses: &[Clause], out: &mut std::collections::HashSet<String>) {
+        for c in clauses {
+            if let Clause::Triple(_) = c {
+                vars(std::slice::from_ref(c), out);
+            }
+        }
+        loop {
+            let before = out.len();
+            for c in clauses {
+                let Clause::Builtin(b) = c else { continue };
+                let n = b.args.len();
+                let Some(kind) = crate::builtins::BuiltinKind::from_name(&b.name) else {
+                    continue;
+                };
+                // an empty call binds nothing, and the compiler reports its arity
+                if n == 0 {
+                    continue;
+                }
+                let ready = kind
+                    .input_positions(n)
+                    .into_iter()
+                    .all(|i| match b.args.get(i) {
+                        Some(Node::Var(v)) => out.contains(v),
+                        _ => true,
+                    });
+                if !ready {
+                    continue;
+                }
+                for i in kind.output_positions(n) {
+                    if let Some(Node::Var(v)) = b.args.get(i) {
+                        out.insert(v.clone());
+                    }
+                }
+            }
+            if out.len() == before {
+                break;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(rules.len());
+    for r in rules {
+        if r.direction == Direction::Forward && deep_backward(&r.head) {
+            return Err(refuse(
+                &r,
+                "a backward rule is nested inside a nested forward rule",
+            ));
+        }
+        let nested_backward = r
+            .head
+            .iter()
+            .any(|c| matches!(c, Clause::Rule(i) if i.direction == Direction::Backward));
+        if r.direction != Direction::Forward || !nested_backward {
+            out.push(r);
+            continue;
+        }
+        // the whole rule is checked, the forward head it keeps as well as the split
+        if functor(&r.body) || functor(&r.head) {
+            return Err(refuse(&r, "it holds a functor term"));
+        }
+        if let Some(b) = effect(&r.body).or_else(|| effect(&r.head)) {
+            return Err(refuse(&r, &format!("it calls {b}")));
+        }
+        let outer: Vec<Clause> = r
+            .body
+            .iter()
+            .filter(|c| !matches!(c, Clause::Rule(_)))
+            .cloned()
+            .collect();
+        let mut head = Vec::new();
+        let mut made = Vec::new();
+        for (n, c) in r.head.iter().enumerate() {
+            match c {
+                Clause::Rule(inner) if inner.direction == Direction::Backward => {
+                    if inner
+                        .head
+                        .iter()
+                        .chain(&inner.body)
+                        .any(|c| matches!(c, Clause::Rule(_)))
+                    {
+                        return Err(refuse(&r, "its backward rule holds a nested rule"));
+                    }
+                    if inner.head.iter().any(|c| !matches!(c, Clause::Triple(_))) {
+                        return Err(refuse(&r, "its backward rule's head is not a triple"));
+                    }
+                    let mut body = outer.clone();
+                    body.extend(inner.body.iter().cloned());
+                    // a head variable that no body clause names would need Jena's goal
+                    // binding, which a bottom-up rule does not have
+                    let mut bound = std::collections::HashSet::new();
+                    let mut head_vars = std::collections::HashSet::new();
+                    bound_by(&body, &mut bound);
+                    vars(&inner.head, &mut head_vars);
+                    if let Some(v) = head_vars.iter().find(|v| !bound.contains(*v)) {
+                        return Err(refuse(
+                            &r,
+                            &format!(
+                                "its backward rule's head names ?{v}, which no body clause binds"
+                            ),
+                        ));
+                    }
+                    made.push(Rule {
+                        name: Some(
+                            inner
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("{}/{}", r.label(), n + 1)),
+                        ),
+                        body,
+                        head: inner.head.clone(),
+                        direction: Direction::Backward,
+                        line: inner.line,
+                    });
+                }
+                c => head.push(c.clone()),
+            }
+        }
+        if !head.is_empty() {
+            out.push(Rule { head, ..r });
+        }
+        out.extend(made);
+    }
     Ok(out)
 }
 

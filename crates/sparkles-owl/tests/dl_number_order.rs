@@ -772,10 +772,12 @@ fn the_fixtures_with_minimums_keep_their_answers_with_the_order() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(counted, 206);
     // The order kept two more cases within the bound until a context gave way to the
-    // contexts it woke, which keeps the same two within it without the order.
+    // contexts it woke, which keeps the same two within it without the order. Products
+    // that derive only their least unions (item 969) keep three more within it with the
+    // order and two more without it.
     assert_eq!(
         (within_on, within_off),
-        (202, 202),
+        (205, 204),
         "the cases within the bound with the order and without it"
     );
 }

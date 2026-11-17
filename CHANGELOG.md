@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Jena hybrid rules
+
+`@hybrid jena .` in a rule text compiles a forward rule's nested backward rule
+`B1 -> [H <- B2]` into the query-time rule `H <- B1, B2` and leaves it out of the
+materialization, as Jena's hybrid engine runs it on demand, which completes roadmap item
+19's Phase 2. A rule that the split cannot state as Jena runs it is refused, such as one
+with a functor term, a builtin that has a side effect or makes terms, or `noValue`. The Fuseki converter writes the directive for a GenericRuleReasoner in
+the hybrid mode. On a rules file checked against Apache Jena 6.2.0, the materialization
+equals Jena's forward deductions and the query-time answers equal Jena's.
+
+### OWL 2 QL rewriting
+
+The `owl-ql` query-time profile rewrites a query against the OWL 2 QL axioms of the
+input graphs with PerfectRef, as part of roadmap item 19. Each basic graph pattern
+becomes a union of patterns over the stored facts that streams, distinguished variables
+are never bound to unnamed individuals, and `budget.maxUnion` bounds the branches, past
+which the `owl-rl` demand program answers with a warning. The setting's `GET` lists the
+axioms outside the profile, a materialization refuses the profile, and the UI offers
+it. The answers of the 14 LUBM queries equal an OWL 2 RL closure of LUBM's OWL 2 QL
+fragment, row for row. A rewritten pattern keeps SPARQL's bag semantics, so a variable
+that stored facts bind keeps its values whether or not the query projects it.
+
+### Query-time reasoning in the UI
+
+The query page's **Options** menu chooses the reasoning of a query as part of roadmap item
+19. Its selector sends `reasoning` as the dataset default, off, materialized, demand or
+auto, with a profile for the last two, and a result that derived facts shows what
+`Sparkles-Reasoning` reports. The server exposes that header to cross-origin pages.
+
 ### SHACL rules
 
 Roadmap item 838 adds the `shacl-af` reasoning profile, which materializes SHACL Advanced
@@ -119,6 +148,18 @@ backup feature `control/1`. `sparkles check` has a `control` check of the two lo
 ordering.
 
 ### OWL classification
+
+A run of the Horn rules without individuals passes over a successor whose role and core
+another successor's contain, and sends a predecessor each successor's core once (roadmap
+item 710). A generated ontology of 15 axioms that derived 210 million conclusions in 5.1 s
+on one thread on `atlas` derives 2.0 million in 69 ms. A product of the disjunctive rules
+that is not ground forms its unions list after list and keeps only the least unions of each
+step of up to 4,096 unions (item 969), which takes three classifications of `ore_ont_14817` of ORE 2015 on four threads on
+`atlas` from 59.7 to 79.5 s down to 19.9 to 38.9 s. Three more counting fixtures finish
+within the counting bound. Item 990 follows the attempt that still passes its budget.
+The sort of successors charges its memory in batches and passes over most pairs by a
+signature of their cores, and files that it does not prune classify up to 6% slower, as
+`ore_ont_9855` does on four threads, which item 991 follows.
 
 A classification after an edit of class axioms keeps the contexts of a run with the Horn
 rules without individuals and of a run of the disjunctive rules without counting or a

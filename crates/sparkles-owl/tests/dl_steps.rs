@@ -203,8 +203,9 @@ fn a_run_in_steps_derives_the_same_on_every_number_of_threads() {
     assert_eq!(within, WITHIN);
 }
 
-/// The cases of [`cases`] that a run in steps finishes within the default bound.
-const WITHIN: usize = 171;
+/// The cases of [`cases`] that a run in steps finishes within the default bound, three
+/// more since a product derives only its least unions (item 969).
+const WITHIN: usize = 174;
 
 /// One case run many times on one, four and eight threads gives one outcome, at the
 /// default bound, which it keeps, at a bound equal to the conclusions it derives, which
@@ -349,4 +350,24 @@ fn eager_and_rooted_runs_in_steps_give_one_outcome() {
             );
         }
     }
+}
+
+#[test]
+fn a_product_derives_only_its_least_unions() {
+    // The counting run of sriq-004 passed its bound, since a product of the Pred rule
+    // derived every union of one premise from each list. A product now derives only the
+    // unions that no other union of it contains, whose conclusions subsume the rest
+    // (item 969), and the run finishes within the bound on every number of threads with
+    // an answer among HermiT's.
+    let case = case(&fixtures("dl603").join("sriq-004.ofn"));
+    let first = outcome(&case, &steps(1));
+    for threads in [2, 4, 8] {
+        assert!(
+            outcome(&case, &steps(threads)) == first,
+            "{threads} threads"
+        );
+    }
+    let ((got, _), _, [over, counting_over, _]) = first;
+    assert!(!over && !counting_over, "the run passes its bound");
+    assert!(got.is_subset(&case.want));
 }

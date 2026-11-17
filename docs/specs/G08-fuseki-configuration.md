@@ -470,7 +470,9 @@ hybrid mode that setting holds the rules too, since a query that arrives before 
 materialization ends, or after one fails, has nothing else to derive with. A dataset whose
 setting already names a default keeps it. `--auto-reason` is left out when every
 inference model is backward, since nothing is materialized. An unknown `jr:ruleMode` is
-reported as unsupported. The tests are `rule_modes_choose_the_query_time_default` in
+reported as unsupported. The hybrid mode's rule text starts with `@hybrid jena .`, so a
+forward rule's nested backward rules run at query time as F17 §5.2 describes. The tests
+are `rule_modes_choose_the_query_time_default` in
 `fuseki_config/tests.rs` and `a_hybrid_configuration_derives_before_a_materialization` in
 the server's reasoning router tests.
 
