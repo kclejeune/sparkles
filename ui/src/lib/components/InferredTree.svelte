@@ -216,14 +216,24 @@
   h3 {
     margin: 0;
   }
+  /* in a card a long title wraps beside its button, which keeps to the right as in Hierarchy */
   .panel-head {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+  }
+  .panel-head > :global(h2) {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .panel-head > button {
+    flex: none;
+    margin-left: auto;
   }
   /* in a card the first and last lines sit on the body's padding, as in the other cards */
-  .panel-body > :first-child {
+  .panel-body > :global(:first-child),
+  .panel-body > :global(.materialization-notice:first-child > p:first-child) {
     margin-top: 0;
   }
-  .panel-body > :last-child {
+  .panel-body > :global(:last-child) {
     margin-bottom: 0;
   }
 </style>
