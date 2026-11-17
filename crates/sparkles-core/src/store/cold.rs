@@ -66,6 +66,11 @@ impl<'a> ColdBudget<'a> {
         self.used
     }
 
+    /// The limit the budget charges against, without what it has charged.
+    pub(crate) fn limit(&self) -> ReadLimit<'a> {
+        self.limit
+    }
+
     pub(crate) fn available(&self) -> u64 {
         self.limit.remaining().saturating_sub(self.used)
     }

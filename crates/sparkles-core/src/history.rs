@@ -921,23 +921,24 @@ impl HistoryState {
 
     /// The generation that serves commit `seq`: the newest retained one covering it.
     pub fn owner(&self, seq: u64, current: u32, head: u64) -> Option<u32> {
-        self.ranges(current, head)
-            .into_iter()
-            .rev()
-            .find(|&(_, b, e)| b <= seq && seq <= e)
-            .map(|(no, _, _)| no)
+        self.owner_with(seq, current, head, &crate::budgeted::Unlimited)
+            .ok()
+            .flatten()
     }
 
-    /// The same newest covering generation without materializing all ranges.
-    pub(crate) fn owner_limited(
+    /// [`owner`](Self::owner) under `limit`, which an accounting control checks at each
+    /// generation.
+    pub(crate) fn owner_with<C: crate::budgeted::Control>(
         &self,
         seq: u64,
         current: u32,
         head: u64,
-        limit: &ReadLimit<'_>,
+        limit: &C,
     ) -> Result<Option<u32>> {
         for (&number, generation) in self.gens.iter().rev() {
-            limit.check(0)?;
+            if C::ACCOUNTS {
+                limit.check(0)?;
+            }
             let end = if number == current {
                 head
             } else {
@@ -1176,12 +1177,23 @@ impl MemHistory {
                 || pins.values().any(|(pin, _)| pin.seq == *seq)
         });
     }
-    pub(crate) fn get_limited(
+    /// The kept state of commit `seq`.
+    pub fn get(&self, seq: u64) -> Option<Arc<Snapshot>> {
+        self.get_with(seq, &crate::budgeted::Unlimited)
+            .ok()
+            .flatten()
+    }
+
+    /// [`get`](Self::get) under `limit`, which an accounting control checks at each kept
+    /// state it compares.
+    pub(crate) fn get_with<C: crate::budgeted::Control>(
         &self,
         seq: u64,
-        limit: &ReadLimit<'_>,
+        limit: &C,
     ) -> Result<Option<Arc<Snapshot>>> {
-        limit.check(0)?;
+        if C::ACCOUNTS {
+            limit.check(0)?;
+        }
         if let Some((_, snapshot)) = self.branch_bases.get(&seq) {
             return Ok(Some(snapshot.clone()));
         }
@@ -1189,27 +1201,14 @@ impl MemHistory {
             return Ok(Some(snapshot.clone()));
         }
         for snapshot in self.window.iter().chain(self.pins.values().map(|(_, s)| s)) {
-            limit.check(0)?;
+            if C::ACCOUNTS {
+                limit.check(0)?;
+            }
             if snapshot.commit == seq {
                 return Ok(Some(snapshot.clone()));
             }
         }
         Ok(None)
-    }
-
-    /// The kept state of commit `seq`.
-    pub fn get(&self, seq: u64) -> Option<Arc<Snapshot>> {
-        self.branch_bases
-            .get(&seq)
-            .map(|(_, s)| s.clone())
-            .or_else(|| self.held.get(&seq).map(|(_, s)| s.clone()))
-            .or_else(|| {
-                self.window
-                    .iter()
-                    .find(|s| s.commit == seq)
-                    .or_else(|| self.pins.values().map(|p| &p.1).find(|s| s.commit == seq))
-                    .cloned()
-            })
     }
 
     /// The metadata of commit `seq` that a branch base or a source hold keeps beside its

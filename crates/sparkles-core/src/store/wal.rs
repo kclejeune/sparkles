@@ -917,9 +917,9 @@ pub(crate) struct WalCursor {
 }
 
 impl WalCursor {
-    /// A cursor read under `limit`. A read with a memory cap keeps its I/O buffer small
-    /// and refuses transaction growth before allocation, and `held` includes the caller's
-    /// retained delta. A read without one has the ordinary megabyte buffer.
+    /// A cursor read under `limit`. An accounting control keeps the I/O buffer small and
+    /// refuses transaction growth before allocation, and `held` includes the caller's
+    /// retained delta. Any other control has the ordinary megabyte buffer.
     pub(crate) fn open_with<C: Control>(
         path: &Path,
         from: WalPoint,
@@ -932,13 +932,11 @@ impl WalCursor {
 
     /// The I/O buffer of a cursor read under `limit`, after checking that it fits.
     fn capacity<C: Control>(limit: &C, held: u64) -> Result<usize> {
-        if C::CHECKS {
-            limit.check(held)?;
-        }
-        let Some(capped) = limit.capped_limit() else {
+        if !C::ACCOUNTS {
             return Ok(1 << 20);
-        };
-        let capacity = capped
+        }
+        limit.check(held)?;
+        let capacity = limit
             .remaining()
             .saturating_sub(held)
             .saturating_div(8)
@@ -969,6 +967,7 @@ impl WalCursor {
         Self::new_with(file, path, from, 1 << 20)
     }
 
+    #[cfg_attr(not(feature = "text"), allow(dead_code))]
     pub fn open(path: &Path, from: WalPoint) -> Result<WalCursor> {
         Self::new(File::open(path)?, path, from)
     }
@@ -998,21 +997,21 @@ impl WalCursor {
     }
 
     /// [`next`](Self::next) under `limit`, which also returns the bytes the cursor holds.
-    /// A read with a memory cap checks each record, charges the growth of the
-    /// transaction buffer before it allocates and streams the checksum in checked
-    /// chunks. `held` is what the caller retains besides the cursor.
+    /// An accounting control checks each record, charges the growth of the transaction
+    /// buffer before it allocates and streams the checksum in checked chunks. `held` is
+    /// what the caller retains besides the cursor. Any other control checks nothing here,
+    /// so its caller checks at its own stride.
     pub(crate) fn next_with<C: Control>(
         &mut self,
         limit: &C,
         held: u64,
     ) -> Result<Option<(u64, &[u8], u64)>> {
-        let capped = limit.capped_limit();
         self.txn.clear();
         self.configuration = None;
         let mut rec = [0u8; WAL_REC];
         let mut offset = self.at.offset;
         loop {
-            if capped.is_some() {
+            if C::ACCOUNTS {
                 limit.check(held.saturating_add(self.buffer_bytes()))?;
             }
             match self.r.read_exact(&mut rec) {
@@ -1023,7 +1022,7 @@ impl WalCursor {
             offset += WAL_REC as u64;
             match rec[0] {
                 WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL => {
-                    if capped.is_some() && self.txn.len() + WAL_REC > self.txn.capacity() {
+                    if C::ACCOUNTS && self.txn.len() + WAL_REC > self.txn.capacity() {
                         let next = (self.txn.capacity().saturating_mul(2)).max(WAL_REC);
                         // Old and replacement allocations can coexist during relocation.
                         limit.check(
@@ -1061,17 +1060,18 @@ impl WalCursor {
             }
         }
         let prev = self.at.seq;
-        let metadata = match capped {
-            Some(capped) => commit::open_wal_commit_with_crc(
+        let metadata = if C::ACCOUNTS {
+            commit::open_wal_commit_with_crc(
                 &rec,
                 replay_crc_limited(
                     &rec,
                     &self.txn,
-                    capped,
+                    limit,
                     held.saturating_add(self.buffer_bytes()),
                 )?,
-            ),
-            None => commit::open_wal_commit(&rec, &self.txn),
+            )
+        } else {
+            commit::open_wal_commit(&rec, &self.txn)
         };
         let seq = match metadata {
             Some(Ok((seq, _, _, flags))) => {
@@ -1121,17 +1121,24 @@ impl WalCursor {
     /// Move to the end of commit `seq` (at or after the cursor's position): the
     /// position after the last transaction numbered at most `seq`. A log that ends
     /// before `seq` is [`Error::Corrupt`].
-    pub fn seek_to(mut self, seq: u64) -> Result<WalPoint> {
+    ///
+    /// An accounting control stops at the end of commit `seq` without reading the
+    /// transaction after it.
+    pub(crate) fn seek_to_with<C: Control>(mut self, seq: u64, limit: &C) -> Result<WalPoint> {
         loop {
             let before = self.at;
+            if C::ACCOUNTS && before.seq == seq {
+                limit.check(0)?;
+                return Ok(before);
+            }
             if before.seq > seq {
                 return Err(Error::Corrupt(format!(
                     "{}: read past commit {seq}",
                     self.path.display()
                 )));
             }
-            match self.next()? {
-                Some((s, _)) if s > seq => return Ok(before),
+            match self.next_with(limit, 0)? {
+                Some((s, _, _)) if s > seq => return Ok(before),
                 Some(_) => {}
                 None if before.seq == seq => return Ok(before),
                 None => {
@@ -1156,9 +1163,9 @@ pub(crate) fn record_quad(rec: &[u8]) -> [Id; 4] {
 }
 
 /// Apply the transactions of a log range to `delta`, forward, from `from` through the
-/// end of commit `to.seq` (`to` is where that commit ends). Under no cap, `limit` is
-/// checked every 64 Ki records with the delta so far. Under a memory cap each delta
-/// mutation and each transaction relocation is charged before it happens.
+/// end of commit `to.seq` (`to` is where that commit ends). A stride control is checked
+/// every 64 Ki records with the delta so far. An accounting control is checked before
+/// each delta mutation and each transaction relocation.
 pub(crate) fn apply_forward<C: Control>(
     path: &Path,
     generation: &Generation,
@@ -1168,14 +1175,15 @@ pub(crate) fn apply_forward<C: Control>(
     to: WalPoint,
     limit: &C,
 ) -> Result<u64> {
-    let capped = limit.capped_limit();
     let delta_bytes = |delta: &Delta| {
-        capped.map_or(0, |_| {
+        if C::ACCOUNTS {
             super::history_limited::preparation_delta_bytes(delta)
-        })
+        } else {
+            0
+        }
     };
-    if let Some(capped) = capped {
-        capped.check(delta_bytes(delta))?;
+    if C::ACCOUNTS {
+        limit.check(delta_bytes(delta))?;
     }
     if from == to {
         return Ok(0);
@@ -1196,25 +1204,25 @@ pub(crate) fn apply_forward<C: Control>(
                 continue;
             }
             let q = record_quad(rec);
-            let in_base = if let Some(capped) = capped {
+            let in_base = if C::ACCOUNTS {
                 // Each changed quad can add one key to every permutation. Check before
                 // mutation, while the validated transaction remains in memory.
                 let held = super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(buffers);
-                capped.check(held)?;
-                spo.contains_limited(cache, &Perm::Spo.to_key(&q), capped, held)?
+                limit.check(held)?;
+                spo.contains_limited(cache, &Perm::Spo.to_key(&q), &limit.read_limit(), held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
             apply(delta, &q, rec[0] == WAL_INSERT, in_base);
             records += 1;
-            if capped.is_none() && Stride::<0x1_0000>::due::<C>(records) {
+            if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;
             }
         }
     }
-    if let Some(capped) = capped {
-        capped.check(delta_bytes(delta))?;
+    if C::ACCOUNTS {
+        limit.check(delta_bytes(delta))?;
     }
     if c.position() != to {
         return Err(Error::Corrupt(format!(
@@ -1229,10 +1237,10 @@ pub(crate) fn apply_forward<C: Control>(
 
 /// Undo the transactions of a log range on `delta`, the state at the end of `hi`, so it
 /// becomes the state at the end of `lo`. The range is read from its end in chunks, and
-/// each transaction's checksum is verified before it is undone. Under a memory cap the
-/// reader retains only one transaction in 64 KiB chunks at most, and charges every
-/// buffer and every delta mutation before it allocates. Under no cap it reads 4 MiB
-/// chunks and checks `limit` every 64 Ki records.
+/// each transaction's checksum is verified before it is undone. Under an accounting
+/// control the reader retains only one transaction in 64 KiB chunks at most, and charges
+/// every buffer and every delta mutation before it allocates. Under any other control it
+/// reads 4 MiB chunks, and a stride control is checked every 64 Ki records.
 pub(crate) fn apply_backward<C: Control>(
     path: &Path,
     generation: &Generation,
@@ -1242,16 +1250,17 @@ pub(crate) fn apply_backward<C: Control>(
     hi: WalPoint,
     limit: &C,
 ) -> Result<u64> {
-    let capped = limit.capped_limit();
-    let chunk_bytes: u64 = if capped.is_some() { 64 << 10 } else { 4 << 20 };
+    let chunk_bytes: u64 = if C::ACCOUNTS { 64 << 10 } else { 4 << 20 };
     let chunk_max: u64 = chunk_bytes / WAL_REC as u64 * WAL_REC as u64;
     let delta_bytes = |delta: &Delta| {
-        capped.map_or(0, |_| {
+        if C::ACCOUNTS {
             super::history_limited::preparation_delta_bytes(delta)
-        })
+        } else {
+            0
+        }
     };
-    if let Some(capped) = capped {
-        capped.check(delta_bytes(delta))?;
+    if C::ACCOUNTS {
+        limit.check(delta_bytes(delta))?;
     }
     let corrupt = |m: String| Error::Corrupt(format!("{}: {m}", path.display()));
     if hi.offset < lo.offset || !(hi.offset - lo.offset).is_multiple_of(WAL_REC as u64) {
@@ -1276,10 +1285,10 @@ pub(crate) fn apply_backward<C: Control>(
                     held_buffers: u64|
      -> Result<()> {
         fwd.clear();
-        if let Some(capped) = capped {
+        if C::ACCOUNTS {
             let need = data.len().saturating_mul(WAL_REC);
             if need > fwd.capacity() {
-                capped.check(
+                limit.check(
                     delta_bytes(delta)
                         .saturating_add(held_buffers)
                         .saturating_add(fwd.capacity() as u64)
@@ -1289,8 +1298,8 @@ pub(crate) fn apply_backward<C: Control>(
             }
         }
         for r in data.iter().rev() {
-            if let Some(capped) = capped {
-                capped.check(
+            if C::ACCOUNTS {
+                limit.check(
                     delta_bytes(delta)
                         .saturating_add(held_buffers)
                         .saturating_add(fwd.capacity() as u64),
@@ -1298,19 +1307,20 @@ pub(crate) fn apply_backward<C: Control>(
             }
             fwd.extend_from_slice(r);
         }
-        let opened = match capped {
-            Some(capped) => commit::open_wal_commit_with_crc(
+        let opened = if C::ACCOUNTS {
+            commit::open_wal_commit_with_crc(
                 commit,
                 replay_crc_limited(
                     commit,
                     &fwd,
-                    capped,
+                    limit,
                     delta_bytes(delta)
                         .saturating_add(held_buffers)
                         .saturating_add(fwd.capacity() as u64),
                 )?,
-            ),
-            None => commit::open_wal_commit(commit, &fwd),
+            )
+        } else {
+            commit::open_wal_commit(commit, &fwd)
         };
         match opened {
             Some(Ok((s, _, _, flags))) if s == *seq => {
@@ -1335,18 +1345,18 @@ pub(crate) fn apply_backward<C: Control>(
                 continue;
             }
             let q = record_quad(r);
-            let in_base = if let Some(capped) = capped {
+            let in_base = if C::ACCOUNTS {
                 let held = super::history_limited::preparation_mutation_bytes(delta)
                     .saturating_add(held_buffers)
                     .saturating_add(fwd.capacity() as u64);
-                capped.check(held)?;
-                spo.contains_limited(cache, &Perm::Spo.to_key(&q), capped, held)?
+                limit.check(held)?;
+                spo.contains_limited(cache, &Perm::Spo.to_key(&q), &limit.read_limit(), held)?
             } else {
                 spo.contains(cache, &Perm::Spo.to_key(&q))?
             };
             apply(delta, &q, r[0] != WAL_INSERT, in_base);
             records += 1;
-            if capped.is_none() && Stride::<0x1_0000>::due::<C>(records) {
+            if Stride::<0x1_0000>::due::<C>(records) {
                 limit.check_delta(delta)?;
             }
         }
@@ -1355,7 +1365,7 @@ pub(crate) fn apply_backward<C: Control>(
     };
     // what the chunk and the collected records hold, besides the delta
     let held_by = |buf: &Vec<u8>, data: &Vec<[u8; WAL_REC]>| -> u64 {
-        if capped.is_some() {
+        if C::ACCOUNTS {
             (buf.capacity() + data.capacity() * WAL_REC) as u64
         } else {
             0
@@ -1365,13 +1375,13 @@ pub(crate) fn apply_backward<C: Control>(
     let mut buf: Vec<u8> = Vec::new();
     while end > lo.offset {
         let mut chunk = chunk_max;
-        if let Some(capped) = capped {
-            capped.check(
+        if C::ACCOUNTS {
+            limit.check(
                 delta_bytes(delta)
                     .saturating_add(buf.capacity() as u64)
                     .saturating_add((data.capacity() * WAL_REC * 2) as u64),
             )?;
-            let remaining = capped
+            let remaining = limit
                 .remaining()
                 .saturating_sub(delta_bytes(delta))
                 .saturating_sub((data.capacity() * WAL_REC * 2) as u64);
@@ -1381,10 +1391,8 @@ pub(crate) fn apply_backward<C: Control>(
         }
         let start = end.saturating_sub(chunk).max(lo.offset);
         let need = (end - start) as usize;
-        if let Some(capped) = capped
-            && need > buf.capacity()
-        {
-            capped.check(
+        if C::ACCOUNTS && need > buf.capacity() {
+            limit.check(
                 delta_bytes(delta)
                     .saturating_add((data.capacity() * WAL_REC * 2) as u64)
                     .saturating_add(buf.capacity() as u64)
@@ -1397,8 +1405,8 @@ pub(crate) fn apply_backward<C: Control>(
         file.seek(SeekFrom::Start(start))?;
         file.read_exact(&mut buf)?;
         for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate().rev() {
-            if let Some(capped) = capped {
-                capped.check(
+            if C::ACCOUNTS {
+                limit.check(
                     delta_bytes(delta)
                         .saturating_add(buf.capacity() as u64)
                         .saturating_add((data.capacity() * WAL_REC * 2) as u64),
@@ -1415,11 +1423,9 @@ pub(crate) fn apply_backward<C: Control>(
                     commit = Some(*rec);
                 }
                 WAL_INSERT | WAL_DELETE | WAL_CONFIGURATION | WAL_CONTROL if commit.is_some() => {
-                    if let Some(capped) = capped
-                        && data.len() == data.capacity()
-                    {
+                    if C::ACCOUNTS && data.len() == data.capacity() {
                         let next = data.capacity().saturating_mul(2).max(1);
-                        capped.check(
+                        limit.check(
                             delta_bytes(delta)
                                 .saturating_add(buf.capacity() as u64)
                                 .saturating_add((data.capacity() * WAL_REC * 2) as u64)
@@ -1453,10 +1459,10 @@ pub(crate) fn apply_backward<C: Control>(
 
 /// The ordinary codec consumes this scalar without allocating another buffer.
 /// Legacy records have no modern checksum and retain their replay fallback.
-fn replay_crc_limited(
+fn replay_crc_limited<C: Control>(
     record: &[u8],
     data: &[u8],
-    limit: &crate::history::ReadLimit<'_>,
+    limit: &C,
     held: u64,
 ) -> Result<flate2::Crc> {
     limit.check(held)?;

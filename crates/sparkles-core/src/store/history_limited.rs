@@ -9,17 +9,6 @@ enum PinnedSource<'a> {
 }
 
 impl Store {
-    pub(super) fn inherited_limited(
-        &self,
-        at: &At,
-        seq: u64,
-        limit: &ReadLimit<'_>,
-    ) -> Result<Error> {
-        let name = limit.read_lock(&self.branching.name)?;
-        limit.check(name.len() as u64)?;
-        Ok(self.inherited_named(at, seq, &name))
-    }
-
     /// An unresolved time has no honest commit number after catalog pruning.
     pub(super) fn unresolved_time_limited(&self, ms: i64, limit: &ReadLimit<'_>) -> Result<Error> {
         let writer = limit.lock(&self.writer)?;
@@ -143,7 +132,7 @@ impl Store {
                     Some(commit) => commit.seq,
                     None if self.branching.ident.is_some() => {
                         drop(catalog);
-                        return Err(self.inherited_limited(at, 0, limit)?);
+                        return Err(self.inherited_with(at, 0, limit)?);
                     }
                     None => {
                         return Err(Error::NotFound(format!(
@@ -181,7 +170,7 @@ impl Store {
                 _ => seq < identity.from.seq,
             };
             if before {
-                return Err(self.inherited_limited(at, seq, limit)?);
+                return Err(self.inherited_with(at, seq, limit)?);
             }
         }
         let metadata = limit.lock(&self.catalog)?.get(seq);
@@ -191,7 +180,7 @@ impl Store {
         };
         let Some(commit) = metadata else {
             if self.starts_at(seq) {
-                return Err(self.inherited_limited(at, seq, limit)?);
+                return Err(self.inherited_with(at, seq, limit)?);
             }
             let name = match at {
                 At::Snapshot(name) => Some(name.clone()),
@@ -366,79 +355,6 @@ impl Store {
             reconstructable,
             metadata,
         })))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn materialize_limited(
-        &self,
-        history: &crate::history::HistoryState,
-        owner: u32,
-        entry: &crate::history::GenEntry,
-        generation: &Arc<Generation>,
-        live: &Snapshot,
-        seq: u64,
-        limit: &ReadLimit<'_>,
-    ) -> Result<(Delta, wal::WalPoint)> {
-        let path = entry.dir.join("wal.log");
-        let target = wal_point_limited(generation, entry, seq, limit)?;
-        let base = wal::WalPoint {
-            seq: entry.base.seq,
-            offset: 0,
-        };
-        let base_delta = generation.link.as_ref().map(|l| &l.base_delta);
-        let mut best = (
-            if base_delta.is_none_or(|d| preparation_delta_bytes(d) <= limit.remaining()) {
-                target.offset
-            } else {
-                u64::MAX
-            },
-            base,
-            base_delta,
-        );
-        for cached in history.cache.iter().filter(|c| c.generation == owner) {
-            limit.check(0)?;
-            let cost = cached.end.offset.abs_diff(target.offset);
-            if cost < best.0 && preparation_delta_bytes(&cached.snap.delta) <= limit.remaining() {
-                best = (cost, cached.end, Some(&cached.snap.delta));
-            }
-        }
-        if Arc::ptr_eq(&live.generation, generation)
-            && !live.historical
-            && preparation_delta_bytes(&live.delta) <= limit.remaining()
-        {
-            let point = wal_point_limited(generation, entry, live.commit, limit)?;
-            let cost = point.offset.abs_diff(target.offset);
-            if cost < best.0 {
-                best = (cost, point, Some(&live.delta));
-            }
-        }
-        let (_, from, seed) = best;
-        limit.check(seed.map_or(0, preparation_delta_bytes))?;
-        let mut delta = seed.cloned().unwrap_or_default();
-        if from.offset <= target.offset {
-            wal::apply_forward(
-                &path,
-                generation,
-                &self.cache,
-                &mut delta,
-                from,
-                target,
-                limit,
-            )?;
-            return Ok((delta, target));
-        }
-        match wal::apply_backward(
-            &path,
-            generation,
-            &self.cache,
-            &mut delta,
-            target,
-            from,
-            limit,
-        ) {
-            Ok(_) => Ok((delta, target)),
-            Err(error) => Err(error),
-        }
     }
 
     pub(super) fn cache_limited_snapshot(
@@ -688,54 +604,6 @@ impl Store {
                         inherited = Some(At::Commit(owner.seq));
                     }
                 }
-            }
-        }
-    }
-}
-
-fn wal_point_limited(
-    generation: &Generation,
-    entry: &crate::history::GenEntry,
-    seq: u64,
-    limit: &ReadLimit<'_>,
-) -> Result<wal::WalPoint> {
-    let path = entry.dir.join("wal.log");
-    // Existing sparse indexes are shared store state. An unindexed sealed generation
-    // is scanned without building an unbounded index as a side effect of this read.
-    let floor = limit
-        .lock(&generation.wal_index)?
-        .as_ref()
-        .map(|index| index.floor(seq))
-        .unwrap_or(wal::WalPoint {
-            seq: entry.base.seq,
-            offset: 0,
-        });
-    limit.check(0)?;
-    if floor.seq == seq {
-        return Ok(floor);
-    }
-    let mut cursor = wal::WalCursor::open_with(&path, floor, limit, 0)?;
-    loop {
-        let before = cursor.position();
-        if before.seq == seq {
-            limit.check(0)?;
-            return Ok(before);
-        }
-        if before.seq > seq {
-            return Err(Error::Corrupt(format!(
-                "{}: read past commit {seq}",
-                path.display()
-            )));
-        }
-        match cursor.next_with(limit, 0)? {
-            Some((found, _, _)) if found > seq => return Ok(before),
-            Some(_) => {}
-            None if before.seq == seq => return Ok(before),
-            None => {
-                return Err(Error::Corrupt(format!(
-                    "{}: the log ends before commit {seq}",
-                    path.display()
-                )));
             }
         }
     }

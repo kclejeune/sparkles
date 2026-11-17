@@ -115,6 +115,42 @@ fn cancellation_and_deadline_apply_to_live_fast_paths() {
     );
 }
 
+/// A historical read with no memory cap still checks cancellation and the deadline, in
+/// a persistent store that replays its log and in an in-memory store, which keeps no
+/// past state by default and would otherwise refuse the read as gone.
+#[test]
+fn an_uncapped_historical_read_is_cancelled_and_times_out() {
+    let root = tempfile::tempdir().unwrap();
+    let disk = Store::open(root.path(), StoreOptions::default()).unwrap();
+    let memory = Store::in_memory(StoreOptions::default());
+    for store in [&disk, &memory] {
+        write(store, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        write(store, "INSERT DATA { <urn:b> <urn:p> 2 }");
+        let past = At::Commit(store.head_commit().seq - 1);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        assert!(matches!(
+            store.snapshot_at(&past, &options),
+            Err(Error::Cancelled)
+        ));
+        cancel.store(false, Ordering::Relaxed);
+        options.deadline = Some(Instant::now() - Duration::from_millis(1));
+        assert!(matches!(
+            store.snapshot_at(&past, &options),
+            Err(Error::Timeout)
+        ));
+    }
+    let past = At::Commit(disk.head_commit().seq - 1);
+    let options = HistoryOptions::default();
+    assert_eq!(
+        values(disk.snapshot_at(&past, &options).unwrap().0).len(),
+        1
+    );
+}
+
 #[test]
 fn bounded_origin_selection_follows_only_the_requested_family() {
     let root = tempfile::tempdir().unwrap();

@@ -253,7 +253,7 @@ impl Store {
                 .ok_or_else(|| managed_history::unavailable("commit has no retained history"))?;
             let history = limit.lock(retained)?;
             let owner = history
-                .owner_limited(
+                .owner_with(
                     seq,
                     commit::generation_number(&snapshot.generation.name),
                     snapshot.commit,

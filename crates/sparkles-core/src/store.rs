@@ -2945,6 +2945,22 @@ impl Store {
         self.inherited_named(at, seq, &self.branch_name())
     }
 
+    /// [`inherited`](Self::inherited) under `limit`. An accounting control reads the
+    /// branch name under its lock control and checks the name's length.
+    pub(super) fn inherited_with<C: crate::budgeted::Control>(
+        &self,
+        at: &crate::history::At,
+        seq: u64,
+        limit: &C,
+    ) -> Result<Error> {
+        if !C::ACCOUNTS {
+            return Ok(self.inherited(at, seq));
+        }
+        let name = limit.read_limit().read_lock(&self.branching.name)?;
+        limit.check(name.len() as u64)?;
+        Ok(self.inherited_named(at, seq, &name))
+    }
+
     fn inherited_named(&self, at: &crate::history::At, seq: u64, name: &str) -> Error {
         let i = self.branching.ident.as_ref().expect("a branch store");
         let mut e = crate::branch::BranchError {
@@ -3012,19 +3028,40 @@ impl Store {
             .map_or(self.opts.history_cache_bytes, |scope| {
                 scope.caches.history().capacity()
             });
-        let memory = memory.map(|n| n.min(capacity));
-        let limit = crate::history::ReadLimit {
-            options: o,
-            memory,
-            held: if memory.is_some() {
-                crate::history::READ_METADATA_BYTES
-            } else {
-                0
-            },
-        };
+        match memory {
+            Some(memory) => self.snapshot_at_with(
+                at,
+                crate::history::ReadLimit {
+                    options: o,
+                    memory: Some(memory.min(capacity)),
+                    held: crate::history::READ_METADATA_BYTES,
+                },
+            ),
+            None => self.snapshot_at_with(
+                at,
+                HistoryCeiling {
+                    limit: crate::history::ReadLimit {
+                        options: o,
+                        memory: None,
+                        held: 0,
+                    },
+                    ceiling: u64::MAX,
+                },
+            ),
+        }
+    }
+
+    /// A historical read under `limit`. An accounting control, a read with a memory cap,
+    /// takes the bounded form of each step. A stride control checks cancellation and the
+    /// deadline as it goes and refuses a state larger than the history cache.
+    fn snapshot_at_with<C: HistoryRead>(
+        &self,
+        at: &crate::history::At,
+        limit: C,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         limit.check(0)?;
-        let r = if memory.is_some() {
-            self.resolve_limited(at, &limit)?
+        let r = if C::ACCOUNTS {
+            self.resolve_limited(at, &limit.read_limit())?
         } else {
             self.resolve(at)?
         };
@@ -3041,13 +3078,8 @@ impl Store {
         }
         let seq = r.commit.seq;
         if let Some(mem) = &self.mem_history {
-            let mut m = limit.lock(mem)?;
-            let found = if memory.is_some() {
-                m.get_limited(seq, &limit)?
-            } else {
-                m.get(seq)
-            };
-            return match found {
+            let mut m = limit.read_limit().lock(mem)?;
+            return match m.get_with(seq, &limit)? {
                 Some(snap) => {
                     limit.check(history_limited::preparation_delta_bytes(&snap.delta))?;
                     m.hits += 1;
@@ -3060,13 +3092,15 @@ impl Store {
                         _ => None,
                     };
                     if self.starts_at(seq) {
-                        if memory.is_some() {
-                            Err(self.inherited_limited(at, seq, &limit)?)
-                        } else {
-                            Err(self.inherited(at, seq))
-                        }
-                    } else if memory.is_some() {
-                        Err(self.mem_gone_limited(seq, r.head, name, Some(r.commit), &limit)?)
+                        Err(self.inherited_with(at, seq, &limit)?)
+                    } else if C::ACCOUNTS {
+                        Err(self.mem_gone_limited(
+                            seq,
+                            r.head,
+                            name,
+                            Some(r.commit),
+                            &limit.read_limit(),
+                        )?)
                     } else {
                         Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
                     }
@@ -3084,33 +3118,21 @@ impl Store {
             _ => None,
         };
         // one materialization at a time: concurrent requests for a state wait for it
-        let mut h = limit.lock(hist)?;
-        let limit = crate::history::ReadLimit {
-            memory: memory.map(|n| n.min(h.budget.capacity())),
-            ..limit
-        };
-        let owner = if memory.is_some() {
-            h.owner_limited(seq, current, r.head, &limit)?
-        } else {
-            h.owner(seq, current, r.head)
-        };
-        let Some(owner) = owner else {
+        let mut h = limit.read_limit().lock(hist)?;
+        let limit = limit.narrowed(h.budget.capacity());
+        let Some(owner) = h.owner_with(seq, current, r.head, &limit)? else {
             if self.starts_at(seq) {
                 drop(h);
-                return Err(if memory.is_some() {
-                    self.inherited_limited(at, seq, &limit)?
-                } else {
-                    self.inherited(at, seq)
-                });
+                return Err(self.inherited_with(at, seq, &limit)?);
             }
-            return if memory.is_some() {
+            return if C::ACCOUNTS {
                 Err(self.history_gone_limited(
                     &h,
                     seq,
                     r.head,
                     snapshot_name,
                     Some(r.commit),
-                    &limit,
+                    &limit.read_limit(),
                 )?)
             } else {
                 Err(self.history_gone(&h, seq, r.head, snapshot_name, Some(r.commit)))
@@ -3125,18 +3147,18 @@ impl Store {
             }
         }
         if let Some(i) = cached {
-            let retained = if memory.is_some()
-                && !Arc::ptr_eq(&h.cache[i].snap.generation, &live.generation)
-            {
-                h.cache[i].snap.generation.retained_bytes_limited(&limit)?
-            } else {
-                0
-            };
-            limit
-                .holding(retained)?
-                .check(history_limited::preparation_delta_bytes(
-                    &h.cache[i].snap.delta,
-                ))?;
+            let retained =
+                if C::ACCOUNTS && !Arc::ptr_eq(&h.cache[i].snap.generation, &live.generation) {
+                    h.cache[i]
+                        .snap
+                        .generation
+                        .retained_bytes_limited(&limit.read_limit())?
+                } else {
+                    0
+                };
+            limit.read_limit().holding(retained)?.check(
+                history_limited::preparation_delta_bytes(&h.cache[i].snap.delta),
+            )?;
             let e = h.cache.remove(i);
             let snap = e.snap.clone();
             h.cache.insert(0, e);
@@ -3145,39 +3167,34 @@ impl Store {
         }
         h.misses += 1;
         // Snapshot/entry/path metadata remains live beside replay's owned buffers.
-        let limit = if memory.is_some() {
-            limit.holding(16 << 10)?
-        } else {
-            limit
-        };
+        let limit = limit.holding(16 << 10)?;
         let entry = h.gens[&owner].clone();
-        let generation = if memory.is_some() {
-            self.history_generation_limited(&mut h, owner, current, &live, &limit, seq)?
+        let generation = if C::ACCOUNTS {
+            self.history_generation_limited(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &limit.read_limit(),
+                seq,
+            )?
         } else {
             self.history_generation(&mut h, owner, current, &live, &entry, seq)?
         };
-        let limit = if memory.is_some() && !Arc::ptr_eq(&generation, &live.generation) {
-            limit.holding(generation.retained_bytes_limited(&limit)?)?
+        let limit = if C::ACCOUNTS && !Arc::ptr_eq(&generation, &live.generation) {
+            let retained = generation.retained_bytes_limited(&limit.read_limit())?;
+            limit.holding(retained)?
         } else {
             limit
         };
-        let budget = h.budget.capacity();
         let t0 = std::time::Instant::now();
-        let ceiling = HistoryCeiling {
-            limit,
-            ceiling: budget,
-        };
-        let (delta, end) = if memory.is_some() {
-            self.materialize_limited(&h, owner, &entry, &generation, &live, seq, &limit)?
-        } else {
-            self.materialize(&h, owner, &entry, &generation, &live, seq, &ceiling)?
-        };
+        let (delta, end) = self.materialize(&h, owner, &entry, &generation, &live, seq, &limit)?;
         limit.check(history_limited::preparation_delta_bytes(&delta))?;
         h.materializations += 1;
         h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
-        let dvocab_len = if memory.is_some() {
-            generation.dvocab.len_limited(&limit)?
+        let dvocab_len = if C::ACCOUNTS {
+            generation.dvocab.len_limited(&limit.read_limit())?
         } else {
             generation.dvocab.len()
         };
@@ -3189,30 +3206,18 @@ impl Store {
                 .historical(true)
                 .build(),
         );
-        if memory.is_some() {
-            Self::cache_limited_snapshot(
-                &mut h,
-                crate::history::Cached {
-                    generation: owner,
-                    seq,
-                    snap: snap.clone(),
-                    bytes,
-                    end,
-                },
-                &limit,
-            )?;
+        let cached = crate::history::Cached {
+            generation: owner,
+            seq,
+            snap: snap.clone(),
+            bytes,
+            end,
+        };
+        if C::ACCOUNTS {
+            Self::cache_limited_snapshot(&mut h, cached, &limit.read_limit())?;
             return Ok((snap, r));
         }
-        h.cache.insert(
-            0,
-            crate::history::Cached {
-                generation: owner,
-                seq,
-                snap: snap.clone(),
-                bytes,
-                end,
-            },
-        );
+        h.cache.insert(0, cached);
         // evict the least recently used states, warm pins' last
         let warm: Vec<(u32, u64)> = h
             .pins
@@ -3318,9 +3323,10 @@ impl Store {
     /// its log. The state starts from whichever known state of the generation is
     /// nearest in the log: its base, a cached past state, or (in the current
     /// generation) the live state. Later states are reached by replaying the log
-    /// forward, earlier ones by undoing it backward.
+    /// forward, earlier ones by undoing it backward. An accounting control starts only
+    /// from a state whose copy fits what it still admits.
     #[allow(clippy::too_many_arguments)]
-    fn materialize(
+    pub(super) fn materialize<C: crate::budgeted::Control>(
         &self,
         h: &crate::history::HistoryState,
         owner: u32,
@@ -3328,35 +3334,49 @@ impl Store {
         generation: &Arc<Generation>,
         live: &Snapshot,
         seq: u64,
-        limit: &HistoryCeiling<'_>,
+        limit: &C,
     ) -> Result<(Delta, wal::WalPoint)> {
+        let fits = |delta: &Delta| {
+            !C::ACCOUNTS || history_limited::preparation_delta_bytes(delta) <= limit.remaining()
+        };
         let path = entry.dir.join("wal.log");
-        let target = wal_point(generation, entry, seq)?;
+        let target = wal_point_with(generation, entry, seq, limit)?;
         let base = wal::WalPoint {
             seq: entry.base.seq,
             offset: 0,
         };
-        // (start, its delta): the base, cached states, the live state
-        let mut best: (u64, wal::WalPoint, Option<&Delta>) = (target.offset, base, None);
-        let live_point = if Arc::ptr_eq(&live.generation, generation) && !live.historical {
-            Some(wal_point(generation, entry, live.commit)?)
-        } else {
-            None
-        };
+        // (cost, start, its delta): the base, cached states, the live state
+        let base_delta = generation.link.as_ref().map(|l| &l.base_delta);
+        let mut best: (u64, wal::WalPoint, Option<&Delta>) = (
+            if base_delta.is_none_or(fits) {
+                target.offset
+            } else {
+                u64::MAX
+            },
+            base,
+            base_delta,
+        );
         for c in h.cache.iter().filter(|c| c.generation == owner) {
+            if C::ACCOUNTS {
+                limit.check(0)?;
+            }
             let cost = c.end.offset.abs_diff(target.offset);
-            if cost < best.0 {
+            if cost < best.0 && fits(&c.snap.delta) {
                 best = (cost, c.end, Some(&c.snap.delta));
             }
         }
-        if let Some(p) = live_point {
+        if Arc::ptr_eq(&live.generation, generation) && !live.historical && fits(&live.delta) {
+            let p = wal_point_with(generation, entry, live.commit, limit)?;
             let cost = p.offset.abs_diff(target.offset);
             if cost < best.0 {
                 best = (cost, p, Some(&live.delta));
             }
         }
         let (_, from, start) = best;
-        let mut delta = start.cloned().unwrap_or_else(|| generation.base_delta());
+        if C::ACCOUNTS {
+            limit.check(start.map_or(0, history_limited::preparation_delta_bytes))?;
+        }
+        let mut delta = start.cloned().unwrap_or_default();
         if from.offset <= target.offset {
             wal::apply_forward(
                 &path,
@@ -3367,20 +3387,18 @@ impl Store {
                 target,
                 limit,
             )?;
-            return Ok((delta, target));
+        } else {
+            wal::apply_backward(
+                &path,
+                generation,
+                &self.cache,
+                &mut delta,
+                target,
+                from,
+                limit,
+            )?;
         }
-        match wal::apply_backward(
-            &path,
-            generation,
-            &self.cache,
-            &mut delta,
-            target,
-            from,
-            limit,
-        ) {
-            Ok(_) => Ok((delta, target)),
-            Err(e) => Err(e),
-        }
+        Ok((delta, target))
     }
 
     fn named(
@@ -7582,24 +7600,68 @@ fn delta_bytes(d: &Delta) -> u64 {
     (d.inserts() + d.deletes()) as u64 * DELTA_QUAD_BYTES
 }
 
-/// The control of a historical read that has no memory cap of its own. Beside the
-/// cancellation and deadline of its limit, it refuses a state that grows past the
-/// capacity of the history cache, which a capped read cannot reach, since its cap is
-/// narrowed to that capacity.
+/// The control of one historical read, which narrows to the history cache once the
+/// read holds it and grows by the metadata it keeps beside replay.
+trait HistoryRead: crate::budgeted::Control + Copy {
+    /// The control once the history cache of `capacity` bytes is known.
+    fn narrowed(self, capacity: u64) -> Self;
+
+    /// The control with `bytes` more held, checked first.
+    fn holding(self, bytes: u64) -> Result<Self>;
+}
+
+/// A read with a memory cap narrows the cap to the cache, which a state must fit.
+impl HistoryRead for crate::history::ReadLimit<'_> {
+    fn narrowed(self, capacity: u64) -> Self {
+        crate::history::ReadLimit {
+            memory: self.memory.map(|n| n.min(capacity)),
+            ..self
+        }
+    }
+
+    fn holding(self, bytes: u64) -> Result<Self> {
+        crate::history::ReadLimit::holding(self, bytes)
+    }
+}
+
+/// The stride control of a historical read that has no memory cap of its own. It checks
+/// the cancellation and deadline of its limit at the reader's stride, and refuses a state
+/// that grows past the capacity of the history cache, which a capped read cannot reach,
+/// since its cap is narrowed to that capacity.
+#[derive(Clone, Copy)]
 struct HistoryCeiling<'a> {
     limit: crate::history::ReadLimit<'a>,
     ceiling: u64,
 }
 
+impl HistoryRead for HistoryCeiling<'_> {
+    fn narrowed(self, capacity: u64) -> Self {
+        HistoryCeiling {
+            ceiling: capacity,
+            ..self
+        }
+    }
+
+    /// A read without a cap charges nothing for what it holds.
+    fn holding(self, _bytes: u64) -> Result<Self> {
+        Ok(self)
+    }
+}
+
 impl crate::budgeted::Control for HistoryCeiling<'_> {
     const CHECKS: bool = true;
+    const ACCOUNTS: bool = false;
 
     fn check(&self, bytes: u64) -> Result<()> {
         self.limit.check(bytes)
     }
 
-    fn capped_limit(&self) -> Option<&crate::history::ReadLimit<'_>> {
-        crate::budgeted::Control::capped_limit(&self.limit)
+    fn remaining(&self) -> u64 {
+        self.limit.remaining()
+    }
+
+    fn read_limit(&self) -> crate::history::ReadLimit<'_> {
+        self.limit
     }
 
     fn check_delta(&self, delta: &Delta) -> Result<()> {
@@ -7835,8 +7897,32 @@ pub(crate) fn wal_point(
     entry: &crate::history::GenEntry,
     seq: u64,
 ) -> Result<wal::WalPoint> {
+    wal_point_with(g, entry, seq, &crate::budgeted::Unlimited)
+}
+
+/// [`wal_point`] under `limit`. An accounting control uses the sparse index only if the
+/// generation already has one, and otherwise reads from the base, since building an
+/// index of unbounded size is not part of a bounded read.
+pub(crate) fn wal_point_with<C: crate::budgeted::Control>(
+    g: &Generation,
+    entry: &crate::history::GenEntry,
+    seq: u64,
+    limit: &C,
+) -> Result<wal::WalPoint> {
     let path = entry.dir.join("wal.log");
-    let floor = {
+    let floor = if C::ACCOUNTS {
+        let floor = limit
+            .read_limit()
+            .lock(&g.wal_index)?
+            .as_ref()
+            .map(|index| index.floor(seq))
+            .unwrap_or(wal::WalPoint {
+                seq: entry.base.seq,
+                offset: 0,
+            });
+        limit.check(0)?;
+        floor
+    } else {
         let mut ix = g.wal_index.lock();
         if ix.is_none() {
             *ix = Some(wal::WalIndex::scan(&path, entry.base.seq)?);
@@ -7846,7 +7932,7 @@ pub(crate) fn wal_point(
     if floor.seq == seq {
         return Ok(floor);
     }
-    wal::WalCursor::open(&path, floor)?.seek_to(seq)
+    wal::WalCursor::open_with(&path, floor, limit, 0)?.seek_to_with(seq, limit)
 }
 
 /// Make a commit durable: its WAL records, already written to `wal`, and the delta terms

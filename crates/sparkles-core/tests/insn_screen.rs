@@ -703,7 +703,7 @@ fn fnv(parts: &[&str]) -> u64 {
 const CASES: &str = "vocab: open, for-each, get-sorted every 7th, get-random 50000, \
                      get-random-checked 50000, find every 13th, missing, prefix 12 bytes of \
                      every 130th; wal: open, open with commits, replay; history: snapshot_at forward, \
-                     backward, limited forward, limited backward; v3";
+                     backward, limited forward, limited backward, sealed forward; v3";
 
 fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize) {
     let commits = env("INSN_SCREEN_COMMITS", 2000);
@@ -840,6 +840,49 @@ fn history_cases(
         );
         out.case(key, counts, other_us, coverage);
     }
+    // After a compaction the commits sit in a sealed generation, whose log has no sparse
+    // index until the first historical read scans it with the uncontrolled cursor.
+    let sealed = tempfile::tempdir().unwrap();
+    let sealed_src = sealed.path().join("db");
+    copy_dir(src, &sealed_src);
+    {
+        // a pin keeps the sealed generation through the compaction
+        let s = Store::open(&sealed_src, StoreOptions::default()).unwrap();
+        s.create_snapshot("insn", &At::Commit(forward), None)
+            .unwrap();
+        s.compact().unwrap();
+    }
+    let key = "history/snapshot-at-sealed-forward";
+    let (mut counts, mut other_us, mut coverage) = (Vec::new(), 0, 1.0f64);
+    let mut quads = None;
+    for _ in 0..reps {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir: PathBuf = scratch.path().join("db");
+        copy_dir(&sealed_src, &dir);
+        let s = Store::open(&dir, StoreOptions::default()).unwrap();
+        let at = At::Commit(forward);
+        let options = HistoryOptions::default();
+        quiesce();
+        let before = other_thread_us();
+        let (n, share, r) = c.count(|| s.snapshot_at(&at, &options).unwrap());
+        other_us += us_since(before);
+        coverage = coverage.min(share);
+        let found = (r.0.commit, r.0.len());
+        assert_eq!(
+            *quads.get_or_insert(found),
+            found,
+            "{key} changed between runs"
+        );
+        counts.push(n);
+    }
+    let (commit, len) = quads.unwrap();
+    out.check_fp(
+        &format!("{key}/state"),
+        commit == forward,
+        format!("commit {commit}, {len} quads"),
+        format!("{commit} {len}"),
+    );
+    out.case(key, counts, other_us, coverage);
 }
 
 /// The other-thread guard sees a worker that ran and was joined while a case ran.
