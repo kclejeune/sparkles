@@ -134,11 +134,17 @@ impl Program {
     }
 
     /// The IR rule of each rule [`lower`](Self::lower) gives, by stratum.
+    /// The vectors have exact capacities, so a caller can charge them before it asks.
     pub fn lowered_origins(&self) -> Vec<Vec<usize>> {
         match self.shape() {
             Shape::Jena | Shape::Monotone => vec![(0..self.rules.len()).collect()],
             Shape::Strata => {
-                let mut v = vec![Vec::new(); self.strata.count as usize];
+                // each stratum's vector is allocated for exactly its rules
+                let mut sizes = vec![0usize; self.strata.count as usize];
+                for part in &self.strata.parts {
+                    sizes[part.stratum as usize] += 1;
+                }
+                let mut v: Vec<Vec<usize>> = sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
                 for part in &self.strata.parts {
                     v[part.stratum as usize].push(part.rule);
                 }

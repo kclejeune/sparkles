@@ -1109,10 +1109,10 @@ fn program_search(
     {
         held.try_grow(generalized.len() * size_of::<Triple>())?;
         let id = |k: &[u8]| terms.try_id_for_key(k);
-        let facts = generalized
-            .iter()
-            .map(|k| Ok([id(&k[0])?, id(&k[1])?, id(&k[2])?]))
-            .collect::<Result<Vec<Triple>, crate::budget::BudgetFailure>>()?;
+        let mut facts: Vec<Triple> = Vec::with_capacity(generalized.len());
+        for k in generalized {
+            facts.push([id(&k[0])?, id(&k[1])?, id(&k[2])?]);
+        }
         g.try_add_batch(facts.into_iter())?;
         held.shrink(generalized.len() * size_of::<Triple>());
     }
@@ -1126,12 +1126,17 @@ fn program_search(
     let mut lowered = program.lower(&budget)?;
     // the lowered rules of every stratum, with the names of their IR rules' variables;
     // the variables and builtins a lowering adds have none
+    // the origins (exact vectors, with the scratch counts that size them), the flat
+    // rules and their infos; the strata's own buffers, which `lowered` charges, are freed
+    // as the rules move out and their bytes are given back below
     let n: usize = lowered.strata.iter().map(Vec::len).sum();
+    let count = lowered.strata.len();
     held.try_grow(
-        lowered.strata.len() * size_of::<Vec<usize>>()
+        count * (size_of::<Vec<usize>>() + size_of::<usize>())
             + n * (size_of::<usize>() + size_of::<CRule>() + size_of::<RuleInfo>()),
     )?;
     let origins = program.lowered_origins();
+    held.shrink(count * size_of::<usize>());
     let mut rules: Vec<CRule> = Vec::with_capacity(n);
     let mut infos: Vec<RuleInfo> = Vec::with_capacity(n);
     for (stratum, ris) in std::mem::take(&mut lowered.strata)
@@ -1176,6 +1181,8 @@ fn program_search(
             rules.push(r);
         }
     }
+    // the strata's buffers, exact in `lower`, are freed
+    held.shrink(count * size_of::<Vec<CRule>>() + n * size_of::<CRule>());
     let sources = vec!["rules".to_string()];
     let mut makes_terms = false;
     if let Some(part) = &part {

@@ -40,18 +40,27 @@ impl Program {
             if !r.head.iter().any(is_rel) {
                 continue;
             }
+            // the copy is built field by field with exact capacities, never larger than
+            // the rule's own, so `bytes` bounds it
             held.try_grow(r.bytes())?;
-            let head: Vec<Head> = r.head.iter().filter(|h| is_rel(h)).cloned().collect();
-            let mut part = r.clone();
-            part.head = head;
+            let mut head = Vec::with_capacity(r.head.iter().filter(|h| is_rel(h)).count());
+            head.extend(r.head.iter().filter(|h| is_rel(h)).cloned());
             let in_head = |v: usize| {
-                part.head.iter().any(|h| match h {
+                head.iter().any(|h| match h {
                     Head::Atom(a) => a.args.contains(&Slot::Var(v)),
                     Head::Action(..) => false,
                 })
             };
-            part.exists = r.exists.iter().copied().filter(|&v| in_head(v)).collect();
-            rules.push(part);
+            let mut exists = Vec::with_capacity(r.exists.iter().filter(|&&v| in_head(v)).count());
+            exists.extend(r.exists.iter().copied().filter(|&v| in_head(v)));
+            rules.push(Rule {
+                name: r.name.clone(),
+                nvars: r.nvars,
+                body: r.body.clone(),
+                head,
+                exists,
+                vars: r.vars.clone(),
+            });
         }
         if rules.is_empty() {
             return Ok(None);
