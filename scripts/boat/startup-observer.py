@@ -305,7 +305,7 @@ def observe_startup(payload):
 # for its children alone and could read the device and inode of its executable. It
 # leaves the set only while its name and executable are the ones it had then and it is
 # again an allowed session process. Its former descendants stay in the set, and a
-# process renamed to bash or sudo, or one that has run exec since, is never released. No probe starts
+# process renamed to bash or sudo, or one whose executable has changed, is never released. No probe starts
 # QUALIFY_SECONDS or more after the phase began, inside the metadata unit's 240
 # seconds, the user-manager query gets only the time left, and a refusal keeps the
 # last busy inventory.

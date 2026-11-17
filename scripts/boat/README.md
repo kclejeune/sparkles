@@ -105,7 +105,10 @@ shell and sudo, which are allowed by their children, can leave the set. One leav
 when the scan that first tracked it refused it for its children alone, and it is again
 an allowed session process with the name and the executable, by device and inode, that
 it had then. Its former descendants stay in the set. A process renamed to bash or sudo,
-one that has run exec since, and one whose executable cannot be read never leave it. A manifest that
+one whose executable has changed since, and one whose executable cannot be read never
+leave it. The session rule itself still goes by name and chain, so a childless process
+named bash under the agent service passes whatever its executable is, in this phase as
+in the startup phase. A manifest that
 differs from its first read refuses at once with no retry. No probe starts 120 seconds or
 more after the phase began, the user-manager query gets only the time left, and at most
 six probes run, inside the metadata unit's 240 seconds. The
