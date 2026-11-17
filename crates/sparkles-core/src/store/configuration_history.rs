@@ -222,117 +222,114 @@ impl Store {
             .as_ref()
             .filter(|identity| identity.from.seq == seq)
             .and_then(|identity| identity.configuration_origin.as_ref());
-        let binding =
-            if let Some(origin) = root_origin {
-                origin.validate(self.owner_dataset_id(), seq)?;
-                origin.binding
-            } else if let Some(memory) = &self.mem_history {
-                preparation
-                    .lock(memory)?
-                    .configurations
-                    .get(&seq)
-                    .copied()
-                    .unwrap_or_default()
+        let binding = if let Some(origin) = root_origin {
+            origin.validate(self.owner_dataset_id(), seq)?;
+            origin.binding
+        } else if let Some(memory) = &self.mem_history {
+            preparation
+                .lock(memory)?
+                .configurations
+                .get(&seq)
+                .copied()
+                .unwrap_or_default()
+        } else {
+            // Hold the whole temporary decoder allowance before using the existing
+            // cold reader. Its buffers are gone before this reservation returns.
+            let allowance = preparation.room();
+            let _held = preparation.reserve(allowance)?;
+            let options = HistoryOptions {
+                cancel: Some(preparation.control().cancel.flag()),
+                deadline: preparation.control().deadline,
+            };
+            let limit = ReadLimit {
+                options: &options,
+                memory: Some(allowance),
+                held: 0,
+            };
+            let snapshot = self.snapshot();
+            let retained = self
+                .history
+                .as_ref()
+                .ok_or_else(|| managed_history::unavailable("commit has no retained history"))?;
+            let history = limit.lock(retained)?;
+            let owner = history
+                .owner_limited(
+                    seq,
+                    commit::generation_number(&snapshot.generation.name),
+                    snapshot.commit,
+                    &limit,
+                )?
+                .ok_or_else(|| {
+                    managed_history::unavailable("commit configuration is no longer retained")
+                })?;
+            let entry = history
+                .gens
+                .get(&owner)
+                .ok_or_else(|| managed_history::unavailable("retained generation is missing"))?;
+            let mut budget = cold::ColdBudget::new(limit)?;
+            // Paths remain borrowed while history keeps this generation alive.
+            budget.charge(
+                (entry.dir.as_os_str().len() as u64)
+                    .saturating_mul(4)
+                    .saturating_add(4096),
+            )?;
+            let physical = commit::read_gen_commit_controlled(&entry.dir, &mut budget)?
+                .ok_or_else(|| {
+                    managed_history::unavailable("retained generation has no commit identity")
+                })?;
+            if physical.value.dataset_id != self.dataset_id
+                || physical.value.commit.seq != entry.base.seq
+            {
+                return Err(managed_history::unavailable(
+                    "retained commit identity differs",
+                ));
+            }
+            if physical.value.commit.seq == seq {
+                physical.value.configuration
             } else {
-                // Hold the whole temporary decoder allowance before using the existing
-                // cold reader. Its buffers are gone before this reservation returns.
-                let allowance = preparation.room();
-                let _held = preparation.reserve(allowance)?;
-                let options = HistoryOptions {
-                    cancel: Some(preparation.control().cancel.flag()),
-                    deadline: preparation.control().deadline,
+                let from = wal::WalPoint {
+                    seq: entry.base.seq,
+                    offset: 0,
                 };
-                let limit = ReadLimit {
-                    options: &options,
-                    memory: Some(allowance),
-                    held: 0,
-                };
-                let snapshot = self.snapshot();
-                let retained = self.history.as_ref().ok_or_else(|| {
-                    managed_history::unavailable("commit has no retained history")
-                })?;
-                let history = limit.lock(retained)?;
-                let owner = history
-                    .owner_limited(
-                        seq,
-                        commit::generation_number(&snapshot.generation.name),
-                        snapshot.commit,
-                        &limit,
-                    )?
-                    .ok_or_else(|| {
-                        managed_history::unavailable("commit configuration is no longer retained")
-                    })?;
-                let entry = history.gens.get(&owner).ok_or_else(|| {
-                    managed_history::unavailable("retained generation is missing")
-                })?;
-                let mut budget = cold::ColdBudget::new(limit)?;
-                // Paths remain borrowed while history keeps this generation alive.
-                budget.charge(
-                    (entry.dir.as_os_str().len() as u64)
-                        .saturating_mul(4)
-                        .saturating_add(4096),
-                )?;
-                let physical = commit::read_gen_commit_controlled(&entry.dir, &mut budget)?
-                    .ok_or_else(|| {
-                        managed_history::unavailable("retained generation has no commit identity")
-                    })?;
-                if physical.value.dataset_id != self.dataset_id
-                    || physical.value.commit.seq != entry.base.seq
-                {
-                    return Err(managed_history::unavailable(
-                        "retained commit identity differs",
-                    ));
-                }
-                if physical.value.commit.seq == seq {
-                    physical.value.configuration
-                } else {
-                    let from = wal::WalPoint {
-                        seq: entry.base.seq,
-                        offset: 0,
-                    };
-                    let cursor_limit = budget.owned_limit()?;
-                    let mut cursor = wal::WalCursor::open_limited(
-                        &entry.dir.join("wal.log"),
-                        from,
-                        &cursor_limit,
-                        0,
-                    )?;
-                    loop {
-                        let found = match cursor.next_limited(&cursor_limit, 0)? {
-                            Some((found, _, _)) => found,
-                            None => {
-                                return Err(managed_history::unavailable(
-                                    "retained WAL has no selected binding",
-                                ));
-                            }
-                        };
-                        if found > seq {
+                let cursor_limit = budget.owned_limit()?;
+                let mut cursor =
+                    wal::WalCursor::open_with(&entry.dir.join("wal.log"), from, &cursor_limit, 0)?;
+                loop {
+                    let found = match cursor.next_with(&cursor_limit, 0)? {
+                        Some((found, _, _)) => found,
+                        None => {
                             return Err(managed_history::unavailable(
-                                "retained WAL passed selected binding",
+                                "retained WAL has no selected binding",
                             ));
                         }
-                        if found == seq {
-                            break match cursor.configuration() {
-                                Some(generation) => {
-                                    let history = installed
-                                        .and_then(|i| i.configuration_history.as_ref())
-                                        .ok_or_else(|| {
-                                            managed_history::unavailable(
-                                                "WAL binding has no published lineage",
-                                            )
-                                        })?;
-                                    managed_history::binding(ConfigurationIdentity {
-                                        dataset_id: self.owner_dataset_id(),
-                                        lineage_id: history.lineage_id,
-                                        generation,
-                                    })
-                                }
-                                None => ConfigurationBinding::LegacyUnbound,
-                            };
-                        }
+                    };
+                    if found > seq {
+                        return Err(managed_history::unavailable(
+                            "retained WAL passed selected binding",
+                        ));
+                    }
+                    if found == seq {
+                        break match cursor.configuration() {
+                            Some(generation) => {
+                                let history = installed
+                                    .and_then(|i| i.configuration_history.as_ref())
+                                    .ok_or_else(|| {
+                                        managed_history::unavailable(
+                                            "WAL binding has no published lineage",
+                                        )
+                                    })?;
+                                managed_history::binding(ConfigurationIdentity {
+                                    dataset_id: self.owner_dataset_id(),
+                                    lineage_id: history.lineage_id,
+                                    generation,
+                                })
+                            }
+                            None => ConfigurationBinding::LegacyUnbound,
+                        };
                     }
                 }
-            };
+            }
+        };
         let cutoff = self
             .branching
             .ident

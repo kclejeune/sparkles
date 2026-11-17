@@ -197,7 +197,15 @@ impl Generation {
                 seq: s.end_seq,
                 offset: s.wal_end,
             };
-            wal::apply_forward(&path, &g, cache, &mut delta, from, to, &mut |_| Ok(()))?;
+            wal::apply_forward(
+                &path,
+                &g,
+                cache,
+                &mut delta,
+                from,
+                to,
+                &crate::budgeted::Unlimited,
+            )?;
         }
         if let Some(overlay) = &file.overlay {
             apply_overlay(gen_dir, overlay, &mut g, cache, &mut delta)?;

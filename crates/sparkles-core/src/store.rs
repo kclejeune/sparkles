@@ -3163,22 +3163,14 @@ impl Store {
         };
         let budget = h.budget.capacity();
         let t0 = std::time::Instant::now();
-        let mut check = |d: &Delta| -> Result<()> {
-            let bytes = delta_bytes(d);
-            limit.check(bytes)?;
-            if bytes > budget {
-                return Err(Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::Memory,
-                    limit: budget,
-                    requested: bytes,
-                }));
-            }
-            Ok(())
+        let ceiling = HistoryCeiling {
+            limit,
+            ceiling: budget,
         };
         let (delta, end) = if memory.is_some() {
             self.materialize_limited(&h, owner, &entry, &generation, &live, seq, &limit)?
         } else {
-            self.materialize(&h, owner, &entry, &generation, &live, seq, &mut check)?
+            self.materialize(&h, owner, &entry, &generation, &live, seq, &ceiling)?
         };
         limit.check(history_limited::preparation_delta_bytes(&delta))?;
         h.materializations += 1;
@@ -3336,7 +3328,7 @@ impl Store {
         generation: &Arc<Generation>,
         live: &Snapshot,
         seq: u64,
-        check: &mut dyn FnMut(&Delta) -> Result<()>,
+        limit: &HistoryCeiling<'_>,
     ) -> Result<(Delta, wal::WalPoint)> {
         let path = entry.dir.join("wal.log");
         let target = wal_point(generation, entry, seq)?;
@@ -3373,7 +3365,7 @@ impl Store {
                 &mut delta,
                 from,
                 target,
-                check,
+                limit,
             )?;
             return Ok((delta, target));
         }
@@ -3384,7 +3376,7 @@ impl Store {
             &mut delta,
             target,
             from,
-            check,
+            limit,
         ) {
             Ok(_) => Ok((delta, target)),
             Err(e) => Err(e),
@@ -7588,6 +7580,40 @@ const DELTA_QUAD_BYTES: u64 = 7 * 64;
 /// Estimated memory of a (replayed) delta.
 fn delta_bytes(d: &Delta) -> u64 {
     (d.inserts() + d.deletes()) as u64 * DELTA_QUAD_BYTES
+}
+
+/// The control of a historical read that has no memory cap of its own. Beside the
+/// cancellation and deadline of its limit, it refuses a state that grows past the
+/// capacity of the history cache, which a capped read cannot reach, since its cap is
+/// narrowed to that capacity.
+struct HistoryCeiling<'a> {
+    limit: crate::history::ReadLimit<'a>,
+    ceiling: u64,
+}
+
+impl crate::budgeted::Control for HistoryCeiling<'_> {
+    const CHECKS: bool = true;
+
+    fn check(&self, bytes: u64) -> Result<()> {
+        self.limit.check(bytes)
+    }
+
+    fn capped_limit(&self) -> Option<&crate::history::ReadLimit<'_>> {
+        crate::budgeted::Control::capped_limit(&self.limit)
+    }
+
+    fn check_delta(&self, delta: &Delta) -> Result<()> {
+        let bytes = delta_bytes(delta);
+        self.limit.check(bytes)?;
+        if bytes > self.ceiling {
+            return Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Memory,
+                limit: self.ceiling,
+                requested: bytes,
+            }));
+        }
+        Ok(())
+    }
 }
 
 /// Retire the generations history no longer needs (`current` is the current generation

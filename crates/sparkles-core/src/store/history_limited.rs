@@ -416,7 +416,7 @@ impl Store {
         limit.check(seed.map_or(0, preparation_delta_bytes))?;
         let mut delta = seed.cloned().unwrap_or_default();
         if from.offset <= target.offset {
-            wal::apply_forward_limited(
+            wal::apply_forward(
                 &path,
                 generation,
                 &self.cache,
@@ -427,7 +427,7 @@ impl Store {
             )?;
             return Ok((delta, target));
         }
-        match wal::apply_backward_limited(
+        match wal::apply_backward(
             &path,
             generation,
             &self.cache,
@@ -714,7 +714,7 @@ fn wal_point_limited(
     if floor.seq == seq {
         return Ok(floor);
     }
-    let mut cursor = wal::WalCursor::open_limited(&path, floor, limit, 0)?;
+    let mut cursor = wal::WalCursor::open_with(&path, floor, limit, 0)?;
     loop {
         let before = cursor.position();
         if before.seq == seq {
@@ -727,7 +727,7 @@ fn wal_point_limited(
                 path.display()
             )));
         }
-        match cursor.next_limited(limit, 0)? {
+        match cursor.next_with(limit, 0)? {
             Some((found, _, _)) if found > seq => return Ok(before),
             Some(_) => {}
             None if before.seq == seq => return Ok(before),

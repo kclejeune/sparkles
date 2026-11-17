@@ -5,6 +5,7 @@ pub mod access;
 pub mod algo;
 pub mod annotations;
 pub mod branch;
+pub(crate) mod budgeted;
 pub mod builder;
 pub mod check;
 pub mod codec;

@@ -1150,8 +1150,8 @@ fn activation_branch(root: &Path, preparation: &Preparation) -> Result<Activatio
         offset: 0,
     };
     let cursor_limit = budget.owned_limit()?;
-    let mut cursor = super::wal::WalCursor::open_limited(&hot, from, &cursor_limit, 0)?;
-    while let Some((seq, _, _)) = cursor.next_limited(&cursor_limit, 0)? {
+    let mut cursor = super::wal::WalCursor::open_with(&hot, from, &cursor_limit, 0)?;
+    while let Some((seq, _, _)) = cursor.next_with(&cursor_limit, 0)? {
         if cursor.configuration().is_some() {
             return Err(unavailable(
                 "activation found an unpublished WAL configuration binding",
