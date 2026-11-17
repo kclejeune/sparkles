@@ -1812,24 +1812,31 @@ mod auth {
                 None,
             )])
             .unwrap();
-        tokio::task::block_in_place(|| {
-            let v = ds.dataset.indexes().vector();
-            v.set_embedding_environment(Some(Environment {
+        ds.dataset
+            .indexes()
+            .vector()
+            .set_embedding_environment(Some(Environment {
                 outbound: sparkles::outbound::OutboundPolicy {
                     allow_private: true,
                     ..Default::default()
                 },
                 ..Default::default()
             }));
-            let cfg: sparkles::vector::VectorIndexConfig = serde_json::from_value(json!({
-                "predicate": "urn:x-test:secretEmb",
-                "dimension": 8,
-                "embedding": {"url": mock.url(), "model": "mock", "predicates": ["http://ex/secret"]}
-            }))
-            .unwrap();
-            v.put("secret", cfg).unwrap();
-            v.embed_until_idle(Duration::from_secs(30)).unwrap();
-        });
+        // index `name` stores the embeddings of `source` under `predicate`
+        let put = |name: &str, predicate: &str, source: &str| {
+            tokio::task::block_in_place(|| {
+                let v = ds.dataset.indexes().vector();
+                let cfg: sparkles::vector::VectorIndexConfig = serde_json::from_value(json!({
+                    "predicate": predicate,
+                    "dimension": 8,
+                    "embedding": {"url": mock.url(), "model": "mock", "predicates": [source]}
+                }))
+                .unwrap();
+                v.put(name, cfg).unwrap();
+                v.embed_until_idle(Duration::from_secs(30)).unwrap();
+            })
+        };
+        put("secret", "urn:x-test:secretEmb", "http://ex/secret");
         let call = |user: &'static str, args: J| {
             let app = s.app.clone();
             async move {
@@ -1871,6 +1878,37 @@ mod auth {
             msg(&named, "urn:x-test:secretEmb"),
             msg(&absent, "urn:x-test:none")
         );
+        let pred = |r: &J| r["structuredContent"]["predicate"].clone();
+        let iris = |r: &J| -> Vec<String> {
+            assert_eq!(r["isError"], false, "{r}");
+            r["structuredContent"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["iri"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // a visible index that sorts after the hidden one: the restricted caller skips
+        // the hidden index and searches the visible one, over its own graphs only
+        put("zvisible", "urn:x-test:visEmb", "http://ex/p");
+        let r = call("gra", json!({"dataset": "graphs", "query": "alpha fox"})).await;
+        assert_eq!(pred(&r), "<urn:x-test:visEmb>", "{r}");
+        let found = iris(&r);
+        assert!(found.contains(&"ex:a1".to_string()), "{r}");
+        assert!(found.iter().all(|i| i == "ex:a1" || i == "ex:a2"), "{r}");
+        let r = call(
+            "gra",
+            json!({"dataset": "graphs", "query": "fox", "predicate": "urn:x-test:visEmb"}),
+        )
+        .await;
+        assert_eq!(pred(&r), "<urn:x-test:visEmb>", "{r}");
+        iris(&r);
+        // the full reader still gets the first index by name, not by creation
+        let r = call("gfull", json!({"dataset": "graphs", "query": "fox"})).await;
+        assert_eq!(pred(&r), "<urn:x-test:secretEmb>", "{r}");
+        put("avisible", "urn:x-test:visEmb2", "http://ex/p");
+        let r = call("gfull", json!({"dataset": "graphs", "query": "fox"})).await;
+        assert_eq!(pred(&r), "<urn:x-test:visEmb2>", "{r}");
     }
 
     /// The memory tools of C17 §6 through graph grants (C12): checks, candidates,
