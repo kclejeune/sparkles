@@ -145,8 +145,10 @@ turns spent waiting set most of the cost of a lane. Four rules follow from this.
 
 - The coordinator owns long waits. A lane does not wait inside its own session on a
   batch gate, a benchmark-host or benchmark-worker timing run, GitHub Actions or another
-  job expected to run past about 45 minutes. It commits, records in its resume file what
-  it is waiting on, where the log is and what marks completion, and returns. The
+  job expected to run past about 45 minutes. It commits its work where the signing agent
+  is reachable, or names its source tip and uncommitted changes when it runs where
+  commits are not made. It records in its resume file what it is waiting on, where the
+  log is and what marks completion, and returns. The
   coordinator watches the job with a background command and starts a fresh agent from
   the resume file when the result is in.
 - A lane checks a shorter wait with bounded commands a few minutes apart, often enough
@@ -154,8 +156,9 @@ turns spent waiting set most of the cost of a lane. Four rules follow from this.
   background command that notifies on completion, so the agent spends no turns polling.
 - A lane is checkpointed and continued by a fresh agent once its context passes about
   150k to 200k tokens, at a natural boundary such as a clean review or a finished phase.
-  The checkpoint is a committed tip and a short resume file that names the next steps,
-  the open decisions and the live jobs. An agent idle for more than an hour is replaced
+  The checkpoint is a tip committed where signing works, or a named source tip with its
+  outstanding changes, and a short resume file that names the next steps, the open
+  decisions and the live jobs. An agent idle for more than an hour is replaced
   by a fresh one from its resume file instead of being resumed, unless its context is
   small.
 - The coordinator assembles and gates batches in its own session. Merging the ready
