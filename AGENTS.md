@@ -60,6 +60,10 @@ adds to this file and does not override it.
   release owned jobs and Boxington leases before stopping or deleting a worker. Keep
   development environments and snapshot seeds separate from CI, and exclude credentials
   and live leases from reusable seeds.
+- Commits are made where the contributor's signing agent is reachable, usually the
+  machine the orchestrating session runs on. A terminal on another host can outlive the
+  forwarded agent, so remote terminals run builds, tests, gates, benchmarks and read-only
+  reviews, and do not commit.
 - Runs that call paid model APIs need the maintainer's approval and a spending cap first.
   Inject their keys through the secret tool the environment provides, and never print or
   write a key.
@@ -78,6 +82,9 @@ adds to this file and does not override it.
   Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
   need an Intel host, and published numbers come from the benchmark host. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+- Run both arms of an A/B comparison on one host with the same compiler and build
+  configuration and no competing heavy work. Never pool or compare timings across hosts,
+  even hosts with the same hardware, and qualify a second host's results separately.
 - A measured slowdown that a gate accepts still gets a follow-up item in
   [docs/ROADMAP.md](docs/ROADMAP.md), added in the same change that accepts it. This holds
   for a loosened gate, a result judged to be noise and a tradeoff taken on purpose.
@@ -147,6 +154,7 @@ results separately from conversation events.
 | Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Terra or Claude Sonnet 5.5 |
 | Substantive planning, dependencies, validation gates and difficult consults | GPT-6.1 Sol or Claude Opus 5.5 |
 | Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
+| Second-look lanes and consults at critical decisions | Claude Fable 5.2 or GPT-6 Astra, preferring the family the stalled lane or consulting session does not use |
 | Implementation of a well-defined plan and routine fixes | GPT-6.1 Terra or Claude Sonnet 5.5 |
 | Code review and finding validation | Prefer GPT-6.1 Sol for difficult work and GPT-6.1 Terra for straightforward work. Claude Opus 5.5 or Sonnet 5.5 may review when appropriate. |
 | Mechanical tasks with an exact rule | A plain script. |
@@ -195,6 +203,29 @@ no clear reason, or before stopping a phase early or declaring a gate unmeetable
 consult decides whether to provide a bounded plan or transfer implementation to Sol
 or Opus. The final report lists each consult.
 
+A session of any model consults a second strong model at critical decision points
+before it commits to a path. These are an on-disk format or durability ordering, a
+planner or executor cost decision, an open API or behaviour question, a change of
+approach after a failed design, closing or deferring an item, and declaring a gate
+unmeetable. The consult goes to an advisor tool when the session has one, or otherwise
+to a read-only agent on a different model family from the session's own, with the
+question, the relevant files and what has been tried. When no other family is
+available, the consult goes to a separate read-only session of the strongest available
+model. A consult shares the session's
+framing, so it never replaces an independent review or a second-look lane. The final
+report lists each consult and whether its advice was followed.
+
+When the implementing lane has made no significant progress on a hard problem, the
+coordinator starts an independent second-look lane on a strong model from a different
+family or tier than the stalled lane's. Typical signs are designs that measure as
+failures, review rounds that keep finding new defects of the same kind, a recommendation
+to close or defer an item for lack of a path, or a long-open item whose attempts have
+not moved it. The second-look lane gets its own worktree and branch, the full record of
+what was tried, and a brief that asks it to test the earlier conclusions rather than
+adopt them. It reports a missed path, an improvement or a confirmation, and the first
+lane's closing step waits for that report. Its prototypes stay behind switches, pass the
+same correctness gates and get the same independent review.
+
 ### Review before landing
 
 No lane lands without review, and each step picks its model from the table above.
@@ -224,7 +255,10 @@ or spec contract, or a fix that changes behaviour beyond a few lines. Other find
 as more precise accounting, documentation wording or a cleanup, are either fixed in the
 same round without a further review or recorded as roadmap follow-ups, and the plan says
 which. A re-review covers only the fix commits since the previous review, and its
-reviewer may keep the earlier round's context instead of reading the branch again.
+reviewer may keep the earlier round's context instead of reading the branch again. A
+lane may keep one reviewer session open for this, such as a Codex session in a named
+terminal, and send each re-review to it as a new turn that names the fix commits. Each
+round still writes its `review.md` under `.artifacts/audits`.
 
 The user decides only scope changes and disagreements with a spec that the validating
 agent raises.
