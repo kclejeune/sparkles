@@ -1097,6 +1097,156 @@ class ProviderSessionTrees(unittest.TestCase):
         # Without the system manager's own identity, its children are not allowed.
         self.assertIn(14086,self.busy(manager=None))
 
+
+class QualificationWait(unittest.TestCase):
+    """The metadata phase's wait for the provider agent's post-resume shells.
+
+    The trees are the diagnostics that the controller took about a second after the
+    refusals of ops/w3-1, ops/w5-1, ops/w6-3 and ops/w1-7. Only w1-7's tree still shows
+    the offender. In the other three it had already ended, so their tests add a
+    transient child to the agent shell that the tree does show, which is a
+    reconstruction."""
+    def setUp(self):
+        self.O=controls.OBSERVER;self.O['bind_profile'](controls.synthetic_profile())
+        d=json.loads((Path(__file__).parent/'fixtures/boat-qualify-refusals.json').read_text())
+        self.trees={}
+        for op,t in d['trees'].items():
+            rows={r['pid']:dict(r,group=r['pid']) for r in t['rows']}
+            self.trees[op]=(rows,{'pid':t['probe'],'start':rows[t['probe']]['start']},t['probe'],tuple(t['manager']))
+        self.dir=tempfile.TemporaryDirectory(prefix='boat-qualify-wait-');self.addCleanup(self.dir.cleanup)
+        self.state=Path(self.dir.name);(self.state/'bootstrap.lock').touch(mode=0o600)
+        self.manifest=self.state/'toolchain.json';self.manifest.write_text('ASCII_MANIFEST');self.manifest.chmod(0o600)
+        self.expected=hashlib.sha256(self.manifest.read_bytes()).hexdigest()
+
+    def busy(self,op,rows=None):
+        tree,launcher,probe,manager=self.trees[op]
+        return {x['pid'] for x in self.O['foreign_startup'](tree if rows is None else rows,launcher,probe,set(),manager)}
+
+    def without(self,op,*pids):
+        rows=copy.deepcopy(self.trees[op][0])
+        for pid in pids:del rows[pid]
+        return rows
+
+    def with_child(self,op,parent,comm='sleep',uid=1000,pid=99001):
+        rows=copy.deepcopy(self.trees[op][0]);rows[pid]={'pid':pid,'ppid':parent,'uid':uid,'comm':comm,'start':rows[parent]['start']+1,'group':pid}
+        return rows
+
+    def qualify(self,op,readers,probe=None):
+        """Runs qualify_at with one tree per scan, the last one repeating."""
+        _,launcher,probe_pid,manager=self.trees[op];clock=controls.Clock();self.scans=[];self.probes=[]
+        def rows():
+            self.scans.append(clock.now());return readers[min(len(self.scans)-1,len(readers)-1)]
+        def run_probe():
+            self.probes.append((clock.now(),len(self.scans)))
+            if probe:probe()
+            return {'qualified':True}
+        return self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r:manager)
+
+    def test_the_recorded_trees(self):
+        # w1-7 still shows the agent's shell running a shell that runs sudo.
+        self.assertEqual(self.busy('w1-7'),{10872,10916,10927})
+        self.assertEqual(self.busy('w1-7',self.without('w1-7',10872,10916,10927)),set())
+        # In w6-3 and w5-1 the offender had already ended, leaving a childless agent shell.
+        self.assertEqual(self.busy('w6-3'),set());self.assertEqual(self.busy('w5-1'),set())
+        self.assertEqual(self.busy('w6-3',self.with_child('w6-3',67279)),{67279,99001})
+        self.assertEqual(self.busy('w5-1',self.with_child('w5-1',31555)),{31555,99001})
+        # w3-1 was refused before its probe, with an agent shell 12 s old.
+        self.assertEqual(self.busy('w3-1'),set());self.assertEqual(self.busy('w3-1',self.with_child('w3-1',9009)),{9009,99001})
+
+    def test_w3_1_waits_before_its_first_probe(self):
+        clean=self.trees['w3-1'][0];child=self.with_child('w3-1',9009)
+        q=self.qualify('w3-1',[child]*4+[clean])
+        self.assertEqual(q['qualification_attempts'],1);self.assertEqual(len(self.probes),1)
+        self.assertGreaterEqual(self.probes[0][0]-self.scans[4],self.O['QUIET_SECONDS'])
+
+    def test_w1_7_waits_for_the_agent_command_to_end(self):
+        busy=self.trees['w1-7'][0];clean=self.without('w1-7',10872,10916,10927)
+        q=self.qualify('w1-7',[busy]*20+[clean])
+        self.assertTrue(q['startup_closed']);self.assertEqual(q['qualification_attempts'],1)
+        # The probe ran once, after a quiet window that began only when the command ended.
+        self.assertEqual(len(self.probes),1);self.assertGreaterEqual(self.probes[0][0]-self.scans[20],self.O['QUIET_SECONDS'])
+
+    def test_a_shell_busy_after_the_probe_reruns_it(self):
+        for op,shell in (('w6-3',67279),('w5-1',31555),('w3-1',9009)):
+            with self.subTest(op):
+                clean=self.trees[op][0];child=self.with_child(op,shell)
+                # Quiet window, probe, then a transient child, then the shell is childless again.
+                readers=[clean]*11+[child]+[clean]
+                q=self.qualify(op,readers)
+                self.assertEqual(q['qualification_attempts'],2);self.assertEqual(len(self.probes),2)
+                # The second probe followed its own full quiet window after the busy scan.
+                self.assertGreaterEqual(self.probes[1][0]-self.scans[12],self.O['QUIET_SECONDS'])
+
+    def test_persistent_startup_work_refuses_with_its_inventory(self):
+        busy=self.trees['w1-7'][0]
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w1-7',[busy])
+        self.assertEqual(str(caught.exception),'startup not quiescent before tools');self.assertEqual(self.probes,[])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{10872,10916,10927});self.assertEqual(caught.exception.unallowed_count,3)
+        self.assertLessEqual(self.scans[-1],self.O['QUALIFY_SECONDS'])
+        # The phase result keeps that inventory, so the controller's refusal record names it.
+        def qualify(payload):self.qualify('w1-7',[busy])
+        result,closed=self.O['run_phase']({'phase':'metadata'},None,qualify)
+        self.assertFalse(closed);self.assertEqual(result['reason_code'],'refusal:startup not quiescent before tools')
+        self.assertEqual(result['unallowed_count'],3)
+        row=controller.phase_evidence(result)['unallowed'];self.assertEqual({x['comm'] for x in row},{'bash','sudo'})
+        self.assertEqual(controller.remote_reason(result['reason_code']),result['reason_code'])
+
+    def test_work_after_every_probe_refuses_within_the_bound(self):
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279)
+        # The child appears in every scan that follows a probe.
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock();probes=[];after=[False]
+        def rows():
+            if after[0]:after[0]=False;return child
+            return clean
+        def run_probe():
+            probes.append(clock.now());after[0]=True;return {'qualified':True}
+        with self.assertRaises(self.O['Refusal']) as caught:
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r:manager)
+        self.assertEqual(str(caught.exception),'startup work during qualification')
+        self.assertEqual(len(probes),self.O['QUALIFY_ATTEMPTS']);self.assertLess(probes[-1],self.O['QUALIFY_SECONDS'])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{67279,99001})
+        self.assertEqual(controller.remote_reason('refusal:startup work during qualification'),'refusal:startup work during qualification')
+
+    def test_a_slow_probe_stops_new_attempts_at_the_bound(self):
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279);clock_holder={}
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock();probes=[];after=[False]
+        def rows():
+            if after[0]:after[0]=False;return child
+            return clean
+        def run_probe():
+            probes.append(clock.now());clock.pause(50);after[0]=True;return {'qualified':True}
+        with self.assertRaises(self.O['Refusal']):
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r:manager)
+        self.assertTrue(all(t<self.O['QUALIFY_SECONDS'] for t in probes));self.assertEqual(len(probes),3)
+
+    def test_a_manifest_change_refuses_at_once(self):
+        clean=self.trees['w6-3'][0]
+        def rewrite():self.manifest.write_text('ASCII_MANIFEST_CHANGED')
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[clean],rewrite)
+        self.assertEqual(str(caught.exception),'startup manifest changed during qualification');self.assertEqual(len(self.probes),1)
+        self.assertEqual(controller.remote_reason('refusal:startup manifest changed during qualification'),'refusal:startup manifest changed during qualification')
+        # A manifest other than the pin refuses before any scan or probe.
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[clean])
+        self.assertEqual(str(caught.exception),'qualification manifest pin');self.assertEqual(self.scans,[])
+
+    def test_an_installer_under_the_agent_shell_still_refuses(self):
+        for comm,uid in (('apt-get',0),('rustup',1000),('mise',1000)):
+            with self.subTest(comm):
+                with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[self.with_child('w6-3',67279,comm,uid)])
+                self.assertEqual(str(caught.exception),'startup not quiescent before tools');self.assertEqual(self.probes,[])
+
+    def test_the_bootstrap_lock_is_held_through_every_attempt(self):
+        import fcntl
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279);held=[]
+        def probe():
+            fd=os.open(self.state/'bootstrap.lock',os.O_RDWR)
+            try:
+                try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);held.append(False)
+                except BlockingIOError:held.append(True)
+            finally:os.close(fd)
+        q=self.qualify('w6-3',[clean]*11+[child]+[clean],probe)
+        self.assertEqual(q['qualification_attempts'],2);self.assertEqual(held,[True,True])
+
 class WatchIO(ExtendIO):
     """The fixture's warm operation with a scripted worker job-closure check."""
     def __init__(self,f,wall=None,boot=None,checks=None):

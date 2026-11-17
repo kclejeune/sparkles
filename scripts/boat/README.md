@@ -93,6 +93,20 @@ time left before the observation deadline, and a closure seen after it does not 
 refuses only when that deadline passes, with `startup_busy:bootstrap_lock_replaced` or
 `startup_busy:state_restore_in_progress` when that was the last thing it saw.
 
+The metadata phase applies the same process rule around its probe. The provider's agent
+service runs short shells in the first minutes after a resume, and a shell with children
+counts as startup work, so one scan before and one after the probe refused workers whose
+manifest had not changed. The phase therefore takes the bootstrap lock once and holds it
+through every attempt. Before each probe it waits for five seconds of consecutive scans
+that find no startup work, and when the scan after the probe finds some, it waits and
+probes again. A busy scan starts the wait again from an empty tracked set, so a shell
+whose children have ended counts as idle again. A manifest that differs from its first
+read refuses at once with no retry. No attempt starts more than 120 seconds after the
+phase began, and at most six probes run, inside the metadata unit's 240 seconds. The
+phase refuses with `startup not quiescent before tools` when no quiet window held, and
+with `startup work during qualification` when startup work followed the last probe. Both
+refusals keep the bounded inventory of the startup work last seen.
+
 ## Phase unit health
 
 The startup, metadata and stop-check phases each run in a transient 512-MiB, zero-swap

@@ -264,6 +264,8 @@ def run_phase(payload,observe,qualify,clock=time.monotonic):
         # A source drift names each recorded field beside the observed one.
         drift=drift_evidence(getattr(error,'source_drift',None))
         if drift is not None:result['source_drift']=drift
+        # A busy refusal names the startup work it last saw, bounded like a checkpoint's.
+        if isinstance(getattr(error,'unallowed',None),list):result.update(unallowed=error.unallowed[:UNALLOWED_MAX],unallowed_count=error.unallowed_count)
     closed=result.get('startup_closed')is True if payload['phase']!='metadata' else result.get('qualified')is True
     if not closed:result.setdefault('reason_code','unreported')
     result['elapsed_seconds']=round(clock()-started,3)
@@ -286,14 +288,70 @@ def observe_startup(payload):
     result.update({'memory_max':'536870912','swap_max':'0','loaded_properties':properties,'memory_events':events})
     return result
 
-def qualify_with_startup_lock(payload):
-    home=Path.home();uid=os.getuid();token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat';tracked=set()
+# The provider's agent service runs short shells of the worker's uid in the first
+# minutes after a resume, such as bash, or bash running bash and sudo, observed on
+# bx_gy2ytgh8 in ops/w1-7 at 146 s of uptime. A shell with children counts as startup
+# work, so a single scan before and after the probe refused four qualifications
+# (w3-1, w5-1, w6-3, w1-7) whose manifests had not changed for days. The metadata phase
+# therefore waits for QUIET_SECONDS of consecutive scans that find no startup work
+# before each probe, and runs the probe again when the scan after it finds some.
+# It holds the bootstrap lock through every attempt, so no bootstrap can run
+# meanwhile. A manifest that differs from its first read refuses at once. An
+# accepted probe always lies between a quiet window and a clean scan. A busy scan
+# starts the window again from an empty tracked set, as the single scan before the
+# probe always did, so a shell that has ended its children counts as idle again.
+# No attempt starts more than QUALIFY_SECONDS after the phase began, inside the
+# metadata unit's 240 seconds, and a refusal keeps the last busy inventory.
+QUIET_SECONDS=5
+QUALIFY_SECONDS=120
+QUALIFY_ATTEMPTS=6
+SCAN_PAUSE=0.5
+
+def with_inventory(error,seen):
+    """The refusal with the bounded inventory of the last startup work seen.
+
+    Each caller names its reason as a literal Refusal, so the controller's
+    packet_refusals() knows it."""
+    rows,busy=seen if seen is not None else ({},[])
+    error.unallowed=unallowed_inventory(rows,busy);error.unallowed_count=len(busy)
+    return error
+
+def quiet_window(scan,clock,pause,deadline,seconds=QUIET_SECONDS):
+    """Wait, within the deadline, until consecutive scans find no startup work for ``seconds``.
+
+    ``scan(tracked)`` returns the rows and the busy processes for one tracked set.
+    Each busy scan starts the window again with a new set. Returns the window's set
+    when it held, or None and the last busy scan when the deadline passed."""
+    tracked=set();since=None;seen=None
+    while clock()<deadline:
+        rows,busy=scan(tracked)
+        if busy:tracked=set();since=None;seen=(rows,busy)
+        elif since is None:since=clock()
+        elif clock()-since>=seconds:return tracked,None
+        pause(min(SCAN_PAUSE,max(0.0,deadline-clock())))
+    return None,seen
+
+def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows:None):
+    """The metadata probe between a quiet startup window and a clean scan, under the bootstrap lock."""
+    deadline=clock()+QUALIFY_SECONDS;seen=None;attempts=0
+    def scan(tracked):
+        rows=rows_reader();return rows,foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
     with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
         before,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
-        need(before['sha256']==payload['pins']['saved_toolchain_manifest_sha256'],'qualification manifest pin')
-        rows=process_rows();need(not foreign_startup(rows,payload['launcher_identity'],os.getpid(),tracked,user_manager(rows,uid)),'startup not quiescent before tools')
-        result=probe(payload)
-        after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
-        rows=process_rows();need(after==before and not foreign_startup(rows,payload['launcher_identity'],os.getpid(),tracked,user_manager(rows,uid)),'startup/source drift during qualification')
-        result.update({'startup_closed':True,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','actual_toolchain_manifest':{'path':str(state/'toolchain.json'),'sha256':before['sha256']},'runtime_env_file':None})
-        return result
+        need(before['sha256']==expected_manifest,'qualification manifest pin')
+        while attempts<QUALIFY_ATTEMPTS and clock()<deadline:
+            tracked,quiet_seen=quiet_window(scan,clock,pause,deadline)
+            if tracked is None:raise with_inventory(Refusal('startup not quiescent before tools'),quiet_seen or seen)
+            attempts+=1;result=run_probe()
+            after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
+            need(after==before,'startup manifest changed during qualification')
+            rows,busy=scan(tracked)
+            if not busy:
+                result.update({'startup_closed':True,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','actual_toolchain_manifest':{'path':str(state/'toolchain.json'),'sha256':before['sha256']},'runtime_env_file':None,'qualification_attempts':attempts})
+                return result
+            seen=(rows,busy)
+        raise with_inventory(Refusal('startup work during qualification'),seen)
+
+def qualify_with_startup_lock(payload):
+    home=Path.home();uid=os.getuid();token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat'
+    return qualify_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],lambda:probe(payload),manager_reader=lambda rows:user_manager(rows,uid))
