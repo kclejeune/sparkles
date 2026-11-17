@@ -670,15 +670,6 @@ fn runs_after_a_change_of_keys_answer_as_a_fresh_classifier() {
     assert!(!t.is_subclass(&c("D"), &c("H")));
 }
 
-/// Classifies with the rooted run and returns the classifier and its answer, for the cases
-/// the reductions decline.
-fn declined(body: &str) -> (Classifier, Classification) {
-    let mut k = Classifier::of(&axioms(body));
-    let out = k.classify(&rooted_limits()).unwrap();
-    no_internal_names(&k, &out, &[Class::thing()]);
-    (k, out)
-}
-
 #[test]
 fn a_name_with_the_prefix_of_the_reductions_keeps_the_ontology_from_them() {
     let ax = axioms(&format!(
@@ -700,12 +691,19 @@ fn a_name_with_the_prefix_of_the_reductions_keeps_the_ontology_from_them() {
     );
 }
 
-/// Classifies with the rooted run, checks that no made-up name reaches the answer, and
-/// returns the axioms left out, for the cases the reductions decline.
+/// Classifies with the rooted run, checks that no made-up name reaches the answer and that
+/// the answer and the axioms left out are those of a run without the option, and returns
+/// the axioms left out, for the cases the reductions decline.
 fn declined(body: &str) -> Vec<String> {
-    let mut k = Classifier::of(&axioms(body));
+    let ax = axioms(body);
+    let mut k = Classifier::of(&ax);
     let out = k.classify(&rooted_limits()).unwrap();
     no_internal_names(&k, &out, &[Class::thing()]);
+    let mut plain = Classifier::of(&ax);
+    let default = plain.classify(&Limits::default()).unwrap();
+    assert_eq!(out.taxonomy, default.taxonomy);
+    assert_eq!(out.consistency, default.consistency);
+    assert_eq!(k.excluded(), plain.excluded());
     k.excluded()
         .iter()
         .map(|e| format!("{:?}", e.axiom))

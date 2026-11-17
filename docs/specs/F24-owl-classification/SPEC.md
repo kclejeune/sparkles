@@ -102,8 +102,24 @@ default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rul
 ontologies with individuals and nominals take the case analysis through a root context,
 with four recorded departures from the journal's rules, a work bound past which the run
 gives its default answer, and 45 of the 50 `shoi` fixtures exact against HermiT. The five
-fixtures that pass the bound are item 822, the default is item 823, and keys and the
-universal property are item 805.
+fixtures that pass the bound are item 822, and the default is item 823.
+
+Item 805 delivers keys over object properties and the universal object property in rooted
+runs, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) describes.
+A key becomes class axioms that mark the values of each named individual with a universal
+restriction, in place of the fresh property per individual that the section first
+designed, which took most generated ontologies with keys past the work bound. The
+universal property becomes a symmetric transitive property with a hub individual. The
+fresh names carry a reserved prefix, an ontology that uses the prefix is not rewritten,
+and no fresh name reaches a taxonomy, a partial answer, a description or the report of
+the axioms left out. On 392 generated ontologies with four individuals and keys or the
+universal property, checked against HermiT 1.4.5 on one and on four threads with the same
+answers, no run reports a subsumption HermiT does not. 274 take the disjunctive rules and
+finish within the bound, and all agree with HermiT but one, a gap of the rooted run that
+the ontology shows without keys or the universal property too and item 823 records. 109
+pass the bound and give their default answer, and 9 take the default paths. ore_ont_14924 states the universal property only in a dropped tautology, so its
+run is rooted now. It passes the bound and gives the default answer, which is HermiT's,
+in about 1 s against 16 ms without the option, and item 1061 follows that cost.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position

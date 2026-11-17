@@ -463,9 +463,14 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   since the completeness of the departed calculus is not proved, and every answer it gives
   is entailed. A rooted run without counting has a bound of 524,288 derived conclusions,
   `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
-  default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It refuses
-  an ontology with keys, a top property or a functional data property, which take the
-  default paths. Roadmap items 805, 822 and 823. Without the option, any other axiom
+  default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
+  keys over object properties and the universal object property by rewriting them into
+  class axioms over fresh names, which never reach an answer, and a run of the rewritten
+  axioms rebuilds after every edit. A key whose rewriting passes its budget, about 60
+  individuals for a key with one property, and a cardinality, functionality or
+  disjointness of the universal property leave the ontology to the default paths, as do
+  keys over data properties, the top data property and functional data properties.
+  Roadmap items 822, 823 and 1061. Without the option, any other axiom
   outside OWL 2 EL that needs case analysis, such as a union, is left out and reported
   with its rule, while the Horn axioms run with the individuals. An axiom with a literal
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
@@ -999,7 +1004,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
   analysis or counting in an ontology with individuals, are left out, since the rooted run
   that takes them is an option whose completeness is not proved, and five of the 50
-  nominal fixtures of its gate pass its work bound. Roadmap items 822 and 823. Axioms that
+  nominal fixtures of its gate pass its work bound. The rooted run also passes its bound
+  on ore_ont_14924, many generated ontologies with the universal property and probably
+  ore_ont_15803, and then gives the default answer after the work. Roadmap items 822, 823
+  and 1061. Axioms that
   need case analysis in an ontology with data properties are left out, and an external DL
   reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
   datatype checker with data cardinalities before they take data properties, and 10 of
