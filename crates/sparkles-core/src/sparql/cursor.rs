@@ -4186,10 +4186,10 @@ impl BaseScan {
         }
     }
 
-    /// Start reading `block`, and remember a handle on it that does not keep it, for the
-    /// reads that follow.
+    /// Start reading `block`. A handle on it that does not keep it is made only when a
+    /// read stops inside it, so a block read whole in one read makes none.
     fn set_block(&mut self, block: crate::index::Block) {
-        self.parked = Some(block.downgrade());
+        self.parked = None;
         self.block = Some(block);
     }
 
@@ -4199,8 +4199,18 @@ impl BaseScan {
         self.parked = None;
     }
 
-    /// Let go of the block between reads. The handle made when it was loaded stays.
+    /// Remember the block being read by a handle that does not keep it, once per block.
+    fn remember_block(&mut self) {
+        if self.parked.is_none()
+            && let Some(block) = &self.block
+        {
+            self.parked = Some(block.downgrade());
+        }
+    }
+
+    /// Let go of the block between reads, keeping the handle on it.
     fn park(&mut self) {
+        self.remember_block();
         self.block = None;
     }
 
@@ -4404,8 +4414,11 @@ impl Scan {
                 }
             };
             let charge = OwnedCharge::new(ctx, 512)?;
+            // The batch takes the scan's handle on the block, which the scan would let go
+            // of at the end of this read anyway, and the scan keeps a weak one.
+            base.remember_block();
             let batch = SharedBatch {
-                block: block.clone(),
+                block: base.block.take().expect("loaded immutable block"),
                 columns,
                 start: base.row,
                 end,
@@ -5175,8 +5188,9 @@ mod tests {
         assert!(peak < crate::index::BLOCK_ROWS as u64 * 8, "peak {peak}");
     }
 
-    /// Cost per shared batch of a scan over three blocks, with each batch held while the
-    /// next is taken, as the response writer does. Run with --ignored --nocapture in release.
+    /// Cost per batch of a scan over three blocks: shared batches of 4,096 rows with each
+    /// held while the next is taken, as the response writer does, then owned batches of
+    /// 4,096 rows and of whole blocks. Run with --ignored --nocapture in release.
     #[cfg(unix)]
     #[test]
     #[ignore]
@@ -5203,7 +5217,7 @@ mod tests {
             dedup: false,
             src: None,
         };
-        let run = |passes: usize| {
+        let shared = |passes: usize| {
             let started = Instant::now();
             let mut batches = 0u64;
             for _ in 0..passes {
@@ -5226,14 +5240,36 @@ mod tests {
                 batches,
             )
         };
-        run(200);
-        let mut best = f64::MAX;
-        for _ in 0..7 {
-            let (ns, batches) = run(2000);
-            best = best.min(ns);
-            eprintln!("shared batch: {ns:.1} ns over {batches} batches");
-        }
-        eprintln!("BEST {best:.1} ns per batch, {} rows a block", BLOCK_ROWS);
+        let owned = |passes: usize, cap: usize| {
+            let started = Instant::now();
+            let mut batches = 0u64;
+            for _ in 0..passes {
+                let mut scan = Scan::new(spec(), None);
+                while let Some(buffer) = scan.next(&ctx, &[var], cap).unwrap() {
+                    if buffer.table.is_empty() {
+                        break;
+                    }
+                    batches += 1;
+                }
+            }
+            (
+                started.elapsed().as_nanos() as f64 / batches as f64,
+                batches,
+            )
+        };
+        let best = |name: &str, run: &dyn Fn(usize) -> (f64, u64), passes: usize| {
+            run(passes / 10);
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let (ns, batches) = run(passes);
+                best = best.min(ns);
+                eprintln!("{name}: {ns:.1} ns over {batches} batches");
+            }
+            eprintln!("BEST {name} {best:.1} ns per batch, {BLOCK_ROWS} rows a block");
+        };
+        best("shared-4096", &shared, 2000);
+        best("owned-4096", &|p| owned(p, 4096), 500);
+        best("owned-block", &|p| owned(p, BLOCK_ROWS), 100);
     }
 
     #[cfg(unix)]
