@@ -6764,6 +6764,115 @@ impl AggState {
         }
     }
 
+    /// Fold `other`, the state of the same aggregate over rows that come after this
+    /// state's rows, into this one, so that the result is what one state over all the
+    /// rows in that order gives. `false`, with this state unchanged, for a state that
+    /// cannot be combined exactly, such as ARQ's shifted sums.
+    pub(super) fn merge(&mut self, ctx: &Ctx, agg: &Agg, other: AggState) -> bool {
+        match (&mut *self, other) {
+            (AggState::Count(a), AggState::Count(b)) => *a += b,
+            (
+                AggState::Sum {
+                    int,
+                    generic,
+                    ok,
+                    rows,
+                },
+                AggState::Sum {
+                    int: oint,
+                    generic: ogeneric,
+                    ok: ook,
+                    rows: orows,
+                },
+            ) => {
+                *rows += orows;
+                if !*ok {
+                    return true;
+                }
+                if !ook {
+                    *ok = false;
+                    return true;
+                }
+                if generic.is_none()
+                    && ogeneric.is_none()
+                    && let Some(s) = int.checked_add(oint)
+                {
+                    *int = s;
+                    return true;
+                }
+                let left = generic.take().or_else(|| super::value::exact_sum(*int));
+                let right = ogeneric.or_else(|| super::value::exact_sum(oint));
+                match (left, right) {
+                    (Some(l), Some(r)) => match arith(NumOp::Add, &l, &r) {
+                        Ok(v) => *generic = Some(v),
+                        Err(_) => *ok = false,
+                    },
+                    _ => *ok = false,
+                }
+            }
+            (AggState::Best(best, best_v), AggState::Best(Some(id), v)) => {
+                let better = match best_v.as_ref() {
+                    None => best.is_none(),
+                    Some(b) => {
+                        let o = order_cmp(v.as_ref(), Some(b));
+                        if matches!(agg.func, AggregateFunction::Min) {
+                            o == Ordering::Less
+                        } else {
+                            o == Ordering::Greater
+                        }
+                    }
+                };
+                if better {
+                    *best = Some(id);
+                    *best_v = v;
+                }
+            }
+            (AggState::Best(..), AggState::Best(None, _)) => {}
+            (AggState::Sample(x), AggState::Sample(y)) => {
+                if x.is_none() {
+                    *x = y;
+                }
+            }
+            _ => {
+                let _ = ctx;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Take back one row that [`AggState::add`] counted, for a state that can: a count,
+    /// and an exact sum of inline integers. `false`, with this state unchanged, for any
+    /// other, since a minimum, a sample or a sum that left the exact integers keeps no
+    /// record of the rows it would have to give up.
+    pub(super) fn retract(&mut self, id: Option<Id>) -> bool {
+        match self {
+            AggState::Count(n) => {
+                if id.is_none_or(|id| !id.is_undef()) {
+                    *n = n.saturating_sub(1);
+                }
+                true
+            }
+            AggState::Sum {
+                int,
+                generic: None,
+                ok: true,
+                rows,
+            } => {
+                let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
+                    return false;
+                };
+                let Some(s) = int.checked_sub(id.as_i64().into()) else {
+                    return false;
+                };
+                *int = s;
+                *rows = rows.saturating_sub(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn finish(self, ctx: &Ctx, agg: &Agg) -> Id {
         match self {
             AggState::Count(n) => Id::from_i64(n as i64).unwrap_or(Id::UNDEF),
