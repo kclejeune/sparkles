@@ -61,3 +61,9 @@ runs in under a second, so run it directly from target/debug/deps/w3c-* when hea
 
 ## Live processes
 None started by this lane remain running (the heavy-run test jobs finished).
+
+## Coordinator note (2026-11-17): Opus takes over
+The previous session ran on Sonnet. 791996b4 holds an uncompiled edit round, so review the evaluator's
+semantics against the spec before you trust its W3C pass counts: a reference oracle that is wrong
+hides engine bugs. Row numbers for engine disagreements start at 1064; tell the coordinator each one
+you use.

@@ -273,17 +273,40 @@ pub(crate) struct Cx<'c> {
     pub env: &'c Solution,
 }
 
+/// Whether a variable is one of the evaluator's own: the blank nodes of a basic graph
+/// pattern and the solution number that BNODE reads. Such a variable is never in scope.
+pub(crate) fn is_hidden(v: &Variable) -> bool {
+    v.as_str().starts_with(':')
+}
+
+/// Compatibility of two solution mappings. The solution numbers of BNODE belong to each
+/// side alone, so they never make two solutions incompatible.
 pub(crate) fn compatible(a: &Solution, b: &Solution) -> bool {
     let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     small
         .iter()
-        .all(|(k, v)| large.get(k).is_none_or(|w| w == v))
+        .all(|(k, v)| *k == row_variable() || large.get(k).is_none_or(|w| w == v))
+}
+
+/// A solution without the evaluator's own variables.
+fn visible(s: &Solution) -> Solution {
+    s.iter()
+        .filter(|(k, _)| !is_hidden(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
     let mut out = a.clone();
     for (k, v) in b {
-        out.insert(k.clone(), v.clone());
+        if out
+            .insert(k.clone(), v.clone())
+            .is_some_and(|old| old != *v)
+        {
+            // the merge of two numbered solutions is a new solution, which a later BNODE
+            // numbers again
+            out.remove(k);
+        }
     }
     out
 }
@@ -502,8 +525,9 @@ impl<'a> Evaluator<'a> {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
                 Ok(l.into_iter()
                     .filter(|a| {
-                        !r.iter()
-                            .any(|b| compatible(a, b) && a.keys().any(|k| b.contains_key(k)))
+                        !r.iter().any(|b| {
+                            compatible(a, b) && a.keys().any(|k| !is_hidden(k) && b.contains_key(k))
+                        })
                     })
                     .collect())
             }
@@ -818,7 +842,7 @@ impl<'a> Evaluator<'a> {
         let (name, expr, distinct) = match a {
             AggregateExpression::CountSolutions { distinct } => {
                 let n = if *distinct {
-                    members.iter().collect::<HashSet<_>>().len()
+                    members.iter().map(visible).collect::<HashSet<_>>().len()
                 } else {
                     members.len()
                 };

@@ -187,14 +187,67 @@ fn collect_manifest(
 
 // -------------------------------------------------------------- comparison ------
 
+thread_local! {
+    /// Compare literals by their exact lexical form, as the reference mode does, except
+    /// for numbers and composite literals. Jena writes a composite literal's map entries
+    /// in hash order.
+    static EXACT_LITERALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Equality of two numeric literals of datatype `dt` by value, without the engine; `None`
+/// for another datatype. SPARQL leaves the lexical form of a computed number to the
+/// implementation, so the exact comparison of the reference mode compares numbers by
+/// value.
+fn numeric_eq(dt: &str, x: &str, y: &str) -> Option<bool> {
+    use std::str::FromStr;
+    let local = dt.strip_prefix("http://www.w3.org/2001/XMLSchema#")?;
+    Some(match local {
+        "double" => {
+            let (p, q) = (
+                oxsdatatypes::Double::from_str(x),
+                oxsdatatypes::Double::from_str(y),
+            );
+            matches!((p, q), (Ok(p), Ok(q)) if p.is_identical_with(q))
+        }
+        "float" => {
+            let (p, q) = (
+                oxsdatatypes::Float::from_str(x),
+                oxsdatatypes::Float::from_str(y),
+            );
+            matches!((p, q), (Ok(p), Ok(q)) if p.is_identical_with(q))
+        }
+        "decimal" | "integer" | "long" | "int" | "short" | "byte" | "nonNegativeInteger"
+        | "positiveInteger" | "nonPositiveInteger" | "negativeInteger" | "unsignedLong"
+        | "unsignedInt" | "unsignedShort" | "unsignedByte" => {
+            let (p, q) = (
+                oxsdatatypes::Decimal::from_str(x),
+                oxsdatatypes::Decimal::from_str(y),
+            );
+            matches!((p, q), (Ok(p), Ok(q)) if p == q)
+        }
+        _ => return None,
+    })
+}
+
 /// Literal equality modulo canonical lexical forms (Jena's harness compares by value).
+/// The reference mode compares exactly, except for numbers and composite literals.
 fn term_eq(a: &Term, b: &Term) -> bool {
     if a == b {
         return true;
     }
+    let exact = EXACT_LITERALS.with(|c| c.get());
+    if exact
+        && let (Term::Literal(x), Term::Literal(y)) = (a, b)
+        && x.datatype() == y.datatype()
+        && let Some(eq) = numeric_eq(x.datatype().as_str(), x.value(), y.value())
+    {
+        return eq;
+    }
     match (a, b) {
         (Term::Literal(x), Term::Literal(y))
-            if x.datatype() == y.datatype() && x.language() == y.language() =>
+            if x.datatype() == y.datatype()
+                && x.language() == y.language()
+                && (!exact || sparkles_core::sparql::cdt::is_cdt(x.datatype().as_str())) =>
         {
             let (vx, vy) = (
                 sparkles_core::sparql::value::Value::from_literal(x),
@@ -435,6 +488,11 @@ fn parse_rdf_result_set(g: &Graph) -> Option<Expected> {
     let mut rows = Vec::new();
     for sol in m.objs(&root, &format!("{RS}solution")) {
         let sol = as_subject(&sol)?;
+        // an ordered result set numbers its solutions with `rs:index`
+        let index = match m.obj(&sol, &format!("{RS}index")) {
+            Some(Term::Literal(l)) => l.value().parse::<u64>().ok(),
+            _ => None,
+        };
         let mut row: Row = vec![None; vars.len()];
         for b in m.objs(&sol, &format!("{RS}binding")) {
             let b = as_subject(&b)?;
@@ -444,8 +502,10 @@ fn parse_rdf_result_set(g: &Graph) -> Option<Expected> {
                 row[i] = Some(val);
             }
         }
-        rows.push(row);
+        rows.push((index, row));
     }
+    rows.sort_by_key(|(index, _)| *index);
+    let rows = rows.into_iter().map(|(_, row)| row).collect();
     Some(Expected::Solutions(vars, rows))
 }
 
@@ -848,7 +908,8 @@ fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> 
                         .collect()
                 })
                 .collect();
-            let ordered = qtext.to_ascii_uppercase().contains("ORDER BY") && false;
+            let ordered = mode.reference && qtext.to_ascii_uppercase().contains("ORDER BY");
+            EXACT_LITERALS.with(|c| c.set(mode.reference));
             if solutions_match(&rows, &actual, ordered) {
                 Ok(())
             } else {

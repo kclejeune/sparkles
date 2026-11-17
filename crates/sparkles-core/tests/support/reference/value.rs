@@ -397,13 +397,8 @@ pub fn spec_order(a: Option<&Term>, b: Option<&Term>) -> Option<Ordering> {
 
 fn literal_order(x: &Literal, y: &Literal) -> Option<Ordering> {
     if let (Some(a), Some(b)) = (numeric(x), numeric(y)) {
-        // NaN is the least numeric value here, since §15.1 does not place it
-        return Some(match (a.is_nan(), b.is_nan()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => a.compare(b)?,
-        });
+        // the operator mapping does not order NaN against any number
+        return a.compare(b);
     }
     if is_simple(x) && is_simple(y) {
         return Some(x.value().cmp(y.value()));
@@ -420,25 +415,75 @@ fn literal_order(x: &Literal, y: &Literal) -> Option<Ordering> {
     None
 }
 
-/// A total order that extends [`spec_order`], for sorting: where the specification
-/// leaves two terms unordered the order is the datatype, then the lexical form, then the
-/// language.
+/// A total order that extends [`spec_order`], for sorting. Each literal falls into a
+/// group, numbers first, then simple strings, booleans, date-times and everything else.
+/// The groups are ordered among themselves, and the terms of a group by value, so the
+/// order stays transitive where the specification leaves pairs open. Ties of value fall
+/// back to the datatype, the lexical form and the language.
 pub fn total_order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
-    if let Some(o) = spec_order(a, b) {
-        return o;
+    let (ca, cb) = (class(a), class(b));
+    if ca != cb {
+        return ca.cmp(&cb);
     }
-    let key = |t: Option<&Term>| -> (String, String, String) {
-        match t {
-            Some(Term::Literal(l)) => (
-                l.datatype().as_str().to_string(),
-                l.value().to_string(),
-                l.language().unwrap_or_default().to_string(),
-            ),
-            Some(t) => (String::new(), t.to_string(), String::new()),
-            None => Default::default(),
+    match (a, b) {
+        (Some(Term::Literal(x)), Some(Term::Literal(y))) => {
+            let (gx, gy) = (group(x), group(y));
+            gx.cmp(&gy)
+                .then_with(|| match gx {
+                    0 => {
+                        let (p, q) = (numeric(x).unwrap(), numeric(y).unwrap());
+                        // NaN first, then by value
+                        q.is_nan().cmp(&p.is_nan()).then_with(|| {
+                            p.compare(q)
+                                .unwrap_or_else(|| p.to_f64().total_cmp(&q.to_f64()))
+                        })
+                    }
+                    1 => x.value().cmp(y.value()),
+                    2 => boolean(x).cmp(&boolean(y)),
+                    3 => utc_date_time(x)
+                        .partial_cmp(&utc_date_time(y))
+                        .unwrap_or(Ordering::Equal),
+                    _ => Ordering::Equal,
+                })
+                .then_with(|| x.datatype().as_str().cmp(y.datatype().as_str()))
+                .then_with(|| x.value().cmp(y.value()))
+                .then_with(|| x.language().cmp(&y.language()))
         }
-    };
-    key(a).cmp(&key(b))
+        (Some(Term::Triple(x)), Some(Term::Triple(y))) => total_order(
+            Some(&Term::from(x.subject.clone())),
+            Some(&Term::from(y.subject.clone())),
+        )
+        .then_with(|| x.predicate.as_str().cmp(y.predicate.as_str()))
+        .then_with(|| total_order(Some(&x.object), Some(&y.object))),
+        (Some(Term::NamedNode(x)), Some(Term::NamedNode(y))) => x.as_str().cmp(y.as_str()),
+        (Some(Term::BlankNode(x)), Some(Term::BlankNode(y))) => x.as_str().cmp(y.as_str()),
+        _ => Ordering::Equal,
+    }
+}
+
+/// The group of a literal in [`total_order`].
+fn group(l: &Literal) -> u8 {
+    if numeric(l).is_some() {
+        0
+    } else if is_simple(l) {
+        1
+    } else if boolean(l).is_some() {
+        2
+    } else if date_time(l).is_some() {
+        3
+    } else {
+        4
+    }
+}
+
+/// A date-time, read as UTC when it has no timezone. Where the specification orders two
+/// date-times, this reading orders them the same way.
+fn utc_date_time(l: &Literal) -> Option<DateTime> {
+    let d = date_time(l)?;
+    if d.timezone_offset().is_some() {
+        return Some(d);
+    }
+    DateTime::from_str(&format!("{}Z", l.value())).ok()
 }
 
 /// The same term, as in `sameTerm`.
