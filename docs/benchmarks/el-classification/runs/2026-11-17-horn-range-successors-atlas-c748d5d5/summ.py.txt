@@ -1,0 +1,29 @@
+# summ.py OUT: per file and thread count, the median of every classification of an arm over the
+# rounds and the median of the rounds' ratios with their range, for the arms base (7506edf5), tip
+# (c748d5d5), tipb1 (tip with the realness prototype) and the EL rules alone of base and tip
+import json, sys, glob, statistics as st
+out = sys.argv[1]; rows = {}
+for p in glob.glob(f"{out}/r*/*/*.json"):
+    r, tag, f = p.split('/')[-3:]
+    try: d = json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception:
+        print("unreadable", p); continue
+    rows[(f[:-5], tag, r)] = d
+rounds = sorted({k[2] for k in rows})
+def side(f, t): return [rows[(f, t, r)] for r in rounds if (f, t, r) in rows]
+def allms(f, t): return [c for d in side(f, t) for c in d['classifyMs']]
+def rats(f, a, b):
+    return [st.median(rows[(f, a, r)]['classifyMs']) / st.median(rows[(f, b, r)]['classifyMs'])
+            for r in rounds if (f, a, r) in rows and (f, b, r) in rows]
+def fmt(rs): return f"{st.median(rs):6.3f} {min(rs):5.3f}-{max(rs):5.3f}"
+med = lambda ds, k: st.median(d[k] for d in ds)
+print(f"{'file':20} {'base ms':>9} {'tip ms':>9} {'tip/base':>6} {'range':>11} {'b1 ms':>9} {'b1/tip':>6} {'range':>11} {'concl base':>12} {'concl tip':>12} {'concl b1':>12} {'conj b':>7} {'conj t':>7} {'rss b':>5} {'rss t':>5} tier n")
+for f in sorted({k[0] for k in rows}):
+    db, dt, d1 = side(f, 'base'), side(f, 'tip'), side(f, 'tipb1')
+    if not db or not dt: continue
+    print(f"{f:20} {st.median(allms(f,'base')):9.1f} {st.median(allms(f,'tip')):9.1f} {fmt(rats(f,'tip','base'))} {st.median(allms(f,'tipb1')):9.1f} {fmt(rats(f,'tipb1','tip'))} {med(db,'conclusions'):12.0f} {med(dt,'conclusions'):12.0f} {med(d1,'conclusions'):12.0f} {med(db,'conjunctions'):7.0f} {med(dt,'conjunctions'):7.0f} {max(d['peakRssKib'] for d in db)/2**20:5.2f} {max(d['peakRssKib'] for d in dt)/2**20:5.2f} {db[0]['tier']}/{dt[0]['tier']} {len(db)},{len(dt)},{len(d1)}")
+print()
+print(f"{'file':20} {'base-el':>8} {'tip-el':>8} {'el t/b':>6} {'range':>11} {'base/base-el':>12} {'range':>11} {'tip/tip-el':>10} {'range':>11} {'b1/tip-el':>9} {'concl b-el':>11} {'concl t-el':>11} {'tip/tip-el':>10}")
+for f in sorted({k[0] for k in rows if k[1] == 'tip-el'}):
+    c = lambda t: med(side(f, t), 'conclusions')
+    print(f"{f:20} {st.median(allms(f,'base-el')):8.1f} {st.median(allms(f,'tip-el')):8.1f} {fmt(rats(f,'tip-el','base-el'))} {fmt(rats(f,'base','base-el')):>24} {fmt(rats(f,'tip','tip-el')):>22} {st.median(rats(f,'tipb1','tip-el')):9.3f} {c('base-el'):11.0f} {c('tip-el'):11.0f} {c('tip')/c('tip-el'):10.2f}")

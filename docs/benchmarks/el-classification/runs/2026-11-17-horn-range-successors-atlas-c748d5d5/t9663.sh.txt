@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# t9663.sh: ore_ont_9663 (and ore_ont_14817) on the build before item 869 with item 990
+# (be684ce5, bin/pre869) against the build with both (7506edf5, bin/base), in interleaved
+# rounds, one process a side. The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/horn-cost-1025
+F=$HOME/lanes/horn-budget-962/files
+OUT=$D/out/t9663; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/pre869 $D/bin/base; } > $OUT/before.txt
+run() { # round tag file threads
+  mkdir -p $OUT/r$1/$2
+  systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    timeout 900 $D/bin/$2 --threads $4 --taxonomy $OUT/r$1/$2/$3.t$4.tax $F/$3.owl > $OUT/r$1/$2/$3.t$4.json 2> $OUT/r$1/$2/$3.t$4.err
+  echo "r$1 $2 $3 t$4 status=$? $(sha256sum < $OUT/r$1/$2/$3.t$4.tax | cut -c1-16)" >> $OUT/log.txt
+  rm -f $OUT/r$1/$2/$3.t$4.tax
+}
+for round in $(seq 1 16); do
+  order="pre869 base"; [ $((round % 2)) -eq 0 ] && order="base pre869"
+  for n in ore_ont_9663 ore_ont_14817; do
+    for tag in $order; do run $round $tag $n 4; done
+  done
+done
+# one thread, where the schedule does not vary
+for round in 17 18 19 20; do
+  order="pre869 base"; [ $((round % 2)) -eq 0 ] && order="base pre869"
+  for tag in $order; do run $round $tag ore_ont_9663 1; done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo T9663-DONE >> $OUT/log.txt

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# t7192.sh: ore_ont_7192 on one thread on bin/base (7506edf5) and bin/tip (c748d5d5), one process
+# each in a 14 GiB scope under the laptop's heavy lock, with the hash of the sorted taxonomy as the
+# sweep takes it. The sweep's 8 GiB scope kills both builds on this file.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-1025/.artifacts/lanes/horn-cost-1025
+O=$L/out/7192; mkdir -p $O
+for side in base tip; do
+  echo "$side start $(date -Is) $(uptime)" >> $O/log.txt
+  ~/.local/bin/sparkles-heavy-run 14 timeout 2400 $L/bin/$side --threads 1 --taxonomy $O/$side.tax /home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev/ore_ont_7192.owl > $O/$side.json 2> $O/$side.err
+  st=$?
+  sha=$(LC_ALL=C sort $O/$side.tax 2>/dev/null | sha256sum | cut -c1-16)
+  rm -f $O/$side.tax
+  echo "ore_ont_7192 1 $side $st $sha $(grep '^{' $O/$side.json | jq -c '[.classifyMs[0],.tier,.conclusions,.conjunctions,.dlOverBudget,.hornOverBudget,.outside,.unsatisfiable,.consistency,.peakRssKib]') end $(date -Is)" >> $O/log.txt
+done
+echo T7192-DONE >> $O/log.txt

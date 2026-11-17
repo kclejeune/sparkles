@@ -162,6 +162,26 @@ ordering.
 
 ### OWL classification
 
+A property assertion `r(a, b)` over a property with a range links `a` to `b`'s own
+context, and the index tells `b` the range. Before, the index made a context of `b` with
+the range for each such assertion, which derived `b` and repeated what `b` holds, under
+the EL rules and the Horn rules alike. On `atlas` the four ORE 2015 DL files with 7,856 to
+114,957 property assertions classify in 0.60 to 0.63 times the time on one thread and
+0.72 to 0.92 times on four, `ore_ont_4510` in 240 instead of 401 ms on one thread, and
+`ore_ont_9654` in 3.1 instead of 5.4 s. The EL rules alone take 0.65 to 0.71 times the
+time on the four files on one thread, and the Horn rules take 1.8 to 2.0 times the EL
+rules' time, which roadmap item 1025 still follows. At a context with several at-most
+restrictions the Horn rules merge the successors of one restriction in a flush, so the
+conclusions that wait in an activation are bounded by the state the run has charged
+(item 1026). The taxonomies of GO, ChEBI lite, the 298 ORE 2015 EL files and the DL
+development set are unchanged. GO classifies 2.3% slower on one thread on `atlas` with
+the same conclusions, and `ore_ont_1370`, `ore_ont_16744` and ChEBI lite 0.9 to 1.6%
+slower, which item 1028 follows. Timed against the build before item 869 now that item
+990 bounds its disjunctive attempt, `ore_ont_9663` classifies in a median of 8.75 against
+8.17 s on four threads, which item 1027 follows. A prototype that tells a successor once
+that it has an instance took 1.4 to 1.9% off the four files and is recorded as an
+experiment that was not kept.
+
 With the Horn rules, a universal restriction or an at-most restriction at a context that
 has an instance sends an individual among the context's successors what the successor
 must hold. Before, the rules made a context for the conjunction of the individual and

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# sweep.sh TIP PART OF: taxonomies of bin/base and bin/TIP on the ORE 2015 EL files, GO, ChEBI lite
+# and the DL development set, on 1 and 8 threads, one process per side, file and thread count.
+# PART of OF takes every OF-th file, so that several sweeps share the list.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-1025/.artifacts/lanes/horn-cost-1025
+EL=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/el-files
+D753=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-1025/.artifacts/lanes/horn-cost-1025/data
+DEV=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+tip=$1; part=$2; of=$3
+O=$L/sweep/out-$tip; mkdir -p $O
+i=0
+for f in $D753/go.ofn $D753/chebi_lite.ofn $(ls $EL/*) $(ls $DEV/*); do
+  i=$((i + 1)); [ $((i % of)) -eq $part ] || continue
+  n=$(basename $f); n=${n%.*}
+  for t in 1 8; do
+    for side in base $tip; do
+      systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=2G -p OOMPolicy=continue \
+        timeout 300 $L/bin/$side --threads $t --taxonomy $O/$n.$side.t$t.tax $f > $O/$n.$side.t$t.json 2> $O/$n.$side.t$t.err
+      st=$?
+      sha=$(LC_ALL=C sort $O/$n.$side.t$t.tax 2>/dev/null | sha256sum | cut -c1-16)
+      rm -f $O/$n.$side.t$t.tax
+      echo "$n $t $side $st $sha $(grep '^{' $O/$n.$side.t$t.json | jq -c '[.classifyMs[0],.tier,.conclusions,.conjunctions,.dlOverBudget,.hornOverBudget,.outside,.unsatisfiable,.consistency]')" >> $L/sweep/log-$tip.$part.txt
+    done
+  done
+done
+echo SWEEP-DONE >> $L/sweep/log-$tip.$part.txt
