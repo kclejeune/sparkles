@@ -8,5 +8,6 @@
 //! batch, and the cursor hands it the batches it pulls.
 
 pub(crate) mod acc;
+pub(crate) mod op;
 
-pub(crate) use acc::{Accumulator, Arg, Batch};
+pub(crate) use op::{Grouping, hashable, order_free, whole};

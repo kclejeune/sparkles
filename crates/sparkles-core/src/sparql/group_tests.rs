@@ -35,6 +35,8 @@ fn fold(ctx: &Ctx, acc: &mut dyn Accumulator, values: &[Id], slots: &[u32]) {
     let batch = Batch {
         table: &table,
         arg: Arg::Column(values),
+        rows: None,
+        base: 0,
     };
     acc.add_batch(ctx, &batch, slots).unwrap();
 }
@@ -67,18 +69,18 @@ fn merging_two_passes_gives_one_pass() {
         AggregateFunction::Sample,
     ] {
         let agg = agg(func, true, false);
-        let mut whole = Running::new(&agg);
+        let mut whole = Running::new(&agg, true);
         whole.init(3);
         fold(&ctx, &mut whole, &values, &slots);
         for split in [0, 1, 4, 10] {
-            let (mut left, mut right) = (Running::new(&agg), Running::new(&agg));
+            let (mut left, mut right) = (Running::new(&agg, true), Running::new(&agg, true));
             left.init(3);
             right.init(3);
             fold(&ctx, &mut left, &values[..split], &slots[..split]);
             fold(&ctx, &mut right, &values[split..], &slots[split..]);
             assert!(left.mergeable());
             left.merge(&ctx, &mut right, &[0, 1, 2]).unwrap();
-            let mut again = Running::new(&agg);
+            let mut again = Running::new(&agg, true);
             again.init(3);
             fold(&ctx, &mut again, &values, &slots);
             assert_eq!(
@@ -96,7 +98,7 @@ fn merging_two_passes_gives_one_pass() {
 fn a_merge_maps_the_groups_of_the_second_pass_onto_the_first() {
     let ctx = ctx();
     let agg = agg(AggregateFunction::Sum, true, false);
-    let (mut a, mut b) = (Running::new(&agg), Running::new(&agg));
+    let (mut a, mut b) = (Running::new(&agg, true), Running::new(&agg, true));
     a.init(2);
     b.init(2);
     let one = int(&ctx, 1);
@@ -110,17 +112,20 @@ fn a_merge_maps_the_groups_of_the_second_pass_onto_the_first() {
 
 #[test]
 fn statistics_aggregates_do_not_merge() {
-    let stdev = Running::new(&agg(
-        AggregateFunction::Custom(
-            oxrdf::NamedNode::new(format!(
-                "{}stdev",
-                spargebra::algebra::ARQ_AGGREGATE_NAMESPACE
-            ))
-            .unwrap(),
+    let stdev = Running::new(
+        &agg(
+            AggregateFunction::Custom(
+                oxrdf::NamedNode::new(format!(
+                    "{}stdev",
+                    spargebra::algebra::ARQ_AGGREGATE_NAMESPACE
+                ))
+                .unwrap(),
+            ),
+            true,
+            false,
         ),
         true,
-        false,
-    ));
+    );
     assert!(!stdev.mergeable());
 }
 
@@ -129,7 +134,7 @@ fn a_sum_that_became_generic_merges_in_row_order() {
     let ctx = ctx();
     let agg = agg(AggregateFunction::Sum, true, false);
     let half = ctx.intern_value(&Value::Double(0.5f64.into()));
-    let (mut a, mut b) = (Running::new(&agg), Running::new(&agg));
+    let (mut a, mut b) = (Running::new(&agg, true), Running::new(&agg, true));
     a.init(1);
     b.init(1);
     fold(&ctx, &mut a, &[int(&ctx, 2), half], &[0, 0]);
@@ -174,7 +179,7 @@ fn distinct_passes_each_value_of_a_group_once() {
     let values: Vec<Id> = [1, 1, 2, 1, 2, 2].iter().map(|&i| int(&ctx, i)).collect();
     let slots = vec![0, 0, 0, 1, 1, 1];
     let a = agg(AggregateFunction::Count, true, true);
-    let mut count = Distinct::new(Box::new(Running::new(&a)), false);
+    let mut count = Distinct::new(Box::new(Running::new(&a, true)), false);
     count.init(2);
     // two calls, so that the set carries over batches
     fold(&ctx, &mut count, &values[..4], &slots[..4]);
@@ -182,7 +187,7 @@ fn distinct_passes_each_value_of_a_group_once() {
     assert_eq!(results(&ctx, &mut count, 2), vec!["2", "2"]);
     assert!(count.take_growth() > 0);
     // an error is never a duplicate of another
-    let mut count = Distinct::new(Box::new(Running::new(&a)), false);
+    let mut count = Distinct::new(Box::new(Running::new(&a, true)), false);
     count.init(1);
     fold(&ctx, &mut count, &[Id::UNDEF, Id::UNDEF], &[0, 0]);
     assert_eq!(results(&ctx, &mut count, 1), vec!["0"]);
@@ -196,11 +201,13 @@ fn count_distinct_star_tells_rows_apart() {
     for row in [[1, 1], [1, 1], [1, 2], [2, 2]] {
         table.push_row(&[Id(row[0]), Id(row[1])]);
     }
-    let mut count = Distinct::new(Box::new(Running::new(&a)), true);
+    let mut count = Distinct::new(Box::new(Running::new(&a, true)), true);
     count.init(1);
     let batch = Batch {
         table: &table,
         arg: Arg::Star,
+        rows: None,
+        base: 0,
     };
     count.add_batch(&ctx, &batch, &[0, 0, 0, 0]).unwrap();
     assert_eq!(results(&ctx, &mut count, 1), vec!["3"]);
@@ -216,7 +223,7 @@ fn retract_undoes_an_add_for_counts_and_integer_sums() {
     ] {
         let agg = agg(func, true, false);
         let values: Vec<Id> = [4, 6, 10].iter().map(|&i| int(&ctx, i)).collect();
-        let mut acc = Running::new(&agg);
+        let mut acc = Running::new(&agg, true);
         acc.init(1);
         assert!(acc.retractable());
         fold(&ctx, &mut acc, &values, &[0, 0, 0]);
@@ -224,9 +231,11 @@ fn retract_undoes_an_add_for_counts_and_integer_sums() {
         let batch = Batch {
             table: &table,
             arg: Arg::Column(&values[1..]),
+            rows: None,
+            base: 0,
         };
         assert!(acc.retract(&ctx, &batch, &[0, 0]).unwrap());
-        let mut only = Running::new(&agg);
+        let mut only = Running::new(&agg, true);
         only.init(1);
         fold(&ctx, &mut only, &values[..1], &[0]);
         assert_eq!(
@@ -237,10 +246,10 @@ fn retract_undoes_an_add_for_counts_and_integer_sums() {
         );
     }
     // a minimum cannot take a row back, and a sum of doubles cannot either
-    let min = Running::new(&agg(AggregateFunction::Min, true, false));
+    let min = Running::new(&agg(AggregateFunction::Min, true, false), true);
     assert!(!min.retractable());
     let sum = agg(AggregateFunction::Sum, true, false);
-    let mut acc = Running::new(&sum);
+    let mut acc = Running::new(&sum, true);
     acc.init(1);
     let half = ctx.intern_value(&Value::Double(0.5f64.into()));
     fold(&ctx, &mut acc, &[half], &[0]);
@@ -248,6 +257,8 @@ fn retract_undoes_an_add_for_counts_and_integer_sums() {
     let batch = Batch {
         table: &table,
         arg: Arg::Column(&[half]),
+        rows: None,
+        base: 0,
     };
     assert!(!acc.retract(&ctx, &batch, &[0]).unwrap());
 }

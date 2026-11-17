@@ -126,6 +126,46 @@ fn spilled_groupings_match_eager_aggregates() {
     }
 }
 
+/// An eager grouping whose groups do not fit the memory budget of a query that may spill
+/// runs again as the cursor's grouping over its input, which spills in partitions, and
+/// returns the cursor's answer.
+#[test]
+fn an_eager_grouping_whose_groups_do_not_fit_spills_in_partitions() {
+    use sparkles_core::sparql::{ExecutionMode, QueryExecution, query_execution};
+    let s = store(20_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    // The outer aggregates sum up the groups, so that the answer is small.
+    let q = "SELECT (COUNT(*) AS ?groups) (SUM(?n) AS ?rows) (SUM(?sum) AS ?total) \
+             (SUM(?hi) AS ?his) (SUM(STRLEN(?all)) AS ?text) (SUM(?any) AS ?samples) { \
+             SELECT ?s (COUNT(*) AS ?n) (SUM(?v) AS ?sum) (MAX(?v) AS ?hi) \
+             (GROUP_CONCAT(STR(?v); separator=\",\") AS ?all) (SAMPLE(?v) AS ?any) \
+             { ?s <urn:p> ?v } GROUP BY ?s }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(MEMORY),
+        spill: Some(spill.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = CursorOptions::default();
+    let execution = query_execution(s.snapshot(), q, &opts, &cursor, ExecutionMode::Eager).unwrap();
+    let plan = execution.plan_json().unwrap();
+    let QueryExecution::Eager(r) = execution else {
+        panic!("an eager result: {plan}");
+    };
+    let rows: Vec<String> = r
+        .result()
+        .rows()
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{r:?}"))
+        .collect();
+    assert_eq!(rows, eager(&s, q));
+    assert!(rows[0].contains("20000"), "{rows:?}");
+    assert!(plan.contains("partitioned to disk"), "{plan}");
+    assert_eq!(spill.reserved_bytes(), 0);
+}
+
 #[test]
 fn groupings_that_fit_never_spill() {
     let s = store(500);

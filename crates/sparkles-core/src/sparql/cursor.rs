@@ -28,9 +28,9 @@ pub mod graph;
 mod group;
 mod joinspill;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
+pub(super) use joinspill::row_hash;
 mod merge;
 mod ripple;
-mod runs;
 mod topk;
 mod walk;
 
@@ -1233,7 +1233,7 @@ fn grouped(ctx: &Ctx, node: &Node) -> bool {
         group = &group.children[0];
     }
     let rows = match &group.kind {
-        Kind::Group { .. } if group::eligible(group) => group.children[0].est,
+        Kind::Group { .. } if group::eligible(ctx, group) => group.children[0].est,
         Kind::GroupCountScan { .. } => group.est,
         _ => return false,
     };
@@ -1463,7 +1463,7 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
         exists
             && (supported(&node.kind)
                 || binary::eligible(node)
-                || group::eligible(node)
+                || group::eligible(ctx, node)
                 || expand::eligible(node)
                 || walk::eligible(node)
                 || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
@@ -2446,7 +2446,7 @@ enum State {
     Ripple(Box<ripple::Ripple>),
     Group(Box<group::Group>),
     /// A grouping over its input's key runs, for aggregates that need a group's rows.
-    RunGroup(Box<runs::RunGroup>),
+    RunGroup(Box<group::RunGroup>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
     Walk(Box<walk::Walk>),
@@ -2804,9 +2804,9 @@ impl Operator {
         let exists = own_exprs(&node.kind).iter().any(|e| e.has_exists());
         let exists_streams = !exists || exists_streams(ctx, &node.kind)?;
         let joins = exists_streams && binary::eligible(&node);
-        let incremental_group = exists_streams && group::eligible(&node);
+        let incremental_group = exists_streams && group::eligible(ctx, &node);
         // FOLD and registered aggregates read each group's rows from key runs.
-        let run_group = exists_streams && runs::eligible(&node);
+        let run_group = exists_streams && group::runs_eligible(ctx, &node);
         let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
         // A pattern count over an input reads all of it, as a sort does, and then has one
@@ -2877,7 +2877,7 @@ impl Operator {
         let hashes = joins && ctx.spill.is_some() && !merge::eligible(ctx, &node);
         let order_free_group = incremental_group
             && match &node.kind {
-                Kind::Group { aggs, .. } => aggs.iter().all(|(_, agg)| group::order_free(agg)),
+                Kind::Group { aggs, .. } => aggs.iter().all(|(_, agg)| group::order_free(ctx, agg)),
                 _ => false,
             };
         let needs: Vec<bool> = (0..node.children.len())
@@ -2949,8 +2949,8 @@ impl Operator {
         // does not keep that order, a stable sort on the keys, which may spill, gives it.
         let mut children = children;
         if run_group {
-            let keys = runs::sort_keys(&node, &node.children[0].vars);
-            if !runs::grouped_by(&children[0].order, &keys) {
+            let keys = group::sort_keys(&node, &node.children[0].vars);
+            if !group::grouped_by(&children[0].order, &keys) {
                 let child = children.pop().expect("a grouping's input");
                 let input = node.children.pop().expect("a grouping's input shape");
                 let mut shell =
@@ -3087,7 +3087,7 @@ impl Operator {
         } else if let Some(group) = group {
             State::Group(Box::new(group))
         } else if run_group {
-            State::RunGroup(Box::new(runs::RunGroup::new(&node, &children[0].vars)))
+            State::RunGroup(Box::new(group::RunGroup::new(&node, &children[0].vars)))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if index_topk {

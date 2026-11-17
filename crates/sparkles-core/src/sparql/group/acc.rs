@@ -37,6 +37,45 @@ pub(crate) enum Arg<'a> {
 pub(crate) struct Batch<'a> {
     pub table: &'a Table,
     pub arg: Arg<'a>,
+    /// The rows of each slot, when the batch holds every row of each of its groups
+    pub rows: Option<&'a RowIndex>,
+    /// The row of `table` that the batch's first row is
+    pub base: usize,
+}
+
+/// The rows of each slot of a batch, in row order: slot `g`'s rows are
+/// `rows[start[g]..start[g + 1]]`.
+pub(crate) struct RowIndex {
+    start: Vec<u32>,
+    rows: Vec<u32>,
+}
+
+impl RowIndex {
+    /// Index `slots` by a counting sort, for `groups` slots.
+    pub(crate) fn new(slots: &[u32], groups: usize) -> Self {
+        let mut start = vec![0u32; groups + 1];
+        for &g in slots {
+            start[g as usize + 1] += 1;
+        }
+        for g in 0..groups {
+            start[g + 1] += start[g];
+        }
+        let mut rows = vec![0u32; slots.len()];
+        let mut next = start.clone();
+        for (i, &g) in slots.iter().enumerate() {
+            rows[next[g as usize] as usize] = i as u32;
+            next[g as usize] += 1;
+        }
+        Self { start, rows }
+    }
+
+    pub(crate) fn groups(&self) -> usize {
+        self.start.len() - 1
+    }
+
+    pub(crate) fn of(&self, group: usize) -> &[u32] {
+        &self.rows[self.start[group] as usize..self.start[group + 1] as usize]
+    }
 }
 
 impl Batch<'_> {
@@ -51,7 +90,10 @@ impl Batch<'_> {
     }
 }
 
-/// How one aggregate folds the rows of its groups.
+/// How one aggregate folds the rows of its groups. `merge` and `retract` have no caller
+/// in the operator yet: a parallel split of a grouping merges, and item 418's view
+/// operator retracts.
+#[allow(dead_code, reason = "merge and retract serve later callers")]
 pub(crate) trait Accumulator: Send {
     /// Add `groups` groups with empty state, after those held.
     fn init(&mut self, groups: usize);
@@ -107,6 +149,8 @@ pub(crate) trait Accumulator: Send {
 /// ARQ's variance and deviation aggregates.
 pub(crate) struct Running {
     agg: Agg,
+    /// Whether the decoded bytes of the best values are tracked, for a charged grouping
+    track: bool,
     states: Vec<AggState>,
     /// The decoded bytes of the best value of each group of a MIN or MAX, which the
     /// state keeps alive.
@@ -115,12 +159,22 @@ pub(crate) struct Running {
 }
 
 impl Running {
-    pub(crate) fn new(agg: &Agg) -> Self {
+    pub(crate) fn new(agg: &Agg, track: bool) -> Self {
         Self {
             agg: agg.clone(),
+            track,
             states: Vec::new(),
             payload: Vec::new(),
             growth: 0,
+        }
+    }
+
+    /// Count `rows` more rows in a `COUNT(*)` of an ungrouped grouping.
+    pub(crate) fn add_rows(&mut self, rows: u64) {
+        for state in &mut self.states {
+            if let AggState::Count(n) = state {
+                *n += rows;
+            }
         }
     }
 
@@ -161,7 +215,7 @@ impl Accumulator for Running {
                 }
             }
             _ => {
-                let best = self.is_best();
+                let best = self.track && self.is_best();
                 for (row, &slot) in slots.iter().enumerate() {
                     if row.is_multiple_of(1024) {
                         ctx.check()?;
@@ -415,7 +469,12 @@ impl Accumulator for Distinct {
             }
             let id = batch.value(row);
             let fresh = if self.star {
-                let key: Box<[Id]> = batch.table.cols.iter().map(|c| c[row]).collect();
+                let key: Box<[Id]> = batch
+                    .table
+                    .cols
+                    .iter()
+                    .map(|c| c[batch.base + row])
+                    .collect();
                 // the boxed row, the set's entry and room for its table to grow
                 let bytes = batch.table.cols.len() as u64 * 8 + 96;
                 let fresh = self.rows.insert((slot, key));
@@ -450,6 +509,8 @@ impl Accumulator for Distinct {
         let inner = Batch {
             table: batch.table,
             arg,
+            rows: None,
+            base: batch.base,
         };
         self.inner.add_batch(ctx, &inner, &keep)
     }
@@ -464,6 +525,71 @@ impl Accumulator for Distinct {
 
     fn take_growth(&mut self) -> u64 {
         std::mem::take(&mut self.growth) + self.inner.take_growth()
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// An aggregate that reads its group's rows: FOLD, a registered aggregate, a custom
+/// aggregate other than ARQ's statistics, and every aggregate when the
+/// `incremental_group` optimization is off. Its batch holds every row of each of its
+/// groups, and the aggregate's kernel runs once per group over them.
+pub(crate) struct Rows {
+    agg: Agg,
+    results: Vec<Id>,
+}
+
+impl Rows {
+    pub(crate) fn new(agg: &Agg) -> Self {
+        Self {
+            agg: agg.clone(),
+            results: Vec::new(),
+        }
+    }
+}
+
+impl Accumulator for Rows {
+    fn init(&mut self, groups: usize) {
+        self.results.extend(std::iter::repeat_n(Id::UNDEF, groups));
+    }
+
+    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, _slots: &[u32]) -> Result<()> {
+        let index = batch.rows.expect("a batch of whole groups");
+        let map = batch.table.var_map(ctx.nvars());
+        let arg = match batch.arg {
+            Arg::Column(values) => Some(values),
+            Arg::Star | Arg::Unbound => None,
+        };
+        for g in 0..index.groups() {
+            ctx.check()?;
+            let rows = index.of(g);
+            self.results[g] = if let Some(descriptor) = &self.agg.registered {
+                crate::sparql::registeredagg::aggregate(
+                    ctx,
+                    batch.table,
+                    &map,
+                    rows,
+                    &self.agg,
+                    descriptor,
+                )?
+            } else {
+                crate::sparql::exec::aggregate(ctx, batch.table, &map, rows, &self.agg, arg)
+            };
+            if ctx.calls_extensions {
+                ctx.check()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, _ctx: &Ctx, group: usize) -> Result<Id> {
+        Ok(self.results[group])
+    }
+
+    fn group_bytes(&self) -> u64 {
+        16
     }
 
     fn as_any(&mut self) -> &mut dyn Any {

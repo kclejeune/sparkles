@@ -1446,7 +1446,7 @@ fn run_node<'ctx>(
         }
         Kind::Group { keys, aggs } => {
             let t = child(0, infos)?;
-            group(ctx, &t, keys, aggs, &mut expr_report)?
+            group_or_spill(ctx, n, t, keys, aggs, &mut expr_report, &mut note)?
         }
         Kind::Path {
             spec,
@@ -4052,22 +4052,7 @@ fn spilled_join(
     let Some(shared) = ctx.shared() else {
         return Err(error);
     };
-    let leaf = |t: Table| {
-        let certain: Vec<VarId> = t
-            .vars
-            .iter()
-            .enumerate()
-            .filter(|&(c, _)| !has_undef(&t, c))
-            .map(|(_, v)| *v)
-            .collect();
-        let sorted = t.sorted.clone();
-        let vars = t.vars.clone();
-        let est = t.len() as f64;
-        let mut leaf = Node::leaf(Kind::Values(t), vars, est, String::new());
-        leaf.certain = certain;
-        leaf.sorted = sorted;
-        leaf
-    };
+    let leaf = values_leaf;
     let mut node = Node::leaf(n.kind.clone(), n.vars.clone(), n.est, String::new());
     node.certain.clone_from(&n.certain);
     node.children = vec![leaf(l), leaf(r)];
@@ -4084,6 +4069,25 @@ fn spilled_join(
         None => spilled.to_string(),
     });
     Ok(out)
+}
+
+/// A VALUES leaf that holds the table `t`, with the order and the bound variables it has,
+/// for an eager operator that falls back to its cursor twin over its input tables.
+fn values_leaf(t: Table) -> Node {
+    let certain: Vec<VarId> = t
+        .vars
+        .iter()
+        .enumerate()
+        .filter(|&(c, _)| !has_undef(&t, c))
+        .map(|(_, v)| *v)
+        .collect();
+    let sorted = t.sorted.clone();
+    let vars = t.vars.clone();
+    let est = t.len() as f64;
+    let mut leaf = Node::leaf(Kind::Values(t), vars, est, String::new());
+    leaf.certain = certain;
+    leaf.sorted = sorted;
+    leaf
 }
 
 /// Output layout of a join: left vars, then right-only vars.
@@ -6495,151 +6499,43 @@ fn distinct_of(ctx: &Ctx, n: &Node, t: Table) -> Result<Table> {
 
 // ------------------------------------------------------------------ group ------
 
-pub(super) fn group(
+/// GROUP BY over the whole input `t`, through the grouping operator. A query that may
+/// spill charges the groups' state, and when they do not fit its memory budget the
+/// grouping runs again as the cursor's grouping over `t`, which passes the rows of the
+/// groups that do not fit to disk in partitions.
+fn group_or_spill(
     ctx: &Ctx,
-    t: &Table,
+    n: &Node,
+    t: Table,
     keys: &[VarId],
     aggs: &[(VarId, Agg)],
     report: &mut ExprReport,
+    note: &mut Option<String>,
 ) -> Result<Table> {
-    if ctx.opt.incremental_group
-        && let Some(out) = group_incremental(ctx, t, keys, aggs)?
-    {
-        return Ok(out);
-    }
-    let kcols: Vec<Option<usize>> = keys.iter().map(|k| t.col_of(*k)).collect();
-    // the keys of each group, in order of first appearance, and each row's group
-    let mut order: Vec<Vec<Id>> = Vec::new();
-    let mut gid: Vec<u32> = Vec::with_capacity(t.len());
-    let key_of = |c: &Option<usize>, i: usize| c.map_or(Id::UNDEF, |c| t.cols[c][i]);
-    if let [kc] = kcols.as_slice() {
-        let mut ids: FxHashMap<Id, u32> = FxHashMap::default();
-        for i in 0..t.len() {
-            if i % 65_536 == 0 {
-                ctx.check()?;
-                ctx.check_output(order.len(), keys.len() + aggs.len())?;
-            }
-            let k = key_of(kc, i);
-            gid.push(*ids.entry(k).or_insert_with(|| {
-                order.push(vec![k]);
-                (order.len() - 1) as u32
-            }));
-        }
-    } else {
-        let mut ids: FxHashMap<Vec<Id>, u32> = FxHashMap::default();
-        let mut key = Vec::with_capacity(kcols.len());
-        for i in 0..t.len() {
-            if i % 65_536 == 0 {
-                ctx.check()?;
-                ctx.check_output(order.len(), keys.len() + aggs.len())?;
-            }
-            key.clear();
-            key.extend(kcols.iter().map(|c| key_of(c, i)));
-            let g = match ids.get(&key) {
-                Some(g) => *g,
-                None => {
-                    order.push(key.clone());
-                    ids.insert(key.clone(), (order.len() - 1) as u32);
-                    (order.len() - 1) as u32
-                }
+    let charged = ctx.spill.is_some();
+    match super::group::whole(ctx, &t, keys, aggs, charged, true, report) {
+        Err(error) if hash::spills(ctx, &error) && super::group::hashable(ctx, aggs) => {
+            let Some(shared) = ctx.shared() else {
+                return Err(error);
             };
-            gid.push(g);
-        }
-    }
-    if t.is_empty() && keys.is_empty() {
-        order.push(Vec::new());
-    }
-    // the rows of each group, in row order: group g's rows are rows[start[g]..start[g + 1]]
-    let mut start = vec![0u32; order.len() + 1];
-    for &g in &gid {
-        start[g as usize + 1] += 1;
-    }
-    for g in 0..order.len() {
-        start[g + 1] += start[g];
-    }
-    let mut rows = vec![0u32; gid.len()];
-    let mut next = start.clone();
-    for (i, &g) in gid.iter().enumerate() {
-        rows[next[g as usize] as usize] = i as u32;
-        next[g as usize] += 1;
-    }
-    let mut vars = keys.to_vec();
-    vars.extend(aggs.iter().map(|(v, _)| *v));
-    let mut out = Table::new(vars);
-    let map = t.var_map(ctx.nvars());
-    // aggregate arguments that are pure over one variable, once per distinct value
-    let mut args = Vec::with_capacity(aggs.len());
-    for (_, agg) in aggs {
-        args.push(match &agg.expr {
-            // FOLD evaluates its expressions itself, in its ORDER BY's order
-            Some(e)
-                if agg.fold.is_none()
-                    && agg.registered.is_none()
-                    && t.len() >= super::exprcache::MIN_ROWS
-                    && super::exprcache::eligible(&[e]).is_ok() =>
-            {
-                super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-                    let map = v.var_map(ctx.nvars());
-                    let f = |i: usize| {
-                        let row = Row {
-                            table: v,
-                            i,
-                            map: &map,
-                            dec: None,
-                        };
-                        eval(e, &row, ctx).ok().map(|x| x.into_id(ctx))
-                    };
-                    map_rows(ctx, v.len(), v.len() > PAR_THRESHOLD && e.parallel(), f)
-                })?
+            let mut node = Node::leaf(n.kind.clone(), n.vars.clone(), n.est, String::new());
+            node.certain.clone_from(&n.certain);
+            node.children = vec![values_leaf(t)];
+            let mut out = Table::new(n.vars.clone());
+            match super::cursor::spilled_join(&shared, node, &mut out) {
+                Ok(()) => {}
+                Err(Error::Unsupported(_)) => return Err(error),
+                Err(other) => return Err(other),
             }
-            _ => None,
-        });
-    }
-    for (g, mut row) in order.into_iter().enumerate() {
-        ctx.check()?;
-        let rows = &rows[start[g] as usize..start[g + 1] as usize];
-        for ((_, agg), arg) in aggs.iter().zip(&args) {
-            row.push(if let Some(descriptor) = &agg.registered {
-                super::registeredagg::aggregate(ctx, t, &map, rows, agg, descriptor)?
-            } else {
-                aggregate(ctx, t, &map, rows, agg, arg.as_ref())
+            let spilled = "[groups did not fit: partitioned to disk]";
+            *note = Some(match note.take() {
+                Some(note) => format!("{note} {spilled}"),
+                None => spilled.to_string(),
             });
-            if ctx.calls_extensions {
-                ctx.check()?;
-            }
+            Ok(out)
         }
-        out.push_row(&row);
+        other => other,
     }
-    Ok(out)
-}
-
-/// Whether `group` can run incrementally: at most one key variable, and aggregates that
-/// are `COUNT(*)` or COUNT / SUM / AVG / MIN / MAX / SAMPLE or one of ARQ's variance and
-/// deviation aggregates of an input column, without DISTINCT. The planner uses this to
-/// name the operator in EXPLAIN.
-pub fn incremental_group_ok(keys: &[VarId], aggs: &[(VarId, Agg)], input: &[VarId]) -> bool {
-    keys.len() <= 1
-        && keys.iter().all(|k| input.contains(k))
-        && aggs.iter().all(|(_, a)| {
-            a.registered.is_none()
-                && !a.distinct
-                && match &a.expr {
-                    None => matches!(a.func, AggregateFunction::Count),
-                    Some(Expr::Var(v)) => {
-                        input.contains(v)
-                            && (matches!(
-                                a.func,
-                                AggregateFunction::Count
-                                    | AggregateFunction::Sum
-                                    | AggregateFunction::Avg
-                                    | AggregateFunction::Min
-                                    | AggregateFunction::Max
-                                    | AggregateFunction::Sample
-                            ) || stat_aggregate(&a.func).is_some())
-                    }
-                    _ => false,
-                }
-        })
 }
 
 /// The ARQ variance or deviation aggregate a custom aggregate is, if it is one.
@@ -6768,6 +6664,7 @@ impl AggState {
     /// state's rows, into this one, so that the result is what one state over all the
     /// rows in that order gives. `false`, with this state unchanged, for a state that
     /// cannot be combined exactly, such as ARQ's shifted sums.
+    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
     pub(super) fn merge(&mut self, ctx: &Ctx, agg: &Agg, other: AggState) -> bool {
         match (&mut *self, other) {
             (AggState::Count(a), AggState::Count(b)) => *a += b,
@@ -6845,6 +6742,7 @@ impl AggState {
     /// and an exact sum of inline integers. `false`, with this state unchanged, for any
     /// other, since a minimum, a sample or a sum that left the exact integers keeps no
     /// record of the rows it would have to give up.
+    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
     pub(super) fn retract(&mut self, id: Option<Id>) -> bool {
         match self {
             AggState::Count(n) => {
@@ -6910,84 +6808,15 @@ impl AggState {
     }
 }
 
-/// GROUP BY in one pass: groups are found through a hash map on the single key id and
-/// every aggregate keeps a running state, instead of collecting per-group row lists and
-/// value vectors. `None` when the query shape is not admitted (see
-/// [`incremental_group_ok`]).
-fn group_incremental(
-    ctx: &Ctx,
-    t: &Table,
-    keys: &[VarId],
-    aggs: &[(VarId, Agg)],
-) -> Result<Option<Table>> {
-    if !incremental_group_ok(keys, aggs, &t.vars) {
-        return Ok(None);
-    }
-    let kcol = keys.first().and_then(|k| t.col_of(*k));
-    let acols: Vec<Option<usize>> = aggs
-        .iter()
-        .map(|(_, a)| match &a.expr {
-            Some(Expr::Var(v)) => t.col_of(*v),
-            _ => None,
-        })
-        .collect();
-    let mut index: FxHashMap<Id, u32> = FxHashMap::default();
-    let mut order: Vec<Id> = Vec::new();
-    let mut states: Vec<AggState> = Vec::new();
-    let na = aggs.len();
-    if kcol.is_none() {
-        // no grouping: one group, also for empty input
-        order.push(Id::UNDEF);
-        states.extend(aggs.iter().map(|(_, a)| AggState::new(a)));
-    }
-    for i in 0..t.len() {
-        if i % 65_536 == 0 {
-            ctx.check()?;
-            ctx.check_output(order.len(), keys.len() + aggs.len())?;
-        }
-        let g = match kcol {
-            None => 0,
-            Some(c) => {
-                let k = t.cols[c][i];
-                *index.entry(k).or_insert_with(|| {
-                    order.push(k);
-                    states.extend(aggs.iter().map(|(_, a)| AggState::new(a)));
-                    (order.len() - 1) as u32
-                }) as usize
-            }
-        };
-        for (a, ((_, agg), col)) in aggs.iter().zip(&acols).enumerate() {
-            states[g * na + a].add(ctx, agg, col.map(|c| t.cols[c][i]));
-        }
-    }
-    let mut vars = keys.to_vec();
-    vars.extend(aggs.iter().map(|(v, _)| *v));
-    let mut out = Table::new(vars);
-    let mut states = states.into_iter();
-    let mut row = Vec::with_capacity(1 + na);
-    for k in order {
-        ctx.check()?;
-        row.clear();
-        if kcol.is_some() {
-            row.push(k);
-        }
-        for (_, agg) in aggs {
-            row.push(states.next().unwrap().finish(ctx, agg));
-        }
-        out.push_row(&row);
-    }
-    Ok(Some(out))
-}
-
-/// One aggregate of one group; `arg` holds the argument's value per row when it was
-/// evaluated per distinct value (`None` in it: an error).
-fn aggregate(
+/// One aggregate of one group, over the group's rows; `arg` holds the argument's value
+/// in every row of `t` when it was evaluated beforehand (unbound in it: an error).
+pub(super) fn aggregate(
     ctx: &Ctx,
     t: &Table,
     map: &[Option<usize>],
     rows: &[u32],
     agg: &Agg,
-    arg: Option<&super::exprcache::PerValue<Option<Id>>>,
+    arg: Option<&[Id]>,
 ) -> Id {
     if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
         return fold(ctx, t, map, rows, e, agg.distinct, spec);
@@ -7008,7 +6837,8 @@ fn aggregate(
         .iter()
         .map(|&i| {
             if let Some(a) = arg {
-                return a.get(i as usize).ok_or(());
+                let id = a[i as usize];
+                return if id.is_undef() { Err(()) } else { Ok(id) };
             }
             eval(
                 e,

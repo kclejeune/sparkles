@@ -5499,9 +5499,7 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let desc = if ctx.opt.incremental_group
-        && super::exec::incremental_group_ok(&keys, &aggs, &child.vars)
-    {
+    let desc = if super::group::hashable(ctx, &aggs) {
         format!("{desc} [incremental]")
     } else {
         desc
