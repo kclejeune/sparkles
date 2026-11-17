@@ -1113,7 +1113,7 @@ fn program_search(
         for k in generalized {
             facts.push([id(&k[0])?, id(&k[1])?, id(&k[2])?]);
         }
-        g.try_add_batch(facts.into_iter())?;
+        g.try_add_batch(facts)?;
         held.shrink(generalized.len() * size_of::<Triple>());
     }
     let vocab = crate::ir::Vocab::of(&terms);
