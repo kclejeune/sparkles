@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Compares the OWL 2 RL materialization of `sparkles infer --profile owl-rl` with the
 # reference materialization of Nemo (scripts/rl-reference/owl2rl.rls), triple for triple.
+# With PROFILE=rdfs it compares `sparkles infer --profile rdfs` with Nemo's run of
+# rdfs.rls instead.
 #
 #   scripts/rl-reference/compare.sh INPUT WORKDIR
 #
@@ -17,24 +19,28 @@
 #   triples that Sparkles lacks must match a row of KNOWN, and Sparkles' additions are
 #   only counted.
 #
+# The rdfs profile has one program, rdfs.rls, whose derived graph must equal Sparkles'.
+# It writes no core.json.
+#
 # WORKDIR gets sparkles-derived.nt, reference-derived.nt, core-derived.nt, diff.json and
 # core.json (the counts by side, predicate and explanation) and the logs. The exit status
 # is 0 when every difference is explained, 1 when one is not and 2 when a step fails.
 #
-# Env: SPARKLES (default target/release/sparkles), NMO (default the flake's nemo package),
-# KNOWN, MAX_INFERRED (the --max-inferred of `sparkles infer`, default 0 for no limit),
-# PYTHON (default python3), ROOT and WORK for the package resolution of
-# scripts/bench-tools.sh.
+# Env: PROFILE (owl-rl or rdfs, default owl-rl), SPARKLES (default
+# target/release/sparkles), NMO (default the flake's nemo package), KNOWN, MAX_INFERRED
+# (the --max-inferred of `sparkles infer`, default 0 for no limit), PYTHON (default
+# python3), ROOT and WORK for the package resolution of scripts/bench-tools.sh.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$(cd "$HERE/../.." && pwd)}
 PYTHON=${PYTHON:-python3}
 KNOWN=${KNOWN:-$HERE/known.tsv}
 MAX_INFERRED=${MAX_INFERRED:-0}
+PROFILE=${PROFILE:-owl-rl}
 INFERRED=urn:x-sparkles:inferred
 
 [ $# -eq 2 ] || {
-  sed -n '2,27p' "$0" >&2
+  sed -n '2,32p' "$0" >&2
   exit 2
 }
 input=$(realpath "$1")
@@ -44,6 +50,7 @@ fail() {
   echo "compare.sh: $*" >&2
   exit 2
 }
+case $PROFILE in owl-rl | rdfs) ;; *) fail "PROFILE must be owl-rl or rdfs" ;; esac
 
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 [ -x "$SPARKLES" ] || fail "no Sparkles binary at $SPARKLES; build it or set SPARKLES"
@@ -57,7 +64,7 @@ fi
 cd "$work"
 rm -rf db enc nemo-aligned nemo-core
 "$SPARKLES" load --loc db "$input" > load.log 2>&1 || fail "sparkles load failed, see $work/load.log"
-"$SPARKLES" infer --loc db --profile owl-rl --max-inferred "$MAX_INFERRED" > infer.log 2>&1 || fail "sparkles infer failed, see $work/infer.log"
+"$SPARKLES" infer --loc db --profile "$PROFILE" --max-inferred "$MAX_INFERRED" > infer.log 2>&1 || fail "sparkles infer failed, see $work/infer.log"
 "$SPARKLES" dump --loc db --format nq --out all.nq > dump.log 2>&1 || fail "sparkles dump failed, see $work/dump.log"
 rm -rf db
 "$PYTHON" -I "$HERE/rl_terms.py" split all.nq base.nt sparkles-derived.nt "$INFERRED" 2> split.log ||
@@ -65,8 +72,13 @@ rm -rf db
 rm -f all.nq
 mkdir -p enc
 "$PYTHON" -I "$HERE/rl_terms.py" encode base.nt enc 2> encode.log || fail "encoding failed, see $work/encode.log"
-# the aligned program leaves out the reflexive cases of scm-eqc2 and scm-eqp2 (owl2rl.rls)
-grep -v '% reflexive-scm-eq$' "$HERE/owl2rl.rls" | cat - "$HERE/sparkles-extensions.rls" > aligned.rls
+rm -f diff.json core.json
+if [ "$PROFILE" = rdfs ]; then
+  cp "$HERE/rdfs.rls" aligned.rls
+else
+  # the aligned program leaves out the reflexive cases of scm-eqc2 and scm-eqp2 (owl2rl.rls)
+  grep -v '% reflexive-scm-eq$' "$HERE/owl2rl.rls" | cat - "$HERE/sparkles-extensions.rls" > aligned.rls
+fi
 nemo() {
   "$NMO" --overwrite-results --import-dir enc --export-dir "nemo-$1" --report short "$2" > "nemo-$1.log" 2>&1 ||
     fail "nemo failed on the $1 program, see $work/nemo-$1.log"
@@ -75,8 +87,9 @@ nemo() {
   rm -rf "nemo-$1"
 }
 nemo aligned aligned.rls reference-derived.nt
-nemo core "$HERE/owl2rl.rls" core-derived.nt
+[ "$PROFILE" = rdfs ] || nemo core "$HERE/owl2rl.rls" core-derived.nt
 rc=0
 "$PYTHON" -I "$HERE/rl_terms.py" diff sparkles-derived.nt reference-derived.nt diff.json --known "$KNOWN" || rc=1
-"$PYTHON" -I "$HERE/rl_terms.py" diff sparkles-derived.nt core-derived.nt core.json --known "$KNOWN" --subset || rc=1
+[ "$PROFILE" = rdfs ] ||
+  "$PYTHON" -I "$HERE/rl_terms.py" diff sparkles-derived.nt core-derived.nt core.json --known "$KNOWN" --subset || rc=1
 exit "$rc"

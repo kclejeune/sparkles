@@ -1,0 +1,164 @@
+{
+ "suite": "owl2bench",
+ "scale": 5,
+ "profile": "owl-rl",
+ "recorded": "2026-11-17T01:56:02Z",
+ "host": {
+  "name": "atlas",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "kernel": "7.2.9"
+ },
+ "sparkles": {
+  "binary": "/home/kclejeune/lanes/rl-reference-timing/bin/sparkles-faaddcdb",
+  "version": "sparkles 0.1.0",
+  "sha256": "085f36b7cff56cc17e6cebcb503e2a7c578197166695ff5888a9b1c76d4fe6a4",
+  "commit": "faaddcdb"
+ },
+ "nemo": {
+  "binary": "/nix/store/94ydj0qlbrklnblfi3i6fwci9wnr637m-nemo-0.10.1/bin/nmo",
+  "version": "nemo-cli 0.10.1"
+ },
+ "config": {
+  "runs": 3,
+  "threads": 20,
+  "incremental": false,
+  "delta_every": 100,
+  "mem_max": "13G",
+  "memory_scope": true,
+  "run_timeout": 3600,
+  "kill_after": 30,
+  "max_inferred": 0
+ },
+ "base_triples": 349607,
+ "change_triples": 3004,
+ "derived_triples": 52966139,
+ "correctness": {
+  "aligned": {
+   "sparkles": 52966139,
+   "reference": 52966139,
+   "common": 52966139,
+   "subset": false,
+   "differences": {
+    "sparkles": {
+     "total": 0,
+     "by_explanation": {},
+     "by_predicate": {},
+     "examples": {}
+    },
+    "reference": {
+     "total": 0,
+     "by_explanation": {},
+     "by_predicate": {},
+     "examples": {}
+    }
+   },
+   "unexplained": 0
+  },
+  "verified": true,
+  "unverified": [],
+  "core": 0
+ },
+ "runs": [
+  {
+   "run": "nemo-full",
+   "round": 1,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 752.78,
+   "max_rss_kib": 2998888,
+   "nemo_import_seconds": 48.552,
+   "nemo_reasoning_seconds": 680.032,
+   "nemo_export_seconds": 24.101,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "sparkles-full",
+   "round": 1,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 74.27,
+   "max_rss_kib": 9686564,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "sparkles-full",
+   "round": 1,
+   "threads": 20,
+   "status": "ok",
+   "seconds": 55.56,
+   "max_rss_kib": 10041680,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "nemo-full",
+   "round": 2,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 751.33,
+   "max_rss_kib": 3003660,
+   "nemo_import_seconds": 48.046,
+   "nemo_reasoning_seconds": 679.111,
+   "nemo_export_seconds": 24.028,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "sparkles-full",
+   "round": 2,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 72.01,
+   "max_rss_kib": 9687668,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "sparkles-full",
+   "round": 2,
+   "threads": 20,
+   "status": "ok",
+   "seconds": 54.07,
+   "max_rss_kib": 8994200,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "nemo-full",
+   "round": 3,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 758.9,
+   "max_rss_kib": 2991604,
+   "nemo_import_seconds": 50.525,
+   "nemo_reasoning_seconds": 683.335,
+   "nemo_export_seconds": 24.914,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "sparkles-full",
+   "round": 3,
+   "threads": 1,
+   "status": "ok",
+   "seconds": 71.8,
+   "max_rss_kib": 10218880,
+   "derived_triples": 52966139,
+   "agrees": true
+  },
+  {
+   "run": "sparkles-full",
+   "round": 3,
+   "threads": 20,
+   "status": "ok",
+   "seconds": 55.02,
+   "max_rss_kib": 10043828,
+   "derived_triples": 52966139,
+   "agrees": true
+  }
+ ]
+}

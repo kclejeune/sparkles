@@ -1164,14 +1164,16 @@ arg "[profile]" default="rdfs" help="rdfs | rdfs-simple | owl-rl"
 run = 'mbx run --release -p sparkles-reasoner --example reasoner-bench -- "$usage_triples" "$usage_profile"'
 
 [tasks."bench:rl-reference"]
-description = "OWL 2 RL materialization against the reference, Nemo, on LUBM or OWL2Bench: the closures compared triple for triple, then full materialization on 1 and N threads and incremental insertion and deletion (scripts/rl-reference/bench.sh)"
+description = "OWL 2 RL or RDFS materialization against the reference, Nemo, on LUBM or OWL2Bench: the closures compared triple for triple, then full materialization on 1 and N threads, each run's closure checked, and incremental insertion and deletion (scripts/rl-reference/bench.sh)"
 depends = ["build"]
 usage = '''
 arg "[suite]" default="lubm" help="lubm or owl2bench"
 arg "[scale]" default="1" help="universities: 1 (smoke) or more"
-arg "[workdir]" help="data, databases, logs and results/ (default .artifacts/bench-rl-reference/<suite>-<scale>)"
+arg "[workdir]" help="data, databases, logs and <profile>/results/ (default .artifacts/bench-rl-reference/<suite>-<scale>)"
+flag "--profile <profile>" default="owl-rl" help="owl-rl, rdfs or all, which runs owl-rl and then rdfs on the same data"
 flag "--runs <n>" default="3" help="timed rounds"
 flag "--threads <n>" help="Sparkles' threads beside 1 (default: all cores)"
+flag "--no-incremental" help="time full materialization only, without the incremental insertion and deletion"
 flag "--delta-every <n>" default="100" help="the change of the incremental runs is every n-th data triple"
 flag "--max-inferred <n>" default="0" help="the --max-inferred of every sparkles infer (0: no limit)"
 '''
@@ -1179,10 +1181,15 @@ run = '''
 mbx sparkles-task -- bash -e <<'SPARKLES_TASK'
 # Built again inside this lease, so collection cannot remove the binary before it runs.
 mbx build --release -p sparkles-server
-RUNS="$usage_runs" THREADS="${usage_threads:-$(nproc)}" DELTA_EVERY="$usage_delta_every" \
-MAX_INFERRED="$usage_max_inferred" \
-scripts/rl-reference/bench.sh "$usage_suite" "$usage_scale" \
-  "$(realpath -m "${usage_workdir:-.artifacts/bench-rl-reference/$usage_suite-$usage_scale}")"
+case "$usage_profile" in all) profiles="owl-rl rdfs" ;; *) profiles=$usage_profile ;; esac
+incremental=1
+[ "${usage_no_incremental:-false}" != true ] || incremental=0
+for profile in $profiles; do
+  PROFILE="$profile" INCREMENTAL="$incremental" RUNS="$usage_runs" THREADS="${usage_threads:-$(nproc)}" \
+  DELTA_EVERY="$usage_delta_every" MAX_INFERRED="$usage_max_inferred" \
+  scripts/rl-reference/bench.sh "$usage_suite" "$usage_scale" \
+    "$(realpath -m "${usage_workdir:-.artifacts/bench-rl-reference/$usage_suite-$usage_scale}")"
+done
 SPARKLES_TASK
 '''
 

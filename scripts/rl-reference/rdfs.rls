@@ -1,0 +1,121 @@
+% The RDFS entailment rules of RDF 1.1 Semantics, section 9.2.1
+% (https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative), with the
+% axiomatic triples that Sparkles' rdfs profile states, written for Nemo as the reference
+% materialization of `sparkles infer --profile rdfs` in docs/benchmarks/reasoning. The
+% rules keep the names of crates/sparkles-reasoner/rules/rdfs.rules, which numbers them as
+% the recommendation does, and the axiomatic triples are that file's list. The
+% recommendation's axioms name every container membership property rdf:_n, and like
+% Sparkles the program states rdf:_1 to rdf:_3 and types the others that the data uses.
+%
+% Input and output are those of owl2rl.rls. base.nt holds the graph with every literal and
+% blank node replaced by an IRI (scripts/rl-reference/rl_terms.py encode), literals.nt
+% marks the encoded literals and blank nodes, and derived.nt holds the triples of the
+% closure that base.nt does not hold. As in Sparkles, the rules derive generalized
+% triples, with a literal as subject or a literal or blank node as predicate, and use them
+% as premises, but derived.nt holds only the RDF triples. A generalized intermediate can
+% lead to an RDF triple, as when a property's superproperty is a blank node with a
+% domain. The rule rdfs1 and the rules of literal values, rdfD1 and rdfD2, are left out,
+% as in Sparkles' rule set.
+
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix rl: <urn:x-rl:> .
+
+@import base :- ntriples{resource="base.nt"} .
+@import lits :- ntriples{resource="literals.nt"} .
+
+t(?s, ?p, ?o) :- base(?s, ?p, ?o) .
+isLit(?l) :- lits(?l, rl:kind, rl:literal) .
+notIri(?l) :- isLit(?l) .
+notIri(?b) :- lits(?b, rl:kind, rl:bnode) .
+
+% ---------------------------------------------------------------- axiomatic triples
+
+t(rdf:type, rdfs:range, rdfs:Class) .
+t(rdfs:Resource, rdf:type, rdfs:Class) .
+t(rdfs:Literal, rdf:type, rdfs:Class) .
+t(rdf:Statement, rdf:type, rdfs:Class) .
+t(rdf:nil, rdf:type, rdf:List) .
+t(rdf:subject, rdf:type, rdf:Property) .
+t(rdf:object, rdf:type, rdf:Property) .
+t(rdf:predicate, rdf:type, rdf:Property) .
+t(rdf:first, rdf:type, rdf:Property) .
+t(rdf:rest, rdf:type, rdf:Property) .
+
+t(rdfs:subPropertyOf, rdfs:domain, rdf:Property) .
+t(rdfs:subClassOf, rdfs:domain, rdfs:Class) .
+t(rdfs:domain, rdfs:domain, rdf:Property) .
+t(rdfs:range, rdfs:domain, rdf:Property) .
+t(rdf:subject, rdfs:domain, rdf:Statement) .
+t(rdf:predicate, rdfs:domain, rdf:Statement) .
+t(rdf:object, rdfs:domain, rdf:Statement) .
+t(rdf:first, rdfs:domain, rdf:List) .
+t(rdf:rest, rdfs:domain, rdf:List) .
+
+t(rdfs:subPropertyOf, rdfs:range, rdf:Property) .
+t(rdfs:subClassOf, rdfs:range, rdfs:Class) .
+t(rdfs:domain, rdfs:range, rdfs:Class) .
+t(rdfs:range, rdfs:range, rdfs:Class) .
+t(rdfs:comment, rdfs:range, rdfs:Literal) .
+t(rdfs:label, rdfs:range, rdfs:Literal) .
+t(rdf:rest, rdfs:range, rdf:List) .
+
+t(rdf:Alt, rdfs:subClassOf, rdfs:Container) .
+t(rdf:Bag, rdfs:subClassOf, rdfs:Container) .
+t(rdf:Seq, rdfs:subClassOf, rdfs:Container) .
+t(rdfs:ContainerMembershipProperty, rdfs:subClassOf, rdf:Property) .
+
+t(rdfs:isDefinedBy, rdfs:subPropertyOf, rdfs:seeAlso) .
+
+t(rdf:XMLLiteral, rdf:type, rdfs:Datatype) .
+t(rdf:langString, rdf:type, rdfs:Datatype) .
+t(rdf:HTML, rdf:type, rdfs:Datatype) .
+t(rdfs:Datatype, rdfs:subClassOf, rdfs:Class) .
+
+t(<http://www.w3.org/1999/02/22-rdf-syntax-ns#_1>, rdf:type, rdfs:ContainerMembershipProperty) .
+t(<http://www.w3.org/1999/02/22-rdf-syntax-ns#_2>, rdf:type, rdfs:ContainerMembershipProperty) .
+t(<http://www.w3.org/1999/02/22-rdf-syntax-ns#_3>, rdf:type, rdfs:ContainerMembershipProperty) .
+
+% The schema vocabulary as binary relations of the closure, which keeps Nemo's joins on
+% small tables, as in owl2rl.rls.
+domain(?p, ?c) :- t(?p, rdfs:domain, ?c) .
+range(?p, ?c) :- t(?p, rdfs:range, ?c) .
+subPropertyOf(?p, ?q) :- t(?p, rdfs:subPropertyOf, ?q) .
+subClassOf(?c, ?d) :- t(?c, rdfs:subClassOf, ?d) .
+type(?x, ?c) :- t(?x, rdf:type, ?c) .
+
+% ---------------------------------------------------------------- rules
+
+% rdf1
+t(?p, rdf:type, rdf:Property) :- t(?x, ?p, ?y) .
+% rdfs4a and rdfs4b
+t(?x, rdf:type, rdfs:Resource) :- t(?x, ?p, ?y) .
+t(?y, rdf:type, rdfs:Resource) :- t(?x, ?p, ?y) .
+% rdfs2
+t(?x, rdf:type, ?c) :- domain(?p, ?c), t(?x, ?p, ?y) .
+% rdfs3
+t(?y, rdf:type, ?c) :- range(?p, ?c), t(?x, ?p, ?y) .
+% rdfs5
+t(?a, rdfs:subPropertyOf, ?c) :- subPropertyOf(?a, ?b), subPropertyOf(?b, ?c) .
+% rdfs6
+t(?a, rdfs:subPropertyOf, ?a) :- type(?a, rdf:Property) .
+% rdfs7
+t(?a, ?q, ?b) :- subPropertyOf(?p, ?q), ?p != ?q, t(?a, ?p, ?b) .
+% rdfs8
+t(?a, rdfs:subClassOf, rdfs:Resource) :- type(?a, rdfs:Class) .
+% rdfs9
+t(?a, rdf:type, ?y) :- subClassOf(?x, ?y), ?x != ?y, type(?a, ?x) .
+% rdfs10
+t(?a, rdfs:subClassOf, ?a) :- type(?a, rdfs:Class) .
+% rdfs11
+t(?a, rdfs:subClassOf, ?c) :- subClassOf(?a, ?b), subClassOf(?b, ?c) .
+% rdfs12, and the typing of the container membership properties that the data uses
+t(?x, rdfs:subPropertyOf, rdfs:member) :- type(?x, rdfs:ContainerMembershipProperty) .
+t(?p, rdf:type, rdfs:ContainerMembershipProperty) :- type(?p, rdf:Property),
+    REGEX(STR(?p), "^http://www[.]w3[.]org/1999/02/22-rdf-syntax-ns#_[1-9][0-9]*$") .
+% rdfs13
+t(?d, rdfs:subClassOf, rdfs:Literal) :- type(?d, rdfs:Datatype) .
+
+% the derived RDF triples, without the generalized ones
+derived(?s, ?p, ?o) :- t(?s, ?p, ?o), ~base(?s, ?p, ?o), ~isLit(?s), ~notIri(?p) .
+@export derived :- ntriples{resource="derived.nt"} .

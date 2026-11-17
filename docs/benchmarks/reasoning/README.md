@@ -12,12 +12,20 @@ The reasoning gate of the [rewrite gates](../../BENCHMARKING.md#rewrite-gates) r
 ## The OWL 2 RL reference
 
 Nemo, the Datalog engine of TU Dresden, is the reference for the correctness and speed of
-the `owl-rl` materialization. Nemo is licensed under Apache-2.0 or MIT, and the flake
+the `owl-rl` and `rdfs` materializations. Nemo is licensed under Apache-2.0 or MIT, and the flake
 builds version 0.10.1 as `.#nemo` from the project's release binaries, which
 `nix/reasoners` pins by the SHA-256 sums that the release publishes. RDFox is not a
 reference. Its evaluation agreement allows benchmark results to be published only after
 an application to its vendor at least 30 days in advance, and not under its name without
 the vendor's approval, so its numbers cannot appear here.
+
+VLog is not a reference either, because it has no pinned build to run. Its project
+publishes source tags but no release binaries, and nixpkgs has no package. The build of
+its last release, 1.3.7, clones the default branch of its Trident dependency unless
+Trident is installed beforehand, and Trident clones its Kognac dependency the same way,
+so a pinned build means packaging both projects at fixed commits. The project's Docker
+image has only a `latest` tag, which was last pushed before release 1.3.6, so it names
+no release.
 
 Nemo has no built-in OWL 2 RL. `scripts/rl-reference/owl2rl.rls` writes the OWL 2 RL/RDF
 rules of [OWL 2 Profiles section 4.3](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules)
@@ -51,6 +59,17 @@ each literal and blank node of the input with an IRI before Nemo reads it, descr
 literal in a second file, and maps the IRIs back in Nemo's output. The input is the
 default graph as Sparkles stores it after the load, so both engines read the same terms.
 
+The `rdfs` profile has a reference of its own. `scripts/rl-reference/rdfs.rls` writes the
+RDFS entailment rules of [RDF 1.1 Semantics section 9.2.1](https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative)
+with the axiomatic triples that Sparkles' `rdfs` rule set states. Like Sparkles, the
+program derives generalized triples, whose subject is a literal or whose predicate is a
+literal or blank node, and uses them as premises, but it writes only the RDF triples of
+the closure. A generalized triple can lead to an RDF one, as when a property's
+superproperty is a blank node with a domain. The recommendation's axioms type
+every container membership property `rdf:_n`, and the program states `rdf:_1` to `rdf:_3`
+and types those that the data uses, as Sparkles does. It leaves out rdfs1 and the
+datatype rules rdfD1 and rdfD2, which Sparkles' rule set also leaves out.
+
 `scripts/rl-reference/compare.sh` compares the derived graphs triple for triple in two
 ways. The aligned comparison adds `scripts/rl-reference/sparkles-extensions.rls` to the
 program, which restates what Sparkles' `owl-rl` rule set adds to the OWL 2 RL rules, as
@@ -65,7 +84,8 @@ also leaves out the cases of scm-eqc2 and scm-eqp2 whose two classes or properti
 same. The aligned closure must equal Sparkles' closure. The core comparison runs the W3C
 program alone, and each of its triples must be in Sparkles' closure. A difference that is
 understood is listed in `scripts/rl-reference/known.tsv` with its explanation, and any
-other difference fails the comparison. The encoding refuses input whose IRIs use the
+other difference fails the comparison. With `PROFILE=rdfs` the script runs `rdfs.rls`
+alone, whose derived graph must equal Sparkles' `rdfs` closure. The encoding refuses input whose IRIs use the
 encoded namespaces. It checks each literal's lexical form against its own datatype, with
 calendar and time zone bounds for dates and the alphabets of the binary types, and gives an
 ill-typed literal no datatype. The value of a valid literal then decides which datatypes'
@@ -74,17 +94,28 @@ value spaces hold it.
 `mise run test:rl-reference` compares the closures of the premise ontologies of the W3C
 OWL 2 test cases that list the RL profile. `mise run bench:rl-reference lubm 1` or
 `owl2bench 1` generates the data with the suite's runner, compares the closures, and
-then times both engines for `--runs` rounds.
+then times both engines for `--runs` rounds. `--profile rdfs` times the `rdfs` profile
+instead, and `--profile all` times both on the same data. The data is shared, and each
+profile writes its databases, logs and results under a directory of its own name.
 
-- A full materialization runs `sparkles infer --full` on a fresh copy of the loaded store,
-  on one thread and on all cores, and Nemo's aligned program on the encoded input. Nemo
-  evaluates its rules on one thread and has no setting for threads.
+- A full materialization runs Nemo's aligned program on the encoded input and then
+  `sparkles infer --full` on a fresh copy of the loaded store, on one thread and on all
+  cores. Nemo evaluates its rules on one thread and has no setting for threads.
+- Every timed full run must derive as many triples as the closure check found, which
+  Sparkles reports and Nemo's output file holds. In the first round each of Sparkles'
+  derived graphs is also compared triple for triple with that round's Nemo closure, so
+  every thread count is checked whole. A run that disagrees stops the benchmark. A run
+  that did not finish, and a check that therefore could not run, are listed in
+  `results/unverified.txt`. The summary then does not claim agreement for every run, and
+  the runner exits with status 1 once it has written the results.
 - Incremental maintenance takes every hundredth data triple outside the RDF, RDFS and OWL
   vocabularies as the change. It inserts the change into the materialized store without
   it and deletes it from the materialized store with it, and times `sparkles infer` after
   each update. Nemo has no incremental maintenance, so its baseline is a full run on the
   data after the update. The first round compares each maintained closure with Nemo's
-  closure of the same data.
+  closure of the same data. Each later round's insertion must derive as many triples as
+  the full closure, and its deletion and Nemo's run without the change as many as
+  Nemo's first closure without the change. `--no-incremental` leaves these runs out.
 - GNU time gives each run's wall time and peak resident memory, and each run has its own
   memory-limited systemd scope and a deadline. A run is recorded as out of memory only
   when the scope's `memory.events` records an out-of-memory kill in the scope. The
@@ -102,7 +133,14 @@ memory limit of each run's scope bounds the run instead. `rl_terms.py` sorts eac
 closure and each side of a comparison on disk with GNU sort, which has a buffer of 1 GiB,
 and merges the sorted files, so it holds no closure in memory. What it still holds grows
 with the encoded literals and blank nodes of the input and with the distinct predicates of
-the differences, not with the size of the closure.
+the differences, not with the size of the closure. Once the comparison agrees, the runner
+removes its derived files and its encoded input and keeps their counts in
+`compare/diff.json` and `compare/core.json`. Each check's derived graphs are removed once
+they agree, and a check that fails keeps them, so the exported graphs of passed checks do
+not accumulate.
 
-The runner writes every run to `results/rl-reference.json` and the medians to
-`results/summary.md` in its working directory.
+The runner writes every run to `<profile>/results/rl-reference.json` in its working
+directory, with the host's processor, memory and kernel, the Sparkles binary's version,
+commit and SHA-256, Nemo's version and the run's configuration, including whether each
+run had a memory-limited scope. It writes the medians to
+`<profile>/results/summary.md`.

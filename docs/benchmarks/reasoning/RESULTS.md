@@ -424,6 +424,44 @@ took 1.4 to 3.4 s at a peak RSS of 808 to 866 MiB, against 1.7 to 4.0 s and 556 
 holds the runs. They come from the development laptop while it ran other builds, and are
 not benchmark measurements.
 
+### Against Nemo
+
+`scripts/rl-reference/bench.sh` timed full materialization by Sparkles and by Nemo 0.10.1
+on the same stored data, with the programs of the
+[OWL 2 RL reference](README.md#the-owl-2-rl-reference). Each row is the median of three
+rounds. Sparkles ran `sparkles infer --full` from a loaded store on one thread and on 20,
+and its time includes writing the derived graph to the store. Nemo has no setting for
+threads and evaluates its rules on one. Its time includes reading the encoded N-Triples
+input and writing the derived triples, and its own report gives the reasoning time
+apart. Peak RSS is the largest of the three rounds.
+
+| Input | Profile | Derived triples | Nemo | Nemo reasoning | Sparkles, 1 thread | Sparkles, 20 threads | Peak RSS, Nemo and Sparkles at 20 threads |
+|---|---|---:|---:|---:|---:|---:|---:|
+| LUBM(10) | `owl-rl` | 1,038,100 | 27.3 s | 18.7 s | 2.14 s | 1.46 s | 437 and 921 MiB |
+| LUBM(100) | `owl-rl` | 10,907,379 | 304.3 s | 202.4 s | 32.8 s | 21.1 s | 4,230 and 3,713 MiB |
+| OWL2Bench(1) | `owl-rl` | 1,400,688 | 19.6 s | 17.4 s | 1.36 s | 1.11 s | 129 and 792 MiB |
+| OWL2Bench(5) | `owl-rl` | 52,966,139 | 752.8 s | 680.0 s | 72.0 s | 55.0 s | 2,933 and 9,808 MiB |
+| LUBM(10) | `rdfs` | 526,316 | 8.33 s | 3.60 s | 2.55 s | 2.31 s | 229 and 812 MiB |
+| LUBM(100) | `rdfs` | 5,527,675 | 93.0 s | 38.8 s | 19.5 s | 15.0 s | 2,234 and 2,861 MiB |
+| OWL2Bench(1) | `rdfs` | 23,335 | 0.48 s | 0.19 s | 0.11 s | 0.12 s | 22 and 221 MiB |
+| OWL2Bench(5) | `rdfs` | 148,189 | 2.83 s | 1.12 s | 0.54 s | 0.47 s | 75 and 560 MiB |
+
+*Measured on atlas, which has the benchmark host's hardware, with Sparkles built at
+faaddcdb and the harness at fcf8623a, or at acc3f8ad for the OWL2Bench(5) `owl-rl` row,
+which differs only in removing the derived files of a check that agrees. The
+[run directory](runs/2026-11-15-rl-reference-timing-atlas/commands.txt) holds the commands,
+the [host](runs/2026-11-15-rl-reference-timing-atlas/env.txt) and each run's record.*
+
+Every timed run derived the closure check's number of triples, and the first round's
+Sparkles runs on 1 and 20 threads equal that round's Nemo closure triple for triple.
+Sparkles is ahead in every row, and on one thread it is also ahead of Nemo's reasoning
+time alone. On OWL 2 RL, Sparkles on one thread is 9.3 to 14.4 times as fast as Nemo's
+whole run. On RDFS it is 3.3 to 5.2 times as fast, and 1.4 to 2.1 times as fast as Nemo's
+reasoning step alone. Twenty threads reduce the elapsed time by 9 to 36% against one,
+except on the smallest RDFS input, OWL2Bench(1), where they give no gain. Sparkles at 20
+threads holds 1.3 to 9.8 times Nemo's peak memory on every row but LUBM(100) under OWL 2
+RL, where it holds less than Nemo.
+
 ## Query-time reasoning latency
 
 `mise run bench:reasoning-latency` is the rewrite gate of derivation on demand and RDFS

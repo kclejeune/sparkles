@@ -141,5 +141,46 @@ class Capped(unittest.TestCase):
                     os.kill(int(pid), 0)
 
 
+@unittest.skipUnless(GTIME and SCOPED, "needs GNU time and a systemd user manager")
+class Verified(unittest.TestCase):
+    """A timed run counts as verified only when it finished and derived the expected count."""
+
+    def run_one(self, cmd, env):
+        fns = "\n".join(
+            [re.search(r"^log\(\) \{.*\}$", TEXT, re.M).group(0)]
+            + [re.search(rf"^{name}\(\) \{{.*?^\}}$", TEXT, re.S | re.M).group(0) for name in ("die", "capped", "run")]
+        )
+        unverified = re.search(r"^UNVERIFIED=0\nunverified\(\) \{.*?^\}$", TEXT, re.S | re.M).group(0)
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "logs").mkdir()
+            (Path(d) / "results").mkdir()
+            script = f"{fns}\n{unverified}\nRECORD=results/runs.jsonl\nrun r-r1 1 1 {cmd}\necho \"rc=$? unverified=$UNVERIFIED\"\n"
+            e = dict(os.environ, GTIME=GTIME, MEM_MAX="200M", RUN_TIMEOUT="2", KILL_AFTER="1", PYTHON="python3", OUT=d, **env)
+            r = subprocess.run(["bash", "-c", script], cwd=d, env=e, capture_output=True, text=True, timeout=60)
+            path = Path(d) / "results" / "unverified.txt"
+            return r, path.read_text() if path.exists() else ""
+
+    def test_a_run_with_the_expected_count_is_verified(self):
+        r, why = self.run_one("echo '5 inferred triples'", {"EXPECT": "5"})
+        self.assertIn("rc=0 unverified=0", r.stdout, r.stderr)
+        self.assertEqual(why, "")
+
+    def test_a_run_that_did_not_finish_is_unverified(self):
+        r, why = self.run_one("sleep 10", {"EXPECT": "5"})
+        self.assertIn("unverified=1", r.stdout, r.stderr)
+        self.assertIn("r-r1: it ended with timeout", why)
+
+    def test_a_run_without_an_expected_count_is_unverified(self):
+        r, why = self.run_one("echo '5 inferred triples'", {})
+        self.assertIn("unverified=1", r.stdout, r.stderr)
+        r, why = self.run_one("echo '5 inferred triples'", {"REFERENCE": "1"})
+        self.assertIn("unverified=0", r.stdout, r.stderr)
+
+    def test_a_run_with_another_count_stops_the_benchmark(self):
+        r, _ = self.run_one("echo '4 inferred triples'", {"EXPECT": "5"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("derived 4 triples, not 5", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
