@@ -738,8 +738,8 @@ charged before it is decoded, the distinct values with their own charge while th
 decoded, and the rows' values after. A column whose charge or decoding does not fit gives
 that charge back and is left to the rows, and only cancellation and the deadline fail the
 pre-decode. The shared pre-decode admits 128 bytes for each decoded row and 8 for each
-row of the table before it starts, which is more than the 44 bytes for each decoded row
-that the separate large-input pre-decode admitted. Under a budget with little room left,
+row of the table before it starts, which is more than the 12 bytes and one value for each
+decoded row that the separate large-input pre-decode admitted. Under a budget with little room left,
 a large column can therefore fall back to its rows where it was decoded before, which
 costs time but no correctness. The comparison of two string columns through cached lexicographic floors serves
 eager tables and cursor batches of at least 4,096 rows alike. A floor reads its string's
