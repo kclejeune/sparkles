@@ -8,12 +8,16 @@
 //! that every rule is safe and has an evaluation order, its strata ([`strata`]) and, when
 //! it has an existential, its weak acyclicity ([`acyclic`]).
 //!
-//! The evaluation form stays [`CRule`], which every consumer of rules reads. The IR is
-//! analysed here, and lowering a program with relations to `CRule`s is a later phase, so
-//! nothing outside this module's tests calls it yet.
+//! The evaluation form stays [`CRule`], which every consumer of rules reads, and
+//! [`lower`] gives a program's rules in that form, by stratum, which
+//! [`engine::run_program`](crate::engine::run_program) evaluates. No frontend produces a
+//! program with relations yet, so only tests reach it.
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod acyclic;
+#[cfg(test)]
+mod eval_tests;
+pub(crate) mod lower;
 pub(crate) mod strata;
 #[cfg(test)]
 mod tests;
@@ -148,6 +152,9 @@ pub(crate) struct IBuiltin {
     pub inputs: SmallVec<[usize; 4]>,
     /// the variables the call binds
     pub outputs: SmallVec<[usize; 4]>,
+    /// the occurrence of a compiled Jena builtin in its program ([`CBuiltin::origin`]),
+    /// which the lowering keeps
+    pub origin: Option<usize>,
 }
 
 impl IBuiltin {
@@ -157,6 +164,7 @@ impl IBuiltin {
             args: SmallVec::from_slice(&b.args),
             inputs: SmallVec::from_slice(&b.inputs),
             outputs: SmallVec::from_slice(&b.outputs),
+            origin: Some(b.origin),
         }
     }
 
@@ -179,6 +187,7 @@ impl IBuiltin {
                 .iter()
                 .filter_map(var)
                 .collect(),
+            origin: None,
         }
     }
 }
