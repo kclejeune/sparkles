@@ -306,6 +306,20 @@ pub fn reduction() -> u8 {
     })
 }
 
+/// How far Tier D reduces the automata that unfold its universals, as [`reduction`] says
+/// for the Horn rules, up to 2: Tier D's links are not those of a Horn run, so it drops no
+/// transition for its role. `SPARKLES_DL_AUTOMATA` sets it, and the default is 0 until the
+/// bounded attempt of the files it changes is measured (roadmap item 693).
+pub fn dl_reduction() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("SPARKLES_DL_AUTOMATA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 impl EpsFree {
     /// Reduces the automaton without changing what its states stand for in an unfolding.
     /// A state stands for the universal over every word it accepts, and a universal on a
@@ -501,7 +515,7 @@ pub(super) struct RoleBox {
 }
 
 impl RoleBox {
-    fn sub(&self, r: Role, s: Role) -> bool {
+    pub(super) fn sub(&self, r: Role, s: Role) -> bool {
         r == s
             || self
                 .sup
