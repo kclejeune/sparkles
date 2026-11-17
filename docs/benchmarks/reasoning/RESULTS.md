@@ -290,6 +290,20 @@ remove the scan. The [run directory](runs/2026-11-15-item-839-atlas/run.sh.txt) 
 commands, the [host and builds](runs/2026-11-15-item-839-atlas/env.txt) and the
 [medians with their ranges](runs/2026-11-15-item-839-atlas/results.txt).
 
+Maintenance of programs with relations changes the shared paths of every kept closure,
+which the same host measures against the build before it on LUBM(100) under OWL 2 RL and
+RDFS. Every run gives the same inferred counts, kept facts and digests as the build
+before, and peak resident memory stays within 1%. Changes of 100 triples to a closure
+kept in memory and their undo take the same median time in six interleaved rounds. Full
+derivations, the first settle of a kept closure and its undo from the dataset take 1.00
+to 1.025 times as long, and OWL 2 RL at one thread takes 1.011 times as long, outside the
+other build's range. In `examples/incremental.rs` under OWL 2 RL, inserting 1 or 100
+triples into a closure read back from the store takes 224 and 228 ms against 215 and
+218 ms, while the in-memory steps measure even. Item 1046 follows up these slowdowns. The
+[run directory](runs/2026-11-16-item-839-phase3-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-16-item-839-phase3-atlas/env.txt) and the
+[medians with their ranges](runs/2026-11-16-item-839-phase3-atlas/results.txt).
+
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.
 

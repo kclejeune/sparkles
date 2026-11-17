@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Item 839 Phase 3 gate on atlas, under ~/lanes/.heavy.lock: base dd964cf0 against the lane
+# tip. LUBM(100) incremental runs of `lubm keep` (kept and read back) for rdfs and owl-rl
+# with changes of 100 and 10,000 triples, `examples/incremental.rs` on 1M generated triples
+# for rdfs and owl-rl, and full `lubm infer` runs at 1 and 20 threads, ROUNDS interleaved
+# rounds with alternating arm order.
+set -uo pipefail
+D=$HOME/lanes/datalog-839
+TIME=/run/current-system/sw/bin/time
+ROUNDS=${ROUNDS:-3}
+cd "$D" || exit 1
+mkdir -p logs3 data scratch
+log() { echo "[$(date +%T)] $*" | tee -a progress3.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+B=$D/bin3/lubm-base
+if [ ! -d data/lubm100.db ]; then
+  log "generating and loading LUBM(100)"
+  "$B" gen 100 data/lubm100 > data/gen.log 2>&1 || { log "gen failed"; exit 1; }
+  scope "$B" load data/lubm100 100 data/lubm100.db > data/load.log 2>&1 || { log "load failed"; exit 1; }
+fi
+timed() {
+  local name=$1 bin=$2 cpus=$3 threads=$4; shift 4
+  local rc=0
+  RAYON_NUM_THREADS=$threads scope "$TIME" -v taskset -c "$cpus" "$bin" "$@" > "logs3/$name.out" 2> "logs3/$name.err" || rc=$?
+  local rss
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "logs3/$name.err")
+  echo "$name rc=$rc rss_kib=$rss load=$(cut -d' ' -f1 /proc/loadavg)" | tee -a results3.txt progress3.log
+}
+for r in $(seq 1 "$ROUNDS"); do
+  if [ $((r % 2)) = 1 ]; then arms="base p3"; else arms="p3 base"; fi
+  for profile in rdfs owl-rl; do
+    for k in 100 10000; do
+      for arm in $arms; do
+        rm -rf scratch/db; cp -r data/lubm100.db scratch/db
+        timed "keep-$profile-$k-$arm-r$r" "$D/bin3/lubm-$arm" 0-19 20 keep scratch/db "$profile" "$k"
+      done
+    done
+    for arm in $arms; do
+      rm -rf scratch/inc
+      timed "incremental-$profile-$arm-r$r" "$D/bin3/incremental-$arm" 0-19 20 scratch/inc 1000000 "$profile"
+    done
+    for t in 1 20; do
+      cpus=2; [ "$t" = 20 ] && cpus=0-19
+      for arm in $arms; do
+        timed "infer-$profile-$arm-t$t-r$r" "$D/bin3/lubm-$arm" "$cpus" "$t" infer data/lubm100.db "$profile"
+      done
+    done
+  done
+done
+rm -rf scratch
+log "DONE"
+
+# The rerun of rounds 3 to 6 with the same binaries and data:
+
+#!/usr/bin/env bash
+# Item 839 Phase 3 gate rerun on atlas, under ~/lanes/.heavy.lock: the flagged runs of
+# atlas3.sh (keep with 100 changes, examples/incremental.rs, lubm infer at 1 thread) for
+# rounds FIRST..LAST, with the same binaries (base dd964cf0, p3 6e03b4d3) and data.
+set -uo pipefail
+D=$HOME/lanes/datalog-839
+TIME=/run/current-system/sw/bin/time
+FIRST=${FIRST:-3}
+LAST=${LAST:-6}
+cd "$D" || exit 1
+[ -d data/lubm100.db ] || { echo "no data"; exit 1; }
+mkdir -p logs3b scratch
+log() { echo "[$(date +%T)] $*" | tee -a progress3b.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+timed() {
+  local name=$1 bin=$2 cpus=$3 threads=$4; shift 4
+  local rc=0
+  RAYON_NUM_THREADS=$threads scope "$TIME" -v taskset -c "$cpus" "$bin" "$@" > "logs3b/$name.out" 2> "logs3b/$name.err" || rc=$?
+  local rss
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "logs3b/$name.err")
+  echo "$name rc=$rc rss_kib=$rss load=$(cut -d' ' -f1 /proc/loadavg)" | tee -a results3b.txt progress3b.log
+}
+log "start rounds $FIRST..$LAST"
+for r in $(seq "$FIRST" "$LAST"); do
+  if [ $((r % 2)) = 1 ]; then arms="base p3"; else arms="p3 base"; fi
+  for profile in rdfs owl-rl; do
+    for arm in $arms; do
+      rm -rf scratch/db; cp -r data/lubm100.db scratch/db
+      timed "keep-$profile-100-$arm-r$r" "$D/bin3/lubm-$arm" 0-19 20 keep scratch/db "$profile" 100
+    done
+    for arm in $arms; do
+      rm -rf scratch/inc
+      timed "incremental-$profile-$arm-r$r" "$D/bin3/incremental-$arm" 0-19 20 scratch/inc 1000000 "$profile"
+    done
+    for arm in $arms; do
+      timed "infer-$profile-$arm-t1-r$r" "$D/bin3/lubm-$arm" 2 1 infer data/lubm100.db "$profile"
+    done
+  done
+done
+rm -rf scratch
+log "DONE"
