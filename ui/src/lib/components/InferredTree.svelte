@@ -16,6 +16,7 @@
     onopen,
     pins,
     refresh = 0,
+    card = false,
   }: {
     target: string;
     graph: string | null;
@@ -26,6 +27,9 @@
     onopen: (iri: string) => void;
     pins?: InferredPins;
     refresh?: number;
+    /** Lay the frame out as a sidebar card: the heading in the card's ruled head and the rest in
+     *  its padded body. The containing element supplies the `panel` surface. */
+    card?: boolean;
   } = $props();
   const model = new InferredTree(
     (source) => pins?.acceptMaterialization(source) ?? true,
@@ -110,88 +114,91 @@
   }
 </script>
 
-<section class="inferred-tree" aria-label={label}>
-  <div class="heading">
-    <h3>
+<section class="inferred-tree" class:panel={card} aria-label={label}>
+  <div class="heading" class:panel-head={card}>
+    <svelte:element this={card ? 'h2' : 'h3'}>
       {kind === 'Class'
         ? 'Kept class hierarchy'
         : individuals
           ? 'Materialized individual types'
           : 'Materialized property hierarchy'}
-    </h3>
+    </svelte:element>
     <button class="btn sm ghost" disabled={commit == null} onclick={() => model.refresh()}
       >Read again</button
     >
   </div>
-  {#if commit == null}<p>Waiting for the displayed source commit.</p>{/if}
-  {#if model.error}<p class="error-box" role="alert">{model.error}</p>{/if}
-  {#if kind === 'Class' && model.reply?.result}
-    <p class="faint">
-      Kept classification at commit {model.reply.commit}.
-      {#if model.reply.outcome?.partial}
-        Partial classification. {model.reply.outcome.incompleteCount}
-        {model.reply.outcome.incompleteCount === 1 ? 'class remains' : 'classes remain'} incomplete.
-      {:else if model.reply.outcome?.complete}
-        Complete for its supported source.
-      {:else if model.reply.outcome && model.reply.outcome.excludedCount > 0}
-        Classification completed with {model.reply.outcome.excludedCount} omitted or partly used axioms.
-      {:else}
-        Classification is incomplete.
-      {/if}
-      {#if model.reply.outcome?.consistency === 'unknown'}Consistency is unknown.{/if}
-      {model.reply.outcome?.consistency === 'inconsistent'
-        ? 'The ontology is inconsistent; every class is unsatisfiable.'
-        : ''}
-    </p>
-    <details>
-      <summary>Classification source</summary>
-      <p class="mono small">{model.reply.result.resultId}</p>
-    </details>
-    <p class="faint">Equivalent names share one group. Explanations are unavailable.</p>
-  {:else if model.source}
-    <MaterializationNotice source={model.source} />
-    <p class="faint">
-      {individuals
-        ? 'Groups contain named materialized types, including indirect types.'
-        : 'Edges connect direct groups in the recorded closure; mutually related names share one group.'}
-    </p>
-  {/if}
-  {#if model.ancestryTruncated}<p class="note">
-      The ancestor read limit was reached. Some paths may be absent.
-    </p>{/if}
-  {#if selected && model.canonical(selected) !== selected}<p class="faint">
-      The selected name belongs to the group represented by <code>{model.canonical(selected)}</code
-      >.
-    </p>{/if}
-  {#if roots.length}
-    <OntoTree
-      {label}
-      {roots}
-      {name}
-      {open}
-      selected={selected ? model.canonical(selected) : null}
-      children={(id) => (individuals ? model.individuals.children(id) : model.tree.children(id))}
-      more={(id) => (individuals ? model.individuals.more(id) : model.tree.more(id))}
-      clipped={(id) => (individuals ? model.individuals.clippedOf(id) : model.tree.clippedOf(id))}
-      onmore={(id) => (individuals ? model.individuals.loadMore(id) : model.tree.loadMore(id))}
-      count={(id) =>
-        individuals ? (isGroup(id) ? model.individuals.counts[id] : 0) : model.tree.counts[id]}
-      badge={(id) => {
-        const n = model.names[id]?.equivalenceCount ?? 1;
-        return individuals && !isGroup(id)
-          ? (model.individuals.types[id] ?? []).map(name).join(', ') || null
-          : n > 1
-            ? `${n} equivalent names`
-            : null;
-      }}
-      onselect={select}
-      ontoggle={toggle}
-    />
-  {:else if model.tree.loading || model.individuals.loading}<p>Reading inferred hierarchy…</p>
-  {:else if !model.error && commit != null}<p>
-      No groups were returned by this source. This does not establish completeness beyond the
-      supported reasoning profile.
-    </p>{/if}
+  <div class="frame-body" class:panel-body={card}>
+    {#if commit == null}<p>Waiting for the displayed source commit.</p>{/if}
+    {#if model.error}<p class="error-box" role="alert">{model.error}</p>{/if}
+    {#if kind === 'Class' && model.reply?.result}
+      <p class="faint">
+        Kept classification at commit {model.reply.commit}.
+        {#if model.reply.outcome?.partial}
+          Partial classification. {model.reply.outcome.incompleteCount}
+          {model.reply.outcome.incompleteCount === 1 ? 'class remains' : 'classes remain'} incomplete.
+        {:else if model.reply.outcome?.complete}
+          Complete for its supported source.
+        {:else if model.reply.outcome && model.reply.outcome.excludedCount > 0}
+          Classification completed with {model.reply.outcome.excludedCount} omitted or partly used axioms.
+        {:else}
+          Classification is incomplete.
+        {/if}
+        {#if model.reply.outcome?.consistency === 'unknown'}Consistency is unknown.{/if}
+        {model.reply.outcome?.consistency === 'inconsistent'
+          ? 'The ontology is inconsistent; every class is unsatisfiable.'
+          : ''}
+      </p>
+      <details>
+        <summary>Classification source</summary>
+        <p class="mono small">{model.reply.result.resultId}</p>
+      </details>
+      <p class="faint">Equivalent names share one group. Explanations are unavailable.</p>
+    {:else if model.source}
+      <MaterializationNotice source={model.source} />
+      <p class="faint">
+        {individuals
+          ? 'Groups contain named materialized types, including indirect types.'
+          : 'Edges connect direct groups in the recorded closure; mutually related names share one group.'}
+      </p>
+    {/if}
+    {#if model.ancestryTruncated}<p class="note">
+        The ancestor read limit was reached. Some paths may be absent.
+      </p>{/if}
+    {#if selected && model.canonical(selected) !== selected}<p class="faint">
+        The selected name belongs to the group represented by <code
+          >{model.canonical(selected)}</code
+        >.
+      </p>{/if}
+    {#if roots.length}
+      <OntoTree
+        {label}
+        {roots}
+        {name}
+        {open}
+        selected={selected ? model.canonical(selected) : null}
+        children={(id) => (individuals ? model.individuals.children(id) : model.tree.children(id))}
+        more={(id) => (individuals ? model.individuals.more(id) : model.tree.more(id))}
+        clipped={(id) => (individuals ? model.individuals.clippedOf(id) : model.tree.clippedOf(id))}
+        onmore={(id) => (individuals ? model.individuals.loadMore(id) : model.tree.loadMore(id))}
+        count={(id) =>
+          individuals ? (isGroup(id) ? model.individuals.counts[id] : 0) : model.tree.counts[id]}
+        badge={(id) => {
+          const n = model.names[id]?.equivalenceCount ?? 1;
+          return individuals && !isGroup(id)
+            ? (model.individuals.types[id] ?? []).map(name).join(', ') || null
+            : n > 1
+              ? `${n} equivalent names`
+              : null;
+        }}
+        onselect={select}
+        ontoggle={toggle}
+      />
+    {:else if model.tree.loading || model.individuals.loading}<p>Reading inferred hierarchy…</p>
+    {:else if !model.error && commit != null}<p>
+        No groups were returned by this source. This does not establish completeness beyond the
+        supported reasoning profile.
+      </p>{/if}
+  </div>
 </section>
 
 <style>
@@ -205,7 +212,18 @@
     align-items: center;
     gap: var(--sp-2);
   }
+  h2,
   h3 {
     margin: 0;
+  }
+  .panel-head {
+    flex-wrap: wrap;
+  }
+  /* in a card the first and last lines sit on the body's padding, as in the other cards */
+  .panel-body > :first-child {
+    margin-top: 0;
+  }
+  .panel-body > :last-child {
+    margin-bottom: 0;
   }
 </style>
