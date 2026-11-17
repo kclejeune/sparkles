@@ -380,8 +380,10 @@ fn n1_nested_footnotes_end() {
     );
 }
 
-// Re-review N5: a deflate bomb whose header says the part is 1 KiB, so that only the
-// bounded read (`take(cap + 1)`) stops it.
+// Re-review N5: a deflate bomb whose header says the part is 1 KiB. Since zip 9 the
+// reader itself refuses to inflate past the declared size, so the part is reported as
+// corrupt after about 1 KiB, and the bounded read (`take(cap + 1)`) stays as the second
+// bound. Either way the conversion fails without unpacking the bomb.
 #[test]
 fn a_deflate_bomb_with_a_lying_header_stops_at_the_part_limit() {
     let _g = serial();
@@ -405,7 +407,7 @@ fn a_deflate_bomb_with_a_lying_header_stops_at_the_part_limit() {
     assert_eq!(patched, 2);
     let (r, used) = peak(|| to_markdown(&f, Format::Docx, &Limits::default()));
     assert!(used < 64 << 20, "peak {used} bytes");
-    assert!(matches!(r, Err(Error::TooLarge(_))), "{r:?}");
+    assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
 }
 
 /// Run `f` on a thread of its own and wait at most `secs` seconds for it, so that a
