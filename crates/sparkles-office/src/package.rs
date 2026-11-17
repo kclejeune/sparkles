@@ -82,7 +82,8 @@ impl<'a> Package<'a> {
         if f.size() > cap as u64 {
             return Err(too_large(name, max, left < max));
         }
-        // the header's size is not trusted: the read stops one byte past the cap
+        // the header's size is not trusted: zip stops at the declared size, and the read
+        // also stops one byte past the cap as a second bound
         let mut out = Vec::new();
         f.take(cap as u64 + 1)
             .read_to_end(&mut out)

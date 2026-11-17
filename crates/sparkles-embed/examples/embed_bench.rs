@@ -45,6 +45,9 @@ fn rss_mb() -> f64 {
 }
 
 fn main() {
+    // as the server does, so Candle's kernels run on the embedding pool only
+    // SAFETY: the first statement of main, before any other thread exists
+    unsafe { sparkles_embed::confine_candle_threads() };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("pull") => {

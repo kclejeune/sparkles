@@ -43,7 +43,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     inherit (finalAttrs) pname version src;
     pnpm = pnpm_10;
     fetcherVersion = 4;
-    hash = "sha256-ZYjGT57rKJ6h1nJqT887Wkkv7luCf4zkhy8aXbqkRS4=";
+    hash = "sha256-fk/Xmm5/ud1biH1KK5I7TYamhHXDm2qEc9Hfu3cBE84=";
   };
 
   preBuild = lib.optionalString (fmtWasm != null) ''

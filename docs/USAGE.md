@@ -3111,7 +3111,10 @@ mirror's address from `$SPARKLES_HUB_ENDPOINT` and a token for gated repositorie
 from `$HF_TOKEN`, and `pull` also takes `--hub-token-file`. The weights load at the first text and are dropped after
 ten idle minutes (`idleUnloadSecs`). Each model runs on its own pool of two threads by
 default (`threads`), at a lower priority than queries, so embedding a large backlog
-slows searches little. `GET /$/models` and the index's card show whether a model is
+slows searches little. The server sets Candle's `CANDLE_NUM_THREADS` to 1 and
+`CANDLE_CPU_MASK` to the CPUs it may use at startup, which keeps Candle's work on these
+pools. It keeps either variable when the environment already sets it, so a
+`CANDLE_NUM_THREADS` above 1 starts Candle's own threads outside these pools. `GET /$/models` and the index's card show whether a model is
 absent, present, loaded or unloaded, and how much memory its weights take.
 
 The architectures are BERT (all-MiniLM, BGE), XLM-RoBERTa (multilingual-e5), NomicBERT

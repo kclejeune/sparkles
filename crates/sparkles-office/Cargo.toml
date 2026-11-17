@@ -7,8 +7,8 @@ license.workspace = true
 
 [dependencies]
 # ZIP containers, read only. No default features: deflate through flate2, which the server
-# already links; no encryption, bzip2, zstd, xz or LZMA
-zip = { version = "7.2", default-features = false, features = ["deflate-flate2"] }
+# already links; no AES encryption, bzip2, zstd, xz or LZMA
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 # the XML parser of oxrdfxml, already in the tree
 quick-xml = "0.37"
 # the deflate backend of zip, as the server links it

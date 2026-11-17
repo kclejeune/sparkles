@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Dependency security updates
+
+The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes
+GHSA-m665-v7pm-7grj and the four other zip advisories for `sparkles-office` and its fuzz
+target. zip 9 refuses to inflate an entry past the size its header declares, so a part
+whose header understates its size now fails as `conversion-failed` with status 422,
+where a deflate bomb of that kind used to reach the part limit and fail as `too-large`
+with status 413. Local embeddings run on Candle 0.11.1 instead of 0.9.2, which completes
+roadmap item 1048. It requires zip 9 and the pure-Rust tokenizers 0.23 that
+`sparkles-embed` already used, so the root `Cargo.lock` holds only zip 9.6.1 and the build
+gains no C or C++ code. Candle 0.11 runs large elementwise operations on a process-wide
+thread pool of its own and, without a thread setting, reads `/proc/cpuinfo` for every
+matrix product on machines whose kernel reports the same capacity for every CPU. The server
+therefore sets `CANDLE_NUM_THREADS=1` and `CANDLE_CPU_MASK` at startup unless the
+operator set them, which keeps Candle's work on the embedding pool's threads at their
+lower priority. The vectors of all-MiniLM-L6-v2, nomic-embed-text-v1.5 and
+Qwen3-Embedding-0.6B match 0.9.2's within 3.5e-6 per component. On a 20-thread Intel
+host, all-MiniLM-L6-v2 embeds documents 21% faster, and the other models' document
+throughput and query latency stay within 3%. The web UI builds
+with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which fix
+their advisories. The SvelteKit advisories that only 3.x fixes concern features the
+static UI does not use, and roadmap item 1049 covers the migration.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,

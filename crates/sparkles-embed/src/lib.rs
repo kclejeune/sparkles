@@ -6,8 +6,13 @@
 //! thread runs the batches on a small dedicated thread pool at a lower scheduling
 //! priority, serves queries before documents, and drops the weights after an idle time.
 //!
+//! A process that embeds calls [`confine_candle_threads`] first in `main`, before it starts
+//! any thread, so that Candle's kernels run on these pools only.
+//!
 //! ```no_run
 //! use sparkles_embed::{Embedder, Kind, ModelSpec, Options};
+//! // SAFETY: at the start of main, before any other thread exists
+//! unsafe { sparkles_embed::confine_candle_threads() };
 //! let e = Embedder::new(ModelSpec::new("/var/lib/sparkles/models/org/model/rev"), Options::default())?;
 //! let v = e.embed(&["rivers of southern France"], Kind::Query)?;
 //! # Ok::<(), sparkles_embed::Error>(())
@@ -302,7 +307,10 @@ fn resolve(cfg: &SnapshotConfig, spec: &ModelSpec) -> Result<Settings> {
 
 impl Embedder {
     /// Read and check the snapshot's configuration and start the dispatcher. The weights
-    /// are not read until the first [`embed`](Embedder::embed).
+    /// are not read until the first [`embed`](Embedder::embed). Without
+    /// [`confine_candle_threads`] at the start of the process, Candle runs large
+    /// elementwise operations on threads of its own outside [`Options::threads`], and on
+    /// some machines reads `/proc/cpuinfo` for every matrix product.
     pub fn new(spec: ModelSpec, opts: Options) -> Result<Embedder> {
         if opts.threads == 0 || opts.micro_batch == 0 || opts.max_queued == 0 {
             return Err(Error::Invalid(
@@ -594,6 +602,68 @@ fn finish(shared: &Shared, job: Job, result: Result<Vec<Vec<f32>>>) {
         }
     }
     let _ = job.reply.send(result);
+}
+
+/// Keep Candle's CPU kernels on the threads of the embedding pools, and its thread count
+/// read once.
+///
+/// Candle 0.11 runs an elementwise operation of 65,536 elements or more on a process-wide
+/// pool of its own, one thread fewer than the machine's preferred or physical cores, which
+/// would run outside an [`Embedder`]'s thread count, its nice value and its release hook.
+/// The pool reads `CANDLE_NUM_THREADS` once, when it starts. This sets that variable to 1,
+/// which gives the pool no threads, so these operations run on the calling pool thread.
+///
+/// Candle 0.11 also passes a thread count to each matrix product. Without
+/// `RAYON_NUM_THREADS`, it takes that count from `CANDLE_CPU_MASK`, then from the
+/// performance cores of a hybrid processor, then from the physical cores, and on a machine
+/// with neither of the first two it reads `/proc/cpuinfo` again for every product. That
+/// tripled the query latency of all-MiniLM-L6-v2 on a 20-thread Intel host. This sets
+/// `CANDLE_CPU_MASK` to the CPUs the process may run on, at most as many as
+/// [`std::thread::available_parallelism`] gives, which Candle reads once and which gives
+/// the count Candle 0.9 used. The mask would also pin the threads of Candle's own pools,
+/// which this crate never starts. `RAYON_NUM_THREADS` is left alone, since it also sizes
+/// the server's query pool.
+///
+/// A value the operator set for either variable is kept.
+///
+/// # Safety
+///
+/// It writes the process environment, so call it while the process starts, before any
+/// other thread exists, as [`std::env::set_var`] requires.
+pub unsafe fn confine_candle_threads() {
+    if std::env::var_os("CANDLE_NUM_THREADS").is_none() {
+        // SAFETY: the caller guarantees that no other thread reads or writes the
+        // environment at the same time
+        unsafe { std::env::set_var("CANDLE_NUM_THREADS", "1") };
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("CANDLE_CPU_MASK").is_none()
+        && let Some(mask) = allowed_cpus()
+    {
+        // SAFETY: as above
+        unsafe { std::env::set_var("CANDLE_CPU_MASK", mask) };
+    }
+}
+
+/// The CPUs the process may run on as a list such as `0,1,2`, at most as many as
+/// [`std::thread::available_parallelism`] gives, which also counts a cgroup's CPU quota.
+#[cfg(target_os = "linux")]
+fn allowed_cpus() -> Option<String> {
+    let limit = std::thread::available_parallelism().ok()?.get();
+    // SAFETY: the set is a plain bit array that sched_getaffinity fills for this process,
+    // and CPU_ISSET reads it within its size
+    let cpus: Vec<String> = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return None;
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| libc::CPU_ISSET(c, &set))
+            .take(limit)
+            .map(|c| c.to_string())
+            .collect()
+    };
+    (!cpus.is_empty()).then(|| cpus.join(","))
 }
 
 /// Raise the calling thread's nice value by `n` (Linux, where nice is per thread). Other
