@@ -1075,8 +1075,14 @@ state at each position the class the last run gave it. The third reduction makes
 automaton depend on which properties have links, so an added axiom such as `A ⊑ ∃v.B`
 can bring a branch back and move the positions. This needs no rule of its own. A state's
 class carries the told axioms of its transitions, and a kept context is saturated again
-when the told axioms of an expression it holds differ from the last run's, which is how
-a changed chain axiom already reached the kept contexts.
+when the told axioms of an expression it holds differ from the last run's. A changed
+property axiom starts the run again, as before.
+
+A reduction takes at most sixteen million steps for an automaton, counted by its size
+alone, so that every run reduces an automaton the same way. A step that would pass the
+bound is left out, and the automaton stays as the steps before left it. The refinement
+of a chain of tens of thousands of operands, which takes a round for each state, is the
+case, and pruning is linear.
 
 On one thread and without their disjunctive attempt, the Horn rules derive 22.1 million
 conclusions on ore_ont_14817 where they derived 29.1 million, and 35.6 million on

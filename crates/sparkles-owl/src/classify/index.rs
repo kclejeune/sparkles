@@ -2641,6 +2641,7 @@ fn horn_index(
     }
     dead.sort_unstable();
     dead.dedup();
+    dead.shrink_to_fit();
     super::horn::HornIx {
         flags,
         base: it.nodes.len() as Ex,

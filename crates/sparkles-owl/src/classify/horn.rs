@@ -103,7 +103,7 @@ impl HornIx {
     }
 
     pub fn bytes(&self) -> usize {
-        self.flags.capacity()
+        self.flags.capacity() + self.dead.capacity() * size_of::<Role>()
     }
 }
 
@@ -320,6 +320,12 @@ pub fn dl_reduction() -> u8 {
     })
 }
 
+/// The steps a reduction of one automaton takes at most: a round of the refinement costs a
+/// step for each state and transition, and a pass over the covered transitions one for
+/// each pair of transitions with one source. Sixteen million steps take some tens of
+/// milliseconds, and the automata of the ORE 2015 files and of Uberon need thousands.
+const REDUCE_WORK: usize = 1 << 24;
+
 impl EpsFree {
     /// Reduces the automaton without changing what its states stand for in an unfolding.
     /// A state stands for the universal over every word it accepts, and a universal on a
@@ -336,10 +342,17 @@ impl EpsFree {
     ///
     /// The two alternate until neither applies, since a dropped transition can make two
     /// states alike. `sub(r, s)` says whether `r` is under `s`.
+    ///
+    /// The work is bounded by [`REDUCE_WORK`] steps, counted by the automaton's size
+    /// alone, so that a run reduces an automaton the same way every time. A step that
+    /// would pass the bound is left out, and the automaton stays as the steps before it
+    /// left it, which is a valid automaton for the unfolding at every point. A long path,
+    /// whose refinement takes a round for each state, is the case.
     pub fn reduce(&mut self, covered: bool, sub: &dyn Fn(Role, Role) -> bool) {
+        let mut work = REDUCE_WORK;
         loop {
-            let merged = self.merge_alike();
-            let dropped = covered && self.drop_covered(sub);
+            let merged = self.merge_alike(&mut work);
+            let dropped = covered && self.drop_covered(sub, &mut work);
             if !merged && !dropped {
                 break;
             }
@@ -348,8 +361,9 @@ impl EpsFree {
 
     /// Merges the states of the coarsest partition whose blocks are final alike and have
     /// the same transitions into the same blocks, and says whether any merged.
-    fn merge_alike(&mut self) -> bool {
+    fn merge_alike(&mut self, work: &mut usize) -> bool {
         let n = self.states as usize;
+        let round = n + self.trans.len();
         let mut out: Vec<Vec<(Role, u32)>> = vec![Vec::new(); n];
         for &(p, l, q) in &self.trans {
             out[p as usize].push((l, q));
@@ -357,6 +371,12 @@ impl EpsFree {
         let mut block: Vec<u32> = self.finals.iter().map(|&f| f as u32).collect();
         let mut blocks = 0usize;
         loop {
+            // a refinement that the bound cuts short is no partition to merge by
+            if *work < round {
+                *work = 0;
+                return false;
+            }
+            *work -= round;
             let mut ids: FxHashMap<(u32, Vec<(Role, u32)>), u32> = FxHashMap::default();
             let mut next = Vec::with_capacity(n);
             for s in 0..n {
@@ -402,8 +422,21 @@ impl EpsFree {
 
     /// Drops the transitions that another from the same state to the same target covers
     /// by a superrole, and says whether any went.
-    fn drop_covered(&mut self, sub: &dyn Fn(Role, Role) -> bool) -> bool {
+    fn drop_covered(&mut self, sub: &dyn Fn(Role, Role) -> bool, work: &mut usize) -> bool {
         let before = self.trans.len();
+        // each transition is compared with those of its source
+        let mut out = vec![0usize; self.states as usize];
+        for t in &self.trans {
+            out[t.0 as usize] += 1;
+        }
+        let cost = out
+            .iter()
+            .fold(before, |c, &d| c.saturating_add(d.saturating_mul(d)));
+        if *work < cost {
+            *work = 0;
+            return false;
+        }
+        *work -= cost;
         let all = self.trans.clone();
         // the transitions are sorted by source, so those of one source are a run
         self.trans.retain(|&(p, l, q)| {
@@ -435,28 +468,34 @@ impl EpsFree {
             }
             keep
         });
+        // the states that reach a final state, from the final states against the
+        // transitions
+        let mut into: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &(p, _, q) in &self.trans {
+            into[q as usize].push(p);
+        }
         let mut useful = self.finals.clone();
-        loop {
-            let mut grew = false;
-            for &(p, _, q) in &self.trans {
-                if useful[q as usize] && !useful[p as usize] {
+        let mut todo: Vec<u32> = (0..n as u32).filter(|&s| useful[s as usize]).collect();
+        while let Some(q) = todo.pop() {
+            for &p in &into[q as usize] {
+                if !useful[p as usize] {
                     useful[p as usize] = true;
-                    grew = true;
+                    todo.push(p);
                 }
-            }
-            if !grew {
-                break;
             }
         }
         self.trans.retain(|&(_, _, q)| useful[q as usize]);
+        // the states the start reaches, numbered in the order a search from it finds
+        // them; the transitions are sorted by source
         let mut id: Vec<Option<u32>> = vec![None; n];
         let mut order = vec![self.start];
         id[self.start as usize] = Some(0);
         let mut at = 0;
         while at < order.len() {
             let p = order[at];
-            for &(x, _, q) in &self.trans {
-                if x == p && id[q as usize].is_none() {
+            let from = self.trans.partition_point(|t| t.0 < p);
+            for &(_, _, q) in self.trans[from..].iter().take_while(|t| t.0 == p) {
+                if id[q as usize].is_none() {
                     id[q as usize] = Some(order.len() as u32);
                     order.push(q);
                 }
@@ -1663,6 +1702,30 @@ mod reduction_tests {
             (a.entered.clone(), a.left.clone()),
             (vec![false], vec![false])
         );
+    }
+
+    #[test]
+    fn a_long_path_is_left_as_it_is_within_the_bound() {
+        // a chain of 40,000 operands: the refinement would take a round for each state,
+        // which the bound of the reduction does not allow, and pruning is linear
+        let n = 40_000u32;
+        let trans: Vec<(u32, Role, u32)> = (0..n).map(|s| (s, s % 2, s + 1)).collect();
+        let mut a = auto(n + 1, &[n], &trans);
+        let same = a.clone();
+        let start = std::time::Instant::now();
+        a.reduce(true, &|r, s| r == s);
+        assert_eq!(a, same);
+        let mut dead = Vec::new();
+        a.prune(&|_| true, &mut dead);
+        assert_eq!(a, same);
+        a.prune(&|l| l == 0, &mut dead);
+        assert_eq!((a.states, a.trans.len()), (1, 0));
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        // a path within the bound has no two states alike either
+        let mut b = auto(4, &[3], &[(0, 0, 1), (1, 0, 2), (2, 0, 3)]);
+        let same = b.clone();
+        b.reduce(true, &|r, s| r == s);
+        assert_eq!(b, same);
     }
 
     /// Random automata over four roles keep their words under the merge, and under the
