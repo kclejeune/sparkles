@@ -371,6 +371,28 @@ class ResampledMemory(unittest.TestCase):
         self.assertEqual(mp.unit_limit(started=100.0),100.0+mp.PROBE_RUNTIME-mp.PROBE_RESERVE)
         self.assertLess(mp.PROBE_RESERVE,mp.PROBE_RUNTIME-mp.MEMORY_RESAMPLE_SECONDS)
 
+    def test_a_pause_that_runs_past_the_window_ends_it_without_another_reading(self):
+        low=self.reading(kib(1.5));high=self.reading(kib(2.6))
+        # A refusal at 0, a pause that ends at 5 and a limit of 4, with an admitting reading ready.
+        mp=metadata_probe();now=[0.0];reads=[]
+        def read():reads.append(now[0]);return [high,low,low][len(reads)-1]
+        def pause(seconds):now[0]+=5.0
+        with self.assertRaises(mp.HeadroomRefusal) as caught:mp.settled_memory(read,lambda:now[0],pause,4.0)
+        self.assertEqual(reads,[0.0]);self.assertEqual([x['admitted'] for x in caught.exception.memory_series],[False])
+        # A pause that ends inside the window reads again.
+        reads.clear();now[0]=0.0
+        def short(seconds):now[0]+=3.0
+        with self.assertRaises(mp.HeadroomRefusal):mp.settled_memory(read,lambda:now[0],short,4.0)
+        self.assertEqual(reads,[0.0,3.0])
+
+    def test_an_expired_limit_takes_the_first_reading_only(self):
+        low=self.reading(kib(1.5));high=self.reading(kib(2.6))
+        mp,(memory,_),reads,sleeps=self.run_series([low],limit=-1.0)
+        self.assertEqual((reads,sleeps),([0.0],[]))
+        mp,error,reads,sleeps=self.run_series([high],limit=-1.0)
+        self.assertIsInstance(error,mp.HeadroomRefusal);self.assertEqual((reads,sleeps),([0.0],[]))
+        self.assertEqual(len(error.memory_series),1)
+
     def test_a_structural_refusal_reads_once_and_never_waits(self):
         gib=2**30;mp=metadata_probe()
         bad_host=('MemTotal: 16000000 kB\n',[])
@@ -1371,9 +1393,12 @@ class QualificationWait(unittest.TestCase):
         self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,lambda:clean,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
         (at,left),=lefts
         self.assertGreater(left,0);self.assertLess(left,self.O['QUALIFY_SECONDS'])
-        # Qualification's own deadline is the probe's, so a memory wait never ends after it.
+        # The deadline is fixed on entry, before anything the probe does first.
         source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
-        self.assertIn('boot()+left',source)
+        body=source[source.index('def probe(payload'):]
+        self.assertLess(body.index('boot()+left'),body.index('validate_runtime('))
+        self.assertLess(body.index('boot()+left'),body.index("command(['systemctl'"))
+        self.assertEqual(body.count('boot()+left'),1)
 
     def test_the_memory_wait_comes_before_every_source_observation(self):
         source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()

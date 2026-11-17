@@ -46,9 +46,9 @@
       "sha256": "a34e1ffb257def8afd3fdb23be3c931875ea4daa8440dd61fca61fcfcf87ff4c"
     },
     "metadata-probe.py": {
-      "bytes": 30873,
+      "bytes": 31288,
       "mode": 420,
-      "sha256": "f0b95aad55f1c5f29f8179fb2fc54b44cc7f6f43be7a2ac6bc5ea7d1b5429a44"
+      "sha256": "6ee12a684b7cf187ba48ff6e55ae1c0bfbcc9aec453bcfc78486e43a17232151"
     },
     "owned_group.py": {
       "bytes": 9498,

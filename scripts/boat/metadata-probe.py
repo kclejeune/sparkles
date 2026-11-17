@@ -323,7 +323,9 @@ def settled_memory(read,clock,pause,limit,interval=MEMORY_RESAMPLE_INTERVAL):
     between readings. A first reading that admits is the whole answer. After a refusal a
     reading admits only when the reading before it did too, so one low reading never
     admits. A reading refused for any other reason, such as a missing memory.stat, refuses
-    at once. When the window ends the last headroom refusal is raised, and the series is on
+    at once. The first reading is always taken, as it was before the window existed. No
+    other reading starts after ``limit``, also when a pause overran. When the window ends
+    the last headroom refusal is raised, and the series is on
     ``memory_series`` of that refusal and under ``memory_series`` of an admitted reading.
     """
     first=clock();end=min(first+MEMORY_RESAMPLE_SECONDS,limit);series=[];refused=None
@@ -336,6 +338,8 @@ def settled_memory(read,clock,pause,limit,interval=MEMORY_RESAMPLE_INTERVAL):
             memory['memory_series']=series;return memory,ancestors
         if clock()+interval>end:refused.memory_series=series;raise refused
         pause(interval)
+        # A pause that ran past the window ends it without another reading.
+        if clock()>end:refused.memory_series=series;raise refused
 
 def unit_limit(started=None):
     """The latest boot-clock time at which a memory reading may start in the metadata unit.
@@ -358,6 +362,9 @@ def read_memory(cg):
     return Path('/proc/meminfo').read_text(),ancestors
 
 def probe(payload,left=None):
+    # The deadline of the memory wait is fixed on entry, so that nothing the probe does first can extend it.
+    boot=lambda:time.clock_gettime(time.CLOCK_BOOTTIME)
+    limit=unit_limit() if left is None else min(unit_limit(),boot()+left)
     uid=os.getuid();home=Path.home();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'worker user')
     pins=payload['pins'];s=payload['release']['snapshot_continuity'];tag=payload['operation_tag'];unit=tag+'-metadata.service'
     need(os.uname().machine=='x86_64','architecture')
@@ -371,8 +378,7 @@ def probe(payload,left=None):
     # Check parent capacity, excluding the deliberately smaller metadata service. A refused
     # headroom is read again before any source or manifest is observed, so that a wait never
     # leaves them unwatched, and never past the ``left`` seconds the caller's phase has.
-    boot=lambda:time.clock_gettime(time.CLOCK_BOOTTIME)
-    memory,ancestors=settled_memory(lambda:read_memory(cg),boot,time.sleep,unit_limit() if left is None else min(unit_limit(),boot()+left))
+    memory,ancestors=settled_memory(lambda:read_memory(cg),boot,time.sleep,limit)
     token=home/'.config/mbx/remote-token';tm=token_metadata(token,uid);denied=(tm['device'],tm['inode'])
     state=home/'.local/state/sparkles-boat';new=Path(pins['installed_bundle']);old=Path(pins['retained_old_bundle'])
     directories=[directory(p,uid) for p in [home,state,new,old,Path(profile()['startup_repositories']['default']),Path(profile()['startup_repositories']['retained'])]]
