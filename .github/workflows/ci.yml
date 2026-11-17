@@ -348,7 +348,7 @@ jobs:
       # A compile can exceed the physical memory of a 16 GB runner, so a job adds a swap
       # file, 16 GiB unless it sets SWAP_GIB. The test build sets 2. It compiles its two
       # largest rustc processes one after the other, and the larger of them peaks near
-      # 12 GB. A runner with memory and swap near the 20 GB of two overlapping compiles
+      # 11 GiB. A runner with memory and swap near the 20 GB of two overlapping compiles
       # lets such a regression thrash for the whole job limit, where less swap ends the
       # build sooner with an out-of-memory kill and its log. GitHub's image may enable a
       # swap file of its own, which the step does not remove, so it prints the memory and
@@ -419,7 +419,7 @@ jobs:
       # workspace.
       #
       # The server's binary and its unit tests each compile in one rustc process, of about
-      # 8.5 GB and 12 GB on four CPUs. Built by one archive command they overlap, and on a
+      # 7 GiB and 11 GiB on four CPUs. Built by one archive command they overlap, and on a
       # 16 GB runner that left the machine unresponsive past the job's limit, so the job
       # ended without a log and without its cleanup steps. The first command therefore
       # builds only the unit tests of the server's binary. The archive commands that follow

@@ -1082,7 +1082,7 @@ manual **compatibility-features** input.
 | Features | A manual run with **compatibility-features** checked runs six jobs through `scripts/test-features.sh`, with the default features off and one feature set each. They build apart from the archive and restore the test build's cache. |
 
 The Build tests job compiles the server's binary and its unit tests in single compiler
-processes of about 8.5 GB and 12 GB on four CPUs. Built together they leave a 16 GB
+processes of about 7 GiB and 11 GiB on four CPUs. Built together they leave a 16 GB
 runner unresponsive, so the job builds the server's unit tests alone first with
 `mbx test --no-run --workspace --bin sparkles`. The archive commands that follow select
 the same packages, features and profile, so they find those tests fresh and the second
