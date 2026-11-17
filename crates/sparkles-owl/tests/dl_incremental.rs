@@ -1397,6 +1397,7 @@ fn a_property_that_gains_its_first_link_gets_its_transitions_back() {
                  SubClassOf(:V ObjectSomeValuesFrom(:w :Q))",
             );
             let out = same_as_fresh(&mut k, &held, threads, "after the chain got links");
+            assert!(out.stats.incremental, "the run started again");
             assert!(out.taxonomy.is_unsatisfiable(&c("E")), "in round {round}");
             assert!(!out.taxonomy.is_unsatisfiable(&c("C")), "in round {round}");
             // one operand without a link leaves the chain without an instance
@@ -1406,6 +1407,7 @@ fn a_property_that_gains_its_first_link_gets_its_transitions_back() {
                 "SubClassOf(:V ObjectSomeValuesFrom(:w :Q))",
             );
             let out = same_as_fresh(&mut k, &held, threads, "after w lost its link");
+            assert!(out.stats.incremental, "the run started again");
             assert!(!out.taxonomy.is_unsatisfiable(&c("E")), "in round {round}");
             assert!(
                 out.taxonomy.is_subclass(&c("E"), &c("P")),
