@@ -467,7 +467,7 @@ fn extend<S: Sink>(
     fs: &[Ex],
     n: Ex,
     r: Role,
-    seen: &mut FxHashSet<Vec<Ex>>,
+    sends: &mut Sends,
     out: &mut S,
 ) -> bool {
     if fs.is_empty() {
@@ -487,9 +487,9 @@ fn extend<S: Sink>(
         Some(a) => {
             // successors by several roles can have one conjunction, which the
             // individual is sent once in a flush
-            if !seen.contains(&core) {
-                send_named(a, &core, out);
-                seen.insert(core);
+            if !sends.seen.contains(&core) {
+                sends.stop |= !send_named(a, &core, out);
+                sends.seen.insert(core);
             }
             if a != n {
                 out.me(Concl::Succ(r, a));
@@ -519,6 +519,14 @@ fn named(ix: &Index, real: bool, core: &[Ex]) -> Option<Ex> {
     core.iter()
         .copied()
         .find(|&e| matches!(ix.head(e).node, Node::Nominal(_)))
+}
+
+/// What a flush keeps of its sends to individuals: the conjunctions it sent, and
+/// whether a check of the run's bounds after one of them stopped the run.
+#[derive(Default)]
+struct Sends {
+    seen: FxHashSet<Vec<Ex>>,
+    stop: bool,
 }
 
 /// Sends the individual `a` the other members of the conjunction `core`, and counts the
@@ -553,8 +561,15 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
     let mut merges = std::mem::take(&mut h.merges);
     merges.sort_unstable();
     merges.dedup();
+    // the conjunctions that an individual was sent in this flush, and whether the run
+    // stopped at one of them
+    let mut sends = Sends::default();
     for (s, b) in merges {
-        sent |= merge_all(ix, st, s, b, out);
+        sent |= merge_all(ix, st, s, b, &mut sends, out);
+        // a run that stopped keeps nothing of the flush
+        if sends.stop {
+            return sent;
+        }
     }
     let h = &mut st.extra.as_mut().expect("the context's Horn state").horn;
     let mut todo: Vec<(Role, Ex)> = if h.dirty {
@@ -578,8 +593,6 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
     }
     h.dirty = false;
     let real = st.real;
-    // the conjunctions that an individual was sent in this flush
-    let mut seen: FxHashSet<Vec<Ex>> = FxHashSet::default();
     // the fillers of the universals that apply to each role of the successors
     let roles = &ix.roles;
     // a short list for the few roles of most contexts, and a map beyond them
@@ -608,9 +621,9 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
         } else {
             many.entry(r).or_insert_with(|| of(r))
         };
-        sent |= extend(ix, real, fs, n, r, &mut seen, out);
+        sent |= extend(ix, real, fs, n, r, &mut sends, out);
         // a run that stopped keeps nothing of the flush
-        if real && out.stopped() {
+        if sends.stop {
             break;
         }
     }
@@ -693,7 +706,14 @@ fn counted<S: Sink>(ix: &Index, me: Ex, st: &mut State, s: Role, b: Ex, x: Membe
 /// make a context for every subset on the way, since each merged successor is counted
 /// again and merges with the rest. A loop makes each successor the instance itself. The
 /// answer is whether it sent a conclusion to the context.
-fn merge_all<S: Sink>(ix: &Index, st: &mut State, s: Role, b: Ex, out: &mut S) -> bool {
+fn merge_all<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    s: Role,
+    b: Ex,
+    sends: &mut Sends,
+    out: &mut S,
+) -> bool {
     let roles = &ix.roles;
     let k = members(ix, st, s, b);
     if k.len() < 2 {
@@ -749,7 +769,7 @@ fn merge_all<S: Sink>(ix: &Index, st: &mut State, s: Role, b: Ex, out: &mut S) -
     let a = named(ix, st.real, &u);
     let m = match a {
         Some(a) => {
-            send_named(a, &u, out);
+            sends.stop |= !send_named(a, &u, out);
             a
         }
         None if u.len() == 1 => u[0],
@@ -1397,15 +1417,16 @@ mod tests {
     }
 
     /// A sink that records what a flush sends and counts its checks of the sent
-    /// messages, and stops the run after a number of them.
-    struct Sends {
+    /// messages, and answers that the run stopped after a number of them. It keeps the
+    /// default answer of [`Sink::stopped`], so that the flush stops on the check's answer.
+    struct Recorded {
         sent: Vec<(Ex, Concl)>,
         local: Vec<Concl>,
         checks: usize,
         left: usize,
     }
 
-    impl Sink for Sends {
+    impl Sink for Recorded {
         fn send(&mut self, to: Ex, c: Concl) {
             self.sent.push((to, c));
         }
@@ -1416,9 +1437,6 @@ mod tests {
             self.checks += 1;
             self.left = self.left.saturating_sub(1);
             self.left > 0
-        }
-        fn stopped(&self) -> bool {
-            self.left == 0
         }
         fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
             out.clear();
@@ -1461,7 +1479,7 @@ mod tests {
             h.dirty = true;
             st
         };
-        let sink = |left: usize| Sends {
+        let sink = |left: usize| Recorded {
             sent: Vec::new(),
             local: Vec::new(),
             checks: 0,

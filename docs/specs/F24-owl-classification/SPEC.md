@@ -1201,12 +1201,22 @@ The rules that read a successor are the EL rules over a backward link, R2 and R4
 a counted predecessor takes, and R7 and R8 at the successor, and each of them reads the
 successor's subsumers, loops, flags and backward links, which `a`'s context holds as the
 conjunction's would, with the context's link, its fillers and its realness among them.
-The context's own state differs only in the id of the successor it names, and a rule
-that reads that id reads the successor's core, which for `a`'s context is `a` and for the
-conjunction's is a set that holds `a`, so a later extension or merge of either holds `a`
-and takes the same step. A context that is not real keeps the conjunction, since what the
-conjunction holds is then true of `a` only where the context has an instance, which a
-world decides. To let the step apply from the first saturation, a run with the Horn rules
+The context's own state differs only in the id of the successor it names, which three
+readers observe. R3 and R5 read the core of the successor with that id, which for `a`'s
+context is `a` and for the conjunction's is a set that holds `a`, so a later extension or
+merge of either holds `a` and takes the same step. R8 compares the ids of a singular
+context's successors with the ids of its predecessors, to find an element that two
+clashing roles join to the context. The conjunction's context and `a`'s have the same
+Horn successors after their exchange, so one of them is a predecessor of the context by
+a role exactly when the other is. The comparison therefore finds `a` on both sides where
+it found the conjunction on both, and a contradiction that it sends a predecessor reaches
+`a` in either form. The step itself compares the id of the successor it extends with `a`
+and adds no link when they are equal, since the context already names `a` by that role.
+When `a` is the context itself, the members go to the context's own list, and the
+activation applies them before it ends. A context that is not real keeps the
+conjunction, since what the conjunction holds is then true of `a` only where the context
+has an instance, which a world decides. To let the step apply from the first saturation,
+a run with the Horn rules
 over an ontology with individuals makes `owl:Thing` and each individual real when it
 initializes their contexts, where the rounds between the saturations did so before, and
 the rounds keep the facts of universal roles and the keys. A context that becomes real

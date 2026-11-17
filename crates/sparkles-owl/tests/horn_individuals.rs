@@ -492,20 +492,28 @@ fn a_universal_over_a_loop_assertion_reaches_the_individual_itself() {
 fn r5_at_an_individual_that_is_its_own_successor_takes_the_other_successor() {
     // a has r to itself and to b and r is functional, so b is a, and a's universal
     // over the conjunction that R5 would make reaches a itself
-    let out = check(
-        "ObjectPropertyAssertion(:r :a :a)
+    let body = "ObjectPropertyAssertion(:r :a :a)
          ObjectPropertyAssertion(:r :a :b)
          FunctionalObjectProperty(:r)
          ClassAssertion(:S :b)
          ObjectPropertyAssertion(:s :a :e)
          SubClassOf(:S ObjectAllValuesFrom(:s :M))
-         EquivalentClasses(:Qe ObjectOneOf(:e))
+         EquivalentClasses(:Qe ObjectOneOf(:e))";
+    // observed through the leaf e alone, a and b make no conjunction
+    let out = check(body, &[("Qe", "M")], &[("M", "Qe")]);
+    assert_eq!(out.stats.conjunctions, 0);
+    // Qa and Qb show that a and b are one. Their contexts take a's successors before a
+    // round finds them real, so they keep the conjunctions of R5 and R3, and the count
+    // says nothing of a's own context
+    check(
+        &format!(
+            "{body}
          EquivalentClasses(:Qa ObjectOneOf(:a))
-         EquivalentClasses(:Qb ObjectOneOf(:b))",
+         EquivalentClasses(:Qb ObjectOneOf(:b))"
+        ),
         &[("Qe", "M"), ("Qa", "Qb"), ("Qb", "Qa"), ("Qa", "S")],
         &[("M", "Qe")],
     );
-    assert_eq!(out.stats.conjunctions, 0);
 }
 
 #[test]
@@ -525,4 +533,21 @@ fn successors_by_several_roles_to_one_individual_take_the_universals_of_their_su
         &[("Qd", "D"), ("C", "Qb")],
     );
     assert_eq!(out.stats.conjunctions, 0);
+}
+
+#[test]
+fn r5_at_an_individual_whose_other_successor_holds_it_keeps_what_the_successor_holds() {
+    // a has r to itself and to an element of C that is a, and r is functional. Every
+    // link of a that R5 counts is a itself or already holds the whole conjunction, so
+    // R5 sends a link to no context, and a takes C through the successor that holds it
+    check(
+        "ObjectPropertyAssertion(:r :a :a)
+         ClassAssertion(ObjectSomeValuesFrom(:r ObjectIntersectionOf(ObjectOneOf(:a) :C)) :a)
+         FunctionalObjectProperty(:r)
+         ObjectPropertyAssertion(:s :a :e)
+         SubClassOf(:C ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))",
+        &[("Qe", "M")],
+        &[("M", "Qe")],
+    );
 }

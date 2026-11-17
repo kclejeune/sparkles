@@ -1128,7 +1128,6 @@ impl Norm<'_> {
     }
 }
 
-/// Whether the expression is the top object property or its inverse.
 /// Whether the axiom is an assertion about an anonymous individual. The rules have no
 /// context for an anonymous individual, so the normalization refuses every such axiom,
 /// and the caller leaves it out and reports it. Finding it here spares the axiom's scope
@@ -1147,6 +1146,7 @@ fn anonymous(ax: &AxiomKind) -> bool {
     }
 }
 
+/// Whether the expression is the top object property or its inverse.
 fn is_top(p: &ObjectPropertyExpression) -> bool {
     p.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY
 }
