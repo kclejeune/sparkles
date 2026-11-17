@@ -333,13 +333,11 @@ are not written to the dataset; they live in F17's per-query tables.
 
 ### 6.4 Compilation
 
-- **Relation encoding.** The rule engine works on triples (`crates/sparkles-reasoner/src/
-  engine.rs`). A binary relation `r(a, b)` becomes the triple `(a, <urn:x-sparkles:dl:r>,
-  b)`, and a unary one `r(a)` becomes `(a, rdf:type, <urn:x-sparkles:dl:r>)`. A relation
-  of arity three or more becomes a tuple node made by the existing `makeSkolem` builtin
-  from the relation name and the arguments, with one triple per column
-  (`<urn:x-sparkles:dl:r#1>` and so on). The `urn:x-sparkles:dl:` namespace is reserved,
-  and a program or a query that names it directly is refused.
+- **Relation encoding.** Relations are the declared relations of the reasoner's rule IR
+  (F23's native n-ary core), which stores a fact as a row of the derived tier over a key
+  that no input can name, with the columns after the first behind a tail handle for arity
+  three or more. Relation names in the `urn:x-sparkles:rel:` namespace are reserved, and a
+  program that declares one is refused.
 - **Non-recursive programs** are unfolded into the query: each relation atom becomes the
   union of its clauses' bodies with renamed variables, and the result compiles to SPARQL
   algebra as a JSON query does. No rule engine runs.
@@ -354,9 +352,14 @@ are not written to the dataset; they live in F17's per-query tables.
 A head variable that does not occur in the body, `.decl advisor(s, a)` with
 `advisor(?s, ?a) :- (?s a ex:PhDStudent).`, asks for a new node for each student, as a
 tuple-generating dependency of Datalog±. The compiler accepts it only when the program
-is weakly acyclic (Fagin, Kolaitis, Miller and Popa), so that the chase terminates, and
-compiles the existential to `makeSkolem` over the body's frontier variables. Otherwise
-it is refused with the dependency cycle named. The fact budget of F17 §8 still applies.
+is weakly acyclic (Fagin, Kolaitis, Miller and Popa), so that the chase terminates.
+Otherwise it is refused with the dependency cycle named. The existential rules run as a
+restricted chase in each stratum, Datalog first: each round evaluates the stratum's rules
+without existentials to their fixpoint and then applies its existential rules one at a
+time in program order, each against the facts the earlier ones added, firing a trigger
+only when no instance of its head already holds (the single-TGD-parallel restricted chase
+of ChaseBench). A stratum completes before the next one reads it. The fact budget of F17
+§8 still applies.
 
 ### 6.6 Relations in JSON queries
 
