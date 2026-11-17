@@ -33,6 +33,11 @@ use sparkles_core::store::{Store, StoreOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+// The test-only reference evaluator (roadmap item 512). Its mode runs the query
+// evaluation tests through it instead of through the engine.
+#[path = "support/reference/mod.rs"]
+mod reference;
+
 const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";
 const QT: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-query#";
 const UT: &str = "http://www.w3.org/2009/sparql/tests/test-update#";
@@ -543,6 +548,8 @@ struct Mode {
     cursor: Option<usize>,
     /// Install an empty extension registry, which must not change any answer.
     registry: bool,
+    /// Answer with the reference evaluator, which reads the test's data files itself.
+    reference: bool,
 }
 
 impl Mode {
@@ -655,16 +662,115 @@ fn cursor_answer(
     Ok(answer)
 }
 
-fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> {
-    let action = as_subject(&m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?)
-        .ok_or("bad action")?;
-    let qurl = iri(&m.obj(&action, &format!("{QT}query")).ok_or("no query")?);
-    let qtext = std::fs::read_to_string(url_to_path(&qurl)).map_err(|e| e.to_string())?;
-    let result_url = iri(&m.obj(&t.entry, &format!("{MF}result")).ok_or("no result")?);
-    let expected = parse_expected(&result_url)?;
+/// The answer of the reference evaluator, which parses the test's data files itself.
+/// A query that it does not evaluate is an error that starts with `reference
+/// unsupported`.
+fn rename_term(t: Term, f: &dyn Fn(&oxrdf::BlankNode) -> oxrdf::BlankNode) -> Term {
+    match t {
+        Term::BlankNode(b) => Term::BlankNode(f(&b)),
+        Term::Triple(t) => Term::Triple(Box::new(oxrdf::Triple {
+            subject: match t.subject {
+                NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(f(&b)),
+                s => s,
+            },
+            predicate: t.predicate,
+            object: rename_term(t.object, f),
+        })),
+        t => t,
+    }
+}
+
+fn rename_quad(q: Quad, f: &dyn Fn(&oxrdf::BlankNode) -> oxrdf::BlankNode) -> Quad {
+    Quad {
+        subject: match q.subject {
+            NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(f(&b)),
+            s => s,
+        },
+        predicate: q.predicate,
+        object: rename_term(q.object, f),
+        graph_name: match q.graph_name {
+            oxrdf::GraphName::BlankNode(b) => oxrdf::GraphName::BlankNode(f(&b)),
+            g => g,
+        },
+    }
+}
+
+fn reference_answer(
+    m: &Manifest,
+    action: &NamedOrBlankNode,
+    qurl: &str,
+    qtext: &str,
+) -> Result<Answer, String> {
+    let mut quads = Vec::new();
+    let mut read = |url: &str, forced: Option<oxrdf::GraphName>| -> Result<(), String> {
+        let path = url_to_path(url);
+        let (fmt, _) =
+            sparkles_core::io::format_for_path(&path).unwrap_or((RdfFormat::Turtle, None));
+        let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let parser = oxrdfio::RdfParser::from_format(fmt)
+            .with_base_iri(url)
+            .map_err(|e| e.to_string())?;
+        // blank node labels belong to their document
+        let file = quads.len();
+        let rename = |b: &oxrdf::BlankNode| {
+            oxrdf::BlankNode::new_unchecked(format!("f{file}{}", b.as_str()))
+        };
+        for q in parser.for_slice(&data) {
+            let mut q = q.map_err(|e| e.to_string())?;
+            q = rename_quad(q, &rename);
+            if let Some(g) = &forced {
+                q.graph_name = g.clone();
+            }
+            quads.push(q);
+        }
+        Ok(())
+    };
+    for d in m.objs(action, &format!("{QT}data")) {
+        read(&iri(&d), None)?;
+    }
+    for g in m.objs(action, &format!("{QT}graphData")) {
+        let url = iri(&g);
+        read(&url, Some(oxrdf::GraphName::NamedNode(nn(&url))))?;
+    }
+    let reference = reference::Reference::new(quads);
+    match reference.run(qtext, Some(qurl)) {
+        Err(reference::Error::Unsupported(why)) => Err(format!("reference unsupported: {why}")),
+        Err(e) => Err(format!("error: {e}")),
+        Ok(reference::Answer::Ask(b)) => Ok(Answer {
+            kind: QueryKind::Ask,
+            boolean: b,
+            vars: Vec::new(),
+            rows: Vec::new(),
+            triples: Vec::new(),
+        }),
+        Ok(reference::Answer::Select { variables, rows }) => Ok(Answer {
+            kind: QueryKind::Select,
+            boolean: false,
+            vars: variables,
+            rows,
+            triples: Vec::new(),
+        }),
+        Ok(reference::Answer::Graph(triples)) => Ok(Answer {
+            kind: QueryKind::Construct,
+            boolean: false,
+            vars: Vec::new(),
+            rows: Vec::new(),
+            triples,
+        }),
+    }
+}
+
+fn engine_answer(
+    m: &Manifest,
+    action: &NamedOrBlankNode,
+    qurl: &str,
+    qtext: &str,
+    mode: Mode,
+) -> Result<Answer, String> {
+    let qurl = qurl.to_string();
     let store = load_store(
         m,
-        &action,
+        action,
         &format!("{QT}data"),
         &format!("{QT}graphData"),
         false,
@@ -701,9 +807,23 @@ fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> 
             .map_err(|e| e.to_string())?,
         );
     }
-    let r = match mode.cursor {
-        Some(batch_rows) => cursor_answer(&store, &qtext, &opts, batch_rows)?,
-        None => eager_answer(&store, &qtext, &opts)?,
+    match mode.cursor {
+        Some(batch_rows) => cursor_answer(&store, qtext, &opts, batch_rows),
+        None => eager_answer(&store, qtext, &opts),
+    }
+}
+
+fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> {
+    let action = as_subject(&m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?)
+        .ok_or("bad action")?;
+    let qurl = iri(&m.obj(&action, &format!("{QT}query")).ok_or("no query")?);
+    let qtext = std::fs::read_to_string(url_to_path(&qurl)).map_err(|e| e.to_string())?;
+    let result_url = iri(&m.obj(&t.entry, &format!("{MF}result")).ok_or("no result")?);
+    let expected = parse_expected(&result_url)?;
+    let r = if mode.reference {
+        reference_answer(m, &action, &qurl, &qtext)?
+    } else {
+        engine_answer(m, &action, &qurl, &qtext, mode)?
     };
     match (expected, r.kind) {
         (Expected::Boolean(b), QueryKind::Ask) => {
@@ -858,7 +978,11 @@ fn run_suite_mode(name: &str, manifests: &[&str], mode: Mode) {
         eprintln!("W3C test suite not found; skipping {name}");
         return;
     };
-    let known = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c-known-failures.txt");
+    let known = Path::new(env!("CARGO_MANIFEST_DIR")).join(if mode.reference {
+        "tests/w3c-reference-known.txt"
+    } else {
+        "tests/w3c-known-failures.txt"
+    });
     run_suite_in(name, &dir, manifests, &known, mode);
 }
 
@@ -881,6 +1005,7 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
     let filter = std::env::var("SPARKLES_W3C_FILTER").ok();
     let verbose = std::env::var("SPARKLES_W3C_VERBOSE").is_ok();
     let (mut pass, mut fail, mut skip) = (0, 0, 0);
+    let mut unsupported = 0;
     let mut new_failures = Vec::new();
     let mut fixed = Vec::new();
     for (t, m) in &tests {
@@ -910,7 +1035,7 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
                 run_query_test(t, m, mode)
             }))
             .unwrap_or_else(|_| Err("panic".into())),
-            _ if mode.cursor.is_some() || mode.registry => {
+            _ if mode.cursor.is_some() || mode.registry || mode.reference => {
                 skip += 1;
                 continue;
             }
@@ -941,6 +1066,7 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
             Err(e) if e.contains("not compared") => skip += 1,
             Err(e) => {
                 fail += 1;
+                unsupported += e.starts_with("reference unsupported") as usize;
                 if verbose || !known.contains(&short) {
                     eprintln!("FAIL {short} [{}]\n    {e}", t.kind);
                 }
@@ -954,6 +1080,11 @@ fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Pat
         "\n{name}: {pass} passed, {fail} failed, {skip} skipped ({} tests)",
         tests.len()
     );
+    if mode.reference {
+        eprintln!(
+            "{name}: {unsupported} of the failures are queries that the reference does not evaluate"
+        );
+    }
     if mode.cursor.is_some() {
         eprintln!(
             "{name}: {} queries needed eager fallback",
@@ -1130,12 +1261,44 @@ fn sparql_query_with_an_unused_registry_cursor() {
     unused_registry(Mode {
         registry: true,
         cursor: Some(3),
+        ..Mode::default()
     });
 }
 
 #[test]
 fn sparql12() {
     run_suite("SPARQL 1.2", &["sparql12/manifest.ttl"]);
+}
+
+/// The query evaluation tests answered by the reference evaluator (roadmap item 512),
+/// which reads the data files itself and shares nothing with the engine but the parser.
+/// `tests/w3c-reference-known.txt` lists the tests that it does not evaluate or answers
+/// differently, with the reason.
+#[test]
+fn reference_sparql10_and_11() {
+    run_suite_mode(
+        "SPARQL 1.0 and 1.1 query (reference evaluator)",
+        &[
+            "sparql10/manifest-evaluation.ttl",
+            "sparql11/manifest-sparql11-query.ttl",
+        ],
+        Mode {
+            reference: true,
+            ..Mode::default()
+        },
+    );
+}
+
+#[test]
+fn reference_sparql12() {
+    run_suite_mode(
+        "SPARQL 1.2 (reference evaluator)",
+        &["sparql12/manifest.ttl"],
+        Mode {
+            reference: true,
+            ..Mode::default()
+        },
+    );
 }
 
 /// Oxigraph's GeoSPARQL function tests, vendored in `testsuite/geosparql/oxigraph` with
