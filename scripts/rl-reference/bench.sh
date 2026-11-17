@@ -36,7 +36,8 @@
 # SIGKILL, or error. The correctness check and the materializations that prepare the
 # incremental runs share the cap and the deadline. Nemo's own report adds its import,
 # reasoning and export times. WORKDIR/PROFILE/results/rl-reference.json holds every run
-# with the host, the versions and the configuration, and summary.md the medians.
+# with the host, the versions and the configuration, and summary.md the medians. The
+# derived graphs of a check are removed once it passes, and kept when it fails.
 #
 # Env: PROFILE (owl-rl or rdfs, default owl-rl), INCREMENTAL (1 or 0, default 1), RUNS
 # (default 3), THREADS (default all cores), DELTA_EVERY (default 100), MEM_MAX
@@ -60,7 +61,7 @@ INCREMENTAL=${INCREMENTAL:-1}
 INFERRED=urn:x-sparkles:inferred
 
 [ $# -eq 3 ] || {
-  sed -n '2,47p' "$0" >&2
+  sed -n '2,48p' "$0" >&2
   exit 2
 }
 case $PROFILE in owl-rl | rdfs) ;; *)
@@ -240,6 +241,9 @@ export PROFILE
 log "comparing the $PROFILE closures"
 capped compare "$HERE/compare.sh" "$WORK/base.nt" compare || die "the closures differ or the comparison failed, see $OUT/logs/compare.log"
 DERIVED=$("$PYTHON" -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["sparkles"])' compare/diff.json)
+# The closures agree, so diff.json and core.json keep what the derived files showed. The
+# files themselves take several times the size of the input, which the timed runs need.
+rm -rf compare/enc compare/base.nt compare/sparkles-derived.nt compare/reference-derived.nt compare/core-derived.nt
 
 # nemo_run NAME ROUND ENC [EXPECTED]: Nemo's timed run of the aligned program on ENC.
 nemo_run() {
@@ -263,10 +267,11 @@ check_closure() {
   fi
   "$SPARKLES" dump --loc "$db" --format nq --out "check-$name.nq" > "logs/check-$name.log" 2>&1 || die "dumping $db failed"
   "$PYTHON" -I "$HERE/rl_terms.py" split "check-$name.nq" "check-$name-base.nt" "check-$name-sparkles.nt" "$INFERRED" 2>> "logs/check-$name.log"
+  rm -f "check-$name.nq" "check-$name-base.nt"
   "$PYTHON" -I "$HERE/rl_terms.py" decode "$enc" "$out/derived.nt" "check-$name-reference.nt" 2>> "logs/check-$name.log"
   "$PYTHON" -I "$HERE/rl_terms.py" diff "check-$name-sparkles.nt" "check-$name-reference.nt" "results/check-$name.json" \
     --known "$HERE/known.tsv" 2>> "logs/check-$name.log" || die "the closure after $name differs from the reference's, see results/check-$name.json"
-  rm -f "check-$name.nq" "check-$name-base.nt"
+  rm -f "check-$name-sparkles.nt" "check-$name-reference.nt"
   log "the closure after $name equals the reference's"
 }
 
