@@ -576,3 +576,196 @@ fn an_existential_over_the_universal_property_reaches_a_nominal() {
         &[("C", "A")],
     );
 }
+
+const INTERNAL: &str = "urn:sparkles:internal:";
+
+fn rooted_limits() -> Limits {
+    Limits {
+        rooted: true,
+        ..Limits::default()
+    }
+}
+
+/// Asserts that no name the reductions of item 805 make up reaches the classifier's answer,
+/// its description of each asked class or its report of the axioms left out.
+fn no_internal_names(k: &Classifier, out: &Classification, asked: &[Class]) {
+    for n in out.taxonomy.nodes() {
+        for cl in &n.classes {
+            assert!(!cl.as_str().starts_with(INTERNAL), "{}", cl.as_str());
+        }
+    }
+    for cl in &out.incomplete {
+        assert!(!cl.as_str().starts_with(INTERNAL), "{}", cl.as_str());
+    }
+    let excluded = format!("{:?}", k.excluded());
+    assert!(!excluded.contains(INTERNAL), "{excluded}");
+    for cl in asked {
+        let d = format!("{:?}", k.describe(cl));
+        assert!(!d.contains(INTERNAL), "{d}");
+    }
+}
+
+#[test]
+fn the_names_of_the_reductions_stay_out_of_every_answer() {
+    let ax = axioms(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)
+         SubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty :B))
+         ClassAssertion(:A :a)
+         ClassAssertion(:Q :d)
+         SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :Q) :R)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0);
+    assert_eq!(out.stats.added, ax.len());
+    // every element is a B and an R, the hub individual among them, which stays out
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("B")));
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("R")));
+    let d = k.describe(&Class::thing()).unwrap();
+    assert!(d.instances.iter().any(|i| i.as_str() == format!("{EX}a")));
+    no_internal_names(&k, &out, &[Class::thing(), c("K"), c("B"), c("R"), c("Z")]);
+}
+
+#[test]
+fn runs_after_a_change_of_keys_answer_as_a_fresh_classifier() {
+    let base = axioms(
+        "ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)
+         ClassAssertion(:G :a)
+         SubClassOf(:D ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(ObjectSomeValuesFrom(:r :G) :H)",
+    );
+    let key = ofn_read::parse(&format!(
+        "Prefix(:=<{EX}>)\nOntology(\nHasKey(:K (:p) ())\nSubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty :B))\n)"
+    ))
+    .unwrap()
+    .axioms;
+    let fresh = |ax: &[&Axiom]| {
+        let mut k = Classifier::of(ax.iter().copied());
+        k.classify(&rooted_limits()).unwrap().taxonomy
+    };
+    let without: Vec<&Axiom> = base.iter().collect();
+    let with: Vec<&Axiom> = base.iter().chain(&key).collect();
+    let mut k = Classifier::of(&base);
+    let t = k.classify(&rooted_limits()).unwrap().taxonomy;
+    assert_eq!(t, fresh(&without));
+    assert!(!t.is_subclass(&c("D"), &c("H")));
+    k.add(&key);
+    let t = k.classify(&rooted_limits()).unwrap().taxonomy;
+    assert_eq!(t, fresh(&with));
+    assert!(t.is_subclass(&c("D"), &c("H")));
+    // a second run of the same rewritten axioms
+    let t = k.classify(&rooted_limits()).unwrap().taxonomy;
+    assert_eq!(t, fresh(&with));
+    k.remove(&key);
+    let t = k.classify(&rooted_limits()).unwrap().taxonomy;
+    assert_eq!(t, fresh(&without));
+    assert!(!t.is_subclass(&c("D"), &c("H")));
+}
+
+/// Classifies with the rooted run and returns the classifier and its answer, for the cases
+/// the reductions decline.
+fn declined(body: &str) -> (Classifier, Classification) {
+    let mut k = Classifier::of(&axioms(body));
+    let out = k.classify(&rooted_limits()).unwrap();
+    no_internal_names(&k, &out, &[Class::thing()]);
+    (k, out)
+}
+
+#[test]
+fn a_name_with_the_prefix_of_the_reductions_keeps_the_ontology_from_them() {
+    let ax = axioms(&format!(
+        "SubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty <{INTERNAL}u>))
+         SubClassOf(<{INTERNAL}m0-0-0-1> :A)"
+    ));
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    // the ontology's own names stay in the taxonomy, and the universal restriction is
+    // left out as it is without the reductions
+    let own = Class::new(format!("{INTERNAL}m0-0-0-1"));
+    assert!(out.taxonomy.is_subclass(&own, &c("A")));
+    assert!(
+        k.excluded()
+            .iter()
+            .any(|e| format!("{:?}", e.axiom).contains("ObjectAllValuesFrom")),
+        "{:#?}",
+        k.excluded()
+    );
+}
+
+/// Classifies with the rooted run, checks that no made-up name reaches the answer, and
+/// returns the axioms left out, for the cases the reductions decline.
+fn declined(body: &str) -> Vec<String> {
+    let mut k = Classifier::of(&axioms(body));
+    let out = k.classify(&rooted_limits()).unwrap();
+    no_internal_names(&k, &out, &[Class::thing()]);
+    k.excluded()
+        .iter()
+        .map(|e| format!("{:?}", e.axiom))
+        .collect()
+}
+
+#[test]
+fn a_universal_property_in_a_maximum_is_left_as_it_is() {
+    let left = declined(
+        "SubClassOf(:A ObjectMaxCardinality(3 owl:topObjectProperty))
+         ClassAssertion(:A :a)",
+    );
+    assert!(
+        left.iter().any(|a| a.contains("ObjectMaxCardinality")),
+        "{left:?}"
+    );
+}
+
+#[test]
+fn a_minimum_of_one_over_the_universal_property_is_an_existential() {
+    check(
+        "ClassAssertion(:B :o)
+         SubClassOf(ObjectMinCardinality(1 owl:topObjectProperty :B) :C)
+         SubClassOf(:A :A)",
+        &[("A", "C")],
+        &[("C", "A")],
+    );
+}
+
+#[test]
+fn a_functional_property_above_the_universal_property_is_declined_by_tier_d() {
+    // p is above the transitive property that stands for the universal one, so p is not
+    // simple, and the rooted run leaves the ontology to its default answer
+    let left = declined(
+        "EquivalentObjectProperties(owl:topObjectProperty :p)
+         FunctionalObjectProperty(:p)
+         ClassAssertion(:A :a)",
+    );
+    assert!(!left.is_empty());
+}
+
+#[test]
+fn a_key_past_the_budget_of_its_reduction_is_left_as_it_is() {
+    // seventy individuals make about 170,000 axioms of one key, past the bound of 131,072
+    let mut body = String::from("HasKey(:K (:p) ())\n");
+    for i in 0..70 {
+        body.push_str(&format!("ClassAssertion(:K :i{i})\n"));
+    }
+    let left = declined(&body);
+    assert!(left.iter().any(|a| a.contains("HasKey")), "{left:?}");
+}
+
+#[test]
+fn without_the_rooted_run_keys_and_the_universal_property_are_left_as_they_are() {
+    let ax = axioms(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         SubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty :B))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    no_internal_names(&k, &out, &[Class::thing()]);
+}

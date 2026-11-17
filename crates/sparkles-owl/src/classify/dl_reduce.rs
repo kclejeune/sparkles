@@ -12,18 +12,25 @@
 //! run without the reductions.
 //!
 //! A key `HasKey(C (r_1 … r_m) ())` holds only of named individuals, and its values are
-//! named too. Each named individual `b` gets a fresh property `W_b` with `⊤ ⊑ ∃W_b.{b}`,
-//! which lets any element see `b`. For each pair of distinct named individuals `a` and `b`,
-//! each key property `r_j` and each named individual `c`, the axiom
-//! `{a} ⊓ ∃r_j.({c} ⊓ ∃W_b.({b} ⊓ ∃r_j.{c})) ⊑ M_jab` marks that `a` and `b` share the
-//! value `c` of `r_j`, and `{a} ⊓ C ⊓ ∃W_b.({b} ⊓ C) ⊓ M_1ab ⊓ … ⊓ M_mab ⊑ {b}` makes them
-//! equal. The fresh names make the reduction a conservative extension of the ontology. The
-//! reduction has `m·n·n(n-1)/2` axioms for `n` named individuals, and an ontology whose keys
-//! pass the bound is left to the run without the reductions.
+//! named too. For each named individual `b` other than the first and each key property
+//! `r_j`, the axiom `{b} ⊓ C ⊑ ∀r_j.V_jb` marks the values of `b` when `b` is a `C`. For
+//! each pair of distinct named individuals `a` and `b`, each `r_j` and each named individual
+//! `c`, the axiom `{a} ⊓ ∃r_j.({c} ⊓ V_jb) ⊑ M_jab` marks that `a` has a named value of `b`,
+//! and `{a} ⊓ C ⊓ M_1ab ⊓ … ⊓ M_mab ⊑ {b}` makes them equal. A model of the ontology
+//! extends to the fresh classes, with `V_jb` the `r_j`-values of `b` when `b` is a `C` and
+//! empty otherwise and `M_jab` the set `{a}` when `a` has a named `r_j`-value in `V_jb`, and
+//! a model of the rewritten axioms satisfies the key. The marks stay on the values, so no
+//! axiom links every element to the individuals, which the reduction through a fresh
+//! property `W_b` with `⊤ ⊑ ∃W_b.{b}` did and which took most generated ontologies with
+//! keys past the rooted run's bound. The reduction has about `m·n·n(n-1)/2` axioms for `n`
+//! named individuals, and an ontology whose keys pass the bound is left to the run without
+//! the reductions.
 //!
-//! Every fresh name has the IRI prefix [`PREFIX`], and the run hides the classes among them
-//! from the taxonomy. The axioms the rewriting makes stand for the original axioms in the
-//! run's report.
+//! Every fresh name has the IRI prefix [`PREFIX`], and an ontology that names anything with
+//! it is left to the run without the reductions. The run hides the classes among them from
+//! the taxonomy, a partial answer and a description, and the hub individual from a
+//! description's instances. The axioms the rewriting makes stand for the original axioms in
+//! the run's report.
 
 use super::dl;
 use crate::model::*;
@@ -180,12 +187,18 @@ impl Cx {
             }
             C::ObjectHasValue(p, i) => C::ObjectHasValue(self.ope(p), i.clone()),
             C::ObjectHasSelf(p) if is_top(p) => return Err(()),
+            // at least none is every element, and at least one is an existential
+            C::ObjectMinCardinality(0, p, _) if is_top(p) => C::Class(Class::thing()),
+            C::ObjectMinCardinality(1, p, f) if is_top(p) => C::ObjectSomeValuesFrom(
+                self.ope(p),
+                Box::new(match f {
+                    Some(f) => self.ce(f)?,
+                    None => C::Class(Class::thing()),
+                }),
+            ),
+            C::ObjectMinCardinality(_, p, _) if is_top(p) => return Err(()),
             C::ObjectMinCardinality(n, p, f) => {
-                if is_top(p) && *n >= 2 {
-                    return Err(());
-                }
-                let p = self.ope(p);
-                C::ObjectMinCardinality(*n, p, filler(self, f)?)
+                C::ObjectMinCardinality(*n, p.clone(), filler(self, f)?)
             }
             C::ObjectMaxCardinality(_, p, _) | C::ObjectExactCardinality(_, p, _) if is_top(p) => {
                 return Err(());
@@ -272,12 +285,17 @@ impl Cx {
 }
 
 /// Whether the axioms hold something that keeps a rooted run of Tier D from them whatever
-/// the rewriting does: data, the bottom property or a reflexive property.
+/// the rewriting does, data, the bottom property or a reflexive property, or a name with
+/// the prefix of the made-up names.
 fn blocked(k: &AxiomKind, inds: &mut BTreeSet<NamedIndividual>) -> bool {
     let mut s = Signature::default();
     s.axiom(k);
     let mut bad = matches!(k, AxiomKind::ReflexiveObjectProperty(p) if !is_top(p));
     for e in &s.0 {
+        // a name of the ontology's own that looks like a made-up one would meet them
+        if e.iri().as_str().starts_with(PREFIX) {
+            bad = true;
+        }
         match e {
             Entity::DataProperty(_) | Entity::Datatype(_) => bad = true,
             Entity::ObjectProperty(p) if p.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY => {
@@ -334,7 +352,7 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
             && !ops.is_empty()
         {
             let m = ops.len();
-            total = total.saturating_add(m.saturating_mul(n).saturating_mul(pairs) + pairs + n);
+            total = total.saturating_add(m.saturating_mul(n).saturating_mul(pairs + 1) + pairs);
             if total > limit {
                 return None;
             }
@@ -398,42 +416,36 @@ fn key(
 ) -> Vec<AxiomKind> {
     use ClassExpression as C;
     let one = |i: &NamedIndividual| C::ObjectOneOf([Individual::Named(i.clone())].into());
-    let w = |b: usize| ObjectProperty::new(format!("{PREFIX}w{b}"));
     let mut out = Vec::new();
     if inds.len() < 2 {
         return out;
     }
-    for (b, ib) in inds.iter().enumerate() {
-        out.push(AxiomKind::SubClassOf(
-            C::Class(Class::thing()),
-            C::ObjectSomeValuesFrom(ObjectPropertyExpression::Property(w(b)), Box::new(one(ib))),
-        ));
+    // V_jb holds the r_j-values of b when b is a C
+    let v = |j: usize, b: usize| Class::new(format!("{PREFIX}v{k}-{j}-{b}"));
+    for (b, ib) in inds.iter().enumerate().skip(1) {
+        for (j, r) in rs.iter().enumerate() {
+            out.push(AxiomKind::SubClassOf(
+                C::ObjectIntersectionOf([one(ib), c.clone()].into()),
+                C::ObjectAllValuesFrom(r.clone(), Box::new(C::Class(v(j, b)))),
+            ));
+        }
     }
     for (a, ia) in inds.iter().enumerate() {
         for (b, ib) in inds.iter().enumerate().skip(a + 1) {
-            let wb = ObjectPropertyExpression::Property(w(b));
-            let mut ms = Vec::with_capacity(rs.len());
+            let mut body = vec![one(ia), c.clone()];
             for (j, r) in rs.iter().enumerate() {
+                // M_jab: a has a named r_j-value that b, a C, has too
                 let m = Class::new(format!("{PREFIX}m{k}-{j}-{a}-{b}"));
                 for ic in inds {
-                    // a has the value c, which b has too
-                    let seen = C::ObjectSomeValuesFrom(
-                        wb.clone(),
-                        Box::new(C::ObjectIntersectionOf(
-                            [
-                                one(ib),
-                                C::ObjectSomeValuesFrom(r.clone(), Box::new(one(ic))),
-                            ]
-                            .into(),
-                        )),
-                    );
                     out.push(AxiomKind::SubClassOf(
                         C::ObjectIntersectionOf(
                             [
                                 one(ia),
                                 C::ObjectSomeValuesFrom(
                                     r.clone(),
-                                    Box::new(C::ObjectIntersectionOf([one(ic), seen].into())),
+                                    Box::new(C::ObjectIntersectionOf(
+                                        [one(ic), C::Class(v(j, b))].into(),
+                                    )),
                                 ),
                             ]
                             .into(),
@@ -441,17 +453,8 @@ fn key(
                         C::Class(m.clone()),
                     ));
                 }
-                ms.push(C::Class(m));
+                body.push(C::Class(m));
             }
-            let mut body = vec![
-                one(ia),
-                c.clone(),
-                C::ObjectSomeValuesFrom(
-                    wb,
-                    Box::new(C::ObjectIntersectionOf([one(ib), c.clone()].into())),
-                ),
-            ];
-            body.extend(ms);
             out.push(AxiomKind::SubClassOf(
                 C::ObjectIntersectionOf(body.into_iter().collect()),
                 one(ib),

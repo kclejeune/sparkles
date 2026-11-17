@@ -253,9 +253,13 @@ pub struct Limits {
     /// OWL 2 EL as it does by default, with [`Stats::dl_rooted_over`] set. Every answer
     /// of a rooted run is entailed, and its completeness is not proved: F24 records the
     /// calculus's departures from the published rules and the fixtures it finishes.
-    /// A rooted run refuses an ontology with keys, a top property or a functional data
-    /// property, which take the default paths, and the option changes nothing for an
-    /// ontology without individuals.
+    /// A rooted run takes keys over object properties and the universal object property
+    /// by rewriting them into class axioms over fresh names, and a run of the rewritten
+    /// axioms always starts from nothing. It refuses an ontology with keys over data
+    /// properties, the top data property or a functional data property, and one whose keys
+    /// or universal property the rewriting declines, which take the default paths. The
+    /// option changes nothing for an ontology without individuals, nominals or the
+    /// universal object property.
     pub rooted: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
@@ -578,8 +582,8 @@ pub struct Saturation {
     /// classes they made up stay out of the taxonomy
     hide_internal: bool,
     /// whether the last run classified rewritten axioms, which the next run's changes
-    /// do not describe
-    reduced: bool,
+    /// do not describe and whose made-up names [`Saturation::describe`] leaves out
+    pub(crate) reduced: bool,
     /// whether the current run of Tier D is rooted and whether it counts, for the
     /// fallback its bound on derived conclusions takes
     dl_rooted: bool,
@@ -1750,9 +1754,9 @@ impl Saturation {
     }
 
     /// Whether a rooted run of Tier D may take axioms outside OWL 2 EL with individuals:
-    /// when the EL part has no keys, top properties or functional data roles. Keys wait on
-    /// their reduction to class axioms and the universal property on its replacement, as
-    /// F24 describes.
+    /// when the EL part has no keys, top properties or functional data roles. A key over
+    /// object properties and the universal object property reach this check only when
+    /// item 805's rewriting in [`Saturation::run`] declined them.
     fn rooted_allowed(&self, ax: &Axioms) -> bool {
         let it = &self.interner;
         ax.functional.is_empty()
@@ -1801,11 +1805,15 @@ impl Saturation {
             // class axioms over fresh names, which a run that does not take Tier D leaves
             // to the run without them
             let all = red.all(axioms);
+            // the interner of an earlier run holds names and individuals that decide the
+            // tiers, so the rewritten axioms start from nothing
+            self.reset();
             self.hide_internal = true;
             let r = self.run_once(&all, None, held_bytes, limits, with_taxonomy);
             self.hide_internal = false;
             match r {
-                Ok(Some(r)) if self.dl_tried => {
+                Ok(Some(mut r)) if self.dl_tried => {
+                    r.2.added = axioms.len();
                     let restore = red.restore(axioms);
                     for e in &mut self.excluded {
                         e.axiom = restore(&e.axiom);
@@ -1822,7 +1830,12 @@ impl Saturation {
                 _ => self.reset(),
             }
         }
+        // after a run of rewritten axioms, whose made-up names and hub individual the
+        // interner still holds, the run starts from nothing
         let was = std::mem::take(&mut self.reduced);
+        if was {
+            self.reset();
+        }
         let changes = changes.filter(|_| !was);
         if let Some(r) = self.run_once(axioms, changes, held_bytes, limits, with_taxonomy)? {
             return Ok(r);
@@ -2749,6 +2762,7 @@ impl Saturation {
                     Node::Class(id) => Some(self.interner.classes[id as usize].clone()),
                     _ => None,
                 })
+                .filter(|k| !self.hide_internal || !k.as_str().starts_with(dl_reduce::PREFIX))
                 .collect();
             classes.sort();
             self.partial = Some((classes, consistency));
