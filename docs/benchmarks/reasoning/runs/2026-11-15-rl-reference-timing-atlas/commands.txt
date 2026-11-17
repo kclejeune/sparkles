@@ -9,6 +9,12 @@ for spec in owl2bench-1 lubm-10 lubm-100 owl2bench-5; do
   done
 done'
 
+# The first OWL2Bench(5) owl-rl attempt filled atlas's disk while it compared round 1's
+# one-thread closure, so it left no record. It ran again alone on 2026-11-16 from a copy of
+# scripts/ at acc3f8ad, which removes a passed check's derived files and is otherwise the
+# harness above, with the same binary, Nemo, data and settings:
+flock ~/lanes/.heavy.lock sh -c 'PROFILE=owl-rl SRC/scripts/rl-reference/bench.sh owl2bench 5 WORK/owl2bench-5'
+
 # The same runs through the mise task, which builds the binary first:
 #   mise run bench:rl-reference lubm 100 --profile all --no-incremental
 
