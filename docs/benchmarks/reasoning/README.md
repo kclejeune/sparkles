@@ -136,8 +136,8 @@ with the encoded literals and blank nodes of the input and with the distinct pre
 the differences, not with the size of the closure. Once the comparison agrees, the runner
 removes its derived files and its encoded input and keeps their counts in
 `compare/diff.json` and `compare/core.json`. Each check's derived graphs are removed once
-they agree, and a check that fails keeps them. Beside the latest Nemo closure, the working
-directory therefore holds the closures of one comparison or check at a time.
+they agree, and a check that fails keeps them, so the exported graphs of passed checks do
+not accumulate.
 
 The runner writes every run to `<profile>/results/rl-reference.json` in its working
 directory, with the host's processor, memory and kernel, the Sparkles binary's version,

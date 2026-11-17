@@ -2215,7 +2215,10 @@ triple for triple, and every triple of the W3C program alone is in Sparkles' clo
 [results](../benchmarks/reasoning/RESULTS.md#owl-2-rl-reference-agreement) give the
 counts. Nemo evaluates its rules on one thread and has no incremental maintenance, so the
 incremental runs compare Sparkles' maintenance with Nemo's full run on the changed data.
-Timings on a benchmark worker and on the benchmark host remain under item 791.
+[Full materialization times](../benchmarks/reasoning/RESULTS.md#against-nemo) on a
+benchmark worker are published for LUBM(10), LUBM(100) and OWL2Bench(1) and (5). The run
+on the benchmark host, the other OWL2Bench scales and the incremental runs remain under
+item 791.
 
 ### Scope changes
 

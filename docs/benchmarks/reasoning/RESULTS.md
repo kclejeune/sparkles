@@ -447,20 +447,20 @@ apart. Peak RSS is the largest of the three rounds.
 | OWL2Bench(5) | `rdfs` | 148,189 | 2.83 s | 1.12 s | 0.54 s | 0.47 s | 75 and 560 MiB |
 
 *Measured on atlas, which has the benchmark host's hardware, with Sparkles built at
-faaddcdb and the harness at fcf8623a. The OWL2Bench(5) `owl-rl` row ran again with the
-harness at acc3f8ad, which removes a passed check's derived files, after the first attempt
-filled the disk while it compared its closure. The
+faaddcdb and the harness at fcf8623a, or at acc3f8ad for the OWL2Bench(5) `owl-rl` row,
+which differs only in removing the derived files of a check that agrees. The
 [run directory](runs/2026-11-15-rl-reference-timing-atlas/commands.txt) holds the commands,
 the [host](runs/2026-11-15-rl-reference-timing-atlas/env.txt) and each run's record.*
 
 Every timed run derived the closure check's number of triples, and the first round's
 Sparkles runs on 1 and 20 threads equal that round's Nemo closure triple for triple.
 Sparkles is ahead in every row, and on one thread it is also ahead of Nemo's reasoning
-time alone. On OWL 2 RL it takes RATIO_OWL times less time on one thread than Nemo's
-whole run. On RDFS the margin is 3.3 to 5.2 times, and Nemo's reasoning step alone is 1.4
-to 2.1 times slower than Sparkles' whole run. On the smallest RDFS input, OWL2Bench(1), 20
-threads are 9% slower than one, and elsewhere they gain 9 to 36%. Sparkles holds more
-memory than Nemo on every input but LUBM(100) under OWL 2 RL, which trades memory for time.
+time alone. On OWL 2 RL, Sparkles on one thread is RATIO_OWL times as fast as Nemo's
+whole run. On RDFS it is 3.3 to 5.2 times as fast, and 1.4 to 2.1 times as fast as Nemo's
+reasoning step alone. Twenty threads reduce the elapsed time by GAIN_RANGE against one,
+except on the smallest RDFS input, OWL2Bench(1), where they give no gain. Sparkles at 20
+threads holds RSS_RATIO times Nemo's peak memory on every other row. On LUBM(100) under
+OWL 2 RL it holds less memory than Nemo and also takes less time.
 
 ## Query-time reasoning latency
 
