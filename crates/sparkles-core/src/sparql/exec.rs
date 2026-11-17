@@ -3446,7 +3446,7 @@ fn topk_rest(
     // order, in one charged, operation-local pass, for the checks and the prefilter
     // below. A larger input reads them through the value cache in parallel.
     let decoded = if rest.len() <= PAR_THRESHOLD {
-        super::exprcache::cursor_dictionary_values(ctx, &rest, &Expr::Var(spec.var))?
+        super::exprcache::dictionary_values(ctx, &rest, &Expr::Var(spec.var))?
     } else {
         None
     };
@@ -3754,7 +3754,7 @@ fn morsel_best(
         return Ok(Some((t, n, last)));
     }
     rows.add(t.mem_bytes().saturating_sub(estimate))?;
-    let decoded = super::exprcache::cursor_dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
+    let decoded = super::exprcache::dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
     let total = match &decoded {
         Some(values) => rest_total(ctx, &t, values)?,
         // without a decoded column, values are read one at a time, as eager execution
@@ -5334,15 +5334,17 @@ impl Decoded {
 }
 
 /// Decode the base-vocabulary ids of the columns the expressions read into row-aligned
-/// value columns for a table of more than [`PAR_THRESHOLD`] rows: rows are argsorted by
-/// id so every distinct term is decoded once and each front-coded block is touched once
-/// (in parallel); per-row lookups are then O(1) and lock-free. A smaller table, such as
-/// a cursor's batch, reads its values through the value cache row by row. Each column's
-/// slots are charged before it is decoded and its values after, and a column whose
-/// charge does not fit is left to the rows, as are the columns after it.
-fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
+/// value columns for a table of more than [`PAR_THRESHOLD`] rows, through the one sorted
+/// pre-decode ([`super::exprcache::vocabulary_values`]): every distinct term is decoded
+/// once in key order with its storage admitted before it is built, and its value moves
+/// or is cloned to its rows, so that per-row lookups are O(1) and lock-free. A smaller
+/// table reads its values through the value cache row by row. Each column's slots are
+/// charged before it is decoded and its rows' values after, and a column whose charge
+/// or decoding the budget refuses is left to the rows, as are the columns after it.
+/// Only cancellation and the deadline fail it.
+fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> {
     if t.len() < 2 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
-        return None;
+        return Ok(None);
     }
     let mut vars = Vec::new();
     for e in exprs {
@@ -5357,12 +5359,11 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
         if ctx.opt.prefetch_terms && crate::index::io_hints() {
             prefetch_column_terms(ctx, t, &vars);
         }
-        return None;
+        return Ok(None);
     }
     if t.len() <= PAR_THRESHOLD {
-        return None;
+        return Ok(None);
     }
-    let vocab = &ctx.snap.generation.vocab;
     let mut out: super::expr::DecodedCols = vec![None; t.width()];
     let mut charge: Option<super::ctx::RetainedCharge> = None;
     // Charge `total` bytes in all, `false` when the query cannot hold them. Shrinking
@@ -5384,63 +5385,60 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<Decoded> {
     for v in vars {
         let Some(c) = t.col_of(v) else { continue };
         let col = &t.cols[c];
-        let mut idx: Vec<u32> = (0..col.len() as u32)
-            .filter(|&i| col[i as usize].tag() == crate::id::Tag::Vocab)
-            .collect();
-        if idx.len() < 4096 {
+        if col
+            .iter()
+            .filter(|id| id.tag() == crate::id::Tag::Vocab)
+            .count()
+            < 4096
+        {
             continue;
         }
-        // While the column is made: its slots, the sorted rows with their distinct ids,
-        // and the distinct decoded values before they move to their rows.
+        // the column's slots, before the distinct values are decoded with their own
+        // charge
         let slots = col.len() as u64 * std::mem::size_of::<Option<Value>>() as u64;
-        let scratch = idx.len() as u64 * (12 + std::mem::size_of::<Value>() as u64);
-        if !set(kept.saturating_add(slots).saturating_add(scratch)) {
+        if !set(kept.saturating_add(slots)) {
             set(kept);
             break;
         }
-        idx.par_sort_unstable_by_key(|&i| col[i as usize]);
-        let mut uniq: Vec<u64> = idx.iter().map(|&i| col[i as usize].payload()).collect();
-        uniq.dedup();
-        let decoded = decode_sorted(vocab, &uniq);
-        if decoded.len() != uniq.len() {
-            set(kept);
-            continue;
-        }
-        let mut vals: Vec<Option<Value>> = vec![None; col.len()];
-        if decoded.len() == idx.len() {
-            // every row holds a different term: move the values instead of cloning
-            for (&i, v) in idx.iter().zip(decoded) {
-                vals[i as usize] = Some(v);
+        let mut values = match super::exprcache::vocabulary_values(ctx, t, v) {
+            Ok(Some(values)) => values,
+            Ok(None) => {
+                set(kept);
+                break;
             }
-        } else {
-            let mut j = 0;
-            for &i in &idx {
-                let p = col[i as usize].payload();
-                while uniq[j] != p {
-                    j += 1;
-                }
-                vals[i as usize] = Some(decoded[j].clone());
+            Err(crate::Error::BudgetExceeded(b))
+                if matches!(
+                    b.kind,
+                    crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                ) =>
+            {
+                set(kept);
+                break;
             }
-        }
+            Err(error) => return Err(error),
+        };
+        let vals = values.sentinel_rows();
         let payload: u64 = vals
             .par_iter()
             .with_min_len(PAR_MIN_LEN)
             .map(key_payload)
             .sum();
-        // A column that does not fit gives back everything it charged.
+        // A column that does not fit gives back everything it charged. The distinct
+        // values' own charge goes once the rows' values are charged.
         let total = kept.saturating_add(slots).saturating_add(payload);
         if !set(total) {
             set(kept);
             break;
         }
+        drop(values);
         kept = total;
         out[c] = Some(vals);
     }
     drop(set);
-    Some(Decoded {
+    Ok(Some(Decoded {
         cols: out,
         _charge: charge,
-    })
+    }))
 }
 
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
@@ -5458,63 +5456,6 @@ fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
     if ids.len() >= 2 {
         ctx.snap.generation.vocab.prefetch_value_pages(&ids);
     }
-}
-
-/// The values of base vocabulary ids (sorted, distinct), in their order: numbers from
-/// the numeric column when the vocabulary has one, the others decoded from their keys,
-/// each front-coded block touched once (in parallel). Fewer values than ids when a key
-/// is missing.
-fn decode_sorted(vocab: &crate::vocab::Vocab, uniq: &[u64]) -> Vec<Value> {
-    let decode = |ids: &[u64]| -> Vec<Value> {
-        ids.par_chunks(4096)
-            .flat_map_iter(|chunk| {
-                let mut part = Vec::with_capacity(chunk.len());
-                vocab.get_sorted(chunk, |_, k| part.push(Value::from_key(k)));
-                part
-            })
-            .collect()
-    };
-    let Some(num) = vocab.numeric() else {
-        return decode(uniq);
-    };
-    if !uniq.iter().any(|&id| num.may_hold(id)) {
-        return decode(uniq);
-    }
-    if (2..=1 << 16).contains(&uniq.len()) {
-        // the keys of the ids outside the column's segments are read meanwhile
-        let keys: Vec<u64> = uniq
-            .iter()
-            .copied()
-            .filter(|&id| !num.may_hold(id))
-            .collect();
-        vocab.prefetch_sorted(&keys);
-    }
-    let from_column: Vec<Option<Value>> = uniq
-        .par_chunks(4096)
-        .flat_map_iter(|chunk| num.get_many(chunk).into_iter().map(|n| n.value()))
-        .collect();
-    let rest: Vec<u64> = uniq
-        .iter()
-        .zip(&from_column)
-        .filter(|(_, v)| v.is_none())
-        .map(|(&p, _)| p)
-        .collect();
-    if rest.len() == uniq.len() {
-        return decode(uniq);
-    }
-    let mut rest = decode(&rest).into_iter();
-    let mut out = Vec::with_capacity(uniq.len());
-    for v in from_column {
-        match v {
-            Some(v) => out.push(v),
-            None => match rest.next() {
-                Some(v) => out.push(v),
-                // a missing key: the caller sees fewer values than ids
-                None => break,
-            },
-        }
-    }
-    out
 }
 
 /// Keep the rows that pass every conjunct: EXISTS conjuncts answered from a key set
@@ -5569,7 +5510,7 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
         return Ok(keep);
     }
     let t0 = Instant::now();
-    let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
+    let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>())?;
     tracing::debug!(target: "sparkles::sparql::exec", "decoded values in {:?}", t0.elapsed());
     evaluate_mask(ctx, t, exprs, Decoded::cols(&dec))
 }
@@ -5753,7 +5694,7 @@ pub(super) fn compute_column(
 }
 
 fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
-    let dec = decode_for(ctx, t, &[e]);
+    let dec = decode_for(ctx, t, &[e])?;
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| match eval(
         e,
@@ -5811,7 +5752,7 @@ fn topk_candidates(
     let values = match decoded {
         Some(values) => Some(values),
         None if t.len() <= PAR_THRESHOLD => {
-            owned = super::exprcache::cursor_dictionary_values(ctx, t, expr)?;
+            owned = super::exprcache::dictionary_values(ctx, t, expr)?;
             owned.as_ref()
         }
         None => None,
@@ -6347,7 +6288,7 @@ fn key_per_value(
         return Ok(None);
     }
     let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])))
+        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])?))
     })?;
     // The distinct keys' payloads stay with them until the sort is done.
     if let Some(values) = &mut values {
@@ -6372,7 +6313,7 @@ fn key_column(
     Ok(match key_per_value(ctx, t, e, report)? {
         Some(p) => super::exprcache::Column::Values(p),
         None if t.len() <= PAR_THRESHOLD => key_column_charged(ctx, t, e, None)?,
-        None => key_column_charged(ctx, t, e, Decoded::cols(&decode_for(ctx, t, &[e])))?,
+        None => key_column_charged(ctx, t, e, Decoded::cols(&decode_for(ctx, t, &[e])?))?,
     })
 }
 
@@ -6402,7 +6343,7 @@ fn order_by_rows(
         .map(|((e, _), _)| e)
         .collect();
     let dec = if t.len() > PAR_THRESHOLD {
-        decode_for(ctx, &t, &rest)
+        decode_for(ctx, &t, &rest)?
     } else {
         None
     };
@@ -10034,6 +9975,105 @@ mod string_order_tests {
         streamed.sort();
         assert!(!eager.is_empty());
         assert_eq!(streamed, eager);
+    }
+
+    /// A table of more than `PAR_THRESHOLD` rows, with `distinct` distinct stored strings
+    /// first and an inline number and a local string after them.
+    fn wide(ctx: &Ctx, s: &Store, distinct: usize) -> (Table, VarId) {
+        let snap = s.snapshot();
+        let words: Vec<Id> = words()
+            .iter()
+            .map(|w| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(w).into())
+                    .unwrap()
+            })
+            .collect();
+        let x = ctx.var("x");
+        let mut t = Table::new(vec![x]);
+        let local = ctx.intern_value(&Value::Str("local".into()));
+        for i in 0..PAR_THRESHOLD + 4096 {
+            let id = match i % 64 {
+                62 => Id::from_i64(i as i64).unwrap(),
+                63 => local,
+                _ => words[i % distinct.min(words.len())],
+            };
+            t.push_row(&[id]);
+        }
+        (t, x)
+    }
+
+    fn str_of(x: VarId) -> Expr {
+        use super::super::expr::Func;
+        Expr::Call(
+            Func::Builtin(spargebra::algebra::Function::Str),
+            vec![Expr::Var(x)],
+        )
+    }
+
+    /// The row-aligned pre-decode decodes every base-vocabulary row to its value in both
+    /// modes, with or without the `expr_cache` switch and with shared or distinct terms,
+    /// and leaves the other rows to the row path.
+    #[test]
+    fn the_row_aligned_pre_decode_matches_the_values_of_its_rows() {
+        let (s, _) = store("long");
+        for cursor in [false, true] {
+            for expr_cache in [true, false] {
+                for distinct in [7, usize::MAX] {
+                    let mut ctx = Ctx::new(s.snapshot());
+                    ctx.mem_limit = 256 << 20;
+                    ctx.opt.expr_cache = expr_cache;
+                    if cursor {
+                        ctx.enable_cursor_accounting().unwrap();
+                    }
+                    let ctx = std::sync::Arc::new(ctx);
+                    ctx.attach_owner();
+                    let (t, x) = wide(&ctx, &s, distinct);
+                    let e = str_of(x);
+                    let decoded = decode_for(&ctx, &t, &[&e]).unwrap().expect("decoded");
+                    let col = decoded.cols[0].as_ref().expect("the column is decoded");
+                    for (i, (&id, value)) in t.cols[0].iter().zip(col).enumerate() {
+                        if id.tag() == Tag::Vocab {
+                            assert_eq!(
+                                format!("{value:?}"),
+                                format!("{:?}", ctx.value(id)),
+                                "row {i}"
+                            );
+                        } else {
+                            assert!(value.is_none(), "row {i}");
+                        }
+                    }
+                    assert!(ctx.check().is_ok());
+                }
+            }
+        }
+    }
+
+    /// A budget that does not hold the decoded column leaves it to the rows without an
+    /// error, in both modes of a context with an owner to charge.
+    #[test]
+    fn a_refused_pre_decode_leaves_the_column_to_the_rows() {
+        let (s, _) = store("long");
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 1 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let ctx = std::sync::Arc::new(ctx);
+            ctx.attach_owner();
+            let (t, x) = wide(&ctx, &s, usize::MAX);
+            let held = ctx
+                .charge((1 << 20) - ctx.live_bytes() - (64 << 10))
+                .unwrap();
+            let e = str_of(x);
+            let decoded = decode_for(&ctx, &t, &[&e]).unwrap();
+            assert!(
+                decoded.is_none_or(|d| d.cols[0].is_none()),
+                "cursor {cursor}"
+            );
+            drop(held);
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
     }
 
     /// A cursor reserves the keys its floors read, so a string longer than the budget
