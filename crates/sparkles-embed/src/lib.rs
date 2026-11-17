@@ -6,8 +6,13 @@
 //! thread runs the batches on a small dedicated thread pool at a lower scheduling
 //! priority, serves queries before documents, and drops the weights after an idle time.
 //!
+//! A process that embeds calls [`confine_candle_threads`] first in `main`, before it starts
+//! any thread, so that Candle's kernels run on these pools only.
+//!
 //! ```no_run
 //! use sparkles_embed::{Embedder, Kind, ModelSpec, Options};
+//! // SAFETY: at the start of main, before any other thread exists
+//! unsafe { sparkles_embed::confine_candle_threads() };
 //! let e = Embedder::new(ModelSpec::new("/var/lib/sparkles/models/org/model/rev"), Options::default())?;
 //! let v = e.embed(&["rivers of southern France"], Kind::Query)?;
 //! # Ok::<(), sparkles_embed::Error>(())
@@ -302,7 +307,10 @@ fn resolve(cfg: &SnapshotConfig, spec: &ModelSpec) -> Result<Settings> {
 
 impl Embedder {
     /// Read and check the snapshot's configuration and start the dispatcher. The weights
-    /// are not read until the first [`embed`](Embedder::embed).
+    /// are not read until the first [`embed`](Embedder::embed). Without
+    /// [`confine_candle_threads`] at the start of the process, Candle runs large
+    /// elementwise operations on threads of its own outside [`Options::threads`], and on
+    /// some machines reads `/proc/cpuinfo` for every matrix product.
     pub fn new(spec: ModelSpec, opts: Options) -> Result<Embedder> {
         if opts.threads == 0 || opts.micro_batch == 0 || opts.max_queued == 0 {
             return Err(Error::Invalid(

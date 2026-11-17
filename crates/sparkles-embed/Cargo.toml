@@ -35,3 +35,9 @@ sparkles-alloc.workspace = true
 [[example]]
 name = "embed-bench"
 path = "examples/embed_bench.rs"
+
+# its own main, so the environment is written before any thread exists
+[[test]]
+name = "candle_threads"
+path = "tests/candle_threads.rs"
+harness = false
