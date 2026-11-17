@@ -25,6 +25,21 @@ with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which
 their advisories. The SvelteKit advisories that only 3.x fixes concern features the
 static UI does not use, and roadmap item 1049 covers the migration.
 
+### Cursor scans charge no index block
+
+A cursor scan over an immutable snapshot keeps its place inside an index block between
+batches through a handle that leaves the decoded columns to the block cache, and it
+decodes the block again when the cache has dropped it. It no longer charges a whole
+block's columns, about 1 MiB, from its first read, which completes roadmap item 1039.
+That charge was taken only when the budget had room for it, so a query such as a count
+over a path closure could be refused under a budget above one at which it answered.
+Batches that a cursor hands out without copying share one charge of their block's
+decoded columns while any of them is held, and the cursor copies rows instead when that
+charge does not fit. Automatic execution's test of whether a cursor fits no longer
+counts a block, so it streams and answers some queries under small budgets that it
+refused before. A cursor that reads a snapshot without filling the block cache, as an
+export does, decodes its current block again for each batch.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,

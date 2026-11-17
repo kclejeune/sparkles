@@ -232,6 +232,12 @@ check them against the W3C suites and Jena's own answers.
   they have not finished and at most a batch more. A full sort and the
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
+* A cursor scan keeps its place inside an index block between batches without charging
+  the block to the query, since the block cache holds its decoded columns, and it
+  decodes the block again when the cache has dropped it. A larger budget therefore never
+  leaves the rest of a query less memory than a smaller one. Batches that a cursor hands
+  out without copying hold their block, and they are charged its decoded columns while
+  any of them is held.
 * Property path closures run within the query's memory budget and timeout in both
   executors. A closure counts its visited set, its frontier and the edge relation of a
   sequence or alternative path against the budget, and the walk checks the deadline while

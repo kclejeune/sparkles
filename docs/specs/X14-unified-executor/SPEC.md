@@ -742,6 +742,28 @@ that stage 6 makes independent of the mode. Item 678 holds the two decoding twin
 that remain, the string floors and the dictionary pre-decode of a cursor batch, which
 `decode_for` does not yet serve.
 
+Roadmap item 1039 removed the cursor scan's block charge. A scan over an immutable
+snapshot kept its decoded index block between batches and charged a whole block's
+columns, `BLOCK_ROWS * 32 + 512` bytes, when the memory left at its first read covered
+that and one batch, and under a smaller budget it seeked each batch without a charge. A
+query could therefore be refused under a budget above one at which it answered. On 2,000
+subjects of one class, a count over `?s (:name|:none)* ?v` was refused under automatic
+and streaming execution at 1,216 and 1,280 KiB, and the closure's unfilled LIMIT in every
+mode at 1,152 and 1,216 KiB, while each answered within 512 KiB. With 69,536 subjects,
+so that the scan reads whole blocks, streaming execution refused the count from 1,216 to
+1,472 KiB and the LIMIT from 1,152 to 1,408 KiB. The scan now holds its block only during
+a read and keeps a `WeakBlock` of its columns between reads, which the block cache keeps
+alive, and it decodes the block again at its row when the cache has dropped it. The
+batches that the cursor root hands out without copying share one charge of the block's
+decoded columns, taken at hand-out and ended with the last of them, and the root copies
+rows when that charge does not fit. `cursor_headroom` counts a block only for the
+admission of a plain scan, whose speed comes from those uncopied batches, and not in
+`cursor_fits`. The tests in `tests/scan_block_budget.rs` check that each mode's answers
+are monotone in the budget on both fixtures and on a root scan, and that the scan's peak
+does not step by a block. A cursor over a read-through snapshot, which keeps no blocks,
+decodes its current block again for each batch, and no cursor query reads such a
+snapshot.
+
 ### One join-kernel library
 
 The module `sparql/join` of `sparkles-core` holds one kernel per join algorithm, and

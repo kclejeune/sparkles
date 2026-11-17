@@ -10709,8 +10709,7 @@ spill file, and `--spill off` turns spill off. These operators spill when it is 
   hash of their keys. Each file is grouped by a pass of its own after the first groups are
   sent, so every aggregate, `GROUP_CONCAT` order and DISTINCT included, sees the rows it
   would see in memory. A later pass sizes itself from the memory it has when it starts,
-  and operators that have finished give back what they held for reading, such as the
-  decoded block of each scan.
+  and operators that have finished give back what they held for reading.
 * A DISTINCT over unordered input does the same with a hash of the whole row, and the
   rows from the files come after the others. Over input ordered on all its columns it
   needs no memory. In `SELECT DISTINCT … ORDER BY` whose sort keys use only projected
