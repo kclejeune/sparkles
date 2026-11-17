@@ -2551,7 +2551,7 @@ impl<'a> Run<'a> {
                     continue;
                 }
                 // R3 of the Horn rules waits for the activation's universals
-                if R::HORN && horn_rules::flush(self.ix, &mut st, &mut out) {
+                if R::HORN && horn_rules::flush(self.ix, me, &mut st, &mut out) {
                     continue;
                 }
                 // Tier D's clauses wait for the units, which the EL rules take first

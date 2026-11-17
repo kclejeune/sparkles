@@ -1161,7 +1161,7 @@ impl<'a> World<'a> {
                     if data_halted.get()
                         || self.halted
                         || !horn
-                        || !super::horn_rules::flush(ix, &mut st, &mut sink)
+                        || !super::horn_rules::flush(ix, e, &mut st, &mut sink)
                     {
                         break;
                     }

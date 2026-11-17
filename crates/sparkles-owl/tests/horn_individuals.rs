@@ -490,8 +490,8 @@ fn a_universal_over_a_loop_assertion_reaches_the_individual_itself() {
 
 #[test]
 fn r5_at_an_individual_that_is_its_own_successor_takes_the_other_successor() {
-    // a has r to itself and to b and r is functional, so b is a, and a's universal
-    // over the conjunction that R5 would make reaches a itself
+    // a has r to itself and to b and r is functional, so b is a. a is then in S, which
+    // b is asserted in, and S gives a's s-successor e the class M
     let body = "ObjectPropertyAssertion(:r :a :a)
          ObjectPropertyAssertion(:r :a :b)
          FunctionalObjectProperty(:r)
@@ -518,7 +518,8 @@ fn r5_at_an_individual_that_is_its_own_successor_takes_the_other_successor() {
 
 #[test]
 fn successors_by_several_roles_to_one_individual_take_the_universals_of_their_superrole() {
-    // a has r1 and r2 to b, both under s, and every s-successor of a is in C and in D
+    // a has r1 and r2 to b and r2 to d, both roles under s. Every s-successor of a is
+    // in C, and every r1-successor is in D, which d is not
     let out = check(
         "SubObjectPropertyOf(:r1 :s)
          SubObjectPropertyOf(:r2 :s)

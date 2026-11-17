@@ -485,12 +485,7 @@ fn extend<S: Sink>(
     }
     let m = match named(ix, real, &core) {
         Some(a) => {
-            // successors by several roles can have one conjunction, which the
-            // individual is sent once in a flush
-            if !sends.seen.contains(&core) {
-                sends.stop |= !send_named(a, &core, out);
-                sends.seen.insert(core);
-            }
+            send_named(a, &core, sends, out);
             if a != n {
                 out.me(Concl::Succ(r, a));
             }
@@ -521,25 +516,48 @@ fn named(ix: &Index, real: bool, core: &[Ex]) -> Option<Ex> {
         .find(|&e| matches!(ix.head(e).node, Node::Nominal(_)))
 }
 
-/// What a flush keeps of its sends to individuals: the conjunctions it sent, and
-/// whether a check of the run's bounds after one of them stopped the run.
-#[derive(Default)]
+/// What a flush keeps of its sends to individuals.
 struct Sends {
-    seen: FxHashSet<Vec<Ex>>,
+    /// the context of the flush
+    me: Ex,
+    /// the members the flush sent the context itself, when it is an individual
+    own: FxHashSet<Ex>,
+    /// whether a check of the run's bounds after a send stopped the run
     stop: bool,
 }
 
-/// Sends the individual `a` the other members of the conjunction `core`, and counts the
-/// messages against the run's bounds, since one flush can send a conjunction for each
-/// successor before the activation applies a conclusion. The answer is whether the run
-/// goes on.
-fn send_named<S: Sink>(a: Ex, core: &[Ex], out: &mut S) -> bool {
+impl Sends {
+    fn new(me: Ex) -> Sends {
+        Sends {
+            me,
+            own: FxHashSet::default(),
+            stop: false,
+        }
+    }
+}
+
+/// Sends the individual `a` the other members of the conjunction `core`. One flush can
+/// send a conjunction for each successor before the activation applies a conclusion, so
+/// the messages to another context are counted against the run's bounds, and
+/// `sends.stop` says that the run stopped there. The messages to the context itself wait
+/// in the activation's own list, which no bound counts, so the flush sends each member
+/// once. The list then grows by no more than the fillers of the context's universals and
+/// the cores of its successors, which the run holds and has counted.
+fn send_named<S: Sink>(a: Ex, core: &[Ex], sends: &mut Sends, out: &mut S) {
+    if a == sends.me {
+        for &e in core {
+            if e != a && sends.own.insert(e) {
+                out.send(a, Concl::Sub(e));
+            }
+        }
+        return;
+    }
     for &e in core {
         if e != a {
             out.send(a, Concl::Sub(e));
         }
     }
-    out.sent_go_on()
+    sends.stop |= !out.sent_go_on();
 }
 
 /// R3 at the end of an activation, over the successors that came since the last call, or
@@ -547,7 +565,7 @@ fn send_named<S: Sink>(a: Ex, core: &[Ex], out: &mut S) -> bool {
 /// universal the context holds by then, so that universals that come one after another
 /// create no context for each conjunction on the way. The answer is whether it sent a
 /// conclusion to the context.
-pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
+pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
     let Some(x) = st.extra.as_mut() else {
         return false;
     };
@@ -561,9 +579,8 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S) -> bool {
     let mut merges = std::mem::take(&mut h.merges);
     merges.sort_unstable();
     merges.dedup();
-    // the conjunctions that an individual was sent in this flush, and whether the run
-    // stopped at one of them
-    let mut sends = Sends::default();
+    // what the flush sent the context itself, and whether the run stopped at a send
+    let mut sends = Sends::new(me);
     for (s, b) in merges {
         sent |= merge_all(ix, st, s, b, &mut sends, out);
         // a run that stopped keeps nothing of the flush
@@ -769,7 +786,7 @@ fn merge_all<S: Sink>(
     let a = named(ix, st.real, &u);
     let m = match a {
         Some(a) => {
-            sends.stop |= !send_named(a, &u, out);
+            send_named(a, &u, sends, out);
             a
         }
         None if u.len() == 1 => u[0],
@@ -1485,18 +1502,70 @@ mod tests {
             checks: 0,
             left,
         };
-        // every individual takes the filler, with a check after each, and the context
-        // gets no successor
+        // every individual takes the filler, with a check after each, and the context,
+        // which is the class, gets no successor
+        let me = c;
         let mut out = sink(usize::MAX);
-        assert!(flush(&ix, &mut state(true), &mut out));
+        assert!(flush(&ix, me, &mut state(true), &mut out));
         let expected: Vec<(Ex, Concl)> = ns.iter().map(|&n| (n, Concl::Sub(c))).collect();
         assert_eq!(out.sent, expected);
         assert_eq!(out.checks, ns.len());
         assert!(out.local.is_empty());
         // the run stops at the first check, and the flush sends no more
         let mut out = sink(1);
-        flush(&ix, &mut state(true), &mut out);
+        flush(&ix, me, &mut state(true), &mut out);
         assert_eq!(out.sent, expected[..1]);
+    }
+
+    /// R3 at an individual that is its own successor by several roles sends the context
+    /// each filler once in a flush. The messages wait in the activation's own list,
+    /// which no bound counts, so the list grows by the distinct fillers and not by the
+    /// fillers of every role (item 869).
+    #[test]
+    fn a_flush_at_an_individual_sends_the_context_itself_each_member_once() {
+        let mut it = Interner::new();
+        let d = it.class(&Class::new("urn:named:d"));
+        let cs: Vec<Ex> = (0..3)
+            .map(|k| it.class(&Class::new(format!("urn:named:c{k}"))))
+            .collect();
+        let a = it.nominal(&crate::model::NamedIndividual::new("urn:named:a"));
+        let _ = it.node(Node::Top);
+        let mut ix = Index::build(&Axioms::default(), &mut it, None, &|| false).unwrap();
+        ix.horn = Some(Box::new(HornIx {
+            flags: Vec::new(),
+            base: it.nodes.len() as Ex,
+            dominate: false,
+        }));
+        // a is its own successor by three roles, each with a filler of its own and one
+        // that all three share
+        let mut st = State {
+            real: true,
+            ..State::default()
+        };
+        let h = hs(&mut st);
+        for (r, &c) in cs.iter().enumerate() {
+            let r = r as Role;
+            h.succ.insert((r, a));
+            h.alls.push((r, c));
+            h.alls.push((r, d));
+            h.all_roles.push(r);
+        }
+        h.dirty = true;
+        let mut out = Recorded {
+            sent: Vec::new(),
+            local: Vec::new(),
+            checks: 0,
+            left: usize::MAX,
+        };
+        assert!(flush(&ix, a, &mut st, &mut out));
+        // the three conjunctions hold six fillers in all, four of them distinct
+        assert_eq!(out.sent.len(), 4, "{:?}", out.sent);
+        for &e in cs.iter().chain([&d]) {
+            assert!(out.sent.contains(&(a, Concl::Sub(e))));
+        }
+        // a already names itself by each role, and its own messages need no check
+        assert!(out.local.is_empty());
+        assert_eq!(out.checks, 0);
     }
 
     /// R6 records each pair of a predecessor and a successor whose core it sent, and the
