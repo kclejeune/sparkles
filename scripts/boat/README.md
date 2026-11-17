@@ -99,10 +99,13 @@ counts as startup work, so one scan before and one after the probe refused worke
 manifest had not changed. The phase therefore takes the bootstrap lock once and holds it
 through every attempt. Before each probe it waits for five seconds of consecutive scans
 that find no startup work, and when the scan after the probe finds some, it waits and
-probes again. A busy scan starts the wait again from an empty tracked set, so a shell
-whose children have ended counts as idle again. A manifest that differs from its first
-read refuses at once with no retry. No attempt starts more than 120 seconds after the
-phase began, and at most six probes run, inside the metadata unit's 240 seconds. The
+probes again. One tracked set spans the whole phase, so a descendant of startup work
+stays startup work after its parents exit, wherever it is reparented. Only the agent's
+shell and sudo, which are allowed by their children, leave the set once they are allowed
+session processes again, and their former descendants stay in it. A manifest that
+differs from its first read refuses at once with no retry. No probe starts 120 seconds or
+more after the phase began, the user-manager query gets only the time left, and at most
+six probes run, inside the metadata unit's 240 seconds. The
 phase refuses with `startup not quiescent before tools` when no quiet window held, and
 with `startup work during qualification` when startup work followed the last probe. Both
 refusals keep the bounded inventory of the startup work last seen.

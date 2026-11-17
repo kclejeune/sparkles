@@ -297,11 +297,14 @@ def observe_startup(payload):
 # before each probe, and runs the probe again when the scan after it finds some.
 # It holds the bootstrap lock through every attempt, so no bootstrap can run
 # meanwhile. A manifest that differs from its first read refuses at once. An
-# accepted probe always lies between a quiet window and a clean scan. A busy scan
-# starts the window again from an empty tracked set, as the single scan before the
-# probe always did, so a shell that has ended its children counts as idle again.
-# No attempt starts more than QUALIFY_SECONDS after the phase began, inside the
-# metadata unit's 240 seconds, and a refusal keeps the last busy inventory.
+# accepted probe always lies between a quiet window and a clean scan. One tracked set
+# spans the whole phase, so a descendant of startup work stays startup work after its
+# parents exit, wherever it is reparented. The one exception is the agent's own shell
+# or sudo, the session processes allowed only by their children (SESSION_CHILDREN):
+# once it is again an allowed session process, its own identity leaves the set, and
+# its former descendants stay in it. No probe starts QUALIFY_SECONDS or more after the
+# phase began, inside the metadata unit's 240 seconds, the user-manager query gets
+# only the time left, and a refusal keeps the last busy inventory.
 QUIET_SECONDS=5
 QUALIFY_SECONDS=120
 QUALIFY_ATTEMPTS=6
@@ -316,42 +319,53 @@ def with_inventory(error,seen):
     error.unallowed=unallowed_inventory(rows,busy);error.unallowed_count=len(busy)
     return error
 
+def release_idle_session(tracked,rows,manager):
+    """Drop from ``tracked`` the agent shells and sudos that are allowed session processes again."""
+    for pid,start in list(tracked):
+        row=rows.get(pid)
+        if row is not None and row['start']==start and row['comm'] in SESSION_CHILDREN and provider_session(pid,rows,manager):
+            tracked.discard((pid,start))
+
 def quiet_window(scan,clock,pause,deadline,seconds=QUIET_SECONDS):
     """Wait, within the deadline, until consecutive scans find no startup work for ``seconds``.
 
-    ``scan(tracked)`` returns the rows and the busy processes for one tracked set.
-    Each busy scan starts the window again with a new set. Returns the window's set
-    when it held, or None and the last busy scan when the deadline passed."""
-    tracked=set();since=None;seen=None
+    Returns True and None when the window held before the deadline, otherwise False
+    and the last busy scan, if any."""
+    since=None;seen=None
     while clock()<deadline:
-        rows,busy=scan(tracked)
-        if busy:tracked=set();since=None;seen=(rows,busy)
+        rows,busy=scan()
+        if busy:since=None;seen=(rows,busy)
         elif since is None:since=clock()
-        elif clock()-since>=seconds:return tracked,None
+        elif clock()-since>=seconds:return clock()<deadline,seen
         pause(min(SCAN_PAUSE,max(0.0,deadline-clock())))
-    return None,seen
+    return False,seen
 
-def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows:None):
+def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows,left:None):
     """The metadata probe between a quiet startup window and a clean scan, under the bootstrap lock."""
-    deadline=clock()+QUALIFY_SECONDS;seen=None;attempts=0
-    def scan(tracked):
-        rows=rows_reader();return rows,foreign_startup(rows,launcher,probe_pid,tracked,manager_reader(rows))
+    deadline=clock()+QUALIFY_SECONDS;seen=None;attempts=0;tracked=set()
+    def scan():
+        rows=rows_reader();left=deadline-clock();manager=manager_reader(rows,left) if left>0 else None
+        release_idle_session(tracked,rows,manager)
+        return rows,foreign_startup(rows,launcher,probe_pid,tracked,manager)
     with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
         before,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
         need(before['sha256']==expected_manifest,'qualification manifest pin')
-        while attempts<QUALIFY_ATTEMPTS and clock()<deadline:
-            tracked,quiet_seen=quiet_window(scan,clock,pause,deadline)
-            if tracked is None:raise with_inventory(Refusal('startup not quiescent before tools'),quiet_seen or seen)
+        while attempts<QUALIFY_ATTEMPTS:
+            quiet,window_seen=quiet_window(scan,clock,pause,deadline)
+            seen=window_seen or seen
+            # A window that held only at or after the deadline starts no probe.
+            if not quiet or clock()>=deadline:break
             attempts+=1;result=run_probe()
             after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
             need(after==before,'startup manifest changed during qualification')
-            rows,busy=scan(tracked)
+            rows,busy=scan()
             if not busy:
                 result.update({'startup_closed':True,'bootstrap_lock':lock,'bootstrap_occurrence':'unknown','actual_toolchain_manifest':{'path':str(state/'toolchain.json'),'sha256':before['sha256']},'runtime_env_file':None,'qualification_attempts':attempts})
                 return result
             seen=(rows,busy)
+        if attempts==0:raise with_inventory(Refusal('startup not quiescent before tools'),seen)
         raise with_inventory(Refusal('startup work during qualification'),seen)
 
 def qualify_with_startup_lock(payload):
     home=Path.home();uid=os.getuid();token=token_metadata(home/'.config/mbx/remote-token',uid);denied=(token['device'],token['inode']);state=home/'.local/state/sparkles-boat'
-    return qualify_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],lambda:probe(payload),manager_reader=lambda rows:user_manager(rows,uid))
+    return qualify_at(state,uid,denied,payload['launcher_identity'],os.getpid(),payload['pins']['saved_toolchain_manifest_sha256'],lambda:probe(payload),manager_reader=lambda rows,left:user_manager(rows,uid,left))

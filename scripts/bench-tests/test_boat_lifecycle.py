@@ -1140,7 +1140,7 @@ class QualificationWait(unittest.TestCase):
             self.probes.append((clock.now(),len(self.scans)))
             if probe:probe()
             return {'qualified':True}
-        return self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r:manager)
+        return self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager)
 
     def test_the_recorded_trees(self):
         # w1-7 still shows the agent's shell running a shell that runs sudo.
@@ -1201,7 +1201,7 @@ class QualificationWait(unittest.TestCase):
         def run_probe():
             probes.append(clock.now());after[0]=True;return {'qualified':True}
         with self.assertRaises(self.O['Refusal']) as caught:
-            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r:manager)
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager)
         self.assertEqual(str(caught.exception),'startup work during qualification')
         self.assertEqual(len(probes),self.O['QUALIFY_ATTEMPTS']);self.assertLess(probes[-1],self.O['QUALIFY_SECONDS'])
         self.assertEqual({x['pid'] for x in caught.exception.unallowed},{67279,99001})
@@ -1216,7 +1216,7 @@ class QualificationWait(unittest.TestCase):
         def run_probe():
             probes.append(clock.now());clock.pause(50);after[0]=True;return {'qualified':True}
         with self.assertRaises(self.O['Refusal']):
-            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r:manager)
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager)
         self.assertTrue(all(t<self.O['QUALIFY_SECONDS'] for t in probes));self.assertEqual(len(probes),3)
 
     def test_a_manifest_change_refuses_at_once(self):
@@ -1234,6 +1234,53 @@ class QualificationWait(unittest.TestCase):
             with self.subTest(comm):
                 with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[self.with_child('w6-3',67279,comm,uid)])
                 self.assertEqual(str(caught.exception),'startup not quiescent before tools');self.assertEqual(self.probes,[])
+
+    def add(self,rows,pid,ppid,comm,uid=1000):
+        rows[pid]={'pid':pid,'ppid':ppid,'uid':uid,'comm':comm,'start':rows[ppid]['start']+1 if ppid in rows else 1,'group':pid};return rows
+
+    def test_a_reparented_descendant_of_an_agent_command_stays_startup_work(self):
+        # Review round 16, finding 1. The agent shell runs sudo, sh and a root tar. The
+        # shell, sudo and sh then exit or go idle and tar is reparented to pid 1, where
+        # neither its uid nor its name would count it. It stays tracked until it ends.
+        tree=self.trees['w6-3'][0]
+        busy=self.add(self.add(self.add(copy.deepcopy(tree),99001,67279,'sudo'),99002,99001,'sh',0),99003,99002,'tar',0)
+        orphan=copy.deepcopy(tree);orphan[99003]=dict(busy[99003],ppid=1)
+        self.assertEqual(self.busy('w6-3',orphan),set())
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[busy,orphan])
+        self.assertEqual(str(caught.exception),'startup not quiescent before tools');self.assertEqual(self.probes,[])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{99003})
+        # Once tar ends, the idle agent shell is released and the phase qualifies.
+        q=self.qualify('w6-3',[busy]+[orphan]*10+[tree])
+        self.assertEqual(q['qualification_attempts'],1);self.assertGreaterEqual(self.probes[0][0]-self.scans[11],self.O['QUIET_SECONDS'])
+        # The same descendant appearing after a probe holds off the next one too.
+        q=self.qualify('w6-3',[tree]*11+[busy]+[orphan]*10+[tree])
+        self.assertEqual(q['qualification_attempts'],2);self.assertGreaterEqual(self.probes[1][0]-self.scans[22],self.O['QUIET_SECONDS'])
+
+    def test_only_the_agent_shell_and_sudo_are_released(self):
+        # A session-named process under startup work stays tracked after it is reparented,
+        # where its name and chain alone would allow it.
+        tree=self.trees['w6-3'][0]
+        busy=self.add(self.add(copy.deepcopy(tree),99001,67279,'apt-get',0),99002,99001,'pulseaudio')
+        orphan=copy.deepcopy(tree);orphan[99002]=dict(busy[99002],ppid=1)
+        self.assertEqual(self.busy('w6-3',orphan),set())
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[busy,orphan])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{99002})
+
+    def test_no_probe_starts_at_or_after_the_bound(self):
+        # Review round 16, finding 2. A slow user-manager query moves a quiet window past
+        # the bound; no probe may start then, and each query gets only the time left.
+        clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279)
+        _,launcher,probe_pid,manager=self.trees['w6-3'];clock=controls.Clock();probes=[];lefts=[];scans=[0]
+        def rows():
+            scans[0]+=1;return child if clock.now()<113 else clean
+        def manager_reader(r,left):
+            lefts.append((clock.now(),left))
+            if clock.now()>=113:clock.pause(2)
+            return manager
+        with self.assertRaises(self.O['Refusal']) as caught:
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,lambda:probes.append(clock.now()) or {'qualified':True},rows,clock.now,clock.pause,manager_reader)
+        self.assertEqual(probes,[]);self.assertEqual(str(caught.exception),'startup not quiescent before tools')
+        self.assertTrue(all(0<left<=self.O['QUALIFY_SECONDS'] and abs(now+left-self.O['QUALIFY_SECONDS'])<1e-9 for now,left in lefts))
 
     def test_the_bootstrap_lock_is_held_through_every_attempt(self):
         import fcntl

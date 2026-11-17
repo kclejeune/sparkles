@@ -1,9 +1,9 @@
 {
   "files": {
     "README.md": {
-      "bytes": 36841,
+      "bytes": 37078,
       "mode": 420,
-      "sha256": "ed0271472fd800e3554c17089ffec724a90ba2fc041f04a062af15e1520b4bc9"
+      "sha256": "468df9f2a8a8caa5a9e5c08026f67d422d17d180bab2207d71eb31376527e5a4"
     },
     "common.py": {
       "bytes": 24734,
@@ -76,9 +76,9 @@
       "sha256": "b7eb00539172fb14a961fa442ce1325393d0ca1a781f96a4d43f3d7bffc42ea5"
     },
     "startup-observer.py": {
-      "bytes": 23534,
+      "bytes": 24290,
       "mode": 420,
-      "sha256": "ce0db6c664d1f86267e832c29a5c745554530a6b66b08f15e5974bf0b37b375b"
+      "sha256": "ddbd563fc7301acb2ee4ef763b99a85486022c3c716cfcc72fd86425c0237f5e"
     },
     "update_sources.py": {
       "bytes": 1367,
