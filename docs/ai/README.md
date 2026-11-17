@@ -21,6 +21,13 @@ build community reports.
   describe resources, find paths, list commits and changes, run full-text and vector
   search, validate with SHACL and ShEx, draft shapes, compare schemas, format SPARQL and
   RDF, run graph algorithms, and run GraphQL. Each stored query is a tool of its own.
+* `search_semantic` embeds a question with the provider of the dataset's vector index,
+  a local model or a remote endpoint, and fuses the nearest entities with the full-text
+  ranking. It refuses with `no-embedder` when no index embeds query text.
+* Tool profiles let a session load only the tools it needs. `--profile` or
+  `--mcp-profile` selects `explore`, `memory` or `admin`, and `--tools` or `--mcp-tools`
+  names single tools ([API.md](../API.md#tool-profiles)). A profile only narrows the
+  tools, and the `initialize` result reports the active set.
 * `check_query` checks a query against the schema without running it,
   `similar_queries` finds stored queries for a question, `link_entities` maps names to
   entities, and `recall` returns the facts around a question with a citation for each.
@@ -773,6 +780,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   keeps its answer for unrestricted readers only, so a reader with limited grants sees
   such a turn without its answer when the thread reopens. Recording each state the steps
   read is planned. Roadmap item 718.
+* A search that embeds its text, through `search_semantic`, `recall`, `link_entities` or
+  `spk:vectorSearch`, waits for the embedding provider under the index's own timeout and
+  retries rather than the call's deadline. Roadmap item 1030.
+* With `reasoning: false`, the memory search helpers leave out inferred hits after the
+  text and vector searches have taken their best 50, so strong inferred matches can push
+  asserted ones out of a `search_semantic`, `recall` or `link_entities` ranking. Roadmap
+  item 1031.
 * ChatGPT-plan model access is planned in [C28](../specs/C28-chatgpt-model-access.md).
   The existing OpenAI-compatible provider uses Chat Completions with configured API
   credentials. It does not accept a ChatGPT subscription as model access. Roadmap
@@ -875,7 +889,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item 503](../ROADMAP.md), [item 914](../ROADMAP.md).
+The remaining work described above refers to [item 6](../ROADMAP.md), [item 12](../ROADMAP.md), [item 15](../ROADMAP.md), [item 77](../ROADMAP.md), [item 81](../ROADMAP.md), [item 100](../ROADMAP.md), [item 260](../ROADMAP.md), [item 261](../ROADMAP.md), [item 262](../ROADMAP.md), [item 263](../ROADMAP.md), [item 270](../ROADMAP.md), [item 339](../ROADMAP.md), [item 340](../ROADMAP.md), [item 341](../ROADMAP.md), [item 344](../ROADMAP.md), [item 396](../ROADMAP.md), [item 503](../ROADMAP.md), [item 914](../ROADMAP.md), [item 1030](../ROADMAP.md), [item 1031](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

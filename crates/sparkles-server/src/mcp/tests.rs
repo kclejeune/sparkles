@@ -203,10 +203,20 @@ async fn a01_discover() {
         res["supportedVersions"],
         json!(["2026-07-28", "2025-11-25", "2025-06-18"])
     );
+    let mut caps = res["capabilities"].clone();
+    let set = caps
+        .as_object_mut()
+        .unwrap()
+        .remove("experimental")
+        .unwrap();
     assert_eq!(
-        res["capabilities"],
+        caps,
         json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true, "subscribe": true}, "tools": {"listChanged": true}})
     );
+    // the active tool set (item 489): every tool without a profile
+    let set = &set["io.sparkles/toolSet"];
+    assert_eq!(set["profiles"], json!(["all"]), "{set}");
+    assert_eq!(set["tools"][0], "list_datasets", "{set}");
     assert!(
         res["instructions"]
             .as_str()
@@ -235,10 +245,21 @@ async fn a02_legacy_handshake() {
         .await;
     let res = &r["result"];
     assert_eq!(res["protocolVersion"], "2025-11-25");
+    let mut caps = res["capabilities"].clone();
+    let set = caps
+        .as_object_mut()
+        .unwrap()
+        .remove("experimental")
+        .unwrap();
     assert_eq!(
-        res["capabilities"],
+        caps,
         json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true}, "tools": {"listChanged": true}})
     );
+    // the server's tools, of which the caller's listing holds those it may call
+    let offered = set["io.sparkles/toolSet"]["tools"].as_array().unwrap();
+    for t in modern_list["result"]["tools"].as_array().unwrap() {
+        assert!(offered.contains(&t["name"]), "{t}");
+    }
     assert_eq!(
         res["serverInfo"],
         json!({"name": "sparkles", "version": env!("CARGO_PKG_VERSION")})
@@ -463,6 +484,16 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "reasoning": rs, "atCommit": at, "at": sel}}),
         ),
         (
+            "search_semantic",
+            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+                "dataset": ds,
+                "query": {"type":"string","minLength":1,"maxLength":1000},
+                "predicate": {"type":"string","description":"Embedding predicate IRI whose vector index embeds query text (default: the first such index by name)"},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"default":10},
+                "withLabels": {"type":"boolean","default":true},
+                "reasoning": rs, "atCommit": at, "at": sel}}),
+        ),
+        (
             "check_query",
             json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds,
@@ -675,6 +706,7 @@ async fn a03_tool_list() {
             #[cfg(feature = "text")]
             "search_text",
             "similar_entities",
+            "search_semantic",
             "check_query",
             "similar_queries",
             "link_entities",
@@ -751,7 +783,7 @@ async fn a03_tool_list() {
         assert_eq!(tool["inputSchema"], schema, "input schema of {name}");
         assert_eq!(
             tool["annotations"],
-            json!({"readOnlyHint": true, "openWorldHint": false}),
+            json!({"readOnlyHint": true, "openWorldHint": name == "search_semantic"}),
             "{name}"
         );
         assert!(tool["title"].is_string() && tool["description"].is_string());

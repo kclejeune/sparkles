@@ -163,6 +163,7 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         #[cfg(feature = "text")]
         "search_text" => t.search_text(args),
         "similar_entities" => t.similar_entities(args),
+        "search_semantic" => t.search_semantic(args),
         #[cfg(feature = "shacl")]
         "validate_shacl" => t.validate_shacl(args),
         #[cfg(feature = "shex")]
@@ -2434,7 +2435,7 @@ impl Queries<'_> {
 }
 
 /// The label predicates as a `VALUES` list.
-fn label_values() -> String {
+pub(super) fn label_values() -> String {
     render::LABEL_PREDICATES
         .iter()
         .map(|p| format!("<{p}>"))
@@ -2442,7 +2443,7 @@ fn label_values() -> String {
         .join(" ")
 }
 
-fn label_rank(p: &Term) -> Option<usize> {
+pub(super) fn label_rank(p: &Term) -> Option<usize> {
     match p {
         Term::NamedNode(n) => render::LABEL_PREDICATES
             .iter()

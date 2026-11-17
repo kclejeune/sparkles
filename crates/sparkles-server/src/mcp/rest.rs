@@ -64,6 +64,8 @@ pub(crate) fn config(st: &AppState, mode: Mode) -> McpConfig {
     // switches do not apply to these routes
     cfg.datasets.clear();
     cfg.disabled.clear();
+    cfg.profiles.clear();
+    cfg.only = None;
     // `POST /{ds}/facts` needs `write` on the graphs it writes, which the tool checks,
     // and a read-only server writes nothing
     cfg.allow_update = mode == Mode::Write && !st.read_only;

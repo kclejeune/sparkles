@@ -45,6 +45,7 @@ mod notify;
 mod ontology;
 mod paths;
 mod pins;
+pub(crate) mod profiles;
 pub(crate) mod relevance;
 pub(crate) mod render;
 pub mod rest;
@@ -52,6 +53,7 @@ pub mod review_http;
 mod schema_history;
 mod schemas;
 mod search;
+mod semantic;
 mod share;
 mod stored;
 mod tasks;
@@ -153,6 +155,21 @@ pub struct McpArgs {
     /// Do not offer this tool (repeatable)
     #[arg(long, value_name = "NAME")]
     pub disable_tool: Vec<String>,
+    /// Offer only the tools of this profile: all (the default), explore, memory or
+    /// admin (repeatable; with --tools, the tools of both)
+    #[arg(long, visible_alias = "mcp-profile", value_name = "NAME")]
+    #[cfg_attr(feature = "auth", arg(conflicts_with = "url"))]
+    pub profile: Vec<String>,
+    /// Offer only these tools, separated by commas (repeatable; with --profile, the
+    /// tools of both)
+    #[arg(
+        long,
+        visible_alias = "mcp-tools",
+        value_name = "NAME,...",
+        value_delimiter = ','
+    )]
+    #[cfg_attr(feature = "auth", arg(conflicts_with = "url"))]
+    pub tools: Vec<String>,
     /// Do not offer the datasets' stored queries as tools
     #[arg(long)]
     pub no_stored_queries: bool,
@@ -199,6 +216,10 @@ pub struct McpConfig {
     pub max_concurrent: usize,
     /// tools removed with `--disable-tool`
     pub disabled: BTreeSet<String>,
+    /// the profiles of `--profile`, as given, which the initialize result reports
+    pub profiles: Vec<String>,
+    /// the only tools offered (`--profile` and `--tools`); `None`: every tool
+    pub only: Option<BTreeSet<String>>,
     /// the dataset names (`*` patterns) the tools may see; empty: all
     pub datasets: Vec<String>,
     /// offer the stored queries of the datasets as tools (C16)
@@ -229,6 +250,8 @@ impl Default for McpConfig {
             allow_update: false,
             max_concurrent: 4,
             disabled: BTreeSet::new(),
+            profiles: Vec::new(),
+            only: None,
             datasets: Vec::new(),
             stored_queries: true,
             watch_interval: Duration::from_secs(2),
@@ -393,6 +416,8 @@ impl McpServer {
         let tools = schemas::tools(&cfg)
             .into_iter()
             .filter(|t| !cfg.disabled.contains(t.name))
+            // a profile or a tool list narrows the set
+            .filter(|t| cfg.only.as_ref().is_none_or(|only| only.contains(t.name)))
             // a read-only server never offers the write tools
             .filter(|t| !(read_only && branches::WRITE_TOOLS.contains(&t.name)))
             // links need the address of the UI
@@ -623,6 +648,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
             );
         }
     }
+    let only = profiles::select(&args.profile, &args.tools, ("--profile", "--tools"))?;
     let timeout = Duration::from_secs_f64(args.timeout);
     let mut st = AppState::standalone(store_opts, timeout);
     // without --allow-update the process never writes: no write tool is offered
@@ -684,6 +710,8 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         allow_update: args.allow_update,
         max_concurrent: args.max_concurrent,
         disabled: args.disable_tool.into_iter().collect(),
+        profiles: args.profile,
+        only,
         datasets: Vec::new(),
         stored_queries: !args.no_stored_queries,
         task_after: Duration::from_millis(args.task_after_ms),

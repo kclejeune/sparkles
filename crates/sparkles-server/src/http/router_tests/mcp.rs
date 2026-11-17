@@ -408,6 +408,106 @@ async fn endpoint_needs_the_flag() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
+/// `--mcp-profile` and `--mcp-tools` narrow the tools, the initialize result names the
+/// active set, a profile does not lift the write switch, and unknown names are refused
+/// with the valid ones (item 489).
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_profiles_narrow_the_tools() {
+    let s = open(
+        &["--mcp-profile", "explore", "--mcp-tools", "recall"],
+        false,
+    );
+    let names = tool_names(&s.app, &[]).await;
+    for t in ["sparql_query", "find_paths", "recall", "search_semantic"] {
+        assert!(names.contains(&t.to_string()), "{t}: {names:?}");
+    }
+    for t in [
+        "link_entities",
+        "assert_facts",
+        "sparql_update",
+        "list_branches",
+    ] {
+        assert!(!names.contains(&t.to_string()), "{t}: {names:?}");
+    }
+    let (_, init) = initialize(&s.app, &[]).await;
+    let set = &init.rpc()["result"]["capabilities"]["experimental"]["io.sparkles/toolSet"];
+    assert_eq!(set["profiles"], json!(["explore"]), "{set}");
+    // the server's set, of which the caller's listing leaves out graphql_query here
+    let offered: Vec<&str> = set["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert!(names.iter().all(|n| offered.contains(&n.as_str())), "{set}");
+    assert!(!offered.contains(&"link_entities"), "{set}");
+    // a tool outside the set is unknown
+    let r = modern(
+        &s.app,
+        "tools/call",
+        json!({"name": "link_entities", "arguments": {"mentions": [{"text": "Alice"}]}}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.rpc()["error"]["code"], -32602, "{}", r.body);
+    // the admin profile names sparql_update, which still needs --mcp-allow-update
+    let s = open(&["--mcp-profile", "admin"], false);
+    let names = tool_names(&s.app, &[]).await;
+    assert!(names.contains(&"list_branches".to_string()), "{names:?}");
+    assert!(!names.contains(&"sparql_update".to_string()), "{names:?}");
+    assert!(!names.contains(&"recall".to_string()), "{names:?}");
+    // the default reports every tool under `all`
+    let s = open(&[], false);
+    let (_, init) = initialize(&s.app, &[]).await;
+    let set = &init.rpc()["result"]["capabilities"]["experimental"]["io.sparkles/toolSet"];
+    assert_eq!(set["profiles"], json!(["all"]), "{set}");
+    let offered = set["tools"].as_array().unwrap();
+    for n in tool_names(&s.app, &[]).await {
+        assert!(offered.contains(&json!(n)), "{n}: {set}");
+    }
+    // unknown names
+    let dir = tempfile::tempdir().unwrap();
+    let st = AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    let refuse = |flags: &[&str]| {
+        let args = ["serve", "--mcp"].into_iter().chain(flags.iter().copied());
+        match Flags::parse_from(args).mcp.conf(&st) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("{flags:?} accepted"),
+        }
+    };
+    assert_eq!(
+        refuse(&["--mcp-profile", "nope"]),
+        "--mcp-profile: unknown profile 'nope' (profiles: all, explore, memory, admin)"
+    );
+    let e = refuse(&["--mcp-tools", "recall,nope"]);
+    assert!(
+        e.starts_with("--mcp-tools: unknown tool 'nope' (tools: list_datasets, "),
+        "{e}"
+    );
+}
+
+/// The HTTP routes of the memory tools, such as `POST /{ds}/check`, ignore the MCP
+/// tool selection, as they ignore `--mcp-disable-tool` (item 489).
+#[tokio::test(flavor = "multi_thread")]
+async fn http_tool_routes_ignore_the_profile() {
+    let s = open(&["--mcp-profile", "admin"], false);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/t/check")
+        .header("content-type", "application/json")
+        .extension(ConnectInfo(Peer::Tcp("127.0.0.2:1".parse().unwrap())))
+        .body(Body::from(
+            json!({"query": "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"}).to_string(),
+        ))
+        .unwrap();
+    let res = s.app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_sessions() {
     let s = open(&[], false);
@@ -417,8 +517,15 @@ async fn legacy_sessions() {
     assert!(r.content_type().starts_with("text/event-stream"));
     let init = r.rpc();
     assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    let mut caps = init["result"]["capabilities"].clone();
+    let set = caps
+        .as_object_mut()
+        .unwrap()
+        .remove("experimental")
+        .unwrap();
+    assert_eq!(set["io.sparkles/toolSet"]["profiles"], json!(["all"]));
     assert_eq!(
-        init["result"]["capabilities"],
+        caps,
         json!({"completions": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}, "prompts": {}, "resources": {"listChanged": true}, "tools": {"listChanged": true}})
     );
     let r = legacy(
@@ -1684,6 +1791,124 @@ mod auth {
             .map(|w| w["code"].as_str().unwrap())
             .collect();
         assert_eq!(codes, ["no-limit"], "{r}");
+    }
+
+    /// `search_semantic` chooses its index through the caller's view: an index whose
+    /// vectors sit only in a graph the caller may not read is reported as absent, and
+    /// its predicate is not named (item 490).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_semantic_follows_graph_grants() {
+        use crate::http::router_tests::auth::graphs::{DATA, users};
+        use sparkles::vector::embed::Environment;
+        use sparkles::vector::embed::mock::MockProvider;
+        let mock = MockProvider::start(8);
+        let s = authed(&[], &[], &users());
+        let ds = s.state.attach("graphs", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                format!("{DATA}<http://ex/b/1> {{ <http://ex/b1> <http://ex/secret> \"hidden fox\" . }}\n")
+                    .into_bytes(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        ds.dataset
+            .indexes()
+            .vector()
+            .set_embedding_environment(Some(Environment {
+                outbound: sparkles::outbound::OutboundPolicy {
+                    allow_private: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        // index `name` stores the embeddings of `source` under `predicate`
+        let put = |name: &str, predicate: &str, source: &str| {
+            tokio::task::block_in_place(|| {
+                let v = ds.dataset.indexes().vector();
+                let cfg: sparkles::vector::VectorIndexConfig = serde_json::from_value(json!({
+                    "predicate": predicate,
+                    "dimension": 8,
+                    "embedding": {"url": mock.url(), "model": "mock", "predicates": [source]}
+                }))
+                .unwrap();
+                v.put(name, cfg).unwrap();
+                v.embed_until_idle(Duration::from_secs(30)).unwrap();
+            })
+        };
+        put("secret", "urn:x-test:secretEmb", "http://ex/secret");
+        let call = |user: &'static str, args: J| {
+            let app = s.app.clone();
+            async move {
+                tool(
+                    &app,
+                    "search_semantic",
+                    args,
+                    &[("authorization", &b(user))],
+                )
+                .await
+            }
+        };
+        let full = call("gfull", json!({"dataset": "graphs", "query": "hidden fox"})).await;
+        assert_eq!(full["isError"], false, "{full}");
+        assert_eq!(
+            full["structuredContent"]["hits"][0]["iri"], "ex:b1",
+            "{full}"
+        );
+        // the caller who reads http://ex/a/* alone sees no index, as if none existed
+        let hidden = call("gra", json!({"dataset": "graphs", "query": "hidden fox"})).await;
+        assert_eq!(tool_error(&hidden), "no-embedder", "{hidden}");
+        let text = hidden["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("secretEmb"), "{text}");
+        let named = call(
+            "gra",
+            json!({"dataset": "graphs", "query": "fox", "predicate": "urn:x-test:secretEmb"}),
+        )
+        .await;
+        let absent = call(
+            "gra",
+            json!({"dataset": "graphs", "query": "fox", "predicate": "urn:x-test:none"}),
+        )
+        .await;
+        let msg = |r: &J, p: &str| {
+            assert_eq!(tool_error(r), "no-embedder", "{r}");
+            r["content"][0]["text"].as_str().unwrap().replace(p, "P")
+        };
+        assert_eq!(
+            msg(&named, "urn:x-test:secretEmb"),
+            msg(&absent, "urn:x-test:none")
+        );
+        let pred = |r: &J| r["structuredContent"]["predicate"].clone();
+        let iris = |r: &J| -> Vec<String> {
+            assert_eq!(r["isError"], false, "{r}");
+            r["structuredContent"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["iri"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // a visible index that sorts after the hidden one: the restricted caller skips
+        // the hidden index and searches the visible one, over its own graphs only
+        put("zvisible", "urn:x-test:visEmb", "http://ex/p");
+        let r = call("gra", json!({"dataset": "graphs", "query": "alpha fox"})).await;
+        assert_eq!(pred(&r), "<urn:x-test:visEmb>", "{r}");
+        let found = iris(&r);
+        assert!(found.contains(&"ex:a1".to_string()), "{r}");
+        assert!(found.iter().all(|i| i == "ex:a1" || i == "ex:a2"), "{r}");
+        let r = call(
+            "gra",
+            json!({"dataset": "graphs", "query": "fox", "predicate": "urn:x-test:visEmb"}),
+        )
+        .await;
+        assert_eq!(pred(&r), "<urn:x-test:visEmb>", "{r}");
+        iris(&r);
+        // the full reader still gets the first index by name, not by creation
+        let r = call("gfull", json!({"dataset": "graphs", "query": "fox"})).await;
+        assert_eq!(pred(&r), "<urn:x-test:secretEmb>", "{r}");
+        put("avisible", "urn:x-test:visEmb2", "http://ex/p");
+        let r = call("gfull", json!({"dataset": "graphs", "query": "fox"})).await;
+        assert_eq!(pred(&r), "<urn:x-test:visEmb2>", "{r}");
     }
 
     /// The memory tools of C17 §6 through graph grants (C12): checks, candidates,

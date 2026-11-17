@@ -1779,6 +1779,42 @@ without Sparkles scopes, a per-dataset scope used on another dataset, and
 `sparkles:admin` failing to reach a dataset the grants hide. Unit tests in
 `auth/oauth.rs` cover the scope parsing and the quoting of the challenges.
 
+### Semantic search tool (item 490, 2026-11-15)
+
+`search_semantic` embeds the text of a question and runs hybrid search, so an agent no
+longer has to write `spk:hybridSearch` by hand or supply a vector to `similar_entities`.
+The code is in `crates/sparkles-server/src/mcp/semantic.rs`.
+
+* The tool takes `query`, an optional embedding `predicate`, `limit` (10, at most 100),
+  `withLabels` and the common snapshot and reasoning arguments. Without `predicate` it
+  uses the first vector index by name whose embedding provider embeds query text and
+  whose vectors the caller can read. An index on a predicate that the caller's view
+  hides counts as absent, so the tool never names it. The provider is the index's own, a local model of F12 or a remote
+  endpoint, and the request goes through the outbound policy and the index's cache.
+* With a full-text index, the query's words, without function words, rank by BM25 and the
+  embedding ranks by cosine, each 50 deep over every graph of the view and reduced to
+  each subject's best hit. The two rankings are fused by reciprocal rank with k = 60 in
+  `sparkles::rank::fuse_rrf`, the fusion that `spk:hybridSearch` and `recall` share. One
+  `spk:hybridSearch` call would fuse per graph, which splits a subject whose text and
+  vector sit in different graphs. `ranking` is then `hybrid`, and each hit carries `textRank` and
+  `vectorRank`. Without a full-text index, or while it is unavailable, the vector ranking
+  is used alone and `ranking` is `vector`.
+* Both searches run as the caller's queries under its view, budgets and deadline, so
+  graph grants and the disclosure guards apply as they do to `sparql_query`.
+* A dataset without an index that embeds query text, or a `predicate` without one, gives
+  `no-embedder` (400) with a hint toward `search_text` and `similar_entities`. A provider
+  failure gives `embedding-failed` (502) instead of a silent fallback to text.
+* The tool is marked open-world, because the query text goes to the index's provider,
+  which may be a remote service, under the outbound policy.
+* The provider call runs under the index's timeout and retries rather than the call's
+  deadline, which item 1030 changes for every search that embeds text. With
+  `reasoning: false` the inferred graph is filtered after each search's limit, which
+  item 1031 changes for the memory search helpers.
+* `memory_tests.rs` checks the hybrid ranking and its fused scores with a mock
+  provider, the provider's input, an explicit predicate without an embedder, a failing
+  provider and the refusal without an embedder. A router test checks that a caller whose
+  grants hide an index's vectors gets the refusal of an absent index.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Progress, tool metrics, load enablement and measurements** (item 42, Tier 4,
@@ -1829,7 +1865,7 @@ how. The scope challenge for operations inside a tool that need admin remains as
 
 These phases belong to [ROADMAP](../ROADMAP.md) item 462, the agent platform workstream, whose primary spec is [C33](C33-agent-platform-controls/README.md). Each phase gets its own numbered item when it is ready to start.
 
-**A hybrid search tool that embeds query text.** Add `search_semantic`, which embeds query text and runs hybrid search. `similar_entities` needs a vector and `search_text` is BM25 only, so agents hand-write `spk:hybridSearch`. It depends on items 34 and 82. Roadmap item 490 holds this phase.
+**A hybrid search tool that embeds query text.** Add `search_semantic`, which embeds query text and runs hybrid search. `similar_entities` needs a vector and `search_text` is BM25 only, so agents hand-write `spk:hybridSearch`. It depends on items 34 and 82. Roadmap item 490 built this phase, as the [Outcome](#semantic-search-tool-item-490-2026-11-15) describes.
 
 **Instance sampling and value-distribution tool.** Sample N instances of a class and return value histograms per predicate. Agents otherwise write SPARQL for grounding.
 

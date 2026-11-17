@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### MCP tool profiles and semantic search
+
+`sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,
+offer only the tools of the `explore`, `memory` or `admin` profile or the named tools,
+which completes roadmap item 489. An unknown profile or tool is refused with the valid
+names, a profile never lifts the write switches or the caller's grants, and the
+`initialize` result reports the active set as the experimental capability
+`io.sparkles/toolSet`. The new MCP tool `search_semantic` embeds the query text with the
+provider of the dataset's vector index and fuses its nearest entities with the full-text
+ranking by reciprocal rank, as `spk:hybridSearch` does, which completes roadmap item 490. It refuses with
+`no-embedder` when no index embeds query text and reports a provider failure as
+`embedding-failed`.
+
 ### Jena hybrid rules
 
 `@hybrid jena .` in a rule text compiles a forward rule's nested backward rule

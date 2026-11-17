@@ -3903,6 +3903,11 @@ The tools are read-only unless the operator turns on the write tool:
 * `search_text` runs BM25 search over a full-text index. `--text` indexes `--data` files.
 * `similar_entities` runs exact search over stored `spk:vector` embeddings. It never
   computes embeddings.
+* `search_semantic` embeds a question with the provider of the dataset's vector index,
+  which can be a local model or a remote endpoint, and fuses the nearest entities with
+  the full-text ranking as `spk:hybridSearch` does. Without a full-text index it ranks
+  by the vector alone, and without an index that embeds query text it refuses with
+  `no-embedder`.
 * `check_query` checks a SPARQL query against what the caller can see without running
   it. It reports syntax errors with their line and column, unknown predicates and
   classes with the nearest known ones, and warnings such as a simple literal matched
@@ -3974,6 +3979,27 @@ A call of a host that supports the tasks extension becomes a task when it runs l
 than 2 seconds (`--task-after-ms`). The host polls for its result and can cancel it.
 Hosts that subscribe to changes hear when tools appear or go away, for example when a
 stored query is saved, and when a subscribed resource changes.
+
+A session that needs only some of the tools can load fewer of them, which saves tokens
+and keeps small models on task. `--profile NAME` offers only the tools of a profile, and
+`--tools a,b` offers only the tools it names. Both flags repeat, and together they offer
+the tools of both. `serve` takes them as `--mcp-profile` and `--mcp-tools`, and
+`sparkles mcp` accepts those spellings too. An unknown profile or tool stops the command
+with the list of valid names.
+
+| Profile | Tools |
+|---|---|
+| `all` | Every tool. This is the default. |
+| `explore` | Discovery, schema, querying, search, paths, algorithms, history and query diagnostics, with no write tool. |
+| `memory` | Agent memory, which is `recall`, `link_entities`, `assert_facts`, the search tools, document sources and the claim proposal tools. |
+| `admin` | Updates, branches, validation, formatting, ontology axioms, reviews and history. |
+
+A profile only narrows the tools. Write tools still need `--allow-update`, a read-only
+server offers none, `--disable-tool` removes a tool from any profile, and every caller
+still sees only the tools its grants allow. Stored queries stay tools of their own unless
+`--no-stored-queries` is given. The `initialize` and `server/discover` results report the
+active set as the experimental capability `io.sparkles/toolSet`, whose `profiles` names
+the profiles and whose `tools` lists the tools the server offers.
 
 Every call runs under the query timeout, a memory budget (`--query-memory-mb`, default
 2048), the intermediate-row cap and, with `--max-rows-produced`, a cap on the rows all of

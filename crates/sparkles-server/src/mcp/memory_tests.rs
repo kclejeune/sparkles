@@ -968,6 +968,128 @@ async fn memory_tools_with_embeddings() {
     assert!(t.contains("## <urn:uuid:pay>"), "{t}");
 }
 
+/// An embedding index on `rdfs:label` of `mem`, under `urn:x-sparkles:test:emb`, whose
+/// vectors come from `mock`, embedded before this returns.
+fn embed_labels(server: &McpServer, mock: &sparkles::vector::embed::mock::MockProvider) {
+    use sparkles::vector::embed::Environment;
+    let ds = server.state.get("mem").unwrap();
+    tokio::task::block_in_place(|| {
+        ds.dataset
+            .indexes()
+            .vector()
+            .set_embedding_environment(Some(Environment {
+                outbound: sparkles::outbound::OutboundPolicy {
+                    allow_private: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        let cfg: sparkles::vector::VectorIndexConfig = serde_json::from_value(json!({
+            "predicate": "urn:x-sparkles:test:emb",
+            "dimension": 8,
+            "embedding": {
+                "url": mock.url(),
+                "model": "mock",
+                "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"]
+            }
+        }))
+        .unwrap();
+        ds.dataset.indexes().vector().put("labels", cfg).unwrap();
+        ds.dataset
+            .indexes()
+            .vector()
+            .embed_until_idle(Duration::from_secs(30))
+            .unwrap();
+    });
+}
+
+/// `search_semantic` embeds the query text with the index's provider and fuses the
+/// vector ranking with the full-text ranking, or ranks by the vector alone without a
+/// full-text index (item 490).
+#[tokio::test(flavor = "multi_thread")]
+async fn search_semantic_embeds_the_query() {
+    use sparkles::vector::embed::mock::MockProvider;
+    let mock = MockProvider::start(8);
+    let server = mem(cfg!(feature = "text"));
+    embed_labels(&server, &mock);
+    let mut c = Client::start(server);
+    let s = c
+        .structured("search_semantic", json!({"query": "Ana Souza", "limit": 3}))
+        .await;
+    // the embedding worker committed the vectors
+    assert_eq!(s["commit"], 3, "{s}");
+    assert_eq!(s["predicate"], "<urn:x-sparkles:test:emb>", "{s}");
+    let ranking = if cfg!(feature = "text") {
+        "hybrid"
+    } else {
+        "vector"
+    };
+    assert_eq!(s["ranking"], ranking, "{s}");
+    let hit = &s["hits"][0];
+    assert_eq!(hit["iri"], "ex:ana2", "{s}");
+    assert_eq!(hit["label"], "Ana Souza", "{s}");
+    assert_eq!(hit["vectorRank"], 1, "{s}");
+    if cfg!(feature = "text") {
+        assert_eq!(hit["textRank"], 1, "{s}");
+    }
+    assert!(s["hits"].as_array().unwrap().len() <= 3, "{s}");
+    // each score is the reciprocal-rank sum over the rankings that hold the hit, and
+    // the hits come in descending score order
+    let mut last = f64::INFINITY;
+    for h in s["hits"].as_array().unwrap() {
+        let expected: f64 = ["vectorRank", "textRank"]
+            .iter()
+            .filter_map(|k| h[*k].as_u64())
+            .map(|r| 1.0 / (sparkles::rank::RRF_K + r as f64))
+            .sum();
+        let score = h["score"].as_f64().unwrap();
+        assert!((score - expected).abs() < 1e-6, "{h}: {expected}");
+        assert!(score <= last, "{s}");
+        last = score;
+    }
+    // the query text went to the provider
+    assert!(
+        mock.state().inputs.iter().any(|i| i == "Ana Souza"),
+        "{:?}",
+        mock.state().inputs
+    );
+    // an explicit predicate must have an index that embeds query text
+    let (t, e) = c
+        .error(
+            "search_semantic",
+            json!({"query": "Ana", "predicate": "rdfs:label"}),
+        )
+        .await;
+    assert_eq!(e, json!({"code": "no-embedder", "status": 400}), "{t}");
+    assert!(t.contains("rdfs:label"), "{t}");
+    // a failing provider is reported, not hidden
+    mock.state().fail = Some(500);
+    let (t, e) = c
+        .error("search_semantic", json!({"query": "payments team"}))
+        .await;
+    assert_eq!(e, json!({"code": "embedding-failed", "status": 502}), "{t}");
+    // bad arguments
+    let (_, e) = c.error("search_semantic", json!({"query": "  "})).await;
+    assert_eq!(e["code"], "bad-argument");
+    let (_, e) = c
+        .error("search_semantic", json!({"query": "Ana", "limit": 101}))
+        .await;
+    assert_eq!(e["code"], "bad-argument");
+}
+
+/// Without an embedding provider `search_semantic` refuses and points at the other
+/// search tools (item 490).
+#[tokio::test(flavor = "multi_thread")]
+async fn search_semantic_needs_an_embedder() {
+    let mut c = Client::start(mem(true));
+    let (t, e) = c
+        .error("search_semantic", json!({"query": "Ana Souza"}))
+        .await;
+    assert_eq!(e, json!({"code": "no-embedder", "status": 400}), "{t}");
+    assert!(t.contains("dataset mem has no vector index"), "{t}");
+    assert!(t.contains("search_text"), "{t}");
+}
+
 /// Two graphs disagree on a predicate the guard limits to one value: `recall` marks
 /// both facts and picks no winner (C17 §5.5).
 #[cfg(feature = "shacl")]

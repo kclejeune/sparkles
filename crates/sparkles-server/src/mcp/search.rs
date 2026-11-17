@@ -82,7 +82,7 @@ fn valid_lang(s: &str) -> bool {
         && parts.all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|c| c.is_ascii_alphanumeric()))
 }
 
-fn score_of(t: Option<&Term>) -> f64 {
+pub(super) fn score_of(t: Option<&Term>) -> f64 {
     match t {
         Some(Term::Literal(l)) => l.value().parse::<f64>().unwrap_or(0.0),
         _ => 0.0,
@@ -90,7 +90,7 @@ fn score_of(t: Option<&Term>) -> f64 {
 }
 
 /// A JSON number (never NaN or infinite), rounded to 6 significant decimals.
-fn score_json(x: f64) -> Value {
+pub(super) fn score_json(x: f64) -> Value {
     if !x.is_finite() {
         return Value::Null;
     }

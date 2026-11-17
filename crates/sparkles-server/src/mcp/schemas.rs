@@ -24,6 +24,7 @@ pub fn all_tools() -> Vec<&'static str> {
         v.push("search_text");
     }
     v.push("similar_entities");
+    v.push("search_semantic");
     v.extend([
         "check_query",
         "similar_queries",
@@ -579,6 +580,30 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "iri":{"type":"string"},"score":{"type":["number","null"]},"label":{"type":"string"}}}},
                 "prefixes":prefixes()}})),
         ),
+        // the query text goes to the index's embedding provider, which may be remote
+        ToolDef {
+            open_world: true,
+            ..read(
+            "search_semantic",
+            "Semantic search",
+            "Search a dataset by meaning: the query text is embedded with the provider of the dataset's vector index and its nearest entities are fused with the full-text (BM25) ranking of its words. Use it for questions in plain language; use search_text for exact keywords. Needs a vector index whose embedding provider embeds query text (describe_schema marks vector predicates); the query text is sent to that provider, which may be a remote service.",
+            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+                "dataset": ds(),
+                "query": {"type":"string","minLength":1,"maxLength":1000},
+                "predicate": {"type":"string","description":"Embedding predicate IRI whose vector index embeds query text (default: the first such index by name)"},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"default":10},
+                "withLabels": {"type":"boolean","default":true},
+                "reasoning": rs(), "atCommit": at(), "at": at_sel()}}),
+            Some(json!({"type":"object","required":["dataset","commit","predicate","ranking","hits","prefixes"],"properties":{
+                "dataset":{"type":"string"},"commit":{"type":"integer"},
+                "predicate":{"type":"string"},
+                "ranking":{"enum":["hybrid","vector"],"description":"hybrid: vector and full-text rankings fused by reciprocal rank; vector: the dataset has no usable full-text index"},
+                "hits":{"type":"array","items":{"type":"object","required":["iri","score"],"properties":{
+                    "iri":{"type":"string"},"score":{"type":["number","null"]},
+                    "textRank":{"type":"integer"},"vectorRank":{"type":"integer"},"label":{"type":"string"}}}},
+                "prefixes":prefixes()}})),
+        )
+        },
         read(
             "check_query",
             "Check a SPARQL query against the schema",
