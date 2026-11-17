@@ -877,3 +877,19 @@ fn the_statistics_count_the_original_axioms_outside_el() {
     assert_eq!(out.stats.outside_el.disjunctive, 1);
     assert_eq!(out.stats.outside_el.taken, 1);
 }
+
+#[test]
+fn the_statistics_count_a_chain_outside_el_for_its_range() {
+    let ax = axioms(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         SubObjectPropertyOf(ObjectPropertyChain(:p :q) :r)
+         ObjectPropertyRange(:r :C)",
+    );
+    let out = Classifier::of(&ax).classify(&rooted_limits()).unwrap();
+    assert!(out.stats.clauses > 0);
+    assert_eq!(out.stats.outside_el.horn, 1);
+    assert_eq!(out.stats.outside_el.disjunctive, 1);
+    assert_eq!(out.stats.outside_el.taken, 2);
+}

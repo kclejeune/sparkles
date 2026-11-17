@@ -581,6 +581,9 @@ pub struct Saturation {
     /// set while a run classifies the axioms that item 805's reductions made, so that the
     /// classes they made up stay out of the taxonomy
     hide_internal: bool,
+    /// the chains outside OWL 2 EL for their ranges alone in a run of rewritten axioms,
+    /// which the statistics of the original axioms count
+    chain_ranged: Vec<AxiomKind>,
     /// whether the last run classified rewritten axioms, which the next run's changes
     /// do not describe and whose made-up names [`Saturation::describe`] leaves out
     pub(crate) reduced: bool,
@@ -1089,6 +1092,7 @@ impl Saturation {
             no_counting: false,
             no_rooted: false,
             hide_internal: false,
+            chain_ranged: Vec::new(),
             reduced: false,
             dl_rooted: false,
             dl_counted: false,
@@ -1622,6 +1626,9 @@ impl Saturation {
         // chain whose superproperty has a range its last property lacks is Horn
         let mut candidates: Vec<&AxiomKind> = outside.iter().map(|(i, _)| axioms[*i]).collect();
         candidates.extend(chain_ranges.iter().map(|(k, _)| *k));
+        if self.hide_internal {
+            self.chain_ranged = chain_ranges.iter().map(|(k, _)| (*k).clone()).collect();
+        }
         candidates.sort();
         candidates.dedup();
         let mut outside_el = OutsideEl::default();
@@ -1818,7 +1825,16 @@ impl Saturation {
                     red.restore(axioms, &mut self.excluded);
                     r.2.added = axioms.len();
                     let tier = r.2.tier;
-                    r.2.outside_el = red.outside_el(axioms, &self.excluded);
+                    let mut chains: Vec<Excluded> = std::mem::take(&mut self.chain_ranged)
+                        .into_iter()
+                        .map(|axiom| Excluded {
+                            axiom,
+                            gap: index::Gap::Partial("chain range"),
+                        })
+                        .collect();
+                    red.restore(axioms, &mut chains);
+                    let chains: Vec<&AxiomKind> = chains.iter().map(|e| &e.axiom).collect();
+                    r.2.outside_el = red.outside_el(axioms, &chains, &self.excluded);
                     r.2.tier = tier;
                     self.reduced = true;
                     return Ok(r);
