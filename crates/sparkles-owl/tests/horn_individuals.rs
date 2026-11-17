@@ -517,6 +517,25 @@ fn r5_at_an_individual_that_is_its_own_successor_takes_the_other_successor() {
 }
 
 #[test]
+fn an_asserted_successor_under_the_domain_of_the_inverse_is_the_individual_itself() {
+    // the domain of q is a range of its inverse r, so r(a, b) puts b in C. a links to
+    // b's own context, and the run has the contexts of the one that asserts C(b)
+    let rest = "InverseObjectProperties(:r :q)
+         FunctionalObjectProperty(:r)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:q :b :a)
+         ClassAssertion(:P :a)
+         EquivalentClasses(:Qb ObjectOneOf(:b))
+         EquivalentClasses(:X ObjectSomeValuesFrom(:q :P))";
+    let yes = [("Qb", "C"), ("Qb", "X")];
+    let no = [("C", "Qb"), ("X", "Qb")];
+    let ranged = check(&format!("ObjectPropertyDomain(:q :C)\n{rest}"), &yes, &no);
+    let asserted = check(&format!("ClassAssertion(:C :b)\n{rest}"), &yes, &no);
+    assert_eq!(ranged.stats.contexts, asserted.stats.contexts);
+    assert_eq!(ranged.stats.conjunctions, 0);
+}
+
+#[test]
 fn successors_by_several_roles_to_one_individual_take_the_universals_of_their_superrole() {
     // a has r1 and r2 to b and r2 to d, both roles under s. Every s-successor of a is
     // in C, and every r1-successor is in D, which nothing makes d
