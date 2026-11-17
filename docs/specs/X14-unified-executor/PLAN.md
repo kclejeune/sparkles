@@ -14,8 +14,8 @@ answers, and the schedule below follows them.
 
 Stages 1 and 3 have shipped, apart from the storage items 479 and 484 that
 [X16](../X16-storage-consolidation/README.md) holds. Stage 4's accounting model and
-mode-neutral kernels have shipped as items 671 to 674, item 675's hierarchical budget is
-landing, and item 678 holds the two decoding twins that remain. The rest of the design is
+mode-neutral kernels have shipped as items 671 to 674, the decoding twins as item 678,
+and item 675's hierarchical budget is landing. The rest of the design is
 stages 5 and 6, together with the phases that are scheduled with their area and the
 execution additions, which this plan does not schedule.
 

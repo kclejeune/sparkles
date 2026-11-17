@@ -210,10 +210,21 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped, and the
-hierarchical budget of item 675 and the decoding twins of item 678 remain. Stage 5's
+479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
+shipped, and the hierarchical budget of item 675 remains. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+
+The decoding twins of item 678 have shipped. The string floors of `string_order_mask`
+read their keys and search for a string's first extension inside the decoding envelope,
+so cursor batches of at least 4,096 rows compare two string columns through them as eager
+tables do, and a refused read fails the batch with its refusal. The row-aligned
+pre-decode of `decode_for` decodes its columns through the same sorted pre-decode as the
+dictionary values of top k and the numeric FILTER, which admits each value's storage
+before it builds it, and moves or clones the distinct values to their rows. Indexing the
+rows through the distinct values' slots was considered and not built, because the row
+evaluator reads the decoded column on its hot path and that change would need its own
+Intel measurement. The bounded-reads test counts every read of the mode, seven in all.
 
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its
@@ -718,11 +729,15 @@ compares full sorts and top k over 8,192 and 32,768 rows eagerly and in cursors 
 batches on both sides of the threshold.
 
 The sorted pre-decode of the columns that row-by-row FILTER, BIND and ORDER BY
-evaluation reads runs for inputs of more than 16,384 rows in both modes, and smaller
-inputs read their values through the value cache. Each decoded column's slots are
-charged before it is decoded, with the distinct values it decodes on the way, and its
-values after. A column whose charge does not fit gives that charge back and is left to the
-rows. The comparison of two string columns through cached lexicographic floors serves
+evaluation reads runs for inputs of more than 16,384 rows in both modes and whatever the
+`expr_cache` switch says, and smaller inputs read their values through the value cache.
+It is the one sorted pre-decode that also serves the dictionary values of top k and the
+numeric FILTER and the ORDER keys of a variable, which decodes each distinct term once in
+key order and admits its storage before it builds it. Each decoded column's slots are
+charged before it is decoded, the distinct values with their own charge while they are
+decoded, and the rows' values after. A column whose charge or decoding does not fit gives
+that charge back and is left to the rows, and only cancellation and the deadline fail the
+pre-decode. The comparison of two string columns through cached lexicographic floors serves
 eager tables and cursor batches of at least 4,096 rows alike. A floor reads its string's
 key, the key before it and, for a string that other strings extend, the search for the
 first of them inside the decoding envelope, so a cursor reserves those reads on the
@@ -741,9 +756,7 @@ without an owner may keep retained state uncharged, whether an empty release tri
 ledger and whether a finished query's pool contribution shrinks. `CursorMemory` is gone, and a context in cursor accounting differs
 from an eager one only by its `streams` flag, its ledger retention and its deadline. The
 result cache and sampled filters stay off for cursors, since they are planning choices
-that stage 6 makes independent of the mode. Item 678 holds the decoding twin that
-remains, the dictionary pre-decode of a cursor batch, which `decode_for` does not yet
-serve.
+that stage 6 makes independent of the mode.
 
 ### One join-kernel library
 
