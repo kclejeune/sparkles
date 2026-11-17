@@ -272,6 +272,44 @@ kept run counts the conclusions of the runs before it, as
 and item 1010 follows the edits after which a kept and a fresh run fall on two sides of the
 bound. Item 1011 follows the bound's form on other ontologies.
 
+Item 869 found where the Horn rules with individuals spend their time on four files of
+the ORE 2015 DL development set with 7,856 to 114,957 property assertions,
+`ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`. A diagnostic build
+counted no witness on them, so their worlds are not the cost. All but 44 to 116 of their
+conjunction contexts held an individual and were real. R3 made the conjunction of `b`
+and a filler for each assertion `r(a, b)` under a universal restriction or the range of a
+transitive property, and that context derived `b`'s closure again and then exchanged
+everything with `b`. R3 and R5 at a real context now send the individual the other
+members of the conjunction and link to the individual's own context, as
+[a successor that holds an individual](#the-horn-rules-with-individuals) argues. In four
+rounds of alternating order on `atlas` the four files classify in 0.38 to 0.49 times the
+base's time on one thread and 0.47 to 0.62 times on four, `ore_ont_4510` in 406 against
+945 ms on one thread, with 116 conjunction contexts against 42,249 and 6.1 against 19.2
+million conclusions. The Horn rules then take 2.0 to 2.2 times the EL rules' time on one
+thread, against 4.2 to 5.6 times before, and item 1025 follows that remainder. The Horn
+normalization also passes over an assertion about an anonymous individual before it
+opens a scope for it, which takes 136 to 251 ms off the index stage of the four files
+whose 243,972 to 457,662 such axioms the reader leaves out. GO, ChEBI lite, the 298 ORE
+2015 EL files and the files of the development set keep their taxonomies byte for byte
+on one and eight threads, as the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#conjunctions-with-an-individual)
+records with the files that pass its limits on both builds. The flush of R3 and R5 keeps
+what it gives its own context, so that the context takes each conclusion once, and counts
+what it sends an individual against the run's bounds. R5 can still give a context one
+link for each pair of a role and a target before a bound counts them, as it did before,
+which item 1026 follows.
+
+Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
+individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
+timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
+the laptop, with a limit of 120 s. The reader refuses one file and two pass the limit.
+Of the other 204, 27 have witnesses, 1 to 160 of them with 1 to 470 classes
+classified again in a world. The time from their first witness to the end of the run,
+which holds the worlds and the build's own counting, is 89 ms of the 2,839 ms that the 27
+files classify in, and at most 17.4 ms on one file, `ore_ont_9151`. The item closed
+without a change, since a criterion with an argument of its own would save less than
+that.
+
 Item 753 makes a run after an edit of class axioms
 [keep the contexts](#incremental-native-dl-classification) of a run with the Horn rules
 without individuals and of a run of the disjunctive rules that does not count, with the
@@ -1225,6 +1263,56 @@ restriction, and the argument above is the whole of it. R7 needs both predecesso
 because `M_1 ⊑ X` for a subsumer `X` of `M_2` holds only when `M_2` has the instance that
 every instance of `M_1` equals. R8 concludes emptiness, which needs no instance.
 
+**A successor that holds an individual.** R3 and R5 link a context to the conjunction of a
+successor with the fillers of its universals, or of the successors an at-most restriction
+counts, and make a context for the conjunction. When the context is real and the
+conjunction holds an individual `a`, they send `a` the other members of the conjunction as
+subsumers and link the context to `a`'s own context, and make no context. The step is
+sound, since the context has an instance, the instance's successor is in the conjunction,
+and the only element of the conjunction is `a`, so `a` is in every member and the instance
+has `a` as the successor. It loses nothing, by the list of what reads the conjunction's
+context. That context would be real, as the successor of a real context, and would derive
+`a`, so the exchange above would give `a` its subsumers, its loops, its Horn successors
+and its backward links with what they know of each predecessor, and would give it `a`'s.
+The rules that read a successor are the EL rules over a backward link, R2 and R4, the
+`SuccIn` conclusion that R5 and R6 count, the `LinkTo` conclusion, the singular flag that
+a counted predecessor takes, and R7 and R8 at the successor, and each of them reads the
+successor's subsumers, loops, flags and backward links, which `a`'s context holds as the
+conjunction's would, with the context's link, its fillers and its realness among them.
+The context's own state differs only in the id of the successor it names, which four
+readers observe. R3 and R5 read the core of the successor with that id, which for `a`'s
+context is `a` and for the conjunction's is a set that holds `a`, so a later extension or
+merge of either holds `a` and takes the same step. R6 sends a predecessor the core of
+the successor that is the same element, which is `a` where it was the conjunction, and a
+context that derives `a` takes `a`'s subsumers, the other members of the conjunction
+among them. R8 compares the ids of a singular
+context's successors with the ids of its predecessors, to find an element that two
+clashing roles join to the context. The conjunction's context and `a`'s have the same
+Horn successors after their exchange, so one of them is a predecessor of the context by
+a role exactly when the other is. The comparison therefore finds `a` on both sides where
+it found the conjunction on both, and a contradiction that it sends a predecessor reaches
+`a` in either form. The step itself compares the id of the successor it extends with `a`
+and adds no link when they are equal, since the context already names `a` by that role.
+The set of a context's successors, the `SuccIn` conclusions that name their sender and
+the record of the cores R6 has sent are keyed by the id and hold `a` where they held the
+conjunction. The order of dominated successors compares ids as well, and a run with
+individuals does not use it. When `a` is the context itself, the members go to the
+context's own list, each once in a flush, and the activation applies them before it
+ends. A context that is not real keeps the
+conjunction, since what the conjunction holds is then true of `a` only where the context
+has an instance, which a world decides. To let the step apply from the first saturation,
+a run with the Horn rules
+over an ontology with individuals makes `owl:Thing` and each individual real when it
+initializes their contexts, where the rounds between the saturations did so before, and
+the rounds keep the facts of universal roles and the keys. A context that becomes real
+after R3 or R5 made a conjunction for one of its successors keeps the conjunction, which
+is then real and exchanges with its individual as before, so the conjunctions a run makes
+depend on the order of delivery while its answer does not. On the four assertion-heavy
+files of the development set, whose property assertions between individuals lie under
+universal restrictions and ranges of transitive properties, every conjunction but 44 to
+116 of 3,098 to 42,249 held an individual and was real, and each repeated its
+individual's closure.
+
 **Witnesses and worlds.** The reachability condition of the EL rules of individuals stays
 the mechanism that makes a conclusion that depends on a class having an instance hold
 only where it does. The rules that read whether a context is real are the exchange from
@@ -1249,10 +1337,12 @@ second kind, since `A` is not real in the global saturation, derives no individu
 reaches no context that does, so without it `A` would get no world and `A ⊑ {b}` would be
 missed. The kinds are sufficient, by the list of rules that read realness, and not
 necessary, since `A ⊑ ∃r.{a}` with an inverse functional `r` alone makes `A` a witness
-whose world finds nothing. A cheaper criterion needs an argument of its own, which item
-868 holds. A run with the Horn rules marks the real contexts whenever the ontology has
-individuals, where a run of the EL rules does so only after a merge, a key or a universal
-role, because R7 reads the real predecessors of the global state.
+whose world finds nothing. A cheaper criterion would need an argument of its own and is
+not built, since the worlds cost little on the files measured, as the
+[Outcome](#outcome) records for item 868. A run with the Horn rules marks the real contexts whenever the ontology has
+individuals, from the first saturation on, where a run of the EL rules does so only after
+a merge, a key or a universal role, because R7 reads the real predecessors of the global
+state and R3 and R5 read whether their own context is real.
 
 Each named class whose context reaches a witness is classified again in a world, as
 before, and the worlds extend to the conjunction contexts. The global table of
@@ -1318,7 +1408,7 @@ worlds is at most the number of named classes, and each can approach a Horn satu
 its own, so the Horn budget counts them, and the scans of R7 and R8 over a singular
 context's predecessors, which are quadratic in their number, poll the run's stop as the
 long rules do. `Stats` gains no count of the witnesses and the worlds, since the API
-compatibility check guards the struct, and item 868 adds the count it needs. An ontology without
+compatibility check guards the struct. An ontology without
 individuals, functional data properties or top properties runs the code it ran before,
 which the EL identity gate checks byte for byte, and the Horn files without individuals of
 the development set are checked the same way. The Horn files with individuals were
@@ -1363,8 +1453,8 @@ discusses.
 
 **Out of scope.** Enumerations of several individuals in a positive position need case
 analysis and stay with the rooted run. At-least restrictions above one beside
-individuals are item 867, a cheaper witness criterion is item 868, and chains through the
-top property stay in item 663. Anonymous individuals stay with the reader's rules. Data cardinalities
+individuals are item 867, and chains through the top property stay in item 663. A cheaper
+witness criterion is not built. Anonymous individuals stay with the reader's rules. Data cardinalities
 and keys over data properties beside the disjunctive rules stay with item 768, counting
 with item 728 and incremental runs after a change with item 753.
 

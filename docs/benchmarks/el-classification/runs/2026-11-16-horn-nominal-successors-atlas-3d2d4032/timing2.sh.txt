@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# timing2.sh: twelve more interleaved rounds of base e2709fb7 against the lane tip 3d2d4032 on
+# ore_ont_14817 and ore_ont_9663 on four threads, one classification a process, as timing.sh ran
+# them, since four rounds do not separate the sides from the spread of the disjunctive attempt.
+# The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/fable-horn-869
+F=$HOME/lanes/horn-budget-962/files
+OUT=$D/out/timing2; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/base $D/bin/tip; } > $OUT/before.txt
+for round in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  order="base tip"; [ $((round % 2)) -eq 0 ] && order="tip base"
+  for n in ore_ont_14817 ore_ont_9663; do
+    for tag in $order; do
+      mkdir -p $OUT/r$round/$tag
+      systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+        timeout 900 $D/bin/$tag --threads 4 --repeat 1 $F/$n.owl > $OUT/r$round/$tag/$n.t4.json 2> $OUT/r$round/$tag/$n.t4.err
+      echo "r$round $tag $n t4 status=$? $(date -Is)" >> $OUT/log.txt
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

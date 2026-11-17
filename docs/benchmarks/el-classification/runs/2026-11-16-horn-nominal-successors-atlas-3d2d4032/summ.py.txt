@@ -1,0 +1,33 @@
+# summ.py OUT: per file and thread count, the median of every classification of a side over the
+# rounds, the median of the rounds' ratios with their range, and the medians of the index stage,
+# the conclusions and the conjunction contexts
+import json, sys, glob, statistics as st
+out = sys.argv[1]; rows = {}
+for p in glob.glob(f"{out}/r*/*/*.json"):
+    r, tag, f = p.split('/')[-3:]
+    try: d = json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: continue
+    rows[(f[:-5], tag, r)] = d
+print(f"{'file':20} {'base ms':>9} {'tip ms':>9} {'ratio':>6} {'range':>13} {'idx b':>7} {'idx t':>7} {'concl base':>13} {'concl tip':>13} {'conj b':>7} {'conj t':>7} {'rss b':>5} {'rss t':>5} tier")
+for f in sorted({k[0] for k in rows}):
+    side = lambda t: [d for (ff, tt, r), d in rows.items() if ff == f and tt == t]
+    db, dt = side('base'), side('tip')
+    if not db or not dt: continue
+    b = [c for d in db for c in d['classifyMs']]; l = [c for d in dt for c in d['classifyMs']]
+    rats = [st.median(rows[(f, 'tip', r)]['classifyMs']) / st.median(rows[(f, 'base', r)]['classifyMs'])
+            for r in sorted({k[2] for k in rows}) if (f, 'base', r) in rows and (f, 'tip', r) in rows]
+    med = lambda ds, k: st.median(d[k] for d in ds)
+    print(f"{f:20} {st.median(b):9.1f} {st.median(l):9.1f} {st.median(rats):6.3f} {min(rats):6.3f}-{max(rats):6.3f} {med(db,'indexMs'):7.1f} {med(dt,'indexMs'):7.1f} {med(db,'conclusions'):13.0f} {med(dt,'conclusions'):13.0f} {med(db,'conjunctions'):7.0f} {med(dt,'conjunctions'):7.0f} {max(d['peakRssKib'] for d in db)/2**20:5.2f} {max(d['peakRssKib'] for d in dt)/2**20:5.2f} {db[0]['tier']}/{dt[0]['tier']}")
+# the tip's EL rules alone against the base and the tip on the four assertion-heavy files
+print()
+print(f"{'file':20} {'el ms':>9} {'base/el':>8} {'tip/el':>7} {'range tip/el':>13} {'concl el':>13} {'base/el':>8} {'tip/el':>7}")
+for f in sorted({k[0] for k in rows if k[1] == 'el'}):
+    side = lambda t: [d for (ff, tt, r), d in rows.items() if ff == f and tt == t]
+    de, db, dt = side('el'), side('base'), side('tip')
+    m = lambda ds: st.median(c for d in ds for c in d['classifyMs'])
+    rr = lambda t: [st.median(rows[(f, t, r)]['classifyMs']) / st.median(rows[(f, 'el', r)]['classifyMs'])
+                    for r in sorted({k[2] for k in rows}) if (f, 'el', r) in rows and (f, t, r) in rows]
+    rats = rr('tip')
+    c = lambda ds: st.median(d['conclusions'] for d in ds)
+    # the time ratios are the medians of the rounds' ratios, as in the table above
+    print(f"{f:20} {m(de):9.1f} {st.median(rr('base')):8.2f} {st.median(rats):7.2f} {min(rats):6.2f}-{max(rats):6.2f} {c(de):13.0f} {c(db)/c(de):8.2f} {c(dt)/c(de):7.2f}")

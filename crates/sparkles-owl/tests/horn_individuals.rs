@@ -365,3 +365,190 @@ fn r7_counts_the_context_itself_through_a_loop_with_a_qualified_filler() {
         &[("B", "M")],
     );
 }
+
+// Roadmap item 869: R3 and R5 at a real context send an individual what its successor
+// holds, where they made a context for the conjunction that held the individual.
+
+#[test]
+fn a_universal_over_an_assertion_reaches_the_individual_without_a_conjunction() {
+    // a has r to b and every r-successor of a is in C, so b is in C
+    let out = check(
+        "ObjectPropertyAssertion(:r :a :b)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         EquivalentClasses(:Q ObjectOneOf(:b))",
+        &[("Q", "C")],
+        &[("C", "Q")],
+    );
+    assert_eq!(out.stats.conjunctions, 0, "b takes C itself");
+}
+
+#[test]
+fn a_universal_follows_a_transitive_chain_of_assertions_without_conjunctions() {
+    // the universal follows the transitive role from a to b and on to d, and each
+    // individual in C gives its s-successor M, which a does not
+    let out = check(
+        "TransitiveObjectProperty(:r)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :b :d)
+         ObjectPropertyAssertion(:s :d :e)
+         ObjectPropertyAssertion(:s :b :f)
+         ObjectPropertyAssertion(:s :a :g)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         SubClassOf(:C ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))
+         EquivalentClasses(:Qf ObjectOneOf(:f))
+         EquivalentClasses(:Qg ObjectOneOf(:g))",
+        &[("Qe", "M"), ("Qf", "M")],
+        &[("Qg", "M"), ("M", "Qe")],
+    );
+    assert_eq!(
+        out.stats.conjunctions, 0,
+        "each individual takes the fillers itself"
+    );
+}
+
+#[test]
+fn r5_at_a_real_context_merges_into_the_individual_without_a_conjunction() {
+    // x has r to a and to b and r is functional, so a and b are one
+    let out = check(
+        "ObjectPropertyAssertion(:r :x :a)
+         ObjectPropertyAssertion(:r :x :b)
+         FunctionalObjectProperty(:r)
+         ClassAssertion(:P :a)
+         ClassAssertion(:S :b)
+         EquivalentClasses(:Qa ObjectOneOf(:a))
+         EquivalentClasses(:Qb ObjectOneOf(:b))",
+        &[("Qa", "Qb"), ("Qb", "Qa"), ("Qa", "S"), ("Qb", "P")],
+        &[("P", "Qa"), ("S", "P")],
+    );
+    assert_eq!(
+        out.stats.conjunctions, 0,
+        "the two individuals exchange what they hold"
+    );
+}
+
+#[test]
+fn a_real_context_that_is_no_individual_sends_its_universal_to_the_individual() {
+    // a's s-successor in D has an instance, whose r-successor is b, so b is in C; E has
+    // none that the ontology gives, so its universal says nothing of b
+    let out = check(
+        "ClassAssertion(ObjectSomeValuesFrom(:s :D) :a)
+         SubClassOf(:D ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(:D ObjectAllValuesFrom(:r :C))
+         SubClassOf(:E ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(:E ObjectAllValuesFrom(:r :F))
+         SubClassOf(:F ObjectAllValuesFrom(ObjectInverseOf(:r) :Z))
+         EquivalentClasses(:Q ObjectOneOf(:b))",
+        &[("Q", "C"), ("E", "Z")],
+        &[("Q", "F"), ("D", "Z"), ("Q", "Z")],
+    );
+    // E is not real, so its successor is the conjunction of b and F, and D's is too when
+    // its universal comes before the word that it is real
+    assert!(
+        (1..=2).contains(&out.stats.conjunctions),
+        "{} conjunctions",
+        out.stats.conjunctions
+    );
+}
+
+#[test]
+fn a_real_context_keeps_the_conjunction_of_a_successor_without_an_individual() {
+    // a's r-successor is in B and C, which no individual stands for
+    let out = check(
+        "ClassAssertion(ObjectSomeValuesFrom(:r :B) :a)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         SubClassOf(ObjectIntersectionOf(:B :C) :Y)
+         SubClassOf(:Y ObjectAllValuesFrom(ObjectInverseOf(:r) :Z))
+         EquivalentClasses(:Q ObjectOneOf(:a))",
+        &[("Q", "Z")],
+        &[("B", "Y"), ("B", "C")],
+    );
+    assert_eq!(out.stats.conjunctions, 1);
+}
+
+#[test]
+fn a_universal_over_a_loop_assertion_reaches_the_individual_itself() {
+    // a is its own r-successor, so a is in C, which is empty
+    let (out, ex) = run("ObjectPropertyAssertion(:r :a :a)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         SubClassOf(:C owl:Nothing)
+         SubClassOf(:D :D)");
+    assert!(ex.is_empty(), "left out: {ex:#?}");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+    // and a takes what C gives when C is not empty
+    let out = check(
+        "ObjectPropertyAssertion(:r :a :a)
+         ClassAssertion(ObjectAllValuesFrom(:r :C) :a)
+         ObjectPropertyAssertion(:s :a :e)
+         SubClassOf(:C ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))",
+        &[("Qe", "M")],
+        &[("M", "Qe")],
+    );
+    assert_eq!(out.stats.conjunctions, 0);
+}
+
+#[test]
+fn r5_at_an_individual_that_is_its_own_successor_takes_the_other_successor() {
+    // a has r to itself and to b and r is functional, so b is a. a is then in S, which
+    // b is asserted in, and S gives a's s-successor e the class M
+    let body = "ObjectPropertyAssertion(:r :a :a)
+         ObjectPropertyAssertion(:r :a :b)
+         FunctionalObjectProperty(:r)
+         ClassAssertion(:S :b)
+         ObjectPropertyAssertion(:s :a :e)
+         SubClassOf(:S ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))";
+    // observed through the leaf e alone, a and b make no conjunction
+    let out = check(body, &[("Qe", "M")], &[("M", "Qe")]);
+    assert_eq!(out.stats.conjunctions, 0);
+    // Qa and Qb show that a and b are one. Their contexts take a's successors before a
+    // round finds them real, so they keep the conjunctions of R5 and R3, and the count
+    // says nothing of a's own context
+    check(
+        &format!(
+            "{body}
+         EquivalentClasses(:Qa ObjectOneOf(:a))
+         EquivalentClasses(:Qb ObjectOneOf(:b))"
+        ),
+        &[("Qe", "M"), ("Qa", "Qb"), ("Qb", "Qa"), ("Qa", "S")],
+        &[("M", "Qe")],
+    );
+}
+
+#[test]
+fn successors_by_several_roles_to_one_individual_take_the_universals_of_their_superrole() {
+    // a has r1 and r2 to b and r2 to d, both roles under s. Every s-successor of a is
+    // in C, and every r1-successor is in D, which nothing makes d
+    let out = check(
+        "SubObjectPropertyOf(:r1 :s)
+         SubObjectPropertyOf(:r2 :s)
+         ObjectPropertyAssertion(:r1 :a :b)
+         ObjectPropertyAssertion(:r2 :a :b)
+         ObjectPropertyAssertion(:r2 :a :d)
+         ClassAssertion(ObjectAllValuesFrom(:s :C) :a)
+         ClassAssertion(ObjectAllValuesFrom(:r1 :D) :a)
+         EquivalentClasses(:Qb ObjectOneOf(:b))
+         EquivalentClasses(:Qd ObjectOneOf(:d))",
+        &[("Qb", "C"), ("Qb", "D"), ("Qd", "C")],
+        &[("Qd", "D"), ("C", "Qb")],
+    );
+    assert_eq!(out.stats.conjunctions, 0);
+}
+
+#[test]
+fn r5_at_an_individual_whose_other_successor_holds_it_keeps_what_the_successor_holds() {
+    // a has r to itself and to an element of C that is a, and r is functional. Every
+    // link of a that R5 counts is a itself or already holds the whole conjunction, so
+    // R5 sends a link to no context, and a takes C through the successor that holds it
+    check(
+        "ObjectPropertyAssertion(:r :a :a)
+         ClassAssertion(ObjectSomeValuesFrom(:r ObjectIntersectionOf(ObjectOneOf(:a) :C)) :a)
+         FunctionalObjectProperty(:r)
+         ObjectPropertyAssertion(:s :a :e)
+         SubClassOf(:C ObjectAllValuesFrom(:s :M))
+         EquivalentClasses(:Qe ObjectOneOf(:e))",
+        &[("Qe", "M")],
+        &[("M", "Qe")],
+    );
+}

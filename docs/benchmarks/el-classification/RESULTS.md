@@ -610,7 +610,8 @@ more, and eight take more than 1.6 times. Three of the eight finish under 6 ms, 
 against 0.5. Four files with 7,856 to 114,957 property assertions, `ore_ont_4510`,
 `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`, take 2.5 to 3.6 times the base and
 stay under half a second: the rules create 3,147 to 42,249 conjunction contexts and derive
-6.6 to 9.6 times the conclusions, which roadmap item 869 follows. The eighth,
+6.6 to 9.6 times the conclusions, most of which item 869 removed, as
+[conjunctions that hold an individual](#conjunctions-with-an-individual) describes. The eighth,
 `ore_ont_16744`, has 3.3 million axioms with RO relations and names the top property in two
 tautological property inclusions, which made the build before the item refuse its two Horn
 axioms. The item's build takes them, and the Horn rules derive 3.8 billion conclusions in
@@ -624,7 +625,7 @@ which item 962 removed, as [symmetric transitive properties](#symmetric-transiti
 describes. The files whose axioms with anonymous
 individuals the reader leaves out, such as `ore_ont_5481` with 457,662 of them, spend 0.12
 to 0.27 s more in the index stage, where the Horn normalization now reads each of them
-before it refuses it, and item 869 follows this too.
+before it refuses it, which item 869 removed too.
 
 | Ontology | EL rules ms | Item 692 ms | Ratio | Conclusions before | Conclusions after |
 |---|---:|---:|---:|---:|---:|
@@ -1280,6 +1281,145 @@ holds every classification of the rounds on `atlas` of both builds, the attempts
 the bound, the runs on `wally` with and without the bound, the attempts' conclusions on
 the laptop with the diagnostic build, the generated ontologies and fixtures, the A/B of the
 bound in steps, the sweep's taxonomy hashes and the scripts that ran.
+
+<a id="conjunctions-with-an-individual"></a>
+
+### Conjunctions that hold an individual
+
+Roadmap item 869 makes R3 and R5 of the Horn rules at a context with an instance send an
+individual what the conjunction of its successor holds, where they made a context for the
+conjunction, as
+[F24](../../specs/F24-owl-classification/SPEC.md#the-horn-rules-with-individuals)
+argues. On `atlas` four rounds of alternating order compared the base, commit e2709fb7,
+with the item's build, commit 3d2d4032, one process per side, file and thread count with
+five classifications each. Each time below is the median of the 20 classifications of a
+side, each ratio the median of the four rounds' ratios, and the conjunction contexts and
+conclusions are the medians of the four processes' reports. The four files are those with
+7,856 to 114,957 property assertions of [the Horn rules with individuals](#horn-individuals).
+
+| Ontology | Threads | Base ms | Item 869 ms | Ratio | Range of the rounds | Conjunctions before | Conjunctions after | Conclusions before | Conclusions after |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| `ore_ont_4510` | 1 | 944.8 | 405.7 | 0.430 | 0.421 to 0.431 | 42,249 | 116 | 19,150,095 | 6,076,004 |
+| `ore_ont_4510` | 4 | 432.6 | 215.1 | 0.529 | 0.451 to 0.567 | 42,249 | 116 | 19,150,563 | 6,092,183 |
+| `ore_ont_12901` | 1 | 616.3 | 300.8 | 0.490 | 0.469 to 0.498 | 29,993 | 44 | 12,716,227 | 4,822,498 |
+| `ore_ont_12901` | 4 | 283.4 | 172.8 | 0.625 | 0.538 to 0.666 | 29,993 | 44 | 12,716,343 | 4,834,237 |
+| `ore_ont_14375` | 1 | 111.4 | 50.4 | 0.454 | 0.449 to 0.458 | 5,678 | 109 | 2,467,393 | 881,264 |
+| `ore_ont_14375` | 4 | 56.3 | 32.6 | 0.555 | 0.493 to 0.687 | 5,678 | 109 | 2,467,436 | 886,393 |
+| `ore_ont_10951` | 1 | 66.8 | 25.4 | 0.378 | 0.378 to 0.380 | 3,098 | 74 | 1,587,086 | 444,256 |
+| `ore_ont_10951` | 4 | 35.9 | 17.5 | 0.468 | 0.454 to 0.615 | 3,116 | 71 | 1,619,795 | 445,703 |
+
+The peak resident set of a process falls with the contexts, from 476 to 385 MiB on
+`ore_ont_4510` on one thread and from 373 to 307 MiB on `ore_ont_12901`. Each round also
+ran the item's build with the EL rules alone on the four files, which leave the Horn
+axioms out. The ratio before is the base's time against the same runs.
+
+| Ontology | Threads | EL rules ms | Item 869 ms | Ratio | Range of the rounds | Ratio before | Conclusions of the EL rules | Conclusions after |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| `ore_ont_4510` | 1 | 185.9 | 405.7 | 2.18 | 2.16 to 2.25 | 5.10 | 2,427,529 | 6,076,004 |
+| `ore_ont_4510` | 4 | 121.3 | 215.1 | 1.81 | 1.59 to 2.05 | 3.57 | 2,427,529 | 6,092,183 |
+| `ore_ont_12901` | 1 | 144.6 | 300.8 | 2.08 | 2.01 to 2.09 | 4.25 | 1,925,362 | 4,822,498 |
+| `ore_ont_12901` | 4 | 99.2 | 172.8 | 1.77 | 1.72 to 1.87 | 2.87 | 1,925,362 | 4,834,237 |
+| `ore_ont_14375` | 1 | 25.3 | 50.4 | 2.00 | 1.98 to 2.02 | 4.39 | 364,763 | 881,264 |
+| `ore_ont_14375` | 4 | 18.9 | 32.6 | 1.72 | 1.42 to 1.83 | 3.00 | 364,763 | 886,393 |
+| `ore_ont_10951` | 1 | 11.9 | 25.4 | 2.12 | 2.11 to 2.13 | 5.60 | 176,238 | 444,256 |
+| `ore_ont_10951` | 4 | 10.3 | 17.5 | 1.68 | 1.47 to 1.87 | 3.36 | 176,238 | 445,703 |
+
+The Horn rules still take 2.0 to 2.2 times the EL rules' time on one thread and 1.7 to
+1.8 times on four, and derive 2.4 to 2.5 times the conclusions, where the base derived
+6.6 to 9.2 times as many. Roadmap item 1025 follows what remains.
+
+The item also makes the Horn normalization pass over an assertion about an anonymous
+individual before it opens a scope for it. The reader leaves such axioms out, and the
+four files below hold 243,972 to 457,662 of them.
+
+| Ontology | Threads | Index before ms | Index after ms | Classification before ms | Classification after ms | Ratio | Range of the rounds |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `ore_ont_5481` | 1 | 989.4 | 744.4 | 1,050.8 | 808.0 | 0.774 | 0.767 to 0.806 |
+| `ore_ont_5481` | 4 | 973.5 | 723.4 | 1,004.7 | 752.9 | 0.752 | 0.745 to 0.754 |
+| `ore_ont_10073` | 1 | 988.4 | 741.8 | 1,050.3 | 807.1 | 0.770 | 0.767 to 0.771 |
+| `ore_ont_10073` | 4 | 969.7 | 718.9 | 1,005.2 | 749.8 | 0.746 | 0.743 to 0.748 |
+| `ore_ont_1370` | 1 | 572.3 | 409.4 | 637.7 | 474.6 | 0.743 | 0.736 to 0.748 |
+| `ore_ont_1370` | 4 | 544.3 | 405.8 | 587.8 | 429.0 | 0.730 | 0.718 to 0.745 |
+| `ore_ont_4755` | 1 | 506.8 | 370.7 | 600.4 | 448.4 | 0.748 | 0.747 to 0.758 |
+| `ore_ont_4755` | 4 | 486.4 | 340.3 | 531.2 | 375.6 | 0.711 | 0.701 to 0.716 |
+
+The index stage takes 136 to 251 ms less, and the processes peak at 356 to 586 MiB on
+one thread against 472 to 702 MiB. The conclusions do not change.
+
+The same rounds ran two files of the development set with witnesses, whose worlds take up to
+15 and 17 ms and which take the disjunctive rules, and four files in which no conjunction
+holds an individual. `ore_ont_8737` had two classifications per process.
+
+| Ontology | Threads | Base ms | Item 869 ms | Ratio | Range of the rounds |
+|---|---:|---:|---:|---:|---|
+| `ore_ont_11378` | 1 | 146.3 | 142.7 | 0.974 | 0.972 to 0.978 |
+| `ore_ont_11378` | 4 | 104.1 | 94.1 | 0.912 | 0.799 to 0.945 |
+| `ore_ont_9151` | 1 | 266.2 | 254.9 | 0.958 | 0.953 to 0.959 |
+| `ore_ont_9151` | 4 | 214.8 | 204.1 | 0.966 | 0.754 to 1.041 |
+| GO | 1 | 302.9 | 306.6 | 1.009 | 1.005 to 1.023 |
+| GO | 4 | 122.3 | 122.4 | 0.993 | 0.954 to 1.041 |
+| ChEBI lite | 1 | 936.7 | 926.3 | 0.989 | 0.988 to 0.993 |
+| ChEBI lite | 4 | 432.7 | 423.2 | 0.957 | 0.921 to 1.047 |
+| `ore_ont_9855` | 1 | 1,470.6 | 1,479.5 | 1.006 | 1.005 to 1.009 |
+| `ore_ont_9855` | 4 | 510.8 | 521.3 | 1.021 | 0.971 to 1.036 |
+| `ore_ont_8737` | 1 | 30,981.6 | 31,157.7 | 1.001 | 0.989 to 1.074 |
+| `ore_ont_8737` | 4 | 9,695.2 | 9,589.9 | 0.992 | 0.952 to 1.032 |
+
+`ore_ont_11378` and `ore_ont_9151` make 112 and 195 conjunction contexts against 211 and
+356. GO, ChEBI lite and `ore_ont_8737` derive the same conclusions as the base on one
+thread, and `ore_ont_9855` derives 21,081,967 against 21,156,356. GO and `ore_ont_9855`
+are 0.5 to 2.3% and 0.5 to 0.9% slower on one thread in every round, which roadmap item
+991 follows with the other costs of the Horn rules on files they do not prune. On four
+threads the peak resident set of `ore_ont_8737` follows the order of delivery. It is 5.2
+to 5.9 GiB over the base's four processes and 5.4 to 7.0 GiB over the item's, with 1.23 to
+1.35 billion conclusions, and on one thread both builds derive 1,619,753,615 conclusions
+and peak at 3.8 GiB. A process that classifies `ore_ont_11378` five times on one thread
+peaks at 195 MiB against 141 MiB, while its estimate falls from 90.1 to 89.4 MB. A process
+that classifies it once peaks at 127 MiB on both builds on the laptop, and on four threads
+the peaks are 166 to 184 MiB against 167 to 195 MiB.
+
+`ore_ont_14817` and `ore_ont_9663` have no individuals and take the disjunctive rules
+first, whose attempt passes its budget before the Horn rules answer. The item does not
+change the disjunctive rules, and the attempt's length follows the order of delivery.
+Sixteen processes of each build on four threads, the four rounds above and twelve more of
+alternating order, gave the classification times below, the attempt included. The Horn
+rules' saturation takes 0.7 to 0.9 s of them on `ore_ont_14817` and 1.2 to 1.6 s on
+`ore_ont_9663` on both builds.
+
+| Ontology | Base s, median | Base s, range | Item 869 s, median | Item 869 s, range | Median of the rounds' ratios | Rounds in which the item's build is faster |
+|---|---:|---|---:|---|---:|---|
+| `ore_ont_14817` | 29.8 | 20.1 to 46.9 | 32.6 | 12.9 to 64.9 | 0.971 | 8 of 16 |
+| `ore_ont_9663` | 13.5 | 11.6 to 21.0 | 14.8 | 12.5 to 24.9 | 1.097 | 5 of 16 |
+
+On one thread, which fixes the order, both builds classify `ore_ont_14817` with the same
+29,062,079 conclusions, 70,702 conjunction contexts and peak estimate, the item's build in
+347.5 s and the base in 340.8 s, one process each. The spreads on four threads overlap on
+both files and do not separate the builds. Roadmap item 990 follows the attempt, and its
+row keeps these times.
+
+A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015 EL files and the 207
+files of the DL development set, 499 distinct files, with both builds on one and eight
+threads with its taxonomy, in a 10 GiB scope with a timeout of 300 s. Eight files are in
+both sets and ran twice. The 991 pairs of a
+file and a thread count that both builds classified gave the same bytes. The reader
+refuses `ore_ont_9881`. `ore_ont_14817`, `ore_ont_9663` and `ore_ont_3215` pass the timeout
+on one thread on both builds. With a timeout of 900 s on `atlas` both builds classify
+`ore_ont_14817` and `ore_ont_3215` on one thread with the taxonomies they give on eight,
+`ore_ont_3215` in 628.8 s for the item's build and 633.5 s for the base. `ore_ont_7192`
+passes the 10 GiB scope on eight threads on both builds, and on one thread the base passes
+the timeout and the item's build the scope. In larger scopes on the laptop both builds
+classify it on one thread with the same taxonomy and 80,580,920 conclusions, after the
+Horn rules pass their budget. The item's build took 405 s with a peak resident set of
+11.3 GiB and the base 875 s with 13.0 GiB, one process each at different loads of the
+laptop, so the two times are not a comparison.
+
+## Records
+
+The [record of item 869](runs/2026-11-16-horn-nominal-successors-atlas-3d2d4032/record.json)
+holds every classification of the rounds on `atlas`, the twelve further rounds and the
+one-thread runs of `ore_ont_14817` and `ore_ont_3215`, the sweep's
+taxonomy hashes, the scan of witnesses and worlds of item 868, the runs of `ore_ont_7192`
+and `ore_ont_11378` on the laptop and the scripts that ran.
 
 The [record of items 710 and 969](runs/2026-11-15-horn-dominance-atlas-a370d073/record.json)
 holds every classification of the rounds on `atlas` of the items' first build, of the build

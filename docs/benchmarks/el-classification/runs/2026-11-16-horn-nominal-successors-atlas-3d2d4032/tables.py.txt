@@ -1,0 +1,55 @@
+# tables.py OUT: the Markdown tables of the results section from the timing outputs
+import json, sys, glob, statistics as st
+out = sys.argv[1]; rows = {}
+for p in glob.glob(f"{out}/r*/*/*.json"):
+    r, tag, f = p.split('/')[-3:]
+    try: d = json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: continue
+    n, t = f[:-5].rsplit('.t', 1)
+    rows[(n, int(t), tag, r)] = d
+rounds = sorted({k[3] for k in rows})
+name = lambda n: {'go': 'GO', 'chebi_lite': 'ChEBI lite'}.get(n, f'`{n}`')
+def side(n, t, tag): return [rows[(n, t, tag, r)] for r in rounds if (n, t, tag, r) in rows]
+def ms(ds): return st.median(c for d in ds for c in d['classifyMs'])
+def med(ds, k): return st.median(d[k] for d in ds)
+def rats(n, t, a, b): return [st.median(rows[(n, t, a, r)]['classifyMs']) / st.median(rows[(n, t, b, r)]['classifyMs']) for r in rounds if (n, t, a, r) in rows and (n, t, b, r) in rows]
+def f1(x): return f"{x:,.1f}"
+def i(x): return f"{int(x):,}"
+heavy = ['ore_ont_4510', 'ore_ont_12901', 'ore_ont_14375', 'ore_ont_10951']
+anon = ['ore_ont_5481', 'ore_ont_10073', 'ore_ont_1370', 'ore_ont_4755']
+other = ['ore_ont_11378', 'ore_ont_9151', 'go', 'chebi_lite', 'ore_ont_9855', 'ore_ont_8737']
+print("| Ontology | Threads | Base ms | Item 869 ms | Ratio | Range of the rounds | Conjunctions before | Conjunctions after | Conclusions before | Conclusions after |\n|---|---:|---:|---:|---:|---|---:|---:|---:|---:|")
+for n in heavy:
+    for t in (1, 4):
+        b, l = side(n, t, 'base'), side(n, t, 'tip'); r = rats(n, t, 'tip', 'base')
+        print(f"| {name(n)} | {t} | {f1(ms(b))} | {f1(ms(l))} | {st.median(r):.3f} | {min(r):.3f} to {max(r):.3f} | {i(med(b,'conjunctions'))} | {i(med(l,'conjunctions'))} | {i(med(b,'conclusions'))} | {i(med(l,'conclusions'))} |")
+print()
+print("| Ontology | Threads | EL rules ms | Item 869 ms | Ratio | Range of the rounds | Ratio before | Conclusions of the EL rules | Conclusions after |\n|---|---:|---:|---:|---:|---|---:|---:|---:|")
+for n in heavy:
+    for t in (1, 4):
+        e, b, l = side(n, t, 'el'), side(n, t, 'base'), side(n, t, 'tip'); r = rats(n, t, 'tip', 'el'); rb = rats(n, t, 'base', 'el')
+        print(f"| {name(n)} | {t} | {f1(ms(e))} | {f1(ms(l))} | {st.median(r):.2f} | {min(r):.2f} to {max(r):.2f} | {st.median(rb):.2f} | {i(med(e,'conclusions'))} | {i(med(l,'conclusions'))} |")
+print()
+print("| Ontology | Threads | Index before ms | Index after ms | Classification before ms | Classification after ms | Ratio | Range of the rounds |\n|---|---:|---:|---:|---:|---:|---:|---|")
+for n in anon:
+    for t in (1, 4):
+        b, l = side(n, t, 'base'), side(n, t, 'tip'); r = rats(n, t, 'tip', 'base')
+        print(f"| {name(n)} | {t} | {f1(med(b,'indexMs'))} | {f1(med(l,'indexMs'))} | {f1(ms(b))} | {f1(ms(l))} | {st.median(r):.3f} | {min(r):.3f} to {max(r):.3f} |")
+print()
+print("| Ontology | Threads | Base ms | Item 869 ms | Ratio | Range of the rounds |\n|---|---:|---:|---:|---:|---|")
+for n in other:
+    for t in (1, 4):
+        b, l = side(n, t, 'base'), side(n, t, 'tip'); r = rats(n, t, 'tip', 'base')
+        if not r: continue
+        print(f"| {name(n)} | {t} | {f1(ms(b))} | {f1(ms(l))} | {st.median(r):.3f} | {min(r):.3f} to {max(r):.3f} |")
+print()
+for n in ['ore_ont_14817', 'ore_ont_9663']:
+    for tag in ('base', 'tip'):
+        ds = side(n, 4, tag)
+        print(n, tag, ', '.join(f"{d['classifyMs'][0]/1000:.1f}" for d in ds), 'tier', {d['tier'] for d in ds}, 'conj', [d['conjunctions'] for d in ds], 'rss', [round(d['peakRssKib']/2**20, 2) for d in ds])
+print()
+for n in heavy + anon + other:
+    for t in (1, 4):
+        b, l = side(n, t, 'base'), side(n, t, 'tip')
+        if not b: continue
+        print(n, t, 'rss GiB', round(max(d['peakRssKib'] for d in b)/2**20, 3), round(max(d['peakRssKib'] for d in l)/2**20, 3), 'concl', i(med(b,'conclusions')), i(med(l,'conclusions')), 'conj', i(med(b,'conjunctions')), i(med(l,'conjunctions')), 'reps', sum(len(d['classifyMs']) for d in b), sum(len(d['classifyMs']) for d in l))
