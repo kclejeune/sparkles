@@ -5175,6 +5175,67 @@ mod tests {
         assert!(peak < crate::index::BLOCK_ROWS as u64 * 8, "peak {peak}");
     }
 
+    /// Cost per shared batch of a scan over three blocks, with each batch held while the
+    /// next is taken, as the response writer does. Run with --ignored --nocapture in release.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn shared_batch_cost_bench() {
+        use crate::index::{BLOCK_ROWS, BlockCache, Perm, read_ahead_fixture};
+        use crate::store::{Store, StoreOptions};
+        let (_dir, idx) = read_ahead_fixture(3);
+        let store = Store::in_memory(StoreOptions::default());
+        let mut snapshot = (*store.snapshot()).clone();
+        drop(store);
+        Arc::get_mut(&mut snapshot.generation)
+            .expect("owned fixture generation")
+            .perms[Perm::Spo.index()] = idx;
+        snapshot.cache = Arc::new(BlockCache::new(64 << 20));
+        let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+        let var = ctx.var("s");
+        let spec = || ScanSpec {
+            perm: Perm::Spo,
+            prefix: vec![],
+            cols: vec![(1, var)],
+            eqs: vec![],
+            graph: super::super::plan::GraphFilter::All,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let run = |passes: usize| {
+            let started = Instant::now();
+            let mut batches = 0u64;
+            for _ in 0..passes {
+                let mut scan = Scan::new(spec(), None);
+                let mut held = None;
+                loop {
+                    match scan.next_shared(&ctx, &[var], 4096).unwrap() {
+                        SharedAttempt::Ready(Some(batch)) => {
+                            batches += 1;
+                            held = Some(batch);
+                        }
+                        SharedAttempt::Ready(None) => break,
+                        _ => panic!("declined"),
+                    }
+                }
+                drop(held);
+            }
+            (
+                started.elapsed().as_nanos() as f64 / batches as f64,
+                batches,
+            )
+        };
+        run(200);
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let (ns, batches) = run(2000);
+            best = best.min(ns);
+            eprintln!("shared batch: {ns:.1} ns over {batches} batches");
+        }
+        eprintln!("BEST {best:.1} ns per batch, {} rows a block", BLOCK_ROWS);
+    }
+
     #[cfg(unix)]
     #[test]
     fn shared_cursor_eviction_restores_read_ahead() {
