@@ -1665,10 +1665,13 @@ flag "--profile <path>" required=#true help="private independently admitted prof
 flag "--release <path>" required=#true help="private reviewed finite release"
 '''
 run = '''
+# The controller runs under the system Python, found by its absolute path since a systemd unit
+# needs one. Hosts without /usr/bin/python3, such as NixOS, use the resolved python3 on PATH.
+py=/usr/bin/python3; [ -x "$py" ] || py=$(readlink -f "$(command -v python3)")
 systemd-run --user --wait --pipe --unit="$usage_unit" --property=Type=exec \
   --property=MemoryMax=512M --property=MemorySwapMax=0 --property=RuntimeMaxSec=2700 \
   --property=TimeoutStopSec=30 --property=KillMode=control-group --property=OOMPolicy=continue \
-  /usr/bin/python3 -I -B "$PWD/scripts/boat/controller.py" run \
+  "$py" -I -B "$PWD/scripts/boat/controller.py" run \
   --owned-worker "$usage_worker" --profile "$usage_profile" --release "$usage_release"
 '''
 
@@ -1692,10 +1695,11 @@ run = '''
 set --
 # shellcheck disable=SC2154 # usage_local_unit is a list of unit names
 for unit in ${usage_local_unit:-}; do set -- "$@" --local-unit "$unit"; done
+py=/usr/bin/python3; [ -x "$py" ] || py=$(readlink -f "$(command -v python3)")
 systemd-run --user --unit="$usage_unit" --collect --property=Type=exec \
   --property=MemoryMax=256M --property=MemorySwapMax=0 --property=RuntimeMaxSec=43500 \
   --property=TimeoutStopSec=30 --property=KillMode=control-group --property=OOMPolicy=continue \
-  /usr/bin/python3 -I -B "$PWD/scripts/boat/controller.py" closure-watch \
+  "$py" -I -B "$PWD/scripts/boat/controller.py" closure-watch \
   --operation "$usage_operation" --lead "$usage_lead" "$@"
 '''
 
