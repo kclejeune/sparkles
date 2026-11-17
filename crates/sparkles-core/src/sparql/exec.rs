@@ -5364,8 +5364,10 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
     if t.len() <= PAR_THRESHOLD {
         return Ok(None);
     }
-    let mut out: super::expr::DecodedCols = vec![None; t.width()];
+    // The charge is declared before the columns it covers, so that on every return the
+    // columns are freed before it is released.
     let mut charge: Option<super::ctx::RetainedCharge> = None;
+    let mut out: super::expr::DecodedCols = vec![None; t.width()];
     // Charge `total` bytes in all, `false` when the query cannot hold them. Shrinking
     // always fits.
     let mut set = |total: u64| -> bool {
@@ -9977,25 +9979,44 @@ mod string_order_tests {
         assert_eq!(streamed, eager);
     }
 
-    /// A table of more than `PAR_THRESHOLD` rows, with `distinct` distinct stored strings
-    /// first and an inline number and a local string after them.
-    fn wide(ctx: &Ctx, s: &Store, distinct: usize) -> (Table, VarId) {
+    /// The rows of the pre-decode tests, more than `PAR_THRESHOLD`.
+    const WIDE_ROWS: usize = PAR_THRESHOLD + 4096;
+
+    /// A store of `WIDE_ROWS` distinct stored strings and the ids of its strings in order.
+    fn unique_store() -> (Store, Vec<Id>) {
+        let mut nt = String::new();
+        for i in 0..WIDE_ROWS {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"string number {i:06}\" .\n"));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
         let snap = s.snapshot();
-        let words: Vec<Id> = words()
-            .iter()
-            .map(|w| {
-                snap.lookup_term(&oxrdf::Literal::new_simple_literal(w).into())
-                    .unwrap()
+        let ids = (0..WIDE_ROWS)
+            .map(|i| {
+                let term = oxrdf::Literal::new_simple_literal(format!("string number {i:06}"));
+                snap.lookup_term(&term.into()).unwrap()
             })
             .collect();
+        drop(snap);
+        (s, ids)
+    }
+
+    /// A table of `WIDE_ROWS` rows over `distinct` of the strings, every one distinct when
+    /// it is `usize::MAX`, with an inline number and a local string among them.
+    fn wide(ctx: &Ctx, strings: &[Id], distinct: usize) -> (Table, VarId) {
         let x = ctx.var("x");
         let mut t = Table::new(vec![x]);
         let local = ctx.intern_value(&Value::Str("local".into()));
-        for i in 0..PAR_THRESHOLD + 4096 {
+        for i in 0..WIDE_ROWS {
             let id = match i % 64 {
                 62 => Id::from_i64(i as i64).unwrap(),
                 63 => local,
-                _ => words[i % distinct.min(words.len())],
+                _ => strings[i % distinct.min(strings.len())],
             };
             t.push_row(&[id]);
         }
@@ -10010,12 +10031,29 @@ mod string_order_tests {
         )
     }
 
+    /// Whether every base-vocabulary row of `t` holds its value in `col`, as `ctx` reads
+    /// it, and every other row holds none.
+    fn assert_rows(ctx: &Ctx, t: &Table, col: &[Option<Value>], what: &str) {
+        for (i, (&id, value)) in t.cols[0].iter().zip(col).enumerate() {
+            if id.tag() == Tag::Vocab {
+                assert_eq!(
+                    format!("{value:?}"),
+                    format!("{:?}", ctx.value(id)),
+                    "{what}: row {i}"
+                );
+            } else {
+                assert!(value.is_none(), "{what}: row {i}");
+            }
+        }
+    }
+
     /// The row-aligned pre-decode decodes every base-vocabulary row to its value in both
-    /// modes, with or without the `expr_cache` switch and with shared or distinct terms,
-    /// and leaves the other rows to the row path.
+    /// modes, with or without the `expr_cache` switch and with shared terms, which it
+    /// clones, or distinct ones, which it moves, and leaves the other rows to the row
+    /// path.
     #[test]
     fn the_row_aligned_pre_decode_matches_the_values_of_its_rows() {
-        let (s, _) = store("long");
+        let (s, strings) = unique_store();
         for cursor in [false, true] {
             for expr_cache in [true, false] {
                 for distinct in [7, usize::MAX] {
@@ -10027,52 +10065,64 @@ mod string_order_tests {
                     }
                     let ctx = std::sync::Arc::new(ctx);
                     ctx.attach_owner();
-                    let (t, x) = wide(&ctx, &s, distinct);
+                    let (t, x) = wide(&ctx, &strings, distinct);
                     let e = str_of(x);
+                    let what = format!("cursor {cursor} cache {expr_cache} distinct {distinct}");
                     let decoded = decode_for(&ctx, &t, &[&e]).unwrap().expect("decoded");
                     let col = decoded.cols[0].as_ref().expect("the column is decoded");
-                    for (i, (&id, value)) in t.cols[0].iter().zip(col).enumerate() {
-                        if id.tag() == Tag::Vocab {
-                            assert_eq!(
-                                format!("{value:?}"),
-                                format!("{:?}", ctx.value(id)),
-                                "row {i}"
-                            );
-                        } else {
-                            assert!(value.is_none(), "row {i}");
-                        }
-                    }
-                    assert!(ctx.check().is_ok());
+                    assert_rows(&ctx, &t, col, &what);
+                    assert!(ctx.check().is_ok(), "{what}");
                 }
             }
         }
     }
 
-    /// A budget that does not hold the decoded column leaves it to the rows without an
-    /// error, in both modes of a context with an owner to charge.
+    /// Whatever room the budget leaves, the pre-decode never fails: the column is decoded
+    /// whole or left to the rows, the charges it took are given back when it drops, and
+    /// the context stays usable. The room runs from too little for the slots, through the
+    /// sorted decoding, to the expansion of the values to their rows.
     #[test]
     fn a_refused_pre_decode_leaves_the_column_to_the_rows() {
-        let (s, _) = store("long");
+        let (s, strings) = unique_store();
+        const LIMIT: u64 = 64 << 20;
         for cursor in [false, true] {
-            let mut ctx = Ctx::new(s.snapshot());
-            ctx.mem_limit = 1 << 20;
-            if cursor {
-                ctx.enable_cursor_accounting().unwrap();
+            let (mut declined, mut decoded) = (0, 0);
+            for room in (0..=96).map(|k| (k as u64) * (128 << 10)) {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = LIMIT;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let ctx = std::sync::Arc::new(ctx);
+                ctx.attach_owner();
+                let (t, x) = wide(&ctx, &strings, usize::MAX);
+                let e = str_of(x);
+                let held = ctx.charge(LIMIT - ctx.live_bytes() - room).unwrap();
+                let before = ctx.live_bytes();
+                let what = format!("cursor {cursor} room {room}");
+                let result = decode_for(&ctx, &t, &[&e]).unwrap_or_else(|e| panic!("{what}: {e}"));
+                match result.as_ref().and_then(|d| d.cols[0].as_ref()) {
+                    Some(col) => {
+                        decoded += 1;
+                        // values read through another context, whose cache this one
+                        // does not charge
+                        assert_rows(&Ctx::new(s.snapshot()), &t, col, &what);
+                    }
+                    None => declined += 1,
+                }
+                drop(result);
+                assert_eq!(
+                    ctx.live_bytes(),
+                    before,
+                    "{what}: the charges are given back"
+                );
+                drop(held);
+                assert!(ctx.check().is_ok(), "{what}");
             }
-            let ctx = std::sync::Arc::new(ctx);
-            ctx.attach_owner();
-            let (t, x) = wide(&ctx, &s, usize::MAX);
-            let held = ctx
-                .charge((1 << 20) - ctx.live_bytes() - (64 << 10))
-                .unwrap();
-            let e = str_of(x);
-            let decoded = decode_for(&ctx, &t, &[&e]).unwrap();
             assert!(
-                decoded.is_none_or(|d| d.cols[0].is_none()),
-                "cursor {cursor}"
+                declined > 0 && decoded > 0,
+                "cursor {cursor}: {declined} declined, {decoded} decoded"
             );
-            drop(held);
-            assert!(ctx.check().is_ok(), "cursor {cursor}");
         }
     }
 
