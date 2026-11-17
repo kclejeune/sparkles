@@ -343,8 +343,9 @@ slower on one thread on `atlas` in every round, and item 1028 follows that. Item
 also timed `ore_ont_9663` against the build before item 869 now that item 990 bounds its
 attempt. Over sixteen processes a side on four threads the build with item 869 takes a
 median of 8.75 against 8.17 s and is slower in 12 rounds, and on one thread 76.3 against
-75.8 s with the same conclusions in each of four rounds, almost all of it in the attempt
-of the disjunctive rules, which item 869 does not change. Item 1027 follows it.
+75.8 s with the same conclusions in each of four rounds. Almost all of the difference is
+outside the Horn rules' final saturation, in time that holds the attempt of the
+disjunctive rules, which item 869 does not change. Item 1027 follows it.
 
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and

@@ -1316,9 +1316,10 @@ axioms out. The ratio before is the base's time against the same runs.
 | `ore_ont_10951` | 1 | 11.9 | 25.4 | 2.12 | 2.11 to 2.13 | 5.60 | 176,238 | 444,256 |
 | `ore_ont_10951` | 4 | 10.3 | 17.5 | 1.68 | 1.47 to 1.87 | 3.36 | 176,238 | 445,703 |
 
-The Horn rules still take 2.0 to 2.2 times the EL rules' time on one thread and 1.7 to
-1.8 times on four, and derive 2.4 to 2.5 times the conclusions, where the base derived
-6.6 to 9.2 times as many. Roadmap item 1025 follows what remains.
+At the build of item 869 the Horn rules took 2.0 to 2.2 times the EL rules' time on one
+thread and 1.7 to 1.8 times on four, and derived 2.4 to 2.5 times the conclusions, where
+the base derived 6.6 to 9.2 times as many. [Assertions under a range](#assertions-under-a-range)
+gives the times since item 1025, which follows what remains.
 
 The item also makes the Horn normalization pass over an assertion about an anonymous
 individual before it opens a scope for it. The reader leaves such axioms out, and the
@@ -1510,17 +1511,21 @@ had one classification per process and `ore_ont_8737` two.
 | `ore_ont_10073` | 4 | 754.1 | 758.4 | 1.005 | 1.004 to 1.014 |
 
 On one thread GO is slower in every round, by 2.0 to 2.3%, and so are `ore_ont_1370`,
-`ore_ont_16744` and ChEBI lite, by 0.7 to 6.5%, 0.2 to 2.3% and 0.6 to 2.2%. The other
-four files on one thread and GO, ChEBI lite, `ore_ont_16744` and `ore_ont_8737` on four
-threads lie on both sides of 1. GO's saturation takes 247.4 against 240.7 ms on one
-thread, `ore_ont_16744`'s 8.18 against 8.02 s and ChEBI lite's 569.8 against 560.4 ms,
-and the index stage of `ore_ont_1370` 414.2 against 408.1 ms. A run on the laptop pinned
-to one performance core counted the instructions of a process that classifies five times
-on one thread. On GO the build of item 1025 alone and the build of both items ran 27.55
-billion against 27.93 billion on the base, and on ChEBI lite 56.61 billion against 55.92
-billion, two processes of each build within 0.01% of each other. The flush of item 1026
-therefore adds no work on these files, and the commit of item 1025, which adds no rule
-to the saturation, changes the generated code. Roadmap item 1028 follows the slowdown.
+`ore_ont_16744` and ChEBI lite, by 0.7 to 6.5%, 0.2 to 2.3% and 0.6 to 2.2%. On four
+threads `ore_ont_10073` is slower in every round, by 0.4 to 1.4%. Every other row has
+rounds on both sides of 1. On one thread GO's saturation takes 247.4 against 240.7 ms,
+`ore_ont_16744`'s 8.18 against 8.02 s and ChEBI lite's 569.8 against 560.4 ms. On
+`ore_ont_1370` the index stage takes most of the difference, 414.2 against 408.1 ms,
+beside a saturation of 43.9 against 43.2 ms. A run on the laptop pinned to one
+performance core counted the instructions of a whole process that reads the file and
+classifies it five times on one thread. On GO the build of item 1025 alone and the build
+of both items ran 27.55 billion against 27.93 billion on the base, and on ChEBI lite
+56.61 billion against 55.92 billion, two processes of each build within 0.01% of each
+other. The flush of item 1026 therefore adds no instructions on these files. The counts
+move in both directions from the commit of item 1025, which adds no rule to the
+saturation, so its build may generate other code for the rules it leaves alone. The run
+does not time the stages or the two commits apart on `atlas`, so the cause of the
+slowdown there is not shown. Roadmap item 1028 follows it.
 
 Item 1025 also timed `ore_ont_9663` and `ore_ont_14817` on the build before item 869,
 commit be684ce5, against the base, which adds item 869 to it, now that the bound of item
@@ -1536,11 +1541,13 @@ one thread.
 
 Every process gave the taxonomy of its file that the other build gave. On one thread
 both builds derive 50,878,012 conclusions on `ore_ont_9663`. On four threads the Horn
-rules' saturation takes a median of 1.26 against 1.21 s on `ore_ont_9663`, and the rest
-of the classification, which is the attempt of the disjunctive rules up to the bound, 7.52
-against 6.92 s, with 60.1 against 59.1 million conclusions that follow the order of
-delivery. Item 869 does not change the disjunctive rules, so `ore_ont_9663` is slower in
-code that the item leaves alone, and roadmap item 1027 follows it. The rounds of
+rules' final saturation takes a median of 1.26 against 1.21 s on `ore_ont_9663`, and the
+time outside it 7.52 against 6.92 s, with 60.1 against 59.1 million conclusions that
+follow the order of delivery. That time holds the attempt of the disjunctive rules up to
+the bound and the index and taxonomy stages, which take about 0.1 s of it, and the
+record does not time the attempt apart. Item 869 does not change the disjunctive rules,
+so most of the slowdown of `ore_ont_9663` is in code that the item leaves alone, and
+roadmap item 1027 follows it. The rounds of
 `ore_ont_14817` do not separate the builds.
 
 A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015 EL files and the 207
@@ -1549,9 +1556,11 @@ items on one and eight threads with its taxonomy, in an 8 GiB scope with a timeo
 300 s. The 994 pairs of a file and a thread count that both builds classified gave the
 same bytes, and no file changed its tier. The reader refuses `ore_ont_9881`, and
 `ore_ont_7192` passes the scope on both builds on one and on eight threads.
-`ore_ont_7192` is the one file of the sweep on which the Horn rules pass their budget,
-the outcome that another order of merges can move, and the pair has not run in the
-larger scope in which the record of item 869 classified it.
+In a 14 GiB scope both builds classify `ore_ont_7192` on one thread with the same
+taxonomy and 80,580,920 conclusions, with the Horn rules past their budget on both,
+the outcome that another order of merges could move. The base took 184 s and the build
+of both items 140 s, one process each at different loads of the laptop, so the two times
+are not a comparison.
 On one thread 57 files of the development set change their conclusions. Of them 52
 derive fewer, `ore_ont_8941` 34,142 against 180,033, and 5 derive up to 0.6% more. GO,
 ChEBI lite and the EL files derive the same.
@@ -1562,8 +1571,8 @@ The [record of items 1025 and 1026](runs/2026-11-17-horn-range-successors-atlas-
 holds every classification of the rounds on `atlas` of the base, the build of both items,
 the prototype of the realness conclusions and the EL rules alone, the twenty rounds of
 `ore_ont_9663` and `ore_ont_14817` on the builds before and with item 869, the sweep's
-taxonomy hashes, the counts by commit and the pinned instruction counts from the laptop,
-the prototype's patch and the scripts that ran.
+taxonomy hashes, the pair of `ore_ont_7192`, the counts by commit and the pinned
+instruction counts from the laptop, the prototype's patch and the scripts that ran.
 
 The [record of item 869](runs/2026-11-16-horn-nominal-successors-atlas-3d2d4032/record.json)
 holds every classification of the rounds on `atlas`, the twelve further rounds and the
