@@ -691,19 +691,22 @@ fn a_name_with_the_prefix_of_the_reductions_keeps_the_ontology_from_them() {
     );
 }
 
-/// Classifies with the rooted run, checks that no made-up name reaches the answer and that
-/// the answer and the axioms left out are those of a run without the option, and returns
-/// the axioms left out, for the cases the reductions decline.
-fn declined(body: &str) -> Vec<String> {
+/// Classifies with the rooted run, checks that no made-up name reaches the answer, and
+/// returns the axioms left out, for the cases the reductions decline. With `plain`, it also
+/// checks that the answer and the axioms left out are those of a run without the option,
+/// which holds when something other than the reductions keeps the rooted run away.
+fn declined(body: &str, plain: bool) -> Vec<String> {
     let ax = axioms(body);
     let mut k = Classifier::of(&ax);
     let out = k.classify(&rooted_limits()).unwrap();
     no_internal_names(&k, &out, &[Class::thing()]);
-    let mut plain = Classifier::of(&ax);
-    let default = plain.classify(&Limits::default()).unwrap();
-    assert_eq!(out.taxonomy, default.taxonomy);
-    assert_eq!(out.consistency, default.consistency);
-    assert_eq!(k.excluded(), plain.excluded());
+    if plain {
+        let mut p = Classifier::of(&ax);
+        let default = p.classify(&Limits::default()).unwrap();
+        assert_eq!(out.taxonomy, default.taxonomy);
+        assert_eq!(out.consistency, default.consistency);
+        assert_eq!(k.excluded(), p.excluded());
+    }
     k.excluded()
         .iter()
         .map(|e| format!("{:?}", e.axiom))
@@ -712,14 +715,16 @@ fn declined(body: &str) -> Vec<String> {
 
 #[test]
 fn a_universal_property_in_a_maximum_is_left_as_it_is() {
+    // the rooted run takes the union and leaves the maximum out, as it did before the
+    // reductions, and the maximum is reported as it is written
     let left = declined(
         "SubClassOf(:A ObjectMaxCardinality(3 owl:topObjectProperty))
          ClassAssertion(:A :a)",
+        false,
     );
-    assert!(
-        left.iter().any(|a| a.contains("ObjectMaxCardinality")),
-        "{left:?}"
-    );
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].contains("ObjectMaxCardinality"), "{left:?}");
+    assert!(left[0].contains("topObjectProperty"), "{left:?}");
 }
 
 #[test]
@@ -734,15 +739,18 @@ fn a_minimum_of_one_over_the_universal_property_is_an_existential() {
 }
 
 #[test]
-fn a_functional_property_above_the_universal_property_is_declined_by_tier_d() {
+fn a_functional_property_above_the_universal_property_is_left_out() {
     // p is above the transitive property that stands for the universal one, so p is not
-    // simple, and the rooted run leaves the ontology to its default answer
+    // simple, and the rooted run leaves its functionality out and reports it, while it
+    // takes the equivalence and the union
     let left = declined(
         "EquivalentObjectProperties(owl:topObjectProperty :p)
          FunctionalObjectProperty(:p)
          ClassAssertion(:A :a)",
+        false,
     );
-    assert!(!left.is_empty());
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].contains("FunctionalObjectProperty"), "{left:?}");
 }
 
 #[test]
@@ -752,8 +760,11 @@ fn a_key_past_the_budget_of_its_reduction_is_left_as_it_is() {
     for i in 0..70 {
         body.push_str(&format!("ClassAssertion(:K :i{i})\n"));
     }
-    let left = declined(&body);
-    assert!(left.iter().any(|a| a.contains("HasKey")), "{left:?}");
+    // the key keeps the rooted run away, and the EL rules take it as they do without the
+    // option and leave the union out
+    let left = declined(&body, true);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].contains("ObjectUnionOf"), "{left:?}");
 }
 
 #[test]

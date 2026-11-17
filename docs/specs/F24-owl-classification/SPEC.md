@@ -3569,8 +3569,9 @@ property goes through the automata of the rules above, and h is not a named indi
 keys or for the taxonomy. A domain or range of the universal property becomes `⊤ ⊑ C`, a
 minimum of none over it is `⊤` and a minimum of one is an existential restriction over U′,
 and a property equivalent to it or its inverse gets U′ as a subproperty. A property above
-U′ is not simple, so the rules above refuse it in a number restriction, a functionality, a
-disjointness or an irreflexivity. A larger minimum, a maximum, an exact cardinality, a
+U′ is not simple, which OWL 2 DL forbids in a number restriction, a functionality, a
+disjointness or an irreflexivity, and the run either leaves such an axiom out and reports
+it or gives the default answer. A larger minimum, a maximum, an exact cardinality, a
 self restriction, functionality, asymmetry, irreflexivity or disjointness of the universal
 property itself has no replacement, and the ontology is then not rewritten. Neither is an
 ontology that names an entity with the prefix `urn:sparkles:internal:` of the fresh names,
