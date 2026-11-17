@@ -242,6 +242,13 @@ that is not ground forms its unions list after list and keeps only the least uni
 step of up to 4,096 unions (item 969), which takes three classifications of `ore_ont_14817` of ORE 2015 on four threads on
 `atlas` from 59.7 to 79.5 s down to 19.9 to 38.9 s. Three more counting fixtures finish
 within the counting bound.
+A run of the Horn rules reduces each automaton before it unfolds a universal or a negative
+existential restriction by it (roadmap item 693). It merges the states that accept the same
+words by the same transitions, drops a transition that another covers by a superproperty,
+and drops the transitions by properties that no link of the run can have. On one thread and
+without their disjunctive attempt, the Horn rules derive 22.1 million conclusions on
+`ore_ont_14817` where they derived 29.1 million and 35.6 million on `ore_ont_9663` where
+they derived 50.9 million, with the same taxonomies.
 A run of the disjunctive rules without counting or the rooted rules ends once it has
 derived 384 conclusions for each class of the signature, and at least 2,097,152, and the
 Horn rules answer as they do past its memory budget (roadmap item 990).

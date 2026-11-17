@@ -1023,6 +1023,71 @@ check compared the taxonomies of 14,547 generated ontologies of 8 to 18 axioms w
 build before on one and eight threads, and of 2,145 of them, with a union that meets
 nothing beside them, with the disjunctive rules counting, and found no difference.
 
+A run reduces each automaton before it unfolds a restriction by it (item 693). The
+closure over the ε-transitions leaves states that accept the same words, transitions by
+a subproperty beside the one by the property, and branches through properties that no
+link of the ontology has. Each state becomes a class in every unfolding, and each
+transition a universal restriction that R3 and R4 carry to every context on the way, so
+a redundant state or transition is paid for at each of those contexts. The automaton of
+the inverse of `part_of` in ore_ont_14817 has 4 states and 10 transitions after the
+closure and 2 states and 2 transitions after the reductions. There are three, and
+`SPARKLES_HORN_AUTOMATA` set to 0, 1 or 2 turns off all of them, the last two or the
+last one for a comparison.
+
+1. **States that accept the same words by the same transitions become one.** The run
+   takes the coarsest partition of the states in which the states of a block are final
+   alike and have transitions by the same properties into the same blocks. The states of
+   a block accept the same words, so the quotient accepts from each block what its
+   states accepted. The translation of the completeness argument above reads only the
+   words each state accepts, and holds for the quotient unchanged.
+2. **A transition that another covers by a superproperty goes.** When a state has
+   transitions by `l` and by `l'` into the same state and `l` is under `l'`, the axiom
+   `X ⊑ ∀l.Y` of the first follows from the axiom `X ⊑ ∀l'.Y` of the second under the
+   property hierarchy. The translation without it has the same models, and the calculus
+   is complete for it as for any translation. Of two transitions by equivalent
+   properties the run keeps one.
+3. **A transition by a property that no link can meet goes.** R3 applies a universal
+   restriction on `l` to the links under `l`, and R4 applies it to the backward links
+   and loops under the inverse of `l`. No other rule reads it. A property is live when a
+   link or loop of the run can be under it or under its inverse, or when it is a
+   universal property. The automaton loses the transitions by the other properties, then
+   the states that no longer reach a final state, and the states the start no longer
+   reaches. The universal of a lost transition was the premise of no rule instance, and
+   a state that reaches no final state gives a context only universals over other such
+   states, so the run derives the same subsumers among the expressions of the ontology.
+
+The third reduction rests on the list of properties a link or loop can have. A context
+links to the successor of each existential restriction it holds, which includes the
+negative restrictions `∃r.F` that the run makes fillers of universals, since a context
+that derives one links to its successor too. Composition adds links by the results of
+the chains the run composes. R6 gives a predecessor a link by the inverse of a
+successor's property. A loop has a reflexive property, the property of a self
+restriction, the property of a link when R6 identifies a predecessor with a successor,
+or a chain's result, and each loop has its inverse. The rules of individuals copy links
+and loops between the contexts of one element and keep their properties. The live
+properties are all of these with their inverses, which is more than the rules can
+produce. A run that composes every chain prunes nothing. The index keeps the properties
+whose transitions went, and a debug build checks at every link and backward link of a
+Horn run that none of them applies to it.
+
+The fresh classes of an unfolding are positional, and an incremental run gives the
+state at each position the class the last run gave it. The third reduction makes the
+automaton depend on which properties have links, so an added axiom such as `A ⊑ ∃v.B`
+can bring a branch back and move the positions. This needs no rule of its own. A state's
+class carries the told axioms of its transitions, and a kept context is saturated again
+when the told axioms of an expression it holds differ from the last run's, which is how
+a changed chain axiom already reached the kept contexts.
+
+On one thread and without their disjunctive attempt, the Horn rules derive 22.1 million
+conclusions on ore_ont_14817 where they derived 29.1 million, and 35.6 million on
+ore_ont_9663 where they derived 50.9 million. Merging gives 27.9 and 46.0 million,
+covered transitions 24.2 and 41.1 million, and dead properties the rest. The EL rules
+alone derive 16.5 and 10.8 million. The contexts of conjunctions hold 5.47 million
+subsumers on ore_ont_14817 where they held 8.50 million, and the peak resident set of
+the laptop runs falls from 796 to 678 MiB and from 1,189 to 933 MiB. The taxonomies are
+equal at every level on one and eight threads. Tier D's own unfolding in its bounded
+attempt is not reduced.
+
 Item 693 also fixed a gap in completeness that phase 3 left. A chain
 `r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of
 phase 3 composed the told chain only. With `r0 ∘ r2⁻ ⊑ r0` and `r2` the inverse of `r0`,
