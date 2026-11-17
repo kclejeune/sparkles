@@ -1,0 +1,68 @@
+# make-record.py LANE DEST: builds the benchmark record of item 869 from the atlas timing outputs,
+# the laptop's taxonomy sweep and the laptop's scan of witnesses and worlds for item 868
+import json, sys, os, glob
+lane, dest = sys.argv[1], sys.argv[2]
+keep = ['classifyMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
+        'outside', 'outsideTaken', 'conclusions', 'contexts', 'conjunctions', 'peakEstimatedBytes', 'peakRssKib', 'threads']
+def rep(p):
+    try: return json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: return None
+def runs(root, pattern):
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, pattern), recursive=True)):
+        d = rep(p)
+        out.append({'path': os.path.relpath(p, root), 'report': {k: d.get(k) for k in keep} if d else None})
+    return out
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+t = os.path.join(lane, 'atlas', 'timing')
+before = text(os.path.join(t, 'before.txt')) or ''
+sha = {l.split()[1].split('/')[-1]: l.split()[0] for l in before.splitlines() if '/bin/' in l}
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'ORE 2015 DL development files ore_ont_4510, ore_ont_12901, ore_ont_14375, ore_ont_10951, ore_ont_5481, ore_ont_10073, ore_ont_1370, ore_ont_4755, ore_ont_11378, ore_ont_9151, ore_ont_9855, ore_ont_8737, ore_ont_14817, ore_ont_9663 and ore_ont_3215, GO 2026-07-26 and ChEBI lite 256 on atlas, and a taxonomy sweep of GO, ChEBI lite, 298 ORE 2015 EL files and 207 DL development files on the laptop',
+  'host': {'name': 'atlas', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+  'manifest': {
+    'sides': {'base': 'e2709fb7, the lane base (batch 26)',
+              'tip': '3d2d4032, the reviewed lane tip with origin/main f854145b merged, which changes nothing in crates/sparkles-owl',
+              'el': 'the tip build with --el-only, on the four assertion-heavy files'},
+    'build': 'mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas',
+    'binaries_sha256': sha,
+    'scripts': ['timing.sh.txt', 'timing2.sh.txt', 't1.sh.txt', 'summ.py.txt', 'tables.py.txt', 'sweep.sh.txt', 'scan.sh.txt', 'make-record.py.txt']},
+  'settings': {'threads': 'one and four in the rounds, four only for ore_ont_14817 and ore_ont_9663 in timing and timing2, one in t1, one and eight in the sweep, four in the scan',
+               'scope': 'one process per run in a 13 GiB systemd scope without swap on atlas, a 10 GiB scope on the laptop',
+               'lock': 'every atlas part ran under ~/lanes/.heavy.lock'},
+  'method': 'timing.sh ran four rounds of alternating order of base and tip, one process per side, file and thread count with --repeat 5, 2 for ore_ont_8737 and 1 for ore_ont_14817 and ore_ont_9663, and in each round the tip with --el-only on the four assertion-heavy files. summ.py takes the median of every classification of a side and the median of the rounds ratios. timing2.sh ran twelve more rounds of alternating order of base and tip on ore_ont_14817 and ore_ont_9663 on four threads, one classification a process, and t1.sh ran the tip and the base once on one thread on ore_ont_14817 and ore_ont_3215 with a timeout of 900 s and the hash of the sorted taxonomy, as the sweep takes it. The sweep classified each file once per side and thread count with its taxonomy on the laptop, with a timeout of 300 s, and compared the hashes of the sorted taxonomies. The scan ran a diagnostic build of the base, which counts witnesses, world classes and the time of the worlds, on every DL development file on four threads on the laptop.',
+  'timing': runs(t, 'r*/*/*.json'),
+  'timing_log': text(os.path.join(t, 'log.txt')),
+  'timing_summary': text(os.path.join(lane, 'atlas', 'summary.txt')),
+  'hosts': {p: text(os.path.join(t, p)) for p in ['before.txt', 'after.txt']},
+  'timing2': runs(os.path.join(lane, 'atlas', 'timing2'), 'r*/*/*.json'),
+  'timing2_log': text(os.path.join(lane, 'atlas', 'timing2', 'log.txt')),
+  'timing2_hosts': {p: text(os.path.join(lane, 'atlas', 'timing2', p)) for p in ['before.txt', 'after.txt']},
+  'one_thread': {'log': text(os.path.join(lane, 'atlas', 't1', 'log.txt')),
+                 'hosts': {p: text(os.path.join(lane, 'atlas', 't1', p)) for p in ['before.txt', 'after.txt']},
+                 'note': 'each line gives the file, the thread count, the side, the exit status, the first 16 hex digits of the SHA-256 of the sorted taxonomy and [classify ms, saturation ms, tier, conclusions, conjunctions, dlOverBudget, hornOverBudget, axioms outside, unsatisfiable, consistency, peak RSS KiB, peak estimated bytes]'},
+  'sweep_host': 'stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB',
+  'sweep': {str(i): text(os.path.join(lane, f'sweep/log-tip.{i}.txt')) for i in range(4)},
+  'laptop_diagnostics': {
+    'ore_ont_7192_one_thread': {
+      'note': 'ore_ont_7192 on one thread passes the sweep limits on both builds. In a 12 GiB scope with 2 GiB of swap the tip classified it in 404.8 s with 80,580,920 conclusions, a peak resident set of 11.3 GiB and the taxonomy hash 116564162182aa0f, which is the hash that the record of items 710 and 969 has for both of its builds on one thread. A first run of the base ended with the laptop at a power loss, and a second run of the base was killed in the same scope after about 970 s with its resident set at the cap. A third run of the base in a 14 GiB scope with 2 GiB of swap finished in 875.3 s with the same hash, 80,580,920 conclusions and a peak resident set of 13.0 GiB. The laptop ran builds and tests of other lanes during these runs, with a load average near 50 at the end of the third, and it was suspended from 22:34:30 to about 22:57 during the third run, which the monotonic clock of the classifier does not count, so the times of the two builds are not a comparison. The resident set samples are seconds since the script started and KiB, and the first samples of the second and third runs show the wrapper that waits for the heavy lock of the laptop.',
+      'tip_report': rep(os.path.join(lane, 'out/7192/tip.json')),
+      'tip_rss_samples': text(os.path.join(lane, 'out/7192/tip.rss')),
+      'base_second_run_rss_samples': text(os.path.join(lane, 'out/7192/base.2.rss')),
+      'base_second_run_done': text(os.path.join(lane, 'out/7192/done2.txt')),
+      'base_third_run_done': text(os.path.join(lane, 'out/7192/done3.txt')),
+      'base_third_run_rss_samples': text(os.path.join(lane, 'out/7192/base.3.rss'))},
+    'ore_ont_11378_resident_set': text(os.path.join(lane, 'out/rss-11378.txt')),
+    'witness_scan_base': text(os.path.join(lane, 'out/scan-base.txt')),
+    'witness_scan_note': 'each line of the scan gives the file, the exit status, [tier, classify ms, index ms, saturation ms, conjunctions, conclusions, axioms outside] and the diagnostic counts first_ms, rounds_ms, worlds_ms, witnesses, world_classes and conj_nominal_core. 204 of 207 files report, 27 have witnesses, and their worlds take 89.3 ms of 2,839.1 ms of classification in all and at most 17.4 ms on a file (ore_ont_9151)',
+    'kinds_ore_ont_4510': 'a diagnostic build of the first fix c7bcac2d, one thread, laptop: Sub 1.22 million new and 2.76 million repeated against 0.66 and 1.10 million for the EL rules alone, Succ 58 thousand new and 490 thousand repeated, RealBack 292 thousand new, Same 27 thousand new and 136 thousand repeated',
+    'other_files': 'ore_ont_9654 on four threads on the laptop: 10.7 s on the base against 2.3 s with the first fix c7bcac2d, 239,094 conjunction contexts against 3,031 and 756 million conclusions against 102 million, with equal taxonomies'},
+}
+os.makedirs(dest, exist_ok=True)
+import shutil
+for src in ['atlas/timing.sh', 'atlas/timing2.sh', 'atlas/t1.sh', 'atlas/summ.py', 'atlas/tables.py', 'sweep/sweep.sh', 'scan.sh', 'atlas/make-record.py']:
+    shutil.copyfile(os.path.join(lane, src), os.path.join(dest, os.path.basename(src) + '.txt'))
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']), 'binaries', sha)

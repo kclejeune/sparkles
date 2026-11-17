@@ -961,7 +961,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   subsumers again. Roadmap item 693.
 * The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
   passes its memory budget before the Horn rules answer. On four threads one of them
-  classifies in 20 to 39 seconds and the other in about 13, almost all of it the attempt.
+  classifies in 13 to 65 seconds and the other in 12 to 25, almost all of it the attempt.
   Roadmap item 990.
 * Horn ontologies whose successors no other successor dominates classify up to 6% slower
   than without the check for dominated successors, which costs more there than it saves.

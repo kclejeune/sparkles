@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# timing.sh: base e2709fb7 against the lane tip on the files of items 869 and 868, in interleaved
+# rounds, one process per side, file and thread count, with the tip's EL rules alone on the four
+# assertion-heavy files. The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/fable-horn-869
+F=$HOME/lanes/horn-budget-962/files
+OUT=$D/out/timing; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/base $D/bin/tip; } > $OUT/before.txt
+files="ore_ont_4510.owl ore_ont_12901.owl ore_ont_14375.owl ore_ont_10951.owl ore_ont_5481.owl ore_ont_10073.owl ore_ont_1370.owl ore_ont_4755.owl ore_ont_11378.owl ore_ont_9151.owl go.ofn chebi_lite.ofn ore_ont_9855.owl ore_ont_8737.owl ore_ont_14817.owl ore_ont_9663.owl"
+for round in 1 2 3 4; do
+  order="base tip"; [ $((round % 2)) -eq 0 ] && order="tip base"
+  for f in $files; do
+    n=${f%.*}
+    for t in 1 4; do
+      for tag in $order; do
+        mkdir -p $OUT/r$round/$tag
+        rep=5
+        case $n in ore_ont_14817|ore_ont_9663) rep=1; [ $t -eq 1 ] && continue;; ore_ont_8737) rep=2;; esac
+        systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 $D/bin/$tag --threads $t --repeat $rep $F/$f > $OUT/r$round/$tag/$n.t$t.json 2> $OUT/r$round/$tag/$n.t$t.err
+        echo "r$round $tag $n t$t status=$?" >> $OUT/log.txt
+      done
+      # the EL rules alone on the four assertion-heavy files, by the tip's build, for the residue
+      case $n in ore_ont_4510|ore_ont_12901|ore_ont_14375|ore_ont_10951)
+        mkdir -p $OUT/r$round/el
+        systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 $D/bin/tip --el-only --threads $t --repeat 5 $F/$f > $OUT/r$round/el/$n.t$t.json 2> $OUT/r$round/el/$n.t$t.err
+        echo "r$round el $n t$t status=$?" >> $OUT/log.txt;;
+      esac
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

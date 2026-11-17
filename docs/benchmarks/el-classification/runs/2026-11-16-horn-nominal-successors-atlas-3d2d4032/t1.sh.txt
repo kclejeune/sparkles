@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# t1.sh: the base and the tip on one thread on ore_ont_14817 and ore_ont_3215, which pass the sweep's
+# 300 s on one thread on both builds, with a timeout of 900 s as lane 693's sweep ran them. One thread
+# fixes the order of delivery, so equal conclusions show that both builds do the same work, and the
+# hashes are those of the sorted taxonomies as in sweep.sh. Lane 693's hashes on one thread are
+# c4cce8afad0915e1 (14817) and b55d92d645f4054c (3215). The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/fable-horn-869
+F=$HOME/lanes/horn-budget-962/files
+O=$D/out/t1; mkdir -p $O
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; sha256sum $D/bin/base $D/bin/tip $F/ore_ont_14817.owl $F/ore_ont_3215.owl; } > $O/before.txt
+for n in ore_ont_14817 ore_ont_3215; do
+  for side in tip base; do
+    systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+      timeout 900 $D/bin/$side --threads 1 --taxonomy $O/$n.$side.tax $F/$n.owl > $O/$n.$side.json 2> $O/$n.$side.err
+    st=$?
+    echo "$n 1 $side $st $(LC_ALL=C sort $O/$n.$side.tax 2>/dev/null | sha256sum | cut -c1-16) $(grep '^{' $O/$n.$side.json | jq -c '[.classifyMs[0],.saturationMs,.tier,.conclusions,.conjunctions,.dlOverBudget,.hornOverBudget,.outside,.unsatisfiable,.consistency,.peakRssKib,.peakEstimatedBytes]') $(date -Is)" >> $O/log.txt
+    rm -f $O/$n.$side.tax
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $O/after.txt
+echo T1-DONE >> $O/log.txt

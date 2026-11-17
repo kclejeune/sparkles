@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# scan.sh BIN OUT: the diag line of every DL development file, 4 threads, 120 s each
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/fable-horn-869/.artifacts/lanes/fable-horn-869
+D=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+: > $2
+for f in $(ls -S -r $D/*); do
+  n=$(basename $f); n=${n%.*}
+  out=$(SPARKLES_HORN_DIAG=1 systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=2G -p OOMPolicy=continue timeout 120 $L/bin/$1 --threads 4 $f 2>&1)
+  st=$?
+  echo "$n $st $(echo "$out" | grep '^{' | jq -c '[.tier,.classifyMs[0],.indexMs,.saturationMs,.conjunctions,.conclusions,.outside]') $(echo "$out" | grep HORNDIAG | grep -o 'first_ms=[0-9.]*\|rounds_ms=[0-9.]*\|worlds_ms=[0-9.]*\|witnesses=[0-9]*\|world_classes=[0-9]*\|conj_nominal_core=[0-9]*' | tr '\n' ' ')" >> $2
+done
+echo SCAN-DONE >> $2
