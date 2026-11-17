@@ -60,6 +60,10 @@ adds to this file and does not override it.
   release owned jobs and Boxington leases before stopping or deleting a worker. Keep
   development environments and snapshot seeds separate from CI, and exclude credentials
   and live leases from reusable seeds.
+- Commits are made where the contributor's signing agent is reachable, usually the
+  machine the orchestrating session runs on. A terminal on another host can outlive the
+  forwarded agent, so remote terminals run builds, tests, gates, benchmarks and read-only
+  reviews, and do not commit.
 - Runs that call paid model APIs need the maintainer's approval and a spending cap first.
   Inject their keys through the secret tool the environment provides, and never print or
   write a key.
@@ -78,6 +82,9 @@ adds to this file and does not override it.
   Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
   need an Intel host, and published numbers come from the benchmark host. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+- Run both arms of an A/B comparison on one host with the same compiler and build
+  configuration and no competing heavy work. Never pool or compare timings across hosts,
+  even hosts with the same hardware, and qualify a second host's results separately.
 - A measured slowdown that a gate accepts still gets a follow-up item in
   [docs/ROADMAP.md](docs/ROADMAP.md), added in the same change that accepts it. This holds
   for a loosened gate, a result judged to be noise and a tradeoff taken on purpose.
@@ -133,6 +140,28 @@ worktree, such as `.artifacts/lanes/<name>/brief.md`. The agent reports results 
 parent, writes long results to a file, and starts no agents of its own unless the brief
 assigns that.
 
+Every turn of an agent re-reads its whole context, so context size and the number of
+turns spent waiting set most of the cost of a lane. Four rules follow from this.
+
+- The coordinator owns long waits. A lane does not wait inside its own session on a
+  batch gate, a benchmark-host or benchmark-worker timing run, GitHub Actions or another
+  job expected to run past about 45 minutes. It commits, records in its resume file what
+  it is waiting on, where the log is and what marks completion, and returns. The
+  coordinator watches the job with a background command and starts a fresh agent from
+  the resume file when the result is in.
+- A lane checks a shorter wait with bounded commands a few minutes apart, often enough
+  that its prompt cache stays warm. A longer wait that it cannot hand back runs as a
+  background command that notifies on completion, so the agent spends no turns polling.
+- A lane is checkpointed and continued by a fresh agent once its context passes about
+  150k to 200k tokens, at a natural boundary such as a clean review or a finished phase.
+  The checkpoint is a committed tip and a short resume file that names the next steps,
+  the open decisions and the live jobs. An agent idle for more than an hour is replaced
+  by a fresh one from its resume file instead of being resumed, unless its context is
+  small.
+- The coordinator assembles and gates batches in its own session. Merging the ready
+  lanes, premerge, the gate and the screen are mostly waiting, so they run as background
+  commands, and an agent is started only to fix a failure.
+
 For a remote agent, record sandbox, conversation and prompt IDs with its source,
 environment version, branch, resource deadline and snapshot identity when applicable.
 Attach the self-contained brief, and confirm subscription authentication before its
@@ -144,15 +173,20 @@ results separately from conversation events.
 
 | Role | Model |
 |---|---|
-| Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Terra or Claude Sonnet 5.5 |
+| Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Sol or Claude Opus 5.5 |
 | Substantive planning, dependencies, validation gates and difficult consults | GPT-6.1 Sol or Claude Opus 5.5 |
 | Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
-| Implementation of a well-defined plan and routine fixes | GPT-6.1 Terra or Claude Sonnet 5.5 |
-| Code review and finding validation | Prefer GPT-6.1 Sol for difficult work and GPT-6.1 Terra for straightforward work. Claude Opus 5.5 or Sonnet 5.5 may review when appropriate. |
+| Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
+| Easy, nearly trivial tasks and the execution of a plan that fixes every step | GPT-6.1 Terra or Claude Sonnet 5.5 |
+| Code review and finding validation | Prefer GPT-6.1 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
 | Mechanical tasks with an exact rule | A plain script. |
-| Broader mechanical tasks, file scans and exploration | Claude Haiku 5.5 or GPT-6 Luna. |
+| Easy tasks that need a lot of context, such as exploration, broad file scans, searches across many files and log triage | Claude Haiku 5.5 or GPT-6 Luna. |
 
 The table is the assignment policy, and it holds whatever model the orchestrator runs.
+Work defaults to Sol or Opus. Terra or Sonnet takes a task only when it is nearly
+trivial or its plan fixes every step, and Haiku or Luna takes easy work whose cost is
+mostly the context it must read.
+
 A coordinating session delegates substantive plans, dependency decisions and validation
 strategy instead of taking them on because it controls the session. A plan names the
 files and behaviour, edge cases, regression checks, acceptance gates and dependencies
@@ -162,28 +196,30 @@ Work that needs substantial judgment includes a refactor whose shape is unclear,
 whose cause is unknown, an open behaviour or API decision, crash durability or WAL
 ordering, concurrency beyond a parallel iterator, an on-disk format, planner or executor
 cost decisions, and `unsafe` code. Its validating planner normally implements it to keep
-the code and reasoning context, and may hand a clearly specified routine portion to a
-cheaper worker with the required checks. A loader for a documented format, a conformance
-phase fixed by its test suite and a binding that mirrors an existing API are usually
-routine.
+the code and reasoning context, and may hand a portion to Terra or Sonnet only when its plan
+fixes every step and names the required checks. A loader for a documented format, a
+conformance phase fixed by its test suite and a binding that mirrors an existing API
+need no substantial judgment, but they still go to Sol or Opus unless their plan fixes
+every step.
 
-Prefer Sol and Terra for reviews where they suit the work, to preserve Claude usage
-limits. Opus adds an independent perspective on difficult work. Model availability or
+Prefer Sol for reviews, to preserve Claude usage limits. Opus adds an independent
+perspective on difficult work. Model availability or
 quota pressure must not lower the required standard of reasoning or verification, and
 review always uses a separate agent, even when it runs the author's model.
 
-Codex runs GPT-6.1 Sol and Terra at high effort for every task. Claude Opus runs at
-medium effort by default, and at high effort for the judgment-sensitive work above and
-for validating findings and planning fixes on that work.
+Codex runs GPT-6.1 Sol and Terra at high effort for every task, and GPT-6 Astra at high
+effort when it takes a second-look lane or a consult at a critical decision. Claude Opus
+runs at medium effort by default, and at high effort for the judgment-sensitive work
+above and for validating findings and planning fixes on that work.
 
 A plain script takes a mechanical task with an exact rule, such as an exact renumbering
-or fixtures from a fixed format. Haiku or Luna takes a task that is clearly mechanical
-but too loosely defined to script without the script becoming a task of its own, such as
-triaging logs, applying a consistent edit across files in varying contexts or sweeping a
-report. They also suit broad scans that find and flag patterns across files, and
-exploration that locates code for another agent. Each task states its rule, its output
+or fixtures from a fixed format. Haiku or Luna takes a task only when it is easy and its
+cost is mostly the context it must read. Examples are exploration that locates code for
+another agent, broad scans and searches that find and flag patterns across many files,
+triaging long logs and sweeping a large report. A mechanical edit that is awkward to
+script but needs little context goes to a script or to Sol or Opus. Each task states its rule, its output
 format and how the result will be checked before it starts. If the check fails twice,
-move the task to Terra or Sonnet. Haiku and Luna do not rewrite documentation prose,
+move the task to Sol or Opus. Haiku and Luna do not rewrite documentation prose,
 touch engine, durability, concurrency, planner or performance code, or review and
 validate findings.
 
@@ -194,6 +230,29 @@ work enters one of the judgment-sensitive areas above, a performance gate misses
 no clear reason, or before stopping a phase early or declaring a gate unmeetable. The
 consult decides whether to provide a bounded plan or transfer implementation to Sol
 or Opus. The final report lists each consult.
+
+A Sol or Opus session consults a second strong model at critical decision points
+before it commits to a path, and chooses that model from the second-look row of the
+table. The critical decision points are an on-disk format or durability ordering, a
+planner or executor cost decision, an open API or behaviour question, a change of
+approach after a failed design, closing or deferring an item, and declaring a gate
+unmeetable. The consult goes to an advisor tool when the session has one, or otherwise
+to a read-only agent with the question, the relevant files and what has been tried. A
+Terra or Sonnet worker still consults Sol or Opus as described above, and that Sol or
+Opus consult applies this rule in turn. A consult shares the session's framing, so it
+never replaces an independent review or a second-look lane. The final report lists
+each consult and whether its advice was followed.
+
+When the implementing lane has made no significant progress on a hard problem, the
+coordinator starts an independent second-look lane on a model chosen from the
+second-look row of the table. Typical signs are designs that measure as failures,
+review rounds that keep finding new defects of the same kind, a recommendation
+to close or defer an item for lack of a path, or a long-open item whose attempts have
+not moved it. The second-look lane gets its own worktree and branch, the full record of
+what was tried, and a brief that asks it to test the earlier conclusions rather than
+adopt them. It reports a missed path, an improvement or a confirmation, and the first
+lane's closing step waits for that report. Its prototypes stay behind switches, pass the
+same correctness gates and get the same independent review.
 
 ### Review before landing
 
@@ -213,8 +272,8 @@ No lane lands without review, and each step picks its model from the table above
    docs to update and the commands that verify it. It also records serious problems the
    review missed.
 3. **The assigned worker implements.** The validating planner normally implements
-   judgment-sensitive repairs itself, and a cheaper worker can execute a well-defined
-   routine plan. The worker reports what it did for each item.
+   judgment-sensitive repairs itself, and Terra or Sonnet can execute a plan only
+   when it fixes every step. The worker reports what it did for each item.
 4. **Re-review.** An independent reviewer checks the fix commits and the validating
    agent validates the findings again. The lane merges once this comes back clean.
 
@@ -224,7 +283,10 @@ or spec contract, or a fix that changes behaviour beyond a few lines. Other find
 as more precise accounting, documentation wording or a cleanup, are either fixed in the
 same round without a further review or recorded as roadmap follow-ups, and the plan says
 which. A re-review covers only the fix commits since the previous review, and its
-reviewer may keep the earlier round's context instead of reading the branch again.
+reviewer may keep the earlier round's context instead of reading the branch again. A
+lane may keep one reviewer session open for this, such as a Codex session in a named
+terminal, and send each re-review to it as a new turn that names the fix commits. Each
+round still writes its `review.md` under `.artifacts/audits`.
 
 The user decides only scope changes and disagreements with a spec that the validating
 agent raises.
