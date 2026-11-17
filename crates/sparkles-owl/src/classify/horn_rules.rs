@@ -539,9 +539,11 @@ impl Sends {
     /// Gives the context itself a conclusion, once in a flush. The conclusions wait in
     /// the activation's own list, which no bound counts, and several at-most
     /// restrictions or successors by several roles give the context the same ones. The
-    /// list then grows by no more than the members of the cores and the fillers that the
-    /// context reads, and the links to the conjunctions that R5 interned, all of which
-    /// the run holds and has counted.
+    /// list then takes each member of the cores and each filler that the context reads
+    /// once, each loop once, and one link for each pair of a role and a target of R5.
+    /// Those pairs can still be as many as the at-most restrictions times the roles,
+    /// when each restriction merges its successors into a target of its own, which
+    /// roadmap item 1026 follows.
     fn me<S: Sink>(&mut self, c: Concl, out: &mut S) {
         if self.own.insert(c) {
             out.me(c);
