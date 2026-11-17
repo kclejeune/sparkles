@@ -8,9 +8,10 @@ set -uo pipefail
 
 interval=${1:-30}
 
-# A stopped sampler also stops its sleep, which would otherwise hold the step's output open.
-sleeper=
-trap '[ -z "$sleeper" ] || kill "$sleeper" 2> /dev/null; exit 0' TERM INT
+# A stopped sampler also stops its sleep. The sleep never holds the step's output, so one
+# that starts as the sampler stops cannot keep the step open.
+# shellcheck disable=SC2046 # one word per job's process ID
+trap 'kill $(jobs -p) 2> /dev/null; exit 0' TERM INT
 
 while :; do
   mem=$(awk '
@@ -36,7 +37,6 @@ while :; do
     }
   ')
   echo "memory $(date -u +%H:%M:%S): $mem, load $load; $top"
-  sleep "$interval" &
-  sleeper=$!
-  wait "$sleeper"
+  sleep "$interval" > /dev/null 2>&1 &
+  wait "$!"
 done
