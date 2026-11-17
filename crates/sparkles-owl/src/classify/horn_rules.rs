@@ -516,12 +516,13 @@ fn named(ix: &Index, real: bool, core: &[Ex]) -> Option<Ex> {
         .find(|&e| matches!(ix.head(e).node, Node::Nominal(_)))
 }
 
-/// What a flush keeps of its sends to individuals.
+/// What a flush keeps of the conclusions it gives its own context and of its sends to
+/// individuals.
 struct Sends {
     /// the context of the flush
     me: Ex,
-    /// the members the flush sent the context itself, when it is an individual
-    own: FxHashSet<Ex>,
+    /// the conclusions that R5 and the step to an individual gave the context itself
+    own: FxHashSet<Concl>,
     /// whether a check of the run's bounds after a send stopped the run
     stop: bool,
 }
@@ -534,20 +535,30 @@ impl Sends {
             stop: false,
         }
     }
+
+    /// Gives the context itself a conclusion, once in a flush. The conclusions wait in
+    /// the activation's own list, which no bound counts, and several at-most
+    /// restrictions or successors by several roles give the context the same ones. The
+    /// list then grows by no more than the members of the cores and the fillers that the
+    /// context reads, and the links to the conjunctions that R5 interned, all of which
+    /// the run holds and has counted.
+    fn me<S: Sink>(&mut self, c: Concl, out: &mut S) {
+        if self.own.insert(c) {
+            out.me(c);
+        }
+    }
 }
 
 /// Sends the individual `a` the other members of the conjunction `core`. One flush can
 /// send a conjunction for each successor before the activation applies a conclusion, so
 /// the messages to another context are counted against the run's bounds, and
-/// `sends.stop` says that the run stopped there. The messages to the context itself wait
-/// in the activation's own list, which no bound counts, so the flush sends each member
-/// once. The list then grows by no more than the fillers of the context's universals and
-/// the cores of its successors, which the run holds and has counted.
+/// `sends.stop` says that the run stopped there. The context itself takes each member
+/// once in a flush ([`Sends::me`]).
 fn send_named<S: Sink>(a: Ex, core: &[Ex], sends: &mut Sends, out: &mut S) {
     if a == sends.me {
         for &e in core {
-            if e != a && sends.own.insert(e) {
-                out.send(a, Concl::Sub(e));
+            if e != a {
+                sends.me(Concl::Sub(e), out);
             }
         }
         return;
@@ -748,7 +759,7 @@ fn merge_all<S: Sink>(
         for (i, &(r1, _)) in links.iter().enumerate() {
             for &(r2, _) in &links[..i] {
                 if r1 != r2 && (roles.clashes(r1, r2) || roles.clashes(r2, r1)) {
-                    out.me(Concl::Sub(BOTTOM));
+                    sends.me(Concl::Sub(BOTTOM), out);
                     return true;
                 }
             }
@@ -760,9 +771,9 @@ fn merge_all<S: Sink>(
         for &(r, n) in &links {
             out.core(ix, n, &mut core);
             for &m in &core {
-                out.me(Concl::Sub(m));
+                sends.me(Concl::Sub(m), out);
             }
-            out.me(Concl::Loop(r));
+            sends.me(Concl::Loop(r), out);
         }
         return !links.is_empty();
     }
@@ -797,7 +808,7 @@ fn merge_all<S: Sink>(
     let mut sent = a.is_some();
     for (&(r, n), c) in links.iter().zip(&cores) {
         if *c != u && a != Some(n) {
-            out.me(Concl::Succ(r, m));
+            sends.me(Concl::Succ(r, m), out);
             sent = true;
         }
     }
@@ -1559,13 +1570,66 @@ mod tests {
         };
         assert!(flush(&ix, a, &mut st, &mut out));
         // the three conjunctions hold six fillers in all, four of them distinct
-        assert_eq!(out.sent.len(), 4, "{:?}", out.sent);
+        assert_eq!(out.local.len(), 4, "{:?}", out.local);
         for &e in cs.iter().chain([&d]) {
-            assert!(out.sent.contains(&(a, Concl::Sub(e))));
+            assert!(out.local.contains(&Concl::Sub(e)));
         }
-        // a already names itself by each role, and its own messages need no check
-        assert!(out.local.is_empty());
+        // a already names itself by each role, and its own conclusions need no check
+        assert!(out.sent.is_empty());
         assert_eq!(out.checks, 0);
+    }
+
+    /// R5 at an individual gives the context each conclusion once in a flush, however
+    /// many at-most restrictions count the same successors (item 869).
+    #[test]
+    fn a_flush_of_several_merges_gives_the_context_each_conclusion_once() {
+        let mut it = Interner::new();
+        let cs: Vec<Ex> = (0..3)
+            .map(|k| it.class(&Class::new(format!("urn:named:c{k}"))))
+            .collect();
+        let bs: Vec<Ex> = (0..4)
+            .map(|k| it.class(&Class::new(format!("urn:named:b{k}"))))
+            .collect();
+        let a = it.nominal(&crate::model::NamedIndividual::new("urn:named:a"));
+        let _ = it.node(Node::Top);
+        let mut ix = Index::build(&Axioms::default(), &mut it, None, &|| false).unwrap();
+        ix.horn = Some(Box::new(HornIx {
+            flags: Vec::new(),
+            base: it.nodes.len() as Ex,
+            dominate: false,
+        }));
+        // a has itself and three classes as successors by one role, and four at-most
+        // restrictions on the role, each of which counts all of them
+        let mut st = State {
+            real: true,
+            ..State::default()
+        };
+        let h = hs(&mut st);
+        for &n in cs.iter().chain([&a]) {
+            h.succ.insert((0, n));
+            for &b in &bs {
+                h.succ_in.insert((n, b));
+            }
+        }
+        for &b in &bs {
+            h.atmost.push((0, b));
+            h.merges.push((0, b));
+        }
+        let mut out = Recorded {
+            sent: Vec::new(),
+            local: Vec::new(),
+            checks: 0,
+            left: usize::MAX,
+        };
+        assert!(flush(&ix, a, &mut st, &mut out));
+        // each merge gives a the three classes and a link to itself for each of them,
+        // and the four merges give the same
+        let mut expected: Vec<Concl> = cs.iter().map(|&c| Concl::Sub(c)).collect();
+        expected.push(Concl::Succ(0, a));
+        out.local.sort();
+        expected.sort();
+        assert_eq!(out.local, expected);
+        assert!(out.sent.is_empty());
     }
 
     /// R6 records each pair of a predecessor and a successor whose core it sent, and the

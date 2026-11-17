@@ -519,7 +519,7 @@ fn r5_at_an_individual_that_is_its_own_successor_takes_the_other_successor() {
 #[test]
 fn successors_by_several_roles_to_one_individual_take_the_universals_of_their_superrole() {
     // a has r1 and r2 to b and r2 to d, both roles under s. Every s-successor of a is
-    // in C, and every r1-successor is in D, which d is not
+    // in C, and every r1-successor is in D, which nothing makes d
     let out = check(
         "SubObjectPropertyOf(:r1 :s)
          SubObjectPropertyOf(:r2 :s)
