@@ -1088,6 +1088,17 @@ the laptop runs falls from 796 to 678 MiB and from 1,189 to 933 MiB. The taxonom
 equal at every level on one and eight threads. Tier D's own unfolding in its bounded
 attempt is not reduced.
 
+A differential check generated small Horn ontologies with chains, transitive properties,
+inverses, ranges and property hierarchies over six properties, of which the class axioms
+use mostly three, so that the automata have branches without links. Of 8,288 cases, 8,274
+take the Horn rules, and none differs in its taxonomy between the unreduced automata and
+each reduction on one thread, all three on eight threads, and a build that checks the
+dead properties at every link. The reductions change the conclusion count of 2,730 cases,
+and the third one that of 2,658. GO, ChEBI lite, the ORE 2015 EL files and the DL
+development set, 497 files that the laptop classifies within 8 GiB, give the same
+taxonomies with and without the reductions on one and eight threads, and 67 of them
+change their conclusion count.
+
 Item 693 also fixed a gap in completeness that phase 3 left. A chain
 `r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of
 phase 3 composed the told chain only. With `r0 ∘ r2⁻ ⊑ r0` and `r2` the inverse of `r0`,
