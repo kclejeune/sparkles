@@ -26,11 +26,27 @@ fn main() {
         }
         return;
     }
-    // a filter that names another test selects nothing here
-    if args
-        .iter()
-        .any(|a| !a.starts_with('-') && !"confine".contains(a.as_str()))
-    {
+    // a filter that names another test selects nothing here; the values of libtest's
+    // options that take one are not filters
+    let mut filters = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if [
+            "--test-threads",
+            "--format",
+            "--color",
+            "--skip",
+            "--logfile",
+            "-Z",
+        ]
+        .contains(&a.as_str())
+        {
+            it.next();
+        } else if !a.starts_with('-') {
+            filters.push(a.as_str());
+        }
+    }
+    if !filters.is_empty() && !filters.iter().any(|f| "confine".contains(f)) {
         return;
     }
     let preset = |v: &str| std::env::var_os(v).is_some();
@@ -39,7 +55,7 @@ fn main() {
         preset("CANDLE_CPU_MASK"),
         preset("RAYON_NUM_THREADS"),
     );
-    // SAFETY: the first statement of main, before this process starts any thread
+    // SAFETY: early in main, before this process starts any thread
     unsafe { sparkles_embed::confine_candle_threads() };
     if !threads_set {
         assert_eq!(std::env::var("CANDLE_NUM_THREADS").unwrap(), "1");
