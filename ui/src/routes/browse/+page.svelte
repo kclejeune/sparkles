@@ -1868,8 +1868,10 @@
             </aside>
           {/if}
           {#if inferredKind}
-            <aside class="panel" aria-label="Inferred hierarchy">
+            <!-- the frame draws its own card, so its heading sits in the card's ruled head -->
+            <aside aria-label="Inferred hierarchy">
               <InferredTreeView
+                card
                 {target}
                 {graph}
                 imports={sel.imports}

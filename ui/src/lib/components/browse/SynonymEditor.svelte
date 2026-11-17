@@ -278,16 +278,18 @@
 {/snippet}
 
 <style>
+  /* a row's hover fill reaches into the gutter, so its kind and text line up with the section's
+     heading and with the read-only page's columns (124px and a 16px gap) */
   .erows {
     list-style: none;
-    margin: 0;
+    margin: 0 -4px 0 -8px;
     padding: 0;
     display: grid;
     gap: 2px;
   }
   .erow {
     display: grid;
-    grid-template-columns: 104px minmax(0, 1fr) auto;
+    grid-template-columns: 132px minmax(0, 1fr) auto;
     align-items: center;
     gap: var(--sp-2);
     min-height: 34px;
@@ -299,7 +301,7 @@
     background: var(--hover);
   }
   .erow.editing {
-    grid-template-columns: 104px minmax(0, 1fr) 4.5em;
+    grid-template-columns: 132px minmax(0, 1fr) 4.5em;
     background: var(--surface-2);
     box-shadow: inset 0 0 0 1px var(--border);
     padding: var(--sp-2);
@@ -345,10 +347,11 @@
   }
   .addrow {
     display: grid;
-    grid-template-columns: 104px minmax(0, 1fr) 4.5em auto;
+    grid-template-columns: 132px minmax(0, 1fr) 4.5em auto;
     gap: var(--sp-2);
     align-items: center;
-    margin-top: var(--sp-2);
+    /* the dashed frame hangs like the rows, so its fields start on the same columns */
+    margin: var(--sp-2) -7px 0 -9px;
     padding: 6px 6px 6px 8px;
     border: 1px dashed var(--border-strong);
     border-radius: var(--r);
