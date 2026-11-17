@@ -5425,10 +5425,13 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
             .with_min_len(PAR_MIN_LEN)
             .map(key_payload)
             .sum();
-        // A column that does not fit gives back everything it charged. The distinct
-        // values' own charge goes once the rows' values are charged.
+        // A column that does not fit frees its rows and its distinct values, and then gives
+        // back everything it charged. The distinct values' own charge goes once the rows'
+        // values are charged.
         let total = kept.saturating_add(slots).saturating_add(payload);
         if !set(total) {
+            drop(vals);
+            drop(values);
             set(kept);
             break;
         }
@@ -10123,6 +10126,64 @@ mod string_order_tests {
                 declined > 0 && decoded > 0,
                 "cursor {cursor}: {declined} declined, {decoded} decoded"
             );
+        }
+    }
+
+    /// A column of a few long strings repeated over every row decodes its distinct values
+    /// within a budget that does not hold their copies on every row. The pre-decode then
+    /// declines at the expansion, with every charge given back, and decodes the column
+    /// when the budget holds the copies.
+    #[test]
+    fn a_refused_expansion_leaves_the_column_to_the_rows() {
+        let long = |i: usize| format!("{i} {}", "x".repeat(4096));
+        let mut nt = String::new();
+        for i in 0..8 {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"{}\" .\n", long(i)));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let strings: Vec<Id> = (0..8)
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(long(i)).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+        // The copies on every row take about 80 MiB, and the slots and the sorted
+        // decoding a few.
+        for (limit, expanded) in [(48u64 << 20, false), (512 << 20, true)] {
+            for cursor in [false, true] {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = limit;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let ctx = std::sync::Arc::new(ctx);
+                ctx.attach_owner();
+                let (t, x) = wide(&ctx, &strings, 8);
+                let e = str_of(x);
+                let before = ctx.live_bytes();
+                let what = format!("cursor {cursor} limit {limit}");
+                let result = decode_for(&ctx, &t, &[&e]).unwrap_or_else(|e| panic!("{what}: {e}"));
+                let col = result.as_ref().and_then(|d| d.cols[0].as_ref());
+                assert_eq!(col.is_some(), expanded, "{what}");
+                if let Some(col) = col {
+                    assert_rows(&Ctx::new(s.snapshot()), &t, col, &what);
+                }
+                drop(result);
+                assert_eq!(
+                    ctx.live_bytes(),
+                    before,
+                    "{what}: the charges are given back"
+                );
+                assert!(ctx.check().is_ok(), "{what}");
+            }
         }
     }
 
