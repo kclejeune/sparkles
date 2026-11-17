@@ -290,16 +290,20 @@ remove the scan. The [run directory](runs/2026-11-15-item-839-atlas/run.sh.txt) 
 commands, the [host and builds](runs/2026-11-15-item-839-atlas/env.txt) and the
 [medians with their ranges](runs/2026-11-15-item-839-atlas/results.txt).
 
-Maintenance of programs with relations changes the shared paths of every kept closure,
-which the same host measures against the build before it on LUBM(100) under OWL 2 RL and
-RDFS. Every run gives the same inferred counts, kept facts and digests as the build
-before, and peak resident memory stays within 1%. Changes of 100 triples to a closure
-kept in memory and their undo take the same median time in six interleaved rounds. Full
-derivations, the first settle of a kept closure and its undo from the dataset take 1.00
-to 1.025 times as long, and OWL 2 RL at one thread takes 1.011 times as long, outside the
-other build's range. In `examples/incremental.rs` under OWL 2 RL, inserting 1 or 100
-triples into a closure read back from the store takes 224 and 228 ms against 215 and
-218 ms, while the in-memory steps measure even. Item 1046 follows up these slowdowns. The
+Maintenance of programs with relations changes paths that every kept closure and full
+derivation shares, which the same host measures against the build before it on LUBM(100)
+under OWL 2 RL and RDFS, on OWL2Bench(5) under OWL 2 RL and in `examples/incremental.rs`
+on its own 1,000,000 generated triples. Every run gives the same inferred counts, kept
+facts and digests as the build before, peak resident memory stays within 1%, and the
+reasoner's budget peaks are equal. Two builds of one commit from two worktrees differ by
+up to 3.1% on a full derivation and 4.7% on a step of the example, so the comparisons
+that decide use builds from one worktree. Changes of 100 triples to a closure kept in
+memory, their undo, the example's steps, OWL2Bench(5) at one thread and every full run at
+20 threads stay within about that spread. LUBM(100) under OWL 2 RL at one thread takes
+16.73 s against 16.37 s, 1.022 times as long and outside the other build's range, in
+every build of the change. It runs the same user-space instructions within 0.2% and needs
+2% more cycles, with 35% more instruction-cache misses, so the cost is in the layout of
+the code rather than in added work, and item 1046 follows it up. The
 [run directory](runs/2026-11-16-item-839-phase3-atlas/run.sh.txt) holds the commands, the
 [host and builds](runs/2026-11-16-item-839-phase3-atlas/env.txt) and the
 [medians with their ranges](runs/2026-11-16-item-839-phase3-atlas/results.txt).

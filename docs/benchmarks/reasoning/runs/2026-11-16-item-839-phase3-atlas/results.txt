@@ -1,4 +1,4 @@
-Rounds 1 and 2 ran every row. Rounds 3 to 6 reran the keep runs with 100 changes, the incremental example and the one-thread full runs, so those rows have six runs per arm and the rest two. Times are milliseconds and rss rows are peak resident KiB. Equal outputs compare inferred counts, kept facts, closure digests and the example's check against a full materialization.
+Gate. Rounds 1 and 2 ran every LUBM(100) row. Rounds 3 to 6 reran the keep runs with 100 changes, the incremental example and the one-thread full runs, so those rows have six runs per arm and the rest two. OWL2Bench(5) ran four rounds. Times are milliseconds, rss rows are peak resident KiB, and peak_heap_mib and reasoner_peak_mib are the heap's and the reasoner budget's peaks in MiB. Equal outputs compare inferred counts, kept facts, closure digests and the example's check against a full materialization.
 
 | Run | Profile | Size | Step | n | base ms (med, range) | p3 ms (med, range) | p3/base | outputs equal |
 |---|---|---|---|---|---|---|---|---|
@@ -45,42 +45,142 @@ Rounds 1 and 2 ran every row. Rounds 3 to 6 reran the keep runs with 100 changes
 | incremental | rdfs | insert10000 | memory | 6/6 | 76 (73-80) | 76 (75-84) | 1.007 | True |
 | incremental | rdfs | insert10000 | store | 6/6 | 474 (471-500) | 488 (482-495) | 1.030 | True |
 | infer | owl-rl | 1 | ms | 6/6 | 16406 (16356-16443) | 16590 (16498-16638) | 1.011 | True |
+| infer | owl-rl | 1 | peak_heap_mib | 6/6 | 1804 (1804.0-1804.1) | 1804 (1803.9-1804.1) | 1.000 | True |
 | infer | owl-rl | 1 | rss | 6/6 | 2081278 (2079352-2082828) | 2078546 (2049792-2083148) | 0.999 | True |
 | infer | owl-rl | 20 | ms | 2/2 | 3140 (3128-3151) | 3114 (3096-3133) | 0.992 | True |
+| infer | owl-rl | 20 | peak_heap_mib | 2/2 | 1805 (1802.2-1808.3) | 1811 (1809.9-1811.5) | 1.003 | True |
 | infer | owl-rl | 20 | rss | 2/2 | 2287706 (2278372-2297040) | 2283710 (2274444-2292976) | 0.998 | True |
+| infer | owl2bench5 | 1 | ms | 4/4 | 29928 (29885-29961) | 31058 (31033-31190) | 1.038 | True |
+| infer | owl2bench5 | 1 | peak_heap_mib | 4/4 | 4191 (4190.7-4190.7) | 4191 (4190.7-4190.7) | 1.000 | True |
+| infer | owl2bench5 | 1 | rss | 4/4 | 4075302 (4072964-4083532) | 4076450 (4070760-4090728) | 1.000 | True |
+| infer | owl2bench5 | 20 | ms | 4/4 | 9702 (9672-9786) | 9650 (9603-9711) | 0.995 | True |
+| infer | owl2bench5 | 20 | peak_heap_mib | 4/4 | 3703 (3702.7-3703.2) | 3703 (3702.6-3703.1) | 1.000 | True |
+| infer | owl2bench5 | 20 | rss | 4/4 | 3674790 (3670412-3684576) | 3675112 (3671148-3684704) | 1.000 | True |
 | infer | rdfs | 1 | ms | 6/6 | 6092 (6062-6567) | 6096 (5706-6150) | 1.001 | True |
+| infer | rdfs | 1 | peak_heap_mib | 6/6 | 1208 (1208.4-1208.4) | 1208 (1208.4-1208.4) | 1.000 | True |
 | infer | rdfs | 1 | rss | 6/6 | 1672264 (1671720-1673952) | 1672188 (1668260-1673952) | 1.000 | True |
 | infer | rdfs | 20 | ms | 2/2 | 1404 (1349-1460) | 1346 (1324-1368) | 0.958 | True |
+| infer | rdfs | 20 | peak_heap_mib | 2/2 | 1191 (1190.9-1191.5) | 1191 (1190.4-1192.2) | 1.000 | True |
 | infer | rdfs | 20 | rss | 2/2 | 1579414 (1572724-1586104) | 1567450 (1567372-1567528) | 0.992 | True |
 | keep | owl-rl | 100 | change | 6/6 | 21 (21-25) | 22 (18-25) | 1.071 | True |
+| keep | owl-rl | 100 | change peak_heap_mib | 6/6 | 55 (51.2-58.3) | 55 (52.9-55.2) | 0.986 | True |
+| keep | owl-rl | 100 | change reasoner_peak_mib | 6/6 | 748 (748.4-748.4) | 748 (748.4-748.4) | 1.000 | True |
 | keep | owl-rl | 100 | change-again | 6/6 | 8 (5-10) | 8 (6-11) | 1.133 | True |
+| keep | owl-rl | 100 | change-again peak_heap_mib | 6/6 | 1 (1.0-1.4) | 1 (1.0-1.4) | 1.048 | True |
+| keep | owl-rl | 100 | change-again reasoner_peak_mib | 6/6 | 725 (725.4-725.5) | 725 (725.4-725.5) | 1.000 | True |
 | keep | owl-rl | 100 | full | 6/6 | 19782 (19628-19868) | 20088 (19914-20947) | 1.015 | True |
+| keep | owl-rl | 100 | full peak_heap_mib | 6/6 | 3193 (3185.2-3195.1) | 3193 (3192.6-3196.6) | 1.000 | True |
+| keep | owl-rl | 100 | full reasoner_peak_mib | 6/6 | 1708 (1707.6-1707.6) | 1708 (1707.6-1707.6) | 1.000 | True |
 | keep | owl-rl | 100 | kept_facts | 6/6 | 0 (0-0) | 0 (0-0) | - | True |
 | keep | owl-rl | 100 | revert | 6/6 | 16 (10-23) | 18 (9-23) | 1.091 | True |
+| keep | owl-rl | 100 | revert peak_heap_mib | 6/6 | 42 (27.5-55.9) | 38 (25.2-41.1) | 0.922 | True |
+| keep | owl-rl | 100 | revert reasoner_peak_mib | 6/6 | 726 (726.0-726.0) | 726 (726.0-726.0) | 1.000 | True |
 | keep | owl-rl | 100 | revert-from-store | 6/6 | 1943 (1876-1968) | 1991 (1984-2019) | 1.025 | True |
+| keep | owl-rl | 100 | revert-from-store peak_heap_mib | 6/6 | 1220 (1218.6-1223.4) | 1220 (1219.0-1221.8) | 1.000 | True |
+| keep | owl-rl | 100 | revert-from-store reasoner_peak_mib | 6/6 | 1217 (1217.4-1217.4) | 1217 (1217.4-1217.4) | 1.000 | True |
 | keep | owl-rl | 100 | rss | 6/6 | 3798494 (3759496-3843992) | 3790070 (3736984-3825304) | 0.998 | True |
 | keep | owl-rl | 100 | settle | 6/6 | 1850 (1831-1861) | 1892 (1881-1908) | 1.023 | True |
+| keep | owl-rl | 100 | settle peak_heap_mib | 6/6 | 1044 (1042.6-1052.9) | 1045 (1040.1-1047.4) | 1.001 | True |
+| keep | owl-rl | 100 | settle reasoner_peak_mib | 6/6 | 1035 (1034.7-1052.0) | 1035 (1034.7-1034.7) | 1.000 | True |
 | keep | owl-rl | 10000 | change | 2/2 | 222 (218-225) | 218 (216-221) | 0.986 | True |
+| keep | owl-rl | 10000 | change peak_heap_mib | 2/2 | 100 (99.2-101.4) | 102 (102.2-102.2) | 1.019 | True |
+| keep | owl-rl | 10000 | change reasoner_peak_mib | 2/2 | 751 (751.1-751.1) | 751 (751.3-751.3) | 1.000 | True |
 | keep | owl-rl | 10000 | change-again | 2/2 | 182 (178-187) | 186 (185-186) | 1.016 | True |
+| keep | owl-rl | 10000 | change-again peak_heap_mib | 2/2 | 18 (16.9-18.1) | 18 (17.9-18.1) | 1.029 | True |
+| keep | owl-rl | 10000 | change-again reasoner_peak_mib | 2/2 | 799 (799.3-799.3) | 799 (799.2-799.4) | 1.000 | True |
 | keep | owl-rl | 10000 | full | 2/2 | 19830 (19775-19886) | 20020 (19843-20197) | 1.010 | True |
+| keep | owl-rl | 10000 | full peak_heap_mib | 2/2 | 3194 (3191.9-3196.4) | 3196 (3194.7-3196.7) | 1.000 | True |
+| keep | owl-rl | 10000 | full reasoner_peak_mib | 2/2 | 1708 (1707.6-1707.6) | 1708 (1707.6-1707.6) | 1.000 | True |
 | keep | owl-rl | 10000 | kept_facts | 2/2 | 0 (0-0) | 0 (0-0) | - | True |
 | keep | owl-rl | 10000 | revert | 2/2 | 398 (384-412) | 386 (384-388) | 0.970 | True |
+| keep | owl-rl | 10000 | revert peak_heap_mib | 2/2 | 104 (103.4-104.4) | 102 (101.5-101.6) | 0.977 | True |
+| keep | owl-rl | 10000 | revert reasoner_peak_mib | 2/2 | 791 (790.6-790.6) | 791 (790.6-790.6) | 1.000 | True |
 | keep | owl-rl | 10000 | revert-from-store | 2/2 | 2269 (2251-2287) | 2311 (2308-2314) | 1.019 | True |
+| keep | owl-rl | 10000 | revert-from-store peak_heap_mib | 2/2 | 1224 (1223.5-1224.1) | 1223 (1223.3-1223.4) | 1.000 | True |
+| keep | owl-rl | 10000 | revert-from-store reasoner_peak_mib | 2/2 | 1221 (1220.8-1220.8) | 1221 (1220.8-1220.8) | 1.000 | True |
 | keep | owl-rl | 10000 | rss | 2/2 | 3795224 (3773636-3816812) | 3811266 (3786692-3835840) | 1.004 | True |
 | keep | owl-rl | 10000 | settle | 2/2 | 1846 (1835-1857) | 1888 (1887-1890) | 1.023 | True |
+| keep | owl-rl | 10000 | settle peak_heap_mib | 2/2 | 1044 (1042.5-1046.1) | 1042 (1040.4-1043.4) | 0.998 | True |
+| keep | owl-rl | 10000 | settle reasoner_peak_mib | 2/2 | 1035 (1034.7-1034.7) | 1035 (1034.7-1034.7) | 1.000 | True |
 | keep | rdfs | 100 | change | 6/6 | 13 (12-14) | 12 (11-16) | 0.923 | True |
+| keep | rdfs | 100 | change peak_heap_mib | 6/6 | 8 (6.4-12.9) | 7 (5.8-12.7) | 0.858 | True |
+| keep | rdfs | 100 | change reasoner_peak_mib | 6/6 | 434 (433.5-433.5) | 434 (433.5-433.5) | 1.000 | True |
 | keep | rdfs | 100 | change-again | 6/6 | 2 (2-4) | 2 (1-4) | 1.000 | True |
+| keep | rdfs | 100 | change-again peak_heap_mib | 6/6 | 1 (1.0-1.0) | 1 (1.0-1.0) | 1.000 | True |
+| keep | rdfs | 100 | change-again reasoner_peak_mib | 6/6 | 436 (435.8-435.8) | 436 (435.8-435.8) | 1.000 | True |
 | keep | rdfs | 100 | full | 6/6 | 14158 (13994-14269) | 14302 (14262-14409) | 1.010 | True |
+| keep | rdfs | 100 | full peak_heap_mib | 6/6 | 2251 (2249.1-2252.9) | 2252 (2250.8-2253.5) | 1.000 | True |
+| keep | rdfs | 100 | full reasoner_peak_mib | 6/6 | 1038 (1037.6-1037.6) | 1038 (1037.6-1037.6) | 1.000 | True |
 | keep | rdfs | 100 | kept_facts | 6/6 | 0 (0-0) | 0 (0-0) | - | True |
 | keep | rdfs | 100 | revert | 6/6 | 6 (4-8) | 6 (4-8) | 0.923 | True |
+| keep | rdfs | 100 | revert peak_heap_mib | 6/6 | 15 (13.2-16.9) | 15 (13.6-16.5) | 1.027 | True |
+| keep | rdfs | 100 | revert reasoner_peak_mib | 6/6 | 436 (436.5-436.5) | 436 (436.5-436.5) | 1.000 | True |
 | keep | rdfs | 100 | revert-from-store | 6/6 | 2792 (2732-2831) | 2826 (2797-2838) | 1.012 | True |
+| keep | rdfs | 100 | revert-from-store peak_heap_mib | 6/6 | 706 (704.1-706.8) | 706 (705.0-708.0) | 1.001 | True |
+| keep | rdfs | 100 | revert-from-store reasoner_peak_mib | 6/6 | 708 (707.8-707.8) | 708 (707.8-707.8) | 1.000 | True |
 | keep | rdfs | 100 | rss | 6/6 | 2704718 (2647832-2775172) | 2722600 (2673448-2740100) | 1.007 | True |
 | keep | rdfs | 100 | settle | 6/6 | 2882 (2828-2990) | 2896 (2882-2946) | 1.005 | True |
+| keep | rdfs | 100 | settle peak_heap_mib | 6/6 | 955 (951.4-957.6) | 954 (953.0-955.6) | 0.999 | True |
+| keep | rdfs | 100 | settle reasoner_peak_mib | 6/6 | 564 (560.0-567.2) | 560 (560.0-567.2) | 0.994 | True |
 | keep | rdfs | 10000 | change | 2/2 | 88 (79-97) | 78 (73-82) | 0.881 | True |
+| keep | rdfs | 10000 | change peak_heap_mib | 2/2 | 26 (25.2-27.4) | 24 (23.4-25.1) | 0.922 | True |
+| keep | rdfs | 10000 | change reasoner_peak_mib | 2/2 | 442 (441.8-441.8) | 442 (441.8-441.8) | 1.000 | True |
 | keep | rdfs | 10000 | change-again | 2/2 | 68 (68-69) | 74 (69-78) | 1.073 | True |
+| keep | rdfs | 10000 | change-again peak_heap_mib | 2/2 | 10 (9.8-9.8) | 10 (9.6-9.8) | 0.990 | True |
+| keep | rdfs | 10000 | change-again reasoner_peak_mib | 2/2 | 451 (450.8-450.8) | 451 (450.8-450.8) | 1.000 | True |
 | keep | rdfs | 10000 | full | 2/2 | 14148 (14071-14226) | 14340 (14252-14427) | 1.013 | True |
+| keep | rdfs | 10000 | full peak_heap_mib | 2/2 | 2254 (2253.9-2253.9) | 2252 (2250.9-2252.8) | 0.999 | True |
+| keep | rdfs | 10000 | full reasoner_peak_mib | 2/2 | 1038 (1037.6-1037.6) | 1038 (1037.6-1037.6) | 1.000 | True |
 | keep | rdfs | 10000 | kept_facts | 2/2 | 0 (0-0) | 0 (0-0) | - | True |
 | keep | rdfs | 10000 | revert | 2/2 | 89 (86-92) | 96 (90-101) | 1.073 | True |
+| keep | rdfs | 10000 | revert peak_heap_mib | 2/2 | 6 (4.1-8.5) | 4 (4.1-4.1) | 0.651 | True |
+| keep | rdfs | 10000 | revert reasoner_peak_mib | 2/2 | 449 (449.0-449.0) | 449 (449.0-449.0) | 1.000 | True |
 | keep | rdfs | 10000 | revert-from-store | 2/2 | 2849 (2847-2851) | 2887 (2881-2893) | 1.013 | True |
+| keep | rdfs | 10000 | revert-from-store peak_heap_mib | 2/2 | 711 (711.1-711.7) | 712 (711.0-714.0) | 1.002 | True |
+| keep | rdfs | 10000 | revert-from-store reasoner_peak_mib | 2/2 | 710 (709.7-709.7) | 710 (709.7-709.7) | 1.000 | True |
 | keep | rdfs | 10000 | rss | 2/2 | 2699276 (2695696-2702856) | 2663708 (2638364-2689052) | 0.987 | True |
 | keep | rdfs | 10000 | settle | 2/2 | 2880 (2870-2890) | 2933 (2919-2947) | 1.018 | True |
+| keep | rdfs | 10000 | settle peak_heap_mib | 2/2 | 950 (949.5-950.4) | 953 (951.4-954.0) | 1.003 | True |
+| keep | rdfs | 10000 | settle reasoner_peak_mib | 2/2 | 564 (560.0-567.2) | 564 (560.0-567.2) | 1.000 | True |
+
+Builds of single changes. One-thread full runs under owl-rl, three rounds. p3re is 6e03b4d3 rebuilt in a second worktree, va is p3re with the RelTuple arm of builtins::eval as in the base, and vb is p3re with the cancel checks and set_deadline calls of run_program and run_from as in the base.
+
+| Data | base | p3 | p3re | va | vb |
+|---|---|---|---|---|---|
+| owl-rl | 16325 (16324-16376), n=3 | 16557 (16554-16594), n=3 | 16696 (16672-16696), n=3 | 16702 (16681-16811), n=3 | 16673 (16670-16710), n=3 |
+| owl2bench5 | 29878 (29871-29882), n=3 | 31004 (30929-31034), n=3 | 29856 (29830-29930), n=3 | 29893 (29884-29893), n=3 | 29967 (29946-29972), n=3 |
+
+Builds of one worktree. basere and p3re are dd964cf0 and 6e03b4d3 built in the same worktree, against the gate's base and p3. Three rounds; full runs at one thread and the incremental example under owl-rl at 20 threads.
+
+| Run | Profile | Step | base | basere | p3 | p3re | p3re/basere |
+|---|---|---|---|---|---|---|---|
+| incremental | owl-rl | delete1 full | 1170 (1163-1190) | 1164 (1147-1167) | 1167 (1145-1167) | 1170 (1158-1172) | 1.005 |
+| incremental | owl-rl | delete1 memory | 2 (1-3) | 1 (1-3) | 3 (1-3) | 3 (1-3) | 3.000 |
+| incremental | owl-rl | delete1 store | 290 (287-293) | 294 (274-294) | 297 (285-299) | 296 (280-301) | 1.007 |
+| incremental | owl-rl | delete100 full | 1141 (1132-1239) | 1162 (1127-1194) | 1202 (1146-1247) | 1167 (1143-1190) | 1.004 |
+| incremental | owl-rl | delete100 memory | 19 (15-20) | 17 (15-23) | 15 (14-18) | 17 (13-19) | 1.000 |
+| incremental | owl-rl | delete100 store | 359 (359-364) | 350 (347-369) | 360 (359-370) | 354 (350-360) | 1.011 |
+| incremental | owl-rl | delete10000 full | 1245 (1173-1264) | 1232 (1148-1238) | 1210 (1207-1243) | 1228 (1192-1234) | 0.997 |
+| incremental | owl-rl | delete10000 memory | 450 (439-462) | 466 (452-484) | 469 (445-476) | 438 (431-480) | 0.940 |
+| incremental | owl-rl | delete10000 store | 739 (730-766) | 756 (749-762) | 758 (750-770) | 759 (752-763) | 1.004 |
+| incremental | owl-rl | insert1 full | 1201 (1178-1214) | 1200 (1164-1204) | 1212 (1170-1223) | 1198 (1191-1204) | 0.998 |
+| incremental | owl-rl | insert1 memory | 2 (1-3) | 1 (1-3) | 3 (1-3) | 3 (1-3) | 3.000 |
+| incremental | owl-rl | insert1 store | 223 (219-225) | 215 (215-220) | 223 (221-225) | 218 (217-225) | 1.014 |
+| incremental | owl-rl | insert100 full | 1180 (1175-1233) | 1195 (1187-1195) | 1199 (1157-1210) | 1174 (1173-1182) | 0.982 |
+| incremental | owl-rl | insert100 memory | 5 (3-5) | 3 (3-5) | 5 (3-5) | 5 (3-5) | 1.667 |
+| incremental | owl-rl | insert100 store | 224 (217-227) | 214 (208-220) | 227 (220-232) | 226 (222-227) | 1.056 |
+| incremental | owl-rl | insert10000 full | 1278 (1270-1279) | 1267 (1251-1275) | 1289 (1259-1305) | 1277 (1264-1331) | 1.008 |
+| incremental | owl-rl | insert10000 memory | 72 (72-75) | 72 (68-73) | 74 (72-76) | 74 (67-75) | 1.028 |
+| incremental | owl-rl | insert10000 store | 281 (275-283) | 279 (275-285) | 291 (286-295) | 282 (278-287) | 1.011 |
+| infer | owl-rl | ms | 16369 (16343-16454) | 16370 (16349-16543) | 16594 (16561-16625) | 16732 (16697-16877) | 1.022 |
+| infer | owl2bench5 | ms | 29976 (29917-29997) | 29976 (29909-30064) | 30964 (30955-31232) | 30043 (29935-30052) | 1.002 |
+
+User-space counters of one-thread full runs of LUBM(100) under owl-rl on a performance core, basere against p3re, two runs each (perf stat, cpu_core events).
+
+| Counter | basere r1 | basere r2 | p3re r1 | p3re r2 |
+|---|---|---|---|---|
+| instructions | 243557514733 | 243621514394 | 243963010395 | 243962458981 |
+| cycles | 86327694470 | 86572438758 | 88258844741 | 88584527092 |
+| branch-misses | 124495096 | 124386184 | 131697749 | 131232146 |
+| L1-icache-load-misses | 12338830 | 12248788 | 16608696 | 16450786 |
+| iTLB-load-misses | 3896347 | 3903469 | 4135760 | 4138457 |

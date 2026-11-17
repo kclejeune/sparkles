@@ -50,7 +50,7 @@ done
 rm -rf scratch
 log "DONE"
 
-# The rerun of rounds 3 to 6 with the same binaries and data:
+# atlas3b.sh
 
 #!/usr/bin/env bash
 # Item 839 Phase 3 gate rerun on atlas, under ~/lanes/.heavy.lock: the flagged runs of
@@ -93,3 +93,141 @@ for r in $(seq "$FIRST" "$LAST"); do
 done
 rm -rf scratch
 log "DONE"
+
+# atlas3c.sh
+
+#!/usr/bin/env bash
+# Item 839 Phase 3 gate, the OWL2Bench(5) rows of Phase 2's full-run gate on atlas, under
+# ~/lanes/.heavy.lock: base dd964cf0 against p3 6e03b4d3 (bin3), `lubm infer` under owl-rl
+# at one thread on CPU 2 and at 20 threads on CPUs 0-19, ROUNDS interleaved rounds.
+set -uo pipefail
+D=$HOME/lanes/datalog-839
+OWL2=$HOME/lanes/derived-tier-835-data/owl2bench5/base.nt
+TIME=/run/current-system/sw/bin/time
+ROUNDS=${ROUNDS:-4}
+cd "$D" || exit 1
+mkdir -p logs3c data
+log() { echo "[$(date +%T)] $*" | tee -a progress3c.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+if [ ! -d data/owl2bench5.db ]; then
+  log "loading OWL2Bench(5)"
+  scope "$D/bin3/lubm-base" loadfile data/owl2bench5.db "$OWL2" > data/load-owl2.log 2>&1 || { log "load failed"; exit 1; }
+fi
+timed() {
+  local name=$1 arm=$2 cpus=$3 threads=$4; shift 4
+  local rc=0
+  RAYON_NUM_THREADS=$threads SPARKLES_MAX_INFERRED=200000000 scope "$TIME" -v taskset -c "$cpus" "$D/bin3/lubm-$arm" "$@" > "logs3c/$name.out" 2> "logs3c/$name.err" || rc=$?
+  local rss
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "logs3c/$name.err")
+  echo "$name rc=$rc rss_kib=$rss load=$(cut -d' ' -f1 /proc/loadavg)" | tee -a results3c.txt progress3c.log
+}
+log "start $ROUNDS rounds"
+for r in $(seq 1 "$ROUNDS"); do
+  if [ $((r % 2)) = 1 ]; then arms="base p3"; else arms="p3 base"; fi
+  for t in 1 20; do
+    cpus=2; [ "$t" = 20 ] && cpus=0-19
+    for arm in $arms; do
+      timed "infer-owl2bench5-$arm-t$t-r$r" "$arm" "$cpus" "$t" infer data/owl2bench5.db owl-rl
+    done
+  done
+done
+log "DONE"
+
+# atlas3d.sh
+
+#!/usr/bin/env bash
+# Item 839 Phase 3 bisect on atlas, under ~/lanes/.heavy.lock: one-thread `lubm infer` under
+# owl-rl on OWL2Bench(5) and LUBM(100), CPU 2, for base dd964cf0, p3 6e03b4d3 (bin3 and a
+# rebuild, p3re), va (p3 with the RelTuple arm of builtins::eval as in base) and vb (p3
+# with run_program/run_from's cancel checks and set_deadline calls as in base).
+set -uo pipefail
+D=$HOME/lanes/datalog-839
+TIME=/run/current-system/sw/bin/time
+ROUNDS=${ROUNDS:-3}
+cd "$D" || exit 1
+mkdir -p logs3d
+log() { echo "[$(date +%T)] $*" | tee -a progress3d.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+timed() {
+  local name=$1 arm=$2; shift 2
+  local rc=0
+  RAYON_NUM_THREADS=1 SPARKLES_MAX_INFERRED=200000000 scope "$TIME" -v taskset -c 2 "$D/bin3/lubm-$arm" "$@" > "logs3d/$name.out" 2> "logs3d/$name.err" || rc=$?
+  local rss
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "logs3d/$name.err")
+  echo "$name rc=$rc rss_kib=$rss load=$(cut -d' ' -f1 /proc/loadavg)" | tee -a results3d.txt progress3d.log
+}
+log "start $ROUNDS rounds"
+all=(base p3 p3re va vb)
+for r in $(seq 1 "$ROUNDS"); do
+  arms=("${all[@]:$((r % 5))}" "${all[@]:0:$((r % 5))}")
+  for arm in "${arms[@]}"; do
+    timed "infer-owl2bench5-$arm-t1-r$r" "$arm" infer data/owl2bench5.db owl-rl
+  done
+  for arm in "${arms[@]}"; do
+    timed "infer-owl-rl-$arm-t1-r$r" "$arm" infer data/lubm100.db owl-rl
+  done
+done
+log "DONE"
+
+# atlas3e.sh
+
+#!/usr/bin/env bash
+# Item 839 Phase 3 build-variance control on atlas, under ~/lanes/.heavy.lock. basere and
+# p3re are dd964cf0 and 6e03b4d3 built in one worktree; base and p3 are the gate's bin3
+# builds from two worktrees. One-thread `lubm infer` under owl-rl on LUBM(100) and
+# OWL2Bench(5) on CPU 2, and `examples/incremental.rs` under owl-rl at 20 threads.
+set -uo pipefail
+D=$HOME/lanes/datalog-839
+TIME=/run/current-system/sw/bin/time
+ROUNDS=${ROUNDS:-3}
+cd "$D" || exit 1
+mkdir -p logs3e scratch
+log() { echo "[$(date +%T)] $*" | tee -a progress3e.log; }
+scope() { systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue "$@"; }
+timed() {
+  local name=$1 bin=$2 cpus=$3 threads=$4; shift 4
+  local rc=0
+  RAYON_NUM_THREADS=$threads SPARKLES_MAX_INFERRED=200000000 scope "$TIME" -v taskset -c "$cpus" "$bin" "$@" > "logs3e/$name.out" 2> "logs3e/$name.err" || rc=$?
+  local rss
+  rss=$(sed -n 's/.*Maximum resident set size (kbytes): //p' "logs3e/$name.err")
+  echo "$name rc=$rc rss_kib=$rss load=$(cut -d' ' -f1 /proc/loadavg)" | tee -a results3e.txt progress3e.log
+}
+log "start $ROUNDS rounds"
+all=(base basere p3 p3re)
+for r in $(seq 1 "$ROUNDS"); do
+  arms=("${all[@]:$((r % 4))}" "${all[@]:0:$((r % 4))}")
+  for arm in "${arms[@]}"; do
+    timed "infer-owl-rl-$arm-t1-r$r" "$D/bin3/lubm-$arm" 2 1 infer data/lubm100.db owl-rl
+  done
+  for arm in "${arms[@]}"; do
+    timed "infer-owl2bench5-$arm-t1-r$r" "$D/bin3/lubm-$arm" 2 1 infer data/owl2bench5.db owl-rl
+  done
+  for arm in "${arms[@]}"; do
+    rm -rf scratch/inc
+    timed "incremental-owl-rl-$arm-r$r" "$D/bin3/incremental-$arm" 0-19 20 scratch/inc 1000000 owl-rl
+  done
+done
+rm -rf scratch
+log "DONE"
+
+# atlas3f.sh
+
+#!/usr/bin/env bash
+# Item 839 Phase 3: user-space instruction and cycle counts of one-thread `lubm infer` under
+# owl-rl on LUBM(100), basere (dd964cf0) against p3re (6e03b4d3), built in one worktree,
+# CPU 2, two runs each, interleaved, under ~/lanes/.heavy.lock.
+set -uo pipefail
+D=$HOME/lanes/datalog-839
+PERF=/nix/store/ciwqn0d1ybrvzw9sdlklfhg58njv3inc-perf-linux-7.3.3/bin/perf
+cd "$D" || exit 1
+mkdir -p logs3f
+for r in 1 2; do
+  arms="basere p3re"; [ "$r" = 2 ] && arms="p3re basere"
+  for arm in $arms; do
+    RAYON_NUM_THREADS=1 SPARKLES_MAX_INFERRED=200000000 systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+      "$PERF" stat -x, -o "logs3f/stat-$arm-r$r.csv" -e instructions:u,cycles:u,branch-misses:u,L1-icache-load-misses:u,iTLB-load-misses:u \
+      taskset -c 2 "$D/bin3/lubm-$arm" infer data/lubm100.db owl-rl > "logs3f/infer-$arm-r$r.out" 2>&1
+    echo "$arm r$r rc=$? $(grep -oE 'ms=[0-9]+' logs3f/infer-$arm-r$r.out)" | tee -a progress3f.log
+  done
+done
+echo DONE | tee -a progress3f.log
