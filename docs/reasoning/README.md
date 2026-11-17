@@ -415,7 +415,13 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   complement. `Limits::expansion` chooses the cautious or the eager successor strategy,
   which give the same answers. These runs share the Horn rules' memory budget, and a run
   that passes it classifies again by the Horn rules, leaves the disjunctive axioms out and
-  reports them, and sets `Stats::dl_over_budget`. With `Limits::partial`, a run of the
+  reports them, and sets `Stats::dl_over_budget`. A run that neither counts nor is rooted
+  also has a bound of 384 derived conclusions for each class of the signature, at least
+  2,097,152, `Limits::dl_attempt_work`, past which it falls back in the same way and sets
+  `Stats::dl_attempt_over` too. The attempts that finish on the ORE 2015 DL development
+  set stay far within it, and those that cannot finish pass it well before their memory
+  budget. On several threads a schedule can decide the outcome of a run that derives
+  about the bound. With `Limits::partial`, a run of the
   disjunctive rules that its deadline, cancellation or memory budget stops returns the
   subsumptions it proved, with `Classification::complete` false, the classes it may have
   left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
@@ -476,7 +482,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   axiom with an individual, a data property, a datatype, a key or a self restriction, and
   a change that moves the ontology to other rules, saturates everything again. So does
   any change to a Horn ontology with individuals, to a counting or a rooted run, and to a
-  disjunctive run with the eager strategy. Roadmap items 753 and 953. A kept classification holds
+  disjunctive run with the eager strategy. Roadmap items 753 and 953. A kept disjunctive run
+  counts the conclusions of the runs since the last full one against the bound above and
+  starts again in full past it, and a run that starts again can derive more than that
+  count, so near the bound a kept run can answer in full where a full run falls back.
+  Roadmap item 1010. A kept classification holds
   the last index beside the new one while it compares them, and starts again once it
   keeps more than twice the expressions of its last full run. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
@@ -954,9 +964,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the EL rules' time, since each context of a conjunction derives its successor's
   subsumers again. Roadmap item 693.
 * The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
-  passes its memory budget before the Horn rules answer. On four threads one of them
-  classifies in 20 to 39 seconds and the other in about 13, almost all of it the attempt.
-  Roadmap item 990.
+  passes its bound on derived conclusions before the Horn rules answer. On four threads on
+  `atlas` the bound ends the attempt so that `ore_ont_9663` classifies in 7.5 to 8.8 s and
+  `ore_ont_14817` in 7.9 to 11.3 s. Konclude 0.7.0 classifies them in 8.9 to 9.7 s on four
+  threads on the laptop. Roadmap items 693 and 1011.
+* Three large ORE 2015 DL files whose disjunctive attempt finishes, `ore_ont_10140`,
+  `ore_ont_6952` and `ore_ont_11460`, classify 1.06 to 1.15 times slower in the EL part of
+  their saturation with the build that bounds the attempt, and as slow with the bound
+  turned off. Roadmap item 1012.
 * Horn ontologies whose successors no other successor dominates classify up to 6% slower
   than without the check for dominated successors, which costs more there than it saves.
   Roadmap item 991.
@@ -1000,8 +1015,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
   the time Konclude takes, which is short of the classifier's aim of three times
   Konclude's speed. Roadmap item 712.
-* ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' memory budget and
-  gets the Horn rules' answer without its 18,323 unions. Roadmap item 713.
+* ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' bound on derived
+  conclusions and gets the Horn rules' answer without its 18,323 unions. Roadmap item 713.
 * `partial` applies only to runs of the disjunctive rules, and runs of the EL and Horn
   rules still fail at a deadline on every surface. Roadmap item 714.
 * The Workbench does not ask for a partial classification, so it shows no partial answers

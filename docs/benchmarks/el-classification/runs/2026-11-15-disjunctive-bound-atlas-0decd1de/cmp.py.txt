@@ -1,0 +1,13 @@
+import sys,collections
+d=collections.defaultdict(dict)
+for l in open(sys.argv[1]):
+    p=l.split(None,5)
+    if len(p)<5: continue
+    n,t,s,st,sha=p[:5]; d[(n,t)][s]=(st,sha,p[5].strip() if len(p)>5 else '')
+eq=diff=0; tip=sys.argv[2]
+for k,v in sorted(d.items()):
+    if 'base' in v and tip in v:
+        if v['base'][:2]==v[tip][:2] and v['base'][0]=='0': eq+=1
+        else:
+            diff+=1; print(k, v)
+print('equal',eq,'differ',diff,'pending',sum(1 for v in d.values() if len(v)<2))

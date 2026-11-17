@@ -1200,7 +1200,86 @@ classified gave the same bytes. On one thread the base passed the 900 s timeout 
 threads, and both builds passed it on `ore_ont_9663`. Both builds passed the 12 GiB cap on
 `ore_ont_7192` on eight threads, and the reader refuses `ore_ont_9881`.
 
+### A bound on the disjunctive attempt
+
+Roadmap item 990 ends a run of the disjunctive rules without counting or the rooted rules
+once it has derived 384 conclusions per class of the signature, at least 2,097,152, and
+the Horn rules then answer. On `atlas` three rounds of alternating order with five
+classifications per process compared the base, commit a370d073, with the item's build on
+the 12 files of the ORE 2015 DL development set whose attempt finishes. Each time below is
+the median of the 15 classifications of a side, each ratio the ratio of the medians, and
+the range that of the three rounds' ratios.
+
+| Ontology | Threads | Base ms | Item 990 ms | Ratio | Range of the rounds |
+|---|---:|---:|---:|---:|---|
+| `ore_ont_12141` | 1 | 58.6 | 57.8 | 0.987 | 0.981 to 1.011 |
+| `ore_ont_12141` | 4 | 24.5 | 24.2 | 0.987 | 0.970 to 1.084 |
+| `ore_ont_15491` | 1 | 28.9 | 29.1 | 1.005 | 0.999 to 1.006 |
+| `ore_ont_15491` | 4 | 16.7 | 16.6 | 0.992 | 0.944 to 1.117 |
+| `ore_ont_5438` | 1 | 618.2 | 614.8 | 0.994 | 0.983 to 1.001 |
+| `ore_ont_5438` | 4 | 195.8 | 193.1 | 0.986 | 0.959 to 1.007 |
+| `ore_ont_13103` | 1 | 1,957.8 | 1,950.7 | 0.996 | 0.996 to 1.000 |
+| `ore_ont_13103` | 4 | 512.4 | 514.6 | 1.004 | 0.981 to 1.039 |
+| `ore_ont_16680` | 1 | 5,908.9 | 5,912.9 | 1.001 | 0.999 to 1.003 |
+| `ore_ont_16680` | 4 | 1,618.3 | 1,569.2 | 0.970 | 0.965 to 1.031 |
+| `ore_ont_6952` | 1 | 876.8 | 1,007.9 | 1.150 | 1.118 to 1.167 |
+| `ore_ont_6952` | 4 | 291.5 | 315.6 | 1.083 | 1.075 to 1.096 |
+| `ore_ont_10140` | 1 | 904.5 | 1,039.4 | 1.149 | 1.135 to 1.150 |
+| `ore_ont_10140` | 4 | 294.3 | 324.7 | 1.103 | 1.095 to 1.114 |
+| `ore_ont_11460` | 1 | 1,475.6 | 1,618.4 | 1.097 | 1.091 to 1.106 |
+| `ore_ont_11460` | 4 | 443.8 | 469.4 | 1.058 | 1.050 to 1.069 |
+
+`ore_ont_4897`, `ore_ont_5940`, `ore_ont_6423` and `ore_ont_6485` classify in under 10 ms,
+and their rounds' ratios range from 0.60 to 2.46, so they are left out of the table. The
+files derive the same conclusions on both builds on one thread, and on four the counts of
+both builds vary by schedule within the same range. On `ore_ont_6952`, `ore_ont_10140` and
+`ore_ont_11460` the extra time is in the saturation outside the attempt's tests, which take
+under 10 ms by the reports' `dlTestingMs`, and the attempts derive under 20,000
+conclusions. On one thread on `wally`, an Intel Core
+i7-12800H, three rounds of the base, the item's build and that build with
+`--dl-attempt-work 0` gave the ratios below, each the ratio of the medians of 15
+classifications. The build is as slow without the bound, so the check of the bound is not
+the cost. Roadmap item 1012 follows it.
+
+| Ontology | Item 990 | Item 990 without the bound |
+|---|---:|---:|
+| `ore_ont_6952` | 1.092 | 1.148 |
+| `ore_ont_10140` | 1.101 | 1.115 |
+| `ore_ont_11460` | 1.081 | 1.075 |
+
+Three rounds of alternating order on four threads and one round on one thread classified
+the files whose attempt passes its memory budget on the base, one process per side and
+round. The times below are the classification times, the attempt included, and the
+taxonomies of both builds are the same.
+
+| Ontology | Threads | Base s | Item 990 s |
+|---|---:|---|---|
+| `ore_ont_9663` | 4 | 12.3, 16.2, 20.6 | 8.8, 8.8, 7.5 |
+| `ore_ont_14817` | 4 | 30.3, 10.1, 29.6 | 8.7, 11.3, 7.9 |
+| `ore_ont_3215` | 4 | 126.9, 137.9, 110.0 | 4.5, 4.6, 4.4 |
+| `ore_ont_9663` | 1 | past the 900 s timeout | 74.5 |
+| `ore_ont_14817` | 1 | 345.3 | 57.7 |
+| `ore_ont_3215` | 1 | 628.4 | 13.6 |
+
+The peak resident set of `ore_ont_3215` on four threads falls from 7.6 to 7.7 GiB to 1.8
+to 2.1 GiB, and that of `ore_ont_14817` from 3.0 to 3.2 GiB to 2.1 to 2.3 GiB. The
+bound's time depends on the run, as the memory budget's did, since the attempt keeps the
+driver without steps.
+
+A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015 EL files and the 207
+files of the DL development set once per build on one and eight threads with its taxonomy.
+The 993 pairs that both builds classified gave the same bytes, and no file changed its
+tier. On one thread the base passed the 900 s timeout on `ore_ont_9663`, whose answer from
+the item's build equals both builds' answer on eight threads. Neither build answered on
+`ore_ont_7192` within the sweep's limits, and the reader refuses `ore_ont_9881`.
+
 ## Records
+
+The [record of item 990](runs/2026-11-15-disjunctive-bound-atlas-0decd1de/record.json)
+holds every classification of the rounds on `atlas` of both builds, the attempts that pass
+the bound, the runs on `wally` with and without the bound, the attempts' conclusions on
+the laptop with the diagnostic build, the generated ontologies and fixtures, the A/B of the
+bound in steps, the sweep's taxonomy hashes and the scripts that ran.
 
 The [record of items 710 and 969](runs/2026-11-15-horn-dominance-atlas-a370d073/record.json)
 holds every classification of the rounds on `atlas` of the items' first build, of the build

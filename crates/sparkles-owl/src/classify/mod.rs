@@ -157,6 +157,22 @@ const DL_WORK_BOUND: usize = 1 << 18;
 /// in seconds. Four million conclusions take a few seconds.
 const DL_RETRY_WORK: usize = 1 << 22;
 
+/// The least bound on the conclusions that a run of Tier D without counting or the rooted
+/// rules derives before it ends and the Horn rules answer (roadmap item 990). The largest
+/// such run among the 2,166 generated ontologies of item 969 with a union derives 536,000
+/// conclusions, and the dl603 and dl897 fixtures derive at most 5,700.
+const DL_ATTEMPT_FLOOR: usize = 1 << 21;
+
+/// The bound on the conclusions of a run of Tier D without counting or the rooted rules,
+/// per class of the signature, which the EL saturation gives a context each, above
+/// [`DL_ATTEMPT_FLOOR`]. Of the ORE 2015 DL development set's 12 attempts that finish,
+/// those above the floor derive at most 212 conclusions per class, ore_ont_16680 with 6.9
+/// million. The three that pass their memory budget, ore_ont_9663, ore_ont_14817 and
+/// ore_ont_3215, derive 38 to 791 million first, 660 to 14,400 per class, in 10 to 88 s
+/// on eight threads, and pass this bound in a third to a half of the time, ore_ont_3215
+/// in a fortieth.
+const DL_ATTEMPT_PER_CLASS: usize = 384;
+
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
 /// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
 /// its index and axioms, on a small ontology.
@@ -201,9 +217,25 @@ pub struct Limits {
     /// takes a bound of [`DL_WORK_BOUND`] conclusions for a run that counts and
     /// [`ROOTED_WORK_BOUND`] for a rooted run. It applies only with
     /// [`counting`](Limits::counting) or [`rooted`](Limits::rooted). A run of Tier D
-    /// with neither has no such bound, except the run that starts again after a run
-    /// that counted passed it, whose bound is 4 million.
+    /// with neither has the bound of [`dl_attempt_work`](Limits::dl_attempt_work),
+    /// except the run that starts again after a run that counted passed it, whose bound
+    /// is 4 million.
     pub dl_work: Option<usize>,
+    /// the most conclusions, kept or redundant, that a run of Tier D without counting and
+    /// without the rooted rules derives before it ends and the Horn rules answer, which
+    /// leave the disjunctive axioms out and report them, as they do when the run passes
+    /// its memory budget, with [`Stats::dl_attempt_over`] set (roadmap item 990). `None`
+    /// takes 384 conclusions for each class of the signature, and at least 2,097,152.
+    /// `Some(0)` takes no bound. A run that keeps the contexts of the last run (roadmap
+    /// item 753) counts the conclusions of the runs since the last one that started
+    /// again with its own, and a run that passes the bound starts again in full, whose
+    /// answer is the one the caller gets. A run that starts again over the same axioms
+    /// can derive more than that sum, so a kept run can answer in full where such a run
+    /// falls back (F24, "Incremental native DL classification"). The run keeps the
+    /// driver without steps ([`dl_steps`](Limits::dl_steps)), so on several threads an
+    /// ontology whose run derives about the bound can answer in full on one schedule and
+    /// fall back on another.
+    pub dl_attempt_work: Option<usize>,
     /// whether Tier D counts, which is off by default. A run that counts takes number
     /// restrictions, functional and inverse functional properties, disjoint properties and
     /// asymmetric properties into the case analysis, and it is complete for them when it
@@ -243,8 +275,10 @@ pub struct Limits {
     /// or keeps its bound on them, and so answers in full or falls back, in the same way
     /// on every number of threads and every schedule (roadmap item 727). On by default.
     /// The runs with such a bound are a run that counts, the run that starts again
-    /// without counting after it, and a rooted run. A step activates the waiting
-    /// contexts in parallel and delivers their messages at its end in a fixed order.
+    /// without counting after it, and a rooted run. The bound of any other run of Tier D,
+    /// [`dl_attempt_work`](Limits::dl_attempt_work), keeps the driver without steps. A
+    /// step activates the waiting contexts in parallel and delivers their messages at its
+    /// end in a fixed order.
     /// The run does not repeat on one thread an attempt that passed its bound. A rooted
     /// run and a run with [`Expansion::Eager`] that has the bound run their saturations
     /// on one thread with the option. A run without the bound has no outcome that a
@@ -269,6 +303,7 @@ impl Default for Limits {
             partial: false,
             expansion: Expansion::default(),
             dl_work: None,
+            dl_attempt_work: None,
             counting: false,
             rooted: false,
             number_order: true,
@@ -372,15 +407,20 @@ pub struct Stats {
     /// conclusions, so the run classified again without the rooted rules and left the
     /// axioms outside OWL 2 EL out, as a run without the option does
     pub dl_rooted_over: bool,
+    /// a run of Tier D without counting and without the rooted rules passed its bound on
+    /// derived conclusions ([`Limits::dl_attempt_work`]), so the run classified with the
+    /// Horn rules and left the disjunctive axioms out
+    pub dl_attempt_over: bool,
     /// the candidate subsumers that Tier D tested in contexts of their own
     pub dl_tests: usize,
     /// the tested candidates that hold
     pub dl_tests_held: usize,
     /// the part of [`saturation`](Stats::saturation) that the tests of Tier D took
     pub dl_testing: Duration,
-    /// Tier D passed its memory budget, so the run classified with the Horn rules and
-    /// left the disjunctive axioms out, or Tier D with counting passed its bound on
-    /// derived conclusions and the run classified without counting
+    /// Tier D passed its memory budget, or its bound on derived conclusions
+    /// ([`dl_attempt_over`](Stats::dl_attempt_over)), so the run classified with the Horn
+    /// rules and left the disjunctive axioms out, or Tier D with counting passed its bound
+    /// on derived conclusions and the run classified without counting
     /// ([`dl_counting_over`](Stats::dl_counting_over)), or a rooted run passed its bound
     /// and the run classified without the rooted rules
     /// ([`dl_rooted_over`](Stats::dl_rooted_over))
@@ -537,6 +577,10 @@ pub struct Saturation {
     /// fallback its bound on derived conclusions takes
     dl_rooted: bool,
     dl_counted: bool,
+    /// whether the current run of Tier D neither counts nor is rooted nor starts again
+    /// without counting, so that its bound on derived conclusions ends it for the Horn
+    /// rules (roadmap item 990)
+    dl_attempt: bool,
     /// set by a run of Tier D that passed its bound on derived conclusions
     dl_worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// set when a Tier D classification requesting partial answers cannot fit its
@@ -1035,6 +1079,7 @@ impl Saturation {
             no_rooted: false,
             dl_rooted: false,
             dl_counted: false,
+            dl_attempt: false,
             dl_worked: Default::default(),
             partial_over: false,
             numeric_halt: false,
@@ -1125,9 +1170,13 @@ impl Saturation {
             // again in full with the same rules before a lower tier takes over, so that
             // its answer is that of a run without the kept contexts (roadmap item 753).
             // That holds for a stop on the budget of exact numeric values too, which
-            // counts the kept state as well.
-            // Its charges draw first on what the pool admitted.
+            // counts the kept state as well, and for the bound on derived conclusions of
+            // a run of Tier D that neither counts nor is rooted, which counts the
+            // conclusions of the runs that derived the kept contexts (roadmap item 990).
+            // Its charges draw first on what the pool admitted. Whether it passed a bound
+            // on derived conclusions is the new run's to say.
             self.reset();
+            self.dl_worked.store(false, Ordering::Relaxed);
             let a = admitted.clone();
             let counting = limits.charge.clone().map(|f| {
                 let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
@@ -1154,6 +1203,7 @@ impl Saturation {
             && !self.partial_over
             && !self.numeric_halt
             && self.dl_worked.load(Ordering::Relaxed)
+            && !self.dl_attempt
         {
             // Tier D passed its bound on derived conclusions, and how many it derives
             // depends on the order in which the threads delivered the contexts'
@@ -1190,7 +1240,7 @@ impl Saturation {
             && !self.partial_over
             && !self.numeric_halt
             && self.dl_worked.load(Ordering::Relaxed)
-            && (self.dl_counted || !self.dl_rooted)
+            && self.dl_counted
         {
             // Tier D with counting passed its bound on derived conclusions, which a run
             // without counting never does: the run starts again with the axioms that need
@@ -1257,6 +1307,13 @@ impl Saturation {
             self.no_rooted = false;
             rooted_over = Some(used);
         }
+        // a run of Tier D without counting or the rooted rules that passed its bound on
+        // derived conclusions, which falls back to the Horn rules as it does past its
+        // memory budget
+        let attempt_over = matches!(r, Err(Error::Memory { .. }))
+            && self.dl_tried
+            && self.dl_attempt
+            && self.dl_worked.load(Ordering::Relaxed);
         let mut dl_over = None;
         if let Err(Error::Memory { used, .. }) = r
             && self.dl_tried
@@ -1290,6 +1347,7 @@ impl Saturation {
             dl_over = Some(used);
             r = r.map(|(consistent, taxonomy, mut stats)| {
                 stats.dl_over_budget = true;
+                stats.dl_attempt_over = attempt_over;
                 stats.peak_memory = stats.peak_memory.max(used);
                 (consistent, taxonomy, stats)
             });
@@ -1319,6 +1377,7 @@ impl Saturation {
                     stats.horn_over_budget = true;
                     if let Some(d) = dl_over {
                         stats.dl_over_budget = true;
+                        stats.dl_attempt_over = attempt_over;
                         stats.peak_memory = stats.peak_memory.max(d);
                     }
                     // the Horn run's high-water mark, which the run reached first
@@ -2078,6 +2137,8 @@ impl Saturation {
         // which it classifies by the EL rules alone (run_with).
         self.dl_rooted = rooted.is_some();
         self.dl_counted = ax.dl.as_ref().is_some_and(|d| d.counting);
+        self.dl_attempt =
+            dl_run.is_some() && !self.dl_rooted && !self.dl_counted && !self.no_counting;
         if let Some(d) = &dl_run {
             // a run that counts has the bound of the limits, and the run that starts again
             // without counting after it passed that bound has the larger one of a run that
@@ -2090,6 +2151,15 @@ impl Saturation {
                 d.set_work_limit(DL_RETRY_WORK);
             } else if self.dl_counted {
                 d.set_work_limit(limits.dl_work.unwrap_or(DL_WORK_BOUND).max(1));
+            } else {
+                // Any other run has a bound that grows with the classes, past which the
+                // Horn rules answer (roadmap item 990). The classes are the signature's,
+                // which a run that keeps contexts and one that starts again share, so
+                // both take the same bound.
+                let classes = roots.len();
+                d.set_work_limit(limits.dl_attempt_work.unwrap_or_else(|| {
+                    DL_ATTEMPT_FLOOR.max(DL_ATTEMPT_PER_CLASS.saturating_mul(classes))
+                }));
             }
         }
         let max_memory = if horn || disj {
@@ -2104,7 +2174,15 @@ impl Saturation {
         // run's literals and of the eager strategy's contexts follow the order in which
         // the threads make them, so those runs take one thread instead, whose order is
         // fixed. The worlds and the taxonomy keep the caller's threads.
-        let fixed = limits.dl_steps && disj && dl_run.as_ref().is_some_and(|d| d.bounded());
+        // The bound of a run that neither counts nor is rooted (roadmap item 990) keeps the
+        // driver without steps, with which the attempts that finish on eight threads took
+        // 1.3 to 1.9 times less time than in steps on the laptop. Such an attempt either finishes well within its
+        // bound or runs on far past it, so a schedule decides its outcome only for an
+        // ontology near the bound, as it does for the memory budget.
+        let fixed = limits.dl_steps
+            && disj
+            && dl_run.as_ref().is_some_and(|d| d.bounded())
+            && !self.dl_attempt;
         let steps = fixed && rooted.is_none() && limits.expansion == Expansion::Cautious;
         let saturation_threads = if fixed && !steps { 1 } else { threads };
         let bounds = Bounds {

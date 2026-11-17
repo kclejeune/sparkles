@@ -2,7 +2,7 @@
 //! reference reasoner and the measurements of `docs/benchmarks/el-classification`.
 //!
 //! ```text
-//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
+//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax (`.ofn`, or any file that starts with `Prefix(` or
@@ -85,6 +85,7 @@ fn main() {
     let mut owned = false;
     let mut eager = false;
     let mut dl_work: Option<usize> = None;
+    let mut dl_attempt_work: Option<usize> = None;
     let mut counting = false;
     let mut number_order = true;
     let mut rooted = false;
@@ -107,12 +108,13 @@ fn main() {
             "--dl-steps" => dl_steps = true,
             "--no-dl-steps" => dl_steps = false,
             "--dl-work" => dl_work = args.next().and_then(|v| v.parse().ok()),
+            "--dl-attempt-work" => dl_attempt_work = args.next().and_then(|v| v.parse().ok()),
             _ => input = Some(a),
         }
     }
     let Some(input) = input else {
         eprintln!(
-            "usage: el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--no-dl-steps] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+            "usage: el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--no-dl-steps] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
         );
         std::process::exit(2);
     };
@@ -168,6 +170,7 @@ fn main() {
             sparkles_owl::classify::Expansion::Cautious
         },
         dl_work,
+        dl_attempt_work,
         counting,
         rooted,
         number_order,
@@ -298,6 +301,7 @@ fn main() {
             "dlWork": s.dl_work,
             "dlCountingOver": s.dl_counting_over,
             "dlRootedOver": s.dl_rooted_over,
+            "dlAttemptOver": s.dl_attempt_over,
             "dlTestsHeld": s.dl_tests_held,
             "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
             "partial": partial,

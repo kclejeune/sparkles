@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# ab.sh THREADS TAG BIN...: the Tier D files of the dev set with each binary, interleaved, with
+# the outcome, the attempt's conclusions and the time. Output dist/ab-TAG.txt.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/disjunctive-stop-990/.artifacts/lanes/disjunctive-stop-990
+DEV=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+t=$1; tag=$2; shift 2
+O=$L/dist/ab-$tag.txt
+files="${FILES:-ore_ont_4897 ore_ont_5940 ore_ont_6423 ore_ont_6485 ore_ont_12141 ore_ont_15491 ore_ont_5438 ore_ont_13103 ore_ont_16680 ore_ont_6952 ore_ont_10140 ore_ont_11460 ore_ont_9663 ore_ont_14817 ore_ont_3215}"
+for r in $(seq ${ROUNDS:-1}); do
+for n in $files; do
+  f=$(ls $DEV/$n.* | head -1)
+  for b in "$@"; do
+    out=$(timeout ${TMO:-900} $L/bin/$b --threads $t --taxonomy $L/dist/d990-$tag.tax $f 2>/dev/null | grep '^{')
+    sha=$(LC_ALL=C sort $L/dist/d990-$tag.tax 2>/dev/null | sha256sum | cut -c1-12); rm -f $L/dist/d990-$tag.tax
+    echo "$n $b $sha $(echo "$out" | jq -c '[.classifyMedianMs,.dlWork,.dlOverBudget,.dlAttemptOver,.outside]')" >> $O
+  done
+done
+done
+echo AB-DONE >> $O
