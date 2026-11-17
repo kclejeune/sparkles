@@ -119,7 +119,8 @@ finish within the bound, and all agree with HermiT but one, a gap of the rooted 
 the ontology shows without keys or the universal property too and item 823 records. 109
 pass the bound and give their default answer, and 9 take the default paths. ore_ont_14924 states the universal property only in a dropped tautology, so its
 run is rooted now. It passes the bound and gives the default answer, which is HermiT's,
-in about 1 s against 16 ms without the option, and item 1061 follows that cost.
+in 0.3 to 1 s against 16 ms without the option on a shared laptop, and item 1061
+follows that cost.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
