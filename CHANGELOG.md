@@ -14,7 +14,7 @@ roadmap item 1048. It requires zip 9 and the pure-Rust tokenizers 0.23 that
 `sparkles-embed` already used, so the root `Cargo.lock` holds only zip 9.6.1 and the build
 gains no C or C++ code. Candle 0.11 runs large elementwise operations on a process-wide
 thread pool of its own and, without a thread setting, reads `/proc/cpuinfo` for every
-matrix product on processors without performance and efficiency cores. The server
+matrix product on machines whose kernel reports the same capacity for every CPU. The server
 therefore sets `CANDLE_NUM_THREADS=1` and `CANDLE_CPU_MASK` at startup unless the
 operator set them, which keeps Candle's work on the embedding pool's threads at their
 lower priority. The vectors of all-MiniLM-L6-v2, nomic-embed-text-v1.5 and

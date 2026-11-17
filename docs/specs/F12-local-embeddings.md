@@ -636,9 +636,10 @@ own. Candle 0.11 brought two runtime changes that the crate works around.
   hook. `confine_candle_threads` sets `CANDLE_NUM_THREADS=1`, which leaves that pool
   without threads, and the server calls it first in `main`.
 * Each matrix product asks for a thread count, and without `RAYON_NUM_THREADS` Candle
-  derives it from the performance cores of a hybrid processor or else from the physical
-  cores, which `num_cpus` counts by reading `/proc/cpuinfo` on every call. On `atlas`,
-  an Intel host with 20 threads and no hybrid capacity list, that raised the query
+  derives it from the CPUs of the highest capacity when the kernel reports differing
+  capacities, or else from the physical cores, which `num_cpus` counts by reading
+  `/proc/cpuinfo` on every call. On `atlas`, an Intel Core i5-13500 with 20 threads whose
+  kernel reports the same capacity for every CPU, that raised the query
   latency of all-MiniLM-L6-v2 from 3.7 ms to 12.5 ms and of nomic-embed-text-v1.5 from
   57 ms to 73 ms. `confine_candle_threads` also sets `CANDLE_CPU_MASK` to the CPUs the
   process may use, at most its available parallelism, which Candle reads once and which
@@ -649,8 +650,10 @@ The vectors of all-MiniLM-L6-v2, nomic-embed-text-v1.5 and Qwen3-Embedding-0.6B,
 and bf16 where the model allows it, for seven texts as queries and as documents, match
 0.9.2's within 3.5e-6 per component, and the ignored tests pass. `embed-bench` on
 `atlas`, four interleaved rounds of each build with a copy of the old build as a
-control, gave these medians. The control stayed within 1% of the old build except for
-the Qwen3 query latency, which a further eight balanced runs of each build measured.
+control, gave these medians. The control stayed within 1% of the old build in document
+throughput and within about 3% in query latency. The Qwen3 query latency comes from a
+further eight runs of each build in balanced order, because the interleaved rounds
+always ran the new build right after another Qwen3 run.
 
 | Model | dtype | Threads | Documents per s, 0.9.2 / 0.11.1 | Query p50, 0.9.2 / 0.11.1 |
 |---|---|---|---|---|
