@@ -103,8 +103,9 @@ probes again. One tracked set spans the whole phase, so a descendant of startup 
 stays startup work after its parents exit, wherever it is reparented. Only the agent's
 shell and sudo, which are allowed by their children, can leave the set. One leaves it
 when the scan that first tracked it refused it for its children alone, and it is again
-an allowed session process under the name it had then. Its former descendants stay in
-the set, and a process renamed to bash or sudo never leaves it. A manifest that
+an allowed session process with the name and the executable, by device and inode, that
+it had then. Its former descendants stay in the set. A process renamed to bash or sudo,
+one that has run exec since, and one whose executable cannot be read never leave it. A manifest that
 differs from its first read refuses at once with no retry. No probe starts 120 seconds or
 more after the phase began, the user-manager query gets only the time left, and at most
 six probes run, inside the metadata unit's 240 seconds. The

@@ -302,9 +302,10 @@ def observe_startup(payload):
 # parents exit, wherever it is reparented. The one exception is the agent's own shell
 # or sudo, the session processes allowed only by their children (SESSION_CHILDREN).
 # An identity is releasable only when the scan that first tracked it found it refused
-# for its children alone, and it leaves the set only while its name is the one it had
-# then and it is again an allowed session process. Its former descendants stay in the
-# set, and a process renamed to bash or sudo is never released. No probe starts
+# for its children alone and could read the device and inode of its executable. It
+# leaves the set only while its name and executable are the ones it had then and it is
+# again an allowed session process. Its former descendants stay in the set, and a
+# process renamed to bash or sudo, or one that has run exec since, is never released. No probe starts
 # QUALIFY_SECONDS or more after the phase began, inside the metadata unit's 240
 # seconds, the user-manager query gets only the time left, and a refusal keeps the
 # last busy inventory.
@@ -322,19 +323,25 @@ def with_inventory(error,seen):
     error.unallowed=unallowed_inventory(rows,busy);error.unallowed_count=len(busy)
     return error
 
+def exe_identity(pid,proc=Path('/proc')):
+    """The device and inode of the process's executable, or None when it cannot be read."""
+    try:s=os.stat(proc/str(pid)/'exe');return (s.st_dev,s.st_ino)
+    except OSError:return None
+
 def refused_for_children_only(pid,rows,manager):
     """Whether this agent shell or sudo is an allowed session process apart from its children."""
     if rows[pid]['comm'] not in SESSION_CHILDREN:return False
     return provider_session(pid,{p:r for p,r in rows.items() if r['ppid']!=pid},manager)
 
-def release_idle_session(tracked,releasable,rows,manager):
+def release_idle_session(tracked,releasable,rows,manager,exe_reader=exe_identity):
     """Drop from ``tracked`` the releasable agent shells and sudos that are allowed session processes again.
 
-    ``releasable`` maps each such identity to the name it had when it was first tracked."""
-    for (pid,start),comm in list(releasable.items()):
+    ``releasable`` maps each such identity to the name and executable identity it had
+    when it was first tracked. An executable that differs or cannot be read keeps it."""
+    for (pid,start),(comm,exe) in list(releasable.items()):
         row=rows.get(pid)
         if row is None or row['start']!=start:releasable.pop((pid,start));continue
-        if row['comm']==comm and provider_session(pid,rows,manager):
+        if row['comm']==comm and provider_session(pid,rows,manager) and exe_reader(pid)==exe:
             tracked.discard((pid,start));releasable.pop((pid,start))
 
 def quiet_window(scan,clock,pause,deadline,seconds=QUIET_SECONDS):
@@ -351,15 +358,17 @@ def quiet_window(scan,clock,pause,deadline,seconds=QUIET_SECONDS):
         pause(min(SCAN_PAUSE,max(0.0,deadline-clock())))
     return False,seen
 
-def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows,left:None):
+def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows,left:None,exe_reader=exe_identity):
     """The metadata probe between a quiet startup window and a clean scan, under the bootstrap lock."""
     deadline=clock()+QUALIFY_SECONDS;seen=None;attempts=0;tracked=set();releasable={}
     def scan():
         rows=rows_reader();left=deadline-clock();manager=manager_reader(rows,left) if left>0 else None
-        release_idle_session(tracked,releasable,rows,manager)
+        release_idle_session(tracked,releasable,rows,manager,exe_reader)
         known=set(tracked);busy=foreign_startup(rows,launcher,probe_pid,tracked,manager)
         for pid,start in tracked-known:
-            if pid in rows and rows[pid]['start']==start and refused_for_children_only(pid,rows,manager):releasable[(pid,start)]=rows[pid]['comm']
+            if pid in rows and rows[pid]['start']==start and refused_for_children_only(pid,rows,manager):
+                exe=exe_reader(pid)
+                if exe is not None:releasable[(pid,start)]=(rows[pid]['comm'],exe)
         return rows,busy
     with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
         before,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)

@@ -1131,16 +1131,21 @@ class QualificationWait(unittest.TestCase):
         rows=copy.deepcopy(self.trees[op][0]);rows[pid]={'pid':pid,'ppid':parent,'uid':uid,'comm':comm,'start':rows[parent]['start']+1,'group':pid}
         return rows
 
-    def qualify(self,op,readers,probe=None):
-        """Runs qualify_at with one tree per scan, the last one repeating."""
-        _,launcher,probe_pid,manager=self.trees[op];clock=controls.Clock();self.scans=[];self.probes=[]
+    def qualify(self,op,readers,probe=None,exe=None):
+        """Runs qualify_at with one tree per scan, the last one repeating.
+
+        A process's executable identity is its row's 'exe' field, or its name when the row
+        has none, as of the latest scan; ``exe`` overrides the reader."""
+        _,launcher,probe_pid,manager=self.trees[op];clock=controls.Clock();self.scans=[];self.probes=[];current={}
         def rows():
-            self.scans.append(clock.now());return readers[min(len(self.scans)-1,len(readers)-1)]
+            self.scans.append(clock.now());current['rows']=readers[min(len(self.scans)-1,len(readers)-1)];return current['rows']
+        def exe_reader(pid):
+            row=current['rows'].get(pid);return None if row is None else ('fs',row.get('exe',row['comm']))
         def run_probe():
             self.probes.append((clock.now(),len(self.scans)))
             if probe:probe()
             return {'qualified':True}
-        return self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager)
+        return self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,exe or exe_reader)
 
     def test_the_recorded_trees(self):
         # w1-7 still shows the agent's shell running a shell that runs sudo.
@@ -1201,7 +1206,7 @@ class QualificationWait(unittest.TestCase):
         def run_probe():
             probes.append(clock.now());after[0]=True;return {'qualified':True}
         with self.assertRaises(self.O['Refusal']) as caught:
-            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager)
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
         self.assertEqual(str(caught.exception),'startup work during qualification')
         self.assertEqual(len(probes),self.O['QUALIFY_ATTEMPTS']);self.assertLess(probes[-1],self.O['QUALIFY_SECONDS'])
         self.assertEqual({x['pid'] for x in caught.exception.unallowed},{67279,99001})
@@ -1216,7 +1221,7 @@ class QualificationWait(unittest.TestCase):
         def run_probe():
             probes.append(clock.now());clock.pause(50);after[0]=True;return {'qualified':True}
         with self.assertRaises(self.O['Refusal']):
-            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager)
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,run_probe,rows,clock.now,clock.pause,lambda r,left:manager,lambda pid:('fs','bash'))
         self.assertTrue(all(t<self.O['QUALIFY_SECONDS'] for t in probes));self.assertEqual(len(probes),3)
 
     def test_a_manifest_change_refuses_at_once(self):
@@ -1281,6 +1286,24 @@ class QualificationWait(unittest.TestCase):
         # The agent shell itself is released once its child ends.
         q=self.qualify('w6-3',[child]+[tree]);self.assertEqual(q['qualification_attempts'],1)
 
+    def test_an_agent_shell_that_runs_exec_is_not_released(self):
+        # Review round 16, third pass. The agent shell runs a child, which ends, and then
+        # execs another program that keeps the name bash. It stays startup work.
+        tree=self.trees['w6-3'][0];child=self.with_child('w6-3',67279)
+        execd=copy.deepcopy(tree);execd[67279]=dict(execd[67279],exe='tar')
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[child,execd])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{67279});self.assertEqual(self.probes,[])
+        # An executable that cannot be read when the shell is first tracked keeps it tracked.
+        with self.assertRaises(self.O['Refusal']):self.qualify('w6-3',[child,tree],exe=lambda pid:None)
+        # So does one that cannot be read when it would be released.
+        reads=[]
+        def flaky(pid):
+            reads.append(pid);return ('fs','bash') if len(reads)==1 else None
+        with self.assertRaises(self.O['Refusal']):self.qualify('w6-3',[child,tree],exe=flaky)
+        # The real reader names the executable by device and inode.
+        self.assertEqual(self.O['exe_identity'](os.getpid()),(os.stat('/proc/self/exe').st_dev,os.stat('/proc/self/exe').st_ino))
+        self.assertIsNone(self.O['exe_identity'](2**22+12345))
+
     def test_no_probe_starts_at_or_after_the_bound(self):
         # Review round 16, finding 2. A slow user-manager query moves a quiet window past
         # the bound; no probe may start then, and each query gets only the time left.
@@ -1293,7 +1316,7 @@ class QualificationWait(unittest.TestCase):
             if clock.now()>=113:clock.pause(2)
             return manager
         with self.assertRaises(self.O['Refusal']) as caught:
-            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,lambda:probes.append(clock.now()) or {'qualified':True},rows,clock.now,clock.pause,manager_reader)
+            self.O['qualify_at'](self.state,os.getuid(),(-1,-1),launcher,probe_pid,self.expected,lambda:probes.append(clock.now()) or {'qualified':True},rows,clock.now,clock.pause,manager_reader,lambda pid:('fs','bash'))
         self.assertEqual(probes,[]);self.assertEqual(str(caught.exception),'startup not quiescent before tools')
         self.assertTrue(all(0<left<=self.O['QUALIFY_SECONDS'] and abs(now+left-self.O['QUALIFY_SECONDS'])<1e-9 for now,left in lefts))
 
