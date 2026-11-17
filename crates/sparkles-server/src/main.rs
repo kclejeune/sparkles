@@ -2563,6 +2563,13 @@ fn main() -> Result<()> {
         }
         ingest::isolate::enable();
     }
+    // Candle's kernels run on the embedding pools only (spec F12 §4.5)
+    #[cfg(feature = "embed-local")]
+    // SAFETY: called while the process starts, before the runtime and the other threads
+    // that could read the environment exist
+    unsafe {
+        sparkles_embed::confine_candle_threads()
+    };
     run().map_err(rejected_exit)
 }
 

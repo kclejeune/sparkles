@@ -309,7 +309,14 @@ the model normalizes.
 
 Each model has one dispatcher thread and a rayon pool of `threads` threads. The pool's
 threads lower their own priority by 10 nice steps on Linux, so a busy model yields to
-query threads. Candle's kernels run inside the pool and use its threads only.
+query threads. Candle's kernels run inside the pool and use its threads only. Candle
+0.11 runs elementwise operations of 65,536 elements or more on a process-wide pool of
+its own, which reads `CANDLE_NUM_THREADS` once, so the server sets that variable to 1
+at startup and the operations run on the pool thread that calls them. Candle 0.11 also
+gives each matrix product a thread count that, without `RAYON_NUM_THREADS` or
+`CANDLE_CPU_MASK`, it can take from `/proc/cpuinfo` on every product, so the server
+sets `CANDLE_CPU_MASK` at startup to the CPUs it may run on, at most as many as its
+available parallelism. The server keeps either variable when the operator set it.
 
 - Requests are queued per kind. Queries go before documents. A document request is cut
   into micro-batches of 16 texts, longest first so that a batch pads little, and a
@@ -486,9 +493,14 @@ capabilities and remaining work are described by the spec status and Outcome.
   `candle-core`, `candle-nn` and `candle-transformers` 0.9.2 (MIT OR Apache-2.0),
   `tokenizers` 0.23 without default features (Apache-2.0), `safetensors` (Apache-2.0)
   and `gemm` and `pulp` (MIT), 49 crates in all under MIT, Apache-2.0, Zlib or
-  BSD-2-Clause terms. Candle 0.10 and 0.11 were not used, because they depend on
+  BSD-2-Clause terms. Candle 0.10 and 0.11.0 were not used, because they depend on
   tokenizers 0.22 with Oniguruma, a C library. THIRD_PARTY_LICENSES.md lists the crates
   of the feature as well, so a build with it ships complete notices.
+- **Dependency update** (roadmap item 1048): the crate moved to `candle-core`,
+  `candle-nn` and `candle-transformers` 0.11.1 (MIT OR Apache-2.0), which depend on
+  `tokenizers` 0.23 with the pure-Rust `fancy-regex` engine and on `zip` 9. The update
+  adds `fancy-regex` 0.19 (MIT), `tempfile` and `zeroize` and their dependencies, all
+  pure Rust, and removes `zip` 7 and `typed-path` 0.12.
 - **Rejected** (spec §10):
   - ONNX Runtime through `ort` or fastembed;
   - the `hf-hub` crate for downloads;
@@ -647,7 +659,7 @@ these. One of its items has since landed: the `Dockerfile` takes
   `.gguf` file instead of the safetensors. ONNX needs a runtime that Candle is not; it
   is a separate feature (`embed-onnx`) over a pure-Rust ONNX runtime if one passes the
   same reference tests, and is not built otherwise, since ONNX Runtime is a C++
-  library, which the 0.9.2 choice above avoided for Oniguruma.
+  library, as Oniguruma is, which the 0.9.2 choice above avoided.
 * **Dense modules.** `SnapshotConfig` reads `modules.json` and refuses any module other
   than Transformer, Pooling and Normalize (`snapshot.rs`, `Error::Unsupported`). A
   `Dense` module is a linear layer with an activation after pooling, in its own

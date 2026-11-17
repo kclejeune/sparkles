@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 sparkles-modelstore.workspace = true
-# pure-Rust tensors and the BERT-family models; CPU only, no accelerator features. 0.11
+# pure-Rust tensors and the BERT-family models; CPU only, no accelerator features. 0.11.1
 # shares the pure-Rust tokenizers 0.23 below and requires zip 9 like sparkles-office
 candle-core = "0.11.1"
 candle-nn = "0.11.1"
