@@ -29,6 +29,11 @@ also pass with `execution=streaming`, through the cursors that a streamed query 
 `mise run test:w3c:streaming` runs that pass alone and reports, for each suite, the
 queries that fall back to eager execution for an operator the cursors do not stream.
 
+A test-only reference evaluator that follows the SPARQL algebra literally, with no part
+of the engine but the parser, answers every SPARQL 1.0, 1.1 and 1.2 query evaluation
+test. The seeded differential queries and the optimizer tests compare the engine's
+answers with it, in eager and streaming execution.
+
 The SPARQL parser is a vendored, patched `spargebra`
 ([`vendor/spargebra/PATCHED.md`](../../vendor/spargebra/PATCHED.md)).
 
@@ -415,6 +420,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   some of them. It skips an embedded query whose holder is ambiguous, such as the
   same query text on two blank nodes, rather than risk another node's findings. Roadmap
   item 444.
+* MIN and MAX pass over a value whose expression is an error, such as an unbound
+  variable. SPARQL orders the values as ORDER BY does, which makes MIN an error and lets
+  MAX pass over it, and Jena makes both an error. Roadmap item 1064.
+* An `xsd:integer` or `xsd:decimal` with more digits than the engine's decimal type
+  holds, about 20 before the point, is not read as a number, so comparisons, arithmetic
+  and range filters treat it as an unknown literal. XSD allows a limit of 16 digits, while
+  Jena reads any length. Roadmap item 1065.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`

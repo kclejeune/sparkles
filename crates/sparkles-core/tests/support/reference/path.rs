@@ -83,10 +83,7 @@ impl Evaluator<'_> {
     /// pairs of `p`, each once.
     fn closure(&self, p: &P, graph: &GraphData, extra: &[Term], zero: bool) -> R<Pairs> {
         let step = self.path_pairs(p, graph, extra)?;
-        let mut next: HashMap<&Term, Vec<&Term>> = HashMap::new();
-        for (a, b) in &step {
-            next.entry(a).or_default().push(b);
-        }
+        let next = successors(&step);
         let starts: Vec<Term> = if zero {
             nodes(graph, extra)
         } else {
@@ -98,27 +95,87 @@ impl Evaluator<'_> {
         };
         let mut out = Vec::new();
         for start in starts {
-            let mut reached: HashSet<Term> = HashSet::new();
-            let mut order = Vec::new();
-            if zero {
-                reached.insert(start.clone());
-                order.push(start.clone());
-            }
-            let mut frontier = vec![start.clone()];
-            while let Some(n) = frontier.pop() {
-                for m in next.get(&n).into_iter().flatten() {
-                    if reached.insert((*m).clone()) {
-                        order.push((*m).clone());
-                        frontier.push((*m).clone());
-                    }
-                }
-            }
-            for end in order {
+            for end in self.walk(&next, &start, zero)? {
                 out.push((start.clone(), end));
             }
         }
         Ok(out)
     }
+
+    /// The pairs of a closure path whose subject or object the pattern fixes, found by
+    /// walking from that one term instead of from every node. The result is the subset of
+    /// the closure's pairs that the fixed term can match, so the answer is unchanged. The
+    /// fixed term is its own zero-length end whether the graph holds it or not, as section
+    /// 18.4 makes every term the pattern names a node of the zero-length paths. Other
+    /// paths, and closures with neither end fixed, return `None`.
+    pub(crate) fn anchored_closure(
+        &self,
+        path: &P,
+        subject: Option<&Term>,
+        object: Option<&Term>,
+        graph: &GraphData,
+        extra: &[Term],
+    ) -> R<Option<Pairs>> {
+        let mut inner = path;
+        let mut reversed = false;
+        while let P::Reverse(p) = inner {
+            inner = p;
+            reversed = !reversed;
+        }
+        let (p, zero) = match inner {
+            P::ZeroOrMore(p) => (p.as_ref(), true),
+            P::OneOrMore(p) => (p.as_ref(), false),
+            _ => return Ok(None),
+        };
+        let mut step = self.path_pairs(p, graph, extra)?;
+        if reversed {
+            step = step.into_iter().map(|(a, b)| (b, a)).collect();
+        }
+        if let Some(s) = subject {
+            let next = successors(&step);
+            let ends = self.walk(&next, s, zero)?;
+            return Ok(Some(ends.into_iter().map(|e| (s.clone(), e)).collect()));
+        }
+        if let Some(o) = object {
+            let back: Pairs = step.into_iter().map(|(a, b)| (b, a)).collect();
+            let next = successors(&back);
+            let starts = self.walk(&next, o, zero)?;
+            return Ok(Some(starts.into_iter().map(|a| (a, o.clone())).collect()));
+        }
+        Ok(None)
+    }
+
+    /// The nodes that walks along `next` reach from `start`, each once, with `start`
+    /// itself first when `zero` allows the zero-length walk. Every reached node counts
+    /// against the work limit, so a runaway closure is refused instead of exhausting memory.
+    fn walk(&self, next: &HashMap<&Term, Vec<&Term>>, start: &Term, zero: bool) -> R<Vec<Term>> {
+        let mut reached: HashSet<Term> = HashSet::new();
+        let mut order = Vec::new();
+        if zero {
+            reached.insert(start.clone());
+            order.push(start.clone());
+        }
+        let mut frontier = vec![start.clone()];
+        while let Some(n) = frontier.pop() {
+            for m in next.get(&n).into_iter().flatten() {
+                if reached.insert((*m).clone()) {
+                    order.push((*m).clone());
+                    frontier.push((*m).clone());
+                }
+            }
+        }
+        self.charge(order.len())?;
+        Ok(order)
+    }
+}
+
+/// The successors of each node under `pairs`.
+fn successors(pairs: &Pairs) -> HashMap<&Term, Vec<&Term>> {
+    let mut next: HashMap<&Term, Vec<&Term>> = HashMap::new();
+    for (a, b) in pairs {
+        next.entry(a).or_default().push(b);
+    }
+    next
 }
 
 /// The nodes of the graph and the extra terms, each once.

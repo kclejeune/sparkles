@@ -568,6 +568,10 @@ runs in parallel with stage 5 and must land before the merge phase starts. Its g
 that it agrees with the engine on every W3C query test and on the seeded queries of
 `tests/query_cursor.rs` at both modes.
 
+The evaluator has landed and passed this gate, apart from the two disagreements that
+items 1064 and 1065 hold. While those items are open, the tests compare MIN and MAX
+under the engine's reading and leave out the queries that read longer numbers. The [spec's Outcome](SPEC.md#outcome) describes it.
+
 ### The merge
 
 The merge phase gets its number when items 825 to 829, 512, 243, 293 and 534 have landed

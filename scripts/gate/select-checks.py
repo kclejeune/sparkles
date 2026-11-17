@@ -80,6 +80,8 @@ CONFORMANCE_PATHS = [
     "crates/sparkles-core/src/geo/*",
     "crates/sparkles-core/tests/w3c.rs",
     "crates/sparkles-core/tests/w3c-known-failures.txt",
+    "crates/sparkles-core/tests/w3c-reference-known.txt",
+    "crates/sparkles-core/tests/support/reference/*",
     "testsuite/geosparql/*",
     "testsuite/jena-arq/*",
     "crates/sparkles-shacl/Cargo.toml",

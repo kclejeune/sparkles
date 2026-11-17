@@ -5,6 +5,11 @@ use super::*;
 use crate::io::{RdfFormat, Source};
 use crate::store::{Store, StoreOptions};
 
+// The test-only reference evaluator (roadmap item 512), which follows the algebra
+// literally and shares nothing with the engine but the parser.
+#[path = "../../tests/support/reference/mod.rs"]
+mod reference;
+
 pub(super) const PREFIXES: &str = "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
 pub(super) fn load(s: &Store, text: &str, format: RdfFormat) {
@@ -60,13 +65,123 @@ pub(super) fn has_desc(p: &PlanInfo, needle: &str) -> bool {
     p.description.contains(needle) || p.children.iter().any(|c| has_desc(c, needle))
 }
 
+/// A term with a number in its canonical form, since SPARQL leaves the lexical form of a
+/// computed number to the implementation.
+fn canonical(t: &Option<oxrdf::Term>) -> String {
+    match t {
+        Some(oxrdf::Term::Literal(l)) => match reference::value::numeric(l) {
+            Some(n) => n.to_literal().to_string(),
+            None => l.to_string(),
+        },
+        Some(t) => t.to_string(),
+        None => "UNDEF".into(),
+    }
+}
+
+/// Rows of `r` with canonical numbers, in the columns of `vars`, sorted.
+fn canonical_rows(
+    variables: &[String],
+    rows: &[Vec<Option<oxrdf::Term>>],
+    vars: &[String],
+) -> Vec<String> {
+    let columns: Vec<usize> = vars
+        .iter()
+        .map(|v| variables.iter().position(|x| x == v).expect("same columns"))
+        .collect();
+    let mut out: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|&c| canonical(&row[c]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Compare `r`, an engine answer to `text`, with the reference evaluator's answer over
+/// the store's quads, where the reference evaluates the query and the specification
+/// fixes its rows. The reference reads no text, spatial or extension indexes, so a
+/// query that uses them is one it does not evaluate, and neither is a query whose nested
+/// loops pass the work limit. A query that reads a number of more than 16 digits is not
+/// compared, since XSD lets the engine limit those (roadmap item 1065). Where MIN or MAX
+/// reads an error, the engine passes over it, which roadmap item 1064 keeps open, so such
+/// a query compares with that reading.
+pub(super) fn same_as_reference(s: &Store, text: &str, r: &QueryResult) {
+    same_as_reference_on(&s.snapshot(), &format!("{PREFIXES}{text}"), r);
+}
+
+/// [`same_as_reference`] over a snapshot, for `text` with its prefixes.
+pub(super) fn same_as_reference_on(snapshot: &crate::store::Snapshot, text: &str, r: &QueryResult) {
+    let mut quads = Vec::new();
+    snapshot
+        .for_each_quad(|q| {
+            quads.push(snapshot.quad_to_terms(q).expect("a stored quad decodes"));
+            Ok(())
+        })
+        .unwrap();
+    let oracle = |pass: bool| {
+        let r = reference::Reference::new(quads.clone())
+            .with_union_default(snapshot.union_default_graph)
+            .with_work_limit(20_000_000);
+        if pass {
+            r.passing_over_min_max_errors()
+        } else {
+            r
+        }
+    };
+    let mut answer = oracle(false).run_noting_choices(text, None);
+    if matches!(&answer, Ok((_, notes)) if notes.min_max_error) {
+        answer = oracle(true).run_noting_choices(text, None);
+    }
+    let (variables, rows) = match answer {
+        Ok((reference::Answer::Select { variables, rows }, notes))
+            if !notes.chose
+                && !notes.distinct_over_blank_nodes
+                && !notes.beyond_minimum_precision =>
+        {
+            (variables, rows)
+        }
+        Ok((reference::Answer::Ask(b), _)) => {
+            assert_eq!(
+                r.test_application_rows().is_empty(),
+                !b,
+                "ASK against the reference: {text}"
+            );
+            return;
+        }
+        // open, not a SELECT, or outside the reference
+        other => {
+            if std::env::var_os("SPARKLES_REFERENCE_SKIPS").is_some() {
+                let why = match other {
+                    Ok((_, notes)) => format!("{notes:?}"),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!("reference skips ({why}): {text}");
+            }
+            return;
+        }
+    };
+    let engine_vars = r.variables().to_vec();
+    assert_eq!(
+        canonical_rows(&engine_vars, &r.test_application_rows(), &variables),
+        canonical_rows(&variables, &rows, &variables),
+        "against the reference: {text}"
+    );
+}
+
 /// Run `text` with every optimization and with none; the answers must be equal and the
 /// optimized plan must contain `op` (an operator name, or `desc:` + description text).
+/// Both answers must also be the reference evaluator's where it evaluates the query.
 pub(super) fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
     let fast = run(s, text, Optimizations::ALL);
     let slow = run(s, text, Optimizations::NONE);
     let (a, b) = (solutions(&fast), solutions(&slow));
     assert_eq!(a, b, "{text}");
+    same_as_reference(s, text, &fast);
     let taken = match op.strip_prefix("desc:") {
         Some(d) => has_desc(fast.plan(), d),
         None => has_op(fast.plan(), op),
@@ -84,10 +199,13 @@ pub(super) fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
     a
 }
 
-/// Rows of `text` with every optimization and with none, without checking the plan.
+/// Rows of `text` with every optimization and with none, without checking the plan, and
+/// the reference evaluator's where it evaluates the query.
 pub(super) fn same_rows(s: &Store, text: &str) -> Vec<String> {
-    let a = solutions(&run(s, text, Optimizations::ALL));
+    let fast = run(s, text, Optimizations::ALL);
+    let a = solutions(&fast);
     assert_eq!(a, solutions(&run(s, text, Optimizations::NONE)), "{text}");
+    same_as_reference(s, text, &fast);
     a
 }
 

@@ -55,10 +55,35 @@ fn parse_integer(lex: &str) -> Option<i128> {
     lex.parse().ok()
 }
 
+thread_local! {
+    static BEYOND_MINIMUM_PRECISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`numeric`] read an integer or decimal with more than 16 digits since the last
+/// call, which XSD 1.1 section 5.4 lets an implementation limit. The call resets it.
+pub fn take_beyond_minimum_precision() -> bool {
+    BEYOND_MINIMUM_PRECISION.with(|c| c.replace(false))
+}
+
+fn note_digits(lex: &str) {
+    let digits = lex
+        .trim_start_matches(['+', '-'])
+        .trim_start_matches('0')
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .count();
+    if digits > 16 {
+        BEYOND_MINIMUM_PRECISION.with(|c| c.set(true));
+    }
+}
+
 /// The numeric value of a well-formed numeric literal.
 pub fn numeric(l: &Literal) -> Option<Num> {
     let dt = l.datatype();
     let dt = dt.as_str();
+    if integer_bounds(dt).is_some() || dt == xsd::DECIMAL.as_str() {
+        note_digits(l.value());
+    }
     if let Some((lo, hi)) = integer_bounds(dt) {
         let v = parse_integer(l.value())?;
         return (lo <= v && v <= hi).then_some(Num::Int(v));

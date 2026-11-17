@@ -70,7 +70,7 @@ spill format.
 
 **One join-order planner.** Keep `joinorder.rs` only, lift its 128-join-variable fallback with the existing Bits set or route it to its own greedy, and delete `Planner::dp`, `apply_dp_filters`, `Planner::greedy` and the `pruned_join_order` toggle. `Planner::dp` and `Planner::greedy` survive in `plan.rs` as a narrow fallback and toggle-off path. Item 84 should land on the unified planner. Roadmap item 475 holds this phase.
 
-**Delete the off paths of replacement-style optimization toggles.** Remove the superseded implementations behind about 15 replacement toggles and the toggles themselves, and keep the algorithm toggles for diagnosis. Optimizations has 44 boolean fields, and every kernel change must keep each off path correct. Roadmap item 476 holds this phase, and item 512 holds the test-only evaluator that follows the SPARQL algebra literally, after which the off paths that only tests reach can go.
+**Delete the off paths of replacement-style optimization toggles.** Remove the superseded implementations behind about 15 replacement toggles and the toggles themselves, and keep the algorithm toggles for diagnosis. Optimizations has 44 boolean fields, and every kernel change must keep each off path correct. Roadmap item 476 holds this phase. Item 512's test-only evaluator, which follows the SPARQL algebra literally, is the oracle of the differential tests, so the off paths that only tests reach can go.
 
 **Shared format registry and small helpers.** Add one syntax registry for format names, extensions and media types, one INFERRED_GRAPH constant, one `parse_duration` and one durable atomic-write helper, and fix the Turtle string escaping that differs between `mapping/rdf.rs` and `mapping/draft.rs`. About ten format tables, nine INFERRED_GRAPH constants and ten atomic-write helpers exist. The unescaped draft writer could produce invalid Turtle. Roadmap item 477 holds this phase.
 
@@ -122,7 +122,7 @@ The maintainer settled these questions for stage 4.
 
 ### Stage 6: the executor merge
 
-**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 240, 243, 293, 534 and 512. Item 93 has shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator becomes their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
+**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 240, 243, 293 and 534. Items 93 and 512 have shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator remains their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
 
 **Eager LIMIT and ASK through pull demand.** Route every ASK and unordered LIMIT through the cursor's pull demand, move UNION branch ordering for ASK into the planner's cost model, and delete `run_limited`'s geometric prefix replay and the unionpush first-work estimator. Eager LIMIT replays growing prefixes and unionpush keeps a duplicate cost model. `ask_streaming` exists, so this can land before the executor merge. It depends on item 7.
 
@@ -157,8 +157,8 @@ The maintainer settled these questions for stage 4.
   the remaining eager fallbacks that the merge must absorb. Item 93 has shipped.
 * Items 240, 243, 293 and 534 settle the cursor writers, row accounting, BIND reuse and
   the streamed response cost that stage 6 relies on.
-* Item 512's test-only reference evaluator is the oracle of the differential tests before
-  the eager executor is deleted.
+* Item 512's test-only reference evaluator is the oracle of the differential tests, as it
+  must be before the eager executor is deleted.
 * The join-algorithm work of [X15](../X15-join-algorithms-and-estimation/README.md),
   [item 454](../../ROADMAP.md), follows the merge so that new algorithms land in one executor.
 
@@ -214,6 +214,32 @@ Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds wit
 hierarchical budget of item 675 and the decoding twins of item 678 remain. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+
+The test-only reference evaluator of item 512 has shipped in
+`crates/sparkles-core/tests/support/reference`. It reads a list of quads and a parsed
+query and evaluates every operator as a nested loop over solution mappings, as the
+SPARQL 1.1 algebra of section 18 and the SPARQL 1.2 drafts define them, with no part of
+the engine but the parser. Indexes on the predicate, subject and object only narrow the
+triples a pattern tries. It answers all 508 query evaluation tests of SPARQL 1.0 and 1.1
+and all 63 of SPARQL 1.2 under a comparison that holds literals to their exact form,
+numbers to their value and ORDER BY results to their order. It reports the queries it
+does not evaluate, such as SERVICE, DESCRIBE and extension functions, rather than
+answer them approximately. Where the specification allows several answers, it notes the
+choice it made, for a slice through rows that ORDER BY does not order strictly, MIN, MAX,
+SAMPLE and GROUP_CONCAT over tied or unordered values, MIN or MAX over an error,
+`COUNT(DISTINCT *)` over solutions with blank nodes and numbers of more than the 16
+digits that XSD requires. The seeded queries of `tests/query_cursor.rs` compare the
+eager answer and the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a
+compacted base, a pending delta, several index blocks and a masked view, and the
+optimizer tests compare both `Optimizations::ALL` and `Optimizations::NONE` with it. A
+query whose answer depends on such a choice is compared only as far as the
+specification fixes it. The parser writes the middle of a path sequence as a blank node,
+which the algebra treats as a variable, so the evaluator cannot count distinct solutions
+over such a middle and leaves those queries uncompared. The comparison found two
+disagreements, which items 1064 and 1065 hold. The engine passes over an error in MIN and
+MAX, where the specification's order makes MIN an error and Jena makes both an error, and
+it does not read an `xsd:integer` or `xsd:decimal` beyond the range of its decimal type
+as a number, which XSD permits and Jena does not do.
 
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its
@@ -390,9 +416,10 @@ that shipped with their measurements in the current release, `probed_optional` a
 `gallop_index_join` chooses between the galloping reader and the clustered reader, which
 are different read paths.
 
-The generic operators of `Optimizations::NONE` remain the oracle of the differential
-tests. The test-only evaluator that follows the SPARQL algebra literally, after which
-the remaining off paths that only tests reach can go, is item 512.
+Item 512's test-only reference evaluator is the oracle of the differential tests. The
+optimizer tests still compare `Optimizations::ALL` with `Optimizations::NONE` and both
+with the reference where it evaluates the query, so the remaining off paths that only
+tests reach can go once their tests rest on the reference alone.
 
 ### Shared format registry and small helpers
 

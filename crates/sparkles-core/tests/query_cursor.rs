@@ -3161,7 +3161,10 @@ impl Expected {
     /// Whether the reference's rows are the only answer that the specification allows
     /// and that the reference evaluates exactly.
     fn exact(notes: &reference::Notes) -> bool {
-        !notes.chose && !notes.min_max_error && !notes.distinct_over_blank_nodes
+        !notes.chose
+            && !notes.min_max_error
+            && !notes.distinct_over_blank_nodes
+            && !notes.beyond_minimum_precision
     }
 }
 

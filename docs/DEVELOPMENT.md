@@ -442,6 +442,17 @@ and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs 
 SHACLC suite read to the expected graph and write back to it.
 `crates/sparkles-core/tests/w3c-known-failures.txt` lists known failures and is empty.
 
+The `reference_` tests of `w3c.rs` answer the query evaluation tests with the test-only
+reference evaluator in `crates/sparkles-core/tests/support/reference`, which follows the
+SPARQL algebra literally and shares only the parser with the engine. They compare
+literals by their exact form, numbers by value and ORDER BY results in order, and
+`crates/sparkles-core/tests/w3c-reference-known.txt` lists the tests it answers
+otherwise, which is none. The seeded queries of `tests/query_cursor.rs` and the optimizer
+tests of `src/sparql/opt_tests.rs` take the evaluator as their oracle. It reports in its
+`Notes` where the specification leaves the answer open, and those comparisons check only
+what the specification fixes. `SPARKLES_REFERENCE_KEEP_GOING=1` makes the seeded queries
+report every disagreement before they fail.
+
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
 `crates/sparkles-shex/tests/known-failures.txt` lists the tests that fail, with reasons.

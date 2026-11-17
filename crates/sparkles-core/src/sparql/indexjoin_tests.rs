@@ -282,6 +282,7 @@ fn check_snapshot(snap: &Arc<crate::store::Snapshot>, label: &str) -> usize {
         let base = run(snap, q, without());
         assert!(!has_op(base.plan(), "IndexJoin") && !has_op(base.plan(), "StarJoin"));
         let want = answer(q, &base);
+        super::opt_tests::same_as_reference_on(snap, &format!("{PREFIXES}{q}"), &base);
         let unfused = Optimizations {
             star_fusion: false,
             ..Optimizations::ALL
@@ -789,7 +790,13 @@ fn secondary_index_keys_preserve_bags_graphs_deltas_and_native_batches() {
                        {body}
                      }}"
                 );
-                let mut want = rows(&run(snapshot, &q, Optimizations::NONE));
+                let generic = run(snapshot, &q, Optimizations::NONE);
+                super::opt_tests::same_as_reference_on(
+                    snapshot,
+                    &format!("{PREFIXES}{q}"),
+                    &generic,
+                );
+                let mut want = rows(&generic);
                 want.sort();
                 let mut eager = rows(&forced(snapshot, &q, Optimizations::ALL, None));
                 eager.sort();

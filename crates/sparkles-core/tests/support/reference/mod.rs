@@ -98,17 +98,28 @@ pub(crate) fn unsupported<T>(what: impl Into<String>) -> R<T> {
 pub(crate) struct GraphData {
     pub triples: Vec<Triple>,
     pub by_predicate: HashMap<NamedNode, Vec<usize>>,
+    by_subject: HashMap<Term, Vec<usize>>,
+    by_object: HashMap<Term, Vec<usize>>,
 }
 
 impl GraphData {
     fn new(triples: Vec<Triple>) -> GraphData {
         let mut by_predicate: HashMap<NamedNode, Vec<usize>> = HashMap::new();
+        let mut by_subject: HashMap<Term, Vec<usize>> = HashMap::new();
+        let mut by_object: HashMap<Term, Vec<usize>> = HashMap::new();
         for (i, t) in triples.iter().enumerate() {
             by_predicate.entry(t.predicate.clone()).or_default().push(i);
+            by_subject
+                .entry(Term::from(t.subject.clone()))
+                .or_default()
+                .push(i);
+            by_object.entry(t.object.clone()).or_default().push(i);
         }
         GraphData {
             triples,
             by_predicate,
+            by_subject,
+            by_object,
         }
     }
 
@@ -132,6 +143,7 @@ pub struct Reference {
     quads: Vec<Quad>,
     union_default: bool,
     pass_min_max_errors: bool,
+    work_limit: Option<u64>,
     now: DateTime,
 }
 
@@ -147,6 +159,7 @@ impl Reference {
             quads,
             union_default: false,
             pass_min_max_errors: false,
+            work_limit: None,
             now: DateTime::now(),
         }
     }
@@ -163,6 +176,14 @@ impl Reference {
     /// with it where the difference is tracked as an open question.
     pub fn passing_over_min_max_errors(mut self) -> Reference {
         self.pass_min_max_errors = true;
+        self
+    }
+
+    /// Refuse a query, as one the evaluator does not evaluate, once it has formed
+    /// `limit` intermediate solutions, which keeps a nested loop over large inputs
+    /// within a test's time and memory.
+    pub fn with_work_limit(mut self, limit: u64) -> Reference {
+        self.work_limit = Some(limit);
         self
     }
 
@@ -225,6 +246,7 @@ impl Reference {
                 ..
             } => (dataset, pattern, base_iri),
         };
+        value::take_beyond_minimum_precision();
         let ev = Evaluator::new(self, dataset.as_ref(), base.clone());
         let run = || -> R<Answer> {
             let solutions = ev.eval_top(pattern)?;
@@ -260,6 +282,7 @@ impl Reference {
         })?;
         let mut notes = ev.notes.get();
         notes.chose = ev.chose.get();
+        notes.beyond_minimum_precision = value::take_beyond_minimum_precision();
         Ok((answer, notes))
     }
 }
@@ -299,6 +322,7 @@ pub(crate) struct Evaluator<'a> {
     /// Whether the evaluation made a choice that the specification leaves open.
     pub chose: Cell<bool>,
     pub notes: Cell<Notes>,
+    work: Cell<u64>,
 }
 
 /// What an evaluation noted about its answer beside the answer itself.
@@ -318,6 +342,11 @@ pub struct Notes {
     /// writes both as blank nodes, so the evaluator cannot tell them apart and leaves
     /// both out.
     pub distinct_over_blank_nodes: bool,
+    /// The evaluation read an `xsd:integer` or `xsd:decimal` with more than 16 digits.
+    /// XSD 1.1 section 5.4 lets an implementation limit such values, as long as it
+    /// supports 16, so the evaluator's answer, which reads them exactly up to 38 digits,
+    /// is one of those it allows.
+    pub beyond_minimum_precision: bool,
 }
 
 /// Solutions in ORDER BY order, with the sort key of each and the direction of each
@@ -443,6 +472,7 @@ impl<'a> Evaluator<'a> {
             rng: Cell::new(0x9e37_79b9_7f4a_7c15),
             chose: Cell::new(false),
             notes: Cell::new(Notes::default()),
+            work: Cell::new(0),
         }
     }
 
@@ -486,6 +516,24 @@ impl<'a> Evaluator<'a> {
     // ---------------------------------------------------------------- patterns ------
 
     pub(crate) fn eval(&self, p: &GraphPattern, cx: &Cx) -> R<Vec<Solution>> {
+        let out = self.eval_inner(p, cx)?;
+        self.charge(out.len())?;
+        Ok(out)
+    }
+
+    /// Count `n` intermediate solutions against the work limit.
+    fn charge(&self, n: usize) -> R<()> {
+        let work = self.work.get() + n as u64;
+        self.work.set(work);
+        match self.data.work_limit {
+            Some(limit) if work > limit => {
+                unsupported(format!("more than {limit} intermediate solutions"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn eval_inner(&self, p: &GraphPattern, cx: &Cx) -> R<Vec<Solution>> {
         match p {
             GraphPattern::Bgp { patterns } => {
                 let mut sols = vec![Solution::new()];
@@ -493,6 +541,7 @@ impl<'a> Evaluator<'a> {
                     let mut next = Vec::new();
                     for s in &sols {
                         self.match_triple_pattern(tp, s, cx, &mut next);
+                        self.charge(1)?;
                     }
                     sols = next;
                 }
@@ -507,6 +556,8 @@ impl<'a> Evaluator<'a> {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
                 let mut out = Vec::new();
                 for a in &l {
+                    // every pair the nested loop tries is work
+                    self.charge(r.len())?;
                     for b in &r {
                         if compatible(a, b) {
                             out.push(merge(a, b));
@@ -523,6 +574,7 @@ impl<'a> Evaluator<'a> {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
                 let mut out = Vec::new();
                 for a in &l {
+                    self.charge(r.len())?;
                     let mut matched = false;
                     for b in &r {
                         if !compatible(a, b) {
@@ -798,6 +850,27 @@ impl<'a> Evaluator<'a> {
     ) -> R<Vec<Solution>> {
         let mut out = Vec::new();
         match name {
+            // Jena's names for the union of the named graphs and for the default graph
+            NamedNodePattern::NamedNode(n)
+                if matches!(
+                    n.as_str(),
+                    "urn:x-arq:UnionGraph" | "urn:x-arq:DefaultGraph"
+                ) =>
+            {
+                let names = if n.as_str() == "urn:x-arq:UnionGraph" {
+                    self.named_names.clone()
+                } else {
+                    self.default_names.clone()
+                };
+                let data = self.graph_of(&names);
+                out = self.eval(
+                    inner,
+                    &Cx {
+                        graph: &data,
+                        env: cx.env,
+                    },
+                )?;
+            }
             NamedNodePattern::NamedNode(n) => {
                 let g = GraphName::NamedNode(n.clone());
                 if self.named_names.contains(&g) {
@@ -889,7 +962,8 @@ impl<'a> Evaluator<'a> {
         cx: &Cx,
         out: &mut Vec<Solution>,
     ) {
-        // an index only narrows the scan to the triples that could match
+        // An index only narrows the scan to the triples that could match, and every
+        // candidate is matched in full, so the answer is the scan's.
         let predicate = match &tp.predicate {
             NamedNodePattern::NamedNode(n) => Some(n.clone()),
             NamedNodePattern::Variable(v) => match s.get(v).or_else(|| cx.env.get(v)) {
@@ -898,15 +972,34 @@ impl<'a> Evaluator<'a> {
                 None => None,
             },
         };
+        let known = |p: &TermPattern| -> Option<Term> {
+            match p {
+                TermPattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
+                TermPattern::Literal(l) => Some(Term::Literal(l.clone())),
+                TermPattern::Variable(v) => s.get(v).or_else(|| cx.env.get(v)).cloned(),
+                TermPattern::BlankNode(b) => s.get(&hidden_bnode_variable(b)).cloned(),
+                TermPattern::Triple(_) => None,
+            }
+        };
+        let mut candidates: Vec<&[usize]> = Vec::new();
+        if let Some(p) = &predicate {
+            candidates.push(cx.graph.by_predicate.get(p).map_or(&[], Vec::as_slice));
+        }
+        if let Some(t) = known(&tp.subject) {
+            candidates.push(cx.graph.by_subject.get(&t).map_or(&[], Vec::as_slice));
+        }
+        if let Some(t) = known(&tp.object) {
+            candidates.push(cx.graph.by_object.get(&t).map_or(&[], Vec::as_slice));
+        }
         let mut try_one = |t: &Triple| {
             let mut m = s.clone();
             if self.match_triple(tp, t, &mut m, cx) {
                 out.push(m);
             }
         };
-        match predicate {
-            Some(p) => {
-                for &i in cx.graph.by_predicate.get(&p).into_iter().flatten() {
+        match candidates.into_iter().min_by_key(|c| c.len()) {
+            Some(c) => {
+                for &i in c {
                     try_one(&cx.graph.triples[i]);
                 }
             }
@@ -938,7 +1031,17 @@ impl<'a> Evaluator<'a> {
             .into_iter()
             .flatten()
             .collect();
-        let pairs = self.path_pairs(path, cx.graph, &extra)?;
+        let (fixed_subject, fixed_object) = (fixed(subject, cx), fixed(object, cx));
+        let pairs = match self.anchored_closure(
+            path,
+            fixed_subject.as_ref(),
+            fixed_object.as_ref(),
+            cx.graph,
+            &extra,
+        )? {
+            Some(pairs) => pairs,
+            None => self.path_pairs(path, cx.graph, &extra)?,
+        };
         let mut out = Vec::new();
         for (a, b) in pairs {
             let mut s = Solution::new();
