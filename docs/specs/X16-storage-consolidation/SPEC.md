@@ -641,6 +641,48 @@ path writes the generation's prefixes before the tail appends its catalog entry,
 failed prefix write leaves the catalog and the snapshot in step. No on-disk format
 changed.
 
+The first stage of Phase 3 is partly built. `budgeted.rs` defines `Control` with two
+constants, `CHECKS` and `ACCOUNTS`, and the carrier's type rather than its memory member
+chooses how a reader is controlled. `Unlimited` has neither and compiles to the ordinary
+reader. A stride carrier, which is `HistoryCeiling` in `store.rs` for a historical read
+without a cap, checks cancellation, the deadline and the history cache's capacity every
+64 Ki records through `check_delta`. An accounting carrier, which is `ReadLimit` or
+`ColdBudget`, checks each record and charges each allocation before it is made, as the
+`_limited` twins did, and it does so whether or not its memory member is present. Every
+former `_limited` call site passes an accounting carrier, so a controlled read without a
+cap, such as a read-only branch read, keeps its per-record checks. The plan's two kinds
+of control became three for that reason. The trait's `check` and `remaining` take
+`&self`, because a reader hands one carrier to its helpers and closures and these only
+read it. `reserve` and `release` are not part of the trait yet. A stage 3 reader that
+charges will take `&mut C` and reborrow it for these readers. `read_limit` lends the
+carrier as a `ReadLimit` to the index readers that are not generic, `contains_limited`
+above all, and `Unlimited` lends one of no control. Stage 3 removes it. `Stride<N>` is a
+const-generic mask that is never due for `Unlimited` or an accounting carrier.
+
+`WalCursor` has one `next_with` in place of `next_inner(Option)`, one `open_with` and
+one `seek_to_with`, and `apply_forward` and `apply_backward` each have one body in place
+of their `_limited` twins. The accounting form keeps the smaller I/O buffers, the
+transaction preflight and the chunked checksum, and the other forms keep the megabyte
+buffer and the 4 MiB backward chunk. `snapshot_at_inner` chooses a carrier once and
+`snapshot_at_with` is generic over it, so its forks are the constant. `materialize`,
+`wal_point`, `HistoryState::owner`, `MemHistory::get` and `Store::inherited` each have one
+body. An accounting `wal_point` still builds no sparse index, and the bounded cache
+insertion stays apart from the ordinary eviction, since both are behaviour rather than
+accounting. The `history_generation`, `len` and `retained_bytes` twins stay, since the
+readers they call belong to stage 3. `history_gone`, `mem_gone` and `resolve` and their
+`_limited` forms remain the rest of this stage under item 830. The first two can fold
+once `bounded_ranges` is shown to merge as both `reconstructable` forms do, and `resolve`
+needs a decision, since the ordinary `NotFound` names where history starts and the
+bounded one does not. [Item 1062](../../ROADMAP.md) takes the read-only change-log
+reader. `changelog/readonly.rs` reads captured descriptors into borrowed record views,
+while `changelog.rs` reads its in-memory segment index into owned records, so the two
+share only their codec and are not twins of one reader.
+
+The `bench:insn` screen gained five historical reads, forward and backward with and
+without a cap and a forward read from a sealed generation, whose first read scans the log
+with the uncontrolled cursor. The screen's case string moved to version 3, so older
+baselines no longer compare. Against its base on one laptop, with the median of three processes, WAL replay of 2,000 commits took 0.985 of the base's instructions and the opens 0.982, the four historical reads 0.986 to 1.006 and the sealed read 0.983. The vocabulary cases, whose source this stage does not change, moved between 0.974 and 1.039 of the base, and the deterministic ordered FSST read rose by 3.9%. The symbol tables show the compiler inlining differently across the crate, which the single codegen unit does not rule out. The `insn_screen` binary's text grew by 0.29%.
+
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
