@@ -1178,11 +1178,12 @@ fn witnesses_under_a_blank_node_in_a_relation_head_are_complete() {
     assert_eq!(reports[0], reports[1]);
 }
 
-/// The relation part's copy of a rule is admitted before it is made (review p3-r3): a
-/// spilled argument list clones with its capacity rounded up to a power of two, and
-/// `clone_bytes` bounds the copy that `relation_part` makes.
+/// `clone_bytes`, which `relation_part` charges before it copies a rule (review p3-r3),
+/// bounds the copy: a spilled argument list clones with its capacity rounded up to a
+/// power of two, past `bytes`, and each copy in the part is within its source's bound.
+/// That the charge comes before the copy is checked by reading `relation_part`.
 #[test]
-fn the_relation_part_admits_its_copy_before_it_makes_it() {
+fn a_relation_part_copy_is_within_its_clone_bound() {
     let v = TV::new();
     let mut rels = Relations::default();
     let r = rels.declare("R", 5, false).unwrap();
