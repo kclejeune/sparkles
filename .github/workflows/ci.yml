@@ -407,8 +407,9 @@ jobs:
       # Some runs of this step left the runner unresponsive past the job's limit, so the
       # job ended without a log and without its cleanup steps. A sampler prints memory,
       # swap, load and the largest compilers every 30 seconds, and the archive commands
-      # stop at 38 minutes, so such a run fails inside the step and keeps its log. The
-      # server's binary and its unit tests each compile in one process of 8 to 11 GB.
+      # stop at 38 minutes, so such a run fails inside the step, lists its processes and
+      # keeps its log. The server's binary and its unit tests each compile in one process
+      # of 8 to 11 GB.
       - name: Build the test archives
         run: |
           scripts/ci-memory.sh 30 &
@@ -423,7 +424,13 @@ jobs:
             mbx nextest archive --locked --workspace -E "$HEAVY_1 | $HEAVY_2 | $TIMING_BINARIES" --zstd-level 3 \
               --archive-file "$RUNNER_TEMP/heavy/tests.tar.zst"
             tar --zstd -cf "$RUNNER_TEMP/server/sparkles.tar.zst" target/debug/sparkles
-          '
+          ' || {
+            # The processes left at a failure or at the limit, for a stall that is not memory
+            status=$?
+            echo "the archive commands ended with status $status at $(date -u +%H:%M:%S)"
+            ps -eo pid,ppid,stat,etime,rss,args --sort=-rss | head -n 40 | cut -c1-200
+            exit "$status"
+          }
           echo "recompression from $(date -u +%H:%M:%S)"
           zstd -q -d -c "$RUNNER_TEMP/raw.tar.zst" | zstd -q -1 -T0 --long=27 -o "$RUNNER_TEMP/archive/tests.tar.zst"
           echo "recompression done at $(date -u +%H:%M:%S)"
