@@ -2542,10 +2542,21 @@ fn horn_index(
     // the universals the transitions make, which the rules apply even when one is a
     // universal that is unfolded too
     let mut made: Vec<Ex> = Vec::new();
-    // the roles that a link or a loop of the run can have: those of the links, the results
-    // of the chains the run composes, and the roles of the loops with their inverses
+    // The roles that a link or a loop of the run can have, with their inverses. The links
+    // are those of the existential restrictions with a successor, among them the negative
+    // ones that became fillers of universals above, and the results of the chains the run
+    // composes. A loop has a reflexive role, the role of a self-restriction, a link's role
+    // when an at-most restriction identifies a predecessor with a successor, or a chain's
+    // result. Without a selection the run composes every chain and prunes nothing.
     let live_roles: Option<Vec<Role>> = selection.as_ref().map(|sel| {
-        let mut v = links.clone();
+        let mut v: Vec<Role> = b
+            .succ
+            .iter()
+            .filter_map(|&(e, _)| match it.nodes[e as usize] {
+                Node::Exist(r, _) => Some(r),
+                _ => None,
+            })
+            .collect();
         v.extend(sel.comp.values().flatten().copied());
         v.extend(ix.roles.reflexive.iter().copied());
         v.extend(it.nodes.iter().filter_map(|n| match *n {
@@ -2558,16 +2569,23 @@ fn horn_index(
         v.dedup();
         v
     });
+    let mut dead: Vec<Role> = Vec::new();
     for (holder, r, f) in unfold {
         let a = autos.entry(r).or_insert_with(|| {
-            let rs = &ix.roles;
-            let lr = live_roles
-                .as_ref()
-                .map(|v| move |l: Role| v.iter().any(|&x| rs.sub(x, l)));
+            // R3 reads a universal on `l` at the links under `l`, and R4 at the links
+            // and loops under its inverse. A universal role relates every pair.
+            let live = live_roles.as_ref().map(|v| {
+                let ix = &*ix;
+                move |l: Role| {
+                    let under = |s: Role| v.iter().any(|&x| ix.roles.sub(x, s));
+                    ix.is_universal(l) || under(l) || ix.roles.inv(l).is_some_and(under)
+                }
+            });
             reduced(
                 &h.autos[&r],
                 &ix.roles,
-                lr.as_ref().map(|f| f as &dyn Fn(Role) -> bool),
+                live.as_ref().map(|f| f as &dyn Fn(Role) -> bool),
+                &mut dead,
             )
         });
         // a universal's holder is the universal, and a negative existential
@@ -2621,10 +2639,13 @@ fn horn_index(
         ix.roles.left = sel.left;
         ix.roles.right = sel.right;
     }
+    dead.sort_unstable();
+    dead.dedup();
     super::horn::HornIx {
         flags,
         base: it.nodes.len() as Ex,
         dominate: false,
+        dead,
     }
 }
 
@@ -2634,13 +2655,14 @@ fn reduced(
     a: &super::horn::Nfa,
     roles: &Roles,
     live: Option<&dyn Fn(Role) -> bool>,
+    dead: &mut Vec<Role>,
 ) -> super::horn::EpsFree {
     let mut a = a.eps_free();
     let level = super::horn::reduction();
     if level > 2
         && let Some(live) = live
     {
-        a.prune(live);
+        a.prune(live, dead);
     }
     if level > 0 {
         a.reduce(level > 1, &|r, s| roles.sub(r, s));

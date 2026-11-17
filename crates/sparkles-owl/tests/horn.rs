@@ -1310,3 +1310,61 @@ fn successors_that_others_dominate_take_no_rule_of_their_own() {
     assert_eq!(out.stats.tier, Tier::Horn);
     assert!(out.stats.conclusions < 20_000, "{}", out.stats.conclusions);
 }
+
+/// A hierarchy over a transitive property with a transitive subproperty, an inverse and a
+/// chain into it whose operands no existential restriction uses.
+const PART_OF: &str = "TransitiveObjectProperty(:part_of)
+     SubObjectPropertyOf(:proper_part_of :part_of)
+     TransitiveObjectProperty(:proper_part_of)
+     InverseObjectProperties(:part_of :has_part)
+     SubObjectPropertyOf(ObjectPropertyChain(:starts :during) :part_of)
+     SubClassOf(:Organ ObjectAllValuesFrom(:part_of :Anatomical))
+     SubClassOf(:C0 :Organ)
+     SubClassOf(:C0 ObjectSomeValuesFrom(:proper_part_of :C1))
+     SubClassOf(:C1 ObjectSomeValuesFrom(:part_of :C2))
+     SubClassOf(:C2 ObjectSomeValuesFrom(:proper_part_of :C3))
+     SubClassOf(:C3 ObjectSomeValuesFrom(:part_of :C4))
+     SubClassOf(:C4 ObjectSomeValuesFrom(:part_of :C5))
+     SubClassOf(:C5 ObjectSomeValuesFrom(:proper_part_of :C6))
+     EquivalentClasses(:InBody ObjectSomeValuesFrom(:part_of ObjectIntersectionOf(:C6 :Anatomical)))";
+
+#[test]
+fn a_reduced_automaton_unfolds_a_universal_into_fewer_classes() {
+    // The automaton of the property has, after its ε-transitions are closed over, final
+    // states with the same transitions, transitions by the subproperty beside those by
+    // the property, and a branch through the chain, whose operands no link of this
+    // ontology has. Unreduced, each context on the way holds the classes and universals
+    // of all of them (roadmap item 693).
+    let out = check(
+        PART_OF,
+        &[("C0", "InBody")],
+        &[("C5", "InBody"), ("C6", "Anatomical")],
+    );
+    assert_eq!(out.stats.tier, Tier::Horn);
+    // 533 unreduced, 518 with the alike states merged, 509 without the covered
+    // transitions and 500 without the chain's branch
+    assert!(out.stats.conclusions < 505, "{}", out.stats.conclusions);
+}
+
+#[test]
+fn a_restriction_that_becomes_a_filler_keeps_its_property_alive() {
+    // No axiom has `∃r.F` on its right side, so `r` has no link at the start. The run
+    // rewrites `∃r.F ⊑ G` as `F ⊑ ∀i.∃r.F` and unfolds it over `p ∘ q ⊑ i`, which gives
+    // Z's context under F0 the restriction and with it a link by `r`. The universal on
+    // `t` must reach that link's successor: its automaton keeps the transitions by the
+    // properties above `r`, which a debug build checks at every link.
+    unsat(
+        "SubClassOf(:F0 :F)
+         SubClassOf(:F0 ObjectSomeValuesFrom(:p :W))
+         SubClassOf(:W ObjectSomeValuesFrom(:q :Z))
+         SubObjectPropertyOf(ObjectPropertyChain(:p :q) :i)
+         InverseObjectProperties(:i :r)
+         SubClassOf(ObjectSomeValuesFrom(:r :F) :G)
+         SubClassOf(:Z ObjectAllValuesFrom(:t :H))
+         SubObjectPropertyOf(:r :t)
+         TransitiveObjectProperty(:t)
+         DisjointClasses(:F :H)",
+        &["F0"],
+        &["F", "W", "Z", "H"],
+    );
+}

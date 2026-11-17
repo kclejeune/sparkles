@@ -1368,3 +1368,65 @@ fn a_run_starts_again_once_it_keeps_twice_the_expressions_of_a_full_run() {
         assert!(kept >= 4, "{kept} runs kept contexts");
     }
 }
+
+/// A universal over a transitive property with a chain into it whose operands no
+/// existential restriction uses, so that the automaton that unfolds the universal has no
+/// transition by them (roadmap item 693).
+const DEAD_CHAIN: &str = "TransitiveObjectProperty(:t)
+     SubObjectPropertyOf(ObjectPropertyChain(:v :w) :t)
+     SubClassOf(:A ObjectAllValuesFrom(:t :B))
+     SubClassOf(:A ObjectSomeValuesFrom(:t :C))
+     SubClassOf(:C ObjectSomeValuesFrom(:t :D))
+     SubClassOf(ObjectSomeValuesFrom(:t ObjectIntersectionOf(:D :B)) :P)
+     SubClassOf(:E :A)
+     DisjointClasses(:Q :B)
+     SubClassOf(:K :L)";
+
+#[test]
+fn a_property_that_gains_its_first_link_gets_its_transitions_back() {
+    for threads in [1, 4] {
+        let (mut k, mut held) = started(DEAD_CHAIN, threads);
+        let out = k.classify(&limits(threads)).unwrap();
+        assert!(out.taxonomy.is_subclass(&c("E"), &c("P")));
+        for round in 0..3 {
+            // C reaches Q by v and w, which is a step of t, so A's universal reaches Q
+            add(
+                &mut k,
+                &mut held,
+                "SubClassOf(:C ObjectSomeValuesFrom(:v :V))
+                 SubClassOf(:V ObjectSomeValuesFrom(:w :Q))",
+            );
+            let out = same_as_fresh(&mut k, &held, threads, "after the chain got links");
+            assert!(out.taxonomy.is_unsatisfiable(&c("E")), "in round {round}");
+            assert!(!out.taxonomy.is_unsatisfiable(&c("C")), "in round {round}");
+            // one operand without a link leaves the chain without an instance
+            remove(
+                &mut k,
+                &mut held,
+                "SubClassOf(:V ObjectSomeValuesFrom(:w :Q))",
+            );
+            let out = same_as_fresh(&mut k, &held, threads, "after w lost its link");
+            assert!(!out.taxonomy.is_unsatisfiable(&c("E")), "in round {round}");
+            assert!(
+                out.taxonomy.is_subclass(&c("E"), &c("P")),
+                "in round {round}"
+            );
+            remove(
+                &mut k,
+                &mut held,
+                "SubClassOf(:C ObjectSomeValuesFrom(:v :V))",
+            );
+            let out = same_as_fresh(&mut k, &held, threads, "after v lost its link");
+            assert!(
+                out.taxonomy.is_subclass(&c("E"), &c("P")),
+                "in round {round}"
+            );
+            // a class beside the rest still keeps every context
+            add(&mut k, &mut held, "SubClassOf(:M :K)");
+            let out = same_as_fresh(&mut k, &held, threads, "after a leaf joined");
+            assert!(out.stats.incremental, "the run started again");
+            remove(&mut k, &mut held, "SubClassOf(:M :K)");
+            same_as_fresh(&mut k, &held, threads, "after the leaf left");
+        }
+    }
+}

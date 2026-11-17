@@ -73,6 +73,10 @@ pub struct HornIx {
     /// whether the rules pass over a successor that another dominates, which a run
     /// without individuals, universal roles or functional data roles does (item 710)
     pub dominate: bool,
+    /// the roles whose transitions the automata lost because no link or loop of the run
+    /// can meet a universal on them ([`EpsFree::prune`]), sorted. The rules check in
+    /// debug builds that no link or loop does.
+    pub dead: Vec<Role>,
 }
 
 impl HornIx {
@@ -407,10 +411,16 @@ impl EpsFree {
     /// `live(l)` says whether a universal on `l` can apply to anything, which it cannot
     /// when no link or loop of the run is under `l` or under its inverse. A universal by
     /// such a role is vacuous, and a state that reaches no final state stands for a
-    /// universal with no consequence.
-    pub fn prune(&mut self, live: &dyn Fn(Role) -> bool) {
+    /// universal with no consequence. The roles of the dropped transitions go to `dead`.
+    pub fn prune(&mut self, live: &dyn Fn(Role) -> bool, dead: &mut Vec<Role>) {
         let n = self.states as usize;
-        self.trans.retain(|&(_, l, _)| live(l));
+        self.trans.retain(|&(_, l, _)| {
+            let keep = live(l);
+            if !keep {
+                dead.push(l);
+            }
+            keep
+        });
         let mut useful = self.finals.clone();
         loop {
             let mut grew = false;
@@ -1496,4 +1506,191 @@ pub fn normalize(
     h.autos = std::mem::take(&mut rb.autos);
     ax.horn = Some(Box::new(h));
     Ok(taken)
+}
+
+#[cfg(test)]
+mod reduction_tests {
+    use super::*;
+
+    fn auto(states: u32, finals: &[u32], trans: &[(u32, Role, u32)]) -> EpsFree {
+        let mut a = EpsFree {
+            states,
+            start: 0,
+            finals: (0..states).map(|s| finals.contains(&s)).collect(),
+            trans: trans.to_vec(),
+            ..EpsFree::default()
+        };
+        a.trans.sort_unstable();
+        a.mark();
+        a
+    }
+
+    /// The words of at most `len` roles out of `0..roles` that the automaton accepts.
+    fn words(a: &EpsFree, roles: Role, len: usize) -> BTreeSet<Vec<Role>> {
+        let mut out = BTreeSet::new();
+        let mut at: Vec<(Vec<Role>, BTreeSet<u32>)> = vec![(Vec::new(), [a.start].into())];
+        for _ in 0..=len {
+            let mut next = Vec::new();
+            for (w, states) in at {
+                if states.iter().any(|&s| a.finals[s as usize]) {
+                    out.insert(w.clone());
+                }
+                for l in 0..roles {
+                    let to: BTreeSet<u32> = a
+                        .trans
+                        .iter()
+                        .filter(|t| states.contains(&t.0) && t.1 == l)
+                        .map(|t| t.2)
+                        .collect();
+                    if !to.is_empty() {
+                        let mut w = w.clone();
+                        w.push(l);
+                        next.push((w, to));
+                    }
+                }
+            }
+            at = next;
+        }
+        out
+    }
+
+    /// The words that some word of `ws` covers, role by role, by a role above.
+    fn under(ws: &BTreeSet<Vec<Role>>, w: &[Role], sub: &dyn Fn(Role, Role) -> bool) -> bool {
+        ws.iter()
+            .any(|v| v.len() == w.len() && w.iter().zip(v).all(|(&x, &y)| sub(x, y)))
+    }
+
+    #[test]
+    fn states_that_are_final_alike_with_the_same_transitions_merge() {
+        // the shape of a transitive role's automaton after the ε-closure: two final
+        // states that both loop into the first
+        let mut a = auto(3, &[1, 2], &[(0, 0, 1), (0, 0, 2), (1, 0, 2), (2, 0, 2)]);
+        let before = words(&a, 1, 5);
+        a.reduce(false, &|r, s| r == s);
+        assert_eq!(a.states, 2);
+        assert_eq!(a.trans, vec![(0, 0, 1), (1, 0, 1)]);
+        assert_eq!(a.finals, vec![false, true]);
+        assert_eq!(
+            (a.entered.clone(), a.left.clone()),
+            (vec![false, true], vec![true, true])
+        );
+        assert_eq!(words(&a, 1, 5), before);
+    }
+
+    #[test]
+    fn a_state_that_differs_only_later_does_not_merge() {
+        // 1 and 2 are final alike, but 2 goes on by another role
+        let mut a = auto(
+            4,
+            &[3],
+            &[(0, 0, 1), (0, 0, 2), (1, 0, 3), (2, 0, 3), (2, 1, 3)],
+        );
+        let same = a.clone();
+        a.reduce(false, &|r, s| r == s);
+        assert_eq!(a, same);
+    }
+
+    #[test]
+    fn a_transition_under_another_to_the_same_state_goes() {
+        // role 1 is under role 0, and roles 2 and 3 are equivalent
+        let sub = |r: Role, s: Role| r == s || (r, s) == (1, 0) || (r.min(s), r.max(s)) == (2, 3);
+        let mut a = auto(
+            3,
+            &[2],
+            &[(0, 0, 1), (0, 1, 1), (0, 1, 2), (1, 2, 2), (1, 3, 2)],
+        );
+        a.reduce(true, &sub);
+        // the transition by 1 to another state stays, and of the equivalent roles the
+        // lower one
+        assert_eq!(a.trans, vec![(0, 0, 1), (0, 1, 2), (1, 2, 2)]);
+    }
+
+    #[test]
+    fn a_dropped_transition_lets_states_merge() {
+        // without the transition by the subrole, 1 and 2 are alike
+        let sub = |r: Role, s: Role| r == s || (r, s) == (1, 0);
+        let mut a = auto(
+            4,
+            &[3],
+            &[(0, 0, 1), (0, 0, 2), (1, 0, 3), (2, 0, 3), (2, 1, 3)],
+        );
+        a.reduce(true, &sub);
+        assert_eq!(a.states, 3);
+        assert_eq!(a.trans, vec![(0, 0, 1), (1, 0, 2)]);
+    }
+
+    #[test]
+    fn pruning_drops_dead_roles_and_what_only_they_reach() {
+        // 0 -0-> 1 -0-> 3 is alive, 0 -1-> 2 -0-> 3 goes with the dead role 1, and
+        // 1 -0-> 4 leads to no final state
+        let mut a = auto(
+            5,
+            &[3],
+            &[(0, 0, 1), (0, 1, 2), (1, 0, 3), (2, 0, 3), (1, 0, 4)],
+        );
+        let mut dead = Vec::new();
+        a.prune(&|l| l != 1, &mut dead);
+        assert_eq!(dead, vec![1]);
+        assert_eq!(a.states, 3);
+        assert_eq!(a.trans, vec![(0, 0, 1), (1, 0, 2)]);
+        assert_eq!(a.finals, vec![false, false, true]);
+        assert_eq!(a.start, 0);
+    }
+
+    #[test]
+    fn pruning_every_way_to_a_final_state_leaves_the_start_alone() {
+        let mut a = auto(2, &[1], &[(0, 0, 1), (1, 0, 1)]);
+        let mut dead = Vec::new();
+        a.prune(&|_| false, &mut dead);
+        assert_eq!((a.states, a.start), (1, 0));
+        assert!(a.trans.is_empty());
+        assert_eq!(a.finals, vec![false]);
+        assert_eq!(
+            (a.entered.clone(), a.left.clone()),
+            (vec![false], vec![false])
+        );
+    }
+
+    /// Random automata over four roles keep their words under the merge, and under the
+    /// drop of covered transitions keep them up to the roles above.
+    #[test]
+    fn random_automata_keep_their_words() {
+        // role 1 is under 0, and 3 under 2 under 0
+        let sub = |r: Role, s: Role| r == s || matches!((r, s), (1, 0) | (2, 0) | (3, 0) | (3, 2));
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as u32
+        };
+        let (mut merged, mut dropped) = (0, 0);
+        for _ in 0..3000 {
+            let n = 2 + rnd(5);
+            let finals: Vec<u32> = (0..n).filter(|_| rnd(3) == 0).collect();
+            let mut trans = Vec::new();
+            for _ in 0..rnd(4 * n as u64) {
+                trans.push((rnd(n as u64), rnd(4), rnd(n as u64)));
+            }
+            trans.sort_unstable();
+            trans.dedup();
+            let a = auto(n, &finals, &trans);
+            let before = words(&a, 4, 5);
+            let mut m = a.clone();
+            m.reduce(false, &sub);
+            assert_eq!(words(&m, 4, 5), before, "{a:?}");
+            merged += usize::from(m.states < a.states);
+            let mut d = a.clone();
+            d.reduce(true, &sub);
+            let after = words(&d, 4, 5);
+            assert!(after.is_subset(&before), "{a:?}");
+            assert!(before.iter().all(|w| under(&after, w, &sub)), "{a:?}");
+            dropped += usize::from(d.trans.len() < m.trans.len());
+            // the marks are those of the transitions
+            let mut marked = d.clone();
+            marked.mark();
+            assert_eq!(marked, d);
+        }
+        assert!(merged > 300 && dropped > 300, "{merged} {dropped}");
+    }
 }
