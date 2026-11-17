@@ -1185,6 +1185,178 @@ const PRODUCT_POLL: usize = 256;
 /// product ends between two checks of the bounds; a larger tail is charged at the end.
 const RECORD_SLACK: usize = 64 * 1024;
 
+/// The most sides of one step of a product that [`fold`] keeps only where no other side
+/// of the step has a subset of their literals, which costs a comparison of each side with
+/// the sides kept before it.
+const FOLD_PRUNE: usize = 4096;
+
+/// Derives the conclusions of a product that is not ground (item 969): the union of one
+/// premise from every list with `base`, list after list. Each step keeps the unions it
+/// makes once, and, up to [`FOLD_PRUNE`] of them, only those that no other union of the
+/// step contains. A union that contains another gives only conclusions that the other's
+/// conclusions subsume, since the unions of both with the premises of the later lists
+/// contain each other in the same way, and the store keeps no clause that another
+/// subsumes. The products of the Pred rule on `ore_ont_14817` of ORE 2015 have up to a
+/// million choices whose unions are a few thousand sets of literals, of which a few dozen
+/// are least. Past [`FOLD_PRUNE`] unions of the steps before the last, each further one
+/// counts as a derived conclusion for the run's bound, as each choice the product derives
+/// does, and a last step past that many derives its unions as it makes them, so that a
+/// bounded run does not build a wide product's steps unbounded. Each step's sets are charged to
+/// the memory budget as they grow, and what a step drops is released when it ends. The
+/// answer is whether the run goes on.
+#[allow(clippy::too_many_arguments)]
+fn fold<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    lists: &[Vec<Side>],
+    mut base: Side,
+    rule: &'static str,
+    root: bool,
+    trace: bool,
+    out: &mut S,
+    derive: &impl Fn(&Index, &mut State, Side, &mut S),
+) -> bool {
+    let norm = |s: &mut Side| {
+        s.0.sort_unstable();
+        s.0.dedup();
+        s.1.sort_unstable();
+        s.1.dedup();
+    };
+    let bytes = |s: &Side| (s.0.capacity() + s.1.capacity()) * std::mem::size_of::<Lit>() + 48;
+    norm(&mut base);
+    let (mut charged, mut pending) = (0usize, 0usize);
+    let mut acc: Vec<Side> = vec![base];
+    let stop = |st: &mut State, out: &mut S, charged: usize| {
+        ds(st).store.interrupted = true;
+        out.release_data(charged);
+        false
+    };
+    let last = lists.len().saturating_sub(1);
+    let mut built = 0usize;
+    let mut streaming = false;
+    for (i, l) in lists.iter().enumerate() {
+        let mut seen: FxHashSet<Side> = FxHashSet::default();
+        let mut next: Vec<Side> = Vec::new();
+        for a in &acc {
+            for t in l {
+                if out.stopped() {
+                    return stop(st, out, charged);
+                }
+                let mut s = a.clone();
+                s.0.extend_from_slice(&t.0);
+                s.1.extend_from_slice(&t.1);
+                norm(&mut s);
+                if !seen.contains(&s) {
+                    // the step's record and its list hold the union
+                    pending += 2 * bytes(&s);
+                    seen.insert(s.clone());
+                    if i < last {
+                        next.push(s);
+                        built += 1;
+                        if built > FOLD_PRUNE {
+                            out.worked(1);
+                        }
+                    } else if streaming {
+                        pending -= bytes(&s);
+                        emit(ix, st, s, rule, root, trace, out, derive);
+                    } else {
+                        next.push(s);
+                        // a last step past FOLD_PRUNE unions derives them as it makes
+                        // them, which counts each toward the bound, and leaves them
+                        // unpruned
+                        if next.len() > FOLD_PRUNE {
+                            streaming = true;
+                            // the list's copies leave the charge, the part not yet
+                            // charged first
+                            let freed: usize = next.iter().map(bytes).sum();
+                            let uncharged = freed.min(pending);
+                            pending -= uncharged;
+                            let back = (freed - uncharged).min(charged);
+                            charged -= back;
+                            out.release_data(back);
+                            for s in std::mem::take(&mut next) {
+                                emit(ix, st, s, rule, root, trace, out, derive);
+                            }
+                        }
+                    }
+                }
+                let x = ds(st);
+                x.choices += 1;
+                if x.choices as usize >= PRODUCT_POLL {
+                    x.choices = 0;
+                    let go = if pending > 0 {
+                        charged += pending;
+                        out.reserve_data(std::mem::take(&mut pending))
+                    } else {
+                        out.go_on()
+                    };
+                    if !go {
+                        return stop(st, out, charged);
+                    }
+                }
+            }
+        }
+        drop(seen);
+        if next.len() <= FOLD_PRUNE {
+            prune(&mut next);
+        }
+        acc = next;
+        // the step's record, the unions it pruned and the last step's list leave what is
+        // held, the part not yet charged first, and the step's tail is then charged once
+        // it is large, as the record of a product's choices was
+        let live: usize = acc.iter().map(bytes).sum();
+        let over = (charged + pending).saturating_sub(live);
+        let uncharged = over.min(pending);
+        pending -= uncharged;
+        let back = (over - uncharged).min(charged);
+        charged -= back;
+        out.release_data(back);
+        if pending >= RECORD_SLACK {
+            charged += pending;
+            if !out.reserve_data(std::mem::take(&mut pending)) {
+                return stop(st, out, charged);
+            }
+        }
+    }
+    for s in acc {
+        emit(ix, st, s, rule, root, trace, out, derive);
+        let x = ds(st);
+        x.choices += 1;
+        if x.choices as usize >= PRODUCT_POLL {
+            x.choices = 0;
+            if !out.go_on() {
+                return stop(st, out, charged);
+            }
+        }
+    }
+    out.release_data(charged);
+    true
+}
+
+/// Derives one conclusion of [`fold`], with its line of the derivation trace.
+#[allow(clippy::too_many_arguments)]
+fn emit<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    s: Side,
+    rule: &'static str,
+    root: bool,
+    trace: bool,
+    out: &mut S,
+    derive: &impl Fn(&Index, &mut State, Side, &mut S),
+) {
+    if trace {
+        let lits = &out.dl().lits;
+        eprintln!(
+            "TR {} {rule} {} -> {}",
+            tr_ctx(st, root),
+            tr(ix, lits, &s.0),
+            tr(ix, lits, &s.1)
+        );
+    }
+    derive(ix, st, s, out);
+}
+
 /// Derives what the rules found: the single conclusions, then each product's choices in
 /// the order of their lists, the last list fastest. The run's bounds are checked after
 /// every [`PRODUCT_POLL`] choices the context derives, counted across calls, and a stop of
@@ -1235,6 +1407,12 @@ pub(super) fn drain_with<S: Sink>(
     let dx = ix.dl.as_deref();
     let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
     for (lists, base, ground, rule) in found.prods {
+        if !ground {
+            if !fold(ix, st, &lists, base, rule, found.root, trace, out, &derive) {
+                return;
+            }
+            continue;
+        }
         let mut at = vec![0usize; lists.len()];
         // two choices whose premises share their literals merge to one conclusion, as
         // when one role premise fits two places of a Pred body or two needs share their
@@ -3141,6 +3319,236 @@ pub fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sink that counts the charges, releases and derived conclusions of [`fold`].
+    #[derive(Default)]
+    struct Charges {
+        reserved: usize,
+        released: usize,
+        releases: usize,
+        work: usize,
+        /// the work past which the run stops, as a bound on derived conclusions does
+        limit: Option<usize>,
+        /// the bytes past which a reservation fails, as the memory budget does
+        budget: Option<usize>,
+    }
+
+    impl Sink for Charges {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        // a reservation checks the bounds too, as the saturation's does
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            self.reserved += bytes;
+            self.go_on()
+                && self
+                    .budget
+                    .is_none_or(|b| self.reserved - self.released <= b)
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.released += bytes;
+            self.releases += 1;
+        }
+        fn worked(&mut self, n: usize) {
+            self.work += n;
+        }
+        fn go_on(&self) -> bool {
+            self.limit.is_none_or(|l| self.work <= l)
+        }
+    }
+
+    fn index() -> Index {
+        let mut it = super::super::index::Interner::new();
+        Index::build(
+            &super::super::index::Axioms::default(),
+            &mut it,
+            None,
+            &|| false,
+        )
+        .unwrap()
+    }
+
+    fn side(head: &[Ex]) -> Side {
+        (Vec::new(), head.iter().map(|&a| Lit::x(a)).collect())
+    }
+
+    /// Runs [`fold`] over the lists and gives the heads it derived, sorted.
+    fn folded(lists: &[Vec<Side>], out: &mut Charges) -> Vec<Vec<Lit>> {
+        let ix = index();
+        let mut st = State::default();
+        let got = std::cell::RefCell::new(Vec::new());
+        let derive =
+            |_: &Index, _: &mut State, s: Side, _: &mut Charges| got.borrow_mut().push(s.1);
+        assert!(fold(
+            &ix,
+            &mut st,
+            lists,
+            side(&[]),
+            "test",
+            false,
+            false,
+            out,
+            &derive
+        ));
+        let mut got = got.into_inner();
+        got.sort();
+        got
+    }
+
+    /// A product derives only the least unions of one premise from each list (item 969).
+    #[test]
+    fn a_product_derives_its_least_unions() {
+        let lists = vec![
+            vec![side(&[1]), side(&[1, 2])],
+            vec![side(&[2]), side(&[3])],
+        ];
+        let mut out = Charges::default();
+        let got = folded(&lists, &mut out);
+        let want: Vec<Vec<Lit>> = vec![side(&[1, 2]).1, side(&[1, 3]).1];
+        assert_eq!(got, want);
+        assert_eq!(out.work, 0);
+    }
+
+    /// The unions of a wide product's steps before the last count as derived conclusions
+    /// for the run's bound once they pass [`FOLD_PRUNE`], so that a bounded run does not
+    /// build them unbounded.
+    #[test]
+    fn a_wide_product_counts_the_unions_of_its_steps() {
+        // fourteen lists of two premises each give 2^14 - 2 unions before the last step
+        let lists: Vec<Vec<Side>> = (0..14)
+            .map(|k| vec![side(&[2 * k + 1]), side(&[2 * k + 2])])
+            .collect();
+        let mut out = Charges::default();
+        let got = folded(&lists, &mut out);
+        assert_eq!(got.len(), 1 << 14);
+        let built: usize = (1..14).map(|k| 1usize << k).sum();
+        assert_eq!(out.work, built - FOLD_PRUNE);
+    }
+
+    /// A last step of more than [`FOLD_PRUNE`] unions derives them as it makes them, each
+    /// counted, so that a run with a bound on its derived conclusions stops it within the
+    /// bound instead of building every union first.
+    #[test]
+    fn a_wide_last_step_stops_at_the_bound() {
+        let ix = index();
+        let mut st = State::default();
+        let wide = |from: Ex| (from..from + 4096).map(|a| side(&[a])).collect::<Vec<_>>();
+        let lists = vec![wide(1), wide(10_000)];
+        let mut out = Charges {
+            limit: Some(20_000),
+            ..Charges::default()
+        };
+        let made = std::cell::Cell::new(0usize);
+        let derive = |_: &Index, _: &mut State, _: Side, out: &mut Charges| {
+            made.set(made.get() + 1);
+            out.worked(1);
+        };
+        assert!(!fold(
+            &ix,
+            &mut st,
+            &lists,
+            side(&[]),
+            "test",
+            false,
+            false,
+            &mut out,
+            &derive
+        ));
+        assert!(
+            made.get() <= 20_000 + PRODUCT_POLL + FOLD_PRUNE,
+            "{}",
+            made.get()
+        );
+        // the unions it built and charged are those it derived, not the 16.7 million of
+        // the whole step
+        assert!(out.reserved < 16 << 20, "{}", out.reserved);
+    }
+
+    /// A last step that turns to deriving its unions as it makes them releases the
+    /// charge of the list it drains, so that the charge follows the unions that live.
+    #[test]
+    fn a_streamed_last_step_releases_its_drained_list() {
+        let ix = index();
+        let wide = |n: Ex| vec![(1..=n).map(|a| side(&[a])).collect::<Vec<_>>()];
+        let run = |lists: &[Vec<Side>], out: &mut Charges| {
+            let mut st = State::default();
+            let derive = |_: &Index, _: &mut State, _: Side, _: &mut Charges| {};
+            fold(
+                &ix,
+                &mut st,
+                lists,
+                side(&[]),
+                "test",
+                false,
+                false,
+                out,
+                &derive,
+            )
+        };
+        // a step of 2,048 unions, which ends at a check of the bounds, charges each
+        // union's two copies, which gives the bytes of one copy
+        let mut out = Charges::default();
+        assert!(run(&wide(2048), &mut out));
+        let unit = out.reserved / 4096;
+        // 6,000 unions hold at most 8,194 copies at once, the two of the 4,097 kept
+        // before the step turns to deriving and one of each union after it
+        let mut out = Charges {
+            budget: Some(9000 * unit),
+            ..Charges::default()
+        };
+        let ok = run(&wide(6000), &mut out);
+        assert!(
+            ok,
+            "the drained list stays charged: unit {unit}, reserved {}, released {}",
+            out.reserved, out.released
+        );
+        assert_eq!(out.reserved, out.released);
+    }
+
+    /// A step that ends between two checks of the bounds drops its record from what it
+    /// has still to charge, so that the next step's check charges only what lives.
+    #[test]
+    fn a_step_drops_its_record_from_what_it_has_to_charge() {
+        let ix = index();
+        let mut st = State::default();
+        let four: Vec<Side> = (0..128)
+            .map(|k| side(&[4 * k + 1, 4 * k + 2, 4 * k + 3, 4 * k + 4]))
+            .collect();
+        let lists = vec![four, vec![side(&[])]];
+        let derive = |_: &Index, _: &mut State, _: Side, _: &mut Charges| {};
+        // the first step's 128 sides of four literals hold 10,240 bytes once its record
+        // goes, and the second step's record and list add as much again each
+        let mut out = Charges {
+            budget: Some(35_840),
+            ..Charges::default()
+        };
+        assert!(fold(
+            &ix,
+            &mut st,
+            &lists,
+            side(&[]),
+            "test",
+            false,
+            false,
+            &mut out,
+            &derive
+        ));
+        assert_eq!(out.reserved, out.released);
+    }
+
+    /// A product's sets are charged once they pass the slack, also when the product has
+    /// fewer choices than a check of the bounds, and each step releases what it drops, so
+    /// that the charge follows the sets that live and ends at zero.
+    #[test]
+    fn a_product_charges_its_wide_steps_and_releases_what_they_drop() {
+        let wide: Vec<Ex> = (10..10 + RECORD_SLACK as Ex).collect();
+        let lists = vec![vec![side(&wide)], vec![side(&[1])], vec![side(&[2])]];
+        let mut out = Charges::default();
+        let got = folded(&lists, &mut out);
+        assert_eq!(got.len(), 1);
+        assert!(out.reserved > RECORD_SLACK, "{}", out.reserved);
+        assert_eq!(out.reserved, out.released);
+        assert!(out.releases > 1, "the steps release nothing before the end");
+    }
 
     /// A context whose minimum waits for the units has work left: a run that stops there
     /// and answers in part must not report the context closed, since the minimum's

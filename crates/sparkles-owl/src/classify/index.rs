@@ -2353,6 +2353,12 @@ impl Index {
             let dx = super::dl_rules::DlIx::new(d, &ax.disjoint, &ix, it.nodes.len());
             ix.dl = Some(Box::new(dx));
         }
+        // the Horn rules pass over dominated successors when no context's conclusions
+        // depend on its predecessors (item 710)
+        let plain = super::saturate::plain(&ix);
+        if let Some(h) = ix.horn.as_mut() {
+            h.dominate = plain;
+        }
         Ok(ix)
     }
 }
@@ -2567,6 +2573,7 @@ fn horn_index(
     super::horn::HornIx {
         flags,
         base: it.nodes.len() as Ex,
+        dominate: false,
     }
 }
 

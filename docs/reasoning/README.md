@@ -806,9 +806,10 @@ for its allowances and the editors.
   with DL-safe SWRL rules, and a vocabulary bundle as disjointness axioms over its
   concepts and relation entities. Sparkles reads that OWL form from files or from a
   dataset that holds each ontology in the named graph of its IRI, and follows the imports
-  between those graphs. On openCAESAR's Kepler16b sample, the classifier's taxonomy
-  equals HermiT's, its named types of individuals equal HermiT's apart from types it
-  gives the SWRL rules' variables, and the classifier finds the
+  between those graphs. On the OWL that openCAESAR's build writes for its Kepler16b
+  sample, the classifier's taxonomy equals the one that `owl-reason` gets from Openllet.
+  Its named types of individuals equal Openllet's apart from types it gives the SWRL
+  rules' variables, and the classifier finds the
   inconsistencies that the bundle's disjointness, keys, functional properties, universal
   restrictions and property characteristics raise
   ([F24](../specs/F24-owl-classification/SPEC.md#oml-and-opencaesar-models)).
@@ -819,9 +820,10 @@ for its allowances and the editors.
   the graph of its IRI, the project's queries on the `sparql` service and shapes posted
   to `shacl?graph=default`. The queries then read the entailments that `owl-reason`
   wrote, not Sparkles' own reasoning.
-* A Jena rules file in the form that the adapter writes with `generateRules`
-  materializes with `sparkles infer --rules` and derives the facts that Jena's rule
-  engine derives.
+* The rule parser refuses the Jena rules file that the adapter writes with
+  `generateRules`, because its `@prefix` lines give the namespace IRIs without angle
+  brackets. Once the brackets are added, `sparkles infer --rules` derives the facts that
+  Jena's rule engine derives from the file.
 * The SWRL rules are not read, so a reified relation's forward property and the facts of
   an OML rule are not derived, and the OWL RL materialization answers a query that needs
   them with fewer rows. Rule-derived inconsistencies, enumerations beside keys, OWL 2 DL
@@ -947,10 +949,17 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   tree-shaped models. Roadmap item 867. Such an ontology may get a world for a class
   whose world finds nothing. Roadmap item 868.
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
-  rules on one thread and raise its peak resident set from 196 to 223 MiB. Two
-  Uberon-based ontologies of the ORE 2015 DL sample classify with the Horn rules in 2.2
-  and 4.0 seconds on one thread, against 0.7 and 0.8 for the EL rules alone. Roadmap
-  item 693.
+  rules on one thread and raise its peak resident set from 196 to 223 MiB. On two
+  Uberon-based ontologies of the ORE 2015 DL sample the Horn rules take about five times
+  the EL rules' time, since each context of a conjunction derives its successor's
+  subsumers again. Roadmap item 693.
+* The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
+  passes its memory budget before the Horn rules answer. On four threads one of them
+  classifies in 20 to 39 seconds and the other in about 13, almost all of it the attempt.
+  Roadmap item 990.
+* Horn ontologies whose successors no other successor dominates classify up to 6% slower
+  than without the check for dominated successors, which costs more there than it saves.
+  Roadmap item 991.
 * The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
   restrictions over a transitive symmetric role derives each link of the transitive
   closure once per intermediate class, so it sends three billion messages for 32 million
@@ -1040,6 +1049,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   few thousand triples. Roadmap item 974.
 * openCAESAR's closed-world cardinality check, its entailment outputs and the OML
   textual syntax have no counterpart. Roadmap items 975 to 977.
+* The Jena rule parser refuses an `@prefix` whose namespace IRI has no angle brackets,
+  which Jena's parser accepts and openCAESAR's adapter writes. Roadmap item 1020.
 
 ## Configuration and usage
 
