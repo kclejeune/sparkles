@@ -133,7 +133,11 @@ memory limit of each run's scope bounds the run instead. `rl_terms.py` sorts eac
 closure and each side of a comparison on disk with GNU sort, which has a buffer of 1 GiB,
 and merges the sorted files, so it holds no closure in memory. What it still holds grows
 with the encoded literals and blank nodes of the input and with the distinct predicates of
-the differences, not with the size of the closure.
+the differences, not with the size of the closure. Once the comparison agrees, the runner
+removes its derived files and its encoded input and keeps their counts in
+`compare/diff.json` and `compare/core.json`. Each check's derived graphs are removed once
+they agree, and a check that fails keeps them. Beside the latest Nemo closure, the working
+directory therefore holds the closures of one comparison or check at a time.
 
 The runner writes every run to `<profile>/results/rl-reference.json` in its working
 directory, with the host's processor, memory and kernel, the Sparkles binary's version,
