@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Dependency security updates
+
+The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes
+GHSA-m665-v7pm-7grj and the four other zip advisories for `sparkles-office` and its fuzz
+target. zip 9 refuses to inflate an entry past the size its header declares, so a part
+whose header understates its size now fails as `conversion-failed` with status 422,
+where a deflate bomb of that kind used to reach the part limit and fail as `too-large`
+with status 413. Candle 0.9.2 still requires zip 7, so the root `Cargo.lock` keeps zip
+7.4.0 for `sparkles-embed`, which reads only safetensors files and never reaches Candle's
+archive readers. Roadmap item 1048 moves Candle to 0.11.1 to remove it. The web UI builds
+with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which fix
+their advisories. The SvelteKit advisories that only 3.x fixes concern features the
+static UI does not use, and roadmap item 1049 covers the migration.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,
