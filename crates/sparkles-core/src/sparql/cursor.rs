@@ -412,11 +412,17 @@ enum BatchBuffer {
 }
 
 struct SharedBatch {
-    block: crate::index::Block,
+    shared: Arc<SharedBlock>,
     columns: [usize; 4],
     start: usize,
     end: usize,
-    _block_charge: Arc<OwnedCharge>,
+    _charge: OwnedCharge,
+}
+
+/// A decoded block that shared batches hand out, with the charge of its decoded columns,
+/// which lasts while any of the batches is held.
+struct SharedBlock {
+    block: crate::index::Block,
     _charge: OwnedCharge,
 }
 
@@ -554,7 +560,7 @@ impl QueryBatch {
         match &self.inner.buffer {
             BatchBuffer::Owned(buffer) => buffer.table.get(row, column),
             BatchBuffer::Shared(batch) => {
-                Id(batch.block.cols[batch.columns[column]][batch.start + row])
+                Id(batch.shared.block.cols[batch.columns[column]][batch.start + row])
             }
         }
     }
@@ -4166,9 +4172,9 @@ struct BaseScan {
     wanted: crate::index::ColMask,
     row: usize,
     row_end: usize,
-    /// the charge of the block that the batches handed out hold, with the block and its
+    /// the block that the batches handed out hold with its charge, and its position and
     /// columns; it ends when the last of them drops
-    shared: Option<(usize, crate::index::ColMask, std::sync::Weak<OwnedCharge>)>,
+    shared: Option<(usize, crate::index::ColMask, std::sync::Weak<SharedBlock>)>,
 }
 
 impl BaseScan {
@@ -4212,6 +4218,18 @@ impl BaseScan {
     fn park(&mut self) {
         self.remember_block();
         self.block = None;
+    }
+
+    /// The block being read, with its charge, while a batch handed out from it is held.
+    fn held_shared(&self) -> Option<Arc<SharedBlock>> {
+        if self.block.is_some() || self.parked.is_none() {
+            return None;
+        }
+        let (block, wanted, shared) = self.shared.as_ref()?;
+        if (*block, *wanted) != (self.next - 1, self.wanted) {
+            return None;
+        }
+        shared.upgrade()
     }
 
     /// Take back the block of the last read, from the cache or by decoding it again.
@@ -4304,9 +4322,15 @@ impl Scan {
             return Ok(SharedAttempt::Unsupported);
         }
         let mut base = self.base.take().expect("checked base scan");
-        let result = base
-            .unpark(ctx, ctx.snap.perm(self.spec.perm))
-            .and_then(|()| self.next_shared_base(ctx, vars, columns, cap, &mut base));
+        // A batch of the block being read that is still held keeps the block, so the
+        // scan takes it from there.
+        let held = base.held_shared();
+        let result = if held.is_some() {
+            Ok(())
+        } else {
+            base.unpark(ctx, ctx.snap.perm(self.spec.perm))
+        }
+        .and_then(|()| self.next_shared_base(ctx, vars, columns, cap, &mut base, held));
         base.park();
         self.base = Some(base);
         result
@@ -4319,6 +4343,7 @@ impl Scan {
         columns: [usize; 4],
         cap: usize,
         base: &mut BaseScan,
+        mut held: Option<Arc<SharedBlock>>,
     ) -> Result<SharedAttempt> {
         let index = ctx.snap.perm(self.spec.perm);
         let mask = exec::scan_mask(&self.spec);
@@ -4328,7 +4353,7 @@ impl Scan {
             if base.next == 0 && base.end == 0 && base.block.is_none() {
                 (base.next, base.end) = index.key_block_range(&lo, &hi);
             }
-            if base.block.is_none() {
+            if base.block.is_none() && held.is_none() {
                 if base.next == base.end {
                     self.at += 1;
                     base.next = 0;
@@ -4375,7 +4400,10 @@ impl Scan {
                 base.clear_block();
                 continue;
             }
-            let block = base.block.as_ref().expect("loaded immutable block");
+            let block = match &held {
+                Some(shared) => &shared.block,
+                None => base.block.as_ref().expect("loaded immutable block"),
+            };
             // Only the rows of this batch are checked, so a small demand does not read
             // the graph column of the whole block.
             let end = base.row_end.min(base.row.saturating_add(cap));
@@ -4383,18 +4411,12 @@ impl Scan {
                 // No row of the batch was consumed: the owned path resumes from it.
                 return Ok(SharedAttempt::Unsupported);
             }
-            // The batches of one block share one charge of its decoded columns, which
-            // lasts while any of them is held.
-            let at = (base.next - 1, base.wanted);
-            let held = base
-                .shared
-                .as_ref()
-                .filter(|(b, wanted, _)| (*b, *wanted) == at)
-                .and_then(|(_, _, charge)| charge.upgrade());
-            let block_charge = match held {
-                Some(charge) => charge,
+            // The batches of one block share it and one charge of its decoded columns,
+            // which last while any of them is held.
+            let bytes = block.decoded_bytes() + 512;
+            let shared = match held.take() {
+                Some(shared) => shared,
                 None => {
-                    let bytes = block.decoded_bytes() + 512;
                     // Leave room for consumers' decoding scratch and an owned fallback.
                     // The room asked for is a whole block's columns, whatever this block
                     // decoded, so that sharing starts at the budgets it always did and
@@ -4408,22 +4430,24 @@ impl Scan {
                     let Ok(charge) = OwnedCharge::new(ctx, bytes) else {
                         return Ok(SharedAttempt::Unsupported);
                     };
-                    let charge = Arc::new(charge);
-                    base.shared = Some((at.0, at.1, Arc::downgrade(&charge)));
-                    charge
+                    // The batches take the scan's handle on the block, which the scan
+                    // would let go of at the end of this read anyway, and the scan keeps
+                    // a weak one.
+                    base.remember_block();
+                    let shared = Arc::new(SharedBlock {
+                        block: base.block.take().expect("loaded immutable block"),
+                        _charge: charge,
+                    });
+                    base.shared = Some((base.next - 1, base.wanted, Arc::downgrade(&shared)));
+                    shared
                 }
             };
-            let charge = OwnedCharge::new(ctx, 512)?;
-            // The batch takes the scan's handle on the block, which the scan would let go
-            // of at the end of this read anyway, and the scan keeps a weak one.
-            base.remember_block();
             let batch = SharedBatch {
-                block: base.block.take().expect("loaded immutable block"),
+                shared,
                 columns,
                 start: base.row,
                 end,
-                _block_charge: block_charge,
-                _charge: charge,
+                _charge: OwnedCharge::new(ctx, 512)?,
             };
             base.row = end;
             if base.row == base.row_end {
@@ -5054,7 +5078,7 @@ mod tests {
             let rows = if mode == "shared" {
                 match scan.next_shared(&ctx, &[var], BLOCK_ROWS).unwrap() {
                     SharedAttempt::Ready(Some(batch)) => {
-                        for &id in &batch.block.cols[1][batch.start..batch.end] {
+                        for &id in &batch.shared.block.cols[1][batch.start..batch.end] {
                             assert_eq!(id, expected[n as usize]);
                             n += 1;
                         }
