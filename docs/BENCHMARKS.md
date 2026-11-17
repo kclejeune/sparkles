@@ -42,6 +42,7 @@ where the two engines' means differed by less than an instance's variation betwe
 | Peak RSS under 16 readers | QLever 1.67× at 1.05M and 1.43× at 10.5M | Sparkles peaks at 567 and 1,339 MiB, against 339 and 939 MiB. |
 | Bulk load peak RSS | QLever 2.90× on the LUBM(100) closure and 1.23× on SP²Bench, Fluree 1.26× on SP²Bench | Sparkles has the lowest peak at 1.05M and on DBpedia, and is within 10% of QLever at 10.5M. |
 | DBpedia server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
+| Peak RSS of OWL 2 RL and RDFS materialization | Nemo 0.10.1 RSS_RANGE | Sparkles at 20 threads holds 3,713 MiB on LUBM(100) under OWL 2 RL against Nemo's 4,230 MiB, and its times are lower on every input. [Item 845](ROADMAP.md) works toward memory parity. |
 | Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |
 | JVM small lookups | TIM 1.3–2.1× and TDB2 1.1–1.4× on `star-lookup`, `values-star` and `employee-docs` | A small query's fixed cost through Jena dominates. |
 | Python small lookups | pyoxigraph 1.49× on value lookups and `knows-reach`, and 1.23× on subject scans | The gaps are 0.67 µs per value, 20 µs per query and 2.06 µs per subject. `values-star` is within 10%, and Sparkles leads on employee and star lookups. |
@@ -65,7 +66,7 @@ partially complete and planned implementation scope.
 | Bindings and model-assisted workflows | Partial coverage | The listed APIs, models and question sets have measurements. Selected API controls and internal A/B runs do not replace a complete peer-suite refresh. |
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance and internal measurements do not establish comparative performance. |
 | OWL 2 EL classification | Measured against ELK, Konclude, Whelk, HermiT and ROBOT | [Times and memory beside ELK 0.6.0](benchmarks/el-classification/RESULTS.md#against-elk) and [beside the other reference reasoners](benchmarks/el-classification/RESULTS.md#reference-reasoners) on GO, ChEBI lite and the largest ORE 2015 EL ontologies are published. The classifier is ahead of ELK and Konclude on every ontology and thread count measured. |
-| OWL 2 RL materialization | Closures checked against Nemo, times unpublished | The derived graphs equal those of Nemo 0.10.1 running the W3C OWL 2 RL/RDF rules on LUBM, OWL2Bench and the W3C OWL 2 RL test cases, as the [agreement results](benchmarks/reasoning/RESULTS.md#owl-2-rl-reference-agreement) show. Times against Nemo on the benchmark host remain open. |
+| OWL 2 RL materialization | Measured against Nemo on a benchmark worker | [Full materialization times and memory beside Nemo 0.10.1](benchmarks/reasoning/RESULTS.md#against-nemo) on LUBM(10), LUBM(100) and OWL2Bench(1) and (5) are published for the `owl-rl` and `rdfs` profiles, with every closure equal to Nemo's. Sparkles is ahead on every input and thread count. The run on the benchmark host remains open. |
 | Evidence and maintained analysis | Unmeasured | C25 provides authenticated evidence proposals and resolution, and C27 supplies temporal profile resources and queries. Review-controlled projections and the managed analysis work in C26, F22 and C22b remain planned. |
 
 ## Reading the comparisons
