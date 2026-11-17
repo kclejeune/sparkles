@@ -1081,6 +1081,13 @@ manual **compatibility-features** input.
 | Jena clients | Jena's own HTTP clients against the debug server binary (`mise run test:jena-clients`). |
 | Features | A manual run with **compatibility-features** checked runs six jobs through `scripts/test-features.sh`, with the default features off and one feature set each. They build apart from the archive and restore the test build's cache. |
 
+The Build tests job compiles the server's binary and its unit tests in single compiler
+processes of about 8 GB and 11 GB. `scripts/ci-memory.sh` prints the runner's memory,
+swap, load and largest compilers every 30 seconds while the archives build, and the
+archive commands stop at 38 minutes and list the processes left. A run that stalls the
+runner therefore fails inside its build step and keeps its log, instead of reaching the
+job's 45-minute limit with no log.
+
 The transcript import integration test reserves all test slots while it runs in its
 shard. It sends a 5 MiB transcript through the real server, whose query deadline stays
 at 30 seconds. Other tests resume after it finishes.
