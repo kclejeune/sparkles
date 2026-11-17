@@ -1523,9 +1523,9 @@ of both items ran 27.55 billion against 27.93 billion on the base, and on ChEBI 
 56.61 billion against 55.92 billion, two processes of each build within 0.01% of each
 other. The flush of item 1026 therefore adds no instructions on these files. The counts
 move in both directions from the commit of item 1025, which adds no rule to the
-saturation, so its build may generate other code for the rules it leaves alone. The run
-does not time the stages or the two commits apart on `atlas`, so the cause of the
-slowdown there is not shown. Roadmap item 1028 follows it.
+saturation, so its build may generate other code for the rules it leaves alone. The
+rounds on `atlas` do not time the two commits apart, so the cause of the slowdown there
+is not shown. Roadmap item 1028 follows it.
 
 Item 1025 also timed `ore_ont_9663` and `ore_ont_14817` on the build before item 869,
 commit be684ce5, against the base, which adds item 869 to it, now that the bound of item
