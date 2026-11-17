@@ -300,11 +300,14 @@ def observe_startup(payload):
 # accepted probe always lies between a quiet window and a clean scan. One tracked set
 # spans the whole phase, so a descendant of startup work stays startup work after its
 # parents exit, wherever it is reparented. The one exception is the agent's own shell
-# or sudo, the session processes allowed only by their children (SESSION_CHILDREN):
-# once it is again an allowed session process, its own identity leaves the set, and
-# its former descendants stay in it. No probe starts QUALIFY_SECONDS or more after the
-# phase began, inside the metadata unit's 240 seconds, the user-manager query gets
-# only the time left, and a refusal keeps the last busy inventory.
+# or sudo, the session processes allowed only by their children (SESSION_CHILDREN).
+# An identity is releasable only when the scan that first tracked it found it refused
+# for its children alone, and it leaves the set only while its name is the one it had
+# then and it is again an allowed session process. Its former descendants stay in the
+# set, and a process renamed to bash or sudo is never released. No probe starts
+# QUALIFY_SECONDS or more after the phase began, inside the metadata unit's 240
+# seconds, the user-manager query gets only the time left, and a refusal keeps the
+# last busy inventory.
 QUIET_SECONDS=5
 QUALIFY_SECONDS=120
 QUALIFY_ATTEMPTS=6
@@ -319,12 +322,20 @@ def with_inventory(error,seen):
     error.unallowed=unallowed_inventory(rows,busy);error.unallowed_count=len(busy)
     return error
 
-def release_idle_session(tracked,rows,manager):
-    """Drop from ``tracked`` the agent shells and sudos that are allowed session processes again."""
-    for pid,start in list(tracked):
+def refused_for_children_only(pid,rows,manager):
+    """Whether this agent shell or sudo is an allowed session process apart from its children."""
+    if rows[pid]['comm'] not in SESSION_CHILDREN:return False
+    return provider_session(pid,{p:r for p,r in rows.items() if r['ppid']!=pid},manager)
+
+def release_idle_session(tracked,releasable,rows,manager):
+    """Drop from ``tracked`` the releasable agent shells and sudos that are allowed session processes again.
+
+    ``releasable`` maps each such identity to the name it had when it was first tracked."""
+    for (pid,start),comm in list(releasable.items()):
         row=rows.get(pid)
-        if row is not None and row['start']==start and row['comm'] in SESSION_CHILDREN and provider_session(pid,rows,manager):
-            tracked.discard((pid,start))
+        if row is None or row['start']!=start:releasable.pop((pid,start));continue
+        if row['comm']==comm and provider_session(pid,rows,manager):
+            tracked.discard((pid,start));releasable.pop((pid,start))
 
 def quiet_window(scan,clock,pause,deadline,seconds=QUIET_SECONDS):
     """Wait, within the deadline, until consecutive scans find no startup work for ``seconds``.
@@ -342,11 +353,14 @@ def quiet_window(scan,clock,pause,deadline,seconds=QUIET_SECONDS):
 
 def qualify_at(state,uid,denied,launcher,probe_pid,expected_manifest,run_probe,rows_reader=process_rows,clock=time.monotonic,pause=time.sleep,manager_reader=lambda rows,left:None):
     """The metadata probe between a quiet startup window and a clean scan, under the bootstrap lock."""
-    deadline=clock()+QUALIFY_SECONDS;seen=None;attempts=0;tracked=set()
+    deadline=clock()+QUALIFY_SECONDS;seen=None;attempts=0;tracked=set();releasable={}
     def scan():
         rows=rows_reader();left=deadline-clock();manager=manager_reader(rows,left) if left>0 else None
-        release_idle_session(tracked,rows,manager)
-        return rows,foreign_startup(rows,launcher,probe_pid,tracked,manager)
+        release_idle_session(tracked,releasable,rows,manager)
+        known=set(tracked);busy=foreign_startup(rows,launcher,probe_pid,tracked,manager)
+        for pid,start in tracked-known:
+            if pid in rows and rows[pid]['start']==start and refused_for_children_only(pid,rows,manager):releasable[(pid,start)]=rows[pid]['comm']
+        return rows,busy
     with bootstrap_lock(state/'bootstrap.lock',uid,denied) as lock:
         before,_=safe_file(state/'toolchain.json',uid,denied,1024*1024)
         need(before['sha256']==expected_manifest,'qualification manifest pin')

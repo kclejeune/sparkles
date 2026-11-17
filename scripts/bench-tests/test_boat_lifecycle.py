@@ -1266,6 +1266,21 @@ class QualificationWait(unittest.TestCase):
         with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[busy,orphan])
         self.assertEqual({x['pid'] for x in caught.exception.unallowed},{99002})
 
+    def test_a_process_renamed_to_the_agent_shell_is_not_released(self):
+        # Review round 16, second pass. A python3 under the agent service is tracked, then
+        # renames itself to bash with the same pid and start; it stays startup work.
+        tree=self.trees['w6-3'][0]
+        busy=self.add(copy.deepcopy(tree),99001,4714,'python3')
+        renamed=copy.deepcopy(busy);renamed[99001]['comm']='bash'
+        self.assertEqual(self.busy('w6-3',renamed),set())
+        with self.assertRaises(self.O['Refusal']) as caught:self.qualify('w6-3',[busy,renamed])
+        self.assertEqual({x['pid'] for x in caught.exception.unallowed},{99001});self.assertEqual(self.probes,[])
+        # A tracked agent shell that renames itself is not released either.
+        child=self.with_child('w6-3',67279);idle=copy.deepcopy(tree);idle[67279]=dict(idle[67279],comm='sudo')
+        with self.assertRaises(self.O['Refusal']):self.qualify('w6-3',[child,idle])
+        # The agent shell itself is released once its child ends.
+        q=self.qualify('w6-3',[child]+[tree]);self.assertEqual(q['qualification_attempts'],1)
+
     def test_no_probe_starts_at_or_after_the_bound(self):
         # Review round 16, finding 2. A slow user-manager query moves a quiet window past
         # the bound; no probe may start then, and each query gets only the time left.
