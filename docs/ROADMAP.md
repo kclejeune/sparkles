@@ -174,7 +174,7 @@ the floor.
 2. The cost of the Horn rules is worked as one piece. It covers the rest of item 693,
    the disjunctive attempt of item 990 that comes before the Horn rules on the Uberon
    files, and what the Horn rules with individuals still derive beyond the EL rules on
-   assertion-heavy files, which items 869 and 1025 follow.
+   assertion-heavy files, which item 1025 follows.
 3. The cost of the EL engine is worked as one piece. It covers the one-thread layout of
    item 722, the warm runs on small files of item 819 and the filter cost of
    `ore_ont_8737` of item 956.
@@ -1096,7 +1096,7 @@ for them.
 
 ## Completed
 
-- **868.** A cheaper witness criterion for Horn runs with individuals is closed without a change, since the worlds it would spare take at most 17.4 ms on any of the 207 files of the ORE 2015 DL development set and 89 ms on all of them, on four threads on the laptop. [F24](specs/F24-owl-classification/SPEC.md#outcome)
+- **868.** A cheaper witness criterion for Horn runs with individuals is closed without a change, since the worlds it would spare take at most 17.4 ms on any of the 204 files of the ORE 2015 DL development set that classify within 120 s and 89 ms on all of them, on four threads on the laptop. [F24](specs/F24-owl-classification/SPEC.md#outcome)
 - **969.** The failed disjunctive attempt on `ore_ont_9663` and `ore_ont_14817` took from 10 s to more than 900 s because a product of the Pred rule enumerated up to 1.4 million choices, of which a few percent gave new unions and under 1% of those were least, and the list lengths at each inference depended on the workers' order. A product that is not ground now forms its unions list after list and keeps only the least ones of each step up to 4,096, charged to the memory budget and counted toward a bound past that, so on four threads on `atlas` the classification of `ore_ont_14817` takes 19.9 to 38.9 s against 59.7 to 79.5 s, and that of `ore_ont_9663` 12.5 to 13.3 s against 14.7 to 44.6 s. Item 990 follows the attempt that still fails. [F24](specs/F24-owl-classification/SPEC.md#outcome)
 - **710.** A generated ontology of 15 axioms with inverse properties, an at-most restriction and nested existential restrictions derived 210 million conclusions in 5.1 s on one thread on `atlas`, since R3 and R5 leave each context many successors whose roles and cores others contain and R5 and R6 counted every one of them with every predecessor. A run of the Horn rules without individuals passes over a successor that another dominates and sends a predecessor each core once, so the ontology derives 2.0 million conclusions in 69 ms, with the same taxonomies on 14,547 generated ontologies. [F24](specs/F24-owl-classification/SPEC.md#the-horn-rules)
 - **980.** The WHERE clause of a SPARQL Update, the queries of SHACL-SPARQL constraints, SPARQL functions and node expressions, and the correlated EXISTS conditions that incremental views evaluate pull an ASK, a LIMIT without ORDER BY and an EXISTS pattern only to the rows they need, as a query does. Their contexts were never shared, so these read their whole input after item 827, and an update that took one row of a product of two 1,000-row patterns produced two million rows where the pulled prefix produces about a thousand. Every caller that executes a plan now shares its context, through query preparation, `Ctx::into_shared` or the public `exec::execute`, and a debug build flags a pull in a context that was never shared. [X14](specs/X14-unified-executor/SPEC.md#outcome)

@@ -235,7 +235,7 @@ activation ends.
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
 timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
-the laptop. Twenty-seven files have witnesses, 1 to 160 of them with 1 to 470 classes
+the laptop, of which 204 classify within its 120 s. Twenty-seven files have witnesses, 1 to 160 of them with 1 to 470 classes
 classified again in a world, and their worlds take 89 ms of the 2,839 ms that the 27
 files classify in, and at most 17.4 ms on one file, `ore_ont_9151`. The item closed
 without a change, since a criterion with an argument of its own would save less than
