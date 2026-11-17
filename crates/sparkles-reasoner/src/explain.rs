@@ -1071,7 +1071,7 @@ pub(crate) fn explain_program(
     program: &crate::ir::Program,
     inputs: &[Id],
     inferred: Option<Id>,
-    generalized: &[Triple],
+    generalized: &[[Vec<u8>; 3]],
     triple: &[Term; 3],
     opts: &ExplainOptions,
 ) -> anyhow::Result<Explained> {
@@ -1091,7 +1091,7 @@ fn program_search(
     program: &crate::ir::Program,
     inputs: &[Id],
     inferred: Option<Id>,
-    generalized: &[Triple],
+    generalized: &[[Vec<u8>; 3]],
     triple: &[Term; 3],
     opts: &ExplainOptions,
 ) -> anyhow::Result<Explained> {
@@ -1101,9 +1101,21 @@ fn program_search(
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
     let mut g = Graph::with_base(base);
     g.set_budget(&budget)?;
-    g.try_add_batch(generalized.iter().copied())?;
     let terms = Terms::new(snap.clone());
     terms.set_budget(&budget)?;
+    // the generalized facts, saved as term keys, in this explanation's terms; the credit
+    // also holds the metadata of the rules below while the search runs
+    let mut held = Held::new(&budget);
+    {
+        held.try_grow(generalized.len() * size_of::<Triple>())?;
+        let id = |k: &[u8]| terms.try_id_for_key(k);
+        let facts = generalized
+            .iter()
+            .map(|k| Ok([id(&k[0])?, id(&k[1])?, id(&k[2])?]))
+            .collect::<Result<Vec<Triple>, crate::budget::BudgetFailure>>()?;
+        g.try_add_batch(facts.into_iter())?;
+        held.shrink(generalized.len() * size_of::<Triple>());
+    }
     let vocab = crate::ir::Vocab::of(&terms);
     let part = program
         .relation_part(&vocab, &budget)
@@ -1114,15 +1126,33 @@ fn program_search(
     let mut lowered = program.lower(&budget)?;
     // the lowered rules of every stratum, with the names of their IR rules' variables;
     // the variables and builtins a lowering adds have none
+    let n: usize = lowered.strata.iter().map(Vec::len).sum();
+    held.try_grow(
+        lowered.strata.len() * size_of::<Vec<usize>>()
+            + n * (size_of::<usize>() + size_of::<CRule>() + size_of::<RuleInfo>()),
+    )?;
     let origins = program.lowered_origins();
-    let mut rules: Vec<CRule> = Vec::new();
-    let mut infos: Vec<RuleInfo> = Vec::new();
+    let mut rules: Vec<CRule> = Vec::with_capacity(n);
+    let mut infos: Vec<RuleInfo> = Vec::with_capacity(n);
     for (stratum, ris) in std::mem::take(&mut lowered.strata)
         .into_iter()
         .zip(&origins)
     {
         for (r, &ri) in stratum.into_iter().zip(ris) {
             let ir = &program.rules[ri];
+            // the names of the variables and builtins, charged before they are made
+            let names = (0..r.nvars.min(ir.nvars))
+                .map(|v| {
+                    ir.vars
+                        .get(v)
+                        .map_or(2 + v.checked_ilog10().unwrap_or(0) as usize, String::len)
+                })
+                .sum::<usize>()
+                + r.builtins
+                    .iter()
+                    .map(|b| b.kind.rule_name().len())
+                    .sum::<usize>();
+            held.try_grow(names + (r.nvars + r.builtins.len()) * size_of::<String>())?;
             let vars = (0..r.nvars)
                 .map(|v| {
                     if v >= ir.nvars {
@@ -1163,9 +1193,18 @@ fn program_search(
             closures: false,
             sampled_planning: false,
             cancel: opts.cancel.clone(),
+            deadline: opts.deadline,
             progress: None,
         };
-        crate::ir::rebuild::rebuild_relations(&mut g, part, &terms, &limits)?;
+        if let Err(e) = crate::ir::rebuild::rebuild_relations(&mut g, part, &terms, &limits) {
+            if opts.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(ExplainBudgetExceeded(
+                    "the explanation passed its timeout".to_string(),
+                )
+                .into());
+            }
+            return Err(e);
+        }
     }
     let rs = RuleSet {
         rules: &rules,

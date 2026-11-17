@@ -913,27 +913,31 @@ fn a_rebuild_and_its_insertion_share_the_limit_of_inferred_facts() {
 }
 
 /// An explanation rebuilds relation facts from the generalized facts of the closure too,
-/// and stops when it is cancelled during the rebuild.
+/// given as term keys, whose local terms it interns again (review p3-r1, finding 1), and
+/// stops when it is cancelled or past its deadline during the rebuild (finding 2).
 #[test]
 fn explanations_rebuild_from_generalized_facts() {
     use crate::explain::{ExplainOptions, Explained, explain_program};
+    use sparkles_core::explain::ExplainBudgetExceeded;
     let v = TV::new();
-    // a literal of the store
-    let lit = v.lits[0];
     let mut rels = Relations::default();
     let r = rels.declare("R", 1, false).unwrap();
+    // `gen` makes a literal the store does not hold, the subject of a generalized fact
     let prog = checked(
         &v,
         rels,
         vec![
             rule(
                 "gen",
-                vec![pos(tri(V(0), v.props[0], V(1)))],
-                vec![head(tri(C(lit), v.props[1], V(1)))],
+                vec![
+                    pos(tri(V(0), v.props[0], V(1))),
+                    bi(B::StrConcat, &[C(v.lits[0]), C(v.lits[1]), V(2)]),
+                ],
+                vec![head(tri(V(2), v.props[1], V(1)))],
             ),
             rule(
                 "rel",
-                vec![pos(tri(C(lit), v.props[1], V(1)))],
+                vec![pos(tri(V(0), v.props[1], V(1))), bi(B::IsLiteral, &[V(0)])],
                 vec![head(rel(r, &[V(1)]))],
             ),
             rule(
@@ -951,32 +955,55 @@ fn explanations_rebuild_from_generalized_facts() {
         .filter(|t| !is_key(t[1]) && !c.terms.valid(t))
         .collect();
     assert_eq!(generalized.len(), 1);
+    assert_eq!(Id(generalized[0][0]).tag(), sparkles_core::id::Tag::Local);
+    let keys: Vec<[Vec<u8>; 3]> = generalized
+        .iter()
+        .map(|t| t.map(|x| c.terms.key_of(x).unwrap()))
+        .collect();
     let (snap, inferred) = write_inferred(&v, &c);
     let term = |x: u64| c.terms.term(x).unwrap();
     let target = [term(v.inds[1]), term(v.props[2]), term(v.inds[1])];
-    let run = |generalized: &[Triple], opts: &ExplainOptions| {
+    let run = |keys: &[[Vec<u8>; 3]], target: &[oxrdf::Term; 3], opts: &ExplainOptions| {
         explain_program(
             snap.clone(),
             &prog,
             &[Id::DEFAULT_GRAPH],
             Some(inferred),
-            generalized,
-            &target,
+            keys,
+            target,
             opts,
         )
     };
     let opts = ExplainOptions::default();
+    let found = run(&keys, &target, &opts).unwrap();
+    assert!(matches!(found, Explained::Found { .. }), "{found:?}");
     assert!(matches!(
-        run(&generalized, &opts).unwrap(),
-        Explained::Found { .. }
+        run(&[], &target, &opts).unwrap(),
+        Explained::NotFound
     ));
-    assert!(matches!(run(&[], &opts).unwrap(), Explained::NotFound));
     let cancelled = ExplainOptions {
         cancel: Some(Arc::new(AtomicBool::new(true))),
         ..Default::default()
     };
-    let e = run(&generalized, &cancelled).unwrap_err();
+    let e = run(&keys, &target, &cancelled).unwrap_err();
     assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+    // a triple the closure lacks, which a search never reaches: only the rebuild can read
+    // the passed deadline
+    let absent = [term(v.inds[0]), term(v.props[2]), term(v.inds[0])];
+    assert!(matches!(
+        run(&keys, &absent, &opts).unwrap(),
+        Explained::NotFound
+    ));
+    let late = ExplainOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..Default::default()
+    };
+    let e = run(&keys, &absent, &late).unwrap_err();
+    assert!(
+        e.downcast_ref::<ExplainBudgetExceeded>()
+            .is_some_and(|b| b.0.contains("timeout")),
+        "{e:#}"
+    );
 }
 
 /// Two facts of one relation never share a node, and a repeated one does.
@@ -1015,4 +1042,138 @@ fn relation_nodes_share_by_their_fact() {
     assert!(!ps[1].shared);
     assert_eq!(ps[2].id, ps[0].id);
     assert!(ps[2].shared);
+}
+
+/// A rebase keeps the tail keys it copies charged until it has interned the moved tails
+/// (review p3-r1, finding 3): the least budget that admits it exceeds the terms it leaves
+/// by at least the copies.
+#[test]
+fn a_rebase_charges_its_copied_tails_until_it_has_moved_them() {
+    use sparkles_core::id::Tag;
+    const N: u64 = 64;
+    let v = TV::new();
+    let mut runs = 0;
+    // a rebase of `N` tails over one local IRI that the store learns, under `limit`: the
+    // number of moved ids, or `None` when the limit refuses the setup or the rebase, and
+    // the bytes used after it. The IRIs differ per run and have equal lengths.
+    let mut run = |limit: Option<usize>| -> (Option<usize>, usize) {
+        runs += 1;
+        let budget = Budget::new(limit);
+        let mut terms = Terms::new(v.store.snapshot());
+        if terms.set_budget(&budget).is_err() {
+            return (None, 0);
+        }
+        let iri = format!("http://ex.org/moved-{runs:04}");
+        let Ok(local) = terms.try_id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+            iri.clone(),
+        ))) else {
+            return (None, 0);
+        };
+        assert_eq!(Id(local).tag(), Tag::Local);
+        for i in 0..N {
+            if terms.try_tail(7, &[local, i + 1, v.inds[0]]).is_err() {
+                return (None, 0);
+            }
+        }
+        // the store learns the IRI through a fact about it
+        let mut txn = v.store.write();
+        let id = txn.intern_key(&sparkles_core::id::iri_key(&iri)).unwrap();
+        txn.insert([id, Id(v.props[1]), Id(v.inds[2]), Id::DEFAULT_GRAPH])
+            .unwrap();
+        txn.commit().unwrap();
+        let got = terms.rebase(v.store.snapshot()).ok().map(|m| m.len());
+        (got, budget.used())
+    };
+    let (got, after) = run(None);
+    assert_eq!(got, Some(1 + N as usize), "the IRI and every tail move");
+    // the least limit that admits the setup and the rebase
+    let (mut lo, mut hi) = (0usize, after * 4);
+    assert!(run(Some(hi)).0.is_some());
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if run(Some(mid)).0.is_some() {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    // a copied key: the tail prefix, the relation and three columns, and its vector entry
+    let copies = N as usize * (3 + 8 * 4 + size_of::<(Vec<u8>, u64)>());
+    assert!(
+        hi >= after + copies,
+        "least limit {hi}, {after} used after the rebase, copies {copies}"
+    );
+}
+
+/// A blank node constant in a relation head is one term of the closure, which a backward
+/// search finds, so the witnesses below it are complete and the same whether the constant
+/// sits among a tuple head's columns (arity 3) or in the triple a relation of arity 2 is
+/// written as (review p3-r1, finding 5, refuted): each is the seed fact.
+#[test]
+fn witnesses_under_a_blank_node_in_a_relation_head_are_complete() {
+    use crate::witness::Witnesses;
+    let v = TV::new();
+    let mut reports = Vec::new();
+    for arity in [3u16, 2] {
+        let t = Terms::new(v.store.snapshot());
+        let blank = t.try_fresh_bnode().unwrap();
+        let mut rels = Relations::default();
+        let r = rels.declare("R", arity, false).unwrap();
+        let (made, read): (Vec<Slot>, Vec<Slot>) = if arity == 3 {
+            (
+                vec![V(0), C(v.inds[0]), C(blank)],
+                vec![V(0), C(v.inds[0]), V(1)],
+            )
+        } else {
+            (vec![V(0), C(blank)], vec![V(0), V(1)])
+        };
+        let prog = Program::new(
+            rels,
+            vec![
+                rule(
+                    "seed",
+                    vec![pos(tri(V(0), v.props[0], V(1)))],
+                    vec![head(rel(r, &made))],
+                ),
+                rule(
+                    "p",
+                    vec![pos(rel(r, &read))],
+                    vec![
+                        head(tri(V(0), v.props[2], V(1))),
+                        head(tri(V(0), v.props[3], V(1))),
+                    ],
+                ),
+            ],
+            &Vocab::of(&t),
+            &unlimited(),
+        )
+        .unwrap();
+        let base: FxHashSet<Triple> = [[v.inds[1], v.props[0], v.inds[2]]].into_iter().collect();
+        let snap = set_default_graph(&v, &base);
+        let b = Base::new(snap, &[Id::DEFAULT_GRAPH]).unwrap();
+        let mut g = Graph::with_base(Arc::new(b));
+        g.set_relations();
+        let mut w = WorkingWarnings::new(&t.budget());
+        engine::run_program(&mut g, &prog, &t, &limits(), &mut w).unwrap();
+        let mut c = Closure::new(g, t).unwrap();
+        let lowered = prog.lower(&unlimited()).unwrap();
+        let w = Witnesses::build(&mut c, &lowered.strata[0], 8, &limits()).unwrap();
+        let below: Vec<Triple> = c
+            .live()
+            .map(|x| x.0)
+            .filter(|t| t[1] == v.props[2] || t[1] == v.props[3])
+            .collect();
+        assert_eq!(below.len(), 2, "arity {arity}");
+        let mut got = BTreeSet::new();
+        for f in below {
+            let ann = w.report_of(&c, &f).unwrap();
+            assert!(!ann.truncated, "arity {arity}, {f:?}: {ann:?}");
+            assert_eq!(ann.witnesses.len(), 1, "arity {arity}: {ann:?}");
+            got.insert(format!("{:?}", ann.witnesses));
+        }
+        // both triples have the seed fact as their one support
+        assert_eq!(got.len(), 1, "arity {arity}: {got:?}");
+        reports.push(got);
+    }
+    assert_eq!(reports[0], reports[1]);
 }

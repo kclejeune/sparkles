@@ -630,6 +630,7 @@ impl Session {
             max_iterations: self.shared.max_iterations,
             max_inferred: max - derived,
             cancel: Some(flag.clone()),
+            deadline: None,
             progress: None,
             budget: self.budget.clone(),
             closures: false,

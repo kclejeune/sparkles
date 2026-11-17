@@ -823,7 +823,9 @@ impl Terms {
         if moved.is_empty() {
             return Ok(());
         }
-        let hit: Vec<(Vec<u8>, u64)> = {
+        // the copied keys stay charged until the loop below has consumed them, while it
+        // interns the new tails beside them
+        let (hit, held): (Vec<(Vec<u8>, u64)>, Held) = {
             let l = self.locals.read().unwrap();
             let tails = l.map.iter().filter(|(k, _)| k.starts_with(TAIL));
             let hit = tails.filter(|(k, _)| {
@@ -836,8 +838,8 @@ impl Terms {
             let n = hit.clone().count();
             let bytes =
                 hit.clone().map(|(k, _)| k.len()).sum::<usize>() + n * size_of::<(Vec<u8>, u64)>();
-            let _held = Held::try_new_exact(&self.budget(), bytes)?;
-            hit.map(|(k, &h)| (k.clone(), h)).collect()
+            let held = Held::try_new_exact(&self.budget(), bytes)?;
+            (hit.map(|(k, &h)| (k.clone(), h)).collect(), held)
         };
         let mut freed = 0;
         for (key, old) in hit {
@@ -855,6 +857,7 @@ impl Terms {
             freed += key.len();
             moved.insert(old, new);
         }
+        drop(held);
         self.release(freed);
         Ok(())
     }

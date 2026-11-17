@@ -1141,6 +1141,7 @@ impl<'a> Program for TierProgram<'a> {
                         max_iterations: limits.max_iterations,
                         max_inferred: limits.max_inferred.saturating_sub(facts),
                         cancel: limits.cancel.clone(),
+                        deadline: limits.deadline,
                         progress: limits.progress.clone(),
                         budget: limits.budget.clone(),
                         closures: limits.closures,
@@ -2476,6 +2477,7 @@ pub(crate) mod tests {
             closures: false,
             sampled_planning: false,
             cancel: None,
+            deadline: None,
             progress: None,
         }
     }

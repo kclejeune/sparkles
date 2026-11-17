@@ -1795,6 +1795,10 @@ pub(crate) struct Limits {
     pub max_iterations: usize,
     pub max_inferred: usize,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// stop the run, as a cancel does, once this passes: a full run reads it with the
+    /// cancel flag between iterations and inside its evaluations, and an evaluation it
+    /// stops fails the run rather than ending an iteration early
+    pub deadline: Option<std::time::Instant>,
     pub progress: Option<crate::ProgressFn>,
     /// the run's memory, against [`crate::ReasonOptions::max_memory`]
     pub budget: Arc<Budget>,
@@ -1804,6 +1808,31 @@ pub(crate) struct Limits {
     /// order rule bodies from sampled bindings ([`sampled`]) where the sample makes an
     /// order clearly cheaper than the greedy one
     pub sampled_planning: bool,
+}
+
+impl Limits {
+    /// Whether the run is cancelled or past its deadline.
+    pub(crate) fn stopped(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+            || self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+    }
+
+    /// The error of a run that [`stopped`](Self::stopped).
+    pub(crate) fn stop_error(&self) -> anyhow::Error {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            anyhow::anyhow!("reasoning cancelled")
+        } else {
+            anyhow::anyhow!("reasoning passed its deadline")
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1935,6 +1964,7 @@ fn split_at<'g>(
                 Mode::New,
                 &limits.budget,
             );
+            ev.set_deadline(limits.deadline);
             ev.collect_at = Some((d, MAX_SPLIT_BINDINGS));
             let mut b = vec![0u64; r.nvars];
             ev.run(0, &mut b, f.clone());
@@ -2343,12 +2373,8 @@ pub(crate) fn run_program(
                 if rules.is_empty() {
                     continue;
                 }
-                if limits
-                    .cancel
-                    .as_ref()
-                    .is_some_and(|c| c.load(Ordering::Relaxed))
-                {
-                    anyhow::bail!("reasoning cancelled");
+                if limits.stopped() {
+                    return Err(limits.stop_error());
                 }
                 let origin = Origin {
                     base_len: Some(base_len),
@@ -2403,12 +2429,8 @@ pub(crate) fn run_from(
         note(here);
     }
     let abort = AtomicBool::new(false);
-    let cancelled = || {
-        limits
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed))
-    };
+    // the deadline among them, so an evaluation it stopped never ends an iteration
+    let cancelled = || limits.stopped();
     let mut iteration = origin.iterations;
     let (mut ds, mut de) = (start.unwrap_or(0).min(here), here);
     // the run's first iteration, which is naive without a start
@@ -2437,7 +2459,7 @@ pub(crate) fn run_from(
         // their runs with older ones while the iteration reads them
         g.set_compaction_floor(ds);
         if cancelled() {
-            anyhow::bail!("reasoning cancelled");
+            return Err(limits.stop_error());
         }
         if iteration >= limits.max_iterations {
             anyhow::bail!(
@@ -2653,6 +2675,7 @@ pub(crate) fn run_from(
                     Mode::New,
                     &limits.budget,
                 );
+                ev.set_deadline(limits.deadline);
                 // Facts are immutable until the merge, so this is the same
                 // replay classification used for planning and work splitting.
                 // a replay for list cells fires every instance it finds, since a list
@@ -2757,7 +2780,7 @@ pub(crate) fn run_from(
                 })
         };
         if cancelled() {
-            anyhow::bail!("reasoning cancelled");
+            return Err(limits.stop_error());
         }
         let candidates = produced.load(Ordering::Relaxed);
         if candidates > max_out {
@@ -3082,6 +3105,7 @@ mod tests {
                         max_iterations: 10,
                         max_inferred: 10_000,
                         cancel: None,
+                        deadline: None,
                         progress: None,
                         budget: Budget::unlimited(),
                         closures: false,

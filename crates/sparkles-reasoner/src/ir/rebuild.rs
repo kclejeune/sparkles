@@ -9,8 +9,8 @@
 //! fixpoint over complete inputs is unique. Its strata coarsen the program's, which is
 //! valid, since a subgraph of a stratified dependency graph stratifies.
 
-use super::{Head, Pred, Program, ProgramError, Vocab};
-use crate::budget::{Budget, WorkingWarnings};
+use super::{Head, Pred, Program, ProgramError, Rule, Vocab};
+use crate::budget::{Budget, Held, WorkingWarnings};
 use crate::builtins::BuiltinKind;
 use crate::engine::{self, CHead, CRule, Limits, Slot};
 use crate::graph::Graph;
@@ -24,17 +24,24 @@ impl Program {
         vocab: &Vocab,
         budget: &Arc<Budget>,
     ) -> Result<Option<Program>, ProgramError> {
-        let mut rules = Vec::new();
+        let is_rel = |h: &Head| matches!(h, Head::Atom(a) if matches!(a.pred, Pred::Rel(_)));
+        // the copy is charged before it is made: the catalog, and each rule with its
+        // vector entry, which bounds its copy with fewer heads
+        let mut held = Held::new(budget);
+        held.try_grow(self.relations.bytes())?;
+        let n = self
+            .rules
+            .iter()
+            .filter(|r| r.head.iter().any(is_rel))
+            .count();
+        held.try_grow(n * size_of::<Rule>())?;
+        let mut rules = Vec::with_capacity(n);
         for r in &self.rules {
-            let head: Vec<Head> = r
-                .head
-                .iter()
-                .filter(|h| matches!(h, Head::Atom(a) if matches!(a.pred, Pred::Rel(_))))
-                .cloned()
-                .collect();
-            if head.is_empty() {
+            if !r.head.iter().any(is_rel) {
                 continue;
             }
+            held.try_grow(r.bytes())?;
+            let head: Vec<Head> = r.head.iter().filter(|h| is_rel(h)).cloned().collect();
             let mut part = r.clone();
             part.head = head;
             let in_head = |v: usize| {
@@ -49,7 +56,11 @@ impl Program {
         if rules.is_empty() {
             return Ok(None);
         }
-        Program::new(self.relations.clone(), rules, vocab, budget).map(Some)
+        let relations = self.relations.clone();
+        // `Program::new` charges the copy before it allocates anything, so the credit
+        // passes to it with no allocation between
+        drop(held);
+        Program::new(relations, rules, vocab, budget).map(Some)
     }
 }
 
@@ -57,22 +68,32 @@ impl Program {
 /// `makeTemp`, `makeSkolem` or a blank node constant in a head, a tuple head's columns
 /// included.
 pub(crate) fn makes_terms(r: &CRule, terms: &Terms) -> bool {
-    let local_bnode = |s: &Slot| match *s {
+    r.builtins
+        .iter()
+        .any(|b| matches!(b.kind, BuiltinKind::MakeTemp | BuiltinKind::MakeSkolem))
+        || blank_columns(r, terms)
+        || r.head.iter().any(|h| match h {
+            CHead::Triple(s, p, o) => [s, p, o].into_iter().any(|s| local_bnode(s, terms)),
+            CHead::Action(..) => false,
+        })
+}
+
+/// Whether a tuple head of lowered rule `r`, a relation head of arity 3 or more, holds a
+/// local blank node constant among its columns.
+pub(crate) fn blank_columns(r: &CRule, terms: &Terms) -> bool {
+    r.builtins.iter().any(|b| {
+        b.kind == BuiltinKind::RelTuple && b.args[2..].iter().any(|s| local_bnode(s, terms))
+    })
+}
+
+fn local_bnode(s: &Slot, terms: &Terms) -> bool {
+    match *s {
         Slot::Const(c) => {
             sparkles_core::id::Id(c).tag() == sparkles_core::id::Tag::Local
                 && terms.kind(c) == Kind::BNode
         }
         _ => false,
-    };
-    r.builtins.iter().any(|b| match b.kind {
-        BuiltinKind::MakeTemp | BuiltinKind::MakeSkolem => true,
-        // the columns of a relation head of arity 3 or more
-        BuiltinKind::RelTuple => b.args[2..].iter().any(local_bnode),
-        _ => false,
-    }) || r.head.iter().any(|h| match h {
-        CHead::Triple(s, p, o) => [s, p, o].into_iter().any(local_bnode),
-        CHead::Action(..) => false,
-    })
+    }
 }
 
 /// Add to `g`, whose triples are a complete closure, the relation facts of `part`, a

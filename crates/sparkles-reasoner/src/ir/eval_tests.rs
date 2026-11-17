@@ -34,6 +34,7 @@ fn limits() -> Limits {
         closures: false,
         sampled_planning: false,
         cancel: None,
+        deadline: None,
         progress: None,
     }
 }
