@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# gen.sh BIN OUT: the Tier D attempts' derived conclusions on the 3,000 generated files with a union
+G=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/gen
+export B=$1
+cd $G && ls dfiles | xargs -P 4 -I{} sh -c 'r=$(SPARKLES_DIAG990=1 timeout 30 $B --threads 1 dfiles/{} 2>&1 >/dev/null | grep -E "^D990[SFH]" | head -2 | tr "\n" " "); echo "{} $r"' > $2
+echo GEN-DONE >> $2

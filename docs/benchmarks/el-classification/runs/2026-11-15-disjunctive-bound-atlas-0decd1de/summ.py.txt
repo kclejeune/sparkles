@@ -1,0 +1,26 @@
+# summ.py DIR: medians of the classifications of each side, file and thread count of timing.sh, the
+# ratio of the medians, the range of the rounds' ratios, and the failing files' times
+import json, glob, os, re, sys, statistics as st, collections
+d = sys.argv[1]
+ms = collections.defaultdict(list); rounds = collections.defaultdict(dict); sha = collections.defaultdict(set)
+for l in open(os.path.join(d, 'log.txt')):
+    m = re.match(r'(\S+) status=(\d+) wall_ms=(\d+) sha=(\S+)', l)
+    if not m: continue
+    name, stt, wall, h = m.groups()
+    p = name.split('.')
+    r, side, f, t = p[0], p[1], p[2], p[3]
+    sha[(f, t)].add(h)
+    try: j = json.loads([x for x in open(os.path.join(d, name + '.json')) if x.startswith('{')][-1])
+    except Exception: j = None
+    if r.startswith('dl'):
+        print(f, t, side, r, 'status', stt, 'wall_s', round(int(wall)/1000, 1), 'attemptOver', j and j.get('dlAttemptOver'), 'dlOver', j and j.get('dlOverBudget'))
+        continue
+    ms[(f, t, side)] += j['classifyMs']
+    rounds[(f, t, r)][side] = st.median(j['classifyMs'])
+print('file threads base_ms tip_ms ratio round_range')
+for (f, t, side) in sorted(ms):
+    if side != 'base': continue
+    b = st.median(ms[(f, t, 'base')]); x = st.median(ms[(f, t, 'tip')])
+    rr = [v['tip'] / v['base'] for (ff, tt, r), v in rounds.items() if ff == f and tt == t and len(v) == 2]
+    print(f, t, round(b, 2), round(x, 2), round(x / b, 3), round(min(rr), 3), round(max(rr), 3))
+print('hash sets with more than one value:', {k: v for k, v in sha.items() if len(v) > 1})

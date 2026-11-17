@@ -251,7 +251,17 @@ dl897 fixtures derive at most 5,700, all within the floor. The bound keeps the d
 without steps, since on eight threads on the laptop the steps made the attempts of
 ore_ont_5438, ore_ont_13103 and ore_ont_16680 1.7 to 1.9 times slower, which item 950
 follows. Near the bound a schedule can therefore decide whether a run on several threads
-answers in full. @@ATLAS@@ A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015
+answers in full. On `atlas` on four threads three classifications of each build took
+7.5 to 8.8 s on ore_ont_9663 against 12.3 to 20.6 s, 7.9 to 11.3 s on ore_ont_14817 against
+10.1 to 30.3 s and 4.4 to 4.6 s on ore_ont_3215 against 110 to 138 s, whose peak resident
+set fell from about 7.7 GiB to about 2 GiB, with the same taxonomies. On one thread ore_ont_14817 took
+57.7 s against 345 s and ore_ont_3215 13.6 s against 628 s, and ore_ont_9663 took 74.5 s
+where the base passed the 900 s timeout. Of the 12 files whose attempt finishes,
+ore_ont_10140, ore_ont_6952 and ore_ont_11460 classify 1.10 to 1.15 times slower than the
+base on one thread and 1.06 to 1.10 on four, all of it in the saturation outside the
+attempt's tests, and the others within 3% of the base apart from four files of under 10 ms
+whose rounds vary. On `wally` the same build with the bound turned off was as slow, so the
+check of the bound is not the cost, and item 1012 follows it. A sweep on the laptop classified GO, ChEBI lite, the 298 ORE 2015
 EL files and the 207 DL development files once per build on one and eight threads. The
 993 pairs that both builds classified gave the same taxonomy bytes, and no file changed
 its tier. On one thread the base passed the 900 s timeout on ore_ont_9663, which this

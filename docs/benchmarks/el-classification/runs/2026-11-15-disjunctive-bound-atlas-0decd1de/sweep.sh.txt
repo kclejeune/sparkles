@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# sweep.sh TIP: taxonomies of bin/base and bin/TIP over GO, ChEBI lite, the 298 ORE EL files and
+# the 207 DL development files, on 1 and 8 threads, three processes at a time. Lines go to
+# sweep/log-TIP.txt: name threads side exit sha [ms, tier, dlWork, dlOverBudget, dlAttemptOver, outside].
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/disjunctive-stop-990/.artifacts/lanes/disjunctive-stop-990
+EL=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/el-files
+DEV=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+D753=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/incremental-dl-753/.artifacts/lanes/incremental-dl-753/data
+export L TIP=$1 O=$L/sweep/out; mkdir -p $O
+export LOG=$L/sweep/log-$1.txt
+{ echo $D753/go.ofn; echo $D753/chebi_lite.ofn; ls $EL/*; ls $DEV/*; } | while read f; do for t in 1 8; do for s in base $1; do echo "$f $t $s"; done; done; done |
+xargs -P 3 -L 1 sh -c '
+f=$0; t=$1; s=$2; n=$(basename $f); n=${n%.*}
+timeout 900 $L/bin/$s --threads $t --taxonomy $O/$n.$s.t$t.tax $f > $O/$n.$s.t$t.json 2> $O/$n.$s.t$t.err
+st=$?
+sha=$(LC_ALL=C sort $O/$n.$s.t$t.tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $O/$n.$s.t$t.tax
+echo "$n $t $s $st $sha $(grep "^{" $O/$n.$s.t$t.json | jq -c "[.classifyMs[0],.tier,.dlWork,.dlOverBudget,.dlAttemptOver,.outside]")" >> $LOG'
+echo SWEEP-DONE >> $LOG

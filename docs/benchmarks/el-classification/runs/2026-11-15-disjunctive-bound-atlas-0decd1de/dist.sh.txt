@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# dist.sh BIN THREADS TAG: Tier D attempts' derived conclusions (diag990 build) and the EL-only
+# saturation of the files that try Tier D. Output in dist/TAG/.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/disjunctive-stop-990/.artifacts/lanes/disjunctive-stop-990
+DEV=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+bin=$L/bin/$1; t=$2; O=$L/dist/$3; mkdir -p $O
+files="${FILES:-ore_ont_4897 ore_ont_5940 ore_ont_6423 ore_ont_6485 ore_ont_12141 ore_ont_15491 ore_ont_5438 ore_ont_13103 ore_ont_16680 ore_ont_6952 ore_ont_10140 ore_ont_11460 ore_ont_9663 ore_ont_14817 ore_ont_3215}"
+for n in $files; do
+  f=$(ls $DEV/$n.* | head -1)
+  SPARKLES_DIAG990=1 timeout ${TMO:-900} $bin --threads $t $f > $O/$n.json 2> $O/$n.err
+  echo "$n exit=$? $(grep -E '^D990[SFH]' $O/$n.err | head -3 | tr '\n' ' ')" >> $O/log.txt
+  if [ -n "${ELONLY:-}" ]; then
+    timeout 900 $bin --el-only --threads $t $f > $O/$n.el.json 2>/dev/null
+    echo "$n el $(jq -c '[.conclusions,.contexts,.classes,.classifyMedianMs]' $O/$n.el.json)" >> $O/log.txt
+  fi
+done
+echo DIST-DONE >> $O/log.txt

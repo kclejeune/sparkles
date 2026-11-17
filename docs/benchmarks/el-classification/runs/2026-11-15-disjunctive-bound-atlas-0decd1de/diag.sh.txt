@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# diag.sh: whether the slowdown of the large finishing files comes from the active bound
+# (tip with --dl-attempt-work 0 against tip and base), three interleaved rounds, one thread
+set -u
+D=$HOME/lanes/disjunctive-stop-990
+F=$D/files
+OUT=$D/out/diag; mkdir -p $OUT; : > $OUT/log.txt
+for round in 1 2 3; do
+  for n in 10140 6952 11460; do
+    for v in base tip tip0; do
+      b=$v; extra=""; [ $v = tip0 ] && { b=tip; extra="--dl-attempt-work 0"; }
+      systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+        timeout 300 $D/bin/$b --threads 1 --repeat 5 $extra $F/ore_ont_$n.owl > $OUT/r$round.$v.$n.json 2> $OUT/r$round.$v.$n.err
+      echo "r$round.$v.$n status=$?" >> $OUT/log.txt
+    done
+  done
+done
+echo DIAG-DONE >> $OUT/log.txt

@@ -1,0 +1,68 @@
+diff --git a/crates/sparkles-owl/src/classify/dl_rules.rs b/crates/sparkles-owl/src/classify/dl_rules.rs
+index 55086dee..caaa76fe 100644
+--- a/crates/sparkles-owl/src/classify/dl_rules.rs
++++ b/crates/sparkles-owl/src/classify/dl_rules.rs
+@@ -571,7 +571,13 @@ impl DlRun {
+     }
+     /// Counts `n` derived conclusions.
+     pub(super) fn count(&self, n: usize) {
+-        self.work.fetch_add(n, Ordering::Relaxed);
++        let old = self.work.fetch_add(n, Ordering::Relaxed);
++        if diag990() {
++            let new = old + n;
++            if new > 0 && (old == 0 || new.ilog2() > old.ilog2()) {
++                eprintln!("D990W {} {}", new, diag990_ms());
++            }
++        }
+     }
+     /// Whether `n` conclusions alone are more than the run's bound, and marks the run
+     /// past its bound when they are.
+@@ -3580,3 +3586,12 @@ mod tests {
+         assert_eq!(run.work(), 100);
+     }
+ }
++
++pub(crate) fn diag990() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("SPARKLES_DIAG990").is_some())
++}
++pub(crate) fn diag990_ms() -> u128 {
++    static START: OnceLock<std::time::Instant> = OnceLock::new();
++    START.get_or_init(std::time::Instant::now).elapsed().as_millis()
++}
+diff --git a/crates/sparkles-owl/src/classify/mod.rs b/crates/sparkles-owl/src/classify/mod.rs
+index ffdd087a..d756d382 100644
+--- a/crates/sparkles-owl/src/classify/mod.rs
++++ b/crates/sparkles-owl/src/classify/mod.rs
+@@ -2156,7 +2156,10 @@ impl Saturation {
+                 halted = Some(stopped(s));
+                 t
+             }
+-            (_, Some(s)) => {
++            (t, Some(s)) => {
++                if dl_rules::diag990() {
++                    eprintln!("D990S {:?} work={} applied={} classes={} n={} ms={}", s, dl_run.as_ref().map_or(0, |d| d.work()), t.conclusions, ax.classes.len(), n, dl_rules::diag990_ms());
++                }
+                 self.dl_worked
+                     .store(matches!(s, Stop::Work { .. }), Ordering::Relaxed);
+                 #[cfg(test)]
+@@ -2286,6 +2289,9 @@ impl Saturation {
+         if over_work {
+             PASSED_AT.with(|p| p.set(dl_run.as_ref().map_or(0, |d| d.work())));
+         }
++        if dl_rules::diag990() && halted.is_some() {
++            eprintln!("D990H {:?} work={} applied={} classes={} n={} ms={}", halted, dl_run.as_ref().map_or(0, |d| d.work()), totals.conclusions, ax.classes.len(), n, dl_rules::diag990_ms());
++        }
+         if (!partial || over_work)
+             && let Some(h) = halted.take()
+         {
+@@ -2507,6 +2513,9 @@ impl Saturation {
+                 }
+             }
+             stats.dl_work = d.work();
++            if dl_rules::diag990() {
++                eprintln!("D990F work={} applied={} classes={} n={} ms={}", d.work(), totals.conclusions, ax.classes.len(), n, dl_rules::diag990_ms());
++            }
+             if open.is_some() {
+                 // A partial answer has taken its record, and the next run starts again,
+                 // so the clause stores and the clause table go before its taxonomy.

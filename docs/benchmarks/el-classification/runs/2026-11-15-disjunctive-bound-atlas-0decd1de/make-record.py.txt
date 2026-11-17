@@ -1,0 +1,64 @@
+# make-record.py LANE DEST: builds the benchmark record of item 990 from the atlas timing outputs,
+# the laptop's distribution of the attempts' conclusions and the laptop's taxonomy sweep
+import json, sys, os, glob
+lane, dest = sys.argv[1], sys.argv[2]
+keep = ['classifyMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
+        'dlAttemptOver', 'dlWork', 'dlContexts', 'dlStored', 'outside', 'conclusions', 'contexts', 'classes',
+        'peakEstimatedBytes', 'peakRssKib', 'threads']
+def rep(p):
+    try: return json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: return None
+def runs(root, pattern):
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, pattern), recursive=True)):
+        d = rep(p)
+        out.append({'path': os.path.relpath(p, root), 'report': {k: d.get(k) for k in keep} if d else None})
+    return out
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+def diag(root):
+    out = {}
+    for p in sorted(glob.glob(os.path.join(root, '*.err'))):
+        n = os.path.basename(p)[:-4]
+        out[n] = [l.rstrip('\n') for l in open(p) if l.startswith('D990')]
+    return out
+a = os.path.join(lane, 'atlas', 'timing')
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'ORE 2015 DL development files whose disjunctive attempt finishes (ore_ont_4897, 5940, 6423, 6485, 12141, 15491, 5438, 13103, 16680, 6952, 10140, 11460) and whose attempt passed its memory budget (ore_ont_9663, 14817, 3215) on atlas; the attempts conclusions on the laptop with the EL rules alone, the 2,166 valid generated ontologies with a union of item 969 and the dl603 and dl897 fixtures; and a taxonomy sweep of GO, ChEBI lite, 298 ORE 2015 EL files and 207 DL development files on the laptop',
+  'host': {'name': 'atlas', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+  'manifest': {
+    'sides': {'base': 'a370d073, whose code is that of 37f4db81, the lane base (item 693 lane tip, in batch 26)',
+              'tip': 'the working tree of d02e004c before its last comment edits and before the restart path of a kept run reset dl_worked, which no fresh run reaches; commits dd75b39f and 2d5e7c51 change tests and comments only'},
+    'build': 'mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas',
+    'binaries_sha256': {},
+    'diag_build': 'a build of 37f4db81 with a diagnostic patch (diag990.patch.txt) that prints the attempts derived conclusions at each power of two with the time, and at the end or stop of the saturation',
+    'scripts': ['timing.sh.txt', 'dist.sh.txt', 'gen.sh.txt', 'ab.sh.txt', 'sweep.sh.txt', 'cmp.py.txt', 'make-record.py.txt', 'diag990.patch.txt', 'diag.sh.txt', 'diag-summ.py.txt']},
+  'settings': {'threads': 'one and four on atlas, one and eight on the laptop',
+               'scope': 'one process per run in a 13 GiB systemd scope without swap on atlas; on the laptop one 12 GiB scope for the distribution runs and one 14 GiB scope for three sweep processes at a time',
+               'lock': 'the atlas runs held ~/lanes/.heavy.lock, which the benchmarks and gates on the host take, and the load averages at the start and the end of the timing are in before.txt and after.txt; the wally runs held that host\'s ~/lanes/.heavy.lock'},
+  'method': 'timing.sh ran three rounds of alternating order of base and tip, one process per side, file and thread count with --repeat 5, on the files whose attempt finishes, then three rounds of alternating order on four threads and one round on one thread of the files whose attempt passed its memory budget, with wall times and taxonomy hashes. dist.sh ran the diagnostic build of the base on the files that attempt the disjunctive rules on one and eight threads, and with --el-only on eight threads. gen.sh ran it on the generated ontologies on one thread with a 30 s timeout. ab.sh ran base and a build with the bound in steps (tip1) on eight threads on the laptop. The sweep classified each file once per side and thread count with its taxonomy on the laptop and compared the sorted taxonomies hashes.',
+  'timing': runs(a, '*.json'),
+  'wally_bound_off': {
+    'host': 'wally, Intel Core i7-12800H, 20 CPUs, 31 GiB',
+    'method': 'diag.sh ran three rounds of base, tip and tip with --dl-attempt-work 0 (tip0) on ore_ont_10140, ore_ont_6952 and ore_ont_11460 on one thread with --repeat 5, one process per side and file, the same binaries as on atlas, in a 13 GiB scope without swap',
+    'runs': runs(os.path.join(lane, 'wally', 'diag'), '*.json'),
+    'log': text(os.path.join(lane, 'wally', 'diag', 'log.txt'))},
+  'timing_log': text(os.path.join(a, 'log.txt')),
+  'hosts': {p: text(os.path.join(a, p)) for p in ['before.txt', 'after.txt']},
+  'laptop': {
+    'host': 'stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB',
+    'distribution_t8': {'log': text(os.path.join(lane, 'dist/t8/log.txt')), 'diag': diag(os.path.join(lane, 'dist/t8'))},
+    'distribution_t1': {'log': text(os.path.join(lane, 'dist/t1/log.txt')), 'diag': diag(os.path.join(lane, 'dist/t1'))},
+    'generated': text(os.path.join(lane, 'dist/gen.txt')),
+    'fixtures': text(os.path.join(lane, 'dist/fixtures.txt')),
+    'steps_ab_t8': text(os.path.join(lane, 'dist/ab-t8a.txt')),
+    'sweep': text(os.path.join(lane, 'sweep/log-tip2.txt')),
+  },
+}
+for k in ['base', 'tip']:
+    p = os.path.join(lane, 'atlas', k + '.sha256')
+    if os.path.exists(p): rec['manifest']['binaries_sha256'][k] = open(p).read().split()[0]
+os.makedirs(dest, exist_ok=True)
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']))

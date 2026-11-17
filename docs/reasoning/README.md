@@ -964,9 +964,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the EL rules' time, since each context of a conjunction derives its successor's
   subsumers again. Roadmap item 693.
 * The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
-  passes its bound on derived conclusions before the Horn rules answer. @@ATLASG@@
-  Konclude 0.7.0 classifies them in 8.9 to 9.7 s on four threads on the laptop. Roadmap
-  items 693 and 1011.
+  passes its bound on derived conclusions before the Horn rules answer. On four threads on
+  `atlas` the bound ends the attempt so that `ore_ont_9663` classifies in 7.5 to 8.8 s and
+  `ore_ont_14817` in 7.9 to 11.3 s. Konclude 0.7.0 classifies them in 8.9 to 9.7 s on four
+  threads on the laptop. Roadmap items 693 and 1011.
+* Three large ORE 2015 DL files whose disjunctive attempt finishes, `ore_ont_10140`,
+  `ore_ont_6952` and `ore_ont_11460`, classify 1.06 to 1.15 times slower in the EL part of
+  their saturation with the build that bounds the attempt, and as slow with the bound
+  turned off. Roadmap item 1012.
 * Horn ontologies whose successors no other successor dominates classify up to 6% slower
   than without the check for dominated successors, which costs more there than it saves.
   Roadmap item 991.

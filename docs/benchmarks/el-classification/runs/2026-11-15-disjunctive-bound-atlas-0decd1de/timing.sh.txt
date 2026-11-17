@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# timing.sh: base (a370d073, the code of 37f4db81) against the item 990 build on the files whose
+# disjunctive attempt finishes, in interleaved rounds of five classifications per process, and on
+# the files whose attempt fails, three single classifications on four threads and one on one
+# thread. Each run writes its taxonomy's hash. The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/disjunctive-stop-990
+F=$HOME/lanes/horn-budget-962/files
+OUT=$D/out/timing; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/base $D/bin/tip; } > $OUT/before.txt
+run() { # tag file threads repeat outname timeout
+  local s=$(date +%s%N)
+  systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    timeout $6 $D/bin/$1 --threads $3 --repeat $4 --taxonomy $OUT/$5.tax $2 > $OUT/$5.json 2> $OUT/$5.err
+  local st=$? w=$(( ($(date +%s%N) - s) / 1000000 ))
+  local sha=$(LC_ALL=C sort $OUT/$5.tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $OUT/$5.tax
+  echo "$5 status=$st wall_ms=$w sha=$sha" >> $OUT/log.txt
+}
+fin="4897 5940 6423 6485 12141 15491 5438 13103 16680 6952 10140 11460"
+for round in 1 2 3; do
+  order="base tip"; [ $((round % 2)) -eq 0 ] && order="tip base"
+  for n in $fin; do for t in 1 4; do for tag in $order; do
+    run $tag $F/ore_ont_$n.owl $t 5 r$round.$tag.ore_ont_$n.t$t 900
+  done; done; done
+done
+for round in 1 2 3; do
+  order="base tip"; [ $((round % 2)) -eq 0 ] && order="tip base"
+  for n in 9663 14817 3215; do for tag in $order; do
+    run $tag $F/ore_ont_$n.owl 4 1 dl$round.$tag.ore_ont_$n.t4 900
+  done; done
+done
+for n in 9663 14817 3215; do for tag in tip base; do
+  run $tag $F/ore_ont_$n.owl 1 1 dl1.$tag.ore_ont_$n.t1 900
+done; done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

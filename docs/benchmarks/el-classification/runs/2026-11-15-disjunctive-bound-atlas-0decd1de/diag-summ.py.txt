@@ -1,0 +1,17 @@
+# diag-summ.py DIR: medians of the one-thread classifications of base, tip and tip with
+# --dl-attempt-work 0 (tip0) from diag.sh, per file, with the saturation times
+import json, glob, os, sys, statistics as st, collections
+d = sys.argv[1]
+ms = collections.defaultdict(list); sat = collections.defaultdict(list)
+for p in glob.glob(os.path.join(d, 'r*.json')):
+    r, v, n = os.path.basename(p)[:-5].split('.')
+    try: j = json.loads([l for l in open(p) if l.startswith('{')][-1])
+    except Exception: continue
+    ms[(n, v)] += j['classifyMs']; sat[(n, v)].append(j['saturationMs'])
+for n in sorted({k[0] for k in ms}):
+    b = st.median(ms[(n, 'base')]) if ms[(n, 'base')] else None
+    row = [n]
+    for v in ['base', 'tip', 'tip0']:
+        if ms[(n, v)]:
+            m = st.median(ms[(n, v)]); row.append(f'{v} {m:.1f} ms ({m / b:.3f}) sat {st.median(sat[(n, v)]):.1f} n={len(ms[(n, v)])}')
+    print(' | '.join(row))
