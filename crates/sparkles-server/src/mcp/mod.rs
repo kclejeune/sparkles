@@ -158,6 +158,7 @@ pub struct McpArgs {
     /// Offer only the tools of this profile: all (the default), explore, memory or
     /// admin (repeatable; with --tools, the tools of both)
     #[arg(long, visible_alias = "mcp-profile", value_name = "NAME")]
+    #[cfg_attr(feature = "auth", arg(conflicts_with = "url"))]
     pub profile: Vec<String>,
     /// Offer only these tools, separated by commas (repeatable; with --profile, the
     /// tools of both)
@@ -167,6 +168,7 @@ pub struct McpArgs {
         value_name = "NAME,...",
         value_delimiter = ','
     )]
+    #[cfg_attr(feature = "auth", arg(conflicts_with = "url"))]
     pub tools: Vec<String>,
     /// Do not offer the datasets' stored queries as tools
     #[arg(long)]

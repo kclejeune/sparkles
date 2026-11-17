@@ -1787,8 +1787,9 @@ The code is in `crates/sparkles-server/src/mcp/semantic.rs`.
 
 * The tool takes `query`, an optional embedding `predicate`, `limit` (10, at most 100),
   `withLabels` and the common snapshot and reasoning arguments. Without `predicate` it
-  uses the first vector index by name whose embedding provider embeds query text, as
-  `recall` does. The provider is the index's own, a local model of F12 or a remote
+  uses the first vector index by name whose embedding provider embeds query text and
+  whose vectors the caller can read. An index on a predicate that the caller's view
+  hides counts as absent, so the tool never names it. The provider is the index's own, a local model of F12 or a remote
   endpoint, and the request goes through the outbound policy and the index's cache.
 * With a full-text index, the query's words, without function words, rank by BM25 and the
   embedding ranks by cosine, each 50 deep over every graph of the view and reduced to
@@ -1803,9 +1804,16 @@ The code is in `crates/sparkles-server/src/mcp/semantic.rs`.
 * A dataset without an index that embeds query text, or a `predicate` without one, gives
   `no-embedder` (400) with a hint toward `search_text` and `similar_entities`. A provider
   failure gives `embedding-failed` (502) instead of a silent fallback to text.
-* `memory_tests.rs` checks the hybrid ranking with a mock provider, the provider's input,
-  an explicit predicate without an embedder, a failing provider and the refusal without
-  an embedder.
+* The tool is marked open-world, because the query text goes to the index's provider,
+  which may be a remote service, under the outbound policy.
+* The provider call runs under the index's timeout and retries rather than the call's
+  deadline, which item 1030 changes for every search that embeds text. With
+  `reasoning: false` the inferred graph is filtered after each search's limit, which
+  item 1031 changes for the memory search helpers.
+* `memory_tests.rs` checks the hybrid ranking and its fused scores with a mock
+  provider, the provider's input, an explicit predicate without an embedder, a failing
+  provider and the refusal without an embedder. A router test checks that a caller whose
+  grants hide an index's vectors gets the refusal of an absent index.
 
 ### Roadmap follow-ups (2026-10-12)
 

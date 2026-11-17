@@ -101,38 +101,51 @@ impl Tools<'_> {
                 "use search_text for keyword search, or similar_entities with a vector; an administrator gives a vector index an embedding provider (PUT /$/vector/{ds}/{name} with an embedding object)",
             )
         };
-        // the index whose provider embeds the query text
-        let pred = match &a.predicate {
-            Some(p) => {
-                let Term::NamedNode(n) = parse_iri(p, &prefix_map, false)? else {
-                    return Err(ToolError::bad_argument("predicate must be an IRI"));
-                };
-                let embeds = ds.dataset.indexes().vector().list().iter().any(|s| {
-                    s.predicate == n.as_str()
-                        && s.embedding.as_ref().is_some_and(|e| e.config.query_text)
-                });
-                if !embeds {
-                    let mut terms = Terms::new(&prefixes, 200);
-                    return Err(no_embedder(format!(
-                        "{} has no vector index in dataset {} whose embedding provider embeds query text",
-                        terms.iri(n.as_str()),
-                        ds.name
-                    )));
-                }
-                n
-            }
-            None => self.first_embedding(&ds).ok_or_else(|| {
-                no_embedder(format!(
-                    "dataset {} has no vector index with an embedding provider that embeds query text, so search_semantic cannot embed the query",
-                    ds.name
-                ))
-            })?,
+        let wanted = match &a.predicate {
+            Some(p) => match parse_iri(p, &prefix_map, false)? {
+                Term::NamedNode(n) => Some(n),
+                _ => return Err(ToolError::bad_argument("predicate must be an IRI")),
+            },
+            None => None,
         };
         let names = prefixes.names();
         let timeout = self.cfg().default_timeout();
         let ctx = self.ctx(&names, timeout.as_secs_f64());
         let deadline = self.call.arrived + timeout;
         let r = self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
+        // the first index by name whose provider embeds query text and whose vectors
+        // the caller can read: an index on a predicate the caller's view hides is
+        // treated as absent, so that its name does not leak
+        let mut indexes = ds.dataset.indexes().vector().list();
+        indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut pred = None;
+        for s in &indexes {
+            if !s.embedding.as_ref().is_some_and(|e| e.config.query_text)
+                || wanted.as_ref().is_some_and(|w| w.as_str() != s.predicate)
+            {
+                continue;
+            }
+            let p = NamedNode::new_unchecked(s.predicate.as_str());
+            let q = format!("ASK {{ {} }}", r.quads(&format!("?s {p} ?v"), &[]));
+            if r.ask(&q, Vec::new()).map_err(|e| ctx.engine(e))? {
+                pred = Some(p);
+                break;
+            }
+        }
+        let Some(pred) = pred else {
+            let mut terms = Terms::new(&prefixes, 200);
+            return Err(no_embedder(match &wanted {
+                Some(w) => format!(
+                    "{} has no vector index in dataset {} whose embedding provider embeds query text and whose vectors you can read",
+                    terms.iri(w.as_str()),
+                    ds.name
+                ),
+                None => format!(
+                    "dataset {} has no vector index whose embedding provider embeds query text and whose vectors you can read, so search_semantic cannot embed the query",
+                    ds.name
+                ),
+            }));
+        };
         // the vector ranking: the provider's failure is the call's error
         let vector = self
             .vector_hits(&r, &pred, &a.query, &[])

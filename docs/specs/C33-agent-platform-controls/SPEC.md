@@ -101,6 +101,9 @@ also accepts the `--mcp-` spellings.
   `--disable-tool`, the caller's grants and each tool's own conditions still decide what a
   caller sees, which meets the first acceptance gate. Stored-query tools follow
   `--no-stored-queries` and are not part of a profile.
+* The HTTP routes of the memory tools, such as `POST /{ds}/check` and `/{ds}/recall`,
+  ignore the selection, as they ignore `--mcp-disable-tool`. `sparkles mcp --url` refuses
+  the flags, because the bridged server's own selection applies.
 * The `initialize` and `server/discover` results carry the experimental capability
   `io.sparkles/toolSet` with the profiles and the tools the server offers.
 * Tests cover the stdio command, the HTTP endpoint's flags, the capability, a tool

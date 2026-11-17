@@ -783,7 +783,7 @@ async fn a03_tool_list() {
         assert_eq!(tool["inputSchema"], schema, "input schema of {name}");
         assert_eq!(
             tool["annotations"],
-            json!({"readOnlyHint": true, "openWorldHint": false}),
+            json!({"readOnlyHint": true, "openWorldHint": name == "search_semantic"}),
             "{name}"
         );
         assert!(tool["title"].is_string() && tool["description"].is_string());

@@ -486,6 +486,28 @@ async fn tool_profiles_narrow_the_tools() {
     );
 }
 
+/// The HTTP routes of the memory tools, such as `POST /{ds}/check`, ignore the MCP
+/// tool selection, as they ignore `--mcp-disable-tool` (item 489).
+#[tokio::test(flavor = "multi_thread")]
+async fn http_tool_routes_ignore_the_profile() {
+    let s = open(&["--mcp-profile", "admin"], false);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/t/check")
+        .header("content-type", "application/json")
+        .extension(ConnectInfo(Peer::Tcp("127.0.0.2:1".parse().unwrap())))
+        .body(Body::from(
+            json!({"query": "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"}).to_string(),
+        ))
+        .unwrap();
+    let res = s.app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_sessions() {
     let s = open(&[], false);
@@ -1769,6 +1791,86 @@ mod auth {
             .map(|w| w["code"].as_str().unwrap())
             .collect();
         assert_eq!(codes, ["no-limit"], "{r}");
+    }
+
+    /// `search_semantic` chooses its index through the caller's view: an index whose
+    /// vectors sit only in a graph the caller may not read is reported as absent, and
+    /// its predicate is not named (item 490).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_semantic_follows_graph_grants() {
+        use crate::http::router_tests::auth::graphs::{DATA, users};
+        use sparkles::vector::embed::Environment;
+        use sparkles::vector::embed::mock::MockProvider;
+        let mock = MockProvider::start(8);
+        let s = authed(&[], &[], &users());
+        let ds = s.state.attach("graphs", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                format!("{DATA}<http://ex/b/1> {{ <http://ex/b1> <http://ex/secret> \"hidden fox\" . }}\n")
+                    .into_bytes(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        tokio::task::block_in_place(|| {
+            let v = ds.dataset.indexes().vector();
+            v.set_embedding_environment(Some(Environment {
+                outbound: sparkles::outbound::OutboundPolicy {
+                    allow_private: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+            let cfg: sparkles::vector::VectorIndexConfig = serde_json::from_value(json!({
+                "predicate": "urn:x-test:secretEmb",
+                "dimension": 8,
+                "embedding": {"url": mock.url(), "model": "mock", "predicates": ["http://ex/secret"]}
+            }))
+            .unwrap();
+            v.put("secret", cfg).unwrap();
+            v.embed_until_idle(Duration::from_secs(30)).unwrap();
+        });
+        let call = |user: &'static str, args: J| {
+            let app = s.app.clone();
+            async move {
+                tool(
+                    &app,
+                    "search_semantic",
+                    args,
+                    &[("authorization", &b(user))],
+                )
+                .await
+            }
+        };
+        let full = call("gfull", json!({"dataset": "graphs", "query": "hidden fox"})).await;
+        assert_eq!(full["isError"], false, "{full}");
+        assert_eq!(
+            full["structuredContent"]["hits"][0]["iri"], "ex:b1",
+            "{full}"
+        );
+        // the caller who reads http://ex/a/* alone sees no index, as if none existed
+        let hidden = call("gra", json!({"dataset": "graphs", "query": "hidden fox"})).await;
+        assert_eq!(tool_error(&hidden), "no-embedder", "{hidden}");
+        let text = hidden["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("secretEmb"), "{text}");
+        let named = call(
+            "gra",
+            json!({"dataset": "graphs", "query": "fox", "predicate": "urn:x-test:secretEmb"}),
+        )
+        .await;
+        let absent = call(
+            "gra",
+            json!({"dataset": "graphs", "query": "fox", "predicate": "urn:x-test:none"}),
+        )
+        .await;
+        let msg = |r: &J, p: &str| {
+            assert_eq!(tool_error(r), "no-embedder", "{r}");
+            r["content"][0]["text"].as_str().unwrap().replace(p, "P")
+        };
+        assert_eq!(
+            msg(&named, "urn:x-test:secretEmb"),
+            msg(&absent, "urn:x-test:none")
+        );
     }
 
     /// The memory tools of C17 §6 through graph grants (C12): checks, candidates,

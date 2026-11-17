@@ -1033,6 +1033,20 @@ async fn search_semantic_embeds_the_query() {
         assert_eq!(hit["textRank"], 1, "{s}");
     }
     assert!(s["hits"].as_array().unwrap().len() <= 3, "{s}");
+    // each score is the reciprocal-rank sum over the rankings that hold the hit, and
+    // the hits come in descending score order
+    let mut last = f64::INFINITY;
+    for h in s["hits"].as_array().unwrap() {
+        let expected: f64 = ["vectorRank", "textRank"]
+            .iter()
+            .filter_map(|k| h[*k].as_u64())
+            .map(|r| 1.0 / (sparkles::rank::RRF_K + r as f64))
+            .sum();
+        let score = h["score"].as_f64().unwrap();
+        assert!((score - expected).abs() < 1e-6, "{h}: {expected}");
+        assert!(score <= last, "{s}");
+        last = score;
+    }
     // the query text went to the provider
     assert!(
         mock.state().inputs.iter().any(|i| i == "Ana Souza"),

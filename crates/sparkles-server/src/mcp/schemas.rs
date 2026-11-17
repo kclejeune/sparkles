@@ -580,10 +580,13 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "iri":{"type":"string"},"score":{"type":["number","null"]},"label":{"type":"string"}}}},
                 "prefixes":prefixes()}})),
         ),
-        read(
+        // the query text goes to the index's embedding provider, which may be remote
+        ToolDef {
+            open_world: true,
+            ..read(
             "search_semantic",
             "Semantic search",
-            "Search a dataset by meaning: the query text is embedded with the provider of the dataset's vector index and its nearest entities are fused with the full-text (BM25) ranking of its words. Use it for questions in plain language; use search_text for exact keywords. Needs a vector index whose embedding provider embeds query text (list_datasets and describe_schema show vector predicates).",
+            "Search a dataset by meaning: the query text is embedded with the provider of the dataset's vector index and its nearest entities are fused with the full-text (BM25) ranking of its words. Use it for questions in plain language; use search_text for exact keywords. Needs a vector index whose embedding provider embeds query text (describe_schema marks vector predicates); the query text is sent to that provider, which may be a remote service.",
             json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds(),
                 "query": {"type":"string","minLength":1,"maxLength":1000},
@@ -599,7 +602,8 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "iri":{"type":"string"},"score":{"type":["number","null"]},
                     "textRank":{"type":"integer"},"vectorRank":{"type":"integer"},"label":{"type":"string"}}}},
                 "prefixes":prefixes()}})),
-        ),
+        )
+        },
         read(
             "check_query",
             "Check a SPARQL query against the schema",

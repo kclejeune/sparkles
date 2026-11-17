@@ -364,4 +364,17 @@ fn stdio_tool_profiles() {
         e.contains("--tools: unknown tool 'nope' (tools: list_datasets, "),
         "{e}"
     );
+    // a proxy to a remote server offers that server's tools, so it takes no profile
+    #[cfg(feature = "auth")]
+    for flags in [["--profile", "explore"], ["--tools", "find_paths"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_sparkles"))
+            .args(["mcp", "--url", "http://127.0.0.1:9/mcp"])
+            .args(flags)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{flags:?}");
+        let e = String::from_utf8(out.stderr).unwrap();
+        assert!(e.contains("cannot be used with"), "{flags:?}: {e}");
+    }
 }
