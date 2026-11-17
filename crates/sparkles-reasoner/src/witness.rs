@@ -520,10 +520,15 @@ impl<'a> Cx<'a> {
             .iter()
             .map(|r| {
                 // a rule that tests for absent data, whose supports can be smaller than
-                // the data it reads
-                r.builtins
-                    .iter()
-                    .any(|b| matches!(b.kind, BuiltinKind::NoValue | BuiltinKind::ListNotContains))
+                // the data it reads, a negated atom of item 839 among them
+                r.builtins.iter().any(|b| {
+                    matches!(
+                        b.kind,
+                        BuiltinKind::NoValue
+                            | BuiltinKind::ListNotContains
+                            | BuiltinKind::RelAbsent
+                    )
+                })
             })
             .collect();
         let any_negated = negated.iter().any(|&n| n);
@@ -1538,7 +1543,8 @@ impl Witnesses {
             ..Default::default()
         };
         for n in self.nodes.iter().filter(|n| n.live) {
-            if kind(c, &n.t) == Kind::Base {
+            // relation facts (item 839) are no triples of the closure
+            if kind(c, &n.t) == Kind::Base || crate::ir::lower::is_key(n.t[1]) {
                 continue;
             }
             r.facts += 1;
@@ -2148,7 +2154,7 @@ mod tests {
         removed: &[Triple],
     ) {
         let snap = set_default_graph(v, base);
-        let moved = c.terms.rebase(snap.clone());
+        let moved = c.terms.rebase(snap.clone()).unwrap();
         c.remap(&moved).unwrap();
         w.remap(&moved);
         if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
@@ -2302,7 +2308,7 @@ mod tests {
                 .unwrap();
             base.remove(&gone);
             let snap = set_default_graph(&v, &base);
-            let moved = c.terms.rebase(snap.clone());
+            let moved = c.terms.rebase(snap.clone()).unwrap();
             c.remap(&moved).unwrap();
             w.remap(&moved);
             let _ = c.set_inputs(snap, &[Id::DEFAULT_GRAPH]).unwrap();

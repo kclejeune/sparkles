@@ -12,6 +12,8 @@ use sparkles_core::store::{Store, StoreOptions};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod maintain;
+
 /// A fact by its relation (`None` for the triple relation) and its columns.
 type Fact = (Option<u32>, Vec<u64>);
 
@@ -32,6 +34,7 @@ fn limits() -> Limits {
         closures: false,
         sampled_planning: false,
         cancel: None,
+        deadline: None,
         progress: None,
     }
 }

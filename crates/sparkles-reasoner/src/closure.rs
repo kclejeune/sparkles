@@ -396,6 +396,14 @@ fn symmetric(r: &CRule) -> Option<(u64, bool)> {
     Some((*c, filtered(r, x, y)?))
 }
 
+/// Whether `r` has a builtin of a lowered relation atom (item 839).
+fn relation_builtins(r: &CRule) -> bool {
+    use crate::builtins::BuiltinKind as B;
+    r.builtins
+        .iter()
+        .any(|b| matches!(b.kind, B::RelTail | B::RelTuple | B::RelAbsent))
+}
+
 impl Closures {
     /// The operators of `rules`, or `None` when no rule has one or the program has a rule
     /// whose result depends on the order of derivation. `start` is the row before which
@@ -405,9 +413,10 @@ impl Closures {
         terms: &Terms,
         start: Option<u32>,
     ) -> Result<Option<Closures>, BudgetFailure> {
+        // the operators read no relation tails (item 839), which only builtins see
         if rules
             .iter()
-            .any(|r| incremental_blocker(r, terms).is_some())
+            .any(|r| incremental_blocker(r, terms).is_some() || relation_builtins(r))
         {
             return Ok(None);
         }

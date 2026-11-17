@@ -747,6 +747,12 @@ pub fn derivation_json(d: &crate::explain::Derivation) -> J {
     if d.missing {
         o["missing"] = true.into();
     }
+    if let Some(r) = &d.relation {
+        o["relation"] = json!({
+            "name": r.name,
+            "args": r.args.iter().map(term_json).collect::<Vec<_>>(),
+        });
+    }
     if d.shared {
         o["shared"] = true.into();
     }

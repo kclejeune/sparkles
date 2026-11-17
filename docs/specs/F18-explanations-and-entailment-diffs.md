@@ -95,6 +95,7 @@ type Derivation = {
   builtins?: { call: string; holds: true }[];  // builtins the instance passed
   premises?: Derivation[];
   sameAs?: { member: Term; representative: Term }[];   // F16 representatives used
+  relation?: { name: string; args: Term[] };   // a fact of a declared relation (F23)
 };
 
 type ExplainResponse =
@@ -207,6 +208,15 @@ bug and is reported as one.
 - Generalized facts (C08 Phase 3: a literal subject, a blank node predicate) can be
   premises and are shown as such, with a note that they are never written to the
   inferred graph.
+- A fact of a relation that a rule program declares (F23's rule IR) is a node of its own,
+  whose `relation` gives the relation's name and the fact's columns. Its `triple` holds the
+  relation's reserved IRI `urn:x-sparkles:rel:<name>` in all three positions and is no
+  fact. Such a node is derived, an axiom, a ref or unexplained, never asserted, and a ref
+  of one is expanded by a request with a larger depth, since no request names a relation
+  fact. Its builtins and bindings leave out the builtins and variables that lowering a
+  relation atom adds, and a negated atom is shown as `not name(args)`. In Rust the field
+  is `Derivation::relation`, a public field that a struct literal outside the workspace
+  must now set.
 
 ### 3.3 Limits
 

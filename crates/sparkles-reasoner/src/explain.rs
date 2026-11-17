@@ -43,7 +43,7 @@ use crate::{Extras, Profile};
 use oxrdf::Term;
 use rustc_hash::{FxHashMap, FxHashSet};
 pub use sparkles_core::explain::{
-    Derivation, DerivationKind, ExplainBudgetExceeded, Explained, RuleRef,
+    Derivation, DerivationKind, ExplainBudgetExceeded, Explained, RelationAtom, RuleRef,
 };
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::index::Perm;
@@ -166,6 +166,9 @@ pub(crate) struct RuleSet<'r> {
     /// the ids of `geo:hasGeometry` and `geo:hasDefaultGeometry`, when default geometries
     /// are facts of the closure
     pub geo: Option<(u64, u64)>,
+    /// the declared relations of a rule program (item 839), whose facts are nodes of
+    /// their own
+    pub relations: Option<&'r crate::ir::Relations>,
 }
 
 struct Search<'a> {
@@ -633,8 +636,71 @@ impl Builder<'_, '_> {
             .ok_or_else(|| anyhow::anyhow!("term {id} of a derivation is unknown"))
     }
 
+    /// The relation fact `f`, when it is one.
+    fn relation(&self, f: u32) -> anyhow::Result<Option<RelationAtom>> {
+        let t = self.s.facts[f as usize];
+        let Some(r) = crate::ir::lower::rel_of(t[1]) else {
+            return Ok(None);
+        };
+        let rel = self
+            .s
+            .rs
+            .relations
+            .and_then(|rs| rs.get(r))
+            .ok_or_else(|| anyhow::anyhow!("relation {} of a derivation is unknown", r.0))?;
+        let mut cols = Vec::with_capacity(rel.arity as usize);
+        match rel.arity {
+            0 => {}
+            1 => cols.push(t[0]),
+            2 => cols.extend([t[0], t[2]]),
+            _ => {
+                let (_, tail) = self
+                    .s
+                    .terms
+                    .tail(t[2])
+                    .ok_or_else(|| anyhow::anyhow!("a tail of a derivation is unknown"))?;
+                cols.push(t[0]);
+                cols.extend(tail);
+            }
+        }
+        let args = cols
+            .into_iter()
+            .map(|x| self.term(x))
+            .collect::<anyhow::Result<Vec<Term>>>()?;
+        let atom = RelationAtom {
+            name: rel.name.to_string(),
+            args,
+        };
+        let bytes = atom.name.len() + atom.args.iter().map(term_bytes).sum::<usize>();
+        self.budget
+            .try_charge(bytes)
+            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
+        Ok(Some(atom))
+    }
+
     fn triple(&self, f: u32) -> anyhow::Result<[Term; 3]> {
         let t = self.s.facts[f as usize];
+        if let Some(r) = crate::ir::lower::rel_of(t[1]) {
+            // a relation node's triple names its relation, and is no fact
+            let name = self
+                .s
+                .rs
+                .relations
+                .and_then(|rs| rs.get(r))
+                .map(|r| r.name.to_string())
+                .unwrap_or_default();
+            let iri = Term::NamedNode(
+                RelationAtom {
+                    name,
+                    args: Vec::new(),
+                }
+                .iri(),
+            );
+            self.budget
+                .try_charge(std::mem::size_of::<Derivation>() + 3 * term_bytes(&iri))
+                .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
+            return Ok([iri.clone(), iri.clone(), iri]);
+        }
         let triple = [self.term(t[0])?, self.term(t[1])?, self.term(t[2])?];
         // the node and its decoded terms, which a large literal can make large
         let bytes =
@@ -698,24 +764,33 @@ impl Builder<'_, '_> {
             if x == 0 {
                 continue;
             }
-            let t = self.term(x)?;
             let name = info.vars.get(v).cloned().unwrap_or_else(|| format!("v{v}"));
+            // a variable a relation's lowering added, such as a tail handle
+            if name.is_empty() {
+                continue;
+            }
+            let t = self.term(x)?;
             bytes += name.len() + term_bytes(&t);
             bindings.push((name, t));
         }
         let mut builtins = Vec::new();
         for (j, b) in rule.builtins.iter().enumerate() {
-            let args: Vec<String> = b
-                .args
-                .iter()
-                .map(|a| match *a {
-                    Slot::Const(c) => call_arg(s.terms.term(c)),
-                    Slot::Var(v) if vals[v] != 0 => call_arg(s.terms.term(vals[v])),
-                    _ => call_arg(None),
-                })
-                .collect();
-            let name = info.builtins.get(j).map_or("builtin", String::as_str);
-            let call = format!("{name}({})", args.join(", "));
+            use crate::builtins::BuiltinKind as B;
+            let arg = |a: &Slot| match *a {
+                Slot::Const(c) => call_arg(s.terms.term(c)),
+                Slot::Var(v) if vals[v] != 0 => call_arg(s.terms.term(vals[v])),
+                _ => call_arg(None),
+            };
+            let call = match b.kind {
+                // the lowering of a relation atom, which the node shows as its premise
+                B::RelTail | B::RelTuple => continue,
+                B::RelAbsent => self.negated(&b.args, &arg),
+                _ => {
+                    let args: Vec<String> = b.args.iter().map(arg).collect();
+                    let name = info.builtins.get(j).map_or("builtin", String::as_str);
+                    format!("{name}({})", args.join(", "))
+                }
+            };
             bytes += call.len();
             builtins.push(call);
         }
@@ -725,8 +800,34 @@ impl Builder<'_, '_> {
         Ok((bindings, builtins))
     }
 
+    /// A negated atom (item 839) as a call: `not name(args)` for a relation, whose lowered
+    /// arguments are the first column, the key and the other columns, and `not (s p o)`
+    /// for a triple.
+    fn negated(&self, args: &[Slot], arg: &dyn Fn(&Slot) -> String) -> String {
+        let key = match args.get(1) {
+            Some(Slot::Const(k)) => crate::ir::lower::rel_of(*k),
+            _ => None,
+        };
+        let rel = key.and_then(|r| self.s.rs.relations.and_then(|rs| rs.get(r)));
+        let Some(rel) = rel else {
+            let a: Vec<String> = args.iter().map(arg).collect();
+            return format!("not ({})", a.join(" "));
+        };
+        let cols: Vec<String> = match rel.arity {
+            0 => Vec::new(),
+            1 => vec![arg(&args[0])],
+            2 => vec![arg(&args[0]), arg(&args[2])],
+            _ => std::iter::once(&args[0])
+                .chain(&args[2..])
+                .map(arg)
+                .collect(),
+        };
+        format!("not {}({})", rel.name, cols.join(", "))
+    }
+
     fn generalized(&self, f: u32) -> bool {
-        !self.s.terms.valid(&self.s.facts[f as usize])
+        let t = &self.s.facts[f as usize];
+        !crate::ir::lower::is_key(t[1]) && !self.s.terms.valid(t)
     }
 
     fn leaf_node(&self, f: u32, id: u32, shared: bool, l: Leaf) -> anyhow::Result<Derivation> {
@@ -810,6 +911,7 @@ impl Builder<'_, '_> {
             generalized: self.generalized(f),
             missing: false,
             read: None,
+            relation: self.relation(f)?,
         })
     }
 
@@ -844,6 +946,7 @@ impl Builder<'_, '_> {
             d.id = id;
             d.kind = DerivationKind::Unexplained;
             d.generalized = self.generalized(f);
+            d.relation = self.relation(f)?;
             return Ok(d);
         };
         let rule = Some(self.rule(i));
@@ -871,6 +974,7 @@ impl Builder<'_, '_> {
             generalized: self.generalized(f),
             missing: false,
             read: None,
+            relation: self.relation(f)?,
         })
     }
 }
@@ -926,6 +1030,7 @@ fn materialized(
             .geo_default_geometry
             .then(|| crate::geo_ids(&terms))
             .transpose()?,
+        relations: None,
     };
     let mut root = [0u64; 3];
     for (k, t) in triple.iter().enumerate() {
@@ -951,6 +1056,200 @@ fn materialized(
         opts,
         &[],
     )
+}
+
+/// [`explain`] for a rule program with relations (item 839's plan, §12.3 and §13), whose
+/// closure was materialized into `inferred`, with `generalized` the derived facts that
+/// are no RDF, which the run saved beside it. The relation facts are not written, so they
+/// are rebuilt on the graph of the inputs, the inferred graph and the generalized facts,
+/// which is the complete closure of triples, with the explanation's budget and
+/// cancellation, and the answer does not depend on a kept closure. Phase 5 reaches it
+/// from [`explain`] when a profile is a program.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn explain_program(
+    snap: Arc<Snapshot>,
+    program: &crate::ir::Program,
+    inputs: &[Id],
+    inferred: Option<Id>,
+    generalized: &[[Vec<u8>; 3]],
+    triple: &[Term; 3],
+    opts: &ExplainOptions,
+) -> anyhow::Result<Explained> {
+    budget_errors(program_search(
+        snap,
+        program,
+        inputs,
+        inferred,
+        generalized,
+        triple,
+        opts,
+    ))
+}
+
+fn program_search(
+    snap: Arc<Snapshot>,
+    program: &crate::ir::Program,
+    inputs: &[Id],
+    inferred: Option<Id>,
+    generalized: &[[Vec<u8>; 3]],
+    triple: &[Term; 3],
+    opts: &ExplainOptions,
+) -> anyhow::Result<Explained> {
+    let budget = Budget::new(opts.max_memory);
+    let mut graphs: Vec<Id> = inputs.to_vec();
+    graphs.extend(inferred);
+    let base = Arc::new(Base::new(snap.clone(), &graphs)?);
+    let mut g = Graph::with_base(base);
+    g.set_budget(&budget)?;
+    let terms = Terms::new(snap.clone());
+    terms.set_budget(&budget)?;
+    // the generalized facts, saved as term keys, in this explanation's terms; the credit
+    // also holds the metadata of the rules below while the search runs
+    let mut held = Held::new(&budget);
+    {
+        held.try_grow(generalized.len() * size_of::<Triple>())?;
+        let id = |k: &[u8]| terms.try_id_for_key(k);
+        let mut facts: Vec<Triple> = Vec::with_capacity(generalized.len());
+        for k in generalized {
+            facts.push([id(&k[0])?, id(&k[1])?, id(&k[2])?]);
+        }
+        g.try_add_batch(facts)?;
+        held.shrink(generalized.len() * size_of::<Triple>());
+    }
+    let vocab = crate::ir::Vocab::of(&terms);
+    let part = program
+        .relation_part(&vocab, &budget)
+        .map_err(|e| match e {
+            crate::ir::ProgramError::Memory(m) => anyhow::Error::from(m),
+            e => anyhow::anyhow!("{e}"),
+        })?;
+    let mut lowered = program.lower(&budget)?;
+    // the lowered rules of every stratum, with the names of their IR rules' variables;
+    // the variables and builtins a lowering adds have none
+    // the origins (exact vectors, with the scratch counts that size them), the flat
+    // rules and their infos; the strata's own buffers, which `lowered` charges, are freed
+    // as the rules move out and their bytes are given back below
+    let n: usize = lowered.strata.iter().map(Vec::len).sum();
+    let count = lowered.strata.len();
+    held.try_grow(
+        count * (size_of::<Vec<usize>>() + size_of::<usize>())
+            + n * (size_of::<usize>() + size_of::<CRule>() + size_of::<RuleInfo>()),
+    )?;
+    let origins = program.lowered_origins();
+    held.shrink(count * size_of::<usize>());
+    let mut rules: Vec<CRule> = Vec::with_capacity(n);
+    let mut infos: Vec<RuleInfo> = Vec::with_capacity(n);
+    for (stratum, ris) in std::mem::take(&mut lowered.strata)
+        .into_iter()
+        .zip(&origins)
+    {
+        for (r, &ri) in stratum.into_iter().zip(ris) {
+            let ir = &program.rules[ri];
+            // the names of the variables and builtins, charged before they are made
+            let names = (0..r.nvars.min(ir.nvars))
+                .map(|v| {
+                    ir.vars
+                        .get(v)
+                        .map_or(2 + v.checked_ilog10().unwrap_or(0) as usize, String::len)
+                })
+                .sum::<usize>()
+                + r.builtins
+                    .iter()
+                    .map(|b| b.kind.rule_name().len())
+                    .sum::<usize>();
+            held.try_grow(names + (r.nvars + r.builtins.len()) * size_of::<String>())?;
+            let vars = (0..r.nvars)
+                .map(|v| {
+                    if v >= ir.nvars {
+                        String::new()
+                    } else {
+                        ir.vars.get(v).cloned().unwrap_or_else(|| format!("v{v}"))
+                    }
+                })
+                .collect();
+            let builtins = r
+                .builtins
+                .iter()
+                .map(|b| b.kind.rule_name().to_string())
+                .collect();
+            infos.push(RuleInfo {
+                vars,
+                builtins,
+                line: 0,
+                parsed: 0,
+            });
+            rules.push(r);
+        }
+    }
+    // the strata's buffers, exact in `lower`, are freed
+    held.shrink(count * size_of::<Vec<CRule>>() + n * size_of::<CRule>());
+    let sources = vec!["rules".to_string()];
+    let mut makes_terms = false;
+    if let Some(part) = &part {
+        let lp = part.lower(&budget)?;
+        makes_terms = lp
+            .strata
+            .iter()
+            .flatten()
+            .any(|r| crate::ir::rebuild::makes_terms(r, &terms));
+        drop(lp);
+        let limits = engine::Limits {
+            max_iterations: usize::MAX,
+            max_inferred: usize::MAX,
+            budget: budget.clone(),
+            closures: false,
+            sampled_planning: false,
+            cancel: opts.cancel.clone(),
+            deadline: opts.deadline,
+            progress: None,
+        };
+        if let Err(e) = crate::ir::rebuild::rebuild_relations(&mut g, part, &terms, &limits) {
+            if opts.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(ExplainBudgetExceeded(
+                    "the explanation passed its timeout".to_string(),
+                )
+                .into());
+            }
+            return Err(e);
+        }
+    }
+    let rs = RuleSet {
+        rules: &rules,
+        infos: &infos,
+        sources: &sources,
+        geo: None,
+        relations: Some(&program.relations),
+    };
+    let mut root = [0u64; 3];
+    for (k, t) in triple.iter().enumerate() {
+        let id = terms.try_id_for(t)?;
+        if Id(id).tag() == Tag::Local {
+            return Ok(Explained::NotFound);
+        }
+        root[k] = id;
+    }
+    if !g.contains(&root) {
+        return Ok(Explained::NotFound);
+    }
+    let extra = FxHashSet::default();
+    let found = search(
+        &snap,
+        &mut g,
+        &terms,
+        &rs,
+        inputs,
+        &extra,
+        &budget,
+        root,
+        opts,
+        &[],
+    )?;
+    if makes_terms && matches!(found, Explained::NotFound) {
+        anyhow::bail!(
+            "the derivation may pass relation facts that make new terms, which an explanation cannot rebuild"
+        );
+    }
+    Ok(found)
 }
 
 /// The search for `root` over `g`, whose leaves are the facts of `inputs` and `extra`.
@@ -1236,6 +1535,7 @@ pub(crate) fn search_session(
         infos: p.infos,
         sources: p.sources,
         geo: p.geo_default.then(|| crate::geo_ids(p.terms)).transpose()?,
+        relations: None,
     };
     search(
         p.snap,
@@ -1395,6 +1695,7 @@ mod partial_tests {
             infos,
             sources: &sources,
             geo: None,
+            relations: None,
         };
         let mut g = Graph::with_capacity(0);
         let plans = Plans::new(&mut g, rules).unwrap();

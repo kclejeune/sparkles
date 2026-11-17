@@ -422,7 +422,7 @@ pub(crate) fn previous(
         let raw = raw.map_err(Fallback)?;
         let mut held = Held::new(budget);
         held.grow(set_bytes(&generalized))?;
-        let moved = closure.terms.rebase(snap.clone());
+        let moved = closure.terms.rebase(snap.clone())?;
         closure.remap(&moved)?;
         if let Some(w) = witnesses.as_mut() {
             w.remap(&moved);
@@ -911,8 +911,8 @@ pub(crate) fn keep(
     // the work after the commit is charged to the run, strictly: a closure that does
     // not fit is not kept
     let budget = closure.graph.budget().clone();
-    let mut moved: FxHashMap<u64, u64> = stored.iter().map(|(l, id)| (*l, id.0)).collect();
-    moved.extend(closure.terms.rebase(snap.clone()));
+    let stored: FxHashMap<u64, u64> = stored.iter().map(|(l, id)| (*l, id.0)).collect();
+    let moved = closure.terms.rebase_with(snap.clone(), stored)?;
     closure.try_remap(&moved)?;
     if let Some(w) = witnesses.as_mut() {
         w.remap(&moved);

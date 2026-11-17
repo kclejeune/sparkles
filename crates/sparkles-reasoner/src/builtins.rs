@@ -62,6 +62,50 @@ pub(crate) enum BuiltinKind {
 use BuiltinKind::*;
 
 impl BuiltinKind {
+    /// The builtin's name in rule text, the first of its names, and for a builtin no rule
+    /// text names, such as a lowered relation atom's, a name of its own.
+    pub fn rule_name(self) -> &'static str {
+        match self {
+            Equal => "equal",
+            NotEqual => "notEqual",
+            LessThan => "lessThan",
+            GreaterThan => "greaterThan",
+            Le => "le",
+            Ge => "ge",
+            Sum => "sum",
+            Difference => "difference",
+            Product => "product",
+            Quotient => "quotient",
+            Min => "min",
+            Max => "max",
+            AddOne => "addOne",
+            StrConcat => "strConcat",
+            UriConcat => "uriConcat",
+            Regex => "regex",
+            IsLiteral => "isLiteral",
+            NotLiteral => "notLiteral",
+            IsBNode => "isBNode",
+            NotBNode => "notBNode",
+            IsDType => "isDType",
+            NotDType => "notDType",
+            IsFunctor => "isFunctor",
+            NotFunctor => "notFunctor",
+            NoValue => "noValue",
+            MakeTemp => "makeTemp",
+            MakeSkolem => "makeInstance",
+            Now => "now",
+            ListMember => "listMember",
+            ListContains => "listContains",
+            ListNotContains => "listNotContains",
+            ListLength => "listLength",
+            ListEntry => "listEntry",
+            ListForAll => "listForAll",
+            GeoSfType => "geoSfType",
+            GeoGmlType => "geoGmlType",
+            _ => "builtin",
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<BuiltinKind> {
         Some(match name {
             "equal" => Equal,
@@ -528,7 +572,16 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
         RelTuple => {
             let key = a(1);
             let cols: smallvec::SmallVec<[u64; 8]> = (2..bi.args.len()).map(a).collect();
-            let h = charged!(ev, t.try_tail(key, &cols));
+            // only a derivation makes a tail: a search over the facts there are finds
+            // none whose tail is not interned, and never grows the terms
+            let h = if matches!(ev.mode, crate::engine::Mode::New) {
+                charged!(ev, t.try_tail(key, &cols))
+            } else {
+                match t.find_tail(key, &cols) {
+                    Some(h) => h,
+                    None => return,
+                }
+            };
             ev.bind_and_continue(bi.args[0], h, k, b);
             return;
         }

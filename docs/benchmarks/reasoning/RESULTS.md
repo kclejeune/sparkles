@@ -290,6 +290,24 @@ remove the scan. The [run directory](runs/2026-11-15-item-839-atlas/run.sh.txt) 
 commands, the [host and builds](runs/2026-11-15-item-839-atlas/env.txt) and the
 [medians with their ranges](runs/2026-11-15-item-839-atlas/results.txt).
 
+Maintenance of programs with relations changes paths that every kept closure and full
+derivation shares, which the same host measures against the build before it on LUBM(100)
+under OWL 2 RL and RDFS, on OWL2Bench(5) under OWL 2 RL and in `examples/incremental.rs`
+on its own 1,000,000 generated triples. Every run gives the same inferred counts, kept
+facts and digests as the build before, peak resident memory stays within 1%, and the
+reasoner's budget peaks are equal. Two builds of one commit from two worktrees differ by
+up to 3.1% on a full derivation and 4.7% on a step of the example, so the comparisons
+that decide use builds from one worktree. Changes of 100 triples to a closure kept in
+memory, their undo, the example's steps, OWL2Bench(5) at one thread and every full run at
+20 threads stay within about that spread. LUBM(100) under OWL 2 RL at one thread takes
+16.73 s against 16.37 s, 1.022 times as long and outside the other build's range, in
+every build of the change. It runs the same user-space instructions within 0.2% and needs
+2% more cycles, with 35% more instruction-cache misses, so the cost is in the layout of
+the code rather than in added work, and item 1046 follows it up. The
+[run directory](runs/2026-11-16-item-839-phase3-atlas/run.sh.txt) holds the commands, the
+[host and builds](runs/2026-11-16-item-839-phase3-atlas/env.txt) and the
+[medians with their ranges](runs/2026-11-16-item-839-phase3-atlas/results.txt).
+
 [F16's follow-ups](../../specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) give
 the ranges, the other sizes and the 1-thread runs.
 
