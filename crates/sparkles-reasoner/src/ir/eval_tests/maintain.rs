@@ -1177,3 +1177,48 @@ fn witnesses_under_a_blank_node_in_a_relation_head_are_complete() {
     }
     assert_eq!(reports[0], reports[1]);
 }
+
+/// The relation part's copy of a rule is admitted before it is made (review p3-r3): a
+/// spilled argument list clones with its capacity rounded up to a power of two, and
+/// `clone_bytes` bounds the copy that `relation_part` makes.
+#[test]
+fn the_relation_part_admits_its_copy_before_it_makes_it() {
+    let v = TV::new();
+    let mut rels = Relations::default();
+    let r = rels.declare("R", 5, false).unwrap();
+    let five = [V(0), V(1), V(2), V(3), V(4)];
+    let prog = checked(
+        &v,
+        rels,
+        vec![
+            rule(
+                "seed",
+                vec![pos(tri(V(0), v.props[0], V(1)))],
+                vec![head(rel(r, &[V(0), V(1), V(1), V(0), V(1)]))],
+            ),
+            rule(
+                "again",
+                vec![pos(rel(r, &five))],
+                vec![
+                    head(rel(r, &[V(1), V(0), V(2), V(3), V(4)])),
+                    head(tri(V(0), v.props[2], V(1))),
+                ],
+            ),
+        ],
+    );
+    for src in &prog.rules {
+        // a list of five slots spills with capacity 5 and clones with capacity 8
+        assert!(src.clone().bytes() > src.bytes(), "{}", src.name);
+        assert!(src.clone().bytes() <= src.clone_bytes(), "{}", src.name);
+    }
+    let t = Terms::new(v.store.snapshot());
+    let part = prog
+        .relation_part(&Vocab::of(&t), &unlimited())
+        .unwrap()
+        .unwrap();
+    for (copy, src) in part.rules.iter().zip(&prog.rules) {
+        assert_eq!(copy.name, src.name);
+        assert_eq!(copy.head.len(), 1);
+        assert!(copy.bytes() <= src.clone_bytes(), "{}", src.name);
+    }
+}

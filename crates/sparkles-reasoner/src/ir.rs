@@ -284,19 +284,31 @@ impl Rule {
     }
 
     fn bytes(&self) -> usize {
+        self.bytes_as(false)
+    }
+
+    /// A bound of the bytes of the rule's clone, or of a copy that clones its parts: a
+    /// spilled `SmallVec` clones by collecting, which rounds its capacity up to a power
+    /// of two, and a `Vec` or `String` clone has the capacity of its length.
+    fn clone_bytes(&self) -> usize {
+        self.bytes_as(true)
+    }
+
+    fn bytes_as(&self, clone: bool) -> usize {
         let mut n = self.name.capacity()
             + self.body.capacity() * size_of::<Literal>()
             + self.head.capacity() * size_of::<Head>()
             + self.exists.capacity() * size_of::<usize>()
             + self.vars.capacity() * size_of::<String>();
         n += self.vars.iter().map(String::capacity).sum::<usize>();
-        let spill = |a: &SmallVec<[Slot; 4]>| {
-            if a.spilled() {
-                a.capacity() * size_of::<Slot>()
-            } else {
-                0
-            }
+        // the slots a spilled vector of `len` items and capacity `cap` holds
+        let slots = |spilled: bool, len: usize, cap: usize| match (spilled, clone) {
+            (false, _) => 0,
+            (true, false) => cap,
+            (true, true) => cap.max(len.next_power_of_two()),
         };
+        let spill =
+            |a: &SmallVec<[Slot; 4]>| slots(a.spilled(), a.len(), a.capacity()) * size_of::<Slot>();
         for l in &self.body {
             n += match l {
                 Literal::Pos(a) | Literal::Neg(a) => spill(&a.args),
@@ -304,8 +316,7 @@ impl Rule {
                     spill(&b.args)
                         + [&b.inputs, &b.outputs]
                             .iter()
-                            .filter(|v| v.spilled())
-                            .map(|v| v.capacity() * size_of::<usize>())
+                            .map(|v| slots(v.spilled(), v.len(), v.capacity()) * size_of::<usize>())
                             .sum::<usize>()
                 }
             };

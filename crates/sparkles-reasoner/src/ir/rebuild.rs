@@ -40,9 +40,10 @@ impl Program {
             if !r.head.iter().any(is_rel) {
                 continue;
             }
-            // the copy is built field by field with exact capacities, never larger than
-            // the rule's own, so `bytes` bounds it
-            held.try_grow(r.bytes())?;
+            // the copy is built field by field: its vectors have exact capacities, never
+            // larger than the rule's own, and its spilled argument lists clone with
+            // rounded capacities, which `clone_bytes` bounds
+            held.try_grow(r.clone_bytes())?;
             let mut head = Vec::with_capacity(r.head.iter().filter(|h| is_rel(h)).count());
             head.extend(r.head.iter().filter(|h| is_rel(h)).cloned());
             let in_head = |v: usize| {
