@@ -349,11 +349,11 @@ jobs:
       # file, 16 GiB unless it sets SWAP_GIB. The test build sets 2. It compiles its two
       # largest rustc processes one after the other, and the larger of them peaks near
       # 12 GB. A runner with memory and swap near the 20 GB of two overlapping compiles
-      # lets such a regression thrash for the whole job limit, where a small file leaves
-      # it little to thrash into and ends the build with an out-of-memory kill and its log.
-      # A larger runner needs no swap file, and a runner whose file system refuses one
-      # warns instead. The step prints the memory and swap it ends with, so a run records
-      # what the runner had.
+      # lets such a regression thrash for the whole job limit, where less swap ends the
+      # build sooner with an out-of-memory kill and its log. GitHub's image may enable a
+      # swap file of its own, which the step does not remove, so it prints the memory and
+      # swap it ends with and a run records the total the runner had. A larger runner needs
+      # no swap file, and a runner whose file system refuses one warns instead.
       - name: Add swap
         if: runner.os == 'Linux'
         shell: bash
@@ -363,6 +363,8 @@ jobs:
           memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
           if [ "$memory_kib" -ge $((24 * 1024 * 1024)) ]; then
             echo "$((memory_kib / 1024 / 1024)) GiB of memory, so no swap file"
+            swapon --show
+            free -h
             exit 0
           fi
           # A name of its own, so a persistent runner never touches another job's swap file

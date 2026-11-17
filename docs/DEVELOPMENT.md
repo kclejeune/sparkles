@@ -1088,8 +1088,9 @@ runner unresponsive, so the job builds the server's unit tests alone first with
 the same packages, features and profile, so they find those tests fresh and the second
 large compile starts after the first has ended. The job adds only a 2 GiB swap file, where the
 Doctests job adds 16 GiB, because a large swap lets overlapping compiles thrash for the
-whole job limit instead of ending in an out-of-memory kill with a log. The step prints the
-runner's memory and swap. `scripts/ci-memory.sh` prints the runner's memory, swap,
+whole job limit instead of ending in an out-of-memory kill with a log. GitHub's image may
+enable a swap file of its own, so the step prints the runner's memory and swap to record
+the total. `scripts/ci-memory.sh` prints the runner's memory, swap,
 load and largest compilers every 30 seconds while the commands run, and they stop at 38
 minutes and list the processes left. A run that stalls the runner therefore fails inside
 its build step and keeps its log, instead of reaching the job's 45-minute limit with no
