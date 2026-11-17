@@ -277,6 +277,41 @@ class MemoryAdmission(unittest.TestCase):
         with self.assertRaises(mp.Refusal):mp.memory_admission(meminfo_text(OBSERVED_MEMINFO),rows)
 
 
+class BoatJobMemory(unittest.TestCase):
+    """Qualification admits a job of BOAT_JOB_MEMORY_GIB, and every Boat job unit has that cap."""
+    def test_the_headroom_and_its_refusal_follow_the_job_figure(self):
+        mp=metadata_probe();g=mp.BOAT_JOB_MEMORY_GIB
+        self.assertEqual(g,11)
+        self.assertEqual(mp.JOB_HEADROOM,g*2**30+512*2**20+2**30)
+        source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
+        self.assertIn(f"'insufficient host headroom for proposed{g}GiB job'",source)
+
+    def test_every_boat_job_cap_is_the_admitted_job(self):
+        import re
+        g=metadata_probe().BOAT_JOB_MEMORY_GIB;scripts=Path(__file__).resolve().parents[1]
+        ci=(scripts/'remote-ci.sh').read_text()
+        boat=ci[ci.index('executor=boat'):ci.index('executor=ssh')]
+        self.assertEqual(re.findall(r'memory_max=(\S+)',boat),[f'{g}G'])
+        screen=(scripts/'remote-screen.sh').read_text()
+        self.assertEqual(set(re.findall(r'MemoryMax=(\S+)',screen)),{f'{g}G'})
+        gate=(scripts/'gate/remote/gate-start.sh').read_text()
+        self.assertEqual(re.findall(r'^boat_mem_g=(\S+)$',gate,re.M),[str(g)])
+        build=(scripts/'nsc-build-host.sh').read_text()
+        self.assertEqual(re.findall(r'SPARKLES_NSC_BUILD_MEMORY_MAX=(\S+?)\s',build),[f'{g}G'])
+
+    def test_the_admission_edge(self):
+        mp=metadata_probe();total=16768798720
+        def meminfo(nonreclaimable):
+            return meminfo_text({'MemTotal':total//1024,'MemAvailable':(total-nonreclaimable)//1024,'AnonPages':nonreclaimable//1024})
+        mp.memory_admission(meminfo(total-mp.JOB_HEADROOM),[])
+        with self.assertRaises(mp.Refusal) as e:mp.memory_admission(meminfo(total-mp.JOB_HEADROOM+1024),[])
+        self.assertEqual(str(e.exception),'insufficient host headroom for proposed11GiB job')
+        # A restored worker measured 2.01 to 2.16 GiB at the probe, which the 12 GiB job
+        # refused at 2.12 GiB and the 11 GiB job admits with a GiB to spare.
+        mp.memory_admission(meminfo(int(2.2*2**30)),[])
+        with self.assertRaises(mp.Refusal):mp.memory_admission(meminfo(int(3.2*2**30)),[])
+
+
 class LifetimeExtension(unittest.TestCase):
     """An explicit, receipted extension of one running qualified worker."""
     def setUp(self):

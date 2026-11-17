@@ -35,10 +35,17 @@ Cargo shim use the shared host cache and each source directory's managed target.
 The memory check counts only memory that the kernel cannot reclaim. On the host this is
 anonymous, shared, unevictable and unreclaimable kernel memory. For every ancestor
 cgroup with a limit it is the cgroup's anonymous, shared, unevictable and unreclaimable
-kernel memory from `memory.stat`. Each limit must leave room for a 12-GiB job, the
+kernel memory from `memory.stat`. Each limit must leave room for an 11-GiB job, the
 512-MiB metadata service and a 1-GiB host reserve. Page cache does not count, so a
 worker whose slice holds several gigabytes of cache is admitted, and a slice that
-exposes no `memory.stat` is refused.
+exposes no `memory.stat` is refused. On a 16-GiB worker that leaves 3.1 GiB for memory
+the kernel cannot reclaim. A worker restored from its snapshot holds 1.4 to 2.2 GiB of
+it at qualification, about 0.9 GiB of which is the provider's restore filesystem. Every
+job unit on a Boat worker therefore has an 11-GiB `MemoryMax`, which covers lane CI from
+`scripts/remote-ci.sh`, a gate from `scripts/gate/gate.sh`, a screen's workload units
+from `scripts/remote-screen.sh` and a screen build from `scripts/nsc-build-host.sh`.
+`BOAT_JOB_MEMORY_GIB` in `scripts/boat/metadata-probe.py` holds the figure, and a test
+checks that each of these caps matches it.
 
 `admit` resolves `mbx` and `rustc` through the same environment that jobs receive. That
 environment puts the pinned mise MBX install on PATH, selects the pinned Rust toolchain

@@ -870,7 +870,8 @@ systemd user unit `gate-<name>` in the detached worktree `~/gate/wt-<name>`, whe
 is the first eight hex digits of the commit. The unit holds `~/gate/.lock`, which is the
 same file as `~/lanes/.heavy.lock`, so gates and the heavy work of lanes on that host take
 turns. Its memory cap is the smaller of 24 GiB and the host's RAM less 2 GiB, with 2 GiB of
-swap. A passing run removes its worktree, and a failing one keeps the sources and drops the
+swap. On a Boat worker the cap is the 11 GiB job that qualification admits, as
+[remote executors](REMOTE-EXECUTORS.md) describes. A passing run removes its worktree, and a failing one keeps the sources and drops the
 build directories.
 
 The CI half retains its task logs and summary in `ci-receipts` under the gate output
@@ -963,8 +964,8 @@ give back that space until the gate ends. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_
 the two amounts, in the environment or in `~/.config/sparkles/gate.env`.
 
 Each run sets `CARGO_BUILD_JOBS` from its host's gate memory cap, the cap in GiB less one,
-halved, between 2 and 8. That gives 6 jobs on a host with 15 GiB of RAM and a 13 GiB cap,
-and 8 jobs on a host with a 24 GiB cap. A Rust test build at 4 jobs peaked at about 9 GiB of
+halved, between 2 and 8. That gives 5 jobs at a Boat worker's 11 GiB cap, 6 jobs on a host
+with 15 GiB of RAM and a 13 GiB cap, and 8 jobs on a host with a 24 GiB cap. A Rust test build at 4 jobs peaked at about 9 GiB of
 process memory, and one at 8 jobs ran the ci half about 18% faster than at 4 on a host with
 a 24 GiB cap. `--cargo-jobs N` sets the jobs for every host of a run.
 `GATE_CARGO_JOBS_HOSTS`, a space-separated list such as `hostA=6 hostB=8` in the

@@ -130,11 +130,19 @@ case $host in
     runtime=$(rx_runtime "$obs" --reserve "${REMOTE_CI_RESERVE:-1200}")
     end=$(($(date +%s) + runtime))
     executor=boat
+    # Qualification admits a Boat worker for a job of BOAT_JOB_MEMORY_GIB in
+    # scripts/boat/metadata-probe.py, so the job's cap is that figure.
+    memory_max=11G
+    cargo_jobs=6
     ;;
   *)
     git push -q "ssh://$host/home/$USER/gate/repo.git" "$full:refs/heads/ci-${full:0:8}" "$bfull:refs/heads/ci-base-${bfull:0:8}"
     end=$((now + 21600))
     executor=ssh
+    # The host expands this, so its own GATE_MEMORY_MAX applies.
+    # shellcheck disable=SC2016
+    memory_max='${GATE_MEMORY_MAX:-13G}'
+    cargo_jobs=6
     ;;
 esac
 min=${REMOTE_CI_MIN_SECONDS:-600}
@@ -167,9 +175,9 @@ for n in MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE
 done
 p=\$PATH; [ ! -d \"\$G/py-venv/bin\" ] || p=\$G/py-venv/bin:\$p
 systemd-run --user --unit gate-$name --collect -q \"\${forward[@]}\" \\
-  -p MemoryMax=\${GATE_MEMORY_MAX:-13G} -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p TimeoutStopSec=60 -p UMask=0022 \\
+  -p MemoryMax=$memory_max -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p TimeoutStopSec=60 -p UMask=0022 \\
   --setenv=HOME=\"\$HOME\" --setenv=USER=\"\$USER\" --setenv=PATH=\"\$p\" --setenv=SPARKLES_REMOTE_EXECUTOR=$executor \\
-  --setenv=CARGO_BUILD_JOBS=6 --setenv=CARGO_INCREMENTAL=0 \\
+  --setenv=CARGO_BUILD_JOBS=$cargo_jobs --setenv=CARGO_INCREMENTAL=0 \\
   --setenv=NEED_GIB=${REMOTE_CI_MIN_FREE_GIB:-85} --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end \\
   /bin/bash \"\$o/ci-job.sh\"
 echo \"started gate-$name, ending by \$(date -u -d @$end +%FT%TZ)\"" < "$here/gate/remote/ci-job.sh"

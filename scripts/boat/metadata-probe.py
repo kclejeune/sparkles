@@ -253,8 +253,11 @@ def validate_pressure(events,swap):
     need(all(int(v)==0 for v in events.values()),'metadata memory pressure')
     need(swap=='0','metadata swap peak')
 
-# A 12 GiB job, the 512 MiB metadata service and a 1 GiB host reserve.
-JOB_HEADROOM=12*2**30+512*2**20+2**30
+# A job of BOAT_JOB_MEMORY_GIB, the 512 MiB metadata service and a 1 GiB host reserve.
+# Every job unit on a Boat worker has this MemoryMax: remote-ci.sh, remote-screen.sh,
+# gate/remote/gate-start.sh and the Boat build of nsc-build-host.sh. A test checks them.
+BOAT_JOB_MEMORY_GIB=11
+JOB_HEADROOM=BOAT_JOB_MEMORY_GIB*2**30+512*2**20+2**30
 HOST_NONRECLAIMABLE=['AnonPages','Shmem','Unevictable','KernelStack','PageTables','SecPageTables','Percpu','SUnreclaim']
 
 def cgroup_nonreclaimable(stat_text):
@@ -286,7 +289,7 @@ def memory_admission(meminfo,ancestors):
     for k in ['MemTotal','MemAvailable','SwapTotal','SwapFree']:
         if k in kb:memory[k]=kb[k]
     host=sum(kb.get(k,0) for k in HOST_NONRECLAIMABLE);memory['host_nonreclaimable']=host
-    need(kb['MemTotal']-host>=JOB_HEADROOM,'insufficient host headroom for proposed12GiB job')
+    need(kb['MemTotal']-host>=JOB_HEADROOM,'insufficient host headroom for proposed11GiB job')
     for row in ancestors:
         if row.get('memory.max','max')=='max':continue
         need('memory.stat' in row,'limited ancestor without memory.stat')
