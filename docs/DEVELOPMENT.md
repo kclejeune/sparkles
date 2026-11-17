@@ -1075,18 +1075,25 @@ manual **compatibility-features** input.
 |---|---|
 | Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, the API compatibility inventory and checker fixtures, and the UI's build, type check and unit tests. It compiles small tooling fixtures and leaves the workspace crates unbuilt. |
 | Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
-| Build tests | `mbx nextest archive` builds every test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. `scripts/ci-free-disk.sh` removes unused preinstalled toolchains from GitHub's runner when it has less than 60 GiB free and reports the least free disk the job reached. |
+| Build tests | The job builds the server's unit tests alone, then `mbx nextest archive` builds every other test binary once and uploads three artifacts. These are the whole archive, a small archive of the binaries in `HEAVY_1` and `HEAVY_2`, and the debug server binary. `scripts/ci-free-disk.sh` removes unused preinstalled toolchains from GitHub's runner when it has less than 60 GiB free and reports the least free disk the job reached. |
 | Doctests | The workspace's doctests, which nextest does not run. They build in parallel with the test archive, so the test jobs do not wait for them. |
 | Test | Two heavy shards run the binaries with the slowest tests from the small archive. The `timing` shard runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. Four more shards split the other tests by count, and the `SPARKLES_TEST_SLICES` variable changes how many. |
 | Jena clients | Jena's own HTTP clients against the debug server binary (`mise run test:jena-clients`). |
 | Features | A manual run with **compatibility-features** checked runs six jobs through `scripts/test-features.sh`, with the default features off and one feature set each. They build apart from the archive and restore the test build's cache. |
 
 The Build tests job compiles the server's binary and its unit tests in single compiler
-processes of about 8 GB and 11 GB. `scripts/ci-memory.sh` prints the runner's memory,
-swap, load and largest compilers every 30 seconds while the archives build, and the
-archive commands stop at 38 minutes and list the processes left. A run that stalls the
-runner therefore fails inside its build step and keeps its log, instead of reaching the
-job's 45-minute limit with no log.
+processes of about 8.5 GB and 12 GB on four CPUs. Built together they leave a 16 GB
+runner unresponsive, so the job builds the server's unit tests alone first with
+`mbx test --no-run --workspace --bin sparkles`. The archive commands that follow select
+the same packages, features and profile, so they find those tests fresh and the second
+large compile starts after the first has ended. The job adds only a 2 GiB swap file, where the
+Doctests job adds 16 GiB, because a large swap lets overlapping compiles thrash for the
+whole job limit instead of ending in an out-of-memory kill with a log. The step prints the
+runner's memory and swap. `scripts/ci-memory.sh` prints the runner's memory, swap,
+load and largest compilers every 30 seconds while the commands run, and they stop at 38
+minutes and list the processes left. A run that stalls the runner therefore fails inside
+its build step and keeps its log, instead of reaching the job's 45-minute limit with no
+log.
 
 The transcript import integration test reserves all test slots while it runs in its
 shard. It sends a 5 MiB transcript through the real server, whose query deadline stays
@@ -1252,10 +1259,10 @@ use the supported Cargo shim because those tools invoke Cargo themselves. CI kee
 tested Boxington version pinned, including checksum-verified container downloads. Other
 client versions may miss cache entries or lack features used by these build scripts.
 
-The **Build tests** job holds the target lease while `mbx nextest archive` builds and
-writes its archive under `RUNNER_TEMP`. Recompression and artifact upload read that
-archive outside the target directory, so collection after the command cannot remove the
-upload.
+The **Build tests** job holds the target lease while the server's unit tests build and while
+`mbx nextest archive` builds and writes its archive under `RUNNER_TEMP`. Recompression
+and artifact upload read that archive outside the target directory, so collection after
+the command cannot remove the upload.
 
 The Linux wheel and Alpine addon containers install the pinned Boxington version from
 checksum-verified portable binaries. They keep the store under `.cache/mbx` in the

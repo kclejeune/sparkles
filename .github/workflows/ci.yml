@@ -345,11 +345,20 @@ jobs:
         run: &free-disk scripts/ci-free-disk.sh start 60
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      # The test build can exceed the physical memory of a 16 GB runner. A larger runner
-      # needs no swap file, and a runner whose file system refuses one warns instead.
+      # A compile can exceed the physical memory of a 16 GB runner, so a job adds a swap
+      # file, 16 GiB unless it sets SWAP_GIB. The test build sets 2. It compiles its two
+      # largest rustc processes one after the other, and the larger of them peaks near
+      # 12 GB. A runner with memory and swap near the 20 GB of two overlapping compiles
+      # lets such a regression thrash for the whole job limit, where a small file leaves
+      # it little to thrash into and ends the build with an out-of-memory kill and its log.
+      # A larger runner needs no swap file, and a runner whose file system refuses one
+      # warns instead. The step prints the memory and swap it ends with, so a run records
+      # what the runner had.
       - name: Add swap
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          SWAP_GIB: "2"
         run: &add-swap |
           memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
           if [ "$memory_kib" -ge $((24 * 1024 * 1024)) ]; then
@@ -358,7 +367,7 @@ jobs:
           fi
           # A name of its own, so a persistent runner never touches another job's swap file
           swapfile="/swapfile-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
-          if ! sudo fallocate -l 16G "$swapfile"; then
+          if ! sudo fallocate -l "${SWAP_GIB:-16}G" "$swapfile"; then
             echo '::warning::the runner refused a swap file'
           elif ! { sudo chmod 600 "$swapfile" && sudo mkswap "$swapfile" > /dev/null &&
             sudo swapon "$swapfile"; }; then
@@ -367,6 +376,8 @@ jobs:
           else
             echo "CI_SWAPFILE=$swapfile" >> "$GITHUB_ENV"
           fi
+          swapon --show
+          free -h
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           cache-bin: false
@@ -400,16 +411,23 @@ jobs:
       # get it next to the archive. The Jena clients job gets the server binary alone.
       - name: Disk space before test archive
         run: &free-disk-wait scripts/ci-free-disk.sh wait
-      # One managed-target lease (scripts/cargo-sparkles-task) covers both archive commands
-      # and the copy of the server binary. Without it Boxington collects the target after
-      # the first command, and the second rebuilds the workspace.
+      # One managed-target lease (scripts/cargo-sparkles-task) covers the server's unit
+      # tests, both archive commands and the copy of the server binary. Without it
+      # Boxington collects the target after the first command, and the next rebuilds the
+      # workspace.
       #
-      # Some runs of this step left the runner unresponsive past the job's limit, so the
-      # job ended without a log and without its cleanup steps. A sampler prints memory,
-      # swap, load and the largest compilers every 30 seconds, and the archive commands
-      # stop at 38 minutes, so such a run fails inside the step, lists its processes and
-      # keeps its log. The server's binary and its unit tests each compile in one process
-      # of 8 to 11 GB.
+      # The server's binary and its unit tests each compile in one rustc process, of about
+      # 8.5 GB and 12 GB on four CPUs. Built by one archive command they overlap, and on a
+      # 16 GB runner that left the machine unresponsive past the job's limit, so the job
+      # ended without a log and without its cleanup steps. The first command therefore
+      # builds only the unit tests of the server's binary. The archive commands that follow
+      # find them fresh, because they select the same packages, features and profile, so
+      # the second large compile starts after the first has ended. The test --no-run line
+      # must keep the --workspace and --locked flags of the archive commands, since a
+      # package selection of its own can unify different features and rebuild the tests.
+      # A sampler prints memory, swap, load and the largest compilers every 30 seconds,
+      # and the commands stop at 38 minutes, so a run that still stalls fails inside the
+      # step, lists its processes and keeps its log.
       - name: Build the test archives
         run: |
           scripts/ci-memory.sh 30 &
@@ -418,6 +436,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/archive" "$RUNNER_TEMP/heavy" "$RUNNER_TEMP/server"
           # shellcheck disable=SC2016 # the inner shell expands the variables
           PATH="$PWD/scripts:$PATH" timeout --kill-after=1m 38m mbx sparkles-task -- bash -euo pipefail -c '
+            echo "server unit tests from $(date -u +%H:%M:%S)"
+            mbx test --locked --workspace --bin sparkles --no-run
             echo "full archive from $(date -u +%H:%M:%S)"
             mbx nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
             echo "heavy archive from $(date -u +%H:%M:%S)"
