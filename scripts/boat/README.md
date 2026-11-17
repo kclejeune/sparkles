@@ -62,6 +62,12 @@ including first bootstrap. Actual bootstrap-lock, descendant, tool, manifest, so
 capacity, token metadata and metadata-service closure checks must pass afterward. A
 different manifest is refused rather than adopted automatically.
 
+The metadata probe's memory check admits a 12 GiB job. A headroom refusal alone is read
+again every 2 seconds for at most 60 seconds, bounded by the metadata unit's own clock, and
+admits only on two readings in a row after a refusal. The readings are kept as
+`memory_series` in the qualification's `memory_bytes` or in the phase's refusal evidence.
+[Remote executors](../../docs/REMOTE-EXECUTORS.md) describes the figures.
+
 ## Startup closure
 
 The startup observer treats a process of the worker's uid as startup work, apart from

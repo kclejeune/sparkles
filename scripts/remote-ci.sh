@@ -132,7 +132,7 @@ case $host in
     executor=boat
     # Qualification admits a Boat worker for a job of BOAT_JOB_MEMORY_GIB in
     # scripts/boat/metadata-probe.py, so the job's cap is that figure.
-    memory_max=11G
+    memory_max=12G
     cargo_jobs=6
     ;;
   *)

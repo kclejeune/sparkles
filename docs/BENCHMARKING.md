@@ -1107,8 +1107,9 @@ A remote build copies the archive of the commit, with the same placeholder `ui/b
 local build, to a scratch directory under `~/lanes/nsc-build` on the host. It builds there
 with `scripts/nsc-build.sh` under the host's own Boxington cache, inside a systemd user
 scope named `nsc-build-<commit>-<suffix>` with the gate's memory cap and 2 GiB of swap,
-while it holds the host's heavy lock. On a Boat worker the cap is 11 GiB. The host's `mbx`
-has to match the `mise.toml` pin.
+while it holds the host's heavy lock. On a Boat worker the cap is 12 GiB and the worker's
+user slice allows no swap, so the build has none. The host's `mbx` has to match the
+`mise.toml` pin.
 The binary comes back into the same cache entry after a SHA-256 check, and the scratch
 directory is removed when the build ends, also after a failure or Ctrl-C, which also stops
 the scope. A binary built on another host with the same pinned toolchain is comparable,

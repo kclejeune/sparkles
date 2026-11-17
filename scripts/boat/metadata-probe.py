@@ -1,6 +1,6 @@
 """Run inside the named 512-MiB qualification service."""
 from pathlib import Path
-import hashlib,itertools,json,os,stat,subprocess,sys,re,shutil,tomllib
+import hashlib,itertools,json,os,stat,subprocess,sys,re,shutil,time,tomllib
 
 class Refusal(Exception):pass
 def need(ok,why):
@@ -256,7 +256,7 @@ def validate_pressure(events,swap):
 # A job of BOAT_JOB_MEMORY_GIB, the 512 MiB metadata service and a 1 GiB host reserve.
 # Every job unit on a Boat worker has this MemoryMax: remote-ci.sh, remote-screen.sh,
 # gate/remote/gate-start.sh and the Boat build of nsc-build-host.sh. A test checks them.
-BOAT_JOB_MEMORY_GIB=11
+BOAT_JOB_MEMORY_GIB=12
 JOB_HEADROOM=BOAT_JOB_MEMORY_GIB*2**30+512*2**20+2**30
 HOST_NONRECLAIMABLE=['AnonPages','Shmem','Unevictable','KernelStack','PageTables','SecPageTables','Percpu','SUnreclaim']
 
@@ -275,6 +275,13 @@ def cgroup_nonreclaimable(stat_text):
     else:kernel=sum(stat.get(k,0) for k in ['kernel_stack','pagetables','sec_pagetables','percpu','sock','vmalloc','slab_unreclaimable'])
     return stat['anon']+stat.get('shmem',0)+stat.get('unevictable',0)+max(0,kernel)
 
+class HeadroomRefusal(Refusal):
+    """A refusal because the measured memory leaves too little room, which a later reading may cure.
+
+    ``memory`` is the reading's evidence so far. Every other memory refusal is structural
+    and is never read again."""
+    def __init__(self,why,memory):super().__init__(why);self.memory=memory
+
 def memory_admission(meminfo,ancestors):
     """Refuse unless the host and every limited ancestor cgroup have room for the job.
 
@@ -289,13 +296,66 @@ def memory_admission(meminfo,ancestors):
     for k in ['MemTotal','MemAvailable','SwapTotal','SwapFree']:
         if k in kb:memory[k]=kb[k]
     host=sum(kb.get(k,0) for k in HOST_NONRECLAIMABLE);memory['host_nonreclaimable']=host
-    need(kb['MemTotal']-host>=JOB_HEADROOM,'insufficient host headroom for proposed11GiB job')
+    if kb['MemTotal']-host<JOB_HEADROOM:raise HeadroomRefusal('insufficient host headroom for proposed12GiB job',memory)
     for row in ancestors:
         if row.get('memory.max','max')=='max':continue
         need('memory.stat' in row,'limited ancestor without memory.stat')
         row['nonreclaimable']=cgroup_nonreclaimable(row['memory.stat'])
-        need(int(row['memory.max'])-row['nonreclaimable']>=JOB_HEADROOM,'ancestor memory headroom')
+        memory['ancestor_nonreclaimable']=max(memory.get('ancestor_nonreclaimable',0),row['nonreclaimable'])
+        if int(row['memory.max'])-row['nonreclaimable']<JOB_HEADROOM:raise HeadroomRefusal('ancestor memory headroom',memory)
     return memory
+
+# A worker restored from its snapshot holds memory for a while that it gives back, so one
+# reading of its headroom can be refused although the same worker admits a few seconds later.
+# A refused headroom is read again every MEMORY_RESAMPLE_INTERVAL seconds for at most
+# MEMORY_RESAMPLE_SECONDS, and never past the unit's own clock less PROBE_RESERVE seconds.
+MEMORY_RESAMPLE_SECONDS=60
+MEMORY_RESAMPLE_INTERVAL=2
+PROBE_RUNTIME=240
+PROBE_RESERVE=40
+
+def settled_memory(read,clock,pause,limit,interval=MEMORY_RESAMPLE_INTERVAL):
+    """The admitted memory reading, read again while only its headroom is refused, and its series.
+
+    ``read`` returns the meminfo text and the ancestor rows of one fresh reading, ``clock``
+    is monotonic and ``limit`` is the latest time on that clock at which a reading may
+    start. The rule and the job figure are those of memory_admission and do not change
+    between readings. A first reading that admits is the whole answer. After a refusal a
+    reading admits only when the reading before it did too, so one low reading never
+    admits. A reading refused for any other reason, such as a missing memory.stat, refuses
+    at once. When the window ends the last headroom refusal is raised, and the series is on
+    ``memory_series`` of that refusal and under ``memory_series`` of an admitted reading.
+    """
+    first=clock();end=min(first+MEMORY_RESAMPLE_SECONDS,limit);series=[];refused=None
+    while True:
+        meminfo,ancestors=read()
+        try:memory=memory_admission(meminfo,ancestors);admitted=True
+        except HeadroomRefusal as error:memory=error.memory;admitted=False;refused=error
+        series.append({'at':round(clock()-first,1),'admitted':admitted,'host_nonreclaimable':memory.get('host_nonreclaimable'),'ancestor_nonreclaimable':memory.get('ancestor_nonreclaimable')})
+        if admitted and (len(series)==1 or series[-2]['admitted']):
+            memory['memory_series']=series;return memory,ancestors
+        if clock()+interval>end:refused.memory_series=series;raise refused
+        pause(interval)
+
+def unit_limit(started=None):
+    """The latest boot-clock time at which a memory reading may start in the metadata unit.
+
+    The unit ends at its RuntimeMax, PROBE_RUNTIME seconds after the start time that the
+    kernel records for this process, and the last PROBE_RESERVE seconds stay free."""
+    if started is None:started=int(Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19])/os.sysconf('SC_CLK_TCK')
+    return started+PROBE_RUNTIME-PROBE_RESERVE
+
+def read_memory(cg):
+    """One fresh reading of the host's meminfo and of every ancestor cgroup of the metadata unit."""
+    ancestors=[];ancestor=cg.parent
+    while ancestor.is_relative_to(Path('/sys/fs/cgroup')):
+        row={'path':str(ancestor)}
+        for name in ['memory.max','memory.current','memory.swap.max','memory.stat']:
+            if (ancestor/name).exists():row[name]=(ancestor/name).read_text().strip()
+        ancestors.append(row)
+        if ancestor==Path('/sys/fs/cgroup'):break
+        ancestor=ancestor.parent
+    return Path('/proc/meminfo').read_text(),ancestors
 
 def probe(payload):
     uid=os.getuid();home=Path.home();need(uid==profile()['worker_uid'] and home==Path(profile()['worker_home']),'worker user')
@@ -342,15 +402,7 @@ def probe(payload):
         if stale is not None:sources[str(repo)]['stat_only_status']=status_evidence(stale)
     after,_=safe_file(state/'toolchain.json',uid,denied,1024*1024);need(after==before,'manifest changed during checker')
     # Check parent capacity, excluding the deliberately smaller metadata service.
-    ancestors=[];ancestor=cg.parent
-    while ancestor.is_relative_to(Path('/sys/fs/cgroup')):
-        row={'path':str(ancestor)}
-        for name in ['memory.max','memory.current','memory.swap.max','memory.stat']:
-            if (ancestor/name).exists():row[name]=(ancestor/name).read_text().strip()
-        ancestors.append(row)
-        if ancestor==Path('/sys/fs/cgroup'):break
-        ancestor=ancestor.parent
-    memory=memory_admission(Path('/proc/meminfo').read_text(),ancestors)
+    memory,ancestors=settled_memory(lambda:read_memory(cg),lambda:time.clock_gettime(time.CLOCK_BOOTTIME),time.sleep,unit_limit())
     for row in ancestors:row.pop('memory.stat',None)
     disk={}
     for root in [home,home/'.local/share/mbx',Path(profile()['startup_repositories']['default']),Path(profile()['startup_repositories']['retained'])]:

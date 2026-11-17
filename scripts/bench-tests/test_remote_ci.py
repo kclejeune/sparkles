@@ -114,7 +114,7 @@ class RemoteCI(unittest.TestCase):
         r = self.run_ci('--base', 'origin/main', GATE_MEMORY_MAX='20G')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         log = self.log.read_text()
-        self.assertIn('prop MemoryMax=11G', log); self.assertNotIn('MemoryMax=20G', log)
+        self.assertIn('prop MemoryMax=12G', log); self.assertNotIn('MemoryMax=20G', log)
 
     @unittest.skipUnless(shutil.which('zsh'), 'zsh is not installed')
     def test_a_host_whose_login_shell_is_zsh_starts_the_job_and_forwards_its_settings(self):

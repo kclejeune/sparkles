@@ -281,7 +281,7 @@ class BoatJobMemory(unittest.TestCase):
     """Qualification admits a job of BOAT_JOB_MEMORY_GIB, and every Boat job unit has that cap."""
     def test_the_headroom_and_its_refusal_follow_the_job_figure(self):
         mp=metadata_probe();g=mp.BOAT_JOB_MEMORY_GIB
-        self.assertEqual(g,11)
+        self.assertEqual(g,12)
         self.assertEqual(mp.JOB_HEADROOM,g*2**30+512*2**20+2**30)
         source=(Path(__file__).resolve().parents[1]/'boat'/'metadata-probe.py').read_text()
         self.assertIn(f"'insufficient host headroom for proposed{g}GiB job'",source)
@@ -305,11 +305,103 @@ class BoatJobMemory(unittest.TestCase):
             return meminfo_text({'MemTotal':total//1024,'MemAvailable':(total-nonreclaimable)//1024,'AnonPages':nonreclaimable//1024})
         mp.memory_admission(meminfo(total-mp.JOB_HEADROOM),[])
         with self.assertRaises(mp.Refusal) as e:mp.memory_admission(meminfo(total-mp.JOB_HEADROOM+1024),[])
-        self.assertEqual(str(e.exception),'insufficient host headroom for proposed11GiB job')
-        # A restored worker measured 2.01 to 2.16 GiB at the probe, which the 12 GiB job
-        # refused at 2.12 GiB and the 11 GiB job admits with a GiB to spare.
-        mp.memory_admission(meminfo(int(2.2*2**30)),[])
-        with self.assertRaises(mp.Refusal):mp.memory_admission(meminfo(int(3.2*2**30)),[])
+        self.assertEqual(str(e.exception),'insufficient host headroom for proposed12GiB job')
+        # A restored worker measured 1.4 to 2.03 GiB at the probe and was refused at 2.12 GiB.
+        mp.memory_admission(meminfo(int(2.0*2**30)),[])
+        with self.assertRaises(mp.HeadroomRefusal):mp.memory_admission(meminfo(int(2.3*2**30)),[])
+
+
+def kib(gib):
+    return int(gib*2**20)*1024
+
+
+class ResampledMemory(unittest.TestCase):
+    """A refused headroom is read again for a bounded time, and nothing else is."""
+    TOTAL=16768798720
+    def reading(self,nonreclaimable,**kw):
+        host=meminfo_text({'MemTotal':self.TOTAL//1024,'MemAvailable':(self.TOTAL-nonreclaimable)//1024,'AnonPages':nonreclaimable//1024})
+        return host,kw.get('ancestors',[])
+
+    def run_series(self,values,limit=1000.0,**kw):
+        """Run settled_memory over readings of the given host figures, a second per pause, and return what it did."""
+        mp=metadata_probe();now=[0.0];reads=[];sleeps=[]
+        def read():
+            reads.append(now[0]);return values[min(len(reads)-1,len(values)-1)] if not callable(values) else values(len(reads))
+        def pause(seconds):sleeps.append(seconds);now[0]+=seconds
+        try:result=mp.settled_memory(read,lambda:now[0],pause,limit,**kw)
+        except mp.Refusal as error:result=error
+        return mp,result,reads,sleeps
+
+    def test_a_first_reading_that_admits_reads_once_and_never_waits(self):
+        mp=metadata_probe();ok=self.reading(kib(1.5))
+        mp,memory,reads,sleeps=self.run_series([ok])
+        self.assertEqual((reads,sleeps),([0.0],[]))
+        self.assertEqual([x['admitted'] for x in memory[0]['memory_series']],[True])
+
+    def test_a_transient_excess_that_settles_admits_on_two_readings_in_a_row(self):
+        gib=2**30;high=self.reading(kib(2.6));low=self.reading(kib(1.5))
+        mp,(memory,_),reads,sleeps=self.run_series([high,high,low,low])
+        self.assertEqual(reads,[0.0,2.0,4.0,6.0])
+        series=memory['memory_series']
+        self.assertEqual([x['admitted'] for x in series],[False,False,True,True])
+        self.assertEqual([x['at'] for x in series],[0.0,2.0,4.0,6.0])
+        self.assertEqual(series[0]['host_nonreclaimable'],kib(2.6))
+
+    def test_one_low_reading_between_high_ones_does_not_admit(self):
+        gib=2**30;high=self.reading(kib(2.6));low=self.reading(kib(1.5))
+        mp,error,reads,sleeps=self.run_series([high,low,high,high,high],limit=8.0)
+        self.assertIsInstance(error,mp.HeadroomRefusal)
+        self.assertEqual(str(error),'insufficient host headroom for proposed12GiB job')
+        self.assertEqual([x['admitted'] for x in error.memory_series],[False,True,False,False,False])
+
+    def test_a_worker_that_stays_over_refuses_when_the_window_ends(self):
+        high=self.reading(kib(2.6))
+        mp,error,reads,sleeps=self.run_series([high])
+        self.assertEqual(str(error),'insufficient host headroom for proposed12GiB job')
+        self.assertLessEqual(reads[-1],mp.MEMORY_RESAMPLE_SECONDS)
+        self.assertGreater(reads[-1],mp.MEMORY_RESAMPLE_SECONDS-mp.MEMORY_RESAMPLE_INTERVAL)
+        self.assertEqual(len(error.memory_series),len(reads))
+        self.assertTrue(all(row['admitted'] is False for row in error.memory_series))
+
+    def test_the_window_ends_with_the_units_clock(self):
+        high=self.reading(kib(2.6))
+        mp,error,reads,sleeps=self.run_series([high],limit=5.0)
+        self.assertEqual(reads,[0.0,2.0,4.0])
+        # The unit keeps PROBE_RESERVE seconds of its RuntimeMax.
+        self.assertEqual(mp.unit_limit(started=100.0),100.0+mp.PROBE_RUNTIME-mp.PROBE_RESERVE)
+        self.assertLess(mp.PROBE_RESERVE,mp.PROBE_RUNTIME-mp.MEMORY_RESAMPLE_SECONDS)
+
+    def test_a_structural_refusal_reads_once_and_never_waits(self):
+        gib=2**30;mp=metadata_probe()
+        bad_host=('MemTotal: 16000000 kB\n',[])
+        stat=cgroup_stat(gib,gib,0,current=2*gib)
+        rows=lambda **extra:[{'path':'/sys/fs/cgroup/user.slice','memory.max':str(16*gib),**extra}]
+        for name,value in [('meminfo',bad_host),('no stat',(meminfo_text({'MemTotal':self.TOTAL//1024,'AnonPages':1}),rows())),
+                           ('bad stat',(meminfo_text({'MemTotal':self.TOTAL//1024,'AnonPages':1}),rows(**{'memory.stat':'file 1'})))]:
+            with self.subTest(name):
+                mp,error,reads,sleeps=self.run_series([value])
+                self.assertIsInstance(error,mp.Refusal);self.assertNotIsInstance(error,mp.HeadroomRefusal)
+                self.assertEqual((len(reads),sleeps),(1,[]))
+
+    def test_an_ancestor_over_its_headroom_is_read_again_too(self):
+        gib=2**30;mp=metadata_probe()
+        def ancestors(anon):
+            stat=cgroup_stat(anon,gib,0,current=anon+gib+100*2**20)
+            return [{'path':'/sys/fs/cgroup/user.slice','memory.max':str(16*gib),'memory.stat':stat}]
+        host=self.reading(gib)[0]
+        values=[(host,ancestors(3*gib)),(host,ancestors(gib)),(host,ancestors(gib))]
+        mp,(memory,_),reads,sleeps=self.run_series(values)
+        self.assertEqual([x['admitted'] for x in memory['memory_series']],[False,True,True])
+        self.assertEqual(memory['memory_series'][0]['ancestor_nonreclaimable'],3*gib+100*2**20)
+
+    def test_the_refused_series_reaches_the_phase_result_and_its_evidence(self):
+        mp,error,reads,sleeps=self.run_series([self.reading(kib(2.6))],limit=3.0)
+        self.assertEqual(len(error.memory_series),2)
+        row=controller.phase_evidence({'memory_series':error.memory_series+['x',{'at':'no','host_nonreclaimable':-1}]})
+        self.assertEqual([x['admitted'] for x in row['evidence']['memory_series']],[False,False,False])
+        self.assertEqual(row['evidence']['memory_series'][-1]['host_nonreclaimable'],None)
+        self.assertIn('insufficient host headroom for proposed12GiB job',controller.packet_refusals())
+        self.assertIn('ancestor memory headroom',controller.packet_refusals())
 
 
 class LifetimeExtension(unittest.TestCase):
@@ -1230,6 +1322,18 @@ class QualificationWait(unittest.TestCase):
         self.assertEqual(result['unallowed_count'],3)
         row=controller.phase_evidence(result)['unallowed'];self.assertEqual({x['comm'] for x in row},{'bash','sudo'})
         self.assertEqual(controller.remote_reason(result['reason_code']),result['reason_code'])
+
+    def test_a_refused_memory_headroom_keeps_its_readings_in_the_phase_result(self):
+        now=[0.0]
+        high=(meminfo_text({'MemTotal':16375784,'MemAvailable':1,'AnonPages':kib(2.6)//1024}),[])
+        def qualify(payload):
+            def pause(seconds):now[0]+=seconds
+            self.O['settled_memory'](lambda:high,lambda:now[0],pause,now[0]+5.0)
+        result,closed=self.O['run_phase']({'phase':'metadata'},None,qualify)
+        self.assertFalse(closed);self.assertEqual(result['reason_code'],'refusal:insufficient host headroom for proposed12GiB job')
+        self.assertEqual(controller.remote_reason(result['reason_code']),result['reason_code'])
+        self.assertEqual([x['at'] for x in result['memory_series']],[0.0,2.0,4.0])
+        self.assertEqual(len(controller.phase_evidence(result)['evidence']['memory_series']),3)
 
     def test_work_after_every_probe_refuses_within_the_bound(self):
         clean=self.trees['w6-3'][0];child=self.with_child('w6-3',67279)

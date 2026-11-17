@@ -44,7 +44,7 @@ def packet_refusals():
     found=set()
     for name in ('common.py','config_schema.py','metadata-probe.py','startup-observer.py','remote-launcher.py','diagnostic-probe.py'):
         for node in ast.walk(ast.parse((ROOT/name).read_text())):
-            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal','SourceDrift'):
+            if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id in ('need','require','Refusal','HeadroomRefusal','SourceDrift'):
                 for arg in node.args:
                     if isinstance(arg,ast.Constant) and isinstance(arg.value,str):found.add(arg.value)
     return frozenset(found)
@@ -88,6 +88,11 @@ def phase_evidence(result):
          'elapsed_seconds':result.get('elapsed_seconds') if type(result.get('elapsed_seconds'))in(int,float) and 0<=result['elapsed_seconds']<10**6 else None,
          'terminal':{k:terminal[k] for k in ('ExecMainStatus','Result','LoadState','ActiveState') if isinstance(terminal.get(k),str) and re.fullmatch(r'[a-z0-9-]{1,32}',terminal[k])}}
     evidence={}
+    series=result.get('memory_series')
+    if isinstance(series,list):
+        evidence['memory_series']=[{'at':x.get('at') if type(x.get('at'))in(int,float) and 0<=x['at']<10**6 else None,'admitted':x.get('admitted')is True,
+                                    'host_nonreclaimable':bounded_int(x.get('host_nonreclaimable')),'ancestor_nonreclaimable':bounded_int(x.get('ancestor_nonreclaimable'))}
+                                   for x in series[:64] if isinstance(x,dict)]
     for name in ('terminal_evidence','phase_memory'):
         x=result.get(name)
         if isinstance(x,dict):

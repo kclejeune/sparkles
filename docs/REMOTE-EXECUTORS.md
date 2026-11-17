@@ -35,17 +35,27 @@ Cargo shim use the shared host cache and each source directory's managed target.
 The memory check counts only memory that the kernel cannot reclaim. On the host this is
 anonymous, shared, unevictable and unreclaimable kernel memory. For every ancestor
 cgroup with a limit it is the cgroup's anonymous, shared, unevictable and unreclaimable
-kernel memory from `memory.stat`. Each limit must leave room for an 11-GiB job, the
+kernel memory from `memory.stat`. Each limit must leave room for a 12-GiB job, the
 512-MiB metadata service and a 1-GiB host reserve. Page cache does not count, so a
 worker whose slice holds several gigabytes of cache is admitted, and a slice that
-exposes no `memory.stat` is refused. On a 16-GiB worker that leaves 3.1 GiB for memory
+exposes no `memory.stat` is refused. On a 16-GiB worker that leaves 2.1 GiB for memory
 the kernel cannot reclaim. A worker restored from its snapshot holds 1.4 to 2.2 GiB of
-it at qualification, about 0.9 GiB of which is the provider's restore filesystem. Every
-job unit on a Boat worker therefore has an 11-GiB `MemoryMax`, which covers lane CI from
+it at qualification, about 0.9 GiB of which is the provider's restore filesystem, and
+part of that is transient while files are restored. A reading that is refused only
+because the headroom is short is therefore read again every 2 seconds for up to 60
+seconds, and never past the last 40 seconds of the metadata unit's runtime. A later
+reading admits only when the reading before it admitted too, so one low reading never
+admits, and the first reading that admits ends the wait at once. A missing or malformed
+`memory.stat` is not read again. The readings are recorded with the qualification, or
+with the refusal when the headroom never settles.
+
+Every job unit on a Boat worker has a 12-GiB `MemoryMax`, which covers lane CI from
 `scripts/remote-ci.sh`, a gate from `scripts/gate/gate.sh`, a screen's workload units
 from `scripts/remote-screen.sh` and a screen build from `scripts/nsc-build-host.sh`.
 `BOAT_JOB_MEMORY_GIB` in `scripts/boat/metadata-probe.py` holds the figure, and a test
-checks that each of these caps matches it.
+checks that each of these caps matches it. The worker's user slice allows no swap, so a
+job has none whatever its `MemorySwapMax` says. The largest single user is the rustc
+that builds the server's unit-test binary, which reaches about 11.2 GiB.
 
 `admit` resolves `mbx` and `rustc` through the same environment that jobs receive. That
 environment puts the pinned mise MBX install on PATH, selects the pinned Rust toolchain

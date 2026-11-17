@@ -255,6 +255,7 @@ def own_cgroup_memory(unit,proc_cgroup=Path('/proc/self/cgroup'),root=Path('/sys
         return {'source':'cgroup','cgroup':line[3:],'memory_peak':int(peak),'swap_peak':int(swap)}
     except Exception as error:return {'source':'unavailable','reason_code':reason_code(error)}
 
+MEMORY_SERIES_MAX=64
 def run_phase(payload,observe,qualify,clock=time.monotonic):
     """One remote phase's result. Every refusal carries a bounded reason code."""
     started=clock()
@@ -264,6 +265,8 @@ def run_phase(payload,observe,qualify,clock=time.monotonic):
         # A source drift names each recorded field beside the observed one.
         drift=drift_evidence(getattr(error,'source_drift',None))
         if drift is not None:result['source_drift']=drift
+        # A refused memory headroom names every reading it took.
+        if isinstance(getattr(error,'memory_series',None),list):result['memory_series']=error.memory_series[:MEMORY_SERIES_MAX]
         # A busy refusal names the startup work it last saw, bounded like a checkpoint's.
         if isinstance(getattr(error,'unallowed',None),list):result.update(unallowed=error.unallowed[:UNALLOWED_MAX],unallowed_count=error.unallowed_count)
     closed=result.get('startup_closed')is True if payload['phase']!='metadata' else result.get('qualified')is True

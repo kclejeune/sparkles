@@ -350,7 +350,7 @@ bh_start() {
   # Qualification admits a Boat worker for a job of BOAT_JOB_MEMORY_GIB in
   # scripts/boat/metadata-probe.py, so a build there takes that cap.
   local cap=
-  case $1 in boat:*) cap='SPARKLES_NSC_BUILD_MEMORY_MAX=11G ' ;; esac
+  case $1 in boat:*) cap='SPARKLES_NSC_BUILD_MEMORY_MAX=12G ' ;; esac
   # shellcheck disable=SC2029
   bh_rx 120 "$1" "${cap}bash $2/bin/nsc-build-remote.sh $2 $3 $expiry $4" < /dev/null || code=$?
   [ "$code" != 0 ] || return 0

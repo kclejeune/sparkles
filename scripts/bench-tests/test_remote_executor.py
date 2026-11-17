@@ -450,10 +450,10 @@ class Admission(unittest.TestCase):
                 if override is not None:env['GATE_MEMORY_MAX']=override
                 return subprocess.run(['bash','-c',script],env=env,capture_output=True,text=True,timeout=30)
             worker=16375784
-            for executor,total,override,want in [('boat',worker,None,'11G 5'),('ssh',worker,None,'13G 6'),('ssh',32*1048576,None,'24G 8'),
+            for executor,total,override,want in [('boat',worker,None,'12G 5'),('ssh',worker,None,'13G 6'),('ssh',32*1048576,None,'24G 8'),
                                                  ('boat',worker,'9G','9G 4'),('ssh',worker,'20G','20G 8')]:
                 r=run(executor,total,override);self.assertEqual((r.returncode,r.stdout.strip()),(0,want),(executor,override,r.stderr))
-            for override in ['12G','24G','11000M','G']:
+            for override in ['13G','24G','12000M','G']:
                 r=run('boat',worker,override);self.assertEqual(r.returncode,2,(override,r.stdout));self.assertIn('GATE_MEMORY_MAX',r.stderr)
 
     def test_gate_start_makes_its_files_private_whatever_the_login_umask(self):
