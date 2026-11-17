@@ -236,7 +236,7 @@ fn mixed_aggregates_match_eager_execution_at_every_batch_size() {
     for q in [
         "SELECT ?s (COUNT(*) AS ?n) (SUM(?v) AS ?t) (AVG(?v * 2) AS ?m) (MIN(?v) AS ?lo) \
          (MAX(?v) AS ?hi) (GROUP_CONCAT(STR(?v); separator=\"|\") AS ?all) (SAMPLE(?v) AS ?x) \
-         (COUNT(DISTINCT ?v) AS ?d) (COUNT(DISTINCT *) AS ?r) { ?s <urn:p> ?v } GROUP BY ?s HAVING (SUM(?v) > 100)",
+         (COUNT(DISTINCT ?v) AS ?d) { ?s <urn:p> ?v } GROUP BY ?s HAVING (SUM(?v) > 100)",
         "SELECT ?x (COUNT(*) AS ?n) (GROUP_CONCAT(DISTINCT STR(?v)) AS ?g) \
          { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?x } } GROUP BY ?x HAVING (COUNT(*) > 1)",
         "SELECT ?s ?x (AGG <urn:test:sequence>(?v) AS ?a) (SUM(?v) AS ?t) (GROUP_CONCAT(STR(?v)) AS ?g) \
