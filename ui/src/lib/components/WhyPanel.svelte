@@ -159,9 +159,12 @@
     expanding = new Set([...expanding, d.id]);
     refError = '';
     try {
+      // the same source as the trees, so that the answer is read the same way
+      const source = explanation?.source;
       const r = await explainTriple(ds, triple, {
         maxTrees: MAX_TREES,
         maxDepth: depth,
+        source: source === 'rdfsOnRead' ? undefined : source,
         signal: c.signal,
       });
       if (gen !== generation) return;
