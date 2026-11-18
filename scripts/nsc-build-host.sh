@@ -304,10 +304,11 @@ bh_send_scripts() {
 bh_send_source() {
   local part=$2/src.part.$BH_SEND_ATTEMPT
   BH_SEND_ATTEMPT=$((BH_SEND_ATTEMPT + 1))
-  # Source mtimes stay current, as in a local build.
+  # Source mtimes stay current, as in a local build. The archive travels compressed, about a
+  # third of its 190 MB, so a slow uplink still delivers it within the attempt's bound.
   # shellcheck disable=SC2029
-  git -C "$BH_ROOT" archive "$3" | bh_rx 900 "$1" \
-    "$(bh_skip_published "$2" src); rm -rf -- $part && mkdir $part && tar -x -m -C $part && mkdir -p $part/ui/build && cp $2/bin/ui-index.html $part/ui/build/index.html && $(bh_publish "$2" src "$part")"
+  git -C "$BH_ROOT" archive "$3" | zstd -q -9 -T0 | bh_rx 900 "$1" \
+    "$(bh_skip_published "$2" src); rm -rf -- $part && mkdir $part && zstd -dcq | tar -x -m -C $part && mkdir -p $part/ui/build && cp $2/bin/ui-index.html $part/ui/build/index.html && $(bh_publish "$2" src "$part")"
 }
 
 # bh_fetch HOST DIR OUT: copy DIR/out back into OUT. The archive is extracted only when it

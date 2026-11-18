@@ -127,7 +127,10 @@ pathlib.Path('target/release/sparkles').chmod(0o755)
     "c++": "#!/bin/sh\necho 'c++ test'\n",
     "zstd": """#!/usr/bin/env python3
 import shutil,sys
-a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a.index('-o')+1]][0],a[a.index('-o')+1])
+# A stream without -o, as the source copy's compression and decompression, passes unchanged.
+a=sys.argv[1:]
+if '-o' not in a:shutil.copyfileobj(sys.stdin.buffer,sys.stdout.buffer);raise SystemExit(0)
+shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a.index('-o')+1]][0],a[a.index('-o')+1])
 """,
 }
 
@@ -420,6 +423,8 @@ class BuildHost(unittest.TestCase):
         result, out = self.bench("--build-host", "h1", env=env)
         [build] = self.builds()
         self.assertTrue(build["cwd"].endswith("/src"), build["cwd"])
+        # The archive travels compressed.
+        self.assertIn("zstd -dcq | tar -x -m -C", self.ssh_log.read_text())
         log = (out / "logs" / "build-A.log").read_text()
         self.assertIn("copying the source of", log)
         self.assertIn("retrying", log)
