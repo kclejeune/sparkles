@@ -109,14 +109,26 @@ const KEYED: &[&str] = &[
     "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(NOT EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k } AS ?b) } GROUP BY ?b ORDER BY ?b",
 ];
 
-/// EXISTS that automatic execution keeps eager. The cursor evaluates one inside a
-/// larger expression or an aggregate argument once per distinct outer key, which
-/// measured slower, and it answers one in an OPTIONAL condition from its key set, but
-/// its conditional OPTIONAL measured slower than the eager one.
+/// EXISTS inside a larger expression, an aggregate argument or an ORDER BY key, which
+/// both executors answer from the key set of the pattern where it can and otherwise
+/// evaluate once per distinct outer key, so automatic execution streams them.
+const NESTED: &[&str] = &[
+    "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER (?v < 10 || EXISTS { ?s <urn:q> <urn:o:5> }) }",
+    "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER (?v < 10 || EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k }) }",
+    "SELECT (SUM(IF(EXISTS { ?s <urn:q> ?o }, 1, 0)) AS ?n) { ?s <urn:p> ?v }",
+    "SELECT ?v (SUM(IF(NOT EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k }, 1, 0)) AS ?n) { ?s <urn:p> ?v } GROUP BY ?v ORDER BY ?v",
+    "SELECT ?e (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(IF(EXISTS { ?s <urn:q> ?o }, \"w\", \"n\") AS ?e) } GROUP BY ?e ORDER BY ?e",
+    "SELECT ?e (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o } BIND(COALESCE(?v > 50 && EXISTS { ?o <urn:r> ?k }, false) AS ?e) } GROUP BY ?e ORDER BY ?e",
+    "SELECT ?e (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(IF(?s = <urn:s:7>, EXISTS { ?s <urn:q> ?o }, false) AS ?e) } GROUP BY ?e ORDER BY ?e",
+    "SELECT ?v (COUNT(?q) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?q } } GROUP BY ?v ORDER BY DESC(EXISTS { ?x <urn:p> ?v . ?x <urn:q> ?o . ?o <urn:r> ?k }) ?v",
+    "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:q> ?o FILTER(?v >= 0) } }",
+    "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?o <urn:r> ?k } }",
+];
+
+/// An OPTIONAL whose condition is an EXISTS, which automatic execution keeps eager
+/// because the cursor's conditional OPTIONAL measured slower than the eager one.
 const PER_KEY: &[&str] = &[
     "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
-    "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER (?v < 10 || EXISTS { ?s <urn:q> <urn:o:5> }) }",
-    "SELECT (SUM(IF(EXISTS { ?s <urn:q> ?o }, 1, 0)) AS ?n) { ?s <urn:p> ?v }",
 ];
 
 #[test]
@@ -166,7 +178,7 @@ fn large_groupings_with_exists_stream_and_match_eager() {
 }
 
 #[test]
-fn exists_evaluated_per_key_stays_eager_and_matches() {
+fn optional_exists_stays_eager_and_matches() {
     let s = store();
     for q in PER_KEY {
         let expected = query(s.snapshot(), q, &Default::default())
@@ -177,6 +189,52 @@ fn exists_evaluated_per_key_stays_eager_and_matches() {
             .unwrap_or_else(|e| panic!("{q}: {e}"));
         assert!(!streamed, "{q}: streamed");
         assert_eq!(ordered(got), ordered(expected), "{q}");
+    }
+}
+
+/// An EXISTS inside a larger expression streams, and its answers equal eager execution
+/// and evaluation per key with the key sets turned off, at two batch sizes.
+#[test]
+fn nested_exists_streams_and_matches_eager() {
+    let s = store();
+    let per_key = QueryOptions {
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            decorrelate_exists: false,
+            ..sparkles_core::sparql::Optimizations::ALL
+        }),
+        ..Default::default()
+    };
+    for q in NESTED {
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+            .rows()
+            .unwrap();
+        let reference = query(s.snapshot(), q, &per_key)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+            .rows()
+            .unwrap();
+        let sort = |rows: Vec<Vec<Option<Term>>>| {
+            if q.contains("ORDER BY") {
+                ordered(rows)
+            } else {
+                bag(rows)
+            }
+        };
+        let expected: Vec<Vec<Option<Term>>> =
+            expected.iter().map(|row| row.values().to_vec()).collect();
+        let reference: Vec<Vec<Option<Term>>> =
+            reference.iter().map(|row| row.values().to_vec()).collect();
+        assert_eq!(sort(expected.clone()), sort(reference), "{q}: key set");
+        for rows in [4096, 10_000] {
+            let cursor = CursorOptions {
+                batch_rows: rows,
+                ..Default::default()
+            };
+            let (got, streamed) = automatic(&s, q, &Default::default(), &cursor)
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(streamed, "{q}: automatic execution kept the plan eager");
+            assert_eq!(sort(got), sort(expected.clone()), "{q}; {rows}");
+        }
     }
 }
 
@@ -236,7 +294,7 @@ fn streamed_exists_honors_cancellation() {
 #[test]
 fn streamed_exists_stays_within_its_memory_budget() {
     let s = store();
-    for q in STREAMED.iter().step_by(2) {
+    for q in STREAMED.iter().step_by(2).chain(NESTED) {
         let expected = query(s.snapshot(), q, &Default::default())
             .unwrap()
             .rows()
@@ -294,27 +352,6 @@ fn streamed_exists_stays_within_its_memory_budget() {
     }
 }
 
-/// A pattern whose inner FILTER reads a variable that every outer row binds cannot use
-/// its key set, so each distinct outer key is evaluated on its own and the plan stays
-/// eager, like the other per-key shapes.
-#[test]
-fn exists_with_an_outer_bound_risky_variable_stays_eager() {
-    let s = store();
-    for q in [
-        "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:q> ?o FILTER(?v >= 0) } }",
-        "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?o <urn:r> ?k } }",
-    ] {
-        let expected = query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .rows()
-            .unwrap();
-        let (got, streamed) = automatic(&s, q, &Default::default(), &Default::default())
-            .unwrap_or_else(|e| panic!("{q}: {e}"));
-        assert!(!streamed, "{q}: streamed");
-        assert_eq!(bag(got), bag(expected), "{q}");
-    }
-}
-
 /// A BIND of EXISTS or NOT EXISTS takes its values from the pattern's key set in a
 /// strict cursor as well as eagerly, and both give the answers of evaluation per key,
 /// including rows that leave a key unbound.
@@ -360,6 +397,56 @@ fn bind_exists_streams_from_the_key_set() {
             assert_eq!(
                 ordered(rows),
                 ordered(expected.clone()),
+                "{q}; {batch_rows}"
+            );
+        }
+    }
+}
+
+/// An ORDER BY key or a top-k key that holds an EXISTS runs in a strict cursor, sorted or
+/// spilled, with the order of evaluation per key.
+#[test]
+fn order_keys_with_exists_stream_from_the_key_set() {
+    use sparkles_core::sparql::{FallbackPolicy, select_cursor};
+    let s = store();
+    let per_key = QueryOptions {
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            decorrelate_exists: false,
+            ..sparkles_core::sparql::Optimizations::ALL
+        }),
+        ..Default::default()
+    };
+    for q in [
+        "SELECT ?s { ?s <urn:p> ?v } ORDER BY DESC(EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k }) ?s LIMIT 20",
+        "SELECT ?s ?v { ?s <urn:p> ?v FILTER(?v = 3) } ORDER BY ?v DESC(NOT EXISTS { ?s <urn:q> ?o }) ?s",
+        "SELECT ?s { ?s <urn:p> ?v } ORDER BY DESC(IF(EXISTS { ?s <urn:q> ?o }, ?v, -1)) ?s LIMIT 30",
+    ] {
+        let expected = query(s.snapshot(), q, &per_key).unwrap().rows().unwrap();
+        assert_retained_rows_eq!(
+            query(s.snapshot(), q, &Default::default())
+                .unwrap()
+                .rows()
+                .unwrap(),
+            expected,
+            "{q}"
+        );
+        for batch_rows in [1000, 4096] {
+            let cursor = CursorOptions {
+                batch_rows,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), q, &Default::default(), &cursor)
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            let mut rows = Vec::new();
+            while let Some(b) = c.next_batch().unwrap() {
+                for i in 0..b.len() {
+                    rows.push(b.row(i).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(
+                ordered(rows),
+                ordered(expected.iter().map(|r| r.values().to_vec())),
                 "{q}; {batch_rows}"
             );
         }

@@ -502,6 +502,7 @@ impl<'a> Pass<'a> {
                 i,
                 map: &map,
                 dec: None,
+                exists: None,
             };
             if ebv {
                 let b = expr::ebv(&compiled, &row, ctx).unwrap_or(false);

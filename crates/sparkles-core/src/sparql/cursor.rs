@@ -1394,12 +1394,11 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         _ if supported(&node.kind) => 0.0,
         _ => rows(node, node.est),
     };
-    // the key sets of a BIND's or an OPTIONAL condition's EXISTS, beside the
-    // operator's own state
+    // the key sets of the EXISTS of a BIND, an ORDER BY key, an aggregate argument or
+    // an OPTIONAL condition, beside the operator's own state
     let keyed = match &node.kind {
-        Kind::Extend(_, e) | Kind::LeftJoin { expr: Some(e) } if e.has_exists() => {
-            keyed_exists_bytes(ctx, node)
-        }
+        Kind::Filter(_) => 0.0,
+        kind if own_exprs(kind).iter().any(|e| e.has_exists()) => keyed_exists_bytes(ctx, node),
         _ => 0.0,
     };
     own + keyed
@@ -1410,8 +1409,9 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
             .sum::<f64>()
 }
 
-/// The estimated bytes of the key sets that answer the EXISTS expressions of `node`,
-/// with the cursor state of their plans, or infinity when one has no key set.
+/// The estimated bytes of the key sets that answer the EXISTS patterns of `node`, with
+/// the cursor state of their plans. A pattern without a key set is evaluated once per
+/// distinct outer key, and its memo stops growing at an eighth of the memory budget.
 fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
     let hashed = |n: &Node| {
         let est = n.est.max(0.0);
@@ -1421,32 +1421,40 @@ fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
             + est * 12.0
             + 1024.0
     };
-    own_exprs(&node.kind)
+    let mut specs = Vec::new();
+    for e in own_exprs(&node.kind) {
+        e.exists_specs(&mut specs);
+    }
+    specs
         .into_iter()
-        .filter(|e| e.has_exists())
-        .map(|e| {
-            keyed_exists(ctx, node, e).map_or(f64::INFINITY, |planned| {
+        .map(|spec| {
+            keyed_exists(ctx, node, spec).map_or((ctx.mem_limit / 8) as f64, |planned| {
                 hashed(&planned) + cursor_state_bytes(ctx, &planned)
             })
         })
         .sum()
 }
 
-/// The plan of the key set that answers the EXISTS expression `e` of `node`: a FILTER
-/// conjunct, a BIND expression or an OPTIONAL condition. The rows a FILTER or a BIND
-/// tests are its input's, and those an OPTIONAL condition tests are the pairs of its
-/// two sides, which bind every variable that either side always binds.
-fn keyed_exists(ctx: &Ctx, node: &Node, e: &Expr) -> Option<Node> {
+/// The plan of the key set that answers the EXISTS of `spec` in an expression of `node`:
+/// a FILTER, a BIND, an ORDER BY key, an aggregate argument or an OPTIONAL condition. The
+/// rows the first four test are their input's, and those an OPTIONAL condition tests are
+/// the pairs of its two sides, which bind every variable that either side always binds.
+fn keyed_exists(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> Option<Node> {
     match (&node.kind, node.children.as_slice()) {
-        (Kind::Filter(_) | Kind::Extend(..), [input]) => {
-            super::exists::keyed_plan(ctx, e, &input.vars, &input.certain)
-        }
+        (
+            Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::OrderBy { .. }
+            | Kind::Sort(_)
+            | Kind::Group { .. },
+            [input],
+        ) => super::exists::keyed_plan(ctx, spec, &input.vars, &input.certain),
         (Kind::LeftJoin { .. }, [left, right]) => {
             let mut vars = left.vars.clone();
             vars.extend(right.vars.iter().filter(|v| !left.vars.contains(v)));
             let mut certain = left.certain.clone();
             certain.extend(right.certain.iter().filter(|v| !left.certain.contains(v)));
-            super::exists::keyed_plan(ctx, e, &vars, &certain)
+            super::exists::keyed_plan(ctx, spec, &vars, &certain)
         }
         _ => None,
     }
@@ -1467,25 +1475,42 @@ fn largest_output_bytes(node: &Node) -> f64 {
 const AUTO_EXISTS_DEPTH: usize = 4;
 
 /// Whether every operator of `node` has a cursor implementation, so that a cursor over
-/// it runs no eager subtree, where a FILTER conjunct or a BIND expression that is `EXISTS { P }` or
-/// `NOT EXISTS { P }` also counts when the cursor can answer it from a key set and the
-/// plan of `P` counts in turn. The key set is filled by a child cursor under the query's
-/// charges. An EXISTS inside a larger expression, such as IF or OR, is evaluated once
-/// per distinct outer key, which measured slower in the cursor than in eager execution,
-/// so such plans stay eager. So does an OPTIONAL whose condition is an EXISTS. The cursor
-/// answers it from the key set as well, but its conditional OPTIONAL took 3.7 to 4.6
-/// times as long as eager execution on Namespace at 10.5M quads, whatever the condition.
-/// The patterns are planned here only to read their operators. Planning interns their
-/// variables in `ctx` and runs no part of them.
+/// it runs no eager subtree. An EXISTS that a FILTER, a BIND, an ORDER BY key or an
+/// aggregate argument evaluates also counts, alone or inside a larger expression such as
+/// IF or OR, when the plan of its pattern counts in turn. Its pattern is answered from a
+/// key set filled by a child cursor under the query's charges where the key set can
+/// answer it, and otherwise evaluated once per distinct outer key with a charged memo,
+/// as eager execution evaluates it. A pattern that calls a SERVICE keeps the plan eager,
+/// and so does an OPTIONAL whose condition holds an EXISTS, because the cursor's
+/// conditional OPTIONAL took 3.7 to 4.6 times as long as eager execution on Namespace at
+/// 10.5M quads, whatever the condition. The patterns are planned here only to read
+/// their operators. Planning interns their variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
+    fn pattern(ctx: &Ctx, node: &Node, e: &Expr, depth: usize) -> bool {
+        let mut specs = Vec::new();
+        e.exists_specs(&mut specs);
+        specs.into_iter().all(|spec| {
+            depth < AUTO_EXISTS_DEPTH
+                && ctx.opt.decorrelate_exists
+                && !spec.calls_service()
+                && keyed_exists(ctx, node, spec)
+                    .or_else(|| {
+                        super::plan::Planner::new(ctx)
+                            .plan(&spec.pattern, &spec.graph, Vec::new())
+                            .ok()
+                    })
+                    .is_some_and(|planned| at(ctx, &planned, depth + 1))
+        })
+    }
     fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
         let exists = match &node.kind {
-            Kind::Filter(_) | Kind::Extend(..) => own_exprs(&node.kind).into_iter().all(|e| {
-                !e.has_exists()
-                    || (depth < AUTO_EXISTS_DEPTH
-                        && keyed_exists(ctx, node, e)
-                            .is_some_and(|planned| at(ctx, &planned, depth + 1)))
-            }),
+            Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::OrderBy { .. }
+            | Kind::Sort(_)
+            | Kind::Group { .. } => own_exprs(&node.kind)
+                .into_iter()
+                .all(|e| !e.has_exists() || pattern(ctx, node, e, depth)),
             kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
         };
         exists
@@ -5359,9 +5384,26 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
                 false,
             ),
-            // and one evaluated per distinct key inside a larger expression
+            // and one inside a larger expression, an aggregate argument or an ORDER BY
+            // key, answered from a key set or per distinct key
             (
                 "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(IF(EXISTS {?s <urn:q> ?b}, 1, 0) AS ?e)} GROUP BY ?e",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER(?a = 1 || NOT EXISTS {?s <urn:q> ?b})}",
+                true,
+            ),
+            (
+                "SELECT ?a (SUM(IF(EXISTS {?s <urn:q> ?b}, 1, 0)) AS ?n) {?s <urn:p> ?a} GROUP BY ?a",
+                true,
+            ),
+            (
+                "SELECT ?a (COUNT(?c) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?c}} GROUP BY ?a ORDER BY DESC(EXISTS {?a <urn:q> ?b}) ?a",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER(?a = 1 || EXISTS {SERVICE <http://example.org/sparql> {?s ?p ?o}})}",
                 false,
             ),
             (

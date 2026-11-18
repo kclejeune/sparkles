@@ -276,12 +276,9 @@ fn exists_of(e: &Expr) -> Option<(&ExistsSpec, bool)> {
     }
 }
 
-/// The unsubstituted plan of the key set that would answer `e`, when `e` is
-/// `EXISTS { P }` or `NOT EXISTS { P }` and `P` is in the admitted algebra. `e` is a
-/// FILTER conjunct, a BIND expression or an OPTIONAL condition. Automatic execution
-/// streams only an EXISTS that it can answer this way. Any other EXISTS is evaluated
-/// once per distinct outer key, which measured slower in the cursor than in eager
-/// execution.
+/// The unsubstituted plan of the key set that would answer the EXISTS of `spec`, when
+/// its pattern `P` is in the admitted algebra, wherever the EXISTS appears in an
+/// expression. Any other EXISTS is evaluated once per distinct outer key.
 ///
 /// `vars` are the variables of the rows `e` tests and `certain` those that every such
 /// row binds. The key set cannot answer a row that binds a risky variable, one that a
@@ -289,11 +286,15 @@ fn exists_of(e: &Expr) -> Option<(&ExistsSpec, bool)> {
 /// forces evaluation per key, as do rows that bind none of the key variables. Both are
 /// rejected here. A risky variable that only some rows bind stays admitted, since the
 /// rows that leave it unbound use the key set.
-pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, vars: &[VarId], certain: &[VarId]) -> Option<Node> {
+pub(super) fn keyed_plan(
+    ctx: &Ctx,
+    spec: &ExistsSpec,
+    vars: &[VarId],
+    certain: &[VarId],
+) -> Option<Node> {
     if !ctx.opt.decorrelate_exists {
         return None;
     }
-    let (spec, _) = exists_of(e)?;
     let plan = admit(ctx, spec).ok()?;
     let constant = |v: &VarId| spec.bound.iter().any(|(b, _)| b == v);
     if plan
@@ -400,7 +401,8 @@ pub(super) fn mask(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Option<Vec<bool>>> 
 }
 
 /// Whether each row of `t` satisfies the EXISTS conjunct `e`, from its key set, if it
-/// has (or gets) one.
+/// has (or gets) one. A row that the key set cannot answer is evaluated by
+/// substitution.
 fn answers(
     ctx: &Ctx,
     t: &Table,
@@ -408,6 +410,43 @@ fn answers(
     spec: &ExistsSpec,
     negated: bool,
 ) -> Result<Option<Vec<bool>>> {
+    let Some(found) = probe_rows(ctx, t, spec)? else {
+        return Ok(None);
+    };
+    let map = t.var_map(ctx.nvars());
+    let mut keep = Vec::with_capacity(found.len());
+    for (i, f) in found.into_iter().enumerate() {
+        keep.push(match f {
+            FOUND => !negated,
+            ABSENT => negated,
+            _ => {
+                if i % 4096 == 0 {
+                    ctx.check()?;
+                }
+                let row = Row {
+                    table: t,
+                    i,
+                    map: &map,
+                    dec: None,
+                    exists: None,
+                };
+                ebv(e, &row, ctx).unwrap_or(false)
+            }
+        });
+    }
+    Ok(Some(keep))
+}
+
+/// A row whose pattern has no solution that agrees with it.
+const ABSENT: u8 = 0;
+/// A row whose pattern has a solution that agrees with it.
+const FOUND: u8 = 1;
+/// A row that the key set cannot answer, which is evaluated by substitution.
+const UNKNOWN: u8 = 2;
+
+/// Whether the pattern of `spec` has a solution that agrees with each row of `t`, from
+/// its key set, if it has (or gets) one, as [`ABSENT`], [`FOUND`] or [`UNKNOWN`].
+fn probe_rows(ctx: &Ctx, t: &Table, spec: &ExistsSpec) -> Result<Option<Vec<u8>>> {
     let Some(build) = prepare(ctx, spec, t)? else {
         return Ok(None);
     };
@@ -443,14 +482,16 @@ fn answers(
             .any(|id| id.is_undef() || id.tag() == Tag::Special)
     {
         ctx.check()?;
-        let keep: Vec<bool> = t.cols[c]
+        let found: Vec<u8> = t.cols[c]
             .par_iter()
             .with_min_len(PAR_MIN_LEN)
-            .map(|id| set.contains(id) != negated)
+            .map(|id| set.contains(id) as u8)
             .collect();
         drop(held);
-        decor.probed.fetch_add(keep.len() as u64, Ordering::Relaxed);
-        return Ok(Some(keep));
+        decor
+            .probed
+            .fetch_add(found.len() as u64, Ordering::Relaxed);
+        return Ok(Some(found));
     }
     let width = keys.len();
     let all = if width == 64 {
@@ -458,12 +499,11 @@ fn answers(
     } else {
         (1u64 << width) - 1
     };
-    let map = t.var_map(ctx.nvars());
     let mut sets: FxHashMap<u64, Option<Arc<Partial>>> = FxHashMap::default();
     let mut key: Vec<Id> = Vec::with_capacity(width);
-    let mut keep = vec![false; t.len()];
+    let mut found = vec![UNKNOWN; t.len()];
     let (mut probed, mut per_row) = (0u64, 0u64);
-    for (i, k) in keep.iter_mut().enumerate() {
+    for (i, f) in found.iter_mut().enumerate() {
         if i % 4096 == 0 {
             ctx.check()?;
         }
@@ -496,27 +536,96 @@ fn answers(
                 };
             }
         }
-        *k = match answer {
-            Some(found) => {
+        match answer {
+            Some(a) => {
                 probed += 1;
-                found != negated
+                *f = a as u8;
             }
-            None => {
-                per_row += 1;
-                let row = Row {
-                    table: t,
-                    i,
-                    map: &map,
-                    dec: None,
-                };
-                ebv(e, &row, ctx).unwrap_or(false)
-            }
-        };
+            None => per_row += 1,
+        }
     }
     drop(held);
     decor.probed.fetch_add(probed, Ordering::Relaxed);
     decor.per_row.fetch_add(per_row, Ordering::Relaxed);
-    Ok(Some(keep))
+    Ok(Some(found))
+}
+
+/// The answers of the EXISTS patterns inside larger expressions, such as IF or OR, an
+/// aggregate argument or an ORDER BY key, for the rows of one table, from the key sets
+/// of their patterns. [`super::expr::eval`] reads a row's answer from here, and
+/// evaluates the pattern for the row by substitution when the key set cannot answer it
+/// or the pattern has no key set. The same admission and cost rule as for a FILTER
+/// decides whether a key set is built. Every row is probed, also those for which the
+/// expression never reaches the EXISTS, because a probe costs a hash lookup.
+pub struct Answers<'a> {
+    table: &'a Table,
+    /// the address of each pattern's spec, which is only compared, with its answers
+    specs: Vec<(usize, Vec<u8>)>,
+}
+
+/// [`Answers`] with the charge of their memory, which the caller holds while it
+/// evaluates the rows.
+pub struct Nested<'a> {
+    pub answers: Answers<'a>,
+    _held: Charge<'a>,
+}
+
+impl Answers<'_> {
+    /// The answer of `spec` for row `i` of `t`, when its key set gave one.
+    #[inline]
+    pub fn get(&self, spec: &ExistsSpec, t: &Table, i: usize) -> Option<bool> {
+        if !std::ptr::eq(self.table, t) {
+            return None;
+        }
+        let (_, found) = self
+            .specs
+            .iter()
+            .find(|(s, _)| *s == std::ptr::from_ref(spec) as usize)?;
+        match found.get(i).copied()? {
+            FOUND => Some(true),
+            ABSENT => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// The key-set answers of the EXISTS patterns that `exprs` evaluate for the rows of
+/// `t`, or `None` when none of them has a key set.
+pub(super) fn nested<'a>(
+    ctx: &'a Ctx,
+    t: &'a Table,
+    exprs: &[&Expr],
+) -> Result<Option<Nested<'a>>> {
+    if !ctx.opt.decorrelate_exists
+        || ctx.calls_extensions
+        || t.is_empty()
+        || PER_ROW.with(Cell::get) > 0
+        || !exprs.iter().any(|e| e.has_exists())
+    {
+        return Ok(None);
+    }
+    let mut all = Vec::new();
+    for e in exprs {
+        e.exists_specs(&mut all);
+    }
+    let mut specs: Vec<(usize, Vec<u8>)> = Vec::new();
+    let held = ctx.charge(0)?;
+    for spec in all {
+        let ptr = Arc::as_ptr(spec) as usize;
+        if specs.iter().any(|(s, _)| *s == ptr) {
+            continue;
+        }
+        if let Some(found) = probe_rows(ctx, t, spec)? {
+            if held.add(found.len() as u64 + 64).is_err() {
+                break;
+            }
+            specs.push((ptr, found));
+        }
+    }
+    Ok((!specs.is_empty()).then_some(Nested {
+        answers: Answers { table: t, specs },
+        _held: held,
+    }))
 }
 
 const RISKY_BOUND: &str = "the outer solutions bind a variable that only a FILTER inside it uses";
@@ -1123,7 +1232,18 @@ pub(super) fn explain(
         let v = counters.get(k).and_then(|v| v.as_u64()).unwrap_or(0) + n;
         counters.insert(k.into(), v.into());
     };
-    for (spec, negated) in exprs.iter().filter_map(exists_of) {
+    let mut specs: Vec<(&ExistsSpec, bool)> = Vec::new();
+    for e in exprs {
+        match exists_of(e) {
+            Some(top) => specs.push(top),
+            None => {
+                let mut nested = Vec::new();
+                e.exists_specs(&mut nested);
+                specs.extend(nested.into_iter().map(|s| (&**s, false)));
+            }
+        }
+    }
+    for (spec, negated) in specs {
         let d = &spec.decor;
         let what = if negated { "NOT EXISTS" } else { "EXISTS" };
         match &*d.state.lock() {
