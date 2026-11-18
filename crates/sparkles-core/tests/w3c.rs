@@ -20,6 +20,9 @@
 //! `SPARKLES_W3C_SPILL=plain` or `encrypted` gives cursor query passes a 1 MiB
 //! memory budget and a private spill directory per query. Eager passes keep their
 //! ordinary options as an unlimited reference.
+//! `SPARKLES_W3C_AGGREGATE_ERRORS=jena|sparkles|spec` runs every query and update under
+//! that reading of errors in aggregates (`mise run test:w3c:aggregate-errors` runs the
+//! two that are not the default); without it they run under the default, `jena`.
 
 use oxrdf::dataset::CanonicalizationAlgorithm;
 use oxrdf::vocab::rdf;
@@ -678,6 +681,7 @@ fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> 
     let mut opts = QueryOptions {
         base_iri: Some(qurl.clone()),
         timeout: Some(std::time::Duration::from_secs(20)),
+        aggregate_errors: aggregate_errors()?,
         extensions: mode
             .registry
             .then(|| sparkles_core::sparql::extensions::ExtensionRegistry::builder().build()),
@@ -784,6 +788,7 @@ fn run_update_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
     )?;
     let opts = QueryOptions {
         base_iri: Some(uurl.clone()),
+        aggregate_errors: aggregate_errors()?,
         ..Default::default()
     };
     let res = sparkles_core::sparql::update::update(&store, &utext, &opts);
@@ -843,6 +848,17 @@ fn run_syntax_test(t: &TestCase, m: &Manifest, positive: bool, update: bool) -> 
         (Ok(()), true) | (Err(_), false) => Ok(()),
         (Err(e), true) => Err(format!("parse error: {e}")),
         (Ok(()), false) => Err("accepted invalid syntax".into()),
+    }
+}
+
+/// The reading of errors in aggregates that `SPARKLES_W3C_AGGREGATE_ERRORS` names.
+fn aggregate_errors() -> Result<Option<sparkles_core::sparql::AggregateErrors>, String> {
+    match std::env::var("SPARKLES_W3C_AGGREGATE_ERRORS") {
+        Ok(m) => m
+            .parse()
+            .map(Some)
+            .map_err(|e: sparkles_core::Error| e.to_string()),
+        Err(_) => Ok(None),
     }
 }
 

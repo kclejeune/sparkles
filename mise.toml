@@ -516,6 +516,13 @@ description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
 # in parallel. Each summary is one line, so their output stays readable.
 run = "mbx test -p sparkles-core --test w3c -- --nocapture"
 
+[tasks."test:w3c:aggregate-errors"]
+description = "The W3C SPARQL suites under the sparkles and spec readings of errors in aggregates (test:w3c runs the default, jena)"
+run = [
+  "SPARKLES_W3C_AGGREGATE_ERRORS=sparkles mbx test -p sparkles-core --test w3c -- --nocapture",
+  "SPARKLES_W3C_AGGREGATE_ERRORS=spec mbx test -p sparkles-core --test w3c -- --nocapture",
+]
+
 [tasks."test:shacl"]
 description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and node expression tests and the SHACLC test pairs"
 run = "mbx test -p sparkles-shacl --test w3c_shacl -- --nocapture"
