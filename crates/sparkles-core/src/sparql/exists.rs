@@ -18,11 +18,15 @@
 //! BNODE (also inside nested EXISTS). Triple terms with variables (RDF 1.2), property
 //! functions (`text:query`, `spk:vectorSearch`, `spatial:`) and everything else
 //! (OPTIONAL, UNION, MINUS, BIND, VALUES, sub-selects, SERVICE) are rejected, and the
-//! EXISTS is evaluated per row as before. The EXISTS must be a top-level conjunct of a
+//! EXISTS is evaluated per row as before. An EXISTS that is a top-level conjunct of a
 //! FILTER (`EXISTS` or `NOT EXISTS`, possibly beside other conjuncts), the whole
-//! expression of a BIND, or the whole condition of an OPTIONAL, whose candidate rows the
-//! key set answers as it answers a filter's rows. One under OR, IF or another function
-//! is evaluated per row. The active graph of the EXISTS
+//! expression of a BIND or the whole condition of an OPTIONAL is answered by a probe of
+//! each row, and the OPTIONAL's candidate rows are answered as a filter's rows are. An
+//! EXISTS inside a larger expression, under OR, IF or another function, in an aggregate
+//! argument or in an ORDER BY key, is answered through [`Answers`], which probes every
+//! row of the table before the expression is evaluated, and the expression reads each
+//! row's answer from it. A row that the key set cannot answer is evaluated by
+//! substitution in every position. The active graph of the EXISTS
 //! must be the default graph, the union graph or a constant graph; `GRAPH ?g { … FILTER
 //! EXISTS … }` qualifies because the planner evaluates such a group per named graph,
 //! each with its own constant active graph and its own key set.

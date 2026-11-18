@@ -153,7 +153,11 @@ check them against the W3C suites and Jena's own answers.
   pattern costs less than evaluating it for each distinct outer key. A row is evaluated
   on its own when it binds a variable that a FILTER inside the pattern reads and the
   pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
-  as IF or OR, is evaluated once per distinct outer key.
+  as IF or OR, an aggregate argument or an ORDER BY key, is answered from the same key
+  set. Every row is probed before the expression is evaluated, also a row on which the
+  expression does not reach the EXISTS. Automatic execution streams a plan with an
+  EXISTS in any of these positions unless the pattern calls a SERVICE, the EXISTS is
+  nested more than four levels deep or it is an OPTIONAL condition.
 * An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
   every execution mode, so each operator reads its inputs a batch at a time and stops
   once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`

@@ -238,11 +238,40 @@ returned the same answers.
 
 *Measured on 8-vCPU AMD EPYC Namespace instances on 2026-11-01.*
 
-An EXISTS inside a larger expression is still evaluated once per distinct outer key,
-which is slower in the cursor, so plans with one stay eager. An OPTIONAL whose condition
-is an EXISTS stays eager as well, because the cursor's conditional OPTIONAL takes several
-times as long as the eager one with any condition. Automatic execution already streams
-`optional-filter` at this size, which item 570 covers.
+An OPTIONAL whose condition is an EXISTS stays eager, because the cursor's conditional
+OPTIONAL takes several times as long as the eager one with any condition. Automatic
+execution already streams `optional-filter` at this size, which item 570 covers.
+
+Both executors also answer an EXISTS inside a larger expression, such as IF, OR, an
+aggregate argument or an ORDER BY key, from the key set of its pattern, and automatic
+execution streams such plans. The next table compares the base 8baa5686 as A with
+c092dddf as B on `atlas`, a 13th-generation Intel Core i5-13500 benchmark worker, at
+10.5M quads with one Rayon thread, three A, B, B, A rounds and seven timed requests in
+each mode. It gives median server execution times, and both builds returned the same
+answers in both modes. The [run record](records/exists-nested-2026-11-18/README.md)
+holds the samples.
+
+| 10.5M, ms | Eager, A | Eager, B | Streamed, A | Streamed, B |
+|---|---:|---:|---:|---:|
+| `exists-agg`, SUM(IF(EXISTS { ?p ex:authorOf ?d }, 1, 0)) over researchers | 885 | **16.0** | 913 | **14.7** |
+| `not-exists`, the bench query | 17.0 | 17.1 | 17.5 | 17.2 |
+| `exists-bind`, as in the table above | 14.5 | 12.5 | 15.1 | **12.2** |
+| `exists-bind-join`, as in the table above | 16.0 | 10.7 | 14.9 | **10.4** |
+| `exists-union`, a COUNT over FILTER EXISTS of a UNION, which has no key set | 2,134 | 2,125 | 2,173 | 2,174 |
+| `exists-union-bind`, a grouping by BIND(EXISTS) of a UNION | 1,549 | 1,538 | 1,521 | 1,545 |
+
+*Measured on `atlas` on 2026-11-18.*
+
+The medians of the short queries spread from 10 to 18 ms between rounds, so their
+differences between builds are within noise. The UNION shapes are evaluated once per
+distinct outer key, and B streams them in 1.00 and 1.015 times their eager time. A
+sequential run of both builds on the laptop at the same size, which other builds kept
+busy, gave `exists-if` 5,025 ms eagerly and 4,243 ms streamed before against 230 and
+84 ms after, `exists-or` 1,010 and 916 ms against 72 and 24 ms, and `exists-order`
+1,324 and 1,268 ms against 152 and 156 ms. An IF branch that is rarely taken,
+`exists-rare`, went from 69 to 76 ms eagerly and from 12 to 26 ms streamed, because
+every row is probed and the key set is built whether or not the expression reaches the
+EXISTS. Item 1080 covers that cost.
 
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M, with the spill directory on the instance's local disk.
