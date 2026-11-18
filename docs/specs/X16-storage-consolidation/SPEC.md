@@ -685,7 +685,12 @@ features such as characteristic sets, `sparkles vector create` and the spatial s
 expect a small first load to build a base generation, while under that rule its quads
 stayed in the delta until a compaction. The phase therefore kept the earlier rule of a
 replacement into an empty store, and item 1097 follows the rebuild cost of a small first
-POST, which both builds pay. The gates were the table test, the entry-point tests, the
+POST, which both builds pay. On `atlas`, with base `8baa5686` and the phase at `0027d406`
+interleaved over 15 rounds, the median first PUT of 10, 1,000 and 50,000 quads took 1.02,
+0.99 and 0.84 times the base's time on a persistent dataset and 1.00, 1.13 and 0.98 times
+in memory. The in-memory ratio at 1,000 quads swung between 0.56 and 1.79 with the order
+of the arms, so it reads as noise. The median first POST took 1.01, 1.00 and 0.94 times the
+base's time persistent and 1.02, 0.99 and 0.97 times in memory. The gates were the table test, the entry-point tests, the
 deadline tests at the default and the saturated threshold, lane CI and seven review
 rounds. Durability, the write-ahead log and the on-disk formats did not change.
 
