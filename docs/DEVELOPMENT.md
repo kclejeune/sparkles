@@ -1095,8 +1095,8 @@ enable swap of its own, so the step prints the runner's memory and swap to recor
 the total.
 
 `scripts/ci-swap.sh` adds the swap as a file in the root file system. Some of GitHub's
-Linux VMs mount the root on a device-mapper snapshot, and there the job's swap is a zram
-device instead. Under memory pressure the kernel's reclaim wrote swapped pages to a file
+Linux VMs mount the root on a device-mapper snapshot, so wherever the root is on device
+mapper the job's swap is a zram device instead. Under memory pressure the kernel's reclaim wrote swapped pages to a file
 on that snapshot, and each write waited on the snapshot's copy pool, whose jobs needed
 memory to finish. Every task that touched the root then waited in the same place, and
 the VM stopped until the job's limit ended it without a log. `scripts/ci-memory.sh` prints the runner's memory, swap,
@@ -1307,7 +1307,7 @@ Gradle and pnpm retain their existing caches. Hermetic Nix builds retain their
 Crane dependency artifacts and Nix binary caches. The dev profile keeps line tables for
 workspace crates and disables dependency debug information. The doctests add 16 GiB
 of swap and the test build 2 GiB to a runner with less than 24 GiB of memory, as a zram
-device where the root is a device-mapper snapshot.
+device where the root is on device mapper.
 
 ## Releases
 

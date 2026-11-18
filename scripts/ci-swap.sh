@@ -6,30 +6,30 @@
 #
 # A compile can exceed the physical memory of a 16 GB runner, so a job adds swap. A
 # runner with 24 GiB of memory or more gets none. On other runners the swap is a file in
-# the root file system, except where the root is a device-mapper snapshot, as on some of
-# GitHub's VMs. There, writing a swapped page to the file waits on the snapshot's copy
-# pool from inside memory reclaim, while completing the copy needs memory, and the whole
-# VM hangs. Such a runner gets a compressed swap device in memory (zram) instead, or no
-# added swap when the kernel cannot add one. `add` prints the swap and memory it ends
-# with, since GitHub's image may enable swap of its own, which the script leaves alone.
+# the root file system, unless the root is on device mapper. Some of GitHub's VMs mount
+# the root on a device-mapper snapshot, and there writing a swapped page to the file
+# waits on the snapshot's copy pool from inside memory reclaim, while completing the copy
+# needs memory, and the whole VM hangs. Such a runner gets a compressed swap device in
+# memory (zram) instead, or no added swap when the kernel cannot add one. `add` prints the
+# swap and memory it ends with, since GitHub's image may enable swap of its own, which the
+# script leaves alone.
 set -euo pipefail
 
-# The block device under the root file system is a device-mapper snapshot.
-root_is_dm_snapshot() {
-  local source
-  source=$(findmnt -no SOURCE --target /) || return 1
-  case $source in
-    /dev/mapper/* | /dev/dm-*) ;;
-    *) return 1 ;;
-  esac
-  sudo dmsetup table "$source" 2> /dev/null | awk '$3 == "snapshot" { found = 1 } END { exit !found }'
+# The root file system is on a device-mapper device. The test reads the root's device
+# number from the kernel rather than a printed device path, since a snapshot root can be
+# mounted as /dev/root. It treats every device-mapper root as a possible snapshot, so it
+# needs no dmsetup and fails toward zram when the root cannot be identified.
+root_is_device_mapper() {
+  local devnum
+  devnum=$(mountpoint -d /) || return 0
+  [ -d "/sys/dev/block/$devnum/dm" ]
 }
 
 add_zram() {
   local gib=$1 id
   [ -e /sys/class/zram-control/hot_add ] || sudo modprobe zram num_devices=0 2> /dev/null || true
   if ! id=$(sudo cat /sys/class/zram-control/hot_add 2> /dev/null); then
-    echo '::warning::the root is a device-mapper snapshot and the kernel adds no zram device, so no swap was added'
+    echo '::warning::the root is on device mapper and the kernel adds no zram device, so no swap was added'
     return 0
   fi
   echo zstd | sudo tee "/sys/block/zram$id/comp_algorithm" > /dev/null 2>&1 || true
@@ -65,8 +65,8 @@ case ${1:-} in
     memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
     if [ "$memory_kib" -ge $((24 * 1024 * 1024)) ]; then
       echo "$((memory_kib / 1024 / 1024)) GiB of memory, so no swap"
-    elif root_is_dm_snapshot; then
-      echo "the root file system is on a device-mapper snapshot, so the swap is zram, not a file"
+    elif root_is_device_mapper; then
+      echo "the root file system is on a device-mapper device, so the swap is zram, not a file"
       add_zram "$gib"
     else
       add_file "$gib"

@@ -349,8 +349,8 @@ jobs:
         with: { cache: false, rustflags: "" }
       # A compile can exceed the physical memory of a 16 GB runner, so a job adds swap,
       # 16 GiB unless it sets SWAP_GIB, as scripts/ci-swap.sh describes. It is a file in the
-      # root file system, or zram where the root is a device-mapper snapshot, since swap
-      # writes to a file there can hang the VM. The test build sets 2. It compiles its two
+      # root file system, or zram where the root is on device mapper, since swap writes to
+      # a file on a device-mapper snapshot can hang the VM. The test build sets 2. It compiles its two
       # largest rustc processes one after the other, and the larger of them peaks near
       # 11 GiB. A runner with memory and swap near the 20 GB of two overlapping compiles
       # lets such a regression thrash for the whole job limit, where less swap ends the
