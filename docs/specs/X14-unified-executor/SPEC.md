@@ -199,8 +199,9 @@ The maintainer settled these questions for stage 4.
   coexistence cost lives only in code the merge deletes, such as the eager executor's
   path or a check of the mode. A kept-path cost lives in code that survives the merge,
   and a cost without a profile counts as one. A kept-path cost names the item that
-  recovers it and is recovered within two batches of the one that accepted it, and until
-  then no phase that changes that query's path lands.
+  recovers it and is recovered within two batches of the one that accepted it. A cost
+  still unrecovered after those two batches stops any further phase that changes that
+  query's path from landing until it is recovered.
 * The forge matrix after each push that changes the query path also compares every
   query with cc94ac7f, the main branch before item 825 landed. A query whose drift from
   cc94ac7f is larger than its recorded costs is bisected and fixed forward at once. The
