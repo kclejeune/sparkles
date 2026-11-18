@@ -687,8 +687,9 @@ whose change can reach a query under 0.3 ms therefore still runs the A/B above, 
 phase that charges memory, allocates, takes locks or atomic reference counts, hands work
 between threads or changes the response path runs it whatever the counts show. Counts are
 enough for a phase only when its change adds or removes computation and reaches no query
-under 0.3 ms, and every query it can reach stays within the floor and resolves within its
-gate.
+under 0.3 ms, and every query it can reach stays within the floor and resolves within 2%
+of its execution time. Instructions do not bound cycles, so such a phase's cost in cycles
+alone is left to the batch screen and the forge matrix after the push.
 
 ### Correctness and conformance
 

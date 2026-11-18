@@ -101,7 +101,7 @@ On `stanley`, an Intel Core Ultra X7 358H, two such runs of eight rounds of 50 r
 the 1.05M-triple store, one of a single binary and one of one source built on `wally` and
 on `stanley`, gave intervals within 0.49% of 1 for queries under 2 million instructions
 per request, except one at 1.07%, and within 0.17% for larger queries, most within 0.04%.
-The small queries' counts spread by 0.4% to 4.1% over processes. A query is therefore
+The small queries' counts spread by up to 4.1% over processes. A query is therefore
 flagged when its interval does not lie within 1 ± 1% below 2 million instructions per
 request, or within 1 ± 0.25% at or above it, and a lone flag of a small query near the
 threshold is rerun with more rounds. Under automatic execution a query can run on a different executor in different
@@ -124,24 +124,38 @@ change in system calls, futex waits or page faults does not show either.
 
 Counts also measure the whole request, and the response usually costs far more than the
 execution that the [Intel rule](specs/X14-unified-executor/PLAN.md#the-intel-rule)
-gates. A count can clear a query only when the noise floor times the request's CPU time
-is within the gate that applies to the query, which is 2% or 0.5 µs of execution time
-under the Intel rule. On `stanley` that resolution is 1.4 to 5.4 µs for every query of the
-matrix under 0.3 ms, including a LIMIT of 1,000 rows over one scan at 2.2 µs under
-streaming. It is 135 µs for the root scan and 1 ms for the export of 500,000 rows, whose
-execution is 0.1 ms and 0.6 ms, and 59 µs for `optional-chain` under streaming against a
-gate of 48 µs. The other 49 of the 76 query and mode cells resolve within their gate.
+gates. The noise floor times the request's CPU time is the smallest change in
+instructions, expressed as time, that the counts can see. A query whose gate is smaller
+than that resolution cannot be cleared by counts at all. On `stanley` the resolution is
+1.4 to 5.4 µs for every query of the matrix under 0.3 ms, against the Intel rule's 0.5 µs,
+including a LIMIT of 1,000 rows over one scan at 2.2 µs under streaming. It is 135 µs for
+the root scan and 1 ms for the export of 500,000 rows, whose execution takes 0.1 ms and
+0.6 ms, and 59 µs for `optional-chain` under streaming against 2% of its execution, 48 µs.
+The other 49 of the 76 query and mode cells resolve within 2% of their execution time.
+A resolution within the gate is necessary for counts to clear a query, and it is not
+sufficient, since instructions do not bound cycles. A few dependent divisions or a new
+cache miss can add more than 2% to a query's time while adding almost no instructions.
 
-Counts are enough when the change only adds or removes computation, its counts stay
-within the floor on every query and mode it can reach, and every such query resolves
-within its gate. Intel timing is required in every other case, which includes
+Counts are enough to skip Intel timing when the change only adds or removes computation
+on data the query already reads, reaches no query under 0.3 ms, stays within the floor on
+every query and mode it can reach, and every such query resolves within 2% of its
+execution time. A cost that such a change carries in cycles alone then reaches the batch
+screen, which catches 10%, and the checks on `forge` after the push, which catch smaller
+costs. Intel timing is required in every other case, which includes
 
-* any count flag that a rerun under explicit modes confirms,
-* a reachable query that does not resolve within its gate, which includes every query
-  under 0.3 ms,
+* any count flag, and a split query that a rerun under explicit modes still flags,
+* any reachable query under 0.3 ms, or one that does not resolve within its gate,
 * changes to memory charging and budgets, allocation, atomic reference counts, locks,
   channels and the hand-off of work between threads, system calls and the response path,
-* changes to memory or cache layout, code generation or concurrency.
+* changes to memory or cache layout, the data a query touches, code generation or
+  concurrency.
+
+The script exits with 0 when every query is within the floor, 2 when a query is flagged or
+split, and 1 when the run cannot clear anything, because a query lacks three rounds that
+hold both builds, a window was not fully counted or the answers differ. It copies both
+builds into the run directory before it starts, so a rebuild cannot change them between
+epochs. The [runs behind these numbers](benchmarks/engine/RESULTS.md#per-request-instruction-counts)
+keep every count, the builds' hashes and the queries.
 
 Both builds come from one host with the same compilers, as for timing, although the
 builds of one source on `wally` and on `stanley` counted the same within the floor.

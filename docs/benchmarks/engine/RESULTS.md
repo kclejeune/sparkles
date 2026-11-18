@@ -487,6 +487,53 @@ no eager fallback. The streaming tests
 replace the cursor pass at 4,096 rows that `sparql_query_cursors` used to run, so CI
 runs about 10 seconds more of these tests than before.
 
+### Per-request instruction counts
+
+`mise run bench:request-insn` counted user-space instructions per request on `stanley`
+in the five runs of the [run record](runs/2026-11-18-request-insn-stanley/README.md),
+each of 38 queries under streaming and automatic execution, eight rounds of A,B,B,A and up
+to 50 counted requests per query and process. The two A-against-A runs set the noise
+floor. The widest 95% interval of a query's ratio deviated from 1 by these amounts, with
+the queries of automatic execution whose processes split left out.
+
+| Instructions per request | One binary | One source built on two hosts |
+|---|--:|--:|
+| Under 2 million, 20 cells | 0.47% | 1.07% |
+| 2 million or more, 56 cells | 0.17% | 0.12% |
+
+The small queries' counts spread by 0.1% to 4.1% over processes, and the larger queries'
+by at most 0.43%. Under automatic execution some queries ran on a different executor in
+some processes. `str-filter-two` ran 225 or 272 million instructions per request, and
+`minus`, `optional-count`, `root-limit`, `group-avg` and a few small queries spread by more
+than 5%. No query split under streaming.
+
+The back tests compared builds whose timing on `atlas` was known.
+
+| Change | Query | Instructions | Interval | Time on `atlas` |
+|---|---|--:|---|--:|
+| Item 678's string floors, a97afd76 against 7e272f4d | `str-pair-lt`, streaming | +13.3% | 1.1320-1.1331 | +24.8% |
+| | `str-pair-names`, streaming | +28.9% | 1.2886-1.2891 | +33.4% |
+| Item 1039's charged scan, 60eeac80 against 9acd6d74 | `root-scan`, streaming | -0.04% | 0.9994-0.9999 | +9.8% execution |
+| | `export-500k`, streaming | 0.00% | 0.9999-1.0001 | +8.8% execution |
+| Row 1063, 9e3d7954 against 9acd6d74 | `root-limit`, streaming | 0.00% | 0.9999-1.0001 | +20% execution |
+
+The counts flagged item 678 on its two queries and on nothing else, and they missed item
+1039 on every query. The execution times that the same rounds recorded on the busy
+`stanley` rose by 9.5% on the root scan and 9.7% on the export under item 1039, and by 24%
+on `root-limit` under row 1063's build, so the cost was present while the instructions
+did not move. Both builds of row 1063 made the same system calls per request, 6 futex
+calls and 2.4 `writev` calls among them. A call-graph profile of 300,000 requests of
+`root-limit` found the same user-space cycles under `next_batch_at_most` within 5%, with
+cycles moved from `Block::key_range` and the old scan's drops to the shared batch's
+closure, `mi_malloc`, `Block::downgrade` and the drop of the weak block handle. The
+profile samples user space through stacks of at most 32 frames, so the gap in execution
+time lies in kernel time, in time off the CPU inside the timed read, or in samples whose
+stacks the profile truncates.
+
+The resolution of the counts is the floor times the request's CPU time. It is 1.4 to
+5.4 µs for every query under 0.3 ms, 135 µs for `root-scan` and 1 ms for `export-500k`,
+and within 2% of execution time for 49 of the 76 cells.
+
 ### Instruction counts of vocabulary scans and WAL replay
 
 `mise run bench:insn` counted the user-space instructions of the vocabulary readers and

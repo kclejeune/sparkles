@@ -60,6 +60,26 @@ class Statistics(unittest.TestCase):
             self.assertIn("1 of 1 flagged: q streaming", text)
             self.assertIn("| 1.0305 |", text)
 
+    def test_a_run_missing_a_build_is_invalid_not_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_samples(d, [((1000, 1001), (1000, 1002))] * 6)
+            p = os.path.join(d, "samples.tsv")
+            lines = open(p).read().splitlines()
+            # keep only the first epoch, as after an interruption
+            open(p, "w").write("\n".join(lines[:3]) + "\n")
+            text, verdict = ri.summary(d, 1.0)
+            self.assertEqual(verdict, "invalid")
+            self.assertIn("INCOMPLETE", text)
+
+    def test_a_split_side_is_inconclusive_even_when_the_median_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            rounds = [((100_000_000, 100_000_000), (100_000_000, 100_000_000))] * 7
+            rounds.append(((100_000_000, 100_000_000), (200_000_000, 200_000_000)))
+            write_samples(d, rounds)
+            text, verdict = ri.summary(d, 1.0)
+            self.assertEqual(verdict, "flagged")
+            self.assertIn("| SPLIT |", text)
+
     def test_summary_reports_a_multiplexed_window(self):
         with tempfile.TemporaryDirectory() as d:
             write_samples(d, [((1000, 1001), (1000, 1002))] * 3)
@@ -69,7 +89,9 @@ class Statistics(unittest.TestCase):
             f[COLS.index("covered")] = "0"
             lines[1] = "\t".join(f)
             open(p, "w").write("\n".join(lines) + "\n")
-            self.assertIn("FAIL: 1 windows were not fully counted", ri.summarize(d, 1.0))
+            text, verdict = ri.summary(d, 1.0)
+            self.assertIn("FAIL: 1 windows were not fully counted", text)
+            self.assertEqual(verdict, "invalid")
 
 
 @unittest.skipUnless(os.path.exists("/proc/sys/kernel/perf_event_paranoid"), "needs Linux")

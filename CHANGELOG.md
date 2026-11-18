@@ -14,7 +14,9 @@ against +25% and +33% in time, and miss item 1039's per-block charge, whose cost
 reference counts, an allocation and a memory charge. Counts measure the whole request,
 so they cannot resolve the 0.5 µs bound of the Intel rule on queries under 0.3 ms, which
 are still timed, as are changes to charging, allocation, atomics, locks, thread
-hand-offs, system calls, the response path, layout and concurrency.
+hand-offs, system calls, the response path, layout and concurrency. Instructions do not
+bound cycles either, so a change cleared by its counts leaves any cost in cycles alone to
+the batch screen and the forge checks after the push.
 
 ### Dependency security updates
 

@@ -41,6 +41,7 @@ import random
 import re
 import shutil
 import signal
+import struct
 import statistics as st
 import subprocess
 import sys
@@ -66,6 +67,8 @@ FLAG_EXCLUDE_HV = 1 << 6
 FLAG_ENABLE_ON_EXEC = 1 << 12
 MIN_RUN_FRACTION = 0.999
 LARGE_INSTRUCTIONS = 2_000_000
+MIN_MATCHED_ROUNDS = 3
+EXIT = {"clean": 0, "invalid": 1, "flagged": 2}
 SPLIT_SPREAD = 0.05
 NR_PERF_EVENT_OPEN = {"x86_64": 298, "aarch64": 241}
 
@@ -163,8 +166,11 @@ class Counters:
     def read(self):
         out = {"ctx_switches": proc_ctx_switches(self.pid), "sched_ns": proc_sched_ns(self.pid)}
         for key, fd in self.fds.items():
-            v, enabled, running = (int.from_bytes(os.read(fd, 24)[i : i + 8], "little") for i in (0, 8, 16))
-            out[key] = (v, enabled, running)
+            # one read, so the value and both times come from one snapshot
+            buf = os.read(fd, 24)
+            if len(buf) != 24:
+                raise OSError(f"short read of counter {key}")
+            out[key] = struct.unpack("<3Q", buf)
         return out
 
     def close(self):
@@ -345,8 +351,9 @@ def wait_ready(port, proc, timeout=60):
     raise RuntimeError("the server did not become ready")
 
 
-def spinners(cpus):
-    out = []
+def spinners(cpus, out):
+    """Starts an idle-priority busy loop on each CPU, appending each to `out` as soon as it
+    runs, so that the caller's cleanup stops every one even when a later start fails."""
     for c in cpus:
         out.append(
             subprocess.Popen(
@@ -355,7 +362,11 @@ def spinners(cpus):
                 stderr=subprocess.DEVNULL,
             )
         )
-    return out
+
+
+def _terminate(signum, frame):
+    # SIGTERM and SIGHUP unwind through the run's cleanup like an interrupt
+    raise KeyboardInterrupt(f"signal {signum}")
 
 
 def answer_digest(data):
@@ -399,7 +410,27 @@ def cmd_run(a):
     if os.path.exists(os.path.join(out, "samples.tsv")):
         sys.exit(f"{out} already holds a run")
     os.makedirs(out, exist_ok=True)
-    bins = {"A": os.path.realpath(a.a), "B": os.path.realpath(a.b)}
+    # Each build is copied into the run, so that a rebuild or a cleaned target cannot change
+    # or remove it between epochs, and the hashes name what ran.
+    src = {"A": os.path.realpath(a.a), "B": os.path.realpath(a.b)}
+    bins = {}
+    for v in ("A", "B"):
+        if v == "B" and src["B"] == src["A"]:
+            bins["B"] = bins["A"]
+            continue
+        bins[v] = os.path.join(out, f"bin-{v}")
+        subprocess.run(["cp", "--reflink=auto", src[v], bins[v]], check=True)
+        os.chmod(bins[v], 0o755)
+    try:
+        return _run_with_bins(a, out, src, bins)
+    finally:
+        if not a.keep_binaries:
+            for v in ("A", "B"):
+                if os.path.exists(os.path.join(out, f"bin-{v}")):
+                    os.remove(os.path.join(out, f"bin-{v}"))
+
+
+def _run_with_bins(a, out, src, bins):
     qnames = sorted(f[:-3] for f in os.listdir(a.queries) if f.endswith(".rq"))
     if a.only:
         want = a.only.split(",")
@@ -437,8 +468,8 @@ def cmd_run(a):
         "host": os.uname().nodename,
         "kernel": os.uname().release,
         "cpu": next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), ""),
-        "A": {"path": bins["A"], "sha256": sha256(bins["A"]), "compilers": compilers(bins["A"]), "label": a.label_a},
-        "B": {"path": bins["B"], "sha256": sha256(bins["B"]), "compilers": compilers(bins["B"]), "label": a.label_b},
+        "A": {"path": src["A"], "sha256": sha256(bins["A"]), "compilers": compilers(bins["A"]), "label": a.label_a},
+        "B": {"path": src["B"], "sha256": sha256(bins["B"]), "compilers": compilers(bins["B"]), "label": a.label_b},
         "store": stores,
         "data": a.data,
         "queries": qnames,
@@ -459,7 +490,21 @@ def cmd_run(a):
         log("warning: A and B were built with different compilers")
     os.sched_setaffinity(0, {a.client_cpu})
     env = dict(os.environ, RAYON_NUM_THREADS=str(a.rayon_threads))
-    spins = [] if a.no_spin else spinners([a.server_cpu, a.client_cpu])
+    spins = []
+    srv = None
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _terminate)
+    try:
+        if not a.no_spin:
+            spinners([a.server_cpu, a.client_cpu], spins)
+        return _run_rounds(a, out, bins, stores, queries, qnames, modes, kernel, server_pmu, env, manifest, log, spins)
+    finally:
+        for s in spins:
+            s.kill()
+            s.wait()
+
+
+def _run_rounds(a, out, bins, stores, queries, qnames, modes, kernel, server_pmu, env, manifest, log, spins):
     samples = open(os.path.join(out, "samples.tsv"), "w")
     cols = [
         "round", "epoch", "variant", "query", "mode", "reps", "instr_u", "instr_k", "cycles_u",
@@ -534,9 +579,6 @@ def cmd_run(a):
     finally:
         if srv is not None:
             srv.stop()
-        for s in spins:
-            s.kill()
-            s.wait()
     for q in qnames:
         for mode in modes:
             ka, kb = answers.get(("A", (q, mode))), answers.get(("B", (q, mode)))
@@ -549,10 +591,10 @@ def cmd_run(a):
     json.dump(manifest, open(os.path.join(out, "manifest.json"), "w"), indent=1)
     for p in problems:
         log(f"FAIL: {p}")
-    text = summarize(out, a.threshold, a.large_threshold)
+    text, verdict = summary(out, a.threshold, a.large_threshold)
     open(os.path.join(out, "summary.md"), "w").write(text)
     print(text)
-    return 1 if problems else 0
+    return EXIT[verdict]
 
 
 # statistics
@@ -632,6 +674,13 @@ def fmt_count(x):
 
 
 def summarize(out, threshold, large_threshold=0.25):
+    return summary(out, threshold, large_threshold)[0]
+
+
+def summary(out, threshold, large_threshold=0.25, ignore_coverage=False):
+    """The report and its verdict: "clean", "flagged" when a query needs timing, or
+    "invalid" when the run cannot clear anything, because it is incomplete, a window was
+    not fully counted or the answers differ."""
     rows = load_samples(out)
     try:
         man = json.load(open(os.path.join(out, "manifest.json")))
@@ -657,7 +706,11 @@ def summarize(out, threshold, large_threshold=0.25):
         for p in man.get("problems", []):
             lines.append(f"- FAIL: {p}")
     lines.append("")
-    uncovered = sum(1 for r in rows if not r["covered"])
+    if ignore_coverage:
+        for r in rows:
+            r["covered"] = True
+    # the idle window only scales the idle share, so its coverage does not count
+    uncovered = sum(1 for r in rows if not r["covered"] and r["query"] != "_idle")
     if uncovered:
         lines.append(
             f"FAIL: {uncovered} windows were not fully counted: a counter on the server's core "
@@ -670,11 +723,19 @@ def summarize(out, threshold, large_threshold=0.25):
         k = (r["query"], r["mode"])
         if r["query"] != "_idle" and k not in keys:
             keys.append(k)
+    invalid = bool(uncovered) or bool(man.get("problems"))
+    for q in man.get("queries", []):
+        for m in man.get("modes", []):
+            if (q, m or "-") not in keys:
+                keys.append((q, m or "-"))
     lines.append(
         f"Flag: the 95% interval of the instruction ratio does not lie within 1 +- {threshold:g}% "
         f"below {LARGE_INSTRUCTIONS / 1e6:g}M instructions per request or 1 +- {large_threshold:g}% above. "
         "Spread is (max - min) / median of the per-process counts. Bimodal marks a side whose "
-        "processes split into two groups or spread by more than 5%."
+        "processes split into two groups or spread by more than 5%, which makes the query "
+        "inconclusive until it is rerun under an explicit mode. A query with fewer than "
+        f"{MIN_MATCHED_ROUNDS} rounds that hold both builds, or with a window that was not fully "
+        "counted, is incomplete."
     )
     lines.append("")
     lines.append(
@@ -688,9 +749,12 @@ def summarize(out, threshold, large_threshold=0.25):
         rs = [r for r in rows if r["query"] == q and r["mode"] == mode]
         va = [r["instr_u"] for r in rs if r["variant"] == "A"]
         vb = [r["instr_u"] for r in rs if r["variant"] == "B"]
-        if not va or not vb:
+        ratios = per_round_ratios(rs, "instr_u") if va and vb else []
+        if len(ratios) < MIN_MATCHED_ROUNDS:
+            invalid = True
+            flagged.append(f"{q} {mode} (incomplete)")
+            lines.append(f"| {q} | {mode} | | | | | | | | | | | | INCOMPLETE, {len(ratios)} rounds |")
             continue
-        ratios = per_round_ratios(rs, "instr_u")
         med = st.median(ratios)
         lo, hi = bootstrap(ratios)
         cpu = st.median(per_round_ratios(rs, "task_clock_ns"))
@@ -708,14 +772,23 @@ def summarize(out, threshold, large_threshold=0.25):
             s for s, vals in (("A", va), ("B", vb)) if bimodal(vals) or spread(vals) > SPLIT_SPREAD
         )
         th = (threshold if st.median(va) < LARGE_INSTRUCTIONS else large_threshold) / 100
-        flag = not (lo >= 1 - th and hi <= 1 + th)
+        outside = not (lo >= 1 - th and hi <= 1 + th)
+        if any(not r["covered"] for r in rs):
+            invalid = True
+            flag = "INCOMPLETE, uncounted window"
+        elif outside:
+            flag = "FLAG"
+        elif bi:
+            flag = "SPLIT"
+        else:
+            flag = ""
         if flag:
-            flagged.append(f"{q} {mode}")
+            flagged.append(f"{q} {mode}" + ("" if flag == "FLAG" else f" ({flag.split(',')[0].lower()})"))
         lines.append(
             f"| {q} | {mode} | {fmt_count(st.median(va))} | {fmt_count(st.median(vb))} | {med:.4f} "
             f"| {lo:.4f}-{hi:.4f} | {min(ratios):.4f}-{max(ratios):.4f} | {spread(va) * 100:.2f}% "
             f"| {spread(vb) * 100:.2f}% | {bi or '-'} | {cpu:.3f} | {csa:.2f}, {csb:.2f} | {share * 100:.2f}% "
-            f"| {'FLAG' if flag else ''} |"
+            f"| {flag} |"
         )
     lines.append("")
     if rows and rows[0]["instr_k"] is not None:
@@ -726,12 +799,16 @@ def summarize(out, threshold, large_threshold=0.25):
         for q, mode in sorted(keys):
             rs = [r for r in rows if r["query"] == q and r["mode"] == mode]
             ratios = per_round_ratios(rs, "instr_k")
+            if not ratios:
+                continue
             ka = st.median([r["instr_k"] for r in rs if r["variant"] == "A"])
             kb = st.median([r["instr_k"] for r in rs if r["variant"] == "B"])
             lines.append(f"| {q} | {mode} | {fmt_count(ka)} | {fmt_count(kb)} | {st.median(ratios):.4f} |")
         lines.append("")
     lines.append(f"{len(flagged)} of {len(keys)} flagged" + (f": {', '.join(flagged)}" if flagged else ""))
-    return "\n".join(lines) + "\n"
+    verdict = "invalid" if invalid else "flagged" if flagged else "clean"
+    lines.append(f"verdict: {verdict}")
+    return "\n".join(lines) + "\n", verdict
 
 
 def main():
@@ -761,6 +838,7 @@ def main():
     r.add_argument("--port", type=int, default=4191)
     r.add_argument("--serve-args", default="", help="extra flags for serve")
     r.add_argument("--no-spin", action="store_true")
+    r.add_argument("--keep-binaries", action="store_true", help="keep the run's copies of the builds")
     r.add_argument("--threshold", type=float, default=1.0, help="flag threshold in percent for small queries")
     r.add_argument("--large-threshold", type=float, default=0.25,
                    help="flag threshold in percent for queries of LARGE_INSTRUCTIONS or more per request")
@@ -770,10 +848,19 @@ def main():
     s.add_argument("out")
     s.add_argument("--threshold", type=float, default=1.0)
     s.add_argument("--large-threshold", type=float, default=0.25)
+    s.add_argument(
+        "--ignore-coverage",
+        action="store_true",
+        help="accept windows marked as not fully counted, for runs recorded before the run fraction was kept",
+    )
     a = p.parse_args()
     if a.cmd == "run":
         sys.exit(cmd_run(a))
-    print(summarize(a.out, a.threshold, a.large_threshold), end="")
+    text, verdict = summary(a.out, a.threshold, a.large_threshold, a.ignore_coverage)
+    if a.ignore_coverage:
+        text += "coverage marks ignored (--ignore-coverage)\n"
+    print(text, end="")
+    sys.exit(EXIT[verdict])
 
 
 if __name__ == "__main__":
