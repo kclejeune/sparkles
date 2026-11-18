@@ -733,7 +733,7 @@ pair shows.
 ### Per-query floor cache
 
 The floor cache of item 1069, 174de1f8, was compared on forge with its base, c0948014, and
-with the direct comparison of two string keys on that base, 971717d2, in interleaved A/Bs
+with a probe build of the direct comparison of two string keys on that base, in interleaved A/Bs
 of release builds that forge made with the same compilers, at 1.05M triples in A,B,B,A
 rounds of ten timed requests per query and server. Item 678's pair, 7e272f4d and
 75a70587, ran beside them with forge builds on both sides. The

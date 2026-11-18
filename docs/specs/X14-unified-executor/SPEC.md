@@ -261,12 +261,14 @@ Forge measured 174de1f8 against c0948014, the build before item 1069, with 1.05M
 in A,B,B,A rounds of ten requests, and every answer was the same. With one thread in
 streaming execution, over five rounds, `str-pair-names` took 0.488 of the base's time,
 28.1 against 57.7 ms, `str-pair-lt` 0.899 and `str-pair-colleague` 1.087. Against the
-direct comparison of the two keys in eager execution, 971717d2, they read 0.460, 0.852 and
+direct comparison of the two keys in eager execution, a probe build on the same base
+that the run record names, they read 0.460, 0.852 and
 1.030. With 12 threads, streaming `str-pair-lt` read 0.939, `str-pair-names` 1.000 and
 `str-pair-colleague` 1.118, and in eager execution `str-pair-lt` read 0.846,
 `str-pair-names` 0.833 and `str-pair-colleague` 0.880. Streaming
-`str-pair-names` takes 31.1 ms with 12 threads against 28.1 ms with one, because each
-worker's map computes the floors its rows need again. The 37-query screens over three
+`str-pair-names` takes 31.1 ms with 12 threads against 28.1 ms with one. Each worker
+keeps its own map, so the floors of a repeated name may be computed once per worker, but
+the cause of the lost gain has not been measured. The 37-query screens over three
 rounds had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no
 query was 10% slower.
 
