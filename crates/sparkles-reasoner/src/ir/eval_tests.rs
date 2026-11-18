@@ -12,7 +12,10 @@ use sparkles_core::store::{Store, StoreOptions};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod demand;
+mod frontend;
 mod maintain;
+mod whynot;
 
 /// A fact by its relation (`None` for the triple relation) and its columns.
 type Fact = (Option<u32>, Vec<u64>);

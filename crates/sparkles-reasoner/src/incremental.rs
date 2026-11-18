@@ -613,6 +613,7 @@ pub(crate) type BeforeDelete<'a> = &'a mut dyn FnMut(&mut Closure) -> anyhow::Re
 /// `before_delete` is called once the closure holds every fact of the previous closure
 /// and the removed explicit facts as candidates, before anything is deleted: the
 /// witnesses of [`crate::witness`] read there which facts the removed ones reach.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn update<'a>(
     c: &mut Closure,
     rules: &'a [CRule],

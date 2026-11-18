@@ -68,6 +68,21 @@ evaluation itself sets most of its time. Arguments that read values, such as
 `STRLEN(?name)`, still decode their columns first, since that was faster on one thread
 than reading them row by row. This is roadmap item 1098.
 
+### Rule programs with relations and negation
+
+A reasoner rule text can declare relations with `.decl name(col, …)`, write relation atoms
+in rule bodies and heads, negate a triple pattern or a relation atom with `not`, and write
+forward rules as `head :- body.` clauses, the rule-file subset of the Datalog syntax of
+spec C24 §6.2. Such a text is one stratified program, which materialization, incremental
+maintenance, witnesses, explanations, query-time reasoning and why-not answers all read,
+and relation facts never reach the dataset. A program with `not` runs in full on every
+update, and one with an existential head or an include of the OWL rule sets is refused. A text without the new syntax is
+parsed and evaluated as before. `Clause` gains the `Relation` and `Not` variants and
+`Rule` the `include` field, `parser::rules_text` writes a parsed program back as text, and
+the web UI shows a relation fact in an explanation as `name(args)` and leaves it out of
+**Show on graph**. The `owl-rl` profile keeps its property chain and key rules per length
+until roadmap item 1102 lets a query-time demand bind a later column of a relation.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes
