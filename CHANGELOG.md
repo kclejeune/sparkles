@@ -37,8 +37,12 @@ many conclusions at the median. On 393 generated ontologies with keys or the uni
 property, 339 rooted runs finish within the bound where 274 did. A run that counts keeps
 the successors. The context of `owl:Thing` is now a query context of the rooted run, so
 an axiom that makes every element one individual gives the subsumptions of `owl:Thing`
-it entails, which completes roadmap item 1070. shoi-022 and 042 still pass the bound and
-stay in item 822.
+it entails, which completes roadmap item 1070. shoi-022 and 042 still pass the bound.
+shoi-022 joins the duplication of ground reasoning across contexts in roadmap item 1061,
+and roadmap item 1075 follows the disjunctive equalities of constants in shoi-042, so item
+822 is complete. The taxonomy no longer panics when an incomplete run derives two classes
+equivalent and only one of them equivalent to `owl:Thing` or unsatisfiable, and places
+both where the equivalence puts them.
 
 ### Keys and the universal property in rooted classification runs
 

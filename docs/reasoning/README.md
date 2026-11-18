@@ -472,7 +472,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   individuals for a key with one property, and a cardinality, functionality or
   disjointness of the universal property leave the ontology to the default paths, as do
   keys over data properties, the top data property and functional data properties.
-  Roadmap items 822, 823 and 1061. Without the option, any other axiom
+  Roadmap items 823, 1061 and 1075. Without the option, any other axiom
   outside OWL 2 EL that needs case analysis, such as a union, is left out and reported
   with its rule, while the Horn axioms run with the individuals. An axiom with a literal
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
@@ -1005,11 +1005,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the bindings always take the Horn axioms. Roadmap item 694.
 * By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
   analysis or counting in an ontology with individuals, are left out, since the rooted run
-  that takes them is an option whose completeness is not proved, and five of the 50
+  that takes them is an option whose completeness is not proved, and two of the 50
   nominal fixtures of its gate pass its work bound. The rooted run also passes its bound
   on ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
-  property, and then gives the default answer after the work. Roadmap items 822, 823
-  and 1061. Axioms that
+  property, and then gives the default answer after the work. Roadmap items 823, 1061
+  and 1075. Axioms that
   need case analysis in an ontology with data properties are left out, and an external DL
   reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
   datatype checker with data cardinalities before they take data properties, and 10 of

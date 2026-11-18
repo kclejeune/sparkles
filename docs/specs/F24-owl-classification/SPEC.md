@@ -130,7 +130,9 @@ fixtures are exact against HermiT in every configuration, and shoi-005, 027 and 
 with 21,485, 12,666 and 30,789 derived conclusions where they passed the bound before.
 The 45 fixtures that finished before derive about half as many conclusions as before at
 the median, with one, shoi-033, rising from 404 to 528. shoi-022 and 042 still pass the
-bound, and item 822 follows them with their new attribution. Of the 393 generated
+bound for other causes, which the departure's section attributes. Item 822 is complete
+for its scope, and shoi-022 joins the duplication of ground reasoning that item 1061
+follows, while item 1075 follows the disjunctive equalities of shoi-042. Of the 393 generated
 ontologies of item 805 that run, 339 now finish within the bound on one and on four threads
 with the same answers, where 274 did before, 44 pass it where 109 did, and 10 take the
 default paths. All agree with
@@ -3444,7 +3446,7 @@ to nominals. The rules it describes are built, apart from keys and the universal
 which item 805 builds. They run when `Limits::rooted` asks for them, and it is off by
 default, because the completeness of the calculus as item 804 departed from the journal's
 rules is not proved and two of the 50 `shoi` fixtures of the phase's gate pass the work
-bound of a rooted run, which item 822 follows. Without the option the disjunctive rules
+bound of a rooted run, which items 1061 and 1075 follow. Without the option the disjunctive rules
 refuse ontologies with individuals and nominals as the section above says, and every run
 takes the paths it took before these rules existed. The option changes nothing for an
 ontology without individuals, nominals or the universal object property. The measurements of the journal's rules are at the end of
@@ -3979,7 +3981,7 @@ first 1.5 million lines of the trace, of which 14,077 are distinct across contex
 is the duplication of ground reasoning across contexts that item 1061 follows. In shoi-042 most of the work is Eq on disjunctive equalities of constants into
 clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With a bound of
 200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
-without link-time optimization.
+without link-time optimization. Item 1075 follows these equalities.
 
 ### ROBOT-compatible commands
 
