@@ -173,7 +173,14 @@ RULES = [
 # The mise tasks that the gate runs: the ci tasks, the conformance suites and the
 # prerequisites that scripts/ci.sh builds before them.
 CONFORMANCE_TASKS = {"test:w3c": "w3c", "test:shacl": "shacl", "test:shex": "shex"}
-PREP_TASKS = ["ui:build", "ui:install", "node:install", "node:build", "jvm:native"]
+# The prerequisites that scripts/ci.sh builds for each task before it starts the checks,
+# as its prep table lists them. A test checks the two against each other.
+PREP_TASKS = {
+    "lint": ["ui:build"], "lint:features": ["ui:build"], "test": ["ui:build"], "test:features": ["ui:build"],
+    "test:quickstart": ["ui:build"], "ui:check": ["ui:build"], "ui:test": ["ui:build"],
+    "licenses:check": ["ui:build"], "ui:fmt:check": ["ui:install"], "node:fmt:check": ["node:install"],
+    "node:client:check": ["node:install"], "node:test": ["node:build"], "jvm:test": ["jvm:native"],
+}
 # The packages whose code the conformance suites check.
 CONFORMANCE_PACKAGES = {"sparkles-core", "sparkles-shacl", "sparkles-shaclc", "sparkles-shex"}
 
@@ -182,8 +189,11 @@ CONFORMANCE_PACKAGES = {"sparkles-core", "sparkles-shacl", "sparkles-shaclc", "s
 # that build or the screen itself. It is skipped only when every changed file matches
 # SCREEN_SKIP and none matches SCREEN_RUN. A file that neither list names runs it.
 SCREEN_RUN = [
-    # The build configuration of the release server.
+    # The build configuration of the release server, including each crate's manifest and
+    # build script, since a skipped crate's manifest can turn on a feature of a dependency
+    # that the server shares.
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "mise.toml", ".cargo/*", ".mbx.toml", "vendor/*",
+    "crates/*/Cargo.toml", "crates/*/build.rs",
     # The scripts that build the revisions and run and summarise the screen. A test
     # checks that every script these name is listed here.
     "scripts/bench.sh", "scripts/bench-lib.sh", "scripts/bench-answers.py", "scripts/bench_hyperfine.py",
@@ -205,8 +215,6 @@ SCREEN_SKIP = [
     "scripts/node-native.sh", "scripts/with-lock.py", "scripts/test-*", "scripts/third-party-licenses.py",
     "scripts/server-artifact*", "scripts/check-doc-*", "scripts/client-types.py", "scripts/api-compat*",
     "scripts/build-fmt-wasm.sh", "scripts/codex-review.sh", "scripts/install-mbx-container.sh",
-    # Tests, benchmarks, examples and fuzz targets, which the server's release build leaves out.
-    "crates/*/tests/*", "crates/*/benches/*", "crates/*/examples/*", "crates/*/fuzz/*",
     # Crates the screen never runs: OWL classification, SHACL, SHACLC and ShEx validation,
     # the HTTP client library, office and memory imports, the browser formatter and the
     # bindings, which are not part of the server.
@@ -216,6 +224,11 @@ SCREEN_SKIP = [
 ]
 
 
+# Tests, benchmarks, examples and fuzz targets at the top of a crate, which the server's
+# release build leaves out. fnmatch's `*` crosses directories, so these are anchored.
+SCREEN_SKIP_TARGETS = re.compile(r"^crates/[^/]+/(tests|benches|examples|fuzz)/")
+
+
 def screen(files):
     """Whether the batch query screen runs for FILES, and the reason."""
     if not files:
@@ -223,7 +236,7 @@ def screen(files):
     for f in files:
         if any(fnmatch.fnmatchcase(f, p) for p in SCREEN_RUN):
             return True, f"{f} changed"
-        if not (any(fnmatch.fnmatchcase(f, p) for p in SCREEN_SKIP) or test_only(f)):
+        if not (any(fnmatch.fnmatchcase(f, p) for p in SCREEN_SKIP) or SCREEN_SKIP_TARGETS.match(f) or test_only(f)):
             return True, f"{f} can reach query execution"
     return False, "no changed file reaches query execution or the screen"
 
@@ -250,7 +263,7 @@ def read_roots(files, read):
         else:
             changed, defs = got
             for root in CI_TASKS + list(CONFORMANCE_TASKS):
-                hit = sorted(changed & cc.reached([root], defs))
+                hit = sorted(changed & cc.reached([root] + PREP_TASKS.get(root, []), defs))
                 if not hit:
                     continue
                 if root in CONFORMANCE_TASKS:

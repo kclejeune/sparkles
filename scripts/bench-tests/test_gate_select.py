@@ -176,6 +176,27 @@ class Selection(unittest.TestCase):
         self.assertTrue(self.sel([])["screen"][0])
         self.assertTrue(gs.select(["Cargo.lock"], None)[0]["screen"][0])
 
+    def test_the_prerequisites_match_ci_sh(self):
+        text = (ROOT / "scripts/ci.sh").read_text()
+        block = re.search(r'for t in "\$\{tasks\[@\]\}"; do\n    case "\$t" in\n(.*?)\n    esac', text, re.S).group(1)
+        want = {}
+        for pats, prep in re.findall(r"^\s*([^)\n]+)\) prep\+=\(([^)]+)\) ;;", block, re.M):
+            for t in pats.split("|"):
+                want.setdefault(t.strip(), []).extend(prep.split())
+        self.assertEqual(want, gs.PREP_TASKS)
+
+    def test_a_prerequisite_change_runs_the_tasks_that_ci_builds_it_for(self):
+        new = MISE.replace('run = "pnpm build"', 'run = "pnpm b"')
+        ci = gs.select(["mise.toml"], "none", lambda p: (MISE, new))[0]["ci"]
+        self.assertIn("test:quickstart", ci)
+        self.assertIn("ui:test", ci)
+
+    def test_manifests_build_scripts_and_nested_test_directories_run_the_screen(self):
+        for f in ["crates/sparkles-owl/Cargo.toml", "crates/sparkles-shacl/build.rs",
+                  "crates/sparkles-core/src/sparql/tests/x.rs", "crates/sparkles-server/src/fuzz/a.rs"]:
+            self.assertTrue(self.sel([f])["screen"][0], f)
+        self.assertFalse(self.sel(["crates/sparkles-core/tests/support/x.rs", "crates/sparkles-core/benches/b.rs"])["screen"][0])
+
     def test_the_scripts_the_screen_reaches_run_it(self):
         # Follow every script name that the screen's scripts mention, by base name, and
         # stop at the scripts that SCREEN_SKIP lists. The ones reached that way are the CI

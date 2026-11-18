@@ -1034,10 +1034,11 @@ The screen is skipped only when every changed file is one that cannot reach the 
 query path or the screen. These are documentation, the GitHub workflows, deployment and
 Nix files, the test suites' data, the JavaScript and JVM packages, the CI, gate, binding,
 licence and release scripts with the script tests, the tests, benchmarks, examples and
-fuzz targets of any crate, the unit-test files inside a crate's `src`, and the OWL,
+fuzz targets at the top of any crate, the unit-test files inside a crate's `src`, and the OWL,
 SHACL, SHACLC, ShEx, client, office import, memory import, browser formatter and binding
 crates. Any other file runs the screen. That includes the query engine, the server and
-every other crate it links, `Cargo.toml`, `Cargo.lock`, the toolchain, `mise.toml`,
+every other crate it links, every crate's `Cargo.toml` and `build.rs`, since a manifest
+can turn on a feature of a dependency the server shares, `Cargo.lock`, the toolchain, `mise.toml`,
 `vendor/`, the UI and the OpenAPI files that the server embeds, the scripts that build
 and time the screen, a file that no rule names, and an empty change. `--full` runs it.
 
