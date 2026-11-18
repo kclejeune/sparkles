@@ -3397,14 +3397,11 @@ fn count_join_counts_a_streamed_join() {
             ),
             false,
         ),
-        // two matching rows before a tail that matches nothing, which a hash join reads
-        // after its last pair
+        // a hash join over a union whose two matching rows come before 60 that match
+        // nothing, so the join reads input after its last pair
         (
-            format!(
-                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES ?s {{ <urn:s:1> <urn:s:2> {} }} ?s <urn:q> ?t }}",
-                (0..100).map(|i| format!("<urn:x:{i}>")).collect::<Vec<_>>().join(" ")
-            ),
-            false,
+            "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o FILTER(?o < 2) } UNION { ?x <urn:r> ?s } ?s <urn:q> ?t }".to_string(),
+            true,
         ),
         // a key that some rows leave unbound
         (
@@ -3424,6 +3421,9 @@ fn count_join_counts_a_streamed_join() {
             assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
             if count_join {
                 assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
+            }
+            if q.contains("UNION") {
+                assert!(has(c.plan(), "HashJoin"), "{q}: {:?}", c.plan());
             }
             assert_eq!(all(c), expected, "{q}; {rows}");
         }
