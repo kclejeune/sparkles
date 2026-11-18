@@ -1088,11 +1088,18 @@ processes of about 7 GiB and 11 GiB on four CPUs. Built together they leave a 16
 runner unresponsive, so the job builds the server's unit tests alone first with
 `mbx test --no-run --workspace --bin sparkles`. The archive commands that follow select
 the same packages, features and profile, so they find those tests fresh and the second
-large compile starts after the first has ended. The job adds only a 2 GiB swap file, where the
+large compile starts after the first has ended. The job adds only 2 GiB of swap, where the
 Doctests job adds 16 GiB, because a large swap lets overlapping compiles thrash for the
 whole job limit instead of ending in an out-of-memory kill with a log. GitHub's image may
-enable a swap file of its own, so the step prints the runner's memory and swap to record
-the total. `scripts/ci-memory.sh` prints the runner's memory, swap,
+enable swap of its own, so the step prints the runner's memory and swap to record
+the total.
+
+`scripts/ci-swap.sh` adds the swap as a file in the root file system. Some of GitHub's
+Linux VMs mount the root on a device-mapper snapshot, so wherever the root is on device
+mapper the job's swap is a zram device instead. Under memory pressure the kernel's reclaim wrote swapped pages to a file
+on that snapshot, and each write waited on the snapshot's copy pool, which apparently
+needs memory to finish its copies. Every task that touched the root then waited in the
+same place, and the VM stopped until the job's limit ended it without a log. `scripts/ci-memory.sh` prints the runner's memory, swap,
 load and largest compilers every 30 seconds while the commands run, and they stop at 38
 minutes and list the processes left. A run that stalls the runner therefore fails inside
 its build step and keeps its log, instead of reaching the job's 45-minute limit with no
@@ -1158,8 +1165,8 @@ The test binaries find the server binary, the UI and their fixtures by paths fix
 they compile. When the build and a test shard run on runners with different checkout
 paths, the shard links the build's path to its own checkout, which needs `sudo` and
 assumes one job at a time on a machine, as on ephemeral runners. A job on a runner with
-at least 24 GiB of memory adds no swap file, and a job that adds one removes it at the end. On a runner whose file
-system refuses one, the job warns and continues. On a large runner the server candidate's
+at least 24 GiB of memory adds no swap, and a job that adds swap removes it at the end. On a runner that
+refuses a swap file or a zram device, the job warns and continues. On a large runner the server candidate's
 container keeps its process limit and drops its 4 CPU and 14 GB limits, and Cargo runs one
 compiler job for each CPU instead of two in total.
 
@@ -1235,27 +1242,32 @@ store.
 
 Pull requests, fork pull requests and runs on other branches restore both caches from
 `main` and save neither. The test build's target entry is about 0.8 GB and Clippy's about 0.6 GB.
-Each commit adds a test store of 0.3 to 0.6 GB and a Clippy store of 0.2 to 0.5 GB. GitHub's
-10 GB repository cache drops the least recently used entries first, so it keeps the
-stores of the last several main commits next to the other workflows' caches.
+Each commit adds a test store of 0.3 to 0.7 GB and a Clippy store of 0.2 to 0.9 GB. Each
+workflow that saves these caches ends with a `prune-caches` job on `main`, which runs
+`scripts/gha-cache-prune.py` after the saving jobs. The script keeps the newest store and
+the newest rust-cache entry of each job kind and platform and deletes the older ones.
+Without it every push would add a full set next to the previous one, and GitHub's 10 GB
+repository cache would evict entries that the next runs restore, including the test
+build's.
 
-The binding workflows and the server candidate build use the same caches, with keys that
+The binding workflows use the same caches, with keys that
 also name the platform and the build profile. The JVM natives and the Node addon build on
 the runner and use both caches. Their rust-cache entry is kept for each platform and
 profile, and its cleanup keeps the binding workspace's dependencies. The JVM jars and
 compatibility jobs restore the Linux x86_64 dev natives' caches without saving, since they
-build the dev bindings generator on that platform. The Linux wheels and the server
-candidate build in containers and cache only the object store. The Alpine addons cache
+build the dev bindings generator on that platform. The Linux wheels build in a
+container and cache only the object store. The Alpine addons cache
 only their Rustup, Cargo tool and pnpm downloads, and their store starts empty. A binding
 workflow saves only on a push to `main`, which builds the dev profile on Linux x86_64.
 Release tags and manual runs build the release profile and every platform from an empty
-store. `MBX_GC_MAX_SIZE` is 2 GiB for the bindings and 3 GiB for the server candidate.
+store. `MBX_GC_MAX_SIZE` is 2 GiB for the bindings. The server candidate build saves no store, as
+[server artifact candidates](#server-artifact-candidates) describes.
 
-Each main push adds a store of about 0.35 GB for the wheel, 0.55 GB for the addon, 0.45 GB
-for the natives and 2.7 GB for the server candidate, and the addon's and the natives'
-target entries are about 0.9 and 0.6 GB. With `ci.yml`'s entries, one main push's set comes
-close to the 10 GB limit, so GitHub evicts the older commits' stores first. The server
-candidate's save takes 3 to 5 min of its job.
+Each main push adds a store of about 0.6 GB for the wheel, 0.55 GB for the addon and 0.5 GB
+for the natives, and the addon's and the natives' target entries are about 0.9 and 0.6 GB.
+With `ci.yml`'s entries and the workflows' small tool caches, the newest set takes about
+7 GB of the 10 GB limit, which leaves room for the entries of one push before its
+`prune-caches` jobs run.
 
 Native build commands and shell build scripts call `mbx` directly. Maturin and napi builds
 use the supported Cargo shim because those tools invoke Cargo themselves. CI keeps its
@@ -1293,8 +1305,9 @@ before temporary build data is collected.
 
 Gradle and pnpm retain their existing caches. Hermetic Nix builds retain their
 Crane dependency artifacts and Nix binary caches. The dev profile keeps line tables for
-workspace crates and disables dependency debug information. The test build and the
-doctests add 16 GB of swap to a runner with less than 24 GiB of memory.
+workspace crates and disables dependency debug information. The doctests add 16 GiB
+of swap and the test build 2 GiB to a runner with less than 24 GiB of memory, as a zram
+device where the root is on device mapper.
 
 ## Releases
 
@@ -1348,6 +1361,11 @@ workspace target and routes child Cargo calls through its shims. Separate smoke 
 download the archive and start its extracted binary in pinned Rocky Linux 8 and
 Debian 11 images, without the checkout or host libraries. No release, image, registry
 package or cryptographic attestation is published.
+
+The candidate build runs Boxington in local mode and saves no store. A saved store took
+about 3.4 GB of the 10 GB repository cache and pushed the CI test build's caches out. It
+shortened the build step to about 22 min from the 35 min of an empty store on GitHub's
+runner, and item 1078 looks for a smaller store that keeps part of that gain.
 
 The outer `server:artifact` task activates the same pinned wasm-bindgen CLI as
 `ui:wasm`, so the packer can record its version after the formatter task exits. A

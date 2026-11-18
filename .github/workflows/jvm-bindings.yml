@@ -344,3 +344,27 @@ jobs:
           curl --fail-with-body --silent --show-error -X POST \
             -H "Authorization: Bearer $token" \
             "https://ossrh-staging-api.central.sonatype.com/manual/upload/defaultRepository/$namespace?publishing_type=$PUBLISHING_TYPE"
+
+  # Each push to main saves new caches under keys that end in the commit's SHA or a lock
+  # hash, and the earlier entries would stay until GitHub's 10 GB repository limit evicts
+  # them, in an order that has removed the test build's caches. After the jobs that save,
+  # this job keeps the newest entry of each family and deletes the others.
+  prune-caches:
+    name: Prune superseded caches
+    needs: natives
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.natives.result != 'skipped' }}
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/gha-cache-prune.py
+          sparse-checkout-cone-mode: false
+      - name: Delete superseded cache entries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/gha-cache-prune.py mbx-store-jvm- v0-rust-jvm-

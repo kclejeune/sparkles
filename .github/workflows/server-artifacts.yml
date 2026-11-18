@@ -1,8 +1,8 @@
 # Unpublished GNU x86_64 candidates. No registry/release/tag operations.
 #
-# mbx builds in local mode with no remote cache. actions/cache carries mbx's object store
-# for each commit, without the managed targets. Pushes to main save, and other runs only
-# restore.
+# mbx builds in local mode with no remote cache and no saved store. A saved store took
+# about 3.4 GB of GitHub's 10 GB repository cache, which pushed the CI test build's caches
+# out, and it shortened this build by about 12 of its 35 minutes on GitHub's runner.
 name: Server artifact candidates
 
 on:
@@ -40,10 +40,6 @@ permissions:
 concurrency:
   group: server-artifacts-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
-env:
-  # The saved mbx store stays small enough for GitHub's 10 GB repository cache.
-  MBX_GC_MAX_SIZE: 3GiB
 
 jobs:
   build:
@@ -124,19 +120,7 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install_args: node pnpm mr-boxington
-      # mbx's object store keeps the crates' outputs by the hash of their inputs, so a crate
-      # whose sources and dependencies did not change is not compiled again. The managed
-      # targets stay out of the saved store.
-      - uses: actions/cache/restore@v4
-        id: mbx-store
-        with:
-          path: &mbx-store |
-            ~/.cache/mbx
-            !~/.cache/mbx/targets
-          key: mbx-store-server-manylinux228-release-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: mbx-store-server-manylinux228-release-${{ runner.os }}-${{ runner.arch }}-mbx1.29.1-${{ hashFiles('rust-toolchain.toml') }}-
-      # local mode: no remote cache, and no link cache, which would add the server binary
-      # to the saved store
+      # local mode: no remote cache and no link cache
       - uses: jdx/mr-boxington-action@v1.7.3
         with:
           backend: local
@@ -146,16 +130,6 @@ jobs:
         run: python3 -m unittest discover -s scripts/bench-tests -p test_server_artifact.py
       - name: Build and assemble the default-feature candidate
         run: mise run server:artifact -- .artifacts/server-candidate
-      - name: Collect the mbx store to its size limit
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        run: |
-          mbx gc
-          du -sh "$(dirname "$(mbx cache dir)")"
-      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        uses: actions/cache/save@v4
-        with:
-          path: *mbx-store
-          key: ${{ steps.mbx-store.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         with:
           name: server-candidate-x86_64-unknown-linux-gnu
