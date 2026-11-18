@@ -1212,6 +1212,60 @@ fn standard_writers_match_eager_and_stop_at_send_without_draining() {
     }
 }
 
+/// A cursor writer goes out through the eager writers' buffer, so a byte budget that
+/// stops it partway leaves `sent` counting the rows of the output the writer took, as
+/// the eager writer's count does, and not the rows of the batches the cursor produced.
+#[test]
+fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
+    use sparkles_core::sparql::results::{
+        LimitedWriter, SolutionsFormat, write_cursor_native_json_counted,
+        write_cursor_solutions_counted, write_solutions_counted,
+    };
+    use std::cell::Cell;
+    let s = store(3000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+    for fmt in [SolutionsFormat::Tsv, SolutionsFormat::Csv] {
+        for limit in [1u64, 20_000, 40_000] {
+            let mut cut = LimitedWriter::new(Vec::new(), Some(limit), None);
+            let sent = Cell::new(0);
+            let mut c = open(&s, q, 1024);
+            let result = write_cursor_solutions_counted(&mut c, fmt, &mut cut, None, &sent);
+            assert!(result.is_err(), "{fmt:?} {limit}");
+            let out = cut.get_ref();
+            let lines = out.iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(sent.get(), lines.saturating_sub(1), "{fmt:?} {limit}");
+            assert!(c.stats().emitted_rows >= sent.get());
+            let mut eager_cut = LimitedWriter::new(Vec::new(), Some(limit), None);
+            let eager_sent = Cell::new(0);
+            assert!(
+                write_solutions_counted(&eager, fmt, &mut eager_cut, None, &eager_sent).is_err()
+            );
+            // the cursor's flush after its first batch moves where the buffer's pieces
+            // end, so the bytes may differ, but the rule that counts them is the same
+            let eager_lines = eager_cut.get_ref().iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(
+                eager_sent.get(),
+                eager_lines.saturating_sub(1),
+                "{fmt:?} {limit}"
+            );
+        }
+        let sent = Cell::new(0);
+        let mut whole = Vec::new();
+        let mut c = open(&s, q, 1024);
+        write_cursor_solutions_counted(&mut c, fmt, &mut whole, None, &sent).unwrap();
+        assert_eq!(sent.get(), 3000);
+    }
+    let mut cut = LimitedWriter::new(Vec::new(), Some(40_000), None);
+    let sent = Cell::new(0);
+    let mut c = open(&s, q, 1024);
+    assert!(write_cursor_native_json_counted(&mut c, &mut cut, None, None, &sent).is_err());
+    // every cell is bound and an object, so each whole row ends with `}]`
+    let rows = cut.get_ref().windows(2).filter(|w| w == b"}]").count() as u64;
+    assert_eq!(sent.get(), rows);
+    assert!(sent.get() > 0 && sent.get() < 3000);
+}
+
 #[test]
 fn batch_writer_decoding_matches_eager_and_declines_under_a_tight_budget() {
     use sparkles_core::sparql::results::{
@@ -1276,7 +1330,9 @@ fn batch_writer_decoding_matches_eager_and_declines_under_a_tight_budget() {
 #[test]
 fn writer_failures_leave_partial_output_and_fuse_production() {
     use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
-    let s = store(20);
+    // The writer sees the output in the buffer's pieces of 8 KiB after the first batch's
+    // flush, so the answer must outlast one piece for the failure to reach production.
+    let s = store(2000);
     struct Failing {
         bytes: Vec<u8>,
     }

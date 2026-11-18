@@ -6,10 +6,9 @@
 //! was buffered and continues in [`CHUNK`]-sized pieces through a bounded channel, so
 //! serialized-body buffering stays bounded. The query result itself may already be
 //! materialized. An error after the switch aborts the transfer (the client sees a
-//! truncated response), and a client that goes away stops the serialization. An eager
-//! body that reaches the result-size budget after the switch first sends the bytes it had
-//! buffered, so the client receives everything the serializer wrote before the budget
-//! stopped it.
+//! truncated response), and a client that goes away stops the serialization. A body that
+//! reaches the result-size budget after the switch first sends the bytes it had buffered,
+//! so the client receives everything the serializer wrote before the budget stopped it.
 
 use super::{ApiError, ApiResult, err};
 use axum::body::Bytes;
@@ -576,15 +575,14 @@ where
         let result = match result {
             Ok(()) => sw.send_chunk().map_err(Error::from),
             Err(e) => {
-                // An eager body stopped by the result-size budget sends what it buffered
-                // before it aborts, so that the client receives every row the report
-                // counts. Its writes already wait for the reader, so this wait is one
-                // more chunk of the same kind. A cursor's body ends at once instead,
-                // since its waits are bounded by the stall limit. The bytes reported
-                // leave out what was not sent.
+                // A body stopped by the result-size budget sends what it buffered before
+                // it aborts, so that the client receives every row the report counts,
+                // which are the rows the size limit let through. Its writes already
+                // waited for the reader, so this wait is one more chunk of the same kind,
+                // under a cursor's deadline and stall bound. Any other failure ends the
+                // body at once. The bytes reported leave out what was not sent.
                 let pending = sw.buf.len() as u64;
-                let flushed = control.is_none()
-                    && matches!(e, Error::BudgetExceeded(_))
+                let flushed = matches!(e, Error::BudgetExceeded(_))
                     && sw.tx.is_some()
                     && sw.send_chunk().is_ok();
                 if sw.tx.is_some() && !flushed {

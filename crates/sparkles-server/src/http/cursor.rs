@@ -178,9 +178,10 @@ pub(super) async fn serve(
     // the plan as it stood when a native JSON stream failed before its first byte
     let failed_plan: Arc<parking_lot::Mutex<Option<serde_json::Value>>> = Default::default();
     let plan_slot = failed_plan.clone();
-    // the rows an eager answer wrote whole, for the report of a body stopped partway
-    let eager_sent: Arc<parking_lot::Mutex<Option<u64>>> = Default::default();
-    let eager_slot = eager_sent.clone();
+    // the rows that reached the response writer whole, for the report of a body stopped
+    // partway
+    let sent_rows: Arc<parking_lot::Mutex<Option<u64>>> = Default::default();
+    let sent_slot = sent_rows.clone();
     let deferred = DeferredReport::default();
     let final_report = deferred.clone();
     let waits = control.clone();
@@ -207,7 +208,7 @@ pub(super) async fn serve(
                 {
                     let sent = std::cell::Cell::new(0);
                     let written = write_thrift_results(result.result(), writer, send, &sent);
-                    *eager_slot.lock() = Some(sent.get());
+                    *sent_slot.lock() = Some(sent.get());
                     written
                 }
                 QueryExecution::Eager(result) => {
@@ -226,34 +227,69 @@ pub(super) async fn serve(
                         io.as_deref(),
                         &sent,
                     );
-                    *eager_slot.lock() = Some(sent.get());
+                    *sent_slot.lock() = Some(sent.get());
                     written
                 }
                 QueryExecution::Select(cursor) if format == SolutionsFormat::Sparkles => {
-                    results::write_cursor_native_json(cursor, &mut *writer, send, metadata)
-                        .map(|_| ())
+                    let sent = std::cell::Cell::new(0);
+                    let written = results::write_cursor_native_json_counted(
+                        cursor,
+                        &mut *writer,
+                        send,
+                        metadata,
+                        &sent,
+                    );
+                    *sent_slot.lock() = Some(sent.get());
+                    written.map(|_| ())
                 }
                 QueryExecution::Select(cursor) => {
-                    results::write_cursor_solutions(cursor, format, &mut *writer, send).map(|_| ())
-                }
-                QueryExecution::Graph(cursor) if native_graph => {
-                    results::write_cursor_graph_native_json(cursor, &mut *writer, send, metadata)
-                        .map(|_| ())
-                }
-                QueryExecution::Graph(cursor) => match rdf_format {
-                    OutFormat::Rdf(format) => sparkles::sparql::cursor::graph::write_cursor_graph(
+                    let sent = std::cell::Cell::new(0);
+                    let written = results::write_cursor_solutions_counted(
                         cursor,
                         format,
                         &mut *writer,
                         send,
-                        &prefixes,
-                    )
-                    .map(|_| ()),
-                    OutFormat::Jena(format) => {
-                        results::write_cursor_jena_graph(cursor, format, &mut *writer, send)
-                            .map(|_| ())
-                    }
-                },
+                        &sent,
+                    );
+                    *sent_slot.lock() = Some(sent.get());
+                    written.map(|_| ())
+                }
+                QueryExecution::Graph(cursor) if native_graph => {
+                    let sent = std::cell::Cell::new(0);
+                    let written = results::write_cursor_graph_native_json_counted(
+                        cursor,
+                        &mut *writer,
+                        send,
+                        metadata,
+                        &sent,
+                    );
+                    *sent_slot.lock() = Some(sent.get());
+                    written.map(|_| ())
+                }
+                QueryExecution::Graph(cursor) => {
+                    let sent = std::cell::Cell::new(0);
+                    let written = match rdf_format {
+                        OutFormat::Rdf(format) => {
+                            sparkles::sparql::cursor::graph::write_cursor_graph_counted(
+                                cursor,
+                                format,
+                                &mut *writer,
+                                send,
+                                &prefixes,
+                                &sent,
+                            )
+                        }
+                        OutFormat::Jena(format) => results::write_cursor_jena_graph_counted(
+                            cursor,
+                            format,
+                            &mut *writer,
+                            send,
+                            &sent,
+                        ),
+                    };
+                    *sent_slot.lock() = Some(sent.get());
+                    written.map(|_| ())
+                }
                 QueryExecution::Ask(result) if format == SolutionsFormat::Sparkles => {
                     results::write_native_json(result.result(), &mut *writer, send, metadata)
                 }
@@ -282,9 +318,9 @@ pub(super) async fn serve(
             let serialize_ms =
                 (began.elapsed().as_secs_f64() * 1000.0 - exec_ms - wait_ms).max(0.0);
             let (outcome, budget) = end.outcome();
-            // An eager answer's statistics count all of its rows, so a body that stopped
-            // partway reports the rows it wrote, as a cursor's emitted rows do.
-            let rows = match *eager_sent.lock() {
+            // The statistics count all the rows an answer produced, so a body that stopped
+            // partway reports the rows that reached the response writer whole.
+            let rows = match *sent_rows.lock() {
                 Some(sent) if end.error.is_some() => Some(sent),
                 _ => stats.as_ref().map(|s| s.emitted_rows),
             };
