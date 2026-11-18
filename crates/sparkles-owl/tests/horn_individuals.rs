@@ -608,3 +608,40 @@ fn a_link_that_r6_gives_beside_the_asserted_inverse_still_clashes() {
          ClassAssertion(:A :x)");
     assert_eq!(out.consistency, Consistency::Inconsistent);
 }
+
+#[test]
+fn a_link_that_r6_gives_beside_a_strict_subrole_of_the_inverse_keeps_what_reads_it() {
+    // as above with q2 strictly under the inverse of p, so that the link R6 gives y by
+    // the inverse of p stands beside y's link by a proper subrole. The universal and the
+    // chain on the inverse of p read the link by q2, the functional p at x counts y
+    // through it, and w, which also inheres in y, is not x
+    check(
+        "SubObjectPropertyOf(:q2 ObjectInverseOf(:p))
+         FunctionalObjectProperty(:p)
+         ObjectPropertyAssertion(:p :x :y)
+         ObjectPropertyAssertion(:q2 :y :x)
+         ObjectPropertyAssertion(:p :w :y)
+         ObjectPropertyAssertion(:t :x :z)
+         SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:p) :t) :u)
+         ClassAssertion(ObjectAllValuesFrom(ObjectInverseOf(:p) :F) :y)
+         ClassAssertion(:D :z)
+         SubClassOf(ObjectSomeValuesFrom(:u :D) :E)
+         EquivalentClasses(:Qx ObjectOneOf(:x))
+         EquivalentClasses(:Qy ObjectOneOf(:y))
+         EquivalentClasses(:Qw ObjectOneOf(:w))",
+        &[("Qx", "F"), ("Qw", "F"), ("Qy", "E")],
+        &[("Qy", "F"), ("Qx", "E"), ("Qx", "Qw"), ("Qw", "Qx")],
+    );
+}
+
+#[test]
+fn a_link_that_r6_gives_beside_a_strict_subrole_of_the_inverse_still_clashes() {
+    let (out, _) = run("SubObjectPropertyOf(:q2 ObjectInverseOf(:p))
+         FunctionalObjectProperty(:p)
+         ObjectPropertyAssertion(:p :x :y)
+         ObjectPropertyAssertion(:q2 :y :x)
+         ObjectPropertyAssertion(:s :y :x)
+         DisjointObjectProperties(ObjectInverseOf(:p) :s)
+         ClassAssertion(:A :x)");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+}

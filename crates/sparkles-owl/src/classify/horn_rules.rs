@@ -179,11 +179,18 @@ fn counts_pred(ix: &Index, st: &State, s: Role, b: Ex, m: Ex) -> bool {
 /// search for witnesses for any, since a context may have passed over the link while it
 /// had few.
 pub fn covered(ix: &Index, h: &HornSt, r: Role, n: Ex) -> bool {
+    let roles = &ix.roles;
+    // the rules at `n` read a backward link through the inverse of its role, so the
+    // subrole's link stands for the other only when its inverse is under the other's
+    let inverse = |r2: Role| match roles.inv(r) {
+        None => true,
+        Some(i) => roles.inv(r2).is_some_and(|i2| roles.sub(i2, i)),
+    };
     spare() >= 2
         && h.succ
             .list
             .iter()
-            .any(|&(r2, n2)| n2 == n && r2 != r && ix.roles.sub(r2, r))
+            .any(|&(r2, n2)| n2 == n && r2 != r && roles.sub(r2, r) && inverse(r2))
 }
 
 /// The successors past which a context keeps every link the Horn rules give it, so
@@ -1724,6 +1731,24 @@ mod tests {
         assert!(!succ(&ix, me, &mut st, 1, n, false, &mut out));
         assert!(out.sent.is_empty() && out.local.is_empty());
         assert_eq!(hs(&mut st).succ.list, vec![(0, n)]);
+        // a link by a role with an inverse stays beside a subrole's link whose inverse
+        // the run does not have, since the target reads its links through the inverse
+        let mut other =
+            Index::build(&Axioms::default(), &mut Interner::new(), None, &|| false).unwrap();
+        other.nominals = ix.nominals.clone();
+        other.roles.sup = vec![vec![0, 1], vec![1], vec![2]];
+        other.roles.inv = vec![super::super::index::NO_ROLE, 2, 1];
+        other.horn = Some(Box::new(HornIx {
+            flags: Vec::new(),
+            base: ix.horn.as_ref().unwrap().base,
+            dominate: false,
+            dead: Vec::new(),
+        }));
+        let mut st2 = State::default();
+        let mut out = Polled::new();
+        assert!(succ(&other, me, &mut st2, 0, n, false, &mut out));
+        assert!(succ(&other, me, &mut st2, 1, n, false, &mut out));
+        assert_eq!(hs(&mut st2).succ.list, vec![(0, n), (1, n)]);
         // a link by a role that is not above the first is another link
         let mut out = Polled::new();
         assert!(succ(&ix, me, &mut st, 2, n, false, &mut out));
