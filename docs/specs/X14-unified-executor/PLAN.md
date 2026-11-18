@@ -433,8 +433,8 @@ A window of sampled rows admits the memo at one repeat in eight. The exact disti
 of the per-batch pass is a required second signal, since it sees hot keys that the
 sampled sketch can miss, and a policy that dropped the per-batch pass when the sketch saw
 no repetition made late hot keys up to 7.3 times slower. A full sketch without admission
-ends the observation. An admitted memo is judged once it has seen as many rows as it
-holds, or filled, and is released when it answers fewer than one row in sixteen. Misses
+ends the observation. An admitted memo is judged once it has seen as many rows as its
+largest size, 65,536 entries, or filled, and is released when it answers fewer than one row in sixteen. Misses
 are evaluated once per distinct key as one batch, and a missed key holds a pending entry
 until the batch is evaluated, so its other rows cost one lookup. The sketch's keys and the
 memo's entries are charged in steps of the query's reservation, so that the optional

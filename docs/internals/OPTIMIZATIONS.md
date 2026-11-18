@@ -300,8 +300,8 @@ implementation and always apply. EXPLAIN shows which ones ran.
   repeats and unchanged-snapshot predicate statistics put the input domain below four
   fifths of the estimated rows. This optional profit hint walks at most 64 plan nodes
   and declines on changed snapshots or unknown operators. Later batches feed a sketch
-  that observes one key in sixteen, chosen by hash, and holds at most 4,096 keys, about
-  128 KiB of charged memory. A window of 256 sampled rows admits the map at one repeat in
+  that observes one key in sixteen, chosen by hash, and holds at most 4,096 keys, charged at
+  32 bytes a key. A window of 256 sampled rows admits the map at one repeat in
   eight, and so does the exact distinct count of the expression cache's pass over one
   batch, which sees hot keys the sketch does not sample. A full sketch without admission
   ends the observation for the query. An admitted map evaluates its misses once per
@@ -309,8 +309,9 @@ implementation and always apply. EXPLAIN shows which ones ran.
   and then answers fewer than one row in sixteen without an evaluation. The query owns
   the map, including cached expression errors. It keeps at most 65,536 entries under the memory
   budget, charged conservatively at about 6 MiB, while dense inline integers retain their
-  smaller 16,384-entry cap. Each batch the map answers also charges 40 bytes a row of
-  scratch while it runs. A refused optional allocation or a full cache leaves uncached
+  smaller 16,384-entry cap. Both charges grow in steps of a sixty-fourth of the query's
+  memory limit. Each batch the map answers also charges 68 bytes a row of scratch while
+  it runs. A refused optional allocation or a full cache leaves uncached
   inputs on ordinary evaluation. Identity copies, volatile expressions and application
   callbacks do not enter this cache.
 * **Numeric range scans.** A FILTER that compares a scan's sort column with numeric

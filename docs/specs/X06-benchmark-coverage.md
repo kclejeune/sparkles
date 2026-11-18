@@ -1675,9 +1675,12 @@ expression cache's own pass over a batch admits it too, because eight hot keys c
 fall outside the sample. An admitted map evaluates its misses once per distinct key as
 one column, and a missed key holds a pending entry until then, so its other rows in the
 batch cost one lookup. The map is judged once it has seen 65,536 rows or filled, and it
-is released when it answers fewer than one row in sixteen. The sketch costs at most
-128 KiB, the map at most about 6 MiB, and a batch the map answers 40 bytes a row while
-it runs.
+is released when it answers fewer than one row in sixteen. The sketch charges 32 bytes
+a key, 128 KiB when full, and the map 96 bytes an entry, about 6 MiB when full. Each
+charge also holds a fixed 512 bytes and grows in steps of a sixty-fourth of the query's
+memory limit, so it can exceed its entries by up to one step. A batch the map answers
+charges 68 bytes a row while it runs, which covers its vectors and the hash table of its
+pending entries.
 
 The matrix behind the policy ran on `atlas` with synthetic inputs of dates, integers,
 strings, IRIs and SHA1 keys of 2,048 to 262,144 rows. Its reuse shapes are unique keys,

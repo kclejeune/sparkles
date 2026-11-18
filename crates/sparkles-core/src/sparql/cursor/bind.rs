@@ -34,6 +34,8 @@ const MAP_WINDOW: u32 = 16384;
 /// Charged bytes per map entry and per sketch key, beside a fixed 512.
 const ENTRY_BYTES: u64 = 96;
 const SKETCH_BYTES: u64 = 32;
+/// Charged bytes per row of a batch the map answers, while it runs.
+const SCRATCH_BYTES: u64 = 28 + 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -365,13 +367,19 @@ impl Reuse {
         expr: &Expr,
     ) -> Result<bool> {
         let n = table.len;
-        // Output, miss rows, distinct miss keys and their slots, beside the input.
-        let Ok(_scratch) = ctx.charge(n as u64 * 40 + 256) else {
+        // The batch's transient memory, beside the input. The output, the missed rows,
+        // the distinct misses and their values take 28 bytes a row at their exact
+        // capacities. Pending slots take at most 39 bytes a row of hash table, since a
+        // table of `c` entries has at most `2c * 8 / 7` buckets of 17 bytes, whether
+        // they grow the map or fill the side map. The map's retained charge of
+        // `ENTRY_BYTES` an entry covers its existing entries in both the old and the new
+        // table while the table grows or shrinks.
+        let Ok(_scratch) = ctx.charge(n as u64 * SCRATCH_BYTES + 256) else {
             return Ok(false);
         };
         let mut output = Vec::with_capacity(n);
-        let mut missed: Vec<u32> = Vec::new();
-        let mut distinct = Vec::new();
+        let mut missed: Vec<u32> = Vec::with_capacity(n);
+        let mut distinct = Vec::with_capacity(n);
         // Every pending entry is resolved before this returns, and an error releases the
         // whole map.
         let pending = match self.answer(
@@ -1178,7 +1186,7 @@ mod tests {
     #[test]
     fn cache_growth_refusal_retains_a_bounded_partial_map_and_normal_evaluation() {
         let store = Store::in_memory(StoreOptions::default());
-        let ctx = cursor_context(&store, 64 << 10);
+        let ctx = cursor_context(&store, 128 << 10);
         let input = ctx.var("date");
         let target = ctx.var("year");
         let expr = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
@@ -1206,7 +1214,7 @@ mod tests {
                 Some(Term::Literal(Literal::from(2000)))
             );
             assert!(table.cols[1][257..].iter().all(|id| *id == Id::UNDEF));
-            assert!(ctx.live_bytes() <= 64 << 10);
+            assert!(ctx.live_bytes() <= 128 << 10);
             ctx.check().unwrap();
             // The table the map allocated, a key and a value per slot, stays within its
             // retained charge after the batch's scratch is released.
