@@ -968,7 +968,8 @@ they do for one eager call. A remote LATERAL loop runs through `enhancer::Remote
 which the eager loop calls once and the cursor calls per batch. The cursor holds the rows
 of a partial bulk request until the request is full or its input ends, so it sends the
 requests and the bulk groups of an eager run, and it keeps the answers it holds charged
-and counts each key's solutions once.
+and counts each key's solutions once. Both modes still parse a whole remote response before
+the budget sees it, which [item 1104](../../ROADMAP.md) changes.
 
 The whole-input operator of `cursor/whole.rs` serves a vector or hybrid search whose
 candidates come from its input, a path search under a limit and an algorithm call that
@@ -1002,6 +1003,21 @@ the same rows as eager runs against the work limit, refuse an input over the mem
 budget in both modes, read a pending transaction's view in an algorithm call, redact a
 masked plan, and send the requests of an eager remote loop at every batch size, with a
 failing endpoint and with SILENT.
+
+`CountJoin` under streaming groups the rows of its join without keys and asks a merge
+join for its count, so it never holds the pairs that eager execution forms. The two modes
+admit the pairs against the row limit and the work limit by the same rule. The eager count
+counts a merge join on one shared variable from its key runs and forms the pairs of any
+other join, admitting them before it counts them, and the streamed count admits each
+batch of pairs of the same joins and checks the total once more when its join has read
+all of its input. Three differences remain. Eager execution chooses between the key runs
+and the pairs at run time and forms the pairs when a key column holds UNDEF or is not
+sorted, while the cursor chooses from the plan, so a limit can refuse such a join in one
+mode and not in the other. The eager count also admits the memory of its pair indices,
+which the streamed count never holds, so it can refuse under a memory budget that the
+streamed count meets, and the merge removes that difference. A count can refuse at a work
+limit equal to the work that its own run reported, in both modes, and
+[item 1103](../../ROADMAP.md) makes the two counts agree.
 
 ### Measurements of stage 1
 
