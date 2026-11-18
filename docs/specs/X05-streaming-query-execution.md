@@ -1782,8 +1782,8 @@ from the table is not served from the cache. Vitest covers the request's mode, t
 stopped metadata, the quads and the comparison of a stopped stream. A mock browser test
 rewrites the mock's answers into the stopped and quads shapes and checks the badge, the
 notice, the graph and a comparison's eager reads, and a browser test against a real
-server streams a grouping over 30,000 rows with a row limit of 1,000 and with one above
-the total.
+server streams a grouping over 30,000 rows with a row limit of 1,000 and with a limit
+above the total.
 
 ### Finite HTTP body limits
 

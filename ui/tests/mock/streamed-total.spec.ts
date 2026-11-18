@@ -52,18 +52,27 @@ type Body = {
   meta: { totalRows: number | null; sentRows: number; status?: string };
 };
 
-/** Answer the page's queries as a streamed answer that the row limit stopped would be. */
-async function streamAnswers(page: Page, urls: URL[]) {
+/**
+ * Answer the page's reads of `query` as the server's cursor writers answer a streamed
+ * read, and record their URLs. Other requests, such as the table's label lookups, pass
+ * through. A read the row limit cut, or one with exactly `stopAt` rows, stops with no
+ * total, since a cursor that reaches the limit does not look for another row.
+ */
+async function streamAnswers(page: Page, query: string, stopAt?: number) {
+  const urls: URL[] = [];
   await page.route(`**/${DS}/sparql*`, async (route: Route) => {
-    const url = new URL(route.request().url());
+    const req = route.request();
+    if (req.method() !== 'POST' || req.postData() !== query) return route.fallback();
+    const url = new URL(req.url());
     urls.push(url);
     const res = await route.fetch();
     const body = (await res.json()) as Body;
     if (url.searchParams.get('execution') !== 'eager') {
-      if (body.meta.sentRows < (body.meta.totalRows ?? 0)) {
-        body.meta.totalRows = null;
-        body.meta.status = 'stopped';
-      } else body.meta.status = 'complete';
+      const m = body.meta;
+      if (m.sentRows < (m.totalRows ?? 0) || m.sentRows === stopAt) {
+        m.totalRows = null;
+        m.status = 'stopped';
+      } else m.status = 'complete';
       if (body.triples) {
         body.quads = body.triples.map((t) => [...t, null]);
         body.triples = [];
@@ -71,32 +80,52 @@ async function streamAnswers(page: Page, urls: URL[]) {
     }
     await route.fulfill({ response: res, json: body });
   });
+  return urls;
 }
+
+// let a handler that is still reading finish before the page closes
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: 'wait' });
+});
 
 const grid = (page: Page) => page.getByRole('grid');
 const tableTab = (page: Page) => page.getByRole('tab', { name: /Table/ });
+const run = (page: Page) => page.getByRole('button', { name: /^Run/ }).click();
 
 test('a streamed answer cut at the row limit has an unknown total', async ({ page }) => {
-  const urls: URL[] = [];
-  await streamAnswers(page, urls);
-  await prepare(page, `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v }`);
+  const query = `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v }`;
+  const urls = await streamAnswers(page, query);
+  await prepare(page, query);
   await page.goto('/ui/query');
-  await page.getByRole('button', { name: /^Run/ }).click();
+  await run(page);
   await expect(grid(page)).toBeVisible();
   // the table leaves the mode to the server
-  expect(urls.at(-1)?.searchParams.has('execution')).toBe(false);
-  expect(urls.at(-1)?.searchParams.get('send')).toBe('1000');
+  expect(urls).toHaveLength(1);
+  expect(urls[0].searchParams.has('execution')).toBe(false);
+  expect(urls[0].searchParams.get('send')).toBe('1000');
   await expect(tableTab(page)).toContainText('1,000+');
   await expect(page.getByText('Showing the first 1,000 results.')).toBeVisible();
   await expect(page.getByText('so there may be more and the total is unknown')).toBeVisible();
   await expect(page.getByText(/Showing the first 1,000 of/)).toHaveCount(0);
 });
 
-test('a streamed answer within the row limit keeps its total', async ({ page }) => {
-  await streamAnswers(page, []);
-  await prepare(page, `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v } LIMIT 20`);
+test('a streamed answer of exactly the row limit may have more rows', async ({ page }) => {
+  const query = `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v } LIMIT 1000`;
+  await streamAnswers(page, query, 1_000);
+  await prepare(page, query);
   await page.goto('/ui/query');
-  await page.getByRole('button', { name: /^Run/ }).click();
+  await run(page);
+  await expect(grid(page)).toBeVisible();
+  await expect(tableTab(page)).toContainText('1,000+');
+  await expect(page.getByText('so there may be more and the total is unknown')).toBeVisible();
+});
+
+test('a streamed answer within the row limit keeps its total', async ({ page }) => {
+  const query = `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v } LIMIT 20`;
+  await streamAnswers(page, query);
+  await prepare(page, query);
+  await page.goto('/ui/query');
+  await run(page);
   await expect(grid(page).getByRole('row')).toHaveCount(21);
   await expect(tableTab(page)).toContainText('20');
   await expect(tableTab(page)).not.toContainText('+');
@@ -104,10 +133,11 @@ test('a streamed answer within the row limit keeps its total', async ({ page }) 
 });
 
 test('a streamed graph answer, sent as quads, fills the graph and the table', async ({ page }) => {
-  await streamAnswers(page, []);
-  await prepare(page, `${PREFIXES}\nCONSTRUCT { ?s ex:w ?v } WHERE { ?s ex:v ?v }`);
+  const query = `${PREFIXES}\nCONSTRUCT { ?s ex:w ?v } WHERE { ?s ex:v ?v }`;
+  await streamAnswers(page, query);
+  await prepare(page, query);
   await page.goto('/ui/query');
-  await page.getByRole('button', { name: /^Run/ }).click();
+  await run(page);
   // a graph answer opens in the Graph view, whose 1,000 statements draw 400 nodes
   await expect(page.getByText('400 nodes, 200 edges')).toBeVisible();
   await expect(tableTab(page)).toContainText('1,000+');
@@ -116,11 +146,11 @@ test('a streamed graph answer, sent as quads, fills the graph and the table', as
 });
 
 test('a comparison reads both states eagerly and compares their counts', async ({ page }) => {
-  const urls: URL[] = [];
-  await streamAnswers(page, urls);
-  await prepare(page, `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v`);
+  const query = `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v`;
+  const urls = await streamAnswers(page, query);
+  await prepare(page, query);
   await page.goto('/ui/query');
-  await page.getByRole('button', { name: /^Run/ }).click();
+  await run(page);
   await expect(grid(page)).toBeVisible();
   await page.getByRole('button', { name: 'History', exact: true }).click();
   const slider = page.getByRole('region', { name: 'History time slider' });
@@ -130,7 +160,7 @@ test('a comparison reads both states eagerly and compares their counts', async (
   await expect(page.getByText('The results were truncated')).toBeVisible();
   await expect(page.getByText('(1,100 rows before, 1,101 after)')).toBeVisible();
   const compared = urls.slice(before);
-  expect(compared.length).toBeGreaterThanOrEqual(2);
+  expect(compared).toHaveLength(2);
   for (const u of compared) expect(u.searchParams.get('execution')).toBe('eager');
   await expect(page.getByText('the total is unknown')).toHaveCount(0);
 });

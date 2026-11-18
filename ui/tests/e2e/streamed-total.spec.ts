@@ -60,8 +60,11 @@ function seed(page: Page, query: string, limit: number) {
 type Meta = { totalRows: number | null; sentRows: number; status?: string; plan: object };
 
 /** Runs the query and returns the URL it sent and the metadata the server answered. */
-async function run(page: Page) {
-  const answered = page.waitForResponse((r) => r.url().includes(`/${DS}/sparql`));
+async function run(page: Page, query: string) {
+  // the editor's read, not the label lookups that the table sends after it
+  const answered = page.waitForResponse(
+    (r) => r.url().includes(`/${DS}/sparql`) && r.request().postData() === query,
+  );
   await page.getByRole('button', { name: /^Run/ }).click();
   const res = await answered;
   const body = (await res.json()) as { meta: Meta };
@@ -73,7 +76,7 @@ const tableTab = (page: Page) => page.getByRole('tab', { name: /Table/ });
 open('a streamed answer cut at the row limit shows an unknown total', async ({ page }) => {
   await seed(page, QUERY, 1_000);
   await page.goto('/ui/query');
-  const { url, meta } = await run(page);
+  const { url, meta } = await run(page, QUERY);
   expect(url.searchParams.has('execution')).toBe(false);
   // the server streamed it: a cursor plan, stopped at the row limit, with no total
   expect(meta).toMatchObject({ totalRows: null, sentRows: 1_000, status: 'stopped' });
@@ -85,9 +88,10 @@ open('a streamed answer cut at the row limit shows an unknown total', async ({ p
 
 open('a streamed answer within the row limit shows its total', async ({ page }) => {
   // the same grouping with a different text, under a limit the 30,000 groups fit in
-  await seed(page, `${QUERY} # whole`, 100_000);
+  const whole = `${QUERY} # whole`;
+  await seed(page, whole, 100_000);
   await page.goto('/ui/query');
-  const { meta } = await run(page);
+  const { meta } = await run(page, whole);
   expect(meta).toMatchObject({ totalRows: ROWS, sentRows: ROWS, status: 'complete' });
   expect(meta.plan).toHaveProperty('materializes');
   await expect(tableTab(page)).toContainText('30,000');
