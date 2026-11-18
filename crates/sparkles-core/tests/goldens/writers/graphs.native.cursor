@@ -1,0 +1,1 @@
+{"queryType":"SELECT","vars":["g","s","o"],"rows":[[{"type":"uri","value":"urn:ex:g"},{"type":"uri","value":"urn:ex:s1"},{"type":"literal","value":"in g"}],[{"type":"uri","value":"urn:ex:g"},{"type":"uri","value":"urn:ex:s3"},{"type":"literal","value":"g2"}]],"meta":{"memory":"<n>","plan":"<n>","rowsProduced":"<n>","sentRows":2,"status":"complete","timing":"<n>","totalRows":2}}

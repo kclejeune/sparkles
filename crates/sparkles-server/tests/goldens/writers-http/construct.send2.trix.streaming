@@ -1,0 +1,15 @@
+200 application/trix+xml
+<trix xmlns="http://www.w3.org/2004/03/trix/trix-1/">
+  <graph>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <typedLiteral datatype="http://www.w3.org/2001/XMLSchema#integer">42</typedLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <id>b0</id>
+    </triple>
+  </graph>
+</trix>

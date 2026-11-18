@@ -1,0 +1,15 @@
+200 application/n-quads
+<urn:ex:s1> <urn:ex:p> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:ex:s1> <urn:ex:p> _:b0 .
+<urn:ex:s1> <urn:ex:p> "]]> <&>" .
+<urn:ex:s1> <urn:ex:p> "abc"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:ex:s1> <urn:ex:p> "ctl\u0001" .
+<urn:ex:s1> <urn:ex:p> "en"@en .
+<urn:ex:s1> <urn:ex:p> "plain" .
+<urn:ex:s1> <urn:ex:p> "quote\" back\\ nl\n tab\t" .
+<urn:ex:s1> <urn:ex:p> "rtl"@ar--rtl .
+<urn:ex:s1> <urn:ex:p> "😀 é" .
+<urn:ex:s1> <urn:ex:p> "" .
+<urn:ex:s1> <urn:ex:p> <<( <urn:ex:a> <urn:ex:b> "t" )>> .
+<urn:ex:s1> <urn:ex:p> <urn:ex:o> .
+_:b0 <urn:ex:q> <urn:ex:s1> .

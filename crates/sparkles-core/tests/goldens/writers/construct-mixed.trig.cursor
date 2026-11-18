@@ -1,0 +1,9 @@
+@prefix ex: <urn:ex:> .
+ex:s1 ex:p "in g" .
+ex:g {
+	ex:s1 ex:in "in g" .
+}
+ex:s3 ex:q "g2" .
+ex:g {
+	ex:s3 ex:in "g2" .
+}

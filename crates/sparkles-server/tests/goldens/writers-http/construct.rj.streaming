@@ -1,0 +1,2 @@
+500 application/json
+{"error":"I/O error: RDF/JSON cannot hold a triple term"}

@@ -1,0 +1,2 @@
+200 application/rdf+json
+{"urn:ex:s1":{"urn:ex:p":[{"datatype":"http://www.w3.org/2001/XMLSchema#integer","type":"literal","value":"42"},{"type":"bnode","value":"_:b0"}]}}

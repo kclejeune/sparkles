@@ -387,15 +387,22 @@ writers of `write_cursor_solutions`, the native JSON writer, the RDF writers of
 Thrift writer moves from `sparkles-server`'s `http.rs` into `sparkles-core` beside
 `ThriftResults`, so `cursor_format` and the streaming route's Thrift refusal go from the
 policy and the server. The ASK boolean is written through the same functions from a
-one-row source. Term decoding runs once per batch column through `decode_for` into
-prebuilt buffers, and the eager writers' row scratch of `results/output.rs` becomes the
-source's decode buffer. The `_counted` eager writers and the `Shared` adapter are
-deleted.
+one-row source. Term decoding runs once per batch in the source's sorted term decoding
+into prebuilt buffers, the cursor's term cache and the eager writer's decoded chunks, and the
+eager writers' row scratch of `results/output.rs` becomes the source's decode buffer. The
+expression decoding of `decode_for` builds value columns and is not the writers' decoder. The
+`_counted` writers are deleted. The SPARQL writers stop using the `Shared` adapter once they
+write rows themselves, and the graph writers keep it, since the RDF serializers they call own
+their writer and need it to flush after the first batch.
 
 The regression tests that fail before the change are a server test that a streaming
 request for a SELECT in Thrift streams rather than being refused and a differential test
-that every format's bytes for a result are equal whether written from the eager result or
-from a cursor at a batch size of one. The edge cases are an answer of zero rows in each format,
+that a SELECT in Thrift has the same bytes from the eager result and from a cursor at a batch
+size of one. Every writer keeps the bytes it writes today, checked against goldens recorded
+before the change. The eager and cursor writers already differ in some formats, in the native
+document's metadata and graph layout, in the Jena binary formats' triple and quad messages and
+in whether a graph answer honours `send`, so the differential test holds every pair that is
+equal today to staying equal, and unifying the rest is a separate change of the responses. The edge cases are an answer of zero rows in each format,
 a literal larger than the buffer, a graph answer whose last batch holds only labels, a
 decode refusal in the middle of a batch, which keeps its original error and the earlier
 complete rows as stage 4 decided, and a client that disconnects between batches.

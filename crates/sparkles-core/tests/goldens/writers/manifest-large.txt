@@ -1,0 +1,15 @@
+large.csv equal
+large.json equal
+large.native differ
+large.send65535.csv equal
+large.send65535.json equal
+large.send65535.native differ
+large.send65535.tsv equal
+large.send65535.xml equal
+large.send65537.csv equal
+large.send65537.json equal
+large.send65537.native differ
+large.send65537.tsv equal
+large.send65537.xml equal
+large.tsv equal
+large.xml equal

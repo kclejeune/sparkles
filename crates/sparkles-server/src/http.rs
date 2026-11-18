@@ -6424,6 +6424,8 @@ mod stream_idle_tests;
 mod text_tests;
 #[cfg(all(test, feature = "shacl"))]
 mod validation_tests;
+#[cfg(test)]
+mod writer_goldens_tests;
 
 #[cfg(test)]
 mod spool_tests {

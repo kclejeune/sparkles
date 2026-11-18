@@ -1,0 +1,2 @@
+500 application/json
+{"error":"I/O error: TriX (XML 1.0) cannot hold the character U+0001"}

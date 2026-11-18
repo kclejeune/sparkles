@@ -1,0 +1,1 @@
+{"urn:ex:s1":{"urn:ex:p":[{"datatype":"http://www.w3.org/2001/XMLSchema#boolean","type":"literal","value":"true"},{"datatype":"http://www.w3.org/2001/XMLSchema#integer","type":"literal","value":"42"}]}}

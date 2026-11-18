@@ -1,0 +1,1 @@
+{"urn:ex:s1":{"urn:ex:p":[{"datatype":"http://www.w3.org/2001/XMLSchema#string","type":"literal","value":"in g"}]},"urn:ex:s3":{"urn:ex:q":[{"datatype":"http://www.w3.org/2001/XMLSchema#string","type":"literal","value":"g2"}]}}
