@@ -232,7 +232,8 @@ above 12 GiB at any job count, so that cap runs a cold release build out of memo
 build needs a dedicated worker that runs nothing else, whose own job release checks that its
 user slice leaves 14.5 GiB for the build, the metadata service and the host reserve, and whose
 job environment sets `SPARKLES_BOAT_BUILD_MEMORY_MAX=13G`. The build scope keeps its own
-13 GiB cap with `OOMPolicy=continue`, so an out-of-memory kill ends only the build. The host
+13 GiB cap with `OOMPolicy=continue`, so reaching that cap kills a process of the build and
+nothing outside it, but a host that runs short first leaves the choice to the kernel. The host
 formula is not part of that check while the memory a resumed worker cannot reclaim varies
 (item 1092). The setting takes a cap
 from 8G to 13G and `SPARKLES_BOAT_BUILD_JOBS` a count from 2 to 8, and a value outside either
