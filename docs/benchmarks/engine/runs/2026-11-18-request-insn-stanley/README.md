@@ -35,3 +35,14 @@ profiles of row 1063, made by `prof.sh.txt` with `perf record --call-graph lbr
 `classify.py.txt` into the samples under `QueryCursor::next_batch_at_most`, the timed
 part of a shared-batch read, and the rest, and the `strace -c -f` counts of 50 and 1,050
 requests of each build.
+
+| Profile files | Event | Period | Requests | Regions |
+|---|---|--:|--:|---|
+| `A-rl-ins2.txt`, `B-rl-ins2.txt` | `cpu_core/instructions/u` | 1,000,003 | 100,000 | `next_batch_at_most` |
+| `A-rl-cyc.txt`, `B-rl-cyc.txt` | `cpu_core/cycles/u` | 300,007 | 100,000 | `next_batch_at_most` |
+| `A-rl-cyc3.txt`, `B-rl-cyc3.txt` | `cpu_core/cycles/u` | 300,007 | 300,000 | `next_batch_at_most` |
+| `A-rl-cyc4.txt`, `B-rl-cyc4.txt` | `cpu_core/cycles/u` | 300,007 | 300,000 | `Operator::next_shared`, then `next_batch_at_most` |
+
+Each profile followed 200 untimed requests in one server process on core 0, with the
+client on core 1. A sample stands for one period of its event, so a count of samples
+times the period over the requests gives the event per request.
