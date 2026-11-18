@@ -47,6 +47,9 @@ struct Form {
     operator: &'static str,
     query: String,
     expect: Expect,
+    /// Text that some operator description of the drained plan holds, such as the note
+    /// of a branch the form must take.
+    note: Option<&'static str>,
 }
 
 fn form(name: &'static str, operator: &'static str, query: &str, expect: Expect) -> Form {
@@ -55,6 +58,14 @@ fn form(name: &'static str, operator: &'static str, query: &str, expect: Expect)
         operator,
         query: query.to_string(),
         expect,
+        note: None,
+    }
+}
+
+impl Form {
+    fn noting(mut self, note: &'static str) -> Self {
+        self.note = Some(note);
+        self
     }
 }
 
@@ -64,6 +75,7 @@ const EAGER_SUBTREES: &[&str] = &["SpatialKnn", "VectorSearch"];
 
 /// The forms whose plan runs a subtree eagerly, which name one of [`EAGER_SUBTREES`].
 const SUBTREE_FORMS: &[&str] = &[
+    "vector ORDER BY answered by the index",
     "vector ORDER BY with its generic fallback",
     "nearest neighbours",
 ];
@@ -173,6 +185,20 @@ fn names(plan: &CursorPlan, out: &mut Vec<String>) {
     }
 }
 
+fn notes(info: &sparkles_core::sparql::PlanInfo, out: &mut Vec<String>) {
+    out.push(info.description.clone());
+    for child in &info.children {
+        notes(child, out);
+    }
+}
+
+fn descriptions(plan: &CursorPlan, out: &mut Vec<String>) {
+    notes(&plan.operator, out);
+    for child in &plan.children {
+        descriptions(child, out);
+    }
+}
+
 fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
     let mut rows: Vec<String> = rows.into_iter().map(|r| format!("{r:?}")).collect();
     rows.sort();
@@ -256,6 +282,15 @@ fn check(snap: &Arc<Snapshot>, opts: &QueryOptions, forms: &[Form]) -> Vec<(Stri
             "{}: {subtree:?}",
             f.name
         );
+        if let Some(note) = f.note {
+            let mut found = Vec::new();
+            descriptions(&plan, &mut found);
+            assert!(
+                found.iter().any(|d| d.contains(note)),
+                "{}: no description holds {note:?}: {found:?}",
+                f.name
+            );
+        }
         if std::env::var_os("INVENTORY_PLANS").is_some() {
             eprintln!("{}: {plan:#?}", f.name);
         }
@@ -433,11 +468,19 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             Native,
         ),
         form(
-            "vector ORDER BY with its generic fallback",
+            "vector ORDER BY answered by the index",
             "VectorSearch",
             "SELECT ?s { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2",
             Refused(Why::Pending("group 6 (8b)")),
         ),
+        // Four vectors have a score, so a limit of six runs the generic plan.
+        form(
+            "vector ORDER BY with its generic fallback",
+            "VectorSearch",
+            "SELECT ?s { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 6",
+            Refused(Why::Pending("group 6 (8b)")),
+        )
+        .noting("ran the generic plan"),
     ];
     let mut refused = check(&snap, &opts, &forms);
     // An ordered top-k without its heap.
@@ -487,9 +530,10 @@ fn text_forms() -> Vec<(String, Why)> {
         r#"
         @prefix ex: <http://example.org/> .
         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
-        ex:b1 rdfs:label "The Quick Brown Fox" .
-        ex:b2 rdfs:label "Brown Bears" .
-        ex:p1 rdfs:label "Foxglove fox" .
+        @prefix spk: <urn:x-sparkles:> .
+        ex:b1 a ex:Doc ; rdfs:label "The Quick Brown Fox" ; ex:emb "[1, 0]"^^spk:vector .
+        ex:b2 a ex:Doc ; rdfs:label "Brown Bears" ; ex:emb "[0.8, 0.6]"^^spk:vector .
+        ex:p1 rdfs:label "Foxglove fox" ; ex:emb "[0, 1]"^^spk:vector .
         "#,
         RdfFormat::Turtle,
     );
@@ -514,6 +558,30 @@ fn text_forms() -> Vec<(String, Why)> {
                 "TextSearch",
                 "SELECT ?s { ?s text:query \"fox\" }",
                 Refused(Why::Pending("text group")),
+            ),
+            form(
+                "text search over its group",
+                "TextSearch",
+                "SELECT ?q ?s { VALUES ?q { \"fox\" \"brown\" } ?s text:query ?q }",
+                Native,
+            ),
+            form(
+                "constant hybrid search",
+                "HybridSearch",
+                "SELECT ?s ?score { (?s ?score) spk:hybridSearch ((\"brown\") (ex:emb \"[1,0]\"^^spk:vector 3) 3) }",
+                Native,
+            ),
+            form(
+                "hybrid search over its group",
+                "HybridSearch",
+                "SELECT ?q ?s { VALUES ?q { \"[1,0]\"^^spk:vector \"[0,1]\"^^spk:vector } (?s ?score) spk:hybridSearch ((\"brown\") (ex:emb ?q 2) 2) }",
+                Native,
+            ),
+            form(
+                "hybrid search over its candidates",
+                "HybridSearch",
+                "SELECT ?s { ?s a ex:Doc . (?s ?score) spk:hybridSearch ((\"brown\") (ex:emb \"[0,1]\"^^spk:vector 2 \"candidates:join\") 5) }",
+                Native,
             ),
         ],
     )
