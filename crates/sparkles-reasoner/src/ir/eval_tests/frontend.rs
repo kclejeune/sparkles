@@ -170,3 +170,34 @@ r(?x) :- (?x ex:p ?y).
         report.warnings
     );
 }
+
+/// The frontend charges the IR rules before it builds them: wide relation atoms over a
+/// small budget are refused as a memory error, not built past the budget.
+#[test]
+fn wide_programs_are_charged_first() {
+    let cols: Vec<String> = (0..60).map(|i| format!("c{i}")).collect();
+    let vars: Vec<String> = (0..60).map(|i| format!("?v{}", i % 2)).collect();
+    let mut text = format!(
+        "@prefix ex: <http://ex.org/> .\n.decl wide({})\n",
+        cols.join(", ")
+    );
+    for i in 0..200 {
+        text.push_str(&format!(
+            "[w{i}: (?v0 ex:p ?v1) -> wide({})]\n",
+            vars.join(", ")
+        ));
+    }
+    let rules = parse_rules(&text).unwrap();
+    let budget = crate::budget::Budget::new(Some(256 << 10));
+    let t = terms();
+    t.set_budget(&budget).unwrap();
+    let mut w = WorkingWarnings::new(&budget);
+    let e = frontend::compile(&rules, &t, &mut w, false)
+        .err()
+        .expect("refused");
+    assert!(
+        crate::budget::BudgetFailure::from_anyhow(&e).is_some(),
+        "{e:#}"
+    );
+    assert!(budget.peak() <= 256 << 10, "{}", budget.peak());
+}

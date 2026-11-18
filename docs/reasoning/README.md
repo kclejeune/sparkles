@@ -886,7 +886,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   binds, until the restricted chase of item 839, and a query `?-` and comparisons such as
   `?x < 5` belong to item 72's Datalog query language. A demand that binds a later column
   of a relation of three or more columns derives every fact of the relation, which keeps
-  `owl-rl`'s chains and keys in rules per length. Roadmap items 1102 and 517.
+  `owl-rl`'s chains and keys in rules per length. Roadmap items 1102 and 517. An
+  explanation of a triple whose derivation passes a relation fact that was derived from
+  a generalized fact, one with a literal subject, finds no derivation. Roadmap item 1103.
 * An update of a `shacl-af` materialization runs in full, and the rules are evaluated
   per focus node in each round rather than semi-naively. Native maintenance of triple
   rules and of SPARQL rules whose bodies are basic graph patterns, and a recompute stratum

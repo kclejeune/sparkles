@@ -74,6 +74,45 @@ pub(crate) fn compile(
         }
         flatten(r, &[], compiler_label(r)?, (r.line, parsed), &mut flat);
     }
+    // the IR rules are larger than the compiled rules the prewalk counts: each literal or
+    // head holds an atom with its arguments, each rule its names, and the catalog the
+    // relations' names, all charged before any of them is made
+    let mut ir_bytes = 0usize;
+    for f in &flat {
+        let body = compile_credit::Shape::clauses(f.body.iter().copied())?;
+        let head = compile_credit::Shape::clauses(f.head.iter().copied())?;
+        let clauses = body.clauses.saturating_add(head.clauses);
+        ir_bytes =
+            ir_bytes
+                .saturating_add(size_of::<ir::Rule>() + f.name.len())
+                .saturating_add(clauses.saturating_mul(
+                    size_of::<Literal>() + size_of::<Head>() + 3 * size_of::<Slot>(),
+                ))
+                .saturating_add(
+                    body.args
+                        .saturating_add(head.args)
+                        .saturating_mul(size_of::<Slot>() + 2 * size_of::<usize>()),
+                )
+                .saturating_add(
+                    body.vars
+                        .saturating_add(head.vars)
+                        .saturating_mul(size_of::<String>())
+                        .saturating_add(body.var_bytes + head.var_bytes),
+                )
+                .saturating_add(2 * size_of::<(usize, usize)>() + size_of::<Option<Box<str>>>());
+        for c in f.body.iter().chain(&f.head) {
+            let a = match c {
+                Clause::Relation(a) => a,
+                Clause::Not(inner) => match &**inner {
+                    Clause::Relation(a) => a,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            ir_bytes = ir_bytes.saturating_add(2 * a.name.len() + 64);
+        }
+    }
+    working.try_grow(ir_bytes)?;
     // the relations, in the order the rules first name them, with the parser's arities
     let mut relations = Relations::default();
     let mut ids: FxHashMap<&str, ir::RelId> = FxHashMap::default();

@@ -285,9 +285,11 @@ impl QueryReasoner {
                     (!B::from_name(&b.name).is_some_and(pure)).then(|| format!("calls {}", b.name))
                 }
                 Clause::Rule(r) => find(&r.body, false).or_else(|| find(&r.head, true)),
-                // a relation atom reads or gives facts as a triple does, and `not` reads
-                // the facts as `noValue` does
-                Clause::Relation(_) => None,
+                // a relation atom reads or gives facts as a triple does, so a head atom
+                // that holds a blank node or a functor makes terms, and `not` reads the
+                // facts as `noValue` does
+                Clause::Relation(a) => (head && a.args.iter().any(makes_terms))
+                    .then(|| "makes a blank node or functor in its head".to_string()),
                 Clause::Not(_) => Some("negates an atom".to_string()),
                 Clause::Triple(t) => (head
                     && [&t.subject, &t.predicate, &t.object]

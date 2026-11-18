@@ -63,6 +63,8 @@ impl Shape {
                 // a relation atom is compiled as an atom, a negation as its atom
                 Clause::Relation(a) => {
                     shape.atoms = plus(shape.atoms, 1)?;
+                    // its arguments are slots of their own, as a builtin's are
+                    shape.args = plus(shape.args, a.args.len())?;
                     for n in &a.args {
                         shape.node(n)?;
                     }

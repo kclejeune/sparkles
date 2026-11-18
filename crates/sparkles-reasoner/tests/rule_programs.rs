@@ -228,12 +228,26 @@ person(?x) :- (?x a ex:Person).
     assert_eq!(with_pred(&got, &format!("<{EX}ancestorOf>")).len(), 6);
 }
 
-/// Kept and cache-free updates of a chain program equal full runs, and a program that
-/// negates runs in full on an update.
+/// Kept and cache-free updates of a chain program equal full runs: one keeps its closure
+/// in memory, and one reads it back from a persistent dataset, which holds no relation
+/// fact, so the update rebuilds the relation first. A program that negates runs in full
+/// on an update.
 #[test]
 fn updates_equal_full_runs() {
     for kept in [true, false] {
-        let s = store(&chain_data(4));
+        let dir = tempfile::tempdir().unwrap();
+        let s = if kept {
+            store(&chain_data(4))
+        } else {
+            let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+            s.load(&[Source::from_bytes(
+                format!("{PREFIXES}{}", chain_data(4)).into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+            s
+        };
         let cache = Cache::default();
         let cache = kept.then_some(&cache);
         let p = rules(CHAINS_AND_KEYS);
@@ -252,14 +266,19 @@ fn updates_equal_full_runs() {
             "kept {kept}: {:?}",
             r.fallback
         );
+        let source = r.changes.as_ref().map(|c| c.source.clone());
+        assert_eq!(
+            source.as_deref(),
+            Some(if kept { "memory" } else { "store" })
+        );
         let got = inferred(&s);
         // the same data, materialized in full
-        let mut ttl = chain_data(4);
-        ttl = ttl.replace("ex:a4_1 ex:c4_2 ex:a4_2 .\n", "");
+        let mut ttl = chain_data(4).replace("ex:a4_1 ex:c4_2 ex:a4_2 .\n", "");
         ttl.push_str("ex:a4_0 ex:c4_1 ex:d1 . ex:d1 ex:c4_2 ex:a4_2 .\n");
         let fresh = store(&ttl);
         reason(&fresh, &p, None, None);
         assert_eq!(got, inferred(&fresh), "kept {kept}");
+        assert!(got.contains(&format!("<{EX}a4_0> <{EX}h4> <{EX}a4_4>")));
     }
     let negating = "@prefix ex: <http://ex.org/> .
 .decl r(x)
