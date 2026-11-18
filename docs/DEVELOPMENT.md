@@ -1041,13 +1041,26 @@ Lane CI, GitHub's CI and every other run of `mise run test` still run these test
 The group runs after the gate with `mise run test:timing-cohort`, alone and one test at a
 time, on one dedicated worker that runs no other job. `scripts/timing-cohort.py check`
 compares each test's time with the worker's thresholds and reports a test that failed,
-timed out or ran past its threshold. A regression writes `regression.md` with a roadmap
-row for a fix-forward item, and it does not block the push. The thresholds come from
-three runs at `origin/main` on the idle worker with
+timed out or ran past its threshold. It also reports a test that the group selects and
+the report lacks, lists twice or marks skipped, a qualified test that the group no longer
+selects, and a nextest run that ended badly with no failing test, since each of these
+means that a test the gate leaves out did not run. A regression writes `regression.md`
+with a roadmap row for a fix-forward item, and it does not block the push.
+
+Each run records its identity in `run.json`, which carries a version. The identity holds
+a unique run ID, the commit, the worker, the compiler, the build configuration, nextest's
+exit status and the tests that the group selected. `SPARKLES_TIMING_WORKER` names the
+worker, such as `boat:bx_ID`, and defaults to the host name. The thresholds come from
+three or more runs at `origin/main` on the idle worker with
 `scripts/timing-cohort.py qualify RUN RUN RUN --out FILE`, which sets each test's
-threshold to its slowest time plus three times the spread of the three, and to at least
-1.5 times the slowest. `SPARKLES_TIMING_THRESHOLDS` or `--thresholds` names that file.
-Each run's results go to `.artifacts/timing-cohort/<time>-<commit>/`.
+threshold to its slowest time plus three times the spread of the runs, and to at least
+1.5 times the slowest. Qualification refuses a run directory given twice, a repeated run
+ID, runs from more than one commit, worker or build configuration, and a run that does
+not report each selected test exactly once with a pass. The thresholds file keeps the
+accepted runs' identities, and a check of a run from another worker or build
+configuration exits 2 and asks for a new qualification. `SPARKLES_TIMING_THRESHOLDS` or
+`--thresholds` names that file. Each run's results go to
+`.artifacts/timing-cohort/<time>-<commit>/`.
 
 ### Checks a batch selects
 
