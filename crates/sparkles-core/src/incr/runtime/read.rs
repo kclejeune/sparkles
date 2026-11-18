@@ -41,40 +41,45 @@ impl Runtime {
                         format!("the view {:?} reads data your grants do not cover", r.name),
                     ));
                 }
-                // another reading of errors than the view's: the view's query at the
-                // reader's snapshot, without the view's state
-                if let Some(m) = r.aggregate_errors.filter(|m| *m != errors) {
-                    let st = cell.state.lock();
-                    return self.evaluate_under(st, r, m);
-                }
-                let status = cell.info.lock().status.clone();
-                match status {
-                    Status::Failed { code, message } => {
-                        let code = if code == "view-failed" {
-                            "view-failed"
-                        } else {
-                            "view-suspended"
-                        };
-                        return Err(crate::incr::error(
-                            code,
-                            format!("the view {:?}: {message}", r.name),
-                        ));
+                // The reading and the status are read under the state lock, which a
+                // switch of the reading takes to replace the circuit and mark it
+                // `building`, so they describe the circuit whose rows are returned. A
+                // build holds that lock, so the wait for it ends at the read's deadline.
+                if let Some(st) = cell.state.try_lock_until(until) {
+                    let held = st.circuit.aggregate_errors.unwrap_or(errors);
+                    // another reading of errors than the view's: the view's query at the
+                    // reader's snapshot, without the view's state
+                    if let Some(m) = r.aggregate_errors.filter(|m| *m != held) {
+                        return self.evaluate_under(st, r, m);
                     }
-                    Status::Ready => {
-                        let st = cell.state.lock();
-                        if st.circuit.applied == r.at || r.allow_stale {
-                            return Ok(ViewRows {
-                                columns: st.circuit.columns(),
-                                rows: st.circuit.rows(),
-                                commit: st.circuit.applied,
-                                evaluated_under: None,
-                            });
+                    let status = cell.info.lock().status.clone();
+                    match status {
+                        Status::Failed { code, message } => {
+                            let code = if code == "view-failed" {
+                                "view-failed"
+                            } else {
+                                "view-suspended"
+                            };
+                            return Err(crate::incr::error(
+                                code,
+                                format!("the view {:?}: {message}", r.name),
+                            ));
                         }
-                        if st.circuit.applied > r.at {
-                            return self.read_back(st, r);
+                        Status::Ready => {
+                            if st.circuit.applied == r.at || r.allow_stale {
+                                return Ok(ViewRows {
+                                    columns: st.circuit.columns(),
+                                    rows: st.circuit.rows(),
+                                    commit: st.circuit.applied,
+                                    evaluated_under: None,
+                                });
+                            }
+                            if st.circuit.applied > r.at {
+                                return self.read_back(st, r);
+                            }
                         }
+                        Status::Building => {}
                     }
-                    Status::Building => {}
                 }
             }
             self.kick();
@@ -205,8 +210,23 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// The reading of errors in aggregates that view `name` keeps: the dataset's
+    /// current reading, which a read waits for the view to be built under. `None`
+    /// without such a view.
+    pub fn view_reading(&self, name: &str) -> Option<crate::sparql::AggregateErrors> {
+        let mut reg = self.reg.lock();
+        self.sync_for_read(&mut reg);
+        reg.view(name).ok()?;
+        Some(reg.aggregate_errors)
+    }
+}
+
 impl ViewSource for Runtime {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
         self.read(r)
+    }
+    fn view_reading(&self, name: &str) -> Option<crate::sparql::AggregateErrors> {
+        Runtime::view_reading(self, name)
     }
 }

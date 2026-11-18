@@ -299,4 +299,74 @@ mod switch_tests {
         rt.sync_inference(&mut reg, host.as_ref());
         assert_eq!(rt.switched.load(Ordering::Acquire), 7);
     }
+
+    /// A read compares its reading with the circuit whose rows it returns. A switch of
+    /// the dataset's reading can rebuild a view between the read's copy of the
+    /// registry's reading and its lock of the view's state, which leaves the registry's
+    /// copy naming the old reading while the circuit holds rows of the new one. A read
+    /// that asks for the old reading then evaluates the view's query under it.
+    #[test]
+    fn a_read_compares_its_reading_with_the_circuit() {
+        use crate::sparql::AggregateErrors;
+        use crate::sparql::viewsvc::ViewRead;
+        let s = Store::in_memory(StoreOptions::default());
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:a> <urn:g> \"x\" ; <urn:v> 1 . <urn:b> <urn:g> \"x\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        rt.set_host(Arc::new(OpenHost));
+        rt.put(
+            &s,
+            "m",
+            crate::incr::views::ViewDef::table(
+                "SELECT (MIN(?v) AS ?m) WHERE { ?s <urn:g> ?g OPTIONAL { ?s <urn:v> ?v } }",
+            ),
+        )
+        .unwrap();
+        rt.round(&s);
+        let snap = s.snapshot();
+        let read = |m: Option<AggregateErrors>| {
+            let r = rt
+                .read(&ViewRead {
+                    name: "m",
+                    at: snap.commit,
+                    snap: Some(&snap),
+                    allow_stale: false,
+                    caller: None,
+                    deadline: None,
+                    aggregate_errors: m,
+                })
+                .unwrap();
+            let cells: Vec<String> = r
+                .rows
+                .iter()
+                .map(|(row, _)| row[0].as_ref().map_or("UNDEF".into(), |t| t.to_string()))
+                .collect();
+            (cells, r.evaluated_under)
+        };
+        assert_eq!(
+            read(Some(AggregateErrors::Jena)),
+            (vec!["UNDEF".into()], None)
+        );
+        // the circuit as a switch to sparkles rebuilt it, while the registry still
+        // names jena
+        let cell = rt.reg.lock().cells.values().next().unwrap().clone();
+        {
+            let mut st = cell.state.lock();
+            let mut c = st.fresh(None).unwrap();
+            c.aggregate_errors = Some(AggregateErrors::Sparkles);
+            c.build(snap.clone(), &Control::none()).unwrap();
+            st.circuit = c;
+        }
+        assert_eq!(rt.reg.lock().aggregate_errors, AggregateErrors::Jena);
+        let one = "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string();
+        assert_eq!(read(None), (vec![one], None));
+        assert_eq!(
+            read(Some(AggregateErrors::Jena)),
+            (vec!["UNDEF".into()], Some(AggregateErrors::Jena))
+        );
+    }
 }
