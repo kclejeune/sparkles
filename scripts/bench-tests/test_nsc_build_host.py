@@ -489,7 +489,7 @@ class BuildHost(unittest.TestCase):
         self.assertIn("bh_entry_host_ok", (self.repo / "scripts/nsc-bench.sh").read_text())
 
     def test_a_boat_build_gets_the_cap_and_a_bounded_jobs_count(self):
-        """The server's final rustc ran a 12G Boat build out of memory at 5 jobs and at 2, so the cap is 13G."""
+        """A Boat build takes the admitted 12G cap by default, and a dedicated screen worker sets 13G."""
         # bh_rx is stubbed, so the test sees the exact command that would reach the host.
         program = ('. "$1/scripts/nsc-build-host.sh"; die() { echo "die: $*" >&2; exit 9; }; '
                    'bh_rx() { echo "$3"; }; bh_start "$2" /scratch unit-x --locked')
@@ -506,11 +506,11 @@ class BuildHost(unittest.TestCase):
         tail = "bash /scratch/bin/nsc-build-remote.sh /scratch unit-x "
         default = start("boat:bx_worker")
         self.assertEqual(default.returncode, 0, default.stderr)
-        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=13G CARGO_BUILD_JOBS=6 " + tail, default.stdout)
-        override = start("boat:bx_worker", "3", "12G")
-        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=12G CARGO_BUILD_JOBS=3 " + tail, override.stdout)
+        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=12G CARGO_BUILD_JOBS=6 " + tail, default.stdout)
+        override = start("boat:bx_worker", "3", "13G")
+        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=13G CARGO_BUILD_JOBS=3 " + tail, override.stdout)
         # An ssh host derives its own cap and jobs, and the caller's override does not reach it.
-        ssh = start("h1", "3", "12G")
+        ssh = start("h1", "3", "13G")
         self.assertEqual(ssh.returncode, 0, ssh.stderr)
         self.assertIn("\n" + tail, ssh.stdout)
         self.assertNotIn("CARGO_BUILD_JOBS", ssh.stdout)

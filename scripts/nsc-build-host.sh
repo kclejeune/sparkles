@@ -342,15 +342,15 @@ bh_expiry() {
 
 # bh_build_env HOST: the environment prefix of the remote build command, empty for an ssh
 # host, which derives its own cap and jobs. A Boat build takes the cap
-# SPARKLES_BOAT_BUILD_MEMORY_MAX, a whole number of G from 8G to 13G (default
-# BH_BOAT_BUILD_MEMORY_MAX), with no swap. The server's final rustc peaks just above 12 GiB
-# whatever the job count, so 12G ran it out of memory at 5 jobs and at 2, and 13G is the
-# screen-build figure. It is 1 GiB above BOAT_JOB_MEMORY_GIB, the job that qualification
-# admits in scripts/boat/metadata-probe.py, so a worker that runs it needs its own job release
-# that checks the 14.5 GiB headroom. The build gets SPARKLES_BOAT_BUILD_JOBS compile jobs, a
-# whole number from 2 to 8 (default BH_BOAT_BUILD_JOBS, the count that passed at 13G). Any
-# other value of either is refused before the worker is admitted.
-BH_BOAT_BUILD_MEMORY_MAX=13G
+# SPARKLES_BOAT_BUILD_MEMORY_MAX, a whole number of G from 8G to 13G, with no swap. The
+# default, BH_BOAT_BUILD_MEMORY_MAX, is BOAT_JOB_MEMORY_GIB, the job that qualification admits
+# in scripts/boat/metadata-probe.py. The server's final rustc peaks just above 12 GiB whatever
+# the job count, so 12G ran it out of memory at 5 jobs and at 2. A dedicated screen worker
+# whose own job release checks the 14.5 GiB headroom of a 13G build sets 13G. The build gets
+# SPARKLES_BOAT_BUILD_JOBS compile jobs, a whole number from 2 to 8 (default
+# BH_BOAT_BUILD_JOBS, the count that passed at 13G). Any other value of either is refused
+# before the worker is admitted.
+BH_BOAT_BUILD_MEMORY_MAX=12G
 BH_BOAT_BUILD_JOBS=6
 bh_build_env() {
   case $1 in
