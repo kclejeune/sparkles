@@ -807,11 +807,12 @@ The module `sparql/group` of `sparkles-core` holds the accumulator trait and the
 operator, and neither knows the mode that runs it. An accumulator holds the state of one
 aggregate for every group of a pass and folds a batch of rows into it per call, given
 each row's slot, with `init`, `add_batch`, `merge`, `finish` and `retract`. `Running`
-wraps `exec::AggState` for COUNT, SUM, AVG, MIN, MAX, SAMPLE and ARQ's statistics,
+wraps `exec::AggState` for COUNT, SUM, AVG, MIN, MAX, SAMPLE and ARQ's variance and
+standard deviations,
 `Concat` holds GROUP_CONCAT's text, and `Distinct` passes each value or row of a group to
 the aggregate underneath once. `Rows` runs the per-group kernel `exec::aggregate` or a
 registered aggregate over its group's rows, which FOLD, registered aggregates and the
-custom aggregates other than ARQ's statistics need. `AggState` gained `merge` and
+other custom aggregates, `MEDIAN` and `MODE` among them, need. `AggState` gained `merge` and
 `retract`. `merge` keeps row order for SAMPLE, GROUP_CONCAT and the ties of MIN and MAX,
 and a statistics aggregate does not merge. `retract` takes back unit-weight rows of
 COUNT, SUM and AVG without DISTINCT. The view operator of `incr/ops/group.rs` keeps its

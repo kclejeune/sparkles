@@ -696,7 +696,7 @@ and EXPLAIN marks it `[incremental]`. `group-avg` and `expr-bind-group` kept run
 in the base as well. Streamed, the same queries read 0.975, 1.004 and 0.980. `types-grouped`,
 `predicate-counts` and `subquery-agg` keep their count plans and read 0.955 to 1.021 in
 both modes, within the spread of the base. Eager `types-grouped` read 1.003, under 0.03 µs
-more, which passes the Intel rule.
+more, which passes the Intel rule. Roadmap item 1067 follows these small deltas.
 
 ### Execution mode of quick texts in fresh servers
 
