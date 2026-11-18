@@ -5715,7 +5715,7 @@ fn string_order_mask(
         // the pool as the generic filter's batch does, so that a cursor's comparison is
         // not left on one thread where the generic filter would use them all. The batch
         // checks the deadline itself and collects the rows' booleans.
-        map_batch_with(ctx, n, true, || ctx.floor_map(), &order_of)?
+        map_batch_with(ctx, n, true, || ctx.floor_map(), order_of)?
     } else {
         let mut floors = ctx.floor_map();
         (0..n)
