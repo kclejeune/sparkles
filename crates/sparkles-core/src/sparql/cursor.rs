@@ -3118,8 +3118,8 @@ impl Operator {
                 )
             } else if whole_input {
                 match whole::bound(&node) {
-                    Some(k) => format!(
-                        "{} reads all of its input under the memory budget, runs once and serves its answer of at most {k} rows",
+                    Some(bound) => format!(
+                        "{} reads all of its input under the memory budget, runs once and serves its answer of {bound}",
                         node.operator()
                     ),
                     None => format!(
@@ -3627,7 +3627,6 @@ impl Operator {
                             | State::Scalar(_)
                             | State::Counts { .. }
                             | State::Expand(_)
-                            | State::Whole(_)
                     )
                 {
                     ctx.produced(b.table.len)?;

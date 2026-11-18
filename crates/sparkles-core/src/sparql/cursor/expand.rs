@@ -327,6 +327,8 @@ impl Expand {
         };
         let table = remote.run.join(ctx, spec, &prefix.table, &self.node.vars)?;
         drop(prefix);
+        // The loop's kernel runs outside the eager executor, which counts its rows.
+        ctx.produced(table.len())?;
         self.counters = Some(remote.run.stats.counters());
         let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
         Ok(Some(Buffer { table, charge }))

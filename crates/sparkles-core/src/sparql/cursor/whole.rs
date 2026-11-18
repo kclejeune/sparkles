@@ -34,11 +34,21 @@ pub(super) fn eligible(node: &Node) -> bool {
 }
 
 /// The bound on the answer of a whole-input operator, for its plan's reason.
-pub(super) fn bound(node: &Node) -> Option<usize> {
+pub(super) fn bound(node: &Node) -> Option<String> {
+    let per_query = |var: bool, k: usize| match var {
+        true => format!("at most {k} rows per distinct query value"),
+        false => format!("at most {k} rows"),
+    };
     match &node.kind {
-        Kind::VectorSearch(spec) => Some(spec.k),
-        Kind::HybridSearch(spec) => Some(spec.limit),
-        Kind::PathSearch(spec) => spec.limit,
+        Kind::VectorSearch(spec) => Some(per_query(
+            matches!(spec.query, crate::sparql::plan::VectorQuery::Var(_)),
+            spec.k,
+        )),
+        Kind::HybridSearch(spec) => Some(format!(
+            "at most {} rows per pair of query values",
+            spec.limit
+        )),
+        Kind::PathSearch(spec) => spec.limit.map(|k| per_query(false, k)),
         _ => None,
     }
 }
