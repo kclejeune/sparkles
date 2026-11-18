@@ -285,9 +285,14 @@ changes, and the second commit unifies the rules by the decisions it records.
 | `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed capability and no control records. | The length is at or above. | It has no size estimate and no small-reader case. |
 | `patch_apply` | The patch has met no delete row, whether or not the row deleted anything, and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
 
-The unified rule takes the strict test everywhere, gives `replace_with` the empty-head
-case and the small-stream exception of `load_with`, gives `load_with` the large-stream
-probe of `replace_with`, and treats a triple protection, the capability to change managed
+The unified rule takes the strict test everywhere and gives `load_with` and
+`replace_with` one empty-head case. An unrestricted load or replacement into an empty
+store takes the bulk path when its inputs hold more than `SMALL_SOURCE_BYTES`, 8 MiB, or
+more than eighty bytes per threshold quad when that bound is lower, and a transaction
+otherwise. Files and buffered bodies are sized by their length, scaled by a codec's expansion
+factor when they are compressed, and streams are read ahead for the rest of the bound, so a threshold of 0 sends any source that holds
+a byte to a rebuild. The rule gives `load_with` the large-stream probe of `replace_with`
+for a store with data, and treats a triple protection, the capability to change managed
 graphs, control records and a delete row as reasons for the transactional path of a batch.
 A graph restriction keeps sources on the transactional path, since a rebuild from sources
 does not check each quad's graph. A batch from `insert_bulk` or a patch has its graphs
