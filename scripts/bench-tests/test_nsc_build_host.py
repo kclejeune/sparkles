@@ -490,16 +490,29 @@ class BuildHost(unittest.TestCase):
         self.assertEqual(ssh.returncode, 0, ssh.stderr)
         self.assertIn("\n" + tail, ssh.stdout)
         self.assertNotIn("CARGO_BUILD_JOBS", ssh.stdout)
-        # A bad value is refused before the worker is admitted or any source is copied.
-        resolve = ('. "$1/scripts/nsc-build-host.sh"; die() { echo "die: $*" >&2; exit 9; }; '
-                   'rx_admit() { echo admitted; }; BH_ARG=$2; bh_resolve')
+        # A bad value is refused by the argument check, before the Boat admission is validated
+        # and before either entry point admits its executor.
+        spy = self.root / "admission-calls"
+        check = ('. "$1/scripts/nsc-build-host.sh"; die() { echo "die: $*" >&2; exit 9; }; '
+                 'SPY=$3; python3() { echo "$*" >> "$SPY"; }; BH_ARG=$2; bh_check_arg')
         for bad in ("1", "9", "5x", "03"):
             env = dict(self.env, SPARKLES_BOAT_BUILD_JOBS=bad)
-            refused = subprocess.run(["bash", "-c", resolve, "bash", str(self.repo), "boat:bx_worker"],
+            refused = subprocess.run(["bash", "-c", check, "bash", str(self.repo), "boat:bx_worker", str(spy)],
                                      env=env, capture_output=True, text=True)
             self.assertEqual(refused.returncode, 9, bad)
             self.assertIn("not a whole number from 2 to 8", refused.stderr)
-            self.assertNotIn("admitted", refused.stdout)
+            self.assertFalse(spy.exists(), bad)
+        accepted = subprocess.run(["bash", "-c", check, "bash", str(self.repo), "boat:bx_worker", str(spy)],
+                                  env=dict(self.env, SPARKLES_BOAT_BUILD_JOBS="2"), capture_output=True, text=True)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("validate boat:bx_worker", spy.read_text())
+        for script in ("nsc-bench.sh", "nsc-writes.sh"):
+            text = (self.repo / "scripts" / script).read_text()
+            self.assertLess(text.index("\nbh_check_arg\n"), text.index("\nscreen_check"), script)
+        result, out = self.bench("--build-host", "boat:bx_worker",
+                                 env=dict(self.env, SPARKLES_BOAT_BUILD_JOBS="9"), ok_stop=False)
+        self.assertIn("not a whole number from 2 to 8", result.stderr)
+        self.assertEqual(self.builds(), [])
         # The remote build takes the forwarded jobs over the count its cap implies.
         d = self.remote_dir()
         env = dict(self.env, SPARKLES_NSC_BUILD_MEMORY_MAX="12G", CARGO_BUILD_JOBS="2")

@@ -79,7 +79,10 @@ bh_entry_key_suffix() {
 bh_check_arg() {
   case $BH_ARG in
     '' | local | auto) ;;
-    boat:bx_*) python3 "$RX_DIR/remote-executor.py" validate "$BH_ARG" > /dev/null || die 'invalid or expired Boat admission' ;;
+    boat:bx_*)
+      bh_build_env "$BH_ARG" > /dev/null || die "SPARKLES_BOAT_BUILD_JOBS is not valid"
+      python3 "$RX_DIR/remote-executor.py" validate "$BH_ARG" > /dev/null || die 'invalid or expired Boat admission'
+      ;;
     -* | *[!A-Za-z0-9._@-]*) die "--build-host is local, auto or a host name, not $BH_ARG" ;;
     *) if is_bench "$BH_ARG"; then die "$BH_ARG is the benchmark host (SPARKLES_BENCH_HOST) and never builds"; fi ;;
   esac
@@ -111,7 +114,6 @@ bh_probe() {
 bh_resolve() {
   [ -z "$BH_HOST" ] || return 0
   local want=$BH_ARG h p l u d min listed fallback='' hosts=()
-  case $want in boat:*) bh_build_env "$want" > /dev/null || die "SPARKLES_BOAT_BUILD_JOBS is not valid" ;; esac
   case $want in boat:*) rx_admit "$want" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > /dev/null || die "Boat build admission failed" ;; esac
   bh_load_config
   min=${SPARKLES_NSC_BUILD_MIN_FREE_GB:-20}
