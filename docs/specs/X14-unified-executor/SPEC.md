@@ -70,7 +70,7 @@ spill format.
 
 **One join-order planner.** Keep `joinorder.rs` only, lift its 128-join-variable fallback with the existing Bits set or route it to its own greedy, and delete `Planner::dp`, `apply_dp_filters`, `Planner::greedy` and the `pruned_join_order` toggle. `Planner::dp` and `Planner::greedy` survive in `plan.rs` as a narrow fallback and toggle-off path. Item 84 should land on the unified planner. Roadmap item 475 holds this phase.
 
-**Delete the off paths of replacement-style optimization toggles.** Remove the superseded implementations behind about 15 replacement toggles and the toggles themselves, and keep the algorithm toggles for diagnosis. Optimizations has 44 boolean fields, and every kernel change must keep each off path correct. Roadmap item 476 holds this phase, and item 512 holds the test-only evaluator that follows the SPARQL algebra literally, after which the off paths that only tests reach can go.
+**Delete the off paths of replacement-style optimization toggles.** Remove the superseded implementations behind about 15 replacement toggles and the toggles themselves, and keep the algorithm toggles for diagnosis. Optimizations has 44 boolean fields, and every kernel change must keep each off path correct. Roadmap item 476 holds this phase. Item 512's test-only evaluator, which follows the SPARQL algebra literally, is the oracle of the differential tests, so the off paths that only tests reach can go.
 
 **Shared format registry and small helpers.** Add one syntax registry for format names, extensions and media types, one INFERRED_GRAPH constant, one `parse_duration` and one durable atomic-write helper, and fix the Turtle string escaping that differs between `mapping/rdf.rs` and `mapping/draft.rs`. About ten format tables, nine INFERRED_GRAPH constants and ten atomic-write helpers exist. The unescaped draft writer could produce invalid Turtle. Roadmap item 477 holds this phase.
 
@@ -122,7 +122,7 @@ The maintainer settled these questions for stage 4.
 
 ### Stage 6: the executor merge
 
-**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 240, 243, 293, 534 and 512. Item 93 has shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator becomes their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
+**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 240, 243, 293 and 534. Items 93 and 512 have shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator remains their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
 
 **Eager LIMIT and ASK through pull demand.** Route every ASK and unordered LIMIT through the cursor's pull demand, move UNION branch ordering for ASK into the planner's cost model, and delete `run_limited`'s geometric prefix replay and the unionpush first-work estimator. Eager LIMIT replays growing prefixes and unionpush keeps a duplicate cost model. `ask_streaming` exists, so this can land before the executor merge. It depends on item 7.
 
@@ -157,8 +157,8 @@ The maintainer settled these questions for stage 4.
   the remaining eager fallbacks that the merge must absorb. Item 93 has shipped.
 * Items 240, 243, 293 and 534 settle the cursor writers, row accounting, BIND reuse and
   the streamed response cost that stage 6 relies on.
-* Item 512's test-only reference evaluator is the oracle of the differential tests before
-  the eager executor is deleted.
+* Item 512's test-only reference evaluator is the oracle of the differential tests, as it
+  must be before the eager executor is deleted.
 * The join-algorithm work of [X15](../X15-join-algorithms-and-estimation/README.md),
   [item 454](../../ROADMAP.md), follows the merge so that new algorithms land in one executor.
 
@@ -257,6 +257,103 @@ filters that decode values became slower in every round. `str-filter-two` took 2
 in streaming and 4.4% longer in automatic execution, `lang-filter` 2.4% and 2.6% longer,
 and streaming `str-pair-lt` 2.1% longer. With 12 threads `str-pair-lt` and `str-pair-names`
 were 2% faster.
+
+The test-only reference evaluator of item 512 has shipped in
+`crates/sparkles-core/tests/support/reference`. It reads a list of quads and a parsed
+query and evaluates every operator as a nested loop over solution mappings, as the
+SPARQL 1.1 algebra of section 18 and the SPARQL 1.2 drafts define them, with no part of
+the engine but the parser. Indexes on the predicate, subject and object narrow the
+triples a pattern tries, a join tries only the solutions that agree on the variables
+every solution of both sides binds, and a closure path with a fixed end is walked from
+that end, none of which changes an answer. It answers all 508 query evaluation tests of SPARQL 1.0 and 1.1
+and all 63 of SPARQL 1.2 under a comparison that holds literals to their exact form,
+numbers to their value and ORDER BY results to their order. It reports the queries it
+does not evaluate, such as SERVICE, DESCRIBE and extension functions, rather than
+answer them approximately. It follows SPARQL 1.2 where the two versions differ, so the
+effective boolean value of an ill-formed literal is an error. It reads XPath regular
+expressions in their own syntax, checks where each quantifier stands and reports as
+unsupported the constructs whose XPath meaning it does not establish, which are a
+back-reference, a class with a `-` other than a simple range, the `i` flag with a category,
+a negation or text that is not ASCII, and the `m` flag with an anchor on text that ends in
+a newline, where XPath's anchors differ from the regex crate's. Where Jena's reading
+differs from the specification's text and the engine follows Jena, the evaluator follows
+Jena too, and a switch selects the text, which the W3C suites take. Under Jena's reading
+the default graph of several FROM clauses is the union of their graphs, as in TDB, a
+negated property set gives a pair once for each triple that joins it, and `\b` in REGEX,
+which Java reads as a word boundary and XPath rejects, is unsupported. ORDER BY orders two
+different terms with equal values, such as `1` and `1.0`, by the terms themselves, where
+the text ties them and orders them by the next condition, so the comparison leaves their
+order open. Where the
+specification allows several answers, it says which. A value that it leaves open, such as
+a SAMPLE, a MIN or MAX among unordered values, a GROUP_CONCAT order, a RAND, a UUID, NOW
+or a new blank node, makes its column open, and an open value that decides which rows
+there are, in a FILTER, a join, a group key or DISTINCT, makes the rows open. For an
+ordered or sliced answer it reports each row's sort key, including keys the query does
+not project. The seeded queries of `tests/query_cursor.rs` compare the eager answer and
+the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a compacted base, a
+pending delta, several index blocks and a masked view, and the optimizer, index-join and
+string-filter tests compare `Optimizations::ALL` with it as well as with
+`Optimizations::NONE`. Both go through one comparison, which passes no answer that the specification
+forbids and, where it cannot decide, reports a partial or unordered comparison instead.
+An open column is compared only by its place in the rows, which makes the comparison
+partial. A column that only computed values bind compares numbers by datatype and value,
+and a column that only copied terms bind compares them exactly. Arithmetic, the numeric
+functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values. A
+variable, a constant, IF, COALESCE, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and SAMPLE
+aggregates pass on the terms or lexical forms they are given, and any other operator
+counts as both. A string or constructor that shows the lexical form of a computed number,
+such as `STR(1.0 + 1.0)` or `STRDT(STR(1.0 + 1.0), xsd:decimal)`, still compares exactly,
+so an engine that writes that number in another allowed form would fail the comparison. A column bound by both,
+such as a COALESCE over a variable and a constant, compares exactly, and a number that
+differs there only in its lexical form makes the comparison partial. An ordered or sliced
+answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
+answer with open rows is left uncompared. A sort key stops before the first condition
+that reads an open value. The conditions after it can still order the rows that tie
+before it, so the key only finds an answer that the earlier conditions forbid, and
+otherwise the order is unchecked and a slice of it is left uncompared. A slice that passes
+the checks against each other row is compared when the reference's other rows, placed
+around it in their own order, complete it to an order that ORDER BY allows. When that
+completion breaks a constraint between two rows, or the order of a slice is otherwise not
+established, the slice is left uncompared. Where DISTINCT keeps a row whose copies have different sort
+keys, the order is unchecked and a slice of it is open. The order check tests the strict
+order between every two blocks of equal keys that it meets, gives up past 50 million key
+comparisons, and where equal rows with different keys make its matching ambiguous it
+reports the order unchecked rather than fail. Whether an open value is bound is open too,
+so BOUND, EXISTS, a join, DISTINCT, a LATERAL join and a GRAPH pattern whose name is a
+variable that its inner pattern binds make the rows open when that variable holds open
+values. Numbers sort by their exact values, which keeps the sort
+transitive where promotion makes values of different datatypes equal. These rules decline to
+judge some answers that the evaluator once compared. Of the 5,000 answers of the seeded
+queries, 20 with open columns are compared in part, 15 others with open columns are
+compared without their order because an ORDER BY condition reads an open value, no slice fails its completion, and 105
+have open rows, 20 more than before because whether an open value is
+bound is open. In the optimizer, index-join and string-filter tests, 3 answers with open columns
+are compared in part, and 12 string filters whose regular expression takes the `i` flag
+over text that is not ASCII are unsupported. No answer of either set has a column bound
+by both copied terms and computed values that differs only in a number's lexical form. The parser writes the middle of a path sequence as a blank node, which
+the algebra treats as a variable, so a `COUNT(DISTINCT *)` over such a middle is an open
+value. A query whose nested loops pass the evaluator's work limit of 20 million
+intermediate solutions is left uncompared, and so is one that reads a number of more than
+16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 hold. The
+engine passes over an error in MIN and MAX, where the specification's order makes MIN an
+error and Jena makes both an error, and it follows Jena in making AVG over errors only an
+error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
+`xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
+XSD permits and Jena does not do. Its string functions take a directional string and a
+language-tagged string of the same language as compatible arguments, which SPARQL 1.2
+and Jena do not. The evaluator evaluates the aggregates of item 1064 under the
+specification's, Jena's or the engine's reading, answers the W3C suites under the
+specification's, and compares the engine under the engine's current reading until the
+setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
+meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
+reading. Item 1077 holds three
+XSD and XPath readings in which the engine differs from both the specification and
+Jena, `isNumeric("inf"^^xsd:double)`, the canonical form of a double cast to a string and
+`.` in REGEX, which matches a carriage return. The
+evaluator takes two well-formed values of different supported types, such as a string
+and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
+default, where Jena's strict mode and the section's main text make the comparison an
+error.
 
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its
@@ -433,9 +530,10 @@ that shipped with their measurements in the current release, `probed_optional` a
 `gallop_index_join` chooses between the galloping reader and the clustered reader, which
 are different read paths.
 
-The generic operators of `Optimizations::NONE` remain the oracle of the differential
-tests. The test-only evaluator that follows the SPARQL algebra literally, after which
-the remaining off paths that only tests reach can go, is item 512.
+Item 512's test-only reference evaluator is the oracle of the differential tests. The
+optimizer tests still compare `Optimizations::ALL` with `Optimizations::NONE` and both
+with the reference where it evaluates the query, so the remaining off paths that only
+tests reach can go once their tests rest on the reference alone.
 
 ### Shared format registry and small helpers
 

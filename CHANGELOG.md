@@ -74,6 +74,25 @@ of a large term beside a shared batch can still be refused under a budget at whi
 copy would answer, which roadmap item 1051 holds. A cursor that reads a snapshot without filling the block cache, as an
 export does, decodes its current block again for each batch of copied rows.
 
+### Reference evaluator for the differential tests
+
+A test-only evaluator in `crates/sparkles-core/tests/support/reference` follows the
+SPARQL 1.1 and 1.2 algebra literally and shares only the parser with the engine, which
+completes roadmap item 512. It answers all 508 SPARQL 1.0 and 1.1 and all 63 SPARQL 1.2
+query evaluation tests under an exact comparison. It is the oracle of the seeded cursor
+differential in place of the eager executor, and the optimizer, index-join and
+string-filter tests compare the engine with it as well as with `Optimizations::NONE`. It
+notes the values and rows that the specification leaves open and the sort key of each
+row, and one comparison in `check.rs` passes no answer that the specification forbids
+and reports a partial, unordered or skipped comparison where it cannot decide. Where Jena's reading differs from the specification's
+text and the engine follows Jena, as for the default graph of several FROM clauses, the
+evaluator follows Jena, and the W3C suites run under the text. It found four groups of
+engine disagreements. MIN and MAX pass over errors, AVG over errors only is an error and
+GROUP_CONCAT reads IRIs and numbers, roadmap item 1064, integers and decimals beyond the
+engine's decimal range are not numbers, roadmap item 1065, the string functions ignore the
+base direction of their arguments, roadmap item 1071, and three XSD and XPath readings
+differ, roadmap item 1077.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,

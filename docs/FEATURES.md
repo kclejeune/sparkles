@@ -280,7 +280,7 @@ answers and instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [SPARQL Query, Update and Graph Store protocols](querying/README.md#standards-conformance) | Complete within the documented conformance scope. | The listed SPARQL suites pass. This does not promise every Jena extension or plugin interface. |
+| [SPARQL Query, Update and Graph Store protocols](querying/README.md#standards-conformance) | Complete within the documented conformance scope. | The listed SPARQL suites pass, and a test-only reference evaluator that follows the SPARQL algebra literally checks the optimizer and cursor tests. This does not promise every Jena extension or plugin interface. |
 | [Durable commits and dataset identity](storage/README.md#storage-and-indexes) | Complete within the documented commit contract. | Transactions have receipts and synchronized acknowledgements. |
 | [Storage, loading and compaction](storage/README.md#storage-and-indexes) | Partially complete. | Compressed indexes, bulk imports, online compaction, optional FSST, a warm-up of the query path before a server reports ready and an optional prewarm after a restart are available. Finer compaction controls and larger-scale measurements remain. |
 | [History, snapshots and branches](storage/README.md#versioning-and-history) | Partially complete. | Retained commits, diffs, branches and merge review are available. Capped Store snapshots and trusted Dataset history handles preserve retained origins. Historical full-text search and further branch administration remain. |
