@@ -9982,7 +9982,7 @@ mod string_order_tests {
                 .iter()
                 .zip(&ids)
                 .filter(|(f, id)| f.is_some_and(|f| f < id.payload()))
-                .any(|(_, id)| id.payload() as usize % crate::vocab::FC_BLOCK == 0),
+                .any(|(_, id)| (id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK)),
             "a block's first string extends another"
         );
         for cursor in [false, true] {

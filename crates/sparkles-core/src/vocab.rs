@@ -4722,12 +4722,12 @@ mod tests {
                 let expect = |prev: Option<&[u8]>, key: &[u8]| {
                     assert_eq!(key, keys[id as usize], "fsst {fsst} id {id}");
                     let i = id as usize;
-                    let alone = i % FC_BLOCK == 0 || keys[i - 1].len() > PREV_KEY_BYTES;
+                    let alone = i.is_multiple_of(FC_BLOCK) || keys[i - 1].len() > PREV_KEY_BYTES;
                     match prev {
                         Some(prev) => assert_eq!(prev, keys[i - 1], "fsst {fsst} id {id}"),
                         None => assert!(alone, "fsst {fsst} id {id}"),
                     }
-                    usize::from(prev.is_none() && i % FC_BLOCK != 0)
+                    usize::from(prev.is_none() && !i.is_multiple_of(FC_BLOCK))
                 };
                 skipped += v.get_with_prev(id, expect).unwrap();
                 v.get_with_prev_checked::<_, ()>(id, |_| Ok(()), expect)
