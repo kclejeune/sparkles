@@ -131,10 +131,17 @@ class Counters(unittest.TestCase):
         self.assertGreater(d["task_clock_ns"], 0)
 
     def test_a_thread_started_before_the_counters_is_reported_uncovered(self):
-        code = "import threading\ndef f():\n    s = 0\n    for i in range(40_000_000): s += i\nt = threading.Thread(target=f); t.start(); t.join()\n"
-        p = subprocess.Popen(["python3", "-c", code])
+        # the child says when its thread runs, and only then are the counters opened
+        code = (
+            "import sys, threading\n"
+            "def f():\n    s = 0\n    for i in range(80_000_000): s += i\n"
+            "t = threading.Thread(target=f); t.start()\n"
+            "print('started', flush=True); t.join()\n"
+        )
+        p = subprocess.Popen(["python3", "-c", code], stdout=subprocess.PIPE, text=True)
         try:
-            time.sleep(0.3)
+            self.assertEqual(p.stdout.readline().strip(), "started")
+            time.sleep(0.05)
             try:
                 c = ri.Counters(p.pid, False)
             except OSError as e:
@@ -146,6 +153,7 @@ class Counters(unittest.TestCase):
         finally:
             p.kill()
             p.wait()
+            p.stdout.close()
         self.assertFalse(d["covered"])
 
 

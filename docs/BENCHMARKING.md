@@ -112,13 +112,12 @@ it counts.
 
 Counts are a one-sided screen. A flag sends the change to timing, and counts never size an
 effect. Item 678's slower string floors added 13% to the instructions of `str-pair-lt` and
-29% to `str-pair-names` against 25% and 33% in time on `atlas`, and the counts flagged
-both and no other query. Item 1039's charged scan added 9.8% to the execution time of a
-root scan and 8.8% to an export of 500,000 rows on `atlas`, and the same rounds on
-`stanley` measured 9.5% and 9.7% more execution time, while the counts stayed within
-0.04% on every query. An LBR profile of the remaining cost places it in weak and strong
-reference counts, an allocation and a memory charge for each block a scan enters, which
-retire few instructions and take many cycles. The counts
+29% to `str-pair-names` against 25% and 33% in time on `atlas`, and under streaming the
+counts flagged both and no other query. Item 1039's charged scan added 9.8% to the
+execution time of a root scan and 8.8% to an export of 500,000 rows on `atlas`, and the
+counts of every query stayed within the noise floor, those of the two scans within 0.04%.
+The cost of that change did not show in instructions, and the profiles of its remaining
+cost have not established where it lies. The counts
 cover user space only, since `kernel.perf_event_paranoid` is 2 on the build hosts, so a
 change in system calls, futex waits or page faults does not show either.
 

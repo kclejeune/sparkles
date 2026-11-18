@@ -522,10 +522,10 @@ they missed item 1039 on every query. Under automatic execution every run, the
 A-against-A runs included, flagged `str-filter-two` and marked a few other queries as
 split, which is why a flag of an automatic query is rerun under explicit modes. Apart from
 those, `bt-678` flagged the two string queries under automatic execution as well, and
-`bt-1039` flagged only `optional-count`, whose processes split between 5.75 and 7.30 million instructions per request in three rounds. The execution times that the same rounds recorded on the busy
-`stanley` rose by 9.5% on the root scan and 9.7% on the export under item 1039, and by 24%
-on `root-limit` under row 1063's build, so the cost was present while the instructions
-did not move. Both builds of row 1063 made the same system calls per request, 6 futex
+`bt-1039` flagged only `optional-count`, whose processes split between 5.75 and 7.30
+million instructions per request in three rounds. The execution times that the runs
+record on the busy `stanley` do not resolve these costs, since their per-round ratios in
+the A-against-A runs scatter by up to 50% on these queries. Both builds of row 1063 made the same system calls per request, 6 futex
 calls and 2.4 `writev` calls among them. A call-graph profile of 300,000 requests of
 `root-limit` found the same user-space cycles under `next_batch_at_most` within 5%, with
 cycles moved from `Block::key_range` and the old scan's drops to the shared batch's

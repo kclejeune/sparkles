@@ -682,7 +682,7 @@ timing](../../BENCHMARKING.md#instruction-counts-before-timing) describes, and a
 flag books the timing run at once. The counts do not replace the timing of this rule.
 They cover the whole request, so on the matrix their resolution is 1.4 to 5.4 µs for
 every query under 0.3 ms, wider than the 0.5 µs bound, and they did not see item 1039's
-cost, which was in reference counts, an allocation and a memory charge per block. A phase
+cost, which added execution time without adding instructions. A phase
 whose change can reach a query under 0.3 ms therefore still runs the A/B above, and a
 phase that charges memory, allocates, takes locks or atomic reference counts, hands work
 between threads or changes the response path runs it whatever the counts show. Counts are
