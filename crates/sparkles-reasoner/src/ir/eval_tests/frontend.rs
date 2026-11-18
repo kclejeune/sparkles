@@ -81,7 +81,7 @@ fn included_rules_and_existentials() {
 @include <owl-rl> .
 .decl r(x)
 r(?x) :- (?x ex:p ?y).
-(?x ex:q ex:none) :- (?x a ex:T), not r(?x).
+(?x ex:q ex:none) :- (?x rdf:type ex:T), not r(?x).
 ";
     let rules = parse_rules(text).unwrap();
     let t = terms();

@@ -208,7 +208,7 @@ fn ancestors_with_negation() {
 .decl person(x)
 ancestor(?a, ?d) :- (?a ex:parent ?d).
 ancestor(?a, ?d) :- (?a ex:parent ?m), ancestor(?m, ?d).
-person(?x) :- (?x a ex:Person).
+person(?x) :- (?x rdf:type ex:Person).
 (?x ex:unrelatedTo ex:n0) :- person(?x), not ancestor(?x, ex:n0), not ancestor(ex:n0, ?x), notEqual(?x, ex:n0).
 (?a ex:ancestorOf ?d) :- ancestor(?a, ?d).
 ";
@@ -283,7 +283,7 @@ fn updates_equal_full_runs() {
     let negating = "@prefix ex: <http://ex.org/> .
 .decl r(x)
 r(?x) :- (?x ex:p ?y).
-(?x ex:q ex:none) :- (?x a ex:T), not r(?x).
+(?x ex:q ex:none) :- (?x rdf:type ex:T), not r(?x).
 ";
     let s = store("ex:a a ex:T . ex:b a ex:T . ex:a ex:p ex:c .");
     let r = reason(&s, &rules(negating), None, None);
@@ -461,7 +461,7 @@ r(?x) :- (?x ex:p ?y), not r(?y).
     assert!(format!("{e:#}").contains("r"), "{e:#}");
     let existential = "@prefix ex: <http://ex.org/> .
 .decl advisor(s, a)
-[adv: (?s a ex:Student) -> advisor(?s, ?a)]
+[adv: (?s rdf:type ex:Student) -> advisor(?s, ?a)]
 (?s ex:hasAdvisor ?a) :- advisor(?s, ?a).
 ";
     let e = materialize_incremental(

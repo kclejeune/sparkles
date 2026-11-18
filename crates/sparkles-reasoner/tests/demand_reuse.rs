@@ -397,8 +397,8 @@ fn program() -> Profile {
         "@prefix ex: <http://ex.org/> .
 .decl r(x)
 r(?x) :- (?x ex:p ?y).
-(?x a ex:B) :- r(?x).
-(?x a ex:B) :- (?x a ex:T), not (?x ex:blocked ex:yes).
+(?x rdf:type ex:B) :- r(?x).
+(?x rdf:type ex:B) :- (?x rdf:type ex:T), not (?x ex:blocked ex:yes).
 "
         .into(),
     )

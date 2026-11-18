@@ -2324,6 +2324,7 @@ pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
     negative.iter().any(|&(h, d)| reaches(d, h))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transform_in(
     rules: &[CRule],
     terms: &Terms,

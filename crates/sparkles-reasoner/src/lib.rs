@@ -984,10 +984,10 @@ enum RunRules {
     Jena(engine::CompiledRules),
     Program {
         rules: Vec<engine::CRule>,
-        part: Option<ir::Program>,
+        part: Option<Box<ir::Program>>,
         /// a stratum after the first: the program negates, and is not maintained
         strata: usize,
-        _held: (Held, ir::lower::Lowered, engine::frontend::ProgramInfo),
+        _held: Box<(Held, ir::lower::Lowered, engine::frontend::ProgramInfo)>,
     },
 }
 
@@ -1027,9 +1027,9 @@ impl RunRules {
             explain::flat_rules(&info.program, &mut lowered, &mut held, &info.lines)?;
         Ok(RunRules::Program {
             rules: flat,
-            part,
+            part: part.map(Box::new),
             strata,
-            _held: (held, lowered, info),
+            _held: Box::new((held, lowered, info)),
         })
     }
 
@@ -1037,7 +1037,7 @@ impl RunRules {
     fn part(&self) -> Option<&ir::Program> {
         match self {
             RunRules::Jena(_) => None,
-            RunRules::Program { part, .. } => part.as_ref(),
+            RunRules::Program { part, .. } => part.as_deref(),
         }
     }
 

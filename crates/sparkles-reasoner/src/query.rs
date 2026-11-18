@@ -523,7 +523,7 @@ enum Compiled {
         rules: Vec<CRule>,
         infos: Vec<engine::RuleInfo>,
         /// the program, which charges its relation catalog, kept for the catalog
-        program: crate::engine::frontend::ProgramInfo,
+        program: Box<crate::engine::frontend::ProgramInfo>,
         /// the program runs as `engine::run_program` runs it: it has an IR feature, so
         /// its lists are read again when their cells arrive, in every stage
         replay: bool,
@@ -545,7 +545,7 @@ fn program_rules(
         Some(m) => memory_error(m, "the rule program"),
         None => component(RULES_CODE, format!("{e:#}")),
     };
-    let program = source(terms, warnings).map_err(failed)?;
+    let program = Box::new(source(terms, warnings).map_err(failed)?);
     let mut lowered = program.program.lower(budget).map_err(|e| match e {
         crate::ir::lower::LowerError::Memory(m) => memory_error(m, "the rule program"),
         e => component(RULES_CODE, e.to_string()),

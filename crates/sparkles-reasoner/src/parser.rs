@@ -1940,7 +1940,7 @@ mod tests {
     /// new syntax.
     #[test]
     fn includes_are_named() {
-        let rs = program("@include <rdfs> .\n.decl r(a)\nr(?x) :- (?x a ex:C).");
+        let rs = program("@include <rdfs> .\n.decl r(a)\nr(?x) :- (?x rdf:type ex:C).");
         assert!(
             rs[..rs.len() - 1]
                 .iter()
