@@ -2,7 +2,7 @@
 //! Dense inline integers retain their cheap admission. Other inputs need observed
 //! repetition in a bounded pilot. Optional cache entries never weaken query budgets.
 use crate::error::Result;
-use crate::id::{Id, Tag};
+use crate::id::{Id, PAYLOAD_MASK, Tag};
 use crate::index::{O, P, Perm, S};
 use crate::sparql::ctx::RetainedCharge;
 use crate::sparql::expr::Expr;
@@ -50,6 +50,9 @@ enum Mode {
 /// Admission needs one repeated row in `ADMIT`, and an admitted map is released once
 /// it answers fewer than one row in `2 * ADMIT` without an evaluation.
 const ADMIT: u32 = 8;
+/// The tag bits of a map entry whose value the current batch has not yet evaluated.
+/// No term carries this tag, so a pending entry cannot be mistaken for a value.
+const PENDING: u64 = !PAYLOAD_MASK;
 
 pub(super) struct Reuse {
     input: VarId,
@@ -265,6 +268,49 @@ impl Reuse {
         Ok(())
     }
 
+    /// The map pass of [`Reuse::apply_map`]. Hits go to `output`. A miss gets a pending
+    /// slot in `output`, and in the map unless the map is full, and its row goes to
+    /// `missed`.
+    fn answer(
+        &mut self,
+        ctx: &Ctx,
+        keys: &[Id],
+        output: &mut Vec<Id>,
+        missed: &mut Vec<u32>,
+        distinct: &mut Vec<Id>,
+    ) -> Result<bool> {
+        // A full map keeps its pending slots apart, since entries it inserted and then
+        // removed for want of room would leave tombstones that force periodic rehashes.
+        let mut slots: Option<FxHashMap<Id, Id>> =
+            (self.values.len() >= self.max_entries).then(FxHashMap::default);
+        for (row, key) in keys.iter().enumerate() {
+            if row.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if let Some(value) = self.values.get(key) {
+                if value.0 & !PAYLOAD_MASK == PENDING {
+                    missed.push(row as u32);
+                }
+                output.push(*value);
+            } else {
+                let next = Id(PENDING | distinct.len() as u64);
+                let slot = match &mut slots {
+                    Some(slots) => *slots.entry(*key).or_insert(next),
+                    None => {
+                        self.values.insert(*key, next);
+                        next
+                    }
+                };
+                if slot == next {
+                    distinct.push(*key);
+                }
+                missed.push(row as u32);
+                output.push(slot);
+            }
+        }
+        Ok(slots.is_none())
+    }
+
     /// Answer the batch from the map. Misses are evaluated once per distinct key, as one
     /// column through the ordinary batch evaluation, and retained while the map has room.
     fn apply_map(
@@ -280,28 +326,26 @@ impl Reuse {
         let Ok(_scratch) = ctx.charge(n as u64 * 40 + 256) else {
             return Ok(false);
         };
-        let keys = &table.cols[column];
         let mut output = Vec::with_capacity(n);
         let mut missed: Vec<u32> = Vec::new();
-        let mut slots: FxHashMap<Id, u32> = FxHashMap::default();
         let mut distinct = Vec::new();
-        for (row, key) in keys.iter().enumerate() {
-            if row.is_multiple_of(4096) {
-                ctx.check()?;
+        // A missed key enters the map at once with a pending slot, so later rows of the
+        // batch find it with the same lookup as a hit. Every pending entry is resolved
+        // or removed before this returns, and an error releases the whole map.
+        let pending = match self.answer(
+            ctx,
+            &table.cols[column],
+            &mut output,
+            &mut missed,
+            &mut distinct,
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.decline();
+                return Err(error);
             }
-            if let Some(value) = self.values.get(key) {
-                output.push(*value);
-            } else {
-                let next = distinct.len() as u32;
-                let slot = *slots.entry(*key).or_insert(next);
-                if slot == next {
-                    distinct.push(*key);
-                }
-                missed.push(row as u32);
-                // the slot until the values are known
-                output.push(Id(slot as u64));
-            }
-        }
+        };
+        let evaluated = distinct.len();
         if !distinct.is_empty() {
             #[cfg(test)]
             {
@@ -310,29 +354,43 @@ impl Reuse {
             let mut misses = Table::new(vec![self.input]);
             misses.len = distinct.len();
             misses.cols[0] = distinct;
-            let values = crate::sparql::exec::column_rows(ctx, &misses, expr)?;
-            ctx.check()?;
+            let values = match crate::sparql::exec::column_rows(ctx, &misses, expr)
+                .and_then(|values| ctx.check().map(|()| values))
+            {
+                Ok(values) => values,
+                Err(error) => {
+                    self.decline();
+                    return Err(error);
+                }
+            };
             for row in &missed {
                 let at = &mut output[*row as usize];
-                *at = values[at.0 as usize];
+                *at = values[(at.0 & PAYLOAD_MASK) as usize];
             }
             let step = ctx.reservation_step();
+            // Entries the map held before this batch, which the charge already covers.
+            let mut held = self.values.len() - if pending { evaluated } else { 0 };
+            // The first refusal ends retention for the batch, and later keys only leave.
+            let mut room = true;
             for (key, value) in misses.cols[0].iter().zip(&values) {
-                if self.values.len() >= self.max_entries
-                    || !self.charge.as_mut().is_some_and(|charge| {
+                room = room
+                    && held < self.max_entries
+                    && self.charge.as_mut().is_some_and(|charge| {
                         charge
-                            .cover(512 + (self.values.len() as u64 + 1) * ENTRY_BYTES, step)
+                            .cover(512 + (held as u64 + 1) * ENTRY_BYTES, step)
                             .is_ok()
-                    })
-                {
-                    break;
+                    });
+                if room {
+                    held += 1;
+                    self.values.insert(*key, *value);
+                } else if pending {
+                    self.values.remove(key);
                 }
-                self.values.insert(*key, *value);
             }
             self.misses += misses.len as u64;
         }
         // Rows that needed no evaluation of their own.
-        let answered = n - slots.len();
+        let answered = n - evaluated;
         self.hits += answered as u64;
         table.vars.push(target);
         table.cols.push(output);
@@ -670,6 +728,42 @@ mod tests {
             Mode::Map,
             "an admitted map keeps its own release rule"
         );
+    }
+
+    fn pending_entries(reuse: &Reuse) -> usize {
+        reuse
+            .values
+            .values()
+            .filter(|value| value.0 & !PAYLOAD_MASK == PENDING)
+            .count()
+    }
+
+    #[test]
+    fn a_map_that_fills_during_a_batch_keeps_no_pending_entries() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        // A dense first batch admits the map with room for 100 entries.
+        let dense = local_strings(&ctx, (0..4096).map(|i| i % 64));
+        run(&ctx, &mut reuse, input, target, &expr, &dense);
+        assert_eq!(reuse.mode, Mode::Map);
+        reuse.max_entries = 100;
+        // This batch repeats 200 keys, so it fills the map partway through and its
+        // keys beyond the room are answered but not retained.
+        let keys = local_strings(&ctx, (0..4096).map(|i| 1000 + i % 200));
+        run(&ctx, &mut reuse, input, target, &expr, &keys);
+        assert_eq!(reuse.values.len(), 100);
+        assert_eq!(pending_entries(&reuse), 0);
+        // A full map keeps the slots of its misses apart and still answers every row.
+        let before = reuse.evaluations;
+        run(&ctx, &mut reuse, input, target, &expr, &keys);
+        assert_eq!(reuse.values.len(), 100);
+        assert_eq!(pending_entries(&reuse), 0);
+        // The 64 dense keys left 36 places, so 164 of the 200 keys miss again.
+        assert_eq!(reuse.evaluations - before, 164);
     }
 
     #[test]
