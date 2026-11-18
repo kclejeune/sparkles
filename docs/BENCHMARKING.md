@@ -1124,7 +1124,13 @@ runs 6 compile jobs, and `SPARKLES_BOAT_BUILD_JOBS` sets another count from 2 to
 `mise.toml` pin.
 The binary comes back into the same cache entry after a SHA-256 check, and the scratch
 directory is removed when the build ends, also after a failure or Ctrl-C, which also stops
-the scope. A binary built on another host with the same pinned toolchain is comparable,
+the scope. A Boat screen whose build host is its executor keeps each binary on the worker
+instead and copies back only the build records, as
+[Remote executors](REMOTE-EXECUTORS.md) describes. Screen binaries are built with the release
+profile unchanged, including its limited debug info (`debug = 1`), so the screens build
+what the other benchmarks measure and reuse the shared cache. Building them without debug info
+would make every unit a cache miss, and with the binary kept on the worker its 1 GB size no
+longer costs a transfer. A binary built on another host with the same pinned toolchain is comparable,
 since nothing is built for the native CPU, and the compiler check below still compares A
 with B. `build.txt` and `manifest.txt` name the host that built each binary, and an entry
 is reused wherever it was built.

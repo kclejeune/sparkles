@@ -13,7 +13,9 @@
 # bin/<commit>-<SHA-256 of the --cargo-args text> when --cargo-args is given. An entry is
 # reused only when its build.txt records the same cargo arguments, wherever it was built,
 # and build.txt and the manifest name the host that built it. A screen whose --build-host
-# is a Boat worker reuses only an entry built on that worker. The dataset comes from
+# is a Boat worker reuses only an entry built on that worker. When that worker is also the
+# --executor, each binary stays on it and the entry records its path and SHA-256 there
+# (bh_keep_on_worker), so no binary crosses the operator's link. The dataset comes from
 # scripts/gen-data.py and is cached there as zstd. The queries are those of scripts/bench.sh
 # unless --query-dir names a directory of *.rq files.
 #
@@ -202,10 +204,28 @@ cleanup_src() {
 }
 trap cleanup_src EXIT
 trap 'exit 130' INT TERM
-# binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source, SHA-256 and compilers
+# binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source, SHA-256 and compilers.
+# A revision built on the Boat worker that also runs the screen stays there (bh_keep_on_worker):
+# its cache entry records the binary's path and SHA-256 on the worker, which are checked before
+# the entry is reused, with the compilers and linking that the worker read from it, and the
+# screen copies it into its own directory there instead of uploading it.
+declare -A KEPT KEPT_SHA
 binary() {
-  local ref=$1 v=$2 bin sha src key entry lock host
-  entry_current() { [ -x "$bin" ] && grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null && bh_entry_host_ok "$entry/build.txt"; }
+  local ref=$1 v=$2 bin sha src key entry lock host keep=0 kept='' kept_sha='' code
+  [ -f "$ref" ] || ! bh_keep_on_worker || keep=1
+  entry_current() {
+    grep -qxF "cargo args: $CARGO_ARGS" "$entry/build.txt" 2> /dev/null && bh_entry_host_ok "$entry/build.txt" || return 1
+    [ "$keep" = 1 ] || {
+      [ -x "$bin" ]
+      return
+    }
+    kept=$(sed -n 's/^kept: //p' "$entry/build.txt")
+    kept_sha=$(sed -n 's/^kept sha256: //p' "$entry/build.txt")
+    code=0
+    bh_kept_check "$BH_ARG" "$kept" "$kept_sha" > /dev/null || code=$?
+    [ "$code" != 2 ] || die "could not check the binary kept on $BH_ARG at $kept"
+    return "$code"
+  }
   if [ -f "$ref" ]; then
     bin=$(realpath "$ref")
     src="file $bin"
@@ -215,6 +235,9 @@ binary() {
     # cargo arguments get their own entry, as in scripts/nsc-writes.sh.
     key=$sha
     [ -z "$CARGO_ARGS" ] || key=$sha-$(printf '%s' "$CARGO_ARGS" | sha256sum | cut -d' ' -f1)
+    # An entry kept on a worker has a key of its own, so it never pairs a binary built
+    # elsewhere with the worker's record.
+    [ "$keep" = 0 ] || key=$key-kept$(bh_entry_key_suffix)
     entry=$CACHE/bin/$key
     bin=$entry/sparkles
     # An entry without a build record, or one recording other arguments, is rebuilt.
@@ -251,22 +274,34 @@ binary() {
           } > "$SRC_TMP/.nsc-build-info.txt"
         else
           echo "building $ref ($sha) on $BH_HOST; log: $OUT/logs/build-$v.log"
-          # The private tree receives the binary and the build host's record of its compilers.
+          # The private tree receives the binary, or with keep its path on the worker, and the
+          # build host's record of its compilers.
           # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
-          bh_build "$BH_HOST" "$sha" "$SRC_TMP" $CARGO_ARGS > "$OUT/logs/build-$v.log" 2>&1 ||
+          BH_KEEP=$keep bh_build "$BH_HOST" "$sha" "$SRC_TMP" $CARGO_ARGS > "$OUT/logs/build-$v.log" 2>&1 ||
             die "build of $ref on $BH_HOST failed, see $OUT/logs/build-$v.log"
-          cp -- "$SRC_TMP/sparkles" "$bin.tmp.$$"
-          chmod 755 "$bin.tmp.$$"
-          mv -- "$bin.tmp.$$" "$bin"
+          if [ "$keep" = 1 ]; then
+            {
+              echo "kept: $(cat "$SRC_TMP/kept")"
+              echo "kept sha256: $(cat "$SRC_TMP/sha256")"
+              echo "kept compilers: $(cat "$SRC_TMP/compilers.txt")"
+              echo "kept dynamic: $(cat "$SRC_TMP/dynamic.txt")"
+            } > "$SRC_TMP/kept.txt"
+          else
+            cp -- "$SRC_TMP/sparkles" "$bin.tmp.$$"
+            chmod 755 "$bin.tmp.$$"
+            mv -- "$bin.tmp.$$" "$bin"
+          fi
           mv -- "$SRC_TMP/info.txt" "$SRC_TMP/.nsc-build-info.txt"
         fi
         {
           echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "cargo args: $CARGO_ARGS"
           cat "$SRC_TMP/.nsc-build-info.txt"
+          [ ! -f "$SRC_TMP/kept.txt" ] || cat "$SRC_TMP/kept.txt"
         } > "$entry/build.txt.tmp.$$"
         mv "$entry/build.txt.tmp.$$" "$entry/build.txt"
         cleanup_src
+        entry_current || die "the binary kept on $BH_ARG does not match its new cache entry $entry"
       fi
       exec {lock}>&-
     fi
@@ -276,6 +311,16 @@ binary() {
     src+=", built on ${host:-an unrecorded host}"
   fi
   note "$v: $src"
+  if [ "$keep" = 1 ]; then
+    KEPT[$v]=$kept
+    KEPT_SHA[$v]=$kept_sha
+    note "$v sha256: $kept_sha"
+    note "$v kept on $BH_ARG at $kept"
+    COMPILERS[$v]=$(sed -n 's/^kept compilers: //p' "$entry/build.txt")
+    note "$v compilers: ${COMPILERS[$v]:-unknown}"
+    echo "DYNAMIC_$v=$(sed -n 's/^kept dynamic: //p' "$entry/build.txt")" >> "$STAGE/run.env"
+    return
+  fi
   note "$v sha256: $(sha256sum "$bin" | cut -d' ' -f1)"
   COMPILERS[$v]=$(compilers "$bin")
   note "$v compilers: ${COMPILERS[$v]:-unknown}"
@@ -378,7 +423,18 @@ note "instance: $ID ($MACHINE, capped at $DURATION), $URL"
 note "phase create: $(secs "$T_CREATE" "$T_UP") s"
 
 rsh() { screen_exec "$@"; }
-for f in bin-A.zst bin-B.zst data.nt.zst queries.tar nsc-bench-remote.sh run.env; do
+# A binary kept on the worker is linked, or else copied, into the screen's directory there after
+# its SHA-256 is checked, and the remote script runs it from bin-<A|B>.
+SENT=()
+for v in A B; do
+  if [ -n "${KEPT[$v]:-}" ]; then
+    rsh "set -e; test \"\$(sha256sum < ${KEPT[$v]} | cut -d' ' -f1)\" = ${KEPT_SHA[$v]}; rm -f -- $REMOTE/bin-$v.part; ln -- ${KEPT[$v]} $REMOTE/bin-$v.part 2> /dev/null || cp -- ${KEPT[$v]} $REMOTE/bin-$v.part; mv -- $REMOTE/bin-$v.part $REMOTE/bin-$v" > "$OUT/logs/stage-$v.log" 2>&1 ||
+      die "could not copy the kept binary of $v into $REMOTE on $ID, see $OUT/logs/stage-$v.log"
+  else
+    SENT+=("bin-$v.zst")
+  fi
+done
+for f in "${SENT[@]}" data.nt.zst queries.tar nsc-bench-remote.sh run.env; do
   ok=0
   for _try in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if screen_upload "$STAGE/$f" "$REMOTE/$f" > "$OUT/logs/upload.log" 2>&1; then
@@ -391,7 +447,7 @@ for f in bin-A.zst bin-B.zst data.nt.zst queries.tar nsc-bench-remote.sh run.env
   [ "$ok" = 1 ] || die "upload of $f failed"
 done
 T_SENT=$(now)
-note "phase upload: $(secs "$T_UP" "$T_SENT") s for $(du -ch "$STAGE"/{bin-A.zst,bin-B.zst,data.nt.zst,queries.tar} | tail -1 | cut -f1)"
+note "phase upload: $(secs "$T_UP" "$T_SENT") s for $(cd "$STAGE" && du -ch "${SENT[@]}" data.nt.zst queries.tar | tail -1 | cut -f1)"
 
 # wait_remote: poll the detached remote run, print its progress and set status
 wait_remote() {
@@ -449,6 +505,17 @@ fetch_results() {
   screen_unpack "$dir/results.tgz" "$dir"
 }
 
+# check_ran DIR: the binaries that the remote run hashed in DIR/results/binaries.sha256 are
+# the ones the manifest names.
+check_ran() {
+  local v want got
+  for v in A B; do
+    want=$(sed -n "s/^$v sha256: //p" "$MANIFEST")
+    got=$(awk -v f="$v/sparkles" '$2 == f {print $1}' "$1/results/binaries.sha256" 2> /dev/null) || got=
+    [ -n "$want" ] && [ "$got" = "$want" ] || die "the binary that ran as $v (${got:-not recorded}) is not the one in $MANIFEST (${want:-none})"
+  done
+}
+
 screen_launch nsc-bench-remote.sh nohup.log "tar -xf queries.tar" ||
   die "could not start the remote run"
 wait_remote
@@ -457,6 +524,8 @@ note "phase remote run: $(secs "$T_SENT" "$T_RAN") s"
 fetch_results "$OUT"
 note "phase download: $(secs "$T_RAN" "$(now)") s"
 [ "$status" = ok ] || die "the remote run failed ($status), see $OUT/results/progress.log"
+check_ran "$OUT"
+note "ran: the binaries whose SHA-256 the manifest names"
 python3 "$ROOT/scripts/nsc-bench-summary.py" "$OUT" > "$OUT/summary.md"
 
 # The flagged queries run again on the same instance with more rounds and requests, as a
@@ -481,6 +550,7 @@ if [ -n "$FLAGGED" ] && [ "$RERUN" = 1 ]; then
   fetch_results "$OUT/rerun"
   note "phase rerun: $(secs "$T_RERUN" "$(now)") s"
   [ "$status" = ok ] || die "the rerun failed ($status), see $OUT/rerun/results/progress.log"
+  check_ran "$OUT/rerun"
   {
     grep -v '^settings: ' "$MANIFEST"
     echo "settings: the flagged queries, $RERUN_ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $RERUN_REPS timed requests per query and server"

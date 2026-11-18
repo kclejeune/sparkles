@@ -26,7 +26,7 @@
 # (default 20), and a lost reply never starts a second build. The scope must stop within
 # SPARKLES_NSC_BUILD_RUNTIME (default 14400) seconds, sooner when SPARKLES_NSC_BUILD_DEADLINE
 # or a Boat worker's admitted lifetime leaves less (bh_expiry), and the host enforces it. A
-# Boat build runs with the cap SPARKLES_BOAT_BUILD_MEMORY_MAX and SPARKLES_BOAT_BUILD_JOBS compile jobs (bh_build_env). The binary and its build record come back over ssh and the SHA-256 is checked.
+# Boat build runs with the cap SPARKLES_BOAT_BUILD_MEMORY_MAX and SPARKLES_BOAT_BUILD_JOBS compile jobs (bh_build_env). The binary and its build record come back over ssh and the SHA-256 is checked. With BH_KEEP=1, which scripts/nsc-bench.sh sets when the Boat build host also runs the screen (bh_keep_on_worker), the binary stays in the scratch directory and only the records come back, with its compilers and linking read on the host (bh_fetch_kept).
 # The scope is stopped and the scratch directory removed when the build ends in any way:
 # after a failure, and from the caller's EXIT trap (bh_cleanup) after an interrupt or lost
 # contact. A Boat worker keeps the directory as evidence. Cleanup touches only the
@@ -241,9 +241,14 @@ bh_cleanup() {
     echo "could not confirm scope closure at $BH_RHOST:$BH_RDIR; keep its evidence and reconcile $BH_RUNIT.scope" >&2
     return 97
   fi
-  case $BH_RHOST in boat:*) echo "retained source/build evidence at $BH_RHOST:$BH_RDIR" ;;
-  *) BH_CLEANUP_RETRY=1 bh_retry "removing $BH_RDIR" - bh_rx 30 "$BH_RHOST" "rm -rf -- $BH_RDIR" < /dev/null ;;
-  esac
+  # A kept binary lives in the directory, so a kept build retains it on any host.
+  if [ "${BH_KEEP:-0}" = 1 ]; then
+    echo "retained the kept binary and its build at $BH_RHOST:$BH_RDIR"
+  else
+    case $BH_RHOST in boat:*) echo "retained source/build evidence at $BH_RHOST:$BH_RDIR" ;;
+    *) BH_CLEANUP_RETRY=1 bh_retry "removing $BH_RDIR" - bh_rx 30 "$BH_RHOST" "rm -rf -- $BH_RDIR" < /dev/null ;;
+    esac
+  fi
   BH_RDIR=
   BH_RUNIT=
 }
@@ -318,6 +323,45 @@ bh_send_source() {
 bh_fetch() {
   # shellcheck disable=SC2029
   bh_rx 600 "$1" "tar -C $2/out -cf - ." < /dev/null | python3 "$RX_DIR/remote-executor.py" unpack "$3"
+}
+
+# bh_keep_on_worker: whether a revision built on this run's --build-host stays there. It does
+# when the build host is a Boat worker and the screen runs on that same worker (EXECUTOR),
+# since the binary is about 1 GB and the operator's link to a Boat worker can carry only a
+# few hundred KB/s. Every other choice copies the binary back as before.
+bh_keep_on_worker() {
+  case $BH_ARG in boat:bx_*) [ "${EXECUTOR:-}" = "$BH_ARG" ] ;; *) return 1 ;; esac
+}
+
+# bh_tools_kept HOST: refuse, before a kept build starts, a host that lacks the tools whose
+# output stands in for the local readelf, ldd and sha256sum of a copied binary.
+bh_tools_kept() {
+  # shellcheck disable=SC2016 # the loop runs on the host
+  bh_rx 60 "$1" 'for t in readelf ldd sha256sum; do command -v "$t" > /dev/null || { echo "$t is not on the build host PATH" >&2; exit 3; }; done' < /dev/null
+}
+
+# bh_fetch_kept HOST DIR OUT: record on HOST what the caller would read from a copied binary,
+# its .comment compilers in DIR/out/compilers.txt (as nsc-bench.sh's compilers) and whether
+# it is dynamically linked in DIR/out/dynamic.txt, and copy DIR/out back into OUT without the
+# binary. A repeat writes the same records again.
+bh_fetch_kept() {
+  # shellcheck disable=SC2016,SC2029
+  bh_rx 300 "$1" "cd $2/out && "'{ readelf -p .comment sparkles 2> /dev/null | sed -n "s/^ *\[ *[0-9a-f]*\] *//p" | sort -u | paste -sd ";" - | sed "s/;/; /g"; } > compilers.txt.tmp && mv compilers.txt.tmp compilers.txt && if ldd sparkles > /dev/null 2>&1; then echo 1; else echo 0; fi > dynamic.txt && tar -cf - --exclude=./sparkles .' < /dev/null |
+    python3 "$RX_DIR/remote-executor.py" unpack "$3"
+}
+
+# bh_kept_check HOST PATH SHA: whether the kept binary PATH on HOST still has the SHA-256 SHA.
+# It prints ok, or missing or changed and returns 1, and returns 2 when HOST cannot be asked.
+bh_kept_check() {
+  local state
+  [[ $2 =~ ^/[A-Za-z0-9._/-]+/lanes/nsc-build/[0-9a-f]{40}\.[A-Za-z0-9]+/out/sparkles$ && $3 =~ ^[0-9a-f]{64}$ ]] || {
+    echo invalid
+    return 1
+  }
+  # shellcheck disable=SC2029
+  state=$(bh_retry "checking the kept binary on $1" - bh_rx 120 "$1" "if [ ! -f $2 ]; then echo missing; elif [ \"\$(sha256sum < $2 | cut -d' ' -f1)\" = $3 ]; then echo ok; else echo changed; fi" < /dev/null) || return 2
+  echo "$state"
+  [ "$state" = ok ] || return 1
 }
 
 # bh_expiry: the Unix time by which the build's scope has stopped, its stop included. It is
@@ -465,6 +509,9 @@ bh_build_steps() {
     BH_ADMISSION=$out/admission.json
     ;;
   esac
+  if [ "${BH_KEEP:-0}" = 1 ]; then
+    bh_retry "checking the tools of $host" - bh_tools_kept "$host" || return
+  fi
   # The name is chosen here, so a retry after a lost reply reuses the same directory.
   suffix=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 8) || true
   tmp=$(mktemp)
@@ -518,6 +565,21 @@ bh_build_steps() {
     return "$build_code"
   fi
   mkdir -p "$out"
+  if [ "${BH_KEEP:-0}" = 1 ]; then
+    bh_retry "copying the build records back from $host" - bh_fetch_kept "$host" "$BH_RDIR" "$out" || {
+      echo "copying the build records back from $host failed" >&2
+      return 1
+    }
+    want=$(cat "$out/sha256" 2> /dev/null) || want=
+    if [ -z "$want" ] || ! bh_kept_check "$host" "$BH_RDIR/out/sparkles" "$want" > /dev/null; then
+      echo "the binary kept on $host does not match its recorded SHA-256" >&2
+      return 1
+    fi
+    printf '%s\n' "$BH_RDIR/out/sparkles" > "$out/kept"
+    { echo "build host: $host" && cat "$out/info.txt"; } > "$out/info.txt.tmp" && mv "$out/info.txt.tmp" "$out/info.txt"
+    echo "built on $host and kept there at $BH_RDIR/out/sparkles, sha256 $want"
+    return 0
+  fi
   bh_retry "copying the binary back from $host" - bh_fetch "$host" "$BH_RDIR" "$out" || {
     echo "copying the binary back from $host failed" >&2
     return 1

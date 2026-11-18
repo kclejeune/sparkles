@@ -216,11 +216,17 @@ job's files. The
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a
 host with a newer glibc do not run there. The executor does not choose the build host,
 so the screen names the worker as its build host and passes two revisions rather than
-binary paths. The screen keeps each binary in its local cache with a record of the host
-that built it. A later screen with the same worker as its build host reuses a cached
-binary only when that worker built it, so a repeated screen of the same revisions skips
-both builds. A write screen with a Boat build host keeps its cache entries under a key
-that names the worker, with the same effect.
+binary paths. When the build host is also the executor, each binary stays on the worker in
+its build directory, since a release binary is about 1 GB and the operator's link to a Boat
+worker can carry only a few hundred KB/s. Only the build records come back. The worker reads
+the binary's SHA-256, its compilers and whether it is dynamically linked, so it needs
+`readelf`, `ldd` and `sha256sum`. The local cache entry, under a key that names the worker,
+records the binary's path and SHA-256 there. A later screen on the same worker reuses the
+entry only after the worker confirms that the file still has that SHA-256, and builds again
+when it is gone or changed. The screen links each binary into its own directory on the
+worker, and the remote run records the SHA-256 of what it runs, which must match the
+manifest. A write screen, or a screen whose build host is another worker, still copies each
+binary back and keeps it in the local cache with a record of the worker that built it.
 
 ```sh
 mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
