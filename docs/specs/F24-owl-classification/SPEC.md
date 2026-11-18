@@ -102,7 +102,7 @@ default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rul
 ontologies with individuals and nominals take the case analysis through a root context,
 with four recorded departures from the journal's rules, a work bound past which the run
 gives its default answer, and 45 of the 50 `shoi` fixtures exact against HermiT. The five
-fixtures that pass the bound are item 822, and the default is item 823.
+fixtures that passed the bound were item 822, and the default is item 823.
 
 Item 805 delivers keys over object properties and the universal object property in rooted
 runs, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) describes.
@@ -122,6 +122,20 @@ run is rooted now. It passes the bound and gives the default answer, which is He
 in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803 does the
 same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
 Item 1061 follows that cost.
+
+Item 822 adds a fifth departure, [the constant of a restriction into a
+singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
+1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`
+fixtures are exact against HermiT in every configuration, and shoi-005, 027 and 032 finish
+with 21,740, 12,666 and 30,781 derived conclusions where they passed the bound before.
+The 45 fixtures that finished before derive about half as many conclusions as before at
+the median, with one, shoi-033, rising from 404 to 528. shoi-022 and 042 still pass the
+bound, and item 822 follows them with their new attribution. On the 392 generated
+ontologies of item 805, 336 now finish within the bound on one and on four threads with
+the same answers, where 274 did before, and 47 pass it where 109 did. All agree with
+HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not report,
+since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
+same values. The gap of `owl:Thing` that item 805 found is closed.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
@@ -3428,7 +3442,7 @@ This section is the design of item 603's sixth phase, which extends the disjunct
 to nominals. The rules it describes are built, apart from keys and the universal property,
 which item 805 builds. They run when `Limits::rooted` asks for them, and it is off by
 default, because the completeness of the calculus as item 804 departed from the journal's
-rules is not proved and five of the 50 `shoi` fixtures of the phase's gate pass the work
+rules is not proved and two of the 50 `shoi` fixtures of the phase's gate pass the work
 bound of a rooted run, which item 822 follows. Without the option the disjunctive rules
 refuse ontologies with individuals and nominals as the section above says, and every run
 takes the paths it took before these rules existed. The option changes nothing for an
@@ -3915,12 +3929,54 @@ axioms outside OWL 2 EL out and reports them as a run without the option does, a
 `Stats::dl_rooted_over` and `dl_over_budget`, so an ontology that the run cannot finish
 gets its default answer after the bound's work. A rooted run that counts keeps the
 counting bound and its retry without counting, which then has the rooted bound. Over the
-50 `shoi` fixtures with the option on, 45 give HermiT's taxonomy in every configuration
-and the other five fall back to their default answer, with 0 wrong, which the `dl_fixtures`
+50 `shoi` fixtures with the option on, 48 give HermiT's taxonomy in every configuration
+with item 822's departure and the other two fall back to their default answer, with 0
+wrong, which the `dl_fixtures`
 suite checks on one thread under the cautious strategy and four threads under the eager
 one. The share of the work that the duplication of ground reasoning across contexts
 costs will be measured on ore_ont_15803 with its two top-property axioms removed, since
 the file itself waits on item 805.
+
+#### Item 822's departure: the constant of a restriction into a singleton
+
+An existential restriction `∃r.B` whose class B is below a singleton `{v}` through told
+subsumers and conjunctions alone gives the role atom `r(t, v)` and the atom `B(v)` in place
+of the successor term `f(t)` with `r(t, f(t))` and `B(f(t))`, at x and at a constant t, in
+the clauses of a context and in its units. The restriction makes no successor and no edge,
+its units take no part in the universal restrictions over successor terms, and a unit's
+EL successor sends it no clause by Pred. The run then reasons about v with the root's
+facts and the context's own ground literals, by Hyper at the constant and the universal
+restrictions over a role atom to a constant that item 804's first departure describes. A
+counting run keeps the successor terms, since an at-most restriction counts its
+neighbours over them, and `SPARKLES_ROOTED_NOMINAL_SUCC=0` turns the departure off for
+measurement.
+
+The rewriting is an equivalence, since `B ⊑ {v}` makes `∃r.B(t)` hold exactly when
+`r(t, v)` and `B(v)` hold, so the run stays sound. For completeness, the departure is
+demodulation by a unit. B's told subsumers give `N_v(f(t))` and so `f(t) ≈ v` under the
+same body and residue as the restriction itself, and with that equality every clause that
+holds `f(t)` rewrites to the clause over v, which is what the journal's Eq makes in the
+same context, as the measured effect above describes. The departure replaces the clauses
+over `f(t)` with their rewritten forms. A successor's own knowledge about its element,
+which Pred would carry back over `f(t)`, is the knowledge about v under the successor's
+markers, and the context derives it at v from the same premises, since the markers of
+such a successor are the context's own literals. What the argument leaves open is the
+same as for the first departure, the lifting of the ground clauses that the context then
+holds over v, and it is not a proof. The rationale is the attribution below. In one second
+of shoi-005 the run derived 223,616 Eq conclusions on a processed equality, and the four
+most frequent rewriting equalities were successor terms of restrictions into singletons
+equal to their constant. With the departure, shoi-005 finishes with 21,740 conclusions
+where it passed the bound and finished with 6.4 million under a larger one, and shoi-027
+and 032 finish too. The derivation trace now names an Eq conclusion by the kinds of terms
+of its rewriting equality, such as `eq:fx>c` for `f(x) ↦ u`.
+
+The two fixtures that still pass the bound have other causes. In shoi-022 most of the work
+is Eq on equalities `f(u) ≈ v` of successor terms of constants, with no x in the
+conclusion, in each of about 17 contexts, since `¬{a3, a0} ⊑ {a3}` makes every element
+`a0` or `a3`, which is the duplication of ground reasoning across contexts that item 1061
+follows. In shoi-042 most of the work is Eq on disjunctive equalities of constants into
+clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With a bound of
+200 million it finishes in 6 s after 4.7 million conclusions.
 
 ### ROBOT-compatible commands
 

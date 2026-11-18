@@ -459,7 +459,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   ontology with individuals or nominals, `Limits::rooted` lets the disjunctive rules take
   nominals, class and property assertions, equalities and inequalities of individuals and
   negative assertions through a root context where the individuals' facts meet, with the
-  four departures from the published calculus that F24 records. It is off by default,
+  five departures from the published calculus that F24 records. An existential
+  restriction into a singleton, or into a class below one, gives a role atom to the
+  individual in place of an anonymous successor, except in a run that counts. It is off by default,
   since the completeness of the departed calculus is not proved, and every answer it gives
   is entailed. A rooted run without counting has a bound of 524,288 derived conclusions,
   `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
