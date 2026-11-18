@@ -58,7 +58,8 @@
     try {
       const rows = await api.select(ds, nearbyQuery(iri, literal, radius, LIMIT), {
         send: LIMIT,
-        // the nearest of a feature's geometries, when some have no distance
+        // the nearest of a feature's geometries, when some have no distance, whatever
+        // reading the dataset sets (roadmap item 1064)
         aggregateErrors: 'sparkles',
       });
       if (!owns()) return;

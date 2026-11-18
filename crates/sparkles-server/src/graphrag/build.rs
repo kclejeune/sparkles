@@ -1020,7 +1020,7 @@ impl Run<'_> {
         output: Option<&str>,
     ) -> Result<Vec<(Fact, Origin)>, RunError> {
         // MIN(?rf) takes the least reifier present across the fact's graphs, some of
-        // which may hold none
+        // which may hold none, whatever reading the dataset sets (roadmap item 1064)
         let opts = &QueryOptions {
             aggregate_errors: Some(sparkles::sparql::AggregateErrors::Sparkles),
             ..opts.clone()

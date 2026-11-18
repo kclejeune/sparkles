@@ -117,6 +117,11 @@ query that names another reading evaluates a view's query from the data and does
 read the view's maintained state, and its plan says so. [Aggregate
 errors](../API.md#aggregate-errors) in the API reference gives the routes.
 
+The engine's own queries choose the `sparkles` reading where a group mixes rows with and
+without a value, so their answers do not change with the dataset's setting. These are the
+MCP memory tools' queries, the GraphRAG build's choice of a fact's reifier, and the web
+UI's list of memory agents and its nearby-features panel.
+
 Fuseki users get the answers they had from Jena. Users of earlier Sparkles releases see
 MIN and MAX become unbound where an argument was unbound or an error, and can set
 `sparkles` on a dataset or on the server to keep the earlier answers.
