@@ -61,6 +61,57 @@ class Selection(unittest.TestCase):
         ci = self.ci(["crates/sparkles-fmt/src/lib.rs"], ["sparkles-fmt", "sparkles-fmt-wasm", "sparkles-server"])
         self.assertIn("fmt:wasm", ci)
 
+    def test_the_workflow_table_matches_the_workflows(self):
+        def push_paths(wf):
+            out, push, inside = [], False, False
+            for line in (ROOT / ".github/workflows" / wf).read_text().splitlines():
+                if line.startswith("  push:"):
+                    push = True
+                elif push and "paths: &paths" in line:
+                    inside = True
+                elif inside:
+                    m = re.match(r"^\s*- ['\"]?([^'\"]+?)['\"]?\s*$", line)
+                    if m:
+                        out.append(m.group(1))
+                    elif not re.match(r"^\s*#", line):
+                        break
+            return out
+        files = {p.name for p in (ROOT / ".github/workflows").glob("*.yml")}
+        mapped = {Path(wf).name for wf, _, _ in gs.WORKFLOWS}
+        self.assertEqual(files, mapped | gs.WORKFLOW_UNMAPPED)
+        self.assertFalse(mapped & gs.WORKFLOW_UNMAPPED)
+        for wf, group, patterns in gs.WORKFLOWS:
+            self.assertIn(group, gs.GROUPS)
+            self.assertEqual(patterns, push_paths(Path(wf).name), wf)
+
+    def test_workflow_paths_follow_github_rules(self):
+        py = next(p for wf, g, p in gs.WORKFLOWS if g == "py")
+        self.assertTrue(gs.workflow_selects("crates/sparkles-core/src/lib.rs", py))
+        self.assertFalse(gs.workflow_selects("crates/sparkles-core/tests/w3c.rs", py))
+        self.assertTrue(gs.workflow_selects("crates/sparkles-core/tests/patch/a.rdfp", py))
+        self.assertTrue(gs.workflow_selects("crates/sparkles-py/tests/test_x.py", py))
+        self.assertFalse(gs.workflow_selects("crates/sparkles-owl/src/lib.rs", py))
+        # `*` stays within one directory, unlike fnmatch's.
+        self.assertFalse(gs.workflow_selects("crates/sparkles-core/src/a/tests/b.rs", ["!crates/sparkles*/tests/**"]))
+        self.assertTrue(gs.workflow_selects("crates/sparkles-core/src/a/tests/b.rs",
+                                            ["crates/**", "!crates/sparkles*/tests/**"]))
+
+    def test_a_workflow_and_its_own_scripts_run_its_local_checks(self):
+        for f, group in [(".github/workflows/python-wheels.yml", "py"), ("scripts/py-sdist.py", "py"),
+                         ("scripts/py-wheel-test.sh", "py"), (".github/workflows/jvm-bindings.yml", "jvm"),
+                         (".github/workflows/node-packages.yml", "node"), ("scripts/ci-node-musl.sh", "node")]:
+            ci = self.ci([f])
+            for t in gs.GROUPS[group]:
+                self.assertIn(t, ci, f)
+        ci = self.ci(["scripts/install-mbx-container.sh"])
+        for t in ["py:test", "node:test"]:
+            self.assertIn(t, ci)
+        self.assertNotIn("jvm:test", ci)
+        # The other workflows and the documentation select no binding.
+        for f in [".github/workflows/ci.yml", ".github/workflows/server-artifacts.yml", "docs/FEATURES.md"]:
+            for t in ["py:test", "jvm:test", "node:test"]:
+                self.assertNotIn(t, self.ci([f]), f)
+
     def test_engine_changes_outside_sparql_skip_conformance_and_bindings(self):
         s = self.sel(["crates/sparkles-core/src/store/compaction.rs"], "all")
         self.assertEqual(s["conformance"], [])

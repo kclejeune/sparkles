@@ -1064,6 +1064,7 @@ and the commit to the checks it calls for, and writes the choice and its reasons
 | `ui/` | The UI checks. |
 | A binding's crate or its own directory and scripts | That binding's checks. `crates/sparkles-py` and `scripts/py-test.sh` run `py:lint` and `py:test`, `crates/sparkles-ffi` and `jvm/` the JVM checks, and `crates/sparkles-node` and `js/` the Node checks. |
 | The public surface: `crates/sparkles`, the OpenAPI description and the baselines that `api:check` compares | Every binding's checks. |
+| A binding workflow in `.github/workflows` or a release script that only it runs, such as `scripts/py-wheel-test.sh` or `scripts/ci-node-musl.sh` | That binding's checks. The workflows' crate paths keep the rows above, so an engine change does not run every binding. |
 | SPARQL parsing, algebra and evaluation in `crates/sparkles-core/src/sparql`, the RDF parsers, the XSD functions, GeoSPARQL, the SHACL, SHACLC and ShEx crates and the suites' own files | `test:w3c`, `test:shacl` and `test:shex`. Unit-test files inside `src` do not count. |
 | The streaming executor, the spill files and the W3C harness | The plain and encrypted spill matrices. |
 | `Cargo.lock` | `lint`, `test` and `licenses:check` for the packages whose locked dependencies change, and the conformance suites and spill matrices when sparkles-core, the SHACL, SHACLC or ShEx crate is among them. A lock that cannot be compared entry by entry runs everything. |

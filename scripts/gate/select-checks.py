@@ -170,6 +170,91 @@ RULES = [
 ]
 
 
+# The GitHub workflows that test a binding, each with the group of local checks that does
+# the same work and its push paths, copied verbatim and in order. A test checks each list
+# against its workflow. Only the files that a workflow alone reads, its own definition and
+# the release scripts it runs, select the group through this table. Crate, vendor and
+# binding sources keep the rules above, which run a binding's checks for its own files and
+# for BINDING_SURFACE, so an engine change does not run every binding in the gate. The
+# post-push report of scripts/gate/github-runs.py catches what that leaves to GitHub.
+# ci.yml runs the Rust tasks that changed-crates.py selects. server-artifacts.yml builds
+# the release server, which the nightly gate's server link check and gate.sh --link-only
+# cover rather than the batch selection. nix.yml runs only by hand. None of the three has
+# an entry.
+WORKFLOWS = [
+    (".github/workflows/python-wheels.yml", "py", [
+        "crates/sparkles/**", "crates/sparkles-alloc/**", "crates/sparkles-budget/**",
+        "crates/sparkles-backup/**", "crates/sparkles-core/**", "crates/sparkles-graphql/**",
+        "crates/sparkles-py/**", "crates/sparkles-reasoner/**", "crates/sparkles-shacl/**",
+        "crates/sparkles-shex/**", "!crates/sparkles*/tests/**", "crates/sparkles-py/tests/**",
+        "crates/sparkles-core/tests/patch/**", "!crates/sparkles*/benches/**", "!crates/sparkles*/examples/**",
+        "vendor/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/install-mbx-container.sh",
+        "mise.toml", "scripts/py-sdist.py", "scripts/py-wheel-test.sh", ".github/workflows/python-wheels.yml",
+    ]),
+    (".github/workflows/jvm-bindings.yml", "jvm", [
+        "crates/sparkles/**", "crates/sparkles-alloc/**", "crates/sparkles-budget/**",
+        "crates/sparkles-backup/**", "crates/sparkles-core/**", "crates/sparkles-ffi/**",
+        "crates/sparkles-fmt/**", "crates/sparkles-graphql/**", "crates/sparkles-reasoner/**",
+        "crates/sparkles-shacl/**", "crates/sparkles-shex/**", "!crates/sparkles*/tests/**",
+        "!crates/sparkles*/benches/**", "!crates/sparkles*/examples/**", "crates/sparkles-ffi/examples/**",
+        "vendor/**", "jvm/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/jvm-native.sh",
+        ".github/workflows/jvm-bindings.yml",
+    ]),
+    (".github/workflows/node-packages.yml", "node", [
+        "crates/sparkles/**", "crates/sparkles-alloc/**", "crates/sparkles-budget/**",
+        "crates/sparkles-backup/**", "crates/sparkles-client/**", "crates/sparkles-core/**",
+        "crates/sparkles-fmt/**", "crates/sparkles-graphql/**", "crates/sparkles-memory-import/**",
+        "crates/sparkles-modelstore/**", "crates/sparkles-node/**", "crates/sparkles-office/**",
+        "crates/sparkles-reasoner/**", "crates/sparkles-server/**", "crates/sparkles-shacl/**",
+        "crates/sparkles-shex/**", "!crates/sparkles*/tests/**", "!crates/sparkles*/benches/**",
+        "!crates/sparkles*/examples/**", "vendor/**", "js/**", "Cargo.toml", "Cargo.lock",
+        "rust-toolchain.toml", "scripts/node-native.sh", "scripts/install-mbx-container.sh",
+        "scripts/node-native.sh", "scripts/ci-node-musl.sh", "mise.toml",
+        ".github/workflows/node-packages.yml",
+    ]),
+]
+WORKFLOW_UNMAPPED = {"ci.yml", "server-artifacts.yml", "nix.yml"}
+
+
+def workflow_glob(pattern):
+    """A regular expression for a GitHub Actions path PATTERN, where `**` crosses
+    directories and `*` does not."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def workflow_selects(path, patterns):
+    """Whether a push that changes PATH runs a workflow with these paths. As in GitHub
+    Actions, the last pattern that matches decides, and a `!` pattern excludes."""
+    selected = False
+    for p in patterns:
+        neg = p.startswith("!")
+        if workflow_glob(p[1:] if neg else p).match(path):
+            selected = not neg
+    return selected
+
+
+def workflow_groups(path):
+    """The groups that the GitHub workflows whose paths select PATH call for, with the
+    workflow of each."""
+    if not path.startswith(("scripts/", ".github/")):
+        return {}
+    return {group: wf for wf, group, patterns in WORKFLOWS if workflow_selects(path, patterns)}
+
+
 # The mise tasks that the gate runs: the ci tasks, the conformance suites and the
 # prerequisites that scripts/ci.sh builds before them.
 CONFORMANCE_TASKS = {"test:w3c": "w3c", "test:shacl": "shacl", "test:shex": "shex"}
@@ -328,6 +413,10 @@ def select(files, packages, read=None):
             if name not in chosen:
                 why.setdefault(name, f"{f} changed")
         chosen |= g
+        for name, wf in sorted(workflow_groups(f).items()):
+            if name not in chosen:
+                why.setdefault(name, f"{f} changed, which {wf} tests")
+            chosen.add(name)
     if "all" in chosen:
         return {"ci": "all", "conformance": list(CONFORMANCE), "spill": list(SPILL), "packages": "all",
                 "screen": (run_screen, why_screen)}, why
