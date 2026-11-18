@@ -11,6 +11,9 @@
 //! | `sparkles` | the other values decide | unbound | its lexical form |
 //! | `spec` | MIN unbound, MAX from the other values | `0` | unbound |
 //!
+//! Jena also makes GROUP_CONCAT(DISTINCT …) over no rows unbound, and so does the `jena`
+//! reading, while the other two give `""` as the aggregate without DISTINCT does.
+//!
 //! Every reading makes SUM, AVG and GROUP_CONCAT unbound when one of their arguments is
 //! an error, and COUNT and SAMPLE pass over errors.
 
@@ -22,8 +25,8 @@ use std::str::FromStr;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AggregateErrors {
     /// Apache Jena's reading: MIN and MAX are unbound when an argument is an error, AVG
-    /// over only errors is unbound, and GROUP_CONCAT reads the lexical form of any term
-    /// that has one.
+    /// over only errors is unbound, GROUP_CONCAT reads the lexical form of any term that
+    /// has one, and GROUP_CONCAT(DISTINCT …) over no rows is unbound.
     #[default]
     Jena,
     /// The engine's earlier reading: MIN and MAX pass over errors, and AVG and
@@ -66,6 +69,12 @@ impl AggregateErrors {
     /// Whether AVG over arguments that are all errors is `0`, as over no rows.
     pub(crate) fn avg_of_errors_zero(self) -> bool {
         self == AggregateErrors::Spec
+    }
+
+    /// Whether GROUP_CONCAT(DISTINCT …) over no rows is unbound, as in Jena, where the
+    /// aggregate without DISTINCT gives `""`.
+    pub(crate) fn distinct_concat_of_nothing_unbound(self) -> bool {
+        self == AggregateErrors::Jena
     }
 
     /// Whether GROUP_CONCAT takes only strings: simple literals, `xsd:string` and

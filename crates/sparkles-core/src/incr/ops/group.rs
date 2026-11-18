@@ -547,6 +547,13 @@ impl Group {
                     AggKind::Min => m.min().unwrap_or(Id::UNDEF),
                     AggKind::Max => m.max(p).unwrap_or(Id::UNDEF),
                     AggKind::Sample => m.sample.unwrap_or(Id::UNDEF),
+                    // Jena's GROUP_CONCAT(DISTINCT …) over no rows
+                    _ if spec.distinct
+                        && g.rows == 0
+                        && p.aggregate_errors.distinct_concat_of_nothing_unbound() =>
+                    {
+                        Id::UNDEF
+                    }
                     _ => Self::concat(p, spec, m),
                 },
             };

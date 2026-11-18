@@ -312,6 +312,8 @@ impl Accumulator for Running {
 /// form.
 pub(crate) struct Concat {
     separator: String,
+    /// GROUP_CONCAT(DISTINCT …), which some readings make unbound over no rows
+    distinct: bool,
     groups: Vec<ConcatState>,
     growth: u64,
 }
@@ -332,6 +334,7 @@ impl Concat {
         };
         Self {
             separator,
+            distinct: agg.distinct,
             groups: Vec::new(),
             growth: 0,
         }
@@ -422,7 +425,10 @@ impl Accumulator for Concat {
                 empty: true,
             },
         );
-        Ok(if state.ok {
+        let nothing = state.empty
+            && self.distinct
+            && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
+        Ok(if state.ok && !nothing {
             // SPARQL 1.1: the result is a simple literal
             ctx.intern_value(&Value::Str(state.text.into()))
         } else {

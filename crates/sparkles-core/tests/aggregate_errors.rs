@@ -109,14 +109,6 @@ fn same(got: &str, want: &str) -> bool {
             (Ok(g), Ok(w)) if got.contains('.') && (g - w).abs() <= 1e-15 * w.abs().max(1.0))
 }
 
-/// The answers that Jena gives and the `jena` reading deliberately does not: Jena makes
-/// GROUP_CONCAT(DISTINCT …) over no rows unbound where the plain aggregate gives `""`,
-/// and the engine gives `""` for both. SAMPLE may pick any value, so only whether it is
-/// bound is compared.
-fn jena_exception(aggregate: &str, group: &str) -> bool {
-    aggregate.starts_with("GROUP_CONCAT(DISTINCT") && group == "\"empty\""
-}
-
 #[test]
 fn the_jena_reading_answers_as_arq() {
     let s = Store::in_memory(StoreOptions::default());
@@ -131,9 +123,8 @@ fn the_jena_reading_answers_as_arq() {
             assert_eq!(got.len(), rows.len(), "{a}: {got:?}");
             for (g, v) in got {
                 let w = &rows.iter().find(|(_, wg, _)| *wg == g).expect("a group").2;
-                if jena_exception(a, &g) {
-                    assert_eq!(v, "\"\"", "{a} {g}");
-                } else if a.starts_with("SAMPLE") {
+                // SAMPLE may pick any value, so only whether it is bound is compared
+                if a.starts_with("SAMPLE") {
                     assert_eq!(v.is_empty(), w.is_empty(), "{a} {g}: {v} against {w}");
                 } else {
                     assert!(same(&v, w), "{a} {g} {opt:?}: {v} against Jena's {w}");
@@ -234,7 +225,13 @@ fn the_three_readings_of_group_concat() {
         for mode in AggregateErrors::ALL {
             assert_eq!(one(&s, mode, &gc, "lang"), "\"a b\"", "{mode} {arg}");
             assert_eq!(one(&s, mode, &gc, "unb"), "", "{mode} {arg}");
-            assert_eq!(one(&s, mode, &gc, "empty"), "\"\"", "{mode} {arg}");
+            // Jena makes GROUP_CONCAT(DISTINCT …) over no rows unbound
+            let nothing = if mode == Jena && arg.starts_with("DISTINCT") {
+                ""
+            } else {
+                "\"\""
+            };
+            assert_eq!(one(&s, mode, &gc, "empty"), nothing, "{mode} {arg}");
         }
     }
 }

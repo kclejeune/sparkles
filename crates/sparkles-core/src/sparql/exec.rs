@@ -6896,6 +6896,12 @@ pub(super) fn aggregate(
         }
         AggregateFunction::Sample => return vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF),
         AggregateFunction::GroupConcat { separator } => {
+            if agg.distinct
+                && rows.is_empty()
+                && ctx.aggregate_errors.distinct_concat_of_nothing_unbound()
+            {
+                return Id::UNDEF;
+            }
             let sep = separator.as_deref().unwrap_or(" ");
             let mut parts = Vec::new();
             let strings = ctx.aggregate_errors.concat_strings_only();
