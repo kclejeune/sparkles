@@ -99,6 +99,9 @@ impl QueryReasoner {
         }
         // a rule text with relations or `not` is a rule program, compiled by the frontend
         // over each session's terms (item 839's plan, §22.4)
+        if crate::parser::uses_program(&rules) {
+            crate::engine::frontend::check_includes(&rules)?;
+        }
         let program: Option<ProgramSource> = crate::parser::uses_program(&rules).then(|| {
             let parsed = Arc::new(rules.clone());
             let source: ProgramSource = Arc::new(move |t: &Terms, w: &mut WorkingWarnings| {

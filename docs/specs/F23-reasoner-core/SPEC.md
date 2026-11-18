@@ -415,7 +415,9 @@ uses relations or `not`, and every other text takes the paths it took before, so
 demand programs and closures of the built-in profiles do not change. A program's
 sessions keep demand tables in the cache under the digest of the rule text, and a negated
 triple makes the changes to its pattern relevant to their reuse. A program with an
-existential head is refused until the chase exists.
+existential head is refused until the chase exists, and one that includes the OWL rule
+sets is refused until roadmap item 1109 shows that the program path agrees with the Jena
+path on them.
 
 The cost probe of Phase 4 decided the column order. Over 40 disjoint paths of six
 properties, a demand on the chain's triple derives 7 facts with its subject bound and 481

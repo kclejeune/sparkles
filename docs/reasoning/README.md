@@ -174,9 +174,12 @@ request or on every write, and the schema report counts what the data holds.
   A text that uses relations or `not` is one program, its `@include`d rule sets
   included, and it must stratify, which means that no relation or predicate depends on
   its own negation through recursion. A program that does not is refused with the cycle
-  named. Its strata run in order, so a `noValue` of a Jena rule in such a program reads
-  the complete lower strata, and the run warns once for each such rule with the rule set
-  it came from. Materialization, explanations, witnesses, query-time reasoning and
+  named. An included `rdfs` set has rules over every predicate, which read the facts of
+  any rule, so a program that includes it stratifies only without `not`. A program
+  cannot include the OWL rule sets, and such a text is refused. A program runs without
+  the closure operators. Its strata run in order, so a `noValue` of a Jena rule in such
+  a program reads the complete lower strata, and the run warns once for each such rule
+  with the rule set it came from. Materialization, explanations, witnesses, query-time reasoning and
   why-not answers read a program as they read Jena rules, and an explanation shows a
   relation fact as a node `name(args)`. A program without `not` is maintained
   incrementally, and one with `not` runs in full on every update. A query-time demand
@@ -888,7 +891,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   of a relation of three or more columns derives every fact of the relation, which keeps
   `owl-rl`'s chains and keys in rules per length. Roadmap items 1102 and 517. An
   explanation of a triple whose derivation passes a relation fact that was derived from
-  a generalized fact, one with a literal subject, finds no derivation. Roadmap item 1103.
+  a generalized fact, one with a literal subject, finds no derivation. Roadmap item 1108.
+  A rule program cannot include the `owl`, `owl-rl`, `owlmini` or `owlmicro` rule sets.
+  Roadmap item 1109.
 * An update of a `shacl-af` materialization runs in full, and the rules are evaluated
   per focus node in each round rather than semi-naively. Native maintenance of triple
   rules and of SPARQL rules whose bodies are basic graph patterns, and a recompute stratum

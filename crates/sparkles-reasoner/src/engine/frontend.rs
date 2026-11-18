@@ -38,6 +38,22 @@ impl ProgramInfo {
     }
 }
 
+/// Refuse a rule program that includes `owl-rl` (any of its names). Its rules run with
+/// the closure operators and read lists in the order the Jena path derives them, which a
+/// program's strata do not keep, so the combination waits for roadmap item 1109.
+pub(crate) fn check_includes(rules: &[Rule]) -> anyhow::Result<()> {
+    if let Some(set) = rules
+        .iter()
+        .filter_map(|r| r.include.as_deref())
+        .find(|set| set.starts_with("owl"))
+    {
+        anyhow::bail!(
+            "a rule program, with relation atoms or 'not', cannot include <{set}>: the OWL rule set runs only as Jena rules, so write the program without the include or the include without relations and 'not'"
+        );
+    }
+    Ok(())
+}
+
 /// Compile `rules`, a rule text that [`uses_program`](crate::parser::uses_program), over
 /// `terms`, and check and stratify it as one program (Q7). Backward rules are compiled
 /// only when `backward` is set, as for query-time reasoning, and are otherwise skipped
@@ -52,6 +68,7 @@ pub(crate) fn compile(
     warnings: &mut WorkingWarnings,
     backward: bool,
 ) -> anyhow::Result<ProgramInfo> {
+    check_includes(rules)?;
     let budget = terms.budget();
     let (bytes, emitted) = compile_credit::prewalk(rules, backward)?;
     let mut working = Held::try_new_exact(&budget, bytes)?;

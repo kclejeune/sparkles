@@ -648,3 +648,86 @@ fn wildcards_in_later_columns() {
         assert_eq!(inferred(&s), full(&positive, &ttl), "kept {kept}");
     }
 }
+
+/// A rule program that includes the OWL rule set, under any of its names, is refused on
+/// every path, with and without `not`, and the include alone still runs. A program with
+/// `<rdfs>` runs.
+#[test]
+fn programs_refuse_the_owl_include() {
+    let s = store("ex:a ex:p ex:b . ex:C rdfs:subClassOf ex:D . ex:a a ex:C . ex:t a ex:T .");
+    let body = ".decl r(x)\nr(?x) :- (?x ex:p ?y).";
+    for (set, head) in [
+        ("owl-rl", "(?x rdf:type ex:B) :- r(?x)."),
+        (
+            "owl-rl",
+            "(?x rdf:type ex:B) :- (?x rdf:type ex:T), not r(?x).",
+        ),
+        ("OWLMicro", "(?x rdf:type ex:B) :- r(?x)."),
+        (
+            "owl",
+            "(?x rdf:type ex:B) :- (?x rdf:type ex:T), not (?x ex:q ex:yes).",
+        ),
+    ] {
+        let text = format!("@prefix ex: <http://ex.org/> .\n@include <{set}> .\n{body}\n{head}\n");
+        let p = rules(&text);
+        let e = materialize_incremental(
+            &s,
+            &p,
+            &Extras::default(),
+            Incremental::default(),
+            &ReasonOptions::default(),
+        )
+        .unwrap_err();
+        let lower = set.to_ascii_lowercase();
+        let want =
+            format!("a rule program, with relation atoms or 'not', cannot include <{lower}>");
+        assert!(format!("{e:#}").contains(&want), "{set}: {e:#}");
+        let e = QueryReasoner::new(p.clone(), &Extras::default(), Inputs::default())
+            .err()
+            .expect("refused at query time");
+        assert!(format!("{e:#}").contains(&want), "{set}: {e:#}");
+        let snap = s.snapshot();
+        let e = explain(
+            &ExplainInput {
+                snap,
+                profile: &p,
+                extras: &Extras::default(),
+                inputs: &[sparkles_core::id::Id::DEFAULT_GRAPH],
+                inferred: None,
+            },
+            &[
+                ex("a"),
+                Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+                ex("B"),
+            ],
+            &ExplainOptions::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains(&want), "{set}: {e:#}");
+    }
+    let jena = "@prefix ex: <http://ex.org/> .\n@include <owl-rl> .\n[b: (?x ex:p ?y) -> (?x rdf:type ex:B)]\n";
+    reason(&s, &rules(jena), None, None);
+    let text = format!(
+        "@prefix ex: <http://ex.org/> .\n@include <rdfs> .\n{body}\n(?x rdf:type ex:C) :- r(?x).\n"
+    );
+    let s = store("ex:a ex:p ex:b . ex:C rdfs:subClassOf ex:D .");
+    let r = reason(&s, &rules(&text), None, None);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(inferred(&s).contains(&format!(
+        "<{EX}a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}D>"
+    )));
+    // with `not`, rdfs's rules over every predicate read the negating rule's own facts,
+    // so the program does not stratify
+    let text = format!(
+        "@prefix ex: <http://ex.org/> .\n@include <rdfs> .\n{body}\n(?x rdf:type ex:B) :- (?x rdf:type ex:T), not r(?x).\n"
+    );
+    let e = materialize_incremental(
+        &s,
+        &rules(&text),
+        &Extras::default(),
+        Incremental::default(),
+        &ReasonOptions::default(),
+    )
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("not stratified"), "{e:#}");
+}

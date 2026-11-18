@@ -72,9 +72,8 @@ r(?x, ?n) :- (?x ex:p ?y), makeTemp(?n).
     assert_eq!(origins, vec![Some(0), Some(1), Some(2)]);
 }
 
-/// The stratified `noValue` warning names the rule set an `@include` brought the rule
-/// from, and a relation head variable that the body does not bind is an existential,
-/// which the run refuses.
+/// A program that includes `owl-rl` is refused, and a relation head variable that the
+/// body does not bind is an existential, which the run refuses.
 #[test]
 fn included_rules_and_existentials() {
     let text = "@prefix ex: <http://ex.org/> .
@@ -86,29 +85,14 @@ r(?x) :- (?x ex:p ?y).
     let rules = parse_rules(text).unwrap();
     let t = terms();
     let mut w = WorkingWarnings::new(&t.budget());
-    match frontend::compile(&rules, &t, &mut w, false) {
-        Ok(info) => {
-            let b = sparkles_core::store::Store::in_memory(StoreOptions::default());
-            let base = crate::facts::Base::new(b.snapshot(), &[Id::DEFAULT_GRAPH]).unwrap();
-            let mut g = Graph::with_base(std::sync::Arc::new(base));
-            engine::run_program(&mut g, &info.program, &t, &limits(), &mut w).unwrap();
-            let warned = w
-                .as_slice()
-                .iter()
-                .any(|m| m.contains("of the included rule set <owl-rl>"));
-            let novalue = info.program.rules.iter().any(|r| {
-                r.body
-                    .iter()
-                    .any(|l| matches!(l, Literal::Builtin(b) if b.kind == B::NoValue))
-            });
-            assert_eq!(warned, novalue);
-        }
-        // `owl-rl` with a negation that does not stratify is refused with its cycle
-        Err(e) => assert!(
-            format!("{e:#}").contains("cycle") || format!("{e:#}").contains("negat"),
-            "{e:#}"
-        ),
-    }
+    // a program does not include the OWL rule set (rule_programs.rs tests every path)
+    let e = frontend::compile(&rules, &t, &mut w, false)
+        .err()
+        .expect("refused");
+    assert!(
+        format!("{e:#}").contains("cannot include <owl-rl>"),
+        "{e:#}"
+    );
     let text = "@prefix ex: <http://ex.org/> .
 .decl r(x, y)
 [e: (?x ex:p ?z) -> r(?x, ?y)]
@@ -200,4 +184,36 @@ fn wide_programs_are_charged_first() {
         "{e:#}"
     );
     assert!(budget.peak() <= 256 << 10, "{}", budget.peak());
+}
+
+/// A Jena rule's `noValue` in a program with a negated atom reads complete lower strata,
+/// and the warning names the rule, and the included rule set when the rule came from one.
+#[test]
+fn stratified_novalue_warnings_name_the_rule_and_its_set() {
+    let text = "@prefix ex: <http://ex.org/> .
+.decl r(x)
+[nv: (?x ex:p ?y), noValue(?x, ex:q, ex:yes) -> (?x ex:s ex:yes)]
+[own: (?x ex:p ?y), noValue(?x, ex:t, ex:yes) -> (?x ex:u ex:yes)]
+r(?x) :- (?x ex:p ?y), not (?x ex:blocked ex:yes).
+";
+    let mut rules = parse_rules(text).unwrap();
+    rules[0].include = Some("rdfs".into());
+    let t = terms();
+    let mut w = WorkingWarnings::new(&t.budget());
+    let info = frontend::compile(&rules, &t, &mut w, false).unwrap();
+    let mut g = Graph::default();
+    let mut w = WorkingWarnings::new(&t.budget());
+    engine::run_program(&mut g, &info.program, &t, &limits(), &mut w).unwrap();
+    let got = w.as_slice().to_vec();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(
+        got[0].starts_with(
+            "the noValue of rule 'nv' of the included rule set <rdfs> reads complete lower strata"
+        ),
+        "{got:?}"
+    );
+    assert!(
+        got[1].starts_with("the noValue of rule 'own' reads complete lower strata"),
+        "{got:?}"
+    );
 }

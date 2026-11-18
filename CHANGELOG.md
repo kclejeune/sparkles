@@ -10,7 +10,7 @@ forward rules as `head :- body.` clauses, the rule-file subset of the Datalog sy
 spec C24 §6.2. Such a text is one stratified program, which materialization, incremental
 maintenance, witnesses, explanations, query-time reasoning and why-not answers all read,
 and relation facts never reach the dataset. A program with `not` runs in full on every
-update, and one with an existential head is refused. A text without the new syntax is
+update, and one with an existential head or an include of the OWL rule sets is refused. A text without the new syntax is
 parsed and evaluated as before. `Clause` gains the `Relation` and `Not` variants and
 `Rule` the `include` field, `parser::rules_text` writes a parsed program back as text, and
 the web UI shows a relation fact in an explanation as `name(args)` and leaves it out of
