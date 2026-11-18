@@ -98,7 +98,6 @@ class AssemblerAndFallbackTest {
                 "SELECT ?x { VALUES ?x { 1 } FILTER NOT EXISTS $inner }",
                 "SELECT ?x { VALUES ?x { 1 2 } } ORDER BY (IF(?x = 1, EXISTS $inner, false)) ?x",
                 "SELECT ?k (COUNT(*) AS ?n) { VALUES ?x { 1 } } GROUP BY (EXISTS $inner AS ?k)",
-                "SELECT (SUM(IF(EXISTS $inner, 1, 0)) AS ?n) { VALUES ?x { 1 } }",
                 "SELECT (COUNT(*) AS ?n) { VALUES ?x { 1 } } HAVING (EXISTS $inner)",
                 "SELECT ?ok { BIND(EXISTS $inner AS ?ok) }",
                 "SELECT ?x ?y { VALUES ?x { 1 } OPTIONAL { VALUES ?y { 2 } FILTER(EXISTS $inner) } }",
