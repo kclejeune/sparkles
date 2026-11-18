@@ -61,8 +61,7 @@ impl Server {
             }
             let err = std::fs::read_to_string(&log).unwrap_or_default();
             assert!(
-                err.to_lowercase().contains("in use")
-                    || err.contains(&format!("binding 127.0.0.1:{port}")),
+                port_taken(&err, port),
                 "the server exited before it answered on port {port}: {err}"
             );
         }
@@ -109,6 +108,16 @@ impl Server {
             0
         );
     }
+}
+
+/// Whether a server's error output says that binding the listener on `port` failed
+/// because the address is in use. The server reports every bind failure as `binding
+/// ADDR`, so the cause after that context must be the OS's address-in-use error. Any other
+/// bind failure, such as a descriptor limit, or an unrelated resource in use is not one.
+fn port_taken(err: &str, port: u16) -> bool {
+    let context = format!("binding 127.0.0.1:{port}");
+    err.find(&context)
+        .is_some_and(|at| err[at + context.len()..].contains("Address already in use"))
 }
 
 impl Drop for Server {
@@ -901,4 +910,41 @@ fn declared_prefixes() {
         .json();
     assert_eq!(j["sources"]["kclj"], "locked");
     assert_eq!(j["warnings"][0]["prefix"], "mem");
+}
+
+/// A real address collision is the one early exit that moves on to another port.
+#[test]
+fn only_a_port_in_use_moves_the_server_to_another_port() {
+    let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(BIN)
+        .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
+        .arg("--data")
+        .arg(dir.path().join("data"))
+        .env_remove("SPARKLES_BACKUP_CONFIG")
+        .stdout(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(port_taken(&err, port), "{err}");
+    drop(holder);
+
+    for err in [
+        format!(
+            "Error: binding 127.0.0.1:{port}\n\nCaused by:\n    Too many open files (os error 24)"
+        ),
+        format!(
+            "Error: binding 127.0.0.1:{port}\n\nCaused by:\n    Permission denied (os error 13)"
+        ),
+        "Error: dataset already in use".to_string(),
+        format!(
+            "Error: binding 127.0.0.1:{}\n\nCaused by:\n    Address already in use (os error 98)",
+            port.wrapping_add(1)
+        ),
+        format!("Error: Address already in use (os error 98)\nError: binding 127.0.0.1:{port}"),
+    ] {
+        assert!(!port_taken(&err, port), "{err}");
+    }
 }
