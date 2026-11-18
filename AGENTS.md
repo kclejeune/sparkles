@@ -316,6 +316,12 @@ files call for, with Clippy and the Rust tests for the packages they can affect,
 scripts and files that no rule covers run everything. Push when the tests pass and the
 screen shows no query 10% or more slower after the rerun of the flagged queries with more
 rounds, which `bench:nsc` runs on the same instance and reports beside the first pass.
+The screen is skipped when `gate.sh` prints `skip screen (reason)`, which it does only
+when every changed file is one that cannot reach the server's query path or the screen,
+such as documentation, the CI scripts, tests or the OWL and validation crates. Any change
+to the query path, the server, `Cargo.lock`, the toolchain, `mise.toml`, the build
+profiles or the screen's own scripts runs it, as the
+[batch query screen section](docs/DEVELOPMENT.md#batch-query-screen) describes.
 `scripts/premerge.sh` checks the generated clients, the binding lock files, the Python
 parity list, the doc paths and the script tests in minutes, and runs on the merged batch
 before the gate starts.

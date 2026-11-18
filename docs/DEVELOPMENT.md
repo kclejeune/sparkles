@@ -310,9 +310,17 @@ the packages that read it. A file in a package's directory belongs to that packa
 few files outside the crates, such as `docs/openapi.json` and `ui/`, belong to the
 packages whose builds or tests read them. The selection then grows by every package that
 depends on a chosen one through normal, build or dev-dependencies. Documentation and
-scripts select no package. A change to a shared root, such as `Cargo.toml`, `Cargo.lock`,
-`mise.toml`, `.config/`, `testsuite/` or `crates/sparkles-core`, or to a file that the
-rules do not cover, keeps the whole workspace.
+scripts select no package. A change to a shared root, such as `Cargo.toml`, `.config/`,
+`testsuite/` or `rust-toolchain.toml`, or to a file that the rules do not cover, keeps
+the whole workspace. A change to `crates/sparkles-core` selects it and the packages that
+depend on it, which leaves out about a tenth of the test time.
+
+`Cargo.lock` and `mise.toml` are compared at the merge base and at the change. A lock
+change selects the workspace packages whose locked dependencies, normal, build or dev,
+reach an entry that it adds, removes or alters. A `mise.toml` change selects no package
+when it alters only the definitions of tasks that the `lint` and `test` tasks do not
+name, directly or through the tasks they name. Any other `mise.toml` change, and a lock
+that does not parse or names a package it does not list, keeps the whole workspace.
 
 Clippy runs with `-p` for each chosen package. nextest still builds the whole workspace,
 so its test binaries are the ones a full run builds and the shared cache already holds,
@@ -990,7 +998,9 @@ and the commit to the checks it calls for, and writes the choice and its reasons
 | The public surface: `crates/sparkles`, the OpenAPI description and the baselines that `api:check` compares | Every binding's checks. |
 | SPARQL parsing, algebra and evaluation in `crates/sparkles-core/src/sparql`, the RDF parsers, the XSD functions, GeoSPARQL, the SHACL, SHACLC and ShEx crates and the suites' own files | `test:w3c`, `test:shacl` and `test:shex`. Unit-test files inside `src` do not count. |
 | The streaming executor, the spill files and the W3C harness | The plain and encrypted spill matrices. |
-| `Cargo.toml`, `Cargo.lock`, the toolchain, `mise.toml`, `.config/`, `vendor/`, `scripts/ci.sh`, `scripts/gate/` and the other CI scripts | Everything. |
+| `Cargo.lock` | `lint`, `test` and `licenses:check` for the packages whose locked dependencies change, and the conformance suites and spill matrices when sparkles-core, the SHACL, SHACLC or ShEx crate is among them. A lock that cannot be compared entry by entry runs everything. |
+| `mise.toml` | The ci tasks and conformance suites whose definitions change, or that name a task whose definition changes, directly or not. A change outside the task definitions runs everything. |
+| `Cargo.toml`, the toolchain, `.config/`, `vendor/`, `scripts/ci.sh`, `scripts/gate/` and the other CI scripts | Everything. |
 | A file that no rule covers, or no changed file | Everything. |
 
 The run then calls `scripts/ci.sh` without `--force`, with the chosen tasks and with
@@ -1008,6 +1018,28 @@ change that a binding's tests would notice.
 `python3 scripts/gate/select-checks.py --base origin/main` prints the selection for the
 checkout's `HEAD`, and `gate.sh --dry-run <rev>` prints whether the batch needs the
 conformance half and the hosts it would use.
+
+### Batch query screen
+
+The selection also decides whether the batch query screen runs, since the screen times
+SPARQL queries against a release build of the server and a batch that cannot change that
+build or the screen gains nothing from it. `select-checks.py` prints `screen run` or
+`screen skip` with the reason, and `gate.sh` prints `run screen (reason)` or
+`skip screen (reason)` before it starts the gate, so the batch's log records the choice.
+The rule reads the changed paths, not the selected packages, because a change to the OWL
+crate selects sparkles-core's dependents, the server among them, through the dependency
+graph without touching query execution.
+
+The screen is skipped only when every changed file is one that cannot reach the server's
+query path or the screen. These are documentation, the GitHub workflows, deployment and
+Nix files, the test suites' data, the JavaScript and JVM packages, the CI, gate, binding,
+licence and release scripts with the script tests, the tests, benchmarks, examples and
+fuzz targets of any crate, the unit-test files inside a crate's `src`, and the OWL,
+SHACL, SHACLC, ShEx, client, office import, memory import, browser formatter and binding
+crates. Any other file runs the screen. That includes the query engine, the server and
+every other crate it links, `Cargo.toml`, `Cargo.lock`, the toolchain, `mise.toml`,
+`vendor/`, the UI and the OpenAPI files that the server embeds, the scripts that build
+and time the screen, a file that no rule names, and an empty change. `--full` runs it.
 
 ### Nightly gate
 
