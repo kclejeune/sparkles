@@ -153,6 +153,36 @@ request or on every write, and the schema report counts what the data holds.
   a backward head variable that no body clause binds or a more deeply nested backward
   rule cannot be split this way and is refused with an error that names it
   ([F17 §5.2](../specs/F17-query-time-reasoning.md#52-hybrid-rules)).
+* A rule text can declare relations and write rules over them, the subset of the Datalog
+  syntax of [C24 §6.2](../specs/C24-json-query-languages.md#62-syntax) that rule files
+  take. `.decl name(col, …)` declares a relation of that many columns, before or after
+  its rules. An atom `name(args)` of a declared relation can stand in a body or a head
+  wherever a triple pattern can, `not` before a triple pattern or a relation atom in a
+  body negates it, and `head :- body.` writes a forward rule whose head is one relation
+  atom or triple pattern. In a relation atom or a negated atom, `_` and `?_` match any
+  value. A relation's facts are not RDF and never reach the dataset, and an atom whose
+  predicate is a variable does not read them. The following program derives the
+  property chains of any length.
+
+  ```text
+  .decl chain(x, h, rest, y)
+  chain(?x, ?h, ?r, ?y) :- (?h owl:propertyChainAxiom ?l), (?l rdf:first ?p), (?l rdf:rest ?r), (?x ?p ?y).
+  chain(?x, ?h, ?r2, ?z) :- chain(?x, ?h, ?r, ?y), (?r rdf:first ?p), (?r rdf:rest ?r2), (?y ?p ?z).
+  (?x ?h ?y) :- chain(?x, ?h, rdf:nil, ?y).
+  ```
+
+  A text that uses relations or `not` is one program, its `@include`d rule sets
+  included, and it must stratify, which means that no relation or predicate depends on
+  its own negation through recursion. A program that does not is refused with the cycle
+  named. Its strata run in order, so a `noValue` of a Jena rule in such a program reads
+  the complete lower strata, and the run warns once for each such rule with the rule set
+  it came from. Materialization, explanations, witnesses, query-time reasoning and
+  why-not answers read a program as they read Jena rules, and an explanation shows a
+  relation fact as a node `name(args)`. A program without `not` is maintained
+  incrementally, and one with `not` runs in full on every update. A query-time demand
+  binds only the first column of a relation of three or more columns, so writing a
+  relation with the column that queries bind first keeps their demand narrow
+  ([F23](../specs/F23-reasoner-core/SPEC.md#rule-ir)).
 * Embedded query providers implement `ReasoningSession::intensional` with a
   `Result<bool>` return. Constant interning can refuse a memory reservation, and
   callers propagate that refusal before preparing demands. Implementations that
@@ -852,6 +882,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 
 ### Reasoning and validation
 
+* A rule program cannot have an existential head, a head variable that no body atom
+  binds, until the restricted chase of item 839, and a query `?-` and comparisons such as
+  `?x < 5` belong to item 72's Datalog query language. A demand that binds a later column
+  of a relation of three or more columns derives every fact of the relation, which keeps
+  `owl-rl`'s chains and keys in rules per length. Roadmap items 1102 and 517.
 * An update of a `shacl-af` materialization runs in full, and the rules are evaluated
   per focus node in each round rather than semi-naively. Native maintenance of triple
   rules and of SPARQL rules whose bodies are basic graph patterns, and a recompute stratum

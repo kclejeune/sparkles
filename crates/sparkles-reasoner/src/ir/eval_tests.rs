@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod demand;
+mod frontend;
 mod maintain;
 mod whynot;
 

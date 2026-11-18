@@ -4,6 +4,7 @@
 
 use super::maintain::chain_and_key_rules;
 use super::*;
+use crate::engine::frontend::ProgramInfo;
 use crate::extras::Extras;
 use crate::facts::Base;
 use crate::incremental::tests::{Vocab as TV, set_default_graph};
@@ -32,7 +33,9 @@ pub(super) fn reasoner(source: &Source) -> QueryReasoner {
         Inputs::default(),
     )
     .unwrap()
-    .with_program(Arc::new(move |t: &Terms| Ok(build(&s, t))))
+    .with_program(Arc::new(move |t: &Terms, _: &mut WorkingWarnings| {
+        Ok(ProgramInfo::bare(build(&s, t), &t.budget()))
+    }))
 }
 
 fn request(snap: &Arc<Snapshot>) -> SessionRequest {
@@ -197,7 +200,7 @@ fn demand_over_chains_and_keys_equals_the_full_run() {
             "both",
         );
     }
-    // the relations by their first column: chain(list, i, x, y) and keyed(x, i, k)
+    // the relations by their first column: chain(x, list, i, y) and keyed(x, i, k)
     for r in 0..2 {
         for &s in &values {
             check(&v, &source, &base, &[rp(r, s, None)], "relation");
@@ -646,8 +649,9 @@ fn a_derived_list_read_in_its_stage_gives_its_members() {
 
 /// The cost probe of §20.7: the facts a session derives for a chain's triple with its
 /// subject or its object bound, over 40 disjoint paths, with the chain written through
-/// the relation `chain(list, i, x, y)` and as one rule of its length, as the profile's
-/// rules per length write it. Run with `--ignored --nocapture`.
+/// the relation `chain(x, list, i, y)` (subject first, the order rule programs use), as
+/// `chain(list, i, x, y)`, and as one rule of its length, as the profile's rules per
+/// length write it. Run with `--ignored --nocapture`.
 #[test]
 #[ignore]
 fn demand_cost_probe() {
@@ -660,29 +664,29 @@ fn demand_cost_probe() {
     });
     let (p0, p1, p2) = (v.props[0], v.props[1], v.props[2]);
     let p = move |i: usize| if i.is_multiple_of(2) { p0 } else { p1 };
-    // the same chain with its subject as the first column: chain(x, list, i, y)
+    // the same chain with the list first: chain(list, i, x, y)
     let list = v.inds[7];
-    let subject_first: Source = Arc::new(move |_: &Terms| {
+    let list_first: Source = Arc::new(move |_: &Terms| {
         let mut rels = Relations::default();
         let chain = rels.declare("chain", 4, false).unwrap();
         let mut rules = vec![rule(
             "chain-0",
             vec![pos(tri(V(0), p(0), V(1)))],
-            vec![head(rel(chain, &[V(0), C(list), C(n(1)), V(1)]))],
+            vec![head(rel(chain, &[C(list), C(n(1)), V(0), V(1)]))],
         )];
         for i in 1..6 {
             rules.push(rule(
                 &format!("chain-{i}"),
                 vec![
-                    pos(rel(chain, &[V(0), C(list), C(n(i as i64)), V(1)])),
+                    pos(rel(chain, &[C(list), C(n(i as i64)), V(0), V(1)])),
                     pos(tri(V(1), p(i), V(2))),
                 ],
-                vec![head(rel(chain, &[V(0), C(list), C(n(i as i64 + 1)), V(2)]))],
+                vec![head(rel(chain, &[C(list), C(n(i as i64 + 1)), V(0), V(2)]))],
             ));
         }
         rules.push(rule(
             "chain-end",
-            vec![pos(rel(chain, &[V(0), C(list), C(n(6)), V(1)]))],
+            vec![pos(rel(chain, &[C(list), C(n(6)), V(0), V(1)]))],
             vec![head(tri(V(0), p2, V(1)))],
         ));
         (rels, rules)
@@ -712,8 +716,8 @@ fn demand_cost_probe() {
         .flat_map(|k| (0..6).map(move |i| [node(k, i), p(i), node(k, i + 1)]))
         .collect();
     for (what, source) in [
-        ("relation", &relation),
-        ("subject first", &subject_first),
+        ("subject first", &relation),
+        ("list first", &list_first),
         ("per length", &per_length),
     ] {
         let want = full(&v, source, &base);
@@ -813,7 +817,9 @@ fn a_lowering_past_the_budget_is_a_memory_failure() {
     let vv = v.clone();
     let source: Source = Arc::new(move |_: &Terms| chain_and_key_rules(&vv));
     let s = source.clone();
-    let ps: crate::query::ProgramSource = Arc::new(move |t: &Terms| Ok(build(&s, t)));
+    let ps: crate::query::ProgramSource = Arc::new(move |t: &Terms, _: &mut WorkingWarnings| {
+        Ok(ProgramInfo::bare(build(&s, t), &t.budget()))
+    });
     let terms = Terms::new(v.store.snapshot());
     let small = crate::budget::Budget::new(Some(256));
     let e = Session::program_rules_for_tests(&ps, &terms, &small).unwrap_err();
@@ -832,16 +838,18 @@ fn the_relation_catalog_stays_charged() {
     let name = "r".repeat(1 << 20);
     let v = Arc::new(TV::new());
     let p0 = v.props[0];
-    let source: crate::query::ProgramSource = Arc::new(move |t: &Terms| {
-        let mut rels = Relations::default();
-        let r = rels.declare(&name, 1, false).unwrap();
-        let rules = vec![rule(
-            "r",
-            vec![pos(tri(V(0), p0, V(1)))],
-            vec![head(rel(r, &[V(0)]))],
-        )];
-        Ok(Program::new(rels, rules, &Vocab::of(t), &t.budget()).unwrap())
-    });
+    let source: crate::query::ProgramSource =
+        Arc::new(move |t: &Terms, _: &mut WorkingWarnings| {
+            let mut rels = Relations::default();
+            let r = rels.declare(&name, 1, false).unwrap();
+            let rules = vec![rule(
+                "r",
+                vec![pos(tri(V(0), p0, V(1)))],
+                vec![head(rel(r, &[V(0)]))],
+            )];
+            let p = Program::new(rels, rules, &Vocab::of(t), &t.budget()).unwrap();
+            Ok(ProgramInfo::bare(p, &t.budget()))
+        });
     let budget = crate::budget::Budget::new(None);
     let terms = Terms::new(v.store.snapshot());
     terms.set_budget(&budget).unwrap();

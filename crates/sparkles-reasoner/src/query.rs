@@ -66,11 +66,17 @@ struct Shared {
     /// a rule program of the IR (item 839) that the sessions evaluate in place of
     /// `rules`, made over each session's terms (see [`QueryReasoner::with_program`])
     program: Option<ProgramSource>,
+    /// `program` was given directly (by a test) and not made from the rule text, so the
+    /// table cache's keys do not name it
+    direct_program: bool,
 }
 
 /// A rule program of the IR over a session's terms.
-pub(crate) type ProgramSource =
-    Arc<dyn Fn(&Terms) -> anyhow::Result<crate::ir::Program> + Send + Sync>;
+pub(crate) type ProgramSource = Arc<
+    dyn Fn(&Terms, &mut WorkingWarnings) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
+        + Send
+        + Sync,
+>;
 
 /// A reasoner that derives facts for queries on demand, with the rules of a profile.
 #[derive(Clone)]
@@ -91,6 +97,15 @@ impl QueryReasoner {
                     .to_string(),
             );
         }
+        // a rule text with relations or `not` is a rule program, compiled by the frontend
+        // over each session's terms (item 839's plan, §22.4)
+        let program: Option<ProgramSource> = crate::parser::uses_program(&rules).then(|| {
+            let parsed = Arc::new(rules.clone());
+            let source: ProgramSource = Arc::new(move |t: &Terms, w: &mut WorkingWarnings| {
+                crate::engine::frontend::compile(&parsed, t, w, true)
+            });
+            source
+        });
         Ok(QueryReasoner {
             shared: Arc::new(Shared {
                 digest: crate::rules_digest(&profile, extras),
@@ -106,7 +121,8 @@ impl QueryReasoner {
                 max_iterations: usize::MAX,
                 max_union: crate::qlrewrite::DEFAULT_MAX_UNION,
                 warnings,
-                program: None,
+                program,
+                direct_program: false,
             }),
         })
     }
@@ -129,6 +145,7 @@ impl QueryReasoner {
                 max_union: s.max_union,
                 warnings: s.warnings.clone(),
                 program: s.program.clone(),
+                direct_program: s.direct_program,
             }),
         }
     }
@@ -151,15 +168,16 @@ impl QueryReasoner {
                 max_union: n.max(1),
                 warnings: s.warnings.clone(),
                 program: s.program.clone(),
+                direct_program: s.direct_program,
             }),
         }
     }
 
     /// The same reasoner over the rule program that `source` makes over each session's
-    /// terms, in place of its profile's rules (item 839's plan, §20.2). No public path
-    /// reaches it before the rule frontend (Phase 5), and its sessions neither read nor
-    /// fill the table cache, whose keys name the profile's rules.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// terms, in place of its profile's rules (item 839's plan, §20.2), for tests that
+    /// build IR rules directly. Its sessions neither read nor fill the table cache, whose
+    /// keys name the profile's rule text and not `source`.
+    #[cfg(test)]
     pub(crate) fn with_program(self, source: ProgramSource) -> QueryReasoner {
         let s = &self.shared;
         QueryReasoner {
@@ -176,6 +194,7 @@ impl QueryReasoner {
                 max_union: s.max_union,
                 warnings: s.warnings.clone(),
                 program: Some(source),
+                direct_program: true,
             }),
         }
     }
@@ -266,6 +285,10 @@ impl QueryReasoner {
                     (!B::from_name(&b.name).is_some_and(pure)).then(|| format!("calls {}", b.name))
                 }
                 Clause::Rule(r) => find(&r.body, false).or_else(|| find(&r.head, true)),
+                // a relation atom reads or gives facts as a triple does, and `not` reads
+                // the facts as `noValue` does
+                Clause::Relation(_) => None,
+                Clause::Not(_) => Some("negates an atom".to_string()),
                 Clause::Triple(t) => (head
                     && [&t.subject, &t.predicate, &t.object]
                         .into_iter()
@@ -498,7 +521,7 @@ enum Compiled {
         rules: Vec<CRule>,
         infos: Vec<engine::RuleInfo>,
         /// the program, which charges its relation catalog, kept for the catalog
-        program: crate::ir::Program,
+        program: crate::engine::frontend::ProgramInfo,
         /// the program runs as `engine::run_program` runs it: it has an IR feature, so
         /// its lists are read again when their cells arrive, in every stage
         replay: bool,
@@ -510,20 +533,26 @@ enum Compiled {
 /// The lowered rules of the program that `source` makes over `terms`, in stratum order.
 /// Demand stages every negation in a stage of its own below its rule (see
 /// [`demand::transform`]), so the strata's boundaries are not kept.
-fn program_rules(source: &ProgramSource, terms: &Terms, budget: &Arc<Budget>) -> Result<Compiled> {
+fn program_rules(
+    source: &ProgramSource,
+    terms: &Terms,
+    budget: &Arc<Budget>,
+    warnings: &mut WorkingWarnings,
+) -> Result<Compiled> {
     let failed = |e: anyhow::Error| match BudgetFailure::from_anyhow(&e) {
         Some(m) => memory_error(m, "the rule program"),
         None => component(RULES_CODE, format!("{e:#}")),
     };
-    let program = source(terms).map_err(failed)?;
-    let mut lowered = program.lower(budget).map_err(|e| match e {
+    let program = source(terms, warnings).map_err(failed)?;
+    let mut lowered = program.program.lower(budget).map_err(|e| match e {
         crate::ir::lower::LowerError::Memory(m) => memory_error(m, "the rule program"),
         e => component(RULES_CODE, e.to_string()),
     })?;
     let replay = lowered.shape != crate::ir::lower::Shape::Jena;
     let mut held = crate::budget::Held::new(budget);
-    let (rules, infos) = crate::explain::flat_rules(&program, &mut lowered, &mut held)
-        .map_err(|e| memory_error(e, "the rule program"))?;
+    let (rules, infos) =
+        crate::explain::flat_rules(&program.program, &mut lowered, &mut held, &program.lines)
+            .map_err(|e| memory_error(e, "the rule program"))?;
     Ok(Compiled::Program {
         rules,
         infos,
@@ -557,7 +586,7 @@ impl Compiled {
     fn relations(&self) -> Option<&crate::ir::Relations> {
         match self {
             Compiled::Profile(_) => None,
-            Compiled::Program { program, .. } => Some(&program.relations),
+            Compiled::Program { program, .. } => Some(&program.program.relations),
         }
     }
 }
@@ -666,7 +695,7 @@ impl Session {
                 engine::compile_info(&shared.rules, &terms, &mut warnings, true)
                     .map_err(|e| memory_error(e, "the compiled rules"))?,
             ),
-            Some(source) => program_rules(source, &terms, &budget)?,
+            Some(source) => program_rules(source, &terms, &budget, &mut warnings)?,
         };
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
         let resolved = match &req.readable {
@@ -709,9 +738,10 @@ impl Session {
             }
             None => (None, None),
         };
-        // a rule program's tables are not kept, since the cache's keys name the
-        // profile's rules (item 839's plan, §20.2)
-        let (anchor_key, schema_view, publish_limit) = if shared.program.is_some() {
+        // the tables of a program that a test gives directly are not kept, since the
+        // cache's keys name the profile's rule text; a program from the rule text is
+        // named by the digest of that text (item 839's plan, §22.5)
+        let (anchor_key, schema_view, publish_limit) = if shared.direct_program {
             (None, None, None)
         } else {
             (anchor_key, schema_view, publish_limit)
@@ -1071,7 +1101,8 @@ impl Session {
         budget: &Arc<Budget>,
     ) -> Result<usize> {
         // the bytes the session's rules hold charged while they live
-        program_rules(source, terms, budget).map(|_compiled| budget.used())
+        let mut w = WorkingWarnings::new(budget);
+        program_rules(source, terms, budget, &mut w).map(|_compiled| budget.used())
     }
 
     fn equality_table(&self) -> Option<(Table, Held)> {

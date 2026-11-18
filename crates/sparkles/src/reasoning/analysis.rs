@@ -171,13 +171,8 @@ pub(crate) fn program(dataset: &Dataset, options: &AnalysisOptions) -> Result<An
                 changed |= forward(rule);
             }
             if changed {
-                program.profile = Profile::Rules(
-                    rules
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+                // with the declarations of the relations, so that a rule program reads back
+                program.profile = Profile::Rules(sparkles_reasoner::parser::rules_text(&rules));
             }
         }
         return Ok(program);

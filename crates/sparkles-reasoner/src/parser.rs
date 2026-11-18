@@ -59,12 +59,24 @@ pub struct BuiltinCall {
     pub args: Vec<Node>,
 }
 
+/// An atom `name(args)` of a relation that a `.decl` declares (spec C24 §6.2), a
+/// relation of the reasoner's rule program (item 839).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RelationAtom {
+    pub name: String,
+    pub args: Vec<Node>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Clause {
     Triple(TriplePattern),
     Builtin(BuiltinCall),
     /// A nested rule (only meaningful in a head).
     Rule(Box<Rule>),
+    /// An atom of a declared relation.
+    Relation(RelationAtom),
+    /// `not` before a triple pattern or a relation atom in a body: stratified negation.
+    Not(Box<Clause>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -85,6 +97,8 @@ pub struct Rule {
     pub direction: Direction,
     /// 1-based line of the rule's first token
     pub line: usize,
+    /// the built-in rule set that an `@include` brought the rule from, if one did
+    pub include: Option<String>,
 }
 
 impl Rule {
@@ -166,6 +180,8 @@ impl fmt::Display for Clause {
             Clause::Triple(t) => write!(f, "({} {} {})", t.subject, t.predicate, t.object),
             Clause::Builtin(b) => write!(f, "{}", Node::Functor(b.name.clone(), b.args.clone())),
             Clause::Rule(r) => write!(f, "{r}"),
+            Clause::Relation(a) => write!(f, "{}", Node::Functor(a.name.clone(), a.args.clone())),
+            Clause::Not(c) => write!(f, "not {c}"),
         }
     }
 }
@@ -202,6 +218,12 @@ enum Tok {
     Arrow,
     BackArrow,
     Dot,
+    /// `.decl`, which declares a relation
+    Decl,
+    /// `:-`, between the head and the body of a Datalog clause
+    Neck,
+    /// `?-`, which begins a query
+    Query,
     Iri(String),
     Word(String),
     Directive(String),
@@ -224,6 +246,9 @@ impl fmt::Display for Tok {
             Tok::Arrow => f.write_str("'->'"),
             Tok::BackArrow => f.write_str("'<-'"),
             Tok::Dot => f.write_str("'.'"),
+            Tok::Decl => f.write_str("'.decl'"),
+            Tok::Neck => f.write_str("':-'"),
+            Tok::Query => f.write_str("'?-'"),
             Tok::Iri(i) => write!(f, "<{i}>"),
             Tok::Word(w) => write!(f, "'{w}'"),
             Tok::Directive(d) => write!(f, "'{d}'"),
@@ -442,6 +467,9 @@ fn lex(text: &str) -> Result<Vec<Token>, RuleParseError> {
                 let tok = match w.as_str() {
                     "->" => Tok::Arrow,
                     "." => Tok::Dot,
+                    ".decl" => Tok::Decl,
+                    ":-" => Tok::Neck,
+                    "?-" => Tok::Query,
                     _ if w.starts_with('@') => Tok::Directive(w),
                     _ => Tok::Word(w),
                 };
@@ -463,6 +491,18 @@ struct Parser {
     depth: usize,
     /// `@hybrid jena`: nested backward rules become query-time rules (spec F17 §5.2)
     hybrid_jena: bool,
+    /// the relations that `.decl` declares, with their arity and where
+    decls: HashMap<String, Decl>,
+    /// the indices, among the rules parsed, of the Datalog clauses `head :- body.`
+    necks: Vec<usize>,
+}
+
+/// A relation's declaration: its arity and the position of its name.
+#[derive(Clone, Copy)]
+struct Decl {
+    arity: usize,
+    line: usize,
+    col: usize,
 }
 
 const MAX_INCLUDE_DEPTH: usize = 8;
@@ -525,8 +565,25 @@ impl Parser {
                     // stray terminator, e.g. `[rule] .`
                     self.pos += 1;
                 }
+                Tok::Decl => {
+                    self.pos += 1;
+                    self.parse_decl(&t)?;
+                }
+                Tok::Query => {
+                    return Err(err(
+                        t.line,
+                        t.col,
+                        "a query '?-' cannot be part of a rule set (queries over rules are \
+                         roadmap item 72's Datalog query language)",
+                    ));
+                }
                 _ => {
+                    let at = self.pos;
                     let r = self.parse_rule(false)?;
+                    if self.toks[at..self.pos].iter().any(|t| t.tok == Tok::Neck) && self.depth == 0
+                    {
+                        self.necks.push(out.len());
+                    }
                     out.push(r);
                 }
             }
@@ -559,6 +616,75 @@ impl Parser {
             self.pos += 1;
         }
         let _ = at;
+        Ok(())
+    }
+
+    /// `.decl name(col, …)`: a relation of the given arity (spec C24 §6.2). The column
+    /// names only document the relation.
+    fn parse_decl(&mut self, at: &Token) -> Result<(), RuleParseError> {
+        let t = self.next()?;
+        let Tok::Word(name) = &t.tok else {
+            return Err(err(
+                t.line,
+                t.col,
+                format!("expected a relation name after .decl, found {}", t.tok),
+            ));
+        };
+        check_relation_name(name, &t)?;
+        if self.peek_tok() != Some(&Tok::LParen) {
+            let (l, c) = self.here();
+            return Err(err(
+                l,
+                c,
+                format!("expected '(' and the columns of relation '{name}'"),
+            ));
+        }
+        self.pos += 1;
+        let mut arity = 0usize;
+        loop {
+            self.skip_commas();
+            let c = self
+                .next()
+                .map_err(|_| err(at.line, at.col, "unterminated .decl (missing ')')"))?;
+            match &c.tok {
+                Tok::RParen => break,
+                Tok::Word(w) if is_identifier(w) => arity += 1,
+                other => {
+                    return Err(err(
+                        c.line,
+                        c.col,
+                        format!("expected a column name in .decl of '{name}', found {other}"),
+                    ));
+                }
+            }
+        }
+        if arity >= u16::MAX as usize {
+            return Err(err(
+                t.line,
+                t.col,
+                format!("relation '{name}' has {arity} columns, more than a relation can have"),
+            ));
+        }
+        if let Some(d) = self.decls.get(name.as_str())
+            && d.arity != arity
+        {
+            return Err(err(
+                t.line,
+                t.col,
+                format!(
+                    "relation '{name}' is declared with {arity} columns here and with {} at line {}, column {}",
+                    d.arity, d.line, d.col
+                ),
+            ));
+        }
+        self.decls.entry(name.clone()).or_insert(Decl {
+            arity,
+            line: t.line,
+            col: t.col,
+        });
+        if self.peek_tok() == Some(&Tok::Dot) {
+            self.pos += 1;
+        }
         Ok(())
     }
 
@@ -630,14 +756,23 @@ impl Parser {
             eof: (0, 0),
             depth: self.depth + 1,
             hybrid_jena: false,
+            decls: HashMap::new(),
+            necks: Vec::new(),
         };
+        let first = out.len();
         sub.parse_all(out).map_err(|e| {
             err(
                 at.line,
                 at.col,
                 format!("in included rule set <{name}>: {e}"),
             )
-        })
+        })?;
+        for r in &mut out[first..] {
+            if r.include.is_none() {
+                r.include = Some(name.to_ascii_lowercase());
+            }
+        }
+        Ok(())
     }
 
     fn parse_rule(&mut self, nested: bool) -> Result<Rule, RuleParseError> {
@@ -658,11 +793,26 @@ impl Parser {
         }
         // left side
         let mut left = Vec::new();
+        let mut neck = false;
         let arrow = loop {
             self.skip_commas();
             match self.peek_tok() {
                 Some(Tok::Arrow) => break Direction::Forward,
                 Some(Tok::BackArrow) => break Direction::Backward,
+                Some(Tok::Neck) if !bracketed && !nested => {
+                    // `head :- body.`: a Datalog clause, a forward rule (spec C24 §6.2)
+                    neck = true;
+                    break Direction::Forward;
+                }
+                Some(Tok::Neck) => {
+                    let (l, c) = self.here();
+                    return Err(err(
+                        l,
+                        c,
+                        "':-' begins the body of a Datalog clause, which is not written in \
+                         brackets (use '->' or '<-' inside '[…]')",
+                    ));
+                }
                 Some(Tok::RBrack) | Some(Tok::Dot) | None => {
                     let (l, c) = self.here();
                     let what = match &name {
@@ -705,31 +855,56 @@ impl Parser {
                         ),
                     ));
                 }
+                None if neck => {
+                    return Err(err(
+                        line,
+                        col,
+                        "unterminated Datalog clause (missing '.' after its body)",
+                    ));
+                }
                 None if !bracketed && !nested => break,
                 None => {
                     return Err(err(line, col, "unterminated rule (missing ']')"));
                 }
-                Some(Tok::Arrow) | Some(Tok::BackArrow) => {
+                Some(Tok::Arrow) | Some(Tok::BackArrow) | Some(Tok::Neck) => {
                     let (l, c) = self.here();
                     return Err(err(
                         l,
                         c,
-                        "a rule may contain only one '->' or '<-' (did you forget ']' or '.'?)",
+                        "a rule may contain only one '->', '<-' or ':-' (did you forget ']' or '.'?)",
                     ));
                 }
                 _ => right.push(self.parse_clause()?),
             }
         }
-        let (body, head) = match arrow {
-            Direction::Forward => (left, right),
-            Direction::Backward => (right, left),
+        let (body, head) = match (neck, arrow) {
+            (true, _) => {
+                if left.len() != 1 || matches!(left[0], Clause::Rule(_) | Clause::Not(_)) {
+                    return Err(err(
+                        line,
+                        col,
+                        "the head of a Datalog clause ':-' is one relation atom or triple pattern",
+                    ));
+                }
+                (right, left)
+            }
+            (false, Direction::Forward) => (left, right),
+            (false, Direction::Backward) => (right, left),
         };
+        if let Some(c) = head.iter().find(|c| matches!(c, Clause::Not(_))) {
+            return Err(err(
+                line,
+                col,
+                format!("'not' cannot be part of a rule's head ({c})"),
+            ));
+        }
         Ok(Rule {
             name,
             body,
             head,
             direction: arrow,
             line,
+            include: None,
         })
     }
 
@@ -774,6 +949,28 @@ impl Parser {
                 }))
             }
             Tok::LBrack => Ok(Clause::Rule(Box::new(self.parse_rule(true)?))),
+            Tok::Word(w)
+                if w == "not"
+                    && matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.tok),
+                        Some(Tok::LParen | Tok::Word(_))
+                    ) =>
+            {
+                // `not (s p o)` or `not name(args)`; the name is checked against the
+                // declarations once the whole text is read
+                self.pos += 1;
+                let inner = self.parse_clause()?;
+                match inner {
+                    Clause::Triple(_) | Clause::Builtin(_) => Ok(Clause::Not(Box::new(inner))),
+                    other => Err(err(
+                        t.line,
+                        t.col,
+                        format!(
+                            "'not' applies to a triple pattern or a relation atom, not {other}"
+                        ),
+                    )),
+                }
+            }
             Tok::Word(w) if !w.starts_with('?') => {
                 self.pos += 1;
                 if self.peek_tok() != Some(&Tok::LParen) {
@@ -979,13 +1176,260 @@ pub fn parse_rules(text: &str) -> Result<Vec<Rule>, RuleParseError> {
         eof,
         depth: 0,
         hybrid_jena: false,
+        decls: HashMap::new(),
+        necks: Vec::new(),
     };
     let mut out = Vec::new();
     p.parse_all(&mut out)?;
+    for r in &mut out {
+        resolve(r, &p.decls)?;
+    }
+    for &i in &p.necks {
+        check_clause(&out[i])?;
+    }
     if p.hybrid_jena {
         out = split_hybrid(out)?;
     }
     Ok(out)
+}
+
+/// Whether `w` is an identifier, `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_identifier(w: &str) -> bool {
+    let mut cs = w.chars();
+    cs.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Refuse a relation name that is no identifier, or that names a builtin, a head action
+/// or a keyword, since an atom `name(args)` must say which it is.
+fn check_relation_name(name: &str, t: &Token) -> Result<(), RuleParseError> {
+    if !is_identifier(name) {
+        return Err(err(
+            t.line,
+            t.col,
+            format!("relation name '{name}' is not an identifier (letters, digits and '_')"),
+        ));
+    }
+    let taken = matches!(name, "not" | "_" | "bound" | "unbound")
+        || crate::builtins::BuiltinKind::from_name(name).is_some()
+        || crate::builtins::HeadAction::from_name(name).is_some();
+    if taken {
+        return Err(err(
+            t.line,
+            t.col,
+            format!("relation name '{name}' is the name of a builtin or a keyword"),
+        ));
+    }
+    Ok(())
+}
+
+/// `?_` in a relation atom or a negated atom is anonymous, as in C24 §6.2: each occurrence
+/// matches anything, as `_` does. Elsewhere `?_` keeps Jena's reading, a variable.
+fn anonymous(args: &mut [Node]) {
+    for n in args {
+        if matches!(n, Node::Var(v) if v == "_") {
+            *n = Node::Any;
+        }
+    }
+}
+
+/// Turn each call of a declared relation in `r` into a relation atom and check its
+/// arity, and refuse a `not` before anything else (spec C24 §6.2).
+fn resolve(r: &mut Rule, decls: &HashMap<String, Decl>) -> Result<(), RuleParseError> {
+    fn clause(
+        c: &mut Clause,
+        decls: &HashMap<String, Decl>,
+        line: usize,
+        label: &dyn Fn() -> String,
+    ) -> Result<(), RuleParseError> {
+        match c {
+            Clause::Builtin(b) => {
+                if let Some(d) = decls.get(&b.name) {
+                    if b.args.len() != d.arity {
+                        return Err(err(
+                            line,
+                            1,
+                            format!(
+                                "rule '{}': relation '{}' has {} columns, and an atom gives it {}",
+                                label(),
+                                b.name,
+                                d.arity,
+                                b.args.len()
+                            ),
+                        ));
+                    }
+                    let mut args = std::mem::take(&mut b.args);
+                    anonymous(&mut args);
+                    *c = Clause::Relation(RelationAtom {
+                        name: std::mem::take(&mut b.name),
+                        args,
+                    });
+                }
+            }
+            Clause::Not(inner) => {
+                if let Clause::Builtin(b) = &**inner
+                    && !decls.contains_key(&b.name)
+                {
+                    return Err(err(
+                        line,
+                        1,
+                        format!(
+                            "rule '{}': 'not' applies to a triple pattern or a declared relation, and '{}' is not declared (.decl {}(…))",
+                            label(),
+                            b.name,
+                            b.name
+                        ),
+                    ));
+                }
+                clause(inner, decls, line, label)?;
+                if let Clause::Triple(t) = &mut **inner {
+                    for n in [&mut t.subject, &mut t.predicate, &mut t.object] {
+                        anonymous(std::slice::from_mut(n));
+                    }
+                }
+            }
+            Clause::Rule(r) => resolve(r, decls)?,
+            Clause::Triple(_) | Clause::Relation(_) => {}
+        }
+        Ok(())
+    }
+    let line = r.line;
+    let name = r.label();
+    let label = || name.clone();
+    for c in r.body.iter_mut().chain(r.head.iter_mut()) {
+        clause(c, decls, line, &label)?;
+    }
+    for c in &r.head {
+        if let Clause::Relation(a) = c
+            && a.args.iter().any(|n| matches!(n, Node::Any))
+        {
+            return Err(err(
+                line,
+                1,
+                format!(
+                    "rule '{}': the head atom {c} has an anonymous argument, and a derived fact needs a value in every column",
+                    label()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a Datalog clause `head :- body.` whose head is not a triple pattern or a
+/// declared relation, or names a variable that no body clause names: an existential head
+/// needs the restricted chase, which the reasoner does not have.
+fn check_clause(r: &Rule) -> Result<(), RuleParseError> {
+    let head = &r.head[0];
+    let nodes: Vec<&Node> = match head {
+        Clause::Triple(t) => vec![&t.subject, &t.predicate, &t.object],
+        Clause::Relation(a) => a.args.iter().collect(),
+        Clause::Builtin(b) => {
+            return Err(err(
+                r.line,
+                1,
+                format!(
+                    "the head of a Datalog clause is a triple pattern or a declared relation, and '{}' is not declared (.decl {}(…))",
+                    b.name, b.name
+                ),
+            ));
+        }
+        _ => unreachable!("checked by the parser"),
+    };
+    fn names(c: &Clause, out: &mut std::collections::HashSet<String>) {
+        let node = |n: &Node| {
+            if let Node::Var(v) = n {
+                out.insert(v.clone());
+            }
+        };
+        match c {
+            Clause::Triple(t) => [&t.subject, &t.predicate, &t.object]
+                .into_iter()
+                .for_each(node),
+            Clause::Relation(a) => a.args.iter().for_each(node),
+            Clause::Builtin(b) => b.args.iter().for_each(node),
+            Clause::Not(c) => names(c, out),
+            Clause::Rule(_) => {}
+        }
+    }
+    let mut body = std::collections::HashSet::new();
+    r.body.iter().for_each(|c| names(c, &mut body));
+    for n in nodes {
+        if let Node::Var(v) = n
+            && !body.contains(v)
+        {
+            return Err(err(
+                r.line,
+                1,
+                format!(
+                    "the head of the Datalog clause at line {} names ?{v}, which its body does not: existential heads need the restricted chase, which the reasoner does not have",
+                    r.line
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `rules` use the syntax of a rule program (spec C24 §6.2, item 839): a
+/// relation atom or a `not`, in a rule or a nested rule. Rules without either are Jena
+/// rules, and every path reads them as before.
+pub fn uses_program(rules: &[Rule]) -> bool {
+    fn clauses(cs: &[Clause]) -> bool {
+        cs.iter().any(|c| match c {
+            Clause::Relation(_) | Clause::Not(_) => true,
+            Clause::Rule(r) => clauses(&r.body) || clauses(&r.head),
+            Clause::Triple(_) | Clause::Builtin(_) => false,
+        })
+    }
+    rules.iter().any(|r| clauses(&r.body) || clauses(&r.head))
+}
+
+/// The rule text of `rules`: a `.decl` for each relation their atoms use, with its arity,
+/// and then each rule as [`Rule`]'s `Display` writes it, so that [`parse_rules`] reads it
+/// back as `rules`, up to the rules' lines and included sets.
+pub fn rules_text(rules: &[Rule]) -> String {
+    fn collect(cs: &[Clause], out: &mut Vec<(String, usize)>) {
+        for c in cs {
+            match c {
+                Clause::Relation(a) => {
+                    if !out.iter().any(|(n, _)| *n == a.name) {
+                        out.push((a.name.clone(), a.args.len()));
+                    }
+                }
+                Clause::Not(inner) => collect(std::slice::from_ref(&**inner), out),
+                Clause::Rule(r) => {
+                    collect(&r.body, out);
+                    collect(&r.head, out);
+                }
+                Clause::Triple(_) | Clause::Builtin(_) => {}
+            }
+        }
+    }
+    let mut rels = Vec::new();
+    for r in rules {
+        collect(&r.body, &mut rels);
+        collect(&r.head, &mut rels);
+    }
+    let mut out = String::new();
+    for (name, arity) in rels {
+        out.push_str(".decl ");
+        out.push_str(&name);
+        out.push('(');
+        for i in 0..arity {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("c{i}"));
+        }
+        out.push_str(")\n");
+    }
+    for r in rules {
+        out.push_str(&r.to_string());
+        out.push('\n');
+    }
+    out
 }
 
 /// The rules of `@hybrid jena` (spec F17 §5.2): a forward rule `B1 -> [H <- B2]` keeps
@@ -1014,6 +1458,8 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
                 .any(|n| matches!(n, Node::Functor(..))),
             Clause::Builtin(b) => b.args.iter().any(|n| matches!(n, Node::Functor(..))),
             Clause::Rule(r) => functor(&r.body) || functor(&r.head),
+            Clause::Relation(a) => a.args.iter().any(|n| matches!(n, Node::Functor(..))),
+            Clause::Not(c) => functor(std::slice::from_ref(&**c)),
         })
     }
     /// A builtin that has a side effect, makes terms, or reads the facts in a way that a
@@ -1070,7 +1516,8 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
                         .for_each(|n| node(n, out));
                 }
                 Clause::Builtin(b) => b.args.iter().for_each(|n| node(n, out)),
-                Clause::Rule(_) => {}
+                Clause::Relation(a) => a.args.iter().for_each(|n| node(n, out)),
+                Clause::Rule(_) | Clause::Not(_) => {}
             }
         }
     }
@@ -1132,6 +1579,9 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
             continue;
         }
         // the whole rule is checked, the forward head it keeps as well as the split
+        if uses_program(std::slice::from_ref(&r)) {
+            return Err(refuse(&r, "it holds a relation atom or 'not'"));
+        }
         if functor(&r.body) || functor(&r.head) {
             return Err(refuse(&r, "it holds a functor term"));
         }
@@ -1187,6 +1637,7 @@ fn split_hybrid(rules: Vec<Rule>) -> Result<Vec<Rule>, RuleParseError> {
                         head: inner.head.clone(),
                         direction: Direction::Backward,
                         line: inner.line,
+                        include: inner.include.clone(),
                     });
                 }
                 c => head.push(c.clone()),
@@ -1381,5 +1832,127 @@ mod tests {
 
         let e = parse_rules("@frobnicate <x> .").unwrap_err();
         assert!(e.message.contains("unknown directive"), "{e}");
+    }
+
+    const P: &str = "@prefix ex: <http://ex.org/> .\n";
+
+    fn program(text: &str) -> Vec<Rule> {
+        parse_rules(&format!("{P}{text}")).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn refused(text: &str) -> String {
+        parse_rules(&format!("{P}{text}")).unwrap_err().message
+    }
+
+    /// `.decl`, relation atoms before and after their declaration, `not` of both kinds,
+    /// `:-` clauses and relations of arity 0 and 5 (spec C24 §6.2).
+    #[test]
+    fn rule_programs() {
+        let rs = program(
+            "r(?x, ?y) :- (?x ex:p ?y).
+             .decl r(a, b)
+             .decl flag()
+             .decl five(a, b, c, d, e)
+             flag() :- (ex:a ex:p ex:b).
+             [w: (?x ex:p ?y), not r(?y, ?x), not (?y ex:q ?x), flag() -> five(?x, ?y, ?x, ?y, ?x)]
+             (?x ex:s ?y) :- five(?x, ?y, ?_, _, ?x), not r(?x, ?_).",
+        );
+        assert!(uses_program(&rs));
+        assert_eq!(rs.len(), 4);
+        assert!(
+            matches!(&rs[0].head[0], Clause::Relation(a) if a.name == "r" && a.args.len() == 2)
+        );
+        assert_eq!(rs[0].direction, Direction::Forward);
+        assert!(matches!(&rs[1].head[0], Clause::Relation(a) if a.args.is_empty()));
+        let w = &rs[2];
+        assert!(matches!(&w.body[1], Clause::Not(c) if matches!(&**c, Clause::Relation(_))));
+        assert!(matches!(&w.body[2], Clause::Not(c) if matches!(&**c, Clause::Triple(_))));
+        // `?_` is anonymous in relation atoms and negated atoms
+        let Clause::Relation(five) = &rs[3].body[0] else {
+            panic!()
+        };
+        assert_eq!(five.args[2], Node::Any);
+        assert_eq!(five.args[3], Node::Any);
+        let Clause::Not(n) = &rs[3].body[1] else {
+            panic!()
+        };
+        let Clause::Relation(r) = &**n else { panic!() };
+        assert_eq!(r.args[1], Node::Any);
+        // Jena rules alone are no program, and keep `?_` a variable
+        let jena = program("[j: (?x ex:p ?_) -> (?x ex:q ?_)]");
+        assert!(!uses_program(&jena));
+        let Clause::Triple(t) = &jena[0].body[0] else {
+            panic!()
+        };
+        assert_eq!(t.object, Node::Var("_".into()));
+        // the program reads back from its text
+        let again = parse_rules(&rules_text(&rs)).unwrap();
+        let show = |rs: &[Rule]| rs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(show(&rs), show(&again));
+    }
+
+    #[test]
+    fn rule_program_refusals() {
+        for (text, want) in [
+            (".decl r(a) .decl r(a, b)", "declared with 2 columns"),
+            (".decl noValue(a)", "name of a builtin"),
+            (".decl not(a)", "name of a builtin or a keyword"),
+            (".decl listMapAsSubject(a)", "name of a builtin"),
+            (".decl ex:r(a)", "not an identifier"),
+            (
+                ".decl r(a) r(?x) :- (?x ex:p ?y), r(?x, ?y).",
+                "has 1 columns, and an atom gives it 2",
+            ),
+            (
+                "[n: (?x ex:p ?y), not s(?x) -> (?x ex:q ?y)]",
+                "'s' is not declared",
+            ),
+            ("s(?x) :- (?x ex:p ?y).", "'s' is not declared"),
+            (".decl r(a) r(?y) :- (?x ex:p ex:o).", "existential heads"),
+            ("(?x ex:q ?z) :- (?x ex:p ?y).", "existential heads"),
+            (
+                ".decl r(a, b) r(?x, ?_) :- (?x ex:p ?y).",
+                "anonymous argument",
+            ),
+            (
+                ".decl r(a, b) [h: (?x ex:p ?y) -> r(?x, _)]",
+                "anonymous argument",
+            ),
+            ("[n: (?x ex:p ?y) -> not (?x ex:q ?y)]", "head"),
+            ("?- (?x ex:p ?y).", "item 72"),
+            ("[n: (?x ex:p ?y) :- (?x ex:q ?y)]", "':-'"),
+            (".decl r(a) r(?x) :- (?x ex:p ?y)", "missing '.'"),
+            (
+                "@hybrid jena .\n.decl r(a) [h: (?x ex:p ?y) -> [(?x ex:q ?y) <- r(?x)]]",
+                "relation atom or 'not'",
+            ),
+        ] {
+            let got = refused(text);
+            assert!(got.contains(want), "{text}: {got}");
+        }
+        // a bracket rule with an unbound head variable stays Jena's, which the compiler
+        // skips with a warning
+        let rs = program("[j: (?x ex:p ?y) -> (?x ex:q ?z)]");
+        assert!(!uses_program(&rs));
+    }
+
+    /// An included rule set's rules carry its name, and no built-in rule set uses the
+    /// new syntax.
+    #[test]
+    fn includes_are_named() {
+        let rs = program("@include <rdfs> .\n.decl r(a)\nr(?x) :- (?x a ex:C).");
+        assert!(
+            rs[..rs.len() - 1]
+                .iter()
+                .all(|r| r.include.as_deref() == Some("rdfs"))
+        );
+        assert_eq!(rs.last().unwrap().include, None);
+        for text in [
+            crate::RDFS_RULES,
+            crate::RDFS_SIMPLE_RULES,
+            crate::OWL_RL_RULES,
+        ] {
+            assert!(!uses_program(&parse_rules(text).unwrap()));
+        }
     }
 }

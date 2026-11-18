@@ -390,3 +390,63 @@ fn a_premise_of_an_instance_left_out_derives_again() {
     let expected = run(&store(&after), TYPES_OF_B, &demand(&reasoner(&rules)));
     assert_eq!(rows(&run(&s, TYPES_OF_B, &o)), rows(&expected));
 }
+
+/// A rule program (item 839) through a relation and a negated triple.
+fn program() -> Profile {
+    Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+.decl r(x)
+r(?x) :- (?x ex:p ?y).
+(?x a ex:B) :- r(?x).
+(?x a ex:B) :- (?x a ex:T), not (?x ex:blocked ex:yes).
+"
+        .into(),
+    )
+}
+
+const PROGRAM_DATA: &str = "ex:a ex:p ex:b . ex:t a ex:T . ex:u ex:knows ex:v .";
+
+/// A rule program's tables are kept under the digest of its text: a commit that no rule
+/// reads keeps them.
+#[test]
+fn a_program_keeps_its_tables() {
+    let r = case(
+        &program(),
+        PROGRAM_DATA,
+        "INSERT DATA { ex:y ex:knows ex:w }",
+        &format!("{PROGRAM_DATA} ex:y ex:knows ex:w ."),
+        TYPES_OF_B,
+    );
+    assert!(
+        r.tables > 0 && r.cached == r.tables,
+        "{} {}",
+        r.tables,
+        r.cached
+    );
+}
+
+/// A fact that reaches the answer only through a relation derives again.
+#[test]
+fn a_premise_of_a_relation_derives_again() {
+    let r = case(
+        &program(),
+        PROGRAM_DATA,
+        "INSERT DATA { ex:z ex:p ex:w }",
+        &format!("{PROGRAM_DATA} ex:z ex:p ex:w ."),
+        TYPES_OF_B,
+    );
+    assert_eq!(r.cached, 0);
+}
+
+/// A fact that a negated triple reads derives again, so the blocked answer goes.
+#[test]
+fn a_negated_premise_derives_again() {
+    let r = case(
+        &program(),
+        PROGRAM_DATA,
+        "INSERT DATA { ex:t ex:blocked ex:yes }",
+        &format!("{PROGRAM_DATA} ex:t ex:blocked ex:yes ."),
+        TYPES_OF_B,
+    );
+    assert_eq!(r.cached, 0);
+}

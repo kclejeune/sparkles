@@ -232,7 +232,8 @@ fn chain_and_key(v: &TV) -> Program {
 /// The relations and rules of [`chain_and_key`].
 pub(super) fn chain_and_key_rules(v: &TV) -> (Relations, Vec<Rule>) {
     let mut rels = Relations::default();
-    // chain(list, i, x, y): the chain's first i properties lead from x to y
+    // chain(x, list, i, y): the chain's first i properties lead from x to y, with the
+    // subject first so that demand with a bound subject binds the first column (Q10)
     let chain = rels.declare("chain", 4, false).unwrap();
     // keyed(x, i, k): x has the key's first i values k (one value per property here)
     let keyed = rels.declare("keyed", 3, false).unwrap();
@@ -241,24 +242,24 @@ pub(super) fn chain_and_key_rules(v: &TV) -> (Relations, Vec<Rule>) {
     let mut rules = vec![rule(
         "chain-0",
         vec![pos(tri(V(0), p(0), V(1)))],
-        vec![head(rel(chain, &[C(ind(7)), C(n(1)), V(0), V(1)]))],
+        vec![head(rel(chain, &[V(0), C(ind(7)), C(n(1)), V(1)]))],
     )];
     for i in 1..6 {
         rules.push(rule(
             &format!("chain-{i}"),
             vec![
-                pos(rel(chain, &[C(ind(7)), C(n(i as i64)), V(0), V(1)])),
+                pos(rel(chain, &[V(0), C(ind(7)), C(n(i as i64)), V(1)])),
                 pos(tri(V(1), p(i), V(2))),
             ],
             vec![head(rel(
                 chain,
-                &[C(ind(7)), C(n(i as i64 + 1)), V(0), V(2)],
+                &[V(0), C(ind(7)), C(n(i as i64 + 1)), V(2)],
             ))],
         ));
     }
     rules.push(rule(
         "chain-end",
-        vec![pos(rel(chain, &[C(ind(7)), C(n(6)), V(0), V(1)]))],
+        vec![pos(rel(chain, &[V(0), C(ind(7)), C(n(6)), V(1)]))],
         vec![head(tri(V(0), v.props[2], V(1)))],
     ));
     // keys over p0 four times by position, standing for four properties

@@ -1019,6 +1019,26 @@ fn materialized(
     let mut warnings = WorkingWarnings::new(&budget);
     let parsed = crate::profile_rules(input.profile, input.extras)?;
     let sources = crate::rule_sources(input.profile, input.extras)?;
+    if crate::parser::uses_program(&parsed) {
+        drop(g);
+        drop(terms);
+        let source = |t: &Terms, w: &mut WorkingWarnings| {
+            crate::engine::frontend::compile(&parsed, t, w, false)
+        };
+        // the generalized facts are not part of the dataset's graphs, so a derivation
+        // through one is not found, as for Jena rules
+        return program_search(
+            snap,
+            &source,
+            &sources,
+            input.extras.geo_default_geometry,
+            input.inputs,
+            input.inferred,
+            &[],
+            triple,
+            opts,
+        );
+    }
     let compiled = engine::compile_info(&parsed, &terms, &mut warnings, false)?;
     let (rules, infos) = (compiled.rules(), compiled.infos());
     let rs = RuleSet {
@@ -1063,9 +1083,10 @@ fn materialized(
 /// are no RDF, which the run saved beside it. The relation facts are not written, so they
 /// are rebuilt on the graph of the inputs, the inferred graph and the generalized facts,
 /// which is the complete closure of triples, with the explanation's budget and
-/// cancellation, and the answer does not depend on a kept closure. Phase 5 reaches it
-/// from [`explain`] when a profile is a program.
-#[cfg_attr(not(test), allow(dead_code))]
+/// cancellation, and the answer does not depend on a kept closure. [`explain`] reaches the
+/// same search when a profile is a rule program. `program`'s constants must be terms of
+/// the store, since the explanation compiles it again over its own terms.
+#[cfg(test)]
 pub(crate) fn explain_program(
     snap: Arc<Snapshot>,
     program: &crate::ir::Program,
@@ -1075,9 +1096,22 @@ pub(crate) fn explain_program(
     triple: &[Term; 3],
     opts: &ExplainOptions,
 ) -> anyhow::Result<Explained> {
+    let source = |t: &Terms, _: &mut WorkingWarnings| {
+        let p = crate::ir::Program::new(
+            program.relations.clone(),
+            program.rules.clone(),
+            &crate::ir::Vocab::of(t),
+            &t.budget(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(crate::engine::frontend::ProgramInfo::bare(p, &t.budget()))
+    };
+    let sources = vec!["rules".to_string()];
     budget_errors(program_search(
         snap,
-        program,
+        &source,
+        &sources,
+        false,
         inputs,
         inferred,
         generalized,
@@ -1085,6 +1119,10 @@ pub(crate) fn explain_program(
         opts,
     ))
 }
+
+/// What a program explanation compiles over its own terms.
+type ExplainSource<'a> = dyn Fn(&Terms, &mut WorkingWarnings) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
+    + 'a;
 
 /// The lowered rules of every stratum of `program`, in stratum order, with the infos of
 /// their IR rules: the names of the IR rules' variables, where the variables and builtins
@@ -1095,6 +1133,7 @@ pub(crate) fn flat_rules(
     program: &crate::ir::Program,
     lowered: &mut crate::ir::lower::Lowered,
     held: &mut Held,
+    lines: &[(usize, usize)],
 ) -> Result<(Vec<CRule>, Vec<RuleInfo>), BudgetFailure> {
     // the lowered rules of every stratum, with the names of their IR rules' variables;
     // the variables and builtins a lowering adds have none
@@ -1144,11 +1183,12 @@ pub(crate) fn flat_rules(
                 .iter()
                 .map(|b| b.kind.rule_name().to_string())
                 .collect();
+            let (line, parsed) = lines.get(ri).copied().unwrap_or((0, 0));
             infos.push(RuleInfo {
                 vars,
                 builtins,
-                line: 0,
-                parsed: 0,
+                line,
+                parsed,
             });
             rules.push(r);
         }
@@ -1158,9 +1198,12 @@ pub(crate) fn flat_rules(
     Ok((rules, infos))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn program_search(
     snap: Arc<Snapshot>,
-    program: &crate::ir::Program,
+    source: &ExplainSource<'_>,
+    sources: &[String],
+    geo: bool,
     inputs: &[Id],
     inferred: Option<Id>,
     generalized: &[[Vec<u8>; 3]],
@@ -1188,6 +1231,11 @@ fn program_search(
         g.try_add_batch(facts)?;
         held.shrink(generalized.len() * size_of::<Triple>());
     }
+    // the program is compiled over this explanation's terms, which hold the local terms
+    // its constants need
+    let mut warnings = WorkingWarnings::new(&budget);
+    let info = source(&terms, &mut warnings)?;
+    let program = &info.program;
     let vocab = crate::ir::Vocab::of(&terms);
     let part = program
         .relation_part(&vocab, &budget)
@@ -1196,8 +1244,7 @@ fn program_search(
             e => anyhow::anyhow!("{e}"),
         })?;
     let mut lowered = program.lower(&budget)?;
-    let (rules, infos) = flat_rules(program, &mut lowered, &mut held)?;
-    let sources = vec!["rules".to_string()];
+    let (rules, infos) = flat_rules(program, &mut lowered, &mut held, &info.lines)?;
     let mut makes_terms = false;
     if let Some(part) = &part {
         let lp = part.lower(&budget)?;
@@ -1230,8 +1277,8 @@ fn program_search(
     let rs = RuleSet {
         rules: &rules,
         infos: &infos,
-        sources: &sources,
-        geo: None,
+        sources,
+        geo: geo.then(|| crate::geo_ids(&terms)).transpose()?,
         relations: Some(&program.relations),
     };
     let mut root = [0u64; 3];

@@ -60,6 +60,17 @@ impl Shape {
                         shape.node(n)?;
                     }
                 }
+                // a relation atom is compiled as an atom, a negation as its atom
+                Clause::Relation(a) => {
+                    shape.atoms = plus(shape.atoms, 1)?;
+                    for n in &a.args {
+                        shape.node(n)?;
+                    }
+                }
+                Clause::Not(inner) => {
+                    shape = shape.merge(Self::clauses(std::iter::once(&**inner))?)?;
+                    continue;
+                }
             }
             shape.clauses = plus(shape.clauses, 1)?;
         }
