@@ -35,8 +35,8 @@ use crate::error::Result;
 /// one thread, so a transaction is faster up to about that size.
 pub(crate) const SMALL_SOURCE_BYTES: u64 = 8 << 20;
 
-/// Bytes of text per quad that [`estimated_quads`](super::estimated_quads) assumes, by
-/// which a stream probe turns the quad threshold into a byte bound.
+/// Bytes of text per quad by which the plan turns the bytes of sources into quads, and a
+/// stream probe turns the quad threshold into a byte bound.
 pub(crate) const BYTES_PER_QUAD: u64 = 80;
 
 /// The path a write takes.
@@ -115,7 +115,7 @@ impl LoadInputs {
 /// The sizes of the sources of a load or a replace, which [`LoadPlan::choose`] asks for
 /// only when they decide the plan, since finding them reads the sources.
 pub(crate) trait Sizes {
-    /// The estimate in quads of the sources that are not streams, from their lengths.
+    /// The decompressed bytes of the sources that are not streams, from their lengths.
     fn estimate(&mut self) -> u64;
     /// Read the streams among the sources ahead and say whether they hold more than
     /// `limit` decompressed bytes.
@@ -149,13 +149,13 @@ impl LoadPlan {
                 // the bound first, and the streams are read ahead for the rest, as only
                 // a read can tell their size.
                 let limit = SMALL_SOURCE_BYTES.min(i.threshold.saturating_mul(BYTES_PER_QUAD));
-                let sized = sizes.estimate().saturating_mul(BYTES_PER_QUAD);
+                let sized = sizes.estimate();
                 sized > limit || (i.streams > 0 && sizes.exceeds(limit - sized)?)
             }
             Entry::Load | Entry::Replace => {
                 // a bound past the largest byte count is one no stream exceeds
                 let bound = i.threshold.checked_mul(BYTES_PER_QUAD);
-                sizes.estimate() > i.threshold
+                sizes.estimate() / BYTES_PER_QUAD > i.threshold
                     || match bound {
                         Some(bound) if i.streams > 0 => sizes.exceeds(bound)?,
                         _ => false,

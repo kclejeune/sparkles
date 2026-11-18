@@ -5468,7 +5468,7 @@ impl Store {
         struct SourceSizes<'a>(&'a [Source], &'a crate::guard::WriteOptions);
         impl load_plan::Sizes for SourceSizes<'_> {
             fn estimate(&mut self) -> u64 {
-                estimated_quads(self.0)
+                estimated_bytes(self.0)
             }
             fn exceeds(&mut self, limit: u64) -> Result<bool> {
                 streams_exceed(self.0, limit, self.1)
@@ -7537,19 +7537,21 @@ fn guard_required_by(root: &Path) -> bool {
     }
 }
 
-/// A rough quad count of RDF sources from their size (~80 bytes per quad in text
-/// formats; compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion)).
-fn estimated_quads(sources: &[Source]) -> u64 {
+/// The decompressed bytes of the RDF sources that are not streams, from their lengths,
+/// with compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion).
+fn estimated_bytes(sources: &[Source]) -> u64 {
     let mut bytes = 0u64;
     for s in sources {
-        bytes += match &s.data {
+        let b = match &s.data {
             crate::io::SourceData::Bytes(b) => b.len() as u64,
             crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
             // a stream's length is unknown until it is read
             crate::io::SourceData::Reader(_) => continue,
-        } * s.codec().map_or(1, |c| c.expansion());
+        }
+        .saturating_mul(s.codec().map_or(1, |c| c.expansion()));
+        bytes = bytes.saturating_add(b);
     }
-    bytes / load_plan::BYTES_PER_QUAD
+    bytes
 }
 
 /// Give each stream among `sources` its decompressing reader (see

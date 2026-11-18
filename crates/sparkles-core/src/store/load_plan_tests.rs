@@ -164,7 +164,8 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The sizes of a row: its quads as the estimate, and its stream bytes.
+/// The sizes of a row: its quads at `BYTES_PER_QUAD` as the estimate, and its stream
+/// bytes.
 struct Stub<'a> {
     quads: u64,
     stream_bytes: u64,
@@ -175,7 +176,7 @@ struct Stub<'a> {
 impl super::Sizes for Stub<'_> {
     fn estimate(&mut self) -> u64 {
         *self.estimated = true;
-        self.quads
+        self.quads * BYTES_PER_QUAD
     }
 
     fn exceeds(&mut self, limit: u64) -> crate::error::Result<bool> {
@@ -585,6 +586,41 @@ fn replace_counts_parsed_quads_on_both_plans() {
         assert_eq!(count, n, "{name}");
         assert_eq!(plan_of(&s), plan, "{name}");
     }
+}
+
+/// A threshold of 0 sends any source that holds a byte into an empty store to a rebuild,
+/// a file shorter than one quad's estimate as well as a stream, and an empty one to a
+/// transaction that commits nothing.
+#[test]
+fn threshold_zero_into_an_empty_store() {
+    let o = WriteOptions::default();
+    let zero = || {
+        Store::in_memory(StoreOptions {
+            bulk_threshold: 0,
+            ..StoreOptions::default()
+        })
+    };
+    let short = b"<urn:s> <urn:p> 1 .\n".to_vec();
+    assert!(short.len() < BYTES_PER_QUAD as usize);
+    let sources = [
+        (
+            "bytes",
+            Source::from_bytes(short.clone(), RdfFormat::NTriples, None),
+        ),
+        (
+            "stream",
+            Source::from_reader(std::io::Cursor::new(short), RdfFormat::NTriples, None),
+        ),
+    ];
+    for (name, src) in sources {
+        let s = zero();
+        s.load_with(&[src], CommitKind::Load, &o).unwrap();
+        assert_eq!(s.snapshot().len(), 1, "{name}");
+        assert_eq!(plan_of(&s), Bulk, "{name}");
+    }
+    let s = zero();
+    let r = s.load_with(&[bytes(0, 0)], CommitKind::Load, &o).unwrap();
+    assert!(!r.committed);
 }
 
 /// An empty source written into an empty store takes a transaction and makes no commit,
