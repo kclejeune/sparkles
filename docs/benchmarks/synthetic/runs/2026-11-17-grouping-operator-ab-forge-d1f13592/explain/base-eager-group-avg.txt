@@ -1,0 +1,11 @@
+(slice 0 10 (project (?o ?avg ?n) (order ((desc ?n) (asc ?o)) (extend ((?n ?fa4fd241c996c835fe1793ac46fe8ac2)) (extend ((?avg ?64fe1cec20f2b6b06e9cd8a3ae468294)) (group (?o) (((avg ?a) ?64fe1cec20f2b6b06e9cd8a3ae468294) ((count ?p) ?fa4fd241c996c835fe1793ac46fe8ac2)) (bgp (triple ?p <http://example.org/worksFor> ?o) (triple ?p <http://xmlns.com/foaf/0.1/age> ?a))))))))
+
+Limit offset 0 limit 10  [est 10 rows, cost 534069]
+  Project ?o ?avg ?n  [est 2000 rows, cost 532069]
+    TopK DESC(?n) ASC(?o)  [est 2000 rows, cost 532069]
+      Bind ?n := ?fa4fd241c996c835fe1793ac46fe8ac2  [est 2000 rows, cost 519104]
+        Bind ?avg := ?64fe1cec20f2b6b06e9cd8a3ae468294  [est 2000 rows, cost 517104]
+          GroupBy by ?o aggs ?64fe1cec20f2b6b06e9cd8a3ae468294=Avg ?fa4fd241c996c835fe1793ac46fe8ac2=Count [incremental]  [est 2000 rows, cost 515104]
+            MergeJoin on ?p  [est 70023 rows, cost 410069]
+              IndexScan PSO ?p <http://example.org/worksFor> ?o  [est 70023 rows, cost 70023]
+              IndexScan PSO ?p <http://xmlns.com/foaf/0.1/age> ?a  [est 100000 rows, cost 100000]

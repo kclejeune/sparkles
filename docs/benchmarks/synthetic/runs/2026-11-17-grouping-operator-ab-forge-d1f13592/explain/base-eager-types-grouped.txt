@@ -1,0 +1,6 @@
+(project (?t ?c) (order ((desc ?c)) (extend ((?c ?bd99af8bccee96246ad0da480af7c7d7)) (group (?t) (((count ?s) ?bd99af8bccee96246ad0da480af7c7d7)) (bgp (triple ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?t))))))
+
+Project ?t ?c  [est 11 rows, cost 42]
+  OrderBy DESC(?c)  [est 11 rows, cost 42]
+    Bind ?c := ?bd99af8bccee96246ad0da480af7c7d7  [est 11 rows, cost 12]
+      GroupCountFromMetadata POS ?s rdf:type ?t by ?t [from statistics]  [est 11 rows, cost 1]

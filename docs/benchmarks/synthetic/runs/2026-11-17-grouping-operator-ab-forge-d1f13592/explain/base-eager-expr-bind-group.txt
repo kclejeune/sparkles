@@ -1,0 +1,8 @@
+(project (?decade ?c) (order ((asc ?decade)) (extend ((?c ?226c3067eb7da34f4ae758b99dc0ed5f)) (group (?decade) (((count) ?226c3067eb7da34f4ae758b99dc0ed5f)) (extend ((?decade (* ( floor (/ ?y "10"^^<http://www.w3.org/2001/XMLSchema#integer>)) "10"^^<http://www.w3.org/2001/XMLSchema#integer>))) (bgp (triple ?d <http://example.org/year> ?y)))))))
+
+Project ?decade ?c  [est 50000 rows, cost 665241]
+  OrderBy ASC(?decade)  [est 50000 rows, cost 665241]
+    Bind ?c := ?226c3067eb7da34f4ae758b99dc0ed5f  [est 50000 rows, cost 225000]
+      GroupBy by ?decade aggs ?226c3067eb7da34f4ae758b99dc0ed5f=Count [incremental]  [est 50000 rows, cost 175000]
+        Bind ?decade := (FLOOR((?y / "10"^^<http://www.w3.org/2001/XMLSchema#integer>)) * "10"^^<http://www.w3.org/2001/XMLSchema#integer>)  [est 50000 rows, cost 100000]
+          IndexScan PSO ?d <http://example.org/year> ?y  [est 50000 rows, cost 50000]

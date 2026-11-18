@@ -213,6 +213,11 @@ check them against the W3C suites and Jena's own answers.
   and hashes in both when it is off, a hash join's OPTIONAL condition is tested once over
   each chunk of candidate pairs rather than over the whole product, and EXPLAIN names
   the algorithm that ran in either mode.
+* Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
+  GROUP_CONCAT, ARQ's statistics aggregates and their DISTINCT forms keep one running
+  state per group, on one key or several and with expression arguments, and EXPLAIN
+  marks such a grouping `[incremental]` in either mode. FOLD, registered aggregates and
+  the other custom aggregates read the whole rows of each group.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and
   stop when the client disconnects.
@@ -262,7 +267,8 @@ check them against the W3C suites and Jena's own answers.
   * Disk is reserved per query with `--query-spill-mb` or `spill-mb=`, and for the server
     with `--spill-max-mb`. With spill on, an eager hash join, OPTIONAL, semi join, anti
     join or MINUS whose hash table does not fit the budget partitions its two inputs to
-    disk through the cursor's join and gives the same answer, automatic execution streams
+    disk through the cursor's join and gives the same answer, an eager grouping whose
+    groups do not fit runs as the cursor's grouping and spills in partitions, automatic execution streams
     a query that eager execution would hold in more than half its budget, and it reruns
     an eager query that exceeds its budget as a cursor unless it calls SERVICE.
   * With `--spill on` or `encrypted`, the server refuses to start with an unusable spill

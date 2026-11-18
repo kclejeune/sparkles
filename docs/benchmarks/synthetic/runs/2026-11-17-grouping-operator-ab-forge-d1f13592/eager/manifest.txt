@@ -1,0 +1,9 @@
+A: commit 7e272f4dabc6b1b3e5f001690573d90ba07afcba (7e272f4d), built on wally
+A sha256: f0090fa03425eb22765931c552c74ab41d35448e95aebdf4f64f1100e2984e8f
+A compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+B: commit d1f13592c5b2dbc3bcb4f560ce7235505fbc2af8 (d1f13592), built on wally
+B sha256: c94b4df89f5a4a16b2f5c02bc9fe67e9e87356c75ac0628e186bf417feb03697
+B compilers: clang version 21.1.8; GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+data: 100000 people (scripts/gen-data.py)
+host: forge (ssh, nsc-bench-remote.sh run directly)
+settings: 6 queries, 12 rounds of A,B,B,A, 3 warm-up and 200 timed requests per query and server, RAYON_NUM_THREADS=1, server CPU 2, client CPU 4, spinners on, execution eager

@@ -499,6 +499,15 @@ preparation and plan with no model call, commit, state change or task, and start
 refresh only when a report's input or the hierarchy changed. The principal's feed no
 longer starts a refresh by itself for a decision, support or withdrawal it lists.
 
+Roadmap item 826 gives the eager executor and the cursor one grouping operator over an
+accumulator trait in `sparql/group`. COUNT, SUM, AVG, MIN, MAX, SAMPLE, GROUP_CONCAT,
+ARQ's statistics aggregates and their DISTINCT forms keep running state per group in both
+modes, on one key or several and with expression arguments, and EXPLAIN marks such a
+grouping `[incremental]` in either. An eager grouping whose groups do not fit the budget
+of a query that may spill runs as the cursor's grouping and spills in partitions instead
+of failing. On forge, eager `expr-bind-group` takes 0.839 of its earlier time,
+`expr-agg-arg` 0.888 and `group-avg` 0.906.
+
 Roadmap item 825 gives the eager executor and the cursor one join-kernel library. The
 hash, keyed and merge kernels of `sparql/join` and one galloping search serve both
 modes, the `merge_left_join` switch selects the merge OPTIONAL without a condition in

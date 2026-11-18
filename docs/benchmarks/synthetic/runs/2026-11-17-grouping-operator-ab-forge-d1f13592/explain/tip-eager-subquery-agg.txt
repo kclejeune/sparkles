@@ -1,0 +1,7 @@
+(project (?o ?n) (filter (> ?n "55"^^<http://www.w3.org/2001/XMLSchema#integer>) (project (?o ?n) (extend ((?n ?40a4fe0eca7e1c65352cf08dd27a49fc)) (group (?o) (((count ?p) ?40a4fe0eca7e1c65352cf08dd27a49fc)) (bgp (triple ?p <http://example.org/worksFor> ?o)))))))
+
+Project ?o ?n  [est 600 rows, cost 75023]
+  Filter (?n > "55"^^<http://www.w3.org/2001/XMLSchema#integer>)  [est 600 rows, cost 75023]
+    Project ?o ?n  [est 2000 rows, cost 72023]
+      Bind ?n := ?40a4fe0eca7e1c65352cf08dd27a49fc  [est 2000 rows, cost 72023]
+        GroupCountFromIndex POS ?p <http://example.org/worksFor> ?o by ?o  [est 2000 rows, cost 70023]

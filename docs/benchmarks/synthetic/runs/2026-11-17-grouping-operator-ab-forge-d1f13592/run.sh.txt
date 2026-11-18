@@ -1,0 +1,103 @@
+# Commands of the grouping-operator A/B on forge
+
+Binaries were built on wally with scripts/nsc-build.sh (build.sh below), staged by stage.sh and run by run-forge.sh as the systemd user unit grouping-826-ab under ~/lanes/.heavy.lock.
+
+```
+./build.sh d1f13592
+./stage.sh eager 7e272f4d d1f13592 100000 12 200 eager 1 "group-avg types-grouped subquery-agg expr-bind-group expr-agg-arg predicate-counts"
+./stage.sh streaming 7e272f4d d1f13592 100000 12 200 streaming 1 "group-avg types-grouped subquery-agg expr-bind-group expr-agg-arg predicate-counts"
+systemd-run --user --unit=grouping-826-ab --collect bash ./run-forge.sh eager streaming
+scripts/nsc-bench-summary.py <cell>
+```
+
+## build.sh
+```bash
+#!/usr/bin/env bash
+# build.sh REV: builds REV into ~/.cache/sparkles-nsc/bin/<sha> on wally, the way
+# scripts/nsc-bench.sh binary() does with --build-host wally.
+set -euo pipefail
+ROOT=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/grouping-826
+CACHE=$HOME/.cache/sparkles-nsc
+. "$ROOT/scripts/remote-screen.sh"
+. "$ROOT/scripts/nsc-build-host.sh"
+BH_ARG=${BH_ARG:-wally}
+CARGO_ARGS=
+OUT=$(dirname "$0")
+mkdir -p "$OUT/logs" "$CACHE"/{bin,data,src,locks}
+bh_check_arg
+sha=$(git -C "$ROOT" rev-parse --verify "$1^{commit}")
+entry=$CACHE/bin/$sha; bin=$entry/sparkles
+[ -x "$bin" ] && [ -f "$entry/build.txt" ] && { echo "cached $sha"; exit 0; }
+exec {lock}> "$CACHE/locks/$sha.lock"; flock "$lock"
+bh_resolve
+mkdir -p "$entry"; rm -f "$entry/build.txt"
+SRC_TMP=$(mktemp -d "$CACHE/src/$sha.XXXXXXXX")
+trap 'rm -rf -- "$SRC_TMP"; bh_cleanup' EXIT
+echo "building $sha on $BH_HOST"
+bh_build "$BH_HOST" "$sha" "$SRC_TMP" > "$OUT/logs/build-$sha.log" 2>&1
+cp -- "$SRC_TMP/sparkles" "$bin.tmp.$$"; chmod 755 "$bin.tmp.$$"; mv -- "$bin.tmp.$$" "$bin"
+{ echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "cargo args: "; cat "$SRC_TMP/info.txt"; } > "$entry/build.txt"
+echo BUILD-DONE "$sha"
+```
+
+## stage.sh
+```bash
+#!/usr/bin/env bash
+# stage.sh NAME A B PEOPLE ROUNDS REPS EXECUTION RAYON "QUERIES"
+# Stages one nsc-bench-remote.sh run for an ssh host (after atlas-measure-1/stage.sh).
+set -euo pipefail
+ROOT=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/grouping-826
+L=$(cd "$(dirname "$0")" && pwd)
+C=$HOME/.cache/sparkles-nsc
+N=$1 A=$2 B=$3 PEOPLE=$4 ROUNDS=$5 REPS=$6 EXECUTION=$7 RAYON=$8 QUERIES=$9
+OUT=$L/$N; S=$OUT/stage
+rm -rf "$OUT"; mkdir -p "$S/queries"
+M=$OUT/manifest.txt; : > "$M"
+for v in A B; do
+  ref=${!v}; sha=$(git -C "$ROOT" rev-parse "$ref^{commit}"); bin=$C/bin/$sha/sparkles
+  echo "$v: commit $sha ($ref), built on $(sed -n 's/^build host: //p' $C/bin/$sha/build.txt)" >> "$M"
+  echo "$v sha256: $(sha256sum "$bin" | cut -d' ' -f1)" >> "$M"
+  echo "$v compilers: $(readelf -p .comment "$bin" | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | sort -u | paste -sd ';' - | sed 's/;/; /g')" >> "$M"
+  echo "DYNAMIC_$v=0" >> "$S/run.env"
+  ln -f "$L/bin-$v-$sha.zst" "$S/bin-$v.zst" 2>/dev/null || { zstd -q -T0 -3 -f "$bin" -o "$L/bin-$v-$sha.zst"; ln -f "$L/bin-$v-$sha.zst" "$S/bin-$v.zst"; }
+done
+ln -f "$C/data/people-$PEOPLE.nt.zst" "$S/data.nt.zst" 2>/dev/null || cp "$C/data/people-$PEOPLE.nt.zst" "$S/data.nt.zst"
+echo "data: $PEOPLE people (scripts/gen-data.py)" >> "$M"
+P=$(sed -n "s/^P='\(.*\)'$/\1/p" "$ROOT/scripts/bench.sh")
+while IFS=$'\t' read -r n q; do [[ " $QUERIES " == *" $n "* ]] && printf '%s%s' "$P" "$q" > "$S/queries/$n.rq"; done < <(sed -n "s/^add \([a-z0-9-]*\) '\(.*\)'$/\1\t\2/p" "$ROOT/scripts/bench.sh")
+for n in $QUERIES; do [ -f "$S/queries/$n.rq" ] || { echo "no query $n"; exit 1; }; done
+cp "$ROOT/scripts/nsc-bench-remote.sh" "$S/"
+cat >> "$S/run.env" <<ENV
+ROUNDS=$ROUNDS
+REPS=$REPS
+WARMUP=3
+RAYON_THREADS=$RAYON
+SERVER_CPU=2
+CLIENT_CPU=4
+SPIN=1
+SERVE_ARGS=""
+EXECUTION=$EXECUTION
+PORT=41931
+PREPARE_A=""
+PREPARE_B=""
+PREPARE_REPEAT=""
+PREPARE_REPS=5
+ENV
+echo "host: forge (ssh, nsc-bench-remote.sh run directly)" >> "$M"
+echo "settings: $(ls $S/queries | wc -l) queries, $ROUNDS rounds of A,B,B,A, 3 warm-up and $REPS timed requests per query and server, RAYON_NUM_THREADS=$RAYON, server CPU 2, client CPU 4, spinners on, execution $EXECUTION" >> "$M"
+```
+
+## run-forge.sh
+```bash
+#!/usr/bin/env bash
+# Runs the staged cells one after another on forge under the heavy lock, each in a 13G scope.
+set -u
+cd ~/lanes/grouping-826-ab
+for n in "$@"; do
+  uptime > $n/uptime-before.txt
+  flock ~/lanes/.heavy.lock systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=2G -p OOMPolicy=continue bash -c "cd $n/stage && bash nsc-bench-remote.sh" > $n/run.log 2>&1
+  echo "exit=$?" > $n/exit.txt
+  echo "$n $(cat $n/exit.txt)"
+done
+echo ALL-DONE > ALL-DONE
+```

@@ -1,0 +1,10 @@
+(slice 0 10 (project (?o ?months) (order ((desc ?months) (asc ?o)) (extend ((?months ?2b9666f96d5933bc76de21bd6b6f3ab3)) (group (?o) (((sum (* ?a "12"^^<http://www.w3.org/2001/XMLSchema#integer>)) ?2b9666f96d5933bc76de21bd6b6f3ab3)) (bgp (triple ?p <http://example.org/worksFor> ?o) (triple ?p <http://xmlns.com/foaf/0.1/age> ?a)))))))
+
+Limit offset 0 limit 10  [est 10 rows, cost 532069]
+  Project ?o ?months  [est 2000 rows, cost 530069]
+    TopK DESC(?months) ASC(?o)  [est 2000 rows, cost 530069]
+      Bind ?months := ?2b9666f96d5933bc76de21bd6b6f3ab3  [est 2000 rows, cost 517104]
+        GroupBy by ?o aggs ?2b9666f96d5933bc76de21bd6b6f3ab3=Sum  [est 2000 rows, cost 515104]
+          MergeJoin on ?p  [est 70023 rows, cost 410069]
+            IndexScan PSO ?p <http://example.org/worksFor> ?o  [est 70023 rows, cost 70023]
+            IndexScan PSO ?p <http://xmlns.com/foaf/0.1/age> ?a  [est 100000 rows, cost 100000]
