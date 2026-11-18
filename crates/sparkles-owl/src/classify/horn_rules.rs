@@ -162,17 +162,6 @@ fn looped(ix: &Index, st: &State, s: Role, b: Ex) -> bool {
     held_own(st, b) && st.loops.iter().any(|&l| ix.roles.sub(l, s))
 }
 
-/// Whether `≤1 S.B` counts the predecessor `m`: a backward link from it by a role under
-/// S⁻, and B among what it holds.
-fn counts_pred(ix: &Index, st: &State, s: Role, b: Ex, m: Ex) -> bool {
-    let roles = &ix.roles;
-    held_pred(st, m, b)
-        && st
-            .back
-            .iter()
-            .any(|(r, srcs)| roles.inv(*r).is_some_and(|i| roles.sub(i, s)) && srcs.contains(&m))
-}
-
 /// Whether a context with the Horn state `h` passes over a link by `r` to `n` that the
 /// Horn rules give it, because it links to `n` by a subrole of `r` already
 /// ([`spare`], level 2). [`succ`] asks it for a context of few successors, and the
@@ -1393,50 +1382,81 @@ fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S
     }
 }
 
-/// The steps of reading at-most restrictions after which [`r7_spare`] checks the run's
-/// bounds: one for a restriction and one for each group of backward links it looks at.
+/// The steps of reading after which [`r7_spare`] checks the run's bounds: one for an
+/// at-most restriction, one for each group of backward links it looks at and one for
+/// each source of a group it counts.
 const R7_SCAN: usize = 64;
 
 /// [`r7`] without the work that changes nothing (roadmap item 1025). A predecessor that
 /// triggers the rule and is not real, or that a restriction does not count, is in no
 /// pair of that restriction, so the search for the pairs is left out for it. The run's
 /// bounds are checked after a restriction that made a pair or a send, and once for
-/// every [`R7_SCAN`] steps of reading restrictions that made none, so that a context of
-/// many restrictions and backward links still stops with the run.
+/// every [`R7_SCAN`] steps of reading restrictions, groups of backward links and their
+/// sources, so that a context with many of any of them still stops with the run.
 fn r7_spare<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S) {
-    if let Some(o) = only
-        && !st
-            .extra
+    let is_real = |st: &State, m: Ex| {
+        st.extra
             .as_ref()
-            .is_some_and(|x| x.horn.real_preds.contains(&o))
+            .is_some_and(|x| x.horn.real_preds.contains(&m))
+    };
+    if let Some(o) = only
+        && !is_real(st, o)
     {
         return;
     }
+    let roles = &ix.roles;
     let mut i = 0;
-    let mut scan = 0usize;
+    let mut steps = 0usize;
+    // counts steps of reading, and answers whether the run goes on
+    let mut read = |n: usize, out: &mut S| {
+        steps += n;
+        if steps < R7_SCAN {
+            return true;
+        }
+        steps = 0;
+        out.go_on()
+    };
     while let Some((s, b)) = atmost_at(st, i) {
         i += 1;
-        // reading a restriction looks at each group of backward links
-        scan += 1 + st.back.len();
-        if scan >= R7_SCAN {
-            scan = 0;
-            if !out.go_on() {
-                return;
+        if !read(1, out) {
+            return;
+        }
+        // whether the restriction counts the predecessor that triggers the rule, by a
+        // backward link from it by a role under S⁻ and B among what it holds, and then
+        // the real predecessors it counts in the order of [`preds`]
+        if let Some(o) = only {
+            let mut counts = false;
+            if held_pred(st, o, b) {
+                for (r, srcs) in &st.back {
+                    if !read(1, out) {
+                        return;
+                    }
+                    if roles.inv(*r).is_some_and(|i| roles.sub(i, s)) && srcs.contains(&o) {
+                        counts = true;
+                        break;
+                    }
+                }
+            }
+            if !counts {
+                continue;
             }
         }
-        if let Some(o) = only
-            && !counts_pred(ix, st, s, b, o)
-        {
-            continue;
+        let mut real: Vec<(Ex, Role)> = Vec::new();
+        for (r, srcs) in &st.back {
+            if !read(1, out) {
+                return;
+            }
+            if roles.inv(*r).is_some_and(|i| roles.sub(i, s)) {
+                for &m in &srcs.list {
+                    if !read(1, out) {
+                        return;
+                    }
+                    if held_pred(st, m, b) && is_real(st, m) {
+                        real.push((m, *r));
+                    }
+                }
+            }
         }
-        let real: Vec<(Ex, Role)> = preds(ix, st, s, b)
-            .into_iter()
-            .filter(|&(m, _)| {
-                st.extra
-                    .as_ref()
-                    .is_some_and(|x| x.horn.real_preds.contains(&m))
-            })
-            .collect();
         if real.is_empty() {
             continue;
         }
@@ -1738,18 +1758,21 @@ mod tests {
     #[test]
     fn a_link_beside_one_by_a_subrole_is_passed_over() {
         // the levels below 2 keep every link, which the comparison of the forms runs
-        if spare() < 2 {
-            return;
-        }
+        let pass = spare() >= 2;
         let (ix, me, n) = roles_index();
         let mut st = State::default();
         let mut out = Polled::new();
         assert!(succ(&ix, me, &mut st, 0, n, false, &mut out));
         assert_eq!(out.sent, vec![(n, Concl::Back(me, 0))]);
         let mut out = Polled::new();
-        assert!(!succ(&ix, me, &mut st, 1, n, false, &mut out));
-        assert!(out.sent.is_empty() && out.local.is_empty());
-        assert_eq!(hs(&mut st).succ.list, vec![(0, n)]);
+        assert_eq!(succ(&ix, me, &mut st, 1, n, false, &mut out), !pass);
+        if pass {
+            assert!(out.sent.is_empty() && out.local.is_empty());
+            assert_eq!(hs(&mut st).succ.list, vec![(0, n)]);
+        } else {
+            assert_eq!(out.sent, vec![(n, Concl::Back(me, 1))]);
+            assert_eq!(hs(&mut st).succ.list, vec![(0, n), (1, n)]);
+        }
         // a link by a role with an inverse stays beside a subrole's link whose inverse
         // the run does not have, since the target reads its links through the inverse
         let mut other =
@@ -1787,17 +1810,18 @@ mod tests {
                 dominate: false,
                 dead: Vec::new(),
             }));
+            let over = under && pass;
             let mut st3 = State::default();
             let mut out = Polled::new();
             assert!(succ(&both, me, &mut st3, 0, n, false, &mut out));
-            assert_eq!(succ(&both, me, &mut st3, 1, n, false, &mut out), !under);
-            let kept = if under {
+            assert_eq!(succ(&both, me, &mut st3, 1, n, false, &mut out), !over);
+            let kept = if over {
                 vec![(0, n)]
             } else {
                 vec![(0, n), (1, n)]
             };
             assert_eq!(hs(&mut st3).succ.list, kept);
-            let backs = if under {
+            let backs = if over {
                 vec![(n, Concl::Back(me, 0))]
             } else {
                 vec![(n, Concl::Back(me, 0)), (n, Concl::Back(me, 1))]
@@ -1916,6 +1940,56 @@ mod tests {
             r7(&ix, me, &mut st, only, &mut out);
             assert_eq!(out.sent, 0);
             assert_eq!(out.checks.get(), 1, "for {only:?}");
+        }
+    }
+
+    /// R7 at a singular context checks the run's bounds while it reads one restriction's
+    /// groups of backward links and their sources, and stops at the first check that
+    /// ends the run: a group of many sources of which one or none is real, and many
+    /// groups that the restriction does not count (item 1025).
+    #[test]
+    fn r7_over_many_backward_links_without_a_pair_stops_with_the_run() {
+        let (ix, me, _) = roles_index();
+        let srcs: Vec<Ex> = (100..600).collect();
+        // one group by role 2, the inverse of the restriction's role, with 500 sources
+        let mut wide = State::default();
+        hs(&mut wide).singular = true;
+        hs(&mut wide).atmost.push((0, TOP));
+        wide.back.push((2, Small::default()));
+        for &m in &srcs {
+            wide.back[0].1.insert(m);
+        }
+        let mut one = wide.clone();
+        hs(&mut one).real_preds.insert(srcs[0]);
+        // 500 groups by role 1, whose sources the restriction does not count
+        let mut many = State::default();
+        hs(&mut many).singular = true;
+        hs(&mut many).atmost.push((0, TOP));
+        for &m in &srcs {
+            many.back.push((1, Small::default()));
+            many.back.last_mut().unwrap().1.insert(m);
+        }
+        hs(&mut many).real_preds.insert(me);
+        let cases = [
+            (one, Some(srcs[0])),
+            (wide, None),
+            (many.clone(), Some(me)),
+            (many, None),
+        ];
+        for (mut st, only) in cases {
+            let st = &mut st;
+            let mut out = Stopped {
+                sent: 0,
+                checks: std::cell::Cell::new(0),
+            };
+            r7(&ix, me, st, only, &mut out);
+            assert_eq!((out.sent, out.checks.get()), (0, 1), "for {only:?}");
+            // the rules as they were check once after the restriction
+            let mut out = Polled::new();
+            r7(&ix, me, st, only, &mut out);
+            assert!(out.sent.is_empty());
+            let least = if spare() >= 1 { srcs.len() / 64 } else { 1 };
+            assert!(out.checks.get() >= least, "for {only:?}");
         }
     }
 
