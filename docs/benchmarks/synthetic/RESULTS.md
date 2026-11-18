@@ -715,7 +715,9 @@ in every server.
 | Eager BIND of the same `IF` and `SUM` | 60.94 ms | 15.21 ms | 0.250 | 59.97 ms | 0.253 |
 | Eager `SUM(IF(EXISTS { ?p ex:authorOf ?d }, 1, 0))` | 917.92 ms | 866.92 ms | 0.944 | 870.70 ms | 0.998 |
 
-Every round read within 0.02 of these ratios except those of the first query against the
+The fix column comes from the pair with main. The ratios against the build before item
+826 divide the other pair's fix medians, 15.16, 15.20 and 868.90 ms. Every round read
+within 0.02 of these ratios except those of the first query against the
 build before item 826, which read 0.988, 0.701 and 0.981. The fix leaves the queries that
 read values within 0.99 to 1.01 of main, such as `SUM(STRLEN(?n))`, `SUM(?s * 2)` and
 `expr-agg-arg`, and every streamed query above 0.3 ms within 0.98 to 1.01 of main. Streamed `sum-if` and the streamed
