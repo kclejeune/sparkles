@@ -5053,13 +5053,15 @@ impl Store {
             + delta_bytes(&snap.delta)
             + snap.generation.dvocab.with(|v| v.bytes()) as u64;
         let size = now.saturating_add((quads as u64).saturating_mul(DELTA_QUAD_BYTES));
-        match self.check_memory(size) {
+        // one reading of the configuration's history serves the check and the preview
+        let total = self.memory_with_configuration(size)?;
+        match self.check_memory_total(total) {
             Err(e) if o.dry_run.is_some() => {
                 *early = Some(crate::preview::StorageCheck {
                     refused: Some(e),
                     limit: self.opts.max_memory_bytes,
                     used: None,
-                    projected: self.memory_with_configuration(size).ok(),
+                    projected: Some(total),
                     stage,
                 });
                 Ok(())
@@ -5085,7 +5087,12 @@ impl Store {
     /// In-memory stores stay within [`StoreOptions::max_memory_bytes`]: `StorageFull`
     /// when a commit would make the data about `size` bytes.
     fn check_memory(&self, size: u64) -> Result<()> {
-        let size = self.memory_with_configuration(size)?;
+        self.check_memory_total(self.memory_with_configuration(size)?)
+    }
+
+    /// `StorageFull` when an in-memory store's data with its configuration's history,
+    /// `size` bytes, would pass its limit.
+    fn check_memory_total(&self, size: u64) -> Result<()> {
         match self.opts.max_memory_bytes {
             Some(max) if self.root.is_none() && size > max => {
                 let h = crate::error::human_bytes;
