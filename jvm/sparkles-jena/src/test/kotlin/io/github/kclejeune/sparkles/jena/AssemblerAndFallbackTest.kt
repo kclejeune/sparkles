@@ -48,9 +48,17 @@ class AssemblerAndFallbackTest {
         QueryExec.dataset(dataset.asDatasetGraph()).query(min).build().use {
             assertEquals("1", it.select().next().get("m").literalLexicalForm)
         }
+        // the property is the dataset's setting, which a later change replaces
+        val setting = (dataset.asDatasetGraph() as DatasetGraphSparkles).settings().aggregateErrors()
+        assertEquals(AggregateErrors.SPARKLES, setting.get())
+        assertTrue(setting.isSet())
         // a query's own context comes first
         val jena = Context().set(Sparkles.AGGREGATE_ERRORS, "jena")
         QueryExec.dataset(dataset.asDatasetGraph()).query(min).context(jena).build().use {
+            assertNull(it.select().next().get("m"))
+        }
+        setting.set(AggregateErrors.JENA)
+        QueryExec.dataset(dataset.asDatasetGraph()).query(min).build().use {
             assertNull(it.select().next().get("m"))
         }
         dataset.close()

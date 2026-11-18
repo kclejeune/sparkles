@@ -6944,8 +6944,9 @@ With the bundle on Fuseki's classpath, a dataset can be opened from an assembler
 Use `sparkles:memory true` instead of `location` for an in-memory dataset. The assembler
 also accepts `readOnly`, `autocommit`, `unionDefaultGraph`, `fallback`,
 `blankNodeLabels` and `aggregateErrors`, and merges Jena context settings.
-`sparkles:aggregateErrors "sparkles"` sets the reading of errors in aggregates of the
-dataset's queries, and a query whose context sets `Sparkles.AGGREGATE_ERRORS` keeps its own.
+`sparkles:aggregateErrors "sparkles"` sets the dataset's reading of errors in aggregates
+when the dataset has no setting of its own, and a query whose context sets
+`Sparkles.AGGREGATE_ERRORS` keeps its own reading.
 
 ### Blank node labels
 

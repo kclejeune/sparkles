@@ -374,3 +374,22 @@ fn an_update_reads_aggregates_as_the_request_or_the_dataset_says() {
     txn.commit().unwrap();
     assert_eq!(written(&s), ["1"]);
 }
+
+/// A new branch keeps its upstream's reading, in memory and on disk.
+#[test]
+fn a_branch_keeps_the_upstream_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    for s in [
+        Store::in_memory(StoreOptions::default()),
+        Store::open(dir.path(), StoreOptions::default()).unwrap(),
+    ] {
+        s.set_aggregate_errors_setting(Some(AggregateErrors::Sparkles))
+            .unwrap();
+        s.create_branch("b", &Default::default()).unwrap();
+        let b = s.branch("b").unwrap();
+        assert_eq!(
+            b.aggregate_errors_setting(),
+            Some(AggregateErrors::Sparkles)
+        );
+    }
+}

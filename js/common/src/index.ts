@@ -639,6 +639,8 @@ export interface UpdateOptions extends OperationOptions {
   message?: string;
   ifHead?: bigint | number;
   noWait?: boolean;
+  /** How the aggregates of the update's WHERE clauses treat errors, over the dataset's setting. */
+  aggregateErrors?: 'jena' | 'sparkles' | 'spec';
 }
 export interface CommitReceipt {
   datasetId: string;

@@ -2,7 +2,6 @@ package io.github.kclejeune.sparkles.jena.assembler
 
 import io.github.kclejeune.sparkles.jena.AggregateErrors
 import io.github.kclejeune.sparkles.jena.BlankNodeLabels
-import io.github.kclejeune.sparkles.jena.Sparkles
 import io.github.kclejeune.sparkles.jena.SparklesDatasets
 import io.github.kclejeune.sparkles.jena.SparklesFallback
 import io.github.kclejeune.sparkles.jena.SparklesOptions
@@ -38,8 +37,8 @@ public class DatasetAssemblerSparkles : DatasetAssembler() {
             .fallback(value("fallback")?.let { SparklesFallback.valueOf(it.uppercase()) } ?: SparklesFallback.AUTO)
             .blankNodeLabels(value("blankNodeLabels")?.let { BlankNodeLabels.valueOf(it.uppercase()) } ?: BlankNodeLabels.DATASET)
             .build()
-        // the reading of errors in aggregates of the dataset's queries, unless a query's
-        // context names another (roadmap item 1064)
+        // the dataset's reading of errors in aggregates, set once: a dataset with a
+        // setting of its own keeps it (roadmap item 1064)
         val aggregateErrors = value("aggregateErrors")?.let { v ->
             AggregateErrors.entries.firstOrNull { it.name.equals(v.trim(), ignoreCase = true) }
                 ?: error("sparkles:aggregateErrors is jena, sparkles or spec, not $v")
@@ -50,7 +49,8 @@ public class DatasetAssemblerSparkles : DatasetAssembler() {
         val ds = if (memory) SparklesDatasets.memory(opts) else SparklesDatasets.open(java.nio.file.Path.of(location!!), opts)
         try {
             AssemblerUtils.mergeContext(root, ds.context)
-            aggregateErrors?.let { ds.context.set(Sparkles.AGGREGATE_ERRORS, it) }
+            val setting = ds.settings().aggregateErrors()
+            if (aggregateErrors != null && !setting.isSet()) setting.set(aggregateErrors)
             return ds
         }
         catch (e: Throwable) { ds.close(); throw e }
