@@ -237,11 +237,12 @@ impl Accumulator for Running {
         Ok(())
     }
 
-    /// SUM and AVG merge exactly while both subtotals are integers or decimals. A merge
-    /// with a double subtotal can round differently from one pass, and an integer
-    /// subtotal beyond the decimal range leaves the result unbound where one pass would
-    /// have promoted it to a double. No caller merges these yet. Roadmap item 1066, the
-    /// parallel split that merges partitions, settles both cases before it does.
+    /// A merged SUM or AVG can differ from one pass in three ways. A float or double
+    /// subtotal can round differently. An integer subtotal beyond the decimal range
+    /// leaves the result unbound where one pass would have promoted it to a double. A
+    /// decimal sum that overflows partway through one pass, and so stays unbound, can
+    /// fit when its parts are summed apart. No caller merges these yet. Roadmap item
+    /// 1066, the parallel split that merges partitions, settles them before it does.
     fn mergeable(&self) -> bool {
         crate::sparql::exec::stat_aggregate(&self.agg.func).is_none()
     }
