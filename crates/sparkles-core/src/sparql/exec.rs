@@ -5350,12 +5350,18 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
     if t.len() < 2 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
         return Ok(None);
     }
+    // Only the variables whose values the rows read. A column that the expressions
+    // answer from ids, such as `?p = ex:a` or an EXISTS pattern's key, costs a decode of
+    // every distinct term and gains nothing.
     let mut vars = Vec::new();
     for e in exprs {
-        e.vars(&mut vars);
+        super::expr::value_vars(e, ctx, &mut vars);
     }
     vars.sort_unstable();
     vars.dedup();
+    if vars.is_empty() {
+        return Ok(None);
+    }
     if t.len() < 4096 {
         // The rows are evaluated one at a time, each reading the terms it needs. On a
         // cold vocabulary every term is a page fault that waits for the one before it.
@@ -10026,6 +10032,68 @@ mod string_order_tests {
                     assert!(ctx.check().is_ok(), "{what}");
                 }
             }
+        }
+    }
+
+    /// The pre-decode leaves alone a column that the expressions answer from ids: one
+    /// compared with a constant IRI by `=`, `!=` or `IN`, one tested by `isIRI`, and an
+    /// EXISTS pattern's key, alone or under `IF`, as in `SUM(IF(?p = ex:a, 1, 0))`. That
+    /// decode cost an eager grouping over 300,000 IRIs four times its time (item 1098). A
+    /// comparison with a constant string reads values and still decodes the column.
+    #[test]
+    fn the_pre_decode_skips_columns_answered_from_ids() {
+        use super::super::expr::{ExistsSpec, Func};
+        use spargebra::algebra::{Function, GraphPattern};
+        let (s, strings) = unique_store();
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 256 << 20;
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+        let (t, x) = wide(&ctx, &strings, usize::MAX);
+        let iri = s
+            .snapshot()
+            .lookup_term(&oxrdf::NamedNode::new("urn:s:0").unwrap().into())
+            .expect("a stored IRI");
+        let var = || Box::new(Expr::Var(x));
+        let int = |i: i64| Box::new(Expr::Const(Id::from_i64(i).unwrap()));
+        let eq = Expr::Eq(var(), Box::new(Expr::Const(iri)));
+        let exists = Expr::Exists(std::sync::Arc::new(ExistsSpec::new(
+            GraphPattern::Bgp {
+                patterns: Vec::new(),
+            },
+            super::super::plan::ActiveGraph::Default,
+            vec![x],
+            Vec::new(),
+        )));
+        let skipped = [
+            ("if-eq", Expr::If(Box::new(eq.clone()), int(1), int(0))),
+            ("not-eq", Expr::Not(Box::new(eq.clone()))),
+            (
+                "in",
+                Expr::In(var(), vec![Expr::Const(iri), Expr::Const(iri)]),
+            ),
+            (
+                "is-iri",
+                Expr::Call(Func::Builtin(Function::IsIri), vec![Expr::Var(x)]),
+            ),
+            ("if-exists", Expr::If(Box::new(exists), int(1), int(0))),
+        ];
+        for (what, e) in &skipped {
+            let decoded = decode_for(&ctx, &t, &[e]).unwrap();
+            assert!(
+                decoded.is_none_or(|d| d.cols.iter().all(Option::is_none)),
+                "{what}: the column is decoded"
+            );
+        }
+        let string = Expr::Eq(var(), Box::new(Expr::Const(strings[1])));
+        let read = [
+            ("eq-string", Expr::If(Box::new(string), int(1), int(0))),
+            ("str", str_of(x)),
+        ];
+        for (what, e) in &read {
+            let decoded = decode_for(&ctx, &t, &[e]).unwrap().expect("decoded");
+            let col = decoded.cols[0].as_ref().expect("the column is decoded");
+            assert_rows(&ctx, &t, col, what);
         }
     }
 

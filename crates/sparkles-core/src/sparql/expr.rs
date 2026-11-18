@@ -742,6 +742,42 @@ pub fn needs_values(e: &Expr) -> bool {
     }
 }
 
+/// The variables of `e` whose decoded values its evaluation reads. A variable compared
+/// with a constant IRI or blank node, by `=`, `!=` or `IN`, is answered from term ids and
+/// kinds, and so is one under `sameTerm`, `isIRI`, `isBlank`, `isLiteral` or `BOUND`. An
+/// EXISTS pattern takes its variables' ids. A variable elsewhere is listed, and so is a
+/// bare variable, whose decoded value some callers sort or hash on. Leaving a variable
+/// out never changes an answer, since its rows then read their values one at a time.
+pub fn value_vars(e: &Expr, ctx: &Ctx, out: &mut Vec<VarId>) {
+    let simple = |x: &Expr| matches!(x, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..));
+    let atomic = |x: &Expr| {
+        x.const_id()
+            .is_some_and(|id| matches!(ctx.kind(id), TermKind::Iri | TermKind::BNode))
+    };
+    match e {
+        Expr::Const(_) | Expr::Lit(..) | Expr::Bound(_) | Expr::Exists(_) => {}
+        Expr::SameTerm(a, b) if simple(a) && simple(b) => {}
+        Expr::Eq(a, b) if (atomic(a) && simple(b)) || (simple(a) && atomic(b)) => {}
+        Expr::In(a, l) if simple(a) && l.iter().all(atomic) => {}
+        Expr::Call(
+            Func::Builtin(Function::IsIri | Function::IsBlank | Function::IsLiteral),
+            args,
+        ) if args.iter().all(simple) => {}
+        Expr::Not(a) => value_vars(a, ctx, out),
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            value_vars(a, ctx, out);
+            value_vars(b, ctx, out);
+        }
+        Expr::If(a, b, c) => {
+            value_vars(a, ctx, out);
+            value_vars(b, ctx, out);
+            value_vars(c, ctx, out);
+        }
+        Expr::Coalesce(l) => l.iter().for_each(|x| value_vars(x, ctx, out)),
+        _ => e.vars(out),
+    }
+}
+
 pub fn ebv(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<bool> {
     match eval(e, row, ctx)? {
         Val::Id(id) if id.tag() == crate::id::Tag::Bool => Ok(id.as_bool()),
