@@ -248,7 +248,9 @@ words by the same transitions, drops a transition that another covers by a super
 and drops the transitions by properties that no link of the run can have. On one thread and
 without their disjunctive attempt, the Horn rules derive 22.1 million conclusions on
 `ore_ont_14817` where they derived 29.1 million and 35.6 million on `ore_ont_9663` where
-they derived 50.9 million, with the same taxonomies.
+they derived 50.9 million, with the same taxonomies. On the benchmark host they take 0.80 and
+0.75 times the time of the build before on one thread, and `ore_ont_9654` classifies in
+0.25 times the time.
 A run of the disjunctive rules without counting or the rooted rules ends once it has
 derived 384 conclusions for each class of the signature, and at least 2,097,152, and the
 Horn rules answer as they do past its memory budget (roadmap item 990).

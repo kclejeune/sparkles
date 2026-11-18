@@ -365,6 +365,36 @@ median of 8.75 against 8.17 s and is slower in 12 rounds, and on one thread 76.3
 outside the Horn rules' final saturation, in time that holds the attempt of the
 disjunctive rules, which item 869 does not change. Item 1027 follows it.
 
+Item 693 reduces the automata by which a run with the Horn rules unfolds its universal
+and negative existential restrictions, as [the Horn rules](#the-horn-rules) describe. It
+merges the states that accept the same words, drops a transition that a superproperty
+covers and drops the transitions by properties that no link of the run can have.
+`SPARKLES_HORN_AUTOMATA` selects the reductions for a comparison, and the default
+applies all three. Six rounds of alternating order on the benchmark host compared the
+build with the base and with itself without the reductions. Without their disjunctive
+attempt the Horn rules classify ore_ont_14817 in 0.80 times the base's time on one
+thread and 0.85 times on four, 2.0 against 2.5 s on one thread, and ore_ont_9663 in 0.75
+times on both, 2.7 against 3.7 s, with peak resident sets of 713 against 808 MiB and 951
+against 1,215 MiB. `ore_ont_9654` classifies in 0.25 times the base's time on one thread
+and 0.41 times on four, with 9.6 against 45.9 million conclusions and 665 against 1,359
+MiB, and `ore_ont_9855` in 0.64 and 0.67 times with 247 against 371 MiB. GO, ChEBI lite
+and the files whose conclusions stay the same take 0.99 to 1.01 times the base's time on
+one thread, and every taxonomy of the rounds is equal on the four sides. The default run
+of the two Uberon files does not gain. Its bounded attempt of the disjunctive rules takes
+nearly all of its 58 and 75 s on one thread and sets its peak resident set, and the run
+is 2.5 and 1.8% slower with the reductions in each of six rounds, although its Horn
+saturation is 0.5 and 0.9 s shorter. A pinned process on the laptop executes the same
+instructions in the attempt on the base and on the build with and without the
+reductions, so the attempt does the same work in more time. On four threads
+`ore_ont_8737` takes 1.03 to 1.04 times the base's time on the build with and without
+the reductions, within the range of the base's own rounds. Item 1090 follows both, and
+the [benchmark report](../../benchmarks/el-classification/RESULTS.md#reduced-automata)
+holds every file. The reductions were also tried in the unfolding of the disjunctive
+rules and not kept, as [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#reasoning)
+records. Item 693 keeps the remaining cost of the Horn rules on the two files, which
+still derive 22.1 and 35.6 million conclusions against 16.5 and 10.8 million for the EL
+rules alone.
+
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
 timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
@@ -1098,9 +1128,10 @@ conclusions on ore_ont_14817 where they derived 29.1 million, and 35.6 million o
 ore_ont_9663 where they derived 50.9 million. Merging gives 27.9 and 46.0 million,
 covered transitions 24.2 and 41.1 million, and dead properties the rest. The EL rules
 alone derive 16.5 and 10.8 million. The contexts of conjunctions hold 5.47 million
-subsumers on ore_ont_14817 where they held 8.50 million, and the peak resident set of
-the laptop runs falls from 796 to 678 MiB and from 1,189 to 933 MiB. The taxonomies are
-equal at every level on one and eight threads. Tier D's own unfolding in its bounded
+subsumers on ore_ont_14817 where they held 8.50 million. On the benchmark host the Horn
+rules alone then take 2.0 against 2.5 s and 2.7 against 3.7 s on one thread, with peak
+resident sets of 713 against 808 MiB and 951 against 1,215 MiB, as the Outcome records.
+The taxonomies are equal at every level on one and eight threads. Tier D's own unfolding in its bounded
 attempt is not reduced. The first two reductions were tried there and not kept. On the
 96 disjunctive files of the development set the taxonomies were equal, the same three
 attempts ended over their bound, and the times of the two Uberon files differed by no
