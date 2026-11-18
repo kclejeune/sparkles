@@ -448,7 +448,7 @@ fn random_programs_on_demand_equal_their_full_runs() {
     let (in1, in2) = (v.props[2], v.props[3]);
     let mut checked = 0;
     let mut negated = 0;
-    for seed in 1..=600u64 {
+    for seed in 1..=4000u64 {
         let t = super::terms();
         let Some((p, facts)) = random_program(&t, seed) else {
             continue;
@@ -506,8 +506,8 @@ fn random_programs_on_demand_equal_their_full_runs() {
         checked += 1;
     }
     eprintln!("checked {checked} negated {negated}");
-    assert!(checked > 50, "{checked} programs checked");
-    assert!(negated > 20, "{negated} programs had a negation");
+    assert!(checked > 300, "{checked} programs checked");
+    assert!(negated > 100, "{negated} programs had a negation");
 }
 
 /// No magic rule of a demand program over a relation of arity three or more interns a
@@ -976,4 +976,49 @@ fn a_large_negated_triple_blocker_is_charged() {
         }
         Ok(w) => panic!("{w:?}"),
     }
+}
+
+/// A negation of a relation beside a rule whose head has a variable predicate: the
+/// relation reads no triple, so the program stratifies, and the demand transformation
+/// agrees, since a relation takes no part in the edges of variable predicates.
+#[test]
+fn a_relation_beside_a_variable_predicate_stratifies_on_demand() {
+    use crate::demand::{Key, KeyP, Pass, negation_on_a_cycle, transform};
+    let v = TV::new();
+    let (p1, p2) = (v.props[1], v.props[2]);
+    let c = v.inds[0];
+    let (rels, ids) = rels(&[1, 1]);
+    let (r0, r) = (ids[0], ids[1]);
+    let rules = vec![
+        rule(
+            "sym",
+            vec![pos(IAtom::triple(V(0), V(1), V(2)))],
+            vec![head(IAtom::triple(V(2), V(1), V(0)))],
+        ),
+        rule("seed", vec![], vec![head(rel(r0, &[C(c)]))]),
+        rule(
+            "r",
+            vec![pos(rel(r0, &[V(0)]))],
+            vec![head(rel(r, &[V(0)]))],
+        ),
+        rule(
+            "s",
+            vec![pos(tri(V(0), p1, V(1))), neg(rel(r, &[V(0)]))],
+            vec![head(tri(V(0), p2, V(1)))],
+        ),
+    ];
+    let t = Terms::new(v.store.snapshot());
+    let p = Program::new(rels, rules, &Vocab::of(&t), &t.budget()).unwrap();
+    assert!(p.strata.stratified.is_ok());
+    let lowered = p.lower(&t.budget()).unwrap();
+    let rules: Vec<engine::CRule> = lowered
+        .strata
+        .iter()
+        .flatten()
+        .map(engine::CRule::clone_shallow)
+        .collect();
+    assert!(!negation_on_a_cycle(&rules, &t));
+    let est = |_: &engine::Atom, _: &[bool]| (1.0, 1.0);
+    let root = Key::new(true, KeyP::Const(p2), false);
+    transform(&rules, &t, &[root], &est, Pass::Plain, true, true).unwrap();
 }
