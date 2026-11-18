@@ -1452,8 +1452,8 @@ modes and options.
 
 `--aggregate-errors jena|sparkles|spec` chooses how MIN, MAX, AVG and GROUP_CONCAT treat
 errors such as unbound values. `jena` is the default and gives Apache Jena's answers.
-`sparkles query` runs its query under the reading, locally or with `--server` as the
-request parameter `aggregate-errors`. `sparkles serve` uses it for the datasets that have
+`sparkles query` and `sparkles update` run their request under the reading, locally or
+with `--server` as the request parameter `aggregate-errors`. `sparkles serve` uses it for the datasets that have
 no setting of their own, and the NixOS module's `services.sparkles.aggregateErrors`
 passes it on. [API.md](API.md#aggregate-errors) describes the readings, the per-dataset
 setting at `/$/aggregate-errors/{ds}` and the parameter, and the Python, Node.js and JVM
@@ -6942,8 +6942,10 @@ With the bundle on Fuseki's classpath, a dataset can be opened from an assembler
 ```
 
 Use `sparkles:memory true` instead of `location` for an in-memory dataset. The assembler
-also accepts `readOnly`, `autocommit`, `unionDefaultGraph`, `fallback` and
-`blankNodeLabels`, and merges Jena context settings.
+also accepts `readOnly`, `autocommit`, `unionDefaultGraph`, `fallback`,
+`blankNodeLabels` and `aggregateErrors`, and merges Jena context settings.
+`sparkles:aggregateErrors "sparkles"` sets the reading of errors in aggregates of the
+dataset's queries, and a query whose context sets `Sparkles.AGGREGATE_ERRORS` keeps its own.
 
 ### Blank node labels
 

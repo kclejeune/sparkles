@@ -2944,6 +2944,8 @@ async fn update_endpoint(
         // where admission did not run
         grant: crate::server_memory::current_grant(),
         pool: ds.dataset.query_options().pool,
+        // the request's reading, else the dataset's
+        aggregate_errors: aggregate_errors_param(&params)?,
         ..Default::default()
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);

@@ -398,12 +398,16 @@ pub fn update(
     dataset: &str,
     update: &str,
     message: Option<&str>,
+    aggregate_errors: Option<&str>,
 ) -> Result<()> {
     let r = Remote::open(server, insecure)?;
-    let req = r
+    let mut req = r
         .req(Method::POST, &format!("/{}/update", ds_path(dataset)))
         .header("content-type", "application/sparql-update")
         .header("accept", "application/json");
+    if let Some(m) = aggregate_errors {
+        req = req.query(&[("aggregate-errors", m)]);
+    }
     let resp = r.check(
         with_message(req, message).body(update.to_string()).send(),
         Some(dataset),

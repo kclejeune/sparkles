@@ -111,7 +111,10 @@ A query chooses its reading with the `aggregate-errors` request parameter, the l
 option `aggregateErrors`, the JVM context symbol `Sparkles.AGGREGATE_ERRORS`, the MCP
 argument `aggregateErrors` or the command line's `--aggregate-errors`. Without one it takes
 the dataset's setting at `/$/aggregate-errors/{ds}`, and a dataset without a setting
-takes the server's default, which `sparkles serve --aggregate-errors` sets. Materialized
+takes the server's default, which `sparkles serve --aggregate-errors` sets. A Fuseki
+configuration sets both with the context symbol `aggregateErrors`
+(`urn:x-sparkles:symbol#aggregateErrors`), in the server's context or a dataset's, and
+the JVM assembler sets a dataset's with `sparkles:aggregateErrors`. Materialized
 views and live queries follow the dataset's reading and evaluate again when it changes. A
 query that names another reading evaluates a view's query from the data and does not
 read the view's maintained state, and its plan says so. [Aggregate

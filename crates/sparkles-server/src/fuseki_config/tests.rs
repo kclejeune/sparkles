@@ -881,6 +881,126 @@ PREFIX jr:     <http://jena.hpl.hp.com/2003/RuleReasoner#>
     );
 }
 
+/// The `aggregateErrors` context symbol, the name of the JVM binding's
+/// `Sparkles.AGGREGATE_ERRORS`, sets the server's reading in the server's context and a
+/// dataset's own reading in the dataset's or an endpoint's (roadmap item 1064).
+#[test]
+fn aggregate_errors_contexts() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = |server: &str, endpoint: &str, dataset: &str| {
+        let cx = |v: &str| {
+            if v.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "ja:context [ ja:cxtName \"urn:x-sparkles:symbol#aggregateErrors\" ; \
+                     ja:cxtValue \"{v}\" ] ;"
+                )
+            }
+        };
+        format!(
+            r#"PREFIX :       <#>
+PREFIX fuseki: <http://jena.apache.org/fuseki#>
+PREFIX ja:     <http://jena.hpl.hp.com/2005/11/Assembler#>
+[] a fuseki:Server ; {} fuseki:services ( :a :b ) .
+:a a fuseki:Service ; fuseki:name "a" ;
+    fuseki:endpoint [ {} fuseki:operation fuseki:query ] ;
+    fuseki:dataset [ a ja:MemoryDataset ; {} ] .
+:b a fuseki:Service ; fuseki:name "b" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ;
+    fuseki:dataset [ a ja:MemoryDataset ] .
+"#,
+            cx(server),
+            cx(endpoint),
+            cx(dataset)
+        )
+    };
+    let mut n = 0;
+    let mut plan_of = |mode: Mode, s: &str, e: &str, d: &str| {
+        n += 1;
+        let path = dir.path().join(format!("config-{n}.ttl"));
+        std::fs::write(&path, config(s, e, d)).unwrap();
+        plan_for(&[path], &UserSource::default(), mode).unwrap()
+    };
+    use sparkles::sparql::AggregateErrors as A;
+    let p = plan_of(Mode::Files, "spec", "", "sparkles");
+    assert!(!p.report.has_unsupported(), "{}", p.report.text());
+    assert!(
+        !has(&p, Kind::Ignored, "aggregateErrors"),
+        "{}",
+        p.report.text()
+    );
+    assert_eq!(p.server.aggregate_errors, Some(A::Spec));
+    assert!(args(&p).contains("--aggregate-errors spec"), "{}", args(&p));
+    assert_eq!(p.datasets[0].aggregate_errors, Some(A::Sparkles));
+    assert_eq!(p.datasets[1].aggregate_errors, None);
+    // serve.sh cannot set a dataset's reading, so the report says how
+    assert!(
+        has(&p, Kind::Approximated, "/$/aggregate-errors/a"),
+        "{}",
+        p.report.text()
+    );
+    // an endpoint's reading applies to its dataset, and the dataset's own one wins
+    let p = plan_of(Mode::Serve, "", "jena", "");
+    assert_eq!(p.server.aggregate_errors, None);
+    assert!(!args(&p).contains("--aggregate-errors"), "{}", args(&p));
+    assert_eq!(p.datasets[0].aggregate_errors, Some(A::Jena));
+    assert!(
+        has(&p, Kind::Approximated, "one endpoint"),
+        "{}",
+        p.report.text()
+    );
+    assert!(!has(&p, Kind::Approximated, "/$/aggregate-errors"));
+    let p = plan_of(Mode::Serve, "", "jena", "spec");
+    assert_eq!(p.datasets[0].aggregate_errors, Some(A::Spec));
+    // a value that names no reading is refused, not read as the default
+    let p = plan_of(Mode::Serve, "oxigraph", "", "");
+    assert!(
+        has(&p, Kind::Unsupported, "oxigraph"),
+        "{}",
+        p.report.text()
+    );
+}
+
+/// At the start of `serve --fuseki-config`, a dataset without a reading of its own gets
+/// the configuration's, and one with a reading set at run time keeps it.
+#[test]
+fn a_configured_reading_does_not_replace_a_dataset_setting() {
+    use crate::state::{AppState, DbType};
+    use sparkles::sparql::AggregateErrors as A;
+    let dir = tempfile::tempdir().unwrap();
+    let st = std::sync::Arc::new(
+        AppState::new(
+            dir.path(),
+            sparkles::store::StoreOptions::default(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    st.create("a", DbType::Persistent).unwrap();
+    st.create("b", DbType::Persistent).unwrap();
+    st.get("b")
+        .unwrap()
+        .dataset
+        .settings()
+        .aggregate_errors()
+        .set(A::Sparkles)
+        .unwrap();
+    let add = super::ServeAdditions {
+        dataset_aggregate_errors: vec![("a".into(), A::Spec), ("b".into(), A::Spec)],
+        ..Default::default()
+    };
+    super::start(&st, &add, &crate::startup::StopFlag::unset()).unwrap();
+    assert_eq!(
+        st.get("a").unwrap().store.aggregate_errors_setting(),
+        Some(A::Spec)
+    );
+    assert_eq!(
+        st.get("b").unwrap().store.aggregate_errors_setting(),
+        Some(A::Sparkles)
+    );
+}
+
 /// The files under `dir`.
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();

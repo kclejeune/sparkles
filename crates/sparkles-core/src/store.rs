@@ -6561,6 +6561,12 @@ impl WriteTxn<'_> {
         Ok((head.seq + 1, ts))
     }
 
+    /// The reading of errors in aggregates the store's queries use unless they choose
+    /// one: the dataset's own setting, else the store's option.
+    pub fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
+        self.store.aggregate_errors()
+    }
+
     /// The graph view of this transaction's writes, if it does not cover every graph.
     pub fn graphs(&self) -> Option<&Arc<crate::access::GraphAccess>> {
         self.opts.graphs.as_ref()

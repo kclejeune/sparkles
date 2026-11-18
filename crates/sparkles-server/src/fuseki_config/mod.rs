@@ -226,6 +226,10 @@ pub struct ServeAdditions {
     pub timeout: Option<f64>,
     pub update_timeout: Option<f64>,
     pub union_default_graph: bool,
+    /// the server's reading of errors in aggregates, which `--aggregate-errors` overrides
+    pub aggregate_errors: Option<sparkles::sparql::AggregateErrors>,
+    /// the datasets' own readings, which a dataset with a setting of its own keeps
+    pub dataset_aggregate_errors: Vec<(String, sparkles::sparql::AggregateErrors)>,
     pub read_only: bool,
     /// the values of `--gsp-direct-naming`
     pub gsp_direct_naming: Vec<String>,
@@ -282,11 +286,15 @@ pub fn for_serve(path: &Path, data_dir: &Path, own_auth: bool) -> Result<ServeAd
     add.timeout = s.timeout;
     add.update_timeout = s.update_timeout;
     add.union_default_graph = s.union_default_graph;
+    add.aggregate_errors = s.aggregate_errors;
     add.read_only = s.read_only;
     add.gsp_direct_naming = write::direct_naming_values(s);
     add.metrics_fuseki_names = s.metrics_fuseki_names;
     add.auto_reason = s.auto_reason;
     for ds in &plan.datasets {
+        if let Some(m) = ds.aggregate_errors {
+            add.dataset_aggregate_errors.push((ds.name.clone(), m));
+        }
         let files = write::dataset_files(ds);
         if ds.persistent(Mode::Serve) {
             add.loc.push(format!(
@@ -375,6 +383,21 @@ pub fn start(
     add: &ServeAdditions,
     stop: &crate::startup::StopFlag,
 ) -> Result<()> {
+    // a dataset's reading of errors in aggregates, set once: one with a setting of its
+    // own, such as from `PUT /$/aggregate-errors/{ds}`, keeps it
+    for (name, m) in &add.dataset_aggregate_errors {
+        let ds = st
+            .get(name)
+            .with_context(|| format!("--fuseki-config: no dataset /{name}"))?;
+        if ds.store.aggregate_errors_setting().is_none() {
+            ds.dataset
+                .settings()
+                .aggregate_errors()
+                .set(*m)
+                .with_context(|| format!("--fuseki-config: the aggregate errors of /{name}"))?;
+            tracing::info!("fuseki-config: /{name} reads aggregate errors as {m}");
+        }
+    }
     for (name, path, graph) in &add.data {
         stop.check()?;
         let ds = st

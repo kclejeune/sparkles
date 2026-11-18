@@ -3382,8 +3382,9 @@ the values, which takes only strings. In every reading an error makes SUM, AVG a
 GROUP_CONCAT unbound, and COUNT and SAMPLE pass over errors. The
 [querying guide](querying/README.md#aggregate-errors) gives examples.
 
-A request's `aggregate-errors` parameter sets the reading of one query. Without it the
-query takes the dataset's setting, and a dataset without a setting takes the server's
+A request's `aggregate-errors` parameter sets the reading of one query, or of the WHERE
+clauses of one update at `/{ds}/update`. Without it the request takes the dataset's
+setting, and a dataset without a setting takes the server's
 default, which `sparkles serve --aggregate-errors` sets. The setting lives at
 `/$/aggregate-errors/{ds}`. `GET` needs read access and returns `mode`, `source`
 (`dataset` or `default`) and the list of `modes`. `PUT` with `{"mode": "spec"}` sets the

@@ -36,6 +36,26 @@ class AssemblerAndFallbackTest {
         resource.addLiteral(model.createProperty(VocabSparkles.NS + "location"), "/unused")
         assertThrows(RuntimeException::class.java) { Assembler.general.open(resource) }
     }
+    @Test fun the_assembler_sets_the_reading_of_errors_in_aggregates() {
+        val model = ModelFactory.createDefaultModel()
+        RDFDataMgr.read(model, ByteArrayInputStream("""
+            @prefix s: <${VocabSparkles.NS}> .
+            <urn:dataset> a s:DatasetSparkles ; s:memory true ; s:aggregateErrors "sparkles" .
+            <urn:bad> a s:DatasetSparkles ; s:memory true ; s:aggregateErrors "oxigraph" .
+        """.trimIndent().toByteArray()), Lang.TURTLE)
+        val dataset = Assembler.general.open(model.getResource("urn:dataset")) as org.apache.jena.query.Dataset
+        val min = "SELECT (MIN(?v) AS ?m) { VALUES ?v { 3 UNDEF 1 } }"
+        QueryExec.dataset(dataset.asDatasetGraph()).query(min).build().use {
+            assertEquals("1", it.select().next().get("m").literalLexicalForm)
+        }
+        // a query's own context comes first
+        val jena = Context().set(Sparkles.AGGREGATE_ERRORS, "jena")
+        QueryExec.dataset(dataset.asDatasetGraph()).query(min).context(jena).build().use {
+            assertNull(it.select().next().get("m"))
+        }
+        dataset.close()
+        assertThrows(RuntimeException::class.java) { Assembler.general.open(model.getResource("urn:bad")) }
+    }
     @Test fun stage_hooks_fall_back_in_auto_and_refuse_in_never() {
         SparklesDatasets.memory().use { ds ->
             var invoked = false

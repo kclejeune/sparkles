@@ -152,6 +152,7 @@ impl Execution {
 pub struct UpdateOptions {
     pub(crate) using_graphs: Vec<String>,
     pub(crate) using_named_graphs: Vec<String>,
+    pub(crate) aggregate_errors: Option<AggregateErrors>,
     pub(crate) write: WriteCommon,
     pub(crate) call: CallOptions,
 }
@@ -177,6 +178,12 @@ impl UpdateOptions {
     /// The protocol's `using-named-graph-uri` (repeatable).
     pub fn using_named_graph(mut self, iri: impl Into<String>) -> Self {
         self.using_named_graphs.push(iri.into());
+        self
+    }
+    /// How the aggregates of the update's WHERE clauses treat errors, over the dataset's
+    /// setting (Sparkles only, the `aggregate-errors` parameter).
+    pub fn aggregate_errors(mut self, reading: AggregateErrors) -> Self {
+        self.aggregate_errors = Some(reading);
         self
     }
     /// The commit message (Sparkles only).
@@ -488,6 +495,10 @@ impl Endpoint {
         }
         for g in &opts.using_named_graphs {
             r.param("using-named-graph-uri", g.clone());
+        }
+        if let Some(m) = opts.aggregate_errors {
+            self.sparkles_only("aggregate-errors")?;
+            r.param("aggregate-errors", m.as_str());
         }
         self.write_params(&mut r, &opts.write)?;
         r.body(ReqBody::text("application/sparql-update", update));

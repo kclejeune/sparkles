@@ -5360,7 +5360,7 @@ fn protocol(p: &mut Paths) {
         .see("per-dataset-sparql-protocol-fuseki-compatible")
         .query("using-graph-uri", json!({ "type": "array", "items": { "type": "string" } }), "`USING` graphs.")
         .query("using-named-graph-uri", json!({ "type": "array", "items": { "type": "string" } }), "`USING NAMED` graphs.")
-        .params(&["memoryMb", "maxRows", "maxRowsProduced"])
+        .params(&["memoryMb", "maxRows", "maxRowsProduced", "aggregateErrors"])
         .body(
             true,
             "The update.",

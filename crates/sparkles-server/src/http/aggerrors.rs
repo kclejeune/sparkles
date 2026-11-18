@@ -178,4 +178,71 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{body}");
         assert_eq!(min(&app, "").await, (StatusCode::OK, "1".into()));
     }
+
+    /// What `INSERT … WHERE { SELECT (MIN(?v) …) }` writes under `params`: the minimum,
+    /// or nothing when the reading leaves it unbound.
+    async fn inserted_min(app: &axum::Router, params: &str) -> (StatusCode, String) {
+        let u = "DELETE WHERE { <urn:r> ?p ?o } ; INSERT { <urn:r> <urn:min> ?m } WHERE { \
+                 SELECT (MIN(?v) AS ?m) WHERE { VALUES ?v { 3 UNDEF 1 } } }";
+        let r = Request::builder()
+            .method("POST")
+            .uri(format!("/ds/update?{params}"))
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(u))
+            .unwrap();
+        let (status, body) = call(app, r).await;
+        if status != StatusCode::OK {
+            return (status, body);
+        }
+        let q = "SELECT ?m WHERE { <urn:r> <urn:min> ?m }";
+        let r = Request::builder()
+            .uri(format!(
+                "/ds/sparql?query={}",
+                url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+            ))
+            .header("accept", "application/sparql-results+json")
+            .body(Body::empty())
+            .unwrap();
+        let (_, body) = call(app, r).await;
+        let j: J = serde_json::from_str(&body).unwrap();
+        let v = j["results"]["bindings"][0]["m"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn an_update_reads_aggregates_as_the_parameter_or_the_dataset_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+        );
+        st.create("ds", DbType::Persistent).unwrap();
+        let app = crate::http::router(st.clone());
+        // the server's default, jena, leaves the minimum unbound
+        assert_eq!(
+            inserted_min(&app, "").await,
+            (StatusCode::OK, String::new())
+        );
+        assert_eq!(
+            inserted_min(&app, "aggregate-errors=sparkles").await,
+            (StatusCode::OK, "1".into())
+        );
+        let (s, body) = call(
+            &app,
+            req("PUT", "/$/aggregate-errors/ds", r#"{"mode":"sparkles"}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(inserted_min(&app, "").await, (StatusCode::OK, "1".into()));
+        assert_eq!(
+            inserted_min(&app, "aggregate-errors=jena").await,
+            (StatusCode::OK, String::new())
+        );
+        assert_eq!(
+            inserted_min(&app, "aggregate-errors=oxigraph").await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

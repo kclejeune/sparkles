@@ -94,6 +94,7 @@ op!(
     &[
         "using-graph-uri",
         "using-named-graph-uri",
+        "aggregate-errors",
         "timeout",
         "dryRun",
         "receipt",

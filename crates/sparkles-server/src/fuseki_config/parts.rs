@@ -988,4 +988,25 @@ impl Converter<'_> {
             }
         }
     }
+
+    /// A converted configuration's datasets get their own readings of errors in
+    /// aggregates when the server starts, and `serve.sh` passes no such setting, so the
+    /// report says how to set them.
+    pub(super) fn settle_aggregate_errors(&mut self, datasets: &[DatasetPlan]) {
+        if self.mode != super::convert::Mode::Files {
+            return;
+        }
+        for d in datasets {
+            if let Some(m) = d.aggregate_errors {
+                self.report.approximated(
+                    format!("dataset /{}", d.name),
+                    format!(
+                        "aggregateErrors {m}: set it once the server runs with PUT \
+                         /$/aggregate-errors/{} and the body {{\"mode\": \"{m}\"}}",
+                        d.name
+                    ),
+                );
+            }
+        }
+    }
 }

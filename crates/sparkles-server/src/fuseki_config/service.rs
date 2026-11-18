@@ -129,6 +129,7 @@ impl Converter<'_> {
             rdfs: None,
             reasoning: None,
             union: union_from_endpoints,
+            aggregate_errors: None,
         };
         let mut graphs = None;
         let dplace = format!("dataset /{name}");
@@ -242,7 +243,14 @@ impl Converter<'_> {
                     continue;
                 }
             };
+            let before = self.local_aggregate_errors.len();
             self.contexts(g, &e, &eplace, Scope::Local);
+            for (p, m) in self.local_aggregate_errors[before..].to_vec() {
+                self.report.approximated(
+                    p,
+                    format!("aggregateErrors {m} on one endpoint applies to the whole dataset"),
+                );
+            }
             for (p, on) in std::mem::take(&mut self.local_union) {
                 self.report.approximated(
                     p,
@@ -364,6 +372,10 @@ impl Converter<'_> {
         self.contexts(g, d, place, Scope::Local);
         for (_, on) in self.local_union.drain(..) {
             plan.union = Some(on);
+        }
+        // the endpoints' readings come first, so the dataset's own one wins
+        for (_, m) in self.local_aggregate_errors.drain(..) {
+            plan.aggregate_errors = Some(m);
         }
         let types = g.types(d);
         let is = |t: String| types.contains(&t);

@@ -332,3 +332,45 @@ fn the_plan_names_the_reading() {
     assert!(!plan(AggregateErrors::Jena, "MIN(?v)").contains("aggregate errors"));
     assert!(!plan(AggregateErrors::Spec, "COUNT(?v)").contains("aggregate errors"));
 }
+
+/// The WHERE clause of an update reads aggregates as the request chooses, else as the
+/// dataset's own setting says, else as the store's option says.
+#[test]
+fn an_update_reads_aggregates_as_the_request_or_the_dataset_says() {
+    let insert = r#"INSERT { <http://ex/r> <http://ex/min> ?m } WHERE {
+        SELECT (MIN(?v) AS ?m) WHERE { VALUES ?v { 3 UNDEF 1 } } }"#;
+    let written = |s: &Store| {
+        let r = query(
+            s.snapshot(),
+            "SELECT ?m WHERE { <http://ex/r> <http://ex/min> ?m }",
+            &QueryOptions::default(),
+        )
+        .unwrap()
+        .rows()
+        .unwrap();
+        let cells: Vec<String> = r.iter().map(|row| tsv(&row.values()[0])).collect();
+        sparkles_core::sparql::update::update(
+            s,
+            "DELETE WHERE { <http://ex/r> ?p ?o }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        cells
+    };
+    let run = |s: &Store, opts: &QueryOptions| {
+        sparkles_core::sparql::update::update(s, insert, opts).unwrap();
+        written(s)
+    };
+    let s = Store::in_memory(StoreOptions::default());
+    // jena: MIN over an unbound value is unbound, so the template writes nothing
+    assert!(run(&s, &QueryOptions::default()).is_empty());
+    assert_eq!(run(&s, &under(AggregateErrors::Sparkles, None)), ["1"]);
+    s.set_aggregate_errors_setting(Some(AggregateErrors::Sparkles))
+        .unwrap();
+    assert_eq!(run(&s, &QueryOptions::default()), ["1"]);
+    assert!(run(&s, &under(AggregateErrors::Jena, None)).is_empty());
+    let mut txn = s.write();
+    sparkles_core::sparql::update::update_in(&mut txn, insert, &QueryOptions::default()).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(written(&s), ["1"]);
+}

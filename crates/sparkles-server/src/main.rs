@@ -151,7 +151,7 @@ struct Cli {
     /// How aggregates treat errors and values that are not strings: jena (MIN and MAX
     /// over an error are unbound, the default), sparkles (MIN and MAX pass over errors)
     /// or spec (the literal SPARQL reading). `serve` uses it for the datasets without a
-    /// setting of their own, and `query` for its one query
+    /// setting of their own, and `query` and `update` for their one request
     #[arg(long, global = true, value_name = "READING",
         value_parser = ["jena", "sparkles", "spec"])]
     aggregate_errors: Option<String>,
@@ -2997,6 +2997,12 @@ fn run() -> Result<()> {
             if fuseki.as_ref().is_some_and(|f| f.union_default_graph) {
                 opts.union_default_graph = true;
             }
+            // the configuration's reading of errors in aggregates, unless the flag names one
+            if cli.aggregate_errors.is_none()
+                && let Some(m) = fuseki.as_ref().and_then(|f| f.aggregate_errors)
+            {
+                opts.aggregate_errors = m;
+            }
             opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
             // persistent datasets without a quota of their own get this one
@@ -4211,6 +4217,7 @@ fn run() -> Result<()> {
                     &ds,
                     &u,
                     message.as_deref(),
+                    cli.aggregate_errors.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(&ds, insecure_http);
@@ -4225,6 +4232,11 @@ fn run() -> Result<()> {
                     message,
                     ..Default::default()
                 },
+                // the flag comes before the dataset's own setting, as for `query`
+                aggregate_errors: cli
+                    .aggregate_errors
+                    .as_deref()
+                    .map(|m| m.parse().expect("clap admits only the readings")),
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;
