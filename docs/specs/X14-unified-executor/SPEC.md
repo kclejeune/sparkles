@@ -255,8 +255,12 @@ forbids and, where it cannot decide, reports a partial or unordered comparison i
 An open column is compared only by its place in the rows, which makes the comparison
 partial. A column that only computed values bind compares numbers by datatype and value,
 and a column that only copied terms bind compares them exactly. Arithmetic, the numeric
-functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values, STRDT
-and STRLANG keep the lexical form they are given, and any other operator counts as both. A column bound by both,
+functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values. A
+variable, a constant, IF, COALESCE, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and SAMPLE
+aggregates pass on the terms or lexical forms they are given, and any other operator
+counts as both. A constructor whose lexical argument shows the form of a computed
+number, such as `STRDT(STR(1.0 + 1.0), xsd:decimal)`, still compares exactly, so an engine
+that writes that number in another allowed form would fail the comparison. A column bound by both,
 such as a COALESCE over a variable and a constant, compares exactly, and a number that
 differs there only in its lexical form makes the comparison partial. An ordered or sliced
 answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
