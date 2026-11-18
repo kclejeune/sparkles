@@ -66,9 +66,8 @@ pub(crate) struct LoadInputs {
     pub entry: Entry,
     /// The store holds no quads.
     pub empty_head: bool,
-    /// The size in quads. For a load or a replace it is the estimate from the sizes of
-    /// the sources that are not streams, and for a bulk insert or a patch the length of
-    /// the batch.
+    /// The length of the batch of a bulk insert or a patch. A load or a replace reads
+    /// its size from [`Sizes`] instead.
     pub quads: u64,
     /// The number of sources of a load or a replace.
     pub sources: usize,
@@ -111,14 +110,32 @@ impl LoadInputs {
     }
 }
 
+/// The sizes of the sources of a load or a replace, which [`LoadPlan::choose`] asks for
+/// only when they decide the plan, since finding them reads the sources.
+pub(crate) trait Sizes {
+    /// The estimate in quads of the sources that are not streams, from their lengths.
+    fn estimate(&mut self) -> u64;
+    /// Read the streams among the sources ahead and say whether they hold more than
+    /// `limit` decompressed bytes.
+    fn exceeds(&mut self, limit: u64) -> Result<bool>;
+}
+
+/// The sizes of a batch, which has no sources.
+pub(crate) struct NoSources;
+
+impl Sizes for NoSources {
+    fn estimate(&mut self) -> u64 {
+        0
+    }
+
+    fn exceeds(&mut self, _: u64) -> Result<bool> {
+        Ok(false)
+    }
+}
+
 impl LoadPlan {
-    /// The plan for `i`. `exceeds(limit)` reads the streams among the sources ahead and
-    /// says whether they hold more than `limit` decompressed bytes. It is called only
-    /// when its answer decides the plan, since a read ahead costs time and memory.
-    pub(crate) fn choose(
-        i: &LoadInputs,
-        mut exceeds: impl FnMut(u64) -> Result<bool>,
-    ) -> Result<LoadPlan> {
+    /// The plan for `i`, with the sizes of its sources from `sizes`.
+    pub(crate) fn choose(i: &LoadInputs, sizes: &mut dyn Sizes) -> Result<LoadPlan> {
         let bulk = match i.entry {
             // A rebuild from sources does not check each quad's graph, so a write limited
             // to some graphs parses them in a transaction.
@@ -127,13 +144,19 @@ impl LoadPlan {
                 // A stream that ends within a few thousand quads goes into an empty
                 // store by a transaction, which costs less than the fixed cost of a
                 // rebuild. Its bytes are read ahead to tell, as only a read can.
-                let small_streams =
-                    i.sources > 0 && i.streams == i.sources && !exceeds(SMALL_STREAM_BYTES)?;
+                let small_streams = i.sources > 0
+                    && i.streams == i.sources
+                    && !sizes.exceeds(SMALL_STREAM_BYTES)?;
                 !small_streams
             }
             Entry::Load | Entry::Replace => {
-                i.quads > i.threshold
-                    || (i.streams > 0 && exceeds(i.threshold.saturating_mul(BYTES_PER_QUAD))?)
+                // a bound past the largest byte count is one no stream exceeds
+                let bound = i.threshold.checked_mul(BYTES_PER_QUAD);
+                sizes.estimate() > i.threshold
+                    || match bound {
+                        Some(bound) if i.streams > 0 => sizes.exceeds(bound)?,
+                        _ => false,
+                    }
             }
             // A batch has checked each quad's graph already, so a restriction to some
             // graphs does not keep it out of a rebuild. Triple protections, managed

@@ -136,15 +136,40 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// The sizes of a row: its quads as the estimate, and its stream bytes.
+struct Stub<'a> {
+    quads: u64,
+    stream_bytes: u64,
+    probes: &'a mut Vec<u64>,
+    estimated: &'a mut bool,
+}
+
+impl super::Sizes for Stub<'_> {
+    fn estimate(&mut self) -> u64 {
+        *self.estimated = true;
+        self.quads
+    }
+
+    fn exceeds(&mut self, limit: u64) -> crate::error::Result<bool> {
+        self.probes.push(limit);
+        Ok(self.stream_bytes > limit)
+    }
+}
+
 #[test]
 fn plan_table() {
     let mut failures = Vec::new();
     for r in rows() {
-        let mut probes = Vec::new();
-        let plan = LoadPlan::choose(&r.inputs, |limit| {
-            probes.push(limit);
-            Ok(r.stream_bytes > limit)
-        })
+        let (mut probes, mut estimated) = (Vec::new(), false);
+        let plan = LoadPlan::choose(
+            &r.inputs,
+            &mut Stub {
+                quads: r.inputs.quads,
+                stream_bytes: r.stream_bytes,
+                probes: &mut probes,
+                estimated: &mut estimated,
+            },
+        )
         .unwrap();
         if plan != r.plan || probes != r.probes {
             failures.push(format!(
@@ -152,8 +177,35 @@ fn plan_table() {
                 r.name, r.plan, r.probes
             ));
         }
+        // the estimate reads file sources, so a plan that it does not decide skips it
+        let sources = matches!(r.inputs.entry, Load | Replace);
+        let needed = sources && !r.inputs.restricted && !r.inputs.empty_head;
+        if estimated != needed {
+            failures.push(format!(
+                "{}: estimated {estimated}, expected {needed}",
+                r.name
+            ));
+        }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A threshold whose byte bound passes the largest byte count probes no stream.
+#[test]
+fn saturated_bound() {
+    let i = LoadInputs {
+        threshold: u64::MAX,
+        ..stream(Load)
+    };
+    let (mut probes, mut estimated) = (Vec::new(), false);
+    let mut stub = Stub {
+        quads: 0,
+        stream_bytes: u64::MAX,
+        probes: &mut probes,
+        estimated: &mut estimated,
+    };
+    assert_eq!(LoadPlan::choose(&i, &mut stub).unwrap(), Txn);
+    assert!(probes.is_empty());
 }
 
 // The entry points themselves, which must pass the inputs the table assumes. A bulk plan
@@ -431,5 +483,77 @@ fn load_plan_timing() {
                 );
             }
         }
+    }
+}
+
+/// A replace counts the quads it parsed, duplicates included, whichever plan it takes.
+#[test]
+fn replace_counts_parsed_quads_on_both_plans() {
+    let twice = |from, n| {
+        let mut v = ntriples(from, n);
+        v.extend(ntriples(from, n));
+        v
+    };
+    let o = WriteOptions::default();
+    let cases: Vec<(&str, Store, Source, u64, LoadPlan)> = vec![
+        (
+            "empty head, bytes",
+            store(),
+            Source::from_bytes(twice(0, 2), RdfFormat::NTriples, None),
+            4,
+            Bulk,
+        ),
+        (
+            "empty head, a small stream",
+            store(),
+            Source::from_reader(std::io::Cursor::new(twice(0, 2)), RdfFormat::NTriples, None),
+            4,
+            Txn,
+        ),
+        (
+            "above the threshold",
+            seeded(2),
+            Source::from_bytes(twice(100, E), RdfFormat::NTriples, None),
+            2 * E,
+            Bulk,
+        ),
+        (
+            "at the threshold",
+            seeded(2),
+            Source::from_bytes(twice(100, E / 2), RdfFormat::NTriples, None),
+            E,
+            Txn,
+        ),
+    ];
+    for (name, s, src, n, plan) in cases {
+        let (count, _) = s
+            .replace_with(ReplaceTarget::Default, &[src], CommitKind::GspPut, &o)
+            .unwrap();
+        assert_eq!(count, n, "{name}");
+        assert_eq!(plan_of(&s), plan, "{name}");
+    }
+}
+
+/// An empty source written into an empty store. A stream takes a transaction and makes no
+/// commit. Other sources take the bulk plan, which commits an empty generation, for a
+/// replace as for a load.
+#[test]
+fn empty_sources_into_an_empty_store() {
+    let o = WriteOptions::default();
+    for (stream, committed) in [(false, true), (true, false)] {
+        let src = || if stream { reader(0, 0) } else { bytes(0, 0) };
+        let s = store();
+        let (count, r) = s
+            .replace_with(ReplaceTarget::Default, &[src()], CommitKind::GspPut, &o)
+            .unwrap();
+        assert_eq!(
+            (count, r.committed),
+            (0, committed),
+            "replace, stream {stream}"
+        );
+        let s = store();
+        let r = s.load_with(&[src()], CommitKind::Load, &o).unwrap();
+        assert_eq!(r.committed, committed, "load, stream {stream}");
+        assert_eq!(s.snapshot().len(), 0);
     }
 }

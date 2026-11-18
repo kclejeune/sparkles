@@ -1657,6 +1657,8 @@ struct BuiltGeneration {
     sourced: Option<Vec<QuadKey>>,
     /// the quads of the dropped graphs, unless there were more than the change cap
     dropped: Option<Vec<[Id; 4]>>,
+    /// the quads the sources gave, duplicates included
+    parsed: u64,
 }
 
 /// A failed switch of `CURRENT` (see [`Store::switch_generation`]).
@@ -5452,7 +5454,6 @@ impl Store {
     ) -> Result<LoadPlan> {
         let inputs = load_plan::LoadInputs {
             empty_head: self.snapshot().is_empty(),
-            quads: estimated_quads(sources),
             sources: sources.len(),
             streams: sources
                 .iter()
@@ -5461,7 +5462,16 @@ impl Store {
             restricted: o.graphs.is_some(),
             ..load_plan::LoadInputs::new(entry, self.opts.bulk_threshold)
         };
-        LoadPlan::choose(&inputs, |limit| streams_exceed(sources, limit, o))
+        struct SourceSizes<'a>(&'a [Source], &'a crate::guard::WriteOptions);
+        impl load_plan::Sizes for SourceSizes<'_> {
+            fn estimate(&mut self) -> u64 {
+                estimated_quads(self.0)
+            }
+            fn exceeds(&mut self, limit: u64) -> Result<bool> {
+                streams_exceed(self.0, limit, self.1)
+            }
+        }
+        LoadPlan::choose(&inputs, &mut SourceSizes(sources, o))
     }
 
     /// A large replace: one rebuild that leaves out the target graphs and adds the
@@ -5509,9 +5519,8 @@ impl Store {
             admission: None,
         };
         let check = (crate::guard::Changes::Unknown, o);
-        let (_, r) = self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, bulk, check)?;
-        // the quads the replacement holds: what is left, less what was kept
-        Ok(((r.commit.quads + dropped).saturating_sub(start_len), r))
+        // the quads parsed, as a transactional replace counts them
+        self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, bulk, check)
     }
 
     /// Compact: merge base ⊕ delta into a new generation. The data does not change, so
@@ -5527,7 +5536,7 @@ impl Store {
     /// transaction), less the graphs in `drop_graphs`. A compaction keeps the head and
     /// builds and catches up on its own (see [`compact_with`](Self::compact_with)); both
     /// publish through [`switch_generation`](Self::switch_generation).
-    /// Returns the number of new quads and the receipt.
+    /// Returns the number of quads its sources parsed, duplicates included, and the receipt.
     #[allow(clippy::too_many_arguments)]
     fn rebuild_locked(
         &self,
@@ -5555,7 +5564,6 @@ impl Store {
             admitted.fence()?
         };
         let started = std::time::Instant::now();
-        let before = snap.len();
         // the head state before the bulk commit, whose changes the change log records
         let prior = self.snapshot();
         // a running compaction gives up: this rebuild makes a new generation itself
@@ -5604,6 +5612,7 @@ impl Store {
             storage,
             sourced,
             dropped,
+            parsed,
         } = self.build_generation(
             w,
             snap,
@@ -5841,7 +5850,7 @@ impl Store {
             validation,
             annotation,
         };
-        Ok((meta.quads.saturating_sub(before), receipt))
+        Ok((parsed, receipt))
     }
 
     /// Build the generation of a bulk commit next to the current one: the quads of
@@ -5893,6 +5902,7 @@ impl Store {
         let mut sourced: Option<Vec<QuadKey>> = None;
         let mut dropped: Vec<[Id; 4]> = Vec::new();
         let mut dropped_over = false;
+        let mut parsed = 0;
         let built = (|| {
             let mut builder = Builder::new(&dir, bopts)?;
             if let Some(i) = interrupt.clone() {
@@ -5923,9 +5933,11 @@ impl Store {
                 },
                 extra_quads,
             )?;
+            let before = builder.input_quads();
             for s in extra {
                 builder.add_source(s)?;
             }
+            parsed = builder.input_quads() - before;
             sourced = builder.take_tapped();
             builder.add_prefixes(self.prefixes());
             let meta = builder.finish()?;
@@ -5956,6 +5968,7 @@ impl Store {
                 storage,
                 sourced,
                 dropped: (!dropped_over).then_some(dropped),
+                parsed,
             }),
             Err(e) => {
                 // the unfinished generation's space is freed now, not at the next rebuild
@@ -6952,8 +6965,8 @@ impl WriteTxn<'_> {
             deleted,
             ..load_plan::LoadInputs::new(entry, self.store.opts.bulk_threshold)
         };
-        // a batch has no streams to probe
-        LoadPlan::choose(&inputs, |_| Ok(false)).unwrap_or(LoadPlan::Transactional)
+        // a batch has no sources to read, so its plan cannot fail
+        LoadPlan::choose(&inputs, &mut load_plan::NoSources).unwrap_or(LoadPlan::Transactional)
     }
 
     /// Durably commit and publish a new snapshot. A transaction without net effect (and
@@ -7550,7 +7563,7 @@ fn streams_exceed(sources: &[Source], limit: u64, o: &crate::guard::WriteOptions
         // the magic bytes that tell the codec, read under the same checks
         r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
         r.decode(s.codec()?, s.max_decompressed, o)?;
-        let want = (limit + 1).saturating_sub(bytes);
+        let want = limit.saturating_add(1).saturating_sub(bytes);
         let held = r.read_ahead(usize::try_from(want).unwrap_or(usize::MAX), &|| o.check())?;
         bytes += held as u64;
         if bytes > limit {
