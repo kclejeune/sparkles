@@ -2503,18 +2503,21 @@ enum State {
     Union {
         at: usize,
     },
-    /// An operator without a cursor implementation. With `inputs`, its children are
-    /// cursors whose output it collects before running. Otherwise its whole subtree
-    /// runs eagerly.
+    /// An operator without a cursor implementation whose children are cursors, whose
+    /// output it collects before its eager kernel runs.
     Fallback {
-        node: Node,
-        loaded: Option<Buffer>,
-        at: usize,
-        inputs: bool,
+        eager: Eager,
         /// Scans among the inputs, which an eager scan reads straight into a table of
         /// the right size. The fallback holds its whole input either way.
         scans: Vec<Option<Node>>,
     },
+    /// A kernel that reads no children, run once into a charged answer that it serves
+    /// batch by batch. A bounded one is native under decision 2 of the X14 plan, and an
+    /// unbounded one runs only under `AllowMaterialization`.
+    Leaf(Eager),
+    /// An operator that is not a leaf and does not read its children as input tables,
+    /// so its whole subtree runs eagerly. The strict policy refuses it.
+    EagerSubtree(Eager),
     Blocking {
         node: Node,
         loaded: Option<Buffer>,
@@ -2524,6 +2527,90 @@ enum State {
     },
     TopK(Box<topk::TopK>),
     IndexTopK(Box<topk::IndexTopK>),
+}
+
+/// An eager kernel's node, its answer once it has run, and how far its consumer has
+/// read that answer.
+struct Eager {
+    node: Node,
+    loaded: Option<Buffer>,
+    at: usize,
+}
+
+impl Eager {
+    fn new(node: Node) -> Self {
+        Self {
+            node,
+            loaded: None,
+            at: 0,
+        }
+    }
+
+    /// The next batch of at most `cap` rows of the loaded answer.
+    fn serve(&mut self, ctx: &Arc<Ctx>, cap: usize) -> Result<Option<Buffer>> {
+        let table = &self.loaded.as_ref().expect("a loaded eager answer").table;
+        let batch = copy_rows(ctx, table, self.at, cap)?;
+        if let Some(batch) = &batch {
+            self.at += batch.table.len;
+        }
+        Ok(batch)
+    }
+
+    /// Whether the consumer has read the whole loaded answer.
+    fn served(&self) -> bool {
+        self.loaded
+            .as_ref()
+            .is_some_and(|loaded| self.at == loaded.table.len)
+    }
+}
+
+/// The charged answer of an eager kernel that has just run, in the order its parents
+/// rely on. The kernel's plan, with its counters and `materializedRows`, becomes the
+/// operator's `info`, keeping the operator's time and the rows it has emitted.
+fn load_eager(
+    ctx: &Arc<Ctx>,
+    mut output: super::table::Materialized<'_>,
+    mut info: PlanInfo,
+    current: &mut PlanInfo,
+    rows: usize,
+    order: &[VarId],
+) -> Result<Buffer> {
+    if ctx.graphs.is_some() {
+        info.redact();
+    }
+    info.time_ms = current.time_ms;
+    let mut counters = info.counters.take().unwrap_or_default();
+    counters.insert("materializedRows".into(), output.table.len.into());
+    info.counters = Some(counters);
+    info.actual_rows = rows.min(i64::MAX as usize) as i64;
+    *current = info;
+    #[cfg(feature = "failpoints")]
+    if output.lease.is_some() {
+        crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+            "algorithm-fallback-transfer",
+            capacity_bytes(&output.table) as usize,
+        ));
+    }
+    let mut charge = if output.lease.is_some() {
+        OwnedCharge::adopt(ctx, &mut output.lease)?
+    } else {
+        OwnedCharge::new(ctx, capacity_bytes(&output.table))?
+    };
+    let mut table = output.table;
+    // Parents rely on the planner's order, which the eager result reports only when its
+    // rows hold it.
+    if !table.sorted.starts_with(order) {
+        // Row indices and the reordered copy coexist with the input.
+        charge.resize(
+            capacity_bytes(&table)
+                .saturating_mul(2)
+                .saturating_add(table.len as u64 * 8),
+        )?;
+        table.sort_by_vars(order);
+        ctx.check()?;
+        charge.resize(capacity_bytes(&table))?;
+    }
+    Ok(Buffer { table, charge })
 }
 
 struct Operator {
@@ -3142,6 +3229,11 @@ impl Operator {
                     "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
                     node.operator()
                 )
+            } else if !inputs && !node.children.is_empty() {
+                format!(
+                    "{} has no resumable cursor implementation and runs its whole subtree eagerly",
+                    node.operator()
+                )
             } else {
                 format!("{} has no resumable cursor implementation", node.operator())
             }
@@ -3178,14 +3270,20 @@ impl Operator {
                 at: 0,
                 external: None,
             }
-        } else if materializes {
+        } else if materializes && inputs {
             State::Fallback {
-                node,
-                loaded: None,
-                at: 0,
-                inputs,
+                eager: Eager::new(node),
                 scans,
             }
+        } else if materializes && node.children.is_empty() {
+            State::Leaf(Eager::new(node))
+        } else if materializes {
+            debug_assert!(
+                !native,
+                "{} is native but runs its subtree",
+                node.operator()
+            );
+            State::EagerSubtree(Eager::new(node))
         } else {
             match &node.kind {
                 Kind::Scan(spec) => State::Scan(Scan::new(spec.clone(), None)),
@@ -3409,11 +3507,7 @@ impl Operator {
             d.children
         };
         let children = match &self.state {
-            State::Fallback {
-                node,
-                inputs: false,
-                ..
-            } => described(node)
+            State::EagerSubtree(Eager { node, .. }) => described(node)
                 .into_iter()
                 .map(|c| eager(c, "inside an eager fallback subtree", true))
                 .collect(),
@@ -3430,6 +3524,8 @@ impl Operator {
                 || matches!(
                     self.state,
                     State::Fallback { .. }
+                        | State::Leaf(_)
+                        | State::EagerSubtree(_)
                         | State::Binary(_)
                         | State::Group(_)
                         | State::Scalar(_)
@@ -3475,8 +3571,17 @@ impl Operator {
         }
         match &self.state {
             State::Fallback {
+                eager: Eager {
+                    loaded: Some(_), ..
+                },
+                ..
+            }
+            | State::Leaf(Eager {
                 loaded: Some(_), ..
-            } => update(&self.info, plan),
+            })
+            | State::EagerSubtree(Eager {
+                loaded: Some(_), ..
+            }) => update(&self.info, plan),
             State::Scalar(_) if self.done => {
                 for (info, plan) in self.info.children.iter().zip(&mut plan.children) {
                     update(info, plan);
@@ -3670,6 +3775,8 @@ impl Operator {
                     && !matches!(
                         self.state,
                         State::Fallback { .. }
+                            | State::Leaf(_)
+                            | State::EagerSubtree(_)
                             | State::Scalar(_)
                             | State::Counts { .. }
                             | State::Expand(_)
@@ -3995,83 +4102,44 @@ impl Operator {
                     self.done = *at == table.len;
                     batch
                 }
-                State::Fallback {
-                    node,
-                    loaded,
-                    at,
-                    inputs,
-                    scans,
-                } => {
-                    if loaded.is_none() {
-                        let (mut output, mut info) = if *inputs {
-                            let children = &mut self.children;
-                            let mut collect = |i: usize| match &scans[i] {
-                                Some(scan) => {
-                                    let (output, info) = exec::execute_owned(ctx, scan)?;
-                                    let table = &output.table;
-                                    let child = &mut children[i];
-                                    child.rows = table.len;
-                                    child.info.actual_rows = info.actual_rows;
-                                    child.info.time_ms = info.time_ms;
-                                    child.done = true;
-                                    Ok((output, info))
-                                }
-                                None => collect_input(ctx, &mut children[i], options),
-                            };
-                            exec::execute_with_inputs(ctx, node, &mut collect)?
-                        } else {
-                            exec::execute_owned(ctx, node)?
+                State::Fallback { eager, scans } => {
+                    if eager.loaded.is_none() {
+                        let children = &mut self.children;
+                        let mut collect = |i: usize| match &scans[i] {
+                            Some(scan) => {
+                                let (output, info) = exec::execute_owned(ctx, scan)?;
+                                let table = &output.table;
+                                let child = &mut children[i];
+                                child.rows = table.len;
+                                child.info.actual_rows = info.actual_rows;
+                                child.info.time_ms = info.time_ms;
+                                child.done = true;
+                                Ok((output, info))
+                            }
+                            None => collect_input(ctx, &mut children[i], options),
                         };
-                        if *inputs {
-                            // The child operators describe themselves.
-                            info.children.clear();
-                        }
-                        if ctx.graphs.is_some() {
-                            info.redact();
-                        }
-                        info.time_ms = self.info.time_ms;
-                        let mut counters = info.counters.take().unwrap_or_default();
-                        counters.insert("materializedRows".into(), output.table.len.into());
-                        info.counters = Some(counters);
-                        info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
-                        self.info = info;
-                        #[cfg(feature = "failpoints")]
-                        if output.lease.is_some() {
-                            crate::algo::observe_projection(
-                                crate::algo::ProjectionEvent::Materialized(
-                                    "algorithm-fallback-transfer",
-                                    capacity_bytes(&output.table) as usize,
-                                ),
-                            );
-                        }
-                        let mut charge = if output.lease.is_some() {
-                            OwnedCharge::adopt(ctx, &mut output.lease)?
-                        } else {
-                            OwnedCharge::new(ctx, capacity_bytes(&output.table))?
-                        };
-                        let mut table = output.table;
-                        // Parents rely on the planner's order, which the eager result
-                        // reports only when its rows hold it.
-                        if !table.sorted.starts_with(&self.order) {
-                            // Row indices and the reordered copy coexist with the input.
-                            charge.resize(
-                                capacity_bytes(&table)
-                                    .saturating_mul(2)
-                                    .saturating_add(table.len as u64 * 8),
-                            )?;
-                            table.sort_by_vars(&self.order);
-                            ctx.check()?;
-                            charge.resize(capacity_bytes(&table))?;
-                        }
-                        *loaded = Some(Buffer { table, charge });
+                        let (output, mut info) =
+                            exec::execute_with_inputs(ctx, &eager.node, &mut collect)?;
+                        // The child operators describe themselves.
+                        info.children.clear();
+                        let buffer =
+                            load_eager(ctx, output, info, &mut self.info, self.rows, &self.order)?;
+                        eager.loaded = Some(buffer);
                     }
-                    let table = &loaded.as_ref().expect("loaded fallback").table;
-                    let b = copy_rows(ctx, table, *at, cap)?;
-                    if let Some(b) = &b {
-                        *at += b.table.len;
+                    let batch = eager.serve(ctx, cap)?;
+                    self.done = eager.served();
+                    batch
+                }
+                State::Leaf(eager) | State::EagerSubtree(eager) => {
+                    if eager.loaded.is_none() {
+                        let (output, info) = exec::execute_owned(ctx, &eager.node)?;
+                        let buffer =
+                            load_eager(ctx, output, info, &mut self.info, self.rows, &self.order)?;
+                        eager.loaded = Some(buffer);
                     }
-                    self.done = *at == table.len;
-                    b
+                    let batch = eager.serve(ctx, cap)?;
+                    self.done = eager.served();
+                    batch
                 }
                 State::Unary(_)
                     if self
