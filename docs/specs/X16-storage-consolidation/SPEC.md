@@ -686,7 +686,7 @@ expect a small first load to build a base generation, while under that rule its 
 stayed in the delta until a compaction. The phase therefore kept the earlier rule of a
 replacement into an empty store, and item 1097 follows the rebuild cost of a small first
 POST, which both builds pay. The gates were the table test, the entry-point tests, the
-deadline tests at the default and the saturated threshold, lane CI and three review
+deadline tests at the default and the saturated threshold, lane CI and seven review
 rounds. Durability, the write-ahead log and the on-disk formats did not change.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
