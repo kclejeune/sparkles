@@ -342,12 +342,14 @@ fn the_result_cache_keys_a_lateral_on_the_reading() {
     assert_eq!(m(&under(AggregateErrors::Sparkles, None)), ["1"]);
     assert_eq!(m(&under(AggregateErrors::Jena, None)), [""]);
     assert!(s.result_cache().hits() > hits, "the cache answered");
-    assert_eq!(m(&QueryOptions::default()), [""]);
+    // the dataset's own setting, which the library passes as the request's reading
+    let dataset = |s: &Store| under(s.aggregate_errors(), None);
+    assert_eq!(m(&dataset(&s)), [""]);
     s.set_aggregate_errors_setting(Some(AggregateErrors::Sparkles))
         .unwrap();
-    assert_eq!(m(&QueryOptions::default()), ["1"]);
+    assert_eq!(m(&dataset(&s)), ["1"]);
     s.set_aggregate_errors_setting(None).unwrap();
-    assert_eq!(m(&QueryOptions::default()), [""]);
+    assert_eq!(m(&dataset(&s)), [""]);
 }
 
 /// EXPLAIN names a reading other than the default on the aggregates it changes.

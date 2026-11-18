@@ -337,10 +337,14 @@ mod tests {
                 Some(sparkles_core::sparql::AggregateErrors::Sparkles)
             );
             assert_eq!(restored.describe_settings(), describe);
+            // the restored setting is the reading the library passes to its queries
             let r = sparkles_core::sparql::query(
                 restored.snapshot(),
                 "SELECT (MIN(?v) AS ?m) WHERE { VALUES ?v { 1 UNDEF } }",
-                &QueryOptions::default(),
+                &QueryOptions {
+                    aggregate_errors: Some(restored.aggregate_errors()),
+                    ..Default::default()
+                },
             )
             .unwrap();
             let rows = r.rows().unwrap();
