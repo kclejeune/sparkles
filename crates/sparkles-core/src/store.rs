@@ -68,6 +68,7 @@ pub use holds::{Acquired, HoldPublication};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod control_tests;
+mod load_plan;
 #[cfg(test)]
 mod managed_tests;
 mod mem_history;
@@ -100,6 +101,9 @@ mod vector;
 pub(crate) use diff::QuadKey;
 pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
+use load_plan::LoadPlan;
+#[cfg(test)]
+use load_plan::SMALL_STREAM_BYTES;
 use publish::{Committed, Publication};
 use snapshot::{Shared, SnapshotBuilder};
 pub(crate) mod wal;
@@ -5253,21 +5257,8 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
-        let snap = self.snapshot();
-        // A stream that ends within a few thousand quads goes into an empty store by a
-        // transaction, which costs less than the fixed cost of a rebuild. Its bytes are
-        // read ahead to tell, as only a read can.
-        let small_streams = snap.is_empty()
-            && !sources.is_empty()
-            && sources
-                .iter()
-                .all(|s| matches!(s.data, crate::io::SourceData::Reader(_)))
-            && !streams_exceed(sources, SMALL_STREAM_BYTES, o)?;
-        // a write limited to some graphs checks each quad, which a rebuild does not
-        if o.graphs.is_none()
-            && !small_streams
-            && (snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold)
-        {
+        let plan = self.source_plan(load_plan::Entry::Load, sources, o)?;
+        if plan == LoadPlan::Bulk {
             let mut w = self.lock_writer(o)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
@@ -5384,9 +5375,8 @@ impl Store {
                 }
                 _ => {}
             }
-        } else if estimated_quads(sources) > self.opts.bulk_threshold
-            || streams_exceed(sources, self.opts.bulk_threshold.saturating_mul(80), o)?
-        {
+        }
+        if self.source_plan(load_plan::Entry::Replace, sources, o)? == LoadPlan::Bulk {
             return self.replace_bulk(target, sources, kind, o);
         }
         let mut parsed = Vec::with_capacity(sources.len());
@@ -5450,6 +5440,27 @@ impl Store {
         let r = txn.commit()?;
         self.add_prefixes(prefixes)?;
         Ok((n, r))
+    }
+
+    /// The [`LoadPlan`] of a load or a replace of `sources` under `o`.
+    fn source_plan(
+        &self,
+        entry: load_plan::Entry,
+        sources: &[Source],
+        o: &crate::guard::WriteOptions,
+    ) -> Result<LoadPlan> {
+        let inputs = load_plan::LoadInputs {
+            empty_head: self.snapshot().is_empty(),
+            quads: estimated_quads(sources),
+            sources: sources.len(),
+            streams: sources
+                .iter()
+                .filter(|s| matches!(s.data, crate::io::SourceData::Reader(_)))
+                .count(),
+            restricted: o.graphs.is_some(),
+            ..load_plan::LoadInputs::new(entry, self.opts.bulk_threshold)
+        };
+        LoadPlan::choose(&inputs, |limit| streams_exceed(sources, limit, o))
     }
 
     /// A large replace: one rebuild that leaves out the target graphs and adds the
@@ -6909,12 +6920,8 @@ impl WriteTxn<'_> {
                 self.check_graph(q[3])?;
             }
         }
-        // a write whose quads protections check goes through the delta, so that the
-        // state it leaves can be checked before the commit
-        if (quads.len() as u64) < self.store.opts.bulk_threshold
-            || self.requested.is_some()
-            || self.managed.is_some()
-            || self.control.is_some()
+        if self.bulk_plan(load_plan::Entry::InsertBulk, quads.len(), false)
+            == LoadPlan::Transactional
         {
             for q in quads {
                 self.insert(q)?;
@@ -6930,6 +6937,22 @@ impl WriteTxn<'_> {
         }
         self.bulk.extend(quads);
         Ok(())
+    }
+
+    /// The [`LoadPlan`] of a batch of `len` quads staged by `entry`, a bulk insert or a
+    /// patch that has met a delete row when `deleted`.
+    pub(crate) fn bulk_plan(&self, entry: load_plan::Entry, len: usize, deleted: bool) -> LoadPlan {
+        let inputs = load_plan::LoadInputs {
+            quads: len as u64,
+            restricted: self.opts.graphs.is_some(),
+            triple_checks: self.requested.is_some(),
+            managed: self.managed.is_some(),
+            control: self.control.is_some(),
+            deleted,
+            ..load_plan::LoadInputs::new(entry, self.store.opts.bulk_threshold)
+        };
+        // a batch has no streams to probe
+        LoadPlan::choose(&inputs, |_| Ok(false)).unwrap_or(LoadPlan::Transactional)
     }
 
     /// Durably commit and publish a new snapshot. A transaction without net effect (and
@@ -7509,14 +7532,8 @@ fn estimated_quads(sources: &[Source]) -> u64 {
             crate::io::SourceData::Reader(_) => continue,
         } * s.codec().map_or(1, |c| c.expansion());
     }
-    bytes / 80
+    bytes / load_plan::BYTES_PER_QUAD
 }
-
-/// Decompressed bytes of streams, about 100,000 quads, below which a load into an empty store
-/// takes a transaction instead of a rebuild. A rebuild has a fixed cost of about 20 ms,
-/// and it parses a stream shorter than one parallel chunk of 8 MiB on one thread, so a
-/// transaction is faster up to about that size.
-const SMALL_STREAM_BYTES: u64 = 8 << 20;
 
 /// Whether the streams among `sources`, whose length is unknown, hold more than `limit`
 /// decompressed bytes. Each stream gets its decompressing reader (see
