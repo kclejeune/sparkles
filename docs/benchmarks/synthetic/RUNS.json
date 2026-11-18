@@ -1905,6 +1905,704 @@
         }
       },
       "metadata_note": "Manual matched-source diagnostic. Not selected for generated peer comparison."
+    },
+    {
+      "run_id": "sha256-ce40bfef42a7a7384020a8f4a5b3a4c9b194efe0db6878493e2f3de9ffabe4ec",
+      "path": "runs/ce40bfef42a7a7384020a8f4a5b3a4c9b194efe0db6878493e2f3de9ffabe4ec/record.json",
+      "sha256": "ce40bfef42a7a7384020a8f4a5b3a4c9b194efe0db6878493e2f3de9ffabe4ec",
+      "format": "legacy-assessment",
+      "context": {
+        "suite": "synthetic",
+        "scale": "10.5m",
+        "manifest": {
+          "binaries": {
+            "92371f0f": {
+              "role": "base before item 826",
+              "commit": "92371f0fb25ef3083c5e1c51d25ee6db09ba68f2",
+              "sha256": "1d131fbabf8c3d6d74030f551ac3e1023dba9ba633e3de6d2fca24ac2fd0d3ba",
+              "built_on": "forge",
+              "build_command": "CARGO_BUILD_JOBS=6 mbx build --release -p sparkles-server --bin sparkles",
+              "compilers": [
+                "clang version 21.1.8",
+                "GCC: (GNU) 16.2.0",
+                "rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+                "Linker: LLD 23.1.1"
+              ]
+            },
+            "bccc5f7b": {
+              "role": "main with item 826",
+              "commit": "bccc5f7b2e72ff052a4cfad997b7e9291a504810",
+              "sha256": "127bea751d6f024edc8a05df2213d5fb021a4540e653f809561642da838ccd0f",
+              "built_on": "forge",
+              "build_command": "CARGO_BUILD_JOBS=6 mbx build --release -p sparkles-server --bin sparkles",
+              "compilers": [
+                "clang version 21.1.8",
+                "GCC: (GNU) 16.2.0",
+                "rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+                "Linker: LLD 23.1.1"
+              ]
+            },
+            "59d29b40": {
+              "role": "the fix",
+              "commit": "59d29b408eb604abee44730cd79b5c1696b931c0",
+              "sha256": "0b61e8e57abdc0781467b83c920b59eb4f141f728f94f552ebe4bc1d91baa75a",
+              "built_on": "forge",
+              "build_command": "CARGO_BUILD_JOBS=6 mbx build --release -p sparkles-server --bin sparkles",
+              "compilers": [
+                "clang version 21.1.8",
+                "GCC: (GNU) 16.2.0",
+                "rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+                "Linker: LLD 23.1.1"
+              ]
+            }
+          },
+          "data": {
+            "people-1000000.nt.zst": {
+              "sha256": "3f51783448371dd0f57391e7d3fdadae66442f0c32ae260c93a3a96b43b1cbd4",
+              "generator": "scripts/gen-data.py, 1,000,000 people",
+              "quads": 10527319
+            }
+          },
+          "store": "one store loaded by the 92371f0f binary and opened read-only by every server"
+        },
+        "settings": {
+          "threads": 1,
+          "rounds": 3,
+          "round_order": "A,B,B,A",
+          "warmups_per_server": 2,
+          "timed_requests_per_server": 7,
+          "samples_per_arm": 42,
+          "modes": [
+            "eager",
+            "streaming"
+          ],
+          "statistic": "median of the server's execMs",
+          "resultCache": false,
+          "cpu_pinning": "none",
+          "spinners": false
+        },
+        "durability_classes": [],
+        "legacy_metadata": {
+          "host": {
+            "name": "forge",
+            "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+            "kernel": "7.2.9",
+            "cpu_count": 20,
+            "competing_work": "none; the run held ~/lanes/.heavy.lock",
+            "steal": "not recorded"
+          },
+          "source": {
+            "lane_commit": "59d29b408eb604abee44730cd79b5c1696b931c0",
+            "files": {
+              "raw/ab.sh.txt": "c3f395ca38c214c5915233938111d38b1719bcb05a00675ae84b506fd7f86b33",
+              "raw/base-fix/answers.tsv": "427fd5f1e65ab71cabcd6430bde2b2fb71c3ba5527545347a9d1d74a9e191918",
+              "raw/base-fix/samples.tsv": "24ac010820b04b216833a722bb81a2e73b5a620856a9ea6c4c690b051a4278e1",
+              "raw/base-fix/summary.tsv": "a1d38190b5201651b8f7b79eb8dc1d4c8cff7b4f659b0e6221fab32116762b6c",
+              "raw/load.log": "dd04ae33d9eb5e5d2db8a7d197c7c2aa0fa264885bce7ef2b17d4a561926e1e8",
+              "raw/main-fix/answers.tsv": "427fd5f1e65ab71cabcd6430bde2b2fb71c3ba5527545347a9d1d74a9e191918",
+              "raw/main-fix/samples.tsv": "ed521064f6b2953726f64273819f79095f63f6c9e113321cdf17b63e291e8905",
+              "raw/main-fix/summary.tsv": "eef1a2a8f7a949fb19a2dd28d2a16c5409ed8d85ebe3daac87fc293040a0aada",
+              "raw/queries/bind-twin.rq": "08ae668c20738287ed6356a1bad97dceafd2cc7b58c6bf272d7d74c706edfce1",
+              "raw/queries/exists-agg.rq": "6604f1c9175a3303ea6d5ee21aea6784655e50ef558b4e0678ba30d750e70d5e",
+              "raw/queries/expr-agg-arg.rq": "a836e686953195b0497801ffe2eac449898f7f20e281ab3752011eb9c9c78892",
+              "raw/queries/filter-ne-iri.rq": "1c563e7588e231578fa1859017af9b3b75e17ca1a4333ba6dc312a2d08a8b4a7",
+              "raw/queries/salary.rq": "60ca7d0d834608a0c1bbaec1fcafcd9a36ac36df67eaec9fc10cfe94ae8af738",
+              "raw/queries/strlen-distinct.rq": "db20bfa2750ee31012beb1a6926f5d60508957c948e4dbf70c63c0d11920b041",
+              "raw/queries/strlen-dup.rq": "b6ee88a091aea74a75d54536280d19f2cd605af1fd5f56a3e071c07ea730729f",
+              "raw/queries/strlen-grouped.rq": "a6013ef837084e92676129856f7ec223a403436f13df0533a55a5a284ffd6943",
+              "raw/queries/sum-if.rq": "750f16204ea4ccd9de13b1110982d48fa63c38d030a4203ad2740853d65c0cde",
+              "raw/run.log": "ee012ddc39e85aaa203ae9398d5c25c566a699cd857109868929b56a5fb45069",
+              "raw/run.sh.txt": "764742cfe000f27dca93d51452191f0634cee44525ce5c700deb43255f2525e2"
+            }
+          },
+          "method": "raw/run.sh.txt builds the three commits and loads the store, and raw/ab.sh.txt starts a fresh server per arm in each A,B,B,A round. The main-fix pair has A = bccc5f7b and B = 59d29b40, and the base-fix pair has A = 92371f0f and B = 59d29b40. Answers are sorted TSV hashes from every server and mode.",
+          "measurement": {
+            "main-fix": [
+              {
+                "query": "bind-twin",
+                "mode": "eager",
+                "a_median_ms": 60.939,
+                "b_median_ms": 15.208,
+                "b_over_a": 0.25,
+                "per_round_b_over_a": [
+                  0.248,
+                  0.25,
+                  0.252
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "bind-twin",
+                "mode": "streaming",
+                "a_median_ms": 13.549,
+                "b_median_ms": 13.486,
+                "b_over_a": 0.995,
+                "per_round_b_over_a": [
+                  0.958,
+                  1.224,
+                  1.001
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "exists-agg",
+                "mode": "eager",
+                "a_median_ms": 917.924,
+                "b_median_ms": 866.916,
+                "b_over_a": 0.944,
+                "per_round_b_over_a": [
+                  0.941,
+                  0.96,
+                  0.94
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "exists-agg",
+                "mode": "streaming",
+                "a_median_ms": 910.797,
+                "b_median_ms": 894.35,
+                "b_over_a": 0.982,
+                "per_round_b_over_a": [
+                  0.994,
+                  0.979,
+                  0.976
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "expr-agg-arg",
+                "mode": "eager",
+                "a_median_ms": 26.983,
+                "b_median_ms": 26.82,
+                "b_over_a": 0.994,
+                "per_round_b_over_a": [
+                  0.982,
+                  1.067,
+                  0.864
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "expr-agg-arg",
+                "mode": "streaming",
+                "a_median_ms": 22.927,
+                "b_median_ms": 23.089,
+                "b_over_a": 1.007,
+                "per_round_b_over_a": [
+                  1.002,
+                  1.069,
+                  0.862
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "filter-ne-iri",
+                "mode": "eager",
+                "a_median_ms": 0.043,
+                "b_median_ms": 0.041,
+                "b_over_a": 0.955,
+                "per_round_b_over_a": [
+                  1.093,
+                  0.908,
+                  0.957
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "filter-ne-iri",
+                "mode": "streaming",
+                "a_median_ms": 0.047,
+                "b_median_ms": 0.035,
+                "b_over_a": 0.752,
+                "per_round_b_over_a": [
+                  0.814,
+                  0.769,
+                  0.819
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "salary",
+                "mode": "eager",
+                "a_median_ms": 55.576,
+                "b_median_ms": 55.667,
+                "b_over_a": 1.002,
+                "per_round_b_over_a": [
+                  0.988,
+                  1.083,
+                  1.0
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "salary",
+                "mode": "streaming",
+                "a_median_ms": 48.4,
+                "b_median_ms": 48.335,
+                "b_over_a": 0.999,
+                "per_round_b_over_a": [
+                  0.998,
+                  1.011,
+                  0.988
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-distinct",
+                "mode": "eager",
+                "a_median_ms": 76.702,
+                "b_median_ms": 76.025,
+                "b_over_a": 0.991,
+                "per_round_b_over_a": [
+                  1.013,
+                  1.013,
+                  0.967
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-distinct",
+                "mode": "streaming",
+                "a_median_ms": 89.576,
+                "b_median_ms": 89.29,
+                "b_over_a": 0.997,
+                "per_round_b_over_a": [
+                  0.992,
+                  1.01,
+                  0.997
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-dup",
+                "mode": "eager",
+                "a_median_ms": 32.898,
+                "b_median_ms": 32.965,
+                "b_over_a": 1.002,
+                "per_round_b_over_a": [
+                  1.008,
+                  1.025,
+                  0.989
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-dup",
+                "mode": "streaming",
+                "a_median_ms": 87.546,
+                "b_median_ms": 88.193,
+                "b_over_a": 1.007,
+                "per_round_b_over_a": [
+                  1.006,
+                  1.029,
+                  0.995
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-grouped",
+                "mode": "eager",
+                "a_median_ms": 86.701,
+                "b_median_ms": 86.331,
+                "b_over_a": 0.996,
+                "per_round_b_over_a": [
+                  0.986,
+                  1.026,
+                  0.977
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-grouped",
+                "mode": "streaming",
+                "a_median_ms": 99.542,
+                "b_median_ms": 99.974,
+                "b_over_a": 1.004,
+                "per_round_b_over_a": [
+                  0.994,
+                  1.019,
+                  0.989
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "sum-if",
+                "mode": "eager",
+                "a_median_ms": 60.063,
+                "b_median_ms": 15.051,
+                "b_over_a": 0.251,
+                "per_round_b_over_a": [
+                  0.251,
+                  0.27,
+                  0.244
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "sum-if",
+                "mode": "streaming",
+                "a_median_ms": 13.678,
+                "b_median_ms": 13.712,
+                "b_over_a": 1.003,
+                "per_round_b_over_a": [
+                  1.01,
+                  1.508,
+                  0.909
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              }
+            ],
+            "base-fix": [
+              {
+                "query": "bind-twin",
+                "mode": "eager",
+                "a_median_ms": 59.97,
+                "b_median_ms": 15.202,
+                "b_over_a": 0.253,
+                "per_round_b_over_a": [
+                  0.252,
+                  0.252,
+                  0.265
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "bind-twin",
+                "mode": "streaming",
+                "a_median_ms": 14.457,
+                "b_median_ms": 19.056,
+                "b_over_a": 1.318,
+                "per_round_b_over_a": [
+                  1.192,
+                  0.943,
+                  1.553
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "exists-agg",
+                "mode": "eager",
+                "a_median_ms": 870.698,
+                "b_median_ms": 868.9,
+                "b_over_a": 0.998,
+                "per_round_b_over_a": [
+                  0.996,
+                  1.007,
+                  0.992
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "exists-agg",
+                "mode": "streaming",
+                "a_median_ms": 884.61,
+                "b_median_ms": 896.629,
+                "b_over_a": 1.014,
+                "per_round_b_over_a": [
+                  1.016,
+                  1.019,
+                  0.988
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "expr-agg-arg",
+                "mode": "eager",
+                "a_median_ms": 30.903,
+                "b_median_ms": 28.7,
+                "b_over_a": 0.929,
+                "per_round_b_over_a": [
+                  0.923,
+                  0.894,
+                  0.958
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "expr-agg-arg",
+                "mode": "streaming",
+                "a_median_ms": 23.419,
+                "b_median_ms": 25.144,
+                "b_over_a": 1.074,
+                "per_round_b_over_a": [
+                  1.019,
+                  1.048,
+                  1.089
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "filter-ne-iri",
+                "mode": "eager",
+                "a_median_ms": 0.044,
+                "b_median_ms": 0.04,
+                "b_over_a": 0.906,
+                "per_round_b_over_a": [
+                  1.161,
+                  0.792,
+                  0.808
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "filter-ne-iri",
+                "mode": "streaming",
+                "a_median_ms": 0.047,
+                "b_median_ms": 0.048,
+                "b_over_a": 1.029,
+                "per_round_b_over_a": [
+                  1.06,
+                  0.863,
+                  1.464
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "salary",
+                "mode": "eager",
+                "a_median_ms": 49.74,
+                "b_median_ms": 57.872,
+                "b_over_a": 1.163,
+                "per_round_b_over_a": [
+                  1.171,
+                  1.173,
+                  1.156
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "salary",
+                "mode": "streaming",
+                "a_median_ms": 48.053,
+                "b_median_ms": 48.7,
+                "b_over_a": 1.013,
+                "per_round_b_over_a": [
+                  1.01,
+                  1.01,
+                  1.02
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-distinct",
+                "mode": "eager",
+                "a_median_ms": 87.263,
+                "b_median_ms": 78.758,
+                "b_over_a": 0.903,
+                "per_round_b_over_a": [
+                  0.912,
+                  0.894,
+                  0.896
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-distinct",
+                "mode": "streaming",
+                "a_median_ms": 88.693,
+                "b_median_ms": 89.429,
+                "b_over_a": 1.008,
+                "per_round_b_over_a": [
+                  1.006,
+                  1.007,
+                  1.008
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-dup",
+                "mode": "eager",
+                "a_median_ms": 33.29,
+                "b_median_ms": 32.6,
+                "b_over_a": 0.979,
+                "per_round_b_over_a": [
+                  0.997,
+                  1.013,
+                  0.86
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-dup",
+                "mode": "streaming",
+                "a_median_ms": 85.44,
+                "b_median_ms": 88.74,
+                "b_over_a": 1.039,
+                "per_round_b_over_a": [
+                  1.038,
+                  1.032,
+                  1.047
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-grouped",
+                "mode": "eager",
+                "a_median_ms": 112.048,
+                "b_median_ms": 87.796,
+                "b_over_a": 0.784,
+                "per_round_b_over_a": [
+                  0.786,
+                  0.79,
+                  0.762
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "strlen-grouped",
+                "mode": "streaming",
+                "a_median_ms": 100.059,
+                "b_median_ms": 100.351,
+                "b_over_a": 1.003,
+                "per_round_b_over_a": [
+                  1.01,
+                  1.002,
+                  0.989
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "sum-if",
+                "mode": "eager",
+                "a_median_ms": 16.099,
+                "b_median_ms": 15.159,
+                "b_over_a": 0.942,
+                "per_round_b_over_a": [
+                  0.988,
+                  0.701,
+                  0.981
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              },
+              {
+                "query": "sum-if",
+                "mode": "streaming",
+                "a_median_ms": 13.514,
+                "b_median_ms": 18.216,
+                "b_over_a": 1.348,
+                "per_round_b_over_a": [
+                  1.29,
+                  0.91,
+                  1.389
+                ],
+                "samples_per_arm": [
+                  42,
+                  42
+                ]
+              }
+            ],
+            "answers": "every query returned one answer hash across all servers, modes and arms"
+          },
+          "kind": "interleaved A/B of execution time",
+          "scope": "Roadmap item 1098, the pre-decode of columns an eager aggregate argument never reads"
+        }
+      }
     }
   ]
 }

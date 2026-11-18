@@ -53,6 +53,21 @@ agent and nearby lists ask for the `sparkles` reading, since they want the value
 present. Backups now hold `aggregate-errors.json` and `describe.json`, which earlier
 backups left out, so a restore kept the data but lost a dataset's DESCRIBE setting.
 
+### Eager aggregates over IRI comparisons and EXISTS
+
+An eager aggregate whose argument compares a variable with a constant IRI or holds an
+EXISTS, such as `SUM(IF(?p = ex:nobody, 1, 0))`, no longer decodes that variable's terms
+before it runs. The grouping operator of item 826 evaluates such arguments as BIND does,
+and that path decoded every vocabulary column an expression named once the table passed
+16,384 rows, although these columns are answered from term ids. The decode now covers
+only the columns whose values the expression reads, which also spares eager BIND and
+ORDER BY keys of the same shape. On forge with one thread over 1,000,000 people, the query
+takes 15.1 ms against 60.1 ms on the previous main and 16.1 ms before item 826, and its BIND
+form 15.2 ms against 60.9 ms. Its EXISTS form takes 867 ms against 918 ms, since the EXISTS
+evaluation itself sets most of its time. Arguments that read values, such as
+`STRLEN(?name)`, still decode their columns first, since that was faster on one thread
+than reading them row by row. This is roadmap item 1098.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes
