@@ -125,10 +125,14 @@ const NESTED: &[&str] = &[
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?o <urn:r> ?k } }",
 ];
 
-/// An OPTIONAL whose condition is an EXISTS, which automatic execution keeps eager
-/// because the cursor's conditional OPTIONAL measured slower than the eager one.
-const PER_KEY: &[&str] = &[
+/// OPTIONALs whose condition holds an EXISTS, which the cursor merges and tests on each
+/// batch's pairs as eager execution does, so automatic execution streams them. The
+/// second and third read the condition's right variable nowhere else, and the third's
+/// condition also reads the left side.
+const OPTIONAL_CONDITION: &[&str] = &[
     "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
+    "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER NOT EXISTS { ?o <urn:r> ?k } } }",
+    "SELECT ?s (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER (?v > 50 || EXISTS { ?o <urn:r> ?k }) } } GROUP BY ?s ORDER BY ?s LIMIT 50",
 ];
 
 #[test]
@@ -177,18 +181,60 @@ fn large_groupings_with_exists_stream_and_match_eager() {
     }
 }
 
+/// An OPTIONAL whose condition holds an EXISTS streams and matches eager execution at
+/// several batch sizes, with the merge OPTIONAL on and with it off, when both modes hash.
 #[test]
-fn optional_exists_stays_eager_and_matches() {
+fn optional_exists_streams_and_matches_eager() {
+    use sparkles_core::sparql::{FallbackPolicy, select_cursor};
     let s = store();
-    for q in PER_KEY {
-        let expected = query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .rows()
-            .unwrap();
-        let (got, streamed) = automatic(&s, q, &Default::default(), &Default::default())
-            .unwrap_or_else(|e| panic!("{q}: {e}"));
-        assert!(!streamed, "{q}: streamed");
-        assert_eq!(ordered(got), ordered(expected), "{q}");
+    for q in OPTIONAL_CONDITION {
+        for merge in [true, false] {
+            let opts = QueryOptions {
+                optimizations: Some(sparkles_core::sparql::Optimizations {
+                    merge_left_join: merge,
+                    ..sparkles_core::sparql::Optimizations::ALL
+                }),
+                ..Default::default()
+            };
+            let expected = query(s.snapshot(), q, &opts).unwrap().rows().unwrap();
+            for rows in [4096, 10_000] {
+                let cursor = CursorOptions {
+                    batch_rows: rows,
+                    ..Default::default()
+                };
+                let (got, streamed) =
+                    automatic(&s, q, &opts, &cursor).unwrap_or_else(|e| panic!("{q}: {e}"));
+                assert!(streamed, "{q}; merge {merge}: kept eager");
+                assert_eq!(
+                    ordered(got),
+                    ordered(expected.clone()),
+                    "{q}; merge {merge}; {rows}"
+                );
+            }
+            // Automatic execution admits no batches this small, so a strict cursor
+            // runs them.
+            for batch_rows in [1, 3, 1000] {
+                let cursor = CursorOptions {
+                    batch_rows,
+                    fallback: FallbackPolicy::RejectMaterialization,
+                    ..Default::default()
+                };
+                let mut c = select_cursor(s.snapshot(), q, &opts, &cursor)
+                    .unwrap_or_else(|e| panic!("{q}: {e}"));
+                let mut got = Vec::new();
+                while let Some(b) = c.next_batch().unwrap() {
+                    assert!(b.len() <= batch_rows);
+                    for i in 0..b.len() {
+                        got.push(b.row(i).unwrap().values().to_vec());
+                    }
+                }
+                assert_eq!(
+                    ordered(got),
+                    ordered(expected.clone()),
+                    "{q}; merge {merge}; strict {batch_rows}"
+                );
+            }
+        }
     }
 }
 
@@ -294,7 +340,12 @@ fn streamed_exists_honors_cancellation() {
 #[test]
 fn streamed_exists_stays_within_its_memory_budget() {
     let s = store();
-    for q in STREAMED.iter().step_by(2).chain(NESTED) {
+    for q in STREAMED
+        .iter()
+        .step_by(2)
+        .chain(NESTED)
+        .chain(OPTIONAL_CONDITION)
+    {
         let expected = query(s.snapshot(), q, &Default::default())
             .unwrap()
             .rows()

@@ -1504,11 +1504,11 @@ const AUTO_EXISTS_DEPTH: usize = 4;
 /// IF or OR, when the plan of its pattern counts in turn. Its pattern is answered from a
 /// key set filled by a child cursor under the query's charges where the key set can
 /// answer it, and otherwise evaluated once per distinct outer key with a charged memo,
-/// as eager execution evaluates it. A pattern that calls a SERVICE keeps the plan eager,
-/// and so does an OPTIONAL whose condition holds an EXISTS, because the cursor's
-/// conditional OPTIONAL took 3.7 to 4.6 times as long as eager execution on Namespace at
-/// 10.5M quads, whatever the condition. The patterns are planned here only to read
-/// their operators. Planning interns their variables in `ctx` and runs no part of them.
+/// as eager execution evaluates it. An OPTIONAL condition counts too, where the cursor
+/// merges the OPTIONAL as eager execution does or the `merge_left_join` switch is off so
+/// that both modes hash. A pattern that calls a SERVICE keeps the plan eager. The
+/// patterns are planned here only to read their operators. Planning interns their
+/// variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
     fn pattern(ctx: &Ctx, node: &Node, e: &Expr, depth: usize) -> bool {
         let mut specs = Vec::new();
@@ -1535,6 +1535,13 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
             | Kind::Group { .. } => own_exprs(&node.kind)
                 .into_iter()
                 .all(|e| !e.has_exists() || pattern(ctx, node, e, depth)),
+            // The merge tests the condition on each batch's pairs as eager execution
+            // does. With the merge_left_join switch off both modes hash. An OPTIONAL
+            // that could merge only eagerly stays eager.
+            Kind::LeftJoin { expr: Some(e) } if e.has_exists() => {
+                (!ctx.opt.merge_left_join || merge::eligible(ctx, node))
+                    && pattern(ctx, node, e, depth)
+            }
             kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
         };
         exists
@@ -5398,14 +5405,19 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
                 true,
             ),
-            // an EXISTS answered from a key set in BIND, and in an OPTIONAL condition,
-            // whose conditional OPTIONAL is slower in the cursor
+            // an EXISTS answered from a key set in BIND, and in the condition of an
+            // OPTIONAL that the cursor merges, but not of one that only eager execution
+            // merges
             (
                 "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
                 true,
             ),
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?x <urn:p> ?s OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
                 false,
             ),
             // and one inside a larger expression, an aggregate argument or an ORDER BY

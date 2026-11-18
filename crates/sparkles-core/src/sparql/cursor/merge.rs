@@ -1952,6 +1952,69 @@ mod tests {
         }
     }
 
+    /// A conditional OPTIONAL whose left rows each meet a long right run of failing pairs,
+    /// and single-row runs whose pair and extension a one-row batch takes together, stays
+    /// within its budget at small batch caps, charges every batch for its rows and
+    /// returns batches of at most the cap after the condition.
+    #[test]
+    fn conditional_optional_merges_stay_within_budget_at_small_caps() {
+        let (left, right) = (2, 3);
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(right)),
+            Box::new(Expr::Var(left)),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        for shared in [false, true] {
+            let mut l: Vec<Vec<i64>> = (0..20).map(|i| vec![0, i % 2, 10_000 + i]).collect();
+            let mut r: Vec<Vec<i64>> = (0..3000).map(|j| vec![0, j % 2, j]).collect();
+            for key in 1..400 {
+                l.push(vec![key, key % 2, key % 7]);
+                r.push(vec![key, key % 2, key % 5]);
+            }
+            if !shared {
+                for row in l.iter_mut().chain(r.iter_mut()) {
+                    row.remove(1);
+                }
+            }
+            let (lv, rv) = if shared {
+                (vec![0, 1, left], vec![0, 1, right])
+            } else {
+                (vec![0, left], vec![0, right])
+            };
+            let mut node = join(values(lv, &l), values(rv, &r));
+            node.kind = Kind::LeftJoin {
+                expr: Some(condition.clone()),
+            };
+            let expected = rows(
+                &exec::execute_materialized(&context(u64::MAX), &node)
+                    .unwrap()
+                    .0
+                    .table,
+            );
+            assert_eq!(expected.len(), 20 + 399);
+            for cap in [1, 2, 3] {
+                let ctx = context(512 << 10);
+                let mut op =
+                    Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                        .unwrap();
+                assert!(matches!(op.state, super::super::State::Merge(_)));
+                let options = CursorOptions {
+                    batch_rows: cap,
+                    ..Default::default()
+                };
+                let mut result = Vec::new();
+                while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
+                    assert!(batch.table.len <= cap && batch.table.len > 0);
+                    assert!(batch.charge.bytes() >= capacity_bytes(&batch.table));
+                    result.extend(rows(&batch.table));
+                }
+                result.sort();
+                assert_eq!(result, expected, "shared {shared}, cap {cap}");
+                assert!(ctx.mem_peak() <= 512 << 10, "shared {shared}, cap {cap}");
+            }
+        }
+    }
+
     /// MINUS and semi and anti joins on one ordered, certainly bound key pass left rows
     /// by the presence of their key on the right, across duplicates on both sides,
     /// batch boundaries and empty inputs, and count without building rows.
