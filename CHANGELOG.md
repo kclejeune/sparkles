@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Materialized inferences in the clauses of entity frames
+
+The materialized frame of a property or individual in Browse and the ontology editor
+writes its rows in the clauses of the entity's frame, such as Types, Facts and
+SubPropertyOf, in Manchester syntax with an Inferred badge on each row, in place of a list
+of functional-style axioms. Names link to their pages in Browse and select the entity in
+the editor, and their labels come from the same pinned read as the rows. Entailments that
+every entity of the profile has, such as a property's subproperty relation to itself or a
+type of `owl:Thing` or `rdfs:Resource`, are counted instead of listed. This is part of
+roadmap item 622. Classifier-backed inferred axioms beyond named-class parents and
+equivalents, and explanation links from F24's justifications, remain open.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes

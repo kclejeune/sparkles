@@ -1990,10 +1990,13 @@
                         {target}
                         {graph}
                         imports={sel.imports}
+                        kind={frameKind}
                         iri={selected}
                         commit={frameCommit}
                         items={frameItems}
+                        {prefixes}
                         pins={frameCommit === summary?.commit ? inferredPins : undefined}
+                        onopen={(iri) => nav({ iri, view: null })}
                       />
                     {/key}
                   {/if}
