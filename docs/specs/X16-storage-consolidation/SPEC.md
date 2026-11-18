@@ -689,10 +689,11 @@ POST, which both builds pay. On `atlas`, with base `8baa5686` and the phase at `
 interleaved over 15 rounds, the median first PUT of 10, 1,000 and 50,000 quads took 1.02,
 0.99 and 0.84 times the base's time on a persistent dataset and 1.00, 1.13 and 0.98 times
 in memory. The in-memory ratio at 1,000 quads swung between 0.56 and 1.79 with the order
-of the arms, so it reads as noise. The median first POST took 1.01, 1.00 and 0.94 times the
-base's time persistent and 1.02, 0.99 and 0.97 times in memory. The gates were the table test, the entry-point tests, the
-deadline tests at the default and the saturated threshold, lane CI and seven review
-rounds. Durability, the write-ahead log and the on-disk formats did not change.
+of the arms, so it reads as noise, and item 1127 times it again. The median first POST
+took 1.01, 1.00 and 0.94 times the base's time persistent and 1.02, 0.99 and 0.97 times in
+memory. The gates were the table test, the entry-point tests, the deadline tests at the
+default and the saturated threshold, lane CI and eight review rounds. Durability, the write-ahead
+log and the on-disk formats did not change.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
