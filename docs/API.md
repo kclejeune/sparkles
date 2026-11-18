@@ -3390,11 +3390,13 @@ default, which `sparkles serve --aggregate-errors` sets. The setting lives at
 (`dataset` or `default`) and the list of `modes`. `PUT` with `{"mode": "spec"}` sets the
 dataset's reading, and `DELETE` removes it. Both need admin, and a read-only server
 refuses them with `403`. A persistent dataset keeps its setting in
-`aggregate-errors.json`.
+`aggregate-errors.json`. Branches copy the setting when they are created, and backups
+hold it, including backups of in-memory datasets.
 
 Materialized views and live queries follow the dataset's reading and evaluate again when
 it changes. A query that names another reading does not read a view's maintained state.
-It evaluates the view's query from the data instead, and its plan says so. A plan's
+It evaluates the view's query from the data instead, and its plan and its EXPLAIN output
+carry the `view-evaluated` warning. A plan's
 Group operator names the reading when it is not `jena`.
 
 ```sh

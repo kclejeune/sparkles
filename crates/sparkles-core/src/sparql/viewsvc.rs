@@ -68,6 +68,23 @@ pub struct ViewRows {
 /// What answers `SERVICE view:read`: a dataset's views.
 pub trait ViewSource: Send + Sync + std::fmt::Debug {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows>;
+    /// The reading of errors in aggregates that view `name` keeps, `None` when the
+    /// source does not say or has no such view. Planning reads it to note, also under
+    /// EXPLAIN, a read that evaluates the view's query instead of its state.
+    fn view_reading(&self, _name: &str) -> Option<super::AggregateErrors> {
+        None
+    }
+}
+
+/// The warning of a read of view `name` under the reader's reading `m`, which is not
+/// the view's.
+fn evaluated(name: &str, m: super::AggregateErrors) -> super::ctx::PlanWarning {
+    super::ctx::PlanWarning {
+        code: "view-evaluated",
+        message: format!(
+            "the view {name:?} keeps another reading of aggregate errors, so its query is evaluated under {m}"
+        ),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +155,13 @@ pub(super) fn view_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node> {
         vars.push(c);
     }
     vars.dedup();
+    // a read under another reading than the view's evaluates the view's query
+    let reading = p.ctx.aggregate_errors;
+    if let Some(views) = &p.ctx.views
+        && views.view_reading(&spec.name).is_some_and(|m| m != reading)
+    {
+        p.ctx.warn(evaluated(&spec.name, reading));
+    }
     let desc = format!("view {:?}", spec.name);
     let mut n = Node::leaf(Kind::ViewRead(Box::new(spec)), vars, 1000.0, desc);
     // a view's columns can be unbound
@@ -163,13 +187,7 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
         aggregate_errors: Some(ctx.aggregate_errors),
     })?;
     if let Some(m) = rows.evaluated_under {
-        ctx.warn(super::ctx::PlanWarning {
-            code: "view-evaluated",
-            message: format!(
-                "the view {:?} keeps another reading of aggregate errors, so its query was evaluated under {m}",
-                spec.name
-            ),
-        });
+        ctx.warn(evaluated(&spec.name, m));
     }
     let cols: Vec<Option<usize>> = vars
         .iter()

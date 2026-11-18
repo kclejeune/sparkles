@@ -183,9 +183,17 @@ fn a_read_under_another_reading_evaluates_the_view_query() {
             aggregate_errors: Some(m),
             ..Default::default()
         };
+        // EXPLAIN notes it without running the query
+        let (_, plan) = ds.explain(read, &opts).unwrap();
+        let noted = plan.warnings.iter().any(|w| w.code == "view-evaluated");
+        assert!(noted, "{m}: EXPLAIN {:?}", plan.warnings);
         let r = ds.query_with(read, &opts).unwrap();
-        let warned = r.plan().warnings.iter().any(|w| w.code == "view-evaluated");
-        assert!(warned, "{m}: {:?}", r.plan().warnings);
+        let warned = r
+            .plan()
+            .warnings
+            .iter()
+            .filter(|w| w.code == "view-evaluated");
+        assert_eq!(warned.count(), 1, "{m}: {:?}", r.plan().warnings);
         assert_eq!(rows(r), under(&ds, AGGS, m), "{m}");
         assert_eq!(
             view(&ds, "aggs"),
@@ -194,6 +202,8 @@ fn a_read_under_another_reading_evaluates_the_view_query() {
         );
     }
     // the dataset's own reading reads the view
+    let (_, plan) = ds.explain(read, &QueryOptions::default()).unwrap();
+    assert!(plan.warnings.iter().all(|w| w.code != "view-evaluated"));
     let r = ds.query(read).unwrap();
     assert!(r.plan().warnings.iter().all(|w| w.code != "view-evaluated"));
     assert_eq!(rows(r), jena);

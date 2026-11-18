@@ -108,6 +108,13 @@ impl ViewSource for Source {
         drop(state);
         rt.read(r)
     }
+    fn view_reading(&self, name: &str) -> Option<crate::sparql::AggregateErrors> {
+        let state = self.state.try_upgrade().ok()??;
+        start(&state, None);
+        let rt = state.views.clone();
+        drop(state);
+        rt.view_reading(name)
+    }
 }
 
 /// Start the thread that runs the views' passes, with `host` (the library's own when
