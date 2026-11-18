@@ -56,8 +56,9 @@ ALL = [
     "vendor/*",
 ]
 
-# The mise tasks whose definitions change what the Rust tasks of ci build or run.
-RUST_TASKS = ["lint", "test"]
+# The mise tasks whose definitions change what the Rust tasks of ci build or run: lint,
+# test and ui:build, which scripts/ci.sh builds for both before they start.
+RUST_TASKS = ["lint", "test", "ui:build"]
 
 # Files outside the crates that known packages read in their builds or tests.
 READ_BY = [

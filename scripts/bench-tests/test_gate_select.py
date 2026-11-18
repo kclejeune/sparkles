@@ -191,6 +191,14 @@ class Selection(unittest.TestCase):
         self.assertIn("test:quickstart", ci)
         self.assertIn("ui:test", ci)
 
+    def test_a_broken_jvm_native_task_runs_the_jvm_test(self):
+        # jvm:test does not name jvm:native in mise.toml, but scripts/ci.sh builds it first.
+        real = (ROOT / "mise.toml").read_text()
+        broken = real.replace('run = "mbx sparkles-task -- scripts/jvm-native.sh"', 'run = "false"', 1)
+        self.assertNotEqual(real, broken)
+        ci = gs.select(["mise.toml"], "none", lambda p: (real, broken))[0]["ci"]
+        self.assertIn("jvm:test", ci)
+
     def test_manifests_build_scripts_and_nested_test_directories_run_the_screen(self):
         for f in ["crates/sparkles-owl/Cargo.toml", "crates/sparkles-shacl/build.rs",
                   "crates/sparkles-core/src/sparql/tests/x.rs", "crates/sparkles-server/src/fuzz/a.rs"]:
