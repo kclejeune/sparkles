@@ -5452,6 +5452,9 @@ impl Store {
         sources: &[Source],
         o: &crate::guard::WriteOptions,
     ) -> Result<LoadPlan> {
+        // Every stream checks the write's controls beneath its decoder whichever plan
+        // runs, including one whose size the plan never reads.
+        control_streams(sources, o)?;
         let inputs = load_plan::LoadInputs {
             empty_head: self.snapshot().is_empty(),
             sources: sources.len(),
@@ -7549,20 +7552,33 @@ fn estimated_quads(sources: &[Source]) -> u64 {
     bytes / load_plan::BYTES_PER_QUAD
 }
 
+/// Give each stream among `sources` its decompressing reader (see
+/// [`ReaderSource::decode`](crate::io::ReaderSource)), beneath which every read of the raw
+/// stream, the decoder's own included, checks `o`. The magic bytes that tell the codec are
+/// read ahead under the same checks, so a slow stream or a gzip header that never ends
+/// stops at the write's deadline before any quad reaches the parser's callback.
+fn control_streams(sources: &[Source], o: &crate::guard::WriteOptions) -> Result<()> {
+    for s in sources {
+        if let crate::io::SourceData::Reader(r) = &s.data {
+            r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
+            r.decode(s.codec()?, s.max_decompressed, o)?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether the streams among `sources`, whose length is unknown, hold more than `limit`
-/// decompressed bytes. Each stream gets its decompressing reader (see
-/// [`ReaderSource::decode`](crate::io::ReaderSource)) and is read ahead until it ends or
-/// passes its share of `limit`, and the bytes read ahead are parsed later. `o` is checked
-/// before each read, so a slow stream stops at the write's deadline.
+/// decompressed bytes. Each stream is given its decompressing reader by
+/// [`control_streams`] and read ahead until it ends or passes its share of `limit`, and
+/// the bytes read ahead are parsed later. `o` is checked before each read, so a slow
+/// stream stops at the write's deadline.
 fn streams_exceed(sources: &[Source], limit: u64, o: &crate::guard::WriteOptions) -> Result<bool> {
+    control_streams(sources, o)?;
     let mut bytes = 0u64;
     for s in sources {
         let crate::io::SourceData::Reader(r) = &s.data else {
             continue;
         };
-        // the magic bytes that tell the codec, read under the same checks
-        r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
-        r.decode(s.codec()?, s.max_decompressed, o)?;
         let want = limit.saturating_add(1).saturating_sub(bytes);
         let held = r.read_ahead(usize::try_from(want).unwrap_or(usize::MAX), &|| o.check())?;
         bytes += held as u64;
@@ -8329,30 +8345,51 @@ mod tests {
                 Ok(1)
             }
         }
-        let store = Store::in_memory(StoreOptions::default());
-        store
-            .load(&[Source::from_bytes(
-                b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
-                RdfFormat::NTriples,
-                None,
-            )])
-            .unwrap();
-        let o = crate::guard::WriteOptions {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)),
-            ..Default::default()
-        };
-        let t = std::time::Instant::now();
-        let src = Source::from_reader(Slow, RdfFormat::NTriples, None);
-        let e = store
-            .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
-            .unwrap_err();
-        assert!(matches!(e, Error::Timeout), "{e}");
-        assert!(
-            t.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            t.elapsed()
-        );
-        assert_eq!(store.snapshot().len(), 1);
+        stops_at_the_deadline(|| Source::from_reader(Slow, RdfFormat::NTriples, None));
+    }
+
+    /// A load and a replace of the stream `src` into a store that holds a quad stop at a
+    /// near deadline, at the default threshold, where the plan reads the stream's size,
+    /// and at the largest, where it reads none.
+    fn stops_at_the_deadline(src: impl Fn() -> Source) {
+        for threshold in [StoreOptions::default().bulk_threshold, u64::MAX] {
+            for load in [false, true] {
+                let store = Store::in_memory(StoreOptions {
+                    bulk_threshold: threshold,
+                    ..Default::default()
+                });
+                store
+                    .load(&[Source::from_bytes(
+                        b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
+                        RdfFormat::NTriples,
+                        None,
+                    )])
+                    .unwrap();
+                let o = crate::guard::WriteOptions {
+                    deadline: Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(30),
+                    ),
+                    ..Default::default()
+                };
+                let t = std::time::Instant::now();
+                let e = if load {
+                    store.load_with(&[src()], CommitKind::Load, &o).map(|_| ())
+                } else {
+                    store
+                        .replace_with(ReplaceTarget::All, &[src()], CommitKind::Transaction, &o)
+                        .map(|_| ())
+                }
+                .unwrap_err();
+                let case = format!("threshold {threshold}, load {load}");
+                assert!(matches!(e, Error::Timeout), "{case}: {e}");
+                assert!(
+                    t.elapsed() < std::time::Duration::from_millis(500),
+                    "{case}: {:?}",
+                    t.elapsed()
+                );
+                assert_eq!(store.snapshot().len(), 1, "{case}");
+            }
+        }
     }
 
     #[test]
@@ -8409,30 +8446,7 @@ mod tests {
                 Ok(1)
             }
         }
-        let store = Store::in_memory(StoreOptions::default());
-        store
-            .load(&[Source::from_bytes(
-                b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
-                RdfFormat::NTriples,
-                None,
-            )])
-            .unwrap();
-        let o = crate::guard::WriteOptions {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)),
-            ..Default::default()
-        };
-        let t = std::time::Instant::now();
-        let src = Source::from_reader(Header(0), RdfFormat::NTriples, None);
-        let e = store
-            .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
-            .unwrap_err();
-        assert!(matches!(e, Error::Timeout), "{e}");
-        assert!(
-            t.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            t.elapsed()
-        );
-        assert_eq!(store.snapshot().len(), 1);
+        stops_at_the_deadline(|| Source::from_reader(Header(0), RdfFormat::NTriples, None));
     }
 
     #[test]
