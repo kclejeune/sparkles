@@ -10437,4 +10437,138 @@ mod string_order_tests {
             }
         }
     }
+
+    /// A short language-tagged string after a string longer than the budget needs no
+    /// floor, so its key is read without the long key before it: the mask declines
+    /// without a refusal in both modes, and the generic filter compares the rows.
+    #[test]
+    fn a_long_string_before_a_tagged_one_does_not_fail_the_mask() {
+        use super::super::expr::CmpOp;
+        let long = "a".repeat(1 << 20);
+        let nt = format!(
+            "<urn:s:0> <urn:p> \"{long}\" .\n<urn:s:1> <urn:p> \"b\"@en .\n<urn:s:2> <urn:p> \"c\"@en .\n"
+        );
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let tagged = |l: &str| {
+            snap.lookup_term(
+                &oxrdf::Literal::new_language_tagged_literal(l, "en")
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap()
+        };
+        let (b, c) = (tagged("b"), tagged("c"));
+        let first = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal(&long).into())
+            .unwrap();
+        // the long string is the key before "b"@en, in the same block
+        assert_eq!(first.payload() + 1, b.payload());
+        assert!(!(b.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 4 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for _ in 0..STRING_ORDER_ROWS {
+                t.push_row(&[b, c]);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+            assert!(matches!(outcome, Ok(None)), "cursor {cursor}: {outcome:?}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            assert!(generic.iter().all(|&k| k), "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// Strings whose distinct ids grow every worker's map past its first table, in a pool
+    /// of several threads: the masks of two tables match the generic filter in both
+    /// modes, the maps' tables are charged and take the query's room, and a budget whose
+    /// cap refuses a later growth leaves the masks exact without a failure.
+    #[test]
+    fn parallel_masks_grow_their_floor_maps_within_the_charge() {
+        use super::super::expr::CmpOp;
+        let n = 6000usize;
+        let mut nt = String::new();
+        for i in 0..n {
+            nt.push_str(&format!(
+                "<urn:s:{i}> <urn:p> \"w{}\" .\n",
+                i * 7919 % 100_003
+            ));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..n)
+            .map(|i| {
+                snap.lookup_term(
+                    &oxrdf::Literal::new_simple_literal(format!("w{}", i * 7919 % 100_003)).into(),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(snap);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for (mem_limit, roomy) in [(256 << 20, true), (2 << 20, false)] {
+                for cursor in [false, true] {
+                    let mut ctx = Ctx::new(s.snapshot());
+                    ctx.mem_limit = mem_limit;
+                    if cursor {
+                        ctx.enable_cursor_accounting().unwrap();
+                    }
+                    let room = ctx.memory_room();
+                    for (round, op) in [CmpOp::Lt, CmpOp::Ge].into_iter().enumerate() {
+                        let (x, y) = (ctx.var("x"), ctx.var("y"));
+                        let mut t = Table::new(vec![x, y]);
+                        for i in 0..4 * n {
+                            t.push_row(&[ids[i % n], ids[(i * 13 + round) % n]]);
+                        }
+                        assert!(t.len() > PAR_THRESHOLD);
+                        let e = cmp(x, y, op);
+                        let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                            .unwrap()
+                            .expect("the floors apply");
+                        let generic =
+                            evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                        assert_eq!(mask, generic, "{mem_limit} cursor {cursor} {op:?}");
+                        assert!(ctx.check().is_ok(), "{mem_limit} cursor {cursor}");
+                    }
+                    let cache = ctx.floor_cache();
+                    let cap = (64u64 << 20).min(mem_limit / 16);
+                    assert!(cache.reserved() <= cap, "{mem_limit} cursor {cursor}");
+                    if roomy {
+                        // more than one map, and at least one past its first table
+                        assert!(cache.entries() > 2 * 1792, "cursor {cursor}");
+                        assert!(cache.reserved() > 0, "cursor {cursor}");
+                        assert!(
+                            ctx.memory_room() + cache.reserved() <= room,
+                            "cursor {cursor}: the cache takes the query's room"
+                        );
+                    } else {
+                        assert!(cache.entries() < n, "cursor {cursor}: the cap refused");
+                    }
+                }
+            }
+        });
+    }
 }

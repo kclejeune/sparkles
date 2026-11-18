@@ -222,6 +222,10 @@ impl ValueCache {
 /// (see [`FloorCache::cap`]).
 const FLOOR_CACHE_BYTES: u64 = 64 << 20;
 
+/// The most reconstruction a cursor's walk of a key and the key before it admits (see
+/// [`Ctx::with_vocab_key_prev`]).
+const PAIR_WALK_BYTES: usize = 4096;
+
 /// The entries a floor map makes room for when it first grows.
 const FLOOR_MAP_FIRST: usize = 1024;
 
@@ -3171,33 +3175,57 @@ impl Ctx {
 
     /// `f(prev, key)` of the key of base vocabulary id `id` and, when the same walk of
     /// its block gives it, the key before it
-    /// ([`crate::vocab::Vocab::get_with_prev`]), with both
-    /// reconstructions and decodings inside the envelope. A refusal records a failure and
-    /// gives `None`.
+    /// ([`crate::vocab::Vocab::get_with_prev`]), with both reconstructions and decodings
+    /// inside the envelope. A refusal records a failure and gives `None`.
+    ///
+    /// A cursor's walk admits at most [`PAIR_WALK_BYTES`] of reconstruction. A longer key
+    /// on the way, such as a long string before a short language-tagged one that needs no
+    /// floor, sends the read to [`Ctx::with_vocab_key`] of `id` alone with `prev` `None`,
+    /// so the key before is reserved only when the caller reads it. An eager walk cannot
+    /// be refused, so it reads both keys in one walk whatever their length.
     fn with_vocab_key_prev<T>(
         &self,
         id: u64,
         f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
     ) -> Option<T> {
-        let decode = |prev: Option<&[u8]>, key: &[u8]| {
+        let mut f = Some(f);
+        let mut decode = |prev: Option<&[u8]>, key: &[u8]| {
             let longest = prev.map_or(0, <[u8]>::len).max(key.len());
-            self.reserve_decode(longest).then(|| f(prev, key))
+            if !self.reserve_decode(longest) {
+                return None;
+            }
+            f.take().map(|f| f(prev, key))
         };
         if !self.envelope_refuses() {
             return self
                 .snap
                 .generation
                 .vocab
-                .get_with_prev(id, decode)
+                .get_with_prev(id, &mut decode)
                 .flatten();
         }
-        match self.snap.generation.vocab.get_with_prev_checked(
+        enum Walk {
+            Long,
+            Refused(Error),
+        }
+        let walked = self.snap.generation.vocab.get_with_prev_checked(
             id,
-            |need| self.reserve_decode_checked(need),
-            decode,
-        ) {
+            |need| {
+                if need > PAIR_WALK_BYTES {
+                    return Err(Walk::Long);
+                }
+                self.reserve_decode_checked(need).map_err(Walk::Refused)
+            },
+            &mut decode,
+        );
+        match walked {
             Ok(found) => found.flatten(),
-            Err(error) => {
+            Err(Walk::Long) => {
+                let mut f = f.take();
+                self.with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
+                    .flatten()
+            }
+            Err(Walk::Refused(error)) => {
                 self.fail_memory(&error);
                 None
             }
