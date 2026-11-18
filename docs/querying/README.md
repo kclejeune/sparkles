@@ -314,11 +314,13 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   it is closed. The
   decoding of a large term beside such a batch can be refused under a budget at which a
   copy would answer, which [roadmap item 1051](../ROADMAP.md) holds.
-* `FILTER(?x < ?y)` and the other order comparisons of two columns of stored strings read
-  the strings' order from their vocabulary ids and each string's floor in both modes, so
-  neither column is decoded. The floors stay in a cache that lasts the query, charged to
-  its budget and capped at 64 MiB or a sixteenth of the budget, which trades that memory
-  for not computing a repeated string's floor again. Pairs whose strings rarely repeat
+* `FILTER(?x < ?y)` and the other order comparisons of two columns of stored simple
+  literals, over a table or cursor batch of at least 4,096 rows, read the strings' order
+  from their vocabulary ids and each string's floor in both modes, so neither column is
+  decoded. Each worker keeps the floors it computes in a map of a cache that lasts the
+  query, charged to its budget and capped at 64 MiB or a sixteenth of the budget, which
+  trades that memory for not computing a repeated string's floor again. Once the cache
+  is full, the floors it lacks are computed each time. Pairs whose strings rarely repeat
   run up to 12% slower than a direct comparison of the keys, which
   [roadmap item 1088](../ROADMAP.md) recovers.
 * Property path closures run within the query's memory budget and timeout in both
