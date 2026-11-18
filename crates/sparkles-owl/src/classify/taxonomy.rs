@@ -948,34 +948,43 @@ mod tests {
         assert_eq!(bad.node_of(&Class::thing()), Some(BOTTOM_NODE));
     }
 
-    #[test]
-    fn a_class_goes_with_its_equivalence_class_when_the_run_missed_owl_thing_or_nothing() {
-        // A and B are equivalent and A comes first in IRI order. The rows are then
-        // changed as an incomplete run can leave them: owl:Thing below A but not B, or A
-        // unsatisfiable while B is not. B's equivalence class starts at A, which has no
-        // node of its own, and the build placed B through a node that does not exist.
-        let axioms = [
+    /// A and B equivalent, with A first in IRI order and both below C.
+    fn equivalent_pair() -> Saturation {
+        saturated(&[
             Axiom::equivalent_classes([c("A").into(), c("B").into()]),
             Axiom::sub_class_of(c("B"), c("C")),
-        ];
-        let ex = |k: &Saturation, s: &str| k.interner.class_ex(&c(s)).unwrap();
-        let mut top = saturated(&axioms);
-        let a = ex(&top, "A");
-        top.worlds.insert(TOP, (false, vec![TOP, a]));
+        ])
+    }
+
+    #[test]
+    fn a_class_goes_to_the_top_with_its_equivalence_class_when_the_run_missed_owl_thing() {
+        // the rows as an incomplete run can leave them, with owl:Thing below A but not
+        // B. B's equivalence class starts at A, which has no node of its own, and the
+        // build placed B through a node that does not exist.
+        let mut k = equivalent_pair();
+        let a = k.interner.class_ex(&c("A")).unwrap();
+        k.worlds.insert(TOP, (false, vec![TOP, a]));
         for threads in [1, 4] {
-            let (t, _) = build(&top, true, threads, false, &|| false, &|_| true).unwrap();
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
             assert_eq!(t.node_of(&c("A")), Some(TOP_NODE));
             assert_eq!(t.node_of(&c("B")), Some(TOP_NODE));
-            assert!(t.node_of(&c("C")).is_some());
+            // a class above the pair stays where its own rows put it
+            assert!(t.node_of(&c("C")).is_some_and(|n| n != TOP_NODE));
         }
-        let mut bottom = saturated(&axioms);
-        let (a, b, cc) = (ex(&bottom, "A"), ex(&bottom, "B"), ex(&bottom, "C"));
-        bottom.worlds.insert(a, (true, vec![a, b, cc]));
+    }
+
+    #[test]
+    fn a_class_goes_to_the_bottom_with_its_equivalence_class_when_the_run_missed_owl_nothing() {
+        // the rows as an incomplete run can leave them, with A unsatisfiable and B not
+        let mut k = equivalent_pair();
+        let ex = |s: &str| k.interner.class_ex(&c(s)).unwrap();
+        let (a, b, cc) = (ex("A"), ex("B"), ex("C"));
+        k.worlds.insert(a, (true, vec![a, b, cc]));
         for threads in [1, 4] {
-            let (t, _) = build(&bottom, true, threads, false, &|| false, &|_| true).unwrap();
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
             assert_eq!(t.node_of(&c("A")), Some(BOTTOM_NODE));
             assert_eq!(t.node_of(&c("B")), Some(BOTTOM_NODE));
-            assert!(t.node_of(&c("C")).is_some());
+            assert!(t.node_of(&c("C")).is_some_and(|n| n != BOTTOM_NODE));
         }
     }
 
