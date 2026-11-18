@@ -12,8 +12,9 @@ the bulk threshold now commits in a transaction. A graph replacement into an emp
 takes the bulk path, as a load did, unless all its inputs are streams that end within
 8 MiB. A first Graph Store PUT into an empty in-memory dataset is therefore admitted by
 the size of the generation it builds, as a POST was, and a replacement of an empty body
-into an empty store commits an empty generation, as a load did. A small first PUT pays
-the rebuild's fixed cost, which roadmap item 1079 follows. A stream load into a store
+into an empty store commits an empty generation, as a load did. A first PUT of 10 to
+1,000 quads into an empty dataset pays the rebuild's fixed cost of about 20 to 27 ms, as
+a first POST did, and roadmap item 1079 follows it. A stream load into a store
 that holds data reads its stream ahead up to 80 bytes per threshold quad, as a
 replacement did, and takes the bulk path past that bound. A bulk replacement returns the
 quads it parsed, duplicates included, as the transactional path and the documentation

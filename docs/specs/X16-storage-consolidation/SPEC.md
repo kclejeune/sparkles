@@ -667,7 +667,7 @@ base `8baa5686` and the phase's load path at `2c08d2b0` interleaved, `sparkles l
 phase over seven rounds, and 10.5M quads took 4.448 s and 4.418 s over five, with peak
 RSS within 2%. Another lane's benchmark ran on the host during these rounds, so they
 show parity rather than a publishable time. The ignored `load_plan_timing` test at 1M
-quads measured a stream load into a store with data at 1.57 s to 1.63 s on the bulk path
+quads, built at `2c08d2b0`, measured a stream load into a store with data at 1.57 s to 1.63 s on the bulk path
 against 2.01 s to 2.23 s transactional, persistent and in memory. A first PUT of 10 to
 1,000 quads into an empty dataset took 21 ms to 34 ms on the phase against 0.7 ms to
 8.5 ms on the base, the fixed cost of a rebuild that a first POST already paid on both,

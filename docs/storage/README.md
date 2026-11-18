@@ -99,7 +99,8 @@ These read paths are tuned for queries over data that is not yet in memory
   large stream load into a dataset that holds data is a bulk commit, so the change-log
   limit of bulk commits under the limitations below applies to it. A graph replacement
   into an empty store, such as a first Graph Store PUT into a new dataset, is a bulk
-  commit for the same reason as a load. An in-memory dataset therefore admits it by the
+  commit for the same reason as a load, so the change-log note on a crash right after a
+  bulk commit under the limitations below applies to it. An in-memory dataset therefore admits it by the
   size of the generation it builds, as it admits a load, rather than by the memory
   estimate of each inserted quad. A load or replacement of an empty body into an empty
   store commits an empty generation. SPARQL `LOAD` always inserts in a transaction. Roadmap item 846 tracks a bulk path for a
@@ -404,8 +405,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   under mixed load measured a p50 ratio of 1.028, both within their gates. Roadmap
   item 448.
 * A first Graph Store PUT of a small buffered body into an empty dataset rebuilds the
-  index, as a first POST does, which costs more than the transaction of a PUT into a
-  dataset that holds data. The rebuild has a fixed cost of some milliseconds. Roadmap
+  index, as a first POST does. The rebuild's fixed cost of about 20 to 27 ms makes a PUT
+  of 10 to 1,000 quads take 21 to 34 ms, where a transaction took 0.7 to 8.5 ms. Roadmap
   item 1079.
 * Branch stores share their dataset's quota, which counts the zeros preallocated after
   each store's log and delta vocabulary as those of the store written last. With several

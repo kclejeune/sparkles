@@ -10819,7 +10819,7 @@ describes when that happens, and `execution=eager` avoids it.
 written to a temporary file as they arrive rather than held in memory. A large PUT,
 estimated above the bulk threshold, replaces its graphs in one index rebuild that parses
 the body as a stream. A PUT or POST into an empty dataset also builds the index in one
-rebuild, whatever the size of its body. Like every write it is
+rebuild, whatever the size of its body, unless the caller may write only some graphs. Like every write it is
 atomic, so a parse error leaves the data as it was.
 
 ### Storage quotas
