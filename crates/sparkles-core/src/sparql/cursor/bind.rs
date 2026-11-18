@@ -75,9 +75,31 @@ pub(super) struct Reuse {
     map_rows: u64,
     hits: u64,
     misses: u64,
+    /// Whether the map's misses may still be spread over the pool. A split that ran no
+    /// faster than the calling thread's timed sample keeps the rest of the query's misses
+    /// on the calling thread.
+    split: bool,
     #[cfg(test)]
     evaluations: usize,
 }
+
+/// The experiment switch `SPARKLES_BIND_SPLIT=measured|never|always`, how the map's
+/// misses use the pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitPolicy {
+    Measured,
+    Never,
+    Always,
+}
+fn split_policy() -> SplitPolicy {
+    static POLICY: std::sync::OnceLock<SplitPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("SPARKLES_BIND_SPLIT").as_deref() {
+        Ok("never") => SplitPolicy::Never,
+        Ok("always") => SplitPolicy::Always,
+        _ => SplitPolicy::Measured,
+    })
+}
+
 impl Reuse {
     pub(super) fn prepare(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Admission> {
         if !ctx.opt.expr_cache {
@@ -112,9 +134,20 @@ impl Reuse {
             map_rows: 0,
             hits: 0,
             misses: 0,
+            split: split_policy() != SplitPolicy::Never,
             #[cfg(test)]
             evaluations: 0,
         })
+    }
+
+    /// Keep the map's later misses on the calling thread once a split of them did not pay.
+    fn observe_split(&mut self, split: Option<crate::sparql::exec::Split>) {
+        if let Some(split) = split
+            && !split.paid()
+            && split_policy() == SplitPolicy::Measured
+        {
+            self.split = false;
+        }
     }
 
     /// The exact count of a batch that the per-batch distinct pass made after
@@ -409,15 +442,19 @@ impl Reuse {
             let mut misses = Table::new(vec![self.input]);
             misses.len = distinct.len();
             misses.cols[0] = distinct;
-            let values = match crate::sparql::exec::column_rows(ctx, &misses, expr)
-                .and_then(|values| ctx.check().map(|()| values))
-            {
-                Ok(values) => values,
-                Err(error) => {
-                    self.decline();
-                    return Err(error);
-                }
-            };
+            let values =
+                match crate::sparql::exec::column_rows_split(ctx, &misses, expr, self.split)
+                    .and_then(|values| ctx.check().map(|()| values))
+                {
+                    Ok((values, split)) => {
+                        self.observe_split(split);
+                        values
+                    }
+                    Err(error) => {
+                        self.decline();
+                        return Err(error);
+                    }
+                };
             for row in &missed {
                 let at = &mut output[*row as usize];
                 *at = values[(at.0 & PAYLOAD_MASK) as usize];
@@ -533,6 +570,51 @@ mod tests {
 
     fn new_reuse(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Reuse> {
         Reuse::new(ctx, Reuse::prepare(ctx, expr, source)?)
+    }
+
+    fn split(sample_nanos: u128, rest_nanos: u128) -> crate::sparql::exec::Split {
+        crate::sparql::exec::Split {
+            sample_rows: 256,
+            sample_nanos,
+            rest_rows: 1024,
+            rest_nanos,
+        }
+    }
+
+    /// A split pays only when the pool maps the rest faster than the calling thread would
+    /// at the rate of its timed sample. The times are given, so no clock decides the test.
+    #[test]
+    fn a_split_pays_only_when_the_pool_beats_the_sampled_rate() {
+        // the sample's rate projects 400 us for the rest
+        assert!(split(100_000, 120_000).paid());
+        assert!(!split(100_000, 400_000).paid(), "equal to the projection");
+        assert!(!split(100_000, 1_200_000).paid(), "contended evaluation");
+        assert!(!split(0, 10).paid());
+    }
+
+    /// The map keeps its misses on the calling thread for the rest of the query once a
+    /// split of them did not pay, and a batch that was not split leaves the choice alone.
+    #[test]
+    fn a_split_that_did_not_pay_keeps_later_misses_on_the_calling_thread() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let v = ctx.var("v");
+        let mut reuse = Reuse::new(
+            &ctx,
+            Admission {
+                input: v,
+                expected_reuse: false,
+            },
+        )
+        .unwrap();
+        assert!(reuse.split);
+        reuse.observe_split(None);
+        reuse.observe_split(Some(split(100_000, 120_000)));
+        assert!(reuse.split, "a split that paid keeps splitting");
+        reuse.observe_split(Some(split(100_000, 1_200_000)));
+        assert!(!reuse.split);
+        reuse.observe_split(Some(split(100_000, 120_000)));
+        assert!(!reuse.split, "the choice holds for the rest of the query");
     }
 
     #[test]

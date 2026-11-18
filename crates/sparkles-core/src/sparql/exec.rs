@@ -119,6 +119,36 @@ pub(super) fn map_batch<T: Send>(
     par: bool,
     f: impl Fn(usize) -> T + Sync + Send,
 ) -> Result<Vec<T>> {
+    map_batch_split(ctx, n, par, f).map(|(out, _)| out)
+}
+
+/// The times of a batch that [`map_batch`] split: its timed sample on the calling thread
+/// and the rest on the pool.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Split {
+    pub(super) sample_rows: usize,
+    pub(super) sample_nanos: u128,
+    pub(super) rest_rows: usize,
+    pub(super) rest_nanos: u128,
+}
+
+impl Split {
+    /// Whether the pool mapped the rest faster than the calling thread would have, at the
+    /// rate of the timed sample. A cheap expression whose evaluation contends across
+    /// threads, such as STR of IRIs interning their strings, can run slower split.
+    pub(super) fn paid(&self) -> bool {
+        self.rest_nanos.saturating_mul(self.sample_rows as u128)
+            < self.sample_nanos.saturating_mul(self.rest_rows as u128)
+    }
+}
+
+/// [`map_batch`], also returning the times of a batch whose rest it mapped on the pool.
+pub(super) fn map_batch_split<T: Send>(
+    ctx: &Ctx,
+    n: usize,
+    par: bool,
+    f: impl Fn(usize) -> T + Sync + Send,
+) -> Result<(Vec<T>, Option<Split>)> {
     let sample = n.min(BATCH_SAMPLE_ROWS);
     let rest = n - sample;
     let mut out = Vec::with_capacity(n);
@@ -128,8 +158,9 @@ pub(super) fn map_batch<T: Send>(
     let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
     let t0 = may_split.then(Instant::now);
     out.extend((0..sample).map(&f));
-    if let Some(t0) = t0
-        && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
+    let sampled = t0.map(|t0| t0.elapsed().as_nanos());
+    if let Some(sample_nanos) = sampled
+        && sample_nanos * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
         // Each piece of the rest is its own vector until it is appended to `out`, which
         // already holds room for every row, so the pieces are the memory this adds.
@@ -141,6 +172,7 @@ pub(super) fn map_batch<T: Send>(
                     .saturating_mul(std::mem::size_of::<Result<Vec<T>>>() as u64 + 16),
             );
         if let Ok(_scratch) = ctx.charge(bytes) {
+            let t1 = Instant::now();
             // an indexed collect writes each piece's slot in place
             let pieces: Vec<Result<Vec<T>>> = starts
                 .into_par_iter()
@@ -149,10 +181,17 @@ pub(super) fn map_batch<T: Send>(
                     Ok((start..(start + BATCH_PAR_PIECE).min(n)).map(&f).collect())
                 })
                 .collect();
+            let rest_nanos = t1.elapsed().as_nanos();
             for piece in pieces {
                 out.extend(piece?);
             }
-            return Ok(out);
+            let split = Split {
+                sample_rows: sample,
+                sample_nanos,
+                rest_rows: rest,
+                rest_nanos,
+            };
+            return Ok((out, Some(split)));
         }
     }
     let mut start = sample;
@@ -162,7 +201,7 @@ pub(super) fn map_batch<T: Send>(
         out.extend((start..end).map(&f));
         start = end;
     }
-    Ok(out)
+    Ok((out, None))
 }
 
 /// Executed operator tree with runtime information (QLever `RuntimeInformation`).
@@ -5707,6 +5746,17 @@ pub(super) fn compute_column(
 }
 
 pub(super) fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
+    column_rows_split(ctx, t, e, true).map(|(values, _)| values)
+}
+
+/// [`column_rows`], which spreads rows over the pool only when `par` allows it, and also
+/// returns the times of a batch of at most [`PAR_THRESHOLD`] rows that it split.
+pub(super) fn column_rows_split(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    par: bool,
+) -> Result<(Vec<Id>, Option<Split>)> {
     let dec = decode_for(ctx, t, &[e])?;
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| match eval(
@@ -5722,10 +5772,11 @@ pub(super) fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
+    let par = par && e.parallel();
     if t.len() <= PAR_THRESHOLD {
-        return map_batch(ctx, t.len(), batch_may_split(t.len()) && e.parallel(), f);
+        return map_batch_split(ctx, t.len(), batch_may_split(t.len()) && par, f);
     }
-    map_rows(ctx, t.len(), e.parallel(), f)
+    Ok((map_rows(ctx, t.len(), par, f)?, None))
 }
 
 type Candidates = (Vec<usize>, Option<super::ctx::RetainedCharge>);
