@@ -576,6 +576,10 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
         put("/disk/data?default", "application/n-triples", small),
         post("/disk/upload", "application/n-triples", small),
         put("/mem/data?default", "application/n-triples", &large),
+        // A small body into an empty dataset takes a transaction, which admits each quad
+        // by its memory estimate, for a POST as for a PUT.
+        put("/fresh-put/data?default", "application/n-triples", &large),
+        post("/fresh-post/data?default", "application/n-triples", &large),
     ];
     for req in writes {
         let what = format!("{} {}", req.method(), req.uri());
@@ -590,14 +594,7 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
     }
     assert_eq!(st.get("disk").unwrap().store.head_commit().seq, 0);
     assert_eq!(st.get("mem").unwrap().store.snapshot().len(), 1);
-    // A body into an empty dataset takes the bulk plan, which admits the generation it
-    // builds by its size, and that of these quads fits in the limit, as for a POST.
-    for req in [
-        put("/fresh-put/data?default", "application/n-triples", &large),
-        post("/fresh-post/data?default", "application/n-triples", &large),
-    ] {
-        let what = format!("{} {}", req.method(), req.uri());
-        let r = send(&app, req).await;
-        assert!(r.status.is_success(), "{what}: {}", r.text());
+    for ds in ["fresh-put", "fresh-post"] {
+        assert!(st.get(ds).unwrap().store.snapshot().is_empty(), "{ds}");
     }
 }

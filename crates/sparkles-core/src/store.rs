@@ -103,7 +103,7 @@ pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
 use load_plan::LoadPlan;
 #[cfg(test)]
-use load_plan::SMALL_STREAM_BYTES;
+use load_plan::SMALL_SOURCE_BYTES;
 use publish::{Committed, Publication};
 use snapshot::{Shared, SnapshotBuilder};
 pub(crate) mod wal;
@@ -8542,10 +8542,10 @@ mod tests {
             RdfFormat::NTriples,
             None,
         );
-        assert!(streams_exceed(std::slice::from_ref(&gz), SMALL_STREAM_BYTES, &o).unwrap());
+        assert!(streams_exceed(std::slice::from_ref(&gz), SMALL_SOURCE_BYTES, &o).unwrap());
         assert_eq!(collect_len(&gz), 300_000);
         let gz = Source::from_reader(std::io::Cursor::new(packed(30)), RdfFormat::NTriples, None);
-        assert!(!streams_exceed(std::slice::from_ref(&gz), SMALL_STREAM_BYTES, &o).unwrap());
+        assert!(!streams_exceed(std::slice::from_ref(&gz), SMALL_SOURCE_BYTES, &o).unwrap());
         assert_eq!(collect_len(&gz), 30);
         for (src, n) in [(big, 1000u64), (small, 3)] {
             let store = Store::in_memory(StoreOptions {
