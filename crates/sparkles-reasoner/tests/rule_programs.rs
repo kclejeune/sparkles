@@ -279,6 +279,25 @@ fn updates_equal_full_runs() {
         reason(&fresh, &p, None, None);
         assert_eq!(got, inferred(&fresh), "kept {kept}");
         assert!(got.contains(&format!("<{EX}a4_0> <{EX}h4> <{EX}a4_4>")));
+        // a delete alone: the chain's last step goes, and with it the chain's fact, which
+        // only the relation facts of the chain connect to the deleted one
+        let since = commit(&r);
+        change(&s, &[], &[t("a4_3", "c4_4", "a4_4")]);
+        let r = reason(&s, &p, Some(since), cache);
+        assert_eq!(
+            r.method,
+            Method::Incremental,
+            "kept {kept}: {:?}",
+            r.fallback
+        );
+        let got = inferred(&s);
+        let fresh = store(&ttl.replace("ex:a4_3 ex:c4_4 ex:a4_4 .\n", ""));
+        reason(&fresh, &p, None, None);
+        assert_eq!(got, inferred(&fresh), "kept {kept}, after the delete");
+        assert!(
+            !got.contains(&format!("<{EX}a4_0> <{EX}h4> <{EX}a4_4>")),
+            "kept {kept}: {got:?}"
+        );
     }
     let negating = "@prefix ex: <http://ex.org/> .
 .decl r(x)
