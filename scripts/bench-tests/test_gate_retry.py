@@ -171,6 +171,12 @@ class Rerun(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertFalse((out / "ci.forgiven").exists())
 
+    def test_a_rebuild_is_a_cache_miss(self):
+        self.assertFalse(tr.rebuilt("   Compiling sparkles-core v0.1.0\nmbx[cache]: 3 hits, 0 misses; 0 B\n"))
+        self.assertTrue(tr.rebuilt("   Compiling sparkles-core v0.1.0\nmbx[cache]: 3 hits, 1 miss; 0 B\n"))
+        self.assertTrue(tr.rebuilt("   Compiling sparkles-core v0.1.0\n"))
+        self.assertFalse(tr.rebuilt("   Compiling serde v1.0.0\n    Finished\n"))
+
     def test_an_ineligible_failure_runs_nothing(self):
         with tempfile.TemporaryDirectory() as d:
             out = gate_out(d, states={"lint": "FAIL", "test": "FAIL"})

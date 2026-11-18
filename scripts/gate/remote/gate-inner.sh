@@ -187,6 +187,10 @@ log "selection: $(tr '\n' ';' < "$out/selection.txt")"
 if [ "$part" != conformance ]; then
   # A forgiveness belongs to the run that wrote it, never to a later run of the same name.
   rm -rf "$out/ci.forgiven" "$out/test-retry.exit" "$out/test-retry.txt" "$out/test-retry"
+  # The host-timing test group of .config/nextest.toml asserts wall-clock bounds, so it
+  # leaves the pass/fail run and runs alone afterwards (mise run test:timing-cohort).
+  # A commit whose changed-crates.py predates the variable runs the group as before.
+  export SPARKLES_TEST_EXCLUDE_GROUP=host-timing
   step ci scripts/ci.sh "${force[@]}" --jobs "$jobs" "${ci_args[@]}"
   # New CI revisions retain actual JUnit under their original lease. Copy only that
   # retained evidence here, after ci.sh has returned; never recover it from a target.

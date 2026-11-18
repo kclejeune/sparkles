@@ -1011,6 +1011,29 @@ and JUnit report beside the first run's evidence in `ci-receipts`. The nightly g
 the same rule. A test that the gate forgave belongs on the list of
 [known flaky tests](#known-flaky-tests) once it recurs.
 
+### Timing cohort
+
+Some tests assert a wall-clock bound, such as a lock held for under 5 ms while writes run
+or an answer within 4 s, and other work on a loaded gate host breaks those bounds without
+any change to the code. They form the `host-timing` test group of `.config/nextest.toml`,
+where one override names each test exactly. The batch gate sets
+`SPARKLES_TEST_EXCLUDE_GROUP=host-timing` for its ci step, and `scripts/changed-crates.py`
+then adds `!group(host-timing)` to the one filter that the `test` task passes to nextest,
+so the group leaves the gate's pass/fail run, the nightly gate's included. The variable is
+part of the task cache key, so a pass without the group never stands in for a full run.
+Lane CI, GitHub's CI and every other run of `mise run test` still run these tests.
+
+The group runs after the gate with `mise run test:timing-cohort`, alone and one test at a
+time, on one dedicated worker that runs no other job. `scripts/timing-cohort.py check`
+compares each test's time with the worker's thresholds and reports a test that failed,
+timed out or ran past its threshold. A regression writes `regression.md` with a roadmap
+row for a fix-forward item, and it does not block the push. The thresholds come from
+three runs at `origin/main` on the idle worker with
+`scripts/timing-cohort.py qualify RUN RUN RUN --out FILE`, which sets each test's
+threshold to its slowest time plus three times the spread of the three, and to at least
+1.5 times the slowest. `SPARKLES_TIMING_THRESHOLDS` or `--thresholds` names that file.
+Each run's results go to `.artifacts/timing-cohort/<time>-<commit>/`.
+
 ### Checks a batch selects
 
 `scripts/gate/gate.sh` passes the gate host the merge base of the commit and `--base`

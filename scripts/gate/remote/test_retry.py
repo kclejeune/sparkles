@@ -15,7 +15,7 @@ failed test passes when it runs again by itself:
 
 Each failed test then runs alone with `mbx nextest run --no-capture --retries 0` and an
 exact binary and test filter, within --seconds in all. It passes only when its own JUnit
-report lists exactly that test, passed, and its log shows no workspace crate rebuilt.
+report lists exactly that test, passed, and its log shows no new compilation.
 Since a failed nextest step ends the test task before its doctests, the doctests of the
 task's packages then run too. When everything passes, the script writes ci.forgiven with
 one `binary test` line per flaky test and exits 0. Otherwise it writes the reason to
@@ -154,7 +154,12 @@ def run(cmd, log, seconds):
 
 
 def rebuilt(log_text):
-    """Whether a log shows Cargo compiling a workspace crate."""
+    """Whether a log shows a workspace crate compiled anew. Cargo prints Compiling for a
+    crate that Boxington restores from its cache too, so its cache line decides when it
+    is there: a miss is a new compilation, which a rerun of the same build never needs."""
+    m = re.search(r"mbx\[cache\]: \d+ hits?, (\d+) miss", log_text)
+    if m:
+        return int(m.group(1)) > 0
     return re.search(r"^\s*Compiling sparkles[a-z0-9-]* v", log_text, re.M) is not None
 
 

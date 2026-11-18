@@ -378,7 +378,8 @@ def choose(base, files=None, rev=None, read=None):
 def cargo_args(mode=None):
     v = os.environ.get("SPARKLES_CHANGED_PACKAGES")
     if v is None or v.strip() == "all":
-        return "--workspace"
+        f = nextest_filter() if mode == "nextest" else None
+        return "--workspace" + (f" -E {f}" if f else "")
     names = v.split()
     if names and names != ["none"] and mode == "doc":
         workspace()
@@ -386,8 +387,23 @@ def cargo_args(mode=None):
     if not names or names == ["none"]:
         return "none"
     if mode == "nextest":
-        return "--workspace -E " + "|".join(f"package({n})" for n in names)
+        return "--workspace -E " + nextest_filter("|".join(f"package({n})" for n in names))
     return " ".join(f"-p {n}" for n in names)
+
+
+def nextest_filter(packages=None):
+    """One nextest filterset for the packages and SPARKLES_TEST_EXCLUDE_GROUP, the test
+    group that the batch gate leaves out. nextest takes the union of several -E
+    arguments, so the exclusion must be part of the same expression. The expression has
+    no spaces, since the test task splits the arguments on them."""
+    group = os.environ.get("SPARKLES_TEST_EXCLUDE_GROUP", "").strip()
+    if group and not re.fullmatch(r"[a-z0-9-]+", group):
+        sys.exit(f"changed-crates: SPARKLES_TEST_EXCLUDE_GROUP is not a test group name: {group!r}")
+    if not group:
+        return packages
+    if not packages:
+        return f"!group({group})"
+    return f"({packages})&!group({group})"
 
 
 def main():
