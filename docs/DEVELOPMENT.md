@@ -1235,27 +1235,32 @@ store.
 
 Pull requests, fork pull requests and runs on other branches restore both caches from
 `main` and save neither. The test build's target entry is about 0.8 GB and Clippy's about 0.6 GB.
-Each commit adds a test store of 0.3 to 0.6 GB and a Clippy store of 0.2 to 0.5 GB. GitHub's
-10 GB repository cache drops the least recently used entries first, so it keeps the
-stores of the last several main commits next to the other workflows' caches.
+Each commit adds a test store of 0.3 to 0.7 GB and a Clippy store of 0.2 to 0.9 GB. Each
+workflow that saves these caches ends with a `prune-caches` job on `main`, which runs
+`scripts/gha-cache-prune.py` after the saving jobs. The script keeps the newest store and
+the newest rust-cache entry of each job kind and platform and deletes the older ones.
+Without it every push would add a full set next to the previous one, and GitHub's 10 GB
+repository cache would evict entries that the next runs restore, including the test
+build's.
 
-The binding workflows and the server candidate build use the same caches, with keys that
+The binding workflows use the same caches, with keys that
 also name the platform and the build profile. The JVM natives and the Node addon build on
 the runner and use both caches. Their rust-cache entry is kept for each platform and
 profile, and its cleanup keeps the binding workspace's dependencies. The JVM jars and
 compatibility jobs restore the Linux x86_64 dev natives' caches without saving, since they
-build the dev bindings generator on that platform. The Linux wheels and the server
-candidate build in containers and cache only the object store. The Alpine addons cache
+build the dev bindings generator on that platform. The Linux wheels build in a
+container and cache only the object store. The Alpine addons cache
 only their Rustup, Cargo tool and pnpm downloads, and their store starts empty. A binding
 workflow saves only on a push to `main`, which builds the dev profile on Linux x86_64.
 Release tags and manual runs build the release profile and every platform from an empty
-store. `MBX_GC_MAX_SIZE` is 2 GiB for the bindings and 3 GiB for the server candidate.
+store. `MBX_GC_MAX_SIZE` is 2 GiB for the bindings. The server candidate build saves no store, as
+[server artifact candidates](#server-artifact-candidates) describes.
 
-Each main push adds a store of about 0.35 GB for the wheel, 0.55 GB for the addon, 0.45 GB
-for the natives and 2.7 GB for the server candidate, and the addon's and the natives'
-target entries are about 0.9 and 0.6 GB. With `ci.yml`'s entries, one main push's set comes
-close to the 10 GB limit, so GitHub evicts the older commits' stores first. The server
-candidate's save takes 3 to 5 min of its job.
+Each main push adds a store of about 0.6 GB for the wheel, 0.55 GB for the addon and 0.5 GB
+for the natives, and the addon's and the natives' target entries are about 0.9 and 0.6 GB.
+With `ci.yml`'s entries and the workflows' small tool caches, the newest set takes about
+6 GB of the 10 GB limit, which leaves room for the entries of one push before its
+`prune-caches` jobs run.
 
 Native build commands and shell build scripts call `mbx` directly. Maturin and napi builds
 use the supported Cargo shim because those tools invoke Cargo themselves. CI keeps its
@@ -1348,6 +1353,11 @@ workspace target and routes child Cargo calls through its shims. Separate smoke 
 download the archive and start its extracted binary in pinned Rocky Linux 8 and
 Debian 11 images, without the checkout or host libraries. No release, image, registry
 package or cryptographic attestation is published.
+
+The candidate build runs Boxington in local mode and saves no store. A saved store took
+about 3.4 GB of the 10 GB repository cache and pushed the CI test build's caches out. It
+shortened the build step to about 22 min from the 35 min of an empty store on GitHub's
+runner, and item 1074 looks for a smaller store that keeps part of that gain.
 
 The outer `server:artifact` task activates the same pinned wasm-bindgen CLI as
 `ui:wasm`, so the packer can record its version after the formatter task exits. A

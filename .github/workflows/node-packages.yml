@@ -291,3 +291,27 @@ jobs:
             fi
             npm publish "$package" --access public --provenance
           done
+
+  # Each push to main saves new native build caches under keys that end in the commit's SHA, and the earlier
+  # commits' entries would stay until GitHub's 10 GB repository limit evicts them, in an
+  # order that has removed the test build's caches. This job keeps the newest entry of each
+  # family and deletes the others (scripts/gha-cache-prune.py).
+  prune-caches:
+    name: Prune superseded caches
+    needs: native
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.native.result != 'skipped' }}
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/gha-cache-prune.py
+          sparse-checkout-cone-mode: false
+      - name: Delete superseded cache entries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/gha-cache-prune.py mbx-store-node- v0-rust-node-

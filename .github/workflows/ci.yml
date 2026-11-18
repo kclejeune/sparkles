@@ -24,6 +24,8 @@
 #   jena-clients Apache Jena's own HTTP clients against the debug server binary
 #   features     an opt-in manual compatibility matrix with the server defaults off
 #                and one optional feature set on, built apart from the archive
+#   prune-caches on main, the superseded entries of the caches that Clippy and the test
+#                build save
 #
 # A manual run can also test Linux arm64 and macOS on Apple silicon, for example before
 # a release. The server embeds ui/build, and its build script writes a placeholder page
@@ -798,3 +800,27 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = macOS ]; then ulimit -c 0; fi
           mbx test --locked --workspace --doc
+
+  # Each push to main saves new Clippy and test build caches under keys that end in the commit's SHA, and the earlier
+  # commits' entries would stay until GitHub's 10 GB repository limit evicts them, in an
+  # order that has removed the test build's caches. This job keeps the newest entry of each
+  # family and deletes the others (scripts/gha-cache-prune.py).
+  prune-caches:
+    name: Prune superseded caches
+    needs: [clippy, build]
+    if: ${{ always() && github.ref == 'refs/heads/main' && (needs.clippy.result != 'skipped' || needs.build.result != 'skipped') }}
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/gha-cache-prune.py
+          sparse-checkout-cone-mode: false
+      - name: Delete superseded cache entries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/gha-cache-prune.py mbx-store-clippy- v0-rust-clippy- mbx-store-tests- v0-rust-tests-
