@@ -177,7 +177,7 @@ fn group_concat_merges_in_row_order() {
 fn distinct_passes_each_value_of_a_group_once() {
     let ctx = ctx();
     let values: Vec<Id> = [1, 1, 2, 1, 2, 2].iter().map(|&i| int(&ctx, i)).collect();
-    let slots = vec![0, 0, 0, 1, 1, 1];
+    let slots = [0, 0, 0, 1, 1, 1];
     let a = agg(AggregateFunction::Count, true, true);
     let mut count = Distinct::new(Box::new(Running::new(&a, true)), false);
     count.init(2);
