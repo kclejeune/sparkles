@@ -190,6 +190,15 @@ The maintainer settled these questions for stage 4.
 * Stage 4 is measured on an Intel host, since its effects on short queries are small.
 * Query budgets, cancellation on disconnect and the results of every query stay as they
   are. A measured slowdown that a gate accepts gets its own roadmap item.
+* From stage 5 to the merge, a phase may land with a real cost on a query under 0.3 ms
+  of at most 2% or 0.5 µs, recorded as a line of the stage's small-costs item with the
+  host and the commits compared. A larger cost keeps its own roadmap item. The merge is
+  measured against cc94ac7f, the main branch before item 825 landed, and meets the first
+  gate above against it, so the costs that phases accept are recovered by the merge or
+  before it. A query whose recorded costs pass the merge gate is recovered before the
+  next phase that changes its path lands. Each cost names the phase that recovers it,
+  since a cost measured in the streaming or automatic path survives the merge unless a
+  phase removes it.
 
 ## Non-goals
 
