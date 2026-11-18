@@ -600,7 +600,7 @@ fn threshold_zero_into_an_empty_store() {
             ..StoreOptions::default()
         })
     };
-    let short = b"<urn:s> <urn:p> 1 .\n".to_vec();
+    let short = b"<urn:s> <urn:p> \"1\" .\n".to_vec();
     assert!(short.len() < BYTES_PER_QUAD as usize);
     let sources = [
         (
