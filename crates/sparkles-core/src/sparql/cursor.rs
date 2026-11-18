@@ -20,6 +20,7 @@ use std::time::Instant;
 
 mod binary;
 mod bind;
+mod countjoin;
 mod distinct;
 mod expand;
 mod extsort;
@@ -27,6 +28,7 @@ mod filter;
 pub mod graph;
 mod group;
 mod joinspill;
+mod leaf;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 pub(super) use joinspill::row_hash;
 mod merge;
@@ -2825,7 +2827,9 @@ impl Operator {
         needed: bool,
     ) -> Result<Self> {
         ctx.check()?;
-        let mut node = node;
+        // A count over a join runs the join and counts its rows.
+        let count_join = matches!(node.kind, Kind::CountJoin { .. });
+        let mut node = countjoin::rewrite(ctx, node);
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
@@ -2859,13 +2863,26 @@ impl Operator {
             && !index_topk
             && !pattern_counts
             && (!native_blocking || !exists_streams);
-        if materializes && fallback == FallbackPolicy::RejectMaterialization {
+        // A kernel that answers whole tables runs as a native operator when its form is
+        // a whole-input one or a bounded leaf (see `leaf`).
+        let native = materializes
+            && exists_streams
+            && leaf::form(&node).is_some_and(|form| {
+                form.native()
+                    && (form != leaf::Form::WholeInput
+                        || (!native_blocking && exec::reads_inputs(&node)))
+            });
+        if materializes && !native && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
                 "cursor requires materialization at {}; use AllowMaterialization or eager execution",
                 node.operator()
             )));
         }
         let mut info = exec::describe_node(ctx, &node);
+        if count_join && matches!(node.kind, Kind::Group { .. }) {
+            info.operator = countjoin::OPERATOR.into();
+            info.description = format!("{} [counts the rows of the join below]", info.description);
+        }
         if let Kind::PatternScan(spec) = &node.kind {
             // the table the scan reads, as the eager plan names it
             info.description = format!("{} {}", info.description, spec.uses.note());
@@ -3094,6 +3111,8 @@ impl Operator {
                     "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
                     node.operator()
                 )
+            } else if native {
+                leaf::reason(&node, leaf::form(&node).expect("a native form"))
             } else if !materializes {
                 format!(
                     "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
@@ -3194,7 +3213,7 @@ impl Operator {
             vars,
             rows: 0,
             done: false,
-            materializes,
+            materializes: materializes && !native,
             growing,
             reason,
             bind_reuse,
@@ -3375,7 +3394,8 @@ impl Operator {
             full_input_before_output: self.materializes
                 || matches!(
                     self.state,
-                    State::Binary(_)
+                    State::Fallback { .. }
+                        | State::Binary(_)
                         | State::Group(_)
                         | State::Scalar(_)
                         | State::Counts { .. }
@@ -3414,7 +3434,7 @@ impl Operator {
         match &self.state {
             State::Fallback {
                 loaded: Some(_), ..
-            } if self.materializes => update(&self.info, plan),
+            } => update(&self.info, plan),
             State::Scalar(_) if self.done => {
                 for (info, plan) in self.info.children.iter().zip(&mut plan.children) {
                     update(info, plan);
@@ -3717,6 +3737,9 @@ impl Operator {
                 }
                 State::Expand(expand) => {
                     let batch = expand.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(counters) = expand.counters() {
+                        self.info.counters = Some(counters.clone());
+                    }
                     let input = self.children.last().is_none_or(|c| c.done);
                     self.done = expand.done(input);
                     batch

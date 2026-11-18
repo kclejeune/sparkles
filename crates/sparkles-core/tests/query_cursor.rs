@@ -923,6 +923,34 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
     }
 }
 
+/// A view source with one `table` view whose column ?x holds the integers below `.0`.
+/// A view read has no resumable cursor, so it is the remaining eager fallback leaf.
+#[derive(Debug)]
+struct IntegersView(i64);
+impl sparkles_core::sparql::viewsvc::ViewSource for IntegersView {
+    fn read_view(
+        &self,
+        _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
+    ) -> sparkles_core::Result<sparkles_core::sparql::viewsvc::ViewRows> {
+        Ok(sparkles_core::sparql::viewsvc::ViewRows {
+            columns: vec!["x".into()],
+            rows: (0..self.0)
+                .map(|i| (vec![Some(Term::Literal(oxrdf::Literal::from(i)))], 1))
+                .collect(),
+            commit: 0,
+        })
+    }
+}
+
+fn with_view(rows: i64) -> QueryOptions {
+    QueryOptions {
+        views: Some(Arc::new(IntegersView(rows))),
+        ..Default::default()
+    }
+}
+
+const VIEW_READ: &str = "SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x }";
+
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
@@ -935,32 +963,28 @@ fn eager_fallback_is_visible_lazy_and_budgeted() {
         None,
     )])
     .unwrap();
-    let q =
-        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }";
+    let q = &format!("SELECT ?x WHERE {{ {VIEW_READ} }}");
+    let views = with_view(100);
     assert!(matches!(
-        select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
+        select_cursor(s.snapshot(), q, &views, &options(2)),
         Err(Error::Unsupported(_))
     ));
     let opts = CursorOptions {
         batch_rows: 2,
         ..Default::default()
     };
-    let mut c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+    let mut c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
     assert!(c.plan().has_materialization());
     assert_eq!(c.stats().rows_produced, 0);
     let b = c.next_batch().unwrap().unwrap();
     assert_eq!(
         b.row(0).unwrap().values().to_vec(),
-        query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows()[0]
+        query(s.snapshot(), q, &views).unwrap().application_rows()[0]
     );
     assert!(c.stats().rows_produced >= 100);
     assert_eq!(
-        all(select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap()),
-        query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows()
+        all(select_cursor(s.snapshot(), q, &views, &opts).unwrap()),
+        query(s.snapshot(), q, &views).unwrap().application_rows()
     );
 }
 
@@ -2286,8 +2310,8 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT (COUNT(*) AS ?n) {{?s ?p ?o} UNION {?o ?p ?s} ?s ?q ?t}",
-            &Default::default(),
+            &format!("SELECT ?x {{ {VIEW_READ} }}"),
+            &with_view(3),
             &strict,
             ExecutionMode::Auto,
         ),
@@ -3309,6 +3333,40 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
     differential("masked", &snapshot, &opts, SEEDS);
 }
 
+/// A count over a join runs the join as a cursor operator of its own and counts its
+/// rows, so the strict policy admits it and no operator materializes (item 829).
+#[test]
+fn count_join_counts_a_streamed_join() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7) % 60))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn has(plan: &sparkles_core::sparql::CursorPlan, op: &str) -> bool {
+        plan.operator.operator == op || plan.children.iter().any(|c| has(c, op))
+    }
+    for q in [
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o > 1000) ?s <urn:q> ?t }",
+    ] {
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
+        for rows in [1, 2, 3, 4096] {
+            let c = open(&s, q, rows);
+            assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
+            assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
+            assert_eq!(all(c), expected, "{q}; {rows}");
+        }
+    }
+}
+
 /// An operator without a cursor implementation materializes only itself. Its inputs
 /// are cursors of their own, and they stream into it.
 #[test]
@@ -3331,19 +3389,23 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
             fallbacks(child, out);
         }
     }
+    let views = with_view(30);
     for q in [
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
-        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
+        format!(
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {VIEW_READ} FILTER(?x = ?o) }} }}"
+        ),
+        format!(
+            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {VIEW_READ} FILTER(?x = 3) }} }}"
+        ),
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows());
+        let q = q.as_str();
+        let expected = bag(query(s.snapshot(), q, &views).unwrap().application_rows());
         for rows in [1, 2, 3, 4096] {
             let opts = CursorOptions {
                 batch_rows: rows,
                 ..Default::default()
             };
-            let c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+            let c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
             let mut found = Vec::new();
             fallbacks(c.plan(), &mut found);
             assert!(!found.is_empty(), "{q}");

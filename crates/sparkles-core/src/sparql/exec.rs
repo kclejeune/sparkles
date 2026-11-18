@@ -1240,7 +1240,7 @@ fn run_node<'ctx>(
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
         }
-        Kind::CountJoin { algo, var } => {
+        Kind::CountJoin { algo, var, .. } => {
             let l = child(0, infos)?;
             let r = if l.is_empty() {
                 infos.push(describe(ctx, &n.children[1]).skip(LEFT_EMPTY));
