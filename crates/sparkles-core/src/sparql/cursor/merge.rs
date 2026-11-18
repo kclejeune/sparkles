@@ -1083,9 +1083,14 @@ impl Merge {
         let marker = out.table.cols.pop().expect("a marker column");
         out.table.vars.pop();
         let pairs = marker.iter().filter(|id| !id.is_undef()).count();
-        // the merged pairs, their verdicts and the rows kept
+        // the merged pairs, their verdicts, the rows kept and the variable map that
+        // evaluating the condition builds
         let _scratch = ctx.charge(
-            pairs as u64 * (width as u64 * 8 + 1) + rows as u64 + width as u64 * 24 + 256,
+            pairs as u64 * (width as u64 * 8 + 1)
+                + rows as u64
+                + width as u64 * 24
+                + ctx.nvars() as u64 * 16
+                + 256,
         )?;
         let mut merged = Table::new(out.table.vars.clone());
         for (to, from) in merged.cols.iter_mut().zip(&out.table.cols) {
@@ -1189,7 +1194,9 @@ impl Merge {
                 .unwrap_or(usize::MAX)
                 .max(1),
         );
-        let mut out = Buffer::new(ctx, vars, cap)?;
+        // Under a condition a one-row batch may take a pair and its extension before the
+        // test keeps one of them, so it reserves and charges room for both.
+        let mut out = Buffer::new(ctx, vars, if extend { cap.max(2) } else { cap })?;
         if let Some(keep_matched) = self.filter {
             self.filter(
                 ctx,
