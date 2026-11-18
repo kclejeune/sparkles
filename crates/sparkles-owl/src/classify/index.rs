@@ -2430,7 +2430,10 @@ fn horn_index(
     links.extend(back);
     links.sort_unstable();
     links.dedup();
-    let linked = |s: Role| links.iter().any(|&l| roles.sub(l, s));
+    // tested for each transition of each automaton below, so by a table: a scan of the
+    // links for each transition of a long chain's automaton is their product
+    let over_links = roles_over(roles, &links);
+    let linked = |s: Role| over_links.get(s as usize).copied().unwrap_or(false);
     // a range of s holds of the predecessors of the links that run against s
     let mut news: Vec<(Ex, Ex)> = Vec::new();
     for &(s, c) in &ax.ranges {
@@ -2569,21 +2572,29 @@ fn horn_index(
         v.dedup();
         v
     });
+    // The roles with a live role under them, as a table: a transition's role is tested
+    // by lookups, where a scan of the live roles for each transition of a long chain's
+    // automaton is their product.
+    let over_live: Option<Vec<bool>> = live_roles.as_ref().map(|v| roles_over(&ix.roles, v));
+    // the steps of one lookup in the role hierarchy, for the bound of a reduction
+    let longest = ix.roles.sup.iter().map(Vec::len).max().unwrap_or(0);
+    let sub_cost = super::horn::log_steps(longest);
     let mut dead: Vec<Role> = Vec::new();
     for (holder, r, f) in unfold {
         let a = autos.entry(r).or_insert_with(|| {
             // R3 reads a universal on `l` at the links under `l`, and R4 at the links
             // and loops under its inverse. A universal role relates every pair.
-            let live = live_roles.as_ref().map(|v| {
+            let live = over_live.as_ref().map(|over| {
                 let ix = &*ix;
                 move |l: Role| {
-                    let under = |s: Role| v.iter().any(|&x| ix.roles.sub(x, s));
+                    let under = |s: Role| over.get(s as usize).copied().unwrap_or(false);
                     ix.is_universal(l) || under(l) || ix.roles.inv(l).is_some_and(under)
                 }
             });
             reduced(
                 &h.autos[&r],
                 &ix.roles,
+                sub_cost,
                 live.as_ref().map(|f| f as &dyn Fn(Role) -> bool),
                 &mut dead,
             )
@@ -2650,11 +2661,32 @@ fn horn_index(
     }
 }
 
+/// For each role, whether a role of `v` is under it, the roles of `v` included. The table
+/// reads the superrole lists of the roles of `v`, which the role table's build walked
+/// under its poll.
+fn roles_over(roles: &Roles, v: &[Role]) -> Vec<bool> {
+    let mut over = vec![false; roles.sup.len()];
+    let mut mark = |s: Role| {
+        if over.len() <= s as usize {
+            over.resize(s as usize + 1, false);
+        }
+        over[s as usize] = true;
+    };
+    for &x in v {
+        mark(x);
+        for &s in roles.sup.get(x as usize).map_or(&[][..], |l| l.as_slice()) {
+            mark(s);
+        }
+    }
+    over
+}
+
 /// The automaton of a role without ε-transitions, reduced as
 /// [`super::horn::reduction`] says.
 fn reduced(
     a: &super::horn::Nfa,
     roles: &Roles,
+    sub_cost: usize,
     live: Option<&dyn Fn(Role) -> bool>,
     dead: &mut Vec<Role>,
 ) -> super::horn::EpsFree {
@@ -2666,7 +2698,7 @@ fn reduced(
         a.prune(live, dead);
     }
     if level > 0 {
-        a.reduce(level > 1, &|r, s| roles.sub(r, s));
+        a.reduce(level > 1, &|r, s| roles.sub(r, s), sub_cost);
     }
     a
 }

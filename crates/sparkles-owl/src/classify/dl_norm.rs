@@ -1673,7 +1673,7 @@ fn unfold(it: &mut Interner, ax: &mut Axioms, clauses: &[(Vec<Ex>, Vec<Ex>)], rb
             let mut a = nfa.eps_free();
             let level = super::horn::dl_reduction();
             if level > 0 {
-                a.reduce(level > 1, &|x, y| rb.sub(x, y));
+                a.reduce(level > 1, &|x, y| rb.sub(x, y), rb.sub_cost());
             }
             a
         });

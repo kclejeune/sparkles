@@ -1078,11 +1078,20 @@ class carries the told axioms of its transitions, and a kept context is saturate
 when the told axioms of an expression it holds differ from the last run's. A changed
 property axiom starts the run again, as before.
 
-A reduction takes at most sixteen million steps for an automaton, counted by its size
-alone, so that every run reduces an automaton the same way. A step that would pass the
-bound is left out, and the automaton stays as the steps before left it. The refinement
-of a chain of tens of thousands of operands, which takes a round for each state, is the
-case, and pruning is linear.
+A reduction takes at most sixteen million steps for an automaton. A step is a state or
+a transition that a pass visits, a comparison of a sort or a comparison of a search in a
+list of superproperties. Each pass charges an upper bound of its steps before it starts,
+which it counts from the automaton's size and the length of the longest list of
+superproperties alone, so that every run reduces an automaton the same way. A round of
+the refinement charges the sort of each state's transitions, and a pass over the covered
+transitions charges two lookups for each pair of transitions with one source and one
+target. A pass that would exceed the bound is left out, and the automaton stays as the
+passes before left it. The refinement of a chain of tens of thousands of operands, which
+takes a round for each state, is such a case, and so is a state with thousands of
+transitions into one target. Pruning is not counted. Its time is linear in the automaton
+up to a logarithm, and it tests a property against a table of the properties that have a
+live property under them, which the run fills once from the superproperty lists of the
+live properties.
 
 On one thread and without their disjunctive attempt, the Horn rules derive 22.1 million
 conclusions on ore_ont_14817 where they derived 29.1 million, and 35.6 million on

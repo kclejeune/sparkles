@@ -1368,3 +1368,36 @@ fn a_restriction_that_becomes_a_filler_keeps_its_property_alive() {
         &["F", "W", "Z", "H"],
     );
 }
+
+#[test]
+fn a_long_chain_among_many_live_properties_is_pruned_by_lookups() {
+    // A chain of 20,000 operands that no link has, a universal on its result, and 20,000
+    // other properties with links. The run drops the transitions of the operands, and
+    // tests each against a table of the properties with a live one under them: a scan of
+    // the live properties for each transition is 1.6 billion lookups in the hierarchy.
+    use std::fmt::Write;
+    let n = 20_000;
+    let mut body = String::from("SubObjectPropertyOf(ObjectPropertyChain(");
+    for k in 0..n {
+        write!(body, ":c{k} ").unwrap();
+    }
+    body.push_str(
+        ") :t)
+         SubClassOf(:A ObjectAllValuesFrom(:t :B))
+         SubClassOf(:A ObjectSomeValuesFrom(:t :C))
+         EquivalentClasses(:D ObjectSomeValuesFrom(:t ObjectIntersectionOf(:B :C)))\n",
+    );
+    for k in 0..n {
+        writeln!(body, "SubClassOf(:X ObjectSomeValuesFrom(:u{k} :Y))").unwrap();
+    }
+    let ax = axioms(&body);
+    let start = std::time::Instant::now();
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    let took = start.elapsed();
+    assert!(k.excluded().is_empty());
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(!out.taxonomy.is_subclass(&c("X"), &c("D")));
+    assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+}

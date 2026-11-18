@@ -2883,10 +2883,9 @@ fn apply_rules<S: Sink, R: Rules>(
             }
             if R::HORN {
                 debug_assert!(
-                    ix.horn.as_ref().is_none_or(|h| h
-                        .dead
-                        .iter()
-                        .all(|&t| roles.inv(t).is_none_or(|i| !roles.sub(r, i)))),
+                    ix.horn
+                        .as_ref()
+                        .is_none_or(|h| !h.dead_over_inverse(roles, r)),
                     "a backward link under the inverse of a role whose universals the \
                      automata dropped"
                 );

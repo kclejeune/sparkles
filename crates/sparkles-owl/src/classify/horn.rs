@@ -26,8 +26,8 @@
 //! simple roles, stays left out and reported, which is sound.
 
 use super::index::{
-    Axioms, BOTTOM, Ex, Halt, Interner, NO_ROLE, Node, POLL_WORK, Role, RoleName, Scope, TOP,
-    class_expression,
+    Axioms, BOTTOM, Ex, Halt, Interner, NO_ROLE, Node, POLL_WORK, Role, RoleName, Roles, Scope,
+    TOP, class_expression,
 };
 use crate::model::*;
 use crate::vocab;
@@ -104,6 +104,32 @@ impl HornIx {
 
     pub fn bytes(&self) -> usize {
         self.flags.capacity() + self.dead.capacity() * size_of::<Role>()
+    }
+
+    /// Whether `r` is under a role whose transitions the automata lost, for the checks
+    /// of a debug build. It searches the sorted list for `r` and each role above it, so
+    /// that a run with many links and many such roles is not checked by their product.
+    pub fn dead_over(&self, roles: &Roles, r: Role) -> bool {
+        let dead = |t: Role| self.dead.binary_search(&t).is_ok();
+        dead(r)
+            || roles
+                .sup
+                .get(r as usize)
+                .is_some_and(|v| v.iter().any(|&t| dead(t)))
+    }
+
+    /// Whether `r` is under the inverse of a role whose transitions the automata lost.
+    pub fn dead_over_inverse(&self, roles: &Roles, r: Role) -> bool {
+        let dead = |i: Role| {
+            roles
+                .inv(i)
+                .is_some_and(|t| self.dead.binary_search(&t).is_ok())
+        };
+        dead(r)
+            || roles
+                .sup
+                .get(r as usize)
+                .is_some_and(|v| v.iter().any(|&i| dead(i)))
     }
 }
 
@@ -320,11 +346,26 @@ pub fn dl_reduction() -> u8 {
     })
 }
 
-/// The steps a reduction of one automaton takes at most: a round of the refinement costs a
-/// step for each state and transition, and a pass over the covered transitions one for
-/// each pair of transitions with one source. Sixteen million steps take some tens of
-/// milliseconds, and the automata of the ORE 2015 files and of Uberon need thousands.
+/// The steps a reduction of one automaton takes at most. A step is a state or a transition
+/// that a pass visits, a comparison of a sort, or a comparison of a search in a superrole
+/// list, and each pass charges an upper bound of its steps before it starts:
+///
+/// * a round of the refinement, a step for each state and `1 + ⌈log2(d + 1)⌉` for each of
+///   the `d` transitions of a state, which builds, sorts and hashes the state's signature;
+/// * the quotient of a refinement, `1 + ⌈log2(m + 1)⌉` for each of the `m` transitions,
+///   which its sort takes, charged before the first round;
+/// * a pass over the covered transitions, twice that for its two sorts, and for each
+///   group of `g` transitions with one source and one target `2·g²` lookups in the role
+///   hierarchy, each of [`log_steps`] of the longest superrole list.
+///
+/// The automata of the ORE 2015 files and of Uberon need thousands of steps.
 const REDUCE_WORK: usize = 1 << 24;
+
+/// The steps that a sort takes for each of `n` elements, and a binary search among `n`:
+/// `1 + ⌈log2(n + 1)⌉`.
+pub(super) fn log_steps(n: usize) -> usize {
+    1 + (usize::BITS - n.leading_zeros()) as usize
+}
 
 impl EpsFree {
     /// Reduces the automaton without changing what its states stand for in an unfolding.
@@ -341,43 +382,74 @@ impl EpsFree {
     ///   id stays.
     ///
     /// The two alternate until neither applies, since a dropped transition can make two
-    /// states alike. `sub(r, s)` says whether `r` is under `s`.
+    /// states alike. `sub(r, s)` says whether `r` is under `s`, and `sub_cost` is the
+    /// steps one call of it takes at most.
     ///
-    /// The work is bounded by [`REDUCE_WORK`] steps, counted by the automaton's size
-    /// alone, so that a run reduces an automaton the same way every time. A step that
-    /// would pass the bound is left out, and the automaton stays as the steps before it
-    /// left it, which is a valid automaton for the unfolding at every point. A long path,
-    /// whose refinement takes a round for each state, is the case.
-    pub fn reduce(&mut self, covered: bool, sub: &dyn Fn(Role, Role) -> bool) {
-        let mut work = REDUCE_WORK;
+    /// The work is bounded by [`REDUCE_WORK`] steps, counted by the automaton's size and
+    /// `sub_cost` alone, so that a run reduces an automaton the same way every time. A
+    /// pass that would pass the bound is left out, and the automaton stays as the passes
+    /// before it left it, which is a valid automaton for the unfolding at every point. A
+    /// long path, whose refinement takes a round for each state, is the case, and so is
+    /// a state with thousands of transitions into one target.
+    pub fn reduce(&mut self, covered: bool, sub: &dyn Fn(Role, Role) -> bool, sub_cost: usize) {
+        self.reduce_within(covered, sub, sub_cost, REDUCE_WORK);
+    }
+
+    /// [`EpsFree::reduce`] with `work` steps, and the steps it leaves.
+    fn reduce_within(
+        &mut self,
+        covered: bool,
+        sub: &dyn Fn(Role, Role) -> bool,
+        sub_cost: usize,
+        mut work: usize,
+    ) -> usize {
         loop {
             let merged = self.merge_alike(&mut work);
-            let dropped = covered && self.drop_covered(sub, &mut work);
+            let dropped = covered && self.drop_covered(sub, sub_cost.max(1), &mut work);
             if !merged && !dropped {
-                break;
+                return work;
             }
         }
+    }
+
+    /// Takes `cost` steps from `work` and says whether they were there. A pass that the
+    /// bound refuses ends the reduction, so nothing is left for a later one.
+    fn charge(work: &mut usize, cost: usize) -> bool {
+        if *work < cost {
+            *work = 0;
+            return false;
+        }
+        *work -= cost;
+        true
     }
 
     /// Merges the states of the coarsest partition whose blocks are final alike and have
     /// the same transitions into the same blocks, and says whether any merged.
     fn merge_alike(&mut self, work: &mut usize) -> bool {
         let n = self.states as usize;
-        let round = n + self.trans.len();
+        let m = self.trans.len();
         let mut out: Vec<Vec<(Role, u32)>> = vec![Vec::new(); n];
         for &(p, l, q) in &self.trans {
             out[p as usize].push((l, q));
+        }
+        // a round builds, sorts and hashes each state's signature
+        let round = out.iter().fold(n, |c, o| {
+            c.saturating_add(o.len().saturating_mul(log_steps(o.len())))
+        });
+        // the quotient's sort
+        if !Self::charge(work, m.saturating_mul(log_steps(m))) {
+            return false;
         }
         let mut block: Vec<u32> = self.finals.iter().map(|&f| f as u32).collect();
         let mut blocks = 0usize;
         loop {
             // a refinement that the bound cuts short is no partition to merge by
-            if *work < round {
-                *work = 0;
+            if !Self::charge(work, round) {
                 return false;
             }
-            *work -= round;
-            let mut ids: FxHashMap<(u32, Vec<(Role, u32)>), u32> = FxHashMap::default();
+            // sized for a block of each state, so that it never grows
+            let mut ids: FxHashMap<(u32, Vec<(Role, u32)>), u32> =
+                FxHashMap::with_capacity_and_hasher(n, Default::default());
             let mut next = Vec::with_capacity(n);
             for s in 0..n {
                 let mut sig: Vec<(Role, u32)> = out[s]
@@ -422,33 +494,46 @@ impl EpsFree {
 
     /// Drops the transitions that another from the same state to the same target covers
     /// by a superrole, and says whether any went.
-    fn drop_covered(&mut self, sub: &dyn Fn(Role, Role) -> bool, work: &mut usize) -> bool {
-        let before = self.trans.len();
-        // each transition is compared with those of its source
-        let mut out = vec![0usize; self.states as usize];
-        for t in &self.trans {
-            out[t.0 as usize] += 1;
-        }
-        let cost = out
-            .iter()
-            .fold(before, |c, &d| c.saturating_add(d.saturating_mul(d)));
-        if *work < cost {
-            *work = 0;
+    fn drop_covered(
+        &mut self,
+        sub: &dyn Fn(Role, Role) -> bool,
+        sub_cost: usize,
+        work: &mut usize,
+    ) -> bool {
+        let m = self.trans.len();
+        // the sort by source and target here, and the sort of what stays
+        if !Self::charge(work, m.saturating_mul(log_steps(m)).saturating_mul(2)) {
             return false;
         }
-        *work -= cost;
-        let all = self.trans.clone();
-        // the transitions are sorted by source, so those of one source are a run
-        self.trans.retain(|&(p, l, q)| {
-            let at = all.partition_point(|t| t.0 < p);
-            !all[at..]
-                .iter()
-                .take_while(|t| t.0 == p)
-                .any(|&(_, l2, q2)| q2 == q && l2 != l && sub(l, l2) && !(sub(l2, l) && l < l2))
-        });
-        if self.trans.len() == before {
+        // a transition is compared with those of its source and target, which are a run
+        // of this order
+        let mut by: Vec<(u32, u32, Role)> = self.trans.iter().map(|&(p, l, q)| (p, q, l)).collect();
+        by.sort_unstable();
+        let pairs = by
+            .chunk_by(|a, b| (a.0, a.1) == (b.0, b.1))
+            .fold(0usize, |c, g| {
+                c.saturating_add(g.len().saturating_mul(g.len()))
+            });
+        // two lookups for a pair
+        if !Self::charge(work, pairs.saturating_mul(sub_cost).saturating_mul(2)) {
             return false;
         }
+        let mut kept: Vec<(u32, Role, u32)> = Vec::with_capacity(m);
+        for g in by.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+            for &(p, q, l) in g {
+                let covered = g
+                    .iter()
+                    .any(|&(_, _, l2)| l2 != l && sub(l, l2) && !(sub(l2, l) && l < l2));
+                if !covered {
+                    kept.push((p, l, q));
+                }
+            }
+        }
+        if kept.len() == m {
+            return false;
+        }
+        kept.sort_unstable();
+        self.trans = kept;
         self.mark();
         true
     }
@@ -560,6 +645,12 @@ impl RoleBox {
                 .sup
                 .get(r as usize)
                 .is_some_and(|v| v.binary_search(&s).is_ok())
+    }
+
+    /// The steps one call of [`RoleBox::sub`] takes at most, for the bound of a
+    /// reduction.
+    pub(super) fn sub_cost(&self) -> usize {
+        log_steps(self.sup.iter().map(Vec::len).max().unwrap_or(0))
     }
 
     fn equiv(&self, r: Role, s: Role) -> bool {
@@ -1619,7 +1710,7 @@ mod reduction_tests {
         // states that both loop into the first
         let mut a = auto(3, &[1, 2], &[(0, 0, 1), (0, 0, 2), (1, 0, 2), (2, 0, 2)]);
         let before = words(&a, 1, 5);
-        a.reduce(false, &|r, s| r == s);
+        a.reduce(false, &|r, s| r == s, 1);
         assert_eq!(a.states, 2);
         assert_eq!(a.trans, vec![(0, 0, 1), (1, 0, 1)]);
         assert_eq!(a.finals, vec![false, true]);
@@ -1639,7 +1730,7 @@ mod reduction_tests {
             &[(0, 0, 1), (0, 0, 2), (1, 0, 3), (2, 0, 3), (2, 1, 3)],
         );
         let same = a.clone();
-        a.reduce(false, &|r, s| r == s);
+        a.reduce(false, &|r, s| r == s, 1);
         assert_eq!(a, same);
     }
 
@@ -1652,7 +1743,7 @@ mod reduction_tests {
             &[2],
             &[(0, 0, 1), (0, 1, 1), (0, 1, 2), (1, 2, 2), (1, 3, 2)],
         );
-        a.reduce(true, &sub);
+        a.reduce(true, &sub, 1);
         // the transition by 1 to another state stays, and of the equivalent roles the
         // lower one
         assert_eq!(a.trans, vec![(0, 0, 1), (0, 1, 2), (1, 2, 2)]);
@@ -1667,7 +1758,7 @@ mod reduction_tests {
             &[3],
             &[(0, 0, 1), (0, 0, 2), (1, 0, 3), (2, 0, 3), (2, 1, 3)],
         );
-        a.reduce(true, &sub);
+        a.reduce(true, &sub, 1);
         assert_eq!(a.states, 3);
         assert_eq!(a.trans, vec![(0, 0, 1), (1, 0, 2)]);
     }
@@ -1713,7 +1804,7 @@ mod reduction_tests {
         let mut a = auto(n + 1, &[n], &trans);
         let same = a.clone();
         let start = std::time::Instant::now();
-        a.reduce(true, &|r, s| r == s);
+        a.reduce(true, &|r, s| r == s, 1);
         assert_eq!(a, same);
         let mut dead = Vec::new();
         a.prune(&|_| true, &mut dead);
@@ -1724,8 +1815,61 @@ mod reduction_tests {
         // a path within the bound has no two states alike either
         let mut b = auto(4, &[3], &[(0, 0, 1), (1, 0, 2), (2, 0, 3)]);
         let same = b.clone();
-        b.reduce(true, &|r, s| r == s);
+        b.reduce(true, &|r, s| r == s, 1);
         assert_eq!(b, same);
+    }
+
+    #[test]
+    fn many_labels_into_one_target_are_left_within_the_bound() {
+        // 4,000 roles from one state into one target: sixteen million pairs with two
+        // lookups each pass the bound, so the pass is left out even where it would drop
+        // every transition but one
+        let n = 4_000u32;
+        let trans: Vec<(u32, Role, u32)> = (0..n).map(|l| (0, l, 1)).collect();
+        let mut a = auto(2, &[1], &trans);
+        let same = a.clone();
+        let calls = std::cell::Cell::new(0usize);
+        let sub = |_: Role, s: Role| {
+            calls.set(calls.get() + 1);
+            s == 0
+        };
+        a.reduce(true, &sub, 1);
+        assert_eq!(a, same);
+        assert_eq!(calls.get(), 0);
+        // within the bound the pass drops them, by the lookups it charged
+        let trans: Vec<(u32, Role, u32)> = (0..1_000).map(|l| (0, l, 1)).collect();
+        let mut a = auto(2, &[1], &trans);
+        a.reduce(true, &sub, 1);
+        assert_eq!(a.trans, vec![(0, 0, 1)]);
+        assert!(calls.get() <= 2 * 1_000 * 1_000);
+        // a hierarchy whose lookups take more steps leaves the same automaton alone
+        let mut a = auto(2, &[1], &trans);
+        let same = a.clone();
+        a.reduce(true, &sub, 10);
+        assert_eq!(a, same);
+    }
+
+    #[test]
+    fn a_state_of_high_degree_charges_its_sorts() {
+        // a state with 30,000 transitions into the states of a path of 300, out of their
+        // order: the refinement takes a round for each state of the path, and each round
+        // charges the sort of the large signature, about 480,000 steps, so the bound
+        // ends it after some thirty rounds. A step for each transition would let all
+        // 300 rounds run.
+        let (fan, path) = (30_000u32, 300u32);
+        let mut trans: Vec<(u32, Role, u32)> = (0..fan).map(|k| (0, k, 1 + k % path)).collect();
+        trans.extend((1..path).map(|s| (s, 0, s + 1)));
+        trans.sort_unstable();
+        let mut a = auto(path + 1, &[path], &trans);
+        let same = a.clone();
+        assert!(300 * (a.states as usize + a.trans.len()) < REDUCE_WORK);
+        assert_eq!(a.reduce_within(false, &|r, s| r == s, 1, REDUCE_WORK), 0);
+        assert_eq!(a, same);
+        // a small automaton leaves nearly all of the bound
+        let mut b = auto(3, &[1, 2], &[(0, 0, 1), (0, 0, 2), (1, 0, 2), (2, 0, 2)]);
+        assert!(b.reduce_within(true, &|r, s| r == s, 1, REDUCE_WORK) > REDUCE_WORK - 200);
+        assert_eq!(b.states, 2);
+        assert_eq!((log_steps(0), log_steps(1), log_steps(4)), (1, 2, 4));
     }
 
     /// Random automata over four roles keep their words under the merge, and under the
@@ -1754,11 +1898,11 @@ mod reduction_tests {
             let a = auto(n, &finals, &trans);
             let before = words(&a, 4, 5);
             let mut m = a.clone();
-            m.reduce(false, &sub);
+            m.reduce(false, &sub, 1);
             assert_eq!(words(&m, 4, 5), before, "{a:?}");
             merged += usize::from(m.states < a.states);
             let mut d = a.clone();
-            d.reduce(true, &sub);
+            d.reduce(true, &sub, 1);
             let after = words(&d, 4, 5);
             assert!(after.is_subset(&before), "{a:?}");
             assert!(before.iter().all(|w| under(&after, w, &sub)), "{a:?}");

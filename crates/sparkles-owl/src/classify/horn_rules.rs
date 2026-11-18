@@ -419,9 +419,7 @@ pub fn succ<S: Sink>(
     }
     let roles = &ix.roles;
     debug_assert!(
-        ix.horn
-            .as_ref()
-            .is_none_or(|h| h.dead.iter().all(|&t| !roles.sub(r, t))),
+        ix.horn.as_ref().is_none_or(|h| !h.dead_over(roles, r)),
         "a link by a role under one whose universals the automata dropped"
     );
     if !sent {
