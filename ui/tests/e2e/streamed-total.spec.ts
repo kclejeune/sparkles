@@ -1,8 +1,8 @@
 // The query page's table against a real server's automatic execution
 // (docs/specs/X05-streaming-query-execution.md). The table sends no `execution`, so the
-// server's default `auto` streams a grouping over 30,000 rows. A streamed answer cut at
-// the row limit has no total, and the page says so. The dataset is compacted first,
-// because automatic execution streams only over an empty delta.
+// server's default `auto` streams a grouping over 30,000 rows and a plain scan of them. A
+// streamed answer cut at the row limit has no total, and the page says so. The dataset is
+// compacted first, because automatic execution streams only over an empty delta.
 
 import type { Page } from '@playwright/test';
 import { expect, open } from './fixtures';
@@ -97,4 +97,16 @@ open('a streamed answer within the row limit shows its total', async ({ page }) 
   await expect(tableTab(page)).toContainText('30,000');
   await expect(tableTab(page)).not.toContainText('+');
   await expect(page.getByText('the total is unknown')).toHaveCount(0);
+});
+
+open('a plain scan of the dataset streams, and its total is unknown', async ({ page }) => {
+  // automatic execution streams plain scans of a thousand rows or more
+  const scan = 'SELECT ?s ?o WHERE { ?s <urn:streamed:v> ?o } # scan';
+  await seed(page, scan, 1_000);
+  await page.goto('/ui/query');
+  const { url, meta } = await run(page, scan);
+  expect(url.searchParams.has('execution')).toBe(false);
+  expect(meta).toMatchObject({ totalRows: null, sentRows: 1_000, status: 'stopped' });
+  expect(meta.plan).toHaveProperty('materializes');
+  await expect(tableTab(page)).toContainText('1,000+');
 });

@@ -1758,7 +1758,8 @@ the nested counters of EXPLAIN, and the decision tables in `cursor.rs` admit the
 
 The query page's result table no longer asks for eager execution. It sends no
 `execution`, so the server's default applies, and automatic execution streams the plans
-that measured faster as cursors, such as a grouping over 20,000 or more input rows. A
+that measured faster as cursors, such as a plain scan of a thousand rows or more and a
+grouping over 20,000 or more input rows, over a dataset whose updates are compacted. A
 streamed answer that reaches the row limit stops with `status: "stopped"` and a null
 `totalRows`, and the cursor writers stop without looking for another row. The Table tab
 then shows the rows sent with a plus sign, such as `1,000+`, and the notice above the
@@ -1783,7 +1784,7 @@ stopped metadata, the quads and the comparison of a stopped stream. A mock brows
 rewrites the mock's answers into the stopped and quads shapes and checks the badge, the
 notice, the graph and a comparison's eager reads, and a browser test against a real
 server streams a grouping over 30,000 rows with a row limit of 1,000 and with a limit
-above the total.
+above the total, and a plain scan of the same rows with a limit of 1,000.
 
 ### Finite HTTP body limits
 
