@@ -503,7 +503,7 @@ r(?x) :- (?x ex:p ?y).
         extras: Extras::default(),
         inputs: Inputs::default(),
     });
-    let e = dataset.reasoning().diff(&req).err().expect("refused");
+    let e = dataset.reasoning().diff(&req).expect_err("refused");
     assert!(
         e.to_string()
             .contains("a rule program, with relation atoms or 'not', cannot include <owl-rl>"),
