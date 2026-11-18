@@ -686,8 +686,23 @@ fn parse_untyped_number(lex: &str, target: &str) -> R<Num> {
         .map_err(|_| Fail::Type)
 }
 
-/// Build the regular expression of the XPath flags `s`, `m`, `i`, `x` and `q`.
+/// Build the regular expression of the XPath flags `s`, `m`, `i`, `x` and `q`, once per
+/// thread for each pattern and flags, since a filter builds the same one for every row.
 fn build_regex(pattern: &str, flags: &str) -> R<regex::Regex> {
+    thread_local! {
+        static BUILT: std::cell::RefCell<std::collections::HashMap<(String, String), Option<regex::Regex>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (pattern.to_owned(), flags.to_owned());
+    if let Some(built) = BUILT.with(|b| b.borrow().get(&key).cloned()) {
+        return built.ok_or(Fail::Type);
+    }
+    let built = compile_regex(pattern, flags).ok();
+    BUILT.with(|b| b.borrow_mut().insert(key, built.clone()));
+    built.ok_or(Fail::Type)
+}
+
+fn compile_regex(pattern: &str, flags: &str) -> R<regex::Regex> {
     let mut b;
     if flags.contains('q') {
         b = RegexBuilder::new(&regex::escape(pattern));
@@ -769,6 +784,9 @@ fn space(l: &Literal) -> Space {
 /// The two literals that are not the same term are an error where one has a datatype
 /// that gives it no value or no equality, unless one of them is language-tagged, which
 /// no other literal equals. That is how the W3C `open-world` tests read RDFterm-equal.
+/// Two well-formed values of different supported types, such as a string and an
+/// integer, are not equal, since the note to section 17.4.1.7 makes the error the
+/// answer only where the implementation cannot tell whether the values are equivalent.
 pub(crate) fn rdf_equal(a: &Term, b: &Term) -> R<bool> {
     match (a, b) {
         (Term::Literal(x), Term::Literal(y)) => match (space(x), space(y)) {
@@ -788,7 +806,8 @@ pub(crate) fn rdf_equal(a: &Term, b: &Term) -> R<bool> {
             }
             _ if x == y => Ok(true),
             (Space::Lang, _) | (_, Space::Lang) => Ok(false),
-            _ => type_error(),
+            (Space::Other, _) | (_, Space::Other) => type_error(),
+            _ => Ok(false),
         },
         (Term::Triple(x), Term::Triple(y)) => {
             let parts = [

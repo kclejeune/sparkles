@@ -427,6 +427,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   holds, about 20 before the point, is not read as a number, so comparisons, arithmetic
   and range filters treat it as an unknown literal. XSD allows a limit of 16 digits, while
   Jena reads any length. Roadmap item 1065.
+* STRSTARTS, STRENDS, CONTAINS, STRBEFORE and STRAFTER compare only the language tags of
+  two language-tagged arguments, so a directional string and a string of the same language
+  without that direction are compatible arguments. SPARQL 1.2 and Jena also require the
+  same base direction. Roadmap item 1066.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`

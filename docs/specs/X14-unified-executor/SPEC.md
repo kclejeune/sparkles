@@ -231,15 +231,19 @@ SAMPLE and GROUP_CONCAT over tied or unordered values, MIN or MAX over an error,
 digits that XSD requires. The seeded queries of `tests/query_cursor.rs` compare the
 eager answer and the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a
 compacted base, a pending delta, several index blocks and a masked view, and the
-optimizer tests compare both `Optimizations::ALL` and `Optimizations::NONE` with it. A
+optimizer, index-join and string-filter tests compare both `Optimizations::ALL` and
+`Optimizations::NONE` with it. A
 query whose answer depends on such a choice is compared only as far as the
 specification fixes it. The parser writes the middle of a path sequence as a blank node,
 which the algebra treats as a variable, so the evaluator cannot count distinct solutions
-over such a middle and leaves those queries uncompared. The comparison found two
-disagreements, which items 1064 and 1065 hold. The engine passes over an error in MIN and
-MAX, where the specification's order makes MIN an error and Jena makes both an error, and
-it does not read an `xsd:integer` or `xsd:decimal` beyond the range of its decimal type
-as a number, which XSD permits and Jena does not do.
+over such a middle and leaves those queries uncompared. A query whose nested loops pass
+the evaluator's work limit of 20 million intermediate solutions is also left uncompared.
+The comparison found three disagreements, which items 1064 to 1066 hold. The engine
+passes over an error in MIN and MAX, where the specification's order makes MIN an error
+and Jena makes both an error. It does not read an `xsd:integer` or `xsd:decimal` beyond
+the range of its decimal type as a number, which XSD permits and Jena does not do. Its
+string functions take a directional string and a language-tagged string of the same
+language as compatible arguments, which SPARQL 1.2 and Jena do not.
 
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its

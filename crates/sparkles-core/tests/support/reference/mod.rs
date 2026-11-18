@@ -142,9 +142,12 @@ impl GraphData {
 pub struct Reference {
     quads: Vec<Quad>,
     union_default: bool,
-    pass_min_max_errors: bool,
+    pass_min_max_errors: Cell<bool>,
     work_limit: Option<u64>,
     now: DateTime,
+    /// The graphs that evaluations have read, by the names merged into each, which every
+    /// evaluation of these quads shares.
+    graphs: RefCell<HashMap<Vec<GraphName>, Rc<GraphData>>>,
 }
 
 impl Reference {
@@ -158,14 +161,16 @@ impl Reference {
         Reference {
             quads,
             union_default: false,
-            pass_min_max_errors: false,
+            pass_min_max_errors: Cell::new(false),
             work_limit: None,
             now: DateTime::now(),
+            graphs: RefCell::new(HashMap::new()),
         }
     }
 
-    /// Make the default graph the merge of every graph, as a store with a union default
-    /// graph does.
+    /// Make the default graph the merge of the named graphs, as a store with a union
+    /// default graph does in TDB2's scope. The stored default graph is then reachable only
+    /// as `GRAPH <urn:x-arq:DefaultGraph>`.
     pub fn with_union_default(mut self, union: bool) -> Reference {
         self.union_default = union;
         self
@@ -174,9 +179,15 @@ impl Reference {
     /// Make MIN and MAX pass over the errors among their values, a reading other than
     /// the specification's, which [`Notes::min_max_error`] describes. A test may compare
     /// with it where the difference is tracked as an open question.
-    pub fn passing_over_min_max_errors(mut self) -> Reference {
-        self.pass_min_max_errors = true;
+    pub fn passing_over_min_max_errors(self) -> Reference {
+        self.pass_min_max_errors.set(true);
         self
+    }
+
+    /// Set whether later evaluations pass over the errors in MIN and MAX, as
+    /// [`Self::passing_over_min_max_errors`] does, for an evaluator kept across queries.
+    pub fn set_passing_over_min_max_errors(&self, pass: bool) {
+        self.pass_min_max_errors.set(pass);
     }
 
     /// Refuse a query, as one the evaluator does not evaluate, once it has formed
@@ -313,7 +324,6 @@ pub(crate) struct Evaluator<'a> {
     pub now: DateTime,
     default_names: Vec<GraphName>,
     named_names: Vec<GraphName>,
-    graphs: RefCell<HashMap<Vec<GraphName>, Rc<GraphData>>>,
     /// The solution that BNODE(label) is evaluated for.
     pub scope: Cell<u64>,
     pub bnodes: RefCell<HashMap<(u64, String), BlankNode>>,
@@ -403,6 +413,51 @@ fn visible(s: &Solution) -> Solution {
         .collect()
 }
 
+/// The solutions of `right` that can be compatible with a solution of `left`, found by
+/// the values of the variables that every solution of both binds. Compatible solutions
+/// agree on those variables, so the candidates hold every compatible solution, in the
+/// order of `right`, and the nested loop over them gives the same answer as over all of
+/// `right` while trying fewer pairs.
+struct Candidates {
+    keys: Vec<Variable>,
+    by_key: HashMap<Vec<Term>, Vec<usize>>,
+    all: Vec<usize>,
+}
+
+impl Candidates {
+    fn new(left: &[Solution], right: &[Solution]) -> Self {
+        let all: Vec<usize> = (0..right.len()).collect();
+        let keys: Vec<Variable> = match (left.first(), right.first()) {
+            (Some(a), Some(_)) => a
+                .keys()
+                .filter(|k| **k != row_variable())
+                .filter(|k| left.iter().all(|s| s.contains_key(*k)))
+                .filter(|k| right.iter().all(|s| s.contains_key(*k)))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut by_key: HashMap<Vec<Term>, Vec<usize>> = HashMap::new();
+        if !keys.is_empty() {
+            for (i, b) in right.iter().enumerate() {
+                by_key
+                    .entry(keys.iter().map(|k| b[k].clone()).collect())
+                    .or_default()
+                    .push(i);
+            }
+        }
+        Candidates { keys, by_key, all }
+    }
+
+    fn of(&self, a: &Solution) -> &[usize] {
+        if self.keys.is_empty() {
+            return &self.all;
+        }
+        let key: Vec<Term> = self.keys.iter().map(|k| a[k].clone()).collect();
+        self.by_key.get(&key).map_or(&[], Vec::as_slice)
+    }
+}
+
 pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
     let mut out = a.clone();
     for (k, v) in b {
@@ -439,11 +494,7 @@ impl<'a> Evaluator<'a> {
                 .collect()
         };
         let (default_names, named_names) = match dataset {
-            None if data.union_default => {
-                let mut d = vec![GraphName::DefaultGraph];
-                d.extend(all_named.clone());
-                (d, all_named)
-            }
+            None if data.union_default => (all_named.clone(), all_named),
             None => (vec![GraphName::DefaultGraph], all_named),
             Some(ds) => {
                 let default = ds
@@ -465,7 +516,6 @@ impl<'a> Evaluator<'a> {
             now: data.now,
             default_names,
             named_names,
-            graphs: RefCell::new(HashMap::new()),
             scope: Cell::new(0),
             bnodes: RefCell::new(HashMap::new()),
             fresh: Cell::new(0),
@@ -477,7 +527,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn graph_of(&self, names: &[GraphName]) -> Rc<GraphData> {
-        if let Some(g) = self.graphs.borrow().get(names) {
+        if let Some(g) = self.data.graphs.borrow().get(names) {
             return g.clone();
         }
         let mut seen = HashSet::new();
@@ -491,7 +541,10 @@ impl<'a> Evaluator<'a> {
             }
         }
         let g = Rc::new(GraphData::new(triples));
-        self.graphs.borrow_mut().insert(names.to_vec(), g.clone());
+        self.data
+            .graphs
+            .borrow_mut()
+            .insert(names.to_vec(), g.clone());
         g
     }
 
@@ -554,11 +607,13 @@ impl<'a> Evaluator<'a> {
             } => self.eval_path_pattern(subject, path, object, cx),
             GraphPattern::Join { left, right } => {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
+                let candidates = Candidates::new(&l, &r);
                 let mut out = Vec::new();
                 for a in &l {
                     // every pair the nested loop tries is work
-                    self.charge(r.len())?;
-                    for b in &r {
+                    let tried = candidates.of(a);
+                    self.charge(tried.len())?;
+                    for b in tried.iter().map(|&i| &r[i]) {
                         if compatible(a, b) {
                             out.push(merge(a, b));
                         }
@@ -572,11 +627,13 @@ impl<'a> Evaluator<'a> {
                 expression,
             } => {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
+                let candidates = Candidates::new(&l, &r);
                 let mut out = Vec::new();
                 for a in &l {
-                    self.charge(r.len())?;
+                    let tried = candidates.of(a);
+                    self.charge(tried.len())?;
                     let mut matched = false;
-                    for b in &r {
+                    for b in tried.iter().map(|&i| &r[i]) {
                         if !compatible(a, b) {
                             continue;
                         }
@@ -655,13 +712,18 @@ impl<'a> Evaluator<'a> {
             }
             GraphPattern::Minus { left, right } => {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
-                Ok(l.into_iter()
-                    .filter(|a| {
-                        !r.iter().any(|b| {
-                            compatible(a, b) && a.keys().any(|k| !is_hidden(k) && b.contains_key(k))
-                        })
-                    })
-                    .collect())
+                let candidates = Candidates::new(&l, &r);
+                let mut out = Vec::new();
+                for a in &l {
+                    let tried = candidates.of(a);
+                    self.charge(tried.len())?;
+                    if !tried.iter().map(|&i| &r[i]).any(|b| {
+                        compatible(a, b) && a.keys().any(|k| !is_hidden(k) && b.contains_key(k))
+                    }) {
+                        out.push(a.clone());
+                    }
+                }
+                Ok(out)
             }
             GraphPattern::Values {
                 variables,
@@ -860,7 +922,7 @@ impl<'a> Evaluator<'a> {
                 let names = if n.as_str() == "urn:x-arq:UnionGraph" {
                     self.named_names.clone()
                 } else {
-                    self.default_names.clone()
+                    vec![GraphName::DefaultGraph]
                 };
                 let data = self.graph_of(&names);
                 out = self.eval(
@@ -1169,13 +1231,13 @@ impl<'a> Evaluator<'a> {
                 // Min and Max sort the values in the order of ORDER BY, where an error
                 // sorts with the unbound values, first. So an error is the minimum, and
                 // the maximum passes over it.
-                if has_error && !self.data.pass_min_max_errors {
+                if has_error && !self.data.pass_min_max_errors.get() {
                     let mut notes = self.notes.get();
                     notes.min_max_error = true;
                     self.notes.set(notes);
                 }
                 if has_error
-                    && !self.data.pass_min_max_errors
+                    && !self.data.pass_min_max_errors.get()
                     && matches!(name, AggregateFunction::Min)
                 {
                     return Ok(None);
