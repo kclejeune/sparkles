@@ -119,6 +119,20 @@ pub(super) fn map_batch<T: Send>(
     par: bool,
     f: impl Fn(usize) -> T + Sync + Send,
 ) -> Result<Vec<T>> {
+    map_batch_with(ctx, n, par, || (), |_, i| f(i))
+}
+
+/// [`map_batch`] with a state for each thread that maps rows, made by `init`: one for the
+/// calling thread and one for each parallel task, as [`rayon`]'s `map_init` gives, such as
+/// a map of the query's floor cache in [`string_order_mask`].
+pub(super) fn map_batch_with<S, T: Send>(
+    ctx: &Ctx,
+    n: usize,
+    par: bool,
+    init: impl Fn() -> S + Sync + Send,
+    f: impl Fn(&mut S, usize) -> T + Sync + Send,
+) -> Result<Vec<T>> {
+    let mut state = init();
     let sample = n.min(BATCH_SAMPLE_ROWS);
     let rest = n - sample;
     let mut out = Vec::with_capacity(n);
@@ -127,7 +141,7 @@ pub(super) fn map_batch<T: Send>(
     // rows of an aggregate's BIND, would pay a clock read for nothing.
     let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
     let t0 = may_split.then(Instant::now);
-    out.extend((0..sample).map(&f));
+    out.extend((0..sample).map(|i| f(&mut state, i)));
     if let Some(t0) = t0
         && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
@@ -144,9 +158,11 @@ pub(super) fn map_batch<T: Send>(
             // an indexed collect writes each piece's slot in place
             let pieces: Vec<Result<Vec<T>>> = starts
                 .into_par_iter()
-                .map(|start| {
+                .map_init(&init, |state, start| {
                     ctx.check()?;
-                    Ok((start..(start + BATCH_PAR_PIECE).min(n)).map(&f).collect())
+                    Ok((start..(start + BATCH_PAR_PIECE).min(n))
+                        .map(|i| f(state, i))
+                        .collect())
                 })
                 .collect();
             for piece in pieces {
@@ -159,7 +175,7 @@ pub(super) fn map_batch<T: Send>(
     while start < n {
         ctx.check()?;
         let end = (start + 1024).min(n);
-        out.extend((start..end).map(&f));
+        out.extend((start..end).map(|i| f(&mut state, i)));
         start = end;
     }
     Ok(out)
@@ -5692,9 +5708,11 @@ fn string_order_mask(
             .map_init(|| ctx.floor_map(), |floors, i| test(floors, i))
             .collect::<Result<Vec<bool>>>()?
     } else {
-        let mut floors = ctx.floor_map();
-        (0..n)
-            .map(|i| test(&mut floors, i))
+        // A table of at most `PAR_THRESHOLD` rows, such as a cursor's batch, spreads over
+        // the pool as the generic filter's batch does, so that a cursor's comparison is
+        // not left on one thread where the generic filter would use them all.
+        map_batch_with(ctx, n, true, || ctx.floor_map(), test)?
+            .into_iter()
             .collect::<Result<Vec<bool>>>()?
     };
     // A refused floor took its row to the generic test, so the mask must not stand.
@@ -10002,11 +10020,21 @@ mod string_order_tests {
     }
 
     /// The floors a query computes for one table serve its later tables, as a cursor's
-    /// batches are, in both modes: a second mask over the same strings computes none.
+    /// batches are, in both modes: a second mask over the same strings computes none. It
+    /// runs on one thread, since each parallel task of a mask learns the floors of its
+    /// own map.
     #[test]
     fn the_floor_cache_lasts_the_query() {
-        use super::super::expr::CmpOp;
         let (s, ids) = store("long");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| the_floor_cache_lasts_the_query_in(&s, &ids));
+    }
+
+    fn the_floor_cache_lasts_the_query_in(s: &Store, ids: &[Id]) {
+        use super::super::expr::CmpOp;
         for cursor in [false, true] {
             let mut ctx = Ctx::new(s.snapshot());
             ctx.mem_limit = 64 << 20;
@@ -10037,6 +10065,44 @@ mod string_order_tests {
             );
             assert!(ctx.check().is_ok(), "cursor {cursor}");
         }
+    }
+
+    /// A cursor's batch of at most `PAR_THRESHOLD` rows spreads its floor comparison over
+    /// the pool as the generic filter's batch does, instead of leaving it on the calling
+    /// thread, with each worker's map returned to the query's cache. The calling thread
+    /// keeps the map of its timed sample, so a batch that ran its pieces on one thread
+    /// leaves two maps and one spread over the pool leaves more. Work stealing may leave
+    /// one attempt on one thread, so the test allows several.
+    #[test]
+    fn a_cursor_batch_compares_floors_on_the_pool() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = store("long");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut spread = false;
+        for _ in 0..20 {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            ctx.enable_cursor_accounting().unwrap();
+            let (t, x, y) = product(&ctx, &ids);
+            assert!(t.len() <= PAR_THRESHOLD && batch_may_split(t.len()));
+            let e = cmp(x, y, CmpOp::Lt);
+            let mask = pool
+                .install(|| string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e))
+                .unwrap()
+                .expect("the floors apply");
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+            assert!(ctx.check().is_ok());
+            // the calling thread's map and one for each task that ran beside another
+            if ctx.floor_cache().shards() > 2 {
+                spread = true;
+                break;
+            }
+        }
+        assert!(spread, "a cursor batch compared its floors on one thread");
     }
 
     /// A floor cache whose growth the budget refuses takes no entries, records no

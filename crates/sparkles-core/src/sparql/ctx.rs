@@ -297,6 +297,12 @@ impl FloorCache {
     pub(super) fn entries(&self) -> usize {
         self.maps.lock().iter().map(|s| s.map.len()).sum()
     }
+
+    /// The maps no worker has checked out, one for each worker that has mapped rows.
+    #[cfg(test)]
+    pub(super) fn shards(&self) -> usize {
+        self.maps.lock().len()
+    }
 }
 
 /// A map of the query's [`FloorCache`] checked out by one worker, returned on drop.
