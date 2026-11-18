@@ -567,6 +567,34 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
             "<http://example.org/s{i}> <http://example.org/p> \"{i}\" .\n"
         ));
     }
+    // A dry run writes nothing, so the memory limit never refuses it outright: its
+    // preview reports the refusal, for a first PUT and a first POST into an empty dataset.
+    for req in [
+        put(
+            "/fresh-put/data?default&dryRun=true",
+            "application/n-triples",
+            &large,
+        ),
+        post(
+            "/fresh-post/data?default&dryRun=true",
+            "application/n-triples",
+            &large,
+        ),
+    ] {
+        let what = format!("{} {}", req.method(), req.uri());
+        let r = send(&app, req).await;
+        assert_eq!(
+            r.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{what}: {}",
+            r.text()
+        );
+        let j = r.json();
+        assert_eq!(j["dryRun"], true, "{what}: {j}");
+        assert_eq!(j["outcome"], "storage-refused", "{what}: {j}");
+        assert_eq!(j["storage"]["status"], "refused", "{what}: {j}");
+        assert_eq!(j["commit"]["inserted"], 5000, "{what}: {j}");
+    }
     let writes = [
         post(
             "/disk/update",

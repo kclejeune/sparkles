@@ -26,8 +26,11 @@ of a load or a replacement now checks the write's deadline and cancellation bene
 decoder whichever plan runs, which a load into a store with data and a write limited to
 some graphs did not do before. A write limited to some graphs still parses its sources in
 a transaction, and a bulk insert or a patch under such a limit, whose graphs are checked
-as it is staged, may still take the bulk path. Durability, the write-ahead log and the
-on-disk formats are unchanged.
+as it is staged, may still take the bulk path. A dry run of a load or a replacement
+through a transaction is no longer refused by an in-memory dataset's memory limit while
+its sources are parsed. It returns a preview that reports the refusal, as a dry run on the
+bulk path does, which also corrects the dry run of a first PUT into an empty in-memory
+dataset. Durability, the write-ahead log and the on-disk formats are unchanged.
 
 ### Dependency security updates
 

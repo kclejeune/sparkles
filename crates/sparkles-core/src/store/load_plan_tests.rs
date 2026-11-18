@@ -623,6 +623,51 @@ fn threshold_zero_into_an_empty_store() {
     assert!(!r.committed);
 }
 
+/// A dry run of a transactional first write into an in-memory store over its limit is
+/// previewed as a storage refusal and not refused outright, for a load as for a replace,
+/// and it leaves the store as it was.
+#[test]
+fn a_dry_run_over_the_memory_limit_is_previewed() {
+    let limited = || {
+        Store::in_memory(StoreOptions {
+            bulk_threshold: 1_000,
+            max_memory_bytes: Some(16 << 10),
+            ..StoreOptions::default()
+        })
+    };
+    let dry = WriteOptions {
+        dry_run: Some(Default::default()),
+        ..Default::default()
+    };
+    let s = limited();
+    let p = crate::preview::catch(s.load_with(&[bytes(0, 500)], CommitKind::Load, &dry)).unwrap();
+    assert_eq!(p.outcome(), crate::preview::Outcome::StorageRefused, "load");
+    assert_eq!(
+        p.commit.as_ref().map(|c| (c.inserted, c.bulk)),
+        Some((500, false))
+    );
+    assert!(s.snapshot().is_empty());
+    let p = crate::preview::catch(s.replace_with(
+        ReplaceTarget::Default,
+        &[bytes(0, 500)],
+        CommitKind::GspPut,
+        &dry,
+    ))
+    .unwrap();
+    assert_eq!(
+        p.outcome(),
+        crate::preview::Outcome::StorageRefused,
+        "replace"
+    );
+    assert!(s.snapshot().is_empty());
+    // the write itself is refused
+    let e = s
+        .load_with(&[bytes(0, 500)], CommitKind::Load, &WriteOptions::default())
+        .unwrap_err();
+    assert!(matches!(e, crate::error::Error::StorageFull(_)), "{e}");
+    assert!(s.snapshot().is_empty());
+}
+
 /// An empty source written into an empty store takes a transaction and makes no commit,
 /// whether it is a stream or bytes, for a replace as for a load.
 #[test]

@@ -5033,9 +5033,11 @@ impl Store {
 
     /// Before `quads` parsed quads are encoded into a transaction of an in-memory store
     /// (which adds their terms to its vocabulary even if the commit is refused later):
-    /// `StorageFull` when their delta alone would pass the limit.
-    fn check_memory_before(&self, quads: usize) -> Result<()> {
-        if self.root.is_some() || self.opts.max_memory_bytes.is_none() {
+    /// `StorageFull` when their delta alone would pass the limit. A dry run is not
+    /// refused here, since it writes nothing and rolls its terms back. Its preview
+    /// reports the same limit as a storage refusal when the transaction commits.
+    fn check_memory_before(&self, quads: usize, o: &crate::guard::WriteOptions) -> Result<()> {
+        if self.root.is_some() || self.opts.max_memory_bytes.is_none() || o.dry_run.is_some() {
             return Ok(());
         }
         let snap = self.snapshot();
@@ -5291,7 +5293,7 @@ impl Store {
                         if parsed % 65_536 == 1 {
                             o.check()?;
                         }
-                        self.check_memory_before(parsed)?;
+                        self.check_memory_before(parsed, o)?;
                         let ids = txn.encode_quad(&q, &mut labels)?;
                         txn.insert(ids)?;
                         Ok(())
@@ -5390,7 +5392,7 @@ impl Store {
             prefixes.extend(p);
             parsed.push(quads);
         }
-        self.check_memory_before(parsed.iter().map(Vec::len).sum())?;
+        self.check_memory_before(parsed.iter().map(Vec::len).sum(), o)?;
         let mut txn = self.try_write_with(kind, o.clone())?;
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
