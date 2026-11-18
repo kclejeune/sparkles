@@ -155,7 +155,7 @@ class Counters:
         self.fds[key] = fd
 
     def read(self):
-        out = {"ctx_switches": proc_ctx_switches(self.pid)}
+        out = {"ctx_switches": proc_ctx_switches(self.pid), "sched_ns": proc_sched_ns(self.pid)}
         for key, fd in self.fds.items():
             v, enabled, running = (int.from_bytes(os.read(fd, 24)[i : i + 8], "little") for i in (0, 8, 16))
             out[key] = (v, enabled, running)
@@ -185,6 +185,24 @@ def proc_ctx_switches(pid):
     return (total, 0, 0)
 
 
+def proc_sched_ns(pid):
+    """The CPU time of the process's live threads from /proc schedstat, which the
+    harness compares with the counters' task-clock to check that they cover every
+    thread."""
+    total = 0
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return (0, 0, 0)
+    for t in tids:
+        try:
+            with open(f"/proc/{pid}/task/{t}/schedstat") as f:
+                total += int(f.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+    return (total, 0, 0)
+
+
 def kernel_counting_allowed():
     try:
         return int(open("/proc/sys/kernel/perf_event_paranoid").read()) <= 1
@@ -204,6 +222,11 @@ def delta(a, b, server_cpu_pmu):
         out[name] = out.get(name, 0) + (v1 - v0)
         if pmu == server_cpu_pmu and (e1 - e0) != (r1 - r0):
             covered = False
+    # The counters miss a thread when they were opened after it started. Its CPU time
+    # then shows in schedstat and not in task-clock. A thread that exits inside the
+    # window drops out of schedstat, so only a shortfall of task-clock counts.
+    if out.get("sched_ns", 0) > 0 and out["task_clock_ns"] < 0.98 * out["sched_ns"]:
+        covered = False
     out["covered"] = covered
     return out
 
@@ -239,13 +262,11 @@ class Server:
         # so the counters' inheritance covers every thread the server starts.
         r, w = os.pipe()
         self.proc = subprocess.Popen(
-            ["sh", "-c", 'read _ <&3; exec "$@"', "sh", *cmd],
+            ["sh", "-c", 'read _ || exit 1; exec "$@" < /dev/null', "sh", *cmd],
             env=env,
             stdout=log,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            pass_fds=(r,),
-            preexec_fn=lambda: os.dup2(r, 3),
+            stdin=r,
         )
         os.close(r)
         try:

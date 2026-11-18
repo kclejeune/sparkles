@@ -7,6 +7,7 @@ import importlib.util
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 
 SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -77,8 +78,7 @@ class Counters(unittest.TestCase):
         # a child that starts a thread doing a known loop, after the counters open
         code = "import threading\ndef f():\n    s = 0\n    for i in range(2_000_000): s += i\nt = threading.Thread(target=f); t.start(); t.join()\n"
         r, w = os.pipe()
-        p = subprocess.Popen(["sh", "-c", 'read _ <&3; exec "$@"', "sh", "python3", "-c", code],
-                             pass_fds=(r,), preexec_fn=lambda: os.dup2(r, 3))
+        p = subprocess.Popen(["sh", "-c", 'read _ || exit 1; exec "$@" < /dev/null', "sh", "python3", "-c", code], stdin=r)
         os.close(r)
         try:
             c = ri.Counters(p.pid, False)
@@ -95,6 +95,24 @@ class Counters(unittest.TestCase):
         # two million loop iterations of the interpreter take far more than 20M instructions
         self.assertGreater(d["instr_u"], 20_000_000)
         self.assertGreater(d["task_clock_ns"], 0)
+
+    def test_a_thread_started_before_the_counters_is_reported_uncovered(self):
+        code = "import threading\ndef f():\n    s = 0\n    for i in range(40_000_000): s += i\nt = threading.Thread(target=f); t.start(); t.join()\n"
+        p = subprocess.Popen(["python3", "-c", code])
+        try:
+            time.sleep(0.3)
+            try:
+                c = ri.Counters(p.pid, False)
+            except OSError as e:
+                self.skipTest(f"no counters here: {e}")
+            c0 = c.read()
+            time.sleep(0.3)
+            d = ri.delta(c0, c.read(), ri.core_pmus()[0][0])
+            c.close()
+        finally:
+            p.kill()
+            p.wait()
+        self.assertFalse(d["covered"])
 
 
 if __name__ == "__main__":
