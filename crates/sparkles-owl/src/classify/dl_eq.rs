@@ -15,7 +15,7 @@
 //! The equality `x ≈ u` as the rewriting equality is blocked outside query contexts (F24,
 //! item 804's third departure, behind `SPARKLES_ROOTED_EQ_BLOCK`): it rewrites `x` to `u`
 //! only in the unit of a core atom of the context of a named class, and `u` to `x` only
-//! in a named-class atom over `u` in such a context, the two forms the journal's Lemmas 21
+//! in a named-class atom over `u` in such a context or that of `owl:Thing` (item 1070), the two forms the journal's Lemmas 21
 //! and 22 use. The equality is still a rewritten literal, so `u ≈ v` turns `x ≈ u` into
 //! `x ≈ v`, and Factor takes it as any equality.
 //!
@@ -38,6 +38,42 @@ use std::sync::OnceLock;
 pub fn eq_block() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_BLOCK").is_none_or(|v| v != "0"))
+}
+
+/// The rule's name in the derivation trace with the shape of its rewriting equality
+/// `s₁ ↦ t₁`, by the kinds of terms: x, a constant, `f(x)` and `f(u)`.
+fn shape(rule: &'static str, s1: RTerm, t1: RTerm) -> &'static str {
+    use RTerm::*;
+    let k = |t: RTerm| match t {
+        X | Y => 0,
+        C(_) => 1,
+        Fx(_) => 2,
+        Fc(..) => 3,
+    };
+    const EQ: [&str; 16] = [
+        "eq:x>x", "eq:x>c", "eq:x>fx", "eq:x>fc", "eq:c>x", "eq:c>c", "eq:c>fx", "eq:c>fc",
+        "eq:fx>x", "eq:fx>c", "eq:fx>fx", "eq:fx>fc", "eq:fc>x", "eq:fc>c", "eq:fc>fx", "eq:fc>fc",
+    ];
+    const INTO: [&str; 16] = [
+        "eqinto:x>x",
+        "eqinto:x>c",
+        "eqinto:x>fx",
+        "eqinto:x>fc",
+        "eqinto:c>x",
+        "eqinto:c>c",
+        "eqinto:c>fx",
+        "eqinto:c>fc",
+        "eqinto:fx>x",
+        "eqinto:fx>c",
+        "eqinto:fx>fx",
+        "eqinto:fx>fc",
+        "eqinto:fc>x",
+        "eqinto:fc>c",
+        "eqinto:fc>fx",
+        "eqinto:fc>fc",
+    ];
+    let i = k(s1) * 4 + k(t1);
+    if rule == "eq" { EQ[i] } else { INTO[i] }
 }
 
 /// What the equality rules read beside a context's state: the index, the run's literals,
@@ -224,6 +260,7 @@ impl Eqs<'_> {
                     }
                     made.clear();
                     self.rewrites(*v2, s1, t1, &mut made);
+                    found.rule = shape("eq", s1, t1);
                     self.push(found, prem, c2, &made, no_xy(v) && no_xy(*v2));
                 }
             }
@@ -283,6 +320,7 @@ impl Eqs<'_> {
                         }
                         made.clear();
                         self.rewrites(v, s1, t1, &mut made);
+                        found.rule = shape("eqinto", s1, t1);
                         self.push(found, &c1, prem, &made, no_xy(self.view(e)) && no_xy(v));
                     }
                 }

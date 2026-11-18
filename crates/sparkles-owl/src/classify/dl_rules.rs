@@ -979,6 +979,8 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Vec<Side>)> {
             }
             units.sort_unstable();
         }
+        // a unit into a singleton has its constant in place of a successor term (item 822)
+        units.retain(|&e| into_nominal(ix, e).is_none());
     }
     out.extend(units.iter().map(|&e| (e, vec![unit()])));
     if let Some(d) = dl(st) {
@@ -1042,6 +1044,102 @@ pub(super) fn no_xy(v: super::dl_clause::XLit) -> bool {
         .iter()
         .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
 }
+
+/// Whether an existential restriction into a singleton class names its constant in place of
+/// a successor term, item 822's departure (F24). `SPARKLES_ROOTED_NOMINAL_SUCC=0` turns it
+/// off, for measurement.
+pub fn nominal_succ() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_NOMINAL_SUCC").is_none_or(|v| v != "0"))
+}
+
+/// For an existential restriction `d = ∃r.N_v` into a singleton class, in a rooted run, its
+/// role and the constant v, so that `d(t)` gives `r(t, v)` and the successor's context
+/// over v in place of a successor term of t.
+pub(super) fn into_nominal(ix: &Index, d: Ex) -> Option<(Role, u32)> {
+    let dx = dix(ix);
+    // a maximum must still merge r(x, v) with the other r-successors, which the counting
+    // rules do over successor terms
+    if !nominal_succ() || dx.root.is_none() || dx.counting {
+        return None;
+    }
+    let h = ix.head(d);
+    let Node::Exist(r, _) = h.node else {
+        return None;
+    };
+    singleton_of(ix, h.succ).map(|v| (r, v))
+}
+
+/// The constant v when the class `a` is below the singleton `N_v` through told subsumers
+/// and conjuncts alone, so that `a(t)` gives `t ≈ v` under no other premise. The search
+/// looks at no more than [`SINGLETON_SEEN`] classes and answers `None` past them.
+///
+/// It runs on every existential the unfolding and the rules at constants meet, so it holds
+/// its classes in arrays on the stack and allocates nothing. A search whose classes to
+/// visit outgrow [`SINGLETON_OPEN`] starts again in [`singleton_of_on_heap`], which gives
+/// the same answer with vectors.
+fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
+    let mut todo = [a; SINGLETON_OPEN];
+    let mut open = 1;
+    let mut seen = [a; SINGLETON_SEEN];
+    let mut met = 0;
+    while open > 0 {
+        open -= 1;
+        let b = todo[open];
+        if seen[..met].contains(&b) {
+            continue;
+        }
+        if met == SINGLETON_SEEN {
+            return None;
+        }
+        seen[met] = b;
+        met += 1;
+        let h = ix.head(b);
+        let told = ix.told_of(h);
+        let conj = match h.node {
+            Node::Nominal(v) => return Some(v),
+            Node::Conj(p, q) => Some((p, q)),
+            _ => None,
+        };
+        if open + 2 + told.len() > SINGLETON_OPEN {
+            return singleton_of_on_heap(ix, a);
+        }
+        if let Some((p, q)) = conj {
+            todo[open] = p;
+            todo[open + 1] = q;
+            open += 2;
+        }
+        todo[open..open + told.len()].copy_from_slice(told);
+        open += told.len();
+    }
+    None
+}
+
+/// [`singleton_of`] with vectors, for a search that outgrows its arrays.
+fn singleton_of_on_heap(ix: &Index, a: Ex) -> Option<u32> {
+    let mut todo = vec![a];
+    let mut seen: Vec<Ex> = Vec::new();
+    while let Some(b) = todo.pop() {
+        if seen.contains(&b) || seen.len() == SINGLETON_SEEN {
+            continue;
+        }
+        seen.push(b);
+        let h = ix.head(b);
+        match h.node {
+            Node::Nominal(v) => return Some(v),
+            Node::Conj(p, q) => todo.extend([p, q]),
+            _ => {}
+        }
+        todo.extend_from_slice(ix.told_of(h));
+    }
+    None
+}
+
+/// The classes [`singleton_of`] looks at for one existential, at most.
+const SINGLETON_SEEN: usize = 65;
+
+/// The classes [`singleton_of`] holds on the stack to visit.
+const SINGLETON_OPEN: usize = 256;
 
 /// Whether a hypothetical successor sends its conclusions with an empty body over constants
 /// and their successor terms to the root as facts in place of keeping them, item 804's
@@ -2329,7 +2427,10 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     // an existential restriction: its role and core over the new successor term are
     // premises in place
-    if let Node::Exist(r, _) = h.node {
+    // a restriction into a singleton has no successor term (item 822)
+    if let Node::Exist(r, _) = h.node
+        && into_nominal(ix, d).is_none()
+    {
         on_rl(ix, st, d, r, &unit, &mut found);
         if dx.counting && dx.root.is_none() {
             let mut us = Vec::new();
@@ -2341,8 +2442,11 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     if dx.root.is_some() {
         rooted_unit(ix, me, st, d, &mut found, &out.dl().lits);
-        // the EL successor of a unit existential restriction takes the ground markers
-        if let Node::Exist(..) = h.node {
+        // the EL successor of a unit existential restriction takes the ground markers,
+        // unless the restriction names its constant
+        if let Node::Exist(..) = h.node
+            && into_nominal(ix, d).is_none()
+        {
             super::dl_root::new_succ(st, h.succ, out);
         }
     }
@@ -2382,9 +2486,11 @@ fn rooted_max(
 }
 
 /// The named class whose context `me` is, which is a query context of the journal with that
-/// class as its core atom, or `None` for a hypothetical successor or the root.
+/// class as its core atom, or `None` for a hypothetical successor or the root. The context
+/// of `owl:Thing` is the query context of `⊤ ⊑ C`, so its named-class atoms over a constant
+/// are rewritten back over x as well (item 1070).
 fn query_of(ix: &Index, me: Ex) -> Option<Ex> {
-    matches!(ix.head(me).node, Node::Class(_)).then_some(me)
+    (me == TOP || matches!(ix.head(me).node, Node::Class(_))).then_some(me)
 }
 
 /// The rules of a rooted run on a new unit `d(x)`, as [`rooted_max`] has them, with the
@@ -2402,6 +2508,21 @@ fn rooted_unit(ix: &Index, me: Ex, st: &State, d: Ex, found: &mut Found, lits: &
         query: query_of(ix, me),
     };
     q.on_unit(st, XLit::Atom(d, RTerm::X), found);
+    // an existential restriction into a singleton names the constant, and its EL
+    // successor's clauses do not come back over f(x) (item 822)
+    if let Some((r, v)) = into_nominal(ix, d) {
+        found.rule = "nomunit";
+        let inv = |s| dx.inv(ix, s);
+        for l in [
+            XLit::Role(r, RTerm::X, RTerm::C(v)),
+            XLit::Atom(ix.head(d).succ, RTerm::C(v)),
+        ] {
+            if let Made::Lit(l) = lits.lit(l.canon(inv), inv) {
+                found.push(with(&unit(), l));
+            }
+        }
+        return;
+    }
     if let Node::Exist(r, _) = ix.head(d).node {
         let f = RTerm::Fx(d);
         q.on_unit(
@@ -2700,6 +2821,9 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
         let mut es = Vec::new();
         reaching(dx, st, v, &mut es);
         for e in es {
+            if into_nominal(ix, e).is_some() {
+                continue;
+            }
             pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
         }
     }
@@ -3022,8 +3146,21 @@ fn process<S: Sink>(
                         found.push(with(&prem, Lit::x(b)));
                     }
                     Node::Exist(r, _) => {
-                        found.push(with(&prem, Lit::rl(d, r)));
-                        found.push(with(&prem, Lit::f(d, h.succ)));
+                        if let Some((r, v)) = into_nominal(ix, d) {
+                            let lits = &out.dl().lits;
+                            let inv = |r| dx.inv(ix, r);
+                            for l in [
+                                super::dl_clause::XLit::Role(r, RTerm::X, RTerm::C(v)),
+                                super::dl_clause::XLit::Atom(h.succ, RTerm::C(v)),
+                            ] {
+                                if let Made::Lit(l) = lits.lit(l.canon(inv), inv) {
+                                    found.push(with(&prem, l));
+                                }
+                            }
+                        } else {
+                            found.push(with(&prem, Lit::rl(d, r)));
+                            found.push(with(&prem, Lit::f(d, h.succ)));
+                        }
                     }
                     _ => {}
                 }
@@ -3108,7 +3245,7 @@ fn process<S: Sink>(
                         into_eq(ix, st, Some(id), l, &prem, &mut found);
                     }
                 }
-                if !matches!(l.kind(), F | RL) {
+                if !matches!(l.kind(), F | RL) || into_nominal(ix, e).is_some() {
                     continue;
                 }
                 // Pred with the clauses the successors of e sent: the one registered with,

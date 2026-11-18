@@ -25,6 +25,25 @@ with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which
 their advisories. The SvelteKit advisories that only 3.x fixes concern features the
 static UI does not use, and roadmap item 1049 covers the migration.
 
+### Fewer rooted classification runs past their bound
+
+With `Limits::rooted`, an existential restriction into a singleton, or into a class below
+one through told subsumers, names its individual in place of an anonymous successor, which
+is a fifth recorded departure of the rooted run (roadmap item 822). It removes the
+rewriting of every clause over the successor by its equality to the individual, so
+shoi-005, 027 and 032 of the nominal fixtures now finish within the bound with HermiT's
+taxonomy, 48 of the 50 in all, and the fixtures that finished before derive about half as
+many conclusions at the median. On 393 generated ontologies with keys or the universal
+property, 339 rooted runs finish within the bound where 274 did. A run that counts keeps
+the successors. The context of `owl:Thing` is now a query context of the rooted run, so
+an axiom that makes every element one individual gives the subsumptions of `owl:Thing`
+it entails, which completes roadmap item 1070. shoi-022 and 042 still pass the bound.
+shoi-022 joins the duplication of ground reasoning across contexts in roadmap item 1061,
+and roadmap item 1075 follows the disjunctive equalities of constants in shoi-042, so item
+822 is complete. The taxonomy no longer panics when an incomplete run derives two classes
+equivalent and only one of them equivalent to `owl:Thing` or unsatisfiable, and places
+both where the equivalence puts them.
+
 ### Keys and the universal property in rooted classification runs
 
 With `Limits::rooted`, the disjunctive rules take keys over object properties and the

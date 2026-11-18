@@ -464,7 +464,7 @@ fn a_context_that_gives_way_keeps_shq_041_within_the_bound_without_the_order() {
 
 /// With `Limits::rooted`, the rooted run of Tier D takes the `shoi` fixtures, which have
 /// individuals and nominals. The run gives HermiT's taxonomy on every fixture it finishes
-/// within its bound on derived conclusions, and the five fixtures that pass the bound fall
+/// within its bound on derived conclusions, and the two fixtures that pass the bound fall
 /// back to the answer of a run without the option, which is sound, on every schedule.
 #[test]
 fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
@@ -480,7 +480,7 @@ fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
         .collect();
     cases.sort();
     assert_eq!(cases.len(), 50);
-    let past_bound = ["shoi-005", "shoi-022", "shoi-027", "shoi-032", "shoi-042"];
+    let past_bound = ["shoi-022", "shoi-042"];
     let mut exact = 0;
     let mut failures = Vec::new();
     for case in &cases {
@@ -588,5 +588,5 @@ fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
-    assert_eq!(exact, 90);
+    assert_eq!(exact, 96);
 }
