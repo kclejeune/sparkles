@@ -6,8 +6,11 @@ use oxrdf::{GraphName, NamedNode, Quad, Term, Triple};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::{QueryOptions, QueryResult, query};
 use sparkles_core::store::{Store, StoreOptions};
-use sparkles_reasoner::explain::{Derivation, ExplainInput, ExplainOptions, Explained, explain};
+use sparkles_reasoner::explain::{
+    DemandInput, Derivation, ExplainInput, ExplainOptions, Explained, explain, explain_demand,
+};
 use sparkles_reasoner::query::QueryReasoner;
+use sparkles_reasoner::whynot::{WhyNot, WhyNotOptions, why_not};
 use sparkles_reasoner::{
     Cache, Extras, INFERRED_GRAPH, Incremental, Inputs, Method, Profile, ReasonOptions,
     ReasonReport, materialize_incremental, parse_rules, rules_text,
@@ -477,7 +480,11 @@ r(?x) :- (?x ex:p ?y), not r(?y).
         &ReasonOptions::default(),
     )
     .unwrap_err();
-    assert!(format!("{e:#}").contains("r"), "{e:#}");
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains("not stratified") && msg.contains("'rule@line 3'"),
+        "{msg}"
+    );
     let existential = "@prefix ex: <http://ex.org/> .
 .decl advisor(s, a)
 [adv: (?s rdf:type ex:Student) -> advisor(?s, ?a)]
@@ -491,7 +498,8 @@ r(?x) :- (?x ex:p ?y), not r(?y).
         &ReasonOptions::default(),
     )
     .unwrap_err();
-    assert!(format!("{e:#}").contains("adv"), "{e:#}");
+    let msg = format!("{e:#}");
+    assert!(msg.contains("'adv'") && msg.contains("exist"), "{msg}");
 }
 
 /// Wildcards in every column of relations of arity 3 and 4, in positive and negated atoms,
@@ -730,4 +738,117 @@ fn programs_refuse_the_owl_include() {
     )
     .unwrap_err();
     assert!(format!("{e:#}").contains("not stratified"), "{e:#}");
+}
+
+/// The chain program of the reasoning guide, as the guide writes it.
+#[test]
+fn the_guides_chain_program() {
+    let text = "@prefix ex: <http://ex.org/> .
+.decl chain(x, h, rest, y)
+chain(?x, ?h, ?r, ?y) :- (?h owl:propertyChainAxiom ?l), (?l rdf:first ?p), (?l rdf:rest ?r), (?x ?p ?y).
+chain(?x, ?h, ?r2, ?z) :- chain(?x, ?h, ?r, ?y), (?r rdf:first ?p), (?r rdf:rest ?r2), (?y ?p ?z).
+(?x ?h ?y) :- chain(?x, ?h, rdf:nil, ?y).
+";
+    let lengths = [2, 3, 5];
+    let data: String = lengths.iter().map(|&n| chain_data(n)).collect();
+    let s = store(&data);
+    let r = reason(&s, &rules(text), None, None);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let got = inferred(&s);
+    for n in lengths {
+        assert_eq!(
+            with_pred(&got, &format!("<{EX}h{n}>")),
+            chain_facts(n),
+            "length {n}"
+        );
+    }
+}
+
+/// Why-not through a rule program: the chain's missing last step is the hypothesis, and
+/// the candidate is the rule of the chain's end.
+#[test]
+fn why_not_through_a_relation() {
+    let data = chain_data(3).replace("ex:a3_2 ex:c3_3 ex:a3_3 .\n", "");
+    let s = store(&data);
+    let p = rules(CHAINS_AND_KEYS);
+    let qr = QueryReasoner::new(p, &Extras::default(), Inputs::default()).unwrap();
+    let w = why_not(
+        &DemandInput {
+            reasoner: &qr,
+            snap: s.snapshot(),
+            readable: None,
+        },
+        &[ex("a3_0"), ex("h3"), ex("a3_3")],
+        &WhyNotOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    let WhyNot::NotEntailed {
+        rules, hypotheses, ..
+    } = w
+    else {
+        panic!("entailed: {w:?}");
+    };
+    assert!(
+        rules.iter().any(|c| c.rule.name == "chain-end"),
+        "{rules:?}"
+    );
+    let want = vec![[ex("a3_2"), ex("c3_3"), ex("a3_3")]];
+    assert!(
+        hypotheses.iter().any(|h| h.missing == want),
+        "{:?}",
+        hypotheses.iter().map(|h| &h.missing).collect::<Vec<_>>()
+    );
+}
+
+/// A default geometry is explained through a rule program, over the materialized closure
+/// and on demand.
+#[test]
+fn default_geometries_through_a_program() {
+    let geo = "http://www.opengis.net/ont/geosparql#";
+    let s = store(&format!("<{EX}f> <{geo}hasGeometry> <{EX}g> ."));
+    let extras = Extras {
+        geo_default_geometry: true,
+        ..Default::default()
+    };
+    let p = rules(CHAINS_AND_KEYS);
+    materialize_incremental(
+        &s,
+        &p,
+        &extras,
+        Incremental::default(),
+        &ReasonOptions::default(),
+    )
+    .unwrap();
+    let t = [
+        ex("f"),
+        Term::NamedNode(NamedNode::new_unchecked(format!("{geo}hasDefaultGeometry"))),
+        ex("g"),
+    ];
+    let snap = s.snapshot();
+    let inferred = snap.lookup_iri(INFERRED_GRAPH);
+    let e = explain(
+        &ExplainInput {
+            snap: snap.clone(),
+            profile: &p,
+            extras: &extras,
+            inputs: &[sparkles_core::id::Id::DEFAULT_GRAPH],
+            inferred,
+        },
+        &t,
+        &ExplainOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(tree(e).rule.unwrap().name, "geo-default-geometry");
+    let qr = QueryReasoner::new(p.clone(), &extras, Inputs::default()).unwrap();
+    let e = explain_demand(
+        &DemandInput {
+            reasoner: &qr,
+            snap,
+            readable: None,
+        },
+        &t,
+        &ExplainOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(tree(e).rule.unwrap().name, "geo-default-geometry");
 }
