@@ -350,6 +350,8 @@ pub fn dl_reduction() -> u8 {
 /// that a pass visits, a comparison of a sort, or a comparison of a search in a superrole
 /// list, and each pass charges an upper bound of its steps before it starts:
 ///
+/// * the start of a refinement, a step for each state and transition, which lists each
+///   state's transitions;
 /// * a round of the refinement, a step for each state and `1 + ⌈log2(d + 1)⌉` for each of
 ///   the `d` transitions of a state, which builds, sorts and hashes the state's signature;
 /// * the quotient of a refinement, `1 + ⌈log2(m + 1)⌉` for each of the `m` transitions,
@@ -428,6 +430,10 @@ impl EpsFree {
     fn merge_alike(&mut self, work: &mut usize) -> bool {
         let n = self.states as usize;
         let m = self.trans.len();
+        // the lists of each state's transitions and the first partition
+        if !Self::charge(work, n.saturating_add(m)) {
+            return false;
+        }
         let mut out: Vec<Vec<(Role, u32)>> = vec![Vec::new(); n];
         for &(p, l, q) in &self.trans {
             out[p as usize].push((l, q));
@@ -1867,7 +1873,7 @@ mod reduction_tests {
         assert_eq!(a, same);
         // a small automaton leaves nearly all of the bound
         let mut b = auto(3, &[1, 2], &[(0, 0, 1), (0, 0, 2), (1, 0, 2), (2, 0, 2)]);
-        assert!(b.reduce_within(true, &|r, s| r == s, 1, REDUCE_WORK) > REDUCE_WORK - 200);
+        assert!(b.reduce_within(true, &|r, s| r == s, 1, REDUCE_WORK) > REDUCE_WORK - 400);
         assert_eq!(b.states, 2);
         assert_eq!((log_steps(0), log_steps(1), log_steps(4)), (1, 2, 4));
     }
