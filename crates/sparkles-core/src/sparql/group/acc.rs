@@ -237,6 +237,11 @@ impl Accumulator for Running {
         Ok(())
     }
 
+    /// SUM and AVG merge exactly while both subtotals are integers or decimals. A merge
+    /// with a double subtotal can round differently from one pass, and an integer
+    /// subtotal beyond the decimal range leaves the result unbound where one pass would
+    /// have promoted it to a double. No caller merges these yet. Roadmap item 1066, the
+    /// parallel split that merges partitions, settles both cases before it does.
     fn mergeable(&self) -> bool {
         crate::sparql::exec::stat_aggregate(&self.agg.func).is_none()
     }
@@ -461,6 +466,9 @@ impl Accumulator for Distinct {
     }
 
     fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+        // The slots and values of the rows that are new, which the aggregate underneath
+        // reads, are charged until it has read them.
+        let _scratch = ctx.charge(slots.len() as u64 * 12 + 64)?;
         let mut keep: Vec<u32> = Vec::with_capacity(slots.len());
         let mut kept: Vec<Id> = Vec::with_capacity(slots.len());
         for (row, &slot) in slots.iter().enumerate() {

@@ -262,3 +262,24 @@ fn retract_undoes_an_add_for_counts_and_integer_sums() {
     };
     assert!(!acc.retract(&ctx, &batch, &[0]).unwrap());
 }
+
+/// The slots and values a DISTINCT passes on are charged while the aggregate underneath
+/// reads them, also when every row repeats one value and the set stays small.
+#[test]
+fn distinct_charges_what_it_passes_on() {
+    let ctx = ctx();
+    let rows = 65_536;
+    let values = vec![int(&ctx, 7); rows];
+    let slots = vec![0u32; rows];
+    let agg = agg(AggregateFunction::Count, true, true);
+    let mut acc = Distinct::new(Box::new(Running::new(&agg, true)), false);
+    acc.init(1);
+    let before = ctx.mem_peak();
+    fold(&ctx, &mut acc, &values, &slots);
+    assert!(
+        ctx.mem_peak() >= before + rows as u64 * 12,
+        "peak {} after {before}",
+        ctx.mem_peak()
+    );
+    assert_eq!(results(&ctx, &mut acc, 1), ["1"]);
+}
