@@ -534,8 +534,9 @@ shift between processes. The functions that only the new build runs there were s
 however. Per request, the shared batch's construction in `Scan::next_shared` added 650
 to 690 cycles, `Block::downgrade` 200 to 270, `Scan::reads_base` 200, `BaseScan::unpark`
 160 and the allocation and the drop of the weak block handle about 100 each, against
-about 250 cycles of `Block::clone` and `Ctx::nvars` that the old build ran. That is about
-1,500 cycles, or 0.3 µs on `stanley`, for the one block that `root-limit` enters, and it
+about 300 cycles of `Block::clone`, `Ctx::nvars` and `scan_mask` that the old build ran.
+That nets about 1,300 cycles, or 0.3 µs on `stanley`, for the one block that `root-limit`
+enters, and it
 retires only a few hundred instructions, a hundredth of the noise floor of a request of
 9.4 million.
 
