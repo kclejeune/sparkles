@@ -148,7 +148,9 @@ def ci_complete(out, ci_sh=Path("scripts/ci.sh")):
         log = (out / "ci.log").read_text(errors="replace").splitlines()
     except OSError:
         raise Decline("the ci step has no log") from None
-    last = [l for l in log if l.strip()][-1:]
+    # Boxington's own report lines (mbx[gc], mbx[savings] and the like) can follow
+    # ci.sh's last line, since its cache maintenance writes to the same log.
+    last = [l for l in log if l.strip() and not l.startswith("mbx[")][-1:]
     if last != ["CI failed: test"]:
         raise Decline("the ci step's log does not end with ci.sh's `CI failed: test`")
     try:
@@ -381,6 +383,8 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
         env = fresh_scratch(rdir, i, target_tmp)
         code = runner(prefix + ["mbx", "nextest", "run", "--workspace", "--no-capture", "--retries", "0",
                                 "--no-fail-fast", "-E", expr], log, min(left, 900), env=env)
+        # A test's scratch, such as a store left by a timeout, stays out of the gate's output.
+        shutil.rmtree(env["TMPDIR"], ignore_errors=True)
         text = log.read_text(errors="replace") if log.exists() else ""
         cases = []
         if junit_path.exists():
@@ -415,6 +419,7 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
         log = rdir / "doctests.log"
         env = fresh_scratch(rdir, "doctests", target_tmp)
         code = runner(prefix + ["mbx", "test", *pkgs, "--doc"], log, left, env=env)
+        shutil.rmtree(env["TMPDIR"], ignore_errors=True)
         lines.append(f"{'PASS' if code == 0 else 'FAIL'} doctests {' '.join(pkgs)} (exit {code}, log {log.name})")
         if code != 0:
             return finish(1, "not forgiven: the doctests failed")

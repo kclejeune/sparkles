@@ -126,6 +126,13 @@ class Eligibility(unittest.TestCase):
                 with self.assertRaises(tr.Decline):
                     tr.eligible(gate_out(d, **kw), COMMIT, 8)
 
+    def test_boxington_lines_after_the_failure_line_are_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = gate_out(d, ci_log="CI failed: test\nmbx[gc]: evicted 282 objects\nmbx[savings]: 1 TiB")
+            self.assertTrue(tr.eligible(out, COMMIT, 8)[0])
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(tr.Decline):
+            tr.eligible(gate_out(d, ci_log="CI failed: test\nsomething else"), COMMIT, 8)
+
     def test_a_missing_manifest_declines(self):
         with tempfile.TemporaryDirectory() as d:
             out = gate_out(d)
@@ -305,6 +312,7 @@ class Rerun(unittest.TestCase):
             self.assertEqual(len(set(tmps)), len(tmps))
             for t in tmps:
                 self.assertTrue(t.startswith(str((out / "test-retry").resolve())), t)
+                self.assertFalse(Path(t).exists(), t)
 
     def test_a_real_check_of_the_worktree(self):
         with tempfile.TemporaryDirectory() as d:
