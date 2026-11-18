@@ -2377,7 +2377,10 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     // an existential restriction: its role and core over the new successor term are
     // premises in place
-    if let Node::Exist(r, _) = h.node {
+    // a restriction into a singleton has no successor term (item 822)
+    if let Node::Exist(r, _) = h.node
+        && into_nominal(ix, d).is_none()
+    {
         on_rl(ix, st, d, r, &unit, &mut found);
         if dx.counting && dx.root.is_none() {
             let mut us = Vec::new();
@@ -2389,8 +2392,11 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     }
     if dx.root.is_some() {
         rooted_unit(ix, me, st, d, &mut found, &out.dl().lits);
-        // the EL successor of a unit existential restriction takes the ground markers
-        if let Node::Exist(..) = h.node {
+        // the EL successor of a unit existential restriction takes the ground markers,
+        // unless the restriction names its constant
+        if let Node::Exist(..) = h.node
+            && into_nominal(ix, d).is_none()
+        {
             super::dl_root::new_succ(st, h.succ, out);
         }
     }
@@ -3189,7 +3195,7 @@ fn process<S: Sink>(
                         into_eq(ix, st, Some(id), l, &prem, &mut found);
                     }
                 }
-                if !matches!(l.kind(), F | RL) {
+                if !matches!(l.kind(), F | RL) || into_nominal(ix, e).is_some() {
                     continue;
                 }
                 // Pred with the clauses the successors of e sent: the one registered with,

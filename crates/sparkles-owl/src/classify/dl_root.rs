@@ -1826,17 +1826,18 @@ mod tests {
 
     #[test]
     fn a_hypothetical_successor_rewrites_nothing_with_an_equality_to_a_constant() {
-        // A ⊑ ∃r.B ⊔ C, B ⊑ {o}, B ⊑ G: the hypothetical successor of ∃r.B holds the
-        // marker B(x) → B(x), B(x) → x ≈ o and B(x) → G(x). With the blocking, x ≈ o
-        // rewrites nothing there, since the successor is no query context; without it,
-        // B(x) → G(o) and B(x) → B(o) follow.
+        // A ⊑ ∃r.B ⊔ C, B ⊑ {o} as a clause, B ⊑ G: the hypothetical successor of ∃r.B
+        // holds the marker B(x) → B(x), B(x) → x ≈ o and B(x) → G(x). With the blocking,
+        // x ≈ o rewrites nothing there, since the successor is no query context; without
+        // it, B(x) → G(o) and B(x) → B(o) follow. A told B ⊑ {o} would name o in place
+        // of the successor (item 822), so the singleton is a clause here.
         let mut s = Sig::new();
         let no = s.ind("o");
         let [a, b, cc, g] = ["A", "B", "C", "G"].map(|n| s.class(n));
         let r = s.role("r");
         let e = s.some_h(r, b);
         s.dl.clauses.push((vec![a], vec![e, cc]));
-        s.sub(b, no);
+        s.dl.clauses.push((vec![b], vec![no]));
         s.sub(b, g);
         let d = saturate_at(s, Some(a));
         let h = dix(&d.ix).hyp[&e];
@@ -1851,6 +1852,48 @@ mod tests {
         assert!(has(XLit::Atom(g, RTerm::X)), "B(x) → G(x)");
         let ground = has(XLit::Atom(g, o)) || has(XLit::Atom(b, o));
         assert_eq!(ground, !super::super::dl_eq::eq_block(), "{cs:?}");
+    }
+
+    #[test]
+    fn a_restriction_into_a_singleton_names_its_constant_whichever_comes_first() {
+        // A ⊑ ∀r.C, A ⊑ B, B ⊑ ∃r.{o}, and D ⊑ ∃r.{o} ⊔ E with D ⊑ ∀r.C: A's context
+        // holds the restriction as a unit after its universal, D's in a clause, and each
+        // holds r(x, o) and C(o) and no literal over the restriction's successor term
+        // (item 822)
+        if !super::super::dl_rules::nominal_succ() {
+            return;
+        }
+        for named in ["A", "D"] {
+            let mut s = Sig::new();
+            let no = s.ind("o");
+            let [a, b, cc, dd, ee] = ["A", "B", "C", "D", "E"].map(|n| s.class(n));
+            let r = s.role("r");
+            let e = s.some_h(r, no);
+            let all = s.all(r, cc);
+            s.sub(a, all);
+            s.sub(a, b);
+            s.sub(b, e);
+            s.sub(dd, all);
+            s.dl.clauses.push((vec![dd], vec![e, ee]));
+            let at = if named == "A" { a } else { dd };
+            let d = saturate_at(s, Some(at));
+            let o = c(no, &d.ix);
+            let cs = d.clauses_of(at);
+            let over_f = cs
+                .iter()
+                .flat_map(|(bd, hd)| bd.iter().chain(hd))
+                .any(|&l| {
+                    let (ts, n) = super::super::dl_clause::terms_of(l);
+                    ts[..n]
+                        .iter()
+                        .any(|t| matches!(t, RTerm::Fx(f) | RTerm::Fc(f, _) if *f == e))
+                });
+            assert!(!over_f, "{named}: a literal over f(x) in {cs:?}");
+            let head = |l: XLit| cs.iter().any(|(_, hd)| hd.contains(&l));
+            let rxo = XLit::Role(r, RTerm::X, o).canon(inv_of(&d.ix, dix(&d.ix)));
+            assert!(head(rxo), "{named}: r(x, o) in {cs:?}");
+            assert!(head(XLit::Atom(cc, o)), "{named}: C(o) in {cs:?}");
+        }
     }
 
     #[test]
@@ -1929,14 +1972,15 @@ mod tests {
     #[test]
     fn a_successor_in_a_singleton_sends_its_equality_and_ground_facts_back() {
         // A ⊑ ∃r.B, B ⊑ {o}, B ⊑ G: B's context has x ≈ o and G(o), and A's context
-        // gets f(x) ≈ o and G(o), and through Eq r(x, o)
+        // gets f(x) ≈ o and G(o), and through Eq r(x, o). The singleton is a clause, since
+        // a told B ⊑ {o} names o in place of the successor (item 822).
         let mut s = Sig::new();
         let no = s.ind("o");
         let [a, b, g] = ["A", "B", "G"].map(|n| s.class(n));
         let r = s.role("r");
         let e = s.some(r, b);
         s.sub(a, e);
-        s.sub(b, no);
+        s.dl.clauses.push((vec![b], vec![no]));
         s.sub(b, g);
         let d = saturate_at(s, Some(a));
         let o = c(no, &d.ix);
@@ -2014,14 +2058,15 @@ mod tests {
 
     #[test]
     fn a_predecessor_that_comes_later_gets_the_clauses_with_maxima() {
-        // B ⊑ {o}, B ⊑ G, A ⊑ ∃r.B, with B's context saturated before A reaches it
+        // B ⊑ {o}, B ⊑ G, A ⊑ ∃r.B, with B's context saturated before A reaches it, and
+        // the singleton a clause, as above
         let mut s = Sig::new();
         let no = s.ind("o");
         let [a, b, g] = ["A", "B", "G"].map(|n| s.class(n));
         let r = s.role("r");
         let e = s.some(r, b);
         s.sub(a, e);
-        s.sub(b, no);
+        s.dl.clauses.push((vec![b], vec![no]));
         s.sub(b, g);
         let d = saturate_after(s, &[b], Some(a), |_, _| Vec::new());
         let o = c(no, &d.ix);
