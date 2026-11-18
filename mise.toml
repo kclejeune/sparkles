@@ -1512,7 +1512,7 @@ SPARKLES_TASK
 '''
 
 [tasks."bench:insn"]
-description = "The instruction-count screen (item 473): user-space instructions of vocabulary scans and WAL replay (crates/sparkles-core/tests/insn_screen.rs, Linux) in several processes, into a gate record"
+description = "The instruction-count screen (item 473): user-space instructions of vocabulary scans, WAL replay and historical reads (crates/sparkles-core/tests/insn_screen.rs, Linux) in several processes, into a gate record"
 usage = '''
 flag "--items <n>" default="20000" help="generated items (about 8 triples each)"
 flag "--commits <n>" default="2000" help="commits that WAL replay reads"

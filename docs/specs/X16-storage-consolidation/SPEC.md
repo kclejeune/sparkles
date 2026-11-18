@@ -677,7 +677,13 @@ starts, as the ordinary one always did. `history_gone` and `mem_gone` are the
 `Unlimited` forms of `history_gone_with` and `mem_gone_with`, and both forms of
 `reconstructable` merge through one `merge_ranges`, which builds and heap-sorts its
 ranges in one vector and charges each step only under an accounting carrier. A stride
-read therefore resolves, waits and reports a missing commit exactly as before.
+read therefore resolves, waits and reports a missing commit exactly as before. The
+read-only branch reads of `branching/readonly.rs` replay their logs through the generic
+`apply_forward` and `apply_backward` with an accounting carrier. Their other
+`_controlled` helpers read commit files, cold vocabularies and annotations, which belong
+to stage 3. No query path, executor, index reader or spill path changed in this stage,
+so the X14 gate and the spill matrices of `test:w3c` have nothing of it to measure, and
+the batch screen covers the query paths as usual.
 [Item 1062](../../ROADMAP.md) takes the read-only change-log
 reader. `changelog/readonly.rs` reads captured descriptors into borrowed record views,
 while `changelog.rs` reads its in-memory segment index into owned records, so the two
@@ -691,9 +697,11 @@ processes of user-space instructions, WAL replay of 2,000 commits and both opens
 1.000 of the base's count, the four historical reads 0.998 to 0.999 and the sealed read
 1.000. The ordered, unordered and checked FSST vocabulary reads counted the same
 instructions as the base. The front-coded reads moved by up to 0.7% of the base in
-either direction, inside the spread of their own processes at one commit. The
-front-coded full scan, for one, counts between 8.69M and 8.95M instructions from one
-process to the next with the same binary. An intermediate commit of the stage had moved the
+either direction, inside the spread of their own processes at one commit. In ten
+processes of each binary, the front-coded random lookups counted 58,303,118 instructions
+in four processes of the base and in six of the stage, and lower counts elsewhere that
+depend on where the data lands, so the two binaries draw from the same counts and no
+case's range lies above the base's. An intermediate commit of the stage had moved the
 vocabulary cases by up to 3.9% through the single codegen unit's inlining, and the
 finished stage does not. The `insn_screen` binary's text grew by 0.08%. The compile
 time of `sparkles-core` before and after the stage is still to be timed on a quiet
