@@ -55,6 +55,23 @@ enum Policy {
     Legacy,
     Off,
 }
+/// The experiment switches `SPARKLES_BIND_ADMIT=N`, admission at one repeated row in
+/// N (default 4) and release below one answered row in 2N, and `SPARKLES_BIND_HINT=0`,
+/// which ignores the snapshot hint.
+fn admit_divisor() -> u32 {
+    static ADMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ADMIT.get_or_init(|| {
+        std::env::var("SPARKLES_BIND_ADMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(4)
+    })
+}
+fn hint_enabled() -> bool {
+    static HINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HINT.get_or_init(|| std::env::var("SPARKLES_BIND_HINT").as_deref() != Ok("0"))
+}
 fn policy() -> Policy {
     static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
     *POLICY.get_or_init(|| match std::env::var("SPARKLES_BIND_REUSE").as_deref() {
@@ -91,12 +108,13 @@ impl Reuse {
         let input = crate::sparql::exprcache::eligible(&[expr]).ok().flatten()?;
         Some(Admission {
             input,
-            expected_reuse: source.is_some_and(|source| {
-                source.est.is_finite()
-                    && source.est > 0.0
-                    && distinct_bound(ctx, source, input, &mut 64)
-                        .is_some_and(|distinct| distinct as f64 <= source.est * 0.8)
-            }),
+            expected_reuse: hint_enabled()
+                && source.is_some_and(|source| {
+                    source.est.is_finite()
+                        && source.est > 0.0
+                        && distinct_bound(ctx, source, input, &mut 64)
+                            .is_some_and(|distinct| distinct as f64 <= source.est * 0.8)
+                }),
         })
     }
     pub(super) fn new(ctx: &Ctx, admission: Admission) -> Option<Self> {
@@ -119,6 +137,19 @@ impl Reuse {
             #[cfg(test)]
             evaluations: 0,
         })
+    }
+
+    /// The exact count of a batch that the per-batch distinct pass made after
+    /// [`Reuse::apply`] declined it. Repetition within one batch is exact where the
+    /// sampled sketch can miss a few hot keys, so it admits the map for later batches.
+    pub(super) fn counted(&mut self, rows: usize, distinct: usize) {
+        if self.mode == Mode::Probe
+            && policy() == Policy::Observed
+            && rows >= crate::sparql::exprcache::MIN_ROWS
+            && (rows - distinct) * admit_divisor() as usize >= rows
+        {
+            self.admit();
+        }
     }
 
     /// Rows answered from the map and evaluations made for it, for EXPLAIN.
@@ -204,7 +235,7 @@ impl Reuse {
                 repeats += 1;
             }
         }
-        if repeats > 0 && (repeats * 4 >= sample || self.expected_reuse) {
+        if repeats > 0 && (repeats * admit_divisor() as usize >= sample || self.expected_reuse) {
             self.max_entries = MAP_ENTRIES;
             self.admit();
             return Ok(true);
@@ -234,7 +265,7 @@ impl Reuse {
             return Ok(false);
         }
         self.window = (0, 0);
-        if repeats * 4 >= rows {
+        if repeats * admit_divisor() >= rows {
             self.admit();
             return Ok(true);
         }
@@ -352,7 +383,7 @@ impl Reuse {
         {
             let (rows, answered) = std::mem::take(&mut self.map_window);
             // A map that answers fewer than an eighth of its rows costs more than it saves.
-            if answered * 8 < rows {
+            if answered * 2 * admit_divisor() < rows {
                 self.decline();
             }
         }
@@ -693,6 +724,46 @@ mod tests {
             reuse.hits >= 131072 - 2 * 32768 - 8192,
             "{} rows answered",
             reuse.hits
+        );
+    }
+
+    #[test]
+    fn hot_keys_the_sketch_does_not_sample_admit_from_the_exact_batch_count() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        run(
+            &ctx,
+            &mut reuse,
+            input,
+            target,
+            &expr,
+            &local_strings(&ctx, 0..4096),
+        );
+        assert_eq!(reuse.mode, Mode::Probe);
+        // Eight hot keys, none of which the sketch samples.
+        let hot = local_strings(&ctx, 10_000..20_000)
+            .into_iter()
+            .filter(|id| !sampled(*id))
+            .take(8)
+            .collect::<Vec<_>>();
+        let keys = (0..4096).map(|i| hot[i % 8]).collect::<Vec<_>>();
+        let mut table = batch(input, &keys);
+        assert!(!reuse.apply(&ctx, &mut table, target, &expr).unwrap());
+        assert_eq!(reuse.mode, Mode::Probe, "the sketch sees no repetition");
+        // The per-batch distinct pass counted 8 distinct of 4,096 rows.
+        reuse.counted(4096, 8);
+        assert_eq!(reuse.mode, Mode::Map);
+        run(&ctx, &mut reuse, input, target, &expr, &keys);
+        assert_eq!(reuse.evaluations, 8);
+        reuse.counted(4096, 4096);
+        assert_eq!(
+            reuse.mode,
+            Mode::Map,
+            "an admitted map keeps its own release rule"
         );
     }
 

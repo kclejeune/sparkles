@@ -46,7 +46,7 @@ const DECODE_PIECE: usize = 4096;
 
 /// What one operator's expressions did, for EXPLAIN.
 #[derive(Default, Debug)]
-pub struct Report(Vec<Entry>, Vec<Decided>);
+pub struct Report(Vec<Entry>, Vec<Decided>, Option<(usize, usize)>);
 
 /// Comparisons with constants that the ids of a column decided (see `rangemask`).
 #[derive(Debug)]
@@ -69,6 +69,13 @@ impl Report {
     pub fn extend(&mut self, other: Report) {
         self.0.extend(other.0);
         self.1.extend(other.1);
+        self.2 = other.2.or(self.2);
+    }
+
+    /// The rows and exact distinct input keys of the last batch whose keys a cursor's
+    /// per-batch distinct pass counted, accepted or not.
+    pub(super) fn counted(&self) -> Option<(usize, usize)> {
+        self.2
     }
 
     /// Record that the ids of a column decided the comparisons `exprs` on `rows` rows,
@@ -1128,6 +1135,7 @@ fn cursor_key_distinct(
         slot[row as usize] = (uniq.len() - 1) as u32;
     }
     ctx.check()?;
+    report.2 = Some((n, uniq.len()));
     if !always && uniq.len() > n / 4 * 3 {
         report.push(
             ctx,

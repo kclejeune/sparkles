@@ -4025,6 +4025,11 @@ impl Operator {
                     };
                     if !reused {
                         b.table = exec::apply_unary(ctx, node, b.table, &mut report)?;
+                        if let (Some(reuse), Some((rows, distinct))) =
+                            (&mut self.bind_reuse, report.counted())
+                        {
+                            reuse.counted(rows, distinct);
+                        }
                     }
                     b.reconcile()?;
                     drop(scratch);
