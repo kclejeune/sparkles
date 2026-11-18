@@ -55,12 +55,6 @@ enum Policy {
     Legacy,
     Off,
 }
-/// The experiment switch `SPARKLES_BIND_ROWS=1`: a batch whose observed repetition is
-/// sparse skips the per-batch distinct pass of `exprcache` and runs row by row.
-fn rows_switch() -> bool {
-    static ROWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| std::env::var("SPARKLES_BIND_ROWS").as_deref() == Ok("1"))
-}
 fn policy() -> Policy {
     static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
     *POLICY.get_or_init(|| match std::env::var("SPARKLES_BIND_REUSE").as_deref() {
@@ -86,8 +80,6 @@ pub(super) struct Reuse {
     map_rows: u64,
     hits: u64,
     misses: u64,
-    /// The last observation repeated fewer than one row in sixteen.
-    sparse: bool,
     #[cfg(test)]
     evaluations: usize,
 }
@@ -124,16 +116,9 @@ impl Reuse {
             map_rows: 0,
             hits: 0,
             misses: 0,
-            sparse: false,
             #[cfg(test)]
             evaluations: 0,
         })
-    }
-
-    /// Whether a batch that [`Reuse::apply`] left alone should run row by row, without
-    /// the per-batch distinct pass, because observed repetition is sparse.
-    pub(super) fn row_by_row(&self) -> bool {
-        self.sparse && self.mode != Mode::Map && rows_switch()
     }
 
     /// Rows answered from the map and evaluations made for it, for EXPLAIN.
@@ -219,7 +204,6 @@ impl Reuse {
                 repeats += 1;
             }
         }
-        self.sparse = repeats * 16 < sample;
         if repeats > 0 && (repeats * 4 >= sample || self.expected_reuse) {
             self.max_entries = MAP_ENTRIES;
             self.admit();
@@ -250,7 +234,6 @@ impl Reuse {
             return Ok(false);
         }
         self.window = (0, 0);
-        self.sparse = repeats * 16 < rows;
         if repeats * 4 >= rows {
             self.admit();
             return Ok(true);
@@ -370,7 +353,6 @@ impl Reuse {
             let (rows, answered) = std::mem::take(&mut self.map_window);
             // A map that answers fewer than an eighth of its rows costs more than it saves.
             if answered * 8 < rows {
-                self.sparse = answered * 16 < rows;
                 self.decline();
             }
         }
