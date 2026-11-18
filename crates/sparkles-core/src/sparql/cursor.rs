@@ -1987,6 +1987,10 @@ impl QueryCursor {
     pub(super) fn charge(&self, bytes: u64) -> Result<OwnedCharge> {
         OwnedCharge::new(&self.ctx, bytes)
     }
+    /// The query context that the output writer charges its buffer to.
+    pub(super) fn output_ctx(&self) -> Arc<Ctx> {
+        self.ctx.clone()
+    }
 
     pub(super) fn stack_depth(&self) -> usize {
         self.depth

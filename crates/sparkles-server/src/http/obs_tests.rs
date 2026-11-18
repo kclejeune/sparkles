@@ -1673,6 +1673,95 @@ fn late_streamed_byte_budget_aborts_and_reports_the_rows_sent() {
     }
 }
 
+/// A body cut by `--max-result-mb` while its reader has stopped reading cannot send the
+/// chunk it had buffered, because the idle timer ends the transfer first. The rows logged
+/// are the rows whose ends lie in the bytes the transport accepted, which leaves out the
+/// rows of that unsent chunk (item 243).
+#[test]
+fn a_failed_budget_flush_reports_only_the_rows_sent() {
+    const ROWS: usize = 5000;
+    let data = (0..ROWS)
+        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(512)))
+        .collect::<String>();
+    let load = |s: &Server| {
+        s.state
+            .get("ds")
+            .unwrap()
+            .store
+            .load(&[Source::from_bytes(
+                data.clone().into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+    };
+    for execution in ["eager", "streaming"] {
+        let uri = format!(
+            "/ds/sparql?execution={execution}&format=tsv&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
+        );
+        // the whole body, from a server without the budget
+        let mut whole = Vec::new();
+        let full_uri = uri.clone();
+        access_lines_of(|| async {
+            let s = server_with(|st| st.limits.max_result_bytes = None);
+            load(&s);
+            let res = s
+                .app
+                .clone()
+                .oneshot(Request::get(full_uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            whole = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
+        });
+        let lines = access_lines_of(|| async {
+            let s = server_with(|st| {
+                st.access_log = true;
+                st.stream_idle_timeout = Duration::from_millis(300);
+                // the switch, then three chunks fill the channel, and the budget cuts
+                // the next chunk halfway, while the reader reads nothing. A streaming
+                // request switches at its first bytes.
+                let switch = if execution == "eager" {
+                    super::stream::STREAM_AFTER
+                } else {
+                    super::stream::FIRST_BYTES_AFTER
+                };
+                st.limits.max_result_bytes =
+                    Some((switch + super::stream::CHUNK * 3 + super::stream::CHUNK / 2) as u64);
+            });
+            load(&s);
+            let res = s
+                .app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{execution}");
+            // the idle timer ends the transfer while the budget flush waits for room
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            drop(res);
+        })
+        .into_iter()
+        .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
+        .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{execution}: {lines:#?}");
+        let j: J = serde_json::from_str(&lines[0]).unwrap();
+        let f = &j["fields"];
+        assert_eq!(f["outcome"], "budget", "{execution}: {f}");
+        let bytes = f["response_bytes"].as_u64().unwrap() as usize;
+        assert!(bytes < whole.len(), "{execution}: {f}");
+        // every whole line after the header within the bytes the transport accepted
+        let lines = whole[..bytes].iter().filter(|&&b| b == b'\n').count() as u64;
+        assert_eq!(
+            f["rows"].as_u64(),
+            Some(lines - 1),
+            "{execution}: the rows logged are the rows in the {bytes} bytes sent: {f}"
+        );
+    }
+}
+
 /// A HEAD request for a large eager answer gets its headers, and the server drops the
 /// streamed body on purpose. That is recorded as a complete request, not a cancelled one.
 #[tokio::test]

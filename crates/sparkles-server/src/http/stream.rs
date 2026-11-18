@@ -14,7 +14,7 @@ use super::{ApiError, ApiResult, err};
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use sparkles::Error;
-use sparkles::sparql::results::LimitedWriter;
+use sparkles::sparql::results::{LimitedWriter, RowLedger};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,6 +66,10 @@ pub struct StreamEnd {
     pub error: Option<Error>,
     /// the client went away before the end
     pub disconnected: bool,
+    /// The rows whose bytes the transport accepted, from the writer's row ledger, or
+    /// `None` when the writer recorded no rows there or the body failed before it was
+    /// committed. A row counts once the send that holds its end has enqueued.
+    pub rows: Option<u64>,
 }
 
 impl StreamEnd {
@@ -105,6 +109,14 @@ pub struct SwitchWriter {
     timeouts: Option<Timeouts>,
     timed: Option<lifetime::Producer>,
     held: Option<crate::ratelimit::Held>,
+    /// where the writer's rows end, credited at each send that enqueued
+    ledger: RowLedger,
+    /// the bytes copied into `buf` since the start
+    copied: u64,
+    /// An error of a send that had already enqueued its chunk, such as the body timer
+    /// aborting the transfer just after. The chunk's rows count, and the error is
+    /// returned from the next write, flush or send.
+    after_send: Option<io::Error>,
     #[cfg(test)]
     producer_gate: Option<Arc<super::algo::probe::Gate>>,
     #[cfg(test)]
@@ -232,7 +244,58 @@ impl SwitchWriter {
         self.deferred
     }
 
+    /// The ledger in which a result writer records where its rows end.
+    pub(crate) fn ledger(&self) -> RowLedger {
+        self.ledger.clone()
+    }
+
+    #[cfg(test)]
+    fn new(threshold: usize, signal: Option<oneshot::Sender<Outcome>>) -> Self {
+        SwitchWriter {
+            buf: Vec::new(),
+            threshold,
+            signal,
+            tx: None,
+            deferred: false,
+            control: None,
+            commit_on_flush: false,
+            timeouts: None,
+            timed: None,
+            held: None,
+            ledger: RowLedger::new(),
+            copied: 0,
+            after_send: None,
+            #[cfg(test)]
+            producer_gate: None,
+            #[cfg(test)]
+            queued_producer_gate: None,
+        }
+    }
+
+    /// The error of an earlier send that enqueued and then failed.
+    #[inline]
+    fn failed_send(&mut self) -> io::Result<()> {
+        match self.after_send.take() {
+            None => Ok(()),
+            Some(e) => {
+                let copy = io::Error::new(e.kind(), e.to_string());
+                self.after_send = Some(e);
+                Err(copy)
+            }
+        }
+    }
+
+    /// The chunk enqueued: its rows count. A check that then fails is kept for the next
+    /// call, so that the write that sent the chunk still counts its bytes.
+    fn enqueued(&mut self, after: io::Result<()>) {
+        self.ledger.handed_over(self.copied);
+        if let Err(e) = after {
+            self.after_send = Some(e);
+        }
+    }
+
     fn send_chunk(&mut self) -> io::Result<()> {
+        self.failed_send()?;
         let Some(tx) = &self.tx else {
             return Ok(());
         };
@@ -241,11 +304,14 @@ impl SwitchWriter {
         }
         let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK));
         if self.control.is_none() && self.timed.is_none() {
-            return tx.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| gone());
+            tx.blocking_send(Ok(Bytes::from(chunk)))
+                .map_err(|_| gone())?;
+            self.enqueued(Ok(()));
+            return Ok(());
         }
         let mut item = Ok(Bytes::from(chunk));
         let stalled = Instant::now();
-        loop {
+        let after = loop {
             if let Some(control) = &self.control {
                 control.check()?;
             }
@@ -257,7 +323,7 @@ impl SwitchWriter {
                 None => tx.try_send(item),
             };
             match sent {
-                Ok(()) => return Ok(()),
+                Ok(()) => break self.timed.as_ref().map_or(Ok(()), |p| p.check()),
                 Err(mpsc::error::TrySendError::Closed(_)) => return Err(gone()),
                 Err(mpsc::error::TrySendError::Full(returned)) => {
                     item = returned;
@@ -281,10 +347,10 @@ impl SwitchWriter {
                             }
                             if let Some(producer) = &self.timed {
                                 producer.permit_send(permit, item)?;
-                            } else {
-                                permit.send(item);
+                                break producer.check();
                             }
-                            return Ok(());
+                            permit.send(item);
+                            break Ok(());
                         }
                         Ok(Err(_)) => return Err(gone()),
                         Err(_) => {
@@ -306,12 +372,15 @@ impl SwitchWriter {
                     }
                 }
             }
-        }
+        };
+        self.enqueued(after);
+        Ok(())
     }
 }
 
 impl Write for SwitchWriter {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.failed_send()?;
         if let Some(control) = &self.control {
             // Serializers write a few bytes at a time, and reading the clock on each
             // write took a third of a streamed response's time. The deadline is
@@ -339,6 +408,8 @@ impl Write for SwitchWriter {
                 ));
             }
             self.buf.extend_from_slice(b);
+            self.copied += b.len() as u64;
+            self.ledger.copied(self.copied);
             return Ok(b.len());
         }
         // A serializer may hand us one enormous literal/body. Consume only the
@@ -354,6 +425,8 @@ impl Write for SwitchWriter {
         };
         let n = b.len().min(room);
         self.buf.extend_from_slice(&b[..n]);
+        self.copied += n as u64;
+        self.ledger.copied(self.copied);
         if self.tx.is_none() && self.buf.len() > self.threshold {
             self.switch()?;
         } else if self.tx.is_some() && self.buf.len() >= CHUNK {
@@ -365,6 +438,7 @@ impl Write for SwitchWriter {
     /// A flush commits an explicitly streamed response that has not switched yet. Every
     /// other flush leaves the buffer to fill its chunk.
     fn flush(&mut self) -> io::Result<()> {
+        self.failed_send()?;
         if self.commit_on_flush
             && self.tx.is_none()
             && self.signal.is_some()
@@ -539,6 +613,9 @@ where
             timeouts,
             timed: None,
             held: Some(held),
+            ledger: RowLedger::new(),
+            copied: 0,
+            after_send: None,
             #[cfg(test)]
             producer_gate: probe.producer,
             #[cfg(test)]
@@ -607,6 +684,7 @@ where
                 serialize_ms,
                 error: result.err(),
                 disconnected,
+                rows: sw.ledger.delivered(),
             });
             drop(span);
             producer.publish();
@@ -616,11 +694,14 @@ where
             (None, Ok(())) => {
                 let body = std::mem::take(&mut sw.buf);
                 if control.is_some() {
+                    // a whole body delivers every row it holds
+                    sw.ledger.handed_over(sw.copied);
                     on_stream_end(StreamEnd {
                         bytes,
                         serialize_ms,
                         error: None,
                         disconnected: false,
+                        rows: sw.ledger.delivered(),
                     });
                 }
                 drop(span);
@@ -638,6 +719,8 @@ where
                         serialize_ms,
                         error: Some(copy_error(&e)),
                         disconnected: false,
+                        // the response is an error, and the rows are reported as before
+                        rows: None,
                     });
                     drop(span);
                     drop(sw.held.take());
@@ -665,6 +748,7 @@ where
                     serialize_ms,
                     error,
                     disconnected,
+                    rows: sw.ledger.delivered(),
                 });
                 drop(span);
                 if let Some(msg) = abort {
@@ -798,6 +882,9 @@ where
         timeouts: None,
         timed: None,
         held: None,
+        ledger: RowLedger::new(),
+        copied: 0,
+        after_send: None,
         #[cfg(test)]
         producer_gate: None,
         #[cfg(test)]
@@ -850,6 +937,39 @@ impl futures_util::Stream for ChunkStream {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// A send that enqueued and then failed its check counts the rows that end in its
+    /// chunk, and its error comes back from the next write, flush or send, also when the
+    /// serializer writes nothing more (item 243).
+    #[test]
+    fn a_send_that_enqueued_and_then_failed_counts_its_rows() {
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let r = sparkles::sparql::query(
+            store.snapshot(),
+            "SELECT ?x WHERE { VALUES ?x { 1 2 3 } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let mut sw = SwitchWriter::new(1 << 20, None);
+        let rows = sparkles::sparql::results::RowCount::with_ledger(sw.ledger());
+        sparkles::sparql::results::write_solutions_counted(
+            &r,
+            sparkles::sparql::results::SolutionsFormat::Tsv,
+            &mut sw,
+            None,
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(rows.get(), 3);
+        assert_eq!(sw.ledger().delivered(), Some(0), "nothing was sent");
+        sw.enqueued(Err(io::Error::new(io::ErrorKind::TimedOut, "aborted")));
+        assert_eq!(sw.ledger().delivered(), Some(3));
+        for _ in 0..2 {
+            assert_eq!(sw.send_chunk().unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(sw.write(b"x").unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(sw.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+    }
 
     fn ends() -> (
         Arc<Mutex<Vec<StreamEnd>>>,
@@ -967,21 +1087,7 @@ mod tests {
         let (signal, outcome) = oneshot::channel();
         let size = CHUNK * 8 + 17;
         let producer = tokio::task::spawn_blocking(move || {
-            let mut w = SwitchWriter {
-                buf: Vec::new(),
-                threshold: 100,
-                signal: Some(signal),
-                tx: None,
-                deferred: false,
-                control: None,
-                commit_on_flush: false,
-                timeouts: None,
-                timed: None,
-                held: None,
-                producer_gate: None,
-                #[cfg(test)]
-                queued_producer_gate: None,
-            };
+            let mut w = SwitchWriter::new(100, Some(signal));
             w.write_all(&vec![b'x'; size])?;
             w.send_chunk()
         });

@@ -294,7 +294,7 @@ fn public_large_writer_keeps_threshold_values_counts_and_joins_prefetch() {
         bytes: 0,
         prefix: Vec::new(),
     };
-    let sent = Cell::new(0);
+    let sent = RowCount::new();
     write_solutions_counted(&result, SolutionsFormat::Tsv, &mut sink, None, &sent).unwrap();
     assert_eq!(sent.get(), (DECODE_ROWS + 1) as u64);
     assert!(sink.prefix.starts_with(b"?o\n\"small\"\n"));
@@ -418,7 +418,7 @@ fn scoped_prefetch_panic_is_an_error_without_unchecked_redo() {
             panic!("actual owned prefetch fault");
         }
     }));
-    let sent = Cell::new(0);
+    let sent = RowCount::new();
     let error =
         write_solutions_counted(&result, SolutionsFormat::Tsv, std::io::sink(), None, &sent)
             .unwrap_err();
@@ -491,7 +491,7 @@ fn observed_io_error_stays_first_while_later_prefetch_panic_is_joined() {
             a.wait();
         }
     }));
-    let sent = Cell::new(0);
+    let sent = RowCount::new();
     let error = write_solutions_counted(
         &result,
         SolutionsFormat::Tsv,
@@ -861,7 +861,7 @@ fn caller_unwind_packet(completed_cells: bool) {
         }
     }));
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         write_solutions_counted(
             &result,
             SolutionsFormat::Tsv,
@@ -907,9 +907,12 @@ fn caller_unwind_packet(completed_cells: bool) {
     } else {
         0
     };
+    // The output writer's buffer is charged while it is live. Its 8 KiB hold 1,024 rows
+    // of this answer's short rows, whose ends grew its marks to 1,024 entries.
+    let writer = OUTPUT_BUFFER as u64 + 1024 * MARK_BYTES;
     assert_eq!(
         during_unwind,
-        baseline + 4096 + 4096 + returned_cells,
+        baseline + 4096 + 4096 + returned_cells + writer,
         "packet contribution returned before actual scope join; completed_cells={completed_cells}"
     );
 }

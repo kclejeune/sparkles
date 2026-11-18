@@ -2162,9 +2162,10 @@ pub(crate) async fn run_query(
     let cancel_guard = _cancel_on_drop;
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
-        let sent = std::cell::Cell::new(0);
+        let sent = results::RowCount::with_ledger(w.get_ref().ledger());
+        let thrift_sent = std::cell::Cell::new(0);
         let written = if thrift {
-            write_thrift_results(&r, w, send, &sent)
+            write_thrift_results(&r, w, send, &thrift_sent)
         } else {
             serialize_result(
                 &r,
@@ -2181,7 +2182,10 @@ pub(crate) async fn run_query(
                 &sent,
             )
         };
-        rows_written.store(sent.get(), std::sync::atomic::Ordering::Relaxed);
+        rows_written.store(
+            sent.get() + thrift_sent.get(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // phase spans once serialization has ended (the request span is current here)
         attempted_ms.set(attempted_ms.get() + ts.elapsed().as_secs_f64() * 1000.0);
         if !w.get_ref().deferred() {
@@ -2198,8 +2202,13 @@ pub(crate) async fn run_query(
     let on_stream_end = move |end: stream::StreamEnd| {
         stream_end_log("query", &end);
         let (outcome, budget) = end.outcome();
+        // the rows whose ends the transport handed over, or for a writer that records
+        // none there, the rows it wrote whole
         let rows = if end.error.is_some() {
-            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed))
+            Some(
+                end.rows
+                    .unwrap_or_else(|| sent_rows.load(std::sync::atomic::Ordering::Relaxed)),
+            )
         } else {
             streamed_base.rows
         };
@@ -2327,7 +2336,7 @@ fn serialize_result(
     seq: u64,
     dataset_id: &str,
     io: Option<&sparkles::ioacct::Profile>,
-    sent: &std::cell::Cell<u64>,
+    sent: &results::RowCount,
 ) -> sparkles::Result<()> {
     if sparkles_doc {
         results::write_native_json_counted(

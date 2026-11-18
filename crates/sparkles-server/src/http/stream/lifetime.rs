@@ -361,9 +361,7 @@ impl Producer {
         drop(state);
         self.shared.complete_abort(action);
         self.shared.changed.notify_one();
-        if result.is_ok() {
-            self.check()?;
-        }
+        // the caller checks after it has counted the enqueued chunk
         Ok(result)
     }
     pub(super) fn permit_send(
@@ -384,7 +382,8 @@ impl Producer {
         drop(state);
         self.shared.complete_abort(action);
         self.shared.changed.notify_one();
-        self.check()
+        // the caller checks after it has counted the enqueued chunk
+        Ok(())
     }
     pub(super) fn record_error(&self, error: &sparkles::Error) {
         Shared::remember(&mut self.shared.state.lock(), error);
@@ -725,6 +724,7 @@ mod tests {
                             serialize_ms: 0.0,
                             error: Some(error),
                             disconnected: false,
+                            rows: None,
                         },
                     )
                 }),

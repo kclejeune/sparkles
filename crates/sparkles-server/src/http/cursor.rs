@@ -212,7 +212,7 @@ pub(super) async fn serve(
                     written
                 }
                 QueryExecution::Eager(result) => {
-                    let sent = std::cell::Cell::new(0);
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
                     let written = serialize_result(
                         result.result(),
                         writer,
@@ -231,7 +231,7 @@ pub(super) async fn serve(
                     written
                 }
                 QueryExecution::Select(cursor) if format == SolutionsFormat::Sparkles => {
-                    let sent = std::cell::Cell::new(0);
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
                     let written = results::write_cursor_native_json_counted(
                         cursor,
                         &mut *writer,
@@ -243,7 +243,7 @@ pub(super) async fn serve(
                     written.map(|_| ())
                 }
                 QueryExecution::Select(cursor) => {
-                    let sent = std::cell::Cell::new(0);
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
                     let written = results::write_cursor_solutions_counted(
                         cursor,
                         format,
@@ -255,7 +255,7 @@ pub(super) async fn serve(
                     written.map(|_| ())
                 }
                 QueryExecution::Graph(cursor) if native_graph => {
-                    let sent = std::cell::Cell::new(0);
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
                     let written = results::write_cursor_graph_native_json_counted(
                         cursor,
                         &mut *writer,
@@ -267,7 +267,7 @@ pub(super) async fn serve(
                     written.map(|_| ())
                 }
                 QueryExecution::Graph(cursor) => {
-                    let sent = std::cell::Cell::new(0);
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
                     let written = match rdf_format {
                         OutFormat::Rdf(format) => {
                             sparkles::sparql::cursor::graph::write_cursor_graph_counted(
@@ -320,8 +320,11 @@ pub(super) async fn serve(
             let (outcome, budget) = end.outcome();
             // The statistics count all the rows an answer produced, so a body that stopped
             // partway reports the rows that reached the response writer whole.
-            let rows = match *sent_rows.lock() {
-                Some(sent) if end.error.is_some() => Some(sent),
+            // The rows of a streamed body are the ones whose ends the transport handed over,
+            // and a writer that records none there reports the rows it wrote whole.
+            let rows = match (end.rows, *sent_rows.lock()) {
+                (Some(delivered), _) if end.error.is_some() => Some(delivered),
+                (None, Some(sent)) if end.error.is_some() => Some(sent),
                 _ => stats.as_ref().map(|s| s.emitted_rows),
             };
             if let Some(stats) = &stats {

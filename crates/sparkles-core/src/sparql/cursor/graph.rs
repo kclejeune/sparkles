@@ -428,6 +428,10 @@ impl GraphCursor {
     pub(in crate::sparql) fn charge(&self, bytes: u64) -> Result<OwnedCharge> {
         OwnedCharge::new(&self.where_cursor.ctx, bytes)
     }
+    /// The query context that the output writer charges its buffer to.
+    pub(in crate::sparql) fn output_ctx(&self) -> Arc<crate::sparql::ctx::Ctx> {
+        self.where_cursor.ctx.clone()
+    }
     pub(crate) fn stack_depth(&self) -> usize {
         self.where_cursor.depth
     }
@@ -464,7 +468,14 @@ pub fn write_cursor_graph(
     send: Option<usize>,
     prefixes: &[(String, String)],
 ) -> Result<CursorStats> {
-    write_cursor_graph_counted(cursor, format, output, send, prefixes, &Cell::new(0))
+    write_cursor_graph_counted(
+        cursor,
+        format,
+        output,
+        send,
+        prefixes,
+        &crate::sparql::results::RowCount::new(),
+    )
 }
 
 /// [`write_cursor_graph`], counting in `sent` the triples and quads that reached `output`
@@ -476,11 +487,14 @@ pub fn write_cursor_graph_counted(
     output: &mut dyn std::io::Write,
     send: Option<usize>,
     prefixes: &[(String, String)],
-    sent: &Cell<u64>,
+    sent: &crate::sparql::results::RowCount,
 ) -> Result<CursorStats> {
-    let result = crate::sparql::results::write_buffered(output, sent, &mut |w, staged| {
-        graph_to(cursor, format, w, send, prefixes, staged)
-    });
+    let result = crate::sparql::results::write_buffered(
+        output,
+        sent,
+        Some(cursor.output_ctx()),
+        &mut |w, staged| graph_to(cursor, format, w, send, prefixes, staged),
+    );
     if let Err(error) = result {
         cursor.failure = Some(error.to_string());
         cursor.finish(CursorStatus::Failed);
@@ -493,7 +507,7 @@ pub fn write_cursor_graph_counted(
 fn graph_to(
     cursor: &mut GraphCursor,
     format: oxrdfio::RdfFormat,
-    output: &mut crate::sparql::results::Buffered<'_>,
+    output: &mut crate::sparql::results::RowOut<'_>,
     send: Option<usize>,
     prefixes: &[(String, String)],
     staged: &Cell<u64>,

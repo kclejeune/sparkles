@@ -13,7 +13,7 @@ enum Format {
 }
 
 impl Format {
-    fn write(self, r: &QueryResult, out: impl Write, sent: &Cell<u64>) -> Result<()> {
+    fn write(self, r: &QueryResult, out: impl Write, sent: &RowCount) -> Result<()> {
         match self {
             Self::Native => write_native_json_counted(r, out, None, None, sent),
             Self::Tsv => write_solutions_counted(r, SolutionsFormat::Tsv, out, None, sent),
@@ -82,7 +82,7 @@ fn exact_refusal(result: Result<()>, expected: Budget) {
 fn positive_writers_preserve_bound_cells_and_whole_row_counts() {
     for shared in [false, true] {
         let r = answer(shared);
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         let mut native = Vec::new();
         Format::Native.write(&r, &mut native, &sent).unwrap();
         assert_eq!(sent.get(), 2);
@@ -98,7 +98,7 @@ fn positive_writers_preserve_bound_cells_and_whole_row_counts() {
         );
         assert_eq!(value["meta"]["sentRows"], 2);
         let mut tsv = Vec::new();
-        sent.set(0);
+        let sent = RowCount::new();
         Format::Tsv.write(&r, &mut tsv, &sent).unwrap();
         assert_eq!(sent.get(), 2);
         assert_eq!(
@@ -112,7 +112,7 @@ fn before_prefix(format: Format, shared: bool) {
     let r = answer(shared);
     let expected = refuse(&r, shared);
     let mut out = Vec::new();
-    let sent = Cell::new(0);
+    let sent = RowCount::new();
     exact_refusal(format.write(&r, &mut out, &sent), expected);
     assert_eq!(sent.get(), 0);
     assert!(!out.windows(4).any(|b| b == b"null"));
@@ -168,7 +168,7 @@ fn after_prefix(format: Format, shared: bool) {
         observed: None,
         out: Vec::new(),
     };
-    let sent = Cell::new(0);
+    let sent = RowCount::new();
     let result = format.write(&r, &mut out, &sent);
     let expected = out
         .observed
@@ -226,7 +226,7 @@ impl Write for FailIo {
 fn an_actual_io_failure_keeps_its_kind_and_zero_accepted_rows() {
     for format in [Format::Native, Format::Tsv] {
         let r = answer(false);
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         assert!(
             matches!(format.write(&r, FailIo, &sent), Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe)
         );
@@ -296,7 +296,7 @@ fn one_cell_fits_but_the_complete_row_refuses_before_publication_and_recovers() 
     assert_eq!(r.test_context().live_bytes(), blocked);
     for format in [Format::Native, Format::Tsv] {
         let mut out = Vec::new();
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         let error = format.write(&r, &mut out, &sent).unwrap_err();
         assert!(
             matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory && b.limit == MB && b.requested > MB)
@@ -316,7 +316,7 @@ fn one_cell_fits_but_the_complete_row_refuses_before_publication_and_recovers() 
     drop(blocker);
     assert_eq!(r.test_context().live_bytes(), before);
     for format in [Format::Native, Format::Tsv] {
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         format.write(&r, Vec::new(), &sent).unwrap();
         assert_eq!(sent.get(), 1);
         assert_eq!(r.test_context().live_bytes(), before);
@@ -327,8 +327,8 @@ fn classifier_late_cap(shared: bool) {
     let r = answer(shared);
     let expected = Cell::new(None);
     let mut limited = LimitedWriter::new(Vec::new(), Some(0), None);
-    let sent = Cell::new(0);
-    let error = write_buffered(&mut limited, &sent, &mut |out, _| {
+    let sent = RowCount::new();
+    let error = write_buffered(&mut limited, &sent, None, &mut |out, _| {
         out.write_all(b"prefix").map_err(io)?;
         let budget = refuse(&r, shared);
         expected.set(Some(budget));
@@ -368,8 +368,8 @@ fn classifier_preserves_memory_refusal_before_later_cancellation() {
     let prior = CANCEL_CHECK_BYTES as usize - 1024;
     limited.write_all(&vec![b' '; prior]).unwrap();
     let expected = Cell::new(None);
-    let sent = Cell::new(0);
-    let error = write_buffered(&mut limited, &sent, &mut |out, _| {
+    let sent = RowCount::new();
+    let error = write_buffered(&mut limited, &sent, None, &mut |out, _| {
         out.write_all(&[b'x'; 1024]).map_err(io)?;
         let budget = refuse(&r, false);
         expected.set(Some(budget));
@@ -390,8 +390,8 @@ fn classifier_preserves_memory_refusal_before_later_cancellation() {
 #[test]
 fn classifier_still_translates_its_actual_io_refusals() {
     let mut limited = LimitedWriter::new(Vec::new(), Some(0), None);
-    let sent = Cell::new(0);
-    let error = write_buffered(&mut limited, &sent, &mut |out, _| {
+    let sent = RowCount::new();
+    let error = write_buffered(&mut limited, &sent, None, &mut |out, _| {
         out.write_all(b"prefix").map_err(io)
     })
     .unwrap_err();
@@ -402,7 +402,7 @@ fn classifier_still_translates_its_actual_io_refusals() {
     assert_eq!((limited.written(), sent.get()), (0, 0));
     let cancel = Arc::new(AtomicBool::new(true));
     let mut limited = LimitedWriter::new(Vec::new(), None, Some(cancel));
-    let error = write_buffered(&mut limited, &sent, &mut |out, _| {
+    let error = write_buffered(&mut limited, &sent, None, &mut |out, _| {
         out.write_all(&vec![b'x'; CANCEL_CHECK_BYTES as usize])
             .map_err(io)
     })
@@ -468,7 +468,7 @@ fn an_actual_parent_ownership_refusal_keeps_its_typed_source_through_serde() {
             "the result retains its own actual metadata/table credit"
         );
         refuse_positive.store(true, std::sync::atomic::Ordering::Relaxed);
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         let error = format.write(&r, Vec::new(), &sent).unwrap_err();
         let Error::Component(component) = error else {
             panic!("lost parent origin: {error:?}")
@@ -540,7 +540,7 @@ fn vocabulary_reconstruction_scratch_is_admitted_before_it_is_allocated() {
         .unwrap();
     let blocked = r.test_context().live_bytes();
     for format in [Format::Native, Format::Tsv] {
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         let error = format.write(&r, Vec::new(), &sent).unwrap_err();
         assert!(
             matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory && b.limit == MB),
@@ -552,7 +552,7 @@ fn vocabulary_reconstruction_scratch_is_admitted_before_it_is_allocated() {
     }
     drop(blocker);
     for format in [Format::Native, Format::Tsv] {
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         format.write(&r, Vec::new(), &sent).unwrap();
         assert_eq!(sent.get(), 2);
         assert_eq!(r.test_context().live_bytes(), before);
