@@ -1059,7 +1059,8 @@ fn root_of<'a, S: Sink>(x: &'a mut super::dl_rules::DlSt, out: &S) -> &'a mut Ro
 }
 
 /// The successors of a context: those it registered with over `f_e(x)` and over `f_e(u)`,
-/// and the EL successors of its unit existential restrictions.
+/// and the EL successors of its unit existential restrictions, other than those into a
+/// singleton, which name their constant in place of a successor (item 822).
 fn successors(ix: &Index, st: &State) -> Vec<Ex> {
     let mut v: Vec<Ex> = Vec::new();
     if let Some(x) = dl(st) {
@@ -1070,7 +1071,9 @@ fn successors(ix: &Index, st: &State) -> Vec<Ex> {
     }
     for &d in &st.subs {
         let h = ix.head(d);
-        if let Node::Exist(..) = h.node {
+        if let Node::Exist(..) = h.node
+            && super::dl_rules::into_nominal(ix, d).is_none()
+        {
             v.push(h.succ);
         }
     }
