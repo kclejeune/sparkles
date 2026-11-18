@@ -605,3 +605,101 @@ fn a_limit_reaches_the_remote_query() {
         }
     }
 }
+
+/// A remote loop runs as a cursor operator over its input's batches (item 829). It
+/// holds the rows of a partial bulk request until more inputs arrive and keeps the
+/// answers of the inputs it has sent, so at every batch size it sends the requests one
+/// eager run sends, with the same answer, the same counters and the same note, even
+/// when a later batch repeats an input.
+#[test]
+fn a_streamed_loop_sends_the_requests_of_an_eager_run() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let streamed = |q: &str, rows: usize| {
+        let o = CursorOptions {
+            batch_rows: rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c =
+            select_cursor(data.snapshot(), q, &opts(), &o).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let mut out = Vec::new();
+        while let Some(b) = c.next_batch().unwrap() {
+            for r in 0..b.len() {
+                out.push(
+                    b.row(r)
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .map(short)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        }
+        out.sort();
+        (out, format!("{:?}", c.plan()))
+    };
+    for q in [
+        // nine inputs, four to a request
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p FILTER(?p != <urn:person1>) }} }}",
+            ep.url()
+        ),
+        // each input twice, the second time in a later batch
+        format!(
+            "SELECT ?d ?x ?p {{ VALUES ?x {{ 1 2 }} ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p FILTER(?p != <urn:person1>) }} }}",
+            ep.url()
+        ),
+        // an optional loop keeps the rows without solutions
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> OPTIONAL {{ SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p FILTER(?p = <urn:person5>) }} }} }}",
+            ep.url()
+        ),
+    ] {
+        let expected = rows(&data, &q);
+        let eager = ep.take().len();
+        assert!(eager > 1, "{q}");
+        for batch in [1, 2, 3, 4096] {
+            let (answer, plan) = streamed(&q, batch);
+            assert_eq!(answer, expected, "{q}; {batch}");
+            let sent = ep.take().len();
+            assert_eq!(sent, eager, "{q}; {batch}: requests");
+            let note = format!("9 inputs, {eager} requests, 0 from the cache");
+            assert!(plan.contains(&note), "{q}; {batch}: {plan}");
+            assert!(
+                plan.contains(&format!("\"serviceRequests\": Number({eager})")),
+                "{plan}"
+            );
+        }
+    }
+    // a failing endpoint fails the stream, and SILENT gives each input one empty
+    // solution, as in eager runs
+    ep.failing.store(true, Ordering::SeqCst);
+    let loud = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let o = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut c = select_cursor(data.snapshot(), &loud, &opts(), &o).unwrap();
+    let mut failed = None;
+    loop {
+        match c.next_batch() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(matches!(failed, Some(Error::Service(_))), "{failed:?}");
+    let silent = loud.replace("SERVICE <", "SERVICE SILENT <");
+    assert_eq!(streamed(&silent, 1).0.len(), 9);
+    assert_eq!(streamed(&silent, 1).0, rows(&data, &silent));
+}

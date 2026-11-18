@@ -1068,6 +1068,34 @@ pub(super) struct LoopStats {
     pub solutions: usize,
 }
 
+impl LoopStats {
+    /// The note of the loop's plan node.
+    pub(super) fn note(&self) -> String {
+        format!(
+            "[{} inputs, {} requests, {} from the cache{}]",
+            self.inputs,
+            self.requests,
+            self.cache_hits,
+            if self.retried > 0 {
+                format!(", {} bulk requests cut short and sent again", self.retried)
+            } else {
+                String::new()
+            }
+        )
+    }
+
+    /// The counters of the loop's plan node.
+    pub(super) fn counters(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut c = serde_json::Map::new();
+        c.insert("serviceInputs".into(), self.inputs.into());
+        c.insert("serviceRequests".into(), self.requests.into());
+        c.insert("serviceCacheHits".into(), self.cache_hits.into());
+        c.insert("serviceRetried".into(), self.retried.into());
+        c.insert("serviceSolutions".into(), self.solutions.into());
+        c
+    }
+}
+
 /// Fail unless the request may call remote services.
 pub(super) fn check_allowed(ctx: &Ctx) -> Result<()> {
     if !ctx.allow_service {
@@ -1141,231 +1169,352 @@ pub(super) fn run_remote(
     l: &Table,
     vars: &[VarId],
 ) -> Result<(Table, LoopStats)> {
-    check_allowed(ctx)?;
-    let mut stats = LoopStats::default();
-    let names: Vec<String> = spec.keys.iter().map(|k| ctx.var_name(*k)).collect();
-    // the constants in force where the loop was planned
-    let mut outer = Subst::default();
-    for (v, id) in &spec.outer {
-        if spec.keys.contains(v) {
-            continue;
-        }
-        let n = ctx.var_name(*v);
-        if let Some(t) = ctx.term(*id) {
-            if spec.outer_scoped.contains(v) {
-                outer.hidden.insert(n.clone());
+    let mut run = RemoteRun::new(ctx, spec, rl)?;
+    run.add(ctx, spec, rl, l);
+    run.send(ctx, spec, rl, true)?;
+    let t = run.join(ctx, spec, l, vars)?;
+    Ok((t, run.stats))
+}
+
+/// A loop over a remote endpoint that takes its left rows in parts. It keeps the
+/// distinct inputs it has seen with their answers, and sends a bulk request only once
+/// it holds a full request of unanswered inputs or the left side has ended, so its
+/// requests are the ones one call over all of the rows sends.
+pub(super) struct RemoteRun {
+    names: Vec<String>,
+    /// the constants in force where the loop was planned
+    outer: Subst,
+    pattern: GraphPattern,
+    text: String,
+    caching: bool,
+    inputs: Vec<Input>,
+    by_values: FxHashMap<Vec<Option<Term>>, usize>,
+    /// the input of each distinct key of the left rows, and whether its solutions have
+    /// been counted
+    by_key: FxHashMap<Vec<Id>, (usize, bool)>,
+    /// the inputs that the cache did not have and no request has answered, in the order
+    /// they first appeared
+    missing: Vec<usize>,
+    pub stats: LoopStats,
+}
+
+impl RemoteRun {
+    pub(super) fn new(ctx: &Ctx, spec: &LateralSpec, rl: &RemoteLoop) -> Result<Self> {
+        check_allowed(ctx)?;
+        let names: Vec<String> = spec.keys.iter().map(|k| ctx.var_name(*k)).collect();
+        let mut outer = Subst::default();
+        for (v, id) in &spec.outer {
+            if spec.keys.contains(v) {
+                continue;
             }
-            outer.add(&n, t);
+            let n = ctx.var_name(*v);
+            if let Some(t) = ctx.term(*id) {
+                if spec.outer_scoped.contains(v) {
+                    outer.hidden.insert(n.clone());
+                }
+                outer.add(&n, t);
+            }
         }
+        let pattern = substitute(&spec.pattern, &outer);
+        let text = spec.pattern.to_string();
+        let cache = &ctx.snap.results.service;
+        let caching = rl.cache != CacheMode::None
+            && rl.cache != CacheMode::Off
+            && ctx.use_cache
+            && cache.enabled()
+            && !super::exec::is_local(ctx, rl.endpoint.as_str());
+        Ok(Self {
+            names,
+            outer,
+            pattern,
+            text,
+            caching,
+            inputs: Vec::new(),
+            by_values: FxHashMap::default(),
+            by_key: FxHashMap::default(),
+            missing: Vec::new(),
+            stats: LoopStats::default(),
+        })
     }
-    let pattern = substitute(&spec.pattern, &outer);
-    let text = spec.pattern.to_string();
-    // the left rows by their values of the keys, and the distinct inputs they give
-    let cols: Vec<Option<usize>> = spec.keys.iter().map(|k| l.col_of(*k)).collect();
-    let mut groups: FxHashMap<Vec<Id>, (usize, Vec<usize>)> = FxHashMap::default();
-    let mut order: Vec<Vec<Id>> = Vec::new();
-    let mut inputs: Vec<Input> = Vec::new();
-    let mut by_values: FxHashMap<Vec<Option<Term>>, usize> = FxHashMap::default();
-    for i in 0..l.len() {
-        let key: Vec<Id> = cols
+
+    /// The values of the keys in row `i` of `l`.
+    fn key(spec: &LateralSpec, l: &Table, i: usize) -> Vec<Id> {
+        spec.keys
             .iter()
-            .map(|c| c.map_or(Id::UNDEF, |c| l.cols[c][i]))
-            .collect();
-        if let Some(g) = groups.get_mut(&key) {
-            g.1.push(i);
-            continue;
-        }
-        let values: Vec<Option<Term>> = key
-            .iter()
-            .map(|id| {
-                (!id.is_undef())
-                    .then(|| ctx.term(*id))
-                    .flatten()
-                    .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_)))
-            })
-            .collect();
-        let n = inputs.len();
-        let input = *by_values.entry(values.clone()).or_insert_with(|| {
-            inputs.push(Input {
-                values,
-                key: None,
-                rows: None,
+            .map(|k| l.col_of(*k).map_or(Id::UNDEF, |c| l.cols[c][i]))
+            .collect()
+    }
+
+    /// Take the left rows `l`: their new distinct inputs, answered from the cache where
+    /// it has them.
+    pub(super) fn add(&mut self, ctx: &Ctx, spec: &LateralSpec, rl: &RemoteLoop, l: &Table) {
+        let first = self.inputs.len();
+        for i in 0..l.len() {
+            let key = Self::key(spec, l, i);
+            if self.by_key.contains_key(&key) {
+                continue;
+            }
+            let values: Vec<Option<Term>> = key
+                .iter()
+                .map(|id| {
+                    (!id.is_undef())
+                        .then(|| ctx.term(*id))
+                        .flatten()
+                        .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_)))
+                })
+                .collect();
+            let n = self.inputs.len();
+            let input = *self.by_values.entry(values.clone()).or_insert_with(|| {
+                self.inputs.push(Input {
+                    values,
+                    key: None,
+                    rows: None,
+                });
+                n
             });
-            n
-        });
-        order.push(key.clone());
-        groups.insert(key, (input, vec![i]));
+            self.by_key.insert(key, (input, false));
+        }
+        self.stats.inputs = self.inputs.len();
+        let cache = &ctx.snap.results.service;
+        for i in first..self.inputs.len() {
+            if self.caching {
+                let input = &mut self.inputs[i];
+                let mut kv: Vec<(&str, &Term)> = self
+                    .outer
+                    .map
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect();
+                for (n, t) in self.names.iter().zip(&input.values) {
+                    if let Some(t) = t {
+                        kv.push((n.as_str(), t));
+                    }
+                }
+                let k = svccache::key(&ctx.service_scope, rl.endpoint.as_str(), &self.text, &kv);
+                if rl.cache.reads() {
+                    input.rows = cache.get(&k);
+                    if input.rows.is_some() {
+                        self.stats.cache_hits += 1;
+                    }
+                } else {
+                    cache.remove(&k);
+                }
+                input.key = Some(k);
+            }
+            if self.inputs[i].rows.is_none() {
+                self.missing.push(i);
+            }
+        }
     }
-    stats.inputs = inputs.len();
-    // the cache
-    let cache = &ctx.snap.results.service;
-    let caching = rl.cache != CacheMode::None
-        && rl.cache != CacheMode::Off
-        && ctx.use_cache
-        && cache.enabled()
-        && !super::exec::is_local(ctx, rl.endpoint.as_str());
-    if caching {
-        for input in &mut inputs {
-            let mut kv: Vec<(&str, &Term)> =
-                outer.map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    /// Send the requests for the unanswered inputs: the full bulk requests among them,
+    /// and with `all` the last partial one too.
+    pub(super) fn send(
+        &mut self,
+        ctx: &Ctx,
+        spec: &LateralSpec,
+        rl: &RemoteLoop,
+        all: bool,
+    ) -> Result<()> {
+        let bulk = rl.bulk.max(1);
+        let ready = match all {
+            true => self.missing.len(),
+            false => self.missing.len() / bulk * bulk,
+        };
+        if ready == 0 {
+            return Ok(());
+        }
+        let missing: Vec<usize> = self.missing.drain(..ready).collect();
+        let (names, outer, pattern) = (&self.names, &self.outer, &self.pattern);
+        let (inputs, stats) = (&mut self.inputs, &mut self.stats);
+        let unit = || {
+            Arc::new(Rows {
+                vars: Vec::new(),
+                rows: vec![Vec::new()],
+            })
+        };
+        let one = |ctx: &Ctx, input: &Input, stats: &mut LoopStats| -> Result<Rows> {
+            let mut s = Subst {
+                hidden: outer.hidden.clone(),
+                ..Subst::default()
+            };
             for (n, t) in names.iter().zip(&input.values) {
                 if let Some(t) = t {
-                    kv.push((n.as_str(), t));
+                    s.add(n, t.clone());
                 }
             }
-            let k = svccache::key(&ctx.service_scope, rl.endpoint.as_str(), &text, &kv);
-            if rl.cache.reads() {
-                input.rows = cache.get(&k);
-                if input.rows.is_some() {
-                    stats.cache_hits += 1;
-                }
-            } else {
-                cache.remove(&k);
-            }
-            input.key = Some(k);
-        }
-    }
-    // the requests for the inputs the cache did not have
-    let missing: Vec<usize> = (0..inputs.len())
-        .filter(|i| inputs[*i].rows.is_none())
-        .collect();
-    let unit = || {
-        Arc::new(Rows {
-            vars: Vec::new(),
-            rows: vec![Vec::new()],
-        })
-    };
-    let one = |ctx: &Ctx, input: &Input, stats: &mut LoopStats| -> Result<Rows> {
-        let mut s = Subst {
-            hidden: outer.hidden.clone(),
-            ..Subst::default()
-        };
-        for (n, t) in names.iter().zip(&input.values) {
-            if let Some(t) = t {
-                s.add(n, t.clone());
-            }
-        }
-        s.map
-            .extend(outer.map.iter().map(|(k, v)| (k.clone(), v.clone())));
-        stats.requests += 1;
-        fetch_rows(
-            ctx,
-            &rl.endpoint,
-            &single_request(&substitute(&spec.pattern, &s)),
-        )
-    };
-    for chunk in missing.chunks(rl.bulk) {
-        ctx.check()?;
-        let fetched: Result<Vec<(usize, Rows, bool)>> = if chunk.len() == 1 {
-            one(ctx, &inputs[chunk[0]], &mut stats).map(|r| vec![(chunk[0], r, true)])
-        } else {
-            let query = if rl.values {
-                let tuples: Vec<&[Option<Term>]> =
-                    chunk.iter().map(|i| &inputs[*i].values[..]).collect();
-                values_request(&pattern, &names, &tuples, &rl.idx)
-            } else {
-                let members: Vec<GraphPattern> = chunk
-                    .iter()
-                    .map(|i| {
-                        let mut s = Subst::default();
-                        for (n, t) in names.iter().zip(&inputs[*i].values) {
-                            if let Some(t) = t {
-                                s.add(n, t.clone());
-                            }
-                        }
-                        substitute(&pattern, &s)
-                    })
-                    .collect();
-                union_request(&members, &rl.idx)
-            };
+            s.map
+                .extend(outer.map.iter().map(|(k, v)| (k.clone(), v.clone())));
             stats.requests += 1;
-            match fetch_rows(ctx, &rl.endpoint, &query) {
-                Ok(r) => match split(&r, &rl.idx, chunk.len()) {
-                    Some(parts) => Ok(chunk
+            fetch_rows(
+                ctx,
+                &rl.endpoint,
+                &single_request(&substitute(&spec.pattern, &s)),
+            )
+        };
+        let cache = &ctx.snap.results.service;
+        for chunk in missing.chunks(bulk) {
+            ctx.check()?;
+            let fetched: Result<Vec<(usize, Rows, bool)>> = if chunk.len() == 1 {
+                one(ctx, &inputs[chunk[0]], stats).map(|r| vec![(chunk[0], r, true)])
+            } else {
+                let query = if rl.values {
+                    let tuples: Vec<&[Option<Term>]> =
+                        chunk.iter().map(|i| &inputs[*i].values[..]).collect();
+                    values_request(pattern, names, &tuples, &rl.idx)
+                } else {
+                    let members: Vec<GraphPattern> = chunk
                         .iter()
-                        .copied()
-                        .zip(parts)
-                        .map(|(i, p)| (i, p, true))
-                        .collect()),
-                    None => {
-                        // cut short: one request per input
-                        stats.retried += 1;
-                        let mut out = Vec::new();
-                        let mut err = None;
-                        for i in chunk {
-                            match ctx.check().and_then(|()| one(ctx, &inputs[*i], &mut stats)) {
-                                Ok(r) => out.push((*i, r, true)),
-                                Err(e) => {
-                                    err = Some(e);
-                                    break;
+                        .map(|i| {
+                            let mut s = Subst::default();
+                            for (n, t) in names.iter().zip(&inputs[*i].values) {
+                                if let Some(t) = t {
+                                    s.add(n, t.clone());
                                 }
                             }
+                            substitute(pattern, &s)
+                        })
+                        .collect();
+                    union_request(&members, &rl.idx)
+                };
+                stats.requests += 1;
+                match fetch_rows(ctx, &rl.endpoint, &query) {
+                    Ok(r) => match split(&r, &rl.idx, chunk.len()) {
+                        Some(parts) => Ok(chunk
+                            .iter()
+                            .copied()
+                            .zip(parts)
+                            .map(|(i, p)| (i, p, true))
+                            .collect()),
+                        None => {
+                            // cut short: one request per input
+                            stats.retried += 1;
+                            let mut out = Vec::new();
+                            let mut err = None;
+                            for i in chunk {
+                                match ctx.check().and_then(|()| one(ctx, &inputs[*i], stats)) {
+                                    Ok(r) => out.push((*i, r, true)),
+                                    Err(e) => {
+                                        err = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            match err {
+                                Some(e) => Err(e),
+                                None => Ok(out),
+                            }
                         }
-                        match err {
-                            Some(e) => Err(e),
-                            None => Ok(out),
-                        }
-                    }
-                },
-                Err(e) => Err(e),
-            }
-        };
-        match fetched {
-            Ok(parts) => {
-                for (i, rows, complete) in parts {
-                    let rows = Arc::new(rows);
-                    if caching
-                        && complete
-                        && rl.cache.writes()
-                        && let Some(k) = &inputs[i].key
-                    {
-                        cache.put(k.clone(), rows.clone());
-                    }
-                    inputs[i].rows = Some(rows);
+                    },
+                    Err(e) => Err(e),
                 }
+            };
+            match fetched {
+                Ok(parts) => {
+                    for (i, rows, complete) in parts {
+                        let rows = Arc::new(rows);
+                        if self.caching
+                            && complete
+                            && rl.cache.writes()
+                            && let Some(k) = &inputs[i].key
+                        {
+                            cache.put(k.clone(), rows.clone());
+                        }
+                        inputs[i].rows = Some(rows);
+                    }
+                }
+                Err(e) => failed(e, rl, chunk, inputs, unit)?,
             }
-            Err(e) => failed(e, rl, chunk, &mut inputs, unit)?,
         }
+        Ok(())
     }
-    // join each group of left rows with its input's solutions
-    let mut rvars: Vec<VarId> = vars
-        .iter()
-        .copied()
-        .filter(|v| l.col_of(*v).is_none() || spec.keys.contains(v))
-        .collect();
-    rvars.dedup();
-    let expr = match &spec.optional {
-        Some(Some(e)) => Some(Planner::new(ctx).compile(e, &spec.graph)),
-        _ => None,
-    };
-    let mut out = Table::new(vars.to_vec());
-    for key in &order {
-        ctx.check()?;
-        let (input, idx) = &groups[key];
-        let input = &inputs[*input];
-        let Some(rows) = &input.rows else { continue };
-        let skip: FxHashSet<VarId> = spec
-            .keys
+
+    /// How many of the first rows of `l` have answered inputs. The unanswered inputs are
+    /// the last to appear, so every row before the first unanswered one is answered.
+    pub(super) fn answered(&self, spec: &LateralSpec, l: &Table) -> usize {
+        (0..l.len())
+            .find(|&i| {
+                self.by_key
+                    .get(&Self::key(spec, l, i))
+                    .is_none_or(|(input, _)| self.inputs[*input].rows.is_none())
+            })
+            .unwrap_or(l.len())
+    }
+
+    /// The bytes of the answers the loop holds.
+    pub(super) fn held_bytes(&self) -> u64 {
+        self.inputs
             .iter()
-            .zip(&input.values)
-            .filter(|(_, v)| v.is_some())
-            .map(|(k, _)| *k)
-            .collect();
-        let r = to_table(ctx, rows, &rvars, &skip);
-        stats.solutions += r.len();
-        let left_rows = l.take_rows(idx);
-        let joined = match &spec.optional {
-            Some(_) => {
-                let mut note = None;
-                left_join(ctx, &left_rows, &r, expr.as_ref(), &mut note)?
-            }
-            None if r.is_empty() => continue,
-            None => join_tables(ctx, &left_rows, &r, &[], false)?,
-        };
-        ctx.check_output(out.len() + joined.len(), vars.len())?;
-        out.append(joined.project(vars));
+            .filter_map(|input| input.rows.as_ref())
+            .map(|rows| rows.bytes())
+            .sum()
     }
-    Ok((out, stats))
+
+    /// Join the left rows `l`, whose inputs all have answers, with their solutions.
+    pub(super) fn join(
+        &mut self,
+        ctx: &Ctx,
+        spec: &LateralSpec,
+        l: &Table,
+        vars: &[VarId],
+    ) -> Result<Table> {
+        // the left rows by their values of the keys, in the order they first appear
+        let mut groups: FxHashMap<Vec<Id>, Vec<usize>> = FxHashMap::default();
+        let mut order: Vec<Vec<Id>> = Vec::new();
+        for i in 0..l.len() {
+            let key = Self::key(spec, l, i);
+            if let Some(g) = groups.get_mut(&key) {
+                g.push(i);
+                continue;
+            }
+            order.push(key.clone());
+            groups.insert(key, vec![i]);
+        }
+        let mut rvars: Vec<VarId> = vars
+            .iter()
+            .copied()
+            .filter(|v| l.col_of(*v).is_none() || spec.keys.contains(v))
+            .collect();
+        rvars.dedup();
+        let expr = match &spec.optional {
+            Some(Some(e)) => Some(Planner::new(ctx).compile(e, &spec.graph)),
+            _ => None,
+        };
+        let mut out = Table::new(vars.to_vec());
+        for key in &order {
+            ctx.check()?;
+            let idx = &groups[key];
+            let Some((input, counted)) = self.by_key.get_mut(key) else {
+                return Err(Error::invalid("a remote loop row has no input"));
+            };
+            let input = &self.inputs[*input];
+            let Some(rows) = &input.rows else { continue };
+            let skip: FxHashSet<VarId> = spec
+                .keys
+                .iter()
+                .zip(&input.values)
+                .filter(|(_, v)| v.is_some())
+                .map(|(k, _)| *k)
+                .collect();
+            let r = to_table(ctx, rows, &rvars, &skip);
+            // one eager call counts the solutions of each key once
+            if !std::mem::replace(counted, true) {
+                self.stats.solutions += r.len();
+            }
+            let left_rows = l.take_rows(idx);
+            let joined = match &spec.optional {
+                Some(_) => {
+                    let mut note = None;
+                    left_join(ctx, &left_rows, &r, expr.as_ref(), &mut note)?
+                }
+                None if r.is_empty() => continue,
+                None => join_tables(ctx, &left_rows, &r, &[], false)?,
+            };
+            ctx.check_output(out.len() + joined.len(), vars.len())?;
+            out.append(joined.project(vars));
+        }
+        Ok(out)
+    }
 }
 
 /// A failed request: a refusal and a spent budget always fail the query; with SILENT,

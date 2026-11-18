@@ -1,0 +1,170 @@
+//! Operators that read all of their input before they answer, and whose answer is
+//! bounded: a vector or hybrid search that ranks the candidate subjects of its whole
+//! input against its global `k` or limit, a path search over its group under a limit,
+//! which takes its paths in one order across all of its sources, and an algorithm call
+//! over its group, which runs once from all of its sources.
+//!
+//! The operator reads each input cursor's batches into a charged table, so a budget
+//! that cannot hold the input refuses the query as a sort without spill does. When the
+//! input has ended it calls the kernel once, charges the answer and serves it batch by
+//! batch. It calls the kernel functions itself rather than the eager executor's node
+//! dispatch.
+use super::{Buffer, CursorOptions, Operator, capacity_bytes, copy_rows, merge};
+use crate::error::Result;
+use crate::sparql::ctx::{Ctx, OwnedCharge};
+use crate::sparql::plan::{Kind, Node};
+use crate::sparql::table::{Table, VarId};
+use std::sync::Arc;
+
+/// Whether a plan node runs as a whole-input operator.
+pub(super) fn eligible(node: &Node) -> bool {
+    let reads = super::leaf::reads_group(node);
+    match &node.kind {
+        Kind::VectorSearch(spec) => {
+            spec.candidates && !spec.order_fallback && node.children.len() == 1
+        }
+        Kind::HybridSearch(spec) => {
+            spec.vector.as_ref().is_some_and(|v| v.candidates) && node.children.len() == 1
+        }
+        Kind::PathSearch(spec) => reads && spec.limit.is_some(),
+        // Decision 2 of the X14 plan counts an algorithm call as bounded.
+        Kind::AlgoCall(_) => reads,
+        _ => false,
+    }
+}
+
+/// The bound on the answer of a whole-input operator, for its plan's reason.
+pub(super) fn bound(node: &Node) -> Option<usize> {
+    match &node.kind {
+        Kind::VectorSearch(spec) => Some(spec.k),
+        Kind::HybridSearch(spec) => Some(spec.limit),
+        Kind::PathSearch(spec) => spec.limit,
+        _ => None,
+    }
+}
+
+pub(super) struct Whole {
+    node: Node,
+    answer: Option<Buffer>,
+    at: usize,
+    /// The kernel's counters and the note of its plan node, once it has run.
+    pub(super) counters: Option<serde_json::Map<String, serde_json::Value>>,
+    note: Option<String>,
+}
+
+impl Whole {
+    pub(super) fn new(node: Node) -> Self {
+        Self {
+            node,
+            answer: None,
+            at: 0,
+            counters: None,
+            note: None,
+        }
+    }
+
+    /// The description of the plan node with the kernel's note, once it has run.
+    pub(super) fn description(&self) -> Option<String> {
+        self.note
+            .as_ref()
+            .map(|note| format!("{} {note}", self.node.desc))
+    }
+
+    pub(super) fn done(&self) -> bool {
+        self.answer.is_none() && self.counters.is_some()
+    }
+
+    pub(super) fn next(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        children: &mut [Operator],
+        options: &CursorOptions,
+        order: &[VarId],
+        vars: &[VarId],
+        cap: usize,
+    ) -> Result<Option<Buffer>> {
+        if self.counters.is_none() {
+            let mut inputs = Vec::with_capacity(children.len());
+            for child in children.iter_mut() {
+                inputs.push(read(ctx, child, options)?);
+            }
+            let mut answer = self.run(ctx, &mut inputs)?;
+            drop(inputs);
+            if !answer.table.sorted.starts_with(order) {
+                // Row indices and the reordered copy coexist with the answer.
+                answer.charge.resize(
+                    capacity_bytes(&answer.table)
+                        .saturating_mul(2)
+                        .saturating_add(answer.table.len as u64 * 8),
+                )?;
+                answer.table.sort_by_vars(order);
+                ctx.check()?;
+                answer.charge.resize(capacity_bytes(&answer.table))?;
+            }
+            answer.project(vars)?;
+            if !answer.table.is_empty() {
+                self.answer = Some(answer);
+            }
+        }
+        let Some(answer) = &self.answer else {
+            return Ok(None);
+        };
+        if self.at == 0 && answer.table.len <= cap {
+            return Ok(self.answer.take());
+        }
+        let batch = copy_rows(ctx, &answer.table, self.at, cap)?;
+        self.at += batch.as_ref().map_or(0, |b| b.table.len);
+        if self.at >= answer.table.len {
+            self.answer = None;
+        }
+        Ok(batch)
+    }
+
+    /// Run the kernel once over the charged input tables, which it takes.
+    fn run(&mut self, ctx: &Arc<Ctx>, inputs: &mut [Buffer]) -> Result<Buffer> {
+        let last = inputs.len().saturating_sub(1);
+        let mut take =
+            |i: usize| -> Table { std::mem::replace(&mut inputs[i].table, Table::new(Vec::new())) };
+        let vars = &self.node.vars;
+        let (table, counters, lease) = match &self.node.kind {
+            Kind::VectorSearch(spec) => {
+                let (t, c) = crate::sparql::exec::vector_search(ctx, spec, Some(take(0)), vars)?;
+                (t, c, None)
+            }
+            Kind::HybridSearch(spec) => {
+                let input = take(0);
+                let mut note = None;
+                let (t, c) = crate::sparql::hybrid::search_bound(ctx, spec, &input, &mut note)?;
+                self.note = note;
+                (t.project(vars), c, None)
+            }
+            Kind::PathSearch(spec) => {
+                let edges = spec.edge_pattern.is_some().then(|| take(last));
+                let (t, c) = crate::sparql::pathsearch::run(ctx, spec, Some(take(0)), edges, vars)?;
+                (t, c, None)
+            }
+            Kind::AlgoCall(spec) => {
+                let edges = spec.proj.pattern.is_some().then(|| take(last));
+                let (t, c) = crate::sparql::algosvc::run(ctx, spec, Some(take(0)), edges, vars)?;
+                (t.table, c, t.lease)
+            }
+            _ => unreachable!("{} is not a whole-input operator", self.node.operator()),
+        };
+        self.counters = Some(counters);
+        let mut lease = lease;
+        let charge = match lease.is_some() {
+            true => OwnedCharge::adopt(ctx, &mut lease)?,
+            false => OwnedCharge::new(ctx, capacity_bytes(&table))?,
+        };
+        Ok(Buffer { table, charge })
+    }
+}
+
+/// Read every batch of `child` into one charged table.
+fn read(ctx: &Arc<Ctx>, child: &mut Operator, options: &CursorOptions) -> Result<Buffer> {
+    let mut input = Buffer::new(ctx, &child.vars, 0)?;
+    while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
+        merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
+    }
+    Ok(input)
+}

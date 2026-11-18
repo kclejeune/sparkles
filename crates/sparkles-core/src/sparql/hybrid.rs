@@ -504,7 +504,23 @@ pub(super) fn search(ctx: &Ctx, spec: &HybridSpec, vars: &[VarId]) -> Result<(Ta
 }
 
 /// The most distinct pairs of query values a call over its group runs.
-const MAX_QUERIES: usize = 1000;
+pub(super) const MAX_QUERIES: usize = 1000;
+
+/// The pair of text and vector query values of each row of `input`, as a call over its
+/// group searches them, or `None` for a row that lacks a value the call needs.
+pub(super) fn query_key<'a>(
+    spec: &HybridSpec,
+    input: &'a Table,
+) -> impl Fn(usize) -> Option<(Id, Id)> + 'a {
+    let (qt, qv) = (spec.text_query_var(), spec.vector_query_var());
+    let col = |v: Option<VarId>| v.and_then(|v| input.col_of(v));
+    let (ct, cv) = (col(qt), col(qv));
+    move |r| {
+        let t = ct.map_or(Id::UNDEF, |c| input.get(r, c));
+        let v = cv.map_or(Id::UNDEF, |c| input.get(r, c));
+        ((qt.is_none() || t != Id::UNDEF) && (qv.is_none() || v != Id::UNDEF)).then_some((t, v))
+    }
+}
 
 /// Evaluate a call over the rows of its group: one fusion per distinct pair of text and
 /// vector query values, with `candidates:join` among the subjects of its rows, each joined
@@ -518,8 +534,6 @@ pub(super) fn search_bound(
     let mut counters = serde_json::Map::new();
     let (qt, qv) = (spec.text_query_var(), spec.vector_query_var());
     let candidates = spec.vector.as_ref().is_some_and(|v| v.candidates);
-    let col = |v: Option<VarId>| v.and_then(|v| input.col_of(v));
-    let (ct, cv) = (col(qt), col(qv));
     let cs = match spec.subject {
         PathEnd::Var(s) if candidates => input.col_of(s),
         _ => None,
@@ -527,12 +541,11 @@ pub(super) fn search_bound(
     // the rows of each pair of query values (a row without a needed value has none)
     let mut groups: FxHashMap<(Id, Id), Vec<usize>> = FxHashMap::default();
     let mut order = Vec::new();
+    let key = query_key(spec, input);
     for r in 0..input.len() {
-        let t = ct.map_or(Id::UNDEF, |c| input.get(r, c));
-        let v = cv.map_or(Id::UNDEF, |c| input.get(r, c));
-        if (qt.is_some() && t == Id::UNDEF) || (qv.is_some() && v == Id::UNDEF) {
+        let Some((t, v)) = key(r) else {
             continue;
-        }
+        };
         groups
             .entry((t, v))
             .or_insert_with(|| {

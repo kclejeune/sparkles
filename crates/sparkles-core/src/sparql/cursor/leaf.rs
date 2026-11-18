@@ -1,21 +1,18 @@
-//! Operators whose eager kernel answers a whole table at once, run as cursor operators
-//! of their own. Two forms count as native.
+//! Operators whose eager kernel answers a whole table at once. There are two forms.
 //!
-//! A whole-input operator reads every batch of its input cursors into charged tables,
-//! runs its kernel once when they are exhausted, and serves the kernel's charged output
-//! batch by batch, as a sort does. Its inputs stream as cursors of their own. This is
-//! the form of a kernel that needs all of its input before it can answer any row: a
-//! vector or hybrid search that ranks candidates from its input, a path search or an
-//! algorithm call over its group or an edge pattern, a registered property function
-//! that does not declare a prefix output, whose calls may have effects, a spatial join
-//! that builds over its input, and a path of a shape the walk and the expansion do not
-//! take.
+//! A whole-input form needs all of its input before it can answer any row: a vector or
+//! hybrid search that ranks candidates from its input, a path search or an algorithm
+//! call over its group, a registered property function that does not declare a prefix
+//! output, whose calls may have effects, a spatial join that builds over its input, and
+//! a path of a shape the walk and the expansion do not take. The bounded ones among
+//! them run as operators of their own (see `whole`), and the strict policy refuses the
+//! rest until their kinds have readers.
 //!
-//! A bounded leaf reads no input. It runs its kernel once into a charged table and
-//! serves it batch by batch. It counts as native only when its answer is bounded by
-//! `k`, `maxHits` or a limit the planner pushed into the call, or when it is an
-//! algorithm call, under decision 2 of the X14 plan. A leaf without such a bound runs
-//! the same way, but it is a materialization that the strict policy refuses.
+//! A leaf reads no group. It runs its kernel once into a charged table and serves it
+//! batch by batch. It counts as native only when its answer is bounded by `k`,
+//! `maxHits` or a limit the planner pushed into the call, or when it is an algorithm
+//! call, under decision 2 of the X14 plan. A leaf without such a bound runs the same
+//! way, but it is a materialization that the strict policy refuses.
 use crate::sparql::plan::{Kind, Node};
 
 /// How an operator without an incremental cursor runs.
@@ -29,18 +26,47 @@ pub(super) enum Form {
 
 impl Form {
     /// Whether the form counts as a native operator, which the strict policy admits.
+    /// A whole-input form counts only once its kind has an operator of its own that
+    /// reads its input batches under a charge (none does so far), and a leaf only when
+    /// its answer is bounded.
     pub(super) fn native(self) -> bool {
         match self {
-            Form::WholeInput => true,
+            Form::WholeInput => false,
             Form::Leaf { bound } => bound.is_some(),
         }
     }
 }
 
+/// Whether the kernel of `node` reads the rest of its group as its first child, as
+/// `exec::run_node` decides. A path search or an algorithm call also has the nested
+/// pattern of its edges as its last child, which is not its input.
+pub(super) fn reads_group(node: &Node) -> bool {
+    let edges = match &node.kind {
+        Kind::PathSearch(spec) => spec.edge_pattern.is_some(),
+        Kind::AlgoCall(spec) => spec.proj.pattern.is_some(),
+        _ => false,
+    };
+    let reads = node.children.len() > usize::from(edges);
+    debug_assert!(
+        match &node.kind {
+            Kind::PathSearch(spec) => reads == spec.needs_input(),
+            Kind::AlgoCall(spec) => reads == spec.needs_input(),
+            Kind::TextSearch(spec) => reads == spec.needs_input(),
+            Kind::VectorSearch(spec) if !spec.order_fallback => reads == spec.needs_input(),
+            Kind::HybridSearch(spec) => reads == spec.needs_input(),
+            Kind::SpatialPf(spec) => reads == spec.needs_input(),
+            Kind::PropertyFn(spec) => reads == spec.needs_input(),
+            _ => true,
+        },
+        "{} reads its group exactly when its specification needs input",
+        node.operator()
+    );
+    reads
+}
+
 /// The form of `node`, for a kind whose kernel runs once over whole tables, or `None`
 /// for one that is not such a kind.
 pub(super) fn form(node: &Node) -> Option<Form> {
-    let leaf = node.children.is_empty();
     let bound = match &node.kind {
         // A vector search below an ORDER BY runs its generic plan itself when too few
         // rows have a score, so its subtree is eager.
@@ -63,16 +89,15 @@ pub(super) fn form(node: &Node) -> Option<Form> {
         | Kind::SpatialJoin(_)
         | Kind::Path { .. }
         | Kind::Lateral(_)
-            if !leaf =>
+            if !node.children.is_empty() =>
         {
             return Some(Form::WholeInput);
         }
         _ => return None,
     };
-    Some(if leaf {
-        Form::Leaf { bound }
-    } else {
-        Form::WholeInput
+    Some(match reads_group(node) {
+        true => Form::WholeInput,
+        false => Form::Leaf { bound },
     })
 }
 

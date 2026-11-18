@@ -35,6 +35,7 @@ mod merge;
 mod ripple;
 mod topk;
 mod walk;
+mod whole;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FallbackPolicy {
@@ -1494,7 +1495,7 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
             && (supported(&node.kind)
                 || binary::eligible(node)
                 || group::eligible(ctx, node)
-                || expand::eligible(node)
+                || expand::auto_eligible(node)
                 || walk::eligible(node)
                 || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
                     && node.children.len() == 1))
@@ -2479,6 +2480,7 @@ enum State {
     RunGroup(Box<group::RunGroup>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
+    Whole(Box<whole::Whole>),
     Walk(Box<walk::Walk>),
     Scan(Scan),
     /// `spk:hasPredicate` read from the predicate patterns, a block of subjects at a time.
@@ -2841,6 +2843,8 @@ impl Operator {
         let run_group = exists_streams && group::runs_eligible(ctx, &node);
         let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
+        // A bounded kernel that needs all of its input reads it under a charge first.
+        let whole_input = exists_streams && whole::eligible(&node);
         // A pattern count over an input reads all of it, as a sort does, and then has one
         // row per predicate.
         let native_blocking = matches!(
@@ -2860,6 +2864,7 @@ impl Operator {
             && !run_group
             && !expanding
             && !walking
+            && !whole_input
             && !index_topk
             && !pattern_counts
             && (!native_blocking || !exists_streams);
@@ -3089,7 +3094,7 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group).then(|| {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input).then(|| {
             if let Kind::OrderedTopK(spec) = &node.kind {
                 format!(
                     "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
@@ -3111,6 +3116,17 @@ impl Operator {
                     "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
                     node.operator()
                 )
+            } else if whole_input {
+                match whole::bound(&node) {
+                    Some(k) => format!(
+                        "{} reads all of its input under the memory budget, runs once and serves its answer of at most {k} rows",
+                        node.operator()
+                    ),
+                    None => format!(
+                        "{} reads all of its input under the memory budget, runs once and serves its charged answer",
+                        node.operator()
+                    ),
+                }
             } else if native {
                 leaf::reason(&node, leaf::form(&node).expect("a native form"))
             } else if !materializes {
@@ -3143,6 +3159,8 @@ impl Operator {
             State::TopK(Box::new(topk::TopK::new(ctx, &node, &children[0].vars)?))
         } else if expanding {
             State::Expand(Box::new(expand::Expand::new(node)))
+        } else if whole_input {
+            State::Whole(Box::new(whole::Whole::new(node)))
         } else if walking {
             State::Walk(Box::new(walk::Walk::new(ctx, &node)?))
         } else if native_blocking {
@@ -3400,6 +3418,7 @@ impl Operator {
                         | State::Scalar(_)
                         | State::Counts { .. }
                         | State::Blocking { .. }
+                        | State::Whole(_)
                         | State::TopK(_)
                         | State::IndexTopK(_)
                 ),
@@ -3416,6 +3435,12 @@ impl Operator {
         plan.complete = self.done;
         if self.info.counters.is_some() {
             plan.operator.counters.clone_from(&self.info.counters);
+        }
+        // An expanding or whole-input kernel notes its runs in its description.
+        if matches!(self.state, State::Expand(_) | State::Whole(_))
+            && plan.operator.description != self.info.description
+        {
+            plan.operator.description.clone_from(&self.info.description);
         }
         fn update(info: &PlanInfo, plan: &mut CursorPlan) {
             plan.operator.actual_rows = info.actual_rows;
@@ -3602,6 +3627,7 @@ impl Operator {
                             | State::Scalar(_)
                             | State::Counts { .. }
                             | State::Expand(_)
+                            | State::Whole(_)
                     )
                 {
                     ctx.produced(b.table.len)?;
@@ -3735,10 +3761,31 @@ impl Operator {
                     self.done = walk.done();
                     batch
                 }
+                State::Whole(whole) => {
+                    let batch = whole.next(
+                        ctx,
+                        &mut self.children,
+                        options,
+                        &self.order,
+                        &self.vars,
+                        cap,
+                    )?;
+                    if let Some(counters) = &whole.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(description) = whole.description() {
+                        self.info.description = description;
+                    }
+                    self.done = whole.done();
+                    batch
+                }
                 State::Expand(expand) => {
                     let batch = expand.next(ctx, &mut self.children, options, &self.vars, cap)?;
                     if let Some(counters) = expand.counters() {
                         self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(description) = expand.description() {
+                        self.info.description = description;
                     }
                     let input = self.children.last().is_none_or(|c| c.done);
                     self.done = expand.done(input);

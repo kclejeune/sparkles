@@ -1864,3 +1864,56 @@ fn text_searches_run_as_cursor_operators() {
     assert!(c.plan().has_materialization());
     assert_eq!(bag(c), eager(&unbounded));
 }
+
+/// A streamed text search over its group holds the cap on distinct query strings across
+/// its input's batches, so a stream of small batches refuses the input that one eager
+/// call refuses (item 829).
+#[test]
+fn a_streamed_text_search_holds_the_query_cap_across_batches() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let s = mem();
+    let values = |n: usize| {
+        (0..n)
+            .map(|i| format!("\"q{i}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let q = |n: usize| {
+        format!(
+            "{P}SELECT ?q ?s {{ VALUES ?q {{ {} }} ?s text:query ?q }}",
+            values(n)
+        )
+    };
+    let run = |q: &str, rows: usize| -> sparkles_core::Result<usize> {
+        let o = CursorOptions {
+            batch_rows: rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &o)?;
+        let mut n = 0;
+        while let Some(b) = c.next_batch()? {
+            n += b.len();
+        }
+        Ok(n)
+    };
+    // at the cap both modes answer
+    assert!(query(s.snapshot(), &q(1000), &QueryOptions::default()).is_ok());
+    for rows in [1, 7, 4096] {
+        assert!(run(&q(1000), rows).is_ok(), "{rows}");
+    }
+    // one more distinct string fails both
+    assert!(matches!(
+        query(s.snapshot(), &q(1001), &QueryOptions::default()),
+        Err(sparkles_core::Error::BudgetExceeded(_))
+    ));
+    for rows in [1, 7, 4096] {
+        assert!(
+            matches!(
+                run(&q(1001), rows),
+                Err(sparkles_core::Error::BudgetExceeded(_))
+            ),
+            "{rows}"
+        );
+    }
+}

@@ -1468,24 +1468,8 @@ fn run_node<'ctx>(
             let l = child(0, infos)?;
             let rl = spec.service.as_deref().expect("a remote loop");
             let (t, st) = super::enhancer::run_remote(ctx, spec, rl, &l, &n.vars)?;
-            note = Some(format!(
-                "[{} inputs, {} requests, {} from the cache{}]",
-                st.inputs,
-                st.requests,
-                st.cache_hits,
-                if st.retried > 0 {
-                    format!(", {} bulk requests cut short and sent again", st.retried)
-                } else {
-                    String::new()
-                }
-            ));
-            let mut c = Counters::new();
-            c.insert("serviceInputs".into(), st.inputs.into());
-            c.insert("serviceRequests".into(), st.requests.into());
-            c.insert("serviceCacheHits".into(), st.cache_hits.into());
-            c.insert("serviceRetried".into(), st.retried.into());
-            c.insert("serviceSolutions".into(), st.solutions.into());
-            counters = Some(c);
+            note = Some(st.note());
+            counters = Some(st.counters());
             t
         }
         Kind::Lateral(spec) => {
@@ -8273,7 +8257,7 @@ fn entity_vector(
 }
 
 /// Distinct query vectors a variable query may bind.
-const MAX_QUERY_VECTORS: usize = 1000;
+pub(super) const MAX_QUERY_VECTORS: usize = 1000;
 
 /// The IRI of a search's predicate.
 fn pred_iri(ctx: &Ctx, pred: Id) -> Option<String> {
@@ -8394,7 +8378,7 @@ fn text_pushdown(ctx: &Ctx, l: &Table, right: &Node) -> Result<Option<(Table, Pl
 }
 
 /// The most distinct query strings a `text:query` call with a variable query runs.
-const MAX_TEXT_QUERIES: usize = 1000;
+pub(super) const MAX_TEXT_QUERIES: usize = 1000;
 
 /// A `text:query` call whose query string is a variable that its input binds: one
 /// search per distinct value, joined with the input rows of that value. A value that is
