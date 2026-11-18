@@ -2539,10 +2539,15 @@ struct Operator {
     bind_reuse: Option<Box<bind::Reuse>>,
     /// Whether the operator and those below it released what they hold for reading.
     released: bool,
-    /// Whether the operator's rows stay out of the produced-row count and the row limit,
-    /// because an eager operator that runs this tree counts and checks them as its own,
-    /// or because, as the pairs below a count over a join, no eager operator holds them.
+    /// Whether the operator's rows stay out of the produced-row count, because an eager
+    /// operator that runs this tree counts them as its own.
     uncounted: bool,
+    /// For the join below a count over a join, whether the eager count admits the pairs
+    /// as an intermediate result (`countjoin::eager_checks_pairs`). Such a join counts
+    /// none of its rows as produced. With `true` it holds the pairs so far to the row
+    /// limit and, with the rows produced so far, to the work limit, as the eager
+    /// admission does once for all of them, and with `false` it checks neither.
+    count_pairs: Option<bool>,
     /// The variables every output batch, and the concatenation of all of them, is
     /// sorted on in raw ID order. It is fixed when the operator is built, and each
     /// output batch carries it.
@@ -2832,6 +2837,7 @@ impl Operator {
         ctx.check()?;
         // A count over a join runs the join and counts its rows.
         let count_join = matches!(node.kind, Kind::CountJoin { .. });
+        let count_pairs = countjoin::eager_checks_pairs(&node);
         let mut node = countjoin::rewrite(ctx, node);
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
@@ -3225,11 +3231,12 @@ impl Operator {
         {
             order.clear();
         }
-        // The pairs of the join below a count over a join are no rows of the eager
-        // count, which counts its inputs and its one row and never holds the pairs, so
-        // they stay out of the count and the row limit.
-        if count_join && let Some(join) = children.first_mut() {
-            join.uncounted = true;
+        // The pairs of the join below a count over a join are no rows the eager count
+        // produces, and it admits them only when it forms them.
+        if let Some(checks) = count_pairs
+            && let Some(join) = children.first_mut()
+        {
+            join.count_pairs = Some(checks);
         }
         let ahead = (reads_ahead && matches!(state, State::Unary(_))).then(Box::default);
         Ok(Self {
@@ -3245,6 +3252,7 @@ impl Operator {
             bind_reuse,
             released: false,
             uncounted: false,
+            count_pairs: None,
             order,
             #[cfg(debug_assertions)]
             last: None,
@@ -3295,6 +3303,7 @@ impl Operator {
             bind_reuse: None,
             released: false,
             uncounted: false,
+            count_pairs: None,
             order,
             #[cfg(debug_assertions)]
             last: None,
@@ -3509,13 +3518,24 @@ impl Operator {
             return Ok(None);
         }
         let began = Instant::now();
-        let count = merge.count(ctx, &mut self.children, options, !self.uncounted)?;
+        let count = merge.count(
+            ctx,
+            &mut self.children,
+            options,
+            self.count_pairs != Some(false),
+        )?;
         self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
         self.rows =
             usize::try_from(count).map_err(|_| Error::invalid("cursor row count overflow"))?;
-        if !self.uncounted {
-            ctx.check_rows(self.rows)?;
-            ctx.produced(self.rows)?;
+        match self.count_pairs {
+            None => {
+                ctx.check_rows(self.rows)?;
+                if !self.uncounted {
+                    ctx.produced(self.rows)?;
+                }
+            }
+            Some(true) => ctx.check_output_rows(self.rows)?,
+            Some(false) => {}
         }
         self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
         self.done = true;
@@ -3585,9 +3605,15 @@ impl Operator {
                     .rows
                     .checked_add(rows)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                if !self.uncounted {
-                    ctx.check_rows(self.rows)?;
-                    ctx.produced(rows)?;
+                match self.count_pairs {
+                    None => {
+                        ctx.check_rows(self.rows)?;
+                        if !self.uncounted {
+                            ctx.produced(rows)?;
+                        }
+                    }
+                    Some(true) => ctx.check_output_rows(self.rows)?,
+                    Some(false) => {}
                 }
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
@@ -3628,11 +3654,14 @@ impl Operator {
                     .rows
                     .checked_add(b.table.len)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                if !self.uncounted {
-                    ctx.check_rows(self.rows)?;
+                match self.count_pairs {
+                    None => ctx.check_rows(self.rows)?,
+                    Some(true) => ctx.check_output_rows(self.rows)?,
+                    Some(false) => {}
                 }
                 // Eager kernels already counted all their operator work during execution.
                 if !self.uncounted
+                    && self.count_pairs.is_none()
                     && !matches!(
                         self.state,
                         State::Fallback { .. }

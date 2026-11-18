@@ -1171,7 +1171,9 @@ pub(super) fn run_remote(
 ) -> Result<(Table, LoopStats)> {
     let mut run = RemoteRun::new(ctx, spec, rl)?;
     run.add(ctx, spec, rl, l);
-    run.send(ctx, spec, rl, true)?;
+    // The eager loop keeps its answers outside the memory charge until it joins them,
+    // and admits the joined rows.
+    run.send(ctx, spec, rl, true, &mut |_| Ok(()))?;
     let t = run.join(ctx, spec, l, vars)?;
     Ok((t, run.stats))
 }
@@ -1338,13 +1340,16 @@ impl RemoteRun {
     }
 
     /// Send the requests for the unanswered inputs: the full bulk requests among them,
-    /// and with `all` the last partial one too.
+    /// and with `all` the last partial one too. After each request it passes `admit` the
+    /// bytes the loop then holds ([`RemoteRun::held_bytes`]), so a caller that charges
+    /// them refuses the loop before it sends the next request.
     pub(super) fn send(
         &mut self,
         ctx: &Ctx,
         spec: &LateralSpec,
         rl: &RemoteLoop,
         all: bool,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         let bulk = rl.bulk.max(1);
         let ready = match all {
@@ -1355,6 +1360,7 @@ impl RemoteRun {
             return Ok(());
         }
         let missing: Vec<usize> = self.missing.drain(..ready).collect();
+        let (mut held, kept) = (self.held, self.kept);
         let (names, outer, pattern) = (&self.names, &self.outer, &self.pattern);
         let (inputs, stats) = (&mut self.inputs, &mut self.stats);
         let unit = || {
@@ -1455,13 +1461,15 @@ impl RemoteRun {
                 }
                 Err(e) => failed(e, rl, chunk, inputs, unit)?,
             }
+            let answered: u64 = chunk
+                .iter()
+                .filter_map(|&i| inputs[i].rows.as_ref())
+                .map(|rows| rows.bytes())
+                .sum();
+            held = held.saturating_add(answered);
+            self.held = held;
+            admit(held.saturating_add(kept))?;
         }
-        let answered: u64 = missing
-            .iter()
-            .filter_map(|&i| self.inputs[i].rows.as_ref())
-            .map(|rows| rows.bytes())
-            .sum();
-        self.held = self.held.saturating_add(answered);
         Ok(())
     }
 

@@ -3357,77 +3357,136 @@ fn count_join_counts_a_streamed_join() {
     fn has(plan: &sparkles_core::sparql::CursorPlan, op: &str) -> bool {
         plan.operator.operator == op || plan.children.iter().any(|c| has(c, op))
     }
-    for q in [
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
-        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o > 1000) ?s <urn:q> ?t }",
-        // 1140 pairs of inputs with at most 60 rows each
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:r> ?g FILTER(?s != <urn:s:0>) ?t <urn:r> ?g }",
+    let pairs = |n: usize, undef: bool| {
+        (0..n)
+            .map(|i| match undef && i % 4 == 0 {
+                true => format!("(UNDEF {i})"),
+                false => format!("(<urn:s:{}> {i})", i % 2),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let two_keys = (0..20)
+        .map(|i| format!("(1 1 {i})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (q, count_join) in [
+        // a merge join on one key, which eager counts from its key runs
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        // a hash join over a union, whose pairs eager forms
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o > 1000) ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        // 1180 pairs of inputs with at most 60 rows each
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:r> ?g FILTER(?s != <urn:s:0>) ?t <urn:r> ?g }".to_string(),
+            true,
+        ),
+        // two shared variables, 400 pairs
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES (?a ?b ?i) {{ {two_keys} }} VALUES (?a ?b ?j) {{ {two_keys} }} }}"
+            ),
+            false,
+        ),
+        // a key that some rows leave unbound
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES (?s ?i) {{ {} }} ?s <urn:q> ?t }}",
+                pairs(40, true)
+            ),
+            false,
+        ),
     ] {
+        let q = q.as_str();
         let expected = query(s.snapshot(), q, &Default::default())
             .unwrap()
             .application_rows();
         for rows in [1, 2, 3, 4096] {
             let c = open(&s, q, rows);
             assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
-            assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
+            if count_join {
+                assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
+            }
             assert_eq!(all(c), expected, "{q}; {rows}");
         }
         // The pairs of the join below the count are not rows that the eager count
-        // produces, so they stay out of the work count and the work limit (Sol review of
-        // item 829, finding 1).
-        let with = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
-            no_cache: true,
-            max_rows_produced: limit,
-            work,
-            ..Default::default()
+        // produces, so they stay out of the work count. The eager count admits them
+        // against the row limit and the work limit when it forms them, and not when it
+        // counts a merge join's key runs, and the streamed count follows it, so both
+        // modes give the same outcome at each limit (Sol review of item 829, findings 1
+        // of rounds 1 and 2).
+        let with = |rows: Option<usize>, limit: Option<u64>, work: Option<Arc<AtomicU64>>| {
+            QueryOptions {
+                no_cache: true,
+                max_rows: rows,
+                max_rows_produced: limit,
+                work,
+                ..Default::default()
+            }
         };
-        let produced = query(s.snapshot(), q, &with(None, None))
-            .unwrap()
-            .rows_produced;
-        let streamed = |limit: Option<u64>, rows: usize| -> Result<u64, Error> {
+        type Outcome = Result<Vec<Vec<Option<Term>>>, Option<BudgetKind>>;
+        let outcome = |r: Result<Vec<Vec<Option<Term>>>, Error>| -> Outcome {
+            r.map_err(|e| match e {
+                Error::BudgetExceeded(b) => Some(b.kind),
+                _ => None,
+            })
+        };
+        let eager = |rows: Option<usize>, limit: Option<u64>| -> Outcome {
+            outcome(query(s.snapshot(), q, &with(rows, limit, None)).map(|r| r.application_rows()))
+        };
+        let streamed = |rows: Option<usize>, limit: Option<u64>, batch: usize| -> (Outcome, u64) {
             let work = Arc::new(AtomicU64::new(0));
-            let mut c = select_cursor(
-                s.snapshot(),
-                q,
-                &with(limit, Some(work.clone())),
-                &options(rows),
-            )?;
-            while c.next_batch()?.is_some() {}
-            Ok(work.load(Ordering::Relaxed))
-        };
-        // Nor do they count against the row limit, which eager runs hold the rows of
-        // each operator to.
-        let rows_limit = QueryOptions {
-            max_rows: Some(120),
-            ..with(None, None)
-        };
-        let eager_fits = query(s.snapshot(), q, &rows_limit).map(|r| r.application_rows());
-        for rows in [1, 3, 4096] {
-            let streamed_fits = (|| -> Result<_, Error> {
-                let mut c = select_cursor(s.snapshot(), q, &rows_limit, &options(rows))?;
+            let run = || -> Result<_, Error> {
+                let opts = with(rows, limit, Some(work.clone()));
+                let mut c = select_cursor(s.snapshot(), q, &opts, &options(batch))?;
                 let mut answer = Vec::new();
-                while let Some(batch) = c.next_batch()? {
-                    for row in 0..batch.len() {
-                        answer.push(batch.row(row).unwrap().values().to_vec());
+                while let Some(b) = c.next_batch()? {
+                    for row in 0..b.len() {
+                        answer.push(b.row(row).unwrap().values().to_vec());
                     }
                 }
                 Ok(answer)
-            })();
-            match &eager_fits {
-                Ok(answer) => assert_eq!(
-                    streamed_fits.as_ref().map_err(|e| e.to_string()),
-                    Ok(answer),
-                    "{q}; {rows}"
-                ),
-                Err(_) => assert!(streamed_fits.is_err(), "{q}; {rows}"),
+            };
+            let r = outcome(run());
+            (r, work.load(Ordering::Relaxed))
+        };
+        let produced = query(s.snapshot(), q, &with(None, None, None))
+            .unwrap()
+            .rows_produced;
+        let count = match expected[0][0].as_ref() {
+            Some(Term::Literal(l)) => l.value().parse::<u64>().unwrap(),
+            other => panic!("{q}: {other:?}"),
+        };
+        let mut limits = vec![
+            (None, None),
+            (Some(120), None),
+            (None, Some(produced)),
+            (None, Some(produced - 1)),
+            (None, Some(produced + count)),
+        ];
+        if count > 0 {
+            limits.push((None, Some(produced + count - 1)));
+        }
+        for batch in [1, 3, 4096] {
+            let (answer, work) = streamed(None, None, batch);
+            assert_eq!(answer, Ok(expected.clone()), "{q}; {batch}");
+            assert_eq!(work, produced, "{q}; {batch}");
+            for &(rows, limit) in &limits {
+                assert_eq!(
+                    streamed(rows, limit, batch).0,
+                    eager(rows, limit),
+                    "{q}; batch {batch}, max_rows {rows:?}, max_rows_produced {limit:?} (produced {produced}, count {count})"
+                );
             }
-            assert_eq!(streamed(None, rows).unwrap(), produced, "{q}; {rows}");
-            assert!(streamed(Some(produced), rows).is_ok(), "{q}; {rows}");
-            assert!(
-                matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
-                "{q}; {rows}"
-            );
         }
     }
 }

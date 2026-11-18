@@ -801,3 +801,45 @@ fn a_streamed_loop_charges_the_keys_it_keeps() {
     assert!(memory(&r), "streamed: {r:?}");
     assert_eq!(streamed(Some(64 << 20)).unwrap(), 0);
 }
+
+/// A streamed remote loop admits each answer as it arrives, so a budget that the answers
+/// outgrow stops the loop before it sends the rest of its requests (Sol review of item
+/// 829, round 2, finding 2).
+#[test]
+fn a_streamed_loop_admits_each_answer_before_the_next_request() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(40));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p ?l {{ ?d a <urn:Department> SERVICE <loop:{}> {{ ?d <urn:hasEmployee> ?p . ?p <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}",
+        ep.url()
+    );
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let o = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: memory,
+            ..opts()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &opts, &o)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    assert_eq!(streamed(None).unwrap(), 820);
+    assert_eq!(ep.take().len(), 40, "one request per department");
+    let r = streamed(Some(48 << 10));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+    let sent = ep.take().len();
+    assert!(sent < 40, "the loop sent {sent} requests past its budget");
+}

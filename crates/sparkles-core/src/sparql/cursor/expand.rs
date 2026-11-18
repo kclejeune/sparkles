@@ -176,6 +176,36 @@ impl CallKeys {
     }
 }
 
+/// Merge one batch's kernel counters into `total` as one eager call over all of the
+/// batches reports them. Counts of work add up and other values keep the latest. A
+/// vector search reports the properties of the index from its first search, present or
+/// absent, so once `total` holds a search (its `method`) a later batch adds none of
+/// them, and its `method` becomes `mixed` when batches differ.
+fn merge_counters(
+    total: &mut serde_json::Map<String, serde_json::Value>,
+    batch: serde_json::Map<String, serde_json::Value>,
+    vector: bool,
+) {
+    let searched = vector && total.contains_key("method");
+    for (key, value) in batch {
+        if searched && exec::vector_counter_is_property(&key) {
+            continue;
+        }
+        let merged = match total.get(&key) {
+            None => value,
+            Some(before) if vector && key == "method" => match *before == value {
+                true => continue,
+                false => "mixed".into(),
+            },
+            Some(before) => match (before.as_u64(), value.as_u64()) {
+                (Some(a), Some(b)) => a.saturating_add(b).into(),
+                _ => value,
+            },
+        };
+        total.insert(key, merged);
+    }
+}
+
 /// The arguments of one input row's call, `None` where the row makes no call.
 type RowKey<'a> = Box<dyn Fn(usize) -> Option<Vec<Id>> + 'a>;
 
@@ -276,29 +306,15 @@ impl Expand {
         self.counters.as_ref()
     }
 
-    /// Add one batch's counters as one eager call over all of the batches reports them:
-    /// counts of work add up, properties of the index the kernel read keep their first
-    /// value, a vector search's method becomes `mixed` when batches differ, and other
-    /// values keep the latest.
+    /// Add one batch's counters as one eager call over all of the batches reports them.
     fn add_counters(&mut self, batch: Option<serde_json::Map<String, serde_json::Value>>) {
         let Some(batch) = batch else { return };
         let vector = matches!(self.node.kind, Kind::VectorSearch(_));
-        let total = self.counters.get_or_insert_with(Default::default);
-        for (key, value) in batch {
-            let merged = match total.get(&key) {
-                None => value,
-                Some(_) if vector && exec::vector_counter_is_property(&key) => continue,
-                Some(before) if vector && key == "method" => match *before == value {
-                    true => continue,
-                    false => "mixed".into(),
-                },
-                Some(before) => match (before.as_u64(), value.as_u64()) {
-                    (Some(a), Some(b)) => a.saturating_add(b).into(),
-                    _ => value,
-                },
-            };
-            total.insert(key, merged);
-        }
+        merge_counters(
+            self.counters.get_or_insert_with(Default::default),
+            batch,
+            vector,
+        );
     }
 
     pub(super) fn done(&self, child_done: bool) -> bool {
@@ -342,8 +358,10 @@ impl Expand {
                 None => remote.held = Some(batch),
             }
         }
-        remote.run.send(ctx, spec, rl, child.done)?;
-        remote.answers.resize(remote.run.held_bytes())?;
+        let Remote { run, answers, .. } = &mut **remote;
+        run.send(ctx, spec, rl, child.done, &mut |bytes| {
+            answers.resize(bytes)
+        })?;
         self.counters = Some(remote.run.stats.counters());
         self.note = Some(remote.run.stats.note());
         let Some(held) = remote.held.take() else {
@@ -505,5 +523,33 @@ mod tests {
             keys.add(std::iter::once(Some(vec![Id(4)]))),
             Err(crate::Error::BudgetExceeded(b)) if b.limit == 3 && b.requested == 4
         ));
+    }
+
+    /// A vector search keeps the index properties of its first search, including the
+    /// ones it did not report, and a batch without a search freezes nothing (Sol review
+    /// of item 829, round 2, finding 3).
+    #[test]
+    fn vector_counters_keep_the_first_search_properties() {
+        let map = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let mut total = serde_json::Map::new();
+        merge_counters(&mut total, map(serde_json::json!({"searches": 0})), true);
+        merge_counters(
+            &mut total,
+            map(
+                serde_json::json!({"method": "hnsw", "ef": 64, "rows": 8, "scored": 5, "searches": 1}),
+            ),
+            true,
+        );
+        merge_counters(
+            &mut total,
+            map(
+                serde_json::json!({"method": "exact", "exactBecause": "filter", "rows": 8, "scored": 8, "searches": 1}),
+            ),
+            true,
+        );
+        assert_eq!(
+            serde_json::Value::Object(total),
+            serde_json::json!({"method": "mixed", "ef": 64, "rows": 8, "scored": 13, "searches": 2})
+        );
     }
 }

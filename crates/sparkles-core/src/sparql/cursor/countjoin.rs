@@ -11,6 +11,21 @@ use spargebra::algebra::AggregateFunction;
 /// What the plan calls the operator, which the cursor keeps for the grouping it runs.
 pub(super) const OPERATOR: &str = "CountJoin";
 
+/// How the eager kernel of a `CountJoin` node holds the pairs it counts. It counts a
+/// merge join on one shared variable from the key runs, checking nothing per pair, and
+/// otherwise forms the pairs, admitting them against the row limit and the work limit
+/// as rows of an intermediate result before it counts them. `None` for another node.
+pub(super) fn eager_checks_pairs(node: &Node) -> Option<bool> {
+    let Kind::CountJoin { algo, .. } = &node.kind else {
+        return None;
+    };
+    let [left, right] = &node.children[..] else {
+        return None;
+    };
+    let shared = right.vars.iter().filter(|v| left.vars.contains(v)).count();
+    Some(!(*algo == crate::sparql::plan::JoinAlgo::Merge && shared == 1))
+}
+
 /// The grouping and join that answer a `CountJoin` node, or the node itself when it is
 /// not one.
 pub(super) fn rewrite(ctx: &Ctx, node: Node) -> Node {
