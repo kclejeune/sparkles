@@ -641,7 +641,7 @@ path writes the generation's prefixes before the tail appends its catalog entry,
 failed prefix write leaves the catalog and the snapshot in step. No on-disk format
 changed.
 
-The first stage of Phase 3 is partly built. `budgeted.rs` defines `Control` with two
+The first stage of Phase 3 is built for the WAL and history readers. `budgeted.rs` defines `Control` with two
 constants, `CHECKS` and `ACCOUNTS`, and the carrier's type rather than its memory member
 chooses how a reader is controlled. `Unlimited` has neither and compiles to the ordinary
 reader. A stride carrier, which is `HistoryCeiling` in `store.rs` for a historical read
@@ -669,11 +669,16 @@ buffer and the 4 MiB backward chunk. `snapshot_at_inner` chooses a carrier once 
 body. An accounting `wal_point` still builds no sparse index, and the bounded cache
 insertion stays apart from the ordinary eviction, since both are behaviour rather than
 accounting. The `history_generation`, `len` and `retained_bytes` twins stay, since the
-readers they call belong to stage 3. `history_gone`, `mem_gone` and `resolve` and their
-`_limited` forms remain the rest of this stage under item 830. The first two can fold
-once `bounded_ranges` is shown to merge as both `reconstructable` forms do, and `resolve`
-needs a decision, since the ordinary `NotFound` names where history starts and the
-bounded one does not. [Item 1062](../../ROADMAP.md) takes the read-only change-log
+readers they call belong to stage 3. `resolve` and `resolve_limited` share one body,
+`resolve_in`, whose locks are controlled only under an accounting carrier. The bounded
+entry keeps its refusal of an invalid snapshot name and its controlled wait for the
+writer's head, and its `NotFound` for a time before history now names where history
+starts, as the ordinary one always did. `history_gone` and `mem_gone` are the
+`Unlimited` forms of `history_gone_with` and `mem_gone_with`, and both forms of
+`reconstructable` merge through one `merge_ranges`, which builds and heap-sorts its
+ranges in one vector and charges each step only under an accounting carrier. A stride
+read therefore resolves, waits and reports a missing commit exactly as before.
+[Item 1062](../../ROADMAP.md) takes the read-only change-log
 reader. `changelog/readonly.rs` reads captured descriptors into borrowed record views,
 while `changelog.rs` reads its in-memory segment index into owned records, so the two
 share only their codec and are not twins of one reader.
@@ -681,7 +686,18 @@ share only their codec and are not twins of one reader.
 The `bench:insn` screen gained five historical reads, forward and backward with and
 without a cap and a forward read from a sealed generation, whose first read scans the log
 with the uncontrolled cursor. The screen's case string moved to version 3, so older
-baselines no longer compare. Against its base on one laptop, with the median of three processes, WAL replay of 2,000 commits took 0.985 of the base's instructions and the opens 0.982, the four historical reads 0.986 to 1.006 and the sealed read 0.983. The vocabulary cases, whose source this stage does not change, moved between 0.974 and 1.039 of the base, and the deterministic ordered FSST read rose by 3.9%. The symbol tables show the compiler inlining differently across the crate, which the single codegen unit does not rule out. The `insn_screen` binary's text grew by 0.29%.
+baselines no longer compare. Against its base on one laptop, with the median of three
+processes of user-space instructions, WAL replay of 2,000 commits and both opens took
+1.000 of the base's count, the four historical reads 0.998 to 0.999 and the sealed read
+1.000. The ordered, unordered and checked FSST vocabulary reads counted the same
+instructions as the base. The front-coded reads moved by up to 0.7% of the base in
+either direction, inside the spread of their own processes at one commit. The
+front-coded full scan, for one, counts between 8.69M and 8.95M instructions from one
+process to the next with the same binary. An intermediate commit of the stage had moved the
+vocabulary cases by up to 3.9% through the single codegen unit's inlining, and the
+finished stage does not. The `insn_screen` binary's text grew by 0.08%. The compile
+time of `sparkles-core` before and after the stage is still to be timed on a quiet
+host.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
