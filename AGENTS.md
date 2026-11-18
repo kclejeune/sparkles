@@ -82,6 +82,15 @@ adds to this file and does not override it.
   gives a quick A/B on a Boat worker, and `mise run bench:nsc A B` on Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
   need an Intel host, and published numbers come from the benchmark host. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+- Count instructions per request with `mise run bench:request-insn BASE_BIN TIP_BIN` before
+  booking an Intel host. A count flag books the timing run, and counts never size an
+  effect. Counts are enough only when the change adds or removes computation, every
+  query it can reach stays within the host's noise floor, and the floor resolves the gate
+  that applies to each such query. Queries under 0.3 ms, and changes to memory charging,
+  allocation, atomics, locks, thread hand-offs, system calls, the response path, memory
+  layout or concurrency, are timed whatever the counts show.
+  [Instruction counts before timing](docs/BENCHMARKING.md#instruction-counts-before-timing)
+  gives the floors and the resolution test.
 - Run both arms of an A/B comparison on one host with the same compiler and build
   configuration and no competing heavy work. Never pool or compare timings across hosts,
   even hosts with the same hardware, and qualify a second host's results separately.

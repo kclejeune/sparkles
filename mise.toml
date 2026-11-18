@@ -1560,7 +1560,7 @@ flag "--queries <dir>" help="directory of NAME.rq files (default: the queries of
 flag "--execution <modes>" default="streaming,auto" help="comma-separated execution modes"
 flag "--rounds <n>" default="8" help="rounds of A,B,B,A"
 flag "--reps <n>" default="50" help="counted requests per query and process"
-flag "--threshold <pct>" default="1.0" help="flag threshold in percent, from an A-against-A run on the host"
+flag "--threshold <pct>" default="1.0" help="flag threshold in percent below 2M instructions per request (0.25% above), from A-against-A runs on the host"
 flag "--server-cpu <n>" default="2"
 flag "--client-cpu <n>" default="3"
 flag "--out <dir>" help="results directory (default .artifacts/bench-request-insn/<UTC time>)"

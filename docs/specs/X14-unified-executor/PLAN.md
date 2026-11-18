@@ -676,6 +676,20 @@ which the stage 4 record lists, and the phase names the ones its change can reac
 difference that survives is profiled with `perf stat` and LBR call stacks on atlas before
 the phase reports, as stage 4's per-query costs were.
 
+A phase counts instructions per request with `mise run bench:request-insn` on a build host
+before it books `atlas`, as [Instruction counts before
+timing](../../BENCHMARKING.md#instruction-counts-before-timing) describes, and a count
+flag books the timing run at once. The counts do not replace the timing of this rule.
+They cover the whole request, so on the matrix their resolution is 1.4 to 5.4 µs for
+every query under 0.3 ms, wider than the 0.5 µs bound, and they did not see item 1039's
+cost, which was in reference counts, an allocation and a memory charge per block. A phase
+whose change can reach a query under 0.3 ms therefore still runs the A/B above, and a
+phase that charges memory, allocates, takes locks or atomic reference counts, hands work
+between threads or changes the response path runs it whatever the counts show. Counts are
+enough for a phase only when its change adds or removes computation and reaches no query
+under 0.3 ms, and every query it can reach stays within the floor and resolves within its
+gate.
+
 ### Correctness and conformance
 
 The differential tests of `tests/query_cursor.rs` run their seeded queries at batch sizes

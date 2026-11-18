@@ -3,7 +3,7 @@
 
 usage: request-insn.py run --a BIN --b BIN (--store DIR | --data FILE) --queries DIR
                            [--execution streaming,auto] [--rounds 6] [--reps 50] ...
-       request-insn.py summarize OUT [--threshold PCT]
+       request-insn.py summarize OUT [--threshold PCT] [--large-threshold PCT]
 
 `run` starts each build as a server in a fresh process for every epoch, in rounds of
 A,B,B,A, with the server pinned to one CPU, the client to another, one Rayon thread and
@@ -24,8 +24,11 @@ request, as curl does. Each variant's sorted TSV answer to each query is compare
 median over rounds of the per-round ratio of B's to A's median per process, a 95%
 bootstrap interval over rounds, the spread of the per-process counts of each side and a
 bimodality flag, and the same ratio for the CPU time and context switches. A query is
-flagged when the interval lies outside 1 +- threshold. The threshold defaults to 1% and
-should come from an A-against-A run on the same host (see docs/BENCHMARKING.md).
+flagged when the interval does not lie within 1 +- threshold, which is 1% for queries under
+LARGE_INSTRUCTIONS per request and 0.25% for larger ones by default, the floors that
+A-against-A runs on stanley support (see docs/BENCHMARKING.md). A side whose processes
+split, as automatic execution does when it picks a different executor in some processes,
+is marked and its flag needs a rerun under an explicit mode.
 """
 
 import argparse
@@ -62,6 +65,8 @@ FLAG_EXCLUDE_KERNEL = 1 << 5
 FLAG_EXCLUDE_HV = 1 << 6
 FLAG_ENABLE_ON_EXEC = 1 << 12
 MIN_RUN_FRACTION = 0.999
+LARGE_INSTRUCTIONS = 2_000_000
+SPLIT_SPREAD = 0.05
 NR_PERF_EVENT_OPEN = {"x86_64": 298, "aarch64": 241}
 
 
@@ -544,7 +549,7 @@ def cmd_run(a):
     json.dump(manifest, open(os.path.join(out, "manifest.json"), "w"), indent=1)
     for p in problems:
         log(f"FAIL: {p}")
-    text = summarize(out, a.threshold)
+    text = summarize(out, a.threshold, a.large_threshold)
     open(os.path.join(out, "summary.md"), "w").write(text)
     print(text)
     return 1 if problems else 0
@@ -626,13 +631,12 @@ def fmt_count(x):
     return f"{x:.0f}"
 
 
-def summarize(out, threshold):
+def summarize(out, threshold, large_threshold=0.25):
     rows = load_samples(out)
     try:
         man = json.load(open(os.path.join(out, "manifest.json")))
     except OSError:
         man = {}
-    th = threshold / 100
     lines = ["# Per-request instruction counts", ""]
     if man:
         for v in ("A", "B"):
@@ -667,9 +671,10 @@ def summarize(out, threshold):
         if r["query"] != "_idle" and k not in keys:
             keys.append(k)
     lines.append(
-        f"Flag: the 95% interval of the instruction ratio lies outside 1 +- {threshold:g}%. "
+        f"Flag: the 95% interval of the instruction ratio does not lie within 1 +- {threshold:g}% "
+        f"below {LARGE_INSTRUCTIONS / 1e6:g}M instructions per request or 1 +- {large_threshold:g}% above. "
         "Spread is (max - min) / median of the per-process counts. Bimodal marks a side whose "
-        "processes split into two groups."
+        "processes split into two groups or spread by more than 5%."
     )
     lines.append("")
     lines.append(
@@ -699,7 +704,10 @@ def summarize(out, threshold):
             if i and i["window_ms"] > 0 and r["instr_u"] > 0:
                 shares.append((i["instr_u"] / i["window_ms"]) * r["window_ms"] / (r["instr_u"] * r["reps"]))
         share = st.median(shares) if shares else float("nan")
-        bi = ",".join(s for s, vals in (("A", va), ("B", vb)) if bimodal(vals))
+        bi = ",".join(
+            s for s, vals in (("A", va), ("B", vb)) if bimodal(vals) or spread(vals) > SPLIT_SPREAD
+        )
+        th = (threshold if st.median(va) < LARGE_INSTRUCTIONS else large_threshold) / 100
         flag = not (lo >= 1 - th and hi <= 1 + th)
         if flag:
             flagged.append(f"{q} {mode}")
@@ -753,16 +761,19 @@ def main():
     r.add_argument("--port", type=int, default=4191)
     r.add_argument("--serve-args", default="", help="extra flags for serve")
     r.add_argument("--no-spin", action="store_true")
-    r.add_argument("--threshold", type=float, default=1.0, help="flag threshold in percent")
+    r.add_argument("--threshold", type=float, default=1.0, help="flag threshold in percent for small queries")
+    r.add_argument("--large-threshold", type=float, default=0.25,
+                   help="flag threshold in percent for queries of LARGE_INSTRUCTIONS or more per request")
     r.add_argument("--out", required=True)
     r.add_argument("--quiet", action="store_true")
     s = sub.add_parser("summarize")
     s.add_argument("out")
     s.add_argument("--threshold", type=float, default=1.0)
+    s.add_argument("--large-threshold", type=float, default=0.25)
     a = p.parse_args()
     if a.cmd == "run":
         sys.exit(cmd_run(a))
-    print(summarize(a.out, a.threshold), end="")
+    print(summarize(a.out, a.threshold, a.large_threshold), end="")
 
 
 if __name__ == "__main__":

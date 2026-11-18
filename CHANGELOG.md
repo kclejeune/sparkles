@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Instruction counts per request before timing
+
+`mise run bench:request-insn` counts the user-space instructions, cycles and CPU time per
+request of two server builds, query by query, in rounds of A,B,B,A on one pinned core,
+and reports each query's ratio with a 95% interval and the spread over processes. Lanes
+now count before they book an Intel host. An A-against-A run on `stanley` set the noise
+floor at 1% for queries under 2 million instructions per request and 0.25% above. Back
+tests showed that the counts flag item 678's slower string floors, at +13% and +29%
+against +25% and +33% in time, and miss item 1039's per-block charge, whose cost is in
+reference counts, an allocation and a memory charge. Counts measure the whole request,
+so they cannot resolve the 0.5 µs bound of the Intel rule on queries under 0.3 ms, which
+are still timed, as are changes to charging, allocation, atomics, locks, thread
+hand-offs, system calls, the response path, layout and concurrency.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes
