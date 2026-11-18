@@ -20,7 +20,9 @@
 # PLAIN_QUERIES (default "geo-q7-knn"; the plain plans of Q5 and Q6 are cross products of
 # 1M x 1,600 and 64k x 64k geometries, hours at N = 1M), PORT (default 3941), SPARKLES
 # (default target/release/sparkles), SPARKLES_ARGS (extra `serve` flags), MAX_TIME
-# (seconds per request, default 300).
+# (seconds per request, default 300), EXECUTION (eager, streaming or auto; empty by
+# default) for the `execution` parameter of every query request, the answer checks and
+# the timed requests alike.
 set -euo pipefail
 
 N=${1:-100000}
@@ -96,14 +98,15 @@ serve() { # serve <log name> <flags…>: the database on $PORT
 
 mapfile -t NAMES < <(find queries -name '*.rq' -printf '%f\n' | sed 's|\.rq$||' | sort)
 selected() { [ -z "${QUERIES:-}" ] || [[ " $QUERIES " == *" $1 "* ]]; }
-q() { echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$1.rq localhost:$PORT/bench/sparql"; }
+ENDPOINT="localhost:$PORT/bench/sparql${EXECUTION:+?execution=$EXECUTION}"
+q() { echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$1.rq '$ENDPOINT'"; }
 
 # run <engine>: the answer check and the timings against the running server
 run() {
   local engine=$1
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
-    r=$(python3 "$ROOT/scripts/bench-answers.py" "localhost:$PORT/bench/sparql" "queries/$n.rq" results/geo-answers.json "$n" "$engine")
+    r=$(python3 "$ROOT/scripts/bench-answers.py" "$ENDPOINT" "queries/$n.rq" results/geo-answers.json "$n" "$engine")
     printf '%-20s %-14s %s rows\n' "$n" "$engine" "$r"
   done
   for n in "${NAMES[@]}"; do
