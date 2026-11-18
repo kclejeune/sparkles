@@ -956,6 +956,53 @@ returned the same answers. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#grouping-operator) keep the run
 record.
 
+### Native search and leaf operators
+
+The first part of item 829 classifies each search, call and leaf by its form, from the
+`needs_input` of its specification, in `cursor/leaf.rs`. An expanding operator in
+`cursor/expand.rs` runs the kernel over each input batch for a text, hybrid, history or
+spatial search whose arguments come from its input and for a vector search with a
+variable query. It keeps the distinct query values of earlier batches in a charged set,
+so the caps of the text, hybrid, spatial and vector kernels hold for the whole input as
+they do for one eager call. A remote LATERAL loop runs through `enhancer::RemoteRun`,
+which the eager loop calls once and the cursor calls per batch. The cursor holds the rows
+of a partial bulk request until the request is full or its input ends, so it sends the
+requests and the bulk groups of an eager run, and it keeps the answers it holds charged
+and counts each key's solutions once.
+
+The whole-input operator of `cursor/whole.rs` serves a vector or hybrid search whose
+candidates come from its input, a path search under a limit and an algorithm call that
+reads its group or a nested edge pattern. It reads each input into a charged table, so
+an input over the budget refuses the query as a sort without spill does, and then calls
+the kernel once and serves its answer batch by batch. It calls `exec::vector_search`,
+`hybrid::search_bound`, `pathsearch::run` and `algosvc::run` itself rather than
+`run_node`. It adopts an algorithm's lease, charges every other answer, counts its rows
+against the work limit once and redacts its plan under a graph view, which `run_node`
+did for these kinds. It does not read or fill the result cache, so an algorithm call over
+an edge pattern that the cache answered under eager execution runs again when streamed.
+A search bounded by `k`, `maxHits` or its own limit argument, an algorithm call over
+constants, `CountJoin` and an ARQ property function over constants run their kernel once
+into a charged table, as decision 2 admits. The expanding kinds and those leaves still
+run the eager kernel through `execute_with_inputs` or `execute_owned`, so the merge must
+move them. EXPLAIN gives each operator a reason that names what it reads whole or what
+bounds its answer.
+
+The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
+spatial scan or relation over constants, a search without a bound, a path search between
+constants without a limit, a spatial join and a registered property function without
+prefix output. They are the second part of the item. Automatic execution keeps its base
+set of expanding kinds, and each new kind joins it only after a same-host A/B of eager
+against streamed runs. The text, geo and vector benchmark scripts send an `EXECUTION`
+mode with every request, and the vector script fingerprints its exact and approximate
+answers, for the A/B of the item's plan. The W3C streaming record of the tip matches its
+base, with 24 eager fallbacks in ARQ's property-function suite and none elsewhere.
+
+Tests compare each form with eager answers at batches of one row to 4,096 rows, count
+the same rows as eager runs against the work limit, refuse an input over the memory
+budget in both modes, read a pending transaction's view in an algorithm call, redact a
+masked plan, and send the requests of an eager remote loop at every batch size, with a
+failing endpoint and with SILENT.
+
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries

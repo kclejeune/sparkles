@@ -238,6 +238,21 @@ check them against the W3C suites and Jena's own answers.
   they have not finished and at most a batch more. A full sort and the
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
+* Under `execution=streaming`, text, hybrid, history and spatial searches whose
+  arguments come from their input, vector searches with a variable query and remote
+  LATERAL loops run over each input batch and keep their caps, their requests and their
+  cache across batches as one eager call does. A vector or hybrid search whose
+  candidates come from its input, a path search under a limit and an algorithm call over
+  their group or a nested edge pattern read that input under the memory budget, run
+  once and serve their answer batch by batch. Searches bounded by `k`, `maxHits` or a
+  limit argument, constant algorithm calls, count joins and ARQ property functions over
+  constants answer once into a charged table. EXPLAIN states for each such operator
+  that it reads its whole input or what bounds its answer. A SERVICE, a view read, a
+  spatial scan or relation over constants, a spatial join, a search without a bound and
+  a registered property function without prefix output still need materialization, so
+  the strict policy refuses them and automatic execution runs them eagerly, as
+  [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every kind in this
+  list eagerly until a same-host measurement admits it.
 * A cursor scan keeps its place inside an index block between batches without charging
   the block to the query, since the block cache holds its decoded columns, and it
   decodes the block again when the cache has dropped it. A scan inside a plan therefore
