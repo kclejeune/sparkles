@@ -287,10 +287,13 @@ changes, and the second commit unifies the rules by the decisions it records.
 
 The unified rule takes the strict test everywhere, gives `replace_with` the empty-head
 case and the small-stream exception of `load_with`, gives `load_with` the large-stream
-probe of `replace_with`, and treats a graph restriction, a triple protection, a managed
-admission and a delete row as reasons for the transactional path in every entry point. The
-table test includes a patch whose delete row removes nothing and still takes the
-transactional path. The group admission's
+probe of `replace_with`, and treats a triple protection, the capability to change managed
+graphs, control records and a delete row as reasons for the transactional path of a batch.
+A graph restriction keeps sources on the transactional path, since a rebuild from sources
+does not check each quad's graph. A batch from `insert_bulk` or a patch has its graphs
+checked as it is staged, so a restriction does not keep it out of a rebuild, as before the
+phase. The table test includes a patch whose delete row removes nothing and still takes
+the transactional path. The group admission's
 `Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad, as
 [decision 4](#decisions) records.
 

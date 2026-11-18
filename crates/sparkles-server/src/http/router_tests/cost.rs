@@ -550,8 +550,17 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
     let st = Arc::new(AppState::new(dir.path(), opts, Duration::from_secs(30)).unwrap());
     st.create("disk", DbType::Persistent).unwrap();
     st.create("mem", DbType::Mem).unwrap();
+    st.create("fresh-put", DbType::Mem).unwrap();
+    st.create("fresh-post", DbType::Mem).unwrap();
     let app = router(st.clone());
     let small = "<http://example.org/a> <http://example.org/p> \"1\" .";
+    // an in-memory dataset below its limit takes writes
+    let r = send(
+        &app,
+        put("/mem/data?default", "application/n-triples", small),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
     let mut large = String::new();
     for i in 0..5000 {
         large.push_str(&format!(
@@ -580,12 +589,15 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
         assert_eq!(r.json()["code"], "storage-full", "{what}");
     }
     assert_eq!(st.get("disk").unwrap().store.head_commit().seq, 0);
-    assert!(st.get("mem").unwrap().store.snapshot().is_empty());
-    // an in-memory dataset below its limit takes writes
-    let r = send(
-        &app,
-        put("/mem/data?default", "application/n-triples", small),
-    )
-    .await;
-    assert!(r.status.is_success(), "{}", r.text());
+    assert_eq!(st.get("mem").unwrap().store.snapshot().len(), 1);
+    // A body into an empty dataset takes the bulk plan, which admits the generation it
+    // builds by its size, and that of these quads fits in the limit, as for a POST.
+    for req in [
+        put("/fresh-put/data?default", "application/n-triples", &large),
+        post("/fresh-post/data?default", "application/n-triples", &large),
+    ] {
+        let what = format!("{} {}", req.method(), req.uri());
+        let r = send(&app, req).await;
+        assert!(r.status.is_success(), "{what}: {}", r.text());
+    }
 }

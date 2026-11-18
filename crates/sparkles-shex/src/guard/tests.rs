@@ -1944,7 +1944,7 @@ fn bulk_schema_preview_preserves_the_committed_grandfather_baseline() {
     let main = Store::open(
         &dir.path().join("bulk-schema"),
         StoreOptions {
-            bulk_threshold: 1,
+            bulk_threshold: 0,
             ..Default::default()
         },
     )

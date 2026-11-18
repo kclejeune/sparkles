@@ -95,8 +95,10 @@ These read paths are tuned for queries over data that is not yet in memory
   tell. A load or a replacement into an empty store also takes the bulk path, unless all
   its inputs are streams that end within 8 MiB. A write limited to some graphs parses its
   inputs in a transaction, and batches that check triple protections, managed graphs or
-  control records stay transactional, as does a patch once it has met a delete row.
-  SPARQL `LOAD` always inserts in a transaction. Roadmap item 846 tracks a bulk path for a
+  control records stay transactional, as does a patch once it has met a delete row. A
+  large stream load into a dataset that holds data is a bulk commit, so the change-log
+  limit of bulk commits under the limitations below applies to it. SPARQL `LOAD` always
+  inserts in a transaction. Roadmap item 846 tracks a bulk path for a
   large `LOAD`.
 * CSV and TSV tables map to triples ([C05](../specs/C05-tabular-imports.md),
   [USAGE.md](../USAGE.md#loading-csv-and-tsv)). `sparkles load`, `sparkles csv`,
