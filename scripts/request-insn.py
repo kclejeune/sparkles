@@ -61,6 +61,7 @@ FLAG_EXCLUDE_USER = 1 << 4
 FLAG_EXCLUDE_KERNEL = 1 << 5
 FLAG_EXCLUDE_HV = 1 << 6
 FLAG_ENABLE_ON_EXEC = 1 << 12
+MIN_RUN_FRACTION = 0.999
 NR_PERF_EVENT_OPEN = {"x86_64": 298, "aarch64": 241}
 
 
@@ -212,20 +213,28 @@ def kernel_counting_allowed():
 
 def delta(a, b, server_cpu_pmu):
     """Folds two counter reads into per-key differences. The per-PMU hardware counts are
-    summed, and `covered` is false when a counter of the PMU of the server's CPU ran for
-    less than the time it was enabled, which means it was multiplexed."""
+    summed. `run_frac` is the smallest share of the window that a counter of the PMU of
+    the server's CPU ran for, and `covered` is false when it shows multiplexing or when
+    the counters' CPU time falls short of schedstat's."""
     out = {}
     covered = True
     for key, (v1, e1, r1) in b.items():
         v0, e0, r0 = a[key]
         name, _, pmu = key.partition("/")
         out[name] = out.get(name, 0) + (v1 - v0)
-        if pmu == server_cpu_pmu and (e1 - e0) != (r1 - r0):
-            covered = False
+        if pmu == server_cpu_pmu and e1 > e0:
+            out["run_frac"] = min(out.get("run_frac", 1.0), (r1 - r0) / (e1 - e0))
+    # A counter that ran for less of the window than it was enabled was multiplexed
+    # with other events, and its count is an estimate.
+    out.setdefault("run_frac", 1.0)
+    if out["run_frac"] < MIN_RUN_FRACTION:
+        covered = False
     # The counters miss a thread when they were opened after it started. Its CPU time
     # then shows in schedstat and not in task-clock. A thread that exits inside the
     # window drops out of schedstat, so only a shortfall of task-clock counts.
-    if out.get("sched_ns", 0) > 0 and out["task_clock_ns"] < 0.98 * out["sched_ns"]:
+    # Windows of less than a millisecond of CPU time are left out, since schedstat's
+    # accounting of a running thread lags by up to a scheduler tick.
+    if out.get("sched_ns", 0) > 1_000_000 and out["task_clock_ns"] < 0.98 * out["sched_ns"]:
         covered = False
     out["covered"] = covered
     return out
@@ -450,7 +459,7 @@ def cmd_run(a):
     cols = [
         "round", "epoch", "variant", "query", "mode", "reps", "instr_u", "instr_k", "cycles_u",
         "task_clock_ns", "ctx_switches", "page_faults", "migrations", "covered", "window_ms",
-        "exec_ms", "wall_ms",
+        "exec_ms", "wall_ms", "sched_ns", "run_frac",
     ]
     samples.write("\t".join(cols) + "\n")
     answers = {}
@@ -495,7 +504,8 @@ def cmd_run(a):
                             rnd, epoch, v, q, mode or "-", reps, d["instr_u"], d.get("instr_k", ""),
                             d["cycles_u"], d["task_clock_ns"], d["ctx_switches"], d["page_faults"],
                             d["migrations"], int(d["covered"]), f"{(t1 - t0) * 1000:.3f}",
-                            f"{st.median(execs):.6f}", f"{st.median(walls):.4f}",
+                            f"{st.median(execs):.6f}", f"{st.median(walls):.4f}", d["sched_ns"],
+                            f"{d['run_frac']:.6f}",
                         ]
                         samples.write("\t".join(str(x) for x in row) + "\n")
                 # an idle window as long as the median query window
@@ -507,7 +517,8 @@ def cmd_run(a):
                 row = [
                     rnd, epoch, v, "_idle", "-", 1, d["instr_u"], d.get("instr_k", ""), d["cycles_u"],
                     d["task_clock_ns"], d["ctx_switches"], d["page_faults"], d["migrations"],
-                    int(d["covered"]), f"{idle_s * 1000:.3f}", "nan", "nan",
+                    int(d["covered"]), f"{idle_s * 1000:.3f}", "nan", "nan", d["sched_ns"],
+                    f"{d['run_frac']:.6f}",
                 ]
                 samples.write("\t".join(str(x) for x in row) + "\n")
                 samples.flush()
@@ -644,7 +655,10 @@ def summarize(out, threshold):
     lines.append("")
     uncovered = sum(1 for r in rows if not r["covered"])
     if uncovered:
-        lines.append(f"FAIL: {uncovered} windows had a multiplexed counter on the server's core type.")
+        lines.append(
+            f"FAIL: {uncovered} windows were not fully counted: a counter on the server's core "
+            "type was multiplexed, or the counters missed a thread."
+        )
         lines.append("")
     idle = [r for r in rows if r["query"] == "_idle"]
     keys = []

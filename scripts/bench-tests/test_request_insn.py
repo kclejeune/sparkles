@@ -17,7 +17,7 @@ spec.loader.exec_module(ri)
 
 COLS = (
     "round epoch variant query mode reps instr_u instr_k cycles_u task_clock_ns ctx_switches "
-    "page_faults migrations covered window_ms exec_ms wall_ms"
+    "page_faults migrations covered window_ms exec_ms wall_ms sched_ns run_frac"
 ).split()
 
 
@@ -30,8 +30,8 @@ def write_samples(d, per_round):
         for rnd, (va, vb) in enumerate(per_round, 1):
             for v, x in (("A", va[0]), ("B", vb[0]), ("B", vb[1]), ("A", va[1])):
                 epoch += 1
-                f.write("\t".join(map(str, [rnd, epoch, v, "q", "streaming", 10, x * 10, "", x * 20, 1000, 5, 0, 0, 1, "1.0", "0.01", "0.1"])) + "\n")
-                f.write("\t".join(map(str, [rnd, epoch, v, "_idle", "-", 1, 100, "", 200, 10, 1, 0, 0, 1, "1.0", "nan", "nan"])) + "\n")
+                f.write("\t".join(map(str, [rnd, epoch, v, "q", "streaming", 10, x * 10, "", x * 20, 1000, 5, 0, 0, 1, "1.0", "0.01", "0.1", 1000, "1.0"])) + "\n")
+                f.write("\t".join(map(str, [rnd, epoch, v, "_idle", "-", 1, 100, "", 200, 10, 1, 0, 0, 1, "1.0", "nan", "nan", 10, "1.0"])) + "\n")
 
 
 class Statistics(unittest.TestCase):
@@ -69,7 +69,7 @@ class Statistics(unittest.TestCase):
             f[COLS.index("covered")] = "0"
             lines[1] = "\t".join(f)
             open(p, "w").write("\n".join(lines) + "\n")
-            self.assertIn("FAIL: 1 windows had a multiplexed counter", ri.summarize(d, 1.0))
+            self.assertIn("FAIL: 1 windows were not fully counted", ri.summarize(d, 1.0))
 
 
 @unittest.skipUnless(os.path.exists("/proc/sys/kernel/perf_event_paranoid"), "needs Linux")
