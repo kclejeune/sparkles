@@ -143,6 +143,7 @@ pub struct Reference {
     quads: Vec<Quad>,
     union_default: bool,
     pass_min_max_errors: Cell<bool>,
+    ignore_direction_in_compatibility: Cell<bool>,
     work_limit: Option<u64>,
     now: DateTime,
     /// The graphs that evaluations have read, by the names merged into each, which every
@@ -162,6 +163,7 @@ impl Reference {
             quads,
             union_default: false,
             pass_min_max_errors: Cell::new(false),
+            ignore_direction_in_compatibility: Cell::new(false),
             work_limit: None,
             now: DateTime::now(),
             graphs: RefCell::new(HashMap::new()),
@@ -188,6 +190,13 @@ impl Reference {
     /// [`Self::passing_over_min_max_errors`] does, for an evaluator kept across queries.
     pub fn set_passing_over_min_max_errors(&self, pass: bool) {
         self.pass_min_max_errors.set(pass);
+    }
+
+    /// Set whether later evaluations take two language-tagged string arguments of the same
+    /// language and different base directions as compatible, a reading other than SPARQL
+    /// 1.2's, which [`Notes::direction_in_compatibility`] describes.
+    pub fn set_ignoring_direction_in_compatibility(&self, ignore: bool) {
+        self.ignore_direction_in_compatibility.set(ignore);
     }
 
     /// Refuse a query, as one the evaluator does not evaluate, once it has formed
@@ -357,14 +366,23 @@ pub struct Notes {
     /// supports 16, so the evaluator's answer, which reads them exactly up to 38 digits,
     /// is one of those it allows.
     pub beyond_minimum_precision: bool,
+    /// A string function had two language-tagged arguments of the same language whose
+    /// base directions differ, which SPARQL 1.2 and Jena make incompatible arguments and
+    /// an error. A test may compare with the reading that ignores the direction where the
+    /// difference is tracked as an open defect.
+    pub direction_in_compatibility: bool,
 }
 
 /// Solutions in ORDER BY order, with the sort key of each and the direction of each
 /// key: what a slice needs to tell whether its cut is one the specification fixes.
 struct Keyed {
     solutions: Vec<Solution>,
-    keys: Option<(Vec<Vec<Option<Term>>>, Vec<bool>)>,
+    keys: Option<(Vec<SortKey>, Vec<bool>)>,
 }
+
+/// The values of the ORDER BY conditions for one solution, unbound where a condition is
+/// an error or unbound.
+type SortKey = Vec<Option<Term>>;
 
 /// Whether the specification puts the key `a` strictly before `b`.
 fn strictly_before(a: &[Option<Term>], b: &[Option<Term>], descending: &[bool]) -> bool {

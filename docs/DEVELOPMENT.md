@@ -447,11 +447,14 @@ reference evaluator in `crates/sparkles-core/tests/support/reference`, which fol
 SPARQL algebra literally and shares only the parser with the engine. They compare
 literals by their exact form, numbers by value and ORDER BY results in order, and
 `crates/sparkles-core/tests/w3c-reference-known.txt` lists the tests it answers
-otherwise, which is none. The seeded queries of `tests/query_cursor.rs` and the optimizer
-tests of `src/sparql/opt_tests.rs` take the evaluator as their oracle. It reports in its
-`Notes` where the specification leaves the answer open, and those comparisons check only
-what the specification fixes. `SPARKLES_REFERENCE_KEEP_GOING=1` makes the seeded queries
-report every disagreement before they fail.
+otherwise, which is none. The seeded queries of `tests/query_cursor.rs` take the
+evaluator as their oracle, and the optimizer, index-join and string-filter tests of
+`src/sparql` compare the engine with it as well as with `Optimizations::NONE`. It reports
+in its `Notes` where the specification leaves the answer open. The seeded queries then
+check only what the specification fixes, and the other tests leave the query to the
+comparison with `Optimizations::NONE`. `SPARKLES_REFERENCE_KEEP_GOING=1` makes the seeded
+queries report every disagreement before they fail, and `SPARKLES_REFERENCE_SKIPS=1` makes
+the other tests print each query they do not compare with the evaluator.
 
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.

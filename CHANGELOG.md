@@ -7,13 +7,14 @@
 A test-only evaluator in `crates/sparkles-core/tests/support/reference` follows the
 SPARQL 1.1 and 1.2 algebra literally and shares only the parser with the engine, which
 completes roadmap item 512. It answers all 508 SPARQL 1.0 and 1.1 and all 63 SPARQL 1.2
-query evaluation tests under an exact comparison, and it is the oracle of the seeded
-cursor differential and of the optimizer tests, in place of `Optimizations::NONE` and the
-eager executor. It notes the answers that the specification leaves open, which the tests
-compare only as far as the specification fixes them. It found three engine
+query evaluation tests under an exact comparison. It is the oracle of the seeded cursor
+differential in place of the eager executor, and the optimizer, index-join and
+string-filter tests compare the engine with it as well as with `Optimizations::NONE`. It
+notes the answers that the specification leaves open, which the cursor differential
+compares only as far as the specification fixes them. It found three engine
 disagreements. MIN and MAX pass over errors, roadmap item 1064, integers and decimals
 beyond the engine's decimal range are not numbers, roadmap item 1065, and the string
-functions ignore the base direction of their arguments, roadmap item 1066.
+functions ignore the base direction of their arguments, roadmap item 1071.
 
 ### MCP tool profiles and semantic search
 

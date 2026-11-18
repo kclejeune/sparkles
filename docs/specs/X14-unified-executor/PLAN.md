@@ -569,9 +569,9 @@ that it agrees with the engine on every W3C query test and on the seeded queries
 `tests/query_cursor.rs` at both modes.
 
 The evaluator has landed and passed this gate, apart from the three disagreements that
-items 1064 to 1066 hold. While those items are open, the tests compare MIN and MAX
-under the engine's reading, leave out the queries that read longer numbers, and report
-rather than fail a differing answer of a string function over directional strings. The [spec's Outcome](SPEC.md#outcome) describes it.
+items 1064, 1065 and 1071 hold. While those items are open, the tests compare MIN and MAX
+and the string functions over directional strings under the engine's reading, and leave
+out the queries that read longer numbers. The [spec's Outcome](SPEC.md#outcome) describes it.
 
 ### The merge
 

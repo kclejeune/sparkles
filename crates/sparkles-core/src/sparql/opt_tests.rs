@@ -108,8 +108,10 @@ fn canonical_rows(
 /// query that uses them is one it does not evaluate, and neither is a query whose nested
 /// loops pass the work limit. A query that reads a number of more than 16 digits is not
 /// compared, since XSD lets the engine limit those (roadmap item 1065). Where MIN or MAX
-/// reads an error, the engine passes over it, which roadmap item 1064 keeps open, so such
-/// a query compares with that reading.
+/// reads an error, the engine passes over it, which roadmap item 1064 keeps open, and
+/// where a string function's arguments differ only in base direction, the engine takes
+/// them as compatible, which roadmap item 1071 records, so such a query compares with
+/// the engine's reading.
 pub(super) fn same_as_reference(s: &Store, text: &str, r: &QueryResult) {
     same_as_reference_on(&s.snapshot(), &format!("{PREFIXES}{text}"), r);
 }
@@ -156,12 +158,19 @@ pub(super) fn same_as_reference_on(
     r: &QueryResult,
 ) {
     let oracle = reference_of(snapshot);
-    oracle.set_passing_over_min_max_errors(false);
     let mut answer = oracle.run_noting_choices(text, None);
-    if matches!(&answer, Ok((_, notes)) if notes.min_max_error) {
-        oracle.set_passing_over_min_max_errors(true);
+    // the readings of the open roadmap items, where the query met them
+    if let Ok((_, notes)) = &answer
+        && (notes.min_max_error || notes.direction_in_compatibility)
+    {
+        oracle.set_passing_over_min_max_errors(notes.min_max_error);
+        oracle.set_ignoring_direction_in_compatibility(notes.direction_in_compatibility);
         answer = oracle.run_noting_choices(text, None);
         oracle.set_passing_over_min_max_errors(false);
+        oracle.set_ignoring_direction_in_compatibility(false);
+    }
+    if let Err(reference::Error::Parse(e)) = &answer {
+        panic!("the reference does not parse a query the engine ran ({e}): {text}");
     }
     let (variables, rows) = match answer {
         Ok((reference::Answer::Select { variables, rows }, notes))
@@ -192,32 +201,11 @@ pub(super) fn same_as_reference_on(
         }
     };
     let engine_vars = r.variables().to_vec();
-    let (engine, reference) = (
+    assert_eq!(
         canonical_rows(&engine_vars, &r.test_application_rows(), &variables),
         canonical_rows(&variables, &rows, &variables),
+        "against the reference: {text}"
     );
-    if engine != reference
-        && let Some(row) = known_disagreement(text, oracle.quads())
-    {
-        eprintln!("known engine disagreement, roadmap item {row}: {text}");
-        return;
-    }
-    assert_eq!(engine, reference, "against the reference: {text}");
-}
-
-/// The roadmap item that records a disagreement of the engine with the specification
-/// which a differing answer to `text` over `quads` may come from. Only an answer that
-/// differs reaches this, so a query that the item cannot affect still fails.
-fn known_disagreement(text: &str, quads: &[oxrdf::Quad]) -> Option<u32> {
-    // Item 1066: the string functions take a language-tagged string and a directional
-    // one of the same language as compatible arguments.
-    let directional = quads
-        .iter()
-        .any(|q| matches!(&q.object, oxrdf::Term::Literal(l) if l.direction().is_some()));
-    let string_function = ["STRSTARTS", "STRENDS", "CONTAINS", "STRBEFORE", "STRAFTER"]
-        .iter()
-        .any(|f| text.contains(f));
-    (directional && string_function && text.contains("\"@")).then_some(1066)
 }
 
 /// Run `text` with every optimization and with none; the answers must be equal and the
