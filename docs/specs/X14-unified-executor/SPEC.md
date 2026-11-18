@@ -754,8 +754,13 @@ so that the scan reads whole blocks, streaming execution refused the count from 
 1,472 KiB and the LIMIT from 1,152 to 1,408 KiB. The scan now holds its block only during
 a read and keeps a `WeakBlock` of its columns between reads, which the block cache keeps
 alive, and it decodes the block again at its row when the cache has dropped it. The
-batches that the cursor root hands out without copying share one charge of the block's
-decoded columns, taken at hand-out and ended with the last of them. The root shares a
+batches that the cursor root hands out without copying share the block and one charge of
+its decoded columns through one handle. The root scan keeps that handle while it reads
+the block, so a writer that drops each batch before it pulls the next, as the result
+writers do with one Rayon worker, does not charge the block again for every batch. The
+charge ends when the scan leaves the block, reads it as owned rows or ends, and when the
+last batch handed out from it drops, so a cursor stopped inside a block keeps it charged
+until the cursor closes. The root shares a
 block only when the memory left covers a whole block's columns and one batch, as it did,
 and copies rows otherwise, so it never holds more than it did under the same budget.
 `cursor_headroom` and `cursor_fits` count a block for automatic admission, which keeps
@@ -766,7 +771,7 @@ by a block, and that root scans answer at every larger budget, one of them decod
 literal of 300 KiB. A root scan that shares its block can still be refused the decoding
 of a term larger than the room the block leaves, under a budget at which a copy would
 answer, and roadmap item 1051 holds that. A cursor over a read-through snapshot, which keeps no blocks,
-decodes its current block again for each batch, and no cursor query reads such a
+decodes its current block again for each batch of copied rows, and no cursor query reads such a
 snapshot.
 
 ### One join-kernel library

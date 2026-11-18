@@ -237,7 +237,9 @@ check them against the W3C suites and Jena's own answers.
   decodes the block again when the cache has dropped it. A scan inside a plan therefore
   takes the same memory under every budget. A cursor whose root is a scan hands out a
   block's rows without copying them when the budget leaves room for a whole block, and
-  those batches are charged the block's decoded columns while any of them is held. The
+  those batches are charged the block's decoded columns while the scan reads the block
+  or any of them is held, so a cursor stopped inside such a block keeps it charged until
+  it is closed. The
   decoding of a large term beside such a batch can be refused under a budget at which a
   copy would answer, which [roadmap item 1051](../ROADMAP.md) holds.
 * Property path closures run within the query's memory budget and timeout in both
