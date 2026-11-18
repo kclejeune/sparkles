@@ -310,9 +310,17 @@ the packages that read it. A file in a package's directory belongs to that packa
 few files outside the crates, such as `docs/openapi.json` and `ui/`, belong to the
 packages whose builds or tests read them. The selection then grows by every package that
 depends on a chosen one through normal, build or dev-dependencies. Documentation and
-scripts select no package. A change to a shared root, such as `Cargo.toml`, `Cargo.lock`,
-`mise.toml`, `.config/`, `testsuite/` or `crates/sparkles-core`, or to a file that the
-rules do not cover, keeps the whole workspace.
+scripts select no package. A change to a shared root, such as `Cargo.toml`, `.config/`,
+`testsuite/` or `rust-toolchain.toml`, or to a file that the rules do not cover, keeps
+the whole workspace. A change to `crates/sparkles-core` selects it and the packages that
+depend on it, which leaves out about a tenth of the test time.
+
+`Cargo.lock` and `mise.toml` are compared at the merge base and at the change. A lock
+change selects the workspace packages whose locked dependencies, normal, build or dev,
+reach an entry that it adds, removes or alters. A `mise.toml` change selects no package
+when it alters only the definitions of tasks that the `lint` and `test` tasks do not
+name, directly or through the tasks they name. Any other `mise.toml` change, and a lock
+that does not parse or names a package it does not list, keeps the whole workspace.
 
 Clippy runs with `-p` for each chosen package. nextest still builds the whole workspace,
 so its test binaries are the ones a full run builds and the shared cache already holds,
@@ -381,7 +389,9 @@ each listed test has a roadmap item to make it deterministic. A retry prints a `
 when it happens, and the final summary lists the test as `FLAKY`. `mise run test` writes
 the tests that passed only on a retry to `.artifacts/ci/flaky-tests.txt`, and
 `scripts/ci.sh` repeats them at the end of its summary. A test that fails every attempt
-still fails the run.
+still fails the run. The batch gate adds one rerun of each failed test, alone, as
+[Reruns of failed tests](#reruns-of-failed-tests) describes, and `mise run test` itself
+retries no other test.
 
 ### Partitioned test runs
 
@@ -973,6 +983,88 @@ a 24 GiB cap. `--cargo-jobs N` sets the jobs for every host of a run.
 environment or the configuration file, sets them per host, and `GATE_CARGO_JOBS` sets them
 for the hosts that list leaves out. The value is recorded in `progress.log`.
 
+### Reruns of failed tests
+
+When the ci step of a gate fails, `scripts/gate/remote/test_retry.py` reruns each failed
+Rust test once, alone, before the conformance steps start, and the gate passes if every
+rerun passes. It does so only when the evidence shows that the failure belongs to a few
+tests and to nothing else. The ci step must have run to its end. Its exit must be 1,
+which is `scripts/ci.sh`'s own failure exit, its log must end with `CI failed: test`,
+and the retained `summary.txt` must list exactly the tasks that the gate selected, each
+in a final state that agrees with its state file. A ci step that was killed, stopped or
+interrupted, or that left a task waiting, running or skipped, is never forgiven. Every
+other ci task and the shared prerequisites must have passed. The retained JUnit manifest
+must record a fresh report of the failed `test` task for the gate's commit, and
+nextest's final summary must be complete, with its failed and timed-out counts equal to
+the failures in the report. The worktree must still be at the gate's commit with no
+tracked change and no untracked file outside git's ignore rules, both before the reruns
+and after them. There must be between 1 and `GATE_RETRY_MAX_FAILURES` failures, 8 by
+default, which is above the largest number that recent gates recorded for a
+load-sensitive failure and far below a real breakage.
+
+Each test runs with `mbx nextest run --no-capture --retries 0` and an exact binary and
+test filter, under one lease on the managed target, within `GATE_RETRY_SECONDS` in all,
+2400 by default, and at most 900 seconds each. Each rerun gets a new empty `TMPDIR`, and
+`target/tmp`, which tests reach as `CARGO_TARGET_TMPDIR`, is emptied before it, so
+scratch that the failed run left behind cannot make the rerun pass. Other ignored paths
+in the worktree and state outside it, such as a service the test talks to, are not
+reset, so a test that depends on such state can still be forgiven. Each command runs in
+its own session. When it runs out of time, or the gate stops the helper, every process
+left in that session gets SIGTERM and then SIGKILL after 20 seconds, which also reaches
+the test processes that nextest puts in their own process groups. A rerun passes only
+when its own JUnit report lists exactly that test as passed and its log shows no
+workspace crate compiled. A failed nextest run ends the `test` task before its doctests,
+so the doctests of the task's packages run next. When all of these pass, the run writes
+`ci.forgiven`, with one line for each flaky test, and `steps.txt` gets a `FLAKY` line
+under the ci step.
+
+`ci.exit` keeps the original result, and the gate's verdict skips it only when
+`ci.forgiven` exists and `test-retry.exit` is 0. Any other outcome, including a rerun
+that fails, times out or matches no test, leaves the ci step failed. `test-retry.txt`
+gives the reason and the outcome of each rerun, and `test-retry/` holds each rerun's log
+and JUnit report beside the first run's evidence in `ci-receipts`. The nightly gate uses
+the same rule. A test that the gate forgave belongs on the list of
+[known flaky tests](#known-flaky-tests) once it recurs.
+
+### Timing cohort
+
+Some tests assert a wall-clock bound, such as a lock held for under 5 ms while writes run
+or an answer within 4 s, and other work on a loaded gate host breaks those bounds without
+any change to the code. They form the `host-timing` test group of `.config/nextest.toml`,
+where one override names each test exactly. The batch gate sets
+`SPARKLES_TEST_EXCLUDE_GROUP=host-timing` for its ci step, and `scripts/changed-crates.py`
+then adds `!group(host-timing)` to the one filter that the `test` task passes to nextest,
+so the group leaves the gate's pass/fail run, the nightly gate's included. The variable is
+part of the task cache key, so a pass without the group never stands in for a full run.
+Lane CI, GitHub's CI and every other run of `mise run test` still run these tests.
+
+The group runs after the gate with `mise run test:timing-cohort`, alone and one test at a
+time, on one dedicated worker that runs no other job. `scripts/timing-cohort.py check`
+compares each test's time with the worker's thresholds and reports a test that failed,
+timed out or ran past its threshold. It also reports a test that the group selects and
+the report lacks, lists twice or marks skipped, a qualified test that the group no longer
+selects, and a nextest run that ended badly with no failing test, since each of these
+means that a test the gate leaves out did not run. A regression writes `regression.md`
+with a roadmap row for a fix-forward item, and it does not block the push.
+
+Each run records its identity in `run.json`, which carries a version. The identity holds
+a unique run ID, the commit, the worker, the compiler, the build configuration, nextest's
+exit status and the tests that the group selected. The build configuration covers the
+Boxington version, each environment override of Cargo's and the compiler's flags and
+profiles, such as `CARGO_ENCODED_RUSTFLAGS` and `CARGO_PROFILE_*`, the manifest's profiles
+and a hash of each Cargo configuration file that applies. `SPARKLES_TIMING_WORKER` names the
+worker, such as `boat:bx_ID`, and defaults to the host name. The thresholds come from
+three or more runs at `origin/main` on the idle worker with
+`scripts/timing-cohort.py qualify RUN RUN RUN --out FILE`, which sets each test's
+threshold to its slowest time plus three times the spread of the runs, and to at least
+1.5 times the slowest. Qualification refuses a run directory given twice, a repeated run
+ID, runs from more than one commit, worker or build configuration, and a run that does
+not report each selected test exactly once with a pass. The thresholds file keeps the
+accepted runs' identities, and a check of a run from another worker or build
+configuration exits 2 and asks for a new qualification. `SPARKLES_TIMING_THRESHOLDS` or
+`--thresholds` names that file. Each run's results go to
+`.artifacts/timing-cohort/<time>-<commit>/`.
+
 ### Checks a batch selects
 
 `scripts/gate/gate.sh` passes the gate host the merge base of the commit and `--base`
@@ -988,9 +1080,12 @@ and the commit to the checks it calls for, and writes the choice and its reasons
 | `ui/` | The UI checks. |
 | A binding's crate or its own directory and scripts | That binding's checks. `crates/sparkles-py` and `scripts/py-test.sh` run `py:lint` and `py:test`, `crates/sparkles-ffi` and `jvm/` the JVM checks, and `crates/sparkles-node` and `js/` the Node checks. |
 | The public surface: `crates/sparkles`, the OpenAPI description and the baselines that `api:check` compares | Every binding's checks. |
+| A binding workflow in `.github/workflows` or a release script that only it runs, such as `scripts/py-wheel-test.sh` or `scripts/ci-node-musl.sh` | That binding's checks. The workflows' crate paths keep the rows above, so an engine change does not run every binding. |
 | SPARQL parsing, algebra and evaluation in `crates/sparkles-core/src/sparql`, the RDF parsers, the XSD functions, GeoSPARQL, the SHACL, SHACLC and ShEx crates and the suites' own files | `test:w3c`, `test:shacl` and `test:shex`. Unit-test files inside `src` do not count. |
 | The streaming executor, the spill files and the W3C harness | The plain and encrypted spill matrices. |
-| `Cargo.toml`, `Cargo.lock`, the toolchain, `mise.toml`, `.config/`, `vendor/`, `scripts/ci.sh`, `scripts/gate/` and the other CI scripts | Everything. |
+| `Cargo.lock` | `lint`, `test` and `licenses:check` for the packages whose locked dependencies change, and the conformance suites and spill matrices when sparkles-core, the SHACL, SHACLC or ShEx crate is among them. A lock that cannot be compared entry by entry runs everything. |
+| `mise.toml` | The ci tasks and conformance suites whose definitions change, or that name a task whose definition changes, directly or not. A change outside the task definitions runs everything. |
+| `Cargo.toml`, the toolchain, `.config/`, `vendor/`, `scripts/ci.sh`, `scripts/gate/` and the other CI scripts | Everything. |
 | A file that no rule covers, or no changed file | Everything. |
 
 The run then calls `scripts/ci.sh` without `--force`, with the chosen tasks and with
@@ -1008,6 +1103,29 @@ change that a binding's tests would notice.
 `python3 scripts/gate/select-checks.py --base origin/main` prints the selection for the
 checkout's `HEAD`, and `gate.sh --dry-run <rev>` prints whether the batch needs the
 conformance half and the hosts it would use.
+
+### Batch query screen
+
+The selection also decides whether the batch query screen runs, since the screen times
+SPARQL queries against a release build of the server and a batch that cannot change that
+build or the screen gains nothing from it. `select-checks.py` prints `screen run` or
+`screen skip` with the reason, and `gate.sh` prints `run screen (reason)` or
+`skip screen (reason)` before it starts the gate, so the batch's log records the choice.
+The rule reads the changed paths, not the selected packages, because a change to the OWL
+crate selects sparkles-core's dependents, the server among them, through the dependency
+graph without touching query execution.
+
+The screen is skipped only when every changed file is one that cannot reach the server's
+query path or the screen. These are documentation, the GitHub workflows, deployment and
+Nix files, the test suites' data, the JavaScript and JVM packages, the CI, gate, binding,
+licence and release scripts with the script tests, the tests, benchmarks, examples and
+fuzz targets at the top of any crate, the unit-test files inside a crate's `src`, and the OWL,
+SHACL, SHACLC, ShEx, client, office import, memory import, browser formatter and binding
+crates. Any other file runs the screen. That includes the query engine, the server and
+every other crate it links, every crate's `Cargo.toml` and `build.rs`, since a manifest
+can turn on a feature of a dependency the server shares, `Cargo.lock`, the toolchain, `mise.toml`,
+`vendor/`, the UI and the OpenAPI files that the server embeds, the scripts that build
+and time the screen, a file that no rule names, and an empty change. `--full` runs it.
 
 ### Nightly gate
 
@@ -1057,6 +1175,20 @@ a run failed, and `GATE_GITHUB_RUNS=0` skips it. The nightly gate writes it to
 failed run only warns and never changes either gate's exit status. A batch that fixes a
 red run has to pass the gate while `main` is still red, so a blocking check would stop
 the fix from landing. Fix the run in the next batch, or say in the batch why it can wait.
+
+The script also follows failure streaks. Each report works out, from each workflow's
+history on the branch, the failed runs since its newest run that neither failed nor was
+cancelled, and fetches up to 200 runs when the newest 20 do not reach such a run. A run
+that finished late or a rerun that changed its result therefore counts as it now stands.
+When there are two or more failed runs, the report writes a roadmap row draft to
+`.artifacts/gates/github-streaks/drafts/` in the main checkout and prints its path. A
+versioned record beside each draft names its repository, branch, workflow and failed
+runs, and each report extends it. A streak that shares a failed run with a record already
+has its draft, so a streak opens one draft, and a streak that ended between two reports
+opens none. A record closes only when the fetched runs include the run that ended its
+streak. Add the drafted row to the roadmap with the next free number. The script
+never edits the roadmap, commits or pushes, an error in following the streaks only
+prints a line, and `--no-streaks` turns them off.
 
 ## Continuous integration
 

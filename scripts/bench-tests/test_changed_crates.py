@@ -23,6 +23,58 @@ PACKAGES = {
     "sparkles-fmt-wasm": ("crates/sparkles-fmt-wasm", {"sparkles-fmt"}),
 }
 
+LOCK = """version = 4
+
+[[package]]
+name = "sparkles-core"
+version = "0.1.0"
+dependencies = ["memchr"]
+
+[[package]]
+name = "sparkles-fmt"
+version = "0.1.0"
+dependencies = ["itoa", "serde 1.0.1"]
+
+[[package]]
+name = "memchr"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa"
+
+[[package]]
+name = "itoa"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb"
+
+[[package]]
+name = "serde"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc"
+dependencies = ["itoa"]
+"""
+
+MISE = """[tools]
+rust = "1.0"
+
+[tasks.test]
+depends = ["ui:build"]
+run = "mbx nextest run"
+
+[tasks.lint]
+run = "mbx clippy"
+
+[tasks."ui:build"]
+run = "pnpm build"
+
+[tasks."py:test"]
+run = "pytest"
+
+[tasks."bench:x"]
+run = "scripts/bench.sh"
+"""
+
 
 class RenamedFiles(unittest.TestCase):
     def test_a_moved_file_reports_both_paths(self):
@@ -50,11 +102,12 @@ class RenamedFiles(unittest.TestCase):
 
 
 class ChangedCrates(unittest.TestCase):
-    def choose(self, *files):
+    def choose(self, *files, texts=None):
+        texts = texts or {}
         with mock.patch.object(cc, "workspace", return_value=PACKAGES), mock.patch.object(
             cc, "changed_files", return_value=sorted(files)
         ):
-            return cc.choose("base")[0]
+            return cc.choose("base", read=lambda path: texts[path])[0]
 
     def test_a_crate_and_its_reverse_dependencies(self):
         self.assertEqual(
@@ -69,9 +122,41 @@ class ChangedCrates(unittest.TestCase):
         )
 
     def test_shared_roots_select_everything(self):
-        for f in ["Cargo.lock", "Cargo.toml", "crates/sparkles-core/src/x.rs", ".config/nextest.toml",
-                  "testsuite/a/b.ttl", "mise.toml", "rust-toolchain.toml"]:
+        for f in ["Cargo.toml", ".config/nextest.toml", "testsuite/a/b.ttl", "rust-toolchain.toml"]:
             self.assertEqual(self.choose("crates/sparkles-fmt/src/lib.rs", f), "all", f)
+
+    def test_sparkles_core_selects_its_dependents(self):
+        self.assertEqual(
+            self.choose("crates/sparkles-core/src/sparql/ctx.rs"),
+            ["sparkles", "sparkles-core", "sparkles-server", "sparkles-shacl"],
+        )
+
+    def test_a_lock_change_selects_the_members_that_reach_it(self):
+        bumped = LOCK.replace('checksum = "bb"', 'checksum = "bd"').replace('version = "1.0.0"', 'version = "1.0.2"')
+        self.assertEqual(
+            self.choose("Cargo.lock", texts={"Cargo.lock": (LOCK, bumped)}),
+            ["sparkles-fmt", "sparkles-fmt-wasm", "sparkles-server"],
+        )
+        added = LOCK.replace('dependencies = ["memchr"]', 'dependencies = ["memchr", "itoa"]')
+        self.assertEqual(
+            self.choose("Cargo.lock", texts={"Cargo.lock": (LOCK, added)}),
+            ["sparkles", "sparkles-core", "sparkles-server", "sparkles-shacl"],
+        )
+        self.assertEqual(self.choose("Cargo.lock", texts={"Cargo.lock": (LOCK, LOCK)}), "none")
+
+    def test_a_lock_that_cannot_be_compared_selects_everything(self):
+        for new in ["not toml [", LOCK.replace("version = 4", "version = 3"), None,
+                    LOCK.replace('dependencies = ["memchr"]', 'dependencies = ["missing"]')]:
+            self.assertEqual(self.choose("Cargo.lock", texts={"Cargo.lock": (LOCK, new)}), "all", new)
+
+    def test_mise_changes_outside_the_rust_tasks_select_no_package(self):
+        changed = MISE.replace('run = "pytest"', 'run = "pytest -x"').replace("bench.sh", "bench.sh --q")
+        self.assertEqual(self.choose("mise.toml", texts={"mise.toml": (MISE, changed)}), "none")
+
+    def test_mise_changes_to_the_rust_tasks_or_their_tools_select_everything(self):
+        for changed in [MISE.replace("nextest run", "nextest run -x"), MISE.replace("pnpm build", "pnpm b"),
+                        MISE.replace('rust = "1.0"', 'rust = "1.1"'), MISE + "\n[env]\nX = '1'\n", "bad ["]:
+            self.assertEqual(self.choose("mise.toml", texts={"mise.toml": (MISE, changed)}), "all", changed)
 
     def test_unknown_files_select_everything(self):
         self.assertEqual(self.choose("examples/new.rs"), "all")

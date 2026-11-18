@@ -21,7 +21,7 @@
 #                run `lint` and `test` only for the workspace packages that the change since
 #                the merge base of BASE and HEAD can affect and the packages that depend on
 #                them (scripts/changed-crates.py). A change to a shared root, such as
-#                Cargo.lock or sparkles-core, keeps the whole workspace. The batch gate
+#                Cargo.toml or .config/, keeps the whole workspace. The batch gate
 #                passes it when its selection narrows the packages
 #                (scripts/gate/select-checks.py).
 #   --exhaustive-features

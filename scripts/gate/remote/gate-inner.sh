@@ -185,6 +185,12 @@ fi
 log "selection: $(tr '\n' ';' < "$out/selection.txt")"
 
 if [ "$part" != conformance ]; then
+  # A forgiveness belongs to the run that wrote it, never to a later run of the same name.
+  rm -rf "$out/ci.forgiven" "$out/test-retry.exit" "$out/test-retry.txt" "$out/test-retry"
+  # The host-timing test group of .config/nextest.toml asserts wall-clock bounds, so it
+  # leaves the pass/fail run and runs alone afterwards (mise run test:timing-cohort).
+  # A commit whose changed-crates.py predates the variable runs the group as before.
+  export SPARKLES_TEST_EXCLUDE_GROUP=host-timing
   step ci scripts/ci.sh "${force[@]}" --jobs "$jobs" "${ci_args[@]}"
   # New CI revisions retain actual JUnit under their original lease. Copy only that
   # retained evidence here, after ci.sh has returned; never recover it from a target.
@@ -203,6 +209,19 @@ if [ "$part" != conformance ]; then
     fi
   }
   step ci-receipts retain_ci_receipts
+  # A failed ci step whose only failure is the test task's, with a few failed tests, gets
+  # one rerun of each failed test alone (test_retry.py). The rerun holds one lease on the
+  # managed target for all its commands. A pass of every rerun and of the doctests writes
+  # ci.forgiven, and the verdict below then skips ci.exit, which keeps its first result.
+  if [ "$(cat "$out/ci.exit")" != 0 ] && [ "$(cat "$out/ci-receipts.exit")" = 0 ] &&
+    [ -f "$(dirname "$0")/test_retry.py" ] && [ -x scripts/cargo-sparkles-task ]; then
+    step test-retry env PATH="$wt/scripts:$PATH" mbx sparkles-task -- python3 -I "$(dirname "$0")/test_retry.py" \
+      --out "$out" --commit "$full" --max-failures "${GATE_RETRY_MAX_FAILURES:-8}" --seconds "${GATE_RETRY_SECONDS:-2400}"
+    if [ "$(cat "$out/test-retry.exit")" = 0 ] && [ -s "$out/ci.forgiven" ]; then
+      log "ci forgiven: $(wc -l < "$out/ci.forgiven") flaky tests passed alone"
+      printf '%-20s FLAKY          %s\n' ci "$(tr '\n' ';' < "$out/ci.forgiven")" >> "$out/steps.txt"
+    fi
+  fi
 fi
 if [ "$part" != ci ]; then
   for t in w3c shacl shex; do
@@ -224,7 +243,14 @@ if [ "$part" != ci ]; then
 fi
 
 fail=0
-for f in "$out"/*.exit; do [ "$(cat "$f")" = 0 ] || fail=1; done
+for f in "$out"/*.exit; do
+  # A ci step that the rerun forgave counts as passed. ci.forgiven exists only when every
+  # failed test passed alone and the doctests passed, and test-retry.exit is then 0.
+  if [ "${f##*/}" = ci.exit ] && [ -s "$out/ci.forgiven" ] && [ "$(cat "$out/test-retry.exit" 2> /dev/null)" = 0 ]; then
+    continue
+  fi
+  [ "$(cat "$f")" = 0 ] || fail=1
+done
 cat "$cg/memory.peak" > "$out/mempeak.final" 2> /dev/null
 log "done fail=$fail peak=$(cat "$out/mempeak.final" 2> /dev/null) $(tail -n1 "$out/mempeak.log" 2> /dev/null | grep -o 'anonmax=[0-9]*')"
 

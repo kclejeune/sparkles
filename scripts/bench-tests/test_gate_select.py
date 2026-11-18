@@ -12,15 +12,30 @@ spec = importlib.util.spec_from_file_location("gate_select", ROOT / "scripts/gat
 gs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gs)
 
+spec2 = importlib.util.spec_from_file_location("ccrates", ROOT / "scripts/bench-tests/test_changed_crates.py")
+fixtures = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(fixtures)
+LOCK, MISE = fixtures.LOCK, fixtures.MISE
+
+# The files of batch 31, OWL classification and documentation, whose screen was skipped.
+BATCH_31 = [
+    "AGENTS.md", "CHANGELOG.md", "crates/sparkles-owl/src/classify/dl_reduce.rs",
+    "crates/sparkles-owl/src/classify/index.rs", "crates/sparkles-owl/src/classify/mod.rs",
+    "crates/sparkles-owl/src/classify/query.rs", "crates/sparkles-owl/tests/dl_nominals.rs",
+    "docs/BENCHMARKING.md", "docs/FEATURES.md", "docs/ROADMAP.md", "docs/reasoning/README.md",
+    "docs/specs/F24-owl-classification/SPEC.md",
+]
+
 BASE = ["fmt:check", "lint:shell", "lint:doc-paths", "api:check", "test:bench-scripts", "client:types:check"]
 
 
 class Selection(unittest.TestCase):
-    def sel(self, files, packages="none"):
-        return gs.select(sorted(files), packages)[0]
+    def sel(self, files, packages="none", texts=None):
+        read = (lambda path: texts[path]) if texts is not None else None
+        return gs.select(sorted(files), packages, read)[0]
 
-    def ci(self, files, packages="none"):
-        return self.sel(files, packages)["ci"]
+    def ci(self, files, packages="none", texts=None):
+        return self.sel(files, packages, texts)["ci"]
 
     def test_the_task_list_matches_ci_sh(self):
         text = (ROOT / "scripts/ci.sh").read_text()
@@ -45,6 +60,57 @@ class Selection(unittest.TestCase):
         self.assertNotIn("py:test", ci)
         ci = self.ci(["crates/sparkles-fmt/src/lib.rs"], ["sparkles-fmt", "sparkles-fmt-wasm", "sparkles-server"])
         self.assertIn("fmt:wasm", ci)
+
+    def test_the_workflow_table_matches_the_workflows(self):
+        def push_paths(wf):
+            out, push, inside = [], False, False
+            for line in (ROOT / ".github/workflows" / wf).read_text().splitlines():
+                if line.startswith("  push:"):
+                    push = True
+                elif push and "paths: &paths" in line:
+                    inside = True
+                elif inside:
+                    m = re.match(r"^\s*- ['\"]?([^'\"]+?)['\"]?\s*$", line)
+                    if m:
+                        out.append(m.group(1))
+                    elif not re.match(r"^\s*#", line):
+                        break
+            return out
+        files = {p.name for p in (ROOT / ".github/workflows").glob("*.yml")}
+        mapped = {Path(wf).name for wf, _, _ in gs.WORKFLOWS}
+        self.assertEqual(files, mapped | gs.WORKFLOW_UNMAPPED)
+        self.assertFalse(mapped & gs.WORKFLOW_UNMAPPED)
+        for wf, group, patterns in gs.WORKFLOWS:
+            self.assertIn(group, gs.GROUPS)
+            self.assertEqual(patterns, push_paths(Path(wf).name), wf)
+
+    def test_workflow_paths_follow_github_rules(self):
+        py = next(p for wf, g, p in gs.WORKFLOWS if g == "py")
+        self.assertTrue(gs.workflow_selects("crates/sparkles-core/src/lib.rs", py))
+        self.assertFalse(gs.workflow_selects("crates/sparkles-core/tests/w3c.rs", py))
+        self.assertTrue(gs.workflow_selects("crates/sparkles-core/tests/patch/a.rdfp", py))
+        self.assertTrue(gs.workflow_selects("crates/sparkles-py/tests/test_x.py", py))
+        self.assertFalse(gs.workflow_selects("crates/sparkles-owl/src/lib.rs", py))
+        # `*` stays within one directory, unlike fnmatch's.
+        self.assertFalse(gs.workflow_selects("crates/sparkles-core/src/a/tests/b.rs", ["!crates/sparkles*/tests/**"]))
+        self.assertTrue(gs.workflow_selects("crates/sparkles-core/src/a/tests/b.rs",
+                                            ["crates/**", "!crates/sparkles*/tests/**"]))
+
+    def test_a_workflow_and_its_own_scripts_run_its_local_checks(self):
+        for f, group in [(".github/workflows/python-wheels.yml", "py"), ("scripts/py-sdist.py", "py"),
+                         ("scripts/py-wheel-test.sh", "py"), (".github/workflows/jvm-bindings.yml", "jvm"),
+                         (".github/workflows/node-packages.yml", "node"), ("scripts/ci-node-musl.sh", "node")]:
+            ci = self.ci([f])
+            for t in gs.GROUPS[group]:
+                self.assertIn(t, ci, f)
+        ci = self.ci(["scripts/install-mbx-container.sh"])
+        for t in ["py:test", "node:test"]:
+            self.assertIn(t, ci)
+        self.assertNotIn("jvm:test", ci)
+        # The other workflows and the documentation select no binding.
+        for f in [".github/workflows/ci.yml", ".github/workflows/server-artifacts.yml", "docs/FEATURES.md"]:
+            for t in ["py:test", "jvm:test", "node:test"]:
+                self.assertNotIn(t, self.ci([f]), f)
 
     def test_engine_changes_outside_sparql_skip_conformance_and_bindings(self):
         s = self.sel(["crates/sparkles-core/src/store/compaction.rs"], "all")
@@ -105,13 +171,121 @@ class Selection(unittest.TestCase):
         self.assertNotIn("ui:test", self.ci(["crates/sparkles-server/src/main.rs"], ["sparkles-server"]))
 
     def test_build_configuration_and_ci_scripts_run_everything(self):
-        for f in ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml", "mise.toml", ".config/nextest.toml",
+        for f in ["Cargo.toml", "rust-toolchain.toml", ".config/nextest.toml",
                   "scripts/ci.sh", "scripts/gate/gate.sh", "scripts/changed-crates.py", "vendor/spargebra/src/x.rs"]:
             s = self.sel(["docs/x.md", f])
             self.assertEqual(s["ci"], "all", f)
             self.assertEqual(s["conformance"], gs.CONFORMANCE, f)
             self.assertEqual(s["spill"], gs.SPILL, f)
             self.assertEqual(s["packages"], "all", f)
+
+    def test_lock_and_mise_changes_run_everything_without_a_reader(self):
+        for f in ["Cargo.lock", "mise.toml"]:
+            self.assertEqual(self.sel(["docs/x.md", f])["ci"], "all", f)
+
+    def test_a_lock_change_runs_the_rust_tasks_of_the_packages_it_reaches(self):
+        bumped = LOCK.replace('checksum = "bb"', 'checksum = "bd"')
+        s = self.sel(["Cargo.lock"], ["sparkles-fmt", "sparkles-server"], {"Cargo.lock": (LOCK, bumped)})
+        for t in ["lint", "test", "licenses:check", "test:quickstart"] + BASE:
+            self.assertIn(t, s["ci"])
+        for t in ["py:test", "jvm:test", "node:test", "ui:test"]:
+            self.assertNotIn(t, s["ci"])
+        self.assertEqual(s["conformance"], [])
+        self.assertEqual(s["spill"], [])
+        core = LOCK.replace('checksum = "aa"', 'checksum = "ad"')
+        s = self.sel(["Cargo.lock"], "all", {"Cargo.lock": (LOCK, core)})
+        self.assertEqual(s["conformance"], gs.CONFORMANCE)
+        self.assertEqual(s["spill"], gs.SPILL)
+        self.assertEqual(self.sel(["Cargo.lock"], "all", {"Cargo.lock": (LOCK, "bad [")})["ci"], "all")
+
+    def test_a_mise_change_runs_the_tasks_whose_definitions_it_changes(self):
+        texts = lambda new: {"mise.toml": (MISE, new)}
+        ci = self.ci(["mise.toml"], "none", texts(MISE.replace('"pytest"', '"pytest -x"')))
+        self.assertEqual(ci, [t for t in gs.CI_TASKS if t in BASE + ["py:test"]])
+        ci = self.ci(["mise.toml"], "none", texts(MISE.replace("bench.sh", "bench.sh -q")))
+        self.assertEqual(ci, [t for t in gs.CI_TASKS if t in BASE])
+        # ui:build is a prerequisite that test names, so the test task runs.
+        self.assertIn("test", self.ci(["mise.toml"], "all", texts(MISE.replace("pnpm build", "pnpm b"))))
+        w3c = MISE + '\n[tasks."test:w3c"]\nrun = "mbx test"\n'
+        s = gs.select(["mise.toml"], "none", lambda p: (MISE, w3c))[0]
+        self.assertEqual(s["conformance"], gs.CONFORMANCE)
+        self.assertEqual(self.ci(["mise.toml"], "all", texts(MISE.replace('"1.0"', '"1.1"'))), "all")
+
+    def test_the_screen_skips_only_changes_that_cannot_reach_query_execution(self):
+        self.assertEqual(self.sel(BATCH_31)["screen"][0], False)
+        self.assertEqual(self.sel(["docs/ROADMAP.md", "crates/sparkles-core/src/sparql_tests.rs",
+                                   "crates/sparkles-core/tests/w3c.rs", ".github/workflows/ci.yml",
+                                   "scripts/gate/gate.sh", "crates/sparkles-py/src/lib.rs"])["screen"][0], False)
+        for f in ["crates/sparkles-core/src/sparql/plan.rs", "crates/sparkles-server/src/http.rs",
+                  "crates/sparkles/src/lib.rs", "crates/sparkles-reasoner/src/lib.rs", "Cargo.lock",
+                  "Cargo.toml", "rust-toolchain.toml", "mise.toml", "scripts/bench.sh", "scripts/nsc-bench.sh",
+                  "scripts/boat/controller.py", "docs/openapi.json", "ui/src/x.svelte", "examples/new.rs",
+                  "crates/sparkles-new/src/lib.rs"]:
+            run, why = self.sel(BATCH_31 + [f])["screen"]
+            self.assertTrue(run, f)
+            self.assertIn(f, why)
+        self.assertTrue(self.sel([])["screen"][0])
+        self.assertTrue(gs.select(["Cargo.lock"], None)[0]["screen"][0])
+
+    def test_the_prerequisites_match_ci_sh(self):
+        text = (ROOT / "scripts/ci.sh").read_text()
+        block = re.search(r'for t in "\$\{tasks\[@\]\}"; do\n    case "\$t" in\n(.*?)\n    esac', text, re.S).group(1)
+        want = {}
+        for pats, prep in re.findall(r"^\s*([^)\n]+)\) prep\+=\(([^)]+)\) ;;", block, re.M):
+            for t in pats.split("|"):
+                want.setdefault(t.strip(), []).extend(prep.split())
+        self.assertEqual(want, gs.PREP_TASKS)
+
+    def test_a_prerequisite_change_runs_the_tasks_that_ci_builds_it_for(self):
+        new = MISE.replace('run = "pnpm build"', 'run = "pnpm b"')
+        ci = gs.select(["mise.toml"], "none", lambda p: (MISE, new))[0]["ci"]
+        self.assertIn("test:quickstart", ci)
+        self.assertIn("ui:test", ci)
+
+    def test_a_broken_jvm_native_task_runs_the_jvm_test(self):
+        # jvm:test does not name jvm:native in mise.toml, but scripts/ci.sh builds it first.
+        real = (ROOT / "mise.toml").read_text()
+        broken = real.replace('run = "mbx sparkles-task -- scripts/jvm-native.sh"', 'run = "false"', 1)
+        self.assertNotEqual(real, broken)
+        ci = gs.select(["mise.toml"], "none", lambda p: (real, broken))[0]["ci"]
+        self.assertIn("jvm:test", ci)
+
+    def test_manifests_build_scripts_and_nested_test_directories_run_the_screen(self):
+        for f in ["crates/sparkles-owl/Cargo.toml", "crates/sparkles-shacl/build.rs",
+                  "crates/sparkles-core/src/sparql/tests/x.rs", "crates/sparkles-server/src/fuzz/a.rs"]:
+            self.assertTrue(self.sel([f])["screen"][0], f)
+        self.assertFalse(self.sel(["crates/sparkles-core/tests/support/x.rs", "crates/sparkles-core/benches/b.rs"])["screen"][0])
+
+    def test_the_scripts_the_screen_reaches_run_it(self):
+        # Follow every script name that the screen's scripts mention, by base name, and
+        # stop at the scripts that SCREEN_SKIP lists. The ones reached that way are the CI
+        # and gate scripts that the remote CI runner names, checked by hand, and any other
+        # is a script of the screen that SCREEN_SKIP must not list.
+        scripts = {p.relative_to(ROOT).as_posix() for p in (ROOT / "scripts").rglob("*") if p.is_file()}
+        by_name = {}
+        for p in scripts:
+            by_name.setdefault(os.path.basename(p), set()).add(p)
+        match = lambda p, pats: any(gs.fnmatch.fnmatchcase(p, pat) for pat in pats)
+        skipped = lambda p: match(p, gs.SCREEN_SKIP) and not match(p, gs.SCREEN_RUN)
+        todo, seen, reached = ["scripts/bench-remote.sh", "scripts/nsc-bench.sh"], set(), set()
+        while todo:
+            p = todo.pop()
+            if p in seen:
+                continue
+            seen.add(p)
+            if skipped(p):
+                reached.add(p)
+                continue
+            text = (ROOT / p).read_text(errors="replace")
+            for name in set(re.findall(r"[A-Za-z0-9_.-]+\.(?:sh|py)\b", text)):
+                todo.extend(by_name.get(name, ()))
+        self.assertEqual(sorted(reached), [
+            "scripts/ci.sh", "scripts/gate/gate.sh", "scripts/gate/remote/ci-job.sh",
+            "scripts/gate/remote/gate-start.sh", "scripts/gate/setup-host.sh", "scripts/premerge.sh",
+        ])
+        for f in ["scripts/bench.sh", "scripts/nsc-bench.sh", "scripts/bench-remote.sh", "scripts/gate/config.sh",
+                  "scripts/new-tool.sh"]:
+            self.assertTrue(self.sel([f])["screen"][0], f)
 
     def test_unknown_files_and_an_empty_change_run_everything(self):
         self.assertEqual(self.ci(["examples/new.rs"]), "all")
@@ -153,7 +327,8 @@ class CommitRange(unittest.TestCase):
                 ).stdout.splitlines()
             finally:
                 os.chdir(cwd)
-            self.assertEqual(out, ["ci " + " ".join(t for t in gs.CI_TASKS if t in BASE), "conformance", "spill"])
+            self.assertEqual(out, ["ci " + " ".join(t for t in gs.CI_TASKS if t in BASE), "conformance", "spill",
+                                   "screen skip (no changed file reaches query execution or the screen)"])
 
 
 if __name__ == "__main__":

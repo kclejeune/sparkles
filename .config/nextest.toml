@@ -63,6 +63,28 @@ threads-required = "num-test-threads"
 filter = "test(controlled_waits_do_not_count_against_the_deadline)"
 threads-required = "num-test-threads"
 
+# Tests that assert a wall-clock bound, such as a lock hold under 5 ms or an answer within
+# 4 s, which other work on the host can break without any change to the code. The batch
+# gate leaves this group out of its pass/fail run (SPARKLES_TEST_EXCLUDE_GROUP, which
+# scripts/gate/remote/gate-inner.sh sets) and runs it afterwards, alone, on a dedicated
+# worker with `mise run test:timing-cohort`, where a regression opens a fix-forward
+# roadmap item instead of blocking the push. Every other run, lane CI and GitHub's among
+# them, still runs these tests. An entry names one test exactly, and
+# scripts/bench-tests/test_timing_cohort.py checks that each still exists.
+[test-groups.host-timing]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = """\
+(package(sparkles-fmt) & test(=lint::tests_embedded::many_holders_of_one_query_keep_to_the_deadline)) | \
+(package(sparkles-core) & test(=store::backup::tests::captures_are_consistent_under_concurrent_writes)) | \
+(package(sparkles-core) & test(=store::family_tests::cohort_waits_cover_earlier_permits_only)) | \
+(package(sparkles-backup) & test(=restore::tests::backups_under_concurrent_writes_restore_to_their_commits)) | \
+(package(sparkles) & binary(nesting) & test(=a_basic_graph_pattern_past_the_plan_limit_is_refused)) | \
+(package(sparkles-server) & test(=http::stream_idle_tests::cleanup_waits_for_the_real_producer_not_only_its_released_pool_grant))\
+"""
+test-group = "host-timing"
+
 # Known flaky tests, and only these, get retries. Each has a roadmap item to make it
 # deterministic, and the entry goes once that item ships. A retry prints a TRY line as it
 # happens, the final summary lists the test as FLAKY, and `mise run test` writes the tests

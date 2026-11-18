@@ -14,19 +14,29 @@ The nightly gate runs every check with --force and does not use this selection.
 Usage:
   select-checks.py --base BASE [--rev REV] [--paths-only]
 
-It prints four lines, with the reasons on standard error:
+It prints five lines, with the reasons on standard error:
   ci TASK...            the scripts/ci.sh tasks to run, or `all`
   conformance SUITE...  the conformance suites (w3c, shacl, shex) to run, possibly none
   spill MODE...         the spill matrices (plain, encrypted) to run, possibly none
+  screen run|skip (R)   whether the batch query screen runs, and why
   packages P...         `all`, `none` or the packages for `scripts/ci.sh --changed`
 --paths-only skips the package selection, which needs `cargo metadata`, and prints no
-packages line and no Rust tasks. The conformance and spill lines do not depend on it.
+packages line and no Rust tasks. The conformance, spill and screen lines do not depend
+on it.
+
+Cargo.lock and mise.toml are read at both commits rather than taken as roots. A lock
+change runs the Rust tasks for the packages whose locked dependencies it changes, and the
+conformance suites when one of them is a package the suites check. A mise.toml change
+runs the ci tasks and conformance suites whose definitions, or the definitions of the
+tasks they name, it changes. Either runs everything when the two versions cannot be
+compared that way, and a mise.toml change to anything but a task does too.
 """
 
 import argparse
 import fnmatch
 import importlib.util
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -128,8 +138,8 @@ BINDING_SURFACE = [
 RULES = [
     # Build configuration and the scripts that run the checks.
     ([
-        "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".mbx.toml", ".cargo/*", ".config/*",
-        "mise.toml", "clippy.toml", "rustfmt.toml", "vendor/*",
+        "Cargo.toml", "rust-toolchain.toml", ".mbx.toml", ".cargo/*", ".config/*",
+        "clippy.toml", "rustfmt.toml", "vendor/*",
         "scripts/ci.sh", "scripts/gate/*", "scripts/cargo-sparkles-task", "scripts/mbx-policy-key.py",
         "scripts/changed-crates.py", "scripts/nextest-slow.py",
     ], ["all"]),
@@ -142,7 +152,10 @@ RULES = [
     ], ["base"]),
     # Workspace crates and the test suites: the Rust tasks come from changed-crates.py.
     (["crates/*", "testsuite/*"], ["base"]),
-    (["THIRD_PARTY_LICENSES*.md", "scripts/third-party-licenses.py", "crates/*/Cargo.toml"], ["licenses"]),
+    (["THIRD_PARTY_LICENSES*.md", "scripts/third-party-licenses.py", "crates/*/Cargo.toml", "Cargo.lock"],
+     ["licenses"]),
+    # select() reads these two at both commits; see read_roots.
+    (["Cargo.lock", "mise.toml"], ["base"]),
     (["README.md", "scripts/test-quickstart.py"], ["quickstart"]),
     (["scripts/build-fmt-wasm.sh"], ["wasm"]),
     (["ui/*"], ["base", "ui"]),
@@ -155,6 +168,198 @@ RULES = [
     (CONFORMANCE_PATHS, ["conformance"]),
     (SPILL_PATHS, ["spill"]),
 ]
+
+
+# The GitHub workflows that test a binding, each with the group of local checks that does
+# the same work and its push paths, copied verbatim and in order. A test checks each list
+# against its workflow. Only the files that a workflow alone reads, its own definition and
+# the release scripts it runs, select the group through this table. Crate, vendor and
+# binding sources keep the rules above, which run a binding's checks for its own files and
+# for BINDING_SURFACE, so an engine change does not run every binding in the gate. The
+# post-push report of scripts/gate/github-runs.py catches what that leaves to GitHub.
+# ci.yml runs the Rust tasks that changed-crates.py selects. server-artifacts.yml builds
+# the release server, which the nightly gate's server link check and gate.sh --link-only
+# cover rather than the batch selection. nix.yml runs only by hand. None of the three has
+# an entry.
+WORKFLOWS = [
+    (".github/workflows/python-wheels.yml", "py", [
+        "crates/sparkles/**", "crates/sparkles-alloc/**", "crates/sparkles-budget/**",
+        "crates/sparkles-backup/**", "crates/sparkles-core/**", "crates/sparkles-graphql/**",
+        "crates/sparkles-py/**", "crates/sparkles-reasoner/**", "crates/sparkles-shacl/**",
+        "crates/sparkles-shex/**", "!crates/sparkles*/tests/**", "crates/sparkles-py/tests/**",
+        "crates/sparkles-core/tests/patch/**", "!crates/sparkles*/benches/**", "!crates/sparkles*/examples/**",
+        "vendor/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/install-mbx-container.sh",
+        "mise.toml", "scripts/py-sdist.py", "scripts/py-wheel-test.sh", ".github/workflows/python-wheels.yml",
+    ]),
+    (".github/workflows/jvm-bindings.yml", "jvm", [
+        "crates/sparkles/**", "crates/sparkles-alloc/**", "crates/sparkles-budget/**",
+        "crates/sparkles-backup/**", "crates/sparkles-core/**", "crates/sparkles-ffi/**",
+        "crates/sparkles-fmt/**", "crates/sparkles-graphql/**", "crates/sparkles-reasoner/**",
+        "crates/sparkles-shacl/**", "crates/sparkles-shex/**", "!crates/sparkles*/tests/**",
+        "!crates/sparkles*/benches/**", "!crates/sparkles*/examples/**", "crates/sparkles-ffi/examples/**",
+        "vendor/**", "jvm/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/jvm-native.sh",
+        ".github/workflows/jvm-bindings.yml",
+    ]),
+    (".github/workflows/node-packages.yml", "node", [
+        "crates/sparkles/**", "crates/sparkles-alloc/**", "crates/sparkles-budget/**",
+        "crates/sparkles-backup/**", "crates/sparkles-client/**", "crates/sparkles-core/**",
+        "crates/sparkles-fmt/**", "crates/sparkles-graphql/**", "crates/sparkles-memory-import/**",
+        "crates/sparkles-modelstore/**", "crates/sparkles-node/**", "crates/sparkles-office/**",
+        "crates/sparkles-reasoner/**", "crates/sparkles-server/**", "crates/sparkles-shacl/**",
+        "crates/sparkles-shex/**", "!crates/sparkles*/tests/**", "!crates/sparkles*/benches/**",
+        "!crates/sparkles*/examples/**", "vendor/**", "js/**", "Cargo.toml", "Cargo.lock",
+        "rust-toolchain.toml", "scripts/node-native.sh", "scripts/install-mbx-container.sh",
+        "scripts/node-native.sh", "scripts/ci-node-musl.sh", "mise.toml",
+        ".github/workflows/node-packages.yml",
+    ]),
+]
+WORKFLOW_UNMAPPED = {"ci.yml", "server-artifacts.yml", "nix.yml"}
+
+
+def workflow_glob(pattern):
+    """A regular expression for a GitHub Actions path PATTERN, where `**` crosses
+    directories and `*` does not."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def workflow_selects(path, patterns):
+    """Whether a push that changes PATH runs a workflow with these paths. As in GitHub
+    Actions, the last pattern that matches decides, and a `!` pattern excludes."""
+    selected = False
+    for p in patterns:
+        neg = p.startswith("!")
+        if workflow_glob(p[1:] if neg else p).match(path):
+            selected = not neg
+    return selected
+
+
+def workflow_groups(path):
+    """The groups that the GitHub workflows whose paths select PATH call for, with the
+    workflow of each."""
+    if not path.startswith(("scripts/", ".github/")):
+        return {}
+    return {group: wf for wf, group, patterns in WORKFLOWS if workflow_selects(path, patterns)}
+
+
+# The mise tasks that the gate runs: the ci tasks, the conformance suites and the
+# prerequisites that scripts/ci.sh builds before them.
+CONFORMANCE_TASKS = {"test:w3c": "w3c", "test:shacl": "shacl", "test:shex": "shex"}
+# The prerequisites that scripts/ci.sh builds for each task before it starts the checks,
+# as its prep table lists them. A test checks the two against each other.
+PREP_TASKS = {
+    "lint": ["ui:build"], "lint:features": ["ui:build"], "test": ["ui:build"], "test:features": ["ui:build"],
+    "test:quickstart": ["ui:build"], "ui:check": ["ui:build"], "ui:test": ["ui:build"],
+    "licenses:check": ["ui:build"], "ui:fmt:check": ["ui:install"], "node:fmt:check": ["node:install"],
+    "node:client:check": ["node:install"], "node:test": ["node:build"], "jvm:test": ["jvm:native"],
+}
+# The packages whose code the conformance suites check.
+CONFORMANCE_PACKAGES = {"sparkles-core", "sparkles-shacl", "sparkles-shaclc", "sparkles-shex"}
+
+# The batch query screen (`bench:remote`, or `bench:nsc` as the fallback) times SPARQL
+# queries against a release build of the server, so it runs for any change that can reach
+# that build or the screen itself. It is skipped only when every changed file matches
+# SCREEN_SKIP and none matches SCREEN_RUN. A file that neither list names runs it.
+SCREEN_RUN = [
+    # The build configuration of the release server, including each crate's manifest and
+    # build script, since a skipped crate's manifest can turn on a feature of a dependency
+    # that the server shares.
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "mise.toml", ".cargo/*", ".mbx.toml", "vendor/*",
+    "crates/*/Cargo.toml", "crates/*/build.rs",
+    # The scripts that build the revisions and run and summarise the screen. A test
+    # checks that every script these name is listed here.
+    "scripts/bench.sh", "scripts/bench-lib.sh", "scripts/bench-answers.py", "scripts/bench_hyperfine.py",
+    "scripts/bench-summary.py", "scripts/bench-writes.py", "scripts/gen-data.py", "scripts/rss-probe.sh",
+    "scripts/bench-remote.sh", "scripts/bench-gate.py", "scripts/bench-docs.py", "scripts/bench-executors.sh",
+    "scripts/nsc-*", "scripts/remote-*", "scripts/build-remote.sh", "scripts/build-host.sh", "scripts/boat/*",
+    "scripts/gate/config.sh", "scripts/mbx-policy-key.py", "scripts/cargo-sparkles-task", "scripts/latency.sh",
+    # Files that the server's build reads from outside its crates.
+    "docs/openapi.json", "docs/openapi-*.json", "docs/API.md", "ui/*",
+]
+SCREEN_SKIP = [
+    "*.md", "LICENSE", "docs/*", ".github/*", ".githooks/*", "deploy/*", "nix/*", "flake.nix",
+    "flake.lock", "Dockerfile", "compose.yaml", ".gitignore", ".dockerignore", ".pre-commit-config.yaml",
+    ".shellcheckrc", ".gitattributes", "testsuite/*", "js/*", "jvm/*",
+    # The CI, gate, binding, licence, documentation and release scripts and the script
+    # tests. Other scripts run the screen, since many of them build or time the server.
+    "scripts/gate/*", "scripts/bench-tests/*", "scripts/ci.sh", "scripts/ci-*", "scripts/premerge.sh",
+    "scripts/changed-crates.py", "scripts/nextest-slow.py", "scripts/py-test.sh", "scripts/jvm-*.sh",
+    "scripts/node-native.sh", "scripts/with-lock.py", "scripts/test-*", "scripts/third-party-licenses.py",
+    "scripts/server-artifact*", "scripts/check-doc-*", "scripts/client-types.py", "scripts/api-compat*",
+    "scripts/build-fmt-wasm.sh", "scripts/codex-review.sh", "scripts/install-mbx-container.sh",
+    # Crates the screen never runs: OWL classification, SHACL, SHACLC and ShEx validation,
+    # the HTTP client library, office and memory imports, the browser formatter and the
+    # bindings, which are not part of the server.
+    "crates/sparkles-owl/*", "crates/sparkles-shacl/*", "crates/sparkles-shaclc/*", "crates/sparkles-shex/*",
+    "crates/sparkles-client/*", "crates/sparkles-office/*", "crates/sparkles-memory-import/*",
+    "crates/sparkles-fmt-wasm/*", "crates/sparkles-py/*", "crates/sparkles-node/*", "crates/sparkles-ffi/*",
+]
+
+
+# Tests, benchmarks, examples and fuzz targets at the top of a crate, which the server's
+# release build leaves out. fnmatch's `*` crosses directories, so these are anchored.
+SCREEN_SKIP_TARGETS = re.compile(r"^crates/[^/]+/(tests|benches|examples|fuzz)/")
+
+
+def screen(files):
+    """Whether the batch query screen runs for FILES, and the reason."""
+    if not files:
+        return True, "no file changed"
+    for f in files:
+        if any(fnmatch.fnmatchcase(f, p) for p in SCREEN_RUN):
+            return True, f"{f} changed"
+        if not (any(fnmatch.fnmatchcase(f, p) for p in SCREEN_SKIP) or SCREEN_SKIP_TARGETS.match(f) or test_only(f)):
+            return True, f"{f} can reach query execution"
+    return False, "no changed file reaches query execution or the screen"
+
+
+def read_roots(files, read):
+    """The groups, ci tasks and conformance suites that changes to Cargo.lock and
+    mise.toml call for, read at both commits through READ, with the reasons."""
+    groups, tasks, conf, why = set(), set(), False, {}
+    if "Cargo.lock" in files:
+        members, reason = cc.lock_changes(*read("Cargo.lock"))
+        if members == "all":
+            groups.add("all")
+            why["all"] = reason
+        elif members & CONFORMANCE_PACKAGES:
+            conf = True
+            why["conformance"] = f"Cargo.lock changes the locked dependencies of {sorted(members & CONFORMANCE_PACKAGES)[0]}"
+            groups.add("spill")
+            why["spill"] = why["conformance"]
+    if "mise.toml" in files:
+        got, reason = cc.mise_changes(*read("mise.toml"))
+        if got == "all":
+            groups.add("all")
+            why.setdefault("all", reason)
+        else:
+            changed, defs = got
+            for root in CI_TASKS + list(CONFORMANCE_TASKS):
+                hit = sorted(changed & cc.reached([root] + PREP_TASKS.get(root, []), defs))
+                if not hit:
+                    continue
+                if root in CONFORMANCE_TASKS:
+                    conf = True
+                    why.setdefault("conformance", f"mise.toml changes the {hit[0]} task")
+                else:
+                    tasks.add(root)
+                    why.setdefault(root, f"mise.toml changes the {hit[0]} task")
+    if conf:
+        groups.add("conformance")
+    return groups, tasks, why
 
 
 def test_only(path):
@@ -179,11 +384,23 @@ def groups_of(path):
     return found
 
 
-def select(files, packages):
+def select(files, packages, read=None):
     """The selection for FILES, with PACKAGES the result of changed-crates.py (`all`,
-    `none` or a list) or None to leave out the Rust tasks. Returns a dict and the reasons."""
+    `none` or a list) or None to leave out the Rust tasks, and READ the old and new text
+    of a path (changed-crates.py's reader). Returns a dict and the reasons."""
     why = {}
     chosen = set()
+    extra = set()
+    run_screen, why_screen = screen(files)
+    if read is not None or {"Cargo.lock", "mise.toml"} & set(files):
+        if read is None:
+            chosen.add("all")
+            why["all"] = "Cargo.lock or mise.toml changed and the selection cannot read them"
+        else:
+            g, extra, w = read_roots(files, read)
+            chosen |= g
+            for k, v in w.items():
+                why.setdefault(k, v)
     if not files:
         chosen.add("all")
         why["all"] = "no file changed, so the gate checks everything"
@@ -196,9 +413,14 @@ def select(files, packages):
             if name not in chosen:
                 why.setdefault(name, f"{f} changed")
         chosen |= g
+        for name, wf in sorted(workflow_groups(f).items()):
+            if name not in chosen:
+                why.setdefault(name, f"{f} changed, which {wf} tests")
+            chosen.add(name)
     if "all" in chosen:
-        return {"ci": "all", "conformance": list(CONFORMANCE), "spill": list(SPILL), "packages": "all"}, why
-    tasks = set()
+        return {"ci": "all", "conformance": list(CONFORMANCE), "spill": list(SPILL), "packages": "all",
+                "screen": (run_screen, why_screen)}, why
+    tasks = set(extra)
     for name in chosen:
         tasks |= set(GROUPS[name])
     if packages is not None:
@@ -213,6 +435,7 @@ def select(files, packages):
         "ci": [t for t in CI_TASKS if t in tasks],
         "conformance": list(CONFORMANCE) if "conformance" in chosen else [],
         "spill": list(SPILL) if "spill" in chosen else [],
+        "screen": (run_screen, why_screen),
     }
     if packages is not None:
         result["packages"] = packages
@@ -226,18 +449,21 @@ def main():
     ap.add_argument("--paths-only", action="store_true")
     args = ap.parse_args()
     files = cc.changed_files(args.base, args.rev)
+    read = cc.reader(args.base, args.rev)
     packages = None
     if not args.paths_only:
-        result, reasons = cc.choose(args.base, files)
+        result, reasons = cc.choose(args.base, files, args.rev, read)
         packages = result if isinstance(result, str) else list(result)
         if isinstance(result, str):
             print(f"select: packages {result}: {reasons}", file=sys.stderr)
-    sel, why = select(files, packages)
+    sel, why = select(files, packages, read)
     for name, reason in sorted(why.items()):
         print(f"select: {name}: {reason}", file=sys.stderr)
     print("ci " + (sel["ci"] if isinstance(sel["ci"], str) else " ".join(sel["ci"])))
     print(("conformance " + " ".join(sel["conformance"])).rstrip())
     print(("spill " + " ".join(sel["spill"])).rstrip())
+    run_screen, why_screen = sel["screen"]
+    print(f"screen {'run' if run_screen else 'skip'} ({why_screen})")
     if "packages" in sel:
         p = sel["packages"]
         print("packages " + (p if isinstance(p, str) else " ".join(p)))
