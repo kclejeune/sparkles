@@ -314,6 +314,27 @@ class Rerun(unittest.TestCase):
                 self.assertTrue(t.startswith(str((out / "test-retry").resolve())), t)
                 self.assertFalse(Path(t).exists(), t)
 
+    def test_a_signal_during_a_rerun_removes_its_scratch(self):
+        with tempfile.TemporaryDirectory() as d:
+            envs = []
+            o = self.passing()
+            out = gate_out(d)
+
+            def runner(cmd, log, seconds, env=None):
+                envs.append(env)
+                Path(env["TMPDIR"], "store").mkdir()
+                raise SystemExit(143)
+            cwd = os.getcwd()
+            os.chdir(ROOT)
+            try:
+                with self.assertRaises(SystemExit):
+                    tr.main(["--out", str(out), "--commit", COMMIT], runner=runner,
+                            junit_path=Path(d) / "j.xml", target_tmp=Path(d) / "tt", check_worktree=clean)
+            finally:
+                os.chdir(cwd)
+            self.assertFalse(Path(envs[0]["TMPDIR"]).exists())
+            self.assertFalse((out / "ci.forgiven").exists())
+
     def test_a_real_check_of_the_worktree(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")

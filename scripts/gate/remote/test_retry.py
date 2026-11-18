@@ -397,10 +397,13 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
         if junit_path.exists():
             junit_path.unlink()
         env = fresh_scratch(rdir, i, target_tmp)
-        code = runner(prefix + ["mbx", "nextest", "run", "--workspace", "--no-capture", "--retries", "0",
-                                "--no-fail-fast", "-E", expr], log, min(left, 900), env=env)
-        # A test's scratch, such as a store left by a timeout, stays out of the gate's output.
-        shutil.rmtree(env["TMPDIR"], ignore_errors=True)
+        # A test's scratch, such as a store left by a timeout, stays out of the gate's output,
+        # also when a signal ends the helper during the rerun.
+        try:
+            code = runner(prefix + ["mbx", "nextest", "run", "--workspace", "--no-capture", "--retries", "0",
+                                    "--no-fail-fast", "-E", expr], log, min(left, 900), env=env)
+        finally:
+            shutil.rmtree(env["TMPDIR"], ignore_errors=True)
         text = log.read_text(errors="replace") if log.exists() else ""
         cases = []
         if junit_path.exists():
@@ -430,8 +433,10 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
     if pkgs != ["none"]:
         log = rdir / "doctests.log"
         env = fresh_scratch(rdir, "doctests", target_tmp)
-        code = runner(prefix + ["mbx", "test", *pkgs, "--doc"], log, left, env=env)
-        shutil.rmtree(env["TMPDIR"], ignore_errors=True)
+        try:
+            code = runner(prefix + ["mbx", "test", *pkgs, "--doc"], log, left, env=env)
+        finally:
+            shutil.rmtree(env["TMPDIR"], ignore_errors=True)
         lines.append(f"{'PASS' if code == 0 else 'FAIL'} doctests {' '.join(pkgs)} (exit {code}, log {log.name})")
         if code != 0:
             return finish(1, "not forgiven: the doctests failed")
