@@ -1,0 +1,48 @@
+waiting for lock 2026-11-18T15:23:49Z
+lock 2026-11-18T15:58:17Z
+build 92371f0f 2026-11-18T15:58:17Z
+build bccc5f7b 2026-11-18T16:11:17Z
+build 59d29b40 2026-11-18T16:23:21Z
+timing 2026-11-18T16:35:58Z
+query	mode	a_ms	b_ms	b/a	n	answers
+bind-twin	eager	60.94	15.21	0.250	42/42	same
+bind-twin	streaming	13.55	13.49	0.995	42/42	same
+exists-agg	eager	917.92	866.92	0.944	42/42	same
+exists-agg	streaming	910.80	894.35	0.982	42/42	same
+expr-agg-arg	eager	26.98	26.82	0.994	42/42	same
+expr-agg-arg	streaming	22.93	23.09	1.007	42/42	same
+filter-ne-iri	eager	0.04	0.04	0.955	42/42	same
+filter-ne-iri	streaming	0.05	0.04	0.752	42/42	same
+salary	eager	55.58	55.67	1.002	42/42	same
+salary	streaming	48.40	48.33	0.999	42/42	same
+strlen-distinct	eager	76.70	76.03	0.991	42/42	same
+strlen-distinct	streaming	89.58	89.29	0.997	42/42	same
+strlen-dup	eager	32.90	32.97	1.002	42/42	same
+strlen-dup	streaming	87.55	88.19	1.007	42/42	same
+strlen-grouped	eager	86.70	86.33	0.996	42/42	same
+strlen-grouped	streaming	99.54	99.97	1.004	42/42	same
+sum-if	eager	60.06	15.05	0.251	42/42	same
+sum-if	streaming	13.68	13.71	1.003	42/42	same
+done-ab
+query	mode	a_ms	b_ms	b/a	n	answers
+bind-twin	eager	59.97	15.20	0.253	42/42	same
+bind-twin	streaming	14.46	19.06	1.318	42/42	same
+exists-agg	eager	870.70	868.90	0.998	42/42	same
+exists-agg	streaming	884.61	896.63	1.014	42/42	same
+expr-agg-arg	eager	30.90	28.70	0.929	42/42	same
+expr-agg-arg	streaming	23.42	25.14	1.074	42/42	same
+filter-ne-iri	eager	0.04	0.04	0.906	42/42	same
+filter-ne-iri	streaming	0.05	0.05	1.029	42/42	same
+salary	eager	49.74	57.87	1.163	42/42	same
+salary	streaming	48.05	48.70	1.013	42/42	same
+strlen-distinct	eager	87.26	78.76	0.903	42/42	same
+strlen-distinct	streaming	88.69	89.43	1.008	42/42	same
+strlen-dup	eager	33.29	32.60	0.979	42/42	same
+strlen-dup	streaming	85.44	88.74	1.039	42/42	same
+strlen-grouped	eager	112.05	87.80	0.784	42/42	same
+strlen-grouped	streaming	100.06	100.35	1.003	42/42	same
+sum-if	eager	16.10	15.16	0.942	42/42	same
+sum-if	streaming	13.51	18.22	1.348	42/42	same
+done-ab
+done-all 2026-11-18T16:46:57Z
+exit 0

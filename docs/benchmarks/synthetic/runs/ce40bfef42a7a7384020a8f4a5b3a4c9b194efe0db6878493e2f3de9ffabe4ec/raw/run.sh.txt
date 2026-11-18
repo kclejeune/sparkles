@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Lane eager-group-1098: build base (92371f0f, parent of 826's merge), main (bccc5f7b) and fix
+# (59d29b40) under the heavy lock, then time them with ab.sh (one Rayon thread, A,B,B,A rounds).
+set -euo pipefail
+D=$HOME/lanes/eager-group-1098
+cd "$D"
+exec 9>"$HOME/lanes/.heavy.lock"
+echo "waiting for lock $(date -u +%FT%TZ)"; flock 9; echo "lock $(date -u +%FT%TZ)"
+mkdir -p bin
+for r in 92371f0f bccc5f7b 59d29b40; do
+  [ -x "bin/$r" ] && continue
+  rm -rf "src/$r"; mkdir -p "src/$r"; tar xzf "src/$r.tar.gz" -C "src/$r"
+  echo "build $r $(date -u +%FT%TZ)"
+  (cd "src/$r" && CARGO_BUILD_JOBS=6 mbx build --release -p sparkles-server --bin sparkles) > "build-$r.log" 2>&1
+  cp "src/$r/target/release/sparkles" "bin/$r"
+done
+if [ ! -d store ]; then
+  zstd -dc people-1000000.nt.zst > data.nt
+  bin/92371f0f load --loc store data.nt > load.log 2>&1
+  rm -f data.nt
+fi
+echo "timing $(date -u +%FT%TZ)"
+./ab.sh bin/bccc5f7b bin/59d29b40 store q ab-main-fix 3 7 18631 1
+./ab.sh bin/92371f0f bin/59d29b40 store q ab-base-fix 3 7 18631 1
+for r in 92371f0f bccc5f7b 59d29b40; do rm -rf "src/$r/target"; done
+echo "done-all $(date -u +%FT%TZ)"

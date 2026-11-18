@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Interleaved base-against-tip timing over one store.
+#   ab.sh BIN_A BIN_B STORE QUERYDIR OUTDIR [ROUNDS] [REPS] [PORT] [THREADS]
+# Each round starts a fresh server per binary in order A,B,B,A, and each server times
+# every query in eager and in streaming mode, recording execMs per request.
+set -euo pipefail
+A=$1 B=$2 STORE=$3 QDIR=$4 OUT=$5 ROUNDS=${6:-3} REPS=${7:-7} PORT=${8:-18431} THREADS=${9:-1}
+mkdir -p "$OUT"
+: > "$OUT/samples.tsv"; : > "$OUT/answers.tsv"
+SPID=
+trap '[ -n "$SPID" ] && kill "$SPID" 2>/dev/null; true' EXIT
+run_bin() { # label bin round
+  env RAYON_NUM_THREADS=$THREADS "$2" --result-cache-mb 0 serve --data "$OUT/srv-$1" --loc bench="$STORE" \
+    --port "$PORT" --timeout 600 --no-access-log > "$OUT/server-$3-$1.log" 2>&1 &
+  SPID=$!
+  for _ in $(seq 600); do curl -sf -o /dev/null "localhost:$PORT/\$/ready" && break; sleep 0.1; done
+  for q in "$QDIR"/*.rq; do
+    n=$(basename "$q" .rq)
+    for m in eager streaming; do
+      for i in $(seq $((REPS + 2))); do
+        e=$(curl -sS -f --max-time 600 -H 'Accept: application/x-sparkles+json' \
+          --data-urlencode "query@$q" --data-urlencode "execution=$m" "localhost:$PORT/bench/sparql" \
+          | grep -o '"execMs":[0-9.eE+-]*' | head -1 | cut -d: -f2) || e=error
+        [ "$i" -le 2 ] || printf '%s\t%s\t%s\t%s\t%s\n' "$3" "$1" "$m" "$n" "$e" >> "$OUT/samples.tsv"
+      done
+      curl -sS -f -H 'Accept: text/tab-separated-values' --data-urlencode "query@$q" \
+        --data-urlencode "execution=$m" "localhost:$PORT/bench/sparql" | sort | sha256sum | cut -c1-16 \
+        | sed "s/^/$3\t$1\t$m\t$n\t/" >> "$OUT/answers.tsv"
+    done
+  done
+  kill "$SPID"; wait "$SPID" 2>/dev/null || true; SPID=
+}
+for r in $(seq "$ROUNDS"); do
+  run_bin a "$A" "$r"; run_bin b "$B" "$r"; run_bin b "$B" "$r"; run_bin a "$A" "$r"
+done
+python3 - "$OUT/samples.tsv" "$OUT/answers.tsv" > "$OUT/summary.tsv" << 'PY'
+import sys, statistics, collections
+d = collections.defaultdict(list)
+for line in open(sys.argv[1]):
+    r, b, m, q, e = line.rstrip("\n").split("\t")
+    if e not in ("", "error"):
+        d[(q, m, b)].append(float(e))
+ans = collections.defaultdict(set)
+for line in open(sys.argv[2]):
+    r, b, m, q, h = line.rstrip("\n").split("\t")
+    ans[q].add(h)
+print("query\tmode\ta_ms\tb_ms\tb/a\tn\tanswers")
+for q, m in sorted({(q, m) for q, m, _ in d}):
+    a, b = d[(q, m, "a")], d[(q, m, "b")]
+    ma, mb = statistics.median(a), statistics.median(b)
+    print(f"{q}\t{m}\t{ma:.2f}\t{mb:.2f}\t{mb/ma:.3f}\t{len(a)}/{len(b)}\t{'same' if len(ans[q]) == 1 else 'DIFFER'}")
+PY
+cat "$OUT/summary.tsv"
+echo done-ab

@@ -700,6 +700,32 @@ both modes, within the spread of the base. Eager `types-grouped` read 1.003, a m
 12-thread cells of these queries come from the forge matrix. Roadmap item 1067 follows
 these small deltas.
 
+An eager aggregate whose argument compares a variable with a constant IRI or holds an
+EXISTS decoded that variable's column before it ran, and item 1098 removed that decode.
+Its fix, 59d29b40, was compared on forge with main, bccc5f7b, and with 92371f0f, the main
+before the grouping operator, at 10.5M triples with one thread. Each pair ran three
+rounds of A,B,B,A with 42 timed requests per arm and mode, from builds made on forge with
+the same compilers. The [run record](runs/ce40bfef42a7a7384020a8f4a5b3a4c9b194efe0db6878493e2f3de9ffabe4ec/README.md)
+keeps the samples, answers, queries and scripts, and every query returned the same answer
+in every server.
+
+| Query | Main | Fix | Fix/main | Before 826 | Fix/before |
+|---|--:|--:|--:|--:|--:|
+| Eager `SUM(IF(?p = ex:nobody, 1, 0))` | 60.06 ms | 15.05 ms | 0.251 | 16.10 ms | 0.942 |
+| Eager BIND of the same `IF` and `SUM` | 60.94 ms | 15.21 ms | 0.250 | 59.97 ms | 0.253 |
+| Eager `SUM(IF(EXISTS { ?p ex:authorOf ?d }, 1, 0))` | 917.92 ms | 866.92 ms | 0.944 | 870.70 ms | 0.998 |
+
+Every round read within 0.02 of these ratios except those of the first query against the
+build before item 826, which read 0.988, 0.701 and 0.981. The fix leaves the queries that
+read values within 0.99 to 1.01 of main, such as `SUM(STRLEN(?n))`, `SUM(?s * 2)` and
+`expr-agg-arg`, and every streamed query above 0.3 ms within 0.98 to 1.01 of main. Streamed `sum-if` and the streamed
+BIND form take about 13.5 ms in most server processes and 17 to 22 ms in some, in all
+three builds, so the second pair's streamed ratios of 1.35 and 1.32 are noise that a round
+below 1.0 shows. Against the build before item 826, eager `SUM(STRLEN(?n))` grouped by
+employer reads 0.784, and eager `SUM(?s * 2)` reads 1.163, 57.9 ms against 49.7 ms, which
+roadmap item 1099 follows. Item 1067 holds the streamed costs of 1% to 7% that the same
+pair shows.
+
 ### Execution mode of quick texts in fresh servers
 
 The Namespace screen of cf033f12, the batch that merged items 679 and 454, against 125edd41
