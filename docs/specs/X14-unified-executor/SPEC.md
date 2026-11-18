@@ -1029,8 +1029,8 @@ it. A streamed count over a join that eager counts from its pairs peaked at 0.3 
 against 6.1 to 7.6 MiB eager. Over a filtered scan it took 6.0 ms against 6.3 ms, and on
 two shared variables it took 9.8 ms against 8.6 ms. Streaming trades that time for the
 memory, and automatic execution keeps such counts eager until the A/B of the item's
-plan admits them. A count of two scans on one variable from their key runs, which this
-item does not change, took 12.0 ms streamed against 6.1 ms eager.
+plan admits them. A count of two scans on one variable from their key runs took 12.0 ms
+streamed against 6.1 ms eager.
 
 ### Measurements of stage 1
 
