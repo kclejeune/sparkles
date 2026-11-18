@@ -87,7 +87,12 @@ adds to this file and does not override it.
   even hosts with the same hardware, and qualify a second host's results separately.
 - A measured slowdown that a gate accepts still gets a follow-up item in
   [docs/ROADMAP.md](docs/ROADMAP.md), added in the same change that accepts it. This holds
-  for a loosened gate, a result judged to be noise and a tradeoff taken on purpose.
+  for a loosened gate and a tradeoff taken on purpose. A difference that the comparison's
+  own rule calls noise needs no item. For the Intel rule that is a ratio whose 95%
+  interval reaches 1.0 or a median added time of at most 0.5 µs, and for other A/Bs a
+  difference that is not above 1 in every round. Small real costs of one workstream go
+  into that workstream's running small-costs item as one line per query, naming the host
+  and the commits compared, and are never combined across hosts.
 - An optimization that is built and measured but not kept, because it measured no faster
   or slower, gets an entry in
   [docs/PERFORMANCE-EXPERIMENTS.md](docs/PERFORMANCE-EXPERIMENTS.md) in the same change.
@@ -330,4 +335,8 @@ is performance measures on a designated benchmark worker with the benchmark host
 hardware before it reports, and every other lane reports once its review and tests pass.
 The benchmark host itself runs published measurements and the pinned checks of the
 screen's flags, including queries under 0.3 ms, after the push. A regression they confirm is
-bisected across the batch's merges and fixed forward in a follow-up commit.
+bisected across the batch's merges and fixed forward in a follow-up commit. The forge
+matrix runs after every push that changes the query path, ahead of lane comparisons on
+forge. Confirmation cells that a lane's goal does not need, such as 12-thread cells and
+reverse-order checks, wait for that matrix. Compile-time comparisons run on a quiet build
+host, since forge builds nothing.
