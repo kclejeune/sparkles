@@ -2044,13 +2044,30 @@ mod tests {
         r7(&ix, me, &mut st, None, &mut out);
         assert_eq!(out.sent.len(), 2);
         let all = out.checks.get();
-        // the run ends at the second check, which the rules as they were reach only
-        // after the pair
+        // the run ends at the second check, which falls among the predecessors that are
+        // not real; the rules as they were check first after the pair
         let mut out = stopped(1);
         r7(&ix, me, &mut st, None, &mut out);
         if spare() >= 1 {
             assert!(all >= 500 / 64);
             assert_eq!((out.sent, out.checks.get()), (0, 2));
+        }
+        // 200 real predecessors that the restriction counts, of which the first triggers
+        // the rule: after its pairs the rule passes the other 199 as first members, and
+        // the eighth check, which ends the run, falls among them
+        let mut st = State::default();
+        hs(&mut st).singular = true;
+        hs(&mut st).atmost.push((0, TOP));
+        st.back.push((2, Small::default()));
+        for k in 100..300 {
+            st.back[0].1.insert(k);
+            hs(&mut st).real_preds.insert(k);
+        }
+        let mut out = stopped(7);
+        r7(&ix, me, &mut st, Some(100), &mut out);
+        assert_eq!(out.sent, 2 * 199);
+        if spare() >= 1 {
+            assert_eq!(out.checks.get(), 8);
         }
         // loops by roles that the restriction does not count, and one real predecessor
         let mut st = State::default();
