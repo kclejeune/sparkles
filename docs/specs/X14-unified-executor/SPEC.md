@@ -232,6 +232,14 @@ rows through the distinct values' slots was considered and not built, because th
 evaluator reads the decoded column on its hot path and that change would need its own
 Intel measurement. The bounded-reads test counts every read of the mode, eight in all.
 
+Forge measured the item against the build before it on 36 queries at 1.05M triples with
+one thread, in three A,B,B,A rounds of ten requests, and every answer was the same. The
+geometric mean was 1.002 in streaming execution and 0.993 in automatic execution. A few
+filters that decode values became slower in every round. `str-filter-two` took 2.4% longer
+in streaming and 4.4% longer in automatic execution, `lang-filter` 2.4% and 2.6% longer,
+and streaming `str-pair-lt` 2.1% longer. With 12 threads `str-pair-lt` and `str-pair-names`
+were 2% faster.
+
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its
 scan in every mode. The planner deduplicates a DISTINCT below its ORDER BY whenever the
