@@ -274,7 +274,7 @@ units, and its code placement moves with changes to the server. Such placement m
 `optional-chain` at 10.5M take 6% to 13% more client time on forge in builds that ran the
 same instructions within 1.7%. The eager result serializers therefore write into a buffer
 whose type is the engine's, so they are compiled with the engine and pass 8 KiB pieces to
-the server's writer. Roadmap item 240 does the same for the streamed writers.
+the server's writer. The cursor writers of streamed answers write into the same buffer.
 
 A Namespace screen could not decide this setting. Its geometric mean was 0.997 for server
 time, with queries under 2 ms moving 9% to 32% in both directions, so the pinned check on

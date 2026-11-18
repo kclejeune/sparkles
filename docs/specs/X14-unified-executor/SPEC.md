@@ -1257,3 +1257,40 @@ second's final form, 0acba641, ran 1.3% more instructions than 6fba19d6 on
 c2b5d7cf over the two runs, longer in every round. The checked writer also had 44% more
 branch misses than 6fba19d6 on `optional-chain`, and none of the builds changed that
 count, so item 763 looks there next.
+
+### The streamed response cost
+
+Roadmap item 534 measured where a streamed response spends the time that an eager one
+does not, at 1.05M triples in native JSON. On the laptop, an Intel Core Ultra X7 358H
+with the server on four performance cores, `perf stat` counted 472 thousand user-space
+instructions per request of a streamed `count-all` against 311 thousand eager, 1.78
+million against 1.19 million on `star-lookup`, and 263 thousand more on
+`predicate-counts`. The user-space cycles of `count-all` were nearly equal, 410 thousand
+streamed against 396 thousand eager per request, so the gap of the short queries is not
+work in the server's code. On the large answers the streamed requests ran 6.13 billion
+instructions against 3.54 billion on `export-500k`, 315 million against 183 million on
+`optional-chain`, 68 million against 39 million on `star-join` and 1.41 billion against
+976 million on `order-by-full`. LBR call stacks showed that the cursor writers' chain of
+calls through the server's size-limited switch writer, which serde's escaping wrote
+through a few bytes at a time and which was not inlined, cost more than the whole
+difference on `export-500k` and about 90 thousand of the 160 thousand instructions on
+`count-all`, while the streamed decoding was cheaper than the eager one.
+
+On forge, with the server on CPUs 0 to 11 with 12 Rayon threads and curl on CPU 12, a
+streamed answer took 0.13 to 0.23 ms more wall time than an eager one on the nine
+queries under 1 ms, 1.29 to 1.47 times as long. The large answers took 7.53 ms against
+5.00 ms on `star-join`, 22.4 against 20.1 ms on `optional-chain`, 49.4 against 40.2 ms
+on `order-by-full` and 284 against 213 ms on `export-500k`. A phase trace of `count-all`
+in a diagnostic build placed the short queries' gap in the hand-off between threads. The
+eager request ran in place on the worker that received it and had serialized its answer
+65 µs after the handler started. The streamed request took 15 µs to reach a blocking-pool
+thread, 67 µs to open its cursor against the eager run's 45 µs, 12 µs to return the
+cursor to the handler, 59 µs to start the producer on a second pool thread, 35 µs for the
+first batch and its write against the eager serialization's 8 µs, and about 43 µs to end
+the body. The wake costs were bimodal, 15 µs for the open's hop on `count-all` and 80 µs
+on `predicate-counts`. The same build answered a streamed request whole, without the
+early commit at the first batch, which removes the channel, the end-of-body handshake and
+the early commit together, and it was no faster. Its streamed `count-all` took 0.729 ms
+against 0.546 ms with the early commit, and the other short queries took 0.58 to 0.89 ms
+against 0.53 to 0.82 ms. The Python client bounded the large answers' wall times in the
+laptop's runs, so their wall times come from curl.
