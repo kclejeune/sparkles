@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### One load plan
+
+`LoadPlan::choose` in `store/load_plan.rs` now picks the bulk path or a transaction for
+`Store::load_with`, `Store::replace_with`, `WriteTxn::insert_bulk` and RDF Patch, which
+each had a rule of their own, and a table test records the plan of each entry point at
+the boundaries. The threshold test is strict everywhere, so a batch or a patch of exactly
+the bulk threshold now commits in a transaction. A graph replacement into an empty store
+takes the bulk path, as a load did, unless all its inputs are streams that end within
+8 MiB. A first Graph Store PUT into an empty in-memory dataset is therefore admitted by
+the size of the generation it builds, as a POST was, and a replacement of an empty body
+into an empty store commits an empty generation, as a load did. A small first PUT pays
+the rebuild's fixed cost, which roadmap item 1079 follows. A stream load into a store
+that holds data reads its stream ahead up to 80 bytes per threshold quad, as a
+replacement did, and takes the bulk path past that bound. A bulk replacement returns the
+quads it parsed, duplicates included, as the transactional path and the documentation
+already did, where it used to return the quads the store held afterwards. Every stream
+of a load or a replacement now checks the write's deadline and cancellation beneath its
+decoder whichever plan runs, which a load into a store with data and a write limited to
+some graphs did not do before. A write limited to some graphs still parses its sources in
+a transaction, and a bulk insert or a patch under such a limit, whose graphs are checked
+as it is staged, may still take the bulk path. Durability, the write-ahead log and the
+on-disk formats are unchanged.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes

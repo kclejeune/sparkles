@@ -97,8 +97,12 @@ These read paths are tuned for queries over data that is not yet in memory
   inputs in a transaction, and batches that check triple protections, managed graphs or
   control records stay transactional, as does a patch once it has met a delete row. A
   large stream load into a dataset that holds data is a bulk commit, so the change-log
-  limit of bulk commits under the limitations below applies to it. SPARQL `LOAD` always
-  inserts in a transaction. Roadmap item 846 tracks a bulk path for a
+  limit of bulk commits under the limitations below applies to it. A graph replacement
+  into an empty store, such as a first Graph Store PUT into a new dataset, is a bulk
+  commit for the same reason as a load. An in-memory dataset therefore admits it by the
+  size of the generation it builds, as it admits a load, rather than by the memory
+  estimate of each inserted quad. A load or replacement of an empty body into an empty
+  store commits an empty generation. SPARQL `LOAD` always inserts in a transaction. Roadmap item 846 tracks a bulk path for a
   large `LOAD`.
 * CSV and TSV tables map to triples ([C05](../specs/C05-tabular-imports.md),
   [USAGE.md](../USAGE.md#loading-csv-and-tsv)). `sparkles load`, `sparkles csv`,
@@ -399,6 +403,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   0.3% more instructions for the group's admission checks, and spatial readers at 1.05M
   under mixed load measured a p50 ratio of 1.028, both within their gates. Roadmap
   item 448.
+* A first Graph Store PUT of a small buffered body into an empty dataset rebuilds the
+  index, as a first POST does, which costs more than the transaction of a PUT into a
+  dataset that holds data. The rebuild has a fixed cost of some milliseconds. Roadmap
+  item 1079.
 * Branch stores share their dataset's quota, which counts the zeros preallocated after
   each store's log and delta vocabulary as those of the store written last. With several
   branches written, the zeros of the others count as data. Roadmap item 560.
