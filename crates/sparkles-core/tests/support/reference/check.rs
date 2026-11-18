@@ -18,10 +18,10 @@
 
 use super::{AggregateErrors, Error, Notes, Provenance, Reference, Selected, value};
 
-/// The engine's reading of the aggregates over errors and non-strings, which the
-/// comparisons take until the setting of roadmap item 1064 lands in the engine with
-/// Jena's reading as its default.
-pub const ENGINE_AGGREGATE_ERRORS: AggregateErrors = AggregateErrors::Sparkles;
+/// The engine's default reading of the aggregates over errors and non-strings, which the
+/// comparisons take. Roadmap item 1064's setting makes Jena's reading the engine's
+/// default, and the engine runs under it whenever a query chooses no other.
+pub const ENGINE_AGGREGATE_ERRORS: AggregateErrors = AggregateErrors::Jena;
 use oxrdf::Term;
 use std::collections::{BTreeSet, HashMap};
 
@@ -35,11 +35,12 @@ pub enum Expected {
     Other,
 }
 
-/// The reference's answer to `text` under the engine's readings of the open roadmap
-/// items, with the names of the readings it took. Where the query meets an item, it is
-/// evaluated again with the engine's reading, so that the comparison is exact under it:
-/// the aggregates over errors and non-strings under [`ENGINE_AGGREGATE_ERRORS`] (item
-/// 1064) and string arguments compatible whatever their base direction (item 1071). An
+/// The reference's answer to `text` under the engine's readings of the questions where
+/// the specification and the engine differ, with the names of the readings it took. Where
+/// the query meets one, it is evaluated again with the engine's reading, so that the
+/// comparison is exact under it. These are the aggregates over errors and non-strings
+/// under [`ENGINE_AGGREGATE_ERRORS`], the default of item 1064's setting, and string
+/// arguments compatible whatever their base direction (item 1071). An
 /// evaluation under one reading can meet another item that the first did not reach, so
 /// the evaluations go on until one meets no item that the readings do not cover.
 pub fn under_engine_readings(

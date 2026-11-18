@@ -5360,9 +5360,11 @@ fn reference_evaluator_review_round_2_cases() {
     assert!(s1.rows_open);
     let s1b = selected("SELECT ?x WHERE { BIND(IF(RAND() < 0.5, 1, 1/0) AS ?x) VALUES ?x { 2 } }");
     assert!(s1b.rows_open);
-    // 2: the readings are taken until no new one is met
-    let q2 = "SELECT (IF(BOUND(?m), STRSTARTS(\"Ada\"@en--ltr, \"A\"@en), false) AS ?x) \
-              WHERE { { SELECT (MIN(?v) AS ?m) WHERE { VALUES ?v { UNDEF 1 } } } }";
+    // 2: the readings are taken until no new one is met. MAX passes over the error under
+    // the specification's reading and is unbound under Jena's, the engine's, which alone
+    // reaches the string arguments of different base directions
+    let q2 = "SELECT (IF(!BOUND(?m), STRSTARTS(\"Ada\"@en--ltr, \"A\"@en), false) AS ?x) \
+              WHERE { { SELECT (MAX(?v) AS ?m) WHERE { VALUES ?v { UNDEF 1 } } } }";
     let Expected::Select(s2) = under_engine_readings(&r, q2).unwrap().0 else {
         panic!("a SELECT answer");
     };

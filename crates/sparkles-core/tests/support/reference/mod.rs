@@ -461,9 +461,9 @@ pub enum AggregateErrors {
     /// Jena's reading. An error makes MIN, MAX and AVG errors, and GROUP_CONCAT reads
     /// the lexical form of any value.
     Jena,
-    /// The engine's reading before item 1064 makes it selectable. MIN and MAX pass over
-    /// errors, an error makes AVG an error, and GROUP_CONCAT reads the lexical form of any
-    /// value.
+    /// The engine's `sparkles` reading, its default before item 1064. MIN and MAX pass
+    /// over errors, an error makes AVG an error, and GROUP_CONCAT reads the lexical form of
+    /// any value.
     Sparkles,
 }
 
