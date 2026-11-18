@@ -428,8 +428,17 @@ rsh() { screen_exec "$@"; }
 SENT=()
 for v in A B; do
   if [ -n "${KEPT[$v]:-}" ]; then
-    rsh "set -e; test \"\$(sha256sum < ${KEPT[$v]} | cut -d' ' -f1)\" = ${KEPT_SHA[$v]}; rm -f -- $REMOTE/bin-$v.part; ln -- ${KEPT[$v]} $REMOTE/bin-$v.part 2> /dev/null || cp -- ${KEPT[$v]} $REMOTE/bin-$v.part; mv -- $REMOTE/bin-$v.part $REMOTE/bin-$v" > "$OUT/logs/stage-$v.log" 2>&1 ||
-      die "could not copy the kept binary of $v into $REMOTE on $ID, see $OUT/logs/stage-$v.log"
+    # Each attempt starts again from the hash check, so a dropped connection can be retried.
+    ok=0
+    for _try in 1 2 3 4 5 6; do
+      if rsh "set -e; test \"\$(sha256sum < ${KEPT[$v]} | cut -d' ' -f1)\" = ${KEPT_SHA[$v]}; rm -f -- $REMOTE/bin-$v.part; ln -- ${KEPT[$v]} $REMOTE/bin-$v.part 2> /dev/null || cp -- ${KEPT[$v]} $REMOTE/bin-$v.part; mv -- $REMOTE/bin-$v.part $REMOTE/bin-$v" >> "$OUT/logs/stage-$v.log" 2>&1; then
+        ok=1
+        break
+      fi
+      echo "copying the kept binary of $v failed (try $_try), retrying" >&2
+      sleep 5
+    done
+    [ "$ok" = 1 ] || die "could not copy the kept binary of $v into $REMOTE on $ID, see $OUT/logs/stage-$v.log"
   else
     SENT+=("bin-$v.zst")
   fi
