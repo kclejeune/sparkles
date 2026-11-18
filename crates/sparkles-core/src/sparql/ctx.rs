@@ -218,6 +218,149 @@ impl ValueCache {
     }
 }
 
+/// The most the string floor cache of one query holds, before the memory budget's share
+/// (see [`FloorCache::cap`]).
+const FLOOR_CACHE_BYTES: u64 = 64 << 20;
+
+/// The entries a floor map makes room for when it first grows.
+const FLOOR_MAP_FIRST: usize = 1024;
+
+/// The query's cache of string floors ([`Ctx::string_floor`]). It lasts the query, so the
+/// batches of a cursor share it as the rows of an eager table do. A mask checks out one
+/// map for each of its workers ([`Ctx::floor_map`]) and returns it when the worker ends,
+/// so a lookup takes no lock. A map's growth is charged to the query before the map
+/// allocates, through a reservation that grows in steps as the value cache's does, and
+/// the query's room falls as the cache grows. A refused growth, or one past the cache's
+/// cap, leaves the map full. The floors it does not hold are then computed each time,
+/// which costs about what a direct comparison of the two keys costs. The reservation is
+/// kept until the context drops.
+#[derive(Default)]
+pub(super) struct FloorCache {
+    /// the maps no worker has checked out
+    maps: parking_lot::Mutex<Vec<FloorShard>>,
+    /// the estimated bytes of the maps' tables, the old table of a growing map included
+    used: AtomicU64,
+    /// the bytes charged for the cache, never fewer than `used`
+    charge: StepReservation,
+    /// the floors computed for its maps (for tests that the cache lasts the query)
+    #[cfg(test)]
+    computed: std::sync::atomic::AtomicUsize,
+}
+
+/// One map of the [`FloorCache`]: the floor of each id it holds, or `u64::MAX` for an id
+/// that is not a base-vocabulary simple literal.
+#[derive(Default)]
+struct FloorShard {
+    map: FxHashMap<Id, u64>,
+    /// the estimated bytes of `map`'s table
+    bytes: u64,
+    /// a growth was refused or would pass the cap, so the map takes no more entries
+    full: bool,
+}
+
+impl FloorCache {
+    /// The most the cache holds under a memory budget of `mem_limit` bytes.
+    fn cap(mem_limit: u64) -> u64 {
+        FLOOR_CACHE_BYTES.min(mem_limit / 16)
+    }
+
+    /// The bytes of a map's table with room for `capacity` entries: a power of two of
+    /// buckets at most 7/8 full, each a 16-byte entry and a control byte.
+    fn table_bytes(capacity: usize) -> u64 {
+        if capacity == 0 {
+            return 0;
+        }
+        ((capacity as u64).saturating_mul(8) / 7)
+            .next_power_of_two()
+            .saturating_mul(17)
+            .saturating_add(16)
+    }
+
+    /// The bytes charged for the cache.
+    #[cfg(test)]
+    pub(super) fn reserved(&self) -> u64 {
+        self.charge.reserved()
+    }
+
+    /// The floors computed for the cache's maps.
+    #[cfg(test)]
+    pub(super) fn computed(&self) -> usize {
+        self.computed.load(Ordering::Relaxed)
+    }
+
+    /// The entries its maps hold.
+    #[cfg(test)]
+    pub(super) fn entries(&self) -> usize {
+        self.maps.lock().iter().map(|s| s.map.len()).sum()
+    }
+}
+
+/// A map of the query's [`FloorCache`] checked out by one worker, returned on drop.
+pub(super) struct FloorMap<'a> {
+    ctx: &'a Ctx,
+    shard: FloorShard,
+}
+
+impl Drop for FloorMap<'_> {
+    fn drop(&mut self) {
+        let shard = std::mem::take(&mut self.shard);
+        self.ctx.floors.maps.lock().push(shard);
+    }
+}
+
+impl FloorMap<'_> {
+    /// [`Ctx::string_floor`] of `id`, computed once while the map has room for it.
+    #[inline]
+    pub(super) fn floor(&mut self, id: Id) -> Option<u64> {
+        if let Some(&f) = self.shard.map.get(&id) {
+            return (f != u64::MAX).then_some(f);
+        }
+        let f = self.ctx.string_floor(id);
+        #[cfg(test)]
+        self.ctx.floors.computed.fetch_add(1, Ordering::Relaxed);
+        // A refused floor recorded a failure that ends the query. It is not kept as the
+        // floor of another kind of value.
+        if (f.is_some() || self.ctx.check_memory_failure().is_ok())
+            && (self.shard.map.len() < self.shard.map.capacity() || self.grow())
+        {
+            self.shard.map.insert(id, f.unwrap_or(u64::MAX));
+        }
+        f
+    }
+
+    /// Make room for twice the entries, charged first. `false` when the map is full.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) -> bool {
+        let shard = &mut self.shard;
+        if shard.full {
+            return false;
+        }
+        let ctx = self.ctx;
+        let cache = &ctx.floors;
+        let target = shard.map.capacity().saturating_mul(2).max(FLOOR_MAP_FIRST);
+        let bytes = FloorCache::table_bytes(target);
+        let cap = FloorCache::cap(ctx.mem_limit);
+        // The old table is freed once its entries have moved, so both are charged.
+        let used = cache.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        if used > cap
+            || (!cache.charge.covers(used)
+                && ctx
+                    .grow_reservation(&cache.charge, used, cap, false)
+                    .is_err())
+        {
+            cache.used.fetch_sub(bytes, Ordering::AcqRel);
+            shard.full = true;
+            return false;
+        }
+        shard.map.reserve(target - shard.map.len());
+        debug_assert!(FloorCache::table_bytes(shard.map.capacity()) <= bytes);
+        cache.used.fetch_sub(shard.bytes, Ordering::AcqRel);
+        shard.bytes = bytes;
+        true
+    }
+}
+
 /// Executor optimizations that can be switched off for diagnosis (every one of them has
 /// a generic fallback with the same results). `SPARKLES_DISABLE_OPTIMIZATIONS` holds a
 /// comma-separated list of names that are off by default in a process.
@@ -600,6 +743,7 @@ pub struct Ctx {
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
     values: ValueCache,
+    floors: FloorCache,
     next_bnode: AtomicU64,
     bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
     /// blank nodes given to the query from outside (initial bindings) that are not
@@ -1164,6 +1308,7 @@ impl Ctx {
             chunk_hook: parking_lot::Mutex::new(None),
             local: RwLock::new(AppendVocab::default()),
             values: Default::default(),
+            floors: Default::default(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
             outside_bnodes: Default::default(),
@@ -1525,8 +1670,7 @@ impl Ctx {
 
     /// Whether the query streams through pull cursors. Both modes charge the same state,
     /// so only the routing of a query, the accumulation of an EXISTS key set across
-    /// batches, whether a decoding envelope can refuse and whether a batch compares
-    /// strings through their floors read it.
+    /// batches and whether a decoding envelope can refuse read it.
     #[inline]
     pub(super) fn streams(&self) -> bool {
         self.accounting() == Accounting::Cursor
@@ -3004,18 +3148,72 @@ impl Ctx {
         if p >= v.first_triple() {
             return None;
         }
-        self.with_vocab_key(p, |key| {
+        self.with_vocab_key_prev(p, |prev, key| {
             if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
                 return None;
             }
             let prefix = &key[..key.len() - 1];
-            // most strings extend none: the key before them does not start with them
-            if p == 0 || !self.with_vocab_key(p - 1, |k| k.starts_with(prefix))? {
+            // Most strings extend none, which the key before them shows by not starting
+            // with them. That key comes from the same walk of the block, or is read on its
+            // own when it starts a block or is long.
+            let extended = match prev {
+                Some(k) => k.starts_with(prefix),
+                None if p == 0 => false,
+                None => self.with_vocab_key(p - 1, |k| k.starts_with(prefix))?,
+            };
+            if !extended {
                 return Some(p);
             }
             self.vocab_lower_bound(prefix)
         })
         .flatten()
+    }
+
+    /// `f(prev, key)` of the key of base vocabulary id `id` and, when the same walk of
+    /// its block gives it, the key before it
+    /// ([`crate::vocab::Vocab::get_with_prev`]), with both
+    /// reconstructions and decodings inside the envelope. A refusal records a failure and
+    /// gives `None`.
+    fn with_vocab_key_prev<T>(
+        &self,
+        id: u64,
+        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+    ) -> Option<T> {
+        let decode = |prev: Option<&[u8]>, key: &[u8]| {
+            let longest = prev.map_or(0, <[u8]>::len).max(key.len());
+            self.reserve_decode(longest).then(|| f(prev, key))
+        };
+        if !self.envelope_refuses() {
+            return self
+                .snap
+                .generation
+                .vocab
+                .get_with_prev(id, decode)
+                .flatten();
+        }
+        match self.snap.generation.vocab.get_with_prev_checked(
+            id,
+            |need| self.reserve_decode_checked(need),
+            decode,
+        ) {
+            Ok(found) => found.flatten(),
+            Err(error) => {
+                self.fail_memory(&error);
+                None
+            }
+        }
+    }
+
+    /// The query's floor cache.
+    #[cfg(test)]
+    pub(super) fn floor_cache(&self) -> &FloorCache {
+        &self.floors
+    }
+
+    /// A map of the query's floor cache for one worker of a mask (see [`FloorCache`]).
+    pub(super) fn floor_map(&self) -> FloorMap<'_> {
+        let shard = self.floors.maps.lock().pop().unwrap_or_default();
+        FloorMap { ctx: self, shard }
     }
 
     /// The first base id whose key is not below `key`, searched inside the decoding
@@ -3940,13 +4138,12 @@ mod charge_tests {
     /// The executors read the accounting mode in at most this many places outside tests.
     /// Stage 4 of item 453 lowered it as each twin merged, and item 827 took the planning
     /// reads out, so that a query plans alike in every mode. The routing of
-    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches, the
-    /// decoding envelope and the cursor exclusion of `string_order_mask` remain, with the
-    /// four reads of the flag that decide whether a cursor owner exists, whether a context
-    /// without an owner may keep retained state uncharged, whether an empty release trims
-    /// the ledger and whether a finished query's pool contribution shrinks. Item 1069's
-    /// per-query floor cache removes the exclusion of `string_order_mask`.
-    const MODE_CHECKS: usize = 8;
+    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches and the
+    /// decoding envelope remain, with the four reads of the flag that decide whether a
+    /// cursor owner exists, whether a context without an owner may keep retained state
+    /// uncharged, whether an empty release trims the ledger and whether a finished
+    /// query's pool contribution shrinks.
+    const MODE_CHECKS: usize = 7;
 
     /// Counts the reads of the accounting mode in the non-test sources of the SPARQL
     /// engine, and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453). A

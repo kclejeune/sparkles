@@ -5613,17 +5613,15 @@ static STRING_ORDER_MASKS: AtomicUsize = AtomicUsize::new(0);
 /// The rows whose values the first test of [`string_order_mask`] reads.
 const STRING_ORDER_SAMPLE: usize = 64;
 
-/// The most ids a worker's cache of string floors holds in [`string_order_mask`].
-const STRING_FLOOR_ENTRIES: usize = 1 << 20;
-
 /// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
-/// each string's floor ([`Ctx::string_floor`]), computed once per distinct id in a cache
-/// of each worker, so neither column is decoded. A row with another kind of value is
-/// evaluated as the generic filter would. `None` when the table is small or its first
-/// rows hold other values, so that the generic filter decodes the columns instead, and
-/// in a cursor. The floors decode inside the envelope, and a refused floor fails the
-/// mask with the refusal it recorded.
+/// each string's floor ([`Ctx::string_floor`]), which the query's floor cache keeps for
+/// each distinct id across tables and the batches of a cursor (see
+/// [`super::ctx::FloorCache`]), so neither column is decoded. A row with another kind of
+/// value is evaluated as the generic filter would. `None` when the table is small or its
+/// first rows hold other values, so that the generic filter decodes the columns instead.
+/// The floors decode inside the envelope, and a refused floor fails the mask with the
+/// refusal it recorded.
 fn string_order_mask(
     ctx: &Ctx,
     t: &Table,
@@ -5636,17 +5634,16 @@ fn string_order_mask(
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
         return Ok(None);
     };
-    // A cursor builds a new floor cache for each batch, so a string that recurs across
-    // batches has its floor computed again in each one, which measured 25-34% slower
-    // than comparing the two keys directly (see `val_cmp`). Its rows compare their keys
-    // until a floor cache that outlives the batch exists (item 1069).
-    if n < STRING_ORDER_ROWS || ctx.streams() {
+    if n < STRING_ORDER_ROWS {
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
     let sample = n.min(STRING_ORDER_SAMPLE);
-    if !(0..sample).all(|i| ctx.string_floor(xs[i]).is_some() && ctx.string_floor(ys[i]).is_some())
-    {
+    let strings = {
+        let mut floors = ctx.floor_map();
+        (0..sample).all(|i| floors.floor(xs[i]).is_some() && floors.floor(ys[i]).is_some())
+    };
+    if !strings {
         // a refused floor is not another kind of value
         ctx.check_memory_failure()?;
         return Ok(None);
@@ -5654,14 +5651,6 @@ fn string_order_mask(
     let threads = rayon::current_num_threads().max(1);
     let par = n > PAR_THRESHOLD && threads > 1;
     let workers = if par { threads } else { 1 };
-    // Each worker's cache holds at most `entries` ids and starts again when it is full.
-    // A table of 16-byte entries with their control bytes, at most 7/8 full, coexists
-    // with its old table while it grows.
-    let entries = n.saturating_mul(2).min(STRING_FLOOR_ENTRIES);
-    let table = ((entries.saturating_mul(8) / 7).next_power_of_two() as u64).saturating_mul(17);
-    let Ok(_cache) = ctx.charge(table.saturating_mul(3) / 2 * workers as u64) else {
-        return Ok(None);
-    };
     let map = t.var_map(ctx.nvars());
     let generic = |i: usize| {
         let row = Row {
@@ -5673,21 +5662,12 @@ fn string_order_mask(
         };
         ebv(expr, &row, ctx).unwrap_or(false)
     };
-    let floor = |cache: &mut FxHashMap<Id, u64>, id: Id| -> Option<u64> {
-        if cache.len() >= entries && !cache.contains_key(&id) {
-            cache.clear();
-        }
-        let f = *cache
-            .entry(id)
-            .or_insert_with(|| ctx.string_floor(id).unwrap_or(u64::MAX));
-        (f != u64::MAX).then_some(f)
-    };
-    let test = |cache: &mut FxHashMap<Id, u64>, i: usize| -> Result<bool> {
+    let test = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> Result<bool> {
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
         let (a, b) = (xs[i], ys[i]);
-        let (Some(fa), Some(fb)) = (floor(cache, a), floor(cache, b)) else {
+        let (Some(fa), Some(fb)) = (floors.floor(a), floors.floor(b)) else {
             return Ok(generic(i));
         };
         let (pa, pb) = (a.payload(), b.payload());
@@ -5709,12 +5689,12 @@ fn string_order_mask(
         (0..n)
             .into_par_iter()
             .with_min_len(n.div_ceil(workers))
-            .map_init(FxHashMap::default, |cache, i| test(cache, i))
+            .map_init(|| ctx.floor_map(), |floors, i| test(floors, i))
             .collect::<Result<Vec<bool>>>()?
     } else {
-        let mut cache = FxHashMap::default();
+        let mut floors = ctx.floor_map();
         (0..n)
-            .map(|i| test(&mut cache, i))
+            .map(|i| test(&mut floors, i))
             .collect::<Result<Vec<bool>>>()?
     };
     // A refused floor took its row to the generic test, so the mask must not stand.
@@ -9839,6 +9819,7 @@ mod paid_eager_producer_tests {
 #[cfg(test)]
 mod string_order_tests {
     use super::*;
+    use crate::error::BudgetKind;
     use crate::id::Tag;
     use crate::io::Source;
     use crate::store::{Store, StoreOptions};
@@ -9942,11 +9923,10 @@ mod string_order_tests {
         Expr::Cmp(Box::new(Expr::Var(x)), Box::new(Expr::Var(y)), op)
     }
 
-    /// An eager table takes the comparison through the vocabulary floors, with the same
-    /// mask as the generic filter that decodes every row. A cursor's batch declines the
-    /// floors and leaves the comparison to the generic filter until item 1069.
+    /// A cursor's batch takes the comparison through the vocabulary floors as an eager
+    /// table does, with the same mask as the generic filter that decodes every row.
     #[test]
-    fn eager_tables_order_strings_through_their_floors_and_cursor_batches_decline() {
+    fn cursor_batches_order_strings_through_their_floors_as_eager_tables_do() {
         use super::super::expr::CmpOp;
         let (s, ids) = store("long");
         assert!(ids.len() * ids.len() > STRING_ORDER_ROWS);
@@ -9960,24 +9940,142 @@ mod string_order_tests {
                 }
                 let (t, x, y) = product(&ctx, &ids);
                 let e = cmp(x, y, op);
-                let mask = string_order_mask(&ctx, &t, (x, y), op, &e).unwrap();
+                let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("cursor {cursor}: the floors apply"));
                 let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
-                if cursor {
-                    assert!(mask.is_none(), "a cursor batch declines the floors");
-                    masks.push(generic);
-                } else {
-                    let mask = mask.expect("the floors apply");
-                    assert_eq!(mask, generic, "{op:?}");
-                    masks.push(mask);
-                }
+                assert_eq!(mask, generic, "cursor {cursor} {op:?}");
+                masks.push(mask);
             }
             assert_eq!(masks[0], masks[1], "{op:?}");
         }
     }
 
-    /// A streamed `FILTER(?x < ?y)` over a product of stored strings, whose batches
-    /// compare their keys without the floors, keeps the rows the eager query keeps
-    /// through the floors.
+    /// The floor of every word is the first id whose key starts with its lexical form, in
+    /// both modes, over words that span many front-coded blocks so that a string often
+    /// starts a block or follows one of its extensions.
+    #[test]
+    fn string_floors_match_a_search_across_blocks() {
+        let (s, ids) = store("long");
+        let snap = s.snapshot();
+        let v = &snap.generation.vocab;
+        let all: Vec<u64> = (0..v.first_triple()).collect();
+        assert!(all.len() > 4 * crate::vocab::FC_BLOCK);
+        let expected: Vec<Option<u64>> = ids
+            .iter()
+            .map(|id| {
+                if id.tag() != Tag::Vocab || id.payload() >= v.first_triple() {
+                    return None;
+                }
+                let key = v.get(id.payload()).unwrap();
+                if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != crate::id::KEY_SEP {
+                    return None;
+                }
+                let prefix = &key[..key.len() - 1];
+                all.iter()
+                    .copied()
+                    .find(|&q| v.get(q).unwrap().starts_with(prefix))
+            })
+            .collect();
+        assert!(
+            expected
+                .iter()
+                .zip(&ids)
+                .filter(|(f, id)| f.is_some_and(|f| f < id.payload()))
+                .any(|(_, id)| id.payload() as usize % crate::vocab::FC_BLOCK == 0),
+            "a block's first string extends another"
+        );
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let floors: Vec<Option<u64>> = ids.iter().map(|&id| ctx.string_floor(id)).collect();
+            assert_eq!(floors, expected, "cursor {cursor}");
+            let mut map = ctx.floor_map();
+            let cached: Vec<Option<u64>> = ids.iter().map(|&id| map.floor(id)).collect();
+            assert_eq!(cached, expected, "cursor {cursor}");
+            drop(map);
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// The floors a query computes for one table serve its later tables, as a cursor's
+    /// batches are, in both modes: a second mask over the same strings computes none.
+    #[test]
+    fn the_floor_cache_lasts_the_query() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = store("long");
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let mut masks = Vec::new();
+            let mut computed = Vec::new();
+            for op in [CmpOp::Lt, CmpOp::Ge] {
+                let (t, x, y) = product(&ctx, &ids);
+                let e = cmp(x, y, op);
+                let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic, "cursor {cursor} {op:?}");
+                masks.push(mask);
+                computed.push(ctx.floor_cache().computed());
+            }
+            let cache = ctx.floor_cache();
+            // every id and the local string, at most once per worker's map
+            assert!(computed[0] > ids.len(), "cursor {cursor}: {computed:?}");
+            assert_eq!(computed[1], computed[0], "cursor {cursor}: no floor again");
+            assert!(cache.entries() > ids.len(), "cursor {cursor}");
+            assert!(
+                cache.reserved() > 0,
+                "cursor {cursor}: the maps are charged"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// A floor cache whose growth the budget refuses takes no entries, records no
+    /// failure and leaves the mask exact, in both modes: the floors it cannot keep are
+    /// computed each time.
+    #[test]
+    fn a_refused_floor_cache_growth_leaves_the_mask_exact() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = store("long");
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 1 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let (t, x, y) = product(&ctx, &ids);
+            let e = cmp(x, y, CmpOp::Lt);
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            // room for the decoding of the short keys, not for a map's first table
+            let room = 24 << 10;
+            let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - room).unwrap();
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the floors apply");
+            assert_eq!(mask, generic, "cursor {cursor}");
+            let cache = ctx.floor_cache();
+            assert_eq!(cache.entries(), 0, "cursor {cursor}");
+            assert_eq!(cache.reserved(), 0, "cursor {cursor}");
+            assert!(
+                cache.computed() > t.len(),
+                "cursor {cursor}: computed each time"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+            drop(held);
+        }
+    }
+
+    /// A streamed `FILTER(?x < ?y)` over a product of stored strings reaches the floors
+    /// in a batch and keeps the rows the eager query keeps.
     #[test]
     fn a_streamed_string_comparison_matches_the_eager_query() {
         use crate::sparql::{CursorOptions, QueryOptions, query, select_cursor};
@@ -9989,7 +10087,6 @@ mod string_order_tests {
             ..Default::default()
         };
         let text = |t: &Option<oxrdf::Term>| t.as_ref().map(|t| t.to_string());
-        let before = STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed);
         let mut eager: Vec<_> = query(s.snapshot(), q, &options)
             .unwrap()
             .rows()
@@ -9998,11 +10095,7 @@ mod string_order_tests {
             .map(|r| r.values().iter().map(text).collect::<Vec<_>>())
             .collect();
         eager.sort();
-        // other tests can build masks concurrently, so only the eager query's is checked
-        assert!(
-            STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed) > before,
-            "the eager query reaches the floors"
-        );
+        let before = STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed);
         let cursor_options = CursorOptions {
             batch_rows: 1 << 16,
             ..Default::default()
@@ -10022,6 +10115,10 @@ mod string_order_tests {
                 );
             }
         }
+        assert!(
+            STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed) > before,
+            "a batch reaches the floors"
+        );
         streamed.sort();
         assert!(!eager.is_empty());
         assert_eq!(streamed, eager);
@@ -10314,11 +10411,10 @@ mod string_order_tests {
         }
     }
 
-    /// An eager table reads the floors of a string longer than the budget unchecked. A
-    /// cursor batch declines the floors before it reads a key, so it records no refusal.
-    /// Item 1069 gives the cursor floors again, which then reserve the keys they read.
+    /// A cursor reserves the keys its floors read, so a string longer than the budget
+    /// fails the mask with a memory refusal, while an eager table reads it unchecked.
     #[test]
-    fn a_long_string_does_not_fail_the_mask() {
+    fn a_refused_floor_fails_the_cursor_mask() {
         use super::super::expr::CmpOp;
         // It sorts after the other strings, so the sample's keys do not reach it.
         let (s, ids) = store(&"ÿ".repeat(1 << 19));
@@ -10332,8 +10428,10 @@ mod string_order_tests {
             let e = cmp(x, y, CmpOp::Lt);
             let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
             if cursor {
-                assert!(matches!(outcome, Ok(None)), "{outcome:?}");
-                assert!(ctx.check().is_ok());
+                assert!(
+                    matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                    "{outcome:?}"
+                );
             } else {
                 assert!(outcome.unwrap().is_some());
             }

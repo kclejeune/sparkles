@@ -38,6 +38,46 @@ const FSST_ROOM: usize = 64;
 /// Every key of a front-coded block, as a mask of [`Vocab::decode_block`].
 const ALL_KEYS: u32 = (1 << FC_BLOCK) - 1;
 
+/// The longest key before another that [`Vocab::get_with_prev`] copies to the stack.
+pub(crate) const PREV_KEY_BYTES: usize = 96;
+
+/// The keys [`Vocab::get_with_prev`] decodes from a block: the `want`-th and the one
+/// before it, when that one is in the block.
+#[inline(always)]
+fn prev_mask(want: usize) -> u32 {
+    if want == 0 { 1 } else { 3 << (want - 1) }
+}
+
+/// A copy of the key before another, when it fits in [`PREV_KEY_BYTES`].
+struct PrevKey {
+    bytes: [u8; PREV_KEY_BYTES],
+    len: Option<usize>,
+}
+
+impl Default for PrevKey {
+    fn default() -> Self {
+        Self {
+            bytes: [0; PREV_KEY_BYTES],
+            len: None,
+        }
+    }
+}
+
+impl PrevKey {
+    #[inline(always)]
+    fn keep(&mut self, key: &[u8]) {
+        self.len = (key.len() <= PREV_KEY_BYTES).then(|| {
+            self.bytes[..key.len()].copy_from_slice(key);
+            key.len()
+        });
+    }
+
+    #[inline(always)]
+    fn get(&self) -> Option<&[u8]> {
+        self.len.map(|n| &self.bytes[..n])
+    }
+}
+
 /// How many bytes of key `i` of a front-coded block a decode of the keys in `wanted`
 /// (a bit per key) needs, given the entry after it: all of a wanted key
 /// (`usize::MAX`), and of another key the bytes that the next key takes from it, its
@@ -1065,6 +1105,85 @@ impl Vocab {
         } else {
             self.get_with_at::<false, T>(id, f)
         }
+    }
+
+    /// `f(prev, key)` of the key of `id` and the key of `id - 1`, decoded in one walk of
+    /// `id`'s front-coded block. `prev` is `None` when `id` is the first key of its block
+    /// or the key before it is longer than [`PREV_KEY_BYTES`], and the caller reads that
+    /// key on its own. The key before is copied to the stack before the walk overwrites
+    /// it, which costs less than a second walk of the block.
+    pub(crate) fn get_with_prev<T>(
+        &self,
+        id: u64,
+        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+    ) -> Option<T> {
+        if id >= self.len {
+            return None;
+        }
+        if ioacct::profiling() {
+            let _t = ioacct::timer(Phase::VocabRead);
+            self.get_with_prev_at::<true, T>(id, f)
+        } else {
+            self.get_with_prev_at::<false, T>(id, f)
+        }
+    }
+
+    #[inline(always)]
+    fn get_with_prev_at<const P: bool, T>(
+        &self,
+        id: u64,
+        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+    ) -> Option<T> {
+        let b = (id as usize) / FC_BLOCK;
+        let want = (id as usize) % FC_BLOCK;
+        let mut prev = PrevKey::default();
+        let mut f = Some(f);
+        let mut out = None;
+        let mut key = Vec::with_capacity(self.scratch_capacity());
+        self.decode_block::<P>(b, prev_mask(want), &mut key, |i, k| {
+            if i < want {
+                prev.keep(k);
+                return true;
+            }
+            out = f.take().map(|f| f(prev.get(), k));
+            false
+        });
+        out
+    }
+
+    /// [`Vocab::get_with_prev`] with every growth of the reconstruction buffer admitted
+    /// by `reserve` first, as [`Vocab::get_with_checked`] admits it.
+    pub(crate) fn get_with_prev_checked<T, E>(
+        &self,
+        id: u64,
+        mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+    ) -> std::result::Result<Option<T>, E> {
+        if id >= self.len {
+            return Ok(None);
+        }
+        let _t = ioacct::timer(Phase::VocabRead);
+        let b = (id as usize) / FC_BLOCK;
+        let want = (id as usize) % FC_BLOCK;
+        let mut prev = PrevKey::default();
+        let mut f = Some(f);
+        let mut out = None;
+        let mut each = |at: u64, k: &[u8]| {
+            if (at as usize) % FC_BLOCK < want {
+                prev.keep(k);
+            } else {
+                out = f.take().map(|f| f(prev.get(), k));
+            }
+            Ok(())
+        };
+        let mut key = Vec::new();
+        let mask = prev_mask(want);
+        if self.fsst.is_some() {
+            self.checked_block::<true, false, E>(b, mask, &mut key, &mut reserve, &mut each)?;
+        } else {
+            self.checked_block::<false, false, E>(b, mask, &mut key, &mut reserve, &mut each)?;
+        }
+        Ok(out)
     }
 
     #[inline(always)]
@@ -4573,6 +4692,50 @@ mod tests {
                     .as_ref(),
                 Some(&keys[last as usize])
             );
+        }
+    }
+
+    /// Every key read with the key before it gives both keys, in both codecs and on both
+    /// paths, and gives no key before it only at a block's first key or past
+    /// [`PREV_KEY_BYTES`].
+    #[test]
+    fn a_key_read_with_the_one_before_it_gives_both() {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..300u32 {
+            let long = "y".repeat(if i % 11 == 0 {
+                120
+            } else {
+                (i % 5 * 7) as usize
+            });
+            keys.push(format!("\"s{i}{long}").into_bytes());
+            keys.push(format!("<http://example.org/{:03}/{long}>", i / 3).into_bytes());
+        }
+        keys.sort();
+        keys.dedup();
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let v = Vocab::open(dir.path()).unwrap();
+            assert_eq!(v.is_fsst(), fsst);
+            let mut skipped = 0;
+            for id in 0..keys.len() as u64 {
+                let expect = |prev: Option<&[u8]>, key: &[u8]| {
+                    assert_eq!(key, keys[id as usize], "fsst {fsst} id {id}");
+                    let i = id as usize;
+                    let alone = i % FC_BLOCK == 0 || keys[i - 1].len() > PREV_KEY_BYTES;
+                    match prev {
+                        Some(prev) => assert_eq!(prev, keys[i - 1], "fsst {fsst} id {id}"),
+                        None => assert!(alone, "fsst {fsst} id {id}"),
+                    }
+                    usize::from(prev.is_none() && i % FC_BLOCK != 0)
+                };
+                skipped += v.get_with_prev(id, expect).unwrap();
+                v.get_with_prev_checked::<_, ()>(id, |_| Ok(()), expect)
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(skipped > 0, "a long key before another is read on its own");
+            assert!(v.get_with_prev(keys.len() as u64, |_, _| ()).is_none());
         }
     }
 
