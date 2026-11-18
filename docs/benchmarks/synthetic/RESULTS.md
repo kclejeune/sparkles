@@ -752,7 +752,7 @@ The one-thread cells ran five rounds and every round agreed in direction with th
 The 37-query screens against the base ran three rounds and read a geometric mean of 0.980
 in streaming and 0.970 in automatic execution, with no query 10% slower. Automatic
 `str-pair-colleague` read 0.777 there. Roadmap item 1088 follows the streaming cost of
-`str-pair-colleague`, whose names rarely repeat, and item 1089 the costs of 0.8% to 2.8%
+`str-pair-colleague`, whose names rarely repeat, and item 1089 the costs of 0.2% to 2.8%
 that the screens found in queries the floors do not reach, together with item 678's costs
 on `lang-filter`, `str-filter-two` and `distinct-join` of 1.8% to 2.9%. Automatic
 `str-filter-two` spread by 22% to 23% between server processes of one build, which item

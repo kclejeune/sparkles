@@ -263,7 +263,8 @@ streaming execution, over five rounds, `str-pair-names` took 0.488 of the base's
 28.1 against 57.7 ms, `str-pair-lt` 0.899 and `str-pair-colleague` 1.087. Against the
 direct comparison of the two keys in eager execution, 971717d2, they read 0.460, 0.852 and
 1.030. With 12 threads, streaming `str-pair-lt` read 0.939, `str-pair-names` 1.000 and
-`str-pair-colleague` 1.118, and eager execution read 0.833, 0.846 and 0.880. Streaming
+`str-pair-colleague` 1.118, and in eager execution `str-pair-lt` read 0.846,
+`str-pair-names` 0.833 and `str-pair-colleague` 0.880. Streaming
 `str-pair-names` takes 31.1 ms with 12 threads against 28.1 ms with one, because each
 worker's map computes the floors its rows need again. The 37-query screens over three
 rounds had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no
@@ -274,12 +275,24 @@ floors are nearly all computed once, and their reads of a key and its predecesso
 more than comparing the two keys. A switch that turns the floors off when a prefix of the
 rows repeats few values was considered and not built, because in a shuffled order the
 first 4,096 rows of `str-pair-names` repeat as few values as `str-pair-colleague` while
-the whole query repeats many, so the switch would lose the names query's 2x. Item 1088
-recovers the colleague cost. The screens also found costs of 0.8% to 2.8% in queries the
-floors do not reach, such as streaming `str-filter-two` and `distinct-join`, and item
-1089 holds them with the 1.8% to 2.9% costs of item 678 on `lang-filter`,
-`str-filter-two` and `distinct-join`, which stay with both builds made on forge.
-Automatic `str-filter-two` changes mode between server processes, which item 1087 holds.
+the whole query repeats many, so the switch would lose the names query's 2x. The
+profile of `str-pair-colleague` puts the cost in `Ctx::with_vocab_key_prev`,
+`Vocab::get_with_prev_checked` and `FloorMap::floor`, and item 1088 recovers it.
+
+Queries that the floors do not reach also became slower in every round, and item 1089
+holds these costs. With one thread, 174de1f8 against c0948014 made streaming
+`str-filter-two` 2.8% slower over five rounds, and the screens found streaming
+`distinct-join` 2.5% slower, `star-join` 1.7% in streaming and 2.0% in automatic
+execution, automatic `employee-docs` 2.8% at 0.036 ms and automatic `star-lookup` 2.5% at
+0.062 ms. `range-topk`, `order-lcase`, automatic `two-hop-count` and automatic `minus`
+read 0.8% to 1.3% slower, and streaming `lang-filter`, streaming `optional-count` and
+automatic `order-by-full` 0.2% to 0.4%. With both builds made on forge, item 678,
+75a70587 against 7e272f4d, made `lang-filter` 2.9% slower in automatic and 2.7% in
+streaming execution, `str-filter-two` 2.1% and 1.8%, and streaming `distinct-join` 1.9%,
+in all five rounds, while `employee-docs` showed no cost. Profiles of item 678's costs on
+the laptop found no function the item changed above 0.14% of the samples and the same
+instruction counts for `lang-filter`. Automatic `str-filter-two` changes mode between
+server processes, which item 1087 holds.
 
 The test-only reference evaluator of item 512 has shipped in
 `crates/sparkles-core/tests/support/reference`. It reads a list of quads and a parsed
