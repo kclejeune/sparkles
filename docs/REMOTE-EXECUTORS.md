@@ -228,10 +228,10 @@ mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HE
 
 The worker builds each revision in a scope without swap, with 6 compile jobs. The cap is
 12 GiB by default, the job that qualification admits, but the server's final rustc peaks just
-above 12 GiB at any job count, so that cap runs a cold release build out of memory. A screen
-therefore runs on a dedicated worker whose own job release checks that its host and user
-slice leave 14.5 GiB for a 13 GiB build, the metadata service and the host reserve, and the
-worker's job environment sets `SPARKLES_BOAT_BUILD_MEMORY_MAX=13G`. The setting takes a cap
+above 12 GiB at any job count, so that cap runs a cold release build out of memory. A 13 GiB
+build needs a dedicated worker whose own job release checks that its host and user slice
+leave 14.5 GiB for the build, the metadata service and the host reserve, and whose job
+environment sets `SPARKLES_BOAT_BUILD_MEMORY_MAX=13G` (item 1079). The setting takes a cap
 from 8G to 13G and `SPARKLES_BOAT_BUILD_JOBS` a count from 2 to 8, and a value outside either
 range is refused before the worker is admitted. A cold build of both revisions takes most of an hour, so the worker's
 admitted lifetime must cover both builds, the screen and its reruns.
