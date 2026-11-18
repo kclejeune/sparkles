@@ -209,7 +209,7 @@ impl Generation {
             // descriptor and link storage in the same remaining allowance.
             budget.release(delta_charge);
             let limit = budget.owned_limit()?;
-            wal::apply_forward_limited(
+            wal::apply_forward(
                 &source.value.join("wal.log"),
                 &generation,
                 cache,

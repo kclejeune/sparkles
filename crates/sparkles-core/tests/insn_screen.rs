@@ -24,6 +24,7 @@
 #![cfg(target_os = "linux")]
 
 use sparkles_core::builder::{BuildOptions, VocabCodec};
+use sparkles_core::history::{At, HistoryOptions};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::QueryOptions;
 use sparkles_core::sparql::update::update;
@@ -701,7 +702,8 @@ fn fnv(parts: &[&str]) -> u64 {
 /// bumps so that a comparison with an older baseline fails.
 const CASES: &str = "vocab: open, for-each, get-sorted every 7th, get-random 50000, \
                      get-random-checked 50000, find every 13th, missing, prefix 12 bytes of \
-                     every 130th; wal: open, open with commits, replay; v2";
+                     every 130th; wal: open, open with commits, replay; history: snapshot_at forward, \
+                     backward, limited forward, limited backward, sealed forward; v3";
 
 fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize) {
     let commits = env("INSN_SCREEN_COMMITS", 2000);
@@ -774,6 +776,113 @@ fn wal_cases(out: &mut Out, c: &counter::Instructions, reps: usize, items: usize
     // the open of the same store without the log, subtracted
     let coverage = empty.coverage.min(replay.coverage);
     out.case(&format!("wal/replay-{commits}-commits"), diff, 0, coverage);
+    history_cases(out, c, reps, &changed_dir, commits);
+}
+
+/// Historical reads that replay the log through the cursor, forward from the base state
+/// and backward from the live state, with no control and with a memory cap. Each
+/// repetition opens a fresh copy, so the history cache is cold, and the open is outside the
+/// counted interval.
+fn history_cases(
+    out: &mut Out,
+    c: &counter::Instructions,
+    reps: usize,
+    src: &Path,
+    commits: usize,
+) {
+    let head = {
+        let s = Store::open(src, StoreOptions::default()).unwrap();
+        s.head_commit().seq
+    };
+    let first = head - commits as u64;
+    let forward = first + (commits as u64 / 10).max(1);
+    let backward = first + (commits as u64 * 9 / 10).max(1);
+    let cap = 256 << 20;
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, u64, Option<u64>); 4] = [
+        ("history/snapshot-at-forward", forward, None),
+        ("history/snapshot-at-backward", backward, None),
+        ("history/snapshot-at-limited-forward", forward, Some(cap)),
+        ("history/snapshot-at-limited-backward", backward, Some(cap)),
+    ];
+    for (key, seq, limit) in cases {
+        let (mut counts, mut other_us, mut coverage) = (Vec::new(), 0, 1.0f64);
+        let mut quads = None;
+        for _ in 0..reps {
+            let scratch = tempfile::tempdir().unwrap();
+            let dir: PathBuf = scratch.path().join("db");
+            copy_dir(src, &dir);
+            let s = Store::open(&dir, StoreOptions::default()).unwrap();
+            let at = At::Commit(seq);
+            let options = HistoryOptions::default();
+            quiesce();
+            let before = other_thread_us();
+            let (n, share, r) = c.count(|| match limit {
+                None => s.snapshot_at(&at, &options).unwrap(),
+                Some(cap) => s.snapshot_at_limited(&at, &options, cap).unwrap(),
+            });
+            other_us += us_since(before);
+            coverage = coverage.min(share);
+            let found = (r.0.commit, r.0.len());
+            assert_eq!(
+                *quads.get_or_insert(found),
+                found,
+                "{key} changed between runs"
+            );
+            counts.push(n);
+        }
+        let (commit, len) = quads.unwrap();
+        out.check_fp(
+            &format!("{key}/state"),
+            commit == seq,
+            format!("commit {commit}, {len} quads"),
+            format!("{commit} {len}"),
+        );
+        out.case(key, counts, other_us, coverage);
+    }
+    // After a compaction the commits sit in a sealed generation, whose log has no sparse
+    // index until the first historical read scans it with the uncontrolled cursor.
+    let sealed = tempfile::tempdir().unwrap();
+    let sealed_src = sealed.path().join("db");
+    copy_dir(src, &sealed_src);
+    {
+        // a pin keeps the sealed generation through the compaction
+        let s = Store::open(&sealed_src, StoreOptions::default()).unwrap();
+        s.create_snapshot("insn", &At::Commit(forward), None)
+            .unwrap();
+        s.compact().unwrap();
+    }
+    let key = "history/snapshot-at-sealed-forward";
+    let (mut counts, mut other_us, mut coverage) = (Vec::new(), 0, 1.0f64);
+    let mut quads = None;
+    for _ in 0..reps {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir: PathBuf = scratch.path().join("db");
+        copy_dir(&sealed_src, &dir);
+        let s = Store::open(&dir, StoreOptions::default()).unwrap();
+        let at = At::Commit(forward);
+        let options = HistoryOptions::default();
+        quiesce();
+        let before = other_thread_us();
+        let (n, share, r) = c.count(|| s.snapshot_at(&at, &options).unwrap());
+        other_us += us_since(before);
+        coverage = coverage.min(share);
+        let found = (r.0.commit, r.0.len());
+        assert_eq!(
+            *quads.get_or_insert(found),
+            found,
+            "{key} changed between runs"
+        );
+        counts.push(n);
+    }
+    let (commit, len) = quads.unwrap();
+    out.check_fp(
+        &format!("{key}/state"),
+        commit == forward,
+        format!("commit {commit}, {len} quads"),
+        format!("{commit} {len}"),
+    );
+    out.case(key, counts, other_us, coverage);
 }
 
 /// The other-thread guard sees a worker that ran and was joined while a case ran.

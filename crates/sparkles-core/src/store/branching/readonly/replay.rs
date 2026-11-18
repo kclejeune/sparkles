@@ -14,13 +14,13 @@ pub(super) fn selected_metadata(
 ) -> Result<()> {
     let start = budget.used();
     let result = (|| {
-        let mut cursor = wal::WalCursor::open_limited(
+        let mut cursor = wal::WalCursor::open_with(
             path,
             from,
             &budget.owned_limit()?,
             history_limited::preparation_delta_bytes(delta),
         )?;
-        let Some((seq, transaction, buffers)) = cursor.next_limited(
+        let Some((seq, transaction, buffers)) = cursor.next_with(
             &budget.owned_limit()?,
             history_limited::preparation_delta_bytes(delta),
         )?

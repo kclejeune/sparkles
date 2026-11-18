@@ -641,6 +641,72 @@ path writes the generation's prefixes before the tail appends its catalog entry,
 failed prefix write leaves the catalog and the snapshot in step. No on-disk format
 changed.
 
+The first stage of Phase 3 is built for the WAL and history readers. `budgeted.rs` defines `Control` with two
+constants, `CHECKS` and `ACCOUNTS`, and the carrier's type rather than its memory member
+chooses how a reader is controlled. `Unlimited` has neither and compiles to the ordinary
+reader. A stride carrier, which is `HistoryCeiling` in `store.rs` for a historical read
+without a cap, checks cancellation, the deadline and the history cache's capacity every
+64 Ki records through `check_delta`. An accounting carrier, which is `ReadLimit` or
+`ColdBudget`, checks each record and charges each allocation before it is made, as the
+`_limited` twins did, and it does so whether or not its memory member is present. Every
+former `_limited` call site passes an accounting carrier, so a controlled read without a
+cap, such as a read-only branch read, keeps its per-record checks. The plan's two kinds
+of control became three for that reason. The trait's `check` and `remaining` take
+`&self`, because a reader hands one carrier to its helpers and closures and these only
+read it. `reserve` and `release` are not part of the trait yet. A stage 3 reader that
+charges will take `&mut C` and reborrow it for these readers. `read_limit` lends the
+carrier as a `ReadLimit` to the index readers that are not generic, `contains_limited`
+above all, and `Unlimited` lends one of no control. Stage 3 removes it. `Stride<N>` is a
+const-generic mask that is never due for `Unlimited` or an accounting carrier.
+
+`WalCursor` has one `next_with` in place of `next_inner(Option)`, one `open_with` and
+one `seek_to_with`, and `apply_forward` and `apply_backward` each have one body in place
+of their `_limited` twins. The accounting form keeps the smaller I/O buffers, the
+transaction preflight and the chunked checksum, and the other forms keep the megabyte
+buffer and the 4 MiB backward chunk. `snapshot_at_inner` chooses a carrier once and
+`snapshot_at_with` is generic over it, so its forks are the constant. `materialize`,
+`wal_point`, `HistoryState::owner`, `MemHistory::get` and `Store::inherited` each have one
+body. An accounting `wal_point` still builds no sparse index, and the bounded cache
+insertion stays apart from the ordinary eviction, since both are behaviour rather than
+accounting. The `history_generation`, `len` and `retained_bytes` twins stay, since the
+readers they call belong to stage 3. `resolve` and `resolve_limited` share one body,
+`resolve_in`, whose locks are controlled only under an accounting carrier. The bounded
+entry keeps its refusal of an invalid snapshot name and its controlled wait for the
+writer's head, and its `NotFound` for a time before history now names where history
+starts, as the ordinary one always did. `history_gone` and `mem_gone` are the
+`Unlimited` forms of `history_gone_with` and `mem_gone_with`, and both forms of
+`reconstructable` merge through one `merge_ranges`, which builds and heap-sorts its
+ranges in one vector and charges each step only under an accounting carrier. A stride
+read therefore resolves, waits and reports a missing commit exactly as before. The
+read-only branch reads of `branching/readonly.rs` replay their logs through the generic
+`apply_forward` and `apply_backward` with an accounting carrier. Their other
+`_controlled` helpers read commit files, cold vocabularies and annotations, which belong
+to stage 3. No query path, executor, index reader or spill path changed in this stage,
+so the X14 gate and the spill matrices of `test:w3c` have nothing of it to measure, and
+the batch screen covers the query paths as usual.
+[Item 1062](../../ROADMAP.md) takes the read-only change-log
+reader. `changelog/readonly.rs` reads captured descriptors into borrowed record views,
+while `changelog.rs` reads its in-memory segment index into owned records, so the two
+share only their codec and are not twins of one reader.
+
+The `bench:insn` screen gained five historical reads, forward and backward with and
+without a cap and a forward read from a sealed generation, whose first read scans the log
+with the uncontrolled cursor. The screen's case string moved to version 3, so older
+baselines no longer compare. Against its base on one laptop, with the median of three
+processes of user-space instructions, WAL replay of 2,000 commits and both opens took
+1.000 of the base's count, the four historical reads 0.998 to 0.999 and the sealed read
+1.000. The ordered, unordered and checked FSST vocabulary reads counted the same
+instructions as the base. The front-coded reads moved by up to 0.7% of the base in
+either direction, inside the spread of their own processes at one commit. In ten
+processes of each binary, the front-coded random lookups counted 58.30M instructions in
+four processes of the base and in seven of the stage, and lower counts in the others that
+depend on where the data lands, so the two binaries draw from the same counts and no
+case's range lies above the base's. An intermediate commit of the stage had moved the
+vocabulary cases by up to 3.9% through the single codegen unit's inlining, and the
+finished stage does not. The `insn_screen` binary's text grew by 0.08%. The compile
+time of `sparkles-core` before and after the stage is still to be timed on a quiet
+host.
+
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a

@@ -1027,7 +1027,12 @@ full scan, decoding every seventh id in order, 50,000 random lookups by id, the 
 lookups through the checked decoder that a cursor uses, lookups of present and missing
 keys and prefix ranges. It also counts opening a store without a
 write-ahead log and with 2,000 commits in it, and the difference, which is the cost of
-replaying them. Each case runs five times and reports the median, and the task runs the
+replaying them. Five historical reads of that store count `snapshot_at` of a commit a tenth of
+the way into the log, which replays forward from the base, and of one nine tenths of the
+way in, which replays backward from the head. The same two reads run again under a memory
+cap, and a fifth read of a pinned commit after a compaction scans the sealed
+generation's log with the uncontrolled cursor. Each read opens a fresh copy of the store
+outside the counted interval. Each case runs five times and reports the median, and the task runs the
 screen in five processes. `--items`, `--commits`, `--reps` and `--processes` change these
 numbers. Every counted result is
 checked against an expectation that the screen computes another way. Before the counted

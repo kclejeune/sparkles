@@ -115,6 +115,42 @@ fn cancellation_and_deadline_apply_to_live_fast_paths() {
     );
 }
 
+/// A historical read with no memory cap still checks cancellation and the deadline, in
+/// a persistent store that replays its log and in an in-memory store, which keeps no
+/// past state by default and would otherwise refuse the read as gone.
+#[test]
+fn an_uncapped_historical_read_is_cancelled_and_times_out() {
+    let root = tempfile::tempdir().unwrap();
+    let disk = Store::open(root.path(), StoreOptions::default()).unwrap();
+    let memory = Store::in_memory(StoreOptions::default());
+    for store in [&disk, &memory] {
+        write(store, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        write(store, "INSERT DATA { <urn:b> <urn:p> 2 }");
+        let past = At::Commit(store.head_commit().seq - 1);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut options = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        assert!(matches!(
+            store.snapshot_at(&past, &options),
+            Err(Error::Cancelled)
+        ));
+        cancel.store(false, Ordering::Relaxed);
+        options.deadline = Some(Instant::now() - Duration::from_millis(1));
+        assert!(matches!(
+            store.snapshot_at(&past, &options),
+            Err(Error::Timeout)
+        ));
+    }
+    let past = At::Commit(disk.head_commit().seq - 1);
+    let options = HistoryOptions::default();
+    assert_eq!(
+        values(disk.snapshot_at(&past, &options).unwrap().0).len(),
+        1
+    );
+}
+
 #[test]
 fn bounded_origin_selection_follows_only_the_requested_family() {
     let root = tempfile::tempdir().unwrap();
@@ -233,4 +269,42 @@ fn ignored_zero_local_capacity_cannot_override_a_shared_scope() {
             .unwrap();
         assert_eq!(resolved.commit.seq, 1);
     }
+}
+
+/// The ordinary and the capped resolver are one body: a time before history and a commit
+/// that is gone give the same error with and without a cap.
+#[test]
+fn capped_and_uncapped_reads_refuse_alike() {
+    let root = tempfile::tempdir().unwrap();
+    let disk = Store::open(root.path(), StoreOptions::default()).unwrap();
+    let memory = Store::in_memory(StoreOptions::default());
+    let options = HistoryOptions::default();
+    for store in [&disk, &memory] {
+        write(store, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        write(store, "INSERT DATA { <urn:b> <urn:p> 2 }");
+        let before = At::Time(0);
+        let plain = store.resolve(&before).err().map(|e| e.to_string());
+        let capped = store
+            .snapshot_at_limited(&before, &options, 64 << 20)
+            .err()
+            .map(|e| e.to_string());
+        let message = plain.clone().expect("a time before history is not found");
+        assert!(message.contains("(history starts at "), "{message}");
+        assert_eq!(plain, capped);
+    }
+    // an in-memory store without a retention window keeps only its head
+    let past = At::Commit(memory.head_commit().seq - 1);
+    let gone = |r: Result<_, Error>| match r {
+        Err(Error::HistoryGone(g)) => (g.message, g.seq, g.head, g.reconstructable),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("commit {past:?} is still reconstructable"),
+    };
+    assert_eq!(
+        gone(memory.snapshot_at(&past, &options).map(|_| ())),
+        gone(
+            memory
+                .snapshot_at_limited(&past, &options, 64 << 20)
+                .map(|_| ())
+        )
+    );
 }

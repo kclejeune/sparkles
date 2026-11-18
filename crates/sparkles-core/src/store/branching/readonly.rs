@@ -768,7 +768,7 @@ impl Store {
         } else {
             target
         };
-        wal::apply_forward_limited(
+        wal::apply_forward(
             &selected.value.dir.join("wal.log"),
             &generation,
             &self.cache,

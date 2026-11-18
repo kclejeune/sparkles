@@ -9,55 +9,17 @@ enum PinnedSource<'a> {
 }
 
 impl Store {
-    pub(super) fn inherited_limited(
-        &self,
-        at: &At,
-        seq: u64,
-        limit: &ReadLimit<'_>,
-    ) -> Result<Error> {
-        let name = limit.read_lock(&self.branching.name)?;
-        limit.check(name.len() as u64)?;
-        Ok(self.inherited_named(at, seq, &name))
-    }
-
     /// An unresolved time has no honest commit number after catalog pruning.
     pub(super) fn unresolved_time_limited(&self, ms: i64, limit: &ReadLimit<'_>) -> Result<Error> {
         let writer = limit.lock(&self.writer)?;
         let head = writer.head.seq;
         let current = commit::generation_number(&self.snapshot().generation.name);
         let reconstructable = if let Some(history) = &self.history {
-            let history = limit.lock(history)?;
-            bounded_ranges(
-                history.gens.iter().map(|(&number, generation)| {
-                    (
-                        generation.base.seq,
-                        if number == current {
-                            head
-                        } else {
-                            generation.end
-                        },
-                    )
-                }),
-                limit,
-            )?
+            limit
+                .lock(history)?
+                .reconstructable_with(current, head, limit)?
         } else if let Some(history) = &self.mem_history {
-            let history = limit.lock(history)?;
-            bounded_ranges(
-                history
-                    .window
-                    .iter()
-                    .map(|snap| (snap.commit, snap.commit))
-                    .chain(
-                        history
-                            .pins
-                            .values()
-                            .map(|(commit, _)| (commit.seq, commit.seq)),
-                    )
-                    .chain(history.branch_bases.keys().map(|&seq| (seq, seq)))
-                    .chain(history.held.keys().map(|&seq| (seq, seq)))
-                    .chain(std::iter::once((head, head))),
-                limit,
-            )?
+            limit.lock(history)?.reconstructable_with(head, limit)?
         } else {
             limit.check(16)?;
             vec![(head, head)]
@@ -126,6 +88,8 @@ impl Store {
         Err(Error::invalid("fork clock has no acyclic retained origin"))
     }
 
+    /// [`resolve`](Store::resolve) under `limit`, which also refuses an invalid snapshot
+    /// name and takes the writer's head under its control.
     pub(super) fn resolve_limited(&self, at: &At, limit: &ReadLimit<'_>) -> Result<Resolved> {
         if let At::Snapshot(name) = at
             && !crate::history::valid_name(name)
@@ -134,88 +98,7 @@ impl Store {
         }
         // Capture the same writer head as resolve(), but do not wait without control.
         let head = limit.lock(&self.writer)?.head;
-        let seq = match at {
-            At::Head => head.seq,
-            At::Commit(n) => *n,
-            At::Time(ms) => {
-                let catalog = limit.lock(&self.catalog)?;
-                match catalog.at_time(*ms) {
-                    Some(commit) => commit.seq,
-                    None if self.branching.ident.is_some() => {
-                        drop(catalog);
-                        return Err(self.inherited_limited(at, 0, limit)?);
-                    }
-                    None => {
-                        return Err(Error::NotFound(format!(
-                            "no commit at or before {}",
-                            commit::rfc3339_ms(*ms)
-                        )));
-                    }
-                }
-            }
-            At::Snapshot(name) => {
-                let found = if let Some(history) = &self.history {
-                    limit.lock(history)?.pins.get(name).map(|p| p.seq)
-                } else {
-                    None
-                };
-                let found = match (found, &self.mem_history) {
-                    (None, Some(history)) => limit.lock(history)?.pins.get(name).map(|p| p.0.seq),
-                    (found, _) => found,
-                };
-                found.ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?
-            }
-        };
-        if seq > head.seq {
-            return Err(Error::NotFound(format!(
-                "no commit {seq} (head is {})",
-                head.seq
-            )));
-        }
-        if let Some(identity) = &self.branching.ident {
-            let before = match at {
-                At::Time(ms) => limit
-                    .lock(&self.catalog)?
-                    .get(identity.from.seq)
-                    .is_some_and(|c| c.timestamp_ms > *ms),
-                _ => seq < identity.from.seq,
-            };
-            if before {
-                return Err(self.inherited_limited(at, seq, limit)?);
-            }
-        }
-        let metadata = limit.lock(&self.catalog)?.get(seq);
-        let metadata = match (metadata, &self.mem_history) {
-            (None, Some(history)) => limit.lock(history)?.kept_commit(seq),
-            (metadata, _) => metadata,
-        };
-        let Some(commit) = metadata else {
-            if self.starts_at(seq) {
-                return Err(self.inherited_limited(at, seq, limit)?);
-            }
-            let name = match at {
-                At::Snapshot(name) => Some(name.clone()),
-                _ => None,
-            };
-            return Err(match &self.history {
-                Some(history) => self.history_gone_limited(
-                    &*limit.lock(history)?,
-                    seq,
-                    head.seq,
-                    name,
-                    None,
-                    limit,
-                )?,
-                None => self.mem_gone_limited(seq, head.seq, name, None, limit)?,
-            });
-        };
-        limit.check(0)?;
-        Ok(Resolved {
-            at: at.clone(),
-            commit,
-            head: head.seq,
-            historical: seq != self.snapshot().commit,
-        })
+        self.resolve_in(at, head, limit)
     }
 
     pub(super) fn history_generation_limited(
@@ -287,158 +170,6 @@ impl Store {
         history.open.insert(0, (owner, generation.clone()));
         limit.check(loaded.charge)?;
         Ok(generation)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn history_gone_limited(
-        &self,
-        history: &crate::history::HistoryState,
-        seq: u64,
-        head: u64,
-        snapshot: Option<String>,
-        metadata: Option<CommitInfo>,
-        limit: &ReadLimit<'_>,
-    ) -> Result<Error> {
-        let current = commit::generation_number(&self.snapshot().generation.name);
-        let reconstructable = bounded_ranges(
-            history.gens.iter().map(|(&number, generation)| {
-                (
-                    generation.base.seq,
-                    if number == current {
-                        head
-                    } else {
-                        generation.end
-                    },
-                )
-            }),
-            limit,
-        )?;
-        let oldest = reconstructable.first().map_or(String::new(), |r| {
-            format!("; the oldest reconstructable commit is {}", r.0)
-        });
-        limit.check(512)?;
-        Ok(Error::HistoryGone(Box::new(crate::history::HistoryGone {
-            message: format!("commit {seq} is no longer reconstructable{oldest}"),
-            seq: Some(seq),
-            at: None,
-            head,
-            snapshot,
-            reconstructable,
-            metadata,
-        })))
-    }
-
-    pub(super) fn mem_gone_limited(
-        &self,
-        seq: u64,
-        head: u64,
-        snapshot: Option<String>,
-        metadata: Option<CommitInfo>,
-        limit: &ReadLimit<'_>,
-    ) -> Result<Error> {
-        let reconstructable = match &self.mem_history {
-            Some(history) => {
-                let history = limit.lock(history)?;
-                bounded_ranges(
-                    history
-                        .window
-                        .iter()
-                        .map(|s| s.commit)
-                        .chain(history.pins.values().map(|p| p.1.commit))
-                        .chain(history.branch_bases.keys().copied())
-                        .chain(history.held.keys().copied())
-                        .chain(std::iter::once(head))
-                        .map(|seq| (seq, seq)),
-                    limit,
-                )?
-            }
-            None => bounded_ranges(std::iter::once((head, head)), limit)?,
-        };
-        limit.check(512)?;
-        Ok(Error::HistoryGone(Box::new(crate::history::HistoryGone {
-            message: format!(
-                "commit {seq} is no longer reconstructable; an in-memory dataset keeps the states its snapshots and retention window hold"
-            ),
-            seq: Some(seq),
-            at: None,
-            head,
-            snapshot,
-            reconstructable,
-            metadata,
-        })))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn materialize_limited(
-        &self,
-        history: &crate::history::HistoryState,
-        owner: u32,
-        entry: &crate::history::GenEntry,
-        generation: &Arc<Generation>,
-        live: &Snapshot,
-        seq: u64,
-        limit: &ReadLimit<'_>,
-    ) -> Result<(Delta, wal::WalPoint)> {
-        let path = entry.dir.join("wal.log");
-        let target = wal_point_limited(generation, entry, seq, limit)?;
-        let base = wal::WalPoint {
-            seq: entry.base.seq,
-            offset: 0,
-        };
-        let base_delta = generation.link.as_ref().map(|l| &l.base_delta);
-        let mut best = (
-            if base_delta.is_none_or(|d| preparation_delta_bytes(d) <= limit.remaining()) {
-                target.offset
-            } else {
-                u64::MAX
-            },
-            base,
-            base_delta,
-        );
-        for cached in history.cache.iter().filter(|c| c.generation == owner) {
-            limit.check(0)?;
-            let cost = cached.end.offset.abs_diff(target.offset);
-            if cost < best.0 && preparation_delta_bytes(&cached.snap.delta) <= limit.remaining() {
-                best = (cost, cached.end, Some(&cached.snap.delta));
-            }
-        }
-        if Arc::ptr_eq(&live.generation, generation)
-            && !live.historical
-            && preparation_delta_bytes(&live.delta) <= limit.remaining()
-        {
-            let point = wal_point_limited(generation, entry, live.commit, limit)?;
-            let cost = point.offset.abs_diff(target.offset);
-            if cost < best.0 {
-                best = (cost, point, Some(&live.delta));
-            }
-        }
-        let (_, from, seed) = best;
-        limit.check(seed.map_or(0, preparation_delta_bytes))?;
-        let mut delta = seed.cloned().unwrap_or_default();
-        if from.offset <= target.offset {
-            wal::apply_forward_limited(
-                &path,
-                generation,
-                &self.cache,
-                &mut delta,
-                from,
-                target,
-                limit,
-            )?;
-            return Ok((delta, target));
-        }
-        match wal::apply_backward_limited(
-            &path,
-            generation,
-            &self.cache,
-            &mut delta,
-            target,
-            from,
-            limit,
-        ) {
-            Ok(_) => Ok((delta, target)),
-            Err(error) => Err(error),
-        }
     }
 
     pub(super) fn cache_limited_snapshot(
@@ -693,135 +424,6 @@ impl Store {
     }
 }
 
-fn wal_point_limited(
-    generation: &Generation,
-    entry: &crate::history::GenEntry,
-    seq: u64,
-    limit: &ReadLimit<'_>,
-) -> Result<wal::WalPoint> {
-    let path = entry.dir.join("wal.log");
-    // Existing sparse indexes are shared store state. An unindexed sealed generation
-    // is scanned without building an unbounded index as a side effect of this read.
-    let floor = limit
-        .lock(&generation.wal_index)?
-        .as_ref()
-        .map(|index| index.floor(seq))
-        .unwrap_or(wal::WalPoint {
-            seq: entry.base.seq,
-            offset: 0,
-        });
-    limit.check(0)?;
-    if floor.seq == seq {
-        return Ok(floor);
-    }
-    let mut cursor = wal::WalCursor::open_limited(&path, floor, limit, 0)?;
-    loop {
-        let before = cursor.position();
-        if before.seq == seq {
-            limit.check(0)?;
-            return Ok(before);
-        }
-        if before.seq > seq {
-            return Err(Error::Corrupt(format!(
-                "{}: read past commit {seq}",
-                path.display()
-            )));
-        }
-        match cursor.next_limited(limit, 0)? {
-            Some((found, _, _)) if found > seq => return Ok(before),
-            Some(_) => {}
-            None if before.seq == seq => return Ok(before),
-            None => {
-                return Err(Error::Corrupt(format!(
-                    "{}: the log ends before commit {seq}",
-                    path.display()
-                )));
-            }
-        }
-    }
-}
-
-// Error metadata is preparation too. Build and merge ranges in one vector with
-// preflighted relocation and interruptible in-place ordering.
-fn bounded_ranges(
-    ranges: impl Iterator<Item = (u64, u64)>,
-    limit: &ReadLimit<'_>,
-) -> Result<Vec<(u64, u64)>> {
-    let mut result: Vec<(u64, u64)> = Vec::new();
-    for range in ranges {
-        limit.check(
-            (result.capacity() as u64)
-                .saturating_mul(16)
-                .saturating_add(1024),
-        )?;
-        if result.len() == result.capacity() {
-            let next = result.capacity().saturating_mul(2).max(1);
-            limit.check(
-                (result.capacity().saturating_add(next) as u64)
-                    .saturating_mul(16)
-                    .saturating_add(1024),
-            )?;
-            result.try_reserve_exact(next - result.len()).map_err(|_| {
-                let memory = limit.memory.unwrap_or(u64::MAX);
-                Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::Memory,
-                    limit: memory,
-                    requested: memory.saturating_add(1),
-                })
-            })?;
-        }
-        result.push(range);
-    }
-    let sift = |values: &mut [(u64, u64)], mut root: usize, end: usize| -> Result<()> {
-        loop {
-            limit.check(
-                (values.len() as u64)
-                    .saturating_mul(16)
-                    .saturating_add(1024),
-            )?;
-            let left = root.saturating_mul(2).saturating_add(1);
-            if left >= end {
-                return Ok(());
-            }
-            let child = if left + 1 < end && values[left] < values[left + 1] {
-                left + 1
-            } else {
-                left
-            };
-            if values[root] >= values[child] {
-                return Ok(());
-            }
-            values.swap(root, child);
-            root = child;
-        }
-    };
-    let len = result.len();
-    for root in (0..len / 2).rev() {
-        sift(&mut result, root, len)?;
-    }
-    for end in (1..len).rev() {
-        result.swap(0, end);
-        sift(&mut result, 0, end)?;
-    }
-    let mut kept = 0;
-    for index in 0..len {
-        limit.check(
-            (result.capacity() as u64)
-                .saturating_mul(16)
-                .saturating_add(1024),
-        )?;
-        let (begin, end) = result[index];
-        if kept > 0 && begin <= result[kept - 1].1.saturating_add(1) {
-            result[kept - 1].1 = result[kept - 1].1.max(end);
-        } else {
-            result[kept] = (begin, end);
-            kept += 1;
-        }
-    }
-    result.truncate(kept);
-    Ok(result)
-}
-
 // The cache's 448-byte/quad estimate is not an allocation bound: even a one-key
 // KeySet leaf reserves 65 keys. Bounded reads include sparse root capacity and the
 // predicate map as well. Leaves rebalance below 16 keys and branches below eight
@@ -1015,15 +617,42 @@ mod tests {
             }
         }
         assert_eq!(
-            bounded_ranges(ranges.into_iter(), &limit).unwrap(),
+            crate::history::merge_ranges(ranges.iter().copied(), &limit).unwrap(),
             expected
         );
+        assert_eq!(
+            crate::history::merge_ranges(ranges.into_iter(), &crate::budgeted::Unlimited).unwrap(),
+            expected
+        );
+        // single commits with duplicates and neighbours, as an in-memory history keeps
+        // them, merge as the deduplicated runs of consecutive commits
+        let seqs: Vec<u64> = (0..1_000)
+            .map(|n| (n * 31) % 1_500)
+            .chain([0, 1, 31, 31, 32])
+            .collect();
+        let mut unique = seqs.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for s in unique {
+            match runs.last_mut() {
+                Some(last) if s == last.1 + 1 => last.1 = s,
+                _ => runs.push((s, s)),
+            }
+        }
+        for merged in [
+            crate::history::merge_ranges(seqs.iter().map(|&s| (s, s)), &limit).unwrap(),
+            crate::history::merge_ranges(seqs.iter().map(|&s| (s, s)), &crate::budgeted::Unlimited)
+                .unwrap(),
+        ] {
+            assert_eq!(merged, runs);
+        }
         let low = ReadLimit {
             memory: Some(1024),
             ..limit
         };
         assert!(matches!(
-            bounded_ranges((0..10_000).map(|n| (n * 2, n * 2)), &low),
+            crate::history::merge_ranges((0..10_000).map(|n| (n * 2, n * 2)), &low),
             Err(Error::BudgetExceeded(_))
         ));
     }

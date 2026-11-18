@@ -525,6 +525,10 @@ flags a case only when a candidate's whole range lies above the baseline's, so t
 cases catch a change larger than their spread. Replaying 2,000 commits cost 64.0 million
 instructions, about 32,000 per commit.
 
+This baseline predates the screen's historical reads. The screen's case string now
+names them, so its workload fingerprint differs and a new run is compared only with a
+baseline taken with the same cases.
+
 The [run record](runs/2026-11-01-insn-screen-forge-5d33aacb/record.json) holds every
 count, the result checks, the workload fingerprint, the compilers and the build
 configuration, with the raw lines and logs of the five processes and the

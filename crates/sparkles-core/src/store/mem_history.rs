@@ -29,11 +29,33 @@ impl Store {
         snapshot: Option<String>,
         metadata: Option<CommitInfo>,
     ) -> Error {
-        let reconstructable = self
-            .mem_history
-            .as_ref()
-            .map_or_else(|| vec![(head, head)], |m| m.lock().reconstructable(head));
-        Error::HistoryGone(Box::new(HistoryGone {
+        crate::history::uncontrolled(self.mem_gone_with(
+            seq,
+            head,
+            snapshot,
+            metadata,
+            &crate::budgeted::Unlimited,
+        ))
+    }
+
+    /// [`mem_gone`](Self::mem_gone) under `limit`. An accounting control locks the
+    /// history under its control and charges the ranges and the message.
+    pub(super) fn mem_gone_with<C: crate::budgeted::Control>(
+        &self,
+        seq: u64,
+        head: u64,
+        snapshot: Option<String>,
+        metadata: Option<CommitInfo>,
+        limit: &C,
+    ) -> Result<Error> {
+        let reconstructable = match &self.mem_history {
+            Some(history) => limit.lock(history)?.reconstructable_with(head, limit)?,
+            None => crate::history::merge_ranges(std::iter::once((head, head)), limit)?,
+        };
+        if C::ACCOUNTS {
+            limit.check(512)?;
+        }
+        Ok(Error::HistoryGone(Box::new(HistoryGone {
             message: format!(
                 "commit {seq} is no longer reconstructable; an in-memory dataset keeps the states its snapshots and retention window hold"
             ),
@@ -43,7 +65,7 @@ impl Store {
             snapshot,
             reconstructable,
             metadata,
-        }))
+        })))
     }
 
     /// Keep the live state as a past one, if the window wants it, before commit `head`
