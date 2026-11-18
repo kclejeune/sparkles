@@ -91,6 +91,13 @@ class AssemblerAndFallbackTest {
             assertThrows(org.apache.jena.query.QueryExecException::class.java) {
                 QueryExec.dataset(ds).query(min).context(sparkles).build().use { it.select().hasNext() }
             }
+            // so is one whose MIN is inside an EXISTS or a NOT EXISTS
+            val inner = "{ { SELECT (MIN(?v) AS ?m) { VALUES ?v { 1 UNDEF } } } FILTER(BOUND(?m)) }"
+            for (q in listOf("SELECT (EXISTS $inner AS ?ok) {}", "SELECT ?x { VALUES ?x { 1 } FILTER NOT EXISTS $inner }")) {
+                assertThrows(org.apache.jena.query.QueryExecException::class.java, {
+                    QueryExec.dataset(ds).query(q).context(sparkles).build().use { it.select().hasNext() }
+                }, q)
+            }
             // a query without those aggregates still falls back
             QueryExec.dataset(ds).query("SELECT (COUNT(?v) AS ?n) { VALUES ?v { 1 UNDEF } }").context(sparkles).build().use {
                 assertEquals("1", it.select().next().get("n").literalLexicalForm)

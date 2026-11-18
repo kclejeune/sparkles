@@ -12,9 +12,10 @@ import org.apache.jena.query.ARQ
 import org.apache.jena.query.Query
 import org.apache.jena.sparql.algebra.Algebra
 import org.apache.jena.sparql.algebra.OpVisitorBase
-import org.apache.jena.sparql.algebra.OpWalker
 import org.apache.jena.sparql.algebra.op.OpGroup
+import org.apache.jena.sparql.algebra.walker.Walker
 import org.apache.jena.sparql.engine.binding.Binding
+import org.apache.jena.sparql.expr.ExprVisitorBase
 import org.apache.jena.sparql.util.Context
 import org.apache.jena.sparql.util.Symbol
 
@@ -101,11 +102,13 @@ private val READING_AGGREGATES = setOf("MIN", "MAX", "AVG", "GROUP_CONCAT")
  */
 internal fun arqCannotRead(query: Query, dsg: DatasetGraphSparkles, context: Context): String? {
     var found = false
-    OpWalker.walk(Algebra.compile(query), object : OpVisitorBase() {
+    // Walker, unlike OpWalker, also walks the algebra of EXISTS and NOT EXISTS inside
+    // expressions, which it reaches only with an expression visitor
+    Walker.walk(Algebra.compile(query), object : OpVisitorBase() {
         override fun visit(opGroup: OpGroup) {
             if (opGroup.aggregators.any { it.aggregator.name.uppercase() in READING_AGGREGATES }) found = true
         }
-    })
+    }, ExprVisitorBase())
     if (!found) return null
     val reading = aggregateErrors(context) ?: dsg.settings().aggregateErrors().get()
     return if (reading == AggregateErrors.JENA) null else
