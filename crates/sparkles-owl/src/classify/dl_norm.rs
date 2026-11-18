@@ -1669,14 +1669,7 @@ fn unfold(it: &mut Interner, ax: &mut Axioms, clauses: &[(Vec<Ex>, Vec<Ex>)], rb
         let Some(nfa) = rb.auto(r, &mut Vec::new()) else {
             continue;
         };
-        let a = autos.entry(r).or_insert_with(|| {
-            let mut a = nfa.eps_free();
-            let level = super::horn::dl_reduction();
-            if level > 0 {
-                a.reduce(level > 1, &|x, y| rb.sub(x, y), rb.sub_cost());
-            }
-            a
-        });
+        let a = autos.entry(r).or_insert_with(|| nfa.eps_free());
         // a universal's holder is the universal, and a negative existential
         // restriction's is its filler, so the restriction names the scope
         let key = match it.nodes[holder as usize] {

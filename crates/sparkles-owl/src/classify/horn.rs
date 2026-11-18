@@ -332,20 +332,6 @@ pub fn reduction() -> u8 {
     })
 }
 
-/// How far Tier D reduces the automata that unfold its universals, as [`reduction`] says
-/// for the Horn rules, up to 2: Tier D's links are not those of a Horn run, so it drops no
-/// transition for its role. `SPARKLES_DL_AUTOMATA` sets it, and the default is 0 until the
-/// bounded attempt of the files it changes is measured (roadmap item 693).
-pub fn dl_reduction() -> u8 {
-    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("SPARKLES_DL_AUTOMATA")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
-
 /// The steps a reduction of one automaton takes at most. A step is a state or a transition
 /// that a pass visits, a comparison of a sort, or a comparison of a search in a superrole
 /// list, and each pass charges an upper bound of its steps before it starts:
@@ -645,18 +631,12 @@ pub(super) struct RoleBox {
 }
 
 impl RoleBox {
-    pub(super) fn sub(&self, r: Role, s: Role) -> bool {
+    fn sub(&self, r: Role, s: Role) -> bool {
         r == s
             || self
                 .sup
                 .get(r as usize)
                 .is_some_and(|v| v.binary_search(&s).is_ok())
-    }
-
-    /// The steps one call of [`RoleBox::sub`] takes at most, for the bound of a
-    /// reduction.
-    pub(super) fn sub_cost(&self) -> usize {
-        log_steps(self.sup.iter().map(Vec::len).max().unwrap_or(0))
     }
 
     fn equiv(&self, r: Role, s: Role) -> bool {

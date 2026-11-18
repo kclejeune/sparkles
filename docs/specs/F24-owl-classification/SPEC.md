@@ -1101,7 +1101,10 @@ alone derive 16.5 and 10.8 million. The contexts of conjunctions hold 5.47 milli
 subsumers on ore_ont_14817 where they held 8.50 million, and the peak resident set of
 the laptop runs falls from 796 to 678 MiB and from 1,189 to 933 MiB. The taxonomies are
 equal at every level on one and eight threads. Tier D's own unfolding in its bounded
-attempt is not reduced.
+attempt is not reduced. The first two reductions were tried there and not kept. On the
+96 disjunctive files of the development set the taxonomies were equal, the same three
+attempts ended over their bound, and the two Uberon files took the same time, as the
+[experiments log](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
 
 A differential check generated small Horn ontologies with chains, transitive properties,
 inverses, ranges and property hierarchies over six properties, of which the class axioms
