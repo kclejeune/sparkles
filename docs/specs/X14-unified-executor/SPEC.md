@@ -845,7 +845,8 @@ stays as a diagnostic that sends every aggregate through `Rows`, so the optimiza
 tests keep an independent check of the running states until item 512's reference
 evaluator replaces it, and the merge phase retires it. The parallel split of a grouping
 over Rayon with `merge`, which the plan names, is not built, since the eager grouping
-was sequential before and the sequential operator measured faster than its base. Roadmap
+was sequential before and the sequential operator measured faster than its base with one
+thread. The 12-thread cells of the forge matrix decide its value. Roadmap
 item 1066 holds the split, together with the cases in which a merged SUM or AVG differs
 from one pass. A DISTINCT accumulator charges the slots and values it passes to the
 aggregate underneath while that aggregate reads them.
@@ -863,7 +864,8 @@ On forge alone, at 1.05M triples with one thread in twelve rounds of A,B,B,A aga
 base 7e272f4d, eager `expr-bind-group` read 0.839, `expr-agg-arg` 0.888 and `group-avg`
 0.906, and streamed they read 0.975, 1.004 and 0.980. `types-grouped`, `predicate-counts`
 and `subquery-agg` keep their count plans and read 0.955 to 1.021 in both modes, within
-the base's spread, and eager `types-grouped` passes the Intel rule at 1.003. Both builds
+the base's spread. Eager `types-grouped` read 1.003, a median of 0.02 µs more in one order
+of the A/B, under the 0.5 µs bound of the Intel rule. Both builds
 returned the same answers. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#grouping-operator) keep the run
 record.

@@ -505,7 +505,7 @@ ARQ's variance and standard-deviation aggregates and their DISTINCT forms keep r
 modes, on one key or several and with expression arguments, and EXPLAIN marks such a
 grouping `[incremental]` in either. An eager `[incremental]` grouping whose groups do not fit the budget
 of a query that may spill runs as the cursor's grouping and spills in partitions instead
-of failing. On forge, eager `expr-bind-group` takes 0.839 of its earlier time,
+of failing. On forge with one thread, eager `expr-bind-group` takes 0.839 of its earlier time,
 `expr-agg-arg` 0.888 and `group-avg` 0.906.
 
 Roadmap item 825 gives the eager executor and the cursor one join-kernel library. The
