@@ -101,7 +101,10 @@ pub(super) struct Merge {
     /// with its extension, and a last output column, bound only on pairs, tells the
     /// two apart. [`Merge::next`] tests the condition on the pairs of each batch and
     /// keeps a left row's extension only when none of its pairs passed.
-    condition: Option<Expr>,
+    condition: Option<Arc<Expr>>,
+    /// The output variables with the marker column, which every pull under a condition
+    /// asks [`Merge::merged`] for. It is built on the first pull.
+    staged: Vec<VarId>,
     /// Whether a pair of the left row whose output the last batch left open passed.
     passed: bool,
     _charge: Option<RetainedCharge>,
@@ -635,7 +638,7 @@ impl Merge {
         let mut columns: Vec<(Option<usize>, Option<usize>)> =
             left.into_iter().zip(right).collect();
         let condition = match &node.kind {
-            Kind::LeftJoin { expr } => expr.clone(),
+            Kind::LeftJoin { expr } => expr.clone().map(Arc::new),
             _ => None,
         };
         let key_columns = |side: usize| {
@@ -673,6 +676,7 @@ impl Merge {
             },
             narrowed: false,
             condition,
+            staged: Vec::new(),
             passed: false,
             _charge: charge,
         })
@@ -1057,20 +1061,30 @@ impl Merge {
         vars: &[VarId],
         cap: usize,
     ) -> Result<Option<Buffer>> {
+        // An Arc, so a pull copies no expression.
         let Some(condition) = self.condition.clone() else {
             return self.merged(ctx, children, options, vars, cap);
         };
-        let mut staged: Vec<VarId> = vars.to_vec();
-        staged.push(VarId::MAX);
-        loop {
-            let Some(mut out) = self.merged(ctx, children, options, &staged, cap)? else {
-                return Ok(None);
-            };
-            self.test(ctx, &mut out, &condition)?;
-            if !out.table.is_empty() {
-                return Ok(Some(out));
-            }
+        if self.staged.len() != vars.len() + 1 {
+            // The staged schema is built once per operator and kept beside its state.
+            self.staged = vars.iter().copied().chain([VarId::MAX]).collect();
         }
+        // Taken out for the pull, since `merged` borrows the operator mutably.
+        let staged = std::mem::take(&mut self.staged);
+        let result = loop {
+            let mut out = match self.merged(ctx, children, options, &staged, cap) {
+                Ok(Some(out)) => out,
+                other => break other,
+            };
+            if let Err(e) = self.test(ctx, &mut out, &condition) {
+                break Err(e);
+            }
+            if !out.table.is_empty() {
+                break Ok(Some(out));
+            }
+        };
+        self.staged = staged;
+        result
     }
 
     /// Test the condition on the pairs of a batch that [`Merge::merged`] produced under
@@ -1083,12 +1097,12 @@ impl Merge {
         let marker = out.table.cols.pop().expect("a marker column");
         out.table.vars.pop();
         let pairs = marker.iter().filter(|id| !id.is_undef()).count();
-        // the merged pairs, their verdicts, the rows kept and the variable map that
-        // evaluating the condition builds
+        // the merged pairs with their column headers and variables, their verdicts, the
+        // rows kept and the variable map that evaluating the condition builds
         let _scratch = ctx.charge(
             pairs as u64 * (width as u64 * 8 + 1)
                 + rows as u64
-                + width as u64 * 24
+                + width as u64 * 28
                 + ctx.nvars() as u64 * 16
                 + 256,
         )?;
