@@ -104,4 +104,87 @@ describe('materializedClauses', () => {
       }),
     ).toBe(false);
   });
+
+  it('keeps an inferred annotation and declaration in their functional form', () => {
+    const items = [
+      item(
+        {
+          type: 'AnnotationAssertion',
+          property: RDFS + 'comment',
+          subject: 'urn:i',
+          value: { value: 'derived comment' },
+        },
+        'AnnotationAssertion(rdfs:comment :i "derived comment")',
+      ),
+      item({ type: 'Declaration', entity: { type: 'NamedIndividual', iri: 'urn:i' } }, 'Decl'),
+    ];
+    const f = materializedClauses('NamedIndividual', 'urn:i', items, new Set(), name, {});
+    expect(f.other.map((r) => r.ofn)).toEqual([
+      'AnnotationAssertion(rdfs:comment :i "derived comment")',
+      'Decl',
+    ]);
+    expect(f.trivial).toBe(0);
+  });
+
+  it('counts a top only in its own role', () => {
+    expect(
+      trivialAxiom({
+        type: 'SubObjectPropertyOf',
+        subProperty: 'urn:p',
+        superProperty: OWL + 'Thing',
+      }),
+    ).toBe(false);
+    expect(
+      trivialAxiom({
+        type: 'SubObjectPropertyOf',
+        subProperty: 'urn:p',
+        superProperty: OWL + 'topDataProperty',
+      }),
+    ).toBe(false);
+    expect(
+      trivialAxiom({
+        type: 'SubDataPropertyOf',
+        subProperty: 'urn:p',
+        superProperty: OWL + 'topDataProperty',
+      }),
+    ).toBe(true);
+    expect(
+      trivialAxiom({
+        type: 'ClassAssertion',
+        class: OWL + 'topObjectProperty',
+        individual: 'urn:i',
+      }),
+    ).toBe(false);
+    expect(
+      trivialAxiom({
+        type: 'SubClassOf',
+        subClass: 'urn:A',
+        superClass: OWL + 'topObjectProperty',
+      }),
+    ).toBe(false);
+  });
+
+  it('writes inferred characteristics in their Manchester clause after the sections', () => {
+    const items = [
+      item({ type: 'TransitiveObjectProperty', property: 'urn:p' }, 'T'),
+      item({ type: 'InverseFunctionalObjectProperty', property: 'urn:p' }, 'IF'),
+      item({ type: 'ObjectPropertyDomain', property: 'urn:p', domain: 'urn:D' }, 'dom'),
+    ];
+    const f = materializedClauses('ObjectProperty', 'urn:p', items, new Set(), name, {});
+    expect(f.clauses.map((c) => [c.word, c.rows.map((r) => text(r.tokens))])).toEqual([
+      ['Domain', ['D']],
+      ['Characteristics', ['Transitive', 'InverseFunctional']],
+    ]);
+    const data = materializedClauses(
+      'DataProperty',
+      'urn:d',
+      [item({ type: 'FunctionalDataProperty', property: 'urn:d' }, 'F')],
+      new Set(),
+      name,
+      {},
+    );
+    expect(data.clauses.map((c) => [c.word, c.rows.map((r) => text(r.tokens))])).toEqual([
+      ['Characteristics', ['Functional']],
+    ]);
+  });
 });

@@ -1075,9 +1075,11 @@ while source and entity changes abort and discard prior reads. Missing or stale 
 remain visible failures and never start implicit computation. Actual inferred-graph
 provenance and duplicate asserted facts are shown. Item 622 writes the materialized frame
 rows in the frame's own clauses in Manchester syntax, with an Inferred badge per row and
-linked names whose labels come from the same pinned read. Self-subsumptions and
-subsumptions by `owl:Thing`, `rdfs:Resource` and the top properties are counted instead
-of listed, and a row whose axiom has no clause keeps its functional-style form. Profile completeness, consistency and
+linked names whose labels come from the same pinned read, and characteristics in a
+Characteristics clause. Self-subsumptions, types and superclasses of `owl:Thing` or
+`rdfs:Resource` and subproperty relations to the top property of the same kind are counted
+instead of listed. Annotations, declarations and other rows that no clause takes keep their
+functional-style form. Profile completeness, consistency and
 arbitrary-axiom explanations remain unknown or unavailable. General classifier-backed
 entailments and matching F24 justifications remain in items 588, 622 and 609. The existing
 mapper and exact-total scans can cost more than a page's output size, and this phase

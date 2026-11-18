@@ -5,6 +5,7 @@
 // counts. No Svelte here.
 
 import {
+  OBJECT_CHARACTERISTICS,
   OWL_THING,
   SECTIONS,
   manchesterTokens,
@@ -36,12 +37,17 @@ const WORDS: Record<string, string> = {
   negative: 'Facts',
 };
 
-/** The tops every class or property of a profile falls under, `rdfs:Resource` among them. */
-const TOP = new Set([
-  OWL_THING,
-  OWL + 'topObjectProperty',
-  OWL + 'topDataProperty',
-  WELL_KNOWN.rdfs + 'Resource',
+/** The classes every individual and class of a profile falls under. */
+const TOP_CLASSES = new Set([OWL_THING, WELL_KNOWN.rdfs + 'Resource']);
+/** The top property of each kind of property subsumption, which no other role shares. */
+const TOP_PROPERTY: Record<string, string> = {
+  SubObjectPropertyOf: OWL + 'topObjectProperty',
+  SubDataPropertyOf: OWL + 'topDataProperty',
+};
+/** The Manchester word of each characteristic axiom. */
+const CHARACTERISTICS = new Map<string, string>([
+  ...OBJECT_CHARACTERISTICS,
+  ['FunctionalDataProperty', 'Functional'],
 ]);
 
 export type MaterializedRow = {
@@ -57,7 +63,8 @@ export type MaterializedClauses = {
   other: MaterializedRow[];
   /**
    * Entailments every entity of the profile has, such as a property's subproperty relation
-   * to itself or a type of `owl:Thing`, which the frame counts instead of listing.
+   * to itself, a type of `owl:Thing` or a subproperty relation to the top property of the
+   * same kind, which the frame counts instead of listing.
    */
   trivial: number;
 };
@@ -67,14 +74,13 @@ export function trivialAxiom(a: AxiomJson): boolean {
   switch (a.type) {
     case 'SubClassOf':
       return (
-        a.subClass === a.superClass || (typeof a.superClass === 'string' && TOP.has(a.superClass))
+        a.subClass === a.superClass ||
+        (typeof a.superClass === 'string' && TOP_CLASSES.has(a.superClass))
       );
     case 'SubObjectPropertyOf':
     case 'SubDataPropertyOf':
       return (
-        !a.chain &&
-        (a.subProperty === a.superProperty ||
-          (typeof a.superProperty === 'string' && TOP.has(a.superProperty)))
+        !a.chain && (a.subProperty === a.superProperty || a.superProperty === TOP_PROPERTY[a.type])
       );
     case 'EquivalentClasses':
     case 'EquivalentObjectProperties':
@@ -84,7 +90,7 @@ export function trivialAxiom(a: AxiomJson): boolean {
       return Array.isArray(members) && new Set(members.map((m) => JSON.stringify(m))).size < 2;
     }
     case 'ClassAssertion':
-      return typeof a.class === 'string' && TOP.has(a.class);
+      return typeof a.class === 'string' && TOP_CLASSES.has(a.class);
     default:
       return false;
   }
@@ -112,12 +118,29 @@ export function materializedClauses(
   const space: ManchesterToken = { text: ' ', role: 'space' };
   for (const item of items) {
     const a = item.axiom;
-    if (a.type === 'Declaration' || a.type === 'AnnotationAssertion') continue;
     if (trivialAxiom(a)) {
       trivial++;
       continue;
     }
     const alsoAsserted = asserted.has(item.ofn);
+    const characteristic = CHARACTERISTICS.get(a.type);
+    if (characteristic && a.property === iri) {
+      let clause = byId.get('characteristics');
+      if (!clause)
+        byId.set(
+          'characteristics',
+          (clause = { id: 'characteristics', word: 'Characteristics', rows: [] }),
+        );
+      clause.rows.push({
+        tokens: [
+          { text: characteristic.replace(/ (\w)/g, (_, c: string) => c.toUpperCase()), role: 'kw' },
+        ],
+        ofn: item.ofn,
+        alsoAsserted,
+      });
+      continue;
+    }
+    // Declarations and annotations have no clause here, and keep their functional form.
     const hit = sectionOf(kind, iri, a);
     if (!hit) {
       other.push({ tokens: [], ofn: item.ofn, alsoAsserted });
@@ -138,6 +161,8 @@ export function materializedClauses(
       for (const v of values) clause.rows.push({ tokens: toks(v), ofn: item.ofn, alsoAsserted });
     }
   }
-  const clauses = [...byId.values()].sort((x, y) => order.indexOf(x.id) - order.indexOf(y.id));
+  // Characteristics follow the sections, as in the asserted frame.
+  const rank = (id: string) => (order.includes(id) ? order.indexOf(id) : order.length);
+  const clauses = [...byId.values()].sort((x, y) => rank(x.id) - rank(y.id));
   return { clauses, other, trivial };
 }
