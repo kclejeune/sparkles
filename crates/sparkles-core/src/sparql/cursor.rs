@@ -4024,7 +4024,14 @@ impl Operator {
                         _ => false,
                     };
                     if !reused {
-                        b.table = exec::apply_unary(ctx, node, b.table, &mut report)?;
+                        match (&self.bind_reuse, &node.kind) {
+                            (Some(reuse), Kind::Extend(target, expr)) if reuse.row_by_row() => {
+                                let column = exec::column_rows(ctx, &b.table, expr)?;
+                                b.table.vars.push(*target);
+                                b.table.cols.push(column);
+                            }
+                            _ => b.table = exec::apply_unary(ctx, node, b.table, &mut report)?,
+                        }
                     }
                     b.reconcile()?;
                     drop(scratch);
