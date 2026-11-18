@@ -12,10 +12,22 @@ import org.apache.jena.query.ARQ
 import org.apache.jena.query.Query
 import org.apache.jena.sparql.algebra.Algebra
 import org.apache.jena.sparql.algebra.OpVisitorBase
+import org.apache.jena.sparql.algebra.Op
+import org.apache.jena.sparql.algebra.OpWalker
+import org.apache.jena.sparql.algebra.op.OpAssign
+import org.apache.jena.sparql.algebra.op.OpExtend
+import org.apache.jena.sparql.algebra.op.OpFilter
 import org.apache.jena.sparql.algebra.op.OpGroup
-import org.apache.jena.sparql.algebra.walker.Walker
+import org.apache.jena.sparql.algebra.op.OpLeftJoin
+import org.apache.jena.sparql.algebra.op.OpOrder
+import org.apache.jena.sparql.algebra.op.OpTopN
 import org.apache.jena.sparql.engine.binding.Binding
+import org.apache.jena.sparql.expr.Expr
+import org.apache.jena.sparql.expr.ExprAggregator
+import org.apache.jena.sparql.expr.ExprFunctionOp
 import org.apache.jena.sparql.expr.ExprVisitorBase
+import org.apache.jena.sparql.expr.ExprWalker
+import org.apache.jena.sparql.expr.aggregate.Aggregator
 import org.apache.jena.sparql.util.Context
 import org.apache.jena.sparql.util.Symbol
 
@@ -96,19 +108,55 @@ internal fun aggregateErrors(context: Context): AggregateErrors? = when (val v =
 private val READING_AGGREGATES = setOf("MIN", "MAX", "AVG", "GROUP_CONCAT")
 
 /**
+ * Finds MIN, MAX, AVG or GROUP_CONCAT anywhere in an algebra expression. It visits every
+ * operator, and itself the expressions of each operator that carries them, since Jena's
+ * walkers leave out sort conditions and aggregate arguments. An EXISTS or NOT EXISTS in
+ * any of those expressions is searched the same way.
+ */
+private class ReadingAggregates {
+    var found = false
+
+    private val exprs = object : ExprVisitorBase() {
+        override fun visit(func: ExprFunctionOp) {
+            func.graphPattern?.let { op(it) }
+        }
+        override fun visit(eAgg: ExprAggregator) {
+            aggregator(eAgg.aggregator)
+        }
+    }
+
+    fun op(op: Op) {
+        OpWalker.walk(op, object : OpVisitorBase() {
+            override fun visit(opFilter: OpFilter) = opFilter.exprs.forEach(::expr)
+            override fun visit(opExtend: OpExtend) = opExtend.varExprList.exprs.values.forEach(::expr)
+            override fun visit(opAssign: OpAssign) = opAssign.varExprList.exprs.values.forEach(::expr)
+            override fun visit(opLeftJoin: OpLeftJoin) { opLeftJoin.exprs?.forEach(::expr) }
+            override fun visit(opOrder: OpOrder) = opOrder.conditions.forEach { expr(it.expression) }
+            override fun visit(opTopN: OpTopN) = opTopN.conditions.forEach { expr(it.expression) }
+            override fun visit(opGroup: OpGroup) {
+                opGroup.groupVars.exprs.values.forEach(::expr)
+                opGroup.aggregators.forEach { aggregator(it.aggregator) }
+            }
+        })
+    }
+
+    private fun aggregator(a: Aggregator) {
+        if (a.name.uppercase() in READING_AGGREGATES) found = true
+        a.exprList?.forEach(::expr)
+    }
+
+    private fun expr(e: Expr?) {
+        if (e != null && !found) ExprWalker.walk(exprs, e)
+    }
+}
+
+/**
  * Why ARQ cannot answer `query` on `dsg` in `context`, or null when it can. ARQ reads
  * errors in aggregates as Jena does, so a query with MIN, MAX, AVG or GROUP_CONCAT under
  * another reading cannot fall back to it.
  */
 internal fun arqCannotRead(query: Query, dsg: DatasetGraphSparkles, context: Context): String? {
-    var found = false
-    // Walker, unlike OpWalker, also walks the algebra of EXISTS and NOT EXISTS inside
-    // expressions, which it reaches only with an expression visitor
-    Walker.walk(Algebra.compile(query), object : OpVisitorBase() {
-        override fun visit(opGroup: OpGroup) {
-            if (opGroup.aggregators.any { it.aggregator.name.uppercase() in READING_AGGREGATES }) found = true
-        }
-    }, ExprVisitorBase())
+    val found = ReadingAggregates().also { it.op(Algebra.compile(query)) }.found
     if (!found) return null
     val reading = aggregateErrors(context) ?: dsg.settings().aggregateErrors().get()
     return if (reading == AggregateErrors.JENA) null else
