@@ -216,15 +216,35 @@ job's files. The
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a
 host with a newer glibc do not run there. The executor does not choose the build host,
 so the screen names the worker as its build host and passes two revisions rather than
-binary paths. The screen keeps each binary in its local cache with a record of the host
-that built it. A later screen with the same worker as its build host reuses a cached
-binary only when that worker built it, so a repeated screen of the same revisions skips
-both builds. A write screen with a Boat build host keeps its cache entries under a key
-that names the worker, with the same effect.
+binary paths. When the build host is also the executor, each binary stays on the worker in
+its build directory, since a release binary is about 1 GB and the operator's link to a Boat
+worker can carry only a few hundred KB/s. Only the build records come back. The worker reads
+the binary's SHA-256, its compilers and whether it is dynamically linked, so it needs
+`readelf`, `ldd` and `sha256sum`. The local cache entry, under a key that names the worker,
+records the binary's path and SHA-256 there. A later screen on the same worker reuses the
+entry only after the worker confirms that the file still has that SHA-256, and builds again
+when it is gone or changed. The screen links each binary into its own directory on the
+worker, and the remote run records the SHA-256 of what it runs, which must match the
+manifest. A write screen, or a screen whose build host is another worker, still copies each
+binary back and keeps it in the local cache with a record of the worker that built it.
 
 ```sh
 mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
 ```
+
+The worker builds each revision in a scope without swap, with 6 compile jobs. The cap is
+12 GiB by default, the job that qualification admits, but the server's final rustc peaks just
+above 12 GiB at any job count, so that cap runs a cold release build out of memory. A 13 GiB
+build needs a dedicated worker that runs nothing else, whose own job release checks that its
+user slice leaves 14.5 GiB for the build, the metadata service and the host reserve, and whose
+job environment sets `SPARKLES_BOAT_BUILD_MEMORY_MAX=13G`. The build scope keeps its own
+13 GiB cap with `OOMPolicy=continue`, so reaching that cap kills a process of the build and
+nothing outside it, but a host that runs short first leaves the choice to the kernel. The host
+formula is not part of that check while the memory a resumed worker cannot reclaim varies
+(item 1092). The setting takes a cap
+from 8G to 13G and `SPARKLES_BOAT_BUILD_JOBS` a count from 2 to 8, and a value outside either
+range is refused before the worker is admitted. A cold build of both revisions takes most of an hour, so the worker's
+admitted lifetime must cover both builds, the screen and its reruns.
 
 A Boat screen and a Namespace screen of the same revisions therefore run different
 binaries, and the Boat screen is judged by its ratios and noise against Namespace rather

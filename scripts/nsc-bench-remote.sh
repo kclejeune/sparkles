@@ -4,7 +4,7 @@
 #
 #   bash nsc-bench-remote.sh   (settings come from ./run.env)
 #
-# Expects bin-A.zst and bin-B.zst (the two binaries), data.nt.zst and queries/*.rq next to
+# Expects bin-A.zst and bin-B.zst (the two binaries, or bin-A and bin-B uncompressed), data.nt.zst and queries/*.rq next to
 # it. Both binaries load their own store from the same data, so a change of the store format
 # between A and B does no harm, unless SHARE_STORE=1 serves B from A's store. Then ROUNDS rounds of A, B, B, A run, each variant in a fresh
 # server process pinned to SERVER_CPU, with this script and its curl client pinned to
@@ -76,11 +76,15 @@ done
 stat_cpu() { awk '/^cpu / {t = 0; for (i = 2; i <= NF; i++) t += $i; print $9, t}' /proc/stat; }
 
 log "unpacking"
+# A binary that scripts/nsc-bench.sh copied here on a Boat worker arrives as bin-A or bin-B,
+# uncompressed, and is linked rather than copied where it can be. results/binaries.sha256
+# records what runs.
 for v in A B; do
   mkdir -p "$v"
-  zstd -q -d -f "bin-$v.zst" -o "$v/sparkles"
+  if [ -f "bin-$v" ]; then ln -f "bin-$v" "$v/sparkles" 2> /dev/null || cp -f "bin-$v" "$v/sparkles"; else zstd -q -d -f "bin-$v.zst" -o "$v/sparkles"; fi
   chmod +x "$v/sparkles"
 done
+sha256sum A/sparkles B/sparkles > "$R/binaries.sha256"
 zstd -q -d -f data.nt.zst -o data.nt
 log "data: $(wc -l < data.nt) triples"
 

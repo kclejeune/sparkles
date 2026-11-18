@@ -1192,15 +1192,27 @@ variable comes from the environment or from a `SPARKLES_NSC_BUILD_HOSTS=` line i
 builds, so `auto` skips it and naming it is refused.
 
 A remote build copies the archive of the commit, with the same placeholder `ui/build` as a
-local build, to a scratch directory under `~/lanes/nsc-build` on the host. It builds there
+local build, to a scratch directory under `~/lanes/nsc-build` on the host. The archive
+travels compressed with zstd, so the host needs `zstd` on its PATH, and a copy whose stream
+is cut off fails rather than leaving a partial tree. It builds there
 with `scripts/nsc-build.sh` under the host's own Boxington cache, inside a systemd user
 scope named `nsc-build-<commit>-<suffix>` with the gate's memory cap and 2 GiB of swap,
-while it holds the host's heavy lock. On a Boat worker the cap is 12 GiB and the worker's
-user slice allows no swap, so the build has none. The host's `mbx` has to match the
+while it holds the host's heavy lock. On a Boat worker the cap is 12 GiB, the job that
+qualification admits, and the worker's user slice allows no swap, so the build has none. The
+server's final rustc peaks just above 12 GiB at any job count, so that cap runs it out of
+memory, and a dedicated screen worker whose job release admits a 13 GiB build sets
+`SPARKLES_BOAT_BUILD_MEMORY_MAX=13G`. The setting takes a cap from 8G to 13G. A Boat build
+runs 6 compile jobs, and `SPARKLES_BOAT_BUILD_JOBS` sets another count from 2 to 8. The host's `mbx` has to match the
 `mise.toml` pin.
 The binary comes back into the same cache entry after a SHA-256 check, and the scratch
 directory is removed when the build ends, also after a failure or Ctrl-C, which also stops
-the scope. A binary built on another host with the same pinned toolchain is comparable,
+the scope. A Boat screen whose build host is its executor keeps each binary on the worker
+instead and copies back only the build records, as
+[Remote executors](REMOTE-EXECUTORS.md) describes. Screen binaries are built with the release
+profile unchanged, including its limited debug info (`debug = 1`), so the screens build
+what the other benchmarks measure and reuse the shared cache. Building them without debug info
+would make every unit a cache miss, and with the binary kept on the worker its 1 GB size no
+longer costs a transfer. A binary built on another host with the same pinned toolchain is comparable,
 since nothing is built for the native CPU, and the compiler check below still compares A
 with B. `build.txt` and `manifest.txt` name the host that built each binary, and an entry
 is reused wherever it was built.
