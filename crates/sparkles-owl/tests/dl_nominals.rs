@@ -184,6 +184,62 @@ fn a_has_value_restriction_is_an_existential_to_the_nominal() {
 }
 
 #[test]
+fn a_universal_over_the_inverse_at_a_nominal_reaches_back_to_its_predecessor() {
+    // A's r-successor is o itself, so o's universal over r⁻ makes A an E, and a class below
+    // a singleton as the filler gives the same
+    check(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:o)))
+         SubClassOf(:B ObjectOneOf(:p))
+         SubClassOf(:D ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :G)))
+         ClassAssertion(ObjectAllValuesFrom(ObjectInverseOf(:r) :E) :o)
+         ClassAssertion(ObjectAllValuesFrom(ObjectInverseOf(:r) ObjectUnionOf(:E :F)) :p)
+         SubClassOf(ObjectSomeValuesFrom(:r :G) ObjectComplementOf(:F))",
+        &[("A", "E"), ("D", "E")],
+        &[("E", "A"), ("D", "F")],
+    );
+}
+
+#[test]
+fn a_universal_at_a_predecessor_meets_the_nominal_it_reaches() {
+    // A's r-successor is o, which A's universal makes a B, and B and C at o clash, so A is
+    // empty, while D, which reaches o through a class below the singleton, is not
+    let out = rooted(
+        "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:o)))
+         SubClassOf(:A ObjectAllValuesFrom(:r ObjectUnionOf(:B :B2)))
+         SubClassOf(:B2 :B)
+         ClassAssertion(:C :o)
+         DisjointClasses(:B :C)
+         SubClassOf(:O ObjectOneOf(:o))
+         SubClassOf(:D ObjectSomeValuesFrom(:r :O))
+         SubClassOf(:E ObjectSomeValuesFrom(:r :O))
+         SubClassOf(:E ObjectAllValuesFrom(:r :B))",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("E")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("D")));
+}
+
+#[test]
+fn a_nominal_covering_the_domain_gives_the_subsumptions_of_owl_thing() {
+    // every element is a, which is b, so every element is a C, owl:Thing included
+    let thing = Class::new("http://www.w3.org/2002/07/owl#Thing");
+    let out = rooted(
+        "SubClassOf(owl:Thing ObjectOneOf(:a))
+         ClassAssertion(:C :b)
+         SubClassOf(:D :C)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_subclass(&thing, &c("C")));
+    assert!(out.taxonomy.is_subclass(&c("Z"), &c("C")));
+    assert!(!out.taxonomy.is_subclass(&thing, &c("D")));
+}
+
+#[test]
 fn an_enumeration_is_a_case_analysis_over_its_individuals() {
     // every member of {a, b} is a D, so a class below the enumeration is too
     check(

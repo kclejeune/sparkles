@@ -2430,9 +2430,11 @@ fn rooted_max(
 }
 
 /// The named class whose context `me` is, which is a query context of the journal with that
-/// class as its core atom, or `None` for a hypothetical successor or the root.
+/// class as its core atom, or `None` for a hypothetical successor or the root. The context
+/// of `owl:Thing` is the query context of `⊤ ⊑ C`, so its named-class atoms over a constant
+/// are rewritten back over x as well (item 1070).
 fn query_of(ix: &Index, me: Ex) -> Option<Ex> {
-    matches!(ix.head(me).node, Node::Class(_)).then_some(me)
+    (me == TOP || matches!(ix.head(me).node, Node::Class(_))).then_some(me)
 }
 
 /// The rules of a rooted run on a new unit `d(x)`, as [`rooted_max`] has them, with the
