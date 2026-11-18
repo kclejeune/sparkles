@@ -382,8 +382,8 @@ and the files whose conclusions stay the same take 0.99 to 1.01 times the base's
 one thread, and every taxonomy of the rounds is equal on the four sides. The default run
 of the two Uberon files does not gain. Its bounded attempt of the disjunctive rules takes
 nearly all of its 58 and 75 s on one thread and sets its peak resident set, and the run
-is 2.5 and 1.8% slower with the reductions in each of six rounds, although its Horn
-saturation is 0.5 and 0.9 s shorter. A pinned process on the laptop executes the same
+is 2.5 and 1.8% slower on the build of the reductions in each of six rounds, although its
+Horn saturation is 0.5 and 0.9 s shorter. A pinned process on the laptop executes the same
 instructions in the attempt of ore_ont_14817 on the base and on the build with and
 without the reductions, which suggests that the attempt does the same work there. On four threads
 `ore_ont_8737` takes 1.03 to 1.04 times the base's time on the build with and without
