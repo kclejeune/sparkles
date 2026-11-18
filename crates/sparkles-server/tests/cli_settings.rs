@@ -21,37 +21,44 @@ impl Server {
         Server::start_in(data, extra, 47130..47150)
     }
 
-    /// Start on the first free port of `ports`.
+    /// Start on the first free port of `ports`. The ports lie in the kernel's ephemeral
+    /// range, so another process can take a port between the check and the server's bind.
+    /// A server that exits before it answers therefore moves on to the next free port.
     fn start_in(data: &Path, extra: &[&str], ports: std::ops::Range<u16>) -> Server {
-        let port = ports
-            .clone()
-            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .unwrap_or_else(|| panic!("a free port in {ports:?}"));
-        let child = Command::new(BIN)
-            .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
-            .arg("--data")
-            .arg(data)
-            .args(extra)
-            .env_remove("SPARKLES_BACKUP_CONFIG")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut s = Server { child, port };
-        let t0 = Instant::now();
-        while s.call("GET", "/$/ready", None).0 != 200 {
-            // a server that could not bind the port leaves it to whatever holds it
-            assert!(
-                s.child.try_wait().unwrap().is_none(),
-                "the server exited before it answered on port {port}"
-            );
-            assert!(
-                t0.elapsed() < Duration::from_secs(30),
-                "server did not start"
-            );
-            std::thread::sleep(Duration::from_millis(50));
+        for port in ports.clone() {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                continue;
+            }
+            let child = Command::new(BIN)
+                .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
+                .arg("--data")
+                .arg(data)
+                .args(extra)
+                .env_remove("SPARKLES_BACKUP_CONFIG")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut s = Server { child, port };
+            let t0 = Instant::now();
+            let mut exited = false;
+            while s.call("GET", "/$/ready", None).0 != 200 {
+                // a server that could not bind the port leaves it to whatever holds it
+                if s.child.try_wait().unwrap().is_some() {
+                    exited = true;
+                    break;
+                }
+                assert!(
+                    t0.elapsed() < Duration::from_secs(30),
+                    "server did not start"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !exited {
+                return s;
+            }
         }
-        s
+        panic!("no server started on a free port in {ports:?}")
     }
 
     fn call(&self, method: &str, path: &str, body: Option<J>) -> (u16, J) {
