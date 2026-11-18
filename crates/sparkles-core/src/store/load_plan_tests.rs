@@ -602,7 +602,9 @@ fn a_dry_run_over_the_memory_limit_is_previewed() {
     let load = |s: &Store, src: Source, o: &WriteOptions| s.load_with(&[src], CommitKind::Load, o);
     type Write<'a> =
         &'a dyn Fn(&Store, Source, &WriteOptions) -> crate::error::Result<crate::commit::Receipt>;
-    let cases: Vec<(&str, bool, Write, fn() -> Source, Option<u64>)> = vec![
+    // name, seeded, write, source, rows a dry run's commit preview inserts
+    type Case<'a> = (&'a str, bool, Write<'a>, fn() -> Source, Option<u64>);
+    let cases: Vec<Case> = vec![
         (
             "load into a store with data",
             true,
