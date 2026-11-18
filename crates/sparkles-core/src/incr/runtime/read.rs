@@ -213,12 +213,28 @@ impl Runtime {
 impl Runtime {
     /// The reading of errors in aggregates that view `name` keeps: the dataset's
     /// current reading, which a read waits for the view to be built under. `None`
-    /// without such a view.
-    pub fn view_reading(&self, name: &str) -> Option<crate::sparql::AggregateErrors> {
-        let mut reg = self.reg.lock();
-        self.sync_for_read(&mut reg);
+    /// without such a view, or when the registry stays locked past `deadline` or the
+    /// read wait.
+    ///
+    /// Planning asks this only to note a read that evaluates the view's query, so it
+    /// asks the host for its reading instead of switching the circuits to it, which
+    /// would wait for the passes of every view.
+    pub fn view_reading(
+        &self,
+        name: &str,
+        deadline: Option<Instant>,
+    ) -> Option<crate::sparql::AggregateErrors> {
+        // the host's callback can drop the last handle, so the close waits for the
+        // operation's end
+        let _operation = Operation::enter();
+        let host = self.host.read().clone();
+        let host_reading = host.as_ref().map(|h| h.aggregate_errors());
+        drop(host);
+        let wait = Instant::now() + self.opts.read().view_wait;
+        let until = deadline.map_or(wait, |d| d.min(wait));
+        let reg = self.reg.try_lock_until(until)?;
         reg.view(name).ok()?;
-        Some(reg.aggregate_errors)
+        Some(host_reading.unwrap_or(reg.aggregate_errors))
     }
 }
 
@@ -226,7 +242,11 @@ impl ViewSource for Runtime {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
         self.read(r)
     }
-    fn view_reading(&self, name: &str) -> Option<crate::sparql::AggregateErrors> {
-        Runtime::view_reading(self, name)
+    fn view_reading(
+        &self,
+        name: &str,
+        deadline: Option<Instant>,
+    ) -> Option<crate::sparql::AggregateErrors> {
+        Runtime::view_reading(self, name, deadline)
     }
 }

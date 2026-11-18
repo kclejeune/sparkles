@@ -300,6 +300,64 @@ mod switch_tests {
         assert_eq!(rt.switched.load(Ordering::Acquire), 7);
     }
 
+    /// Planning asks for a view's reading without waiting for another view's pass: a
+    /// change of the dataset's reading is not applied to the circuits there, and a
+    /// registry held past the query's deadline gives no answer.
+    #[test]
+    fn the_planning_reading_waits_for_no_pass() {
+        use crate::sparql::AggregateErrors;
+        use std::time::{Duration, Instant};
+        struct Reading(Mutex<AggregateErrors>);
+        impl Host for Reading {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                Err(Error::NotFound("none".into()))
+            }
+            fn aggregate_errors(&self) -> AggregateErrors {
+                *self.0.lock()
+            }
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        let host = Arc::new(Reading(Mutex::new(AggregateErrors::Jena)));
+        rt.set_host(host.clone());
+        for (name, q) in [
+            ("a", "SELECT (MIN(?o) AS ?m) WHERE { ?s ?p ?o }"),
+            ("b", "SELECT ?s WHERE { ?s ?p ?o }"),
+        ] {
+            rt.put(&s, name, crate::incr::views::ViewDef::table(q))
+                .unwrap();
+        }
+        rt.round(&s);
+        assert_eq!(rt.view_reading("a", None), Some(AggregateErrors::Jena));
+        // a pass of b holds its state while the dataset's reading changes
+        let b = rt.reg.lock().views.get("b").unwrap().cell.clone().unwrap();
+        let pass = b.state.lock();
+        *host.0.lock() = AggregateErrors::Sparkles;
+        let ask = |deadline: Duration| {
+            let rt = rt.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(rt.view_reading("a", Some(Instant::now() + deadline)))
+                    .unwrap();
+            });
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("the planning reading waited past its deadline")
+        };
+        assert_eq!(
+            ask(Duration::from_millis(10)),
+            Some(AggregateErrors::Sparkles)
+        );
+        assert_eq!(rt.view_reading("missing", None), None);
+        // a registry held past the deadline gives no answer by the deadline
+        let reg = rt.reg.lock();
+        assert_eq!(ask(Duration::from_millis(10)), None);
+        drop(reg);
+        drop(pass);
+    }
+
     /// A read compares its reading with the circuit whose rows it returns. A switch of
     /// the dataset's reading can rebuild a view between the read's copy of the
     /// registry's reading and its lock of the view's state, which leaves the registry's

@@ -70,8 +70,13 @@ pub trait ViewSource: Send + Sync + std::fmt::Debug {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows>;
     /// The reading of errors in aggregates that view `name` keeps, `None` when the
     /// source does not say or has no such view. Planning reads it to note, also under
-    /// EXPLAIN, a read that evaluates the view's query instead of its state.
-    fn view_reading(&self, _name: &str) -> Option<super::AggregateErrors> {
+    /// EXPLAIN, a read that evaluates the view's query instead of its state. A source
+    /// answers by `deadline`, the query's, or not at all.
+    fn view_reading(
+        &self,
+        _name: &str,
+        _deadline: Option<std::time::Instant>,
+    ) -> Option<super::AggregateErrors> {
         None
     }
 }
@@ -158,7 +163,9 @@ pub(super) fn view_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node> {
     // a read under another reading than the view's evaluates the view's query
     let reading = p.ctx.aggregate_errors;
     if let Some(views) = &p.ctx.views
-        && views.view_reading(&spec.name).is_some_and(|m| m != reading)
+        && views
+            .view_reading(&spec.name, p.ctx.current_deadline())
+            .is_some_and(|m| m != reading)
     {
         p.ctx.warn(evaluated(&spec.name, reading));
     }
