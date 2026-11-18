@@ -522,6 +522,57 @@ faster in both builds. The
 holds the revisions, binary hashes, settings, per-round ratios and compressed request
 samples. These are internal comparisons and make no cross-engine claim.
 
+## Pinned checks of the screen flags of batches 19 to 29
+
+Namespace screens of batches 19 to 29 flagged `path-plus`, `star-lookup`, `minus` and
+`distinct-obj` on short queries, and item 856 measured a fixed cost on the four queries
+under 0.01 ms. A pinned check on forge ran each flag's pre-flag base against 8baa5686, the
+main branch at batch 30, for 24 interleaved rounds of A, B, B and A with 200 timed
+requests per query and server process. Both builds of a pair loaded the same 1,052,807
+generated triples. The server ran on CPU 2 with one Rayon thread and the client on CPU 4,
+with spinners on both, the host's benchmark locks held and zero steal time. Execution was
+the server's default. All builds came from `scripts/nsc-build.sh` on the laptop with the
+same compilers, and every answer matched across each pair.
+
+A query under 0.3 ms passes when the upper end of the 95% interval of its ratio is at most
+1.02 or its median added server time is at most 0.5 µs, the rule of the
+[X14 acceptance gates](../../specs/X14-unified-executor/SPEC.md#acceptance-gates). The
+interval is the t interval of the mean log round ratio over the 24 rounds. Each query is
+judged on the pair of its own flag.
+
+| query | base | base ms | 8baa5686 ms | ratio | 95% interval | added µs | slower rounds | result |
+|---|---|--:|--:|--:|---|--:|--:|---|
+| `path-plus` | 06ca04ef | 0.00982 | 0.01028 | 1.046 | 1.028 to 1.058 | 0.46 | 23 of 24 | pass |
+| `star-lookup` | c2b5d7cf | 0.06188 | 0.06125 | 0.990 | 0.951 to 1.006 | −0.64 | 7 of 24 | pass |
+| `distinct-obj` | f854145b | 0.00363 | 0.00413 | 1.137 | 1.121 to 1.160 | 0.50 | 24 of 24 | pass |
+| `count-all` | 321508fe | 0.00431 | 0.00458 | 1.064 | 1.049 to 1.085 | 0.28 | 22 of 24 | pass |
+| `distinct-obj` | 321508fe | 0.00376 | 0.00402 | 1.069 | 1.054 to 1.085 | 0.26 | 23 of 24 | pass |
+| `predicate-counts` | 321508fe | 0.00430 | 0.00466 | 1.082 | 1.069 to 1.094 | 0.35 | 24 of 24 | pass |
+| `predicate-subjects` | 321508fe | 0.00625 | 0.00652 | 1.043 | 1.034 to 1.052 | 0.27 | 24 of 24 | pass |
+
+The `path-plus` and `distinct-obj` flags pass on added time alone, and `distinct-obj`
+passes at 0.499 µs, at the limit of the rule. Its cost against f854145b is real, since all
+24 rounds are slower, and it is of the same kind as item 856's. Against 321508fe, the main
+branch before item 825, the four queries of item 856 are 0.26 to 0.35 µs slower with
+nearly every round agreeing, which confirms the item's measurement at the batch 30 build.
+Cross-checks in the same runs put `path-plus` 0.80 µs and `star-lookup` 2.5 µs slower
+than 321508fe, 1.085 and 1.043 of its time.
+
+`minus` takes one of two speeds for the life of each server process, about 0.25 ms or about
+0.40 ms, in both builds of every pair. The two speeds match its cursor and eager execution
+times in the [forge matrix](#forge-record-at-batch-30-against-cc94ac7f), so this is the
+history of quick texts settling on one mode per process, as
+[the execution mode of quick texts](#execution-mode-of-quick-texts-in-fresh-servers)
+describes, and the pooled median depends on how many processes settle eagerly. Within each
+mode, 8baa5686 runs `minus` at 0.2537 ms against 0.2530 ms for adbe757c and at 0.4022 ms
+against 0.4048 ms, so the flags of batches 21 and 22 are not costs. On 321508fe the slow
+mode takes 0.302 ms, so the eager mode of `minus` has been about 0.10 ms slower since item
+825, which the matrix measures in every cell.
+
+The [run record](runs/2026-11-18-post-push-pinned-forge-8baa5686/validation.json) holds
+the binary hashes, the settings, the per-mode medians of `minus`, the analysis script and
+compressed request samples. These are internal comparisons and make no cross-engine claim.
+
 ## Eager-against-cursor matrix
 
 `mise run bench:executors` is the rewrite gate of the executor paths and the oracle of
@@ -729,6 +780,45 @@ below 1.0 shows. Against the build before item 826, eager `SUM(STRLEN(?n))` grou
 employer reads 0.784, and eager `SUM(?s * 2)` reads 1.163, 57.9 ms against 49.7 ms, which
 roadmap item 1099 follows. Item 1067 holds the streamed costs of 1% to 7% that the same
 pair shows.
+
+### Forge record at batch 30 against cc94ac7f
+
+The matrix ran on forge alone for cc94ac7f, the main branch before item 825 and the fixed
+baseline that the [X14 acceptance gates](../../specs/X14-unified-executor/SPEC.md#acceptance-gates)
+compare every later main branch with, and then for 8baa5686, the main branch at batch 30.
+Both runs used the scripts of 8baa5686, the same data and release builds with the same
+compilers and build configuration, GCC 15.3.0, clang 23.1.0git and rustc 1.99.1, made on
+the laptop and copied to forge. The run records of
+[cc94ac7f](runs/2026-11-18-executor-matrix-forge-cc94ac7f/summary.md) and
+[8baa5686](runs/2026-11-18-executor-matrix-forge-8baa5686/summary.md) hold the records,
+summaries and commands. Both modes returned the same answers in every cell of both runs,
+and no answer fingerprint changed.
+
+Against cc94ac7f, `bench-gate.py compare` flagged 67 of 248 execution times
+([execution times](runs/2026-11-18-executor-matrix-forge-8baa5686/compare-cc94ac7f-exec.md),
+[wall times](runs/2026-11-18-executor-matrix-forge-8baa5686/compare-cc94ac7f-wall.md)).
+Forty-three of them are queries under 0.3 ms, which the matrix's ten timed requests per
+server cannot resolve. The flags above 0.3 ms are the drift of batches 17 to 30 from the
+baseline.
+
+| query | mode | cells | ratio to cc94ac7f | cc94ac7f ms | 8baa5686 ms |
+|---|---|---|--:|--:|--:|
+| `minus` | eager | all four | 1.30 to 1.42 | 0.31 to 3.30 | 0.41 to 4.30 |
+| `lang-filter` | both | one thread | 1.12 to 1.13 | 1.64 and 16.0 | 1.83 and 18.0 |
+| `lang-filter` | either | 12 threads | 1.07 to 1.11 | 0.73 and 2.91 | 0.81 and 3.12 |
+| `regex-iri` | both | one thread | 1.09 to 1.11 | 3.48 and 34.5 | 3.80 and 38.2 |
+| `optional-chain` | streaming | three of four | 1.06 to 1.12 | 1.95 to 22.5 | 2.06 to 25.3 |
+| `optional-count` | streaming | three of four | 1.05 to 1.06 | 0.52 to 5.18 | 0.54 to 5.45 |
+| `distinct-join` | both | 1.05M, 12 threads | 1.05 and 1.07 | 3.58 and 3.77 | 3.76 and 4.02 |
+
+Every server process of a cell agrees on the first four queries. Eager `minus` took 0.31 ms in each process
+of cc94ac7f at 1.05M triples with one thread and 0.41 ms in each process of 8baa5686, and
+the pinned checks place this cost at item 825. The same cells are faster at 10.5M triples
+with 12 threads, where `order-by-full` takes 0.56 to 0.58 of its time in both modes and
+eager `optional-chain` 0.56, and four of the eight cells and modes of `export-500k` are 7% to 15% faster in execution.
+Eager `optional-chain` at that size varied from 38.6 to 47.6 ms between the processes of
+cc94ac7f, which was itself 1.59 of the e52937ca record there. In wall time, streamed `export-500k` is 5% to 6% slower in all four cells and
+`lang-filter` and `regex-iri` 10% to 12% slower at 10.5M triples with one thread.
 
 ### Execution mode of quick texts in fresh servers
 
