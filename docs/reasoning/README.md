@@ -1005,8 +1005,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   analysis or counting in an ontology with individuals, are left out, since the rooted run
   that takes them is an option whose completeness is not proved, and five of the 50
   nominal fixtures of its gate pass its work bound. The rooted run also passes its bound
-  on ore_ont_14924, many generated ontologies with the universal property and probably
-  ore_ont_15803, and then gives the default answer after the work. Roadmap items 822, 823
+  on ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
+  property, and then gives the default answer after the work. Roadmap items 822, 823
   and 1061. Axioms that
   need case analysis in an ontology with data properties are left out, and an external DL
   reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a

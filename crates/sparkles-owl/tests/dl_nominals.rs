@@ -893,3 +893,29 @@ fn the_statistics_count_a_chain_outside_el_for_its_range() {
     assert_eq!(out.stats.outside_el.disjunctive, 1);
     assert_eq!(out.stats.outside_el.taken, 2);
 }
+
+#[test]
+fn a_rewritten_run_that_does_not_take_tier_d_answers_as_a_fresh_classifier() {
+    // r ∘ U ∘ r ⊑ r is not regular, so the rewritten run does not take the disjunctive
+    // rules and starts again on the original axioms
+    let base = axioms(
+        "ClassAssertion(:A :a)
+         ObjectPropertyAssertion(:r :a :b)",
+    );
+    let more = ofn_read::parse(&format!(
+        "Prefix(:=<{EX}>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\nSubObjectPropertyOf(ObjectPropertyChain(:r owl:topObjectProperty :r) :r)\nSubClassOf(:A ObjectAllValuesFrom(owl:topObjectProperty :B))\n)"
+    ))
+    .unwrap()
+    .axioms;
+    let all: Vec<&Axiom> = base.iter().chain(&more).collect();
+    let mut k = Classifier::of(&base);
+    k.classify(&rooted_limits()).unwrap();
+    k.add(&more);
+    let out = k.classify(&rooted_limits()).unwrap();
+    let mut fresh = Classifier::of(all.iter().copied());
+    let want = fresh.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.taxonomy, want.taxonomy);
+    assert_eq!(out.consistency, want.consistency);
+    assert_eq!(k.excluded(), fresh.excluded());
+    no_internal_names(&k, &out, &[Class::thing(), c("A"), c("B")]);
+}
