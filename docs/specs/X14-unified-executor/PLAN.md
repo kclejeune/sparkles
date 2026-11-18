@@ -172,13 +172,13 @@ phases name are carried here as they stand at the base of this plan.
 | Grouping operator, item 826 | Item 93. | Item 7's grouping over key runs has shipped. Item 418 is outstanding, and the [schedule](#order-of-work) says how item 826 proceeds with and without it. |
 | Frontier kernel | Item 417. | Items 8 and 51. |
 | Expression memo | None. | Item 293. |
-| Columnar writers, item 828 | None. | Items 91, 240, 243 and 534. Item 828 follows items 534 and 240 and carries items 243 and 91 as its own gates. |
+| Columnar writers, item 828 | Item 240. | Items 91, 243 and 534. Item 828 carries items 243 and 91 as its own gates and the in-place route of item 534's hand-off plan. |
 | Mode-independent plans and pull-demand LIMIT and ASK, item 827 | None. | Item 7, for the EXISTS shapes that stay eager, which item 827 leaves to item 829. |
 | Native leaf cursors, item 829 | None. | Item 827 for the admission code, and item 825 for the operators that build over their input. |
-| The merge | Items 93, 469 to 473. | Items 7, 240, 243, 293, 534 and 512, and items 825 to 829. |
+| The merge | Items 93, 240, 469 to 473. | Items 7, 243, 293, 534 and 512, and items 825 to 829. |
 | Demand seeding and one visitor | None. | Item 190. |
 
-Items 7, 240, 243, 293 and 534 are on the merge's critical path because the design puts
+Items 7, 243, 293 and 534 are on the merge's critical path because the design puts
 them there, and this plan does not shorten that path. Item 243 lands inside item 828's
 work on the writers, and item 293 settles the memo's admission before the merge deletes
 the eager memo.
@@ -195,9 +195,9 @@ ownership boundaries given below, and the rows are serial.
 | Step | Phases | Why they wait |
 |---|---|---|
 | Now | Item 675 lands. Items 678, 512 and 534 start. Item 825 starts. Item 827 starts. | Each owns its own functions, as the boundaries below say. Item 534 is measurement work that items 240 and 828 build on. |
-| After 825 | Item 826 starts. Item 240 starts once item 534 says where the streamed time goes. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
+| After 825 | Item 826 starts. Item 240 has shipped on item 534's measurement. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
-| After 240 | Item 828 starts. | The writers take the buffer that item 240 gives the cursor writers. |
+| After 240 | Item 828 can start, and item 534 opens the cursor in the producer's task. | The writers take the buffer that item 240 gave the cursor writers. |
 | After 293 | The expression memo phase is numbered and starts. | Its admission policy is item 293's open question. |
 | After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
@@ -809,7 +809,7 @@ they change planner and executor cost decisions, and their validating planner im
 them. Item 678, item 512, the expanding operators of item 829 for forms whose eager
 kernel already runs per batch, and the visitor half of the demand phase are routine work
 with this plan and the design as their specification, with the planner validating item
-512's semantics. Item 828 is routine once items 534 and 240 have written down where the
+512's semantics. Item 828 is routine now that items 534 and 240 have written down where the
 time goes, and item 534 itself is performance work for a capable implementer on atlas.
 
 Items 678, 512, 534 and 825 run at the same time with item 827 within the ownership

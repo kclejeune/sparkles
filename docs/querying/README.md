@@ -312,6 +312,11 @@ check them against the W3C suites and Jena's own answers.
   Expiry aborts the transfer and requests cancellation. Actual producer owners remain
   until work stops, and only a successful transfer is a complete answer. The settings
   also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
+* A response that the result-size budget stops after its first bytes, eager or streamed,
+  first sends what its writer had buffered and then aborts the transfer, so the client
+  receives every row that the access log and the metrics count for it. When the client
+  has stopped reading, that last send waits only as long as the idle limit, and the
+  report then leaves out the bytes it did not send.
 * A query that a budget or its timeout stopped keeps its plan in the error body of the
   `application/x-sparkles+json` format.
 * `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the

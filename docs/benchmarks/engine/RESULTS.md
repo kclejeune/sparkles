@@ -118,6 +118,27 @@ whose bytes the response writer took. That accounting costs 7% of the instructio
 a buffer that counts rows only when it is written out, and on forge `optional-chain` took
 150.8 ms of client time against 132.0 ms without it. Roadmap item 243 follows this up.
 
+Streamed answers write through the same buffer, with the same count of the rows the client
+received. The table gives `instructions:u` per request of a native JSON request with
+`execution=streaming` at 1.05M triples, over two passes of 200 requests for the short
+queries and 10 for the large ones, for a build whose cursor writers wrote to the response
+writer a few bytes at a time and for the current one, with the eager request's count
+beside them. The eager counts of the two builds agree within 0.5%.
+
+| Query | Writing to the response writer | Writing to the buffer | Eager |
+|---|--:|--:|--:|
+| `count-all` | 453.2 thousand | 390.9 thousand | 307.0 thousand |
+| `predicate-counts` | 670.3 thousand | 509.7 thousand | 422.3 thousand |
+| `star-lookup` | 1,760.0 thousand | 1,327.1 thousand | 1,188.7 thousand |
+| `star-join` | 67.6 million | 40.4 million | 39.6 million |
+| `optional-chain` | 315.1 million | 157.6 million | 182.4 million |
+| `order-by-full` | 1,407.3 million | 970.5 million | 975.8 million |
+| `export-500k` | 6,132.2 million | 2,816.6 million | 3,537.1 million |
+
+*Instructions were counted on an Intel Core Ultra X7 358H laptop with the server on four
+performance cores, for release builds of 8baa5686 and a016b7bd made on the same host. The
+laptop ran other builds at the time, so cycles and wall times are not reported.*
+
 A pinned forge comparison of the combined feature changes, with 16 A,B,B,A rounds and
 100 requests per server process, found `count-all` server time 12.5% higher at 6.0 µs
 against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Every round was slower for both
