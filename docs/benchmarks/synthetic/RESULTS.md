@@ -730,6 +730,34 @@ employer reads 0.784, and eager `SUM(?s * 2)` reads 1.163, 57.9 ms against 49.7 
 roadmap item 1099 follows. Item 1067 holds the streamed costs of 1% to 7% that the same
 pair shows.
 
+### Per-query floor cache
+
+The floor cache of item 1069, 174de1f8, was compared on forge with its base, c0948014, and
+with the direct comparison of two string keys on that base, 971717d2, in interleaved A/Bs
+of release builds that forge made with the same compilers, at 1.05M triples in A,B,B,A
+rounds of ten timed requests per query and server. Item 678's pair, 7e272f4d and
+75a70587, ran beside them with forge builds on both sides. The
+[run record](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f1-streaming/summary.md) keeps the samples, answers and summary of each
+of the eight cells with their [commands](runs/2026-11-18-floor-cache-ab-forge-174de1f8/run.sh.txt). Every cell returned the same
+answers from both builds, and steal was zero.
+
+| Cell | `str-pair-lt` | `str-pair-names` | `str-pair-colleague` |
+|---|--:|--:|--:|
+| Streaming against the base, one thread | 0.899 | 0.488 | 1.087 |
+| Eager against the direct comparison, one thread | 0.852 | 0.460 | 1.030 |
+| Streaming against the base, 12 threads | 0.939 | 1.000 | 1.118 |
+| Eager against the base, 12 threads | 0.846 | 0.833 | 0.880 |
+
+The one-thread cells ran five rounds and every round agreed in direction with the median.
+The 37-query screens against the base ran three rounds and read a geometric mean of 0.980
+in streaming and 0.970 in automatic execution, with no query 10% slower. Automatic
+`str-pair-colleague` read 0.777 there. Roadmap item 1088 follows the streaming cost of
+`str-pair-colleague`, whose names rarely repeat, and item 1089 the costs of 0.8% to 2.8%
+that the screens found in queries the floors do not reach, together with item 678's costs
+on `lang-filter`, `str-filter-two` and `distinct-join` of 1.8% to 2.9%. Automatic
+`str-filter-two` spread by 22% to 23% between server processes of one build, which item
+1087 follows.
+
 ### Execution mode of quick texts in fresh servers
 
 The Namespace screen of cf033f12, the batch that merged items 679 and 454, against 125edd41
