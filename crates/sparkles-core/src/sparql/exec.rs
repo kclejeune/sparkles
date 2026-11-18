@@ -6821,7 +6821,7 @@ pub(super) fn aggregate(
     exists: Option<&super::exists::Answers<'_>>,
 ) -> Id {
     if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
-        return fold(ctx, t, map, rows, e, agg.distinct, spec, exists);
+        return fold(ctx, t, map, rows, (e, spec, agg.distinct), exists);
     }
     let Some(e) = &agg.expr else {
         // COUNT(*)
@@ -6932,14 +6932,13 @@ pub(super) fn aggregate(
 /// is a null, and DISTINCT keeps the first of equal terms and one null), or the `e`
 /// keys with the `value` values as a `cdt:Map` literal (a row whose key is an error or a
 /// blank node is skipped, a later row replaces an earlier one's value).
+/// The fold is given as its argument, its spec and its DISTINCT flag.
 fn fold(
     ctx: &Ctx,
     t: &Table,
     map: &[Option<usize>],
     rows: &[u32],
-    e: &Expr,
-    distinct: bool,
-    fold: &super::plan::Fold,
+    (e, fold, distinct): (&Expr, &super::plan::Fold, bool),
     exists: Option<&super::exists::Answers<'_>>,
 ) -> Id {
     use super::cdt::{Elem, Map, map_put};
