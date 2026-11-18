@@ -263,9 +263,10 @@ fn spilled_hash_join_matches_eager_at_every_batch_size(q: &str) {
     let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
     assert_eq!(sorted(memory.rows.clone()), expected, "{q}");
     assert!(memory.plan.contains("HashJoin"), "{q}: {}", memory.plan);
-    // A8: the build input is several times the budget.
+    // A8: the build input is several times the budget. The scans charge no decoded
+    // block (item 1039), so the peak is the join's own state.
     assert!(
-        memory.peak > 4 * MEMORY,
+        memory.peak > 2 * MEMORY,
         "{q}: an unlimited join peaks at {} bytes",
         memory.peak
     );

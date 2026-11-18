@@ -37,6 +37,24 @@ whose rewriting passes its budget or a cardinality of the universal property kee
 default answer. On 392 generated ontologies, no rooted run reports a subsumption HermiT
 does not, and ore_ont_14924, which passes the run's bound, is item 1061.
 
+### Cursor scans charge no index block
+
+A cursor scan over an immutable snapshot keeps its place inside an index block between
+batches through a handle that leaves the decoded columns to the block cache, and it
+decodes the block again when the cache has dropped it. It no longer charges a whole
+block's columns, about 1 MiB, from its first read, which completes roadmap item 1039.
+That charge was taken only when the budget had room for it, so a query such as a count
+over a path closure could be refused under a budget above one at which it answered.
+Batches that a cursor root hands out without copying share one charge of their block's
+decoded columns, which lasts while the root scan reads the block or any of the batches
+is held. The root shares a block only when the budget
+leaves room for a whole block's columns, as before, and copies rows otherwise. The eager
+memory retry no longer counts a block in its test of whether a cursor fits, so automatic
+execution answers some queries under small budgets that it refused before. The decoding
+of a large term beside a shared batch can still be refused under a budget at which a
+copy would answer, which roadmap item 1051 holds. A cursor that reads a snapshot without filling the block cache, as an
+export does, decodes its current block again for each batch of copied rows.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,

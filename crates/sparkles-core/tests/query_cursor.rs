@@ -2352,7 +2352,7 @@ fn optional_decoded_block_cache_leaves_room_for_output_under_a_tight_budget() {
 fn shared_scan_batches_pin_blocks_and_charge_retained_ownership() {
     let s = store(100_000);
     let opts = QueryOptions {
-        max_memory_bytes: Some(2_300_000),
+        max_memory_bytes: Some(1_400_000),
         ..Default::default()
     };
     let mut cursor = select_cursor(
@@ -2372,7 +2372,7 @@ fn shared_scan_batches_pin_blocks_and_charge_retained_ownership() {
     }
     assert_eq!(cursor.status(), CursorStatus::Failed);
     assert!(cursor.next_batch().unwrap().is_none());
-    assert!(cursor.stats().mem_peak_bytes <= 2_300_000);
+    assert!(cursor.stats().mem_peak_bytes <= 1_400_000);
     assert!(retained.iter().map(|b| b.len()).sum::<usize>() > 32_768);
     let first = retained[0].row(0).unwrap();
     drop(cursor);

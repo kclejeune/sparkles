@@ -412,11 +412,17 @@ enum BatchBuffer {
 }
 
 struct SharedBatch {
-    block: crate::index::Block,
+    shared: Arc<SharedBlock>,
     columns: [usize; 4],
     start: usize,
     end: usize,
-    _block_charge: Arc<OwnedCharge>,
+    _charge: OwnedCharge,
+}
+
+/// A decoded block that shared batches hand out, with the charge of its decoded columns,
+/// which lasts while the scan reads the block or any of the batches is held.
+struct SharedBlock {
+    block: crate::index::Block,
     _charge: OwnedCharge,
 }
 
@@ -554,7 +560,7 @@ impl QueryBatch {
         match &self.inner.buffer {
             BatchBuffer::Owned(buffer) => buffer.table.get(row, column),
             BatchBuffer::Shared(batch) => {
-                Id(batch.block.cols[batch.columns[column]][batch.start + row])
+                Id(batch.shared.block.cols[batch.columns[column]][batch.start + row])
             }
         }
     }
@@ -1173,7 +1179,7 @@ pub(super) fn auto_streaming(
     if !(scanned || grouped(ctx, node)) {
         return false;
     }
-    let headroom = cursor_headroom(ctx, node, options);
+    let headroom = cursor_headroom(ctx, node, options, true);
     kind == QueryKind::Select
         && ctx.snap.delta.is_empty()
         && batches_admitted(options)
@@ -1187,8 +1193,13 @@ fn batches_admitted(options: &CursorOptions) -> bool {
 }
 
 /// The memory a cursor over `node` needs besides the state its operators keep: one
-/// index block of input, one batch of output and the query's variables.
-fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions) -> u64 {
+/// batch of output and the query's variables, and with `shared_block` the charge of the
+/// decoded index block whose rows the root hands out without copying them. A scan
+/// inside the plan charges no block, which the block cache keeps between its reads
+/// (roadmap item 1039), and the root copies rows when the block's charge does not fit.
+/// Automatic admission counts the block, and the eager memory retry does not (see
+/// [`cursor_fits`]).
+fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions, shared_block: bool) -> u64 {
     let cap = options
         .batch_rows
         .min(options.batch_bytes / node.vars.len().max(1).saturating_mul(8));
@@ -1201,7 +1212,12 @@ fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions) -> u64 {
     // A projection can be narrower than its scan. Admission must leave room for the
     // scan's input batches as well as the result.
     let row_bytes = (width(node) as u64).saturating_mul(8).saturating_add(16);
-    (crate::index::BLOCK_ROWS as u64 * 32 + 512)
+    let block = if shared_block {
+        crate::index::BLOCK_ROWS as u64 * 32 + 512
+    } else {
+        0
+    };
+    block
         .saturating_add((cap as u64).saturating_mul(row_bytes))
         .saturating_add((ctx.nvars() as u64).saturating_mul(16))
         .saturating_add(4096)
@@ -1264,23 +1280,35 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
 /// smaller input, the key set of the NOT EXISTS and one row per group.
 fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
     let eager = largest_output_bytes(node);
-    eager.is_finite() && eager * 2.0 > admission_room(ctx) && cursor_fits(ctx, node, kind, options)
+    eager.is_finite()
+        && eager * 2.0 > admission_room(ctx)
+        && cursor_fits(ctx, node, kind, options, true)
 }
 
 /// Whether a cursor over `node` can run without spill: the query is a SELECT over an
 /// immutable snapshot, every operator streams natively, and the state the cursor keeps,
 /// with its batch headroom, is expected to fit in half of the memory the query may use.
 /// Automatic admission asks this when eager execution is expected not to fit, and the
-/// eager memory retry asks it when eager execution has failed, so both send the same
-/// plans to a cursor without spill (roadmap items 91 and 96).
-fn cursor_fits(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
+/// eager memory retry asks it when eager execution has failed, so both send the plans
+/// that fit to a cursor without spill (roadmap items 91 and 96). Admission counts the
+/// decoded block of uncopied batches in the headroom (`shared_block`), as it did when
+/// every scan charged one, so that it keeps eager the plans it kept eager. The retry
+/// does not, since a scan charges no block (roadmap item 1039) and the cursor copies
+/// rows when a block's charge does not fit, and its alternative is the eager failure.
+fn cursor_fits(
+    ctx: &Ctx,
+    node: &Node,
+    kind: QueryKind,
+    options: &CursorOptions,
+    shared_block: bool,
+) -> bool {
     kind == QueryKind::Select
         && ctx.snap.delta.is_empty()
         && batches_admitted(options)
         && streams_natively(ctx, node)
         && {
             let state = cursor_state_bytes(ctx, node);
-            let headroom = cursor_headroom(ctx, node, options) as f64;
+            let headroom = cursor_headroom(ctx, node, options, shared_block) as f64;
             state.is_finite() && state * 2.0 + headroom <= admission_room(ctx)
         }
 }
@@ -1720,7 +1748,7 @@ fn fits_without_spill(
 ) -> bool {
     let options = within_first_deadline(options, started);
     super::prepare_query(snapshot.clone(), parsed, &options, None, None)
-        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor))
+        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor, false))
 }
 
 /// `options` with a relative timeout turned into the deadline of the run that started
@@ -4118,15 +4146,105 @@ struct Scan {
     base: Option<BaseScan>,
 }
 
+/// A scan's position inside the blocks of an immutable snapshot, kept between reads so
+/// that a read resumes at its row instead of seeking a whole key again.
+///
+/// The scan holds its decoded block only during a read. Between reads it keeps a
+/// [`WeakBlock`](crate::index::WeakBlock), which leaves the columns to the block cache,
+/// and the next read takes them back, or decodes the block again when the cache has
+/// dropped it. Nothing it keeps between reads is query memory, so the scan charges no
+/// block and runs the same way under every budget. A scan that kept its block charged
+/// it at a whole block's columns, about 1 MiB, from its first read on, and a query that
+/// had room for that charge could then be refused memory that a smaller budget, under
+/// which the scan seeked each batch, left free (roadmap item 1039).
+///
+/// [`Scan::next_shared`] hands out batches that keep the block itself, charged by its
+/// decoded columns. Only the root of a cursor asks for them, and only with room for a
+/// whole block's columns. While it reads such a block, the scan keeps the block and its
+/// charge between reads too, so a writer that drops each batch before it pulls the next
+/// does not charge the block again for every batch. The charge ends when the scan
+/// leaves the block, reads it as owned rows, or ends, and when the last batch handed out
+/// from it drops. A cursor stopped inside such a block keeps it charged until the cursor
+/// is closed.
 struct BaseScan {
     /// read-ahead over the blocks of the current range
     ahead: crate::index::ReadAhead,
     next: usize,
     end: usize,
+    /// the block being read, held only during a read
     block: Option<crate::index::Block>,
+    /// between reads, a handle on the block that does not keep it
+    parked: Option<crate::index::WeakBlock>,
+    /// the columns the block was read with
+    wanted: crate::index::ColMask,
     row: usize,
     row_end: usize,
-    _charge: Arc<OwnedCharge>,
+    /// the block being read with its charge, while the scan hands out batches that keep it
+    shared: Option<Arc<SharedBlock>>,
+}
+
+impl BaseScan {
+    fn new() -> Self {
+        Self {
+            ahead: Default::default(),
+            next: 0,
+            end: 0,
+            block: None,
+            parked: None,
+            wanted: 0,
+            row: 0,
+            row_end: 0,
+            shared: None,
+        }
+    }
+
+    /// Start reading `block`. A handle on it that does not keep it is made only when a
+    /// read stops inside it, so a block read whole in one read makes none.
+    fn set_block(&mut self, block: crate::index::Block) {
+        self.parked = None;
+        self.block = Some(block);
+    }
+
+    /// The block is read to its end, or has none of the rows asked for.
+    fn clear_block(&mut self) {
+        self.block = None;
+        self.parked = None;
+        self.shared = None;
+    }
+
+    /// Remember the block being read by a handle that does not keep it, once per block.
+    fn remember_block(&mut self) {
+        if self.parked.is_none()
+            && let Some(block) = &self.block
+        {
+            self.parked = Some(block.downgrade());
+        }
+    }
+
+    /// Let go of the block between reads, keeping the handle on it.
+    fn park(&mut self) {
+        self.remember_block();
+        self.block = None;
+    }
+
+    /// Take back the block of the last read, from the cache or by decoding it again.
+    fn unpark(&mut self, ctx: &Ctx, index: &crate::index::PermIndex) -> Result<()> {
+        if self.block.is_some() {
+            return Ok(());
+        }
+        let Some(parked) = &self.parked else {
+            return Ok(());
+        };
+        self.block = Some(match parked.upgrade() {
+            Some(block) => block,
+            None => {
+                let block = ctx.snap.cache.get_cols(index, self.next - 1, self.wanted)?;
+                self.parked = Some(block.downgrade());
+                block
+            }
+        });
+        Ok(())
+    }
 }
 
 impl Scan {
@@ -4162,6 +4280,19 @@ impl Scan {
         self.at == self.ranges.len()
     }
 
+    /// Whether the scan reads blocks of the base index directly, keeping its position
+    /// inside a block. A captured empty delta never changes, so the choice is made at the
+    /// first read and holds for the scan.
+    fn reads_base(&mut self, ctx: &Ctx) -> bool {
+        if !self.base_checked {
+            self.base_checked = true;
+            if ctx.snap.delta.is_empty() {
+                self.base = Some(BaseScan::new());
+            }
+        }
+        self.base.is_some()
+    }
+
     fn next_shared(&mut self, ctx: &Arc<Ctx>, vars: &[VarId], cap: usize) -> Result<SharedAttempt> {
         if self.done() {
             return Ok(SharedAttempt::Ready(None));
@@ -4182,29 +4313,31 @@ impl Scan {
             };
             *column = *source;
         }
-        if !self.base_checked {
-            let cache_bytes = crate::index::BLOCK_ROWS as u64 * 32 + 512;
-            // Leave room for consumers' decoding scratch and an owned fallback.
-            let output_bytes =
-                cap as u64 * (vars.len() as u64 * 8 + 16) + ctx.nvars() as u64 * 16 + 4096;
-            if ctx.memory_remaining() < cache_bytes.saturating_add(output_bytes) {
-                return Ok(SharedAttempt::Unsupported);
-            }
-            let charge = OwnedCharge::new(ctx, cache_bytes)?;
-            self.base = Some(BaseScan {
-                ahead: Default::default(),
-                next: 0,
-                end: 0,
-                block: None,
-                row: 0,
-                row_end: 0,
-                _charge: Arc::new(charge),
-            });
-            self.base_checked = true;
-        }
-        let Some(base) = &mut self.base else {
+        if !self.reads_base(ctx) {
             return Ok(SharedAttempt::Unsupported);
-        };
+        }
+        let mut base = self.base.take().expect("checked base scan");
+        let held = base.shared.clone();
+        let result = if held.is_some() {
+            Ok(())
+        } else {
+            base.unpark(ctx, ctx.snap.perm(self.spec.perm))
+        }
+        .and_then(|()| self.next_shared_base(ctx, vars, columns, cap, &mut base, held));
+        base.park();
+        self.base = Some(base);
+        result
+    }
+
+    fn next_shared_base(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        vars: &[VarId],
+        columns: [usize; 4],
+        cap: usize,
+        base: &mut BaseScan,
+        mut held: Option<Arc<SharedBlock>>,
+    ) -> Result<SharedAttempt> {
         let index = ctx.snap.perm(self.spec.perm);
         let mask = exec::scan_mask(&self.spec);
         while self.at < self.ranges.len() {
@@ -4213,19 +4346,13 @@ impl Scan {
             if base.next == 0 && base.end == 0 && base.block.is_none() {
                 (base.next, base.end) = index.key_block_range(&lo, &hi);
             }
-            if base.block.is_none() {
+            if base.block.is_none() && held.is_none() {
                 if base.next == base.end {
                     self.at += 1;
                     base.next = 0;
                     base.end = 0;
                     base.ahead = Default::default();
                     continue;
-                }
-                if Arc::strong_count(&base._charge) > 1 {
-                    base._charge = Arc::new(OwnedCharge::new(
-                        ctx,
-                        crate::index::BLOCK_ROWS as u64 * 32 + 512,
-                    )?);
                 }
                 let metadata = &index.blocks[base.next];
                 let whole = metadata.first >= lo && metadata.last <= hi;
@@ -4259,32 +4386,66 @@ impl Scan {
                     block.key_range(&lo, &hi)
                 };
                 base.next += 1;
-                base.block = Some(block);
+                base.wanted = wanted;
+                base.set_block(block);
             }
             if base.row == base.row_end {
-                base.block = None;
+                base.clear_block();
                 continue;
             }
-            let block = base.block.as_ref().expect("loaded immutable block");
+            let block = match &held {
+                Some(shared) => &shared.block,
+                None => base.block.as_ref().expect("loaded immutable block"),
+            };
             // Only the rows of this batch are checked, so a small demand does not read
             // the graph column of the whole block.
             let end = base.row_end.min(base.row.saturating_add(cap));
             if !exec::block_passes(&self.spec, block, base.row, end) {
                 // No row of the batch was consumed: the owned path resumes from it.
+                base.shared = None;
                 return Ok(SharedAttempt::Unsupported);
             }
-            let charge = OwnedCharge::new(ctx, 512)?;
+            // The batches of one block share it and one charge of its decoded columns,
+            // which last while any of them is held.
+            let bytes = block.decoded_bytes() + 512;
+            let shared = match held.take() {
+                Some(shared) => shared,
+                None => {
+                    // Leave room for consumers' decoding scratch and an owned fallback.
+                    // The room asked for is a whole block's columns, whatever this block
+                    // decoded, so that sharing starts at the budgets it always did and
+                    // never holds more than it did there.
+                    let output_bytes =
+                        cap as u64 * (vars.len() as u64 * 8 + 16) + ctx.nvars() as u64 * 16 + 4096;
+                    let room = crate::index::BLOCK_ROWS as u64 * 32 + 512;
+                    if ctx.memory_remaining() < room.saturating_add(output_bytes) {
+                        return Ok(SharedAttempt::Unsupported);
+                    }
+                    let Ok(charge) = OwnedCharge::new(ctx, bytes) else {
+                        return Ok(SharedAttempt::Unsupported);
+                    };
+                    // The batches take the scan's handle on the block, which the scan
+                    // would let go of at the end of this read anyway, and the scan keeps
+                    // a weak one.
+                    base.remember_block();
+                    let shared = Arc::new(SharedBlock {
+                        block: base.block.take().expect("loaded immutable block"),
+                        _charge: charge,
+                    });
+                    base.shared = Some(shared.clone());
+                    shared
+                }
+            };
             let batch = SharedBatch {
-                block: block.clone(),
+                shared,
                 columns,
                 start: base.row,
                 end,
-                _block_charge: base._charge.clone(),
-                _charge: charge,
+                _charge: OwnedCharge::new(ctx, 512)?,
             };
             base.row = end;
             if base.row == base.row_end {
-                base.block = None;
+                base.clear_block();
                 if base.next == base.end {
                     self.at += 1;
                     base.next = 0;
@@ -4368,12 +4529,6 @@ impl Scan {
                 }
                 let metadata = &index.blocks[base.next];
                 let whole = metadata.first >= lo && metadata.last <= hi;
-                if Arc::strong_count(&base._charge) > 1 {
-                    base._charge = Arc::new(OwnedCharge::new(
-                        ctx,
-                        crate::index::BLOCK_ROWS as u64 * 32 + 512,
-                    )?);
-                }
                 let columns = |b: usize| {
                     let m = &index.blocks[b];
                     if m.first >= lo && m.last <= hi {
@@ -4404,7 +4559,8 @@ impl Scan {
                     block.key_range(&lo, &hi)
                 };
                 base.next += 1;
-                base.block = Some(block);
+                base.wanted = wanted;
+                base.set_block(block);
             }
             let block = base.block.as_ref().unwrap();
             let end = base.row_end.min(base.row + cap - out.table.len);
@@ -4423,7 +4579,7 @@ impl Scan {
                 }
             }
             if base.row == base.row_end {
-                base.block = None;
+                base.clear_block();
             }
         }
         if !exact && !out.table.is_empty() {
@@ -4439,32 +4595,14 @@ impl Scan {
         if self.done() {
             return Ok(None);
         }
-        if !self.base_checked {
-            self.base_checked = true;
-            // A captured empty delta never changes. Keep a row position inside
-            // a selectively decoded immutable block rather than reseeking a
-            // complete quad key for each output batch. Retained decoded columns
-            // have a conservative charge, and this optional path may decline.
-            let cache_bytes = crate::index::BLOCK_ROWS as u64 * 32 + 512;
-            let output_bytes =
-                cap as u64 * (vars.len() as u64 * 8 + 16) + ctx.nvars() as u64 * 16 + 4096;
-            if ctx.snap.delta.is_empty()
-                && ctx.memory_remaining() >= cache_bytes.saturating_add(output_bytes)
-                && let Ok(charge) = OwnedCharge::new(ctx, cache_bytes)
-            {
-                self.base = Some(BaseScan {
-                    ahead: Default::default(),
-                    next: 0,
-                    end: 0,
-                    block: None,
-                    row: 0,
-                    row_end: 0,
-                    _charge: Arc::new(charge),
-                });
-            }
-        }
-        if let Some(mut base) = self.base.take() {
-            let result = self.next_base(ctx, vars, cap, &mut base);
+        if self.reads_base(ctx) {
+            let mut base = self.base.take().expect("checked base scan");
+            // Owned rows do not keep the block, so its charge for shared batches ends.
+            base.shared = None;
+            let result = base
+                .unpark(ctx, ctx.snap.perm(self.spec.perm))
+                .and_then(|()| self.next_base(ctx, vars, cap, &mut base));
+            base.park();
             self.base = Some(base);
             return result;
         }
@@ -4936,7 +5074,7 @@ mod tests {
             let rows = if mode == "shared" {
                 match scan.next_shared(&ctx, &[var], BLOCK_ROWS).unwrap() {
                     SharedAttempt::Ready(Some(batch)) => {
-                        for &id in &batch.block.cols[1][batch.start..batch.end] {
+                        for &id in &batch.shared.block.cols[1][batch.start..batch.end] {
                             assert_eq!(id, expected[n as usize]);
                             n += 1;
                         }
@@ -4999,6 +5137,163 @@ mod tests {
         if !crate::index::io_hints() {
             assert!(spans.is_empty());
         }
+    }
+
+    /// A scan of base blocks read in batches much smaller than a block: rows, decoded
+    /// columns and the bytes it charges, with the block cache `fill` or read-through.
+    #[cfg(unix)]
+    fn small_batch_base_scan(fill: bool) -> (u64, u64, u64) {
+        use crate::index::{
+            BLOCK_ROWS, BlockCache, Perm, read_ahead_fixture, read_ahead_reference,
+        };
+        use crate::store::{Store, StoreOptions};
+        let (_dir, idx) = read_ahead_fixture(3);
+        let store = Store::in_memory(StoreOptions::default());
+        let mut snapshot = (*store.snapshot()).clone();
+        drop(store);
+        Arc::get_mut(&mut snapshot.generation)
+            .expect("owned fixture generation")
+            .perms[Perm::Spo.index()] = idx;
+        let cache = BlockCache::new(64 << 20);
+        snapshot.cache = Arc::new(if fill { cache } else { cache.read_through() });
+        let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+        let var = ctx.var("s");
+        let spec = ScanSpec {
+            perm: Perm::Spo,
+            prefix: vec![],
+            cols: vec![(1, var)],
+            eqs: vec![],
+            graph: super::super::plan::GraphFilter::All,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let expected = read_ahead_reference(3 * BLOCK_ROWS);
+        let before = ctx.snap.cache.misses();
+        let mut scan = Scan::new(spec, None);
+        let mut n = 0;
+        while let Some(buffer) = scan.next(&ctx, &[var], 1000).unwrap() {
+            for id in &buffer.table.cols[0] {
+                assert_eq!(id.0, expected[n]);
+                n += 1;
+            }
+        }
+        assert_eq!(n, 3 * BLOCK_ROWS);
+        (n as u64, ctx.snap.cache.misses() - before, ctx.mem_peak())
+    }
+
+    /// Between batches a scan keeps its block through the cache, without a charge, and
+    /// decodes each block once (roadmap item 1039).
+    #[cfg(unix)]
+    #[test]
+    fn base_scan_charges_no_block_and_decodes_each_once() {
+        let (_, misses, peak) = small_batch_base_scan(true);
+        assert_eq!(misses, 3, "one column of each of three blocks");
+        assert!(
+            peak < crate::index::BLOCK_ROWS as u64 * 8,
+            "the scan charged a block: peak {peak}"
+        );
+    }
+
+    /// A view that keeps no blocks drops the block between batches, and the scan decodes
+    /// it again at the row it reached.
+    #[cfg(unix)]
+    #[test]
+    fn base_scan_decodes_a_dropped_block_again_at_its_row() {
+        let (_, misses, peak) = small_batch_base_scan(false);
+        assert!(
+            misses > 3,
+            "the read-through view kept a block: {misses} misses"
+        );
+        assert!(peak < crate::index::BLOCK_ROWS as u64 * 8, "peak {peak}");
+    }
+
+    /// Cost per batch of a scan over three blocks: shared batches of 4,096 rows with each
+    /// held while the next is taken, as the response writer does with more than one Rayon
+    /// worker, and with each dropped first, as it does with one, then owned batches of
+    /// 4,096 rows and of whole blocks. Run with --ignored --nocapture in release.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn shared_batch_cost_bench() {
+        use crate::index::{BLOCK_ROWS, BlockCache, Perm, read_ahead_fixture};
+        use crate::store::{Store, StoreOptions};
+        let (_dir, idx) = read_ahead_fixture(3);
+        let store = Store::in_memory(StoreOptions::default());
+        let mut snapshot = (*store.snapshot()).clone();
+        drop(store);
+        Arc::get_mut(&mut snapshot.generation)
+            .expect("owned fixture generation")
+            .perms[Perm::Spo.index()] = idx;
+        snapshot.cache = Arc::new(BlockCache::new(64 << 20));
+        let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+        let var = ctx.var("s");
+        let spec = || ScanSpec {
+            perm: Perm::Spo,
+            prefix: vec![],
+            cols: vec![(1, var)],
+            eqs: vec![],
+            graph: super::super::plan::GraphFilter::All,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let shared = |passes: usize, keep: bool| {
+            let started = Instant::now();
+            let mut batches = 0u64;
+            for _ in 0..passes {
+                let mut scan = Scan::new(spec(), None);
+                let mut held = None;
+                loop {
+                    match scan.next_shared(&ctx, &[var], 4096).unwrap() {
+                        SharedAttempt::Ready(Some(batch)) => {
+                            batches += 1;
+                            if keep {
+                                held = Some(batch);
+                            }
+                        }
+                        SharedAttempt::Ready(None) => break,
+                        _ => panic!("declined"),
+                    }
+                }
+                drop(held);
+            }
+            (
+                started.elapsed().as_nanos() as f64 / batches as f64,
+                batches,
+            )
+        };
+        let owned = |passes: usize, cap: usize| {
+            let started = Instant::now();
+            let mut batches = 0u64;
+            for _ in 0..passes {
+                let mut scan = Scan::new(spec(), None);
+                while let Some(buffer) = scan.next(&ctx, &[var], cap).unwrap() {
+                    if buffer.table.is_empty() {
+                        break;
+                    }
+                    batches += 1;
+                }
+            }
+            (
+                started.elapsed().as_nanos() as f64 / batches as f64,
+                batches,
+            )
+        };
+        let best = |name: &str, run: &dyn Fn(usize) -> (f64, u64), passes: usize| {
+            run(passes / 10);
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let (ns, batches) = run(passes);
+                best = best.min(ns);
+                eprintln!("{name}: {ns:.1} ns over {batches} batches");
+            }
+            eprintln!("BEST {name} {best:.1} ns per batch, {BLOCK_ROWS} rows a block");
+        };
+        best("shared-4096", &|p| shared(p, true), 2000);
+        best("shared-turn", &|p| shared(p, false), 2000);
+        best("owned-4096", &|p| owned(p, 4096), 500);
+        best("owned-block", &|p| owned(p, BLOCK_ROWS), 100);
     }
 
     #[cfg(unix)]
@@ -5418,8 +5713,9 @@ mod tests {
 
     /// A cursor over a few dozen distinct IRIs and literals, and its first batch of
     /// eight rows, for the tests of the decoded batch's reservation.
-    /// The scans under a merge join give back the charge of their decoded blocks once
-    /// the join ends, while the grouping above it still outputs its groups (item 93).
+    /// The scans under a merge join charge no decoded block, which the block cache keeps
+    /// between their reads, so nothing of theirs stays charged once the join ends while
+    /// the grouping above it still outputs its groups (items 93 and 1039).
     #[test]
     fn finished_joins_release_their_scans_block_charges() {
         use crate::io::Source;
@@ -5456,16 +5752,73 @@ mod tests {
         assert!(plan.contains("MergeJoin"), "{plan}");
         let batch = cursor.next_batch().unwrap().unwrap();
         assert_eq!(batch.len(), 1);
-        // Each scan charged a block's decoded columns, BLOCK_ROWS * 32 bytes.
+        // A scan that kept its block charged it at BLOCK_ROWS * 32 bytes.
         let block = crate::index::BLOCK_ROWS as u64 * 32;
         assert!(
-            cursor.ctx.mem_peak() > 2 * block,
-            "the scans held no blocks: peak {}",
+            cursor.ctx.mem_peak() < block,
+            "the scans charged their blocks: peak {}",
             cursor.ctx.mem_peak()
         );
         assert!(
             cursor.ctx.live_bytes() < block,
             "the finished scans still hold their blocks: live {}",
+            cursor.ctx.live_bytes()
+        );
+    }
+
+    /// A root scan that hands out shared batches keeps the block it reads, charged, while
+    /// a writer drops each batch before it pulls the next, charges it once per block, and
+    /// gives the charge back when the cursor stops inside the block (item 1039).
+    #[test]
+    fn root_scan_keeps_its_shared_block_charged_until_the_cursor_stops() {
+        use crate::index::BLOCK_ROWS;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions {
+            result_cache_bytes: 0,
+            ..StoreOptions::default()
+        });
+        let data = (0..BLOCK_ROWS + 4_000)
+            .map(|i| format!("<urn:s{i}> <urn:name> \"n{i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let options = CursorOptions {
+            batch_rows: 1_000,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(
+            store.snapshot(),
+            "SELECT ?s ?v WHERE { ?s <urn:name> ?v }",
+            &QueryOptions::default(),
+            &options,
+        )
+        .unwrap();
+        let baseline = cursor.ctx.live_bytes();
+        let block = BLOCK_ROWS as u64 * 32 + 512;
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let batch = cursor.next_batch().unwrap().unwrap();
+            assert!(matches!(batch.inner.buffer, BatchBuffer::Shared(_)));
+            drop(batch);
+            held.push(cursor.ctx.live_bytes() - baseline);
+        }
+        // The scan reads two columns of the block, 16 bytes a row.
+        assert!(
+            held[0] >= BLOCK_ROWS as u64 * 8 && held[0] <= block,
+            "the block's charge between batches: {held:?}"
+        );
+        assert!(held.iter().all(|&h| h == held[0]), "{held:?}");
+        cursor.close();
+        assert!(
+            cursor.ctx.live_bytes() <= baseline,
+            "the stopped cursor kept {} bytes over {baseline}",
             cursor.ctx.live_bytes()
         );
     }

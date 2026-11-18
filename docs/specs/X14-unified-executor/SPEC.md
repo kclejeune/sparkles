@@ -742,6 +742,38 @@ that stage 6 makes independent of the mode. Item 678 holds the two decoding twin
 that remain, the string floors and the dictionary pre-decode of a cursor batch, which
 `decode_for` does not yet serve.
 
+Roadmap item 1039 removed the cursor scan's block charge. A scan over an immutable
+snapshot kept its decoded index block between batches and charged a whole block's
+columns, `BLOCK_ROWS * 32 + 512` bytes, when the memory left at its first read covered
+that and one batch, and under a smaller budget it seeked each batch without a charge. A
+query could therefore be refused under a budget above one at which it answered. On 2,000
+subjects of one class, a count over `?s (:name|:none)* ?v` was refused under automatic
+and streaming execution at 1,216 and 1,280 KiB, and the closure's unfilled LIMIT in every
+mode at 1,152 and 1,216 KiB, while each answered within 512 KiB. With 69,536 subjects,
+so that the scan reads whole blocks, streaming execution refused the count from 1,216 to
+1,472 KiB and the LIMIT from 1,152 to 1,408 KiB. The scan now holds its block only during
+a read and keeps a `WeakBlock` of its columns between reads, which the block cache keeps
+alive, and it decodes the block again at its row when the cache has dropped it. The
+batches that the cursor root hands out without copying share the block and one charge of
+its decoded columns through one handle. The root scan keeps that handle while it reads
+the block, so a writer that drops each batch before it pulls the next, as the result
+writers do with one Rayon worker, does not charge the block again for every batch. The
+charge ends when the scan leaves the block, reads it as owned rows or ends, and when the
+last batch handed out from it drops, so a cursor stopped inside a block keeps it charged
+until the cursor closes. The root shares a
+block only when the memory left covers a whole block's columns and one batch, as it did,
+and copies rows otherwise, so it never holds more than it did under the same budget.
+`cursor_headroom` and `cursor_fits` count a block for automatic admission, which keeps
+eager the plans it kept eager, and not for the eager memory retry, whose alternative is
+the eager failure. The tests in `tests/scan_block_budget.rs` check that each mode's
+answers are monotone in the budget on both fixtures, that the scan's peak does not step
+by a block, and that root scans answer at every larger budget, one of them decoding a
+literal of 300 KiB. A root scan that shares its block can still be refused the decoding
+of a term larger than the room the block leaves, under a budget at which a copy would
+answer, and roadmap item 1051 holds that. A cursor over a read-through snapshot, which keeps no blocks,
+decodes its current block again for each batch of copied rows, and no cursor query reads such a
+snapshot.
+
 ### One join-kernel library
 
 The module `sparql/join` of `sparkles-core` holds one kernel per join algorithm, and
