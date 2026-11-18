@@ -4173,7 +4173,8 @@ struct BaseScan {
     end: usize,
     /// the block being read, held only during a read
     block: Option<crate::index::Block>,
-    /// between reads, a handle on the block that does not keep it
+    /// between reads, a handle on the block that does not keep it, none while the block
+    /// is shared
     parked: Option<crate::index::WeakBlock>,
     /// the columns the block was read with
     wanted: crate::index::ColMask,
@@ -4225,6 +4226,22 @@ impl BaseScan {
     fn park(&mut self) {
         self.remember_block();
         self.block = None;
+        debug_assert!(
+            self.row == self.row_end || self.shared.is_some() || self.parked.is_some(),
+            "a scan stopped inside a block without a way back to it"
+        );
+    }
+
+    /// Stop sharing the block being read, taking it back as the block of the read. While
+    /// it shares a block the scan keeps no weak handle on it, since the shared block keeps
+    /// it, so a scan that goes on inside the block takes it back here, and the next
+    /// [`park`](Self::park) makes the handle.
+    fn unshare(&mut self) {
+        if let Some(shared) = self.shared.take()
+            && self.block.is_none()
+        {
+            self.block = Some(shared.block.clone());
+        }
     }
 
     /// Take back the block of the last read, from the cache or by decoding it again.
@@ -4316,39 +4333,47 @@ impl Scan {
         if !self.reads_base(ctx) {
             return Ok(SharedAttempt::Unsupported);
         }
-        let mut base = self.base.take().expect("checked base scan");
-        let held = base.shared.clone();
-        let result = if held.is_some() {
+        // The base scan is borrowed in place rather than moved out and back for the read.
+        let Scan {
+            spec,
+            ranges,
+            at,
+            base,
+            ..
+        } = self;
+        let base = base.as_mut().expect("checked base scan");
+        let result = if base.shared.is_some() {
             Ok(())
         } else {
-            base.unpark(ctx, ctx.snap.perm(self.spec.perm))
+            base.unpark(ctx, ctx.snap.perm(spec.perm))
         }
-        .and_then(|()| self.next_shared_base(ctx, vars, columns, cap, &mut base, held));
+        .and_then(|()| Self::next_shared_base(ctx, spec, ranges, at, vars, columns, cap, base));
         base.park();
-        self.base = Some(base);
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn next_shared_base(
-        &mut self,
         ctx: &Arc<Ctx>,
+        spec: &ScanSpec,
+        ranges: &[(Key, Key, bool)],
+        at: &mut usize,
         vars: &[VarId],
         columns: [usize; 4],
         cap: usize,
         base: &mut BaseScan,
-        mut held: Option<Arc<SharedBlock>>,
     ) -> Result<SharedAttempt> {
-        let index = ctx.snap.perm(self.spec.perm);
-        let mask = exec::scan_mask(&self.spec);
-        while self.at < self.ranges.len() {
+        let index = ctx.snap.perm(spec.perm);
+        let mask = exec::scan_mask(spec);
+        while *at < ranges.len() {
             ctx.check()?;
-            let (lo, hi, _) = self.ranges[self.at];
+            let (lo, hi, _) = ranges[*at];
             if base.next == 0 && base.end == 0 && base.block.is_none() {
                 (base.next, base.end) = index.key_block_range(&lo, &hi);
             }
-            if base.block.is_none() && held.is_none() {
+            if base.block.is_none() && base.shared.is_none() {
                 if base.next == base.end {
-                    self.at += 1;
+                    *at += 1;
                     base.next = 0;
                     base.end = 0;
                     base.ahead = Default::default();
@@ -4393,23 +4418,33 @@ impl Scan {
                 base.clear_block();
                 continue;
             }
-            let block = match &held {
+            let block = match &base.shared {
                 Some(shared) => &shared.block,
                 None => base.block.as_ref().expect("loaded immutable block"),
             };
             // Only the rows of this batch are checked, so a small demand does not read
             // the graph column of the whole block.
             let end = base.row_end.min(base.row.saturating_add(cap));
-            if !exec::block_passes(&self.spec, block, base.row, end) {
-                // No row of the batch was consumed: the owned path resumes from it.
-                base.shared = None;
+            if !exec::block_passes(spec, block, base.row, end) {
+                // No row of the batch was consumed: the owned path resumes from it, with
+                // the block taken back from the shared one.
+                base.unshare();
                 return Ok(SharedAttempt::Unsupported);
             }
             // The batches of one block share it and one charge of its decoded columns,
             // which last while any of them is held.
             let bytes = block.decoded_bytes() + 512;
-            let shared = match held.take() {
-                Some(shared) => shared,
+            let batch = match &base.shared {
+                Some(shared) => {
+                    let shared = shared.clone();
+                    SharedBatch {
+                        shared,
+                        columns,
+                        start: base.row,
+                        end,
+                        _charge: OwnedCharge::new(ctx, 512)?,
+                    }
+                }
                 None => {
                     // Leave room for consumers' decoding scratch and an owned fallback.
                     // The room asked for is a whole block's columns, whatever this block
@@ -4424,30 +4459,34 @@ impl Scan {
                     let Ok(charge) = OwnedCharge::new(ctx, bytes) else {
                         return Ok(SharedAttempt::Unsupported);
                     };
+                    // The batch's own charge comes before the block moves, so a refusal
+                    // leaves the scan holding its block.
+                    let batch_charge = OwnedCharge::new(ctx, 512)?;
                     // The batches take the scan's handle on the block, which the scan
-                    // would let go of at the end of this read anyway, and the scan keeps
-                    // a weak one.
-                    base.remember_block();
+                    // would let go of at the end of this read anyway. While the block is
+                    // shared the scan keeps it through the shared block and needs no weak
+                    // handle, and a batch that ends the block leaves the scan none.
                     let shared = Arc::new(SharedBlock {
                         block: base.block.take().expect("loaded immutable block"),
                         _charge: charge,
                     });
-                    base.shared = Some(shared.clone());
-                    shared
+                    if end < base.row_end {
+                        base.shared = Some(shared.clone());
+                    }
+                    SharedBatch {
+                        shared,
+                        columns,
+                        start: base.row,
+                        end,
+                        _charge: batch_charge,
+                    }
                 }
-            };
-            let batch = SharedBatch {
-                shared,
-                columns,
-                start: base.row,
-                end,
-                _charge: OwnedCharge::new(ctx, 512)?,
             };
             base.row = end;
             if base.row == base.row_end {
                 base.clear_block();
                 if base.next == base.end {
-                    self.at += 1;
+                    *at += 1;
                     base.next = 0;
                     base.end = 0;
                     base.ahead = Default::default();
@@ -4598,7 +4637,7 @@ impl Scan {
         if self.reads_base(ctx) {
             let mut base = self.base.take().expect("checked base scan");
             // Owned rows do not keep the block, so its charge for shared batches ends.
-            base.shared = None;
+            base.unshare();
             let result = base
                 .unpark(ctx, ctx.snap.perm(self.spec.perm))
                 .and_then(|()| self.next_base(ctx, vars, cap, &mut base));
@@ -5180,6 +5219,93 @@ mod tests {
         }
         assert_eq!(n, 3 * BLOCK_ROWS);
         (n as u64, ctx.snap.cache.misses() - before, ctx.mem_peak())
+    }
+
+    /// A scan that switches between shared batches and owned rows inside a block, with
+    /// the shared batches dropped or held and a view that keeps no blocks, returns every
+    /// row once and in order. A scan keeps no weak handle on a block it shares, so every
+    /// switch to owned rows takes the block back from the shared one (roadmap item 1063).
+    /// Rows of another graph inside the first block make a shared read decline there.
+    #[cfg(unix)]
+    #[test]
+    fn base_scan_switches_between_shared_and_owned_rows_inside_a_block() {
+        use crate::index::{BLOCK_ROWS, BlockCache, Perm, PermIndex, PermWriter};
+        use crate::store::{Store, StoreOptions};
+        let rows = 2 * BLOCK_ROWS + 1_000;
+        let other = |i: usize| (5_000..5_003).contains(&i) || i == BLOCK_ROWS + 7_777;
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for i in 0..rows as u64 {
+            let graph = if other(i as usize) { 9 } else { 0 };
+            writer.push([i, i * 3 + 1, 0, graph]).unwrap();
+        }
+        writer.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let expected = (0..rows)
+            .filter(|&i| !other(i))
+            .map(|i| i as u64 * 3 + 1)
+            .collect::<Vec<_>>();
+        for (fill, keep) in [(false, false), (false, true), (true, false), (true, true)] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut snapshot = (*store.snapshot()).clone();
+            drop(store);
+            Arc::get_mut(&mut snapshot.generation)
+                .expect("owned fixture generation")
+                .perms[Perm::Spo.index()] = idx.clone();
+            let cache = BlockCache::new(64 << 20);
+            snapshot.cache = Arc::new(if fill { cache } else { cache.read_through() });
+            let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+            let var = ctx.var("o");
+            let spec = ScanSpec {
+                perm: Perm::Spo,
+                prefix: vec![],
+                cols: vec![(1, var)],
+                eqs: vec![],
+                graph: super::super::plan::GraphFilter::One(0),
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            };
+            let mut scan = Scan::new(spec, None);
+            let mut seen = Vec::new();
+            let mut held = None;
+            let (mut shared, mut owned) = (0, 0);
+            for step in 0.. {
+                if scan.done() {
+                    break;
+                }
+                let cap = [1_000, 3, 4_096, 777][step % 4];
+                // Every third read asks for owned rows, the others for shared batches.
+                let attempt = if step % 3 == 2 {
+                    SharedAttempt::Unsupported
+                } else {
+                    scan.next_shared(&ctx, &[var], cap).unwrap()
+                };
+                match attempt {
+                    SharedAttempt::Ready(Some(batch)) => {
+                        shared += 1;
+                        let column = &batch.shared.block.cols[batch.columns[0]];
+                        seen.extend_from_slice(&column[batch.start..batch.end]);
+                        held = keep.then_some(batch);
+                    }
+                    SharedAttempt::Ready(None) => break,
+                    SharedAttempt::Unsupported => {
+                        let Some(buffer) = scan.next(&ctx, &[var], cap).unwrap() else {
+                            break;
+                        };
+                        owned += 1;
+                        seen.extend(buffer.table.cols[0].iter().map(|id| id.0));
+                    }
+                }
+            }
+            drop(held);
+            assert!(shared > 10 && owned > 10, "{shared} shared, {owned} owned");
+            assert_eq!(seen.len(), expected.len(), "fill {fill}, keep {keep}");
+            assert!(
+                seen == expected,
+                "fill {fill}, keep {keep}: rows out of order"
+            );
+        }
     }
 
     /// Between batches a scan keeps its block through the cache, without a charge, and
