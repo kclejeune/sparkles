@@ -219,12 +219,14 @@ join-kernel library has shipped, and its other phases follow the
 Item 678 has shipped in part. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
 read fails the comparison with its refusal. Cursor batches still compare two string
-columns key by key and do not use the floors. Each batch would build its own floor cache
-and compute again the floors of strings that recur across batches, and on atlas with
-1.05M triples and one thread that made streaming `str-pair-lt` 24.8% slower and
-`str-pair-names` 33.4% slower than the direct comparison, in every round. Item 1069 gives
-`Ctx` a charged per-query floor cache that serves both modes and then removes the
-exclusion. The row-aligned
+columns key by key and do not use the floors. On atlas with 1.05M triples and one
+thread, comparing through floors cached per batch made streaming `str-pair-lt` 24.8%
+slower and `str-pair-names` 33.4% slower than the direct comparison, in every round. The
+names of `str-pair-names` repeat across batches, with 83,226 and 91,694 distinct values in
+its two columns over 249,868 rows, so each batch computes again floors that an earlier batch had. Every name of
+`str-pair-lt` is distinct, 70,023 in 70,023 rows, and the cause of its loss is not
+established. Item 1069 takes up a floor cache that lasts the query and the exclusion.
+The row-aligned
 pre-decode of `decode_for` decodes its columns through the same sorted pre-decode as the
 dictionary values of top k and the numeric FILTER, which admits each value's storage
 before it builds it, and moves or clones the distinct values to their rows. Indexing the
@@ -760,8 +762,8 @@ lexicographic floors serves eager tables of at least 4,096 rows. A floor reads i
 string's key, the key before it and, for a string that other strings extend, the search
 for the first of them inside the decoding envelope, and a refused read fails the
 comparison with the refusal it recorded. Cursor batches compare the two keys directly
-instead, because a floor cache that lasts one batch measured slower than that
-comparison, until item 1069 gives the floors a cache that lasts the query.
+instead, because the floors with a cache that lasts one batch measured slower than that
+comparison. Item 1069 takes up a cache that lasts the query.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 reads of the accounting mode outside tests and fails above its bound. A read is a call of

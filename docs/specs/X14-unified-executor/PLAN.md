@@ -245,12 +245,13 @@ of this section listed. Before the change the test counts eight sites, the mode 
 `exists::prepare`, `envelope_refuses`, `string_order_mask` and the four direct reads.
 
 The floors now decode inside the envelope, and `decode_for` decodes through the one
-sorted pre-decode. Cursor batches still skip the floors, because each batch builds its
-own floor cache and recomputes the floors of strings that recur across batches. On
-atlas, comparing through the floors made `str-pair-lt` 24.8% slower and
-`str-pair-names` 33.4% slower in streaming mode. The exclusion in `string_order_mask`
-therefore stays, and the bound stays at eight. Item 1069 gives `Ctx` a charged per-query
-floor cache that serves both modes, removes the exclusion and lowers the bound to seven.
+sorted pre-decode. Cursor batches still skip the floors. On atlas, comparing through
+floors cached per batch made `str-pair-lt` 24.8% slower and `str-pair-names` 33.4% slower
+in streaming mode. The names of `str-pair-names` repeat across batches, so each batch
+computes floors again, while every name of `str-pair-lt` is distinct and the cause of its
+loss is not established. The exclusion in `string_order_mask` therefore stays, and the
+bound stays at eight. Item 1069 takes up a charged per-query floor cache that serves both
+modes, the removal of the exclusion and the bound of seven.
 
 ## Stage 5: shared kernels
 
