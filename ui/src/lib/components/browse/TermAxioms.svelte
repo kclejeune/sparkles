@@ -134,7 +134,10 @@
           {target}
           {graph}
           {imports}
+          {kind}
           {iri}
+          {prefixes}
+          href={linker.href}
           {commit}
           {pins}
           items={groups.flatMap((g) => g.items.map((it) => it.axiom))}

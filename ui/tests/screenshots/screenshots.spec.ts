@@ -416,15 +416,16 @@ test.describe('materialized ontology views', () => {
     });
     await expect(tree.getByRole('button', { name: 'performs in', exact: true })).toBeVisible();
     const frame = page.getByRole('region', { name: 'Materialized inferred axioms', exact: true });
-    await expect(frame).toContainText('SubObjectPropertyOf');
+    const supers = frame.locator('[data-section="materialized-superProperties"]');
+    await expect(supers).toContainText('SubPropertyOf:');
+    await expect(supers.getByRole('button', { name: 'related to', exact: true })).toBeVisible();
+    await expect(frame).toContainText('One trivial entailment');
     await expect(frame).toContainText('Completeness and consistency are unknown');
     await frame.scrollIntoViewIfNeeded();
     await expect(
       frame.getByRole('heading', { name: 'Materialized inferred axioms' }),
     ).toBeVisible();
-    await expect(
-      frame.locator('li code').filter({ hasText: 'SubObjectPropertyOf' }).first(),
-    ).toBeVisible();
+    await expect(supers).toBeVisible();
     await shoot(page, 'ontology-materialized-properties');
   });
 
@@ -432,8 +433,12 @@ test.describe('materialized ontology views', () => {
     await page.setViewportSize({ width: 1440, height: 1100 });
     await page.goto(`/ui/browse?ds=${ds}&iri=${encodeURIComponent(ns + 'ada')}`);
     const frame = page.getByRole('region', { name: 'Materialized inferred axioms', exact: true });
-    await expect(frame).toContainText('ClassAssertion');
-    await expect(frame).toContainText('ClassAssertion(:Artist :ada)');
+    const types = frame.locator('[data-section="materialized-types"]');
+    await expect(types.getByRole('link', { name: 'Artist', exact: true })).toBeVisible();
+    await expect(types.getByRole('link', { name: 'Musician', exact: true })).toBeVisible();
+    await expect(frame.locator('[data-section="materialized-objectAssertions"]')).toContainText(
+      'related to',
+    );
     await expect(frame).toContainText('read only');
     await expect(
       page.getByRole('region', { name: 'Individuals (materialized inferred types)', exact: true }),
