@@ -988,20 +988,35 @@ for the hosts that list leaves out. The value is recorded in `progress.log`.
 When the ci step of a gate fails, `scripts/gate/remote/test_retry.py` reruns each failed
 Rust test once, alone, before the conformance steps start, and the gate passes if every
 rerun passes. It does so only when the evidence shows that the failure belongs to a few
-tests and to nothing else. The retained JUnit manifest must record a fresh report of the
-failed `test` task for the gate's commit, every other ci task and the shared
-prerequisites must have passed, and nextest's final summary must be complete, with its
-failed and timed-out counts equal to the failures in the report. There must be between 1
-and `GATE_RETRY_MAX_FAILURES` failures, 8 by default, which is above the largest number
-that recent gates recorded for a load-sensitive failure and far below a real breakage.
+tests and to nothing else. The ci step must have run to its end. Its exit must be 1,
+which is `scripts/ci.sh`'s own failure exit, its log must end with `CI failed: test`,
+and the retained `summary.txt` must list exactly the tasks that the gate selected, each
+in a final state that agrees with its state file. A ci step that was killed, stopped or
+interrupted, or that left a task waiting, running or skipped, is never forgiven. Every
+other ci task and the shared prerequisites must have passed. The retained JUnit manifest
+must record a fresh report of the failed `test` task for the gate's commit, and
+nextest's final summary must be complete, with its failed and timed-out counts equal to
+the failures in the report. The worktree must still be at the gate's commit with no
+tracked change and no untracked file outside git's ignore rules, both before the reruns
+and after them. There must be between 1 and `GATE_RETRY_MAX_FAILURES` failures, 8 by
+default, which is above the largest number that recent gates recorded for a
+load-sensitive failure and far below a real breakage.
 
 Each test runs with `mbx nextest run --no-capture --retries 0` and an exact binary and
 test filter, under one lease on the managed target, within `GATE_RETRY_SECONDS` in all,
-2400 by default, and at most 900 seconds each. A rerun passes only when its own JUnit
-report lists exactly that test as passed and its log shows no workspace crate compiled.
-A failed nextest run ends the `test` task before its doctests, so the doctests of the
-task's packages run next. When all of these pass, the run writes `ci.forgiven`, with one
-line for each flaky test, and `steps.txt` gets a `FLAKY` line under the ci step.
+2400 by default, and at most 900 seconds each. Each rerun gets a new empty `TMPDIR`, and
+`target/tmp`, which tests reach as `CARGO_TARGET_TMPDIR`, is emptied before it, so
+scratch that the failed run left behind cannot make the rerun pass. Other ignored paths
+in the worktree and state outside it, such as a service the test talks to, are not
+reset, so a test that depends on such state can still be forgiven. Each command runs in
+its own session. When it runs out of time, or the gate stops the helper, every process
+left in that session gets SIGTERM and then SIGKILL after 20 seconds, which also reaches
+the test processes that nextest puts in their own process groups. A rerun passes only
+when its own JUnit report lists exactly that test as passed and its log shows no
+workspace crate compiled. A failed nextest run ends the `test` task before its doctests,
+so the doctests of the task's packages run next. When all of these pass, the run writes
+`ci.forgiven`, with one line for each flaky test, and `steps.txt` gets a `FLAKY` line
+under the ci step.
 
 `ci.exit` keeps the original result, and the gate's verdict skips it only when
 `ci.forgiven` exists and `test-retry.exit` is 0. Any other outcome, including a rerun

@@ -6,15 +6,26 @@ step, when the ci step failed and its evidence was retained. It forgives the ci 
 only on positive evidence that the failure was the test task's alone and that every
 failed test passes when it runs again by itself:
 
+- The ci step ran to its end and failed on the test task alone. ci.exit is 1, the last
+  line of ci.log is `CI failed: test`, and the retained summary.txt lists exactly the
+  tasks that the gate selected, each with a final state that agrees with its state
+  file. Every task and the shared prerequisites passed, and the test task failed. A
+  run that was killed, stopped or interrupted, or that left a task waiting, declines.
 - The retained JUnit manifest records the test task as selected, retained and failed,
   for this commit, with a report written during the task.
-- Every other ci task and the shared prerequisites passed, and the test task failed.
+- The worktree is still at this commit, with no tracked change and no untracked file
+  that git does not ignore, both before the reruns and after them.
 - nextest's final summary in the test task's log is complete, with no test left unrun,
   and its failed and timed-out counts add up to the failures in the JUnit report.
 - That count is between 1 and --max-failures. A larger count is not a flake.
 
 Each failed test then runs alone with `mbx nextest run --no-capture --retries 0` and an
-exact binary and test filter, within --seconds in all. It passes only when its own JUnit
+exact binary and test filter, within --seconds in all. Each rerun gets a new empty
+TMPDIR, and target/tmp (CARGO_TARGET_TMPDIR) is emptied before it, so scratch that the
+first run left there cannot make a rerun pass. Other ignored paths in the worktree and
+state outside it are not reset. Each command runs in its own session, and when it runs
+out of time every process left in that session is stopped, including those in other
+process groups such as nextest's test processes. It passes only when its own JUnit
 report lists exactly that test, passed, and its log shows no new compilation.
 Since a failed nextest step ends the test task before its doctests, the doctests of the
 task's packages then run too. When everything passes, the script writes ci.forgiven with
@@ -29,11 +40,17 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+# Seconds between SIGTERM and SIGKILL for a command that ran out of time. nextest
+# forwards SIGTERM to its tests and gives them 10 seconds before it kills them.
+GRACE = 20
 
 # The categories of nextest's final summary line that this script understands.
 SUMMARY = re.compile(r"^\s*Summary \[[^\]]*\]\s+(\d+) tests? run: (.*)$")
@@ -88,10 +105,103 @@ def junit_cases(path):
     ]
 
 
+def full_tasks(ci_sh=Path("scripts/ci.sh")):
+    """The tasks that scripts/ci.sh runs when it is given none, from its `full=(` list."""
+    try:
+        m = re.search(r"^\s*full=\(([^)]*)\)", ci_sh.read_text(), re.M)
+    except OSError:
+        m = None
+    if not m or not m.group(1).split():
+        raise Decline("cannot read scripts/ci.sh's full task list")
+    return m.group(1).split()
+
+
+def selected_tasks(out, ci_sh=Path("scripts/ci.sh")):
+    """The ci tasks that the gate gave scripts/ci.sh, from selection.txt. Like
+    gate-inner.sh, a missing, empty or `all` ci line means ci.sh's full list."""
+    try:
+        text = (out / "selection.txt").read_text()
+    except OSError:
+        raise Decline("the gate wrote no selection.txt") from None
+    lines = [l for l in text.splitlines() if l == "ci" or l.startswith("ci ")]
+    if len(lines) > 1:
+        raise Decline("selection.txt has more than one ci line")
+    tasks = lines[0].split()[1:] if lines else []
+    if not tasks or tasks == ["all"]:
+        return full_tasks(ci_sh)
+    return tasks
+
+
+def ci_complete(out, ci_sh=Path("scripts/ci.sh")):
+    """Decline unless the ci step ran every selected task to a final state and failed on
+    the test task alone. Its exit is 1, ci.sh's own failure exit, its log ends with
+    `CI failed: test`, and the retained summary lists the selected tasks, and the shared
+    prerequisites when there are any, each passed except the failed test task."""
+    rec = out / "ci-receipts"
+    try:
+        code = (out / "ci.exit").read_text().strip()
+    except OSError:
+        raise Decline("the ci step has no exit code") from None
+    if code != "1":
+        raise Decline(f"the ci step exited {code}, not ci.sh's failure exit 1")
+    try:
+        log = (out / "ci.log").read_text(errors="replace").splitlines()
+    except OSError:
+        raise Decline("the ci step has no log") from None
+    last = [l for l in log if l.strip()][-1:]
+    if last != ["CI failed: test"]:
+        raise Decline("the ci step's log does not end with ci.sh's `CI failed: test`")
+    try:
+        summary = (rec / "summary.txt").read_text().splitlines()
+    except OSError:
+        raise Decline("the ci receipts have no summary.txt") from None
+    if not summary or not summary[0].startswith("CI started "):
+        raise Decline("the ci summary has no header")
+    rows = {}
+    for line in summary[1:]:
+        if not line.strip():
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2 or parts[0] in rows:
+            raise Decline(f"the ci summary has a row this script does not understand: {line}")
+        rows[parts[0]] = parts[1].split(" ", 1)[0]
+    expected = selected_tasks(out, ci_sh)
+    listed = [t for t in rows if t != "prepare"]
+    if sorted(listed) != sorted(expected):
+        raise Decline("the ci summary does not list exactly the selected tasks")
+    for task, state in rows.items():
+        want = "FAIL" if task == "test" else "pass"
+        if state != want:
+            raise Decline(f"the ci summary records {task} as {state}, not {want}")
+        try:
+            recorded = (rec / "state" / task.replace(":", "_")).read_text().split(" ", 1)[0].strip()
+        except OSError:
+            raise Decline(f"the ci receipts have no state for {task}") from None
+        if recorded != state:
+            raise Decline(f"the state of {task} does not agree with the ci summary")
+
+
+def worktree_clean(commit):
+    """Decline unless the worktree's HEAD is COMMIT, with no tracked change and no
+    untracked file that git does not ignore."""
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=60)
+        status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Decline(f"cannot read the worktree's state ({e})") from None
+    if head.returncode != 0 or head.stdout.strip() != commit:
+        raise Decline("the worktree is not at the gate's commit")
+    if status.returncode != 0 or status.stdout.strip():
+        raise Decline("the worktree has changed or untracked files: "
+                      + " ".join(l[3:] for l in status.stdout.splitlines()[:5]))
+
+
 def eligible(out, commit, max_failures):
     """The failed tests of the gate's ci step in OUT when this script may rerun them, and
     the selected packages of the test task. Raises Decline otherwise."""
     rec = out / "ci-receipts"
+    ci_complete(out)
     try:
         manifest = json.loads((rec / "junit/manifest.json").read_text())
     except (OSError, ValueError) as e:
@@ -109,14 +219,6 @@ def eligible(out, commit, max_failures):
             or reports[0].get("freshness") != "new-or-changed-since-task-start":
         raise Decline("the test task did not write one fresh report of the default profile")
     junit = rec / "junit" / reports[0]["retained_path"]
-    states = {}
-    for f in sorted((rec / "state").glob("*")):
-        states[f.name] = f.read_text().split(" ", 1)[0].strip()
-    if states.get("test") != "FAIL":
-        raise Decline("the ci summary does not record the test task as failed")
-    others = sorted(k for k, v in states.items() if k != "test" and v != "pass")
-    if others:
-        raise Decline(f"other ci steps did not pass: {' '.join(others)}")
     counts = summary_counts((rec / "logs/test.log").read_text(errors="replace"))
     try:
         failures = junit_failures(junit)
@@ -140,30 +242,102 @@ def filterset(binary, name):
     return f"binary_id(={binary}) & test(={name})"
 
 
-def run(cmd, log, seconds):
-    """Run CMD with its output in LOG, for at most SECONDS. Returns the exit code, or
-    None when it ran out of time."""
+def session_pids(sid):
+    """The processes whose session is SID."""
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            fields = (d / "stat").read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        # After the command name: state, ppid, pgrp, session.
+        if len(fields) > 3 and fields[3] == str(sid) and fields[0] != "Z":
+            out.append(int(d.name))
+    return out
+
+
+def stop_session(proc, grace=None):
+    """Stop PROC and every process left in its session, which it leads. SIGTERM first,
+    to its process group and to every other process of the session, then SIGKILL after
+    GRACE seconds to whatever remains, and reap PROC."""
+    grace = GRACE if grace is None else grace
+
+    def signal_all(sig):
+        for pid in session_pids(proc.pid):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+
+    signal_all(signal.SIGTERM)
+    end = time.monotonic() + grace
+    while time.monotonic() < end and session_pids(proc.pid):
+        try:
+            proc.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+    for _ in range(50):
+        if not session_pids(proc.pid):
+            break
+        signal_all(signal.SIGKILL)
+        try:
+            proc.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+    proc.wait()
+
+
+def run(cmd, log, seconds, env=None):
+    """Run CMD with its output in LOG, for at most SECONDS, in a new session. Returns the
+    exit code, or None when it ran out of time, after every process of its session is
+    stopped. A signal that ends this script stops the session too."""
     with open(log, "w") as f:
         f.write("$ " + " ".join(cmd) + "\n")
         f.flush()
+        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         try:
-            return subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, timeout=max(1, seconds)).returncode
+            code = proc.wait(timeout=max(1, seconds))
         except subprocess.TimeoutExpired:
+            stop_session(proc)
             f.write(f"\nstopped after {seconds} s\n")
             return None
+        except BaseException:
+            stop_session(proc)
+            raise
+        # The command ended, and anything it left in its session goes with it.
+        if session_pids(proc.pid):
+            stop_session(proc)
+        return code
 
 
 def rebuilt(log_text):
     """Whether a log shows a workspace crate compiled anew. Cargo prints Compiling for a
     crate that Boxington restores from its cache too, so its cache line decides when it
-    is there: a miss is a new compilation, which a rerun of the same build never needs."""
-    m = re.search(r"mbx\[cache\]: \d+ hits?, (\d+) miss", log_text)
-    if m:
-        return int(m.group(1)) > 0
+    is there: a miss on any of its lines is a new compilation, which a rerun of the same build never needs."""
+    misses = re.findall(r"mbx\[cache\]: \d+ hits?, (\d+) miss", log_text)
+    if misses:
+        return any(int(n) > 0 for n in misses)
     return re.search(r"^\s*Compiling sparkles[a-z0-9-]* v", log_text, re.M) is not None
 
 
-def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xml")):
+def fresh_scratch(rdir, i, target_tmp):
+    """A new empty TMPDIR for rerun I, and an empty TARGET_TMP. Returns the environment."""
+    tmp = rdir / f"{i}.tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+    if target_tmp.is_dir():
+        for child in target_tmp.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    return dict(os.environ, TMPDIR=str(tmp.resolve()))
+
+
+def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xml"),
+         target_tmp=Path("target/tmp"), check_worktree=worktree_clean):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--commit", required=True)
@@ -183,8 +357,12 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
         print(reason)
         return code
 
+    # The gate's unit stops this script with SIGTERM. Raising here lets run() stop the
+    # command's session before the script ends.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         failures, packages = eligible(out, args.commit, args.max_failures)
+        check_worktree(args.commit)
     except Decline as e:
         return finish(1, f"not rerun: {e}")
     rdir.mkdir(exist_ok=True)
@@ -200,8 +378,9 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
         log = rdir / f"{i}.log"
         if junit_path.exists():
             junit_path.unlink()
+        env = fresh_scratch(rdir, i, target_tmp)
         code = runner(prefix + ["mbx", "nextest", "run", "--workspace", "--no-capture", "--retries", "0",
-                                "--no-fail-fast", "-E", expr], log, min(left, 900))
+                                "--no-fail-fast", "-E", expr], log, min(left, 900), env=env)
         text = log.read_text(errors="replace") if log.exists() else ""
         cases = []
         if junit_path.exists():
@@ -218,19 +397,31 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
     left = int(deadline - time.monotonic())
     if left <= 0:
         return finish(1, "not forgiven: no time left for the doctests")
-    env_pkgs = subprocess.run(
-        ["python3", "scripts/changed-crates.py", "--cargo-args", "--doc"],
-        env=dict(os.environ, SPARKLES_CHANGED_PACKAGES=packages), capture_output=True, text=True,
-    )
+    try:
+        env_pkgs = subprocess.run(
+            ["python3", "scripts/changed-crates.py", "--cargo-args", "--doc"],
+            env=dict(os.environ, SPARKLES_CHANGED_PACKAGES=packages), capture_output=True, text=True,
+            timeout=max(1, min(left, 300)),
+        )
+    except subprocess.TimeoutExpired:
+        return finish(1, "not forgiven: choosing the doctest packages ran out of time")
     pkgs = env_pkgs.stdout.split()
     if env_pkgs.returncode != 0 or not pkgs:
         return finish(1, "not forgiven: cannot choose the doctest packages")
+    left = int(deadline - time.monotonic())
+    if left <= 0:
+        return finish(1, "not forgiven: no time left for the doctests")
     if pkgs != ["none"]:
         log = rdir / "doctests.log"
-        code = runner(prefix + ["mbx", "test", *pkgs, "--doc"], log, left)
+        env = fresh_scratch(rdir, "doctests", target_tmp)
+        code = runner(prefix + ["mbx", "test", *pkgs, "--doc"], log, left, env=env)
         lines.append(f"{'PASS' if code == 0 else 'FAIL'} doctests {' '.join(pkgs)} (exit {code}, log {log.name})")
         if code != 0:
             return finish(1, "not forgiven: the doctests failed")
+    try:
+        check_worktree(args.commit)
+    except Decline as e:
+        return finish(1, f"not forgiven: after the reruns, {e}")
     (out / "ci.forgiven").write_text("".join(f"{b} {n}\n" for b, n in failures))
     return finish(0, f"forgiven: {len(failures)} flaky test{'s' if len(failures) != 1 else ''} passed alone")
 
