@@ -5113,7 +5113,8 @@ fn whole_input_operators_count_their_rows_as_eager_does() {
         let eager = query(s.snapshot(), &q, &opts(None, None)).unwrap();
         let produced = eager.rows_produced;
         assert!(!eager.is_empty(), "{q}");
-        let streamed = |limit: Option<u64>, rows: usize| -> Result<u64, Error> {
+        let expected = bag(eager.application_rows());
+        let streamed = |limit: Option<u64>, rows: usize| -> Result<(u64, Vec<String>), Error> {
             let work = Arc::new(AtomicU64::new(0));
             let mut c = select_cursor(
                 s.snapshot(),
@@ -5129,11 +5130,18 @@ fn whole_input_operators_count_their_rows_as_eager_does() {
                     .any(|r| r.contains(reads) && r.contains("runs once")),
                 "{q}: {found:?}"
             );
-            while c.next_batch()?.is_some() {}
-            Ok(work.load(Ordering::Relaxed))
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch()? {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            Ok((work.load(Ordering::Relaxed), bag(answer)))
         };
         for rows in [1, 3, 4096] {
-            assert_eq!(streamed(None, rows).unwrap(), produced, "{q}; {rows}");
+            let (work, answer) = streamed(None, rows).unwrap();
+            assert_eq!(answer, expected, "{q}; {rows}");
+            assert_eq!(work, produced, "{q}; {rows}");
             assert!(streamed(Some(produced), rows).is_ok(), "{q}; {rows}");
             assert!(
                 matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
@@ -5143,6 +5151,133 @@ fn whole_input_operators_count_their_rows_as_eager_does() {
         assert!(
             matches!(query(s.snapshot(), &q, &opts(Some(produced - 1), None)), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
             "{q}"
+        );
+    }
+}
+
+/// A whole-input operator holds its input under the memory budget, so a budget that
+/// cannot hold the input refuses the query with a budget error in both modes, while
+/// small batches alone fit (item 829). The forms read their group or their edge pattern.
+#[test]
+fn whole_input_operators_refuse_an_input_over_the_memory_budget() {
+    let n = 6000;
+    let s = store(n);
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % n))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let prefixes = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    for q in [
+        "SELECT ?s ?b WHERE { ?s <urn:p> ?o SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 3 } }",
+        "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 3 ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        "SELECT ?n WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n . ?a <urn:q> ?b } } LIMIT 1",
+    ] {
+        let q = format!("{prefixes}{q}");
+        let tight = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(48 << 10),
+            ..Default::default()
+        };
+        let memory = |r: Result<(), Error>| matches!(r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+        assert!(
+            memory(query(s.snapshot(), &q, &tight).map(drop)),
+            "{q}: eager"
+        );
+        let run = |opts: &QueryOptions| -> Result<(), Error> {
+            let mut c = select_cursor(s.snapshot(), &q, opts, &options(8))?;
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        };
+        run(&QueryOptions::default()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let r = run(&tight);
+        let refused = matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+        assert!(refused, "{q}: {:?}", r.err().map(|e| e.to_string()));
+    }
+}
+
+/// Peak memory and time of the whole-input and bounded-leaf forms against eager runs of
+/// the same queries, for the item 829 measurement. Run it alone in release mode with
+/// `--ignored --nocapture`; LEAF_MEASURE_N sets the graph size (default 200000).
+#[test]
+#[ignore]
+fn measure_whole_input_and_leaf_forms() {
+    use std::time::Instant;
+    let n: usize = std::env::var("LEAF_MEASURE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let s = store(n);
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % n))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let p = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    let forms = [
+        (
+            "path search over its group",
+            "SELECT ?s ?b WHERE { ?s <urn:p> ?o SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 10 } }",
+        ),
+        (
+            "path search over an edge pattern",
+            "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 10 ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        ),
+        (
+            "path search leaf",
+            "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:predicate <urn:q> ; path:limit 10 } }",
+        ),
+        (
+            "algorithm call over its group",
+            "SELECT ?n ?d WHERE { ?src <urn:p> ?o FILTER(?o < 4) SERVICE algo:bfs { [] algo:predicate <urn:q> ; algo:source ?src ; algo:node ?n ; algo:depth ?d } }",
+        ),
+        (
+            "algorithm call over an edge pattern",
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n ; algo:component ?c . ?a <urn:q> ?b } }",
+        ),
+        (
+            "algorithm call leaf",
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:q> ; algo:node ?n ; algo:component ?c } }",
+        ),
+        (
+            "count join",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o ?s <urn:q> ?t }",
+        ),
+    ];
+    println!("| form | rows | eager peak | streamed peak | eager ms | streamed ms |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    for (name, q) in forms {
+        let q = format!("{p}{q}");
+        let opts = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let (mut eager_ms, mut streamed_ms) = (f64::MAX, f64::MAX);
+        let (mut eager_peak, mut streamed_peak, mut rows) = (0, 0, 0);
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = query(s.snapshot(), &q, &opts).unwrap();
+            eager_ms = eager_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            eager_peak = r.mem_peak_bytes;
+            rows = r.len();
+            let t = Instant::now();
+            let mut c = select_cursor(s.snapshot(), &q, &opts, &options(4096)).unwrap();
+            while c.next_batch().unwrap().is_some() {}
+            streamed_ms = streamed_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            streamed_peak = c.stats().mem_peak_bytes;
+        }
+        println!(
+            "| {name} | {rows} | {:.1} MiB | {:.1} MiB | {eager_ms:.1} | {streamed_ms:.1} |",
+            eager_peak as f64 / 1048576.0,
+            streamed_peak as f64 / 1048576.0
         );
     }
 }

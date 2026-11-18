@@ -1195,6 +1195,8 @@ pub(super) struct RemoteRun {
     /// the inputs that the cache did not have and no request has answered, in the order
     /// they first appeared
     missing: Vec<usize>,
+    /// the bytes of the answers the inputs hold, summed as they arrive
+    held: u64,
     pub stats: LoopStats,
 }
 
@@ -1233,6 +1235,7 @@ impl RemoteRun {
             by_values: FxHashMap::default(),
             by_key: FxHashMap::default(),
             missing: Vec::new(),
+            held: 0,
             stats: LoopStats::default(),
         })
     }
@@ -1293,8 +1296,9 @@ impl RemoteRun {
                 let k = svccache::key(&ctx.service_scope, rl.endpoint.as_str(), &self.text, &kv);
                 if rl.cache.reads() {
                     input.rows = cache.get(&k);
-                    if input.rows.is_some() {
+                    if let Some(rows) = &input.rows {
                         self.stats.cache_hits += 1;
+                        self.held = self.held.saturating_add(rows.bytes());
                     }
                 } else {
                     cache.remove(&k);
@@ -1426,6 +1430,12 @@ impl RemoteRun {
                 Err(e) => failed(e, rl, chunk, inputs, unit)?,
             }
         }
+        let answered: u64 = missing
+            .iter()
+            .filter_map(|&i| self.inputs[i].rows.as_ref())
+            .map(|rows| rows.bytes())
+            .sum();
+        self.held = self.held.saturating_add(answered);
         Ok(())
     }
 
@@ -1443,11 +1453,7 @@ impl RemoteRun {
 
     /// The bytes of the answers the loop holds.
     pub(super) fn held_bytes(&self) -> u64 {
-        self.inputs
-            .iter()
-            .filter_map(|input| input.rows.as_ref())
-            .map(|rows| rows.bytes())
-            .sum()
+        self.held
     }
 
     /// Join the left rows `l`, whose inputs all have answers, with their solutions.
