@@ -1071,12 +1071,56 @@ pub(super) fn into_nominal(ix: &Index, d: Ex) -> Option<(Role, u32)> {
 }
 
 /// The constant v when the class `a` is below the singleton `N_v` through told subsumers
-/// and conjuncts alone, so that `a(t)` gives `t ≈ v` under no other premise.
+/// and conjuncts alone, so that `a(t)` gives `t ≈ v` under no other premise. The search
+/// looks at no more than [`SINGLETON_SEEN`] classes and answers `None` past them.
+///
+/// It runs on every existential the unfolding and the rules at constants meet, so it holds
+/// its classes in arrays on the stack and allocates nothing. A search whose classes to
+/// visit outgrow [`SINGLETON_OPEN`] starts again in [`singleton_of_on_heap`], which gives
+/// the same answer with vectors.
 fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
+    let mut todo = [a; SINGLETON_OPEN];
+    let mut open = 1;
+    let mut seen = [a; SINGLETON_SEEN];
+    let mut met = 0;
+    while open > 0 {
+        open -= 1;
+        let b = todo[open];
+        if seen[..met].contains(&b) {
+            continue;
+        }
+        if met == SINGLETON_SEEN {
+            return None;
+        }
+        seen[met] = b;
+        met += 1;
+        let h = ix.head(b);
+        let told = ix.told_of(h);
+        let conj = match h.node {
+            Node::Nominal(v) => return Some(v),
+            Node::Conj(p, q) => Some((p, q)),
+            _ => None,
+        };
+        if open + 2 + told.len() > SINGLETON_OPEN {
+            return singleton_of_on_heap(ix, a);
+        }
+        if let Some((p, q)) = conj {
+            todo[open] = p;
+            todo[open + 1] = q;
+            open += 2;
+        }
+        todo[open..open + told.len()].copy_from_slice(told);
+        open += told.len();
+    }
+    None
+}
+
+/// [`singleton_of`] with vectors, for a search that outgrows its arrays.
+fn singleton_of_on_heap(ix: &Index, a: Ex) -> Option<u32> {
     let mut todo = vec![a];
     let mut seen: Vec<Ex> = Vec::new();
     while let Some(b) = todo.pop() {
-        if seen.contains(&b) || seen.len() > 64 {
+        if seen.contains(&b) || seen.len() == SINGLETON_SEEN {
             continue;
         }
         seen.push(b);
@@ -1090,6 +1134,12 @@ fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
     }
     None
 }
+
+/// The classes [`singleton_of`] looks at for one existential, at most.
+const SINGLETON_SEEN: usize = 65;
+
+/// The classes [`singleton_of`] holds on the stack to visit.
+const SINGLETON_OPEN: usize = 256;
 
 /// Whether a hypothetical successor sends its conclusions with an empty body over constants
 /// and their successor terms to the root as facts in place of keeping them, item 804's
