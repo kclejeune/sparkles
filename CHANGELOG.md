@@ -23,7 +23,9 @@ insert or a patch under such a limit, whose graphs are checked as it is staged, 
 take the bulk path. A dry run of a load or a replacement through a transaction is no
 longer refused by an in-memory dataset's memory limit while its sources are parsed. It
 returns a preview that reports the refusal the write itself gets, as a dry run on the
-bulk path does, which corrects the dry run of a large first PUT into an empty in-memory
+bulk path does, with the sizes of the check that refused it. The refusal comes before a
+rejection by the guard, and for a replacement before a failed precondition too, since the
+write meets them in that order. This corrects the dry run of a large first PUT into an empty in-memory
 dataset and of a large POST into one with data. Durability, the write-ahead log and the
 on-disk formats are unchanged.
 

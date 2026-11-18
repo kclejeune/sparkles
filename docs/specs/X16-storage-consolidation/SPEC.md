@@ -666,8 +666,10 @@ at the write's deadline whichever plan runs. Before, a load into a store with da
 restricted write and a probe skipped at a saturated bound parsed such a stream without
 that check. A dry run of a transactional load or replacement into an in-memory store is
 no longer refused by the memory limit while its sources are parsed. The first refusal is
-kept and reported in the preview, which then gives the error the write itself gets, with
-or without a net change. On `atlas`, with
+kept with its sizes and its stage, the parse of a load or the preparation of a
+replacement before its transaction opens, and the preview then gives the outcome and the
+error the write itself gets in the order it meets its checks, with or without a net
+change. On `atlas`, with
 base `8baa5686` and the phase's load path at `2c08d2b0` interleaved, `sparkles load` of
 1.05M quads into an empty store took a median 0.558 s on the base and 0.557 s on the
 phase over seven rounds, and 10.5M quads took 4.448 s and 4.418 s over five, with peak

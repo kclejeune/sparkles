@@ -634,6 +634,9 @@ fn a_dry_run_over_the_memory_limit_is_previewed() {
         assert_eq!(p.error(), Some(e.to_string()), "{name}");
         assert_eq!(p.commit.as_ref().map(|c| c.inserted), inserted, "{name}");
         assert!(p.commit.as_ref().is_none_or(|c| !c.bulk), "{name}");
+        // the sizes are those of the check that refused it, with or without a commit
+        let (projected, limit) = (p.storage.projected.unwrap(), p.storage.limit.unwrap());
+        assert!(projected > limit, "{name}: {projected} <= {limit}");
         assert_eq!(s.snapshot().len(), before, "{name}");
     }
 }

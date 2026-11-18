@@ -52,6 +52,24 @@ pub struct StorageCheck {
     pub used: Option<u64>,
     /// the bytes the check compared with the limit
     pub projected: Option<u64>,
+    /// when the check that refused the write runs among the write's other checks
+    pub stage: RefusalStage,
+}
+
+/// When the storage check of a previewed write runs, which decides whether its refusal
+/// comes before a failed precondition or a rejection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefusalStage {
+    /// with the commit, after the precondition, and before or after the validation as
+    /// [`Preview::outcome`] describes for each path
+    #[default]
+    Commit,
+    /// while a transaction parses its sources, after the precondition and before the
+    /// validation
+    Parse,
+    /// before the write opens its transaction, ahead of the precondition and the
+    /// validation
+    Prepare,
 }
 
 /// How a previewed write would end.
@@ -136,8 +154,16 @@ impl Preview {
     /// How the write would end: the first refusal it would meet, in the order the write
     /// checks them, else whether it would commit.
     pub fn outcome(&self) -> Outcome {
+        let refused = self.storage.refused.is_some();
+        let stage = self.storage.stage;
+        if refused && stage == RefusalStage::Prepare {
+            return Outcome::StorageRefused;
+        }
         if matches!(self.precondition, Some(Err(_))) {
             return Outcome::PreconditionFailed;
+        }
+        if refused && stage == RefusalStage::Parse {
+            return Outcome::StorageRefused;
         }
         // a write without a net change can still be refused, by an in-memory limit
         // that its sources pass while they are parsed
@@ -149,7 +175,6 @@ impl Preview {
             };
         };
         let rejected = self.rejected();
-        let refused = self.storage.refused.is_some();
         // a write through the WAL validates before it checks the storage; a bulk write
         // measures the generation it built before validating it
         match (c.bulk, rejected, refused) {

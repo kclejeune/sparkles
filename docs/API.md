@@ -3545,7 +3545,7 @@ refuses it like any write.
 | `changes` | With `changes=N`. `total` counts every changed quad, and `quads` lists the first `N`, removals first, in the form of [diffs](#diffs-between-commits). |
 | `validation` | The write-time validation summary the write would get, in the guard's mode, including grandfather mode. Absent when no guard runs. |
 | `precondition` | With `If-Match` or `If-None-Match`, whether the condition holds, with the `error` the write would get when it does not. |
-| `storage` | Whether the write fits. With a [storage quota](#storage-quotas), `limit`, `used` and `projected` give the bytes before and after the write. A refusal has the `error` and its `budget` or `code`. |
+| `storage` | Whether the write fits. With a [storage quota](#storage-quotas), `limit`, `used` and `projected` give the bytes before and after the write, and an in-memory dataset gives `limit` and `projected`. A refusal has the `error` and its `budget` or `code`, with the sizes of the check that refused it. |
 
 The status is the one the write would get. A write that would succeed answers `200`. A
 write that a failed precondition would stop answers `412`, one the guard would reject
@@ -3553,7 +3553,11 @@ answers `422`, and one the quota would refuse answers `507`. Each of these still
 the whole preview, with every check evaluated, plus the `error`, `code`, `budget` and
 `validation` members of the real error. When several apply, the status is the one the
 write would meet first: the precondition, then the validation, then the storage, except
-that a bulk write measures its new generation before it validates it. Any other failure,
+that a bulk write measures its new generation before it validates it. A load or a
+replacement through a transaction checks an in-memory dataset's size limit while it
+parses its body, before the validation, and a PUT does so before its precondition too. A
+dry run builds the whole state the write would leave, so that limit does not bound the
+memory a preview takes, while its deadline and cancellation still apply. Any other failure,
 such as a syntax error, a missing permission or a timeout, is the write's own error.
 Responses carry `Sparkles-Dry-Run: true` and `Sparkles-Dry-Run-Outcome` with the
 outcome, and `Sparkles-Validation` when a guard ran.

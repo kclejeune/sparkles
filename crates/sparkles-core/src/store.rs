@@ -5034,39 +5034,43 @@ impl Store {
     /// Before `quads` parsed quads are encoded into a transaction of an in-memory store
     /// (which adds their terms to its vocabulary even if the commit is refused later):
     /// `StorageFull` when their delta alone would pass the limit. A dry run writes
-    /// nothing and rolls its terms back, so it is not refused here: its first refusal is
-    /// kept in `refused`, and `with_early_refusal` puts it in the preview, which then
-    /// reports the refusal the write itself would get.
+    /// nothing and rolls its terms back, so it is not refused here: the check that first
+    /// refuses it, which runs at `stage` among the write's checks, is kept in `early`, and
+    /// `with_early_refusal` puts it in the preview, which then reports the refusal and the
+    /// sizes the write itself would get.
     fn check_memory_before(
         &self,
         quads: usize,
         o: &crate::guard::WriteOptions,
-        refused: &mut Option<Error>,
+        stage: crate::preview::RefusalStage,
+        early: &mut Option<crate::preview::StorageCheck>,
     ) -> Result<()> {
-        if self.root.is_some() || self.opts.max_memory_bytes.is_none() || refused.is_some() {
+        if self.root.is_some() || self.opts.max_memory_bytes.is_none() || early.is_some() {
             return Ok(());
         }
-        match self.check_memory_parsed(quads) {
+        let snap = self.snapshot();
+        let now = snap.generation.disk_bytes()
+            + delta_bytes(&snap.delta)
+            + snap.generation.dvocab.with(|v| v.bytes()) as u64;
+        let size = now.saturating_add((quads as u64).saturating_mul(DELTA_QUAD_BYTES));
+        match self.check_memory(size) {
             Err(e) if o.dry_run.is_some() => {
-                *refused = Some(e);
+                *early = Some(crate::preview::StorageCheck {
+                    refused: Some(e),
+                    limit: self.opts.max_memory_bytes,
+                    used: None,
+                    projected: self.memory_with_configuration(size).ok(),
+                    stage,
+                });
                 Ok(())
             }
             r => r,
         }
     }
 
-    /// The test of [`check_memory_before`](Self::check_memory_before).
-    fn check_memory_parsed(&self, quads: usize) -> Result<()> {
-        let snap = self.snapshot();
-        let now = snap.generation.disk_bytes()
-            + delta_bytes(&snap.delta)
-            + snap.generation.dvocab.with(|v| v.bytes()) as u64;
-        self.check_memory(now + quads as u64 * DELTA_QUAD_BYTES)
-    }
-
-    /// In-memory stores stay within [`StoreOptions::max_memory_bytes`]: `StorageFull`
-    /// when a commit would make the data about `size` bytes.
-    fn check_memory(&self, size: u64) -> Result<()> {
+    /// `size` bytes of data with the retained history of the managed configuration, which
+    /// an in-memory store's limit also counts.
+    fn memory_with_configuration(&self, size: u64) -> Result<u64> {
         let history = self.family.managed.load();
         let configuration = match history.as_deref() {
             Some(crate::managed::ManagedState::Installed(i)) => {
@@ -5074,9 +5078,14 @@ impl Store {
             }
             _ => 0,
         };
-        let size = size
-            .checked_add(configuration)
-            .ok_or_else(|| Error::invalid("dataset memory size overflow"))?;
+        size.checked_add(configuration)
+            .ok_or_else(|| Error::invalid("dataset memory size overflow"))
+    }
+
+    /// In-memory stores stay within [`StoreOptions::max_memory_bytes`]: `StorageFull`
+    /// when a commit would make the data about `size` bytes.
+    fn check_memory(&self, size: u64) -> Result<()> {
+        let size = self.memory_with_configuration(size)?;
         match self.opts.max_memory_bytes {
             Some(max) if self.root.is_none() && size > max => {
                 let h = crate::error::human_bytes;
@@ -5301,7 +5310,7 @@ impl Store {
             let mut txn = self.try_write_with(kind, o.clone())?;
             let mut prefixes = BTreeMap::new();
             let mut parsed = 0;
-            let mut refused = None;
+            let mut early = None;
             let prepared = (|| -> Result<()> {
                 for s in sources {
                     o.check()?;
@@ -5311,7 +5320,12 @@ impl Store {
                         if parsed % 65_536 == 1 {
                             o.check()?;
                         }
-                        self.check_memory_before(parsed, o, &mut refused)?;
+                        self.check_memory_before(
+                            parsed,
+                            o,
+                            crate::preview::RefusalStage::Parse,
+                            &mut early,
+                        )?;
                         let ids = txn.encode_quad(&q, &mut labels)?;
                         txn.insert(ids)?;
                         Ok(())
@@ -5333,7 +5347,7 @@ impl Store {
                 txn.guard.next_bnode = txn.start_bnode;
                 return Err(error);
             }
-            let r = with_early_refusal(txn.commit(), refused)?;
+            let r = with_early_refusal(txn.commit(), early)?;
             self.add_prefixes(prefixes)?;
             Ok(r)
         }
@@ -5410,8 +5424,14 @@ impl Store {
             prefixes.extend(p);
             parsed.push(quads);
         }
-        let mut refused = None;
-        self.check_memory_before(parsed.iter().map(Vec::len).sum(), o, &mut refused)?;
+        // the transaction checks the precondition when it opens, after this check
+        let mut early = None;
+        self.check_memory_before(
+            parsed.iter().map(Vec::len).sum(),
+            o,
+            crate::preview::RefusalStage::Prepare,
+            &mut early,
+        )?;
         let mut txn = self.try_write_with(kind, o.clone())?;
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
@@ -5461,7 +5481,7 @@ impl Store {
         drop(keep);
         let n = ids.len() as u64;
         txn.insert_bulk(ids)?;
-        let r = with_early_refusal(txn.commit(), refused)?;
+        let r = with_early_refusal(txn.commit(), early)?;
         self.add_prefixes(prefixes)?;
         Ok((n, r))
     }
@@ -7558,13 +7578,13 @@ fn guard_required_by(root: &Path) -> bool {
     }
 }
 
-/// A dry run's preview with `refused`, the memory refusal its sources met while they were
-/// parsed, which the write itself gets before its commit checks the storage, so that the
-/// preview reports that refusal, with or without a net change.
-fn with_early_refusal<T>(r: Result<T>, refused: Option<Error>) -> Result<T> {
-    match (r, refused) {
-        (Err(Error::DryRun(mut p)), Some(e)) => {
-            p.storage.refused = Some(e);
+/// A dry run's preview with `early`, the memory check that refused its sources before
+/// they were encoded, which the write itself meets before its commit checks the storage,
+/// so that the preview reports that refusal and its sizes, with or without a net change.
+fn with_early_refusal<T>(r: Result<T>, early: Option<crate::preview::StorageCheck>) -> Result<T> {
+    match (r, early) {
+        (Err(Error::DryRun(mut p)), Some(s)) => {
+            p.storage = s;
             Err(Error::DryRun(p))
         }
         (r, _) => r,
