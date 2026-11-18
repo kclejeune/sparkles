@@ -417,7 +417,7 @@ serialized its answer a median of 65 µs after the handler started. A streamed r
 woke a blocking-pool thread to open its cursor, woke the handler to receive the cursor
 and woke a second pool thread to write the body. Each pool wake took either about 10 µs
 or about 80 µs per request, so their means are the useful measure, 35 to 80 µs for the
-open's wake and 32 to 73 µs for the producer's across the nine queries, with 8 to 10 µs
+open's wake and 32 to 73 µs for the producer's across the nine queries, with medians of 8 to 10 µs
 for the return to the handler. The plan therefore predicts savings in wakes removed and
 judges them by per-request deltas. Three changes follow, and they differ in what they change for a
 client.

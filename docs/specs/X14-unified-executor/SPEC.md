@@ -1288,7 +1288,7 @@ after the handler started. A streamed request woke a blocking-pool thread to ope
 cursor, woke the handler to receive the cursor and woke a second pool thread to write
 the body. Each pool wake took either about 10 µs or about 80 µs, and their means across
 the nine queries were 35 to 80 µs for the open's wake and 32 to 73 µs for the
-producer's, with 8 to 10 µs for the return to the handler. The end of the body, from the
+producer's, with medians of 8 to 10 µs for the return to the handler. The end of the body, from the
 last write to the producer's finish, took 49 to 85 µs on average. On `count-all` the
 cursor's open took a median of 59 µs against the eager run's 45 µs, and the first batch
 with its write 42 µs against the eager serialization's 8 µs. The same build answered a streamed request whole, without the
