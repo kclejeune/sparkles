@@ -3089,3 +3089,84 @@ mod proof_cache_tests {
         assert!(get(&key, &other).is_none());
     }
 }
+
+#[cfg(test)]
+mod program_identity_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    /// The demand programs of `rdfs` and `owl-rl` for LUBM-style patterns, printed rule by
+    /// rule, to compare two builds (item 839's plan, §20.6). Run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_profile_demand_programs() {
+        const UB: &str = "http://swat.cse.lehigh.edu/onto/univ-bench.owl#";
+        let ttl = format!(
+            "@prefix ub: <{UB}> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+             @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+             ub:GraduateStudent rdfs:subClassOf ub:Student . ub:takesCourse rdfs:domain ub:Student . \
+             ub:memberOf owl:inverseOf ub:member . ub:subOrganizationOf a owl:TransitiveProperty . \
+             ub:worksFor rdfs:subPropertyOf ub:memberOf . <http://ex.org/s> ub:takesCourse <http://ex.org/c> ."
+        );
+        for profile in [Profile::Rdfs, Profile::OwlRl] {
+            let store = Store::in_memory(StoreOptions::default());
+            store
+                .load(&[Source::from_bytes(
+                    ttl.clone().into_bytes(),
+                    RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+            let name = profile.name().to_string();
+            let reasoner =
+                QueryReasoner::new(profile, &crate::Extras::default(), crate::Inputs::default())
+                    .unwrap();
+            let mut session = Session::new(
+                reasoner.shared.clone(),
+                SessionRequest {
+                    snap: store.snapshot(),
+                    readable: None,
+                    stop: Arc::new(|| Ok(())),
+                    max_memory: None,
+                    no_cache: true,
+                },
+            )
+            .unwrap();
+            session.make_graph().unwrap();
+            let id = |iri: &str| {
+                session
+                    .terms
+                    .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(iri)))
+                    .unwrap()
+            };
+            let ty = id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+            let keys = [
+                Key::new(false, KeyP::Const(ty), true).with_class(id(&format!("{UB}Student"))),
+                Key::new(true, KeyP::Const(id(&format!("{UB}memberOf"))), false),
+                Key::new(
+                    false,
+                    KeyP::Const(id(&format!("{UB}subOrganizationOf"))),
+                    true,
+                ),
+                Key::new(true, KeyP::Free, false),
+                Key::new(false, KeyP::Free, false),
+            ];
+            for (ki, k) in keys.iter().enumerate() {
+                let rules: Vec<CRule> = session
+                    .compiled
+                    .rules()
+                    .iter()
+                    .map(CRule::clone_shallow)
+                    .collect();
+                let program = session.transform(&rules, &[*k], Pass::Plain).unwrap();
+                for (si, st) in program.stages.iter().enumerate() {
+                    for r in &st.rules {
+                        eprintln!("ident {name} key{ki} stage{si} {r:?}");
+                    }
+                }
+            }
+        }
+    }
+}
