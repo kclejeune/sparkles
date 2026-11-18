@@ -62,12 +62,12 @@
   ts: ManchesterToken[],
 )}{#each ts as t, i (i)}{#if t.role === 'name' && t.iri}{@const to =
         t.iri}{#if to !== iri && href?.(to)}<a class="iri-link" href={href(to)} title={to}
-          >{t.text}</a
+          >{name(to)}</a
         >{:else if to !== iri && onopen}<button
           class="iri-link"
           title={to}
-          onclick={() => onopen?.(to)}>{t.text}</button
-        >{:else}<span title={to}>{t.text}</span>{/if}{:else if t.role === 'kw'}<span class="kw"
+          onclick={() => onopen?.(to)}>{name(to)}</button
+        >{:else}<span title={to}>{name(to)}</span>{/if}{:else if t.role === 'kw'}<span class="kw"
         >{t.text}</span
       >{:else}{t.text}{/if}{/each}{/snippet}
 
