@@ -245,7 +245,7 @@ impl Converter<'_> {
             };
             let before = self.local_aggregate_errors.len();
             self.contexts(g, &e, &eplace, Scope::Local);
-            for (p, m) in self.local_aggregate_errors[before..].to_vec() {
+            for (p, m) in self.local_aggregate_errors[before..].iter().cloned() {
                 self.report.approximated(
                     p,
                     format!("aggregateErrors {m} on one endpoint applies to the whole dataset"),
