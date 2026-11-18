@@ -149,7 +149,8 @@ pub(super) fn same_as_reference_on(
                 Ok(reference::check::Outcome::Compared) => {}
                 Ok(
                     reference::check::Outcome::Skipped(why)
-                    | reference::check::Outcome::OrderUnchecked(why),
+                    | reference::check::Outcome::OrderUnchecked(why)
+                    | reference::check::Outcome::Partial(why),
                 ) => skip(why),
                 Err(m) => panic!("against the reference: {m}: {text}"),
             }
@@ -600,6 +601,15 @@ fn count_joins_from_key_runs() {
         "CountJoinFromRuns"
     ));
     same_rows(&s, q);
+    // an ASK answer, true and false, compares with the reference's
+    for (q, expected) in [
+        ("ASK { ?a ex:knows ?b }", true),
+        ("ASK { ?a ex:knows ex:nobody }", false),
+    ] {
+        let r = run(&s, q, Optimizations::ALL);
+        assert_eq!(r.boolean, expected, "{q}");
+        same_as_reference(&s, q, &r);
+    }
     // updates are visible
     update(
         &s,

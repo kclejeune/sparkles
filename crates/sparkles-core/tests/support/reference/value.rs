@@ -190,6 +190,38 @@ impl Num {
         }
     }
 
+    /// The order of the two numbers by their exact values, which every finite `float`,
+    /// `double`, `decimal` and `integer` has, with the infinities at the ends. Unlike the
+    /// order after promotion, it is transitive across datatypes. Neither may be NaN.
+    pub fn exact_cmp(self, other: Num) -> Ordering {
+        match (self, other) {
+            (Num::Int(a), Num::Int(b)) => return a.cmp(&b),
+            (Num::Flt(_) | Num::Dbl(_), Num::Flt(_) | Num::Dbl(_)) => {
+                return self.to_f64().total_cmp(&other.to_f64());
+            }
+            _ => {}
+        }
+        if let (Some(a), Some(b)) = (self.to_decimal(), other.to_decimal()) {
+            return a.cmp(&b);
+        }
+        let (x, y) = (self.to_f64(), other.to_f64());
+        if x.is_infinite() || y.is_infinite() || (x - y).abs() > 1e-9 * x.abs().max(y.abs()) {
+            // the conversions err far less than the gap
+            return x.total_cmp(&y);
+        }
+        exact_decimal_cmp(&self.exact_decimal(), &other.exact_decimal())
+    }
+
+    /// The exact value of a finite number as a decimal numeral.
+    fn exact_decimal(self) -> String {
+        match self {
+            Num::Int(i) => i.to_string(),
+            Num::Dec(d) => d.to_string(),
+            // a double has at most 1074 digits after the point, which this prints exactly
+            Num::Flt(_) | Num::Dbl(_) => format!("{:.1100}", self.to_f64()),
+        }
+    }
+
     pub fn is_nan(self) -> bool {
         match self {
             Num::Flt(f) => f.is_nan(),
@@ -500,6 +532,36 @@ fn class(t: Option<&Term>) -> u8 {
     }
 }
 
+/// The order of two decimal numerals, such as `-12.50`, by their values.
+fn exact_decimal_cmp(a: &str, b: &str) -> Ordering {
+    // the sign, the integer digits without leading zeros and the fraction digits
+    // without trailing zeros
+    let parts = |s: &str| -> (bool, String, String) {
+        let (neg, s) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let (i, f) = s.split_once('.').unwrap_or((s, ""));
+        let i = i.trim_start_matches('0').to_string();
+        let f = f.trim_end_matches('0').to_string();
+        let zero = i.is_empty() && f.is_empty();
+        (neg && !zero, i, f)
+    };
+    let (an, ai, af) = parts(a);
+    let (bn, bi, bf) = parts(b);
+    let magnitude = ai
+        .len()
+        .cmp(&bi.len())
+        .then_with(|| ai.cmp(&bi))
+        .then_with(|| af.cmp(&bf));
+    match (an, bn) {
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+        (false, false) => magnitude,
+        (true, true) => magnitude.reverse(),
+    }
+}
+
 /// What the specification orders: `Some` where SPARQL 1.1 §15.1 and the operator
 /// mapping of §17.3 define the order of the two terms, and `None` for the pairs that
 /// it leaves to the implementation, such as an integer against a string.
@@ -510,8 +572,8 @@ pub fn spec_order(a: Option<&Term>, b: Option<&Term>) -> Option<Ordering> {
     }
     match (a, b) {
         (None, None) => Some(Ordering::Equal),
-        // blank nodes have no order among themselves
-        (Some(Term::BlankNode(_)), Some(Term::BlankNode(_))) => None,
+        // distinct blank nodes have no order among themselves, and one is equal to itself
+        (Some(Term::BlankNode(x)), Some(Term::BlankNode(y))) => (x == y).then_some(Ordering::Equal),
         (Some(Term::NamedNode(x)), Some(Term::NamedNode(y))) => Some(x.as_str().cmp(y.as_str())),
         // SPARQL 1.2 section 15.1 leaves two triple terms unordered
         (Some(Term::Triple(x)), Some(Term::Triple(y))) => (x == y).then_some(Ordering::Equal),
@@ -542,9 +604,10 @@ fn literal_order(x: &Literal, y: &Literal) -> Option<Ordering> {
 
 /// A total order that extends [`spec_order`], for sorting. Each literal falls into a
 /// group, numbers first, then simple strings, booleans, date-times and everything else.
-/// The groups are ordered among themselves, and the terms of a group by value, so the
-/// order stays transitive where the specification leaves pairs open. Ties of value fall
-/// back to the datatype, the lexical form and the language.
+/// The groups are ordered among themselves, and the terms of a group by value, numbers by
+/// their exact values, so the order stays transitive where the specification leaves pairs
+/// open or promotion makes them equal. Ties of value fall back to the datatype, the
+/// lexical form and the language.
 pub fn total_order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
     let (ca, cb) = (class(a), class(b));
     if ca != cb {
@@ -557,11 +620,14 @@ pub fn total_order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
                 .then_with(|| match gx {
                     0 => {
                         let (p, q) = (numeric(x).unwrap(), numeric(y).unwrap());
-                        // NaN first, then by value
-                        q.is_nan().cmp(&p.is_nan()).then_with(|| {
-                            p.compare(q)
-                                .unwrap_or_else(|| p.to_f64().total_cmp(&q.to_f64()))
-                        })
+                        // NaN first, then by exact value, which keeps the order transitive
+                        // where promotion makes values of different datatypes equal
+                        match (p.is_nan(), q.is_nan()) {
+                            (true, true) => Ordering::Equal,
+                            (true, false) => Ordering::Less,
+                            (false, true) => Ordering::Greater,
+                            (false, false) => p.exact_cmp(q),
+                        }
                     }
                     1 => x.value().cmp(y.value()),
                     2 => boolean(x).cmp(&boolean(y)),

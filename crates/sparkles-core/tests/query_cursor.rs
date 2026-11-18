@@ -3167,7 +3167,7 @@ fn differential(
     // before failing, for triage.
     let keep_going = std::env::var_os("SPARKLES_REFERENCE_KEEP_GOING").is_some();
     let disagreements = std::cell::Cell::new(0);
-    let (mut skipped, mut unordered, mut readings) = (0, 0, 0);
+    let (mut skipped, mut unordered, mut partial, mut readings) = (0, 0, 0, 0);
     for seed in 1..=seeds {
         let shape = Gen::new(seed).query();
         let q = &shape.query;
@@ -3185,6 +3185,7 @@ fn differential(
                 Ok(reference::check::Outcome::Compared) => {}
                 Ok(reference::check::Outcome::Skipped(_)) => skipped += 1,
                 Ok(reference::check::Outcome::OrderUnchecked(_)) => unordered += 1,
+                Ok(reference::check::Outcome::Partial(_)) => partial += 1,
                 Err(m) => {
                     eprintln!("{name} seed {seed}, {what} against the reference: {m}: {q}");
                     disagreements.set(disagreements.get() + 1);
@@ -3214,7 +3215,7 @@ fn differential(
     eprintln!(
         "{name}: of {seeds} queries and their five answers each, {skipped} answers have rows \
          that the specification leaves open, {unordered} were compared without their order, \
-         and {readings} queries compare under the engine's reading of an open roadmap item"
+         {partial} were compared with some cells only in part, and {readings} queries compare under the engine's reading of an open roadmap item"
     );
     assert_eq!(
         disagreements.get(),
@@ -5116,14 +5117,18 @@ fn reference_evaluator_review_cases() {
             iri("urn:g2").into(),
         ),
     ];
-    let r = reference::Reference::new(quads);
+    let r = reference::Reference::new(quads.clone()).with_spec_readings(true);
+    let jena = reference::Reference::new(quads);
     let rows = |q: &str| reference_select(&r, q, "review").1;
     let one = |q: &str| rows(q).remove(0).remove(0);
     let int = |n: i32| Some(Term::Literal(Literal::from(n)));
     let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
 
-    // 1: a negated property set gives a pair once
-    assert_eq!(rows("SELECT ?o WHERE { <urn:a> !<urn:z> ?o }").len(), 1);
+    // 1: a negated property set gives a pair once, and under Jena's reading once for each
+    // triple
+    let nps = "SELECT ?o WHERE { <urn:a> !<urn:z> ?o }";
+    assert_eq!(rows(nps).len(), 1);
+    assert_eq!(reference_select(&jena, nps, "review").1.len(), 2);
     // 2: BNODE(label) is a new blank node for each solution that an aggregate reads
     assert_eq!(
         one("SELECT (COUNT(DISTINCT BNODE(\"x\")) AS ?n) WHERE { VALUES ?v { 1 2 } }"),
@@ -5173,26 +5178,27 @@ fn reference_evaluator_review_cases() {
     assert_eq!(cast("1.5e0"), string("1.5"));
     assert_eq!(cast("1.0e-7"), string("1.0E-7"));
     assert_eq!(cast("2.50"), string("2.5"));
-    // 9: a back-reference is unsupported, not an error, and \b is no XPath escape
+    // 9: a back-reference is unsupported, not an error, and \b is no XPath escape, which
+    // Jena reads as Java's word boundary
     assert!(matches!(
         r.run("SELECT (REGEX(\"aa\", \"(a)\\\\1\") AS ?r) WHERE {}", None),
         Err(reference::Error::Unsupported(_))
     ));
-    assert_eq!(
-        one("SELECT (REGEX(\"a b\", \"a\\\\b\") AS ?r) WHERE {}"),
-        None
-    );
+    let boundary = "SELECT (REGEX(\"a b\", \"a\\\\b\") AS ?r) WHERE {}";
+    assert_eq!(one(boundary), None);
+    assert!(matches!(
+        jena.run(boundary, None),
+        Err(reference::Error::Unsupported(_))
+    ));
     assert_eq!(
         one("SELECT (REGEX(\"a\\rb\", \"a.b\") AS ?r) WHERE {}"),
         Some(Term::Literal(Literal::from(false)))
     );
-    // 10: the default graph of two FROM clauses keeps their blank nodes apart
+    // 10: the default graph of two FROM clauses keeps their blank nodes apart, and Jena's
+    // reading takes their union
     let from = "SELECT ?s FROM <urn:g1> FROM <urn:g2> WHERE { ?s <urn:p> ?x ; <urn:q> ?y }";
-    let (_, merged, notes) = reference_select(&r, from, "review");
-    assert!(merged.is_empty() && notes.from_shares_blank_nodes);
-    r.set_union_of_from_graphs(true);
-    assert_eq!(reference_select(&r, from, "review").1.len(), 1);
-    r.set_union_of_from_graphs(false);
+    assert!(rows(from).is_empty());
+    assert_eq!(reference_select(&jena, from, "review").1.len(), 1);
     // 11: two triple terms are unordered
     use reference::value::spec_order;
     let triple = |s: &str| {
@@ -5216,21 +5222,21 @@ fn reference_evaluator_review_cases() {
 
     let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
     let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    // 13: a RAND column is open, and the rows still count
+    // 13: a RAND column is open, and the rows still count, in a partial comparison
     let s13 = selected("SELECT ?v (RAND() AS ?r) WHERE { VALUES ?v { 1 2 } }");
     let rand = |v: i32, x: f64| vec![int(v), Some(Term::Literal(Literal::from(x)))];
-    assert_eq!(
+    assert!(matches!(
         check_select(&s13, &vars(&["v", "r"]), &[rand(1, 0.25), rand(2, 0.5)]),
-        Ok(Outcome::Compared)
-    );
+        Ok(Outcome::Partial(_))
+    ));
     assert!(check_select(&s13, &vars(&["v", "r"]), &[rand(1, 0.25)]).is_err());
     // 14: an open MIN keeps the COUNT beside it compared
     let s14 = selected("SELECT (MIN(?x) AS ?m) (COUNT(*) AS ?n) WHERE { VALUES ?x { 1 \"a\" } }");
     assert!(check_select(&s14, &vars(&["m", "n"]), &[]).is_err());
-    assert_eq!(
+    assert!(matches!(
         check_select(&s14, &vars(&["m", "n"]), &[vec![string("a"), int(2)]]),
-        Ok(Outcome::Compared)
-    );
+        Ok(Outcome::Partial(_))
+    ));
     // 16: a slice must be one of an order that ORDER BY allows
     let s16 = selected(
         "SELECT ?y WHERE { VALUES (?x ?y) { (1 \"a\") (2 \"b\") (2 \"c\") (3 \"d\") } } ORDER BY ?x LIMIT 2",
@@ -5281,6 +5287,223 @@ fn reference_evaluator_review_cases() {
         check_select(&open_rows, &vars(&["v"]), &[]),
         Ok(Outcome::Skipped(_))
     ));
+}
+
+/// The cases of the second review of the reference evaluator, each of which the
+/// evaluator or the comparison got wrong before its fix.
+#[test]
+fn reference_evaluator_review_round_2_cases() {
+    use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
+    use reference::check::{Expected, Outcome, check_select, under_engine_readings};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let int = |n: i64| Some(Term::Literal(Literal::from(n)));
+    let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
+    let boolean = |b: bool| Some(Term::Literal(Literal::from(b)));
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let col = |v: Vec<Option<Term>>| v.into_iter().map(|x| vec![x]).collect::<Vec<_>>();
+    let b = BlankNode::new_unchecked("b");
+    let (a1, b2) = (
+        BlankNode::new_unchecked("a1"),
+        BlankNode::new_unchecked("b2"),
+    );
+    let quads = vec![
+        Quad::new(
+            b.clone(),
+            iri("urn:p"),
+            Literal::from(1),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            b.clone(),
+            iri("urn:p"),
+            Literal::from(2),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(a1.clone(), iri("urn:p"), Literal::from(1), iri("urn:g1")),
+        Quad::new(b2.clone(), iri("urn:q"), Literal::from(2), iri("urn:g2")),
+    ];
+    let r = reference::Reference::new(quads.clone());
+    let spec = reference::Reference::new(quads).with_spec_readings(true);
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+    let regex = |q: &str| r.run(q, None);
+    let one = |q: &str| match r.run(q, None) {
+        Ok(reference::Answer::Select { mut rows, .. }) => rows.remove(0).remove(0),
+        other => panic!("{other:?}: {q}"),
+    };
+
+    // 1: whether an open value is bound is open, in BOUND and in a join
+    let s1 = selected("SELECT ?x WHERE { BIND(IF(RAND() < 0.5, 1, 1/0) AS ?x) FILTER(BOUND(?x)) }");
+    assert!(s1.rows_open);
+    let s1b = selected("SELECT ?x WHERE { BIND(IF(RAND() < 0.5, 1, 1/0) AS ?x) VALUES ?x { 2 } }");
+    assert!(s1b.rows_open);
+    // 2: the readings are taken until no new one is met
+    let q2 = "SELECT (IF(BOUND(?m), STRSTARTS(\"Ada\"@en--ltr, \"A\"@en), false) AS ?x) \
+              WHERE { { SELECT (MIN(?v) AS ?m) WHERE { VALUES ?v { UNDEF 1 } } } }";
+    let Expected::Select(s2) = under_engine_readings(&r, q2).unwrap().0 else {
+        panic!("a SELECT answer");
+    };
+    assert_eq!(s2.rows, vec![vec![boolean(true)]]);
+    // 3: an open second key keeps the order of the first
+    let s3 = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
+    assert!(check_select(&s3, &vars(&["x"]), &col(vec![int(2), int(1)])).is_err());
+    let s3b = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND() LIMIT 1");
+    assert!(check_select(&s3b, &vars(&["x"]), &col(vec![int(2)])).is_err());
+    assert_eq!(
+        check_select(&s3b, &vars(&["x"]), &col(vec![int(1)])),
+        Ok(Outcome::Compared)
+    );
+    // 4: DISTINCT over copies with different keys leaves the order unchecked, not passed
+    let s4 = selected(
+        "SELECT DISTINCT ?y WHERE { VALUES (?x ?y) { (0 \"c\") (1 \"a\") (2 \"b\") (3 \"a\") (4 \"d\") } } ORDER BY ?x",
+    );
+    let got4 = col(["a", "c", "b", "d"].map(string).to_vec());
+    assert!(matches!(
+        check_select(&s4, &vars(&["y"]), &got4),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    // 5: the order of numbers is transitive across datatypes
+    let xsd = |l: &str, d: &str| {
+        Term::Literal(Literal::new_typed_literal(
+            l,
+            iri(&format!("http://www.w3.org/2001/XMLSchema#{d}")),
+        ))
+    };
+    let terms = [
+        xsd("16777216", "integer"),
+        xsd("16777217", "decimal"),
+        xsd("16777216", "float"),
+        xsd("16777217", "integer"),
+        xsd("0.1", "decimal"),
+        xsd("0.1", "float"),
+        xsd("0.1", "double"),
+        xsd("1", "integer"),
+        xsd("1.0", "decimal"),
+        xsd("1E0", "double"),
+        xsd("-0", "double"),
+        xsd("0", "integer"),
+        xsd("INF", "float"),
+        xsd("-INF", "double"),
+        xsd("NaN", "double"),
+        xsd("170141183460469231731687303715884105727", "integer"),
+        xsd("1.7014118346046923E38", "double"),
+    ];
+    use reference::value::{spec_order, total_order};
+    use std::cmp::Ordering;
+    for x in &terms {
+        for y in &terms {
+            let o = total_order(Some(x), Some(y));
+            assert_eq!(o, total_order(Some(y), Some(x)).reverse(), "{x} {y}");
+            if spec_order(Some(x), Some(y)) == Some(Ordering::Less) {
+                assert_eq!(o, Ordering::Less, "{x} {y}");
+            }
+            for z in &terms {
+                if o.is_le() && total_order(Some(y), Some(z)).is_le() {
+                    assert!(total_order(Some(x), Some(z)).is_le(), "{x} {y} {z}");
+                }
+            }
+        }
+    }
+    let s5 = selected(
+        "SELECT ?x WHERE { VALUES ?x { 16777216 16777217.0 \"16777216\"^^<http://www.w3.org/2001/XMLSchema#float> } } ORDER BY ?x",
+    );
+    let mut got5: Vec<Vec<Option<Term>>> = s5.rows.clone();
+    got5.reverse();
+    assert!(check_select(&s5, &vars(&["x"]), &got5).is_err());
+    assert_eq!(
+        check_select(&s5, &vars(&["x"]), &s5.rows),
+        Ok(Outcome::Compared)
+    );
+    // 6: one blank node is equal to itself, so the next key orders the rows
+    let s6 = selected("SELECT ?x WHERE { ?b <urn:p> ?x } ORDER BY ?b ?x");
+    assert!(check_select(&s6, &vars(&["x"]), &col(vec![int(2), int(1)])).is_err());
+    // equal values of different terms tie under the text, so the next condition orders
+    // them, and Jena orders them by the terms
+    let ties = "SELECT ?s WHERE { VALUES (?v ?s) { (1.0 <urn:b>) (1 <urn:a>) } } ORDER BY ?v ?s";
+    let ba = col(vec![Some(iri("urn:b").into()), Some(iri("urn:a").into())]);
+    let spec_ties = spec.run_selected(ties, None).unwrap().unwrap();
+    assert!(check_select(&spec_ties, &vars(&["s"]), &ba).is_err());
+    assert_eq!(
+        check_select(&selected(ties), &vars(&["s"]), &ba),
+        Ok(Outcome::Compared)
+    );
+    // 7: COALESCE passes a term through, with its lexical form
+    let s7 = selected(
+        "SELECT (COALESCE(?x, 0) AS ?y) WHERE { VALUES ?x { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } }",
+    );
+    assert!(!matches!(
+        check_select(&s7, &vars(&["y"]), &col(vec![int(1)])),
+        Ok(Outcome::Compared)
+    ));
+    let s7b = selected(
+        "SELECT ?y WHERE { { VALUES ?y { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } } UNION { BIND(1 + 1 AS ?y) } }",
+    );
+    assert!(!matches!(
+        check_select(&s7b, &vars(&["y"]), &[vec![int(1)], vec![int(2)]]),
+        Ok(Outcome::Compared)
+    ));
+    // 8: an open column passes no forbidden value as compared
+    let s8 = selected("SELECT (SAMPLE(?v) AS ?s) (COUNT(*) AS ?n) WHERE { VALUES ?v { 1 2 } }");
+    for wrong in [int(999), None] {
+        assert!(!matches!(
+            check_select(&s8, &vars(&["s", "n"]), &[vec![wrong, int(2)]]),
+            Ok(Outcome::Compared)
+        ));
+    }
+    // 9: aggregates over one solution read the same BNODE
+    assert_eq!(
+        one(
+            "SELECT (sameTerm(?a, ?b) AS ?eq) WHERE { { SELECT (SAMPLE(BNODE(\"x\")) AS ?a) (MIN(BNODE(\"x\")) AS ?b) WHERE {} } }"
+        ),
+        boolean(true)
+    );
+    // 10: the RDF merge keeps its blank nodes apart from the named graphs
+    let q10 = "SELECT (sameTerm(?s, ?t) AS ?eq) FROM <urn:g1> FROM <urn:g2> FROM NAMED <urn:g1> \
+               WHERE { ?s <urn:p> 1 GRAPH <urn:g1> { ?t <urn:p> 1 } }";
+    match spec.run(q10, None) {
+        Ok(reference::Answer::Select { rows, .. }) => assert_eq!(rows, vec![vec![boolean(false)]]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(one(q10), boolean(true));
+    // 11: the x flag removes whitespace before the pattern is read
+    assert_eq!(
+        one("SELECT (REGEX(\"aa\", \"a{ 2 }\", \"x\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    assert_eq!(
+        one("SELECT (REGEX(\"a b\", \"a[ ]b\", \"x\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    // 12: the i flag with a category, and the m flag with an anchor, are unsupported
+    for q in [
+        "SELECT (REGEX(\"a\", \"\\\\p{Lu}\", \"i\") AS ?r) WHERE {}",
+        "SELECT (REGEX(\"a\\n\", \"^$\", \"m\") AS ?r) WHERE {}",
+        "SELECT (REGEX(\"\u{17f}\", \"s\", \"i\") AS ?r) WHERE {}",
+        "SELECT (REGEX(\"A\", \"[^a]\", \"i\") AS ?r) WHERE {}",
+    ] {
+        assert!(
+            matches!(regex(q), Err(reference::Error::Unsupported(_))),
+            "{q}"
+        );
+    }
+    assert_eq!(
+        one("SELECT (REGEX(\"aBc\", \"b\", \"i\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    // the m flag with an anchor agrees with XPath on text that does not end in a newline
+    assert_eq!(
+        one("SELECT (REGEX(\"a\\nb\", \"^b$\", \"m\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    // 13: a quantifier after a quantifier is an error
+    assert_eq!(one("SELECT (REGEX(\"a\", \"a**\") AS ?r) WHERE {}"), None);
+    assert_eq!(
+        one("SELECT (REGEX(\"a\", \"a{2}{3}\") AS ?r) WHERE {}"),
+        None
+    );
+    assert_eq!(
+        one("SELECT (REGEX(\"aa\", \"a+?\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
 }
 
 /// The reference evaluator's own cases: the choices that it notes, the scope of the

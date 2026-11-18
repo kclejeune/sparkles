@@ -792,7 +792,8 @@ fn reference_answer(
         let url = iri(&g);
         read(&url, Some(oxrdf::GraphName::NamedNode(nn(&url))))?;
     }
-    let reference = reference::Reference::new(quads);
+    // the W3C suites test the specification's text, where Jena's reading differs
+    let reference = reference::Reference::new(quads).with_spec_readings(true);
     match reference.run(qtext, Some(qurl)) {
         Err(reference::Error::Unsupported(why)) => Err(format!("reference unsupported: {why}")),
         Err(e) => Err(format!("error: {e}")),

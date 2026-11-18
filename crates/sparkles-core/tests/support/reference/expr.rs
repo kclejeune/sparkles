@@ -184,8 +184,9 @@ impl Evaluator<'_> {
             }
             E::Exists(p) => {
                 let env = merge(cx.env, s);
-                // the pattern may read the open values that the solution binds
-                if env.keys().any(|k| self.open_vars.borrow().contains(k)) {
+                // the pattern may read the open values that the solution binds, or their
+                // open absence
+                if self.mentions_open(p) {
                     self.read_open.set(true);
                 }
                 let found = self.eval(
@@ -197,7 +198,13 @@ impl Evaluator<'_> {
                 )?;
                 Ok(bool_term(!found.is_empty()))
             }
-            E::Bound(v) => Ok(bool_term(s.contains_key(v) || cx.env.contains_key(v))),
+            E::Bound(v) => {
+                // whether an open value is bound is open too
+                if self.open_vars.borrow().contains(v) {
+                    self.read_open.set(true);
+                }
+                Ok(bool_term(s.contains_key(v) || cx.env.contains_key(v)))
+            }
             E::If(c, a, b) => {
                 let c = self.expr(c, cx, s)?;
                 if ebv(&c).ok_or(Fail::Type)? {
@@ -385,14 +392,15 @@ impl Evaluator<'_> {
                     Some(f) => simple_arg(f)?.value().to_string(),
                     None => String::new(),
                 };
-                let re = build_regex(pattern.value(), &flags)?;
+                let text = src.value();
+                let built = build_regex(pattern.value(), &flags, self.data.spec_readings.get())?;
+                let re = built.on(text)?;
                 if re.is_match("") && re.find("").is_some_and(|m| m.is_empty()) {
                     // fn:replace raises an error for a pattern that matches the empty string
                     return type_error();
                 }
                 let mut out = String::new();
                 let mut last = 0;
-                let text = src.value();
                 for caps in re.captures_iter(text) {
                     let m = caps.get(0).ok_or(Fail::Type)?;
                     out.push_str(&text[last..m.start()]);
@@ -525,7 +533,8 @@ impl Evaluator<'_> {
                     Some(f) => simple_arg(f)?.value().to_string(),
                     None => String::new(),
                 };
-                let re = build_regex(pattern.value(), &flags)?;
+                let built = build_regex(pattern.value(), &flags, self.data.spec_readings.get())?;
+                let re = built.on(text.value())?;
                 Ok(bool_term(re.is_match(text.value())))
             }
             F::Triple => {
@@ -734,40 +743,181 @@ fn parse_untyped_number(lex: &str, target: &str) -> R<Num> {
         .map_err(|_| Fail::Type)
 }
 
+/// A built regular expression, and the texts on which its flags make it unsupported.
+#[derive(Clone)]
+struct Built {
+    re: regex::Regex,
+    /// The `i` flag, which is supported on ASCII text.
+    ascii_only: bool,
+    /// The `m` flag with an anchor. In XPath's multi-line mode, `^` does not match after a
+    /// newline that ends the text, and `$` does not match at the end of a text that ends in
+    /// a newline, where the regex crate's do, so a text that ends in a newline is
+    /// unsupported, and on any other text the two agree.
+    no_final_newline: bool,
+}
+
+impl Built {
+    /// The regular expression, to match `text`.
+    fn on(&self, text: &str) -> R<&regex::Regex> {
+        if self.ascii_only && !text.is_ascii() {
+            return unsupported("the i flag of a regular expression on text that is not ASCII");
+        }
+        if self.no_final_newline && text.ends_with('\n') {
+            return unsupported(
+                "an anchor under the m flag of a regular expression on text that ends in a \
+                 newline",
+            );
+        }
+        Ok(&self.re)
+    }
+}
+
 /// Build the regular expression of the XPath flags `s`, `m`, `i`, `x` and `q`, once per
-/// thread for each pattern and flags, since a filter builds the same one for every row.
-/// An invalid pattern is a type error, and a valid one that the evaluator cannot build,
-/// such as one with a back-reference, is unsupported.
-fn build_regex(pattern: &str, flags: &str) -> R<regex::Regex> {
+/// thread for each pattern, flags and reading, since a filter builds the same one for every
+/// row. A pattern that XPath rejects is an error, and one whose meaning the translation
+/// cannot keep, such as one with a back-reference, is unsupported.
+fn build_regex(pattern: &str, flags: &str, spec: bool) -> R<Built> {
     thread_local! {
-        static BUILT: std::cell::RefCell<HashMap<(String, String), R<regex::Regex>>> =
+        static BUILT: std::cell::RefCell<HashMap<(String, String, bool), R<Built>>> =
             std::cell::RefCell::new(HashMap::new());
     }
-    let key = (pattern.to_owned(), flags.to_owned());
+    let key = (pattern.to_owned(), flags.to_owned(), spec);
     if let Some(built) = BUILT.with(|b| b.borrow().get(&key).cloned()) {
         return built;
     }
-    let built = compile_regex(pattern, flags);
+    let built = compile_regex(pattern, flags, spec);
     BUILT.with(|b| b.borrow_mut().insert(key, built.clone()));
     built
 }
 
-fn compile_regex(pattern: &str, flags: &str) -> R<regex::Regex> {
+/// The escapes of `pattern` outside and inside classes, and whether it has an anchor
+/// outside a class and a negated class.
+struct Scan {
+    escapes: Vec<char>,
+    anchor: bool,
+    negated_class: bool,
+}
+
+fn scan(pattern: &str) -> Scan {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = Scan {
+        escapes: Vec::new(),
+        anchor: false,
+        negated_class: false,
+    };
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                if let Some(&e) = chars.get(i + 1) {
+                    out.escapes.push(e);
+                }
+                i += 1;
+            }
+            '[' => {
+                depth += 1;
+                if chars.get(i + 1) == Some(&'^') {
+                    out.negated_class = true;
+                    i += 1;
+                }
+            }
+            ']' if depth > 0 => depth -= 1,
+            '^' | '$' if depth == 0 => out.anchor = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `pattern` without the whitespace outside classes, which the `x` flag removes before
+/// the pattern is read. A backslash before whitespace would escape the character after
+/// the whitespace, so it is unsupported.
+fn without_whitespace(pattern: &str) -> R<String> {
+    let ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut out = String::new();
+    let mut chars = pattern.chars().peekable();
+    let mut depth = 0usize;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let Some(e) = chars.next() else {
+                    out.push(c);
+                    break;
+                };
+                if ws(e) {
+                    return unsupported("whitespace after a backslash under the x flag");
+                }
+                out.push(c);
+                out.push(e);
+            }
+            c if ws(c) && depth == 0 => {}
+            '[' => {
+                depth += 1;
+                out.push(c);
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+fn compile_regex(pattern: &str, flags: &str, spec: bool) -> R<Built> {
     for c in flags.chars() {
         if !"smixq".contains(c) {
             return type_error();
         }
     }
+    let insensitive = flags.contains('i');
+    let mut anchor = false;
     let translated = if flags.contains('q') {
+        if insensitive && !pattern.is_ascii() {
+            return unsupported("the i flag of a regular expression that is not ASCII");
+        }
         regex::escape(pattern)
     } else {
-        xpath_regex(pattern, flags.contains('s'), flags.contains('x'))?
+        let pattern = if flags.contains('x') {
+            without_whitespace(pattern)?
+        } else {
+            pattern.to_owned()
+        };
+        // check the syntax first, so that an error is an error under any flags
+        let translated = xpath_regex(&pattern, flags.contains('s'), spec)?;
+        let scanned = scan(&pattern);
+        // XPath's case-insensitive matching of categories and negations differs from the
+        // regex crate's, and so may its case folding beyond ASCII
+        if insensitive
+            && (!pattern.is_ascii()
+                || scanned.negated_class
+                || scanned
+                    .escapes
+                    .iter()
+                    .any(|e| matches!(e, 'p' | 'P' | 'w' | 'W' | 'S' | 'D')))
+        {
+            return unsupported(
+                "the i flag of a regular expression with a category, a negation or a \
+                 character that is not ASCII",
+            );
+        }
+        anchor = scanned.anchor;
+        translated
     };
     let mut b = RegexBuilder::new(&translated);
-    b.case_insensitive(flags.contains('i'))
-        .multi_line(flags.contains('m'));
-    b.build()
-        .map_err(|e| Fail::Unsupported(format!("the regular expression {pattern:?}: {e}")))
+    let multi_line = flags.contains('m') && anchor;
+    b.case_insensitive(insensitive).multi_line(multi_line);
+    let re = b
+        .build()
+        .map_err(|e| Fail::Unsupported(format!("the regular expression {pattern:?}: {e}")))?;
+    Ok(Built {
+        re,
+        ascii_only: insensitive,
+        no_final_newline: multi_line,
+    })
 }
 
 /// The general categories that `\p{..}` names in XML Schema 1.1 regular expressions.
@@ -781,19 +931,46 @@ const CATEGORIES: &[&str] = &[
 /// 5.6.1, written in the syntax of the `regex` crate with the same meaning. The two
 /// differ in `.`, which in XPath matches neither a newline nor a carriage return
 /// without the `s` flag, in `\s`, `\w` and `\d`, which XPath defines by its own
-/// character sets, in the escapes each accepts, in `&`, `~` and `[` inside a class, and
-/// in the `x` flag, which in XPath removes whitespace outside classes and has no comments.
-fn xpath_regex(pattern: &str, dot_all: bool, extended: bool) -> R<String> {
+/// character sets, in the escapes each accepts and in `&`, `~` and `[` inside a class.
+/// The regex crate also accepts patterns that XPath rejects, such as a quantifier after a
+/// quantifier, so the translation checks where each quantifier stands. A construct whose
+/// XPath meaning the translation does not establish is unsupported rather than guessed.
+fn xpath_regex(pattern: &str, dot_all: bool, spec: bool) -> R<String> {
+    /// What the last piece of the pattern was, for the quantifier after it.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Last {
+        /// The start of the pattern, of a group or of a branch.
+        Nothing,
+        Atom,
+        Anchor,
+        Quantified,
+        Reluctant,
+    }
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::new();
     let mut i = 0;
     let mut groups = 0usize;
+    let mut last = Last::Nothing;
+    // a quantifier stands only after an atom, and a reluctant `?` only after a quantifier
+    let quantify = |last: &mut Last, reluctant: bool| -> R<()> {
+        *last = match (*last, reluctant) {
+            (Last::Atom, _) => Last::Quantified,
+            (Last::Quantified, true) => Last::Reluctant,
+            (Last::Anchor, _) => {
+                return unsupported("a quantifier after an anchor in a regular expression");
+            }
+            _ => return type_error(),
+        };
+        Ok(())
+    };
     while i < chars.len() {
         let c = chars[i];
         i += 1;
         match c {
-            c if extended && matches!(c, ' ' | '\t' | '\n' | '\r') => {}
-            '.' => out.push_str(if dot_all { "(?s:.)" } else { "[^\n\r]" }),
+            '.' => {
+                out.push_str(if dot_all { "(?s:.)" } else { "[^\n\r]" });
+                last = Last::Atom;
+            }
             '\\' => {
                 let Some(&e) = chars.get(i) else {
                     return type_error();
@@ -805,7 +982,8 @@ fn xpath_regex(pattern: &str, dot_all: bool, extended: bool) -> R<String> {
                     }
                     return unsupported("a back-reference in a regular expression");
                 }
-                out.push_str(&escape(e, &chars, &mut i)?);
+                out.push_str(&escape(e, &chars, &mut i, spec)?);
+                last = Last::Atom;
             }
             '(' => {
                 if chars.get(i) == Some(&'?') {
@@ -818,11 +996,36 @@ fn xpath_regex(pattern: &str, dot_all: bool, extended: bool) -> R<String> {
                     groups += 1;
                     out.push('(');
                 }
+                last = Last::Nothing;
             }
-            '[' => out.push_str(&class(&chars, &mut i)?),
+            ')' => {
+                out.push(')');
+                last = Last::Atom;
+            }
+            '|' => {
+                out.push('|');
+                last = Last::Nothing;
+            }
+            '^' | '$' => {
+                out.push(c);
+                last = Last::Anchor;
+            }
+            '*' | '+' => {
+                quantify(&mut last, false)?;
+                out.push(c);
+            }
+            '?' => {
+                quantify(&mut last, true)?;
+                out.push(c);
+            }
+            '[' => {
+                out.push_str(&class(&chars, &mut i, spec)?);
+                last = Last::Atom;
+            }
             ']' => return type_error(),
             '{' => {
                 // a quantifier: {n}, {n,} or {n,m}
+                quantify(&mut last, false)?;
                 let start = i;
                 while i < chars.len() && chars[i] != '}' {
                     i += 1;
@@ -845,24 +1048,36 @@ fn xpath_regex(pattern: &str, dot_all: bool, extended: bool) -> R<String> {
                 out.push('}');
             }
             '}' => return type_error(),
-            '&' | '~' | '-' | '#' => {
-                out.push('\\');
-                out.push(c);
+            '&' | '~' | '-' | '#' | ' ' | '\t' | '\n' | '\r' => {
+                out.push_str(&regex::escape(&c.to_string()));
+                last = Last::Atom;
             }
-            c => out.push(c),
+            c => {
+                out.push(c);
+                last = Last::Atom;
+            }
         }
     }
     Ok(out)
 }
 
-/// A character class from just after its `[` to just after its `]`.
-fn class(chars: &[char], i: &mut usize) -> R<String> {
+/// The escapes that name one character, which may end a range in a class.
+fn single_escape(e: char) -> bool {
+    "nrt\\|.?*+(){}-[]^$".contains(e)
+}
+
+/// A character class from just after its `[` to just after its `]`. A `-` stands as a
+/// range between two single characters, or as itself at the start or the end of the class;
+/// anything else with a `-`, such as a subtraction, is unsupported.
+fn class(chars: &[char], i: &mut usize, spec: bool) -> R<String> {
     let mut out = String::from("[");
     if chars.get(*i) == Some(&'^') {
         out.push('^');
         *i += 1;
     }
     let mut first = true;
+    // whether the last item was one character, which can start a range
+    let mut single = false;
     while let Some(&c) = chars.get(*i) {
         *i += 1;
         match c {
@@ -871,8 +1086,36 @@ fn class(chars: &[char], i: &mut usize) -> R<String> {
                 out.push(']');
                 return Ok(out);
             }
-            '-' if chars.get(*i) == Some(&'[') => {
-                return unsupported("a character class subtraction in a regular expression");
+            '-' if first || chars.get(*i) == Some(&']') => {
+                out.push_str("\\-");
+                single = false;
+            }
+            '-' => {
+                let end_single = match chars.get(*i) {
+                    Some('\\') => chars.get(*i + 1).is_some_and(|&e| single_escape(e)),
+                    Some('[') | None => false,
+                    Some(_) => true,
+                };
+                if !single || !end_single {
+                    return unsupported(
+                        "a character class with a '-' that is not a simple range in a \
+                         regular expression",
+                    );
+                }
+                out.push('-');
+                single = false;
+                first = false;
+                // the end of the range
+                let e = chars[*i];
+                *i += 1;
+                if e == '\\' {
+                    let x = chars[*i];
+                    *i += 1;
+                    out.push_str(&escape(x, chars, i, spec)?);
+                } else {
+                    out.push_str(&regex::escape(&e.to_string()));
+                }
+                continue;
             }
             '[' => return type_error(),
             '\\' => {
@@ -880,13 +1123,13 @@ fn class(chars: &[char], i: &mut usize) -> R<String> {
                     return type_error();
                 };
                 *i += 1;
-                out.push_str(&escape(e, chars, i)?);
+                out.push_str(&escape(e, chars, i, spec)?);
+                single = single_escape(e);
             }
-            '&' | '~' => {
-                out.push('\\');
-                out.push(c);
+            c => {
+                out.push_str(&regex::escape(&c.to_string()));
+                single = true;
             }
-            c => out.push(c),
         }
         first = false;
     }
@@ -894,8 +1137,9 @@ fn class(chars: &[char], i: &mut usize) -> R<String> {
 }
 
 /// The escape `\e`, after which `i` is just past it. A set it names is a nested class,
-/// which the regex crate also takes inside a class.
-fn escape(e: char, chars: &[char], i: &mut usize) -> R<String> {
+/// which the regex crate also takes inside a class. Jena reads `\b` and `\B` as Java's
+/// word boundaries, which the evaluator does not model, and XPath has no such escape.
+fn escape(e: char, chars: &[char], i: &mut usize, spec: bool) -> R<String> {
     let set = |s: &str| format!("[{s}]");
     Ok(match e {
         'n' => "\\n".into(),
@@ -909,6 +1153,9 @@ fn escape(e: char, chars: &[char], i: &mut usize) -> R<String> {
         'D' => "\\P{Nd}".into(),
         'w' => set("^\\p{P}\\p{Z}\\p{C}"),
         'W' => set("\\p{P}\\p{Z}\\p{C}"),
+        'b' | 'B' if !spec => {
+            return unsupported("the word boundary \\b or \\B of Java in a regular expression");
+        }
         'i' | 'I' | 'c' | 'C' => {
             return unsupported("the XML name escapes \\i and \\c in a regular expression");
         }

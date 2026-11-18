@@ -1,17 +1,19 @@
 //! The comparison of an engine's SELECT answer with the reference evaluator's, which the
 //! optimizer tests and the seeded cursor differential share.
 //!
-//! The comparison allows every answer that the specification allows and no other, as far
-//! as the reference can tell them apart. A column whose values the specification leaves
-//! open, such as a SAMPLE or a RAND, is compared only by its place in the rows, and a
-//! column that the reference computed compares numbers by datatype and value, since the
-//! lexical form of a computed number is the implementation's. Every other term must be
-//! the same term. Where the query orders or slices its answer, the engine's rows must be
-//! a slice, at the query's offset, of an order that ORDER BY allows. An answer whose rows
-//! themselves are open, because an open value decides which rows there are, is not
-//! compared.
+//! The comparison passes no answer that the specification forbids, and where it cannot
+//! tell, it says how much it compared instead of passing the answer as compared. A column
+//! whose values the specification leaves open, such as a SAMPLE or a RAND, is compared
+//! only by its place in the rows, which makes the comparison partial. A column that only
+//! computed values bind compares numbers by datatype and value, since the lexical form of
+//! a computed number is the implementation's. Every other term must be the same term,
+//! except that a column bound by both copied terms and computed values, where a number
+//! that differs only in its lexical form may be either, makes the comparison partial.
+//! Where the query orders or slices its answer, the engine's rows must be a slice, at the
+//! query's offset, of an order that ORDER BY allows. An answer whose rows themselves are
+//! open, because an open value decides which rows there are, is not compared.
 
-use super::{AggregateErrors, Error, Notes, Reference, Selected, value};
+use super::{AggregateErrors, Error, Notes, Provenance, Reference, Selected, value};
 
 /// The engine's reading of the aggregates over errors and non-strings, which the
 /// comparisons take until the setting of roadmap item 1064 lands in the engine with
@@ -34,54 +36,59 @@ pub enum Expected {
 /// items, with the names of the readings it took. Where the query meets an item, it is
 /// evaluated again with the engine's reading, so that the comparison is exact under it:
 /// the aggregates over errors and non-strings under [`ENGINE_AGGREGATE_ERRORS`] (item
-/// 1064), string arguments compatible whatever their base direction (item 1071), and the
-/// default graph of several FROM clauses as the union of their graphs.
+/// 1064) and string arguments compatible whatever their base direction (item 1071). An
+/// evaluation under one reading can meet another item that the first did not reach, so
+/// the evaluations go on until one meets no item that the readings do not cover.
 pub fn under_engine_readings(
     r: &Reference,
     text: &str,
 ) -> Result<(Expected, Vec<&'static str>), Error> {
+    let query = super::parse(text, None)?;
     let run = || -> Result<Expected, Error> {
-        if let Some(s) = r.run_selected(text, None)? {
-            return Ok(Expected::Select(s));
-        }
-        Ok(match r.run_ask(text, None)? {
-            Some((b, notes)) => Expected::Ask(b, notes),
-            None => Expected::Other,
+        Ok(match r.evaluate_all(&query)? {
+            (_, _, Some(s)) => Expected::Select(s),
+            (super::Answer::Ask(b), notes, None) => Expected::Ask(b, notes),
+            _ => Expected::Other,
         })
     };
-    let first = run()?;
-    let notes = match &first {
-        Expected::Select(s) => s.notes,
-        Expected::Ask(_, n) => *n,
-        Expected::Other => return Ok((first, Vec::new())),
+    let notes_of = |e: &Expected| match e {
+        Expected::Select(s) => Some(s.notes),
+        Expected::Ask(_, n) => Some(*n),
+        Expected::Other => None,
     };
-    let mut readings = Vec::new();
-    let aggregates = notes.min_max_error || notes.avg_of_errors || notes.group_concat_non_string;
-    if aggregates {
-        readings.push("the engine's aggregates over errors and non-strings");
-    }
-    if notes.direction_in_compatibility {
-        readings.push("string arguments ignore the base direction");
-    }
-    if notes.from_shares_blank_nodes {
-        readings.push("FROM graphs share their blank nodes");
-    }
-    if readings.is_empty() {
-        return Ok((first, readings));
-    }
-    let set = |on: bool| {
-        r.set_aggregate_errors(if on && aggregates {
+    let (mut aggregates, mut direction) = (false, false);
+    let set = |aggregates: bool, direction: bool| {
+        r.set_aggregate_errors(if aggregates {
             ENGINE_AGGREGATE_ERRORS
         } else {
             AggregateErrors::Spec
         });
-        r.set_ignoring_direction_in_compatibility(on && notes.direction_in_compatibility);
-        r.set_union_of_from_graphs(on && notes.from_shares_blank_nodes);
+        r.set_ignoring_direction_in_compatibility(direction);
     };
-    set(true);
-    let again = run();
-    set(false);
-    Ok((again?, readings))
+    let mut answer = run();
+    // each round turns on at least one of the two readings, so there are at most three
+    while let Some(notes) = answer.as_ref().ok().and_then(notes_of) {
+        let a = aggregates
+            || notes.min_max_error
+            || notes.avg_of_errors
+            || notes.group_concat_non_string;
+        let d = direction || notes.direction_in_compatibility;
+        if (a, d) == (aggregates, direction) {
+            break;
+        }
+        (aggregates, direction) = (a, d);
+        set(aggregates, direction);
+        answer = run();
+    }
+    set(false, false);
+    let mut readings = Vec::new();
+    if aggregates {
+        readings.push("the engine's aggregates over errors and non-strings");
+    }
+    if direction {
+        readings.push("string arguments ignore the base direction");
+    }
+    Ok((answer?, readings))
 }
 
 /// How a comparison ended when it found no disagreement.
@@ -91,6 +98,9 @@ pub enum Outcome {
     Compared,
     /// The rows were compared, and their order was not, for the reason given.
     OrderUnchecked(String),
+    /// The rows and their order were compared, and some of their cells only in part, for
+    /// the reason given.
+    Partial(String),
     /// Nothing was compared, for the reason given.
     Skipped(String),
 }
@@ -130,42 +140,82 @@ pub fn check_select(
                 .ok_or_else(|| format!("the engine lacks the column {v}"))
         })
         .collect::<Result<_, _>>()?;
-    let mask = |row: &[Option<Term>]| -> String {
-        (0..row.len())
-            .map(|c| cell(&row[c], expected.open[c], expected.computed[c]))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let got: Vec<String> = engine_rows
-        .iter()
-        .map(|row| {
-            let ordered: Vec<Option<Term>> = columns.iter().map(|&i| row[i].clone()).collect();
-            mask(&ordered)
-        })
-        .collect();
-    let Some(order) = &expected.order else {
-        let mut a = got;
-        let mut b: Vec<String> = expected.rows.iter().map(|r| mask(r)).collect();
-        a.sort();
-        b.sort();
-        return if a == b {
-            Ok(Outcome::Compared)
-        } else {
-            Err(bag_difference(&a, &b))
+    let compare = |relax_mixed: bool| -> Result<Outcome, String> {
+        let mask = |row: &[Option<Term>]| -> String {
+            (0..row.len())
+                .map(|c| cell(&row[c], expected.open[c], expected.computed[c], relax_mixed))
+                .collect::<Vec<_>>()
+                .join(" ")
         };
+        let got: Vec<String> = engine_rows
+            .iter()
+            .map(|row| {
+                let ordered: Vec<Option<Term>> = columns.iter().map(|&i| row[i].clone()).collect();
+                mask(&ordered)
+            })
+            .collect();
+        let Some(order) = &expected.order else {
+            let mut a = got;
+            let mut b: Vec<String> = expected.rows.iter().map(|r| mask(r)).collect();
+            a.sort();
+            b.sort();
+            return if a != b {
+                Err(bag_difference(&a, &b))
+            } else if expected.order_unchecked {
+                Ok(Outcome::OrderUnchecked(
+                    "DISTINCT kept a row whose copies have different sort keys".into(),
+                ))
+            } else {
+                Ok(Outcome::Compared)
+            };
+        };
+        let items: Vec<String> = order.items.iter().map(|(r, _)| mask(r)).collect();
+        check_order(order, &items, &got)
     };
-    let items: Vec<String> = order.items.iter().map(|(r, _)| mask(r)).collect();
-    check_order(order, &items, &got)
+    let outcome = match compare(false) {
+        Ok(o) => o,
+        Err(e) => {
+            // a number of another lexical form in a column that copies terms and computes
+            // values may be allowed or not
+            let mixed = expected.computed.contains(&Provenance::Mixed);
+            if mixed && compare(true).is_ok() {
+                return Ok(Outcome::Partial(format!(
+                    "a column copies terms and computes values, and the answer agrees only \
+                     where its numbers are compared by value: {e}"
+                )));
+            }
+            return Err(e);
+        }
+    };
+    let open: Vec<&str> = expected
+        .variables
+        .iter()
+        .zip(&expected.open)
+        .filter(|(_, o)| **o)
+        .map(|(v, _)| v.as_str())
+        .collect();
+    Ok(match outcome {
+        Outcome::Compared if !open.is_empty() && !expected.rows.is_empty() => Outcome::Partial(
+            format!("the columns {open:?} hold open values, compared only by their place"),
+        ),
+        other => other,
+    })
 }
 
-/// One cell of a row as the comparison sees it.
-fn cell(t: &Option<Term>, open: bool, computed: bool) -> String {
+/// One cell of a row as the comparison sees it. Numbers compare by datatype and value in
+/// a computed column, and in a mixed one when `relax_mixed`.
+fn cell(t: &Option<Term>, open: bool, provenance: Provenance, relax_mixed: bool) -> String {
     if open {
         return "*".into();
     }
+    let relax = match provenance {
+        Provenance::Computed => true,
+        Provenance::Mixed => relax_mixed,
+        Provenance::Copied => false,
+    };
     match t {
         None => "UNDEF".into(),
-        Some(Term::Literal(l)) if computed => match value::numeric(l) {
+        Some(Term::Literal(l)) if relax => match value::numeric(l) {
             Some(n) => format!("\"{}\"^^<{}>", n.canonical_lexical(), l.datatype().as_str()),
             None => l.to_string(),
         },
@@ -208,9 +258,9 @@ fn bag_difference(got: &[String], expected: &[String]) -> String {
 /// Check that `got` is a slice, at the query's offset, of an order of the reference's
 /// rows that ORDER BY allows.
 ///
-/// The reference's rows are in an order that extends the specification's, so a row can
-/// be strictly before another only when it comes earlier. Rows with the same sort key
-/// form a block, and the strict order is tested between blocks. The engine's rows are
+/// Rows with the same sort key form a block, and the strict order is tested between
+/// every two blocks that the check meets, in both directions, so the check does not rely
+/// on the reference's order extending the specification's. The engine's rows are
 /// matched to the reference's rows, each to the first unused row with the same cells.
 /// The returned rows must be in an allowed order among themselves. The other rows that
 /// the order puts strictly before a returned row must all be cut by the offset, and those
@@ -244,7 +294,7 @@ fn check_order(
     let mut before = |a: usize, b: usize| -> Option<bool> {
         budget = budget.checked_sub(1)?;
         Some(match (keys[a], keys[b]) {
-            (Some(x), Some(y)) => super::strictly_before(x, y, &order.descending),
+            (Some(x), Some(y)) => super::strictly_before(x, y, &order.descending, order.term_ties),
             _ => false,
         })
     };
@@ -293,7 +343,7 @@ fn check_order(
     let mut seen: BTreeSet<usize> = BTreeSet::new();
     for (j, &i) in chosen.iter().enumerate() {
         let b = block[i];
-        for &earlier in seen.range(b + 1..) {
+        for &earlier in &seen {
             match before(b, earlier) {
                 None => return unchecked(),
                 Some(true) => {
@@ -323,15 +373,14 @@ fn check_order(
             None => {
                 let mut is_before = false;
                 let mut is_after = false;
-                // only a later block can be strictly after, and an earlier one before
                 for &r in &returned {
-                    if r > b && !is_before {
+                    if !is_before {
                         match before(b, r) {
                             None => return unchecked(),
                             Some(x) => is_before = x,
                         }
                     }
-                    if r < b && !is_after {
+                    if !is_after {
                         match before(r, b) {
                             None => return unchecked(),
                             Some(x) => is_after = x,

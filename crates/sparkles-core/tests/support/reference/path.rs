@@ -1,6 +1,7 @@
 //! Property paths, SPARQL 1.1 section 18.4. A path evaluates to the pairs of nodes that it
 //! connects in the active graph. Sequence and alternative keep their duplicates, and the
-//! closure operators and a negated property set produce each pair once.
+//! closure operators produce each pair once. A negated property set produces each pair
+//! once under the specification's reading and once for each triple under Jena's.
 
 use super::{Evaluator, GraphData, R, unsupported};
 use oxrdf::Term;
@@ -66,16 +67,18 @@ impl Evaluator<'_> {
             }
             P::ZeroOrMore(p) => self.closure(p, graph, extra, true)?,
             P::OneOrMore(p) => self.closure(p, graph, extra, false)?,
-            // a pair once, whatever the number of predicates that join it, since section
-            // 18.4 defines the solutions of a negated property set as a set
+            // Section 18.4 defines the solutions of a negated property set as a set, a
+            // pair once whatever the number of predicates that join it, and Jena gives a
+            // pair for each triple
             P::NegatedPropertySet(excluded) => {
+                let once = self.data.spec_readings.get();
                 let mut seen = HashSet::new();
                 graph
                     .triples
                     .iter()
                     .filter(|t| !excluded.contains(&t.predicate))
                     .map(|t| (Term::from(t.subject.clone()), t.object.clone()))
-                    .filter(|pair| seen.insert(pair.clone()))
+                    .filter(|pair| !once || seen.insert(pair.clone()))
                     .collect()
             }
             P::Range { .. } => return unsupported("a Jena path range"),
