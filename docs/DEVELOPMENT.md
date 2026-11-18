@@ -1365,7 +1365,7 @@ package or cryptographic attestation is published.
 The candidate build runs Boxington in local mode and saves no store. A saved store took
 about 3.4 GB of the 10 GB repository cache and pushed the CI test build's caches out. It
 shortened the build step to about 22 min from the 35 min of an empty store on GitHub's
-runner, and item 1074 looks for a smaller store that keeps part of that gain.
+runner, and item 1078 looks for a smaller store that keeps part of that gain.
 
 The outer `server:artifact` task activates the same pinned wasm-bindgen CLI as
 `ui:wasm`, so the packer can record its version after the formatter task exits. A
