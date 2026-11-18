@@ -5582,9 +5582,9 @@ const STRING_FLOOR_ENTRIES: usize = 1 << 20;
 /// each string's floor ([`Ctx::string_floor`]), computed once per distinct id in a cache
 /// of each worker, so neither column is decoded. A row with another kind of value is
 /// evaluated as the generic filter would. `None` when the table is small or its first
-/// rows hold other values, so that the generic filter decodes the columns instead. The
-/// floors decode inside the envelope in both accounting modes, and a refused floor
-/// fails the mask with the refusal it recorded.
+/// rows hold other values, so that the generic filter decodes the columns instead, and
+/// in a cursor. The floors decode inside the envelope, and a refused floor fails the
+/// mask with the refusal it recorded.
 fn string_order_mask(
     ctx: &Ctx,
     t: &Table,
@@ -5597,7 +5597,11 @@ fn string_order_mask(
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
         return Ok(None);
     };
-    if n < STRING_ORDER_ROWS {
+    // A cursor builds a new floor cache for each batch, so a string that recurs across
+    // batches has its floor computed again in each one, which measured 25-34% slower
+    // than comparing the two keys directly (see `val_cmp`). Its rows compare their keys
+    // until a floor cache that outlives the batch exists (item 1069).
+    if n < STRING_ORDER_ROWS || ctx.streams() {
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
@@ -9800,7 +9804,6 @@ mod paid_eager_producer_tests {
 #[cfg(test)]
 mod string_order_tests {
     use super::*;
-    use crate::error::BudgetKind;
     use crate::id::Tag;
     use crate::io::Source;
     use crate::store::{Store, StoreOptions};
@@ -9904,10 +9907,11 @@ mod string_order_tests {
         Expr::Cmp(Box::new(Expr::Var(x)), Box::new(Expr::Var(y)), op)
     }
 
-    /// A cursor's batch takes the comparison through the vocabulary floors as an eager
-    /// table does, with the same mask as the generic filter that decodes every row.
+    /// An eager table takes the comparison through the vocabulary floors, with the same
+    /// mask as the generic filter that decodes every row. A cursor's batch declines the
+    /// floors and leaves the comparison to the generic filter until item 1069.
     #[test]
-    fn cursor_batches_order_strings_through_their_floors_as_eager_tables_do() {
+    fn eager_tables_order_strings_through_their_floors_and_cursor_batches_decline() {
         use super::super::expr::CmpOp;
         let (s, ids) = store("long");
         assert!(ids.len() * ids.len() > STRING_ORDER_ROWS);
@@ -9921,19 +9925,24 @@ mod string_order_tests {
                 }
                 let (t, x, y) = product(&ctx, &ids);
                 let e = cmp(x, y, op);
-                let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
-                    .unwrap()
-                    .unwrap_or_else(|| panic!("cursor {cursor}: the floors apply"));
+                let mask = string_order_mask(&ctx, &t, (x, y), op, &e).unwrap();
                 let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
-                assert_eq!(mask, generic, "cursor {cursor} {op:?}");
-                masks.push(mask);
+                if cursor {
+                    assert!(mask.is_none(), "a cursor batch declines the floors");
+                    masks.push(generic);
+                } else {
+                    let mask = mask.expect("the floors apply");
+                    assert_eq!(mask, generic, "{op:?}");
+                    masks.push(mask);
+                }
             }
             assert_eq!(masks[0], masks[1], "{op:?}");
         }
     }
 
-    /// A streamed `FILTER(?x < ?y)` over a product of stored strings reaches the floors
-    /// in a batch and keeps the rows the eager query keeps.
+    /// A streamed `FILTER(?x < ?y)` over a product of stored strings, whose batches
+    /// compare their keys without the floors, keeps the rows the eager query keeps
+    /// through the floors.
     #[test]
     fn a_streamed_string_comparison_matches_the_eager_query() {
         use crate::sparql::{CursorOptions, QueryOptions, query, select_cursor};
@@ -9945,6 +9954,7 @@ mod string_order_tests {
             ..Default::default()
         };
         let text = |t: &Option<oxrdf::Term>| t.as_ref().map(|t| t.to_string());
+        let before = STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed);
         let mut eager: Vec<_> = query(s.snapshot(), q, &options)
             .unwrap()
             .rows()
@@ -9953,7 +9963,11 @@ mod string_order_tests {
             .map(|r| r.values().iter().map(text).collect::<Vec<_>>())
             .collect();
         eager.sort();
-        let before = STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed);
+        // other tests can build masks concurrently, so only the eager query's is checked
+        assert!(
+            STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed) > before,
+            "the eager query reaches the floors"
+        );
         let cursor_options = CursorOptions {
             batch_rows: 1 << 16,
             ..Default::default()
@@ -9973,10 +9987,6 @@ mod string_order_tests {
                 );
             }
         }
-        assert!(
-            STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed) > before,
-            "a batch reaches the floors"
-        );
         streamed.sort();
         assert!(!eager.is_empty());
         assert_eq!(streamed, eager);
@@ -10187,10 +10197,11 @@ mod string_order_tests {
         }
     }
 
-    /// A cursor reserves the keys its floors read, so a string longer than the budget
-    /// fails the mask with a memory refusal, while an eager table reads it unchecked.
+    /// An eager table reads the floors of a string longer than the budget unchecked. A
+    /// cursor batch declines the floors before it reads a key, so it records no refusal.
+    /// Item 1069 gives the cursor floors again, which then reserve the keys they read.
     #[test]
-    fn a_refused_floor_fails_the_cursor_mask() {
+    fn a_long_string_does_not_fail_the_mask() {
         use super::super::expr::CmpOp;
         // It sorts after the other strings, so the sample's keys do not reach it.
         let (s, ids) = store(&"ÿ".repeat(1 << 19));
@@ -10204,10 +10215,8 @@ mod string_order_tests {
             let e = cmp(x, y, CmpOp::Lt);
             let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
             if cursor {
-                assert!(
-                    matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
-                    "{outcome:?}"
-                );
+                assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+                assert!(ctx.check().is_ok());
             } else {
                 assert!(outcome.unwrap().is_some());
             }

@@ -1519,7 +1519,8 @@ impl Ctx {
 
     /// Whether the query streams through pull cursors. Both modes charge the same state,
     /// so only the routing of a query, the accumulation of an EXISTS key set across
-    /// batches and whether a decoding envelope can refuse read it.
+    /// batches, whether a decoding envelope can refuse and whether a batch compares
+    /// strings through their floors read it.
     #[inline]
     pub(super) fn streams(&self) -> bool {
         self.accounting() == Accounting::Cursor
@@ -3933,12 +3934,13 @@ mod charge_tests {
     /// The executors read the accounting mode in at most this many places outside tests.
     /// Stage 4 of item 453 lowered it as each twin merged, and item 827 took the planning
     /// reads out, so that a query plans alike in every mode. The routing of
-    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches and the
-    /// decoding envelope remain, with the four reads of the flag that decide whether a
-    /// cursor owner exists, whether a context without an owner may keep retained state
-    /// uncharged, whether an empty release trims the ledger and whether a finished
-    /// query's pool contribution shrinks.
-    const MODE_CHECKS: usize = 7;
+    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches, the
+    /// decoding envelope and the cursor exclusion of `string_order_mask` remain, with the
+    /// four reads of the flag that decide whether a cursor owner exists, whether a context
+    /// without an owner may keep retained state uncharged, whether an empty release trims
+    /// the ledger and whether a finished query's pool contribution shrinks. Item 1069's
+    /// per-query floor cache removes the exclusion of `string_order_mask`.
+    const MODE_CHECKS: usize = 8;
 
     /// Counts the reads of the accounting mode in the non-test sources of the SPARQL
     /// engine, and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453). A
