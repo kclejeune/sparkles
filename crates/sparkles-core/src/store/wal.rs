@@ -2024,4 +2024,165 @@ mod tests {
             Err(Error::Unsupported(_))
         ));
     }
+
+    /// A stride carrier with no memory cap, whose check counts the stride checks and can
+    /// stop the read at the first one.
+    struct Tripwire {
+        options: crate::history::HistoryOptions,
+        checks: std::cell::Cell<u64>,
+        stop: bool,
+    }
+
+    impl Control for Tripwire {
+        const CHECKS: bool = true;
+        const ACCOUNTS: bool = false;
+
+        fn check(&self, _bytes: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn remaining(&self) -> u64 {
+            u64::MAX
+        }
+
+        fn read_limit(&self) -> crate::history::ReadLimit<'_> {
+            crate::history::ReadLimit {
+                options: &self.options,
+                memory: None,
+                held: 0,
+            }
+        }
+
+        fn check_delta(&self, _delta: &Delta) -> Result<()> {
+            self.checks.set(self.checks.get() + 1);
+            if self.stop {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Past 65,536 quad records a stride carrier is checked once per stride in both
+    /// directions, and a failing check stops the replay with its error. The quads span
+    /// three transactions, so the stride falls inside a transaction.
+    #[test]
+    fn a_stride_carrier_is_checked_every_64_ki_records_in_both_directions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), Default::default()).unwrap();
+        let (commits, per) = (3u64, 24_000u64);
+        for commit in 1..=commits {
+            let mut body = String::from("INSERT DATA {");
+            use std::fmt::Write;
+            for n in 0..per {
+                write!(body, " <urn:s{commit}:{n}> <urn:p> {n} .").unwrap();
+            }
+            body.push('}');
+            crate::sparql::update::update(&store, &body, &Default::default()).unwrap();
+        }
+        let snap = store.snapshot();
+        let path = snap.generation.dir.as_ref().unwrap().join("wal.log");
+        let base = p(0, 0);
+        let mut cursor = WalCursor::open(&path, base).unwrap();
+        while cursor.next().unwrap().is_some() {}
+        let end = cursor.position();
+        assert_eq!(end.seq, commits);
+        let total = commits * per;
+        let strides = total / 0x1_0000;
+        assert_eq!(strides, 1, "the fixture crosses one stride");
+        let cache = store.cache();
+        let tripwire = |stop| Tripwire {
+            options: Default::default(),
+            checks: std::cell::Cell::new(0),
+            stop,
+        };
+        // forward, through every stride, then stopped at the first
+        let mut forward = Delta::default();
+        let pass = tripwire(false);
+        let n = apply_forward(
+            &path,
+            &snap.generation,
+            cache,
+            &mut forward,
+            base,
+            end,
+            &pass,
+        )
+        .unwrap();
+        assert_eq!((n, pass.checks.get()), (total, strides));
+        let stop = tripwire(true);
+        let r = apply_forward(
+            &path,
+            &snap.generation,
+            cache,
+            &mut Delta::default(),
+            base,
+            end,
+            &stop,
+        );
+        assert!(matches!(r, Err(Error::Cancelled)), "{:?}", r.err());
+        assert_eq!(stop.checks.get(), 1);
+        // backward from the state at the end, through every stride, then stopped
+        let mut backward = forward.clone();
+        let pass = tripwire(false);
+        let n = apply_backward(
+            &path,
+            &snap.generation,
+            cache,
+            &mut backward,
+            base,
+            end,
+            &pass,
+        )
+        .unwrap();
+        assert_eq!((n, pass.checks.get()), (total, strides));
+        let mut empty = Delta::default();
+        let n = apply_backward(
+            &path,
+            &snap.generation,
+            cache,
+            &mut empty,
+            end,
+            end,
+            &Unlimited,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        let stop = tripwire(true);
+        let r = apply_backward(
+            &path,
+            &snap.generation,
+            cache,
+            &mut forward.clone(),
+            base,
+            end,
+            &stop,
+        );
+        assert!(matches!(r, Err(Error::Cancelled)), "{:?}", r.err());
+        assert_eq!(stop.checks.get(), 1);
+        // the uncontrolled replays read the same records
+        let mut plain = Delta::default();
+        let n = apply_forward(
+            &path,
+            &snap.generation,
+            cache,
+            &mut plain,
+            base,
+            end,
+            &Unlimited,
+        )
+        .unwrap();
+        assert_eq!(n, total);
+        let n = apply_backward(
+            &path,
+            &snap.generation,
+            cache,
+            &mut plain,
+            base,
+            end,
+            &Unlimited,
+        )
+        .unwrap();
+        assert_eq!(n, total);
+    }
 }
