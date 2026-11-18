@@ -463,6 +463,7 @@ class Transaction:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...
     def _apply(self, ops: Iterable[tuple[bool, Quad]]) -> tuple[int, int, dict[str, str]]: ...
     def _quads_iter(
@@ -649,6 +650,7 @@ class Dataset:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...
     def apply_patch(
         self, data: str | bytes, binary: bool = False, *, message: str | None = None

@@ -38,3 +38,27 @@ def test_the_dataset_setting_persists(tmp_path: Path) -> None:
         assert ds.settings.aggregate_errors.get()["mode"] == "sparkles"
         assert ds.settings.aggregate_errors.reset()["source"] == "default"
         assert values(ds.select(Q)) == (None, None)
+
+
+INSERT_MIN = """INSERT { <urn:r> <urn:min> ?m } WHERE {
+    SELECT (MIN(?v) AS ?m) WHERE { VALUES ?v { 1 UNDEF } } }"""
+
+
+def written(ds: Dataset) -> list:
+    rows = ds.select("SELECT ?m WHERE { <urn:r> <urn:min> ?m }")
+    out = [row["m"].value for row in rows]
+    ds.update("DELETE WHERE { <urn:r> ?p ?o }")
+    return out
+
+
+def test_an_update_takes_the_keyword() -> None:
+    ds = Dataset()
+    ds.update(INSERT_MIN)
+    assert written(ds) == []
+    ds.update(INSERT_MIN, aggregate_errors="sparkles")
+    assert written(ds) == ["1"]
+    with ds.transaction() as tx:
+        tx.update(INSERT_MIN, aggregate_errors="sparkles")
+    assert written(ds) == ["1"]
+    with pytest.raises(ValueError, match="aggregate-errors"):
+        ds.update(INSERT_MIN, aggregate_errors="arq")

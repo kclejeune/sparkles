@@ -914,7 +914,7 @@ impl PyDataset {
     }
 
     /// Run a SPARQL Update request in one transaction.
-    #[pyo3(signature = (update, *, base_iri = None, prefixes = None, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None))]
+    #[pyo3(signature = (update, *, base_iri = None, prefixes = None, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn update(
         &self,
@@ -927,6 +927,7 @@ impl PyDataset {
         max_memory_bytes: Option<u64>,
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'_, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<PyUpdateStats> {
         let ds = self.ds_for_write(py)?;
         let args = QueryArgs {
@@ -937,6 +938,7 @@ impl PyDataset {
             max_memory_bytes,
             max_rows_produced,
             cancel,
+            aggregate_errors,
             ..Default::default()
         };
         let (opts, _) = query_options(&args)?;

@@ -102,6 +102,7 @@ class Dataset:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...
     async def select_cursor(
         self,
@@ -222,4 +223,5 @@ class Transaction:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...
