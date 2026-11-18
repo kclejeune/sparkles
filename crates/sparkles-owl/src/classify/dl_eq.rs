@@ -15,7 +15,7 @@
 //! The equality `x ≈ u` as the rewriting equality is blocked outside query contexts (F24,
 //! item 804's third departure, behind `SPARKLES_ROOTED_EQ_BLOCK`): it rewrites `x` to `u`
 //! only in the unit of a core atom of the context of a named class, and `u` to `x` only
-//! in a named-class atom over `u` in such a context, the two forms the journal's Lemmas 21
+//! in a named-class atom over `u` in such a context or that of `owl:Thing` (item 1070), the two forms the journal's Lemmas 21
 //! and 22 use. The equality is still a rewritten literal, so `u ≈ v` turns `x ≈ u` into
 //! `x ≈ v`, and Factor takes it as any equality.
 //!

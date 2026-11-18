@@ -130,9 +130,10 @@ fixtures are exact against HermiT in every configuration, and shoi-005, 027 and 
 with 21,485, 12,666 and 30,789 derived conclusions where they passed the bound before.
 The 45 fixtures that finished before derive about half as many conclusions as before at
 the median, with one, shoi-033, rising from 404 to 528. shoi-022 and 042 still pass the
-bound, and item 822 follows them with their new attribution. On the 392 generated
-ontologies of item 805, 339 now finish within the bound on one and on four threads with
-the same answers, where 274 did before, and 44 pass it where 109 did. All agree with
+bound, and item 822 follows them with their new attribution. Of the 393 generated
+ontologies of item 805 that run, 339 now finish within the bound on one and on four threads
+with the same answers, where 274 did before, 44 pass it where 109 did, and 10 take the
+default paths. All agree with
 HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not report,
 since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
 same values. The gap of `owl:Thing` that item 805 found is closed.
@@ -3808,7 +3809,7 @@ departures in place.
 
 **Equalities with `x` in query contexts.** The rewriting equality `x ≈ u` rewrites `x` to
 `u` only in a unit clause whose atom is a core atom of a query context, which is the
-context of a named class, and rewrites `u` to `x` only in a named-class atom over `u` and
+context of a named class or, since item 1070, of `owl:Thing`, and rewrites `u` to `x` only in a named-class atom over `u` and
 only in a query context. Elsewhere Eq does not rewrite with `x ≈ u`. Every other rule
 stays. Factor takes `x ≈ u` and `x ≈ v` in one head as Table 2 says, and an equality of
 constants `u ≈ v` rewrites the constant in `x ≈ u` to give `x ≈ v`, since it is the
@@ -3944,7 +3945,7 @@ subsumers and conjunctions alone gives the role atom `r(t, v)` and the atom `B(v
 of the successor term `f(t)` with `r(t, f(t))` and `B(f(t))`, at x and at a constant t, in
 the clauses of a context and in its units. The restriction makes no successor and no edge,
 its units take no part in the universal restrictions over successor terms, and a unit's
-EL successor sends it no clause by Pred. The run then reasons about v with the root's
+EL successor sends it no clause by Pred and gets none of its ground markers. The run then reasons about v with the root's
 facts and the context's own ground literals, by Hyper at the constant and the universal
 restrictions over a role atom to a constant that item 804's first departure describes. A
 counting run keeps the successor terms, since an at-most restriction counts its
@@ -3962,21 +3963,23 @@ which Pred would carry back over `f(t)`, is the knowledge about v under the succ
 markers, and the context derives it at v from the same premises, since the markers of
 such a successor are the context's own literals. What the argument leaves open is the
 same as for the first departure, the lifting of the ground clauses that the context then
-holds over v, and it is not a proof. The rationale is the attribution below. In one second
-of shoi-005 the run derived 223,616 Eq conclusions on a processed equality, and the four
-most frequent rewriting equalities were successor terms of restrictions into singletons
-equal to their constant. With the departure, shoi-005 finishes with 21,485 conclusions
+holds over v, and it is not a proof. The rationale is the attribution below. In the first
+second of shoi-005 with the departure off, 80,589 of 240,993 conclusions are Eq inferences
+whose rewriting equality is `f(u) ≈ v`, a successor term of a constant equal to a
+constant, and the successor terms are those of restrictions into singletons. With the departure, shoi-005 finishes with 21,485 conclusions
 where it passed the bound and finished with 6.4 million under a larger one, and shoi-027
 and 032 finish too. The derivation trace now names an Eq conclusion by the kinds of terms
 of its rewriting equality, such as `eq:fx>c` for `f(x) ↦ u`.
 
 The two fixtures that still pass the bound have other causes. In shoi-022 most of the work
 is Eq on equalities `f(u) ≈ v` of successor terms of constants, with no x in the
-conclusion, in each of about 17 contexts, since `¬{a3, a0} ⊑ {a3}` makes every element
-`a0` or `a3`, which is the duplication of ground reasoning across contexts that item 1061
-follows. In shoi-042 most of the work is Eq on disjunctive equalities of constants into
+conclusion, in 15 contexts besides the root, since `¬{a3, a0} ⊑ {a3}` makes every element
+`a0` or `a3`. The contexts derive 143,756 distinct ground conclusions between them in the
+first 1.5 million lines of the trace, of which 14,077 are distinct across contexts, which
+is the duplication of ground reasoning across contexts that item 1061 follows. In shoi-042 most of the work is Eq on disjunctive equalities of constants into
 clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With a bound of
-200 million it finishes in 6 s after 4.7 million conclusions.
+200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
+without link-time optimization.
 
 ### ROBOT-compatible commands
 
