@@ -43,12 +43,6 @@ git rev-parse HEAD > "$out/commit"
   uptime
 } > "$out/host.txt" 2>&1
 rustc -vV > "$out/rustc.txt"
-{
-  mbx --version
-  echo "MBX_LINKER=${MBX_LINKER:-}"
-  echo "RUSTFLAGS=${RUSTFLAGS:-}"
-  python3 -c 'import json, sys, tomllib; print(json.dumps(tomllib.load(open("Cargo.toml", "rb")).get("profile", {}), sort_keys=True))'
-} > "$out/build.txt"
 filter='group(host-timing)'
 rc=0
 rm -f target/nextest/default/junit.xml

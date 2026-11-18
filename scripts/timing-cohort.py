@@ -11,7 +11,10 @@ Usage:
   timing-cohort.py record RUN --nextest-exit N --list LIST.json --worker ID
       Write RUN/run.json, the run's identity: a unique run ID, the source commit, the
       worker, the compiler and build configuration, nextest's exit status and the tests
-      that the group selected, from `nextest list --message-format json`.
+      that the group selected, from `nextest list --message-format json`. The build
+      configuration holds the Boxington version, every environment override of Cargo's
+      and the compiler's flags and profiles, the manifest's profiles and a hash of each
+      Cargo configuration file that applies.
   timing-cohort.py qualify RUN RUN RUN... --out THRESHOLDS
       From three or more distinct runs at one commit on one worker with one build
       configuration, write each test's duration threshold: the slowest run plus three
@@ -32,7 +35,10 @@ does not know is refused.
 
 import argparse
 import json
+import hashlib
 import os
+import re
+import subprocess
 import uuid
 import sys
 import xml.etree.ElementTree as ET
@@ -188,6 +194,45 @@ def check(run, thresholds):
     return lines
 
 
+# Environment variables that change how Cargo and the compiler build the tests. Each one
+# that is set goes into the build identity by name and value, and the listed names that
+# are unset go in as unset, so a run with an override never compares with one without.
+BUILD_ENV = re.compile(r"^(CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS|RUSTFLAGS|RUSTDOCFLAGS"
+                       r"|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTC_BOOTSTRAP|CARGO_INCREMENTAL"
+                       r"|CARGO_BUILD_[A-Z0-9_]+|CARGO_PROFILE_[A-Z0-9_]+|CARGO_TARGET_[A-Z0-9_]+"
+                       r"|CARGO_UNSTABLE_[A-Z0-9_]+|MBX_LINKER|MBX_[A-Z_]*INCREMENTAL"
+                       r"|CC|CXX|CFLAGS|CXXFLAGS|LDFLAGS)$")
+LISTED_ENV = ("CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTC_WRAPPER",
+              "CARGO_INCREMENTAL", "MBX_LINKER")
+SECRET = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
+
+
+def build_identity(root, env):
+    """The build configuration of a run from ROOT under ENV: the Boxington version, the
+    build environment overrides, the manifest's profiles and the Cargo configuration
+    files that apply, as one stable string."""
+    import tomllib
+    lines = []
+    try:
+        lines.append(subprocess.run(["mbx", "--version"], capture_output=True, text=True, check=True).stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        lines.append("mbx unknown")
+    for name in sorted(set(LISTED_ENV) | {n for n in env if BUILD_ENV.match(n)}):
+        if SECRET.search(name):
+            continue
+        lines.append(f"{name}={env[name]}" if name in env else f"{name} unset")
+    root = Path(root)
+    profiles = tomllib.loads((root / "Cargo.toml").read_text()).get("profile", {})
+    lines.append("profiles " + json.dumps(profiles, sort_keys=True))
+    home = Path(env.get("CARGO_HOME") or Path(env.get("HOME", "/")) / ".cargo")
+    configs = [d / ".cargo" / n for d in [root, *root.parents] for n in ("config.toml", "config")]
+    configs += [home / "config.toml", home / "config"]
+    for c in configs:
+        if c.is_file():
+            lines.append(f"config {c} {hashlib.sha256(c.read_bytes()).hexdigest()}")
+    return "\n".join(lines)
+
+
 def record(run, nextest_exit, listing, worker):
     """Write RUN/run.json."""
     run = Path(run)
@@ -197,7 +242,7 @@ def record(run, nextest_exit, listing, worker):
         "commit": (run / "commit").read_text().strip(),
         "worker": worker,
         "rustc": (run / "rustc.txt").read_text().strip(),
-        "build": (run / "build.txt").read_text().strip(),
+        "build": build_identity(Path(__file__).resolve().parents[1], os.environ),
         "nextest_exit": nextest_exit,
         "selected": selected(json.loads(Path(listing).read_text())),
     }

@@ -192,7 +192,6 @@ class Runs(unittest.TestCase):
             run.mkdir()
             (run / "commit").write_text("abc\n")
             (run / "rustc.txt").write_text("rustc 1.99.1\n")
-            (run / "build.txt").write_text("mbx 1\n")
             listing = {"rust-suites": {"sparkles-core": {"binary-id": "sparkles-core", "testcases": {
                 "a": {"filter-match": {"status": "matches"}},
                 "b": {"filter-match": {"status": "mismatch", "reason": "expression"}}}},
@@ -207,10 +206,35 @@ class Runs(unittest.TestCase):
                              (1, "abc", "boat:bx_1", 0))
             other = Path(d) / "run2"
             other.mkdir()
-            for f in ("commit", "rustc.txt", "build.txt"):
+            for f in ("commit", "rustc.txt"):
                 (other / f).write_text((run / f).read_text())
             tc.record(other, 0, Path(d) / "list.json", "boat:bx_1")
             self.assertNotEqual(json.loads((other / "run.json").read_text())["run_id"], ident["run_id"])
+
+
+    def test_the_build_identity_holds_every_build_override(self):
+        base = {"HOME": "/nonexistent", "PATH": os.environ.get("PATH", "")}
+        plain = tc.build_identity(ROOT, base)
+        self.assertIn("CARGO_ENCODED_RUSTFLAGS unset", plain)
+        self.assertIn("profiles {", plain)
+        for extra in [{"CARGO_ENCODED_RUSTFLAGS": "-Copt-level=3"}, {"CARGO_PROFILE_TEST_OPT_LEVEL": "3"},
+                      {"CARGO_PROFILE_DEV_DEBUG": "false"}, {"CARGO_BUILD_RUSTFLAGS": "-Ctarget-cpu=native"},
+                      {"MBX_LINKER": "mold"}, {"RUSTC_WRAPPER": "sccache"}]:
+            other = tc.build_identity(ROOT, {**base, **extra})
+            self.assertNotEqual(other, plain, extra)
+            name, value = next(iter(extra.items()))
+            self.assertIn(f"{name}={value}", other)
+        self.assertEqual(tc.build_identity(ROOT, {**base, "CARGO_PROFILE_TEST_OPT_LEVEL": "0"}),
+                         tc.build_identity(ROOT, {**base, "CARGO_PROFILE_TEST_OPT_LEVEL": "0"}))
+        self.assertNotIn("hunter2", tc.build_identity(ROOT, {**base, "MBX_REMOTE_TOKEN": "hunter2",
+                                                              "CARGO_REGISTRY_TOKEN": "hunter2"}))
+        # unrelated variables do not change it
+        self.assertEqual(tc.build_identity(ROOT, {**base, "TERM": "dumb"}), plain)
+        with tempfile.TemporaryDirectory() as d:
+            th = thresholds_file(d, TWO)
+            cases = [("core", "a", 1.0, False), ("fmt", "b", 1.0, False)]
+            self.assertEqual(tc.main(["check", run_dir(d, "o3", cases, build=tc.build_identity(
+                ROOT, {**base, "CARGO_ENCODED_RUSTFLAGS": "-Copt-level=3"})), "--thresholds", th]), 2)
 
 
 if __name__ == "__main__":

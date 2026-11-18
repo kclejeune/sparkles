@@ -1049,7 +1049,10 @@ with a roadmap row for a fix-forward item, and it does not block the push.
 
 Each run records its identity in `run.json`, which carries a version. The identity holds
 a unique run ID, the commit, the worker, the compiler, the build configuration, nextest's
-exit status and the tests that the group selected. `SPARKLES_TIMING_WORKER` names the
+exit status and the tests that the group selected. The build configuration covers the
+Boxington version, each environment override of Cargo's and the compiler's flags and
+profiles, such as `CARGO_ENCODED_RUSTFLAGS` and `CARGO_PROFILE_*`, the manifest's profiles
+and a hash of each Cargo configuration file that applies. `SPARKLES_TIMING_WORKER` names the
 worker, such as `boat:bx_ID`, and defaults to the host name. The thresholds come from
 three or more runs at `origin/main` on the idle worker with
 `scripts/timing-cohort.py qualify RUN RUN RUN --out FILE`, which sets each test's
