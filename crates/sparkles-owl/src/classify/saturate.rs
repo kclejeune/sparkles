@@ -2882,6 +2882,13 @@ fn apply_rules<S: Sink, R: Rules>(
                 link_to(ix, me, st, e, r, out);
             }
             if R::HORN {
+                debug_assert!(
+                    ix.horn
+                        .as_ref()
+                        .is_none_or(|h| !h.dead_over_inverse(roles, r)),
+                    "a backward link under the inverse of a role whose universals the \
+                     automata dropped"
+                );
                 horn_rules::back(ix, me, st, e, r, out);
                 if R::FULL {
                     horn_rules::back_full(ix, me, st, e, r, out);

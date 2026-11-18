@@ -1565,7 +1565,122 @@ On one thread 57 files of the development set change their conclusions. Of them 
 derive fewer, `ore_ont_8941` 34,142 against 180,033, and 5 derive up to 0.6% more. GO,
 ChEBI lite and the EL files derive the same.
 
+<a id="reduced-automata"></a>
+
+### Reduced automata of the Horn rules
+
+Roadmap item 693 reduces each automaton before a run with the Horn rules unfolds a
+universal or a negative existential restriction by it, as
+[F24](../../specs/F24-owl-classification/SPEC.md#the-horn-rules) describes.
+`SPARKLES_HORN_AUTOMATA` selects the reductions. Level 0 applies none, level 2 merges the
+states that accept the same words and drops the transitions that a superproperty covers,
+and level 3, the default, also drops the transitions by properties that no link can have.
+On forge six rounds of alternating order compared the base, commit 7e272f4d, with the
+build of the reductions, commit 7d064abd, at levels 0, 2 and 3, one process per side, file
+and thread count. A process classified five times, twice on `ore_ont_8737` and
+`ore_ont_9654` and once on `ore_ont_16744`. Each time below is the median over the six
+processes of a side of the process's median classification, each ratio divides level 3's
+time by the base's, and the range is that of the six rounds' own ratios. The memory is the
+median peak resident set of a side's processes. The conclusions are those of one thread,
+where the six processes of a side report the same count. Every taxonomy has the same hash
+on the four sides in every round.
+
+| Ontology | Threads | Base ms | Level 0 ms | Level 2 ms | Level 3 ms | Level 3 / base | Range of the rounds | Base MiB | Level 3 MiB | Conclusions, base | Conclusions, level 3 |
+|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| GO | 1 | 309 | 312 | 312 | 311 | 1.01 | 1.00 to 1.02 | 247 | 247 | 2,946,303 | 2,947,343 |
+| | 4 | 124 | 121 | 123 | 123 | 0.99 | 0.94 to 1.04 | 272 | 276 | | |
+| ChEBI lite | 1 | 933 | 932 | 931 | 932 | 1.00 | 0.99 to 1.02 | 671 | 671 | 26,995,717 | 26,995,717 |
+| | 4 | 428 | 428 | 425 | 437 | 1.02 | 0.93 to 1.08 | 765 | 788 | | |
+| `ore_ont_14817` | 1 | 58,433 | | | 59,904 | 1.03 | 1.01 to 1.03 | 1,695 | 1,694 | 29,062,079 | 22,090,247 |
+| | 4 | 7,687 | | | 8,274 | 1.08 | 0.91 to 1.46 | 2,111 | 2,198 | | |
+| `ore_ont_9663` | 1 | 75,337 | | | 76,682 | 1.02 | 1.01 to 1.02 | 1,385 | 1,380 | 50,878,012 | 35,611,566 |
+| | 4 | 8,576 | | | 8,188 | 0.95 | 0.93 to 1.05 | 3,117 | 3,115 | | |
+| `ore_ont_9654` | 1 | 3,088 | 3,064 | 1,431 | 762 | 0.25 | 0.21 to 0.25 | 1,359 | 665 | 45,903,674 | 9,576,942 |
+| | 4 | 1,096 | 1,070 | 625 | 449 | 0.41 | 0.33 to 0.46 | 1,417 | 689 | | |
+| `ore_ont_9855` | 1 | 1,460 | 1,458 | 931 | 930 | 0.64 | 0.63 to 0.64 | 371 | 247 | 20,811,316 | 10,859,414 |
+| | 4 | 517 | 525 | 348 | 347 | 0.67 | 0.64 to 0.72 | 500 | 370 | | |
+| `ore_ont_6132` | 1 | 21.6 | 21.7 | 21.9 | 20.3 | 0.94 | 0.93 to 0.96 | 75 | 77 | 308,111 | 277,366 |
+| | 4 | 14.9 | 15.3 | 15.1 | 14.9 | 1.00 | 0.94 to 1.04 | 109 | 111 | | |
+| `ore_ont_4510` | 1 | 240 | 241 | 241 | 237 | 0.98 | 0.97 to 1.02 | 353 | 353 | 2,477,970 | 2,357,244 |
+| | 4 | 157 | 157 | 154 | 155 | 0.99 | 0.82 to 1.00 | 376 | 376 | | |
+| `ore_ont_12901` | 1 | 180 | 182 | 182 | 177 | 0.98 | 0.97 to 1.02 | 309 | 309 | 1,914,884 | 1,816,166 |
+| | 4 | 124 | 123 | 124 | 118 | 0.96 | 0.83 to 0.98 | 337 | 339 | | |
+| `ore_ont_14375` | 1 | 32.0 | 32.3 | 32.3 | 31.2 | 0.97 | 0.97 to 0.98 | 87 | 95 | 382,067 | 363,547 |
+| | 4 | 25.5 | 25.1 | 25.3 | 25.0 | 0.98 | 0.82 to 1.17 | 143 | 143 | | |
+| `ore_ont_10951` | 1 | 15.3 | 15.5 | 15.6 | 15.0 | 0.98 | 0.97 to 0.99 | 49 | 49 | 190,519 | 180,785 |
+| | 4 | 14.1 | 12.9 | 13.2 | 13.2 | 0.94 | 0.83 to 1.35 | 107 | 95 | | |
+| `ore_ont_8737` | 1 | 30,594 | 30,706 | 30,640 | 30,839 | 1.01 | 1.00 to 1.12 | 3,877 | 3,885 | 1,619,753,615 | 1,619,753,615 |
+| | 4 | 9,652 | 10,004 | 9,910 | 10,048 | 1.04 | 0.95 to 1.08 | 5,955 | 5,760 | | |
+| `ore_ont_16744` | 1 | 9,191 | 9,168 | 9,092 | 9,126 | 0.99 | 0.99 to 1.02 | 2,505 | 2,496 | 592,208,319 | 592,208,319 |
+| | 4 | 3,199 | 3,105 | 3,144 | 3,115 | 0.97 | 0.92 to 1.03 | 2,874 | 2,878 | | |
+| `ore_ont_10073` | 1 | 807 | 806 | 805 | 808 | 1.00 | 0.98 to 1.05 | 585 | 585 | 1,704,715 | 1,704,715 |
+| | 4 | 755 | 754 | 751 | 753 | 1.00 | 0.99 to 1.02 | 596 | 590 | | |
+| `ore_ont_1370` | 1 | 478 | 473 | 472 | 472 | 0.99 | 0.98 to 1.03 | 359 | 359 | 2,074,571 | 2,074,571 |
+| | 4 | 436 | 427 | 429 | 427 | 0.98 | 0.93 to 0.99 | 397 | 407 | | |
+| `ore_ont_4572` | 1 | 248 | 250 | 250 | 249 | 1.00 | 0.98 to 1.03 | 365 | 365 | 1,517,836 | 1,517,836 |
+| | 4 | 245 | 243 | 244 | 242 | 0.99 | 0.92 to 1.05 | 427 | 418 | | |
+| `ore_ont_10754` | 1 | 12.0 | 12.0 | 12.0 | 12.1 | 1.00 | 0.99 to 1.02 | 53 | 53 | 135,584 | 135,584 |
+| | 4 | 9.8 | 10.2 | 9.3 | 9.8 | 0.99 | 0.92 to 1.18 | 88 | 88 | | |
+
+`ore_ont_14817` and `ore_ont_9663`, the two Uberon files, ran their default pipeline on
+the base and at level 3 only, with one classification per process. Nearly all of that
+time is the bounded attempt of the disjunctive rules, which ends past its bound before
+the Horn rules answer. The same rounds ran the two files on all four sides with
+`--dl-attempt-work 1`, which ends the attempt at once and so times the Horn rules alone,
+with three classifications per process.
+
+| Ontology | Threads | Base ms | Level 0 ms | Level 2 ms | Level 3 ms | Level 3 / base | Range of the rounds | Base MiB | Level 3 MiB | Conclusions, base | Conclusions, level 3 |
+|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| `ore_ont_9663` | 1 | 3,663 | 3,671 | 3,189 | 2,742 | 0.75 | 0.69 to 0.75 | 1,215 | 951 | 50,878,012 | 35,611,566 |
+| | 4 | 1,420 | 1,366 | 1,235 | 1,070 | 0.75 | 0.68 to 0.77 | 1,462 | 1,157 | | |
+| `ore_ont_14817` | 1 | 2,495 | 2,487 | 2,186 | 1,995 | 0.80 | 0.75 to 0.81 | 808 | 713 | 29,062,079 | 22,090,247 |
+| | 4 | 920 | 928 | 836 | 779 | 0.85 | 0.81 to 0.94 | 991 | 832 | | |
+
+Without the attempt the Horn rules classify `ore_ont_14817` in 0.80 times the base's time
+on one thread and 0.85 times on four, and `ore_ont_9663` in 0.75 times on both, with peak
+resident sets of 713 against 808 MiB and 951 against 1,215 MiB on one thread. Level 2
+gives 0.88 and 0.87 on one thread, so the dead properties account for about two fifths
+of the gain on the first file and half on the second. `ore_ont_9654` classifies in 0.25 times
+the base's time on one thread and 0.41 times on four, with 9.6 against 45.9 million
+conclusions and a peak resident set of 665 against 1,359 MiB, and level 2 alone gives
+0.46 and 0.57. `ore_ont_9855` classifies in 0.64 and 0.67 times the base's time with
+10.9 against 20.8 million conclusions and 247 against 371 MiB, all of it at level 2.
+`ore_ont_6132` and the four files of [assertions under a range](#assertions-under-a-range)
+derive 5 to 10% fewer conclusions and take 0.94 and 0.97 to 0.98 times the base's time on
+one thread. GO derives 1,040 conclusions more at levels 2 and 3 than its 2,946,303 on the
+base, in the same time. On one thread level 0 is within 1.2% of the base on every file.
+
+The default run of the two Uberon files shows neither gain. On one thread it takes 59.9
+against 58.4 s on `ore_ont_14817` and 76.7 against 75.3 s on `ore_ont_9663`, slower in
+each of the six rounds, while the Horn rules' final saturation takes 1.53 against 2.02 s
+and 2.57 against 3.51 s. The time outside that saturation, which holds the attempt, is
+therefore about 2.0 and 2.3 s longer, 3.5 and 3.2% of it. The attempt sets the peak
+resident set, which stays at 1,694 and 1,380 MiB. The rounds have no level 0 side of the
+default run, so they do not tell the reductions from the build. A pinned
+process on the laptop executes the same instructions outside the Horn rules on the base
+and at levels 0 and 3, 705.18, 705.22 and 705.20 billion on `ore_ont_14817`, and 21.4
+against 26.9 billion for the Horn rules alone at level 3. On that file the counts suggest
+that the attempt does the same work, and they do not explain the longer time on forge.
+`ore_ont_9663` has no such count.
+On four threads the two files' rounds range from 0.91 to 1.46 and from 0.93 to 1.05 of
+the base, so the medians of 1.08 and 0.95 are not effects.
+
+The files whose conclusions the reductions leave alone take 0.99 to 1.01 times the base's
+time on one thread. On `ore_ont_8737` on one thread the first round ran 9 to 22% longer than
+the later ones on every side and the second 6 and 9% longer on the base and level 3, and
+rounds three to six put level 3 within 1.2% of the base. On
+four threads its three levels take 1.03 to 1.04 times the base's time, and level 0 is
+slower than the base in each of the six rounds, so the difference belongs to the build
+and not to the reductions. It lies within the base's own rounds, which range from 9.47
+to 10.17 s. Roadmap item 1090 follows it with the Uberon files' time outside the
+saturation. The peak resident set of `ore_ont_14375` on one thread is 95 against 87 MiB.
+
 ## Records
+
+The [record of item 693's reduced automata](runs/2026-11-17-horn-automata-forge-7d064abd/record.json)
+holds every classification of the six rounds on forge of the base and of the build at
+levels 0, 2 and 3, the taxonomy hashes, the binary and data hashes, the pinned instruction
+counts from the laptop and the scripts that ran.
 
 The [record of items 1025 and 1026](runs/2026-11-17-horn-range-successors-atlas-c748d5d5/record.json)
 holds every classification of the rounds on `atlas` of the base, the build of both items,

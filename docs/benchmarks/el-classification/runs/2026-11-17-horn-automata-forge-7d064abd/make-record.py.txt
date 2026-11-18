@@ -1,0 +1,51 @@
+# make-record.py LANE DEST: builds the benchmark record of item 693's reduced automata from the
+# rounds of timing.sh on forge and the laptop's instruction counts
+import json, sys, os, glob, shutil
+lane, dest = sys.argv[1], sys.argv[2]
+keep = ['classifyMs', 'classifyMedianMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
+        'dlAttemptOver', 'outside', 'outsideTaken', 'conclusions', 'contexts', 'conjunctions', 'estimatedBytes',
+        'peakEstimatedBytes', 'peakRssKib', 'threads']
+def runs(root, pattern):
+    out = []
+    for p in sorted(glob.glob(os.path.join(root, pattern))):
+        d = json.load(open(p))
+        out.append({'path': os.path.relpath(p, root), 'report': {k: d.get(k) for k in keep}})
+    return out
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+t = os.path.join(lane, 'out', 'forge', 'timing'); ins = os.path.join(lane, 'out', 'instr')
+before = text(os.path.join(t, 'before.txt'))
+shas = {l.split()[1].split('/')[-1]: l.split()[0] for l in before.splitlines() if '/bin/' in l}
+data = {l.split()[1]: l.split()[0] for l in before.splitlines() if l.endswith(('.owl', '.ofn'))}
+heads = {n: text(os.path.join(lane, 'bin', n + '.head')).split()[0] for n in ['base', 'tip']}
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'ORE 2015 DL development files ore_ont_14817, ore_ont_9663, ore_ont_9855, ore_ont_8737, ore_ont_9654, ore_ont_4572, ore_ont_6132, ore_ont_10754, ore_ont_16744, ore_ont_4510, ore_ont_12901, ore_ont_14375, ore_ont_10951, ore_ont_10073 and ore_ont_1370, GO 2026-07-26 and ChEBI lite 256',
+  'host': {'name': 'forge', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+  'manifest': {
+    'sides': {'base': '7e272f4d, the lane base',
+              'l0, l2 and l3': '7d064abd, the reviewed build of the reduced automata, with SPARKLES_HORN_AUTOMATA set to 0, 2 and 3. Level 3 is the default.',
+              'base-horn, l0-horn, l2-horn and l3-horn': 'the same sides with --dl-attempt-work 1, which ends the disjunctive attempt at once, on ore_ont_14817 and ore_ont_9663'},
+    'build': 'mbx build --release -p sparkles-owl --example el_classify on wally, both sides from clean checkouts in one worktree with mbx 1.30.0 and rustc 1.99.1, copied to forge',
+    'commits': heads, 'binaries_sha256': shas, 'data_sha256': data,
+    'scripts': ['timing.sh.txt', 'summarize.py.txt', 'tables.py.txt', 'instructions.sh.txt', 'make-record.py.txt']},
+  'settings': {'threads': 'one and four in the rounds, one in the instruction counts',
+               'scope': 'one process per run in a 13 GiB systemd scope without swap on forge',
+               'lock': 'the rounds ran under ~/lanes/.heavy.lock as the systemd user unit horn-uberon-2-ab'},
+  'method': 'timing.sh ran six rounds of alternating order of base, l0, l2 and l3, one process per side, file and thread count with --repeat 5, 2 for ore_ont_8737 and ore_ont_9654 and 1 for ore_ont_16744. The default pipeline of ore_ont_14817 and ore_ont_9663 ran base and l3 only with one classification a process, and their runs with --dl-attempt-work 1 ran all four sides with three. summarize.py and tables.py take the median over the six processes of each process median classification, the ratio of those medians and the range of the six rounds ratios. Each line of the log gives the round, the side, the file, the thread count, the exit status and the first 16 hex digits of the SHA-256 of the sorted taxonomy.',
+  'timing': runs(t, 'r*/*/*.json'),
+  'timing_log': text(os.path.join(t, 'log.txt')),
+  'timing_summary': text(os.path.join(lane, 'out', 'forge', 'summary.txt')),
+  'timing_tables': text(os.path.join(lane, 'out', 'forge', 'tables.md')),
+  'hosts': {'before.txt': before, 'after.txt': text(os.path.join(t, 'after.txt'))},
+  'laptop_diagnostics': {
+    'host': 'stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB',
+    'instructions': text(os.path.join(ins, 'summary.txt')),
+    'instructions_note': 'perf stat counted user-mode instructions of one process pinned to a performance core with taskset -c 2 on one thread with one classification for each side of ore_ont_14817, with the default pipeline (full) and with --dl-attempt-work 1 (horn), from the binaries of the rounds. The laptop ran other work, so the cycles and times are not measurements.'},
+}
+os.makedirs(dest, exist_ok=True)
+for src in ['atlas/timing.sh', 'atlas/summarize.py', 'atlas/tables.py', 'out/instr/run.sh', 'atlas/make-record.py']:
+    name = 'instructions.sh' if src.endswith('run.sh') else os.path.basename(src)
+    shutil.copyfile(os.path.join(lane, src), os.path.join(dest, name + '.txt'))
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']), shas, heads)

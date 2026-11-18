@@ -2422,15 +2422,41 @@ fn horn_index(
             _ => None,
         })
         .collect();
+    // a link's role is under an at-most restriction's when the role or one above it is
+    // such a role, which a table of them says without a scan of them for each link
+    let mut counted: Vec<bool> = Vec::new();
+    for &s in &most {
+        if counted.len() <= s as usize {
+            counted.resize(s as usize + 1, false);
+        }
+        counted[s as usize] = true;
+    }
+    let counts = |s: Role| counted.get(s as usize).copied().unwrap_or(false);
     let back: Vec<Role> = links
         .iter()
-        .filter(|&&l| most.iter().any(|&s| roles.sub(l, s)))
+        .filter(|&&l| {
+            counts(l)
+                || roles
+                    .sup
+                    .get(l as usize)
+                    .is_some_and(|v| v.iter().any(|&s| counts(s)))
+        })
         .filter_map(|&l| roles.inv(l))
         .collect();
     links.extend(back);
     links.sort_unstable();
     links.dedup();
-    let linked = |s: Role| links.iter().any(|&l| roles.sub(l, s));
+    // tested for each transition of each automaton below, so by a table: a scan of the
+    // links for each transition of a long chain's automaton is their product
+    let over_links = roles_over(roles, &links);
+    let linked = |s: Role| over_links.get(s as usize).copied().unwrap_or(false);
+    // for each automaton, whether a link runs along one of its transitions, found once:
+    // the negative existentials below ask it of the same automaton again and again
+    let runs: FxHashMap<Role, bool> = h
+        .autos
+        .iter()
+        .map(|(&r, a)| (r, a.trans.iter().any(|t| t.1.is_some_and(linked))))
+        .collect();
     // a range of s holds of the predecessors of the links that run against s
     let mut news: Vec<(Ex, Ex)> = Vec::new();
     for &(s, c) in &ax.ranges {
@@ -2463,21 +2489,21 @@ fn horn_index(
             .any(|n| matches!(n, Node::Forall(..) | Node::AtMost1(..) | Node::SelfLoop(_)))
         || b.exist.iter().any(|&(f, (r, _))| {
             f != TOP
-                && roles.inv(r).is_some_and(|i| match h.autos.get(&i) {
-                    Some(a) => a.trans.iter().any(|t| t.1.is_some_and(linked)),
+                && roles.inv(r).is_some_and(|i| match runs.get(&i) {
+                    Some(&run) => run,
                     None => linked(i),
                 })
         });
-    let unlinked = |i: Role| {
-        h.autos
-            .get(&i)
-            .is_some_and(|a| !a.trans.iter().any(|t| t.1.is_some_and(linked)))
-    };
+    let unlinked = |i: Role| runs.get(&i).is_some_and(|&run| !run);
     // a negative existential over a role that chains reach and whose inverse the run
     // does not have cannot be unfolded, and keeps every chain composed
-    let invertible = b.exist.iter().all(|&(_, (r, _))| {
-        roles.inv(r).is_some() || !ax.chains.iter().any(|(_, v)| roles.sub(*v, r))
-    });
+    let results: Vec<Role> = ax.chains.iter().map(|(_, v)| *v).collect();
+    let over_results = roles_over(roles, &results);
+    let reached = |r: Role| over_results.get(r as usize).copied().unwrap_or(false);
+    let invertible = b
+        .exist
+        .iter()
+        .all(|&(_, (r, _))| roles.inv(r).is_some() || !reached(r));
     let selection = (fires && !roles.any_empty && invertible).then(|| {
         let mut seeds: Vec<Role> = b
             .exist
@@ -2496,9 +2522,9 @@ fn horn_index(
             continue;
         }
         let Some(i) = roles.inv(r) else { continue };
-        match h.autos.get(&i) {
-            Some(a)
-                if a.trans.iter().any(|t| t.1.is_some_and(linked))
+        match runs.get(&i) {
+            Some(&run)
+                if run
                     || selection
                         .as_ref()
                         .is_some_and(|s| s.composed.binary_search(&r).is_err()) =>
@@ -2542,8 +2568,60 @@ fn horn_index(
     // the universals the transitions make, which the rules apply even when one is a
     // universal that is unfolded too
     let mut made: Vec<Ex> = Vec::new();
+    // The roles that a link or a loop of the run can have, with their inverses. The links
+    // are those of the existential restrictions with a successor, among them the negative
+    // ones that became fillers of universals above, and the results of the chains the run
+    // composes. A loop has a reflexive role, the role of a self-restriction, a link's role
+    // when an at-most restriction identifies a predecessor with a successor, or a chain's
+    // result. Without a selection the run composes every chain and prunes nothing.
+    let live_roles: Option<Vec<Role>> = selection.as_ref().map(|sel| {
+        let mut v: Vec<Role> = b
+            .succ
+            .iter()
+            .filter_map(|&(e, _)| match it.nodes[e as usize] {
+                Node::Exist(r, _) => Some(r),
+                _ => None,
+            })
+            .collect();
+        v.extend(sel.comp.values().flatten().copied());
+        v.extend(ix.roles.reflexive.iter().copied());
+        v.extend(it.nodes.iter().filter_map(|n| match *n {
+            Node::SelfLoop(r) => Some(r),
+            _ => None,
+        }));
+        let invs: Vec<Role> = v.iter().filter_map(|&r| ix.roles.inv(r)).collect();
+        v.extend(invs);
+        v.sort_unstable();
+        v.dedup();
+        v
+    });
+    // The roles with a live role under them, as a table: a transition's role is tested
+    // by lookups, where a scan of the live roles for each transition of a long chain's
+    // automaton is their product.
+    let over_live: Option<Vec<bool>> = live_roles.as_ref().map(|v| roles_over(&ix.roles, v));
+    // the steps of one lookup in the role hierarchy, for the bound of a reduction
+    let longest = ix.roles.sup.iter().map(Vec::len).max().unwrap_or(0);
+    let sub_cost = super::horn::log_steps(longest);
+    let mut dead: Vec<Role> = Vec::new();
     for (holder, r, f) in unfold {
-        let a = autos.entry(r).or_insert_with(|| h.autos[&r].eps_free());
+        let a = autos.entry(r).or_insert_with(|| {
+            // R3 reads a universal on `l` at the links under `l`, and R4 at the links
+            // and loops under its inverse. A universal role relates every pair.
+            let live = over_live.as_ref().map(|over| {
+                let ix = &*ix;
+                move |l: Role| {
+                    let under = |s: Role| over.get(s as usize).copied().unwrap_or(false);
+                    ix.is_universal(l) || under(l) || ix.roles.inv(l).is_some_and(under)
+                }
+            });
+            reduced(
+                &h.autos[&r],
+                &ix.roles,
+                sub_cost,
+                live.as_ref().map(|f| f as &dyn Fn(Role) -> bool),
+                &mut dead,
+            )
+        });
         // a universal's holder is the universal, and a negative existential
         // restriction's is its filler, which restrictions over other roles share, so
         // the restriction names the scope
@@ -2595,11 +2673,57 @@ fn horn_index(
         ix.roles.left = sel.left;
         ix.roles.right = sel.right;
     }
+    dead.sort_unstable();
+    dead.dedup();
+    dead.shrink_to_fit();
     super::horn::HornIx {
         flags,
         base: it.nodes.len() as Ex,
         dominate: false,
+        dead,
     }
+}
+
+/// For each role, whether a role of `v` is under it, the roles of `v` included. The table
+/// reads the superrole lists of the roles of `v`, which the role table's build walked
+/// under its poll.
+fn roles_over(roles: &Roles, v: &[Role]) -> Vec<bool> {
+    let mut over = vec![false; roles.sup.len()];
+    let mut mark = |s: Role| {
+        if over.len() <= s as usize {
+            over.resize(s as usize + 1, false);
+        }
+        over[s as usize] = true;
+    };
+    for &x in v {
+        mark(x);
+        for &s in roles.sup.get(x as usize).map_or(&[][..], |l| l.as_slice()) {
+            mark(s);
+        }
+    }
+    over
+}
+
+/// The automaton of a role without ε-transitions, reduced as
+/// [`super::horn::reduction`] says.
+fn reduced(
+    a: &super::horn::Nfa,
+    roles: &Roles,
+    sub_cost: usize,
+    live: Option<&dyn Fn(Role) -> bool>,
+    dead: &mut Vec<Role>,
+) -> super::horn::EpsFree {
+    let mut a = a.eps_free();
+    let level = super::horn::reduction();
+    if level > 2
+        && let Some(live) = live
+    {
+        a.prune(live, dead);
+    }
+    if level > 0 {
+        a.reduce(level > 1, &|r, s| roles.sub(r, s), sub_cost);
+    }
+    a
 }
 
 /// The chains a run with the Horn rules composes, and the roles whose negative

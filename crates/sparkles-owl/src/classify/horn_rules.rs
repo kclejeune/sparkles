@@ -418,6 +418,10 @@ pub fn succ<S: Sink>(
         return false;
     }
     let roles = &ix.roles;
+    debug_assert!(
+        ix.horn.as_ref().is_none_or(|h| !h.dead_over(roles, r)),
+        "a link by a role under one whose universals the automata dropped"
+    );
     if !sent {
         out.send(n, Concl::Back(me, r));
         if roles.keeps_forward(r) {
@@ -1452,6 +1456,7 @@ mod tests {
             flags: Vec::new(),
             base: it.nodes.len() as Ex,
             dominate: true,
+            dead: Vec::new(),
         }));
         (ix, cs)
     }
@@ -1504,6 +1509,7 @@ mod tests {
             flags: Vec::new(),
             base: it.nodes.len() as Ex,
             dominate: false,
+            dead: Vec::new(),
         }));
         let state = |real: bool| {
             let mut st = State {
@@ -1558,6 +1564,7 @@ mod tests {
             flags: Vec::new(),
             base: it.nodes.len() as Ex,
             dominate: false,
+            dead: Vec::new(),
         }));
         // a is its own successor by three roles, each with a filler of its own and one
         // that all three share
@@ -1609,6 +1616,7 @@ mod tests {
             flags: Vec::new(),
             base: it.nodes.len() as Ex,
             dominate: false,
+            dead: Vec::new(),
         }));
         // a has itself and three classes as successors by one role, and four at-most
         // restrictions on the role, each of which counts all of them
@@ -1668,6 +1676,7 @@ mod tests {
             flags: Vec::new(),
             base: it.nodes.len() as Ex,
             dominate: false,
+            dead: Vec::new(),
         }));
         // each role has an at-most restriction of its own, with an individual and a class
         // as its successors, so each restriction merges into a target of its own
@@ -1769,6 +1778,7 @@ mod tests {
             flags: Vec::new(),
             base: it.nodes.len() as Ex,
             dominate: true,
+            dead: Vec::new(),
         }));
         let mut st = State::default();
         let mut out = Checks::new(usize::MAX);
@@ -1836,6 +1846,7 @@ mod tests {
             flags: Vec::new(),
             base: it.nodes.len() as Ex,
             dominate: true,
+            dead: Vec::new(),
         }));
         let mut st = State::default();
         for &m in &parts {

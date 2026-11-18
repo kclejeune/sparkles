@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""tables.py OUTDIR: the rows of the RESULTS table from the rounds of timing.sh. A time is the
+median over the rounds of each process's median classification, the ratio is level 3's time over
+the base's, and the range is the least and greatest of the rounds' own ratios. Conclusions and
+contexts of conjunctions are given on one thread only, where every round reports the same."""
+import json, sys, os, statistics as st
+out = sys.argv[1]
+def load(arm, name, t):
+    ds = []
+    for r in range(1, 7):
+        p = os.path.join(out, f"r{r}", arm, f"{name}.t{t}.json")
+        ds.append(json.load(open(p)) if os.path.exists(p) else None)
+    return ds
+def med(ds, k): return st.median(d[k] for d in ds)
+def ms(x): return f"{x:,.0f}" if x >= 100 else f"{x:.1f}"
+names = sorted({f[:-5].rsplit(".t", 1)[0] for f in os.listdir(os.path.join(out, "r1", "base"))})
+for suffix, title in (("", "default pipeline"), ("-horn", "Horn rules alone")):
+    print(title)
+    for name in names:
+        for t in (1, 4):
+            b = load("base" + suffix, name, t)
+            if b[0] is None: continue
+            arms = {a: load(a + suffix, name, t) for a in ("l0", "l2", "l3")}
+            l3 = arms["l3"]
+            rr = [x["classifyMedianMs"] / y["classifyMedianMs"] for x, y in zip(l3, b)]
+            cells = [f"`{name}`" if t == 1 else "", str(t), ms(med(b, "classifyMedianMs"))]
+            for a in ("l0", "l2", "l3"):
+                cells.append(ms(med(arms[a], "classifyMedianMs")) if arms[a][0] else "")
+            cells += [f"{med(l3, 'classifyMedianMs') / med(b, 'classifyMedianMs'):.2f}", f"{min(rr):.2f} to {max(rr):.2f}",
+                      f"{med(b, 'peakRssKib') / 1024:,.0f}", f"{med(l3, 'peakRssKib') / 1024:,.0f}"]
+            if t == 1:
+                cb = {d["conclusions"] for d in b}; c3 = {d["conclusions"] for d in l3}
+                assert len(cb) == 1 and len(c3) == 1, (name, cb, c3)
+                cells += [f"{cb.pop():,}", f"{c3.pop():,}"]
+            else: cells += ["", ""]
+            print("| " + " | ".join(cells) + " |")

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# User-mode instruction counts on one thread pinned to a performance core: base, tip at level 0 and 3, the default pipeline
+# and the Horn rules alone (--dl-attempt-work 1). Counts do not depend on the host's load.
+set -u
+cd "$(dirname "$0")"
+P=${PERF:-perf}
+F=${F:?the path of ore_ont_14817.owl}
+N=$(basename $F .owl)
+for arm in base:0 tip:0 tip:3; do
+  b=${arm%:*}; h=${arm#*:}
+  for mode in horn full; do
+    flags=""; [ $mode = horn ] && flags="--dl-attempt-work 1"
+    SPARKLES_HORN_AUTOMATA=$h timeout 1800 taskset -c 2 $P stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u -o $N.$b.l$h.$mode.stat \
+      ../../bin/$b $flags --threads 1 --repeat 1 $F > $N.$b.l$h.$mode.json 2> $N.$b.l$h.$mode.err
+    echo "$N $b l$h $mode status=$?" >> log.txt
+  done
+done
+echo INSTR-DONE >> log.txt

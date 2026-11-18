@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# timing.sh: one binary (bin/tip, lane tip) with the reductions of item
+# 693 off and on, in interleaved rounds, one process per arm, file and thread count. The caller
+# holds ~/lanes/.heavy.lock. Arms: l0 (SPARKLES_HORN_AUTOMATA=0), l2, l3 (the default). The two Uberon files
+# also run with --dl-attempt-work 1, which ends the disjunctive attempt at once and times the
+# Horn rules alone (suffix -horn). The arm base is bin/base, the same example built from
+# 7e272f4d on the host and toolchain that built bin/tip, since the index tables of the lane
+# also run at level 0. The default pipeline of the two Uberon files runs only the arms base and l3
+# once per process, since nearly all of it is the bounded disjunctive attempt that this lane
+# does not change. ROUNDS and FILES shorten a smoke run, OUTNAME names its directory.
+set -u
+D=$HOME/lanes/horn-uberon-2
+F=$D/files
+OUT=$D/out/${OUTNAME:-timing}; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/tip $D/bin/base; cat $D/bin/*.head; (cd $F && sha256sum *); } > $OUT/before.txt
+files="${FILES:-ore_ont_14817.owl ore_ont_9663.owl go.ofn ore_ont_9855.owl ore_ont_8737.owl ore_ont_9654.owl ore_ont_4572.owl ore_ont_6132.owl ore_ont_10754.owl ore_ont_16744.owl ore_ont_4510.owl ore_ont_12901.owl ore_ont_14375.owl ore_ont_10951.owl ore_ont_10073.owl ore_ont_1370.owl chebi_lite.ofn}"
+one() { # round arm name threads rep file [flags]
+  local h=3 bin=tip
+  case ${2%-horn} in l0) h=0;; l2) h=2;; base) bin=base;; esac
+  mkdir -p $OUT/r$1/$2
+  SPARKLES_HORN_AUTOMATA=$h systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=0 -p OOMPolicy=continue \
+    timeout 900 $D/bin/$bin "${@:7}" --threads $4 --repeat $5 --taxonomy $OUT/r$1/$2/$3.t$4.tax $6 > $OUT/r$1/$2/$3.t$4.json 2> $OUT/r$1/$2/$3.t$4.err
+  echo "r$1 $2 $3 t$4 status=$? $(LC_ALL=C sort $OUT/r$1/$2/$3.t$4.tax | sha256sum | cut -c1-16)" >> $OUT/log.txt
+  rm -f $OUT/r$1/$2/$3.t$4.tax
+}
+for round in ${ROUNDS:-1 2 3 4 5 6}; do
+  order="base l0 l2 l3"; [ $((round % 2)) -eq 0 ] && order="l3 l2 l0 base"
+  for f in $files; do
+    n=${f%.*}
+    for t in 1 4; do
+      rep=5; arms=$order
+      case $n in ore_ont_8737|ore_ont_9654) rep=2;; ore_ont_16744) rep=1;;
+        ore_ont_14817|ore_ont_9663) rep=1; arms="base l3"; [ $((round % 2)) -eq 0 ] && arms="l3 base";; esac
+      for arm in $arms; do
+        one $round $arm $n $t $rep $F/$f
+      done
+      case $n in ore_ont_14817|ore_ont_9663)
+        for arm in $order; do one $round $arm-horn $n $t 3 $F/$f --dl-attempt-work 1; done;;
+      esac
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIMING-DONE >> $OUT/log.txt

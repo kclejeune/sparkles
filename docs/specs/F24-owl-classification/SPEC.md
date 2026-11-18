@@ -382,6 +382,36 @@ median of 8.75 against 8.17 s and is slower in 12 rounds, and on one thread 76.3
 outside the Horn rules' final saturation, in time that holds the attempt of the
 disjunctive rules, which item 869 does not change. Item 1027 follows it.
 
+Item 693 reduces the automata by which a run with the Horn rules unfolds its universal
+and negative existential restrictions, as [the Horn rules](#the-horn-rules) describe. It
+merges the states that accept the same words, drops a transition that a superproperty
+covers and drops the transitions by properties that no link of the run can have.
+`SPARKLES_HORN_AUTOMATA` selects the reductions for a comparison, and the default
+applies all three. Six rounds of alternating order on the benchmark host compared the
+build with the base and with itself without the reductions. Without their disjunctive
+attempt the Horn rules classify ore_ont_14817 in 0.80 times the base's time on one
+thread and 0.85 times on four, 2.0 against 2.5 s on one thread, and ore_ont_9663 in 0.75
+times on both, 2.7 against 3.7 s, with peak resident sets of 713 against 808 MiB and 951
+against 1,215 MiB. `ore_ont_9654` classifies in 0.25 times the base's time on one thread
+and 0.41 times on four, with 9.6 against 45.9 million conclusions and 665 against 1,359
+MiB, and `ore_ont_9855` in 0.64 and 0.67 times with 247 against 371 MiB. GO, ChEBI lite
+and the files whose conclusions stay the same take 0.99 to 1.01 times the base's time on
+one thread, and every taxonomy of the rounds is equal on the four sides. The default run
+of the two Uberon files does not gain. Its bounded attempt of the disjunctive rules takes
+nearly all of its 58 and 75 s on one thread and sets its peak resident set, and the run
+is 2.5 and 1.8% slower on the build of the reductions in each of six rounds, although its
+Horn saturation is 0.5 and 0.9 s shorter. A pinned process on the laptop executes the same
+instructions in the attempt of ore_ont_14817 on the base and on the build with and
+without the reductions, which suggests that the attempt does the same work there. On four threads
+`ore_ont_8737` takes 1.03 to 1.04 times the base's time on the build with and without
+the reductions, within the range of the base's own rounds. Item 1090 follows both, and
+the [benchmark report](../../benchmarks/el-classification/RESULTS.md#reduced-automata)
+holds every file. The reductions were also tried in the unfolding of the disjunctive
+rules and not kept, as [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#reasoning)
+records. Item 693 keeps the remaining cost of the Horn rules on the two files, which
+still derive 22.1 and 35.6 million conclusions against 16.5 and 10.8 million for the EL
+rules alone.
+
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
 timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
@@ -1039,6 +1069,102 @@ take conclusions from its predecessors, such as realness and singularity. A diff
 check compared the taxonomies of 14,547 generated ontologies of 8 to 18 axioms with the
 build before on one and eight threads, and of 2,145 of them, with a union that meets
 nothing beside them, with the disjunctive rules counting, and found no difference.
+
+A run reduces each automaton before it unfolds a restriction by it (item 693). The
+closure over the ε-transitions leaves states that accept the same words, transitions by
+a subproperty beside the one by the property, and branches through properties that no
+link of the ontology has. Each state becomes a class in every unfolding, and each
+transition a universal restriction that R3 and R4 carry to every context on the way, so
+a redundant state or transition is paid for at each of those contexts. The automaton of
+the inverse of `part_of` in ore_ont_14817 has 4 states and 10 transitions after the
+closure and 2 states and 2 transitions after the reductions. There are three, and
+`SPARKLES_HORN_AUTOMATA` set to 0, 1 or 2 turns off all of them, the last two or the
+last one for a comparison.
+
+1. **States that accept the same words by the same transitions become one.** The run
+   takes the coarsest partition of the states in which the states of a block are final
+   alike and have transitions by the same properties into the same blocks. The states of
+   a block accept the same words, so the quotient accepts from each block what its
+   states accepted. The translation of the completeness argument above reads only the
+   words each state accepts, and holds for the quotient unchanged.
+2. **A transition that another covers by a superproperty goes.** When a state has
+   transitions by `l` and by `l'` into the same state and `l` is under `l'`, the axiom
+   `X ⊑ ∀l.Y` of the first follows from the axiom `X ⊑ ∀l'.Y` of the second under the
+   property hierarchy. The translation without it has the same models, and the calculus
+   is complete for it as for any translation. Of two transitions by equivalent
+   properties the run keeps one.
+3. **A transition by a property that no link can meet goes.** R3 applies a universal
+   restriction on `l` to the links under `l`, and R4 applies it to the backward links
+   and loops under the inverse of `l`. No other rule reads it. A property is live when a
+   link or loop of the run can be under it or under its inverse, or when it is a
+   universal property. The automaton loses the transitions by the other properties, then
+   the states that no longer reach a final state, and the states the start no longer
+   reaches. The universal of a lost transition was the premise of no rule instance, and
+   a state that reaches no final state gives a context only universals over other such
+   states, so the run derives the same subsumers among the expressions of the ontology.
+
+The third reduction rests on the list of properties a link or loop can have. A context
+links to the successor of each existential restriction it holds, which includes the
+negative restrictions `∃r.F` that the run makes fillers of universals, since a context
+that derives one links to its successor too. Composition adds links by the results of
+the chains the run composes. R6 gives a predecessor a link by the inverse of a
+successor's property. A loop has a reflexive property, the property of a self
+restriction, the property of a link when R6 identifies a predecessor with a successor,
+or a chain's result, and each loop has its inverse. The rules of individuals copy links
+and loops between the contexts of one element and keep their properties. The live
+properties are all of these with their inverses, which is more than the rules can
+produce. A run that composes every chain prunes nothing. The index keeps the properties
+whose transitions went, and a debug build checks at every link and backward link of a
+Horn run that none of them applies to it.
+
+The fresh classes of an unfolding are positional, and an incremental run gives the
+state at each position the class the last run gave it. The third reduction makes the
+automaton depend on which properties have links, so an added axiom such as `A ⊑ ∃v.B`
+can bring a branch back and move the positions. This needs no rule of its own. A state's
+class carries the told axioms of its transitions, and a kept context is saturated again
+when the told axioms of an expression it holds differ from the last run's. A changed
+property axiom starts the run again, as before.
+
+A reduction takes at most sixteen million steps for an automaton. A step is a state or
+a transition that a pass visits, a comparison of a sort or a comparison of a search in a
+list of superproperties. Each pass charges an upper bound of its steps before it starts,
+which it counts from the automaton's size and the length of the longest list of
+superproperties alone, so that every run reduces an automaton the same way. A round of
+the refinement charges the sort of each state's transitions, and a pass over the covered
+transitions charges two lookups for each pair of transitions with one source and one
+target. A pass that would exceed the bound is left out, and the automaton stays as the
+passes before left it. The refinement of a chain of tens of thousands of operands, which
+takes a round for each state, is such a case, and so is a state with thousands of
+transitions into one target. Pruning is not counted. Its time is linear in the automaton
+up to a logarithm, and it tests a property against a table of the properties that have a
+live property under them, which the run fills once from the superproperty lists of the
+live properties.
+
+On one thread and without their disjunctive attempt, the Horn rules derive 22.1 million
+conclusions on ore_ont_14817 where they derived 29.1 million, and 35.6 million on
+ore_ont_9663 where they derived 50.9 million. Merging gives 27.9 and 46.0 million,
+covered transitions 24.2 and 41.1 million, and dead properties the rest. The EL rules
+alone derive 16.5 and 10.8 million. The contexts of conjunctions hold 5.47 million
+subsumers on ore_ont_14817 where they held 8.50 million. On the benchmark host the Horn
+rules alone then take 2.0 against 2.5 s and 2.7 against 3.7 s on one thread, with peak
+resident sets of 713 against 808 MiB and 951 against 1,215 MiB, as the Outcome records.
+The taxonomies are equal at every level on one and eight threads. Tier D's own unfolding in its bounded
+attempt is not reduced. The first two reductions were tried there and not kept. On the
+96 disjunctive files of the development set the taxonomies were equal, the same three
+attempts ended over their bound, and the times of the two Uberon files differed by no
+more than the spread of their runs, 52 to 125 s, as the
+[experiments log](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
+
+A differential check generated small Horn ontologies with chains, transitive properties,
+inverses, ranges and property hierarchies over six properties, of which the class axioms
+use mostly three, so that the automata have branches without links. Of 8,288 cases, 8,274
+take the Horn rules, and none differs in its taxonomy between the unreduced automata and
+each reduction on one thread, all three on eight threads, and a build that checks the
+dead properties at every link. The reductions change the conclusion count of 2,730 cases,
+and the third one that of 2,658. GO, ChEBI lite, the ORE 2015 EL files and the DL
+development set, 497 files that the laptop classifies within 8 GiB, give the same
+taxonomies with and without the reductions on one and eight threads, and 67 of them
+change their conclusion count.
 
 Item 693 also fixed a gap in completeness that phase 3 left. A chain
 `r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of
