@@ -424,26 +424,26 @@ class BuildHost(unittest.TestCase):
                 self.assertEqual(self.scratch("h1"), [])
 
     def test_a_dropped_source_copy_is_retried_into_a_fresh_tree(self):
-        env = dict(self.env, FAKE_SSH_DROP="tar -x -m:1")
+        env = dict(self.env, FAKE_SSH_DROP="tar --zstd -x -m:1")
         result, out = self.bench("--build-host", "h1", env=env)
+        self.assertEqual((self.hosts / "drops").read_text(), "1")
         [build] = self.builds()
         self.assertTrue(build["cwd"].endswith("/src"), build["cwd"])
-        # The archive travels compressed.
-        self.assertIn("tar --zstd -x -m -C", self.ssh_log.read_text())
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("copying the source of", log)
+        self.assertIn("retrying", log)
+        self.assertEqual(self.scratch("h1"), [])
 
     def test_a_cut_off_compressed_source_is_never_published(self):
         """tar extracts a valid prefix of the archive and would succeed alone, so the failure
         of the decompression must fail the copy."""
         env = dict(self.env, FAKE_ZSTD_CUT="2048")
         result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        self.assertIn("tar --zstd -x -m -C", self.ssh_log.read_text())
         log = (out / "logs" / "build-A.log").read_text()
         self.assertIn("copying the source of", log)
         self.assertIn("failed 8 times", log)
         self.assertEqual(self.builds(), [])
-        self.assertEqual(self.scratch("h1"), [])
-        log = (out / "logs" / "build-A.log").read_text()
-        self.assertIn("copying the source of", log)
-        self.assertIn("retrying", log)
         self.assertEqual(self.scratch("h1"), [])
 
     def test_lost_contact_fails_after_bounded_retries_and_stops_the_build(self):
