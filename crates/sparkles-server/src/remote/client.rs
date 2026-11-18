@@ -401,13 +401,17 @@ pub fn update(
     aggregate_errors: Option<&str>,
 ) -> Result<()> {
     let r = Remote::open(server, insecure)?;
-    let mut req = r
-        .req(Method::POST, &format!("/{}/update", ds_path(dataset)))
+    // the reading is one of the three names, which need no escaping
+    let params = aggregate_errors
+        .map(|m| format!("?aggregate-errors={m}"))
+        .unwrap_or_default();
+    let req = r
+        .req(
+            Method::POST,
+            &format!("/{}/update{params}", ds_path(dataset)),
+        )
         .header("content-type", "application/sparql-update")
         .header("accept", "application/json");
-    if let Some(m) = aggregate_errors {
-        req = req.query(&[("aggregate-errors", m)]);
-    }
     let resp = r.check(
         with_message(req, message).body(update.to_string()).send(),
         Some(dataset),
