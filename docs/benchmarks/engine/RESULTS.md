@@ -522,7 +522,7 @@ they missed item 1039 on every query. Under automatic execution every run, the
 A-against-A runs included, flagged `str-filter-two` and marked a few other queries as
 split, which is why a flag of an automatic query is rerun under explicit modes. Apart from
 those, `bt-678` flagged the two string queries under automatic execution as well, and
-`bt-1039` flagged only `optional-count`, whose processes split in a single round. The execution times that the same rounds recorded on the busy
+`bt-1039` flagged only `optional-count`, whose processes split between 5.75 and 7.30 million instructions per request in three rounds. The execution times that the same rounds recorded on the busy
 `stanley` rose by 9.5% on the root scan and 9.7% on the export under item 1039, and by 24%
 on `root-limit` under row 1063's build, so the cost was present while the instructions
 did not move. Both builds of row 1063 made the same system calls per request, 6 futex
