@@ -72,6 +72,55 @@ check them against the W3C suites and Jena's own answers.
   plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and as
   Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
 
+### Aggregate errors
+
+SPARQL leaves room for more than one answer when an argument of MIN, MAX, AVG or
+GROUP_CONCAT is an error, such as a variable that OPTIONAL leaves unbound. Each query
+runs under one of three readings, and `jena` is the default on every surface.
+
+| Reading | `MIN(?v)` and `MAX(?v)` with an unbound `?v` | AVG when every argument is an error | `GROUP_CONCAT` over an IRI or a number |
+|---|---|---|---|
+| `jena` | Unbound, as in Apache Jena. | Unbound. | The lexical form. |
+| `sparkles` | The bound values decide. | Unbound. | The lexical form. |
+| `spec` | MIN is unbound and the bound values decide MAX. | `0`. | Unbound. |
+
+The `jena` reading matches ARQ on every aggregate over unbound values, type errors,
+groups of errors alone and empty groups, which a fixture of ARQ's own answers checks. It
+also makes `GROUP_CONCAT(DISTINCT …)` over no rows unbound, as ARQ does, where the other
+readings give `""`. The `sparkles` reading is how the engine answered before the setting
+existed. The `spec` reading takes the text of SPARQL 1.1 and 1.2 literally. MIN and MAX
+order the values as ORDER BY does, which puts errors first. AVG divides Sum by Count, and
+Count leaves errors out. GROUP_CONCAT applies CONCAT, which takes only strings. Under
+every reading an error makes SUM, AVG and GROUP_CONCAT unbound, while COUNT and SAMPLE
+pass over it.
+
+```sparql
+SELECT ?person (MAX(?age) AS ?oldest)
+WHERE { ?person a :Parent . OPTIONAL { ?person :child/:age ?age } }
+GROUP BY ?person
+```
+
+Under `jena` and `spec`, `?oldest` is the greatest age of a parent whose every child has
+an age. Under `sparkles` it is the greatest of the ages that are present, and under
+`jena` a parent with a child of unknown age gets no `?oldest`. A query that should pass
+over missing values can filter them, as in `MAX(?age)` over `FILTER(BOUND(?age))`, and
+then gives the same answer under every reading.
+
+A query chooses its reading with the `aggregate-errors` request parameter, the library's
+`QueryOptions::aggregate_errors`, the Python keyword `aggregate_errors`, the Node.js
+option `aggregateErrors`, the JVM context symbol `Sparkles.AGGREGATE_ERRORS`, the MCP
+argument `aggregateErrors` or the command line's `--aggregate-errors`. Without one it takes
+the dataset's setting at `/$/aggregate-errors/{ds}`, and a dataset without a setting
+takes the server's default, which `sparkles serve --aggregate-errors` sets. Materialized
+views and live queries follow the dataset's reading and evaluate again when it changes. A
+query that names another reading evaluates a view's query from the data and does not
+read the view's maintained state, and its plan says so. [Aggregate
+errors](../API.md#aggregate-errors) in the API reference gives the routes.
+
+Fuseki users get the answers they had from Jena. Users of earlier Sparkles releases see
+MIN and MAX become unbound where an argument was unbound or an error, and can set
+`sparkles` on a dataset or on the server to keep the earlier answers.
+
 ### Jena ARQ extensions
 
 * ARQ's syntax extensions are accepted by default, as Fuseki accepts them
@@ -434,6 +483,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   some of them. It skips an embedded query whose holder is ambiguous, such as the
   same query text on two blank nodes, rather than risk another node's findings. Roadmap
   item 444.
+* AVG over decimals divides to 18 digits where Jena divides to 24, so the last digits
+  of such an average can differ from ARQ's. Roadmap item 1084.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
@@ -497,10 +548,11 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 * Read [ARQ syntax extensions](../API.md#arq-syntax-extensions).
 * Read [ARQ's property functions](../API.md#arqs-property-functions).
 * Read [DESCRIBE](../API.md#describe).
+* Read [Aggregate errors](../API.md#aggregate-errors).
 
 ## Roadmap
 
-The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
+The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md), [item 1084](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

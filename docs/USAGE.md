@@ -735,6 +735,7 @@ sparkles query   --data file.ttl --query q.rq # query files in memory (arq --dat
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
 sparkles query   --loc db --reasoning demand --profile owl-rl 'SELECT ...'   # derive on demand (--rules FILE, --max-derived N)
 sparkles query   --loc db --describe scbd 'DESCRIBE <http://ex.org/a>'   # cbd|scbd|outgoing, --describe-labels
+sparkles query   --loc db --aggregate-errors spec 'SELECT (MIN(?v) AS ?m) ...'   # jena (default)|sparkles|spec
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles patch   --loc db changes.rdfp        # apply RDF Patch files, one commit per file
 sparkles compact --loc db                     # merge updates into a new generation
@@ -1446,6 +1447,19 @@ as `--describe MODE`, `--describe-labels`, `--describe-reifiers`, `--describe-ma
 N` and `--describe-max-depth N`. They apply to a local query, and with `--server` they
 travel to the server as the request parameters. [API.md](API.md#describe) describes the
 modes and options.
+
+### Aggregate errors
+
+`--aggregate-errors jena|sparkles|spec` chooses how MIN, MAX, AVG and GROUP_CONCAT treat
+errors such as unbound values. `jena` is the default and gives Apache Jena's answers.
+`sparkles query` runs its query under the reading, locally or with `--server` as the
+request parameter `aggregate-errors`. `sparkles serve` uses it for the datasets that have
+no setting of their own, and the NixOS module's `services.sparkles.aggregateErrors`
+passes it on. [API.md](API.md#aggregate-errors) describes the readings, the per-dataset
+setting at `/$/aggregate-errors/{ds}` and the parameter, and the Python, Node.js and JVM
+bindings take them as `aggregate_errors`, `aggregateErrors` and
+`Sparkles.AGGREGATE_ERRORS`, with the setting under `settings.aggregate_errors`,
+`settings.aggregateErrors` and `settings().aggregateErrors()`.
 
 ### GraphQL
 
@@ -6849,6 +6863,7 @@ in the dataset's `getContext()` or on one execution.
 | `Sparkles.INCLUDE_INFERRED` | The reasoner's `urn:x-sparkles:inferred` graph is part of the default graph. |
 | `Sparkles.MAX_ROWS`, `MAX_MEMORY_BYTES`, `MAX_ROWS_PRODUCED` | The request's budgets. |
 | `Sparkles.NO_CACHE` | The request neither reads nor fills the result cache. |
+| `Sparkles.AGGREGATE_ERRORS` | How the query's aggregates treat errors, as an `AggregateErrors` or its name. A query that falls back to ARQ reads them as Jena does. |
 | `Sparkles.AT` | A historical reference such as `snapshot:before-edit` or `commit:42`. |
 | `ARQ.httpServiceAllowed` | `false` refuses SERVICE. |
 

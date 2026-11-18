@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Aggregate errors follow Jena by default
+
+MIN and MAX are now unbound when one of their arguments is an error, such as a value
+that OPTIONAL leaves unbound, as in Apache Jena, and `GROUP_CONCAT(DISTINCT …)` over no
+rows is unbound as Jena makes it. Earlier releases let MIN and MAX pass over such
+arguments, so queries that relied on that answer differently. The setting
+`aggregate-errors` chooses among three readings, `jena` (the default), `sparkles` (the
+earlier answers) and `spec` (the text of SPARQL 1.1 and 1.2, in which MIN is unbound, MAX
+passes over errors, AVG over only errors is `0` and GROUP_CONCAT takes only strings),
+which completes roadmap item 1064. A query sets it with the `aggregate-errors` request
+parameter, the library's `QueryOptions::aggregate_errors`, the Python, Node.js and JVM
+query options, the MCP argument `aggregateErrors` or `--aggregate-errors`. A dataset keeps
+its own at `/$/aggregate-errors/{ds}` in `aggregate-errors.json`, and `sparkles serve
+--aggregate-errors` and the NixOS option `aggregateErrors` set the server's default.
+Materialized views and live queries follow the dataset's reading and evaluate again when
+it changes, and a query under another reading evaluates a view's query from the data.
+The incremental group state now keeps error counts, so view checkpoints of earlier
+releases are refused and rebuilt from the data on the first start, and a deployment with
+views should expect that rebuild. The memory tools, GraphRAG's fact reader and the UI's
+agent and nearby lists ask for the `sparkles` reading, since they want the values
+present. Backups now hold `aggregate-errors.json` and `describe.json`, which earlier
+backups left out, so a restore kept the data but lost a dataset's DESCRIBE setting.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes

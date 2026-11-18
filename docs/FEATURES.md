@@ -41,6 +41,8 @@ including supported ARQ extensions, federation, query plans and incremental view
 The guide also covers [standards conformance](querying/README.md#standards-conformance),
 the [command line](querying/README.md#command-line) and
 [formatting and editor support](querying/README.md#formatter-and-editor-support).
+How MIN, MAX, AVG and GROUP_CONCAT treat errors is a setting with Jena's answers as its
+default, described under [aggregate errors](querying/README.md#aggregate-errors).
 
 <a id="storage-and-indexes"></a>
 <a id="indexes-and-vocabulary"></a>
