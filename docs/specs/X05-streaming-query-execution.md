@@ -1711,6 +1711,49 @@ to 26 µs were 7 to 14% slower in server time with spreads of 18 to 80%, and ite
 571 rechecks them on a quiet Intel host.
 
 
+### EXISTS inside larger expressions (2026-11-18)
+
+Both executors now answer an EXISTS inside a larger expression from the key set of its
+pattern, as they answer a FILTER EXISTS. This covers an EXISTS under IF, OR or another
+function, in an aggregate argument and in an ORDER BY key. Before the expression is
+evaluated over a table, every row of the table is probed once for each such EXISTS, and
+the evaluator reads the row's answer. A row that the key set cannot answer, and a pattern
+without a key set, are evaluated by substitution with the memo per distinct key as
+before. The probe answers and the key sets stay charged to the query while the
+expression reads them, and a row evaluated by substitution is counted when the
+expression reaches it. EXPLAIN reports the probes and the rows evaluated per row on the
+filter, extension, grouping and ordering that hold the EXISTS.
+
+Automatic execution now streams every FILTER, BIND, ORDER BY and grouping whose EXISTS
+patterns have cursor plans, whether the pattern is answered from a key set or per key.
+Three shapes stay eager. A pattern that calls a SERVICE stays eager because a cursor
+could repeat its effects, an EXISTS nested deeper than four levels stays eager under the
+admission's depth cap, which item 1081 covers, and an OPTIONAL whose condition holds an
+EXISTS stays eager until item 570 gives the cursor's merge OPTIONAL a condition.
+
+Probing every row costs a hash lookup per row and EXISTS, also for rows on which the
+expression never reaches the EXISTS. An IF branch that is rarely taken therefore builds
+a key set that it barely uses. On the laptop at 10.5M quads, `exists-rare` took 76 ms
+eagerly against 69 ms before, and 26 ms streamed against 12 ms before. The cost is
+bounded by one evaluation of the pattern, and item 1080 covers it.
+
+A quiet A/B on `atlas`, an Intel benchmark worker, compared the base with this change
+at 10.5M quads with one Rayon thread, over three A, B, B, A rounds of seven timed
+requests in each mode. Both builds returned the same answers in both modes. The
+aggregate `exists-agg` went from 885 to 16 ms eagerly and from 913 to 15 ms streamed. The
+keyed `not-exists`, `exists-bind` and `exists-bind-join` shapes, whose probe path the
+change rewrote, took 0.70 to 0.98 times as long as the base streamed, and the per-key shapes
+`exists-union` and `exists-union-bind`, whose UNION has no key set, took 1.00 and 1.015
+times as long streamed as eagerly. The [memory results](../benchmarks/memory/RESULTS.md#automatic-exists)
+give the table, and the [run record](../benchmarks/memory/records/exists-nested-2026-11-18/README.md)
+holds the samples.
+
+`tests/exists_auto.rs` compares automatic and eager answers for EXISTS under OR, IF and
+COALESCE, in SUM and in an ORDER BY key, with and without a key set, checks that each one
+streams and runs them under the budget loop from 512 KiB to 64 MiB. `exists_tests`
+compares the key-set answers with evaluation per key for the same positions and checks
+the nested counters of EXPLAIN, and the decision tables in `cursor.rs` admit the shapes.
+
 ### Finite HTTP body limits
 
 Finite streamed query, Graph Store export, diff and changes responses use a separate

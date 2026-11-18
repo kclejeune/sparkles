@@ -1380,6 +1380,18 @@ fn run_node<'ctx>(
             let t = child(0, infos)?;
             let (t, pre) = order_by(ctx, t, keys, *limit, &mut expr_report)?;
             note = pre;
+            let exprs: Vec<Expr> = keys
+                .iter()
+                .filter(|(e, _)| e.has_exists())
+                .map(|(e, _)| e.clone())
+                .collect();
+            if !exprs.is_empty() {
+                let (exists, c) = super::exists::explain(ctx, &exprs);
+                if let Some(x) = exists {
+                    note = Some(note.map_or(x.clone(), |n| format!("{n} {x}")));
+                }
+                counters = merge_counters(counters, c);
+            }
             t
         }
         Kind::Project(vars) => {
@@ -1446,7 +1458,21 @@ fn run_node<'ctx>(
         }
         Kind::Group { keys, aggs } => {
             let t = child(0, infos)?;
-            group_or_spill(ctx, n, t, keys, aggs, &mut expr_report, &mut note)?
+            let out = group_or_spill(ctx, n, t, keys, aggs, &mut expr_report, &mut note)?;
+            let exprs: Vec<Expr> = aggs
+                .iter()
+                .filter_map(|(_, agg)| agg.expr.as_ref())
+                .filter(|e| e.has_exists())
+                .cloned()
+                .collect();
+            if !exprs.is_empty() {
+                let (exists, c) = super::exists::explain(ctx, &exprs);
+                if let Some(x) = exists {
+                    note = Some(note.map_or(x.clone(), |n| format!("{n} {x}")));
+                }
+                counters = merge_counters(counters, c);
+            }
+            out
         }
         Kind::Path {
             spec,
@@ -5546,6 +5572,8 @@ fn evaluate_mask(
     dec: Option<&super::expr::DecodedCols>,
 ) -> Result<Vec<bool>> {
     let t0 = Instant::now();
+    let nested = super::exists::nested(ctx, t, &exprs.iter().collect::<Vec<_>>())?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let test = |i: usize| {
         let row = Row {
@@ -5553,6 +5581,7 @@ fn evaluate_mask(
             i,
             map: &map,
             dec,
+            exists,
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
@@ -5634,6 +5663,7 @@ fn string_order_mask(
             i,
             map: &map,
             dec: None,
+            exists: None,
         };
         ebv(expr, &row, ctx).unwrap_or(false)
     };
@@ -5707,6 +5737,8 @@ pub(super) fn compute_column(
 }
 
 fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let dec = decode_for(ctx, t, &[e])?;
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| match eval(
@@ -5716,6 +5748,7 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
             i,
             map: &map,
             dec: Decoded::cols(&dec),
+            exists,
         },
         ctx,
     ) {
@@ -5999,6 +6032,9 @@ pub(super) fn offer_rows<P>(
             _ => HeapKey::Expr(e),
         });
     }
+    let later: Vec<&Expr> = keys.iter().skip(1).map(|(e, _)| e).collect();
+    let nested = super::exists::nested(ctx, t, &later)?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let key_of = |i: usize, k: usize| -> SortKey {
         match &sources[k] {
@@ -6013,6 +6049,7 @@ pub(super) fn offer_rows<P>(
                         i,
                         map: &map,
                         dec: None,
+                        exists,
                     },
                     ctx,
                 )
@@ -6156,6 +6193,8 @@ fn key_rows(
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
 ) -> Result<Vec<Option<Value>>> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| {
         eval(
@@ -6165,6 +6204,7 @@ fn key_rows(
                 i,
                 map: &map,
                 dec,
+                exists,
             },
             ctx,
         )
@@ -6230,6 +6270,8 @@ fn key_rows_charged(
     e: &Expr,
 ) -> Result<super::exprcache::Column<Option<Value>>> {
     let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
     let mut charge = ctx.retained_charge(bytes)?;
@@ -6248,6 +6290,7 @@ fn key_rows_charged(
                 i,
                 map: &map,
                 dec: None,
+                exists,
             },
             ctx,
         )
@@ -6775,9 +6818,10 @@ pub(super) fn aggregate(
     rows: &[u32],
     agg: &Agg,
     arg: Option<&[Id]>,
+    exists: Option<&super::exists::Answers<'_>>,
 ) -> Id {
     if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
-        return fold(ctx, t, map, rows, e, agg.distinct, spec);
+        return fold(ctx, t, map, rows, (e, spec, agg.distinct), exists);
     }
     let Some(e) = &agg.expr else {
         // COUNT(*)
@@ -6805,6 +6849,7 @@ pub(super) fn aggregate(
                     i: i as usize,
                     map,
                     dec: None,
+                    exists,
                 },
                 ctx,
             )
@@ -6887,14 +6932,14 @@ pub(super) fn aggregate(
 /// is a null, and DISTINCT keeps the first of equal terms and one null), or the `e`
 /// keys with the `value` values as a `cdt:Map` literal (a row whose key is an error or a
 /// blank node is skipped, a later row replaces an earlier one's value).
+/// The fold is given as its argument, its spec and its DISTINCT flag.
 fn fold(
     ctx: &Ctx,
     t: &Table,
     map: &[Option<usize>],
     rows: &[u32],
-    e: &Expr,
-    distinct: bool,
-    fold: &super::plan::Fold,
+    (e, fold, distinct): (&Expr, &super::plan::Fold, bool),
+    exists: Option<&super::exists::Answers<'_>>,
 ) -> Id {
     use super::cdt::{Elem, Map, map_put};
     let row = |i: u32| Row {
@@ -6902,6 +6947,7 @@ fn fold(
         i: i as usize,
         map,
         dec: None,
+        exists,
     };
     let mut order: Vec<u32> = rows.to_vec();
     if !fold.order.is_empty() {

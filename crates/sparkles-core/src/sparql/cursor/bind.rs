@@ -136,6 +136,7 @@ impl Reuse {
                         i: row,
                         map: &map,
                         dec: None,
+                        exists: None,
                     },
                     ctx,
                 )

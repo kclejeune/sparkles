@@ -115,9 +115,11 @@ path search, history changes, view reads, algorithm calls, the predicate-table
 unsupported shape, remote LATERAL, a registered property function whose registration does
 not declare `prefix_output`, and any node one of whose EXISTS patterns cannot itself be
 built without materialization, which `exists_streams` decides by building each pattern
-under the strict policy. The depth cap of four and the refusal of a LeftJoin condition
-with EXISTS belong to `streams_natively`, the admission predicate of automatic execution,
-and not to the fallback. Several of these kinds have two forms. The `needs_input` methods
+under the strict policy. The depth cap of four, the refusal of an EXISTS pattern that
+calls a SERVICE and the refusal of a LeftJoin condition with EXISTS belong to
+`streams_natively`, the admission predicate of automatic execution, and not to the
+fallback. An EXISTS inside a larger expression, such as IF, OR, an aggregate argument or
+an ORDER BY key, is admitted, with or without a key set. Several of these kinds have two forms. The `needs_input` methods
 of `TextSpec`, `VectorSpec`, `HybridSpec`, `HistorySpec`, `AlgoSpec`, `SpatialPfSpec` and
 `PathSearchSpec` say whether a node reads variables its input binds, and the planner
 places a node that does above its input.
@@ -538,9 +540,10 @@ without a bound, as a maintained limitation that the streaming record names, and
 merge removes it with the eager executor. In both cases
 `mise run test:w3c:streaming` records no eager fallback for the W3C query suites, which
 hold no such shape. The EXISTS shapes that automatic execution keeps eager through
-`streams_natively`, an EXISTS deeper than four levels, a LeftJoin condition with EXISTS
-and an EXISTS inside a larger expression, are item 7's remaining work and an admission
-choice rather than a fallback, and the merge removes the admission with the mode.
+`streams_natively` are an admission choice rather than a fallback, and the merge removes
+the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, an
+EXISTS deeper than four levels is item 1081 and an EXISTS pattern that calls a SERVICE
+stays eager because a cursor cannot repeat its effects.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
 that a streaming request over each former fallback form returns a cursor plan without a

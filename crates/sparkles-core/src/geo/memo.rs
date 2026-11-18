@@ -532,6 +532,7 @@ mod tests {
             i: 0,
             map: &[],
             dec: None,
+            exists: None,
         };
         let wkt = lit("POINT(1 2)", WKT_LITERAL);
         let id = ctx.intern_value(&wkt);
@@ -584,6 +585,7 @@ mod tests {
             i: 0,
             map: &[],
             dec: None,
+            exists: None,
         };
         let arg = |ctx: &Ctx, lex: &str| {
             let id = ctx.snap.lookup_term(&literal(lex)).unwrap();

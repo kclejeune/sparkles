@@ -561,6 +561,7 @@ pub fn spatial_scan(
                     i,
                     map: &map,
                     dec: None,
+                    exists: None,
                 };
                 spec.filter
                     .iter()

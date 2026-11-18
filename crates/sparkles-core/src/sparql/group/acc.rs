@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::id::Id;
 use crate::sparql::ctx::Ctx;
 use crate::sparql::exec::AggState;
+use crate::sparql::expr::Expr;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
 use crate::sparql::value::Value;
@@ -571,6 +572,21 @@ impl Accumulator for Rows {
             Arg::Column(values) => Some(values),
             Arg::Star | Arg::Unbound => None,
         };
+        // EXISTS patterns that the aggregate evaluates itself, such as in a FOLD's value
+        // or ORDER BY, answered from their key sets for the batch's rows
+        let evaluated: Vec<&Expr> = self
+            .agg
+            .expr
+            .iter()
+            .filter(|_| arg.is_none())
+            .chain(self.agg.fold.iter().flat_map(|fold| {
+                fold.value
+                    .iter()
+                    .chain(fold.order.iter().map(|(key, _)| key))
+            }))
+            .collect();
+        let nested = crate::sparql::exists::nested(ctx, batch.table, &evaluated)?;
+        let exists = nested.as_ref().map(|n| &n.answers);
         for g in 0..index.groups() {
             ctx.check()?;
             let rows = index.of(g);
@@ -584,7 +600,7 @@ impl Accumulator for Rows {
                     descriptor,
                 )?
             } else {
-                crate::sparql::exec::aggregate(ctx, batch.table, &map, rows, &self.agg, arg)
+                crate::sparql::exec::aggregate(ctx, batch.table, &map, rows, &self.agg, arg, exists)
             };
             if ctx.calls_extensions {
                 ctx.check()?;

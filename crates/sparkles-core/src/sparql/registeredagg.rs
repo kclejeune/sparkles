@@ -158,6 +158,7 @@ fn aggregate_inner(
                 i: i as usize,
                 map,
                 dec: None,
+                exists: None,
             },
             ctx,
         );

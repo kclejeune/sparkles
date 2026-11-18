@@ -102,6 +102,11 @@ impl ExistsSpec {
         }
     }
 
+    /// Whether the pattern calls a SERVICE.
+    pub fn calls_service(&self) -> bool {
+        self.calls_service
+    }
+
     /// The same EXISTS with `v` substituted by `c` as well.
     pub fn with_bound(&self, v: VarId, c: Id) -> ExistsSpec {
         let mut bound = self.bound.clone();
@@ -130,7 +135,7 @@ impl ExistsSpec {
 }
 
 /// The most entries the memo of one EXISTS keeps.
-const EXISTS_MEMO_ENTRIES: usize = 100_000;
+pub(super) const EXISTS_MEMO_ENTRIES: usize = 100_000;
 
 /// The deepest expression evaluated on rayon's threads (see [`Expr::parallel`]): their
 /// stack is 2 MiB unless the application sets another, and a debug build's evaluator
@@ -446,6 +451,8 @@ pub struct Row<'a> {
     pub map: &'a [Option<usize>],
     /// values decoded up front for this operator, per table column and row
     pub dec: Option<&'a DecodedCols>,
+    /// the answers of EXISTS patterns from their key sets, for this row's table
+    pub exists: Option<&'a super::exists::Answers<'a>>,
 }
 
 /// Row-aligned decoded values for some columns of a table (`None` = not decoded).
@@ -694,6 +701,9 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             Err(TypeError)
         }
         Expr::Exists(spec) => {
+            if let Some(found) = row.exists.and_then(|a| a.get(spec, row.table, row.i)) {
+                return Ok(b(found));
+            }
             let key: Vec<Id> = spec.vars.iter().map(|&v| spec.value(row, v)).collect();
             // nothing to substitute: one answer for every such row
             let unbound = !ctx.calls_extensions && key.iter().all(|id| id.is_undef());

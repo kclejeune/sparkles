@@ -109,6 +109,18 @@ engine's decimal range are not numbers, roadmap item 1065, the string functions 
 base direction of their arguments, roadmap item 1071, and three XSD and XPath readings
 differ, roadmap item 1077.
 
+### EXISTS inside larger expressions
+
+Both executors answer an EXISTS inside a larger expression, such as IF, OR, an aggregate
+argument or an ORDER BY key, from the key set of its pattern, as they answer a FILTER
+EXISTS, and automatic execution streams such plans. On an Intel host at 10.5M quads with
+one Rayon thread, a SUM over IF(EXISTS …) went from 885 to 16 ms eagerly and from 913 to
+15 ms streamed. Every row is probed, also one on which the expression does not reach the
+EXISTS, so an IF branch that is never taken still builds the key set, which roadmap item
+1080 covers. An EXISTS pattern evaluated per key now streams too, and the plans that stay
+eager are an EXISTS over a SERVICE, an EXISTS nested more than four levels deep, which item
+1081 covers, and an OPTIONAL whose condition holds an EXISTS, which item 570 covers.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,

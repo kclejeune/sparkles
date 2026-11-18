@@ -248,6 +248,7 @@ pub fn fold_const(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
         i: 0,
         map: &map,
         dec: None,
+        exists: None,
     };
     eval(e, &row, ctx).ok()?.value(ctx).ok()
 }
