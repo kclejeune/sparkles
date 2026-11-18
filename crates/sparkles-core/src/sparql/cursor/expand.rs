@@ -128,17 +128,56 @@ struct Remote {
     run: crate::sparql::enhancer::RemoteRun,
     /// The input rows whose inputs a request has still to answer.
     held: Option<Buffer>,
-    /// The charge of the answers the loop keeps for inputs that later rows repeat.
+    /// The charge of what the loop keeps for inputs that later rows repeat: their
+    /// answers, and the distinct keys and inputs that look them up.
     answers: OwnedCharge,
 }
 
 /// The distinct argument values of a search over its group across all of its batches.
 struct Calls {
+    keys: CallKeys,
+    charge: OwnedCharge,
+}
+
+/// The distinct argument values a search has made calls with, and the cap on them.
+struct CallKeys {
     seen: FxHashSet<Vec<Id>>,
     /// The most distinct values the eager kernel searches.
     limit: usize,
-    charge: OwnedCharge,
+    /// The identifiers of the widest key held, which every key of one search shares.
+    /// It outlives the batch that added the keys, so a later batch whose rows make no
+    /// call keeps their charge.
+    width: usize,
 }
+
+impl CallKeys {
+    fn new(limit: usize) -> Self {
+        Self {
+            seen: FxHashSet::default(),
+            limit,
+            width: 0,
+        }
+    }
+
+    /// Add the keys of one batch, refusing it once the distinct keys pass the cap as the
+    /// eager kernel refuses its whole input, and return the bytes the set then holds.
+    fn add(&mut self, keys: impl Iterator<Item = Option<Vec<Id>>>) -> Result<u64> {
+        for key in keys.flatten() {
+            self.width = self.width.max(key.len());
+            if self.seen.insert(key) && self.seen.len() > self.limit {
+                return Err(crate::Error::BudgetExceeded(crate::Budget {
+                    kind: crate::BudgetKind::Rows,
+                    limit: self.limit as u64,
+                    requested: self.seen.len() as u64,
+                }));
+            }
+        }
+        Ok(self.seen.capacity() as u64 * call_bytes(self.width.max(1)))
+    }
+}
+
+/// The arguments of one input row's call, `None` where the row makes no call.
+type RowKey<'a> = Box<dyn Fn(usize) -> Option<Vec<Id>> + 'a>;
 
 /// The bytes a set of distinct calls holds per value of `width` identifiers, with the
 /// hash table's slot and the vector's header.
@@ -174,77 +213,62 @@ impl Expand {
     /// runs one search per distinct value, so without the count a stream of batches
     /// would search more distinct values than one eager call admits.
     fn count_calls(&mut self, ctx: &Arc<Ctx>, input: &Table) -> Result<()> {
-        let (limit, keys): (usize, Box<dyn Fn(usize) -> Option<Vec<Id>> + '_>) =
-            match &self.node.kind {
-                Kind::TextSearch(spec) => {
-                    let Some(col) = spec.query_var.and_then(|v| input.col_of(v)) else {
-                        return Ok(());
-                    };
-                    (
-                        exec::MAX_TEXT_QUERIES,
-                        Box::new(move |r| {
-                            let id = input.get(r, col);
-                            (id != Id::UNDEF).then(|| vec![id])
-                        }),
-                    )
-                }
-                Kind::VectorSearch(spec) => {
-                    let crate::sparql::plan::VectorQuery::Var(var) = spec.query else {
-                        return Ok(());
-                    };
-                    let Some(col) = input.col_of(var) else {
-                        return Ok(());
-                    };
-                    (
-                        exec::MAX_QUERY_VECTORS,
-                        Box::new(move |r| {
-                            let id = input.get(r, col);
-                            (id != Id::UNDEF).then(|| vec![id])
-                        }),
-                    )
-                }
-                Kind::HybridSearch(spec) => {
-                    let key = crate::sparql::hybrid::query_key(spec, input);
-                    (
-                        crate::sparql::hybrid::MAX_QUERIES,
-                        Box::new(move |r| key(r).map(|(t, v)| vec![t, v])),
-                    )
-                }
-                #[cfg(feature = "geo")]
-                Kind::SpatialPf(spec) => {
-                    let Some(slots) = spec.deferred.as_deref() else {
-                        return Ok(());
-                    };
-                    (
-                        crate::geo::exec::MAX_ARGUMENT_BINDINGS,
-                        Box::new(crate::geo::exec::argument_key(slots, input)),
-                    )
-                }
-                _ => return Ok(()),
-            };
+        let (limit, keys): (usize, RowKey<'_>) = match &self.node.kind {
+            Kind::TextSearch(spec) => {
+                let Some(col) = spec.query_var.and_then(|v| input.col_of(v)) else {
+                    return Ok(());
+                };
+                (
+                    exec::MAX_TEXT_QUERIES,
+                    Box::new(move |r| {
+                        let id = input.get(r, col);
+                        (id != Id::UNDEF).then(|| vec![id])
+                    }),
+                )
+            }
+            Kind::VectorSearch(spec) => {
+                let crate::sparql::plan::VectorQuery::Var(var) = spec.query else {
+                    return Ok(());
+                };
+                let Some(col) = input.col_of(var) else {
+                    return Ok(());
+                };
+                (
+                    exec::MAX_QUERY_VECTORS,
+                    Box::new(move |r| {
+                        let id = input.get(r, col);
+                        (id != Id::UNDEF).then(|| vec![id])
+                    }),
+                )
+            }
+            Kind::HybridSearch(spec) => {
+                let key = crate::sparql::hybrid::query_key(spec, input);
+                (
+                    crate::sparql::hybrid::MAX_QUERIES,
+                    Box::new(move |r| key(r).map(|(t, v)| vec![t, v])),
+                )
+            }
+            #[cfg(feature = "geo")]
+            Kind::SpatialPf(spec) => {
+                let Some(slots) = spec.deferred.as_deref() else {
+                    return Ok(());
+                };
+                (
+                    crate::geo::exec::MAX_ARGUMENT_BINDINGS,
+                    Box::new(crate::geo::exec::argument_key(slots, input)),
+                )
+            }
+            _ => return Ok(()),
+        };
         let calls = match &mut self.calls {
             Some(calls) => calls,
             None => self.calls.insert(Calls {
-                seen: FxHashSet::default(),
-                limit,
+                keys: CallKeys::new(limit),
                 charge: OwnedCharge::new(ctx, 0)?,
             }),
         };
-        let mut width = 0;
-        for r in 0..input.len {
-            let Some(key) = keys(r) else { continue };
-            width = key.len();
-            if calls.seen.insert(key) && calls.seen.len() > calls.limit {
-                return Err(crate::Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::Rows,
-                    limit: calls.limit as u64,
-                    requested: calls.seen.len() as u64,
-                }));
-            }
-        }
-        calls
-            .charge
-            .resize(calls.seen.capacity() as u64 * call_bytes(width.max(1)))
+        let bytes = calls.keys.add((0..input.len).map(keys))?;
+        calls.charge.resize(bytes)
     }
 
     /// The kernel's counters over the batches so far, as one eager run reports them.
@@ -252,16 +276,28 @@ impl Expand {
         self.counters.as_ref()
     }
 
-    /// Add one batch's counters: numbers add up, and other values keep the latest.
+    /// Add one batch's counters as one eager call over all of the batches reports them:
+    /// counts of work add up, properties of the index the kernel read keep their first
+    /// value, a vector search's method becomes `mixed` when batches differ, and other
+    /// values keep the latest.
     fn add_counters(&mut self, batch: Option<serde_json::Map<String, serde_json::Value>>) {
         let Some(batch) = batch else { return };
+        let vector = matches!(self.node.kind, Kind::VectorSearch(_));
         let total = self.counters.get_or_insert_with(Default::default);
         for (key, value) in batch {
-            let sum = match (total.get(&key).and_then(|v| v.as_u64()), value.as_u64()) {
-                (Some(a), Some(b)) => Some(a.saturating_add(b).into()),
-                _ => None,
+            let merged = match total.get(&key) {
+                None => value,
+                Some(_) if vector && exec::vector_counter_is_property(&key) => continue,
+                Some(before) if vector && key == "method" => match *before == value {
+                    true => continue,
+                    false => "mixed".into(),
+                },
+                Some(before) => match (before.as_u64(), value.as_u64()) {
+                    (Some(a), Some(b)) => a.saturating_add(b).into(),
+                    _ => value,
+                },
             };
-            total.insert(key, sum.unwrap_or(value));
+            total.insert(key, merged);
         }
     }
 
@@ -297,6 +333,8 @@ impl Expand {
             && let Some(batch) = child.next(ctx, options, options.batch_rows.max(1))?
         {
             remote.run.add(ctx, spec, rl, &batch.table);
+            // The keys and inputs the batch added are held before any request is sent.
+            remote.answers.resize(remote.run.held_bytes())?;
             match &mut remote.held {
                 Some(held) => {
                     super::merge::append(ctx, held, &batch.table, 0..batch.table.len)?;
@@ -433,5 +471,39 @@ impl Expand {
                 self.at = 0;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A batch whose rows make no call holds the keys earlier batches added, so the
+    /// bytes it reports for them do not shrink (Sol review of item 829, finding 3).
+    #[test]
+    fn a_batch_without_calls_keeps_the_charge_of_the_keys_held() {
+        let mut keys = CallKeys::new(usize::MAX);
+        let wide = keys
+            .add((0..100u64).map(|i| Some(vec![Id(i), Id(i + 1), Id(i + 2), Id(i + 3)])))
+            .unwrap();
+        assert!(wide >= 100 * call_bytes(4), "{wide}");
+        let after = keys.add((0..100).map(|_| None)).unwrap();
+        assert_eq!(after, wide);
+        let narrower = keys.add(std::iter::once(Some(vec![Id(7)]))).unwrap();
+        assert!(narrower >= wide, "{narrower} < {wide}");
+    }
+
+    /// The cap counts distinct keys over every batch, as one eager call counts them.
+    #[test]
+    fn the_cap_counts_distinct_keys_across_batches() {
+        let mut keys = CallKeys::new(3);
+        keys.add([Some(vec![Id(1)]), Some(vec![Id(2)])].into_iter())
+            .unwrap();
+        keys.add([Some(vec![Id(1)]), Some(vec![Id(3)])].into_iter())
+            .unwrap();
+        assert!(matches!(
+            keys.add(std::iter::once(Some(vec![Id(4)]))),
+            Err(crate::Error::BudgetExceeded(b)) if b.limit == 3 && b.requested == 4
+        ));
     }
 }

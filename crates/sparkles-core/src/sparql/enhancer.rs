@@ -1197,7 +1197,30 @@ pub(super) struct RemoteRun {
     missing: Vec<usize>,
     /// the bytes of the answers the inputs hold, summed as they arrive
     held: u64,
+    /// the bytes of the keys and inputs the loop keeps, summed as they are added
+    kept: u64,
     pub stats: LoopStats,
+}
+
+/// The bytes one distinct key of `width` identifiers holds in `by_key`: the key, its
+/// vector header and value, and the hash table's slot and control byte.
+fn key_bytes(width: usize) -> u64 {
+    (width * size_of::<Id>() + size_of::<(Vec<Id>, (usize, bool))>() + 1) as u64
+}
+
+/// The bytes one distinct input holds: its values in `inputs` and again as the key of
+/// `by_values`, the slot of each, its place in `missing` and its cache key.
+fn input_bytes(input: &Input) -> u64 {
+    let values = input.values.len() * size_of::<Option<Term>>();
+    let terms: u64 = input
+        .values
+        .iter()
+        .flatten()
+        .map(|t| super::output::term_bytes(t).unwrap_or(u64::MAX / 4))
+        .sum();
+    let slots = size_of::<Input>() + size_of::<(Vec<Option<Term>>, usize)>() + 1;
+    let cache_key = input.key.as_ref().map_or(0, String::capacity);
+    (2 * values + slots + size_of::<usize>() + cache_key) as u64 + 2 * terms
 }
 
 impl RemoteRun {
@@ -1236,6 +1259,7 @@ impl RemoteRun {
             by_key: FxHashMap::default(),
             missing: Vec::new(),
             held: 0,
+            kept: 0,
             stats: LoopStats::default(),
         })
     }
@@ -1275,6 +1299,7 @@ impl RemoteRun {
                 });
                 n
             });
+            self.kept = self.kept.saturating_add(key_bytes(key.len()));
             self.by_key.insert(key, (input, false));
         }
         self.stats.inputs = self.inputs.len();
@@ -1308,6 +1333,7 @@ impl RemoteRun {
             if self.inputs[i].rows.is_none() {
                 self.missing.push(i);
             }
+            self.kept = self.kept.saturating_add(input_bytes(&self.inputs[i]));
         }
     }
 
@@ -1451,9 +1477,10 @@ impl RemoteRun {
             .unwrap_or(l.len())
     }
 
-    /// The bytes of the answers the loop holds.
+    /// The bytes the loop holds: the answers of its inputs, and the distinct keys and
+    /// inputs it keeps to look them up.
     pub(super) fn held_bytes(&self) -> u64 {
-        self.held
+        self.held.saturating_add(self.kept)
     }
 
     /// Join the left rows `l`, whose inputs all have answers, with their solutions.

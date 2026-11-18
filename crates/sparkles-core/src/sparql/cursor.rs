@@ -2539,8 +2539,9 @@ struct Operator {
     bind_reuse: Option<Box<bind::Reuse>>,
     /// Whether the operator and those below it released what they hold for reading.
     released: bool,
-    /// Whether the operator's rows stay out of the produced-row count, because an eager
-    /// operator that runs this tree counts them as its own.
+    /// Whether the operator's rows stay out of the produced-row count and the row limit,
+    /// because an eager operator that runs this tree counts and checks them as its own,
+    /// or because, as the pairs below a count over a join, no eager operator holds them.
     uncounted: bool,
     /// The variables every output batch, and the concatenation of all of them, is
     /// sorted on in raw ID order. It is fixed when the operator is built, and each
@@ -3224,6 +3225,12 @@ impl Operator {
         {
             order.clear();
         }
+        // The pairs of the join below a count over a join are no rows of the eager
+        // count, which counts its inputs and its one row and never holds the pairs, so
+        // they stay out of the count and the row limit.
+        if count_join && let Some(join) = children.first_mut() {
+            join.uncounted = true;
+        }
         let ahead = (reads_ahead && matches!(state, State::Unary(_))).then(Box::default);
         Ok(Self {
             state,
@@ -3502,12 +3509,14 @@ impl Operator {
             return Ok(None);
         }
         let began = Instant::now();
-        let count = merge.count(ctx, &mut self.children, options)?;
+        let count = merge.count(ctx, &mut self.children, options, !self.uncounted)?;
         self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
         self.rows =
             usize::try_from(count).map_err(|_| Error::invalid("cursor row count overflow"))?;
-        ctx.check_rows(self.rows)?;
-        ctx.produced(self.rows)?;
+        if !self.uncounted {
+            ctx.check_rows(self.rows)?;
+            ctx.produced(self.rows)?;
+        }
         self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
         self.done = true;
         self.release_finished();
@@ -3576,8 +3585,8 @@ impl Operator {
                     .rows
                     .checked_add(rows)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                ctx.check_rows(self.rows)?;
                 if !self.uncounted {
+                    ctx.check_rows(self.rows)?;
                     ctx.produced(rows)?;
                 }
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
@@ -3619,7 +3628,9 @@ impl Operator {
                     .rows
                     .checked_add(b.table.len)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                ctx.check_rows(self.rows)?;
+                if !self.uncounted {
+                    ctx.check_rows(self.rows)?;
+                }
                 // Eager kernels already counted all their operator work during execution.
                 if !self.uncounted
                     && !matches!(

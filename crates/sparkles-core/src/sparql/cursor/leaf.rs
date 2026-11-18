@@ -49,7 +49,9 @@ pub(super) fn reads_group(node: &Node) -> bool {
     let reads = node.children.len() > usize::from(edges);
     debug_assert!(
         match &node.kind {
-            Kind::PathSearch(spec) => reads == spec.needs_input(),
+            // A variable end may be an output the search binds, so a search that
+            // may take input need not have any.
+            Kind::PathSearch(spec) => !reads || spec.needs_input(),
             Kind::AlgoCall(spec) => reads == spec.needs_input(),
             Kind::TextSearch(spec) => reads == spec.needs_input(),
             Kind::VectorSearch(spec) if !spec.order_fallback => reads == spec.needs_input(),
@@ -58,7 +60,7 @@ pub(super) fn reads_group(node: &Node) -> bool {
             Kind::PropertyFn(spec) => reads == spec.needs_input(),
             _ => true,
         },
-        "{} reads its group exactly when its specification needs input",
+        "{} reads its group only when its specification takes input",
         node.operator()
     );
     reads

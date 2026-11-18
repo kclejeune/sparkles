@@ -663,6 +663,46 @@ fn vector_searches_run_as_cursor_operators() {
     assert_eq!(eager(&q).len(), 1);
 }
 
+/// A vector search whose query vector its group binds reports the counters of one eager
+/// search however its input splits into batches: work such as `scored` and `searches`
+/// adds up, and properties of the index such as `rows` keep their value (Sol review of
+/// item 829, finding 4).
+#[test]
+fn streamed_vector_search_counters_match_one_search_over_the_input() {
+    use sparkles_core::sparql::{CursorOptions, CursorPlan, FallbackPolicy, select_cursor};
+    let s = store(StoreOptions::default());
+    fn find(plan: &CursorPlan) -> Option<&CursorPlan> {
+        if plan.operator.operator == "VectorSearch" {
+            return Some(plan);
+        }
+        plan.children.iter().find_map(find)
+    }
+    let q = format!(
+        "{P}SELECT ?q ?s ?score {{ VALUES ?q {{ ex:a ex:c }} (?s ?score) spk:vectorSearch (ex:emb ?q 2) }}"
+    );
+    let counters = |rows: usize| {
+        let o = CursorOptions {
+            batch_rows: rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(s.snapshot(), &q, &QueryOptions::default(), &o).unwrap();
+        while c.next_batch().unwrap().is_some() {}
+        find(c.plan())
+            .and_then(|p| p.operator.counters.clone())
+            .expect("vector search counters")
+    };
+    let one = counters(4096);
+    assert_eq!(
+        one.get("searches").and_then(|v| v.as_u64()),
+        Some(2),
+        "{one:?}"
+    );
+    for rows in [1, 2] {
+        assert_eq!(counters(rows), one, "{rows}");
+    }
+}
+
 /// Vector searches as cursor operators count the rows they produce against the work
 /// limit as eager runs do: both modes count the same rows, and a limit one row short of
 /// that count stops both (item 829).

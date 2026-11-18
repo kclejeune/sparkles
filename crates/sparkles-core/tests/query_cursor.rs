@@ -3337,9 +3337,16 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
 /// rows, so the strict policy admits it and no operator materializes (item 829).
 #[test]
 fn count_join_counts_a_streamed_join() {
+    use std::sync::atomic::AtomicU64;
     let s = store(60);
     let data = (0..60)
-        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7) % 60))
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:q> <urn:s:{}> .\n<urn:s:{i}> <urn:r> <urn:g:{}> .\n",
+                (i * 7) % 60,
+                i % 3
+            )
+        })
         .collect::<String>();
     s.load(&[Source::from_bytes(
         data.into_bytes(),
@@ -3354,6 +3361,8 @@ fn count_join_counts_a_streamed_join() {
         "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
         "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
         "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o > 1000) ?s <urn:q> ?t }",
+        // 1140 pairs of inputs with at most 60 rows each
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:r> ?g FILTER(?s != <urn:s:0>) ?t <urn:r> ?g }",
     ] {
         let expected = query(s.snapshot(), q, &Default::default())
             .unwrap()
@@ -3363,6 +3372,62 @@ fn count_join_counts_a_streamed_join() {
             assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
             assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
             assert_eq!(all(c), expected, "{q}; {rows}");
+        }
+        // The pairs of the join below the count are not rows that the eager count
+        // produces, so they stay out of the work count and the work limit (Sol review of
+        // item 829, finding 1).
+        let with = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+            no_cache: true,
+            max_rows_produced: limit,
+            work,
+            ..Default::default()
+        };
+        let produced = query(s.snapshot(), q, &with(None, None))
+            .unwrap()
+            .rows_produced;
+        let streamed = |limit: Option<u64>, rows: usize| -> Result<u64, Error> {
+            let work = Arc::new(AtomicU64::new(0));
+            let mut c = select_cursor(
+                s.snapshot(),
+                q,
+                &with(limit, Some(work.clone())),
+                &options(rows),
+            )?;
+            while c.next_batch()?.is_some() {}
+            Ok(work.load(Ordering::Relaxed))
+        };
+        // Nor do they count against the row limit, which eager runs hold the rows of
+        // each operator to.
+        let rows_limit = QueryOptions {
+            max_rows: Some(120),
+            ..with(None, None)
+        };
+        let eager_fits = query(s.snapshot(), q, &rows_limit).map(|r| r.application_rows());
+        for rows in [1, 3, 4096] {
+            let streamed_fits = (|| -> Result<_, Error> {
+                let mut c = select_cursor(s.snapshot(), q, &rows_limit, &options(rows))?;
+                let mut answer = Vec::new();
+                while let Some(batch) = c.next_batch()? {
+                    for row in 0..batch.len() {
+                        answer.push(batch.row(row).unwrap().values().to_vec());
+                    }
+                }
+                Ok(answer)
+            })();
+            match &eager_fits {
+                Ok(answer) => assert_eq!(
+                    streamed_fits.as_ref().map_err(|e| e.to_string()),
+                    Ok(answer),
+                    "{q}; {rows}"
+                ),
+                Err(_) => assert!(streamed_fits.is_err(), "{q}; {rows}"),
+            }
+            assert_eq!(streamed(None, rows).unwrap(), produced, "{q}; {rows}");
+            assert!(streamed(Some(produced), rows).is_ok(), "{q}; {rows}");
+            assert!(
+                matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+                "{q}; {rows}"
+            );
         }
     }
 }

@@ -8469,6 +8469,23 @@ fn text_bound(
     Ok((t, c))
 }
 
+/// Whether the vector search counter `key` describes the index the search read rather
+/// than work: one call over several query vectors reports these from its first search,
+/// and sums the others (`scored`, `searches`). A cursor that runs the kernel once per
+/// batch merges its counters by the same rule.
+pub(super) fn vector_counter_is_property(key: &str) -> bool {
+    matches!(
+        key,
+        "exactBecause"
+            | "index"
+            | "ef"
+            | "rows"
+            | "overlayInserts"
+            | "overlayPending"
+            | "overlayDeletes"
+    )
+}
+
 pub(super) fn vector_search(
     ctx: &Ctx,
     spec: &super::plan::VectorSpec,

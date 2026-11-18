@@ -3,7 +3,9 @@
 
 include!("support/retained_rows_eq.rs");
 
-use sparkles_core::access::{Caller, GraphAccess, Graphs, Limits, Protection, Rule, TripleRules};
+use sparkles_core::access::{
+    Caller, GraphAccess, GraphRule, Graphs, Limits, Protection, Rule, TripleRules,
+};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::update::update;
 use sparkles_core::sparql::{QueryOptions, query};
@@ -2878,7 +2880,11 @@ fn a_streamed_algorithm_call_reads_pending_views_and_redacts_masked_plans() {
     let (nodes, _) = streamed(s.snapshot(), &opts);
     assert_eq!(nodes.len(), 2, "the rolled-back bridge is gone");
     let masked = QueryOptions {
-        graphs: Some(Arc::new(GraphAccess::graphs(Graphs::All, Graphs::All))),
+        // A view of the default graph alone; a view of every graph is no view.
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new(["default"], &[])),
+            Graphs::none(),
+        ))),
         ..Default::default()
     };
     let (nodes, call) = streamed(s.snapshot(), &masked);

@@ -751,3 +751,53 @@ fn a_streamed_loop_counts_its_rows_as_an_eager_run_does() {
         Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced
     ));
 }
+
+/// A streamed remote loop holds what it keeps across batches under the memory budget:
+/// each distinct key of its input rows, as well as the answers. Blank-node keys all send
+/// the same unbound request, and its answer is empty, so only the keys grow. A budget
+/// that cannot hold the input refuses the eager run, and it refuses the streamed run with
+/// a memory error too, while a larger budget answers (Sol review of item 829, finding 2).
+#[test]
+fn a_streamed_loop_charges_the_keys_it_keeps() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let n = 20_000;
+    let data = store(
+        &(0..n)
+            .map(|i| format!("_:b{i} <urn:q> <urn:x> .\n"))
+            .collect::<String>(),
+    );
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p {{ ?d <urn:q> <urn:x> SERVICE <loop:{}> {{ ?d <urn:none> ?p }} }}",
+        ep.url()
+    );
+    let with = |memory: Option<u64>| QueryOptions {
+        no_cache: true,
+        max_memory_bytes: memory,
+        ..opts()
+    };
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let o = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &with(memory), &o)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    let memory = |r: &Result<usize, Error>| matches!(r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+    let tight = Some(100 << 10);
+    assert_eq!(query(data.snapshot(), &q, &with(None)).unwrap().len(), 0);
+    assert_eq!(streamed(None).unwrap(), 0);
+    assert_eq!(ep.take().len(), 2, "one request per run");
+    let r = query(data.snapshot(), &q, &with(tight)).map(|r| r.len());
+    assert!(memory(&r), "eager: {r:?}");
+    let r = streamed(tight);
+    assert!(memory(&r), "streamed: {r:?}");
+    assert_eq!(streamed(Some(64 << 20)).unwrap(), 0);
+}
