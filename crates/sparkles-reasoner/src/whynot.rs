@@ -221,6 +221,42 @@ fn blocker_call(
     Ok(call)
 }
 
+/// The call of a failing negated atom of a rule program (item 839), as explanations show
+/// it: `not name(args)` for a relation, whose lowered arguments are the first column, the
+/// key and the other columns, and `not (s p o)` for a triple. A relation fact has no RDF
+/// form, so the blocker names no fact.
+fn negated_call(
+    terms: &Terms,
+    relations: Option<&crate::ir::Relations>,
+    args: &[Option<u64>],
+    retained: &mut crate::budget::Held,
+) -> anyhow::Result<String> {
+    let rel = args
+        .get(1)
+        .copied()
+        .flatten()
+        .and_then(crate::ir::lower::rel_of)
+        .and_then(|r| relations.and_then(|rs| rs.get(r)));
+    let Some(rel) = rel else {
+        let mut call = blocker_call(terms, "not ", args, retained)?;
+        // `not (s p o)`, as explanations write a negated triple
+        call = call.replace(", ", " ");
+        return Ok(call);
+    };
+    let cols: Vec<Option<u64>> = match rel.arity {
+        0 => Vec::new(),
+        1 => vec![args[0]],
+        2 => vec![args[0], args[2]],
+        _ => std::iter::once(args[0])
+            .chain(args[2..].iter().copied())
+            .collect(),
+    };
+    let mut name = String::with_capacity(4 + rel.name.len());
+    name.push_str("not ");
+    name.push_str(&rel.name);
+    blocker_call(terms, &name, &cols, retained)
+}
+
 /// A canonical hypothesis: its facts sorted, placeholders numbered by first use.
 fn canonical(facts: &[Pat]) -> Vec<Pat> {
     let mut v: Vec<Pat> = facts.to_vec();
@@ -416,6 +452,26 @@ impl Unfold<'_> {
     /// Derive the facts of `pats`, in one program when it fits and one at a time when
     /// not.
     fn derive(&mut self, pats: Vec<[Option<u64>; 3]>) -> anyhow::Result<()> {
+        // a relation's key has no term, so such patterns are asked by id (item 839)
+        if pats
+            .iter()
+            .any(|p| p[1].is_some_and(crate::ir::lower::is_key))
+        {
+            for p in &pats {
+                self.demanded.insert(*p);
+            }
+            return match self.session.derive_ids(&pats) {
+                Ok(()) => Ok(()),
+                Err(e)
+                    if matches!(&e, sparkles_core::Error::Component(c)
+                        if c.code == crate::query::BUDGET_CODE && c.message.contains("rules")) =>
+                {
+                    self.lossy = true;
+                    Ok(())
+                }
+                Err(e) => Err(session_error(e)),
+            };
+        }
         let mut demands = Vec::with_capacity(pats.len());
         for p in &pats {
             self.demanded.insert(*p);
@@ -494,24 +550,66 @@ impl Unfold<'_> {
                     .iter()
                     .any(|slot| matches!(slot, Slot::Const(id) if self.terms().is_rule_bnode(*id)))
             })
+            // the columns of a relation head's tail (item 839)
+            || r.builtins.iter().any(|b| {
+                b.kind == BuiltinKind::RelTuple
+                    && b.args[2..]
+                        .iter()
+                        .any(|slot| matches!(slot, Slot::Const(id) if self.terms().is_rule_bnode(*id)))
+            })
     }
 
     /// The bindings of rule `ri`'s head `hi` unified with `t`, or `None`.
-    fn unify(r: &CRule, hi: usize, t: &Pat) -> Option<Vec<u64>> {
+    /// A head of a relation of arity three or more, `(c0, key, ?h)` with the `RelTuple`
+    /// that gives `?h`, binds the builtin's columns from the tail of `t`'s handle too, so
+    /// the unfolding of a relation fact starts from its whole tuple (item 839).
+    fn unify(r: &CRule, hi: usize, t: &Pat, terms: &Terms) -> Option<Vec<u64>> {
         let CHead::Triple(s, p, o) = &r.head[hi] else {
             return None;
         };
+        // a head with a variable predicate gives no relation fact (see `demand::unifies`)
+        if crate::ir::lower::is_key(t[1]) && !matches!(p, Slot::Const(_)) {
+            return None;
+        }
         let mut b = vec![0u64; r.nvars];
-        for (slot, v) in [(*s, t[0]), (*p, t[1]), (*o, t[2])] {
+        let bind = |slot: Slot, v: u64, b: &mut Vec<u64>| -> bool {
             match slot {
-                Slot::Const(c) if c != v => return None,
+                Slot::Const(c) if c != v => return false,
                 Slot::Var(x) => {
                     if b[x] != 0 && b[x] != v {
-                        return None;
+                        return false;
                     }
                     b[x] = v;
                 }
                 _ => {}
+            }
+            true
+        };
+        for (slot, v) in [(*s, t[0]), (*p, t[1]), (*o, t[2])] {
+            if !bind(slot, v, &mut b) {
+                return None;
+            }
+        }
+        if let Slot::Var(h) = *o
+            && crate::ir::lower::is_key(t[1])
+            && let Some(tuple) = r
+                .builtins
+                .iter()
+                .find(|x| x.kind == BuiltinKind::RelTuple && x.args.first() == Some(&Slot::Var(h)))
+        {
+            let (key, cols) = terms.tail(t[2])?;
+            if key != t[1] {
+                return None;
+            }
+            let mut n = 0;
+            for (slot, v) in tuple.args[2..].iter().zip(cols) {
+                if !bind(*slot, v, &mut b) {
+                    return None;
+                }
+                n += 1;
+            }
+            if n != tuple.args.len() - 2 {
+                return None;
             }
         }
         Some(b)
@@ -626,6 +724,20 @@ impl Unfold<'_> {
         };
         let infos = self.session.infos();
         for (j, bi) in r.builtins.iter().enumerate() {
+            // the tail of a missing relation atom whose columns the instance binds: its
+            // handle makes the missing fact ground, so that it can be unfolded (item 839)
+            if bi.kind == BuiltinKind::RelTail
+                && let (Some(Slot::Var(h)), Some(Slot::Const(key))) =
+                    (bi.args.first(), bi.args.get(1))
+                && b[*h] == 0
+            {
+                let cols: Option<Vec<u64>> = bi.args[2..].iter().map(|&s| val(s, &b)).collect();
+                match cols {
+                    Some(cols) => b[*h] = terms.try_tail(*key, &cols)?,
+                    None => self.complete = false,
+                }
+                continue;
+            }
             let args: Vec<Option<u64>> = bi.args.iter().map(|&s| val(s, &b)).collect();
             let name = infos
                 .get(ri)
@@ -697,8 +809,17 @@ impl Unfold<'_> {
                 }
             };
             if let Some(fact) = fail {
-                if self.report_blockers {
-                    let call = blocker_call(terms, name, &args, &mut self.work)?;
+                // a tail that does not match is an atom that does not match, and no
+                // builtin of the rule's text
+                let lowered = matches!(bi.kind, BuiltinKind::RelTail | BuiltinKind::RelTuple);
+                if self.report_blockers && !lowered {
+                    let (call, fact) = if bi.kind == BuiltinKind::RelAbsent {
+                        let call =
+                            negated_call(terms, self.session.relations(), &args, &mut self.work)?;
+                        (call, None)
+                    } else {
+                        (blocker_call(terms, name, &args, &mut self.work)?, fact)
+                    };
                     blocked.push((call, fact));
                 }
                 return Ok(());
@@ -752,7 +873,13 @@ impl Unfold<'_> {
         if self.path.contains(&t) {
             return Ok(Vec::new());
         }
-        let mut alts = vec![(vec![t], 0)];
+        // a relation fact (item 839) cannot be asserted, so it is only unfolded
+        let relation = crate::ir::lower::is_key(t[1]);
+        let mut alts = if relation {
+            Vec::new()
+        } else {
+            vec![(vec![t], 0)]
+        };
         let pat = t.map(Some);
         if !self.derivable(pat) {
             return Ok(alts);
@@ -794,12 +921,14 @@ impl Unfold<'_> {
                     // a head action gives facts the search does not unfold
                     let hs = head_slots(&r.head[hi]);
                     let one = |x: Slot, v: u64| !matches!(x, Slot::Const(c) if c != v);
-                    if one(hs.0, t[0]) && one(hs.1, t[1]) && one(hs.2, t[2]) {
+                    let relation =
+                        crate::ir::lower::is_key(t[1]) && !matches!(hs.1, Slot::Const(_));
+                    if !relation && one(hs.0, t[0]) && one(hs.1, t[1]) && one(hs.2, t[2]) {
                         self.complete = false;
                     }
                     continue;
                 }
-                let Some(b) = Self::unify(r, hi, &t) else {
+                let Some(b) = Self::unify(r, hi, &t, self.session.terms()) else {
                     continue;
                 };
                 if self.makes_terms(r) {
@@ -830,16 +959,22 @@ impl Unfold<'_> {
                     // those of a missing atom's own hypotheses come after them
                     let mut combos: Vec<Combo> = vec![(Vec::new(), holes(&comp.missing) as u64, 1)];
                     for m in comp.missing {
-                        let alts = if m.iter().any(|&x| is_hole(x)) {
-                            if self.derivable(m.map(|x| (!is_hole(x)).then_some(x))) {
-                                // a missing intensional atom with a placeholder is kept
-                                // as a fact, not unfolded
+                        let alts =
+                            if m.iter().any(|&x| is_hole(x)) && crate::ir::lower::is_key(m[1]) {
+                                // a relation fact (item 839) with a placeholder can be neither
+                                // asserted nor unfolded
                                 self.complete = false;
-                            }
-                            None
-                        } else {
-                            Some(self.alternatives(m, depth + 1)?)
-                        };
+                                Some(Vec::new())
+                            } else if m.iter().any(|&x| is_hole(x)) {
+                                if self.derivable(m.map(|x| (!is_hole(x)).then_some(x))) {
+                                    // a missing intensional atom with a placeholder is kept
+                                    // as a fact, not unfolded
+                                    self.complete = false;
+                                }
+                                None
+                            } else {
+                                Some(self.alternatives(m, depth + 1)?)
+                            };
                         let mut next = Vec::new();
                         'combine: for (c, free, steps) in &combos {
                             match &alts {
@@ -1320,6 +1455,11 @@ fn verify(
 }
 
 /// Replace the terms of `names` in the tree.
+#[cfg(test)]
+pub(crate) fn rename_for_tests(d: &mut Derivation, names: &[(Term, Term)]) {
+    rename(d, names)
+}
+
 fn rename(d: &mut Derivation, names: &[(Term, Term)]) {
     for t in d.triple.iter_mut() {
         if let Some((_, to)) = names.iter().find(|(from, _)| from == t) {
@@ -1329,6 +1469,14 @@ fn rename(d: &mut Derivation, names: &[(Term, Term)]) {
     for (_, t) in d.bindings.iter_mut() {
         if let Some((_, to)) = names.iter().find(|(from, _)| from == t) {
             *t = to.clone();
+        }
+    }
+    // a relation node's columns (item 839)
+    if let Some(rel) = d.relation.as_mut() {
+        for t in rel.args.iter_mut() {
+            if let Some((_, to)) = names.iter().find(|(from, _)| from == t) {
+                *t = to.clone();
+            }
         }
     }
     for p in &mut d.premises {

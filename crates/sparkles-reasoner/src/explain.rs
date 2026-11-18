@@ -32,7 +32,7 @@
 //! charged to the request's memory budget. The deadline is read between rules and inside
 //! each rule's evaluation, so a rule whose candidates all fail stops at it too.
 
-use crate::budget::{Budget, Held, WorkingWarnings};
+use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings};
 use crate::engine::{self, CRule, Eval, Mode, RuleInfo, Slot, Step};
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
@@ -1086,44 +1086,16 @@ pub(crate) fn explain_program(
     ))
 }
 
-fn program_search(
-    snap: Arc<Snapshot>,
+/// The lowered rules of every stratum of `program`, in stratum order, with the infos of
+/// their IR rules: the names of the IR rules' variables, where the variables and builtins
+/// a lowering adds have none. `held` is charged for the rules, their infos and the
+/// origins, and the strata's buffers, which `lowered` charges, are given back to it as
+/// the rules move out (item 839's plan, §12.3 and §20.2).
+pub(crate) fn flat_rules(
     program: &crate::ir::Program,
-    inputs: &[Id],
-    inferred: Option<Id>,
-    generalized: &[[Vec<u8>; 3]],
-    triple: &[Term; 3],
-    opts: &ExplainOptions,
-) -> anyhow::Result<Explained> {
-    let budget = Budget::new(opts.max_memory);
-    let mut graphs: Vec<Id> = inputs.to_vec();
-    graphs.extend(inferred);
-    let base = Arc::new(Base::new(snap.clone(), &graphs)?);
-    let mut g = Graph::with_base(base);
-    g.set_budget(&budget)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(&budget)?;
-    // the generalized facts, saved as term keys, in this explanation's terms; the credit
-    // also holds the metadata of the rules below while the search runs
-    let mut held = Held::new(&budget);
-    {
-        held.try_grow(generalized.len() * size_of::<Triple>())?;
-        let id = |k: &[u8]| terms.try_id_for_key(k);
-        let mut facts: Vec<Triple> = Vec::with_capacity(generalized.len());
-        for k in generalized {
-            facts.push([id(&k[0])?, id(&k[1])?, id(&k[2])?]);
-        }
-        g.try_add_batch(facts)?;
-        held.shrink(generalized.len() * size_of::<Triple>());
-    }
-    let vocab = crate::ir::Vocab::of(&terms);
-    let part = program
-        .relation_part(&vocab, &budget)
-        .map_err(|e| match e {
-            crate::ir::ProgramError::Memory(m) => anyhow::Error::from(m),
-            e => anyhow::anyhow!("{e}"),
-        })?;
-    let mut lowered = program.lower(&budget)?;
+    lowered: &mut crate::ir::lower::Lowered,
+    held: &mut Held,
+) -> Result<(Vec<CRule>, Vec<RuleInfo>), BudgetFailure> {
     // the lowered rules of every stratum, with the names of their IR rules' variables;
     // the variables and builtins a lowering adds have none
     // the origins (exact vectors, with the scratch counts that size them), the flat
@@ -1183,6 +1155,48 @@ fn program_search(
     }
     // the strata's buffers, exact in `lower`, are freed
     held.shrink(count * size_of::<Vec<CRule>>() + n * size_of::<CRule>());
+    Ok((rules, infos))
+}
+
+fn program_search(
+    snap: Arc<Snapshot>,
+    program: &crate::ir::Program,
+    inputs: &[Id],
+    inferred: Option<Id>,
+    generalized: &[[Vec<u8>; 3]],
+    triple: &[Term; 3],
+    opts: &ExplainOptions,
+) -> anyhow::Result<Explained> {
+    let budget = Budget::new(opts.max_memory);
+    let mut graphs: Vec<Id> = inputs.to_vec();
+    graphs.extend(inferred);
+    let base = Arc::new(Base::new(snap.clone(), &graphs)?);
+    let mut g = Graph::with_base(base);
+    g.set_budget(&budget)?;
+    let terms = Terms::new(snap.clone());
+    terms.set_budget(&budget)?;
+    // the generalized facts, saved as term keys, in this explanation's terms; the credit
+    // also holds the metadata of the rules below while the search runs
+    let mut held = Held::new(&budget);
+    {
+        held.try_grow(generalized.len() * size_of::<Triple>())?;
+        let id = |k: &[u8]| terms.try_id_for_key(k);
+        let mut facts: Vec<Triple> = Vec::with_capacity(generalized.len());
+        for k in generalized {
+            facts.push([id(&k[0])?, id(&k[1])?, id(&k[2])?]);
+        }
+        g.try_add_batch(facts)?;
+        held.shrink(generalized.len() * size_of::<Triple>());
+    }
+    let vocab = crate::ir::Vocab::of(&terms);
+    let part = program
+        .relation_part(&vocab, &budget)
+        .map_err(|e| match e {
+            crate::ir::ProgramError::Memory(m) => anyhow::Error::from(m),
+            e => anyhow::anyhow!("{e}"),
+        })?;
+    let mut lowered = program.lower(&budget)?;
+    let (rules, infos) = flat_rules(program, &mut lowered, &mut held)?;
     let sources = vec!["rules".to_string()];
     let mut makes_terms = false;
     if let Some(part) = &part {
@@ -1535,7 +1549,7 @@ pub(crate) fn search_session(
         infos: p.infos,
         sources: p.sources,
         geo: p.geo_default.then(|| crate::geo_ids(p.terms)).transpose()?,
-        relations: None,
+        relations: p.relations,
     };
     search(
         p.snap,

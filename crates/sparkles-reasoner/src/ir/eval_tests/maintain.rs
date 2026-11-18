@@ -225,6 +225,12 @@ fn random_histories_match_full_runs() {
 /// A chain of six properties through `chain/4` and a key of four values through
 /// `keyed/3`, after `owl2rl.rls`: `chain-end` derives `(x p2 y)` and `key-end` `(x p3 y)`.
 fn chain_and_key(v: &TV) -> Program {
+    let (rels, rules) = chain_and_key_rules(v);
+    checked(v, rels, rules)
+}
+
+/// The relations and rules of [`chain_and_key`].
+pub(super) fn chain_and_key_rules(v: &TV) -> (Relations, Vec<Rule>) {
     let mut rels = Relations::default();
     // chain(list, i, x, y): the chain's first i properties lead from x to y
     let chain = rels.declare("chain", 4, false).unwrap();
@@ -279,7 +285,7 @@ fn chain_and_key(v: &TV) -> Program {
         ],
         vec![head(tri(V(0), v.props[3], V(1)))],
     ));
-    checked(v, rels, rules)
+    (rels, rules)
 }
 
 /// Chains and keys written as relations, after `owl2rl.rls`: a chain of six properties

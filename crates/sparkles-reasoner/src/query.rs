@@ -63,7 +63,14 @@ struct Shared {
     /// the most branches of one basic graph pattern's OWL 2 QL rewriting
     max_union: usize,
     warnings: Vec<String>,
+    /// a rule program of the IR (item 839) that the sessions evaluate in place of
+    /// `rules`, made over each session's terms (see [`QueryReasoner::with_program`])
+    program: Option<ProgramSource>,
 }
+
+/// A rule program of the IR over a session's terms.
+pub(crate) type ProgramSource =
+    Arc<dyn Fn(&Terms) -> anyhow::Result<crate::ir::Program> + Send + Sync>;
 
 /// A reasoner that derives facts for queries on demand, with the rules of a profile.
 #[derive(Clone)]
@@ -99,6 +106,7 @@ impl QueryReasoner {
                 max_iterations: usize::MAX,
                 max_union: crate::qlrewrite::DEFAULT_MAX_UNION,
                 warnings,
+                program: None,
             }),
         })
     }
@@ -120,6 +128,7 @@ impl QueryReasoner {
                 max_iterations: s.max_iterations,
                 max_union: s.max_union,
                 warnings: s.warnings.clone(),
+                program: s.program.clone(),
             }),
         }
     }
@@ -141,6 +150,32 @@ impl QueryReasoner {
                 max_iterations: s.max_iterations,
                 max_union: n.max(1),
                 warnings: s.warnings.clone(),
+                program: s.program.clone(),
+            }),
+        }
+    }
+
+    /// The same reasoner over the rule program that `source` makes over each session's
+    /// terms, in place of its profile's rules (item 839's plan, §20.2). No public path
+    /// reaches it before the rule frontend (Phase 5), and its sessions neither read nor
+    /// fill the table cache, whose keys name the profile's rules.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_program(self, source: ProgramSource) -> QueryReasoner {
+        let s = &self.shared;
+        QueryReasoner {
+            shared: Arc::new(Shared {
+                profile: s.profile.clone(),
+                extras: s.extras.clone(),
+                rules: s.rules.clone(),
+                sources: vec!["rules".to_string()],
+                geo_default: s.geo_default,
+                inputs: s.inputs.clone(),
+                digest: s.digest,
+                max_derived: s.max_derived,
+                max_iterations: s.max_iterations,
+                max_union: s.max_union,
+                warnings: s.warnings.clone(),
+                program: Some(source),
             }),
         }
     }
@@ -313,6 +348,14 @@ impl QueryReasoner {
     /// `cached` set it reads and fills the schema's table, whose facts join the graph, and
     /// without it not even that, since facts added to the session (a why-not hypothesis)
     /// change the schema.
+    /// A query's session, with linear recursion rewritten or not, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_session(&self, req: SessionRequest, linear: bool) -> Result<Session> {
+        let mut s = Session::new(self.shared.clone(), req)?;
+        s.rewrite_linear = linear;
+        Ok(s)
+    }
+
     pub(crate) fn explain_session(&self, mut req: SessionRequest, cached: bool) -> Result<Session> {
         req.no_cache = true;
         let mut s = Session::new(self.shared.clone(), req)?;
@@ -443,13 +486,74 @@ pub(crate) struct Parts<'a> {
     pub snap: &'a Arc<Snapshot>,
     pub budget: &'a Arc<Budget>,
     pub compact_rounds: &'a [u32],
+    /// the relations of the session's rule program (item 839)
+    pub relations: Option<&'a crate::ir::Relations>,
+}
+
+/// The rules a session evaluates: its profile's, compiled, or a rule program's, lowered
+/// with the infos of its IR rules and its relations (item 839).
+enum Compiled {
+    Profile(engine::CompiledInfo),
+    Program {
+        rules: Vec<CRule>,
+        infos: Vec<engine::RuleInfo>,
+        relations: crate::ir::Relations,
+        /// the charges of the rules, their infos and the lowering's buffers
+        _held: (crate::budget::Held, crate::ir::lower::Lowered),
+    },
+}
+
+/// The lowered rules of the program that `source` makes over `terms`, in stratum order.
+/// Demand stages every negation in a stage of its own below its rule (see
+/// [`demand::transform`]), so the strata's boundaries are not kept.
+fn program_rules(source: &ProgramSource, terms: &Terms, budget: &Arc<Budget>) -> Result<Compiled> {
+    let failed = |e: anyhow::Error| match BudgetFailure::from_anyhow(&e) {
+        Some(m) => memory_error(m, "the rule program"),
+        None => component(RULES_CODE, format!("{e:#}")),
+    };
+    let program = source(terms).map_err(failed)?;
+    let mut lowered = program
+        .lower(budget)
+        .map_err(|e| failed(anyhow::Error::from(e)))?;
+    let mut held = crate::budget::Held::new(budget);
+    let (rules, infos) = crate::explain::flat_rules(&program, &mut lowered, &mut held)
+        .map_err(|e| memory_error(e, "the rule program"))?;
+    Ok(Compiled::Program {
+        rules,
+        infos,
+        relations: program.relations,
+        _held: (held, lowered),
+    })
+}
+
+impl Compiled {
+    fn rules(&self) -> &[CRule] {
+        match self {
+            Compiled::Profile(c) => c.rules(),
+            Compiled::Program { rules, .. } => rules,
+        }
+    }
+
+    fn infos(&self) -> &[engine::RuleInfo] {
+        match self {
+            Compiled::Profile(c) => c.infos(),
+            Compiled::Program { infos, .. } => infos,
+        }
+    }
+
+    fn relations(&self) -> Option<&crate::ir::Relations> {
+        match self {
+            Compiled::Profile(_) => None,
+            Compiled::Program { relations, .. } => Some(relations),
+        }
+    }
 }
 
 pub(crate) struct Session {
     shared: Arc<Shared>,
     snap: Arc<Snapshot>,
     terms: Terms,
-    compiled: engine::CompiledInfo,
+    compiled: Compiled,
     /// whether the demand program rewrites linear recursion (see [`demand::transform`])
     rewrite_linear: bool,
     graphs: Vec<Id>,
@@ -472,6 +576,9 @@ pub(crate) struct Session {
     publish_limit: Option<u64>,
     warnings: WorkingWarnings,
     demands: Vec<Demand>,
+    /// the demands were given by id ([`Session::derive_ids`]), and their terms name
+    /// them only in part, so no table is kept for them
+    by_id: bool,
     keys: Vec<Key>,
     /// the constants of each demand (0 where none), and its seeded position
     consts: Vec<[u64; 3]>,
@@ -541,8 +648,13 @@ impl Session {
             .map_err(|e| memory_error(e, "the rules"))?;
         let mut warnings = WorkingWarnings::try_clone_from(&shared.warnings, &budget)
             .map_err(|e| memory_error(e, "the rule warnings"))?;
-        let compiled = engine::compile_info(&shared.rules, &terms, &mut warnings, true)
-            .map_err(|e| memory_error(e, "the compiled rules"))?;
+        let compiled = match &shared.program {
+            None => Compiled::Profile(
+                engine::compile_info(&shared.rules, &terms, &mut warnings, true)
+                    .map_err(|e| memory_error(e, "the compiled rules"))?,
+            ),
+            Some(source) => program_rules(source, &terms, &budget)?,
+        };
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
         let resolved = match &req.readable {
             Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
@@ -584,6 +696,13 @@ impl Session {
             }
             None => (None, None),
         };
+        // a rule program's tables are not kept, since the cache's keys name the
+        // profile's rules (item 839's plan, §20.2)
+        let (anchor_key, schema_view, publish_limit) = if shared.program.is_some() {
+            (None, None, None)
+        } else {
+            (anchor_key, schema_view, publish_limit)
+        };
         let view = schema_view.clone().filter(|_| !req.no_cache);
         Ok(Session {
             shared,
@@ -602,6 +721,7 @@ impl Session {
             publish_limit,
             warnings,
             demands: Vec::new(),
+            by_id: false,
             keys: Vec::new(),
             consts: Vec::new(),
             seeded: Vec::new(),
@@ -643,6 +763,9 @@ impl Session {
 
     /// The table cache's key of demand `d` with `seeds` (sorted), when it may be cached.
     fn table_key(&self, d: usize, seeds: &[u64]) -> Option<tables::Key> {
+        if self.by_id {
+            return None;
+        }
         let view = self.view.as_ref()?;
         // the demand names its constants by term, but seeds by the session's ids
         if seeds.iter().any(|&s| Id(s).tag() == Tag::Local) {
@@ -718,9 +841,19 @@ impl Session {
             ends[*count] = end;
             *count += 1;
         };
+        // a lowered program's rules read a list again when its cells arrive, as its full
+        // run reads them (item 839's plan, §20.1)
+        let lists =
+            (!compact && demand::replays_lists(rules)).then_some((terms.rdf_first, terms.rdf_rest));
         let (r, stopped) = watched(&self.stop, &flag, || {
             if compact {
                 engine::run_observed(g, rules, terms, &limits, None, Some(&mut note))
+            } else if lists.is_some() {
+                let origin = engine::Origin {
+                    lists,
+                    ..engine::Origin::default()
+                };
+                engine::run_from(g, rules, terms, &limits, Some(start), None, origin)
             } else {
                 engine::run(g, rules, terms, &limits, Some(start))
             }
@@ -772,6 +905,10 @@ impl Session {
         let mut g = Graph::with_base(Arc::new(base));
         g.set_budget(&self.budget)
             .map_err(|e| memory_error(e, "the input graphs"))?;
+        // relation facts are hidden from every atom with a variable predicate
+        if self.compiled.relations().is_some_and(|r| !r.is_empty()) {
+            g.set_relations();
+        }
         self.graph = Some(g);
         Ok(())
     }
@@ -906,7 +1043,13 @@ impl Session {
     /// it, or `None` when it is not kept (see [`Session::cache_equality`]).
     fn equality_table(&self) -> Option<(Table, Held)> {
         let g = self.graph.as_ref().expect("graph made");
-        let kept = || g.facts().filter(|t| !self.hidden.contains(&t[1]));
+        // a relation fact is left out: the handle of its tail is a local term whose
+        // columns a replay cannot map, and the stages above the equality stages, where
+        // only owl:sameAs is complete, derive the relation facts they ask for again
+        let kept = || {
+            g.facts()
+                .filter(|t| !self.hidden.contains(&t[1]) && !crate::ir::lower::is_key(t[1]))
+        };
         let local = |x: &u64| Id(*x).tag() == Tag::Local;
         // the facts and their local ids are counted first, and each list is made at the
         // size its charge admits, so that none of them grows
@@ -1471,6 +1614,7 @@ impl Session {
             } else {
                 &[]
             },
+            relations: self.compiled.relations(),
         })
     }
 
@@ -1499,6 +1643,33 @@ impl Session {
         let seeds = (0..demands.len()).map(|d| (d, Vec::new())).collect();
         self.derive(seeds)?;
         Ok(())
+    }
+
+    /// [`derive_all`](Self::derive_all) for patterns of ids, `None` where a position is
+    /// free, which may name a relation's key (item 839's plan, §20.2). A pattern names its
+    /// terms in the reports where they have one.
+    pub(crate) fn derive_ids(&mut self, pats: &[[Option<u64>; 3]]) -> Result<()> {
+        let term = |x: Option<u64>| match x.and_then(|id| self.terms.term(id)) {
+            Some(t) => DemandTerm::Const(t),
+            None => DemandTerm::Var,
+        };
+        let demands: Vec<Demand> = pats
+            .iter()
+            .map(|p| Demand {
+                s: term(p[0]),
+                p: term(p[1]),
+                o: term(p[2]),
+            })
+            .collect();
+        self.prepare_ids(&demands, Some(pats), false)?;
+        let seeds = (0..pats.len()).map(|d| (d, Vec::new())).collect();
+        self.derive(seeds)?;
+        Ok(())
+    }
+
+    /// The relations of the session's rule program, when it has one.
+    pub(crate) fn relations(&self) -> Option<&crate::ir::Relations> {
+        self.compiled.relations()
     }
 
     /// The session's graph, made when no demand derived yet.
@@ -1881,30 +2052,38 @@ fn estimate(g: &Graph, a: &Atom, bound: &[bool]) -> (f64, f64) {
     (stored, unknown)
 }
 
-impl ReasoningSession for Session {
-    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> Result<bool> {
-        let slot = |t: Option<&Term>, v: usize| match t {
-            Some(t) => self.id_of(t).map(Slot::Const),
-            None => Ok(Slot::Var(v)),
-        };
-        Ok(demand::intensional(
-            self.compiled.rules(),
-            (slot(s, 0)?, slot(p, 1)?, slot(o, 2)?),
-        ))
-    }
-
-    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
+impl Session {
+    /// [`ReasoningSession::prepare`], with the constants of each demand given by id in
+    /// `ids` when it is set, where `demands` names them only for the reports: a relation's
+    /// key has no term (item 839's plan, §20.2).
+    fn prepare_ids(
+        &mut self,
+        demands: &[Demand],
+        ids: Option<&[[Option<u64>; 3]]>,
+        estimates: bool,
+    ) -> Result<Vec<DemandInfo>> {
         self.demands = demands.to_vec();
+        self.by_id = ids.is_some();
         self.keys.clear();
         self.consts.clear();
         self.seeded.clear();
-        for d in demands {
+        // which positions of each demand are constants
+        let mut constant: Vec<[bool; 3]> = Vec::with_capacity(demands.len());
+        for (di, d) in demands.iter().enumerate() {
             let mut c = [0u64; 3];
+            let mut fixed = [false; 3];
+            let given = ids.map(|x| x[di]);
             let mut val = |t: &DemandTerm, i: usize| -> Result<bool> {
+                if let Some(g) = given {
+                    fixed[i] = g[i].is_some();
+                    c[i] = g[i].unwrap_or(0);
+                    return Ok(fixed[i]);
+                }
                 Ok(match t {
                     DemandTerm::Const(t) => {
                         let id = self.id_of(t)?;
                         c[i] = id;
+                        fixed[i] = true;
                         true
                     }
                     DemandTerm::Seeded => true,
@@ -1917,11 +2096,11 @@ impl ReasoningSession for Session {
             let kp = if p { KeyP::Const(c[1]) } else { KeyP::Free };
             let k = Key::new(s, kp, o);
             let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
-            self.keys.push(match (&d.p, &d.o) {
-                (DemandTerm::Const(_), DemandTerm::Const(_)) if c[1] == rdf_type => {
-                    k.with_class(c[2])
-                }
-                _ => k,
+            constant.push(fixed);
+            self.keys.push(if fixed[1] && fixed[2] && c[1] == rdf_type {
+                k.with_class(c[2])
+            } else {
+                k
             });
             self.consts.push(c);
             self.seeded.push(match (&d.s, &d.o) {
@@ -1942,11 +2121,15 @@ impl ReasoningSession for Session {
                     DemandTerm::Const(t) => short(t),
                     _ => "?p".to_string(),
                 };
-                let slot = |t: &DemandTerm, i: usize| match t {
-                    DemandTerm::Const(_) => Slot::Const(c[i]),
-                    _ => Slot::Var(i),
+                let fixed = constant[i];
+                let slot = |j: usize| {
+                    if fixed[j] {
+                        Slot::Const(c[j])
+                    } else {
+                        Slot::Var(j)
+                    }
                 };
-                let pattern = (slot(&d.s, 0), slot(&d.p, 1), slot(&d.o, 2));
+                let pattern = (slot(0), slot(1), slot(2));
                 let cone = demand::cone_indices(self.compiled.rules(), &self.terms, pattern);
                 // the materializer skips top-level backward rules (spec F17 §5.1), so a
                 // materialization lacks the facts of a cone that holds one
@@ -1990,6 +2173,23 @@ impl ReasoningSession for Session {
         self.program = None;
         self.specialized = false;
         Ok(infos)
+    }
+}
+
+impl ReasoningSession for Session {
+    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> Result<bool> {
+        let slot = |t: Option<&Term>, v: usize| match t {
+            Some(t) => self.id_of(t).map(Slot::Const),
+            None => Ok(Slot::Var(v)),
+        };
+        Ok(demand::intensional(
+            self.compiled.rules(),
+            (slot(s, 0)?, slot(p, 1)?, slot(o, 2)?),
+        ))
+    }
+
+    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
+        self.prepare_ids(demands, None, estimates)
     }
 
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> Result<Derived> {
@@ -2339,13 +2539,15 @@ mod compact_tests {
         // Keep this structural strategy control on valid compiler-owned fixtures.
         let mut warnings = WorkingWarnings::new(&session.budget);
         let many = crate::parse_rules(&"[(?s ?p ?o) -> (?o ?p ?s)]\n".repeat(257)).unwrap();
-        session.compiled =
-            engine::compile_info(&many, &session.terms, &mut warnings, true).unwrap();
+        session.compiled = Compiled::Profile(
+            engine::compile_info(&many, &session.terms, &mut warnings, true).unwrap(),
+        );
         assert!(!session.prefer_compact(50_000).unwrap());
         let wide =
             crate::parse_rules(&format!("[{} -> (?s ?p ?o)]", "(?s ?p ?o) ".repeat(65))).unwrap();
-        session.compiled =
-            engine::compile_info(&wide, &session.terms, &mut warnings, true).unwrap();
+        session.compiled = Compiled::Profile(
+            engine::compile_info(&wide, &session.terms, &mut warnings, true).unwrap(),
+        );
         assert!(!session.prefer_compact(8192).unwrap());
     }
 
