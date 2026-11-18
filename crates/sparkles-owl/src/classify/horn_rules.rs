@@ -156,12 +156,6 @@ fn atmost_at(st: &State, i: usize) -> Option<(Role, Ex)> {
         .and_then(|x| x.horn.atmost.get(i).copied())
 }
 
-/// Whether a loop of the context is a successor that `≤1 S.B` counts, which
-/// [`members`] lists with the links.
-fn looped(ix: &Index, st: &State, s: Role, b: Ex) -> bool {
-    held_own(st, b) && st.loops.iter().any(|&l| ix.roles.sub(l, s))
-}
-
 /// Whether a context with the Horn state `h` passes over a link by `r` to `n` that the
 /// Horn rules give it, because it links to `n` by a subrole of `r` already
 /// ([`spare`], level 2). [`succ`] asks it for a context of few successors, and the
@@ -1383,16 +1377,18 @@ fn r7<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S
 }
 
 /// The steps of reading after which [`r7_spare`] checks the run's bounds: one for an
-/// at-most restriction, one for each group of backward links it looks at and one for
-/// each source of a group it counts.
+/// at-most restriction, for each group of backward links it looks at, for each source
+/// of a group it counts, for each loop and for each predecessor of a pair it visits,
+/// and the length of the table of the roles that clash for each lookup in it.
 const R7_SCAN: usize = 64;
 
 /// [`r7`] without the work that changes nothing (roadmap item 1025). A predecessor that
 /// triggers the rule and is not real, or that a restriction does not count, is in no
 /// pair of that restriction, so the search for the pairs is left out for it. The run's
 /// bounds are checked after a restriction that made a pair or a send, and once for
-/// every [`R7_SCAN`] steps of reading restrictions, groups of backward links and their
-/// sources, so that a context with many of any of them still stops with the run.
+/// every [`R7_SCAN`] steps of reading restrictions, groups of backward links, their
+/// sources, loops and pairs, so that a context with many of any of them still stops
+/// with the run.
 fn r7_spare<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: &mut S) {
     let is_real = |st: &State, m: Ex| {
         st.extra
@@ -1460,20 +1456,42 @@ fn r7_spare<S: Sink>(ix: &Index, me: Ex, st: &mut State, only: Option<Ex>, out: 
         if real.is_empty() {
             continue;
         }
-        let looped = looped(ix, st, s, b);
-        let mut work = 0usize;
-        for &(m1, r1) in real.iter().filter(|&&(m, _)| only.is_none_or(|o| m == o)) {
+        // whether a loop of the context is a successor that the restriction counts,
+        // which [`members`] lists with the links
+        let mut looped = false;
+        if held_own(st, b) {
+            for &l in &st.loops {
+                if !read(1, out) {
+                    return;
+                }
+                if roles.sub(l, s) {
+                    looped = true;
+                    break;
+                }
+            }
+        }
+        // a lookup of a clash reads the table of the roles that clash twice
+        let lookup = 2 * roles.clash.len();
+        for &(m1, r1) in &real {
+            if !read(1, out) {
+                return;
+            }
+            if only.is_some_and(|o| m1 != o) {
+                continue;
+            }
             if looped {
                 out.send(m1, Concl::Same(me));
                 out.me(Concl::Same(m1));
             }
             for &(m2, r2) in &real {
-                work += 1;
-                if work.is_multiple_of(64) && !out.go_on() {
+                if !read(1, out) {
                     return;
                 }
                 if m2 == m1 || (only.is_none() && m2 > m1) {
                     continue;
+                }
+                if !read(lookup, out) {
+                    return;
                 }
                 if clash(ix, r1, r2) {
                     out.send(m1, Concl::Sub(BOTTOM));
@@ -1885,10 +1903,12 @@ mod tests {
         assert_eq!(out.sent.len(), 2);
     }
 
-    /// A sink that counts the checks of the run's bounds and stops the run at the first.
+    /// A sink that counts the checks of the run's bounds and stops the run at the check
+    /// after the first `allow`.
     struct Stopped {
         sent: usize,
         checks: std::cell::Cell<usize>,
+        allow: usize,
     }
 
     impl Sink for Stopped {
@@ -1900,7 +1920,7 @@ mod tests {
         }
         fn go_on(&self) -> bool {
             self.checks.set(self.checks.get() + 1);
-            false
+            self.checks.get() <= self.allow
         }
         fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
             out.clear();
@@ -1936,6 +1956,7 @@ mod tests {
             let mut out = Stopped {
                 sent: 0,
                 checks: std::cell::Cell::new(0),
+                allow: 0,
             };
             r7(&ix, me, &mut st, only, &mut out);
             assert_eq!(out.sent, 0);
@@ -1981,6 +2002,7 @@ mod tests {
             let mut out = Stopped {
                 sent: 0,
                 checks: std::cell::Cell::new(0),
+                allow: 0,
             };
             r7(&ix, me, st, only, &mut out);
             assert_eq!((out.sent, out.checks.get()), (0, 1), "for {only:?}");
@@ -1991,6 +2013,75 @@ mod tests {
             let least = if spare() >= 1 { srcs.len() / 64 } else { 1 };
             assert!(out.checks.get() >= least, "for {only:?}");
         }
+    }
+
+    /// R7 at a singular context checks the run's bounds while it reads the context's
+    /// loops, the predecessors of a pair and the table of the roles that clash, and a
+    /// check that ends the run after one that let it go on stops the rule before the
+    /// pair it was about to make (item 1025).
+    #[test]
+    fn r7_stops_with_the_run_before_a_pair_it_has_not_reached() {
+        let (mut ix, me, n) = roles_index();
+        let m = TOP;
+        let stopped = |allow| Stopped {
+            sent: 0,
+            checks: std::cell::Cell::new(0),
+            allow,
+        };
+        // two real predecessors that the restriction counts, behind 500 that are not real
+        let mut st = State::default();
+        hs(&mut st).singular = true;
+        hs(&mut st).atmost.push((0, TOP));
+        st.back.push((2, Small::default()));
+        for k in 100..600 {
+            st.back[0].1.insert(k);
+        }
+        st.back[0].1.insert(n);
+        st.back[0].1.insert(m);
+        hs(&mut st).real_preds.insert(n);
+        hs(&mut st).real_preds.insert(m);
+        let mut out = Polled::new();
+        r7(&ix, me, &mut st, None, &mut out);
+        assert_eq!(out.sent.len(), 2);
+        let all = out.checks.get();
+        // the run ends at the second check, which the rules as they were reach only
+        // after the pair
+        let mut out = stopped(1);
+        r7(&ix, me, &mut st, None, &mut out);
+        if spare() >= 1 {
+            assert!(all >= 500 / 64);
+            assert_eq!((out.sent, out.checks.get()), (0, 2));
+        }
+        // loops by roles that the restriction does not count, and one real predecessor
+        let mut st = State::default();
+        hs(&mut st).singular = true;
+        hs(&mut st).atmost.push((0, TOP));
+        st.back.push((2, Small::default()));
+        st.back[0].1.insert(n);
+        hs(&mut st).real_preds.insert(n);
+        st.loops = vec![2; 500];
+        let mut out = stopped(0);
+        r7(&ix, me, &mut st, Some(n), &mut out);
+        assert_eq!((out.sent, out.checks.get()), (0, 1));
+        // a long table of roles that clash, none of them the roles of the pair, is read
+        // for each pair, so the run ends before the first pair is made
+        ix.roles.clash = vec![(1, 1); 500];
+        let mut st = State::default();
+        hs(&mut st).singular = true;
+        hs(&mut st).atmost.push((0, TOP));
+        st.back.push((2, Small::default()));
+        st.back[0].1.insert(n);
+        st.back[0].1.insert(m);
+        hs(&mut st).real_preds.insert(n);
+        hs(&mut st).real_preds.insert(m);
+        let mut out = stopped(0);
+        r7(&ix, me, &mut st, None, &mut out);
+        if spare() >= 1 {
+            assert_eq!((out.sent, out.checks.get()), (0, 1));
+        }
+        let mut out = Polled::new();
+        r7(&ix, me, &mut st, None, &mut out);
+        assert_eq!(out.sent.len(), 2);
     }
 
     /// R3 at a real context sends each individual among its successors the fillers of
