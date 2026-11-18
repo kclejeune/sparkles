@@ -389,7 +389,9 @@ each listed test has a roadmap item to make it deterministic. A retry prints a `
 when it happens, and the final summary lists the test as `FLAKY`. `mise run test` writes
 the tests that passed only on a retry to `.artifacts/ci/flaky-tests.txt`, and
 `scripts/ci.sh` repeats them at the end of its summary. A test that fails every attempt
-still fails the run.
+still fails the run. The batch gate adds one rerun of each failed test, alone, as
+[Reruns of failed tests](#reruns-of-failed-tests) describes, and `mise run test` itself
+retries no other test.
 
 ### Partitioned test runs
 
@@ -980,6 +982,34 @@ a 24 GiB cap. `--cargo-jobs N` sets the jobs for every host of a run.
 `GATE_CARGO_JOBS_HOSTS`, a space-separated list such as `hostA=6 hostB=8` in the
 environment or the configuration file, sets them per host, and `GATE_CARGO_JOBS` sets them
 for the hosts that list leaves out. The value is recorded in `progress.log`.
+
+### Reruns of failed tests
+
+When the ci step of a gate fails, `scripts/gate/remote/test_retry.py` reruns each failed
+Rust test once, alone, before the conformance steps start, and the gate passes if every
+rerun passes. It does so only when the evidence shows that the failure belongs to a few
+tests and to nothing else. The retained JUnit manifest must record a fresh report of the
+failed `test` task for the gate's commit, every other ci task and the shared
+prerequisites must have passed, and nextest's final summary must be complete, with its
+failed and timed-out counts equal to the failures in the report. There must be between 1
+and `GATE_RETRY_MAX_FAILURES` failures, 8 by default, which is above the largest number
+that recent gates recorded for a load-sensitive failure and far below a real breakage.
+
+Each test runs with `mbx nextest run --no-capture --retries 0` and an exact binary and
+test filter, under one lease on the managed target, within `GATE_RETRY_SECONDS` in all,
+2400 by default, and at most 900 seconds each. A rerun passes only when its own JUnit
+report lists exactly that test as passed and its log shows no workspace crate compiled.
+A failed nextest run ends the `test` task before its doctests, so the doctests of the
+task's packages run next. When all of these pass, the run writes `ci.forgiven`, with one
+line for each flaky test, and `steps.txt` gets a `FLAKY` line under the ci step.
+
+`ci.exit` keeps the original result, and the gate's verdict skips it only when
+`ci.forgiven` exists and `test-retry.exit` is 0. Any other outcome, including a rerun
+that fails, times out or matches no test, leaves the ci step failed. `test-retry.txt`
+gives the reason and the outcome of each rerun, and `test-retry/` holds each rerun's log
+and JUnit report beside the first run's evidence in `ci-receipts`. The nightly gate uses
+the same rule. A test that the gate forgave belongs on the list of
+[known flaky tests](#known-flaky-tests) once it recurs.
 
 ### Checks a batch selects
 

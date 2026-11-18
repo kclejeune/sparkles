@@ -249,14 +249,15 @@ hout=gate/out/$hname
 # The results directory names the host that ran ci. Older drivers always used -wally.
 dest=$root/.artifacts/gates/main-gate-$name-$primary
 
-# Installs scripts/gate/remote/ and scripts/boat/disk_clean.py on a host under
+# Installs scripts/gate/remote/'s gate-start.sh, gate-inner.sh and test_retry.py and
+# scripts/boat/disk_clean.py on a host under
 # ~/gate/bin/v-<hash>/ and prints that path.
 # A content-addressed directory leaves running gates and older callers' scripts untouched.
 install_remote() {
   local h=$1 v
-  v=$(cat "$here/remote/gate-start.sh" "$here/remote/gate-inner.sh" "$here/../boat/disk_clean.py" | sha256sum | cut -c1-12)
+  v=$(cat "$here/remote/gate-start.sh" "$here/remote/gate-inner.sh" "$here/remote/test_retry.py" "$here/../boat/disk_clean.py" | sha256sum | cut -c1-12)
   # shellcheck disable=SC2029
-  tar -cf - -C "$here/remote" gate-start.sh gate-inner.sh -C "$here/../boat" disk_clean.py | rx_exec "$h" "
+  tar -cf - -C "$here/remote" gate-start.sh gate-inner.sh test_retry.py -C "$here/../boat" disk_clean.py | rx_exec "$h" "
     d=\$HOME/gate/bin/v-$v
     if [ ! -x \"\$d/gate-start.sh\" ]; then
       t=\$(mktemp -d \"\$HOME/gate/bin/.v-$v.XXXXXX\")
