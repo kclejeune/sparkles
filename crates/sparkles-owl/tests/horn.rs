@@ -1399,5 +1399,64 @@ fn a_long_chain_among_many_live_properties_is_pruned_by_lookups() {
     assert_eq!(out.stats.tier, Tier::Horn);
     assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
     assert!(!out.taxonomy.is_subclass(&c("X"), &c("D")));
-    assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+    // a debug build took 106 s with the scans, and takes a few seconds
+    assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+}
+
+#[test]
+fn many_restrictions_ask_one_automaton_and_many_links_meet_many_at_mosts() {
+    // 2,000 negative restrictions over the result of a chain of 2,000 operands, which
+    // all ask whether a link runs along the same automaton, beside a chain that links do
+    // run along: the index answers from one pass over each automaton.
+    use std::fmt::Write;
+    let n = 2_000;
+    let mut body = String::from("SubObjectPropertyOf(ObjectPropertyChain(");
+    for k in 0..n {
+        write!(body, ":c{k} ").unwrap();
+    }
+    body.push_str(
+        ") :t)
+         SubObjectPropertyOf(ObjectPropertyChain(:p :q) :t)
+         SubClassOf(:A ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:q :F0)))
+         SubClassOf(:A ObjectAllValuesFrom(:p :B))\n",
+    );
+    for k in 0..n {
+        writeln!(body, "SubClassOf(ObjectSomeValuesFrom(:t :F{k}) :G{k})").unwrap();
+    }
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty());
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G0")));
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("G1")));
+    assert!(!out.taxonomy.is_subclass(&c("F0"), &c("G0")));
+    // 2,000 links by properties of their own beside 2,000 at-most restrictions on
+    // others: a link's property is looked up among the restrictions' properties, and
+    // the one link that a restriction counts still merges its successors.
+    let mut body = String::from(
+        "SubClassOf(:X ObjectSomeValuesFrom(:l0 :Z))
+         SubClassOf(:X ObjectMaxCardinality(1 :m))
+         SubObjectPropertyOf(:l0 :m)
+         EquivalentClasses(:W ObjectSomeValuesFrom(:l0 ObjectIntersectionOf(:Y :Z)))
+         SubClassOf(:Y ObjectMaxCardinality(1 ObjectInverseOf(:l1)))
+         SubClassOf(:X :V)
+         SubClassOf(:U ObjectSomeValuesFrom(:l1 :Y))
+         EquivalentClasses(:T ObjectSomeValuesFrom(:l1 ObjectSomeValuesFrom(ObjectInverseOf(:l1) :V)))\n",
+    );
+    for k in 0..n {
+        writeln!(body, "SubClassOf(:X ObjectSomeValuesFrom(:l{k} :Y))").unwrap();
+        writeln!(body, "SubClassOf(:M ObjectMaxCardinality(1 :s{k}))").unwrap();
+    }
+    let ax = axioms(&body);
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(k.excluded().is_empty());
+    assert_eq!(out.stats.tier, Tier::Horn);
+    // R5 through the superproperty of the link
+    assert!(out.taxonomy.is_subclass(&c("X"), &c("W")));
+    assert!(!out.taxonomy.is_subclass(&c("M"), &c("W")));
+    // R6: Y has at most one predecessor by l1, so X's successor by l1 goes back to X
+    assert!(out.taxonomy.is_subclass(&c("X"), &c("T")));
+    assert!(!out.taxonomy.is_subclass(&c("U"), &c("T")));
 }

@@ -2422,9 +2422,25 @@ fn horn_index(
             _ => None,
         })
         .collect();
+    // a link's role is under an at-most restriction's when the role or one above it is
+    // such a role, which a table of them says without a scan of them for each link
+    let mut counted: Vec<bool> = Vec::new();
+    for &s in &most {
+        if counted.len() <= s as usize {
+            counted.resize(s as usize + 1, false);
+        }
+        counted[s as usize] = true;
+    }
+    let counts = |s: Role| counted.get(s as usize).copied().unwrap_or(false);
     let back: Vec<Role> = links
         .iter()
-        .filter(|&&l| most.iter().any(|&s| roles.sub(l, s)))
+        .filter(|&&l| {
+            counts(l)
+                || roles
+                    .sup
+                    .get(l as usize)
+                    .is_some_and(|v| v.iter().any(|&s| counts(s)))
+        })
         .filter_map(|&l| roles.inv(l))
         .collect();
     links.extend(back);
@@ -2434,6 +2450,13 @@ fn horn_index(
     // links for each transition of a long chain's automaton is their product
     let over_links = roles_over(roles, &links);
     let linked = |s: Role| over_links.get(s as usize).copied().unwrap_or(false);
+    // for each automaton, whether a link runs along one of its transitions, found once:
+    // the negative existentials below ask it of the same automaton again and again
+    let runs: FxHashMap<Role, bool> = h
+        .autos
+        .iter()
+        .map(|(&r, a)| (r, a.trans.iter().any(|t| t.1.is_some_and(linked))))
+        .collect();
     // a range of s holds of the predecessors of the links that run against s
     let mut news: Vec<(Ex, Ex)> = Vec::new();
     for &(s, c) in &ax.ranges {
@@ -2466,21 +2489,21 @@ fn horn_index(
             .any(|n| matches!(n, Node::Forall(..) | Node::AtMost1(..) | Node::SelfLoop(_)))
         || b.exist.iter().any(|&(f, (r, _))| {
             f != TOP
-                && roles.inv(r).is_some_and(|i| match h.autos.get(&i) {
-                    Some(a) => a.trans.iter().any(|t| t.1.is_some_and(linked)),
+                && roles.inv(r).is_some_and(|i| match runs.get(&i) {
+                    Some(&run) => run,
                     None => linked(i),
                 })
         });
-    let unlinked = |i: Role| {
-        h.autos
-            .get(&i)
-            .is_some_and(|a| !a.trans.iter().any(|t| t.1.is_some_and(linked)))
-    };
+    let unlinked = |i: Role| runs.get(&i).is_some_and(|&run| !run);
     // a negative existential over a role that chains reach and whose inverse the run
     // does not have cannot be unfolded, and keeps every chain composed
-    let invertible = b.exist.iter().all(|&(_, (r, _))| {
-        roles.inv(r).is_some() || !ax.chains.iter().any(|(_, v)| roles.sub(*v, r))
-    });
+    let results: Vec<Role> = ax.chains.iter().map(|(_, v)| *v).collect();
+    let over_results = roles_over(roles, &results);
+    let reached = |r: Role| over_results.get(r as usize).copied().unwrap_or(false);
+    let invertible = b
+        .exist
+        .iter()
+        .all(|&(_, (r, _))| roles.inv(r).is_some() || !reached(r));
     let selection = (fires && !roles.any_empty && invertible).then(|| {
         let mut seeds: Vec<Role> = b
             .exist
@@ -2499,9 +2522,9 @@ fn horn_index(
             continue;
         }
         let Some(i) = roles.inv(r) else { continue };
-        match h.autos.get(&i) {
-            Some(a)
-                if a.trans.iter().any(|t| t.1.is_some_and(linked))
+        match runs.get(&i) {
+            Some(&run)
+                if run
                     || selection
                         .as_ref()
                         .is_some_and(|s| s.composed.binary_search(&r).is_err()) =>
