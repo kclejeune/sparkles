@@ -214,6 +214,27 @@ pub(super) fn input(exprs: &[&Expr]) -> std::result::Result<Option<VarId>, Strin
     }
 }
 
+impl PerValue<Option<super::value::Value>> {
+    /// One value per row of a dictionary decoding, whose slot 0 is the unbound sentinel
+    /// of the rows it did not decode. The values move to their rows when no two rows
+    /// share one, and are cloned otherwise. The charge goes with `self`, so the caller
+    /// charges the rows' values before it drops what this returns with.
+    pub(super) fn sentinel_rows(&mut self) -> Vec<Option<super::value::Value>> {
+        let Some(slot) = &self.slot else {
+            return std::mem::take(&mut self.vals);
+        };
+        let decoded = slot.iter().filter(|&&s| s != 0).count();
+        if decoded + 1 == self.vals.len() {
+            // every decoded row holds a different term
+            slot.iter().map(|&s| self.vals[s as usize].take()).collect()
+        } else {
+            slot.iter()
+                .map(|&s| self.vals[s as usize].clone())
+                .collect()
+        }
+    }
+}
+
 /// Results per distinct input value and each row's index into them.
 pub struct PerValue<T> {
     pub vals: Vec<T>,
@@ -868,7 +889,7 @@ fn numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<boo
     let Some(column) = t.col_of(var) else {
         return Ok(None);
     };
-    let values = match cursor_dictionary_values(ctx, t, &Expr::Var(var)) {
+    let values = match dictionary_values(ctx, t, &Expr::Var(var)) {
         Ok(Some(values)) => values,
         Ok(None) => return Ok(None),
         Err(crate::Error::BudgetExceeded(b))
@@ -1294,6 +1315,42 @@ pub(super) fn key_filter_mask(
     Ok(hit)
 }
 
+/// Which ids of a column [`sorted_values`] decodes, and how it treats the switches and
+/// refusals of its callers.
+#[derive(Clone, Copy)]
+struct SortedDecode {
+    /// the ids decoded, the others keeping the unbound sentinel in slot 0
+    ids: DecodeIds,
+    /// Whether the decoding is the value reuse that `expr_cache` switches and that
+    /// needs [`MIN_ROWS`] rows. The row-aligned pre-decode of [`super::exec`] is not.
+    reuse: bool,
+    /// Whether a refused payload of a term outside the base vocabulary declines the
+    /// decoding instead of failing it, for a caller that has a fallback that keeps one
+    /// value per distinct term. A refused base-vocabulary payload always declines.
+    decline: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeIds {
+    /// every row's id, inline numbers included
+    Every,
+    /// the ids of the base vocabulary, the delta vocabulary and the query's local terms
+    Dictionary,
+    /// the ids of the base vocabulary
+    Vocab,
+}
+
+impl DecodeIds {
+    #[inline]
+    fn decodes(self, id: Id) -> bool {
+        match self {
+            DecodeIds::Every => true,
+            DecodeIds::Dictionary => matches!(id.tag(), Tag::Vocab | Tag::Delta | Tag::Local),
+            DecodeIds::Vocab => id.tag() == Tag::Vocab,
+        }
+    }
+}
+
 /// Charge-owning ORDER variable values, decoded once per sorted ID. Unlike the
 /// scalar cache, this operation-local bulk decoder never populates Ctx.values.
 pub(super) fn cursor_variable_values(
@@ -1301,39 +1358,73 @@ pub(super) fn cursor_variable_values(
     table: &Table,
     expr: &Expr,
 ) -> Result<Option<PerValue<Option<super::value::Value>>>> {
-    cursor_values(ctx, table, expr, false)
+    let Expr::Var(var) = expr else {
+        return Ok(None);
+    };
+    let decode = SortedDecode {
+        ids: DecodeIds::Every,
+        reuse: true,
+        decline: table.len > super::exec::PAR_THRESHOLD,
+    };
+    sorted_values(ctx, table, *var, decode)
 }
 
 /// Decode only dictionary-backed values. Inline numeric IDs keep their cheap
 /// direct path; their slots are the unbound sentinel and must not be read.
-pub(super) fn cursor_dictionary_values(
+pub(super) fn dictionary_values(
     ctx: &Ctx,
     table: &Table,
     expr: &Expr,
-) -> Result<Option<PerValue<Option<super::value::Value>>>> {
-    cursor_values(ctx, table, expr, true)
-}
-
-fn cursor_values(
-    ctx: &Ctx,
-    table: &Table,
-    expr: &Expr,
-    dictionary_only: bool,
 ) -> Result<Option<PerValue<Option<super::value::Value>>>> {
     let Expr::Var(var) = expr else {
         return Ok(None);
     };
-    if !ctx.opt.expr_cache || table.len < MIN_ROWS {
+    let decode = SortedDecode {
+        ids: DecodeIds::Dictionary,
+        reuse: true,
+        decline: table.len > super::exec::PAR_THRESHOLD,
+    };
+    sorted_values(ctx, table, *var, decode)
+}
+
+/// The values of the base-vocabulary ids of `var`'s column, decoded once per distinct
+/// id in key order, for the row-aligned pre-decode of [`super::exec`]. It runs whatever
+/// the `expr_cache` switch says, and a refused payload declines it, since its caller
+/// leaves the column to the rows. Every other id's slot is the unbound sentinel.
+pub(super) fn vocabulary_values(
+    ctx: &Ctx,
+    table: &Table,
+    var: VarId,
+) -> Result<Option<PerValue<Option<super::value::Value>>>> {
+    let decode = SortedDecode {
+        ids: DecodeIds::Vocab,
+        reuse: false,
+        decline: true,
+    };
+    sorted_values(ctx, table, var, decode)
+}
+
+/// The one sorted pre-decode of a column: its distinct ids sorted, each base-vocabulary
+/// term decoded once in key order with its storage admitted before it is built, and a
+/// slot per row. Its callers differ only in the parameters of [`SortedDecode`].
+fn sorted_values(
+    ctx: &Ctx,
+    table: &Table,
+    var: VarId,
+    decode: SortedDecode,
+) -> Result<Option<PerValue<Option<super::value::Value>>>> {
+    if decode.reuse && (!ctx.opt.expr_cache || table.len < MIN_ROWS) {
         return Ok(None);
     }
-    let Some(column) = table.col_of(*var) else {
+    let Some(column) = table.col_of(var) else {
         return Ok(None);
     };
     if table.len > u32::MAX as usize {
         return Ok(None);
     }
     let ids = &table.cols[column];
-    let dictionary = |id: Id| matches!(id.tag(), Tag::Vocab | Tag::Delta | Tag::Local);
+    let dictionary_only = decode.ids != DecodeIds::Every;
+    let dictionary = |id: Id| decode.ids.decodes(id);
     let count = if dictionary_only {
         ids.iter().filter(|&&id| dictionary(id)).count()
     } else {
@@ -1417,6 +1508,28 @@ fn cursor_values(
         .map(|id| id.payload())
         .collect::<Vec<_>>();
     let numeric = ctx.snap.generation.vocab.numeric();
+    // The keys of the ids outside the numeric column's segments are asked for before the
+    // column is read, so that a cold vocabulary reads them meanwhile. The hint is
+    // optional, and a budget that does not hold its ids skips it.
+    if let Some(num) = numeric
+        && crate::index::io_hints()
+        && (2..=1 << 16).contains(&payloads.len())
+        && payloads.iter().any(|&p| num.may_hold(p))
+    {
+        let count = payloads.iter().filter(|&&p| !num.may_hold(p)).count();
+        if let Ok(hint) = ctx.charge(count as u64 * 8) {
+            let keys: Vec<u64> = payloads
+                .iter()
+                .copied()
+                .filter(|&p| !num.may_hold(p))
+                .collect();
+            let _ = ctx
+                .snap
+                .generation
+                .vocab
+                .prefetch_sorted_checked(&keys, |need| hint.add(need as u64));
+        }
+    }
     let scratch = ctx.charge(0)?;
     let mut reserved = 0;
     let mut bytes = base;
@@ -1503,7 +1616,7 @@ fn cursor_values(
                 // A large input's caller falls back to per-value reuse, which keeps one value
                 // per distinct term, so the refusal declines this optional decoding there. A
                 // smaller input's caller retries with a smaller trial and needs the refusal.
-                if table.len > super::exec::PAR_THRESHOLD {
+                if decode.decline {
                     return Ok(None);
                 }
                 return Err(error);

@@ -5,7 +5,8 @@ first stage of deletions, the policy items 480 to 483 of its third stage and the
 accounting model and mode-neutral kernels of its fourth stage have shipped, as its
 [Outcome](SPEC.md#outcome) records. The format cutoff of item 479 and the commit publish
 tail of item 484 remain with [X16](../X16-storage-consolidation/README.md), the
-hierarchical budget of item 675 and the decoding twins of item 678 close stage 4, and
+hierarchical budget of item 675 and the string floors of cursor batches in items 678 and
+1069 close stage 4, and
 [roadmap item 453](../../ROADMAP.md) holds the rest of the work. The [plan](PLAN.md)
 orders the remaining stages into phases, items 825 to 829 first, with their files, gates,
 measurements and the decisions that are open.

@@ -1519,8 +1519,9 @@ impl Ctx {
     }
 
     /// Whether the query streams through pull cursors. Both modes charge the same state,
-    /// so only planning and routing choices, the accumulation of an EXISTS key set across
-    /// batches and whether a decoding envelope can refuse read it.
+    /// so only the routing of a query, the accumulation of an EXISTS key set across
+    /// batches, whether a decoding envelope can refuse and whether a batch compares
+    /// strings through their floors read it.
     #[inline]
     pub(super) fn streams(&self) -> bool {
         self.accounting() == Accounting::Cursor
@@ -2985,6 +2986,10 @@ impl Ctx {
     /// `a < b` by id, the lexical form of `a` is less than that of `b` exactly when `a`
     /// is below `b`'s floor, since the keys between `b`'s floor and `b` all start with
     /// `b`'s lexical form.
+    ///
+    /// Both keys it reads and the search for the floor decode inside the envelope
+    /// ([`Ctx::reserve_decode`]), so a cursor reserves them on the ledger. A refusal
+    /// records a failure, which the next check reports, and gives `None`.
     pub(super) fn string_floor(&self, id: Id) -> Option<u64> {
         if id.tag() != Tag::Vocab {
             return None;
@@ -2994,16 +2999,35 @@ impl Ctx {
         if p >= v.first_triple() {
             return None;
         }
-        let key = v.get(p)?;
-        if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
-            return None;
+        self.with_vocab_key(p, |key| {
+            if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
+                return None;
+            }
+            let prefix = &key[..key.len() - 1];
+            // most strings extend none: the key before them does not start with them
+            if p == 0 || !self.with_vocab_key(p - 1, |k| k.starts_with(prefix))? {
+                return Some(p);
+            }
+            self.vocab_lower_bound(prefix)
+        })
+        .flatten()
+    }
+
+    /// The first base id whose key is not below `key`, searched inside the decoding
+    /// envelope. A refusal records a failure and gives `None`.
+    fn vocab_lower_bound(&self, key: &[u8]) -> Option<u64> {
+        let v = &self.snap.generation.vocab;
+        if !self.envelope_refuses() {
+            let (Ok(i) | Err(i)) = v.find(key);
+            return Some(i);
         }
-        let prefix = &key[..key.len() - 1];
-        // most strings extend none: the key before them does not start with them
-        if p == 0 || !v.get_with(p - 1, |k| k.starts_with(prefix))? {
-            return Some(p);
+        match v.find_with_checked(key, |need| self.reserve_decode_checked(need)) {
+            Ok(Ok(i) | Err(i)) => Some(i),
+            Err(error) => {
+                self.fail_memory(&error);
+                None
+            }
         }
-        Some(v.prefix_range(prefix).0)
     }
 
     pub fn local_len(&self) -> u64 {
@@ -3909,14 +3933,21 @@ mod charge_tests {
     }
 
     /// The executors read the accounting mode in at most this many places outside tests.
-    /// Stage 4 of item 453 lowers it as each `cursor_*` twin merges, and item 827 took
-    /// the planning reads out, so that a query plans alike in every mode. The routing of
-    /// `query_execution_with_plan`, the EXISTS key set, the decoding envelope and
-    /// `string_order_mask` remain.
-    const MODE_CHECKS: usize = 4;
+    /// Stage 4 of item 453 lowered it as each twin merged, and item 827 took the planning
+    /// reads out, so that a query plans alike in every mode. The routing of
+    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches, the
+    /// decoding envelope and the cursor exclusion of `string_order_mask` remain, with the
+    /// four reads of the flag that decide whether a cursor owner exists, whether a context
+    /// without an owner may keep retained state uncharged, whether an empty release trims
+    /// the ledger and whether a finished query's pool contribution shrinks. Item 1069's
+    /// per-query floor cache removes the exclusion of `string_order_mask`.
+    const MODE_CHECKS: usize = 8;
 
-    /// Counts the calls of `streams()` in the non-test sources of the SPARQL engine,
-    /// and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453).
+    /// Counts the reads of the accounting mode in the non-test sources of the SPARQL
+    /// engine, and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453). A
+    /// read is a call of `streams()` or `accounting()`, a use of `Accounting::Cursor` or
+    /// `Accounting::Collect`, or a direct read of the `streams` field. The bodies of the
+    /// two accessors and the one write of the field are not reads.
     #[test]
     fn the_accounting_mode_is_read_in_a_bounded_number_of_places() {
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -3928,6 +3959,32 @@ mod charge_tests {
                     out.push(path);
                 }
             }
+        }
+        /// Whether `line` reads the mode, as a word match so that `streams` inside a
+        /// longer name does not count.
+        fn reads_mode(line: &str) -> bool {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains(".streams()")
+                || code.contains(".accounting()")
+                || code.contains("Accounting::Cursor")
+                || code.contains("Accounting::Collect")
+            {
+                return true;
+            }
+            let mut rest = code;
+            while let Some(at) = rest.find(".streams") {
+                let after = &rest[at + ".streams".len()..];
+                let next = after.chars().next();
+                let word_end = next.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                // `.streams = ` writes the flag, and `.streams()` was counted above
+                let writes =
+                    after.trim_start().starts_with("= ") && !after.trim_start().starts_with("==");
+                if word_end && next != Some('(') && !writes {
+                    return true;
+                }
+                rest = after;
+            }
+            false
         }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sparql");
         let mut files = Vec::new();
@@ -3943,8 +4000,21 @@ mod charge_tests {
             let code = text
                 .find("\n#[cfg(test)]\nmod ")
                 .map_or(text.as_str(), |end| &text[..end]);
+            // the body of `fn accounting` and of `fn streams`, up to their closing brace
+            let mut accessor = false;
             for (line, content) in code.lines().enumerate() {
-                if content.contains(".streams()") {
+                if name == "ctx.rs" {
+                    if content.starts_with("    pub(super) fn streams(")
+                        || content.starts_with("    pub(super) fn accounting(")
+                    {
+                        accessor = true;
+                    }
+                    if accessor {
+                        accessor = content != "    }";
+                        continue;
+                    }
+                }
+                if reads_mode(content) {
                     sites.push(format!("{name}:{}", line + 1));
                 }
             }
@@ -4320,6 +4390,95 @@ mod charge_tests {
                 );
             } else {
                 assert!(ctx.term(literals[1].0).is_some());
+                assert!(ctx.check().is_ok());
+            }
+            drop(held);
+        }
+    }
+
+    /// The floor of every stored string is the same in both modes and is the first id
+    /// whose key starts with its lexical form. A cursor reserves the keys a floor reads
+    /// and the search for it, so a long string refuses once the budget is held, and the
+    /// refusal fails the next check. An eager floor reads it unchecked.
+    #[test]
+    fn string_floors_agree_across_modes_and_reserve_their_reads_in_a_cursor() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+        let store = Store::in_memory(StoreOptions::default());
+        let long = "a".repeat(256 << 10);
+        let mut nt = String::new();
+        for (i, w) in ["", "a", "ab", "abc", "b", "ba", "é", "z"]
+            .into_iter()
+            .chain([long.as_str(), "abé"])
+            .enumerate()
+        {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"{w}\" .\n"));
+        }
+        nt.push_str("<urn:s:n> <urn:p> \"5\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n");
+        nt.push_str("<urn:s:l> <urn:p> \"ab\"@en .\n");
+        store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let v = &snap.generation.vocab;
+        let ids: Vec<u64> = (0..v.first_triple()).collect();
+        let expected: Vec<Option<u64>> = ids
+            .iter()
+            .map(|&p| {
+                let key = v.get(p).unwrap();
+                if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
+                    return None;
+                }
+                let prefix = &key[..key.len() - 1];
+                ids.iter()
+                    .copied()
+                    .find(|&q| v.get(q).unwrap().starts_with(prefix))
+            })
+            .collect();
+        assert!(
+            expected
+                .iter()
+                .zip(&ids)
+                .any(|(f, p)| f.is_some_and(|f| f < *p)),
+            "a string extends another"
+        );
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 64 * MIB;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let floors: Vec<Option<u64>> = ids
+                .iter()
+                .map(|&p| ctx.string_floor(Id::vocab(p)))
+                .collect();
+            assert_eq!(floors, expected, "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+        let long_id = ids
+            .iter()
+            .copied()
+            .find(|&p| v.get(p).unwrap().len() > 1000)
+            .unwrap();
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = MIB;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let held = ctx.charge(MIB - ctx.live_bytes() - 100).unwrap();
+            let floor = ctx.string_floor(Id::vocab(long_id));
+            if cursor {
+                assert_eq!(floor, None);
+                assert!(
+                    matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+                );
+            } else {
+                assert_eq!(floor, expected[long_id as usize]);
                 assert!(ctx.check().is_ok());
             }
             drop(held);

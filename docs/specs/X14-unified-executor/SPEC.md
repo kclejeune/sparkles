@@ -210,10 +210,37 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped, and the
-hierarchical budget of item 675 and the decoding twins of item 678 remain. Stage 5's
+479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped. The
+hierarchical budget of item 675 remains, and so does the cursor exclusion of the string
+floors, which item 1069 removes. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+
+Item 678 has shipped in part. The string floors of `string_order_mask` read their keys
+and search for a string's first extension inside the decoding envelope, and a refused
+read fails the comparison with its refusal. Cursor batches still compare two string
+columns key by key and do not use the floors. On atlas with 1.05M triples and one
+thread, comparing through floors cached per batch made streaming `str-pair-lt` 24.8%
+slower and `str-pair-names` 33.4% slower than the direct comparison, in every round. The
+names of `str-pair-names` repeat across batches, with 83,226 and 91,694 distinct values in
+its two columns over 249,868 rows, so each batch computes again floors that an earlier batch had. Every name of
+`str-pair-lt` is distinct, 70,023 in 70,023 rows, and the cause of its loss is not
+established. Item 1069 takes up a floor cache that lasts the query and the exclusion.
+The row-aligned
+pre-decode of `decode_for` decodes its columns through the same sorted pre-decode as the
+dictionary values of top k and the numeric FILTER, which admits each value's storage
+before it builds it, and moves or clones the distinct values to their rows. Indexing the
+rows through the distinct values' slots was considered and not built, because the row
+evaluator reads the decoded column on its hot path and that change would need its own
+Intel measurement. The bounded-reads test counts every read of the mode, eight in all.
+
+Forge measured the item against the build before it on 36 queries at 1.05M triples with
+one thread, in three A,B,B,A rounds of ten requests, and every answer was the same. The
+geometric mean was 1.002 in streaming execution and 0.993 in automatic execution. A few
+filters that decode values became slower in every round. `str-filter-two` took 2.4% longer
+in streaming and 4.4% longer in automatic execution, `lang-filter` 2.4% and 2.6% longer,
+and streaming `str-pair-lt` 2.1% longer. With 12 threads `str-pair-lt` and `str-pair-names`
+were 2% faster.
 
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its
@@ -718,29 +745,40 @@ compares full sorts and top k over 8,192 and 32,768 rows eagerly and in cursors 
 batches on both sides of the threshold.
 
 The sorted pre-decode of the columns that row-by-row FILTER, BIND and ORDER BY
-evaluation reads runs for inputs of more than 16,384 rows in both modes, and smaller
-inputs read their values through the value cache. Each decoded column's slots are
-charged before it is decoded, with the distinct values it decodes on the way, and its
-values after. A column whose charge does not fit gives that charge back and is left to the
-rows. The comparison of two string columns through cached lexicographic floors stays off
-for cursor batches, because the floors reconstruct strings without reserving the
-decoding, which only an eager query may do.
+evaluation reads runs for inputs of more than 16,384 rows in both modes and whatever the
+`expr_cache` switch says, and smaller inputs read their values through the value cache.
+It is the one sorted pre-decode that also serves the dictionary values of top k and the
+numeric FILTER and the ORDER keys of a variable, which decodes each distinct term once in
+key order and admits its storage before it builds it. Each decoded column's slots are
+charged before it is decoded, the distinct values with their own charge while they are
+decoded, and the rows' values after. A column whose charge or decoding does not fit gives
+that charge back and is left to the rows, and only cancellation and the deadline fail the
+pre-decode. The shared pre-decode admits 128 bytes for each decoded row and 8 for each
+row of the table before it starts, which is more than the 12 bytes and one value for each
+decoded row that the separate large-input pre-decode admitted. Under a budget with little room left,
+a large column can therefore fall back to its rows where it was decoded before, which
+costs time but no correctness. The comparison of two string columns through cached
+lexicographic floors serves eager tables of at least 4,096 rows. A floor reads its
+string's key, the key before it and, for a string that other strings extend, the search
+for the first of them inside the decoding envelope, and a refused read fails the
+comparison with the refusal it recorded. Cursor batches compare the two keys directly
+instead, because the floors with a cache that lasts one batch measured slower than that
+comparison. Item 1069 takes up a cache that lasts the query.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
-calls of `streams()`, formerly `is_cursor()`, outside tests and fails above its bound,
-which each step lowered. It was 26 after the regular expressions, 17 after per-value
-reuse, 7 after the sort keys and is 6 after the decoded columns. Three are the planning and
-routing choices that stage 6 removes, in `plan.rs`, `unionpush.rs` and `cursor.rs`. The
-fourth accumulates an EXISTS key set across a cursor's batches, which an eager table
-builds in one batch. The fifth lets a cursor's decoding envelope refuse on the ledger,
-because eager callers of `term` and `value` cannot report a refusal and decode without
-the envelope instead. The sixth keeps cursors from the string floors above, until those
-reconstruct with the decoding admitted. `CursorMemory` is gone, and a context in cursor accounting differs
+reads of the accounting mode outside tests and fails above its bound. A read is a call of
+`streams()` or `accounting()`, a use of either `Accounting` variant or a direct read of
+the `streams` field outside its accessors. The bound is 8. The first read is the routing
+of `query_execution_with_plan` in `cursor.rs`. The second accumulates an EXISTS key set
+across a cursor's batches, which an eager table builds in one batch. The third lets a
+cursor's decoding envelope refuse on the ledger, because eager callers of `term` and
+`value` cannot report a refusal and decode without the envelope instead. The fourth
+keeps cursor batches from the string floors until item 1069. The other four read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
+without an owner may keep retained state uncharged, whether an empty release trims the
+ledger and whether a finished query's pool contribution shrinks. `CursorMemory` is gone, and a context in cursor accounting differs
 from an eager one only by its `streams` flag, its ledger retention and its deadline. The
 result cache and sampled filters stay off for cursors, since they are planning choices
-that stage 6 makes independent of the mode. Item 678 holds the two decoding twins
-that remain, the string floors and the dictionary pre-decode of a cursor batch, which
-`decode_for` does not yet serve.
+that stage 6 makes independent of the mode.
 
 Roadmap item 1039 removed the cursor scan's block charge. A scan over an immutable
 snapshot kept its decoded index block between batches and charged a whole block's
