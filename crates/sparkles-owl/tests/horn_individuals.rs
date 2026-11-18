@@ -571,3 +571,40 @@ fn r5_at_an_individual_whose_other_successor_holds_it_keeps_what_the_successor_h
         &[("M", "Qe")],
     );
 }
+
+#[test]
+fn a_link_that_r6_gives_beside_the_asserted_inverse_keeps_what_reads_it() {
+    // y bears x by the asserted q, and x inheres in y by the functional p, whose
+    // inverse q is. R6 at x identifies its predecessor y with its successor y and gives
+    // y a link to x by the inverse of p, which y has by q already. What reads the link
+    // by the inverse of p, a universal, a chain and a restriction on it, reads q's
+    check(
+        "InverseObjectProperties(:p :q)
+         FunctionalObjectProperty(:p)
+         ObjectPropertyAssertion(:p :x :y)
+         ObjectPropertyAssertion(:q :y :x)
+         ObjectPropertyAssertion(:t :x :z)
+         SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:p) :t) :u)
+         ClassAssertion(ObjectAllValuesFrom(ObjectInverseOf(:p) :F) :y)
+         ClassAssertion(:D :z)
+         SubClassOf(ObjectSomeValuesFrom(:u :D) :E)
+         SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:p) :F) :G)
+         EquivalentClasses(:Qx ObjectOneOf(:x))
+         EquivalentClasses(:Qy ObjectOneOf(:y))",
+        &[("Qx", "F"), ("Qy", "E"), ("Qy", "G")],
+        &[("Qy", "F"), ("Qx", "E"), ("Qx", "G"), ("F", "Qx")],
+    );
+}
+
+#[test]
+fn a_link_that_r6_gives_beside_the_asserted_inverse_still_clashes() {
+    // as above, and the inverse of p is disjoint with s, by which y also links to x
+    let (out, _) = run("InverseObjectProperties(:p :q)
+         FunctionalObjectProperty(:p)
+         ObjectPropertyAssertion(:p :x :y)
+         ObjectPropertyAssertion(:q :y :x)
+         ObjectPropertyAssertion(:s :y :x)
+         DisjointObjectProperties(ObjectInverseOf(:p) :s)
+         ClassAssertion(:A :x)");
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+}
