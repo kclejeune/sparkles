@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod aggerrors;
 mod algo;
 pub(crate) mod branches;
 mod budgets;
@@ -431,6 +432,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::rdfs::routes());
     // DESCRIBE settings (`/$/describe`)
     let app = app.merge(describe::routes());
+    let app = app.merge(aggerrors::routes());
     // model providers, memory settings and suggested examples (C18)
     let app = app.merge(crate::models::http::routes());
     let app = app.merge(crate::assist::routes());
@@ -1507,6 +1509,24 @@ pub(crate) fn reasoning_mode(ds: &Dataset, params: &Params) -> sparkles::reasoni
     }
 }
 
+/// The reading of errors in aggregates a request's `aggregate-errors` parameter names
+/// (`jena`, `sparkles` or `spec`), `None` without one; any other value is refused.
+pub(crate) fn aggregate_errors_param(
+    params: &Params,
+) -> ApiResult<Option<sparkles::sparql::AggregateErrors>> {
+    params
+        .get("aggregate-errors")
+        .map(|v| {
+            v.parse().map_err(|_| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "aggregate-errors must be jena, sparkles or spec",
+                )
+            })
+        })
+        .transpose()
+}
+
 /// Query-time reasoning a query asks for with `reasoning=demand` or `reasoning=auto`
 /// (spec F17 §2.1): the reasoner of the dataset, with the profile `reasoningProfile`
 /// names, else the dataset's query-time setting's or the last materialization's, and at
@@ -1840,6 +1860,7 @@ pub(crate) async fn run_query(
     let mut opts =
         CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     query_reasoning(&st, &ds, &params, &mut opts)?;
+    opts.aggregate_errors = aggregate_errors_param(&params)?.or(opts.aggregate_errors);
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
@@ -3047,6 +3068,7 @@ async fn explain(
     let mut opts =
         CallerContext::for_caller(&st, &ds, &p).options(&params, crate::auth::Endpoint::Query);
     query_reasoning(&st, &ds, &params, &mut opts)?;
+    opts.aggregate_errors = aggregate_errors_param(&params)?.or(opts.aggregate_errors);
     let at = history::at_param(&params)?;
     blocking(move || {
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;

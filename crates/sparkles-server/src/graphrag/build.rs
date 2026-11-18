@@ -1019,6 +1019,12 @@ impl Run<'_> {
         members: &[String],
         output: Option<&str>,
     ) -> Result<Vec<(Fact, Origin)>, RunError> {
+        // MIN(?rf) takes the least reifier present across the fact's graphs, some of
+        // which may hold none
+        let opts = &QueryOptions {
+            aggregate_errors: Some(sparkles::sparql::AggregateErrors::Sparkles),
+            ..opts.clone()
+        };
         let mut out = Vec::new();
         if graphs.is_empty() {
             return Ok(out);

@@ -4,6 +4,25 @@
  */
 
 export interface paths {
+    "/$/aggregate-errors/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the reading of errors in aggregates */
+        get: operations["getAggregateErrors"];
+        /** Set the reading of errors in aggregates */
+        put: operations["setAggregateErrors"];
+        post?: never;
+        /** Remove the reading of errors in aggregates */
+        delete: operations["deleteAggregateErrors"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/algo/{ds}/projections": {
         parameters: {
             query?: never;
@@ -5194,6 +5213,17 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AggregateErrorsSetting: {
+            /** @enum {string} */
+            mode: "jena" | "sparkles" | "spec";
+        };
+        AggregateErrorsStatus: {
+            /** @enum {string} */
+            mode: "jena" | "sparkles" | "spec";
+            modes: string[];
+            /** @enum {string} */
+            source: "dataset" | "default";
+        };
         /** @description A named projection of a dataset. A PUT sends the definition, or this object with its `definition` member. */
         AlgoProjection: {
             author?: string;
@@ -13995,6 +14025,8 @@ export interface components {
     parameters: {
         /** @description An HTTP date. Read the last commit at or before it (RFC 7089). */
         acceptDatetime: string;
+        /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+        aggregateErrors: "jena" | "sparkles" | "spec";
         /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
         at: string;
         /** @description The backup's id. */
@@ -14135,6 +14167,93 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getAggregateErrors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The reading of errors in aggregates. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AggregateErrorsStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setAggregateErrors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AggregateErrorsSetting"];
+            };
+        };
+        responses: {
+            /** @description The new reading of errors in aggregates. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AggregateErrorsStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteAggregateErrors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The reading of errors in aggregates after the removal. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AggregateErrorsStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     listAlgorithmProjections: {
         parameters: {
             query?: never;
@@ -25351,6 +25470,8 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
                 /** @description The graph IRI. `default` and `union` name the default graph and the union of the named graphs. */
@@ -25548,6 +25669,8 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
             };
@@ -27804,6 +27927,8 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
             };
@@ -27879,6 +28004,8 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
             };
@@ -28193,6 +28320,8 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
             };
@@ -28268,6 +28397,8 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
+                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
             };

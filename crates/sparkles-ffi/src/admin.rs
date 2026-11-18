@@ -235,6 +235,31 @@ impl FfiDataset {
         Ok(self.inner.ds.settings().describe().reset()?)
     }
 
+    /// The dataset's reading of errors in aggregates: `jena`, `sparkles` or `spec`.
+    pub fn aggregate_errors_get(&self) -> String {
+        self.inner
+            .ds
+            .settings()
+            .aggregate_errors()
+            .get()
+            .as_str()
+            .into()
+    }
+    /// Whether the dataset has a reading of its own rather than the store's default.
+    pub fn aggregate_errors_is_set(&self) -> bool {
+        self.inner.ds.settings().aggregate_errors().status().source
+            == sparkles::handles::SettingSource::Dataset
+    }
+    pub fn aggregate_errors_set(&self, mode: String) -> FfiResult<()> {
+        self.inner.check_writable()?;
+        let m: sparkles::sparql::AggregateErrors = mode.parse()?;
+        Ok(self.inner.ds.settings().aggregate_errors().set(m)?)
+    }
+    pub fn aggregate_errors_reset(&self) -> FfiResult<()> {
+        self.inner.check_writable()?;
+        Ok(self.inner.ds.settings().aggregate_errors().reset()?)
+    }
+
     pub fn text_status(&self) -> Option<TextInfo> {
         self.inner.ds.indexes().text().status().map(Into::into)
     }

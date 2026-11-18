@@ -131,6 +131,7 @@ fn query_params(o: Op) -> Op {
         "describeReifiers",
         "describeMaxTriples",
         "describeMaxDepth",
+        "aggregateErrors",
     ])
     .query(
         "force-accept",
@@ -3466,6 +3467,16 @@ fn settings(p: &mut Paths) {
         "DescribeStatus",
         "DescribeSetting",
         "describe",
+    );
+    setting(
+        p,
+        "/$/aggregate-errors/{ds}",
+        "SPARQL",
+        "reading of errors in aggregates",
+        "AggregateErrors",
+        "AggregateErrorsStatus",
+        "AggregateErrorsSetting",
+        "aggregate-errors",
     );
     setting(
         p,

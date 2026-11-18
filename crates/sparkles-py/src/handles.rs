@@ -31,6 +31,7 @@ handle!(PyHistory, "History");
 handle!(PySettings, "Settings");
 handle!(PyCompactionSetting, "CompactionSetting");
 handle!(PyDescribeSetting, "DescribeSetting");
+handle!(PyAggregateErrorsSetting, "AggregateErrorsSetting");
 handle!(PyQuotaSetting, "QuotaSetting");
 handle!(PyRetentionSetting, "RetentionSetting");
 handle!(PyChangeLogSetting, "ChangeLogSetting");
@@ -461,6 +462,12 @@ impl PySettings {
         }
     }
     #[getter]
+    fn aggregate_errors(&self, py: Python<'_>) -> PyAggregateErrorsSetting {
+        PyAggregateErrorsSetting {
+            owner: self.owner.clone_ref(py),
+        }
+    }
+    #[getter]
     fn describe(&self, py: Python<'_>) -> PyDescribeSetting {
         PyDescribeSetting {
             owner: self.owner.clone_ref(py),
@@ -531,6 +538,32 @@ impl PyDescribeSetting {
         py.detach(|| ds.settings().describe().set(c))
             .py(py)
             .map(|_| ())
+    }
+}
+
+/// How the dataset's aggregates treat errors: `get()` reports the reading, its source
+/// and the readings there are, `set("spec")` gives the dataset its own and `reset()`
+/// returns it to the store's default. `set` and `reset` report the new setting.
+#[pymethods]
+impl PyAggregateErrorsSetting {
+    fn get<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds(py)?;
+        admin::to_py(py, &py.detach(|| ds.settings().aggregate_errors().status()))
+    }
+    fn reset<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.write(py)?;
+        let h = ds.settings().aggregate_errors();
+        py.detach(|| h.reset()).py(py)?;
+        admin::to_py(py, &h.status())
+    }
+    fn set<'py>(&self, py: Python<'py>, mode: &str) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.write(py)?;
+        let m: sparkles::sparql::AggregateErrors = mode
+            .parse()
+            .map_err(|e: sparkles::Error| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let h = ds.settings().aggregate_errors();
+        py.detach(|| h.set(m)).py(py)?;
+        admin::to_py(py, &h.status())
     }
 }
 
@@ -647,6 +680,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySettings>()?;
     m.add_class::<PyCompactionSetting>()?;
     m.add_class::<PyDescribeSetting>()?;
+    m.add_class::<PyAggregateErrorsSetting>()?;
     m.add_class::<PyQuotaSetting>()?;
     m.add_class::<PyRetentionSetting>()?;
     m.add_class::<PyChangeLogSetting>()?;

@@ -126,7 +126,7 @@ test('invalid prefix and IRI input is rejected before sending a request', async 
     await assert.rejects(ds.query('ASK {}', options), InvalidInputError);
   assert.equal(calls, 0);
 });
-test('Sparkles query parameters carry snapshot, inferred flag, budgets and DESCRIBE settings on a branch', async () => {
+test('Sparkles query parameters carry snapshot, inferred flag, budgets, DESCRIBE settings and the reading of aggregate errors on a branch', async () => {
   let url;
   const ds = dataset(async (input) => {
     url = new URL(input.url);
@@ -140,6 +140,7 @@ test('Sparkles query parameters carry snapshot, inferred flag, budgets and DESCR
     maxRowsProduced: 3,
     maxMemoryBytes: 2 << 20,
     describe: { mode: 'scbd', labels: true, reifiers: false, maxTriples: 10, maxDepth: 2 },
+    aggregateErrors: 'spec',
   });
   assert.equal(url.pathname, '/wiki/sparql');
   assert.equal(url.searchParams.get('branch'), 'work');
@@ -155,11 +156,13 @@ test('Sparkles query parameters carry snapshot, inferred flag, budgets and DESCR
     'describe-reifiers': 'false',
     'describe-max-triples': '10',
     'describe-max-depth': '2',
+    'aggregate-errors': 'spec',
   }))
     assert.equal(url.searchParams.get(key), value);
   await assert.rejects(ds.ask('ASK {}', { maxMemoryBytes: 4 }), UnsupportedError);
   await assert.rejects(ds.ask('ASK {}', { describe: { arbitrary: true } }), UnsupportedError);
   await assert.rejects(ds.ask('ASK {}', { maxRows: 0 }), InvalidInputError);
+  await assert.rejects(ds.ask('ASK {}', { aggregateErrors: 'arq' }), InvalidInputError);
 });
 test('unsupported controls never silently disappear on plain endpoints or graph writes', async () => {
   let calls = 0;
@@ -173,6 +176,7 @@ test('unsupported controls never silently disappear on plain endpoints or graph 
     { includeInferred: false },
     { maxRows: 1 },
     { describe: 'cbd' },
+    { aggregateErrors: 'jena' },
     { batchBytes: 1024 },
     { bindings: {} },
   ])

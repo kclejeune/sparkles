@@ -1,5 +1,6 @@
 package io.github.kclejeune.sparkles.jena.engine
 
+import io.github.kclejeune.sparkles.jena.AggregateErrors
 import io.github.kclejeune.sparkles.jena.DatasetGraphSparkles
 import io.github.kclejeune.sparkles.jena.Sparkles
 import io.github.kclejeune.sparkles.jena.SparklesFallback
@@ -73,5 +74,14 @@ internal fun requestOptions(dsg: DatasetGraphSparkles, context: Context, input: 
         bindingNames = names,
         bindingValues = if (names.isEmpty()) ByteArray(0) else encodeTerms(values),
         noCache = context.isTrue(Sparkles.NO_CACHE),
+        aggregateErrors = aggregateErrors(context)?.name?.lowercase(),
     )
+}
+
+/** The reading of errors in aggregates that `context` names, if any. */
+internal fun aggregateErrors(context: Context): AggregateErrors? = when (val v = context.get<Any>(Sparkles.AGGREGATE_ERRORS)) {
+    null -> null
+    is AggregateErrors -> v
+    else -> AggregateErrors.entries.firstOrNull { it.name.equals(v.toString().trim(), ignoreCase = true) }
+        ?: throw IllegalArgumentException("aggregateErrors is jena, sparkles or spec, not $v")
 }

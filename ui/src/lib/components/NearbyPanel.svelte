@@ -56,7 +56,11 @@
     loading = true;
     error = null;
     try {
-      const rows = await api.select(ds, nearbyQuery(iri, literal, radius, LIMIT), { send: LIMIT });
+      const rows = await api.select(ds, nearbyQuery(iri, literal, radius, LIMIT), {
+        send: LIMIT,
+        // the nearest of a feature's geometries, when some have no distance
+        aggregateErrors: 'sparkles',
+      });
       if (!owns()) return;
       hits = rows.flatMap((r) => {
         if (!r.f) return [];

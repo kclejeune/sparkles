@@ -183,6 +183,7 @@ function params(options: QueryOptions | UpdateOptions, sparkles: boolean): URLSe
     'maxMemoryBytes',
     'maxRowsProduced',
     'describe',
+    'aggregateErrors',
     'noCache',
   ] as const) {
     if (key in options && (options as QueryOptions)[key] !== undefined && !sparkles)
@@ -238,6 +239,11 @@ function params(options: QueryOptions | UpdateOptions, sparkles: boolean): URLSe
           throw new InvalidInputError('DESCRIBE mode must be a string');
         p.set(parameter[key], String(value));
       }
+  }
+  if (q.aggregateErrors !== undefined) {
+    if (!['jena', 'sparkles', 'spec'].includes(q.aggregateErrors))
+      throw new InvalidInputError('aggregateErrors must be jena, sparkles or spec');
+    p.set('aggregate-errors', q.aggregateErrors);
   }
   if (q.batchSize !== undefined || q.batchBytes !== undefined)
     throw new UnsupportedError('Remote results do not use native transfer batches');
@@ -664,6 +670,7 @@ export class RemoteDataset implements SparqlDataset {
       'defaultGraph',
       'namedGraphs',
       'describe',
+      'aggregateErrors',
       'batchSize',
       'batchBytes',
       'includeInferred',

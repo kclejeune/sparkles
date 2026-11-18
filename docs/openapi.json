@@ -9,6 +9,19 @@
           "type": "string"
         }
       },
+      "aggregateErrors": {
+        "description": "How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting.",
+        "in": "query",
+        "name": "aggregate-errors",
+        "schema": {
+          "enum": [
+            "jena",
+            "sparkles",
+            "spec"
+          ],
+          "type": "string"
+        }
+      },
       "at": {
         "description": "The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`.",
         "in": "query",
@@ -1054,6 +1067,53 @@
       }
     },
     "schemas": {
+      "AggregateErrorsSetting": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "jena",
+              "sparkles",
+              "spec"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "AggregateErrorsStatus": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "jena",
+              "sparkles",
+              "spec"
+            ],
+            "type": "string"
+          },
+          "modes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "enum": [
+              "dataset",
+              "default"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "source",
+          "modes"
+        ],
+        "type": "object"
+      },
       "AlgoProjection": {
         "description": "A named projection of a dataset. A PUT sends the definition, or this object with its `definition` member.",
         "externalDocs": {
@@ -29077,6 +29137,181 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/$/aggregate-errors/{ds}": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#aggregate-errors"
+        },
+        "operationId": "deleteAggregateErrors",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AggregateErrorsStatus"
+                }
+              }
+            },
+            "description": "The reading of errors in aggregates after the removal."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove the reading of errors in aggregates",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#aggregate-errors"
+        },
+        "operationId": "getAggregateErrors",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AggregateErrorsStatus"
+                }
+              }
+            },
+            "description": "The reading of errors in aggregates."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the reading of errors in aggregates",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#aggregate-errors"
+        },
+        "operationId": "setAggregateErrors",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AggregateErrorsSetting"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AggregateErrorsStatus"
+                }
+              }
+            },
+            "description": "The new reading of errors in aggregates."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set the reading of errors in aggregates",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
     "/$/algo/{ds}/projections": {
       "get": {
         "externalDocs": {
@@ -54693,6 +54928,9 @@
             "$ref": "#/components/parameters/describeMaxDepth"
           },
           {
+            "$ref": "#/components/parameters/aggregateErrors"
+          },
+          {
             "description": "Label the response `text/plain` so a browser shows it.",
             "in": "query",
             "name": "force-accept",
@@ -54981,6 +55219,9 @@
           },
           {
             "$ref": "#/components/parameters/describeMaxDepth"
+          },
+          {
+            "$ref": "#/components/parameters/aggregateErrors"
           },
           {
             "description": "Label the response `text/plain` so a browser shows it.",
@@ -60485,6 +60726,9 @@
             "$ref": "#/components/parameters/describeMaxDepth"
           },
           {
+            "$ref": "#/components/parameters/aggregateErrors"
+          },
+          {
             "description": "Label the response `text/plain` so a browser shows it.",
             "in": "query",
             "name": "force-accept",
@@ -60615,6 +60859,9 @@
           },
           {
             "$ref": "#/components/parameters/describeMaxDepth"
+          },
+          {
+            "$ref": "#/components/parameters/aggregateErrors"
           },
           {
             "description": "Label the response `text/plain` so a browser shows it.",
@@ -61416,6 +61663,9 @@
             "$ref": "#/components/parameters/describeMaxDepth"
           },
           {
+            "$ref": "#/components/parameters/aggregateErrors"
+          },
+          {
             "description": "Label the response `text/plain` so a browser shows it.",
             "in": "query",
             "name": "force-accept",
@@ -61546,6 +61796,9 @@
           },
           {
             "$ref": "#/components/parameters/describeMaxDepth"
+          },
+          {
+            "$ref": "#/components/parameters/aggregateErrors"
           },
           {
             "description": "Label the response `text/plain` so a browser shows it.",

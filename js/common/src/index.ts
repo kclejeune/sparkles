@@ -629,6 +629,8 @@ export interface QueryOptions extends OperationOptions {
   batchSize?: number;
   batchBytes?: number;
   describe?: string | Record<string, unknown>;
+  /** How the query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+  aggregateErrors?: 'jena' | 'sparkles' | 'spec';
 }
 export interface UpdateOptions extends OperationOptions {
   dryRun?: boolean | { changes?: number; maxChanges?: number };

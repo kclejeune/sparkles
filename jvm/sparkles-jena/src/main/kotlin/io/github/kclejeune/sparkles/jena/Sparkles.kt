@@ -47,6 +47,13 @@ public object Sparkles {
     @JvmField
     public val STREAMING_STRICT: Symbol = Symbol.create(NS + "streamingStrict")
 
+    /**
+     * How the query's aggregates treat errors: an [AggregateErrors] or its name, over the
+     * dataset's setting. A query that falls back to ARQ reads errors as Jena does.
+     */
+    @JvmField
+    public val AGGREGATE_ERRORS: Symbol = Symbol.create(NS + "aggregateErrors")
+
     /** Neither read nor write Sparkles' result cache (a Boolean), as for benchmarks. */
     @JvmField
     public val NO_CACHE: Symbol = Symbol.create(NS + "noCache")

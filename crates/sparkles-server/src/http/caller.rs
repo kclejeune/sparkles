@@ -109,6 +109,13 @@ pub(crate) fn request_options(st: &AppState, ds: &Dataset, params: &Params) -> Q
     // cursor sorts write sorted runs here when they outgrow the memory budget
     opts.spill = st.spill.clone();
     opts.no_cache = params.get("nocache").is_some_and(truthy);
+    // the query routes refuse a value that names no reading
+    if let Some(m) = params
+        .get("aggregate-errors")
+        .and_then(|v| v.parse::<sparkles::sparql::AggregateErrors>().ok())
+    {
+        opts.aggregate_errors = Some(m);
+    }
     opts.default_graph_uris = params.all("default-graph-uri");
     opts.named_graph_uris = params.all("named-graph-uri");
     opts.allow_service = st.allow_service;

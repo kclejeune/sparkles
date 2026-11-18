@@ -774,6 +774,14 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put(
+        "aggregateErrors",
+        q(
+            "aggregate-errors",
+            json!({ "type": "string", "enum": ["jena", "sparkles", "spec"] }),
+            "How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting.",
+        ),
+    );
+    put(
         "describe",
         q(
             "describe",

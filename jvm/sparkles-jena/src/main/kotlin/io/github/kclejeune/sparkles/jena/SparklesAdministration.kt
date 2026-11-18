@@ -59,11 +59,39 @@ public data class DescribeOptions @JvmOverloads public constructor(
     public val mode: DescribeMode = DescribeMode.CBD, public val labels: Boolean = false,
     public val reifiers: Boolean = true, public val maxTriples: Long? = null, public val maxDepth: Int? = null,
 )
+/**
+ * How aggregates treat errors, such as an unbound variable. [JENA], the default, gives
+ * Apache Jena's answers: MIN and MAX over an error are unbound. [SPARKLES] lets MIN and
+ * MAX pass over errors, and [SPEC] follows the text of SPARQL 1.1 and 1.2. API.md
+ * describes each under "Aggregate errors".
+ */
+public enum class AggregateErrors { JENA, SPARKLES, SPEC }
 public class SparklesSettings internal constructor(private val owner: DatasetGraphSparkles) {
+    public fun aggregateErrors(): AggregateErrorsSetting = AggregateErrorsSetting(owner)
     public fun describe(): DescribeSetting = DescribeSetting(owner)
     public fun compaction(): CompactionSetting = CompactionSetting(owner)
     public fun quota(): QuotaSetting = QuotaSetting(owner)
     public fun retention(): RetentionSetting = RetentionSetting(owner)
+}
+/**
+ * The dataset's reading of errors in aggregates. [get] gives the reading its queries use,
+ * its own or else the store's default, and [isSet] tells which. A query chooses another
+ * with the context symbol [Sparkles.AGGREGATE_ERRORS].
+ */
+public class AggregateErrorsSetting internal constructor(private val owner: DatasetGraphSparkles) {
+    public fun get(): AggregateErrors {
+        owner.checkOpen()
+        return AggregateErrors.valueOf(ffi { owner.handle.ffi.aggregateErrorsGet() }.uppercase())
+    }
+    public fun isSet(): Boolean {
+        owner.checkOpen()
+        return ffi { owner.handle.ffi.aggregateErrorsIsSet() }
+    }
+    public fun set(mode: AggregateErrors) {
+        owner.checkNoTxn("settings.aggregateErrors.set")
+        ffi { owner.handle.ffi.aggregateErrorsSet(mode.name.lowercase()) }
+    }
+    public fun reset() { owner.checkNoTxn("settings.aggregateErrors.reset"); ffi { owner.handle.ffi.aggregateErrorsReset() } }
 }
 public class DescribeSetting internal constructor(private val owner: DatasetGraphSparkles) {
     public fun get(): DescribeOptions {
