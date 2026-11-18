@@ -159,6 +159,7 @@ fn check_view(rt: &Runtime, s: &Store, key: &str, name: &str, text: &str, opts: 
         allow_stale: false,
         caller: None,
         deadline: None,
+        aggregate_errors: None,
     });
     let fresh = sparql::query(
         s.snapshot(),

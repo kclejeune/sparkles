@@ -5504,6 +5504,24 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
     } else {
         desc
     };
+    // Another reading of errors changes the answer of these aggregates, and the
+    // description is part of the result cache's key.
+    let desc = if ctx.aggregate_errors != super::AggregateErrors::default()
+        && aggs.iter().any(|(_, a)| {
+            a.registered.is_none()
+                && a.fold.is_none()
+                && matches!(
+                    a.func,
+                    AggregateFunction::Min
+                        | AggregateFunction::Max
+                        | AggregateFunction::Avg
+                        | AggregateFunction::GroupConcat { .. }
+                )
+        }) {
+        format!("{desc} [aggregate errors: {}]", ctx.aggregate_errors)
+    } else {
+        desc
+    };
     let dist = vars.iter().map(|&v| (v, est)).collect();
     let certain = keys
         .iter()

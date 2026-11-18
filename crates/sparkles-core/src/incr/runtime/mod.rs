@@ -134,6 +134,14 @@ pub trait Host: Send + Sync {
     fn inference(&self) -> Option<Inference> {
         None
     }
+    /// How the dataset's aggregates treat errors (see
+    /// [`AggregateErrors`](crate::sparql::AggregateErrors)): its own setting, else the
+    /// store's. Views and live queries run with it, a change of it evaluates them again,
+    /// and a query that reads a view under another reading evaluates the view's query
+    /// itself instead of reading the view's state.
+    fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
+        crate::sparql::AggregateErrors::default()
+    }
 }
 
 /// A host without access control: every principal reads every quad, and stored

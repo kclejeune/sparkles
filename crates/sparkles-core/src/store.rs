@@ -35,6 +35,7 @@ pub(crate) mod configuration_history;
 pub use bound_read_source::BoundReadSource;
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
+mod aggregates;
 pub mod definitions;
 mod deltas;
 mod describe;
@@ -103,6 +104,7 @@ pub use embed::embed_texts;
 use publish::{Committed, Publication};
 use snapshot::{Shared, SnapshotBuilder};
 pub(crate) mod wal;
+pub use aggregates::AGGREGATE_ERRORS_FILE;
 pub use backup::{
     BackupBranch, BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard,
     MEMORY_CAPTURE_PREFIX, MemoryCaptureOptions,
@@ -616,6 +618,9 @@ pub struct Snapshot {
     /// the spatial index as of this commit (datasets with a spatial index)
     pub geo: Option<Arc<crate::geo::GeoView>>,
     pub union_default_graph: bool,
+    /// How aggregates treat errors for queries on this snapshot that do not choose
+    /// ([`StoreOptions::aggregate_errors`])
+    pub aggregate_errors: crate::sparql::AggregateErrors,
     /// largest sum of input vertices of one geometry operation in queries on this
     /// snapshot ([`StoreOptions::geo_op_vertices`])
     pub geo_op_vertices: u64,
@@ -1403,6 +1408,10 @@ pub struct StoreOptions {
     /// that cache.
     pub service_cache_bytes: u64,
     pub union_default_graph: bool,
+    /// How aggregates treat errors and values that are not strings in queries that do
+    /// not choose, the server's default (see [`crate::sparql::AggregateErrors`]). A
+    /// dataset's own setting, which the library applies as a query default, comes first.
+    pub aggregate_errors: crate::sparql::AggregateErrors,
     pub build: BuildOptions,
     /// Loads smaller than this many quads go through the transactional delta; larger
     /// loads trigger a rebuild (bulk path).
@@ -1534,6 +1543,7 @@ impl Default for StoreOptions {
             result_cache_min_ms: 1.0,
             service_cache_bytes: 64 << 20,
             union_default_graph: false,
+            aggregate_errors: Default::default(),
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
             memory_commit_ring: 65_536,
@@ -1771,6 +1781,9 @@ pub struct Store {
     compaction: compaction::Track,
     /// the dataset's DESCRIBE setting (`describe.json` of a persistent store)
     describe: parking_lot::RwLock<crate::sparql::describe::DescribeOptions>,
+    /// the dataset's own reading of errors in aggregates (`aggregate-errors.json` of a
+    /// persistent store)
+    aggregate_errors: parking_lot::RwLock<Option<crate::sparql::AggregateErrors>>,
     /// the branch this store is, and the dataset's branches
     branching: branching::Branching,
     /// who keeps the dataset-managed definitions that captures record
@@ -2074,6 +2087,7 @@ impl Store {
                         cache: &cache,
                         results: &results,
                         union_default_graph: opts.union_default_graph,
+                        aggregate_errors: opts.aggregate_errors,
                         geo_op_vertices: opts.geo_op_vertices,
                         change_log: changelog.clone(),
                     },
@@ -2131,6 +2145,7 @@ impl Store {
             branching: Default::default(),
             compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
             describe: Default::default(),
+            aggregate_errors: Default::default(),
             definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
@@ -2622,6 +2637,7 @@ impl Store {
                         cache: &cache,
                         results: &results,
                         union_default_graph: opts.union_default_graph,
+                        aggregate_errors: opts.aggregate_errors,
                         geo_op_vertices: opts.geo_op_vertices,
                         change_log: changelog.clone(),
                     },
@@ -2692,6 +2708,7 @@ impl Store {
                 Some(head.timestamp_ms),
             ),
             describe: parking_lot::RwLock::new(describe::read_settings(root)?),
+            aggregate_errors: parking_lot::RwLock::new(aggregates::read_setting(root)?),
             definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
@@ -8199,6 +8216,7 @@ pub(crate) fn replay_wal(
             cache,
             results: from.results,
             union_default_graph: false,
+            aggregate_errors: Default::default(),
             geo_op_vertices: StoreOptions::default().geo_op_vertices,
             change_log: None,
         },

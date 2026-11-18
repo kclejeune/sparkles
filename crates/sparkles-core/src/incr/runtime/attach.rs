@@ -26,6 +26,7 @@ impl Runtime {
         let mut circuit = Circuit::new(compiled, access);
         circuit.max_memory_bytes = max_memory_bytes;
         circuit.inference = inference;
+        circuit.aggregate_errors = Some(reg.aggregate_errors);
         let info = Info {
             status: Status::Building,
             applied: 0,
@@ -183,23 +184,26 @@ impl Runtime {
         }
     }
 
-    /// Compile every circuit for the host's inference when it has changed. Each circuit
-    /// then evaluates its query again in the new mode on the next round, and the
-    /// difference reaches its live queries as a diff or a `reset`, so views stay
-    /// attached and live queries keep running.
+    /// Compile every circuit for the host's inference and reading of errors in
+    /// aggregates when either has changed. Each circuit then evaluates its query again
+    /// in the new mode on the next round, and the difference reaches its live queries as
+    /// a diff or a `reset`, so views stay attached and live queries keep running.
     pub(super) fn sync_inference(&self, reg: &mut Registry, host: &dyn Host) {
         let now = host.inference();
-        if Inference::same(reg.inference.as_deref(), now.as_ref()) {
+        let errors = host.aggregate_errors();
+        if Inference::same(reg.inference.as_deref(), now.as_ref()) && errors == reg.aggregate_errors
+        {
             return;
         }
         let now = now.map(Arc::new);
         tracing::info!(
             target: "sparkles::incr::runtime",
-            "the dataset's inference changed ({}): {} circuits evaluate again",
+            "the dataset's inference ({}) or aggregate errors ({errors}) changed: {} circuits evaluate again",
             now.as_ref().map_or("none", |i| i.reason()),
             reg.cells.len()
         );
         reg.inference = now.clone();
+        reg.aggregate_errors = errors;
         // every event of the old mode carries a commit at most `seen`, or at most the
         // commit of a circuit whose pass was in flight, which the state lock waits for
         let mut boundary = self.seen.load(Ordering::Acquire);
@@ -210,7 +214,10 @@ impl Runtime {
             self.switched.fetch_max(boundary, Ordering::AcqRel);
             let fresh = st.fresh(now.clone());
             let mut c = match fresh {
-                Ok(c) => c,
+                Ok(mut c) => {
+                    c.aggregate_errors = Some(errors);
+                    c
+                }
                 Err(e) => {
                     self.fail(cell, &mut st, &e);
                     continue;

@@ -61,6 +61,13 @@ impl Host for LibraryHost {
         inference(&*self.state.upgrade()?)
     }
 
+    fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
+        self.state
+            .upgrade()
+            .map(|s| s.store.aggregate_errors())
+            .unwrap_or_default()
+    }
+
     fn stored_query(&self, name: &str) -> Result<String> {
         let state = self
             .state
@@ -252,6 +259,7 @@ impl Views {
             allow_stale: false,
             caller: None,
             deadline: None,
+            aggregate_errors: None,
         })
     }
 
@@ -585,6 +593,7 @@ mod tests {
                             allow_stale: false,
                             caller: None,
                             deadline: None,
+                            aggregate_errors: None,
                         });
                     }
                     "live" => {

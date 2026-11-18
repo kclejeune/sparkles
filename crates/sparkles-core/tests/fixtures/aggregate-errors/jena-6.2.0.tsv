@@ -1,0 +1,196 @@
+COUNT(?v)	"allunb"	0
+COUNT(?v)	"good"	3
+COUNT(?v)	"iri"	2
+COUNT(?v)	"lang"	2
+COUNT(?v)	"str"	3
+COUNT(?v)	"unb"	2
+COUNT(?v)	"empty"	0
+COUNT((?v * 1))	"allunb"	0
+COUNT((?v * 1))	"good"	3
+COUNT((?v * 1))	"iri"	1
+COUNT((?v * 1))	"lang"	0
+COUNT((?v * 1))	"str"	2
+COUNT((?v * 1))	"unb"	2
+COUNT((?v * 1))	"empty"	0
+COUNT(DISTINCT ?v)	"allunb"	0
+COUNT(DISTINCT ?v)	"good"	2
+COUNT(DISTINCT ?v)	"iri"	2
+COUNT(DISTINCT ?v)	"lang"	2
+COUNT(DISTINCT ?v)	"str"	3
+COUNT(DISTINCT ?v)	"unb"	2
+COUNT(DISTINCT ?v)	"empty"	0
+COUNT(DISTINCT (?v * 1))	"allunb"	0
+COUNT(DISTINCT (?v * 1))	"good"	2
+COUNT(DISTINCT (?v * 1))	"iri"	1
+COUNT(DISTINCT (?v * 1))	"lang"	0
+COUNT(DISTINCT (?v * 1))	"str"	2
+COUNT(DISTINCT (?v * 1))	"unb"	2
+COUNT(DISTINCT (?v * 1))	"empty"	0
+SUM(?v)	"allunb"	
+SUM(?v)	"good"	5
+SUM(?v)	"iri"	
+SUM(?v)	"lang"	
+SUM(?v)	"str"	
+SUM(?v)	"unb"	
+SUM(?v)	"empty"	0
+SUM((?v * 1))	"allunb"	
+SUM((?v * 1))	"good"	5
+SUM((?v * 1))	"iri"	
+SUM((?v * 1))	"lang"	
+SUM((?v * 1))	"str"	
+SUM((?v * 1))	"unb"	
+SUM((?v * 1))	"empty"	0
+SUM(DISTINCT ?v)	"allunb"	
+SUM(DISTINCT ?v)	"good"	3
+SUM(DISTINCT ?v)	"iri"	
+SUM(DISTINCT ?v)	"lang"	
+SUM(DISTINCT ?v)	"str"	
+SUM(DISTINCT ?v)	"unb"	
+SUM(DISTINCT ?v)	"empty"	0
+SUM(DISTINCT (?v * 1))	"allunb"	
+SUM(DISTINCT (?v * 1))	"good"	3
+SUM(DISTINCT (?v * 1))	"iri"	
+SUM(DISTINCT (?v * 1))	"lang"	
+SUM(DISTINCT (?v * 1))	"str"	
+SUM(DISTINCT (?v * 1))	"unb"	
+SUM(DISTINCT (?v * 1))	"empty"	0
+AVG(?v)	"allunb"	
+AVG(?v)	"good"	1.666666666666666666666667
+AVG(?v)	"iri"	
+AVG(?v)	"lang"	
+AVG(?v)	"str"	
+AVG(?v)	"unb"	
+AVG(?v)	"empty"	0
+AVG((?v * 1))	"allunb"	
+AVG((?v * 1))	"good"	1.666666666666666666666667
+AVG((?v * 1))	"iri"	
+AVG((?v * 1))	"lang"	
+AVG((?v * 1))	"str"	
+AVG((?v * 1))	"unb"	
+AVG((?v * 1))	"empty"	0
+AVG(DISTINCT ?v)	"allunb"	
+AVG(DISTINCT ?v)	"good"	1.5
+AVG(DISTINCT ?v)	"iri"	
+AVG(DISTINCT ?v)	"lang"	
+AVG(DISTINCT ?v)	"str"	
+AVG(DISTINCT ?v)	"unb"	
+AVG(DISTINCT ?v)	"empty"	0
+AVG(DISTINCT (?v * 1))	"allunb"	
+AVG(DISTINCT (?v * 1))	"good"	1.5
+AVG(DISTINCT (?v * 1))	"iri"	
+AVG(DISTINCT (?v * 1))	"lang"	
+AVG(DISTINCT (?v * 1))	"str"	
+AVG(DISTINCT (?v * 1))	"unb"	
+AVG(DISTINCT (?v * 1))	"empty"	0
+MIN(?v)	"allunb"	
+MIN(?v)	"good"	1
+MIN(?v)	"iri"	<http://ex/i>
+MIN(?v)	"lang"	"b"
+MIN(?v)	"str"	"x"
+MIN(?v)	"unb"	
+MIN(?v)	"empty"	
+MIN((?v * 1))	"allunb"	
+MIN((?v * 1))	"good"	1
+MIN((?v * 1))	"iri"	
+MIN((?v * 1))	"lang"	
+MIN((?v * 1))	"str"	
+MIN((?v * 1))	"unb"	
+MIN((?v * 1))	"empty"	
+MIN(DISTINCT ?v)	"allunb"	
+MIN(DISTINCT ?v)	"good"	1
+MIN(DISTINCT ?v)	"iri"	<http://ex/i>
+MIN(DISTINCT ?v)	"lang"	"b"
+MIN(DISTINCT ?v)	"str"	"x"
+MIN(DISTINCT ?v)	"unb"	
+MIN(DISTINCT ?v)	"empty"	
+MIN(DISTINCT (?v * 1))	"allunb"	
+MIN(DISTINCT (?v * 1))	"good"	1
+MIN(DISTINCT (?v * 1))	"iri"	
+MIN(DISTINCT (?v * 1))	"lang"	
+MIN(DISTINCT (?v * 1))	"str"	
+MIN(DISTINCT (?v * 1))	"unb"	
+MIN(DISTINCT (?v * 1))	"empty"	
+MAX(?v)	"allunb"	
+MAX(?v)	"good"	2
+MAX(?v)	"iri"	2
+MAX(?v)	"lang"	"a"@en
+MAX(?v)	"str"	3
+MAX(?v)	"unb"	
+MAX(?v)	"empty"	
+MAX((?v * 1))	"allunb"	
+MAX((?v * 1))	"good"	2
+MAX((?v * 1))	"iri"	
+MAX((?v * 1))	"lang"	
+MAX((?v * 1))	"str"	
+MAX((?v * 1))	"unb"	
+MAX((?v * 1))	"empty"	
+MAX(DISTINCT ?v)	"allunb"	
+MAX(DISTINCT ?v)	"good"	2
+MAX(DISTINCT ?v)	"iri"	2
+MAX(DISTINCT ?v)	"lang"	"a"@en
+MAX(DISTINCT ?v)	"str"	3
+MAX(DISTINCT ?v)	"unb"	
+MAX(DISTINCT ?v)	"empty"	
+MAX(DISTINCT (?v * 1))	"allunb"	
+MAX(DISTINCT (?v * 1))	"good"	2
+MAX(DISTINCT (?v * 1))	"iri"	
+MAX(DISTINCT (?v * 1))	"lang"	
+MAX(DISTINCT (?v * 1))	"str"	
+MAX(DISTINCT (?v * 1))	"unb"	
+MAX(DISTINCT (?v * 1))	"empty"	
+SAMPLE(?v)	"allunb"	
+SAMPLE(?v)	"good"	1
+SAMPLE(?v)	"iri"	<http://ex/i>
+SAMPLE(?v)	"lang"	"a"@en
+SAMPLE(?v)	"str"	1
+SAMPLE(?v)	"unb"	1
+SAMPLE(?v)	"empty"	
+SAMPLE((?v * 1))	"allunb"	
+SAMPLE((?v * 1))	"good"	1
+SAMPLE((?v * 1))	"iri"	2
+SAMPLE((?v * 1))	"lang"	
+SAMPLE((?v * 1))	"str"	1
+SAMPLE((?v * 1))	"unb"	1
+SAMPLE((?v * 1))	"empty"	
+SAMPLE(DISTINCT ?v)	"allunb"	
+SAMPLE(DISTINCT ?v)	"good"	2
+SAMPLE(DISTINCT ?v)	"iri"	2
+SAMPLE(DISTINCT ?v)	"lang"	"b"
+SAMPLE(DISTINCT ?v)	"str"	3
+SAMPLE(DISTINCT ?v)	"unb"	3
+SAMPLE(DISTINCT ?v)	"empty"	
+SAMPLE(DISTINCT (?v * 1))	"allunb"	
+SAMPLE(DISTINCT (?v * 1))	"good"	2
+SAMPLE(DISTINCT (?v * 1))	"iri"	2
+SAMPLE(DISTINCT (?v * 1))	"lang"	
+SAMPLE(DISTINCT (?v * 1))	"str"	3
+SAMPLE(DISTINCT (?v * 1))	"unb"	3
+SAMPLE(DISTINCT (?v * 1))	"empty"	
+GROUP_CONCAT(?v)	"allunb"	
+GROUP_CONCAT(?v)	"good"	"1 2 2"
+GROUP_CONCAT(?v)	"iri"	"http://ex/i 2"
+GROUP_CONCAT(?v)	"lang"	"a b"
+GROUP_CONCAT(?v)	"str"	"1 x 3"
+GROUP_CONCAT(?v)	"unb"	
+GROUP_CONCAT(?v)	"empty"	""
+GROUP_CONCAT((?v * 1))	"allunb"	
+GROUP_CONCAT((?v * 1))	"good"	"1 2 2"
+GROUP_CONCAT((?v * 1))	"iri"	
+GROUP_CONCAT((?v * 1))	"lang"	
+GROUP_CONCAT((?v * 1))	"str"	
+GROUP_CONCAT((?v * 1))	"unb"	
+GROUP_CONCAT((?v * 1))	"empty"	""
+GROUP_CONCAT(DISTINCT ?v)	"allunb"	
+GROUP_CONCAT(DISTINCT ?v)	"good"	"1 2"
+GROUP_CONCAT(DISTINCT ?v)	"iri"	"http://ex/i 2"
+GROUP_CONCAT(DISTINCT ?v)	"lang"	"a b"
+GROUP_CONCAT(DISTINCT ?v)	"str"	"1 x 3"
+GROUP_CONCAT(DISTINCT ?v)	"unb"	
+GROUP_CONCAT(DISTINCT ?v)	"empty"	
+GROUP_CONCAT(DISTINCT (?v * 1))	"allunb"	
+GROUP_CONCAT(DISTINCT (?v * 1))	"good"	"1 2"
+GROUP_CONCAT(DISTINCT (?v * 1))	"iri"	
+GROUP_CONCAT(DISTINCT (?v * 1))	"lang"	
+GROUP_CONCAT(DISTINCT (?v * 1))	"str"	
+GROUP_CONCAT(DISTINCT (?v * 1))	"unb"	
+GROUP_CONCAT(DISTINCT (?v * 1))	"empty"	

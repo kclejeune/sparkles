@@ -9,15 +9,17 @@ impl Runtime {
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
-            let (cell, access, suspended, error) = {
+            let (cell, access, suspended, error, errors) = {
                 let mut reg = self.reg.lock();
                 self.sync_for_read(&mut reg);
+                let errors = reg.aggregate_errors;
                 let e = reg.view(r.name)?;
                 (
                     e.cell.clone(),
                     e.access.clone(),
                     e.suspended.clone(),
                     e.error.clone(),
+                    errors,
                 )
             };
             if let Some(why) = suspended {
@@ -39,6 +41,12 @@ impl Runtime {
                         format!("the view {:?} reads data your grants do not cover", r.name),
                     ));
                 }
+                // another reading of errors than the view's: the view's query at the
+                // reader's snapshot, without the view's state
+                if let Some(m) = r.aggregate_errors.filter(|m| *m != errors) {
+                    let st = cell.state.lock();
+                    return self.evaluate_under(st, r, m);
+                }
                 let status = cell.info.lock().status.clone();
                 match status {
                     Status::Failed { code, message } => {
@@ -59,6 +67,7 @@ impl Runtime {
                                 columns: st.circuit.columns(),
                                 rows: st.circuit.rows(),
                                 commit: st.circuit.applied,
+                                evaluated_under: None,
                             });
                         }
                         if st.circuit.applied > r.at {
@@ -103,6 +112,7 @@ impl Runtime {
                 columns,
                 rows,
                 commit: r.at,
+                evaluated_under: None,
             });
         }
         let ahead = || {
@@ -141,6 +151,56 @@ impl Runtime {
             columns,
             rows: c.rows(),
             commit: r.at,
+            evaluated_under: None,
+        })
+    }
+}
+
+impl Runtime {
+    /// The rows of the view's query evaluated at the reader's snapshot under the
+    /// reader's reading of errors in aggregates `m`, which differs from the view's. The
+    /// view's state is neither read nor changed.
+    fn evaluate_under(
+        &self,
+        st: parking_lot::MutexGuard<'_, Slot>,
+        r: &ViewRead<'_>,
+        m: crate::sparql::AggregateErrors,
+    ) -> Result<ViewRows> {
+        let Some(snap) = r.snap else {
+            return Err(crate::incr::error(
+                "view-reading",
+                format!(
+                    "the view {:?} keeps another reading of aggregate errors than {m}, and there is no snapshot to evaluate its query at",
+                    r.name
+                ),
+            ));
+        };
+        // the view's own default graph, whatever the reading query asked for
+        let union = st
+            .circuit
+            .snap
+            .as_ref()
+            .map_or(snap.union_default_graph, |s| s.union_default_graph);
+        let snap = if union == snap.union_default_graph {
+            snap.clone()
+        } else {
+            let mut s = (**snap).clone();
+            s.union_default_graph = union;
+            Arc::new(s)
+        };
+        let mut c = st.fresh(st.circuit.inference.clone())?;
+        drop(st);
+        c.aggregate_errors = Some(m);
+        let control = Control {
+            deadline: r.deadline.or(self.control().deadline),
+            ..Control::none()
+        };
+        c.build(snap.clone(), &control)?;
+        Ok(ViewRows {
+            columns: c.columns(),
+            rows: c.rows(),
+            commit: snap.commit,
+            evaluated_under: Some(m),
         })
     }
 }

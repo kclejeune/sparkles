@@ -46,6 +46,10 @@ pub struct ViewRead<'a> {
     /// the reader's view of the dataset (`None`: every graph)
     pub caller: Option<&'a Arc<GraphAccess>>,
     pub deadline: Option<Instant>,
+    /// the reader's reading of errors in aggregates (`None`: the view's). Under another
+    /// reading than the view's, the view's query is evaluated at the reader's snapshot
+    /// and the view's state is neither read nor changed.
+    pub aggregate_errors: Option<super::AggregateErrors>,
 }
 
 /// The rows of a view.
@@ -55,6 +59,10 @@ pub struct ViewRows {
     pub rows: Vec<(Vec<Option<Term>>, i64)>,
     /// the commit the rows reflect
     pub commit: u64,
+    /// the reading of errors in aggregates the rows were evaluated under, when it is
+    /// the reader's and not the view's, so that the rows come from the view's query
+    /// and not its state
+    pub evaluated_under: Option<super::AggregateErrors>,
 }
 
 /// What answers `SERVICE view:read`: a dataset's views.
@@ -152,7 +160,17 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
         allow_stale: spec.allow_stale,
         caller: ctx.graphs.as_ref(),
         deadline: ctx.current_deadline(),
+        aggregate_errors: Some(ctx.aggregate_errors),
     })?;
+    if let Some(m) = rows.evaluated_under {
+        ctx.warn(super::ctx::PlanWarning {
+            code: "view-evaluated",
+            message: format!(
+                "the view {:?} keeps another reading of aggregate errors, so its query was evaluated under {m}",
+                spec.name
+            ),
+        });
+    }
     let cols: Vec<Option<usize>> = vars
         .iter()
         .map(|v| {

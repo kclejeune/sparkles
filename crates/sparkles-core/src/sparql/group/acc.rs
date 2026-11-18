@@ -366,6 +366,11 @@ impl Accumulator for Concat {
             let Some(value) = ctx.value(id) else {
                 continue;
             };
+            // CONCAT takes only strings
+            if ctx.aggregate_errors.concat_strings_only() && !value.is_string() {
+                state.ok = false;
+                continue;
+            }
             let Ok(lexical) = value.lexical() else {
                 state.ok = false;
                 continue;

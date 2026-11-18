@@ -674,6 +674,9 @@ pub struct Ctx {
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
+    /// How the query's aggregates treat errors and values that are not strings: the
+    /// request's choice, else the snapshot's (see [`super::AggregateErrors`])
+    pub aggregate_errors: super::AggregateErrors,
     /// the I/O counters when the query began, taken only under a profile (see
     /// [`Ctx::io_stats`]); boxed, so that a context without a profile stays small
     io_start: Option<Box<crate::ioacct::IoSnapshot>>,
@@ -1131,6 +1134,7 @@ impl Ctx {
     }
 
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
+        let aggregate_errors = snap.aggregate_errors;
         Ctx {
             reasoning: None,
             local_facts: false,
@@ -1192,6 +1196,7 @@ impl Ctx {
             views: None,
             rdfs: None,
             opt: Optimizations::default(),
+            aggregate_errors,
             io_start: crate::ioacct::profiling()
                 .then(|| Box::new(crate::ioacct::IoSnapshot::now())),
             geo: Default::default(),
