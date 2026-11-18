@@ -225,7 +225,8 @@ impl ValueCache {
 pub struct Optimizations {
     /// numeric range FILTERs on a scan's sorted column read only the matching id ranges
     pub range_pushdown: bool,
-    /// GROUP BY on one variable with plain-variable aggregates keeps one state per group
+    /// aggregates that can keep one running state per group do, rather than reading
+    /// their group's rows, which is the diagnostic path when this is off
     pub incremental_group: bool,
     /// COUNT(*) over a join of two scans counts per-key runs instead of reading rows
     pub count_join_runs: bool,

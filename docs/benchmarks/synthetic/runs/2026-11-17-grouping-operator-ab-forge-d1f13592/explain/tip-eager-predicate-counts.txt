@@ -1,0 +1,5 @@
+(project (?p ?c) (extend ((?c ?ed988b96364b0bd4ef75e6d5e6adb44)) (group (?p) (((count) ?ed988b96364b0bd4ef75e6d5e6adb44)) (bgp (triple ?s ?p ?o)))))
+
+Project ?p ?c  [est 1052801 rows, cost 1052802]
+  Bind ?c := ?ed988b96364b0bd4ef75e6d5e6adb44  [est 1052801 rows, cost 1052802]
+    GroupCountFromMetadata PSO ?s ?p ?o by ?p [from statistics]  [est 1052801 rows, cost 1]

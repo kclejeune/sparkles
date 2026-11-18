@@ -833,6 +833,75 @@ measurement of item 570's conditional OPTIONAL in both modes on the benchmark wo
 which the plan asks of this phase, is outstanding, and item 570 records it when it is
 taken.
 
+### One grouping operator
+
+The module `sparql/group` of `sparkles-core` holds the accumulator trait and the grouping
+operator, and neither knows the mode that runs it. An accumulator holds the state of one
+aggregate for every group of a pass and folds a batch of rows into it per call, given
+each row's slot, with `init`, `add_batch`, `merge`, `finish` and `retract`. `Running`
+wraps `exec::AggState` for COUNT, SUM, AVG, MIN, MAX, SAMPLE and ARQ's variance and
+standard deviations,
+`Concat` holds GROUP_CONCAT's text, and `Distinct` passes each value or row of a group to
+the aggregate underneath once. `Rows` runs the per-group kernel `exec::aggregate` or a
+registered aggregate over its group's rows, which FOLD, registered aggregates and the
+other custom aggregates, `MEDIAN` and `MODE` among them, need. `AggState` gained `merge` and
+`retract`. `merge` keeps row order for SAMPLE, GROUP_CONCAT and the ties of MIN and MAX,
+and a statistics aggregate does not merge. `retract` takes back unit-weight rows of
+COUNT, SUM and AVG without DISTINCT. The view operator of `incr/ops/group.rs` keeps its
+own states, which item 418 extended with an ordered multiset of each group's values, and
+adds and retracts with a weight per change. It does not use the trait, and moving it
+there would give `Batch` a weight column.
+
+The operator finds each row's group through a hash table on the keys, in order of first
+appearance. When every aggregate keeps running state, rows arrive in any batches, and a
+grouping that may spill passes the rows of the groups that do not fit to 16 partition
+files and reads each in a pass of its own, as the cursor's grouping did. The files hold
+input rows and never accumulator state, so no format changed. Otherwise the operator
+takes one batch that holds every row of each of its groups and indexes the rows of each
+slot once for the aggregates that read them. The eager grouping is one call of the
+operator over its whole input table, folded in chunks of 65,536 rows so that GROUP_CONCAT
+text and DISTINCT sets are charged as they grow. The cursor's `Group` drives the operator
+over the batches it pulls, and its `RunGroup` holds the rows of unfinished groups of an
+input ordered on the keys and runs the operator over the finished ones. `exec::group`,
+`exec::group_incremental` and `cursor/runs.rs` are gone.
+
+Every running aggregate is admitted in both modes, so DISTINCT aggregates, expression
+arguments, GROUP_CONCAT and groupings on several keys keep one state per group in eager
+execution as well, and EXPLAIN marks them `[incremental]` in both. Expression arguments
+are evaluated once per batch through `compute_column`, which reuses one value per
+distinct input in both modes. An eager grouping of a query that may spill charges its
+groups, and when they do not fit, it runs again as the cursor's grouping over its input
+table and its plan notes `[groups did not fit: partitioned to disk]`. An eager grouping
+of a query that cannot spill charges nothing, as before. The `incremental_group` switch
+stays as a diagnostic that sends every aggregate through `Rows`, so the optimization
+tests keep an independent check of the running states until item 512's reference
+evaluator replaces it, and the merge phase retires it. The parallel split of a grouping
+over Rayon with `merge`, which the plan names, is not built, since the eager grouping
+was sequential before and the sequential operator measured faster than its base with one
+thread. The 12-thread cells of the forge matrix decide its value. Roadmap
+item 1066 holds the split, together with the cases in which a merged SUM or AVG differs
+from one pass. A DISTINCT accumulator charges the slots and values it passes to the
+aggregate underneath while that aggregate reads them.
+
+Tests compare mixed aggregates with HAVING between eager execution and the cursor at
+batches of one row and 4,096 rows, with and without the memory to hold the groups, and
+run an eager grouping under a budget its groups do not fit, which spills in partitions
+and returns the eager answer. A grouping holds its value cache outside the pass
+threshold, so GROUP_CONCAT or MIN and MAX over many distinct values can still exceed a
+small budget while the pass has room, as before. A group whose own state, such as a
+DISTINCT set or a GROUP_CONCAT text, exceeds the budget cannot be split and fails, while a
+group whose rows alone exceed the budget lands in one partition and is folded whole.
+
+On forge alone, at 1.05M triples with one thread in twelve rounds of A,B,B,A against the
+base 7e272f4d, eager `expr-bind-group` read 0.839, `expr-agg-arg` 0.888 and `group-avg`
+0.906, and streamed they read 0.975, 1.004 and 0.980. `types-grouped`, `predicate-counts`
+and `subquery-agg` keep their count plans and read 0.955 to 1.021 in both modes, within
+the base's spread. Eager `types-grouped` read 1.003, a median of 0.02 µs more in one order
+of the A/B, under the 0.5 µs bound of the Intel rule. Both builds
+returned the same answers. The
+[synthetic results](../../benchmarks/synthetic/RESULTS.md#grouping-operator) keep the run
+record.
+
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries

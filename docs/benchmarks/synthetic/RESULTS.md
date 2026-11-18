@@ -679,6 +679,27 @@ The batch that followed, 62d9cb53 to 125edd41, changed no executor code. With on
 `predicate-counts` at 0.958, `types-grouped` at 0.964 and `path-plus` at 1.020, 0.21 µs
 more, so it added no cost to the short queries that the Namespace screen flagged.
 
+### Grouping operator
+
+The grouping operator of item 826 was compared with its base, 7e272f4d, on forge alone in
+an interleaved A/B of release builds made on wally with the same compilers, at 1.05M
+triples with one thread, in twelve rounds of A,B,B,A with 200 timed requests per query and
+server. The [run record](runs/2026-11-17-grouping-operator-ab-forge-d1f13592/eager/summary.md)
+keeps the samples and answers of both cells and the eager plans of both builds with their
+[commands](runs/2026-11-17-grouping-operator-ab-forge-d1f13592/run.sh.txt). Both builds
+returned the same answers to all six queries in both modes, and steal was zero.
+
+Eager `expr-bind-group` read 0.839 of the base, 0.50 ms against 0.60 ms, `expr-agg-arg`
+0.888 and `group-avg` 0.906, with every round within 0.02 of those ratios. Eager
+`expr-agg-arg` now keeps a running sum per group instead of collecting each group's rows,
+and EXPLAIN marks it `[incremental]`. `group-avg` and `expr-bind-group` kept running state
+in the base as well. Streamed, the same queries read 0.975, 1.004 and 0.980. `types-grouped`,
+`predicate-counts` and `subquery-agg` keep their count plans and read 0.955 to 1.021 in
+both modes, within the spread of the base. Eager `types-grouped` read 1.003, a median of
+0.02 µs more in this one order of the A/B, under the 0.5 µs bound of the Intel rule. The
+12-thread cells of these queries come from the forge matrix. Roadmap item 1067 follows
+these small deltas.
+
 ### Execution mode of quick texts in fresh servers
 
 The Namespace screen of cf033f12, the batch that merged items 679 and 454, against 125edd41

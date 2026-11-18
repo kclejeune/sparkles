@@ -213,6 +213,12 @@ check them against the W3C suites and Jena's own answers.
   and hashes in both when it is off, a hash join's OPTIONAL condition is tested once over
   each chunk of candidate pairs rather than over the whole product, and EXPLAIN names
   the algorithm that ran in either mode.
+* Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
+  GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms
+  keep one running state per group, on one key or several and with expression arguments,
+  and EXPLAIN marks a grouping whose aggregates all do so `[incremental]` in either mode.
+  FOLD, registered aggregates, `MEDIAN`, `MODE` and the other custom aggregates read the
+  whole rows of each group.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and
   stop when the client disconnects.
@@ -258,7 +264,8 @@ check them against the W3C suites and Jena's own answers.
   store spills when `QueryOptions::spill` holds a spill directory.
   * A streamed sort without LIMIT writes sorted runs and merges them. A grouping or a
     DISTINCT keeps what fits and handles the rest in later passes over hash-partitioned
-    files.
+    files. Every row of a group lands in the same pass, so one group's own state, such
+    as a large DISTINCT set or GROUP_CONCAT text, must fit the budget by itself.
   * A hash join whose build input outgrows its share partitions both inputs by key, up to
     three levels, and joins a heavy key as a block nested loop. A merge join spools a long
     run of equal keys to a file. A spilled join restores its probe input's order only for
@@ -272,7 +279,9 @@ check them against the W3C suites and Jena's own answers.
   * Disk is reserved per query with `--query-spill-mb` or `spill-mb=`, and for the server
     with `--spill-max-mb`. With spill on, an eager hash join, OPTIONAL, semi join, anti
     join or MINUS whose hash table does not fit the budget partitions its two inputs to
-    disk through the cursor's join and gives the same answer, automatic execution streams
+    disk through the cursor's join and gives the same answer, an eager `[incremental]`
+    grouping whose groups do not fit runs as the cursor's grouping and spills in
+    partitions, automatic execution streams
     a query that eager execution would hold in more than half its budget, and it reruns
     an eager query that exceeds its budget as a cursor unless it calls SERVICE.
   * With `--spill on` or `encrypted`, the server refuses to start with an unusable spill

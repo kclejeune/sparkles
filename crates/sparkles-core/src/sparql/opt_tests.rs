@@ -436,19 +436,22 @@ fn incremental_grouping_matches_the_generic_aggregates() {
     let slow = run(&s, q, slow);
     assert_eq!(solutions(&fast), solutions(&slow), "{q}");
     assert!(has_desc(fast.plan(), "[incremental]") && !has_desc(slow.plan(), "[incremental]"));
-    // not admitted: DISTINCT, expressions, GROUP_CONCAT, several keys
+    // DISTINCT, expressions, GROUP_CONCAT and several keys keep running state as well
     for q in [
         "SELECT ?o (COUNT(DISTINCT ?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
         "SELECT ?o (SUM(?a * 2) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
         "SELECT ?o (GROUP_CONCAT(?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
-        "SELECT ?o (MEDIAN(?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
         "SELECT ?o (STDEV(DISTINCT ?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
         "SELECT ?o ?a (COUNT(*) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o ?a",
+        "SELECT ?o (COUNT(DISTINCT *) AS ?n) (GROUP_CONCAT(DISTINCT ?a; separator=\",\") AS ?g) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o HAVING (COUNT(*) > 1)",
     ] {
-        let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_desc(r.plan(), "[incremental]"), "{q}");
-        same_rows(&s, q);
+        same_answer(&s, q, "desc:[incremental]");
     }
+    // a custom aggregate other than ARQ's statistics reads its group's rows
+    let q = "SELECT ?o (MEDIAN(?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o";
+    let r = run(&s, q, Optimizations::ALL);
+    assert!(!has_desc(r.plan(), "[incremental]"), "{q}");
+    same_rows(&s, q);
 }
 
 // --------------------------------------------------------- count join runs ------

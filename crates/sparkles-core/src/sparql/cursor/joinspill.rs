@@ -81,7 +81,7 @@ pub(super) fn mix(mut z: u64) -> u64 {
 /// seed, so two different keys share a partition at one depth and at the next only by
 /// chance. A seeded mix of the row's FxHash kept rows whose FxHash values collide in one
 /// partition at every depth, since the seed cannot separate equal hashes.
-pub(super) fn row_hash(depth: u64, key: impl IntoIterator<Item = Id>) -> u64 {
+pub(in crate::sparql) fn row_hash(depth: u64, key: impl IntoIterator<Item = Id>) -> u64 {
     let mut state = mix(depth.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5bd1_e995);
     for id in key {
         state = mix(state ^ id.0);

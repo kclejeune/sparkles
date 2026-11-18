@@ -26,6 +26,7 @@ mod fnlib;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
+mod group;
 pub mod history_svc;
 pub mod hybrid;
 pub mod indexjoin;
@@ -2512,6 +2513,8 @@ mod depth_tests;
 mod exists_tests;
 #[cfg(test)]
 mod exprcache_tests;
+#[cfg(test)]
+mod group_tests;
 #[cfg(test)]
 mod indexjoin_tests;
 #[cfg(test)]

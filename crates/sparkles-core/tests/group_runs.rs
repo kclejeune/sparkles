@@ -207,3 +207,61 @@ fn a_group_spanning_many_batches() {
     let (rows, _) = cursor(&s, q, &opts, 64).unwrap();
     assert_eq!(rows, expected);
 }
+
+/// Groupings that mix running aggregates with those that read their groups' rows, with
+/// HAVING, give the eager answers at batches of one row and of 4,096 rows, with and
+/// without the memory to hold their groups. They include an ungrouped aggregate over no
+/// rows, a key that is unbound in some rows and DISTINCT arguments.
+#[test]
+fn mixed_aggregates_match_eager_execution_at_every_batch_size() {
+    // Few distinct values, so that the query's value cache stays small under the budget.
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..18_000usize {
+        let k = (i * 7919) % 18_000;
+        data.push_str(&format!("<urn:s:{}> <urn:p> {} .\n", k % 6000, k % 97));
+        if (k % 6000).is_multiple_of(2) {
+            data.push_str(&format!("<urn:s:{}> <urn:q> {} .\n", k % 6000, k % 13));
+        }
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let mut spilled = false;
+    for q in [
+        "SELECT ?s (COUNT(*) AS ?n) (SUM(?v) AS ?t) (AVG(?v * 2) AS ?m) (MIN(?v) AS ?lo) \
+         (MAX(?v) AS ?hi) (GROUP_CONCAT(STR(?v); separator=\"|\") AS ?all) (SAMPLE(?v) AS ?x) \
+         (COUNT(DISTINCT ?v) AS ?d) { ?s <urn:p> ?v } GROUP BY ?s HAVING (SUM(?v) > 100)",
+        "SELECT ?x (COUNT(*) AS ?n) (GROUP_CONCAT(DISTINCT STR(?v)) AS ?g) \
+         { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?x } } GROUP BY ?x HAVING (COUNT(*) > 1)",
+        "SELECT ?s ?x (AGG <urn:test:sequence>(?v) AS ?a) (SUM(?v) AS ?t) (GROUP_CONCAT(STR(?v)) AS ?g) \
+         { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?x } } GROUP BY ?s ?x HAVING (COUNT(?v) >= 1)",
+        "SELECT (COUNT(*) AS ?n) (SUM(?v) AS ?t) (GROUP_CONCAT(STR(?v)) AS ?g) (SAMPLE(?v) AS ?x) \
+         { ?s <urn:absent> ?v }",
+        "SELECT (COUNT(DISTINCT *) AS ?n) (MAX(?v) AS ?hi) { ?s <urn:p> ?v FILTER(?v < 40) }",
+    ] {
+        let expected = bag(query(s.snapshot(), q, &options(None, None))
+            .unwrap()
+            .rows()
+            .unwrap());
+        for batch_rows in [4096, 1] {
+            let (rows, _) = cursor(&s, q, &options(None, None), batch_rows).unwrap();
+            assert_eq!(rows, expected, "{q} at {batch_rows}");
+            let (rows, plan) = cursor(
+                &s,
+                q,
+                &options(Some(4 << 20), Some(spill.clone())),
+                batch_rows,
+            )
+            .unwrap_or_else(|e| panic!("{q} at {batch_rows}: {e}"));
+            assert_eq!(rows, expected, "{q} at {batch_rows} under 4 MiB");
+            spilled |= plan.contains("spillPasses");
+        }
+    }
+    assert!(spilled, "no grouping spilled");
+}
