@@ -258,9 +258,9 @@ and a column that only copied terms bind compares them exactly. Arithmetic, the 
 functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values. A
 variable, a constant, IF, COALESCE, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and SAMPLE
 aggregates pass on the terms or lexical forms they are given, and any other operator
-counts as both. A constructor whose lexical argument shows the form of a computed
-number, such as `STRDT(STR(1.0 + 1.0), xsd:decimal)`, still compares exactly, so an engine
-that writes that number in another allowed form would fail the comparison. A column bound by both,
+counts as both. A string or constructor that shows the lexical form of a computed number,
+such as `STR(1.0 + 1.0)` or `STRDT(STR(1.0 + 1.0), xsd:decimal)`, still compares exactly,
+so an engine that writes that number in another allowed form would fail the comparison. A column bound by both,
 such as a COALESCE over a variable and a constant, compares exactly, and a number that
 differs there only in its lexical form makes the comparison partial. An ordered or sliced
 answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
@@ -281,8 +281,8 @@ variable that its inner pattern binds make the rows open when that variable hold
 values. Numbers sort by their exact values, which keeps the sort
 transitive where promotion makes values of different datatypes equal. These rules decline to
 judge some answers that the evaluator once compared. Of the 5,000 answers of the seeded
-queries, 20 with open columns are compared in part, 15 are compared without their order
-because an ORDER BY condition reads an open value, no slice fails its completion, and 105
+queries, 20 with open columns are compared in part, 15 others with open columns are
+compared without their order because an ORDER BY condition reads an open value, no slice fails its completion, and 105
 have open rows, 20 more than before because whether an open value is
 bound is open. In the optimizer, index-join and string-filter tests, 3 answers with open columns
 are compared in part, and 12 string filters whose regular expression takes the `i` flag
