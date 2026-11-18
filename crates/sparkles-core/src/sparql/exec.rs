@@ -10085,6 +10085,25 @@ mod string_order_tests {
                 "{what}: the column is decoded"
             );
         }
+        // Each skipped expression gives on every row what it gives over the decoded column.
+        let full = decode_for(&ctx, &t, &[&str_of(x)])
+            .unwrap()
+            .expect("decoded");
+        let map = t.var_map(ctx.nvars());
+        for (what, e) in skipped.iter().filter(|(what, _)| *what != "if-exists") {
+            for i in 0..t.len() {
+                let at = |dec| {
+                    let row = Row {
+                        table: &t,
+                        i,
+                        map: &map,
+                        dec,
+                    };
+                    eval(e, &row, &ctx).ok().map(|v| v.into_id(&ctx))
+                };
+                assert_eq!(at(None), at(Some(&full.cols)), "{what}: row {i}");
+            }
+        }
         let string = Expr::Eq(var(), Box::new(Expr::Const(strings[1])));
         let read = [
             ("eq-string", Expr::If(Box::new(string), int(1), int(0))),
