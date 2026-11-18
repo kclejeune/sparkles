@@ -1266,7 +1266,7 @@ store. `MBX_GC_MAX_SIZE` is 2 GiB for the bindings. The server candidate build s
 Each main push adds a store of about 0.6 GB for the wheel, 0.55 GB for the addon and 0.5 GB
 for the natives, and the addon's and the natives' target entries are about 0.9 and 0.6 GB.
 With `ci.yml`'s entries and the workflows' small tool caches, the newest set takes about
-6 GB of the 10 GB limit, which leaves room for the entries of one push before its
+7 GB of the 10 GB limit, which leaves room for the entries of one push before its
 `prune-caches` jobs run.
 
 Native build commands and shell build scripts call `mbx` directly. Maturin and napi builds
@@ -1305,8 +1305,9 @@ before temporary build data is collected.
 
 Gradle and pnpm retain their existing caches. Hermetic Nix builds retain their
 Crane dependency artifacts and Nix binary caches. The dev profile keeps line tables for
-workspace crates and disables dependency debug information. The test build and the
-doctests add 16 GB of swap to a runner with less than 24 GiB of memory.
+workspace crates and disables dependency debug information. The doctests add 16 GiB
+of swap and the test build 2 GiB to a runner with less than 24 GiB of memory, as a zram
+device where the root is a device-mapper snapshot.
 
 ## Releases
 
