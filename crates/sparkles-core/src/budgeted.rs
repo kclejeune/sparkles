@@ -55,6 +55,21 @@ pub(crate) trait Control {
         self.check(0)
     }
 
+    /// Lock `mutex`. An accounting control checks itself while it waits and refuses to
+    /// wait under `no_wait`, as [`ReadLimit::lock`] does. Any other control takes the
+    /// plain lock, as the readers without a memory cap always have.
+    #[inline]
+    fn lock<'m, T>(
+        &self,
+        mutex: &'m parking_lot::Mutex<T>,
+    ) -> Result<parking_lot::MutexGuard<'m, T>> {
+        if Self::ACCOUNTS {
+            self.read_limit().lock(mutex)
+        } else {
+            Ok(mutex.lock())
+        }
+    }
+
     /// The control as a [`ReadLimit`], for the index readers that the accounting readers
     /// call and that are not generic yet. Stage 3 of item 830 removes it.
     fn read_limit(&self) -> ReadLimit<'_>;

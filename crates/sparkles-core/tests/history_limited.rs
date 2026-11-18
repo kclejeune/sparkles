@@ -270,3 +270,41 @@ fn ignored_zero_local_capacity_cannot_override_a_shared_scope() {
         assert_eq!(resolved.commit.seq, 1);
     }
 }
+
+/// The ordinary and the capped resolver are one body: a time before history and a commit
+/// that is gone give the same error with and without a cap.
+#[test]
+fn capped_and_uncapped_reads_refuse_alike() {
+    let root = tempfile::tempdir().unwrap();
+    let disk = Store::open(root.path(), StoreOptions::default()).unwrap();
+    let memory = Store::in_memory(StoreOptions::default());
+    let options = HistoryOptions::default();
+    for store in [&disk, &memory] {
+        write(store, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        write(store, "INSERT DATA { <urn:b> <urn:p> 2 }");
+        let before = At::Time(0);
+        let plain = store.resolve(&before).err().map(|e| e.to_string());
+        let capped = store
+            .snapshot_at_limited(&before, &options, 64 << 20)
+            .err()
+            .map(|e| e.to_string());
+        let message = plain.clone().expect("a time before history is not found");
+        assert!(message.contains("(history starts at "), "{message}");
+        assert_eq!(plain, capped);
+    }
+    // an in-memory store without a retention window keeps only its head
+    let past = At::Commit(memory.head_commit().seq - 1);
+    let gone = |r: Result<_, Error>| match r {
+        Err(Error::HistoryGone(g)) => (g.message, g.seq, g.head, g.reconstructable),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("commit {past:?} is still reconstructable"),
+    };
+    assert_eq!(
+        gone(memory.snapshot_at(&past, &options).map(|_| ())),
+        gone(
+            memory
+                .snapshot_at_limited(&past, &options, 64 << 20)
+                .map(|_| ())
+        )
+    );
+}

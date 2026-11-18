@@ -417,6 +417,87 @@ impl ReadControl for crate::access::Preparation {
 /// Fixed selector/result/error metadata, including bounded snapshot names.
 pub(crate) const READ_METADATA_BYTES: u64 = 1024;
 
+/// The value of a reader that cannot fail without an accounting control.
+#[inline]
+pub(crate) fn uncontrolled<T>(value: Result<T>) -> T {
+    match value {
+        Ok(value) => value,
+        Err(_) => unreachable!("a reader without an accounting control does not fail"),
+    }
+}
+
+/// `ranges` sorted, with the ranges that overlap or touch merged, as ascending disjoint
+/// ranges. Under an accounting control the merge builds and sorts the ranges in one
+/// vector, checks the control before each growth and at each step of an in-place heap
+/// sort, and refuses an allocation the system refuses, since an error's metadata is
+/// preparation too. Without one it checks nothing and cannot fail.
+pub(crate) fn merge_ranges<C: crate::budgeted::Control>(
+    ranges: impl Iterator<Item = (u64, u64)>,
+    limit: &C,
+) -> Result<Vec<(u64, u64)>> {
+    let check = |held: usize| -> Result<()> {
+        if C::ACCOUNTS {
+            limit.check((held as u64).saturating_mul(16).saturating_add(1024))
+        } else {
+            Ok(())
+        }
+    };
+    let mut result: Vec<(u64, u64)> = Vec::new();
+    for range in ranges {
+        if C::ACCOUNTS {
+            check(result.capacity())?;
+            if result.len() == result.capacity() {
+                let next = result.capacity().saturating_mul(2).max(1);
+                check(result.capacity().saturating_add(next))?;
+                result
+                    .try_reserve_exact(next - result.len())
+                    .map_err(|_| limit.refused())?;
+            }
+        }
+        result.push(range);
+    }
+    let sift = |values: &mut [(u64, u64)], mut root: usize, end: usize| -> Result<()> {
+        loop {
+            check(values.len())?;
+            let left = root.saturating_mul(2).saturating_add(1);
+            if left >= end {
+                return Ok(());
+            }
+            let child = if left + 1 < end && values[left] < values[left + 1] {
+                left + 1
+            } else {
+                left
+            };
+            if values[root] >= values[child] {
+                return Ok(());
+            }
+            values.swap(root, child);
+            root = child;
+        }
+    };
+    let len = result.len();
+    for root in (0..len / 2).rev() {
+        sift(&mut result, root, len)?;
+    }
+    for end in (1..len).rev() {
+        result.swap(0, end);
+        sift(&mut result, 0, end)?;
+    }
+    let mut kept = 0;
+    for index in 0..len {
+        check(result.capacity())?;
+        let (begin, end) = result[index];
+        if kept > 0 && begin <= result[kept - 1].1.saturating_add(1) {
+            result[kept - 1].1 = result[kept - 1].1.max(end);
+        } else {
+            result[kept] = (begin, end);
+            kept += 1;
+        }
+    }
+    result.truncate(kept);
+    Ok(result)
+}
+
 /// One read's preparation limit. This does not resize the shared history cache.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadLimit<'a> {
@@ -953,20 +1034,23 @@ impl HistoryState {
 
     /// The readable commits, as ascending disjoint ranges.
     pub fn reconstructable(&self, current: u32, head: u64) -> Vec<(u64, u64)> {
-        let mut r: Vec<(u64, u64)> = self
-            .ranges(current, head)
-            .into_iter()
-            .map(|(_, b, e)| (b, e))
-            .collect();
-        r.sort_unstable();
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        for (b, e) in r {
-            match out.last_mut() {
-                Some(last) if b <= last.1 + 1 => last.1 = last.1.max(e),
-                _ => out.push((b, e)),
-            }
-        }
-        out
+        uncontrolled(self.reconstructable_with(current, head, &crate::budgeted::Unlimited))
+    }
+
+    /// [`reconstructable`](Self::reconstructable) under `limit`, which an accounting
+    /// control checks as [`merge_ranges`] says.
+    pub(crate) fn reconstructable_with<C: crate::budgeted::Control>(
+        &self,
+        current: u32,
+        head: u64,
+        limit: &C,
+    ) -> Result<Vec<(u64, u64)>> {
+        merge_ranges(
+            self.gens
+                .iter()
+                .map(|(&no, g)| (g.base.seq, if no == current { head } else { g.end })),
+            limit,
+        )
     }
 
     /// The protected commits as inclusive ranges with what protects them: the head,
@@ -1222,25 +1306,27 @@ impl MemHistory {
 
     /// The readable commits, the head included, as ascending disjoint ranges.
     pub fn reconstructable(&self, head: u64) -> Vec<(u64, u64)> {
-        let mut seqs: Vec<u64> = self
-            .window
-            .iter()
-            .map(|s| s.commit)
-            .chain(self.pins.values().map(|p| p.1.commit))
-            .chain(self.branch_bases.keys().copied())
-            .chain(self.held.keys().copied())
-            .chain(std::iter::once(head))
-            .collect();
-        seqs.sort_unstable();
-        seqs.dedup();
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        for s in seqs {
-            match out.last_mut() {
-                Some(last) if s == last.1 + 1 => last.1 = s,
-                _ => out.push((s, s)),
-            }
-        }
-        out
+        uncontrolled(self.reconstructable_with(head, &crate::budgeted::Unlimited))
+    }
+
+    /// [`reconstructable`](Self::reconstructable) under `limit`, which an accounting
+    /// control checks as [`merge_ranges`] says.
+    pub(crate) fn reconstructable_with<C: crate::budgeted::Control>(
+        &self,
+        head: u64,
+        limit: &C,
+    ) -> Result<Vec<(u64, u64)>> {
+        merge_ranges(
+            self.window
+                .iter()
+                .map(|s| s.commit)
+                .chain(self.pins.values().map(|p| p.1.commit))
+                .chain(self.branch_bases.keys().copied())
+                .chain(self.held.keys().copied())
+                .chain(std::iter::once(head))
+                .map(|seq| (seq, seq)),
+            limit,
+        )
     }
 
     /// Drop the window's states that it no longer covers (`ts(s)` gives a commit's

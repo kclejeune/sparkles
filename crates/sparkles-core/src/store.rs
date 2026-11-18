@@ -2817,12 +2817,36 @@ impl Store {
         snapshot: Option<String>,
         metadata: Option<CommitInfo>,
     ) -> Error {
+        crate::history::uncontrolled(self.history_gone_with(
+            h,
+            seq,
+            head,
+            snapshot,
+            metadata,
+            &crate::budgeted::Unlimited,
+        ))
+    }
+
+    /// [`history_gone`](Self::history_gone) under `limit`. An accounting control charges
+    /// the ranges and the message.
+    pub(super) fn history_gone_with<C: crate::budgeted::Control>(
+        &self,
+        h: &crate::history::HistoryState,
+        seq: u64,
+        head: u64,
+        snapshot: Option<String>,
+        metadata: Option<CommitInfo>,
+        limit: &C,
+    ) -> Result<Error> {
         let current = commit::generation_number(&self.snapshot().generation.name);
-        let reconstructable = h.reconstructable(current, head);
+        let reconstructable = h.reconstructable_with(current, head, limit)?;
         let oldest = reconstructable.first().map_or(String::new(), |r| {
             format!("; the oldest reconstructable commit is {}", r.0)
         });
-        Error::HistoryGone(Box::new(crate::history::HistoryGone {
+        if C::ACCOUNTS {
+            limit.check(512)?;
+        }
+        Ok(Error::HistoryGone(Box::new(crate::history::HistoryGone {
             message: format!("commit {seq} is no longer reconstructable{oldest}"),
             seq: Some(seq),
             at: None,
@@ -2830,7 +2854,7 @@ impl Store {
             snapshot,
             reconstructable,
             metadata,
-        }))
+        })))
     }
 
     /// Resolve a selector to a commit (metadata only): `NotFound` for a commit beyond the
@@ -2846,17 +2870,28 @@ impl Store {
         at: &crate::history::At,
         head: CommitInfo,
     ) -> Result<crate::history::Resolved> {
+        self.resolve_in(at, head, &crate::budgeted::Unlimited)
+    }
+
+    /// [`resolve`](Self::resolve) against `head`, under `limit`. An accounting control
+    /// takes each lock under its control and charges the metadata of an error.
+    pub(super) fn resolve_in<C: crate::budgeted::Control>(
+        &self,
+        at: &crate::history::At,
+        head: CommitInfo,
+        limit: &C,
+    ) -> Result<crate::history::Resolved> {
         use crate::history::At;
         let seq = match at {
             At::Head => head.seq,
             At::Commit(n) => *n,
             At::Time(ms) => {
-                let cat = self.catalog.lock();
+                let cat = limit.lock(&self.catalog)?;
                 match cat.at_time(*ms) {
                     Some(c) => c.seq,
                     None if self.branching.ident.is_some() => {
                         drop(cat);
-                        return Err(self.inherited(at, 0));
+                        return Err(self.inherited_with(at, 0, limit)?);
                     }
                     None => {
                         let first = cat.first().map_or(String::new(), |c| {
@@ -2869,16 +2904,17 @@ impl Store {
                     }
                 }
             }
-            At::Snapshot(name) => self
-                .history
-                .as_ref()
-                .and_then(|h| h.lock().pins.get(name).map(|p| p.seq))
-                .or_else(|| {
-                    self.mem_history
-                        .as_ref()
-                        .and_then(|h| h.lock().pins.get(name).map(|p| p.0.seq))
-                })
-                .ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?,
+            At::Snapshot(name) => {
+                let found = match &self.history {
+                    Some(history) => limit.lock(history)?.pins.get(name).map(|p| p.seq),
+                    None => None,
+                };
+                let found = match (found, &self.mem_history) {
+                    (None, Some(history)) => limit.lock(history)?.pins.get(name).map(|p| p.0.seq),
+                    (found, _) => found,
+                };
+                found.ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?
+            }
         };
         if seq > head.seq {
             return Err(Error::NotFound(format!(
@@ -2889,38 +2925,39 @@ impl Store {
         // a branch shares the commits before its starting commit with its upstream
         if let Some(i) = &self.branching.ident {
             let before = match at {
-                At::Time(ms) => self
-                    .catalog
-                    .lock()
+                At::Time(ms) => limit
+                    .lock(&self.catalog)?
                     .get(i.from.seq)
                     .is_some_and(|c| c.timestamp_ms > *ms),
                 _ => seq < i.from.seq,
             };
             if before {
-                return Err(self.inherited(at, seq));
+                return Err(self.inherited_with(at, seq, limit)?);
             }
         }
         // History operations also acquire memory history before the catalog. Release
         // the catalog guard before following a missing record into memory history.
-        let meta = self.catalog.lock().get(seq);
-        let meta = meta.or_else(|| {
-            self.mem_history
-                .as_ref()
-                .and_then(|m| m.lock().kept_commit(seq))
-        });
+        let meta = limit.lock(&self.catalog)?.get(seq);
+        let meta = match (meta, &self.mem_history) {
+            (None, Some(history)) => limit.lock(history)?.kept_commit(seq),
+            (meta, _) => meta,
+        };
         let Some(commit) = meta else {
             if self.starts_at(seq) {
-                return Err(self.inherited(at, seq));
+                return Err(self.inherited_with(at, seq, limit)?);
             }
             let snapshot = match at {
                 At::Snapshot(n) => Some(n.clone()),
                 _ => None,
             };
             return Err(match &self.history {
-                Some(h) => self.history_gone(&h.lock(), seq, head.seq, snapshot, None),
-                None => self.mem_gone(seq, head.seq, snapshot, None),
+                Some(h) => {
+                    self.history_gone_with(&*limit.lock(h)?, seq, head.seq, snapshot, None, limit)?
+                }
+                None => self.mem_gone_with(seq, head.seq, snapshot, None, limit)?,
             });
         };
+        limit.check(0)?;
         Ok(crate::history::Resolved {
             at: at.clone(),
             commit,
@@ -3093,16 +3130,8 @@ impl Store {
                     };
                     if self.starts_at(seq) {
                         Err(self.inherited_with(at, seq, &limit)?)
-                    } else if C::ACCOUNTS {
-                        Err(self.mem_gone_limited(
-                            seq,
-                            r.head,
-                            name,
-                            Some(r.commit),
-                            &limit.read_limit(),
-                        )?)
                     } else {
-                        Err(self.mem_gone(seq, r.head, name, Some(r.commit)))
+                        Err(self.mem_gone_with(seq, r.head, name, Some(r.commit), &limit)?)
                     }
                 }
             };
@@ -3125,18 +3154,14 @@ impl Store {
                 drop(h);
                 return Err(self.inherited_with(at, seq, &limit)?);
             }
-            return if C::ACCOUNTS {
-                Err(self.history_gone_limited(
-                    &h,
-                    seq,
-                    r.head,
-                    snapshot_name,
-                    Some(r.commit),
-                    &limit.read_limit(),
-                )?)
-            } else {
-                Err(self.history_gone(&h, seq, r.head, snapshot_name, Some(r.commit)))
-            };
+            return Err(self.history_gone_with(
+                &h,
+                seq,
+                r.head,
+                snapshot_name,
+                Some(r.commit),
+                &limit,
+            )?);
         };
         let mut cached = None;
         for (index, entry) in h.cache.iter().enumerate() {
