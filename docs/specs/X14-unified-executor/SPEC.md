@@ -981,16 +981,16 @@ against the work limit once and redacts its plan under a graph view, which `run_
 did for these kinds. It does not read or fill the result cache, so an algorithm call over
 an edge pattern that the cache answered under eager execution runs again when streamed.
 A search bounded by `k`, `maxHits` or its own limit argument, an algorithm call over
-constants, `CountJoin` and an ARQ property function over constants run their kernel once
-into a charged table, as decision 2 admits. The expanding kinds and those leaves still
+constants and `CountJoin` run their kernel once into a charged table, as decision 2
+admits. The expanding kinds and those leaves still
 run the eager kernel through `execute_with_inputs` or `execute_owned`, so the merge must
 move them. EXPLAIN gives each operator a reason that names what it reads whole or what
 bounds its answer.
 
 The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
 spatial scan or relation over constants, a search without a bound, a path search between
-constants without a limit, a spatial join and a registered property function without
-prefix output. They are the second part of the item. Automatic execution keeps its base
+constants without a limit, a spatial join, a property function over constants and a
+registered property function without prefix output. They are the second part of the item. Automatic execution keeps its base
 set of expanding kinds, and each new kind joins it only after a same-host A/B of eager
 against streamed runs. The text, geo and vector benchmark scripts send an `EXECUTION`
 mode with every request, and the vector script fingerprints its exact and approximate

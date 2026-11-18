@@ -245,11 +245,12 @@ check them against the W3C suites and Jena's own answers.
   candidates come from its input, a path search under a limit and an algorithm call over
   their group or a nested edge pattern read that input under the memory budget, run
   once and serve their answer batch by batch. Searches bounded by `k`, `maxHits` or a
-  limit argument, constant algorithm calls, count joins and ARQ property functions over
-  constants answer once into a charged table. EXPLAIN states for each such operator
+  limit argument, constant algorithm calls and count joins answer once into a charged
+  table. EXPLAIN states for each such operator
   that it reads its whole input or what bounds its answer. A SERVICE, a view read, a
   spatial scan or relation over constants, a spatial join, a search without a bound and
-  a registered property function without prefix output still need materialization, so
+  a property function over constants and a registered property function without
+  prefix output still need materialization, so
   the strict policy refuses them and automatic execution runs them eagerly, as
   [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every kind in this
   list eagerly until a same-host measurement admits it.
