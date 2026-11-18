@@ -989,6 +989,10 @@ release is refused and the view is rebuilt from the data, and no file format cha
 
 The W3C SPARQL suites pass under all three readings, which
 `mise run test:w3c:aggregate-errors` checks for the two readings that are not the default.
+None of their tests tells the readings apart. `agg-err-01` averages a group that holds a
+string, which leaves AVG unbound under every reading, and their MIN and MAX tests read
+groups in which no value is an error, so the fixture of ARQ's answers in
+`sparkles-core/tests/aggregate_errors.rs` is what separates the readings.
 
 ### Measurements of stage 1
 
