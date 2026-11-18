@@ -567,33 +567,38 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
             "<http://example.org/s{i}> <http://example.org/p> \"{i}\" .\n"
         ));
     }
-    // A dry run writes nothing, so the memory limit never refuses it outright: its
-    // preview reports the refusal, for a first PUT and a first POST into an empty dataset.
-    for req in [
-        put(
-            "/fresh-put/data?default&dryRun=true",
-            "application/n-triples",
-            &large,
-        ),
-        post(
-            "/fresh-post/data?default&dryRun=true",
-            "application/n-triples",
-            &large,
-        ),
+    // A small body into an empty dataset takes a transaction, which admits each quad by
+    // its memory estimate, for a POST as for a PUT. A dry run writes nothing, so the limit
+    // does not refuse it outright, and its preview reports the refusal the write gets.
+    for (method, uri) in [
+        ("PUT", "/fresh-put/data?default"),
+        ("POST", "/fresh-post/data?default"),
     ] {
-        let what = format!("{} {}", req.method(), req.uri());
-        let r = send(&app, req).await;
+        let req = |uri: &str| {
+            let f = if method == "PUT" { put } else { post };
+            f(uri, "application/n-triples", &large)
+        };
+        let r = send(&app, req(&format!("{uri}&dryRun=true"))).await;
         assert_eq!(
             r.status,
             StatusCode::INSUFFICIENT_STORAGE,
-            "{what}: {}",
+            "{method} {uri}: {}",
             r.text()
         );
         let j = r.json();
-        assert_eq!(j["dryRun"], true, "{what}: {j}");
-        assert_eq!(j["outcome"], "storage-refused", "{what}: {j}");
-        assert_eq!(j["storage"]["status"], "refused", "{what}: {j}");
-        assert_eq!(j["commit"]["inserted"], 5000, "{what}: {j}");
+        assert_eq!(j["dryRun"], true, "{method} {uri}: {j}");
+        assert_eq!(j["outcome"], "storage-refused", "{method} {uri}: {j}");
+        assert_eq!(j["storage"]["status"], "refused", "{method} {uri}: {j}");
+        assert_eq!(j["commit"]["inserted"], 5000, "{method} {uri}: {j}");
+        let real = send(&app, req(uri)).await;
+        assert_eq!(
+            real.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            real.text()
+        );
+        assert_eq!(real.json()["code"], "storage-full");
+        assert_eq!(real.json()["error"], j["error"], "{method} {uri}");
     }
     let writes = [
         post(
@@ -604,10 +609,6 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
         put("/disk/data?default", "application/n-triples", small),
         post("/disk/upload", "application/n-triples", small),
         put("/mem/data?default", "application/n-triples", &large),
-        // A small body into an empty dataset takes a transaction, which admits each quad
-        // by its memory estimate, for a POST as for a PUT.
-        put("/fresh-put/data?default", "application/n-triples", &large),
-        post("/fresh-post/data?default", "application/n-triples", &large),
     ];
     for req in writes {
         let what = format!("{} {}", req.method(), req.uri());

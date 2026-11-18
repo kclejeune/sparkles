@@ -666,6 +666,55 @@ fn a_dry_run_over_the_memory_limit_is_previewed() {
         .unwrap_err();
     assert!(matches!(e, crate::error::Error::StorageFull(_)), "{e}");
     assert!(s.snapshot().is_empty());
+    // Copies of one quad are refused while they are parsed, though the commit would hold
+    // one quad, and the preview reports the same refusal.
+    let copies = || {
+        Source::from_bytes(
+            b"<urn:s> <urn:p> <urn:o> .\n".repeat(500),
+            RdfFormat::NTriples,
+            None,
+        )
+    };
+    let real = s
+        .load_with(&[copies()], CommitKind::Load, &WriteOptions::default())
+        .unwrap_err()
+        .to_string();
+    let p = crate::preview::catch(s.load_with(&[copies()], CommitKind::Load, &dry)).unwrap();
+    assert_eq!(
+        p.outcome(),
+        crate::preview::Outcome::StorageRefused,
+        "copies"
+    );
+    assert_eq!(
+        p.storage.refused.as_ref().map(|e| e.to_string()),
+        Some(real)
+    );
+    let real = s
+        .replace_with(
+            ReplaceTarget::Default,
+            &[copies()],
+            CommitKind::GspPut,
+            &WriteOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+    let p = crate::preview::catch(s.replace_with(
+        ReplaceTarget::Default,
+        &[copies()],
+        CommitKind::GspPut,
+        &dry,
+    ))
+    .unwrap();
+    assert_eq!(
+        p.outcome(),
+        crate::preview::Outcome::StorageRefused,
+        "replace copies"
+    );
+    assert_eq!(
+        p.storage.refused.as_ref().map(|e| e.to_string()),
+        Some(real)
+    );
+    assert!(s.snapshot().is_empty());
 }
 
 /// An empty source written into an empty store takes a transaction and makes no commit,

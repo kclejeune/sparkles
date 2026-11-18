@@ -5033,13 +5033,30 @@ impl Store {
 
     /// Before `quads` parsed quads are encoded into a transaction of an in-memory store
     /// (which adds their terms to its vocabulary even if the commit is refused later):
-    /// `StorageFull` when their delta alone would pass the limit. A dry run is not
-    /// refused here, since it writes nothing and rolls its terms back. Its preview
-    /// reports the same limit as a storage refusal when the transaction commits.
-    fn check_memory_before(&self, quads: usize, o: &crate::guard::WriteOptions) -> Result<()> {
-        if self.root.is_some() || self.opts.max_memory_bytes.is_none() || o.dry_run.is_some() {
+    /// `StorageFull` when their delta alone would pass the limit. A dry run writes
+    /// nothing and rolls its terms back, so it is not refused here: its first refusal is
+    /// kept in `refused`, and `with_early_refusal` puts it in the preview, which then
+    /// reports the refusal the write itself would get.
+    fn check_memory_before(
+        &self,
+        quads: usize,
+        o: &crate::guard::WriteOptions,
+        refused: &mut Option<Error>,
+    ) -> Result<()> {
+        if self.root.is_some() || self.opts.max_memory_bytes.is_none() || refused.is_some() {
             return Ok(());
         }
+        match self.check_memory_parsed(quads) {
+            Err(e) if o.dry_run.is_some() => {
+                *refused = Some(e);
+                Ok(())
+            }
+            r => r,
+        }
+    }
+
+    /// The test of [`check_memory_before`](Self::check_memory_before).
+    fn check_memory_parsed(&self, quads: usize) -> Result<()> {
         let snap = self.snapshot();
         let now = snap.generation.disk_bytes()
             + delta_bytes(&snap.delta)
@@ -5284,6 +5301,7 @@ impl Store {
             let mut txn = self.try_write_with(kind, o.clone())?;
             let mut prefixes = BTreeMap::new();
             let mut parsed = 0;
+            let mut refused = None;
             let prepared = (|| -> Result<()> {
                 for s in sources {
                     o.check()?;
@@ -5293,7 +5311,7 @@ impl Store {
                         if parsed % 65_536 == 1 {
                             o.check()?;
                         }
-                        self.check_memory_before(parsed, o)?;
+                        self.check_memory_before(parsed, o, &mut refused)?;
                         let ids = txn.encode_quad(&q, &mut labels)?;
                         txn.insert(ids)?;
                         Ok(())
@@ -5315,7 +5333,7 @@ impl Store {
                 txn.guard.next_bnode = txn.start_bnode;
                 return Err(error);
             }
-            let r = txn.commit()?;
+            let r = with_early_refusal(txn.commit(), refused)?;
             self.add_prefixes(prefixes)?;
             Ok(r)
         }
@@ -5392,7 +5410,8 @@ impl Store {
             prefixes.extend(p);
             parsed.push(quads);
         }
-        self.check_memory_before(parsed.iter().map(Vec::len).sum(), o)?;
+        let mut refused = None;
+        self.check_memory_before(parsed.iter().map(Vec::len).sum(), o, &mut refused)?;
         let mut txn = self.try_write_with(kind, o.clone())?;
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
@@ -5442,7 +5461,7 @@ impl Store {
         drop(keep);
         let n = ids.len() as u64;
         txn.insert_bulk(ids)?;
-        let r = txn.commit()?;
+        let r = with_early_refusal(txn.commit(), refused)?;
         self.add_prefixes(prefixes)?;
         Ok((n, r))
     }
@@ -7541,6 +7560,21 @@ fn guard_required_by(root: &Path) -> bool {
 
 /// The decompressed bytes of the RDF sources that are not streams, from their lengths,
 /// with compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion).
+/// A dry run's preview with `refused`, the memory refusal its sources met while they were
+/// parsed, when the commit's own storage check found none, so that the preview reports the
+/// refusal the write would get.
+fn with_early_refusal<T>(r: Result<T>, refused: Option<Error>) -> Result<T> {
+    match (r, refused) {
+        (Err(Error::DryRun(mut p)), Some(e)) => {
+            if p.storage.refused.is_none() {
+                p.storage.refused = Some(e);
+            }
+            Err(Error::DryRun(p))
+        }
+        (r, _) => r,
+    }
+}
+
 fn estimated_bytes(sources: &[Source]) -> u64 {
     let mut bytes = 0u64;
     for s in sources {
