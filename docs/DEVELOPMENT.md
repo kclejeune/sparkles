@@ -1097,9 +1097,9 @@ the total.
 `scripts/ci-swap.sh` adds the swap as a file in the root file system. Some of GitHub's
 Linux VMs mount the root on a device-mapper snapshot, so wherever the root is on device
 mapper the job's swap is a zram device instead. Under memory pressure the kernel's reclaim wrote swapped pages to a file
-on that snapshot, and each write waited on the snapshot's copy pool, whose jobs needed
-memory to finish. Every task that touched the root then waited in the same place, and
-the VM stopped until the job's limit ended it without a log. `scripts/ci-memory.sh` prints the runner's memory, swap,
+on that snapshot, and each write waited on the snapshot's copy pool, which apparently
+needs memory to finish its copies. Every task that touched the root then waited in the
+same place, and the VM stopped until the job's limit ended it without a log. `scripts/ci-memory.sh` prints the runner's memory, swap,
 load and largest compilers every 30 seconds while the commands run, and they stop at 38
 minutes and list the processes left. A run that stalls the runner therefore fails inside
 its build step and keeps its log, instead of reaching the job's 45-minute limit with no

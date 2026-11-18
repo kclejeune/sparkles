@@ -8,11 +8,11 @@
 # runner with 24 GiB of memory or more gets none. On other runners the swap is a file in
 # the root file system, unless the root is on device mapper. Some of GitHub's VMs mount
 # the root on a device-mapper snapshot, and there writing a swapped page to the file
-# waits on the snapshot's copy pool from inside memory reclaim, while completing the copy
-# needs memory, and the whole VM hangs. Such a runner gets a compressed swap device in
-# memory (zram) instead, or no added swap when the kernel cannot add one. `add` prints the
-# swap and memory it ends with, since GitHub's image may enable swap of its own, which the
-# script leaves alone.
+# waits on the snapshot's copy pool from inside memory reclaim. In a hung VM every task
+# that wrote to the root waited there, apparently because the copies need memory to
+# finish. Such a runner gets a compressed swap device in memory (zram) instead, or no
+# added swap when the kernel cannot add one. `add` prints the swap and memory it ends
+# with, since GitHub's image may enable swap of its own, which the script leaves alone.
 set -euo pipefail
 
 # The root file system is on a device-mapper device. The test reads the root's device
