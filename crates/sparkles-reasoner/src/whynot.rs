@@ -238,9 +238,25 @@ fn negated_call(
         .and_then(crate::ir::lower::rel_of)
         .and_then(|r| relations.and_then(|rs| rs.get(r)));
     let Some(rel) = rel else {
-        let mut call = blocker_call(terms, "not ", args, retained)?;
         // `not (s p o)`, as explanations write a negated triple
-        call = call.replace(", ", " ");
+        let mut temporary = crate::budget::Held::new(retained.budget());
+        let mut parts: Vec<String> = Vec::with_capacity(args.len());
+        for arg in args {
+            let part = match arg.and_then(|id| terms.term(id)) {
+                Some(t) => {
+                    temporary.try_grow(2 * sparkles_core::explain::term_bytes(&t))?;
+                    t.to_string()
+                }
+                None => "_".to_string(),
+            };
+            parts.push(part);
+        }
+        let bytes = 6 + parts.iter().map(|p| p.len() + 1).sum::<usize>();
+        retained.try_grow(bytes + 2 * std::mem::size_of::<(String, Option<Triple>)>())?;
+        let mut call = String::with_capacity(bytes);
+        call.push_str("not (");
+        call.push_str(&parts.join(" "));
+        call.push(')');
         return Ok(call);
     };
     let cols: Vec<Option<u64>> = match rel.arity {
@@ -723,19 +739,17 @@ impl Unfold<'_> {
             _ => None,
         };
         let infos = self.session.infos();
+        // the tails of missing relation atoms (item 839), whose columns later builtins
+        // may bind, such as another relation atom's tail
+        let mut deferred: Vec<usize> = Vec::new();
         for (j, bi) in r.builtins.iter().enumerate() {
             // the tail of a missing relation atom whose columns the instance binds: its
-            // handle makes the missing fact ground, so that it can be unfolded (item 839)
+            // handle makes the missing fact ground, so that it can be unfolded
             if bi.kind == BuiltinKind::RelTail
-                && let (Some(Slot::Var(h)), Some(Slot::Const(key))) =
-                    (bi.args.first(), bi.args.get(1))
+                && let Some(Slot::Var(h)) = bi.args.first()
                 && b[*h] == 0
             {
-                let cols: Option<Vec<u64>> = bi.args[2..].iter().map(|&s| val(s, &b)).collect();
-                match cols {
-                    Some(cols) => b[*h] = terms.try_tail(*key, &cols)?,
-                    None => self.complete = false,
-                }
+                deferred.push(j);
                 continue;
             }
             let args: Vec<Option<u64>> = bi.args.iter().map(|&s| val(s, &b)).collect();
@@ -769,12 +783,18 @@ impl Unfold<'_> {
                     // Use the evaluator itself for the builtin's value semantics and
                     // output bindings. Missing inputs remain placeholders, so only an
                     // instance whose inputs are known can be diagnosed as blocked.
-                    if bi
-                        .kind
-                        .input_positions(bi.args.len())
-                        .iter()
-                        .any(|&i| args[i].is_none())
-                    {
+                    // a negated atom's wildcard is no input (item 839)
+                    let unknown = if bi.kind == BuiltinKind::RelAbsent {
+                        bi.args
+                            .iter()
+                            .any(|s| matches!(s, Slot::Var(v) if b[*v] == 0))
+                    } else {
+                        bi.kind
+                            .input_positions(bi.args.len())
+                            .iter()
+                            .any(|&i| args[i].is_none())
+                    };
+                    if unknown {
                         // Fresh blank nodes do not cover every possible literal or
                         // datatype value a builtin can require of a missing term.
                         self.complete = false;
@@ -823,6 +843,17 @@ impl Unfold<'_> {
                     blocked.push((call, fact));
                 }
                 return Ok(());
+            }
+        }
+        for j in deferred {
+            let bi = &r.builtins[j];
+            let (Slot::Var(h), Slot::Const(key)) = (bi.args[0], bi.args[1]) else {
+                continue;
+            };
+            let cols: Option<Vec<u64>> = bi.args[2..].iter().map(|&s| val(s, &b)).collect();
+            match cols {
+                Some(cols) => b[h] = terms.try_tail(key, &cols)?,
+                None => self.complete = false,
             }
         }
         if missing.is_empty() {

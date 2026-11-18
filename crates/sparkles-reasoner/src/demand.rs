@@ -2327,6 +2327,8 @@ fn transform_in(
     list_stages: bool,
     linear: bool,
 ) -> Result<Program, TransformError> {
+    // a property of the program as a whole, before the closed pass leaves rules out
+    let replay = replays_lists(rules);
     let closed = match pass {
         Pass::Closed(c) => Some(c),
         _ => None,
@@ -2350,7 +2352,6 @@ fn transform_in(
         ))
         .map_err(TransformError::Memory)?;
     let vocab = Vocab::of(rules, terms);
-    let replay = replays_lists(rules);
     // equality as a lower stage, when rules derive owl:sameAs and read it
     let same_as = terms
         .try_id_for(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(

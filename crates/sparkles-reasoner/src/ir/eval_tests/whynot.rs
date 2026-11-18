@@ -277,3 +277,189 @@ fn a_demand_explanation_shows_relation_nodes() {
         .collect();
     assert_eq!(leaves, want);
 }
+
+/// `R(x, y, z), S(k, y, z) → (x out k)`, in both body orders, with `R` missing and `S`
+/// holding: the columns that `S`'s tail binds make the missing `R` ground, so that it is
+/// unfolded to the triple that gives it.
+#[test]
+fn a_missing_tail_waits_for_a_later_binder() {
+    let v = Arc::new(TV::new());
+    let ind = |i: usize| v.inds[i];
+    let (p0, q, out) = (v.props[0], v.props[1], v.props[2]);
+    let c = ind(7);
+    for r_first in [true, false] {
+        let source: Source = Arc::new(move |_: &Terms| {
+            let (rels, ids) = rels(&[3, 3]);
+            let (r, s) = (ids[0], ids[1]);
+            let ra = pos(rel(r, &[V(0), V(1), V(2)]));
+            let sa = pos(rel(s, &[V(3), V(1), V(2)]));
+            let body = if r_first { vec![ra, sa] } else { vec![sa, ra] };
+            let rules = vec![
+                rule(
+                    "r",
+                    vec![pos(tri(V(0), p0, V(1)))],
+                    vec![head(rel(r, &[V(0), V(1), C(c)]))],
+                ),
+                rule(
+                    "s",
+                    vec![pos(tri(V(0), q, V(1)))],
+                    vec![head(rel(s, &[V(0), V(1), C(c)]))],
+                ),
+                rule("out", body, vec![head(tri(V(0), out, V(3)))]),
+            ];
+            (rels, rules)
+        });
+        let base: FxHashSet<Triple> = [[ind(3), q, ind(1)]].into_iter().collect();
+        let WhyNot::NotEntailed { hypotheses, .. } = ask(&v, &source, &base, [ind(0), out, ind(3)])
+        else {
+            panic!("entailed")
+        };
+        let support = triple(&v, [ind(0), p0, ind(1)]);
+        assert!(
+            hypotheses
+                .iter()
+                .any(|h| h.missing == vec![support.clone()]),
+            "r first {r_first}: {hypotheses:?}"
+        );
+    }
+}
+
+/// A negated atom with a wildcard that an existing fact blocks is reported, for a binary
+/// relation, a relation of arity 3 and a triple.
+#[test]
+fn a_wildcard_negation_is_a_blocker() {
+    let v = Arc::new(TV::new());
+    let ind = |i: usize| v.inds[i];
+    let (p0, p1, p2, p3) = (v.props[0], v.props[1], v.props[2], v.props[3]);
+    for arity in [0u16, 2, 3] {
+        let source: Source = Arc::new(move |_: &Terms| {
+            let (rels, ids) = rels(&[arity.max(2)]);
+            let (given, negated) = match arity {
+                0 => (tri(V(0), p3, V(1)), tri(V(0), p3, Any)),
+                2 => (rel(ids[0], &[V(0), V(1)]), rel(ids[0], &[V(0), Any])),
+                _ => (
+                    rel(ids[0], &[V(0), V(1), V(1)]),
+                    rel(ids[0], &[V(0), Any, V(2)]),
+                ),
+            };
+            let mut body = vec![pos(tri(V(0), p1, V(2))), neg(negated)];
+            if arity != 3 {
+                body[0] = pos(tri(V(0), p1, V(1)));
+            }
+            let rules = vec![
+                rule("r", vec![pos(tri(V(0), p0, V(1)))], vec![head(given)]),
+                rule("q", body, vec![head(tri(V(0), p2, V(0)))]),
+            ];
+            (rels, rules)
+        });
+        let base: FxHashSet<Triple> = [[ind(0), p0, ind(1)], [ind(0), p1, ind(1)]]
+            .into_iter()
+            .collect();
+        let WhyNot::NotEntailed { rules, .. } = ask(&v, &source, &base, [ind(0), p2, ind(0)])
+        else {
+            panic!("entailed")
+        };
+        let q = rules.iter().find(|c| c.rule.name == "q").unwrap();
+        let a = term(&v, ind(0));
+        let want = match arity {
+            0 => format!("not ({a} {} _)", term(&v, p3)),
+            2 => format!("not r0({a}, _)"),
+            _ => format!("not r0({a}, _, {})", term(&v, ind(1))),
+        };
+        assert!(
+            q.blocked_by
+                .iter()
+                .any(|b| b.call == want && b.fact.is_none()),
+            "arity {arity}: {:?}",
+            q.blocked_by
+        );
+    }
+}
+
+/// A negated triple's blocker keeps a literal's comma.
+#[test]
+fn a_negated_triple_blocker_keeps_its_literal() {
+    let v = Arc::new(TV::new());
+    let ind = |i: usize| v.inds[i];
+    let (p0, p1, p2) = (v.props[0], v.props[1], v.props[2]);
+    let lit = {
+        let key =
+            sparkles_core::id::term_key(&Term::Literal(oxrdf::Literal::new_simple_literal("a, b")));
+        let mut txn = v.store.write();
+        let id = txn.intern_key(&key).unwrap().0;
+        txn.commit().unwrap();
+        id
+    };
+    let source: Source = Arc::new(move |_: &Terms| {
+        let rules = vec![rule(
+            "q",
+            vec![pos(tri(V(0), p1, V(1))), neg(tri(V(0), p0, C(lit)))],
+            vec![head(tri(V(0), p2, V(1)))],
+        )];
+        (Relations::default(), rules)
+    });
+    let base: FxHashSet<Triple> = [[ind(0), p0, lit], [ind(0), p1, ind(1)]]
+        .into_iter()
+        .collect();
+    let WhyNot::NotEntailed { rules, .. } = ask(&v, &source, &base, [ind(0), p2, ind(1)]) else {
+        panic!("entailed")
+    };
+    let q = rules.iter().find(|c| c.rule.name == "q").unwrap();
+    assert!(
+        q.blocked_by.iter().any(|b| b.call.contains("\"a, b\"")),
+        "{:?}",
+        q.blocked_by
+    );
+}
+
+/// Why not a key's triple whose second individual lacks the key's later values: the
+/// hypotheses name only triples about it, verified through `keyed` relation nodes.
+#[test]
+fn why_not_through_a_key_of_four_values() {
+    let v = Arc::new(TV::new());
+    let vv = v.clone();
+    let source: Source = Arc::new(move |_: &Terms| chain_and_key_rules(&vv));
+    let ind = |i: usize| v.inds[i];
+    let (p0, p1, p3) = (v.props[0], v.props[1], v.props[3]);
+    let base: FxHashSet<Triple> = [
+        [ind(2), p0, ind(5)],
+        [ind(2), p1, ind(2)],
+        [ind(3), p0, ind(5)],
+    ]
+    .into_iter()
+    .collect();
+    let snap = set_default_graph(&v, &base);
+    let qr = reasoner(&source);
+    let opts = WhyNotOptions {
+        max_missing: 4,
+        max_unfold: 6,
+        ..Default::default()
+    };
+    let WhyNot::NotEntailed { hypotheses, .. } = why_not(
+        &DemandInput {
+            reasoner: &qr,
+            snap,
+            readable: None,
+        },
+        &triple(&v, [ind(3), p3, ind(2)]),
+        &opts,
+    )
+    .unwrap() else {
+        panic!("entailed")
+    };
+    let h = hypotheses
+        .iter()
+        .find(|h| {
+            h.missing
+                .iter()
+                .all(|f| f[0] == term(&v, ind(3)) && f[1] == term(&v, p1))
+        })
+        .unwrap_or_else(|| panic!("{hypotheses:?}"));
+    let mut nodes = Vec::new();
+    walk(&h.tree, &mut nodes);
+    assert!(
+        nodes
+            .iter()
+            .any(|d| d.relation.as_ref().is_some_and(|r| r.name == "keyed"))
+    );
+}

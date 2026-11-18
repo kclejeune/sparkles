@@ -497,7 +497,11 @@ enum Compiled {
     Program {
         rules: Vec<CRule>,
         infos: Vec<engine::RuleInfo>,
-        relations: crate::ir::Relations,
+        /// the program, which charges its relation catalog, kept for the catalog
+        program: crate::ir::Program,
+        /// the program runs as `engine::run_program` runs it: it has an IR feature, so
+        /// its lists are read again when their cells arrive, in every stage
+        replay: bool,
         /// the charges of the rules, their infos and the lowering's buffers
         _held: (crate::budget::Held, crate::ir::lower::Lowered),
     },
@@ -512,16 +516,19 @@ fn program_rules(source: &ProgramSource, terms: &Terms, budget: &Arc<Budget>) ->
         None => component(RULES_CODE, format!("{e:#}")),
     };
     let program = source(terms).map_err(failed)?;
-    let mut lowered = program
-        .lower(budget)
-        .map_err(|e| failed(anyhow::Error::from(e)))?;
+    let mut lowered = program.lower(budget).map_err(|e| match e {
+        crate::ir::lower::LowerError::Memory(m) => memory_error(m, "the rule program"),
+        e => component(RULES_CODE, e.to_string()),
+    })?;
+    let replay = lowered.shape != crate::ir::lower::Shape::Jena;
     let mut held = crate::budget::Held::new(budget);
     let (rules, infos) = crate::explain::flat_rules(&program, &mut lowered, &mut held)
         .map_err(|e| memory_error(e, "the rule program"))?;
     Ok(Compiled::Program {
         rules,
         infos,
-        relations: program.relations,
+        program,
+        replay,
         _held: (held, lowered),
     })
 }
@@ -541,10 +548,16 @@ impl Compiled {
         }
     }
 
+    /// Whether the rules run as `engine::run_program` runs a program with an IR feature,
+    /// reading lists again when their cells arrive (item 839's plan, §21).
+    fn replays_lists(&self) -> bool {
+        matches!(self, Compiled::Program { replay: true, .. })
+    }
+
     fn relations(&self) -> Option<&crate::ir::Relations> {
         match self {
             Compiled::Profile(_) => None,
-            Compiled::Program { relations, .. } => Some(relations),
+            Compiled::Program { program, .. } => Some(&program.relations),
         }
     }
 }
@@ -843,8 +856,9 @@ impl Session {
         };
         // a lowered program's rules read a list again when its cells arrive, as its full
         // run reads them (item 839's plan, §20.1)
-        let lists =
-            (!compact && demand::replays_lists(rules)).then_some((terms.rdf_first, terms.rdf_rest));
+        // in every stage, since a lower stage may hold none of the IR's features
+        let lists = (!compact && self.compiled.replays_lists())
+            .then_some((terms.rdf_first, terms.rdf_rest));
         let (r, stopped) = watched(&self.stop, &flag, || {
             if compact {
                 engine::run_observed(g, rules, terms, &limits, None, Some(&mut note))
@@ -1041,6 +1055,25 @@ impl Session {
 
     /// The equality table of the session's derived facts, with the charge for building
     /// it, or `None` when it is not kept (see [`Session::cache_equality`]).
+    /// The facts of [`equality_table`](Self::equality_table), for tests.
+    #[cfg(test)]
+    pub(crate) fn equality_facts_for_tests(&self) -> Option<Vec<[u64; 3]>> {
+        self.equality_table()
+            .map(|(t, _)| t.facts().copied().collect())
+    }
+
+    /// The bytes charged to `budget` while the rules of `source` over `terms` live, for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn program_rules_for_tests(
+        source: &ProgramSource,
+        terms: &Terms,
+        budget: &Arc<Budget>,
+    ) -> Result<usize> {
+        // the bytes the session's rules hold charged while they live
+        program_rules(source, terms, budget).map(|_compiled| budget.used())
+    }
+
     fn equality_table(&self) -> Option<(Table, Held)> {
         let g = self.graph.as_ref().expect("graph made");
         // a relation fact is left out: the handle of its tail is a local term whose

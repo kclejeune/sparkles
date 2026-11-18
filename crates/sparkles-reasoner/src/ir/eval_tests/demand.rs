@@ -731,3 +731,120 @@ fn demand_cost_probe() {
         }
     }
 }
+
+/// The list pipeline beneath a negation: the copy of a stored list and its reader give
+/// `(x p3 x)` in the lower stage that completes `not (x p3 x)`, a stage that holds none of
+/// the IR's features, and still reads the copied list when its cells arrive.
+#[test]
+fn a_lower_stage_replays_its_lists() {
+    let v = Arc::new(TV::new());
+    let ind = |i: usize| v.inds[i];
+    let rdf = |l: &str| v.iri[&format!("{RDF}{l}")];
+    let (first, rest, nil) = (rdf("first"), rdf("rest"), rdf("nil"));
+    let (l0, l1, l2) = (v.list_nodes[0], v.list_nodes[1], v.list_nodes[2]);
+    let (p1, p2, p3, copy, uses) = (v.props[1], v.props[2], v.props[3], v.props[0], v.props[4]);
+    let source: Source = Arc::new(move |_: &Terms| {
+        let rules = vec![
+            rule(
+                "copy",
+                vec![pos(tri(V(0), copy, V(1))), bi(B::ListMember, &[V(0), V(2)])],
+                vec![head(tri(V(1), first, V(2))), head(tri(V(1), rest, C(nil)))],
+            ),
+            rule(
+                "use",
+                vec![pos(tri(V(0), uses, V(1))), bi(B::ListMember, &[V(1), V(2)])],
+                vec![head(tri(V(2), p3, V(2)))],
+            ),
+            rule(
+                "q",
+                vec![pos(tri(V(0), p1, V(1))), neg(tri(V(0), p3, V(0)))],
+                vec![head(tri(V(0), p2, V(1)))],
+            ),
+        ];
+        (Relations::default(), rules)
+    });
+    let base: FxHashSet<Triple> = [
+        [l0, first, ind(0)],
+        [l0, rest, l2],
+        [l2, first, ind(1)],
+        [l2, rest, nil],
+        [l0, copy, l1],
+        [ind(5), uses, l1],
+        [ind(0), p1, ind(2)],
+        [ind(3), p1, ind(2)],
+    ]
+    .into_iter()
+    .collect();
+    let want = full(&v, &source, &base);
+    assert!(want.contains(&(None, vec![ind(0), p3, ind(0)])), "{want:?}");
+    assert!(!want.contains(&(None, vec![ind(0), p2, ind(2)])));
+    assert!(want.contains(&(None, vec![ind(3), p2, ind(2)])));
+    for s in [None, Some(ind(0)), Some(ind(3))] {
+        check(&v, &source, &base, &[tp(p2, s, None)], "subject");
+    }
+}
+
+/// An equality table leaves relation facts out, since their tails are the session's own
+/// terms.
+#[test]
+fn equality_tables_leave_relation_facts_out() {
+    let v = Arc::new(TV::new());
+    let vv = v.clone();
+    let source: Source = Arc::new(move |_: &Terms| chain_and_key_rules(&vv));
+    let p = |i: usize| v.props[i % 2];
+    let ind = |i: usize| v.inds[i];
+    let base: FxHashSet<Triple> = (0..6).map(|i| [ind(i), p(i), ind(i + 1)]).collect();
+    let snap = set_default_graph(&v, &base);
+    let qr = reasoner(&source);
+    let mut s: Session = qr.test_session(request(&snap), true).unwrap();
+    s.derive_ids(&[[Some(ind(0)), Some(v.props[2]), None]])
+        .unwrap();
+    assert!(s.graph().unwrap().facts().any(|f| is_key(f[1])));
+    let facts = s.equality_facts_for_tests().unwrap();
+    assert!(!facts.is_empty());
+    assert!(facts.iter().all(|f| !is_key(f[1])), "{facts:?}");
+}
+
+/// A budget that admits the program but not its lowering refuses the session as a
+/// memory failure, not as rules that cannot be evaluated.
+#[test]
+fn a_lowering_past_the_budget_is_a_memory_failure() {
+    let v = Arc::new(TV::new());
+    let vv = v.clone();
+    let source: Source = Arc::new(move |_: &Terms| chain_and_key_rules(&vv));
+    let s = source.clone();
+    let ps: crate::query::ProgramSource = Arc::new(move |t: &Terms| Ok(build(&s, t)));
+    let terms = Terms::new(v.store.snapshot());
+    let small = crate::budget::Budget::new(Some(256));
+    let e = Session::program_rules_for_tests(&ps, &terms, &small).unwrap_err();
+    match &e {
+        sparkles_core::Error::Component(c) => {
+            assert_eq!(c.code, crate::query::BUDGET_CODE, "{e}")
+        }
+        e => panic!("{e}"),
+    }
+}
+
+/// A session's rule program keeps its relation catalog charged while it lives: a long
+/// relation name stays counted after the rules are lowered.
+#[test]
+fn the_relation_catalog_stays_charged() {
+    let name = "r".repeat(1 << 20);
+    let v = Arc::new(TV::new());
+    let p0 = v.props[0];
+    let source: crate::query::ProgramSource = Arc::new(move |t: &Terms| {
+        let mut rels = Relations::default();
+        let r = rels.declare(&name, 1, false).unwrap();
+        let rules = vec![rule(
+            "r",
+            vec![pos(tri(V(0), p0, V(1)))],
+            vec![head(rel(r, &[V(0)]))],
+        )];
+        Ok(Program::new(rels, rules, &Vocab::of(t), &t.budget()).unwrap())
+    });
+    let budget = crate::budget::Budget::new(None);
+    let terms = Terms::new(v.store.snapshot());
+    terms.set_budget(&budget).unwrap();
+    let used = Session::program_rules_for_tests(&source, &terms, &budget).unwrap();
+    assert!(used >= 1 << 20, "{used} bytes charged");
+}
