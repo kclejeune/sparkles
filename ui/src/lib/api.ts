@@ -456,9 +456,21 @@ export type SparklesResult = {
   rows?: (Term | null)[][];
   boolean?: boolean;
   triples?: [Term, Term, Term][];
+  /**
+   * A streamed graph answer's statements: it sends `triples: []` and every statement here,
+   * with a null graph for the default graph. `normalizeResult` moves those into `triples`,
+   * as an eager answer has them, and keeps the named-graph quads here.
+   */
+  quads?: [Term, Term, Term, Term | null][];
   meta: {
-    totalRows: number;
+    /**
+     * The answer's row count, or null when the server streamed it and stopped after
+     * `sentRows` rows (`status: 'stopped'`), so that there may be more.
+     */
+    totalRows: number | null;
     sentRows: number;
+    /** Present on a streamed answer: whether the server produced every row. */
+    status?: 'complete' | 'stopped';
     timing: Timing;
     plan: PlanNode;
     /** Peak estimated memory of intermediate results; absent on older servers. */
@@ -1196,11 +1208,13 @@ export type QueryOptions = {
   maxResponseBytes?: number;
   send?: number;
   /**
-   * How the server runs the query. The table view asks for `eager`, because it shows the
-   * total row count and compares totals, which a streamed result stopped after `send`
-   * rows does not know. Downloads leave it to the server, whose default is `auto`.
+   * How the server runs the query. `query` and `runStoredQuery` ask for `eager` unless
+   * this names a mode, because most callers need an exact total. `server` sends no mode,
+   * so the server's default applies, which is `auto`. The query page's table asks for
+   * that and shows an unknown total when the server streamed the answer and stopped after
+   * `send` rows. Its comparisons ask for `eager`, since they compare whole results.
    */
-  execution?: 'eager' | 'auto' | 'streaming';
+  execution?: 'eager' | 'auto' | 'streaming' | 'server';
   timeout?: number;
   /**
    * `reasoning=`: `false` reads the asserted data, `true` or `materialized` the
@@ -1222,7 +1236,7 @@ function queryParams(opts: QueryOptions): string {
   if (opts.at) p.set('at', opts.at);
   if (opts.nocache) p.set('nocache', 'true');
   if (opts.send != null) p.set('send', String(opts.send));
-  if (opts.execution) p.set('execution', opts.execution);
+  if (opts.execution && opts.execution !== 'server') p.set('execution', opts.execution);
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
   if (opts.reasoningProfile && (opts.reasoning === 'demand' || opts.reasoning === 'auto'))
@@ -1429,6 +1443,14 @@ export function planOf(p: PlanNode | CursorPlan, id = '0'): PlanNode {
   };
 }
 
+/**
+ * Whether a result's total is unknown: the server streamed it and stopped after
+ * `sentRows` rows, so there may be more. A streamed result that the row limit did not
+ * reach is complete and has its total.
+ */
+export const totalUnknown = (meta: Pick<SparklesResult['meta'], 'totalRows' | 'status'>) =>
+  meta.totalRows == null || meta.status === 'stopped';
+
 export function normalizeResult(r: SparklesResult): SparklesResult {
   // Be lenient about variable names with a leading '?' and missing meta.
   if (r.vars) r.vars = r.vars.map((v) => v.replace(/^[?$]/, ''));
@@ -1436,6 +1458,18 @@ export function normalizeResult(r: SparklesResult): SparklesResult {
   // (a plan in a format this client does not know stays as it is, for `PlanView` to refuse)
   const plan = r.meta?.plan as PlanNode | CursorPlan | undefined;
   if (r.meta && plan && !planFormatProblem(plan)) r.meta.plan = planOf(plan);
+  // a streamed graph answer sends every statement as a quad, the default graph's with a
+  // null graph, where an eager one sends those as triples
+  if (r.quads?.length) {
+    const named = r.quads.filter((q) => q[3] != null);
+    if (named.length < r.quads.length) {
+      r.triples = [
+        ...(r.triples ?? []),
+        ...r.quads.filter((q) => q[3] == null).map(([s, p, o]): [Term, Term, Term] => [s, p, o]),
+      ];
+      r.quads = named;
+    }
+  }
   r.meta ??= {
     totalRows: r.rows?.length ?? r.triples?.length ?? 0,
     sentRows: r.rows?.length ?? r.triples?.length ?? 0,
