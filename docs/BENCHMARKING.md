@@ -1110,7 +1110,9 @@ variable comes from the environment or from a `SPARKLES_NSC_BUILD_HOSTS=` line i
 builds, so `auto` skips it and naming it is refused.
 
 A remote build copies the archive of the commit, with the same placeholder `ui/build` as a
-local build, to a scratch directory under `~/lanes/nsc-build` on the host. It builds there
+local build, to a scratch directory under `~/lanes/nsc-build` on the host. The archive
+travels compressed with zstd, so the host needs `zstd` on its PATH, and a copy whose stream
+is cut off fails rather than leaving a partial tree. It builds there
 with `scripts/nsc-build.sh` under the host's own Boxington cache, inside a systemd user
 scope named `nsc-build-<commit>-<suffix>` with the gate's memory cap and 2 GiB of swap,
 while it holds the host's heavy lock. On a Boat worker the cap is 12 GiB and the worker's

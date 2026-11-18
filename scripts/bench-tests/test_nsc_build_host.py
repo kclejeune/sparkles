@@ -128,7 +128,12 @@ pathlib.Path('target/release/sparkles').chmod(0o755)
     "zstd": """#!/usr/bin/env python3
 import shutil,sys
 # A stream without -o, as the source copy's compression and decompression, passes unchanged.
+# With FAKE_ZSTD_CUT=N a decompression writes the first N bytes and fails, as zstd does on
+# a cut-off stream.
+import os
 a=sys.argv[1:]
+cut=os.environ.get('FAKE_ZSTD_CUT')
+if cut and any(x.startswith('-d') for x in a):sys.stdout.buffer.write(sys.stdin.buffer.read(int(cut)));raise SystemExit(1)
 if '-o' not in a:shutil.copyfileobj(sys.stdin.buffer,sys.stdout.buffer);raise SystemExit(0)
 shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a.index('-o')+1]][0],a[a.index('-o')+1])
 """,
@@ -424,7 +429,18 @@ class BuildHost(unittest.TestCase):
         [build] = self.builds()
         self.assertTrue(build["cwd"].endswith("/src"), build["cwd"])
         # The archive travels compressed.
-        self.assertIn("zstd -dcq | tar -x -m -C", self.ssh_log.read_text())
+        self.assertIn("tar --zstd -x -m -C", self.ssh_log.read_text())
+
+    def test_a_cut_off_compressed_source_is_never_published(self):
+        """tar extracts a valid prefix of the archive and would succeed alone, so the failure
+        of the decompression must fail the copy."""
+        env = dict(self.env, FAKE_ZSTD_CUT="2048")
+        result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("copying the source of", log)
+        self.assertIn("failed 8 times", log)
+        self.assertEqual(self.builds(), [])
+        self.assertEqual(self.scratch("h1"), [])
         log = (out / "logs" / "build-A.log").read_text()
         self.assertIn("copying the source of", log)
         self.assertIn("retrying", log)
