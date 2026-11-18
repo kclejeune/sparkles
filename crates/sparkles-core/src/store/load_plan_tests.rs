@@ -61,291 +61,78 @@ fn restricted(i: LoadInputs) -> LoadInputs {
     }
 }
 
+/// Inputs of `entry` with a small file and a stream.
+fn mixed(entry: Entry) -> LoadInputs {
+    LoadInputs {
+        quads: 1,
+        sources: 2,
+        streams: 1,
+        ..LoadInputs::new(entry, T)
+    }
+}
+
+/// A write limited to some graphs whose triple protections limit writes.
+fn protected(i: LoadInputs) -> LoadInputs {
+    LoadInputs {
+        triple_checks: true,
+        ..restricted(i)
+    }
+}
+
 const SMALL: u64 = SMALL_STREAM_BYTES;
 const LARGE: u64 = T * BYTES_PER_QUAD;
 
+/// The table: a name, the inputs, the bytes of the streams, the plan and the probes.
+#[rustfmt::skip]
 fn rows() -> Vec<Row> {
-    let row = |name, inputs, stream_bytes, plan, probes| Row {
-        name,
-        inputs,
-        stream_bytes,
-        plan,
-        probes,
-    };
+    let row = |name, inputs, stream_bytes, plan, probes| Row { name, inputs, stream_bytes, plan, probes };
     vec![
         // load_with
-        row(
-            "load: empty head, a small file",
-            empty(sized(Load, 1)),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "load: empty head, no sources",
-            empty(sized(Load, 0)),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "load: empty head, no sources at all",
-            empty(LoadInputs::new(Load, T)),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "load: empty head, stream at the small bound",
-            empty(stream(Load)),
-            SMALL,
-            Txn,
-            &[SMALL],
-        ),
-        row(
-            "load: empty head, stream above the small bound",
-            empty(stream(Load)),
-            SMALL + 1,
-            Bulk,
-            &[SMALL],
-        ),
-        row(
-            "load: empty head, a file and a stream",
-            empty(LoadInputs {
-                quads: 1,
-                sources: 2,
-                streams: 1,
-                ..LoadInputs::new(Load, T)
-            }),
-            1,
-            Bulk,
-            &[],
-        ),
-        row(
-            "load: estimate at the threshold",
-            sized(Load, T),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "load: estimate above the threshold",
-            sized(Load, T + 1),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "load: stream at the large bound",
-            stream(Load),
-            LARGE,
-            Txn,
-            &[],
-        ),
-        row(
-            "load: stream above the large bound",
-            stream(Load),
-            LARGE + 1,
-            Txn,
-            &[],
-        ),
-        row(
-            "load: restricted, empty head",
-            restricted(empty(sized(Load, 1))),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "load: restricted, above the threshold",
-            restricted(sized(Load, T + 1)),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "load: restricted, empty head, large stream",
-            restricted(empty(stream(Load))),
-            SMALL + 1,
-            Txn,
-            &[SMALL],
-        ),
+        row("load: empty head, a small file", empty(sized(Load, 1)), 0, Bulk, &[]),
+        row("load: empty head, no sources", empty(LoadInputs::new(Load, T)), 0, Bulk, &[]),
+        row("load: empty head, stream at the small bound", empty(stream(Load)), SMALL, Txn, &[SMALL]),
+        row("load: empty head, stream above the small bound", empty(stream(Load)), SMALL + 1, Bulk, &[SMALL]),
+        row("load: empty head, stream above the large bound", empty(stream(Load)), LARGE + 1, Txn, &[SMALL]),
+        row("load: empty head, a file and a stream", empty(mixed(Load)), 1, Bulk, &[]),
+        row("load: estimate at the threshold", sized(Load, T), 0, Txn, &[]),
+        row("load: estimate above the threshold", sized(Load, T + 1), 0, Bulk, &[]),
+        row("load: stream at the large bound", stream(Load), LARGE, Txn, &[]),
+        row("load: stream above the large bound", stream(Load), LARGE + 1, Txn, &[]),
+        row("load: a small file and a large stream", mixed(Load), LARGE + 1, Txn, &[]),
+        row("load: restricted, empty head", restricted(empty(sized(Load, 1))), 0, Txn, &[]),
+        row("load: restricted, above the threshold", restricted(sized(Load, T + 1)), 0, Txn, &[]),
+        row("load: restricted, empty head, large stream", restricted(empty(stream(Load))), SMALL + 1, Txn, &[SMALL]),
         // replace_with
-        row(
-            "replace: empty head, a small file",
-            empty(sized(Replace, 1)),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "replace: empty head, a small stream",
-            empty(stream(Replace)),
-            1,
-            Txn,
-            &[LARGE],
-        ),
-        row(
-            "replace: estimate at the threshold",
-            sized(Replace, T),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "replace: estimate above the threshold",
-            sized(Replace, T + 1),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "replace: stream at the large bound",
-            stream(Replace),
-            LARGE,
-            Txn,
-            &[LARGE],
-        ),
-        row(
-            "replace: stream above the large bound",
-            stream(Replace),
-            LARGE + 1,
-            Bulk,
-            &[LARGE],
-        ),
-        row(
-            "replace: restricted, above the threshold",
-            restricted(sized(Replace, T + 1)),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "replace: restricted, large stream",
-            restricted(stream(Replace)),
-            LARGE + 1,
-            Txn,
-            &[],
-        ),
+        row("replace: empty head, a small file", empty(sized(Replace, 1)), 0, Txn, &[]),
+        row("replace: empty head, no sources", empty(LoadInputs::new(Replace, T)), 0, Txn, &[]),
+        row("replace: empty head, a small stream", empty(stream(Replace)), 1, Txn, &[LARGE]),
+        row("replace: empty head, stream above the large bound", empty(stream(Replace)), LARGE + 1, Bulk, &[LARGE]),
+        row("replace: empty head, stream above the small bound", empty(stream(Replace)), SMALL + 1, Bulk, &[LARGE]),
+        row("replace: estimate at the threshold", sized(Replace, T), 0, Txn, &[]),
+        row("replace: estimate above the threshold", sized(Replace, T + 1), 0, Bulk, &[]),
+        row("replace: stream at the large bound", stream(Replace), LARGE, Txn, &[LARGE]),
+        row("replace: stream above the large bound", stream(Replace), LARGE + 1, Bulk, &[LARGE]),
+        row("replace: a small file and a large stream", mixed(Replace), LARGE + 1, Bulk, &[LARGE]),
+        row("replace: restricted, above the threshold", restricted(sized(Replace, T + 1)), 0, Txn, &[]),
+        row("replace: restricted, large stream", restricted(stream(Replace)), LARGE + 1, Txn, &[]),
         // insert_bulk
-        row(
-            "insert_bulk: below the threshold",
-            sized(InsertBulk, T - 1),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "insert_bulk: at the threshold",
-            sized(InsertBulk, T),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "insert_bulk: above the threshold",
-            sized(InsertBulk, T + 1),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "insert_bulk: empty head, small batch",
-            empty(sized(InsertBulk, 1)),
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "insert_bulk: restricted",
-            restricted(sized(InsertBulk, T + 1)),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "insert_bulk: triple protections",
-            LoadInputs {
-                triple_checks: true,
-                ..restricted(sized(InsertBulk, T + 1))
-            },
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "insert_bulk: managed",
-            LoadInputs {
-                managed: true,
-                ..sized(InsertBulk, T + 1)
-            },
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "insert_bulk: control records",
-            LoadInputs {
-                control: true,
-                ..sized(InsertBulk, T + 1)
-            },
-            0,
-            Txn,
-            &[],
-        ),
+        row("insert_bulk: below the threshold", sized(InsertBulk, T - 1), 0, Txn, &[]),
+        row("insert_bulk: at the threshold", sized(InsertBulk, T), 0, Bulk, &[]),
+        row("insert_bulk: above the threshold", sized(InsertBulk, T + 1), 0, Bulk, &[]),
+        row("insert_bulk: empty head, small batch", empty(sized(InsertBulk, 1)), 0, Txn, &[]),
+        row("insert_bulk: restricted", restricted(sized(InsertBulk, T + 1)), 0, Bulk, &[]),
+        row("insert_bulk: triple protections", protected(sized(InsertBulk, T + 1)), 0, Txn, &[]),
+        row("insert_bulk: managed", LoadInputs { managed: true, ..sized(InsertBulk, T + 1) }, 0, Txn, &[]),
+        row("insert_bulk: control records", LoadInputs { control: true, ..sized(InsertBulk, T + 1) }, 0, Txn, &[]),
         // patch_apply
-        row(
-            "patch: below the threshold",
-            sized(Patch, T - 1),
-            0,
-            Txn,
-            &[],
-        ),
+        row("patch: below the threshold", sized(Patch, T - 1), 0, Txn, &[]),
         row("patch: at the threshold", sized(Patch, T), 0, Bulk, &[]),
-        row(
-            "patch: above the threshold",
-            sized(Patch, T + 1),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "patch: a delete row, even one that removes nothing",
-            LoadInputs {
-                deleted: true,
-                ..sized(Patch, T + 1)
-            },
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "patch: restricted",
-            restricted(sized(Patch, T + 1)),
-            0,
-            Bulk,
-            &[],
-        ),
-        row(
-            "patch: triple protections",
-            LoadInputs {
-                triple_checks: true,
-                ..restricted(sized(Patch, T + 1))
-            },
-            0,
-            Txn,
-            &[],
-        ),
-        row(
-            "patch: managed",
-            LoadInputs {
-                managed: true,
-                ..sized(Patch, T + 1)
-            },
-            0,
-            Txn,
-            &[],
-        ),
+        row("patch: above the threshold", sized(Patch, T + 1), 0, Bulk, &[]),
+        row("patch: a delete row, even one that removes nothing", LoadInputs { deleted: true, ..sized(Patch, T + 1) }, 0, Txn, &[]),
+        row("patch: restricted", restricted(sized(Patch, T + 1)), 0, Bulk, &[]),
+        row("patch: triple protections", protected(sized(Patch, T + 1)), 0, Txn, &[]),
+        row("patch: managed", LoadInputs { managed: true, ..sized(Patch, T + 1) }, 0, Txn, &[]),
+        row("patch: control records", LoadInputs { control: true, ..sized(Patch, T + 1) }, 0, Txn, &[]),
     ]
 }
 
