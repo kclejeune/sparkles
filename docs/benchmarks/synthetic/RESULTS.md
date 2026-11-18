@@ -566,8 +566,10 @@ history of quick texts settling on one mode per process, as
 describes, and the pooled median depends on how many processes settle eagerly. Within each
 mode, 8baa5686 runs `minus` at 0.2537 ms against 0.2530 ms for adbe757c and at 0.4022 ms
 against 0.4048 ms, so the flags of batches 21 and 22 are not costs. On 321508fe the slow
-mode takes 0.302 ms, so the eager mode of `minus` has been about 0.10 ms slower since item
-825, which the matrix measures in every cell.
+mode takes 0.302 ms and on 06ca04ef, the merge of item 825, 0.402 ms, each in its own pair
+against 8baa5686. The query-path changes between those two commits are item 825's, and the
+rest are reasoner changes, so the eager mode of `minus` most likely became about 0.10 ms
+slower with item 825. The matrix measures that cost in every cell.
 
 The [run record](runs/2026-11-18-post-push-pinned-forge-8baa5686/validation.json) holds
 the binary hashes, the settings, the per-mode medians of `minus`, the analysis script and
@@ -811,13 +813,17 @@ baseline.
 | `optional-count` | streaming | three of four | 1.05 to 1.06 | 0.52 to 5.18 | 0.54 to 5.45 |
 | `distinct-join` | both | 1.05M, 12 threads | 1.05 and 1.07 | 3.58 and 3.77 | 3.76 and 4.02 |
 
-Every server process of a cell agrees on the first four queries. Eager `minus` took 0.31 ms in each process
+Every server process of a cell agrees on `minus`, and with one thread on `regex-iri`,
+`lang-filter` and streamed `optional-chain`. With 12 threads the process medians of the two
+builds overlap for `lang-filter` and streamed `optional-chain`. Eager `minus` took 0.31 ms in each process
 of cc94ac7f at 1.05M triples with one thread and 0.41 ms in each process of 8baa5686, and
-the pinned checks place this cost at item 825. The same cells are faster at 10.5M triples
+the pinned checks place this cost between 321508fe and
+06ca04ef, the range of item 825. The same cells are faster at 10.5M triples
 with 12 threads, where `order-by-full` takes 0.56 to 0.58 of its time in both modes and
 eager `optional-chain` 0.56, and four of the eight cells and modes of `export-500k` are 7% to 15% faster in execution.
 Eager `optional-chain` at that size varied from 38.6 to 47.6 ms between the processes of
-cc94ac7f, which was itself 1.59 of the e52937ca record there. In wall time, streamed `export-500k` is 5% to 6% slower in all four cells and
+cc94ac7f. The e52937ca record took 28.5 ms there, but its compilers differ, so that ratio is
+not a measurement of the code. In wall time, streamed `export-500k` is 5% to 6% slower in all four cells and
 `lang-filter` and `regex-iri` 10% to 12% slower at 10.5M triples with one thread.
 
 ### Execution mode of quick texts in fresh servers
