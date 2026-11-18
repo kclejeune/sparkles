@@ -1455,6 +1455,50 @@ mod timed_tests {
         assert!(failed);
         assert!(!report.disconnected);
     }
+    /// The budget flush of a cursor body under the body timers, as the server runs every
+    /// cursor request. A reader that has stopped reading holds the flush only until the
+    /// idle timer, and the body ends as a budget failure that reports only the bytes that
+    /// reached the channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_budget_cut_with_a_stalled_reader_stays_a_budget_failure() {
+        let (send, end) = oneshot::channel();
+        let control = StreamControl::new(Default::default(), None, Default::default(), None);
+        // as in the untimed test, the budget cuts a chunk while the channel is full
+        let sent = 101 + (CHUNK * 3) as u64;
+        let limit = sent + (CHUNK / 2) as u64;
+        let result = serialize_inner_timed(
+            100,
+            false,
+            Some(limit),
+            Some(control),
+            Some(timeouts()),
+            |w: &mut LimitedWriter<SwitchWriter>| -> sparkles::Result<()> {
+                for _ in 0..10_000_000 {
+                    w.write_all(b"0123456789")?;
+                }
+                Ok(())
+            },
+            move |e| {
+                let _ = send.send(e);
+            },
+        )
+        .await;
+        let Ok(Serialized::Timed {
+            body,
+            abort: _abort,
+        }) = result
+        else {
+            panic!("expected a timed stream");
+        };
+        let report = ended(end).await;
+        assert!(
+            matches!(report.error, Some(Error::BudgetExceeded(_))),
+            "the idle timer must not replace the budget error: {:?}",
+            report.error
+        );
+        assert_eq!(report.bytes, sent, "the unsent chunk must not be reported");
+        assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writer_unwind_is_failed_transfer_and_owned_timer_joins() {
         let (body, _, end) = timed(timeouts(), None, |w| {
