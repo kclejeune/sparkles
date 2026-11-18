@@ -75,6 +75,17 @@ class WorkflowTest(unittest.TestCase):
                 self.assertIn("github.ref == 'refs/heads/main'", job.split("steps:", 1)[0])
                 self.assertIn("actions: write", job)
 
+    def test_pruning_waits_for_every_job_that_saves(self):
+        for name in ("ci.yml", "jvm-bindings.yml", "node-packages.yml", "python-wheels.yml"):
+            with self.subTest(workflow=name):
+                workflow = (ROOT / ".github/workflows" / name).read_text()
+                jobs = dict(re.findall(r"^  ([a-z][a-z-]*):\n(.*?)(?=^  [a-z][a-z-]*:\n|\Z)", workflow, re.M | re.S))
+                saving = {job for job, body in jobs.items()
+                          if ("actions/cache/save" in body and "mbx-store-" in body) or re.search(r"save-if: \$\{\{", body)}
+                needs = re.search(r"needs: \[?([^\]\n]+)", jobs["prune-caches"]).group(1)
+                self.assertTrue(saving)
+                self.assertLessEqual(saving, {n.strip() for n in needs.split(",")})
+
     def test_server_candidates_keep_no_store(self):
         workflow = (ROOT / ".github/workflows/server-artifacts.yml").read_text()
         self.assertNotIn("actions/cache", workflow)

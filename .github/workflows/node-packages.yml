@@ -292,10 +292,10 @@ jobs:
             npm publish "$package" --access public --provenance
           done
 
-  # Each push to main saves new native build caches under keys that end in the commit's SHA, and the earlier
-  # commits' entries would stay until GitHub's 10 GB repository limit evicts them, in an
-  # order that has removed the test build's caches. This job keeps the newest entry of each
-  # family and deletes the others (scripts/gha-cache-prune.py).
+  # Each push to main saves new caches under keys that end in the commit's SHA or a lock
+  # hash, and the earlier entries would stay until GitHub's 10 GB repository limit evicts
+  # them, in an order that has removed the test build's caches. After the jobs that save,
+  # this job keeps the newest entry of each family and deletes the others.
   prune-caches:
     name: Prune superseded caches
     needs: native
