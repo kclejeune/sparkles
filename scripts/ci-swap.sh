@@ -22,6 +22,8 @@ set -euo pipefail
 root_is_device_mapper() {
   local devnum
   devnum=$(mountpoint -d /) || return 0
+  # An anonymous device number, as btrfs and overlay report, names no block device.
+  [ -d "/sys/dev/block/$devnum" ] || return 0
   [ -d "/sys/dev/block/$devnum/dm" ]
 }
 
