@@ -196,7 +196,9 @@ class ChangedCrates(unittest.TestCase):
                 self.assertEqual(cc.cargo_args(), want, value)
 
     def test_nextest_arguments_build_the_workspace(self):
-        with mock.patch.dict(os.environ, {"SPARKLES_CHANGED_PACKAGES": "a b"}):
+        env = {k: v for k, v in os.environ.items() if k != "SPARKLES_TEST_EXCLUDE_GROUP"}
+        env["SPARKLES_CHANGED_PACKAGES"] = "a b"
+        with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(cc.cargo_args("nextest"), "--workspace -E package(a)|package(b)")
 
     def test_doc_arguments_keep_library_packages(self):
