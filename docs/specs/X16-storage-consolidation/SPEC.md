@@ -645,6 +645,36 @@ path writes the generation's prefixes before the tail appends its catalog entry,
 failed prefix write leaves the catalog and the snapshot in step. No on-disk format
 changed.
 
+Phase 4 is built. `LoadPlan::choose` in `store/load_plan.rs` takes a `LoadInputs` and a
+`Sizes` that reads a source's estimate or probes its streams only when the plan depends
+on it, and `load_with`, `replace_with`, `insert_bulk` and `patch_apply` ask it. The
+first commit encoded the four earlier rules in the table test, and the second applied
+the unified rule above with the strict test. The maintainer kept one exception to the
+text of the rule. A batch from `insert_bulk` or a patch under a graph restriction checks
+each quad's graph as it is staged and may still take a rebuild, while loads and
+replacements under a restriction stay transactional. `replace_bulk` now returns the
+quads its sources parsed, duplicates included, through `Builder::input_quads`, as the
+transactional replace and `Store::replace` documented, and `rebuild_locked` returns that
+count. Every reader source of a load or a replacement gets its decoder and its
+`Controlled` stream before the plan is chosen, so a stream that never yields a quad stops
+at the write's deadline whichever plan runs. Before, a load into a store with data, a
+restricted write and a probe skipped at a saturated bound parsed such a stream without
+that check. A replacement into an empty store is a bulk commit, so a first PUT into an
+in-memory dataset is admitted by the size of the generation it builds, as a first POST
+was, and an empty body into an empty store commits an empty generation. On `atlas`, with
+base `8baa5686` and the phase's load path at `2c08d2b0` interleaved, `sparkles load` of
+1.05M quads into an empty store took a median 0.558 s on the base and 0.557 s on the
+phase over seven rounds, and 10.5M quads took 4.448 s and 4.418 s over five, with peak
+RSS within 2%. Another lane's benchmark ran on the host during these rounds, so they
+show parity rather than a publishable time. The ignored `load_plan_timing` test at 1M
+quads measured a stream load into a store with data at 1.57 s to 1.63 s on the bulk path
+against 2.01 s to 2.23 s transactional, persistent and in memory. A first PUT of 10 to
+1,000 quads into an empty dataset took 21 ms to 34 ms on the phase against 0.7 ms to
+8.5 ms on the base, the fixed cost of a rebuild that a first POST already paid on both,
+and item 1079 follows it. The gates were the table test, the entry-point tests, the
+deadline tests at the default and the saturated threshold, lane CI and three review
+rounds. Durability, the write-ahead log and the on-disk formats did not change.
+
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
