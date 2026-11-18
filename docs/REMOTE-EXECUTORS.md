@@ -226,6 +226,13 @@ that names the worker, with the same effect.
 mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
 ```
 
+The worker builds each revision in a 12 GiB scope without swap, the job size that
+qualification admits, with 2 compile jobs. A cold release build of the server ran out of
+memory at the 5 jobs that the cap would otherwise imply. `SPARKLES_BOAT_BUILD_JOBS` sets
+another count from 2 to 8, and a value outside that range is refused before the worker is
+admitted. A cold build of both revisions takes about an hour at 2 jobs, so the worker's
+admitted lifetime must cover both builds, the screen and its reruns.
+
 A Boat screen and a Namespace screen of the same revisions therefore run different
 binaries, and the Boat screen is judged by its ratios and noise against Namespace rather
 than by identical binaries.

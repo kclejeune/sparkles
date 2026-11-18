@@ -25,7 +25,8 @@
 # SPARKLES_NSC_BUILD_RETRIES times (default 8), SPARKLES_NSC_BUILD_RETRY_SECONDS apart
 # (default 20), and a lost reply never starts a second build. The scope must stop within
 # SPARKLES_NSC_BUILD_RUNTIME (default 14400) seconds, sooner when SPARKLES_NSC_BUILD_DEADLINE
-# or a Boat worker's admitted lifetime leaves less (bh_expiry), and the host enforces it. The binary and its build record come back over ssh and the SHA-256 is checked.
+# or a Boat worker's admitted lifetime leaves less (bh_expiry), and the host enforces it. A
+# Boat build runs with a 12G cap and SPARKLES_BOAT_BUILD_JOBS compile jobs (bh_build_env). The binary and its build record come back over ssh and the SHA-256 is checked.
 # The scope is stopped and the scratch directory removed when the build ends in any way:
 # after a failure, and from the caller's EXIT trap (bh_cleanup) after an interrupt or lost
 # contact. A Boat worker keeps the directory as evidence. Cleanup touches only the
@@ -110,6 +111,7 @@ bh_probe() {
 bh_resolve() {
   [ -z "$BH_HOST" ] || return 0
   local want=$BH_ARG h p l u d min listed fallback='' hosts=()
+  case $want in boat:*) bh_build_env "$want" > /dev/null || die "SPARKLES_BOAT_BUILD_JOBS is not valid" ;; esac
   case $want in boat:*) rx_admit "$want" --minimum "${SPARKLES_REMOTE_MIN_LIFETIME:-1800}" > /dev/null || die "Boat build admission failed" ;; esac
   bh_load_config
   min=${SPARKLES_NSC_BUILD_MIN_FREE_GB:-20}
@@ -333,6 +335,29 @@ bh_expiry() {
   echo "$expiry"
 }
 
+# bh_build_env HOST: the environment prefix of the remote build command, empty for an ssh
+# host, which derives its own cap and jobs. Qualification admits a Boat worker for a job of
+# BOAT_JOB_MEMORY_GIB in scripts/boat/metadata-probe.py, so a build there takes a 12G cap
+# with no swap. The jobs that nsc-build-remote.sh would derive from that cap, 5, ran a cold
+# server build out of memory, and the jobs also bound the codegen threads of the server's
+# final rustc through the jobserver. A Boat build therefore gets SPARKLES_BOAT_BUILD_JOBS
+# compile jobs, a whole number from 2 to 8 (default BH_BOAT_BUILD_JOBS). Any other value is
+# refused before the worker is admitted.
+BH_BOAT_BUILD_JOBS=2
+bh_build_env() {
+  case $1 in
+    boat:*)
+      local jobs=${SPARKLES_BOAT_BUILD_JOBS:-$BH_BOAT_BUILD_JOBS}
+      case $jobs in [2-8]) ;; *)
+        echo "SPARKLES_BOAT_BUILD_JOBS is $jobs, not a whole number from 2 to 8" >&2
+        return 1
+        ;;
+      esac
+      echo "SPARKLES_NSC_BUILD_MEMORY_MAX=12G CARGO_BUILD_JOBS=$jobs "
+      ;;
+  esac
+}
+
 # bh_start HOST DIR UNIT ARGS: start the detached build. When the reply is lost, the build's
 # state decides. A build that started, even one that already ended, counts as started, and a
 # start that the host refused sets BH_START_REFUSED to its exit status, so neither is
@@ -347,10 +372,8 @@ bh_start() {
     return 0
   fi
   echo "starting the build to stop by $(date -u -d "@$expiry" +%FT%TZ)"
-  # Qualification admits a Boat worker for a job of BOAT_JOB_MEMORY_GIB in
-  # scripts/boat/metadata-probe.py, so a build there takes that cap.
-  local cap=
-  case $1 in boat:*) cap='SPARKLES_NSC_BUILD_MEMORY_MAX=12G ' ;; esac
+  local cap
+  cap=$(bh_build_env "$1") || die "the build environment for $1 is not valid"
   # shellcheck disable=SC2029
   bh_rx 120 "$1" "${cap}bash $2/bin/nsc-build-remote.sh $2 $3 $expiry $4" < /dev/null || code=$?
   [ "$code" != 0 ] || return 0

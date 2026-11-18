@@ -1114,7 +1114,10 @@ local build, to a scratch directory under `~/lanes/nsc-build` on the host. It bu
 with `scripts/nsc-build.sh` under the host's own Boxington cache, inside a systemd user
 scope named `nsc-build-<commit>-<suffix>` with the gate's memory cap and 2 GiB of swap,
 while it holds the host's heavy lock. On a Boat worker the cap is 12 GiB and the worker's
-user slice allows no swap, so the build has none. The host's `mbx` has to match the
+user slice allows no swap, so the build has none. A Boat build runs 2 compile jobs, which
+also bound the codegen threads of the server's final rustc, because the 5 jobs that the cap
+implies ran a cold server build out of memory. `SPARKLES_BOAT_BUILD_JOBS` sets another count
+from 2 to 8. The host's `mbx` has to match the
 `mise.toml` pin.
 The binary comes back into the same cache entry after a SHA-256 check, and the scratch
 directory is removed when the build ends, also after a failure or Ctrl-C, which also stops
