@@ -78,8 +78,8 @@ adds to this file and does not override it.
   does not know.
 - Features inspired by Fluree are built clean-room. Work from the W3C standards and
   Fluree's public documentation only, and never read Fluree's source code.
-- Performance claims need measurements. `mise run bench:nsc A B` gives a quick A/B on
-  Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
+- Performance claims need measurements. `mise run bench:remote --executor boat:bx_ID A B`
+  gives a quick A/B on a Boat worker, and `mise run bench:nsc A B` on Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
   need an Intel host, and published numbers come from the benchmark host. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 - Run both arms of an A/B comparison on one host with the same compiler and build
@@ -305,17 +305,17 @@ affect and falls back to the whole workspace when a shared root changes. Lanes d
 full gates of their own.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
-batch. One gate runs on the batch, with a Namespace screen
-(`mise run bench:nsc origin/main HEAD`). This provider-specific screen remains the
-required fallback until a replacement is qualified; the Boat placement policy does not
-change its acceptance criteria. `scripts/gate/gate.sh <rev>` runs the gate on the
+batch. One gate runs on the batch, with a query screen on an admitted
+Boat worker (`mise run bench:remote --executor boat:bx_ID --build-host boat:bx_ID
+origin/main HEAD`). The Namespace screen (`mise run bench:nsc origin/main HEAD`) remains
+the fallback when no Boat worker can take the screen, with the same acceptance criteria. `scripts/gate/gate.sh <rev>` runs the gate on the
 configured gate hosts and selects its checks from the batch's diff against `origin/main`.
 It runs the `scripts/ci.sh` tasks, conformance suites and spill matrices that the changed
 files call for, with Clippy and the Rust tests for the packages they can affect, as the
 [batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Build configuration, the CI
 scripts and files that no rule covers run everything. Push when the tests pass and the
 screen shows no query 10% or more slower after the rerun of the flagged queries with more
-rounds, which `bench:nsc` runs on the same instance and reports beside the first pass.
+rounds, which the screen runs on the same worker or instance and reports beside the first pass.
 `scripts/premerge.sh` checks the generated clients, the binding lock files, the Python
 parity list, the doc paths and the script tests in minutes, and runs on the merged batch
 before the gate starts.

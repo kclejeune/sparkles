@@ -32,14 +32,13 @@ Each kind of claim needs a host that can resolve it.
 
 Use available local resources for builds and validation first, with Boat for overflow
 and isolation, as described under [remote executors](DEVELOPMENT.md#remote-executors).
-Keep benchmark workers free for measurements. The quick screen below still uses its
-Namespace-specific harness; a Boat replacement needs qualification before it supplies
-gate evidence. Keep each A/B comparison on one host with matching tools and configuration,
+Keep benchmark workers free for measurements. The quick query screen runs on an admitted Boat
+worker, and the Namespace harness remains its fallback. Keep each A/B comparison on one host with matching tools and configuration,
 and retain the actual host identity with its results.
 
 | Host | Use | Why |
 |---|---|---|
-| Namespace instance, `mise run bench:nsc A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | The instances are noisy shared AMD EPYC virtual machines, so they cannot confirm a change of a few percent. |
+| Boat worker, `mise run bench:remote --executor boat:bx_ID A B`, or a Namespace instance, `mise run bench:nsc A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | Both are shared virtual machines, so they cannot confirm a change of a few percent. Boat workers showed no CPU steal and fewer false first-pass flags than Namespace instances on the same pair of revisions. |
 | `atlas` or `forge`, Intel Core i5-13500 | Effects under about 5%, queries under 0.3 ms and changes sensitive to code generation | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
 | `forge` | Published reference numbers | The main comparison tables use this host and preserve each run's environment. |
 | `wally`, Intel Core i7-12800H with 32 GiB RAM | Separately qualified memory-heavy query recovery | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
@@ -1054,10 +1053,12 @@ separate from workloads. Both arms and all flagged-query reruns stay on one isol
 worker with matching binaries, compiler and runtime configuration. The query defaults,
 answer checks and 1.10 regression threshold match the Namespace command.
 
-Boat adapter contract tests do not qualify the performance screen. The required
-Namespace screen remains in force until item 762 has real lifecycle, workload and
-full-denominator comparison evidence. Small smoke workloads establish transport and
-correctness only. Published numbers still come from the benchmark host.
+The batch query screen runs through `bench:remote` on a Boat worker. A full-denominator
+comparison against the Namespace screen on the same revisions found no CPU steal on the
+Boat worker and 2 false first-pass flags out of 30 queries against Namespace's 3, which
+qualifies it for the screen's 10% rule. The Namespace screen remains the fallback, and
+`bench:nsc-writes` remains the write screen until a Boat write screen is qualified under
+item 762. Small smoke workloads establish transport and correctness only. Published numbers still come from the benchmark host.
 
 ### Namespace query screens
 
