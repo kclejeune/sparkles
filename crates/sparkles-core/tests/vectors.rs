@@ -603,3 +603,62 @@ fn compact_vectors() {
     );
     assert!(e.contains("spk:vectorB64"), "{e}");
 }
+
+/// Vector searches run as cursor operators (item 829). A search with a constant vector is
+/// a leaf bounded by its k. A search whose candidates or query values come from its input
+/// reads the whole input before it ranks, so k of one over candidates split across input
+/// batches of one row still returns the one global winner, as eager execution does.
+#[test]
+fn vector_searches_run_as_cursor_operators() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let s = store(StoreOptions::default());
+    let strict = |rows: usize| CursorOptions {
+        batch_rows: rows,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let bag = |mut c: sparkles_core::sparql::QueryCursor| {
+        let mut out = Vec::new();
+        while let Some(b) = c.next_batch().unwrap() {
+            for r in 0..b.len() {
+                out.push(format!("{:?}", b.row(r).unwrap().values()));
+            }
+        }
+        out.sort();
+        out
+    };
+    let eager = |q: &str| {
+        let r = query(s.snapshot(), q, &QueryOptions::default()).unwrap();
+        let mut out: Vec<String> = r
+            .rows()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{:?}", row.values()))
+            .collect();
+        out.sort();
+        out
+    };
+    for q in [
+        "SELECT ?s ?score { (?s ?score) spk:vectorSearch (ex:emb \"[1,0,0]\"^^spk:vector 3) }",
+        "SELECT ?s ?score { VALUES ?s { ex:a ex:b ex:c ex:d } (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 1 \"candidates:join\") }",
+        "SELECT ?s ?score { ?s a ex:Doc . (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 1 \"candidates:join\") }",
+        "SELECT ?q ?s ?score { VALUES ?q { ex:a ex:c } (?s ?score) spk:vectorSearch (ex:emb ?q 2) }",
+    ] {
+        let q = format!("{P}{q}");
+        let expected = eager(&q);
+        assert!(!expected.is_empty(), "{q}");
+        for rows in [1, 2, 4096] {
+            let c = select_cursor(s.snapshot(), &q, &QueryOptions::default(), &strict(rows))
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(!c.plan().has_materialization(), "{q}");
+            assert_eq!(bag(c), expected, "{q}; {rows}");
+        }
+    }
+    // the global winner of the split candidates
+    let q = format!(
+        "{P}SELECT ?s {{ VALUES ?s {{ ex:a ex:c }} (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 1 \"candidates:join\") }}"
+    );
+    let c = select_cursor(s.snapshot(), &q, &QueryOptions::default(), &strict(1)).unwrap();
+    assert_eq!(bag(c).len(), 1);
+    assert_eq!(eager(&q).len(), 1);
+}
