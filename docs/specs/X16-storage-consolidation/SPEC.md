@@ -698,8 +698,8 @@ processes of user-space instructions, WAL replay of 2,000 commits and both opens
 1.000. The ordered, unordered and checked FSST vocabulary reads counted the same
 instructions as the base. The front-coded reads moved by up to 0.7% of the base in
 either direction, inside the spread of their own processes at one commit. In ten
-processes of each binary, the front-coded random lookups counted 58,303,118 instructions
-in four processes of the base and in six of the stage, and lower counts elsewhere that
+processes of each binary, the front-coded random lookups counted 58.30M instructions in
+four processes of the base and in seven of the stage, and lower counts in the others that
 depend on where the data lands, so the two binaries draw from the same counts and no
 case's range lies above the base's. An intermediate commit of the stage had moved the
 vocabulary cases by up to 3.9% through the single codegen unit's inlining, and the
