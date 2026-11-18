@@ -1088,11 +1088,18 @@ processes of about 7 GiB and 11 GiB on four CPUs. Built together they leave a 16
 runner unresponsive, so the job builds the server's unit tests alone first with
 `mbx test --no-run --workspace --bin sparkles`. The archive commands that follow select
 the same packages, features and profile, so they find those tests fresh and the second
-large compile starts after the first has ended. The job adds only a 2 GiB swap file, where the
+large compile starts after the first has ended. The job adds only 2 GiB of swap, where the
 Doctests job adds 16 GiB, because a large swap lets overlapping compiles thrash for the
 whole job limit instead of ending in an out-of-memory kill with a log. GitHub's image may
-enable a swap file of its own, so the step prints the runner's memory and swap to record
-the total. `scripts/ci-memory.sh` prints the runner's memory, swap,
+enable swap of its own, so the step prints the runner's memory and swap to record
+the total.
+
+`scripts/ci-swap.sh` adds the swap as a file in the root file system. Some of GitHub's
+Linux VMs mount the root on a device-mapper snapshot, and there the job's swap is a zram
+device instead. Under memory pressure the kernel's reclaim wrote swapped pages to a file
+on that snapshot, and each write waited on the snapshot's copy pool, whose jobs needed
+memory to finish. Every task that touched the root then waited in the same place, and
+the VM stopped until the job's limit ended it without a log. `scripts/ci-memory.sh` prints the runner's memory, swap,
 load and largest compilers every 30 seconds while the commands run, and they stop at 38
 minutes and list the processes left. A run that stalls the runner therefore fails inside
 its build step and keeps its log, instead of reaching the job's 45-minute limit with no
@@ -1158,8 +1165,8 @@ The test binaries find the server binary, the UI and their fixtures by paths fix
 they compile. When the build and a test shard run on runners with different checkout
 paths, the shard links the build's path to its own checkout, which needs `sudo` and
 assumes one job at a time on a machine, as on ephemeral runners. A job on a runner with
-at least 24 GiB of memory adds no swap file, and a job that adds one removes it at the end. On a runner whose file
-system refuses one, the job warns and continues. On a large runner the server candidate's
+at least 24 GiB of memory adds no swap, and a job that adds swap removes it at the end. On a runner that
+refuses a swap file or a zram device, the job warns and continues. On a large runner the server candidate's
 container keeps its process limit and drops its 4 CPU and 14 GB limits, and Cargo runs one
 compiler job for each CPU instead of two in total.
 

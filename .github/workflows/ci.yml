@@ -347,41 +347,21 @@ jobs:
         run: &free-disk scripts/ci-free-disk.sh start 60
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      # A compile can exceed the physical memory of a 16 GB runner, so a job adds a swap
-      # file, 16 GiB unless it sets SWAP_GIB. The test build sets 2. It compiles its two
+      # A compile can exceed the physical memory of a 16 GB runner, so a job adds swap,
+      # 16 GiB unless it sets SWAP_GIB, as scripts/ci-swap.sh describes. It is a file in the
+      # root file system, or zram where the root is a device-mapper snapshot, since swap
+      # writes to a file there can hang the VM. The test build sets 2. It compiles its two
       # largest rustc processes one after the other, and the larger of them peaks near
       # 11 GiB. A runner with memory and swap near the 20 GB of two overlapping compiles
       # lets such a regression thrash for the whole job limit, where less swap ends the
-      # build sooner with an out-of-memory kill and its log. GitHub's image may enable a
-      # swap file of its own, which the step does not remove, so it prints the memory and
-      # swap it ends with and a run records the total the runner had. A larger runner needs
-      # no swap file, and a runner whose file system refuses one warns instead.
+      # build sooner with an out-of-memory kill and its log. The step prints the memory and
+      # swap it ends with, so a run records the total the runner had.
       - name: Add swap
         if: runner.os == 'Linux'
         shell: bash
         env:
           SWAP_GIB: "2"
-        run: &add-swap |
-          memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
-          if [ "$memory_kib" -ge $((24 * 1024 * 1024)) ]; then
-            echo "$((memory_kib / 1024 / 1024)) GiB of memory, so no swap file"
-            swapon --show
-            free -h
-            exit 0
-          fi
-          # A name of its own, so a persistent runner never touches another job's swap file
-          swapfile="/swapfile-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
-          if ! sudo fallocate -l "${SWAP_GIB:-16}G" "$swapfile"; then
-            echo '::warning::the runner refused a swap file'
-          elif ! { sudo chmod 600 "$swapfile" && sudo mkswap "$swapfile" > /dev/null &&
-            sudo swapon "$swapfile"; }; then
-            echo '::warning::the runner refused a swap file'
-            sudo rm -f "$swapfile" || true
-          else
-            echo "CI_SWAPFILE=$swapfile" >> "$GITHUB_ENV"
-          fi
-          swapon --show
-          free -h
+        run: &add-swap scripts/ci-swap.sh add
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           cache-bin: false
@@ -477,12 +457,10 @@ jobs:
       - name: Disk space after test archive
         if: ${{ always() }}
         run: &free-disk-report scripts/ci-free-disk.sh report
-      # A persistent runner keeps the machine, so the job removes its own swap file.
+      # A persistent runner keeps the machine, so the job removes its own swap.
       - name: Remove swap
-        if: ${{ always() && env.CI_SWAPFILE != '' }}
-        run: &remove-swap |
-          sudo swapoff "$CI_SWAPFILE" || true
-          sudo rm -f "$CI_SWAPFILE" || true
+        if: ${{ always() && env.CI_SWAP != '' }}
+        run: &remove-swap scripts/ci-swap.sh remove
       # The archives are zstd already.
       - uses: actions/upload-artifact@v4
         with:
@@ -549,7 +527,7 @@ jobs:
         if: ${{ always() }}
         run: *free-disk-report
       - name: Remove swap
-        if: ${{ always() && env.CI_SWAPFILE != '' }}
+        if: ${{ always() && env.CI_SWAP != '' }}
         run: *remove-swap
 
   # Each shard runs a part of the tests from an archive. The settings come from
@@ -665,11 +643,7 @@ jobs:
       - name: Add swap
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          sudo fallocate -l 16G /swapfile-ci
-          sudo chmod 600 /swapfile-ci
-          sudo mkswap /swapfile-ci > /dev/null
-          sudo swapon /swapfile-ci
+        run: *add-swap
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           cache-bin: false
@@ -760,11 +734,7 @@ jobs:
       - name: Add swap
         if: runner.os == 'Linux'
         shell: bash
-        run: |
-          sudo fallocate -l 16G /swapfile-ci
-          sudo chmod 600 /swapfile-ci
-          sudo mkswap /swapfile-ci > /dev/null
-          sudo swapon /swapfile-ci
+        run: *add-swap
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           cache-bin: false
