@@ -24,6 +24,7 @@ fn qopts() -> QueryOpts {
         binding_names: Vec::new(),
         binding_values: Vec::new(),
         no_cache: false,
+        aggregate_errors: None,
     }
 }
 

@@ -10188,6 +10188,7 @@ mod string_order_tests {
                         i,
                         map: &map,
                         dec,
+                        exists: None,
                     };
                     eval(e, &row, &ctx).ok().map(|v| v.into_id(&ctx))
                 };
