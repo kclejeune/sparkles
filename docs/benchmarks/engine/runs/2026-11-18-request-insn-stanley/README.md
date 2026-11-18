@@ -24,8 +24,9 @@ build of 7e272f4d is byte for byte the build of 9acd6d74 on wally. Each director
 `summary.md`. `aa-same` and `bt-1039` were recorded before the script kept the counters'
 run fraction, and their windows were marked as not fully counted whenever the running
 and enabled times differed by rounding, so their summaries are made with
-`--ignore-coverage`. The later runs record a smallest run fraction of 0.999997 on every
-query window. Every pair returned the same answers to every query.
+`--ignore-coverage`. In the later runs the smallest run fraction of a query window is
+0.999578 in `aa-build`, 0.999765 in `bt-678` and 0.999813 in `r1063`, above the 0.999
+that the script requires. Every pair returned the same answers to every query.
 
 `analyze.py.txt` computes the per-query interval deviations and the per-round ratios of
 execution and wall time that the results page quotes. `profiles/` holds the call-graph

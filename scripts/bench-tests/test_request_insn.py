@@ -4,6 +4,7 @@
 """
 
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -23,7 +24,9 @@ COLS = (
 
 def write_samples(d, per_round):
     """per_round: list of (A values, B values) per round, two processes each, in counts per
-    request of 10 requests."""
+    request of 10 requests. A finished run's manifest goes beside them."""
+    with open(os.path.join(d, "manifest.json"), "w") as f:
+        json.dump({"queries": ["q"], "modes": ["streaming"], "complete": True, "problems": []}, f)
     with open(os.path.join(d, "samples.tsv"), "w") as f:
         f.write("\t".join(COLS) + "\n")
         epoch = 0
@@ -70,6 +73,15 @@ class Statistics(unittest.TestCase):
             text, verdict = ri.summary(d, 1.0)
             self.assertEqual(verdict, "invalid")
             self.assertIn("INCOMPLETE", text)
+
+    def test_a_run_without_a_finished_manifest_is_invalid(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "samples.tsv"), "w").write("\t".join(COLS) + "\n")
+            self.assertEqual(ri.summary(d, 1.0)[1], "invalid")
+            write_samples(d, [((1000, 1001), (1000, 1002))] * 6)
+            json.dump({"queries": ["q"], "modes": ["streaming"], "complete": False},
+                      open(os.path.join(d, "manifest.json"), "w"))
+            self.assertEqual(ri.summary(d, 1.0)[1], "invalid")
 
     def test_a_split_side_is_inconclusive_even_when_the_median_passes(self):
         with tempfile.TemporaryDirectory() as d:

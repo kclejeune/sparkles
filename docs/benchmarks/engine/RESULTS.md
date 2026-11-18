@@ -517,8 +517,12 @@ The back tests compared builds whose timing on `atlas` was known.
 | | `export-500k`, streaming | 0.00% | 0.9999-1.0001 | +8.8% execution |
 | Row 1063, 9e3d7954 against 9acd6d74 | `root-limit`, streaming | 0.00% | 0.9999-1.0001 | +20% execution |
 
-The counts flagged item 678 on its two queries and on nothing else, and they missed item
-1039 on every query. The execution times that the same rounds recorded on the busy
+Under streaming the counts flagged item 678 on its two queries and on nothing else, and
+they missed item 1039 on every query. Under automatic execution every run, the
+A-against-A runs included, flagged `str-filter-two` and marked a few other queries as
+split, which is why a flag of an automatic query is rerun under explicit modes. Apart from
+those, `bt-678` flagged the two string queries under automatic execution as well, and
+`bt-1039` flagged only `optional-count`, whose processes split in a single round. The execution times that the same rounds recorded on the busy
 `stanley` rose by 9.5% on the root scan and 9.7% on the export under item 1039, and by 24%
 on `root-limit` under row 1063's build, so the cost was present while the instructions
 did not move. Both builds of row 1063 made the same system calls per request, 6 futex

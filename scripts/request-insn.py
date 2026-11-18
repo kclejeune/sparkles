@@ -486,6 +486,10 @@ def _run_with_bins(a, out, src, bins):
         "load_before": open("/proc/loadavg").read().strip(),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    # the expected queries and modes are on disk before the first sample, and `complete`
+    # is set only once every round ran and the answers were compared
+    manifest["complete"] = False
+    json.dump(manifest, open(os.path.join(out, "manifest.json"), "w"), indent=1)
     if manifest["A"]["compilers"] != manifest["B"]["compilers"]:
         log("warning: A and B were built with different compilers")
     os.sched_setaffinity(0, {a.client_cpu})
@@ -588,6 +592,7 @@ def _run_rounds(a, out, bins, stores, queries, qnames, modes, kernel, server_pmu
     manifest["load_after"] = open("/proc/loadavg").read().strip()
     manifest["ended"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     manifest["problems"] = problems
+    manifest["complete"] = True
     json.dump(manifest, open(os.path.join(out, "manifest.json"), "w"), indent=1)
     for p in problems:
         log(f"FAIL: {p}")
@@ -687,7 +692,7 @@ def summary(out, threshold, large_threshold=0.25, ignore_coverage=False):
     except OSError:
         man = {}
     lines = ["# Per-request instruction counts", ""]
-    if man:
+    if "A" in man:
         for v in ("A", "B"):
             m = man[v]
             lines.append(f"- {v}: {m.get('label') or m['path']}, sha256 {m['sha256'][:16]}, {m['compilers']}")
@@ -724,6 +729,15 @@ def summary(out, threshold, large_threshold=0.25, ignore_coverage=False):
         if r["query"] != "_idle" and k not in keys:
             keys.append(k)
     invalid = bool(uncovered) or bool(man.get("problems"))
+    # a run clears nothing without its manifest, before its last round and answer check,
+    # or without a single comparison
+    # (a manifest without the field predates it and was written after the last round)
+    if not man or man.get("complete", True) is not True:
+        invalid = True
+    if not man:
+        lines.append("FAIL: no manifest.json, so the expected queries and the answer check are unknown.")
+    elif man.get("complete") is False:
+        lines.append("FAIL: the run did not finish, so its answers were not compared.")
     for q in man.get("queries", []):
         for m in man.get("modes", []):
             if (q, m or "-") not in keys:
@@ -806,6 +820,9 @@ def summary(out, threshold, large_threshold=0.25, ignore_coverage=False):
             lines.append(f"| {q} | {mode} | {fmt_count(ka)} | {fmt_count(kb)} | {st.median(ratios):.4f} |")
         lines.append("")
     lines.append(f"{len(flagged)} of {len(keys)} flagged" + (f": {', '.join(flagged)}" if flagged else ""))
+    if not keys:
+        invalid = True
+        lines.append("FAIL: the run holds no comparison.")
     verdict = "invalid" if invalid else "flagged" if flagged else "clean"
     lines.append(f"verdict: {verdict}")
     return "\n".join(lines) + "\n", verdict
