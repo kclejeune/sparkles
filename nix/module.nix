@@ -165,6 +165,10 @@ let
   ]
   ++ lib.optional cfg.unionDefaultGraph "--union-default-graph"
   ++ [
+    "--aggregate-errors"
+    cfg.aggregateErrors
+  ]
+  ++ [
     "serve"
     "--data"
     cfg.dataDir
@@ -578,6 +582,21 @@ in
       type = types.bool;
       default = false;
       description = "Treat the default graph as the union of all named graphs (TDB2 `unionDefaultGraph`).";
+    };
+
+    aggregateErrors = mkOption {
+      type = types.enum [
+        "jena"
+        "sparkles"
+        "spec"
+      ];
+      default = "jena";
+      description = ''
+        How aggregates treat errors in the datasets that have no setting of their own
+        (`--aggregate-errors`). `jena` gives Apache Jena's answers, `sparkles` lets MIN and
+        MAX pass over errors, and `spec` follows the text of SPARQL. See "Aggregate errors"
+        in `docs/API.md`.
+      '';
     };
 
     auth.configFile = mkOption {

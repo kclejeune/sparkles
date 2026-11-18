@@ -119,6 +119,12 @@ describe('query', () => {
     expect(r.meta.totalRows).toBe(0);
   });
 
+  it('passes the reading of errors in aggregates', async () => {
+    const calls = stubFetch(() => jsonResponse({ queryType: 'SELECT', vars: [], rows: [] }));
+    await api.query('ds', 'SELECT * {}', { aggregateErrors: 'sparkles' });
+    expect(calls[0].url).toContain('aggregate-errors=sparkles');
+  });
+
   it('sends a query-time mode with its profile and reads what it derived', async () => {
     const calls = stubFetch(() => {
       const r = jsonResponse({ queryType: 'SELECT', vars: ['x'], rows: [] });

@@ -30,18 +30,23 @@ impl Store {
                     Err(e) => return Err(e.into()),
                 }
             } else {
-                let mut v = serde_json::to_value(&s).expect("settings serialize");
-                v.as_object_mut()
-                    .expect("an object")
-                    .insert("format".into(), 1.into());
-                let mut bytes = serde_json::to_vec_pretty(&v).expect("json serializes");
-                bytes.push(b'\n');
-                write_atomic(&path, &bytes)?;
+                write_atomic(&path, &settings_bytes(&s))?;
             }
         }
         *cur = s;
         Ok(())
     }
+}
+
+/// The contents of `describe.json` for setting `s`.
+pub(crate) fn settings_bytes(s: &DescribeOptions) -> Vec<u8> {
+    let mut v = serde_json::to_value(s).expect("settings serialize");
+    v.as_object_mut()
+        .expect("an object")
+        .insert("format".into(), 1.into());
+    let mut bytes = serde_json::to_vec_pretty(&v).expect("json serializes");
+    bytes.push(b'\n');
+    bytes
 }
 
 /// Read a dataset's `describe.json` (the defaults without one).

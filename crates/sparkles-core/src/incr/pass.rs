@@ -143,6 +143,8 @@ pub struct Pass<'a> {
     pub base: Option<oxiri::Iri<String>>,
     /// the dataset's inference, which evaluations read with
     pub inference: Option<Arc<super::inference::Inference>>,
+    /// how the circuit's aggregates treat errors, the dataset's reading
+    pub aggregate_errors: crate::sparql::AggregateErrors,
     /// the annotation the circuit keeps (spec F13 §5)
     pub prov: super::prov::Provenance,
     /// the keys of quads met so far, when the circuit keeps an annotation
@@ -175,6 +177,7 @@ impl<'a> Pass<'a> {
         vars: &'a [String],
     ) -> Pass<'a> {
         let full = old.is_none();
+        let aggregate_errors = new.aggregate_errors;
         Pass {
             new,
             old,
@@ -190,6 +193,7 @@ impl<'a> Pass<'a> {
             max_memory_bytes: None,
             base: None,
             inference: None,
+            aggregate_errors,
             prov: super::prov::Provenance::None,
             facts: None,
             #[cfg(test)]
@@ -411,6 +415,7 @@ impl<'a> Pass<'a> {
             };
             let mut c = Ctx::new(snap);
             c.use_cache = false;
+            c.aggregate_errors = self.aggregate_errors;
             c.base_iri = self.base.clone();
             c.deadline = self.control.deadline;
             c.cancel = self.control.cancel.flag();
@@ -600,6 +605,7 @@ impl<'a> Pass<'a> {
             allow_service: false,
             forbid_service: true,
             defaults_applied: true,
+            aggregate_errors: Some(self.aggregate_errors),
             rdfs: self.inference.as_ref().and_then(|i| i.rdfs.clone()),
             default_graph_extra: self
                 .inference

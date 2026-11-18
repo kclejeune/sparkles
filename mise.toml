@@ -54,7 +54,7 @@ global_env = [
   "RUSTFLAGS", "CARGO_FEATURES", "CARGO_INCREMENTAL", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
   "MBX_INCREMENTAL", "MBX_LEARNED_INCREMENTAL", "MBX_EAGER_INCREMENTAL", "MBX_LINKER",
   "MBX_SEED_INCREMENTAL", "MBX_VERIFY", "MBX_VERIFY_SAMPLE_RATE",
-  "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS",
+  "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_W3C_AGGREGATE_ERRORS", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS",
   "SPARKLES_CHANGED_PACKAGES", "SPARKLES_TEST_EXCLUDE_GROUP",
 ]
 
@@ -520,6 +520,13 @@ description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
 # Each suite and cursor batch size is its own test with its own state, so the tests run
 # in parallel. Each summary is one line, so their output stays readable.
 run = "mbx test -p sparkles-core --test w3c -- --nocapture"
+
+[tasks."test:w3c:aggregate-errors"]
+description = "The W3C SPARQL suites under the sparkles and spec readings of errors in aggregates (test:w3c runs the default, jena)"
+run = [
+  "SPARKLES_W3C_AGGREGATE_ERRORS=sparkles mbx test -p sparkles-core --test w3c -- --nocapture",
+  "SPARKLES_W3C_AGGREGATE_ERRORS=spec mbx test -p sparkles-core --test w3c -- --nocapture",
+]
 
 [tasks."test:shacl"]
 description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and node expression tests and the SHACLC test pairs"

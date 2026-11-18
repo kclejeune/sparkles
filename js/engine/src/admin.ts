@@ -109,6 +109,17 @@ export interface Setting<T = Configuration> {
   set(value: T, options?: UpdateOptions): Promise<unknown>;
   reset(options?: UpdateOptions): Promise<unknown>;
 }
+/** How aggregates treat errors (see "Aggregate errors" in API.md). */
+export type AggregateErrors = 'jena' | 'sparkles' | 'spec';
+/**
+ * The reading of errors in aggregates. `get` also reports `source` (`dataset` or
+ * `default`) and the readings there are, and `set` takes `{ mode }`.
+ */
+export interface AggregateErrorsSetting {
+  mode: AggregateErrors;
+  source?: 'dataset' | 'default';
+  modes?: AggregateErrors[];
+}
 const at = (v: string | number | bigint = 'head') =>
   typeof v === 'string' ? v : 'commit:' + unsigned(v);
 const setting = <T>(call: AdminCall, name: string): Setting<T> => ({
@@ -890,6 +901,7 @@ export class Administration {
       prune: (o?: UpdateOptions) => call<bigint>('history.prune', {}, o, true),
     };
     this.settings = {
+      aggregateErrors: setting<AggregateErrorsSetting>(call, 'aggregateErrors'),
       describe: setting(call, 'describe'),
       compaction: setting(call, 'compaction'),
       quota: {

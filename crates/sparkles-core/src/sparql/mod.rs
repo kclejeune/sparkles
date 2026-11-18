@@ -1,5 +1,6 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
+pub mod aggerrors;
 pub mod aggext;
 pub mod algorun;
 pub mod algosvc;
@@ -66,6 +67,7 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::ioacct;
 use crate::store::Snapshot;
+pub use aggerrors::AggregateErrors;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use cursor::{
     AskResult, CursorOptions, CursorPlan, CursorStats, CursorStatus, ExecutionMode, FallbackPolicy,
@@ -204,6 +206,9 @@ pub struct QueryOptions {
     /// (`None`: the store's setting). Unlike a protocol dataset whose default graph is
     /// `urn:x-arq:UnionGraph`, it leaves the named graphs as they are.
     pub union_default_graph: Option<bool>,
+    /// How aggregates treat errors and values that are not strings for this request
+    /// (`None`: the snapshot's, which is the store's setting). See [`AggregateErrors`].
+    pub aggregate_errors: Option<AggregateErrors>,
     /// Whether these options already hold a dataset's query defaults, which are RDFS on
     /// read, the overlay of materialized inferences and the DESCRIBE setting.
     /// `sparkles::Dataset::query_options` returns options with this set, and a
@@ -770,6 +775,7 @@ fn make_ctx_input_policy(
     if let Some(o) = opts.optimizations {
         ctx.opt = o;
     }
+    ctx.aggregate_errors = opts.aggregate_errors.unwrap_or(ctx.snap.aggregate_errors);
     ctx.base_iri = base.cloned();
     let mut ds = DatasetSpec::default();
     if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {

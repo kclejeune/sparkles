@@ -6553,17 +6553,22 @@ pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
     /// SUM / AVG: an exact integer sum while every value is an inline integer, then the
-    /// generic numeric sum; `None` once a value was unbound or not numeric. The integer
-    /// sum is held in an `i128`, so that a sum whose result fits an `xsd:integer` is found
-    /// whatever the order of its rows, and only the result is checked
+    /// generic numeric sum; `ok` is false once a value was unbound or not numeric. The
+    /// integer sum is held in an `i128`, so that a sum whose result fits an
+    /// `xsd:integer` is found whatever the order of its rows, and only the result is
+    /// checked. `errs` counts the rows whose argument was an error, apart from values
+    /// that are not numbers, for the reading in which AVG over only errors is zero.
     Sum {
         int: i128,
         generic: Option<Value>,
         ok: bool,
         rows: u64,
+        errs: u64,
     },
-    /// MIN / MAX: the best id and its value
-    Best(Option<Id>, Option<Value>),
+    /// MIN / MAX: the best id and its value, and the count of arguments that were
+    /// errors, which some readings make the result unbound (see
+    /// [`super::AggregateErrors`])
+    Best(Option<Id>, Option<Value>, u64),
     Sample(Option<Id>),
     /// ARQ's variance and deviation aggregates
     Stat(super::aggext::Arq, super::aggext::StatAcc),
@@ -6580,8 +6585,9 @@ impl AggState {
                 generic: None,
                 ok: true,
                 rows: 0,
+                errs: 0,
             },
-            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None),
+            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
             AggregateFunction::Sample => AggState::Sample(None),
             _ => AggState::Count(0),
         }
@@ -6597,9 +6603,11 @@ impl AggState {
                 generic,
                 ok,
                 rows,
+                errs,
             } => {
                 *rows += 1;
                 let id = id.unwrap_or(Id::UNDEF);
+                *errs += u64::from(id.is_undef());
                 if !*ok {
                     return;
                 }
@@ -6631,8 +6639,9 @@ impl AggState {
                     None => *ok = false,
                 }
             }
-            AggState::Best(best, best_v) => {
+            AggState::Best(best, best_v, errs) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
+                    *errs += 1;
                     return;
                 };
                 let v = ctx.value(id);
@@ -6675,15 +6684,18 @@ impl AggState {
                     generic,
                     ok,
                     rows,
+                    errs,
                 },
                 AggState::Sum {
                     int: oint,
                     generic: ogeneric,
                     ok: ook,
                     rows: orows,
+                    errs: oerrs,
                 },
             ) => {
                 *rows += orows;
+                *errs += oerrs;
                 if !*ok {
                     return true;
                 }
@@ -6708,7 +6720,8 @@ impl AggState {
                     _ => *ok = false,
                 }
             }
-            (AggState::Best(best, best_v), AggState::Best(Some(id), v)) => {
+            (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
+                *errs += oerrs;
                 let better = match best_v.as_ref() {
                     None => best.is_none(),
                     Some(b) => {
@@ -6725,7 +6738,7 @@ impl AggState {
                     *best_v = v;
                 }
             }
-            (AggState::Best(..), AggState::Best(None, _)) => {}
+            (AggState::Best(_, _, errs), AggState::Best(None, _, oerrs)) => *errs += oerrs,
             (AggState::Sample(x), AggState::Sample(y)) => {
                 if x.is_none() {
                     *x = y;
@@ -6757,6 +6770,7 @@ impl AggState {
                 generic: None,
                 ok: true,
                 rows,
+                ..
             } => {
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
@@ -6780,7 +6794,16 @@ impl AggState {
                 generic,
                 ok,
                 rows,
+                errs,
             } => {
+                // AVG is Sum over Count, and Count leaves the errors out
+                if rows > 0
+                    && errs == rows
+                    && matches!(agg.func, AggregateFunction::Avg)
+                    && ctx.aggregate_errors.avg_of_errors_zero()
+                {
+                    return ctx.intern_value(&Value::Integer(0.into()));
+                }
                 if !ok {
                     return Id::UNDEF;
                 }
@@ -6802,7 +6825,14 @@ impl AggState {
                 };
                 v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
             }
-            AggState::Best(best, _) => best.unwrap_or(Id::UNDEF),
+            AggState::Best(best, _, errs) => {
+                let min = matches!(agg.func, AggregateFunction::Min);
+                if errs > 0 && ctx.aggregate_errors.best_errs(min) {
+                    Id::UNDEF
+                } else {
+                    best.unwrap_or(Id::UNDEF)
+                }
+            }
             AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
             AggState::Stat(arq, acc) => acc.finish(ctx, arq),
         }
@@ -6884,6 +6914,9 @@ pub(super) fn aggregate(
         }
         AggregateFunction::Min | AggregateFunction::Max => {
             let is_min = matches!(agg.func, AggregateFunction::Min);
+            if vals.iter().any(|v| v.is_err()) && ctx.aggregate_errors.best_errs(is_min) {
+                return Id::UNDEF;
+            }
             let mut best: Option<Id> = None;
             let mut best_v: Option<Value> = None;
             for id in vals.iter().filter_map(|v| v.ok()) {
@@ -6908,9 +6941,20 @@ pub(super) fn aggregate(
         }
         AggregateFunction::Sample => return vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF),
         AggregateFunction::GroupConcat { separator } => {
+            if agg.distinct
+                && rows.is_empty()
+                && ctx.aggregate_errors.distinct_concat_of_nothing_unbound()
+            {
+                return Id::UNDEF;
+            }
             let sep = separator.as_deref().unwrap_or(" ");
             let mut parts = Vec::new();
+            let strings = ctx.aggregate_errors.concat_strings_only();
             for v in values() {
+                // CONCAT takes only strings
+                if strings && !v.is_string() {
+                    return Id::UNDEF;
+                }
                 let Ok(s) = v.lexical() else { return Id::UNDEF };
                 parts.push(s.to_string());
             }

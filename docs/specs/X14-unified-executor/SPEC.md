@@ -1054,6 +1054,45 @@ returned the same answers. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#grouping-operator) keep the run
 record.
 
+### Readings of errors in aggregates
+
+Item 1064 makes the treatment of errors in MIN, MAX, AVG and GROUP_CONCAT a setting,
+`aggregate-errors`, with the readings `jena`, `sparkles` and `spec`. `jena` is the
+default on every surface. The readings differ only when the aggregates finish, so the
+running accumulators, the per-group kernel and the incremental group operator keep a
+count of the arguments that were errors and decide at `finish`. A count rather than a
+flag keeps retraction exact, since a group that loses its last error answers again as
+if it never had one, and it keeps item 1066's merges of partial states exact. A query's
+reading comes from `QueryOptions::aggregate_errors`, else the dataset's setting in
+`aggregate-errors.json`, else the store's option, which is the server's default.
+
+The `jena` reading was fixed by running ARQ 6.2.0 on every aggregate, with and without
+DISTINCT and over a variable and an expression, for groups with unbound values, type
+errors, only errors and no rows. The fixture `tests/fixtures/aggregate-errors/` keeps
+that output, and the `jena` reading gives every answer in it apart from SAMPLE's choice
+and the digits beyond 18 of a decimal AVG, which item 1084 holds. Jena's rule turned out
+wider than the three cases of the item only where the engine already agreed, so an error
+makes SUM, AVG, MIN, MAX and GROUP_CONCAT unbound and COUNT and SAMPLE pass over it. The
+one further difference was `GROUP_CONCAT(DISTINCT …)` over no rows, which ARQ makes
+unbound and the `jena` reading follows. The planner's shortcuts were audited, and only
+the COUNT plans assume anything about errors, which every reading shares.
+
+Materialized and incrementally maintained state follows the dataset's reading, else the
+server's. Views and live queries run under it, switch when it changes as they switch on
+a change of inference, and fingerprint their checkpoints with it. A query whose own
+reading differs never reads or writes the maintained state. It evaluates the view's
+query from the data at its snapshot, and its plan notes the fallback. A Group node names
+a reading other than `jena`, which also keys the result cache. The group state's new
+error counts changed the incremental compiler's version, so a checkpoint of an earlier
+release is refused and the view is rebuilt from the data, and no file format changed.
+
+The W3C SPARQL suites pass under all three readings, which
+`mise run test:w3c:aggregate-errors` checks for the two readings that are not the default.
+None of their tests tells the readings apart. `agg-err-01` averages a group that holds a
+string, which leaves AVG unbound under every reading, and their MIN and MAX tests read
+groups in which no value is an error, so the fixture of ARQ's answers in
+`sparkles-core/tests/aggregate_errors.rs` is what separates the readings.
+
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries

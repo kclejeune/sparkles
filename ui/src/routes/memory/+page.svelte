@@ -90,7 +90,9 @@
     if (!name) return;
     void section(
       'agents',
-      () => api.select(name, AGENTS_QUERY),
+      // the last write of an agent whose activities have a time, when some have none,
+      // whatever reading the dataset sets (roadmap item 1064)
+      () => api.select(name, AGENTS_QUERY, { aggregateErrors: 'sparkles' }),
       (s) => (agents = s),
       name,
     );

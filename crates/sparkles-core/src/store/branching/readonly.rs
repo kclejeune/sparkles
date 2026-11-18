@@ -812,6 +812,7 @@ impl Store {
                     cache: &self.cache,
                     results: &self.results,
                     union_default_graph: set.opts.union_default_graph,
+                    aggregate_errors: set.opts.aggregate_errors,
                     geo_op_vertices: set.opts.geo_op_vertices,
                     change_log: Some(log.value),
                 },

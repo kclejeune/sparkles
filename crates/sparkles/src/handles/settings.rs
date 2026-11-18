@@ -5,6 +5,7 @@
 use crate::Dataset;
 use crate::error::Result;
 use crate::history::{CatalogHorizon, HistoryStatus, Retention, Schedule};
+use crate::sparql::AggregateErrors;
 use crate::sparql::describe::{DescribeMode, DescribeOptions};
 use crate::store::{
     ChangeLogSettings, ChangeLogStatus, CompactionMeasures, CompactionSettings, QuotaStatus,
@@ -29,6 +30,14 @@ impl Settings {
     /// How DESCRIBE describes a resource (`describe.json`).
     pub fn describe(&self) -> DescribeSetting {
         DescribeSetting {
+            ds: self.ds.clone(),
+        }
+    }
+
+    /// How aggregates treat errors and values that are not strings
+    /// (`aggregate-errors.json`).
+    pub fn aggregate_errors(&self) -> AggregateErrorsSetting {
+        AggregateErrorsSetting {
             ds: self.ds.clone(),
         }
     }
@@ -208,6 +217,60 @@ impl DescribeSetting {
     pub fn status(&self) -> DescribeStatus {
         DescribeStatus::of(&self.get())
     }
+}
+
+/// How the dataset's aggregates treat errors and values that are not strings, unless a
+/// query chooses (see [`AggregateErrors`]). Without a setting of its own the dataset
+/// follows the store's option, which is the server's default.
+#[derive(Clone)]
+pub struct AggregateErrorsSetting {
+    ds: Dataset,
+}
+
+impl AggregateErrorsSetting {
+    /// The reading the dataset's queries use: its own, else the store's option.
+    pub fn get(&self) -> AggregateErrors {
+        self.ds.store().aggregate_errors()
+    }
+
+    /// Give the dataset a reading of its own. Its views and live queries evaluate again
+    /// under it.
+    pub fn set(&self, m: AggregateErrors) -> Result<()> {
+        self.ds.store().set_aggregate_errors_setting(Some(m))?;
+        self.ds.inner.views.kick();
+        Ok(())
+    }
+
+    /// Remove the dataset's own reading, so that the store's option applies.
+    pub fn reset(&self) -> Result<()> {
+        self.ds.store().set_aggregate_errors_setting(None)?;
+        self.ds.inner.views.kick();
+        Ok(())
+    }
+
+    /// The setting as `GET /$/aggregate-errors/{ds}` reports it.
+    pub fn status(&self) -> AggregateErrorsStatus {
+        AggregateErrorsStatus {
+            mode: self.get(),
+            source: if self.ds.store().aggregate_errors_setting().is_some() {
+                SettingSource::Dataset
+            } else {
+                SettingSource::Default
+            },
+            modes: AggregateErrors::ALL.to_vec(),
+        }
+    }
+}
+
+/// The reading of errors in aggregates as `GET /$/aggregate-errors/{ds}` reports it:
+/// the reading, whether the dataset has one of its own, and the readings there are.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AggregateErrorsStatus {
+    pub mode: AggregateErrors,
+    pub source: SettingSource,
+    pub modes: Vec<AggregateErrors>,
 }
 
 /// Whether a setting is the dataset's own or the defaults.

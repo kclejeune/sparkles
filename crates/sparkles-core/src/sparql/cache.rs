@@ -551,6 +551,12 @@ pub(super) fn write_view_key(ctx: &Ctx, mut s: impl std::fmt::Write) -> std::fmt
 fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
     let mut s = view_key(ctx);
     s.reserve(256);
+    // Another reading of errors changes the answers of aggregates, including those of
+    // subqueries planned while the query runs, such as a correlated LATERAL's right
+    // side, whose Group is not a child of the node the key describes.
+    if ctx.aggregate_errors != super::AggregateErrors::default() {
+        let _ = write!(s, "a{}|", ctx.aggregate_errors);
+    }
     write_node(n, ctx, &mut s).then_some(s)
 }
 

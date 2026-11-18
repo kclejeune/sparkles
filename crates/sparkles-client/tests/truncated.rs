@@ -91,7 +91,9 @@ async fn a_cut_off_select_answer_is_an_error() {
     .await;
     let client = Client::new(&base).unwrap();
     let ds = client.dataset("ds");
-    let opts = QueryOptions::new().execution(Execution::Eager);
+    let opts = QueryOptions::new()
+        .execution(Execution::Eager)
+        .aggregate_errors(sparkles_client::AggregateErrors::Spec);
     let result = ds.query_with("SELECT ?s WHERE {?s ?p ?o}", &opts).await;
     let failed = match result.and_then(|r| r.into_solutions()) {
         Err(_) => true,
@@ -109,4 +111,5 @@ async fn a_cut_off_select_answer_is_an_error() {
     assert!(failed, "a truncated JSON body ended cleanly");
     // the opt-out reaches the server
     assert!(seen.lock().unwrap()[0].contains("execution=eager"));
+    assert!(seen.lock().unwrap()[0].contains("aggregate-errors=spec"));
 }

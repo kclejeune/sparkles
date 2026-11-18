@@ -1212,6 +1212,11 @@ export type QueryOptions = {
   reasoningProfile?: QueryTimeProfile;
   /** Bypass the server's result cache. */
   nocache?: boolean;
+  /**
+   * `aggregate-errors=`: how MIN, MAX, AVG and GROUP_CONCAT treat errors. The UI's own
+   * queries that want the least or greatest value present ask for `sparkles`.
+   */
+  aggregateErrors?: 'jena' | 'sparkles' | 'spec';
   /** Read a past state: `head`, `42`, `commit:42`, `time:<RFC 3339>`, `snapshot:NAME`. */
   at?: string;
   signal?: AbortSignal;
@@ -1221,6 +1226,7 @@ function queryParams(opts: QueryOptions): string {
   const p = new URLSearchParams();
   if (opts.at) p.set('at', opts.at);
   if (opts.nocache) p.set('nocache', 'true');
+  if (opts.aggregateErrors) p.set('aggregate-errors', opts.aggregateErrors);
   if (opts.send != null) p.set('send', String(opts.send));
   if (opts.execution) p.set('execution', opts.execution);
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));

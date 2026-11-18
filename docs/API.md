@@ -746,6 +746,9 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/describe/{ds}`           | *Extension.* The dataset's DESCRIBE setting. See [DESCRIBE](#describe). |
 | PUT    | `/$/describe/{ds}`           | *Extension.* Replaces the DESCRIBE setting with the JSON object's options: `mode`, `labels`, `reifiers`, `maxTriples` and `maxDepth`. Needs `admin`. `400` for a malformed body, `403` on a read-only server. |
 | DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
+| GET    | `/$/aggregate-errors/{ds}`   | *Extension.* How the dataset's aggregates read errors. See [Aggregate errors](#aggregate-errors). |
+| PUT    | `/$/aggregate-errors/{ds}`   | *Extension.* Sets the dataset's reading from the JSON object's `mode`, which is `jena`, `sparkles` or `spec`. Needs `admin`. `400` for a malformed body, `403` on a read-only server. |
+| DELETE | `/$/aggregate-errors/{ds}`   | *Extension.* Removes the dataset's reading, so that it follows the server's default. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
 | DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, a reasoning run or a vector projection. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, `read` on the whole dataset for a `vector-projection`, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
@@ -2755,6 +2758,9 @@ Query parameters beyond the standard protocol:
 * `describe`, `describe-labels`, `describe-reifiers`, `describe-max-triples` and
   `describe-max-depth` choose how a DESCRIBE query describes a resource. See
   [DESCRIBE](#describe).
+* `aggregate-errors=jena|sparkles|spec` chooses how the query's MIN, MAX, AVG and
+  GROUP_CONCAT treat errors, over the dataset's setting. Any other value is a `400`. See
+  [Aggregate errors](#aggregate-errors).
 
 ### CSV and TSV uploads
 
@@ -3354,6 +3360,52 @@ and the bulk requests sent again.
 
 Jena's slice-aware cache, which serves overlapping LIMIT and OFFSET ranges from stored
 pages, and its management functions `se:cacheRm` and `se:cacheLs` are not supported.
+
+### Aggregate errors
+
+SPARQL leaves room for more than one reading of what MIN, MAX, AVG and GROUP_CONCAT give
+when an argument is an error, such as an unbound variable, and engines differ. Each
+query runs under one of three readings, and `jena` is the default.
+
+| Reading | MIN and MAX over an error | AVG over only errors | GROUP_CONCAT of an IRI or a number |
+|---|---|---|---|
+| `jena` (default) | Unbound. | Unbound. | Its lexical form. |
+| `sparkles` | The other values decide. | Unbound. | Its lexical form. |
+| `spec` | MIN is unbound, and the other values decide MAX. | `0`. | Unbound. |
+
+The `jena` reading gives Apache Jena's answers. It also makes `GROUP_CONCAT(DISTINCT …)`
+over no rows unbound, as Jena does, where the other readings give `""`. The `sparkles`
+reading is the engine's earlier behaviour. The `spec` reading follows the text of SPARQL
+1.1 and 1.2. Its MIN and MAX order values as ORDER BY does, with errors first, its AVG
+is Sum over Count after Count leaves out the errors, and its GROUP_CONCAT is CONCAT over
+the values, which takes only strings. In every reading an error makes SUM, AVG and
+GROUP_CONCAT unbound, and COUNT and SAMPLE pass over errors. The
+[querying guide](querying/README.md#aggregate-errors) gives examples.
+
+A request's `aggregate-errors` parameter sets the reading of one query, or of the WHERE
+clauses of one update at `/{ds}/update`. Without it the request takes the dataset's
+setting, and a dataset without a setting takes the server's
+default, which `sparkles serve --aggregate-errors` sets. The setting lives at
+`/$/aggregate-errors/{ds}`. `GET` needs read access and returns `mode`, `source`
+(`dataset` or `default`) and the list of `modes`. `PUT` with `{"mode": "spec"}` sets the
+dataset's reading, and `DELETE` removes it. Both need admin, and a read-only server
+refuses them with `403`. A persistent dataset keeps its setting in
+`aggregate-errors.json`. Branches copy the setting when they are created, and backups
+hold it, including backups of in-memory datasets.
+
+Materialized views and live queries follow the dataset's reading and evaluate again when
+it changes. A query that names another reading does not read a view's maintained state.
+It evaluates the view's query from the data instead, and its plan and its EXPLAIN output
+carry the `view-evaluated` warning. A plan's
+Group operator names the reading when it is not `jena`.
+
+```sh
+curl -X PUT localhost:3030/$/aggregate-errors/ds -H 'Content-Type: application/json' \
+  -d '{"mode": "spec"}'
+curl 'localhost:3030/ds/sparql?aggregate-errors=sparkles' \
+  --data-urlencode 'query=SELECT (MIN(?v) AS ?m) WHERE { OPTIONAL { ?s <http://example.org/p> ?v } }'
+sparkles query --loc db --aggregate-errors spec 'SELECT (AVG(?v) AS ?a) WHERE { ?s ?p ?v }'
+```
 
 ### DESCRIBE
 

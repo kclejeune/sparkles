@@ -15,6 +15,8 @@ _Format = Union[RdfFormat, str]
 # a DESCRIBE mode ("cbd", "scbd", "outgoing"), or options: mode, labels, reifiers,
 # max_triples and max_depth (None or 0: no limit)
 _Describe = Union[str, Mapping[str, Union[str, bool, int, None]]]
+# how aggregates treat errors: "jena" (the default), "sparkles" or "spec"
+_AggregateErrors = str
 _Subject = Union[NamedNode, BlankNode]
 _Term = Union[NamedNode, BlankNode, Literal, Triple]
 _GraphName = Union[NamedNode, BlankNode, DefaultGraph]
@@ -448,6 +450,7 @@ class Transaction:
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> _QueryResult: ...
     def update(
         self,
@@ -460,6 +463,7 @@ class Transaction:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...
     def _apply(self, ops: Iterable[tuple[bool, Quad]]) -> tuple[int, int, dict[str, str]]: ...
     def _quads_iter(
@@ -532,6 +536,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> _QueryResult: ...
     def select(
         self,
@@ -550,6 +555,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> QuerySolutions: ...
     def select_cursor(
         self,
@@ -568,6 +574,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
         batch_rows: int = 4096,
         batch_bytes: int = 1048576,
         allow_materialization: bool = True,
@@ -589,6 +596,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
         batch_rows: int = 4096,
         batch_bytes: int = 1048576,
         allow_materialization: bool = True,
@@ -610,6 +618,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> bool: ...
     def construct(
         self,
@@ -628,6 +637,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> QueryTriples: ...
     def update(
         self,
@@ -640,6 +650,7 @@ class Dataset:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...
     def apply_patch(
         self, data: str | bytes, binary: bool = False, *, message: str | None = None
@@ -1154,6 +1165,8 @@ class History:
 @final
 class Settings:
     @property
+    def aggregate_errors(self) -> AggregateErrorsSetting: ...
+    @property
     def compaction(self) -> CompactionSetting: ...
     @property
     def describe(self) -> DescribeSetting: ...
@@ -1176,6 +1189,12 @@ class DescribeSetting:
     def get(self, /) -> dict[str, Any]: ...
     def reset(self, /) -> dict[str, Any]: ...
     def set(self, /, config: _Describe) -> None: ...
+
+@final
+class AggregateErrorsSetting:
+    def get(self, /) -> dict[str, Any]: ...
+    def reset(self, /) -> dict[str, Any]: ...
+    def set(self, /, mode: _AggregateErrors) -> dict[str, Any]: ...
 
 @final
 class QuotaSetting:
