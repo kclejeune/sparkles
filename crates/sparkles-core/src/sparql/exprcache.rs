@@ -643,6 +643,7 @@ fn distinct(
         u
     };
     uniq.shrink_to_fit();
+    report.2 = Some((n, uniq.len()));
     if !always && uniq.len() > n / 4 * 3 {
         return reject(report, format!("{} distinct of {n} rows", uniq.len()));
     }
@@ -1794,6 +1795,33 @@ mod tests {
 
     fn ids(v: &[i64]) -> Vec<Id> {
         v.iter().map(|&i| Id::from_i64(i).unwrap()).collect()
+    }
+
+    /// The cursor's key pass reports the exact distinct count of a batch whether or not
+    /// the batch is sorted on the key, since BIND reuse admits from that count.
+    #[test]
+    fn the_cursor_key_pass_counts_sorted_and_unsorted_batches() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let v = ctx.var("k");
+        let e = Expr::Var(v);
+        let mut t = Table::new(vec![v]);
+        t.cols[0] = ids(&(0..4096)
+            .map(|i| 5000 + (i % 3) * 100_000)
+            .collect::<Vec<_>>());
+        t.len = 4096;
+        let mut report = Report::default();
+        cursor_key_distinct(&ctx, &t, &[&e], v, false, &mut report).unwrap();
+        assert_eq!(report.counted(), Some((4096, 3)));
+        t.cols[0].sort_unstable();
+        t.sorted = vec![v];
+        let mut report = Report::default();
+        cursor_key_distinct(&ctx, &t, &[&e], v, false, &mut report).unwrap();
+        assert_eq!(
+            report.counted(),
+            Some((4096, 3)),
+            "the sorted path counts too"
+        );
     }
 
     /// The parallel mapping of a dense range of integers, over several pieces, finds the

@@ -62,6 +62,9 @@ pub(super) struct Reuse {
     expected_reuse: bool,
     max_entries: usize,
     sketch: FxHashSet<Id>,
+    /// The sketch filled without admitting the map. The next batch declines, so the
+    /// exact count of the batch that filled it can still admit through [`Reuse::counted`].
+    exhausted: bool,
     /// Sampled rows, and those whose key the sketch held, in the current window.
     window: (u32, u32),
     /// Rows, and those answered without an evaluation, since the map's last check.
@@ -101,6 +104,7 @@ impl Reuse {
             expected_reuse: admission.expected_reuse,
             max_entries: INTEGER_ENTRIES,
             sketch: Default::default(),
+            exhausted: false,
             window: (0, 0),
             map_window: (0, 0),
             map_rows: 0,
@@ -141,6 +145,10 @@ impl Reuse {
         match self.mode {
             Mode::Off => return Ok(false),
             Mode::Map => {}
+            Mode::Probe if self.exhausted => {
+                self.decline();
+                return Ok(false);
+            }
             Mode::Pilot | Mode::Probe => {
                 if table.len < crate::sparql::exprcache::MIN_ROWS {
                     // Small batches only feed the sketch of a probing map.
@@ -168,6 +176,7 @@ impl Reuse {
     fn admit(&mut self) {
         self.mode = Mode::Map;
         self.sketch = Default::default();
+        self.exhausted = false;
         self.map_window = (0, 0);
         self.map_rows = 0;
     }
@@ -221,7 +230,8 @@ impl Reuse {
     }
 
     /// Later batches: admit once a window of sampled rows repeats one time in
-    /// [`ADMIT`], and decline once the sketch is full without that.
+    /// [`ADMIT`]. A sketch that fills without that marks itself exhausted, and the next
+    /// batch declines.
     fn probe(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<bool> {
         self.observe(ctx, keys)?;
         let (rows, repeats) = self.window;
@@ -234,7 +244,7 @@ impl Reuse {
             return Ok(true);
         }
         if self.sketch.len() >= SKETCH_KEYS {
-            self.decline();
+            self.exhausted = true;
         }
         Ok(false)
     }
@@ -268,9 +278,44 @@ impl Reuse {
         Ok(())
     }
 
+    /// Keep the evaluated values of a batch's pending entries while the map is below
+    /// its cap and its retained charge covers them, and remove the rest. A removal
+    /// shrinks the table, so that its allocation stays within the retained charge once
+    /// the batch's scratch is released.
+    fn retain(&mut self, ctx: &Ctx, keys: &[Id], values: &[Id]) {
+        let step = ctx.reservation_step();
+        // Entries the map held before this batch, which the charge already covers.
+        let mut held = self.values.len() - keys.len();
+        let mut room = true;
+        for (key, value) in keys.iter().zip(values) {
+            room = room
+                && held < self.max_entries
+                && self.charge.as_mut().is_some_and(|charge| {
+                    charge
+                        .cover(512 + (held as u64 + 1) * ENTRY_BYTES, step)
+                        .is_ok()
+                });
+            if room {
+                held += 1;
+                if let Some(entry) = self.values.get_mut(key) {
+                    *entry = *value;
+                }
+            } else {
+                self.values.remove(key);
+            }
+        }
+        if !room {
+            self.values.shrink_to_fit();
+        }
+    }
+
     /// The map pass of [`Reuse::apply_map`]. Hits go to `output`. A miss gets a pending
-    /// slot in `output`, and in the map unless the map is full, and its row goes to
-    /// `missed`.
+    /// slot in `output` and its row goes to `missed`. Below the entry cap the miss also
+    /// enters the map with that slot, so the batch's later rows of the key need one
+    /// lookup, and the batch's scratch charge covers these entries until retention is
+    /// decided. A full map keeps the pending slots in a side map instead, since entries
+    /// it inserted and then removed would leave tombstones that force rehashes. This
+    /// returns whether the pending slots entered the map.
     fn answer(
         &mut self,
         ctx: &Ctx,
@@ -279,8 +324,6 @@ impl Reuse {
         missed: &mut Vec<u32>,
         distinct: &mut Vec<Id>,
     ) -> Result<bool> {
-        // A full map keeps its pending slots apart, since entries it inserted and then
-        // removed for want of room would leave tombstones that force periodic rehashes.
         let mut slots: Option<FxHashMap<Id, Id>> =
             (self.values.len() >= self.max_entries).then(FxHashMap::default);
         for (row, key) in keys.iter().enumerate() {
@@ -292,21 +335,21 @@ impl Reuse {
                     missed.push(row as u32);
                 }
                 output.push(*value);
-            } else {
-                let next = Id(PENDING | distinct.len() as u64);
-                let slot = match &mut slots {
-                    Some(slots) => *slots.entry(*key).or_insert(next),
-                    None => {
-                        self.values.insert(*key, next);
-                        next
-                    }
-                };
-                if slot == next {
-                    distinct.push(*key);
-                }
-                missed.push(row as u32);
-                output.push(slot);
+                continue;
             }
+            let next = Id(PENDING | distinct.len() as u64);
+            let slot = match &mut slots {
+                Some(slots) => *slots.entry(*key).or_insert(next),
+                None => {
+                    self.values.insert(*key, next);
+                    next
+                }
+            };
+            if slot == next {
+                distinct.push(*key);
+            }
+            missed.push(row as u32);
+            output.push(slot);
         }
         Ok(slots.is_none())
     }
@@ -329,9 +372,8 @@ impl Reuse {
         let mut output = Vec::with_capacity(n);
         let mut missed: Vec<u32> = Vec::new();
         let mut distinct = Vec::new();
-        // A missed key enters the map at once with a pending slot, so later rows of the
-        // batch find it with the same lookup as a hit. Every pending entry is resolved
-        // or removed before this returns, and an error releases the whole map.
+        // Every pending entry is resolved before this returns, and an error releases the
+        // whole map.
         let pending = match self.answer(
             ctx,
             &table.cols[column],
@@ -367,25 +409,8 @@ impl Reuse {
                 let at = &mut output[*row as usize];
                 *at = values[(at.0 & PAYLOAD_MASK) as usize];
             }
-            let step = ctx.reservation_step();
-            // Entries the map held before this batch, which the charge already covers.
-            let mut held = self.values.len() - if pending { evaluated } else { 0 };
-            // The first refusal ends retention for the batch, and later keys only leave.
-            let mut room = true;
-            for (key, value) in misses.cols[0].iter().zip(&values) {
-                room = room
-                    && held < self.max_entries
-                    && self.charge.as_mut().is_some_and(|charge| {
-                        charge
-                            .cover(512 + (held as u64 + 1) * ENTRY_BYTES, step)
-                            .is_ok()
-                    });
-                if room {
-                    held += 1;
-                    self.values.insert(*key, *value);
-                } else if pending {
-                    self.values.remove(key);
-                }
+            if pending {
+                self.retain(ctx, &misses.cols[0], &values);
             }
             self.misses += misses.len as u64;
         }
@@ -783,6 +808,66 @@ mod tests {
     }
 
     #[test]
+    fn the_batch_that_fills_the_sketch_can_still_admit_from_its_exact_count() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let all = local_strings(&ctx, 0..120_000);
+        let (sampled_keys, unsampled): (Vec<Id>, Vec<Id>) =
+            all.into_iter().partition(|id| sampled(*id));
+        assert!(sampled_keys.len() > SKETCH_KEYS + WINDOW as usize);
+        // A pilot of 4,095 sampled keys and one unsampled key leaves the sketch one
+        // window short of full.
+        let mut first = sampled_keys[..SKETCH_KEYS - 1].to_vec();
+        first.push(unsampled[0]);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        assert!(
+            !reuse
+                .apply(&ctx, &mut batch(input, &first), target, &expr)
+                .unwrap()
+        );
+        assert_eq!(reuse.mode, Mode::Probe);
+        assert_eq!(reuse.sketch.len(), SKETCH_KEYS - 1);
+        // The next batch fills the sketch with new sampled keys, while one unsampled
+        // key repeats in the rest of it.
+        let hot = unsampled[1];
+        let mut keys = sampled_keys[SKETCH_KEYS..SKETCH_KEYS + WINDOW as usize].to_vec();
+        keys.resize(4096, hot);
+        assert!(
+            !reuse
+                .apply(&ctx, &mut batch(input, &keys), target, &expr)
+                .unwrap()
+        );
+        assert!(reuse.exhausted);
+        reuse.counted(4096, WINDOW as usize + 1);
+        assert_eq!(reuse.mode, Mode::Map, "the exact count admits the map");
+        let before = reuse.evaluations;
+        run(&ctx, &mut reuse, input, target, &expr, &vec![hot; 4096]);
+        assert_eq!(reuse.evaluations - before, 1);
+        // Without that count, the next batch declines.
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        assert!(
+            !reuse
+                .apply(&ctx, &mut batch(input, &first), target, &expr)
+                .unwrap()
+        );
+        assert!(
+            !reuse
+                .apply(&ctx, &mut batch(input, &keys), target, &expr)
+                .unwrap()
+        );
+        reuse.counted(4096, 4096);
+        assert!(
+            !reuse
+                .apply(&ctx, &mut batch(input, &keys), target, &expr)
+                .unwrap()
+        );
+        assert_eq!(reuse.mode, Mode::Off);
+    }
+
+    #[test]
     fn an_admitted_map_that_stops_answering_rows_is_released() {
         let store = Store::in_memory(StoreOptions::default());
         let ctx = cursor_context(&store, 64 << 20);
@@ -1123,6 +1208,15 @@ mod tests {
             assert!(table.cols[1][257..].iter().all(|id| *id == Id::UNDEF));
             assert!(ctx.live_bytes() <= 64 << 10);
             ctx.check().unwrap();
+            // The table the map allocated, a key and a value per slot, stays within its
+            // retained charge after the batch's scratch is released.
+            assert_eq!(pending_entries(&reuse), 0);
+            assert!(
+                reuse.values.capacity() as u64 * 16 <= reuse.charge.as_ref().unwrap().bytes(),
+                "capacity {} against a charge of {}",
+                reuse.values.capacity(),
+                reuse.charge.as_ref().unwrap().bytes()
+            );
             if let Some(entries) = retained {
                 assert_eq!(
                     reuse.values.len(),
