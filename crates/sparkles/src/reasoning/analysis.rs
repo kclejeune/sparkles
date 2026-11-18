@@ -166,6 +166,9 @@ pub(crate) fn program(dataset: &Dataset, options: &AnalysisOptions) -> Result<An
                 .profile
                 .rules()
                 .map_err(|error| Error::invalid(error.to_string()))?;
+            // the rewrite below drops the included sets, which the program's check reads
+            sparkles_reasoner::parser::check_program_includes(&rules)
+                .map_err(|error| Error::invalid(format!("{error:#}")))?;
             let mut changed = false;
             for rule in &mut rules {
                 changed |= forward(rule);

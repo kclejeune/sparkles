@@ -1386,6 +1386,27 @@ pub fn uses_program(rules: &[Rule]) -> bool {
     rules.iter().any(|r| clauses(&r.body) || clauses(&r.head))
 }
 
+/// Refuse a rule program, a text that [`uses_program`], that includes the OWL rule sets
+/// under any of their names. Their rules run with the closure operators and read lists in
+/// the order the Jena path derives them, which a program's strata do not keep. A caller
+/// that rewrites a program, such as through [`rules_text`], which drops the included sets,
+/// checks it before the rewrite.
+pub fn check_program_includes(rules: &[Rule]) -> anyhow::Result<()> {
+    if !uses_program(rules) {
+        return Ok(());
+    }
+    if let Some(set) = rules
+        .iter()
+        .filter_map(|r| r.include.as_deref())
+        .find(|set| set.starts_with("owl"))
+    {
+        anyhow::bail!(
+            "a rule program, with relation atoms or 'not', cannot include <{set}>: the OWL rule set runs only as Jena rules, so write the program without the include or the include without relations and 'not'"
+        );
+    }
+    Ok(())
+}
+
 /// The rule text of `rules`: a `.decl` for each relation their atoms use, with its arity,
 /// and then each rule as [`Rule`]'s `Display` writes it, so that [`parse_rules`] reads it
 /// back as `rules`, up to the rules' lines and included sets.

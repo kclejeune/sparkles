@@ -515,6 +515,7 @@ quad(?x, ?m, ?c, ?y) :- link(?x, ?m, ?y), (?m ex:c ?c).
 (?x ex:start ex:yes) :- link(?x, ?_, ?_).
 (?y ex:end ex:yes) :- link(?_, ?_, ?y).
 (?m ex:mid ?c) :- quad(?_, ?m, ?c, ?_).
+(?x ex:ends ?y) :- quad(?x, ?_, ?_, ?y).
 (?x ex:lonely ex:yes) :- (?x rdf:type ex:T), not link(?x, ?_, ?_).
 (?x ex:noMid ex:yes) :- (?x rdf:type ex:T), not link(?_, ?x, ?_).
 (?x ex:noEnd ?z) :- (?x rdf:type ex:T), (?z rdf:type ex:T), not link(?x, ?_, ?z).
@@ -543,6 +544,7 @@ qmy(?m, ?y) :- quad(?a, ?m, ?b, ?y).
 (?x ex:start ex:yes) :- link(?x, ?w1, ?w2).
 (?y ex:end ex:yes) :- link(?w1, ?w2, ?y).
 (?m ex:mid ?c) :- quad(?w1, ?m, ?c, ?w2).
+(?x ex:ends ?y) :- quad(?x, ?w1, ?w2, ?y).
 (?x ex:lonely ex:yes) :- (?x rdf:type ex:T), not lx(?x).
 (?x ex:noMid ex:yes) :- (?x rdf:type ex:T), not lm(?x).
 (?x ex:noEnd ?z) :- (?x rdf:type ex:T), (?z rdf:type ex:T), not lxy(?x, ?z).
@@ -574,12 +576,14 @@ fn wildcards_in_later_columns() {
     assert!(has("a", "noC", "k3") && !has("a", "noC", "k1") && !has("c", "noC", "k2"));
     assert!(has("b", "noTail", "a") && !has("b", "noTail", "c") && !has("d", "noTail", "a"));
     assert!(has("d", "mid", "k2") && has("b", "mid", "k1"));
+    assert!(has("a", "ends", "c") && has("c", "ends", "a") && !has("a", "ends", "a"));
     // explanations through wildcard atoms, positive and negated
     let es = store(WILD_DATA);
     reason(&es, &rules(WILD), None, None);
     for (s, p, o) in [
         ("a", "hop", "c"),
         ("d", "mid", "k2"),
+        ("a", "ends", "d"),
         ("e", "lonely", "yes"),
         ("b", "noTail", "a"),
     ] {
@@ -597,7 +601,7 @@ fn wildcards_in_later_columns() {
         ..Default::default()
     };
     for p in [
-        "hop", "start", "end", "mid", "lonely", "noMid", "noEnd", "noC", "noTail",
+        "hop", "start", "end", "mid", "ends", "lonely", "noMid", "noEnd", "noC", "noTail",
     ] {
         for q in [
             format!("SELECT ?x ?y WHERE {{ ?x ex:{p} ?y }}"),
@@ -738,6 +742,16 @@ fn programs_refuse_the_owl_include() {
     )
     .unwrap_err();
     assert!(format!("{e:#}").contains("not stratified"), "{e:#}");
+    // a negated relation that reads no triple stratifies beside rdfs
+    let text = "@include <rdfs> .
+.decl r(x)
+[seed: -> r(<urn:a>)]
+[out: not r(<urn:b>) -> (<urn:b> <urn:ok> <urn:yes>)]
+";
+    let s = store("ex:a ex:p ex:b .");
+    let r = reason(&s, &rules(text), None, None);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(inferred(&s).contains("<urn:b> <urn:ok> <urn:yes>"));
 }
 
 /// The chain program of the reasoning guide, as the guide writes it.

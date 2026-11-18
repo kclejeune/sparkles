@@ -174,8 +174,10 @@ request or on every write, and the schema report counts what the data holds.
   A text that uses relations or `not` is one program, its `@include`d rule sets
   included, and it must stratify, which means that no relation or predicate depends on
   its own negation through recursion. A program that does not is refused with the cycle
-  named. An included `rdfs` set has rules over every predicate, which read the facts of
-  any rule, so a program that includes it stratifies only without `not`. A program
+  named. An included `rdfs` set has rules over every predicate, through which a negated
+  atom that reads triples, directly or through relations, depends on every rule that
+  derives a triple, so a rule that negates such an atom and derives a triple makes a
+  cycle. A program
   cannot include the OWL rule sets, and such a text is refused. A program runs without
   the closure operators. Its strata run in order, so a `noValue` of a Jena rule in such
   a program reads the complete lower strata, and the run warns once for each such rule
