@@ -5396,8 +5396,16 @@ fn measure_whole_input_and_leaf_forms() {
             "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:q> ; algo:node ?n ; algo:component ?c } }",
         ),
         (
-            "count join",
+            "count join of two scans (key runs)",
             "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t }",
+        ),
+        (
+            "count join over a filter",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o >= 0) ?s <urn:q> ?t }",
+        ),
+        (
+            "count join on two variables",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?t <urn:q> ?s }",
         ),
     ];
     println!("| form | rows | eager peak | streamed peak | eager ms | streamed ms |");

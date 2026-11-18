@@ -1019,6 +1019,19 @@ streamed count meets, and the merge removes that difference. A count can refuse 
 limit equal to the work that its own run reported, in both modes, and
 [item 1103](../../ROADMAP.md) makes the two counts agree.
 
+The ignored test `measure_whole_input_and_leaf_forms` in `query_cursor.rs` measured the
+peak memory and the best of five times of each form on 200,000 subjects in a release
+build on the development laptop, which is not a benchmark host. A path search under a
+limit of 10 over its group or over an edge pattern peaked at 7.1 MiB streamed against 3.1
+MiB eager and took the same time within 1 ms. An algorithm call over its group,
+over an edge pattern or over constants peaked within 1 MiB of eager and took within 1 ms of
+it. A streamed count over a join that eager counts from its pairs peaked at 0.3 MiB
+against 6.1 to 7.6 MiB eager. Over a filtered scan it took 6.0 ms against 6.3 ms, and on
+two shared variables it took 9.8 ms against 8.6 ms. Streaming trades that time for the
+memory, and automatic execution keeps such counts eager until the A/B of the item's
+plan admits them. A count of two scans on one variable from their key runs, which this
+item does not change, took 12.0 ms streamed against 6.1 ms eager.
+
 ### Measurements of stage 1
 
 A Namespace screen of the base against the five deletions ran the 30 synthetic queries
