@@ -127,7 +127,7 @@ beside them. The eager counts of the two builds agree within 0.5%.
 
 | Query | Writing to the response writer | Writing to the buffer | Eager |
 |---|--:|--:|--:|
-| `count-all` | 453.2 thousand | 390.9 thousand | 307.0 thousand |
+| `count-all` | 453.2 thousand | 390.9 thousand | 306.8 thousand |
 | `predicate-counts` | 670.3 thousand | 509.7 thousand | 422.3 thousand |
 | `star-lookup` | 1,760.0 thousand | 1,327.1 thousand | 1,188.7 thousand |
 | `star-join` | 67.6 million | 40.4 million | 39.6 million |
