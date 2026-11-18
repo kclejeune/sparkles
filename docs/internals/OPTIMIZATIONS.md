@@ -295,14 +295,22 @@ implementation and always apply. EXPLAIN shows which ones ran.
   which the table keeps warm for the thread's next query.
   The planner counts the cost of sorting an unsorted input column, so a single pattern
   under such a FILTER is read from the permutation sorted on the filtered variable. A
-  cursor BIND can retain results across batches when at least a quarter of a bounded
-  pilot repeats exact input IDs. It also
-  admits a repeated pilot when unchanged-snapshot predicate statistics put the input
-  domain below four fifths of estimated rows. This optional profit hint walks at most
-  64 plan nodes and declines on changed snapshots or unknown operators. The query owns the map,
-  including cached expression errors. It keeps at most 65,536 entries under the memory
+  cursor BIND can retain results across batches in a map keyed by exact input IDs. Its
+  first batch admits the map when one row in eight repeats an earlier key, or when a key
+  repeats and unchanged-snapshot predicate statistics put the input domain below four
+  fifths of the estimated rows. This optional profit hint walks at most 64 plan nodes
+  and declines on changed snapshots or unknown operators. Later batches feed a sketch
+  that observes one key in sixteen, chosen by hash, and holds at most 4,096 keys, about
+  128 KiB of charged memory. A window of 256 sampled rows admits the map at one repeat in
+  eight, and so does the exact distinct count of the expression cache's pass over one
+  batch, which sees hot keys the sketch does not sample. A full sketch without admission
+  ends the observation for the query. An admitted map evaluates its misses once per
+  distinct key as one column, and it is released once it has seen 65,536 rows or filled
+  and then answers fewer than one row in sixteen without an evaluation. The query owns
+  the map, including cached expression errors. It keeps at most 65,536 entries under the memory
   budget, charged conservatively at about 6 MiB, while dense inline integers retain their
-  smaller 16,384-entry cap. A refused optional allocation or a full cache leaves uncached
+  smaller 16,384-entry cap. Each batch the map answers also charges 40 bytes a row of
+  scratch while it runs. A refused optional allocation or a full cache leaves uncached
   inputs on ordinary evaluation. Identity copies, volatile expressions and application
   callbacks do not enter this cache.
 * **Numeric range scans.** A FILTER that compares a scan's sort column with numeric

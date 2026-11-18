@@ -151,6 +151,16 @@ of 64 took 0.31 µs on the JVM against 0.97 µs for a single call, and 0.31 µs 
 Node against 0.84 µs. In Python a batch saves about a tenth, since the lookup is most
 of an `in`.
 
+### BIND reuse across cursor batches
+
+A cursor BIND keeps observing repetition after its first batch, through a sampled sketch
+of its input keys and the exact distinct count of each batch, and admits its map of
+results when one row in eight repeats. Before, a first batch without enough repetition
+ended reuse for the query, so an input whose keys repeated only after 65,536 rows
+evaluated every row. A map that stops paying is released, and the sketch and the map are
+charged to the query's memory budget, at most 128 KiB and about 6 MiB. Roadmap item 293
+is complete, and items 1082 and 1083 follow the remaining costs.
+
 ### One plan in every execution mode
 
 A query has one plan whatever its execution mode (roadmap item 827), and EXPLAIN shows

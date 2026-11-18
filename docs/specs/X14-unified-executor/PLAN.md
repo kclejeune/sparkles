@@ -78,8 +78,8 @@ ranges live in `plan.rs`, not in the ARQ property functions.
 
 Three expression memos keep three admission policies. `exprcache.rs` admits per-value
 reuse from a Chao1 estimate of distinct inputs and a sample of 4,096 rows,
-`cursor/bind.rs` keeps the cursor's own exact id cache behind a pilot over its first
-4,096 rows, and the EXISTS memo of `expr.rs` admits up to 100,000 entries within an
+`cursor/bind.rs` keeps the cursor's own exact id cache, admitted from a pilot over its
+first batch and from repetition it observes across later batches, and the EXISTS memo of `expr.rs` admits up to 100,000 entries within an
 eighth of the budget. The decorrelated EXISTS key sets of `exists.rs` are shared.
 
 The result writers exist twice, and the design's two gaps have narrowed. The eager
@@ -194,7 +194,7 @@ ownership boundaries given below, and the rows are serial.
 | After 825 | Item 826 starts. Item 240 starts once item 534 says where the streamed time goes. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
 | After 240 | Item 828 starts. | The writers take the buffer that item 240 gives the cursor writers. |
-| After 293 | The expression memo phase is numbered and starts. | Its admission policy is item 293's open question. |
+| After 293 | The expression memo phase is numbered and starts. | It takes the admission policy that item 293 settled. |
 | After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
 
@@ -425,6 +425,20 @@ the admission policy for sparse reuse, and gets its number when item 293 settles
 memo's charge is a retained charge of stage 4, its bound is the EXISTS memo's eighth of
 the budget, and its oracle is the differential test of stage 4 that compares reuse with
 row-by-row evaluation on both sides of the 16,384-row threshold.
+
+Item 293 settled the policy that the memo takes from `cursor/bind.rs`. A sketch across
+batches observes one input in sixteen, chosen by a hash of its id, so that it sees every
+occurrence of the keys it samples, and holds at most as many keys as a full memo covers.
+A window of sampled rows admits the memo at one repeat in eight. The exact distinct count
+of the per-batch pass is a required second signal, since it sees hot keys that the
+sampled sketch can miss, and a policy that dropped the per-batch pass when the sketch saw
+no repetition made late hot keys up to 7.3 times slower. A full sketch without admission
+ends the observation. An admitted memo is judged once it has seen as many rows as it
+holds, or filled, and is released when it answers fewer than one row in sixteen. Misses
+are evaluated once per distinct key as one batch, and a missed key holds a pending entry
+until the batch is evaluated, so its other rows cost one lookup. The sketch's keys and the
+memo's entries are charged in steps of the query's reservation, so that the optional
+memory never weakens the query's budget.
 
 ## Stage 6: the executor merge
 

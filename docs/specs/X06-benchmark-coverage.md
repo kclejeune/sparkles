@@ -1665,6 +1665,41 @@ checks, and expose the different completed reader work in mixed throughput compa
 Direct synchronization and small absolute serial differences support deferring further
 work under290. No change to durability or crash-recovery behavior is inferred.
 
+#### Observed admission across batches
+
+Item 293 replaced the one-shot pilot with admission that keeps observing after the first
+batch. A first batch that declines seeds a sketch of one input key in sixteen, chosen by
+a hash of the id, and later batches feed it until it holds 4,096 keys. A window of 256
+sampled rows admits the map at one repeat in eight. The exact distinct count of the
+expression cache's own pass over a batch admits it too, because eight hot keys can all
+fall outside the sample. An admitted map evaluates its misses once per distinct key as
+one column, and a missed key holds a pending entry until then, so its other rows in the
+batch cost one lookup. The map is judged once it has seen 65,536 rows or filled, and it
+is released when it answers fewer than one row in sixteen. The sketch costs at most
+128 KiB, the map at most about 6 MiB, and a batch the map answers 40 bytes a row while
+it runs.
+
+The matrix behind the policy ran on `atlas` with synthetic inputs of dates, integers,
+strings, IRIs and SHA1 keys of 2,048 to 262,144 rows. Its reuse shapes are unique keys,
+one early duplicate, low and moderate repetition, strides of 8 and 16, random repeats of
+60, repetition that starts after one period of 65,536 keys, and hot keys late in the
+input. Every comparison ran A,B,B,A rounds in one binary through its experiment
+switches, with one server core and one Rayon thread unless noted, and every answer
+agreed. Against the one-shot pilot, a period of 65,536 keys repeated over 262,144 rows
+took 0.33 to 0.46 of the time and moderate repetition 0.82 to 0.91. Inputs whose map
+never pays pay for the sketch, 0.3% to 0.9% on unique keys and 1% to 2% when the
+repetition starts after 65,536 rows. Admission at one in eight against one in four took
+inputs with a stride of 8 to 0.926 to 0.986 and joins with random repeats to 0.922 and
+0.946, and moved no other input by more than 0.6%. The snapshot hint stays, since random
+repeats became up to 1.21 times slower without it. The rejected thresholds and the
+rejected skip of the per-batch pass are recorded in PERFORMANCE-EXPERIMENTS.
+
+All server threads on a mask that includes the efficiency cores of `atlas` made STR of
+IRIs about 3.5 times slower than one pinned core in both arms, 174 ms against 49 ms for
+65,536 unique IRIs, and the same mask on the performance cores alone or with one Rayon
+thread does not. Item 1082 follows that cost, which comes from parallel evaluation of
+the expression rather than from reuse.
+
 ### Decimal arithmetic and inline date components
 
 Item 432 profiled `births-by-decade` on the 50M slice with `perf` on atlas. About 47 of
