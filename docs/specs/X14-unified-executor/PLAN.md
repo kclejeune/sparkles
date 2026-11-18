@@ -242,8 +242,14 @@ Item 827 removed the reads in `has_predicate` and `limited_input` that an earlie
 of this section listed. Before the change the test counts eight sites, the mode branch of
 `query_execution_with_plan`, the EXISTS key set accumulated across batches in
 `exists::prepare`, `envelope_refuses`, `string_order_mask` and the four direct reads.
-With the string floors gone the bound is seven, and the test fails at that bound before
-the change. This is routine work with the design's text as its specification.
+
+The floors now decode inside the envelope, and `decode_for` decodes through the one
+sorted pre-decode. Cursor batches still skip the floors, because each batch builds its
+own floor cache and recomputes the floors of strings that recur across batches. On
+atlas, comparing through the floors made `str-pair-lt` 24.8% slower and
+`str-pair-names` 33.4% slower in streaming mode. The exclusion in `string_order_mask`
+therefore stays, and the bound stays at eight. Item 1069 gives `Ctx` a charged per-query
+floor cache that serves both modes, removes the exclusion and lowers the bound to seven.
 
 ## Stage 5: shared kernels
 
@@ -436,10 +442,11 @@ and sampled filters planning choices that do not depend on the mode. The result 
 serves a cursor's subtree when the subtree is materialized anyway, and sampled filters
 prepare their samples once per plan. EXPLAIN then prints one plan for a query whatever
 the mode, which `plan_fidelity_tests.rs` checks, with a spill-configured DISTINCT over
-ORDER BY among its cases. After items 827 and 678 the mode is read in seven places, the
-mode branch of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
-`envelope_refuses` and the four direct reads in `ctx.rs`, and the bounded-reads test's
-bound is seven. The merge removes the rest.
+ORDER BY among its cases. After item 827 the mode is read in eight places, the mode
+branch of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
+`envelope_refuses`, the cursor exclusion of `string_order_mask` and the four direct reads
+in `ctx.rs`, and the bounded-reads test's bound is eight. Item 1069 removes the exclusion
+of `string_order_mask`, and the merge removes the rest.
 
 The phase then routes every ASK and unordered LIMIT through pull demand. A streaming
 request already pulls its ASK through the cursor, so the change is that automatic and
@@ -751,4 +758,4 @@ The maintainer took these answers, and the phases above follow them.
    before it lands. The merge also runs the full matrix on atlas before it lands, since
    it deletes the eager executor and atlas has forge's hardware.
 9. The bounded-reads test counts direct reads of the mode flag as well as `streams()`
-   calls, so its bound is seven after items 827 and 678.
+   calls, so its bound is eight after item 827 and seven after item 1069.
