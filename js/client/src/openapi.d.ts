@@ -14025,7 +14025,7 @@ export interface components {
     parameters: {
         /** @description An HTTP date. Read the last commit at or before it (RFC 7089). */
         acceptDatetime: string;
-        /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+        /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
         aggregateErrors: "jena" | "sparkles" | "spec";
         /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
         at: string;
@@ -25470,7 +25470,7 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
-                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
                 "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
@@ -25669,7 +25669,7 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
-                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
                 "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
@@ -27927,7 +27927,7 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
-                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
                 "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
@@ -28004,7 +28004,7 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
-                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
                 "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
@@ -28320,7 +28320,7 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
-                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
                 "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
@@ -28397,7 +28397,7 @@ export interface operations {
                 "describe-max-triples"?: components["parameters"]["describeMaxTriples"];
                 /** @description A lower limit on the levels a DESCRIBE follows. */
                 "describe-max-depth"?: components["parameters"]["describeMaxDepth"];
-                /** @description How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting. */
+                /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
                 "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description Label the response `text/plain` so a browser shows it. */
                 "force-accept"?: string;
@@ -28648,6 +28648,8 @@ export interface operations {
                 "max-rows"?: components["parameters"]["maxRows"];
                 /** @description A budget of the rows all operators produce. */
                 "max-rows-produced"?: components["parameters"]["maxRowsProduced"];
+                /** @description How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting. */
+                "aggregate-errors"?: components["parameters"]["aggregateErrors"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */

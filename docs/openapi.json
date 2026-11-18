@@ -10,7 +10,7 @@
         }
       },
       "aggregateErrors": {
-        "description": "How this query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's setting.",
+        "description": "How the MIN, MAX, AVG and GROUP_CONCAT of this query, or of this update's WHERE clauses, treat errors, over the dataset's setting.",
         "in": "query",
         "name": "aggregate-errors",
         "schema": {
@@ -62448,6 +62448,9 @@
           },
           {
             "$ref": "#/components/parameters/maxRowsProduced"
+          },
+          {
+            "$ref": "#/components/parameters/aggregateErrors"
           },
           {
             "$ref": "#/components/parameters/branch"
