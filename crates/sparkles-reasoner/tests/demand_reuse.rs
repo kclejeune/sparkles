@@ -438,14 +438,17 @@ fn a_premise_of_a_relation_derives_again() {
     assert_eq!(r.cached, 0);
 }
 
-/// A fact that a negated triple reads derives again, so the blocked answer goes.
+/// A fact that a negated triple reads derives again, so the blocked answer goes. The data
+/// holds the change's terms and predicate before, so that only the negated pattern makes
+/// the change relevant.
 #[test]
 fn a_negated_premise_derives_again() {
+    let before = format!("{PROGRAM_DATA} ex:q ex:blocked ex:yes .");
     let r = case(
         &program(),
-        PROGRAM_DATA,
+        &before,
         "INSERT DATA { ex:t ex:blocked ex:yes }",
-        &format!("{PROGRAM_DATA} ex:t ex:blocked ex:yes ."),
+        &format!("{before} ex:t ex:blocked ex:yes ."),
         TYPES_OF_B,
     );
     assert_eq!(r.cached, 0);
