@@ -1079,6 +1079,57 @@ mod tests {
         assert!(seen[0].bytes < 100_000_000);
     }
 
+    /// A cursor body cut by the result-size budget sends what it had buffered before it
+    /// aborts. A reader that has stopped reading holds that send only to the stall
+    /// bound, and the body still ends as a budget failure that reports only the bytes
+    /// that reached the channel.
+    #[tokio::test]
+    async fn a_budget_cut_with_a_stalled_reader_stays_a_budget_failure() {
+        let (seen, on_end) = ends();
+        let control = StreamControl::new(
+            Default::default(),
+            None,
+            Default::default(),
+            Some(Duration::from_millis(150)),
+        );
+        // The switch sends the first 101 bytes and three full chunks fill the channel of
+        // four, so the budget cuts the next chunk halfway while the channel is full.
+        let sent = 101 + (CHUNK * 3) as u64;
+        let limit = sent + (CHUNK / 2) as u64;
+        let started = Instant::now();
+        let Ok(Serialized::Streamed(body)) = serialize_inner(
+            100,
+            false,
+            Some(limit),
+            Some(control),
+            write_n(10_000_000, None),
+            on_end,
+        )
+        .await
+        else {
+            panic!("expected a stream");
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a stalled reader must not hold the budget flush past the stall bound");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        {
+            let seen = seen.lock().unwrap();
+            assert!(
+                matches!(seen[0].error, Some(Error::BudgetExceeded(_))),
+                "the failed flush must not replace the budget error: {:?}",
+                seen[0].error
+            );
+            assert_eq!(seen[0].bytes, sent, "the unsent chunk must not be reported");
+        }
+        let received = axum::body::to_bytes(body, usize::MAX).await;
+        assert!(received.is_err(), "a cut body must not end successfully");
+    }
+
     #[tokio::test]
     async fn a_reader_that_stalls_past_the_stall_bound_times_out() {
         let (seen, on_end) = ends();
