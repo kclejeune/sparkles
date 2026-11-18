@@ -282,8 +282,8 @@ impl Reuse {
 
     /// Keep the evaluated values of a batch's pending entries while the map is below
     /// its cap and its retained charge covers them, and remove the rest. A removal
-    /// shrinks the table, so that its allocation stays within the retained charge once
-    /// the batch's scratch is released.
+    /// rebuilds the table at the size of its survivors, without tombstones, so that its
+    /// allocation stays within the retained charge once the batch's scratch is released.
     fn retain(&mut self, ctx: &Ctx, keys: &[Id], values: &[Id]) {
         let step = ctx.reservation_step();
         // Entries the map held before this batch, which the charge already covers.
@@ -307,7 +307,12 @@ impl Reuse {
             }
         }
         if !room {
-            self.values.shrink_to_fit();
+            // Rebuild rather than shrink. `shrink_to_fit` keeps a table whose bucket count
+            // the survivors still need, with the removed entries' tombstones, and a later
+            // insertion could then grow it past the size its live entries justify.
+            let old = std::mem::take(&mut self.values);
+            self.values = FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
+            self.values.extend(old);
         }
     }
 
@@ -800,6 +805,39 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_batch_leaves_no_tombstones_in_the_map() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        run(
+            &ctx,
+            &mut reuse,
+            input,
+            target,
+            &expr,
+            &local_strings(&ctx, (0..4096).map(|i| i % 64)),
+        );
+        assert_eq!(reuse.mode, Mode::Map);
+        // 950 new keys against room for 936 more. The survivors need the same bucket
+        // count as the table that held the 14 refused keys, so a shrink would keep that
+        // table and any tombstones the removals left. Removals into groups with empty
+        // slots leave none, so this checks the rebuilt table's room rather than
+        // reproducing tombstones, which need colliding hashes.
+        reuse.max_entries = 1000;
+        let keys = local_strings(&ctx, 1000..1950);
+        run(&ctx, &mut reuse, input, target, &expr, &keys);
+        assert_eq!(reuse.values.len(), 1000);
+        assert_eq!(pending_entries(&reuse), 0);
+        assert_eq!(
+            reuse.values.capacity(),
+            FxHashMap::<Id, Id>::with_capacity_and_hasher(1000, Default::default()).capacity()
+        );
+    }
+
+    #[test]
     fn unique_inputs_stop_probing_once_the_sketch_is_full() {
         let store = Store::in_memory(StoreOptions::default());
         let ctx = cursor_context(&store, 64 << 20);
@@ -1219,6 +1257,15 @@ mod tests {
             // The table the map allocated, a key and a value per slot, stays within its
             // retained charge after the batch's scratch is released.
             assert_eq!(pending_entries(&reuse), 0);
+            // A rebuilt table has a fresh table's room, with no tombstones to use it up.
+            assert_eq!(
+                reuse.values.capacity(),
+                FxHashMap::<Id, Id>::with_capacity_and_hasher(
+                    reuse.values.len(),
+                    Default::default()
+                )
+                .capacity()
+            );
             assert!(
                 reuse.values.capacity() as u64 * 16 <= reuse.charge.as_ref().unwrap().bytes(),
                 "capacity {} against a charge of {}",
