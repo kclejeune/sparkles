@@ -116,8 +116,10 @@ effect. Item 678's slower string floors added 13% to the instructions of `str-pa
 counts flagged both and no other query. Item 1039's charged scan added 9.8% to the
 execution time of a root scan and 8.8% to an export of 500,000 rows on `atlas`, and the
 counts of every query stayed within the noise floor, those of the two scans within 0.04%.
-The cost of that change did not show in instructions, and the profiles of its remaining
-cost have not established where it lies. The counts
+Cycle profiles of its remaining cost on `root-limit` place about 1,300 cycles per block
+in the new build's shared-batch construction, weak block handle and scan checks, which
+retire a few hundred instructions, as the
+[results](benchmarks/engine/RESULTS.md#per-request-instruction-counts) show. The counts
 cover user space only, since `kernel.perf_event_paranoid` is 2 on the build hosts, so a
 change in system calls, futex waits or page faults does not show either.
 
