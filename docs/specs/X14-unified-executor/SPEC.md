@@ -227,8 +227,20 @@ and all 63 of SPARQL 1.2 under a comparison that holds literals to their exact f
 numbers to their value and ORDER BY results to their order. It reports the queries it
 does not evaluate, such as SERVICE, DESCRIBE and extension functions, rather than
 answer them approximately. It follows SPARQL 1.2 where the two versions differ, so the
-effective boolean value of an ill-formed literal is an error, and it reads XPath regular
-expressions in their own syntax, reporting a back-reference as unsupported. Where the
+effective boolean value of an ill-formed literal is an error. It reads XPath regular
+expressions in their own syntax, checks where each quantifier stands and reports as
+unsupported the constructs whose XPath meaning it does not establish, which are a
+back-reference, a class with a `-` other than a simple range, the `i` flag with a category,
+a negation or text that is not ASCII, and the `m` flag with an anchor on text that ends in
+a newline, where XPath's anchors differ from the regex crate's. Where Jena's reading
+differs from the specification's text and the engine follows Jena, the evaluator follows
+Jena too, and a switch selects the text, which the W3C suites take. Under Jena's reading
+the default graph of several FROM clauses is the union of their graphs, as in TDB, a
+negated property set gives a pair once for each triple that joins it, and `\b` in REGEX,
+which Java reads as a word boundary and XPath rejects, is unsupported. ORDER BY orders two
+different terms with equal values, such as `1` and `1.0`, by the terms themselves, where
+the text ties them and orders them by the next condition, so the comparison leaves their
+order open. Where the
 specification allows several answers, it says which. A value that it leaves open, such as
 a SAMPLE, a MIN or MAX among unordered values, a GROUP_CONCAT order, a RAND, a UUID, NOW
 or a new blank node, makes its column open, and an open value that decides which rows
@@ -238,17 +250,34 @@ not project. The seeded queries of `tests/query_cursor.rs` compare the eager ans
 the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a compacted base, a
 pending delta, several index blocks and a masked view, and the optimizer, index-join and
 string-filter tests compare `Optimizations::ALL` with it as well as with
-`Optimizations::NONE`. Both go through one comparison, which compares an open column
-only by its place in the rows, a number that the evaluator computed by datatype and
-value, and every other term exactly. An ordered or sliced answer must be a slice, at the
-query's offset, of an order that ORDER BY allows, and an answer with open rows is left
-uncompared. The order check gives up past 50 million key comparisons, and where equal
-rows with different keys make its matching ambiguous it reports the order unchecked
-rather than fail. The parser writes the middle of a path sequence as a blank node, which
+`Optimizations::NONE`. Both go through one comparison, which passes no answer that the specification
+forbids and, where it cannot decide, reports a partial or unordered comparison instead.
+An open column is compared only by its place in the rows, which makes the comparison
+partial. A column that only computed values bind compares numbers by datatype and value,
+and a column that only copied terms bind compares them exactly. A column bound by both,
+such as a COALESCE over a variable and a constant, compares exactly, and a number that
+differs there only in its lexical form makes the comparison partial. An ordered or sliced
+answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
+answer with open rows is left uncompared. A sort key stops before the first condition
+that reads an open value. Where DISTINCT keeps a row whose copies have different sort
+keys, the order is unchecked and a slice of it is open. The order check tests the strict
+order between every two blocks of equal keys that it meets, gives up past 50 million key
+comparisons, and where equal rows with different keys make its matching ambiguous it
+reports the order unchecked rather than fail. Whether an open value is bound is open too,
+so BOUND, EXISTS, a join, DISTINCT and a LATERAL join over a variable in scope that holds
+open values make the rows open. Numbers sort by their exact values, which keeps the sort
+transitive where promotion makes values of different datatypes equal. These rules decline to
+judge some answers that the evaluator once compared. Of the 5,000 answers of the seeded
+queries, 35 with open columns are compared in part, 0 are compared without their order,
+and 105 have open rows, 20 more than before because whether an open value is bound is
+open. In the optimizer, index-join and string-filter tests, 3 answers with open columns
+are compared in part, and 12 string filters whose regular expression takes the `i` flag
+over text that is not ASCII are unsupported. No answer of either set has a column bound
+by both copied terms and computed values that differs only in a number's lexical form. The parser writes the middle of a path sequence as a blank node, which
 the algebra treats as a variable, so a `COUNT(DISTINCT *)` over such a middle is an open
 value. A query whose nested loops pass the evaluator's work limit of 20 million
 intermediate solutions is left uncompared, and so is one that reads a number of more than
-16 digits. The comparison found disagreements, which items 1064, 1065 and 1071 hold. The
+16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 hold. The
 engine passes over an error in MIN and MAX, where the specification's order makes MIN an
 error and Jena makes both an error, and it follows Jena in making AVG over errors only an
 error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
@@ -260,7 +289,10 @@ specification's, Jena's or the engine's reading, answers the W3C suites under th
 specification's, and compares the engine under the engine's current reading until the
 setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
 meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
-reading. The
+reading. Item 1077 holds three
+XSD and XPath readings in which the engine differs from both the specification and
+Jena, `isNumeric("inf"^^xsd:double)`, the canonical form of a double cast to a string and
+`.` in REGEX, which matches a carriage return. The
 evaluator takes two well-formed values of different supported types, such as a string
 and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
 default, where Jena's strict mode and the section's main text make the comparison an

@@ -11,12 +11,16 @@ query evaluation tests under an exact comparison. It is the oracle of the seeded
 differential in place of the eager executor, and the optimizer, index-join and
 string-filter tests compare the engine with it as well as with `Optimizations::NONE`. It
 notes the values and rows that the specification leaves open and the sort key of each
-row, and one comparison in `check.rs` allows every answer that the specification allows,
-including every slice of an order that ORDER BY allows. It found three groups of engine
-disagreements. MIN and MAX pass over errors, AVG over errors only is an error and
-GROUP_CONCAT reads IRIs and numbers, roadmap item 1064, integers and decimals
-beyond the engine's decimal range are not numbers, roadmap item 1065, and the string
-functions ignore the base direction of their arguments, roadmap item 1071.
+row, and one comparison in `check.rs` passes no answer that the specification forbids,
+allows every slice of an order that ORDER BY allows, and reports a partial or unordered
+comparison where it cannot decide. Where Jena's reading differs from the specification's
+text and the engine follows Jena, as for the default graph of several FROM clauses, the
+evaluator follows Jena, and the W3C suites run under the text. It found four groups of
+engine disagreements. MIN and MAX pass over errors, AVG over errors only is an error and
+GROUP_CONCAT reads IRIs and numbers, roadmap item 1064, integers and decimals beyond the
+engine's decimal range are not numbers, roadmap item 1065, the string functions ignore the
+base direction of their arguments, roadmap item 1071, and three XSD and XPath readings
+differ, roadmap item 1077.
 
 ### MCP tool profiles and semantic search
 

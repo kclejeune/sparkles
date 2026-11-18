@@ -434,6 +434,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   two language-tagged arguments, so a directional string and a string of the same language
   without that direction are compatible arguments. SPARQL 1.2 and Jena also require the
   same base direction. Roadmap item 1071.
+* `isNumeric("inf"^^xsd:double)` is true, though XSD spells infinity `INF`, and a cast of a
+  double to `xsd:string` gives `"1000000"` for `1e6`, where XPath gives `"1.0E6"`. In
+  REGEX, `.` matches a carriage return, which XPath excludes without the `s` flag. Roadmap
+  item 1077.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
