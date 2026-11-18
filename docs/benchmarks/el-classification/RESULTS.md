@@ -1659,8 +1659,9 @@ resident set, which stays at 1,694 and 1,380 MiB. The rounds have no level 0 sid
 default run, so they do not tell the reductions from the build. A pinned
 process on the laptop executes the same instructions outside the Horn rules on the base
 and at levels 0 and 3, 705.18, 705.22 and 705.20 billion on `ore_ont_14817`, and 21.4
-against 26.9 billion for the Horn rules alone at level 3. The attempt therefore does the
-same work, and the longer time on forge is not more of it.
+against 26.9 billion for the Horn rules alone at level 3. On that file the counts suggest
+that the attempt does the same work, and they do not explain the longer time on forge.
+`ore_ont_9663` has no such count.
 On four threads the two files' rounds range from 0.91 to 1.46 and from 0.93 to 1.05 of
 the base, so the medians of 1.08 and 0.95 are not effects.
 

@@ -384,8 +384,8 @@ of the two Uberon files does not gain. Its bounded attempt of the disjunctive ru
 nearly all of its 58 and 75 s on one thread and sets its peak resident set, and the run
 is 2.5 and 1.8% slower with the reductions in each of six rounds, although its Horn
 saturation is 0.5 and 0.9 s shorter. A pinned process on the laptop executes the same
-instructions in the attempt on the base and on the build with and without the
-reductions, so the attempt does the same work in more time. On four threads
+instructions in the attempt of ore_ont_14817 on the base and on the build with and
+without the reductions, which suggests that the attempt does the same work there. On four threads
 `ore_ont_8737` takes 1.03 to 1.04 times the base's time on the build with and without
 the reductions, within the range of the base's own rounds. Item 1090 follows both, and
 the [benchmark report](../../benchmarks/el-classification/RESULTS.md#reduced-automata)
