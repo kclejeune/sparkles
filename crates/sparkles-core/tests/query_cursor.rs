@@ -3347,7 +3347,13 @@ fn count_join_counts_a_streamed_join() {
                 i % 3
             )
         })
-        .collect::<String>();
+        .collect::<String>()
+        // two pairs with `?s <urn:q> ?t` on both variables, then 60 rows that match
+        // nothing
+        + "<urn:s:1> <urn:w> <urn:s:7> .\n<urn:s:2> <urn:w> <urn:s:14> .\n"
+        + &(0..60)
+            .map(|i| format!("<urn:z:{i}> <urn:w> <urn:z:{i}> .\n"))
+            .collect::<String>();
     s.load(&[Source::from_bytes(
         data.into_bytes(),
         RdfFormat::Turtle,
@@ -3376,7 +3382,7 @@ fn count_join_counts_a_streamed_join() {
             "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }".to_string(),
             true,
         ),
-        // a hash join over a union, whose pairs eager forms
+        // a join over a sorted union, which the cursor plans as a merge join
         (
             "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }".to_string(),
             true,
@@ -3397,10 +3403,11 @@ fn count_join_counts_a_streamed_join() {
             ),
             false,
         ),
-        // a hash join over a union whose two matching rows come before 60 that match
-        // nothing, so the join reads input after its last pair
+        // a hash join on two variables that BIND leaves unsorted, whose two pairs come
+        // before rows that match nothing, so the join reads input after its last pair
+        // (a merge join would stop at the end of one input, which eager reads whole)
         (
-            "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o FILTER(?o < 2) } UNION { ?x <urn:r> ?s } ?s <urn:q> ?t }".to_string(),
+            "SELECT (COUNT(*) AS ?n) WHERE { { ?a <urn:q> ?b BIND(?a AS ?s) BIND(?b AS ?t) } ?s <urn:w> ?t }".to_string(),
             true,
         ),
         // a key that some rows leave unbound
@@ -3422,7 +3429,7 @@ fn count_join_counts_a_streamed_join() {
             if count_join {
                 assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
             }
-            if q.contains("UNION") {
+            if q.contains("BIND") {
                 assert!(has(c.plan(), "HashJoin"), "{q}: {:?}", c.plan());
             }
             assert_eq!(all(c), expected, "{q}; {rows}");
@@ -3442,10 +3449,16 @@ fn count_join_counts_a_streamed_join() {
                 ..Default::default()
             }
         };
-        type Outcome = Result<Vec<Vec<Option<Term>>>, Option<BudgetKind>>;
+        // A refusal compares by its kind. A streamed count refuses at the first batch
+        // that passes a limit, so the total it reports is in general below eager's. The
+        // hash join whose input goes on after its last pair also compares the total,
+        // since eager and the streamed count both refuse once the join has read all of
+        // its input, and not when a later operator counts its row.
+        let exact = q.contains("BIND");
+        type Outcome = Result<Vec<Vec<Option<Term>>>, Option<(BudgetKind, u64)>>;
         let outcome = |r: Result<Vec<Vec<Option<Term>>>, Error>| -> Outcome {
             r.map_err(|e| match e {
-                Error::BudgetExceeded(b) => Some(b.kind),
+                Error::BudgetExceeded(b) => Some((b.kind, if exact { b.requested } else { 0 })),
                 _ => None,
             })
         };
@@ -3480,6 +3493,8 @@ fn count_join_counts_a_streamed_join() {
             (Some(120), None),
             (None, Some(produced)),
             (None, Some(produced - 1)),
+            (None, Some(produced - 2)),
+            (None, Some(produced - 3)),
             (None, Some(produced + count)),
         ];
         if count > 0 {
@@ -5382,7 +5397,7 @@ fn measure_whole_input_and_leaf_forms() {
         ),
         (
             "count join",
-            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o ?s <urn:q> ?t }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t }",
         ),
     ];
     println!("| form | rows | eager peak | streamed peak | eager ms | streamed ms |");
