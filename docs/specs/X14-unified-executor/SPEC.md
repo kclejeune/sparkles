@@ -254,23 +254,33 @@ string-filter tests compare `Optimizations::ALL` with it as well as with
 forbids and, where it cannot decide, reports a partial or unordered comparison instead.
 An open column is compared only by its place in the rows, which makes the comparison
 partial. A column that only computed values bind compares numbers by datatype and value,
-and a column that only copied terms bind compares them exactly. A column bound by both,
+and a column that only copied terms bind compares them exactly. Arithmetic, the numeric
+functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values, STRDT
+and STRLANG keep the lexical form they are given, and any other operator counts as both. A column bound by both,
 such as a COALESCE over a variable and a constant, compares exactly, and a number that
 differs there only in its lexical form makes the comparison partial. An ordered or sliced
 answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
 answer with open rows is left uncompared. A sort key stops before the first condition
-that reads an open value. Where DISTINCT keeps a row whose copies have different sort
+that reads an open value. The conditions after it can still order the rows that tie
+before it, so the key only finds an answer that the earlier conditions forbid, and
+otherwise the order is unchecked and a slice of it is left uncompared. A slice that passes
+the checks against each other row is compared when the reference's other rows, placed
+around it in their own order, complete it to an order that ORDER BY allows. When that
+completion breaks a constraint between two rows, or the order of a slice is otherwise not
+established, the slice is left uncompared. Where DISTINCT keeps a row whose copies have different sort
 keys, the order is unchecked and a slice of it is open. The order check tests the strict
 order between every two blocks of equal keys that it meets, gives up past 50 million key
 comparisons, and where equal rows with different keys make its matching ambiguous it
 reports the order unchecked rather than fail. Whether an open value is bound is open too,
-so BOUND, EXISTS, a join, DISTINCT and a LATERAL join over a variable in scope that holds
-open values make the rows open. Numbers sort by their exact values, which keeps the sort
+so BOUND, EXISTS, a join, DISTINCT, a LATERAL join and a GRAPH pattern whose name is a
+variable that its inner pattern binds make the rows open when that variable holds open
+values. Numbers sort by their exact values, which keeps the sort
 transitive where promotion makes values of different datatypes equal. These rules decline to
 judge some answers that the evaluator once compared. Of the 5,000 answers of the seeded
-queries, 35 with open columns are compared in part, 0 are compared without their order,
-and 105 have open rows, 20 more than before because whether an open value is bound is
-open. In the optimizer, index-join and string-filter tests, 3 answers with open columns
+queries, 20 with open columns are compared in part, 15 are compared without their order
+because an ORDER BY condition reads an open value, no slice fails its completion, and 105
+have open rows, 20 more than before because whether an open value is
+bound is open. In the optimizer, index-join and string-filter tests, 3 answers with open columns
 are compared in part, and 12 string filters whose regular expression takes the `i` flag
 over text that is not ASCII are unsupported. No answer of either set has a column bound
 by both copied terms and computed values that differs only in a number's lexical form. The parser writes the middle of a path sequence as a blank node, which

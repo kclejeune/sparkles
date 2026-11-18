@@ -11,9 +11,8 @@ query evaluation tests under an exact comparison. It is the oracle of the seeded
 differential in place of the eager executor, and the optimizer, index-join and
 string-filter tests compare the engine with it as well as with `Optimizations::NONE`. It
 notes the values and rows that the specification leaves open and the sort key of each
-row, and one comparison in `check.rs` passes no answer that the specification forbids,
-allows every slice of an order that ORDER BY allows, and reports a partial or unordered
-comparison where it cannot decide. Where Jena's reading differs from the specification's
+row, and one comparison in `check.rs` passes no answer that the specification forbids
+and reports a partial, unordered or skipped comparison where it cannot decide. Where Jena's reading differs from the specification's
 text and the engine follows Jena, as for the default graph of several FROM clauses, the
 evaluator follows Jena, and the W3C suites run under the text. It found four groups of
 engine disagreements. MIN and MAX pass over errors, AVG over errors only is an error and

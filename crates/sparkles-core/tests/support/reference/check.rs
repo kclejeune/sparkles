@@ -10,8 +10,11 @@
 //! except that a column bound by both copied terms and computed values, where a number
 //! that differs only in its lexical form may be either, makes the comparison partial.
 //! Where the query orders or slices its answer, the engine's rows must be a slice, at the
-//! query's offset, of an order that ORDER BY allows. An answer whose rows themselves are
-//! open, because an open value decides which rows there are, is not compared.
+//! query's offset, of an order that ORDER BY allows. Where an ORDER BY condition reads an
+//! open value, the conditions after it can still order the rows that tie before it, so
+//! such an order is not checked and a slice of it is not compared, beyond failing an
+//! answer that the conditions before it forbid. An answer whose rows themselves are open,
+//! because an open value decides which rows there are, is not compared.
 
 use super::{AggregateErrors, Error, Notes, Provenance, Reference, Selected, value};
 
@@ -170,7 +173,31 @@ pub fn check_select(
             };
         };
         let items: Vec<String> = order.items.iter().map(|(r, _)| mask(r)).collect();
-        check_order(order, &items, &got)
+        let outcome = check_order(order, &items, &got)?;
+        // The keys of an order with an open condition tell which orders are forbidden and
+        // not which are allowed, so an answer that breaks no constraint is not passed.
+        Ok(match outcome {
+            Outcome::Compared | Outcome::OrderUnchecked(_)
+                if order.open_conditions && got.len() < order.items.len() =>
+            {
+                Outcome::Skipped(
+                    "an ORDER BY condition reads an open value, which can decide the rows of \
+                     the slice"
+                        .into(),
+                )
+            }
+            Outcome::Compared if order.open_conditions => Outcome::OrderUnchecked(
+                "an ORDER BY condition reads an open value, and the conditions after it can \
+                 order rows that tie before it"
+                    .into(),
+            ),
+            // where the slice cuts rows, an order that is not established leaves its rows
+            // open too
+            Outcome::OrderUnchecked(why) if got.len() < order.items.len() => {
+                Outcome::Skipped(format!("the rows of the slice are not established: {why}"))
+            }
+            other => other,
+        })
     };
     let outcome = match compare(false) {
         Ok(o) => o,
@@ -178,13 +205,19 @@ pub fn check_select(
             // a number of another lexical form in a column that copies terms and computes
             // values may be allowed or not
             let mixed = expected.computed.contains(&Provenance::Mixed);
-            if mixed && compare(true).is_ok() {
-                return Ok(Outcome::Partial(format!(
+            return match compare(true) {
+                Ok(Outcome::Compared) if mixed => Ok(Outcome::Partial(format!(
                     "a column copies terms and computes values, and the answer agrees only \
                      where its numbers are compared by value: {e}"
-                )));
-            }
-            return Err(e);
+                ))),
+                // a weaker outcome under the relaxed comparison stays as weak
+                Ok(Outcome::OrderUnchecked(why)) if mixed => Ok(Outcome::OrderUnchecked(format!(
+                    "{why}, and a column that copies terms and computes values agrees only \
+                     where its numbers are compared by value"
+                ))),
+                Ok(weaker) if mixed => Ok(weaker),
+                _ => Err(e),
+            };
         }
     };
     let open: Vec<&str> = expected
@@ -265,7 +298,11 @@ fn bag_difference(got: &[String], expected: &[String]) -> String {
 /// The returned rows must be in an allowed order among themselves. The other rows that
 /// the order puts strictly before a returned row must all be cut by the offset, and those
 /// strictly after one must all follow the slice, so the two sets cannot meet, the first
-/// must fit in the offset and the second in the rows after the slice.
+/// must fit in the offset and the second in the rows after the slice. Strict order need
+/// not be transitive across these checks, where promotion makes two values equal, so a
+/// slice that passes them is compared only when the reference's other rows, placed
+/// around it in their own order, complete it to an allowed order, and its order is
+/// unchecked otherwise.
 fn check_order(
     order: &super::TopOrder,
     items: &[String],
@@ -411,6 +448,38 @@ fn check_order(
             "{forced_after} rows belong after the returned rows, more than the {} rows after the slice",
             rest - from
         ));
+    }
+    // A slice without ORDER BY has no constraints between its rows.
+    if keys.iter().all(Option::is_none) {
+        return Ok(Outcome::Compared);
+    }
+    // The checks above test the returned rows against each other row on its own, and the
+    // strict order between the rows left out can still force a returned row out of the
+    // slice. The answer is compared when one order that ORDER BY allows holds it, the
+    // order that puts the rows left out around it in the reference's order, the first
+    // `from` before it and the others after it.
+    let unused: Vec<usize> = (0..n).filter(|&i| !used[i]).collect();
+    let mut sequence: Vec<usize> = unused[..from]
+        .iter()
+        .chain(&chosen)
+        .chain(&unused[from..])
+        .map(|&i| block[i])
+        .collect();
+    sequence.dedup();
+    for (j, &later) in sequence.iter().enumerate() {
+        for &earlier in &sequence[..j] {
+            match before(later, earlier) {
+                None => return unchecked(),
+                Some(true) => {
+                    return Ok(Outcome::OrderUnchecked(
+                        "the order that completes the slice with the reference's other rows \
+                         breaks a constraint between them, and no other completion is tried"
+                            .into(),
+                    ));
+                }
+                Some(false) => {}
+            }
+        }
     }
     Ok(Outcome::Compared)
 }

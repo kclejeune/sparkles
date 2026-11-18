@@ -3168,6 +3168,9 @@ fn differential(
     let keep_going = std::env::var_os("SPARKLES_REFERENCE_KEEP_GOING").is_some();
     let disagreements = std::cell::Cell::new(0);
     let (mut skipped, mut unordered, mut partial, mut readings) = (0, 0, 0, 0);
+    // the number of answers for each reason the comparison gives, which
+    // SPARKLES_REFERENCE_SKIPS prints
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
     for seed in 1..=seeds {
         let shape = Gen::new(seed).query();
         let q = &shape.query;
@@ -3183,9 +3186,25 @@ fn differential(
         let mut check =
             |got: &Rows, what: &str| match reference::check::check_select(&selected, &vars, got) {
                 Ok(reference::check::Outcome::Compared) => {}
-                Ok(reference::check::Outcome::Skipped(_)) => skipped += 1,
-                Ok(reference::check::Outcome::OrderUnchecked(_)) => unordered += 1,
-                Ok(reference::check::Outcome::Partial(_)) => partial += 1,
+                Ok(outcome) => {
+                    let (kind, why) = match outcome {
+                        reference::check::Outcome::Skipped(why) => {
+                            skipped += 1;
+                            ("skipped", why)
+                        }
+                        reference::check::Outcome::OrderUnchecked(why) => {
+                            unordered += 1;
+                            ("unordered", why)
+                        }
+                        reference::check::Outcome::Partial(why) => {
+                            partial += 1;
+                            ("partial", why)
+                        }
+                        reference::check::Outcome::Compared => unreachable!(),
+                    };
+                    let why = why.split(':').next().unwrap_or_default();
+                    *reasons.entry(format!("{kind}, {why}")).or_default() += 1;
+                }
                 Err(m) => {
                     eprintln!("{name} seed {seed}, {what} against the reference: {m}: {q}");
                     disagreements.set(disagreements.get() + 1);
@@ -3217,6 +3236,11 @@ fn differential(
          that the specification leaves open, {unordered} were compared without their order, \
          {partial} were compared with some cells only in part, and {readings} queries compare under the engine's reading of an open roadmap item"
     );
+    if std::env::var_os("SPARKLES_REFERENCE_SKIPS").is_some() {
+        for (why, n) in &reasons {
+            eprintln!("{name}: {n} answers {why}");
+        }
+    }
     assert_eq!(
         disagreements.get(),
         0,
@@ -5343,15 +5367,20 @@ fn reference_evaluator_review_round_2_cases() {
         panic!("a SELECT answer");
     };
     assert_eq!(s2.rows, vec![vec![boolean(true)]]);
-    // 3: an open second key keeps the order of the first
+    // 3: an open second key keeps the order of the first, and an answer that keeps it
+    // is not passed, since the open key decides the rest of the order
     let s3 = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
     assert!(check_select(&s3, &vars(&["x"]), &col(vec![int(2), int(1)])).is_err());
+    assert!(matches!(
+        check_select(&s3, &vars(&["x"]), &col(vec![int(1), int(2)])),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
     let s3b = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND() LIMIT 1");
     assert!(check_select(&s3b, &vars(&["x"]), &col(vec![int(2)])).is_err());
-    assert_eq!(
+    assert!(matches!(
         check_select(&s3b, &vars(&["x"]), &col(vec![int(1)])),
-        Ok(Outcome::Compared)
-    );
+        Ok(Outcome::Skipped(_))
+    ));
     // 4: DISTINCT over copies with different keys leaves the order unchecked, not passed
     let s4 = selected(
         "SELECT DISTINCT ?y WHERE { VALUES (?x ?y) { (0 \"c\") (1 \"a\") (2 \"b\") (3 \"a\") (4 \"d\") } } ORDER BY ?x",
@@ -5504,6 +5533,90 @@ fn reference_evaluator_review_round_2_cases() {
         one("SELECT (REGEX(\"aa\", \"a+?\") AS ?r) WHERE {}"),
         boolean(true)
     );
+}
+
+/// The cases of the third review of the reference evaluator, each of which the
+/// comparison passed as compared before its fix although the specification forbids the
+/// engine's answer or allows another.
+#[test]
+fn reference_evaluator_review_round_3_cases() {
+    use oxrdf::{BlankNode, Literal, NamedNode, Quad};
+    use reference::check::{Outcome, check_select};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let int = |n: i64| Some(Term::Literal(Literal::from(n)));
+    let xsd = |l: &str, d: &str| {
+        Some(Term::Literal(Literal::new_typed_literal(
+            l,
+            iri(&format!("http://www.w3.org/2001/XMLSchema#{d}")),
+        )))
+    };
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let col = |v: Vec<Option<Term>>| v.into_iter().map(|x| vec![x]).collect::<Vec<_>>();
+    let r = reference::Reference::new([Quad::new(
+        BlankNode::new_unchecked("b"),
+        iri("urn:p"),
+        Literal::from(1),
+        iri("urn:g1"),
+    )]);
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+    let compared = |o: &Result<Outcome, String>| matches!(o, Ok(Outcome::Compared));
+    let mut failed: Vec<String> = Vec::new();
+    let mut check = |ok: bool, what: String| {
+        if !ok {
+            failed.push(what);
+        }
+    };
+
+    // 1: a condition that reads an open value is dropped from the key, and the rows that
+    // tie on the conditions before it may still be ordered by the ones after it
+    let s1 =
+        selected("SELECT ?x WHERE { { BIND(RAND() AS ?r) } VALUES ?x { 1 2 } } ORDER BY ?r ?x");
+    let o1 = check_select(&s1, &vars(&["x"]), &col(vec![int(2), int(1)]));
+    check(!compared(&o1), format!("1: {o1:?}"));
+    let s1b = selected(
+        "SELECT ?x WHERE { { BIND(RAND() AS ?r) } VALUES ?x { 1 2 } } ORDER BY ?r ?x LIMIT 1",
+    );
+    let o1b = check_select(&s1b, &vars(&["x"]), &col(vec![int(2)]));
+    check(!compared(&o1b), format!("1 LIMIT 1: {o1b:?}"));
+
+    // 2: the constraints between the rows that a slice leaves out still fix its rows
+    let q2 = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?x WHERE { VALUES ?x { \
+              16777219 \"16777219.5\"^^xsd:double \"16777220\"^^xsd:float } } \
+              ORDER BY ?x OFFSET 1 LIMIT 1";
+    let s2 = selected(q2);
+    let o2 = check_select(&s2, &vars(&["x"]), &col(vec![int(16777219)]));
+    check(!compared(&o2), format!("2: {o2:?}"));
+    let o2b = check_select(&s2, &vars(&["x"]), &col(vec![xsd("16777219.5", "double")]));
+    check(compared(&o2b), format!("2 allowed: {o2b:?}"));
+    // a weaker outcome of the comparison by value in a mixed column stays as weak
+    let s2c = selected(
+        "SELECT ?y WHERE { { VALUES ?y { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } } \
+         UNION { BIND(1 + 1 AS ?y) } } ORDER BY ?y RAND()",
+    );
+    let o2c = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    check(
+        matches!(o2c, Ok(Outcome::OrderUnchecked(_))),
+        format!("2 mixed: {o2c:?}"),
+    );
+
+    // 3: STRDT keeps the lexical form of its argument
+    let s3 = selected(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(\"01\", xsd:integer) AS ?x) WHERE {}",
+    );
+    let o3 = check_select(&s3, &vars(&["x"]), &col(vec![int(1)]));
+    check(o3.is_err(), format!("3: {o3:?}"));
+    let o3b = check_select(&s3, &vars(&["x"]), &col(vec![xsd("01", "integer")]));
+    check(compared(&o3b), format!("3 allowed: {o3b:?}"));
+
+    // 4: GRAPH joins an open graph name of its inner pattern with the graph's name
+    let s4 = selected(
+        "SELECT ?g WHERE { GRAPH ?g { SELECT (IF(RAND() < 0.5, <urn:g1>, <urn:g2>) AS ?g) WHERE {} } }",
+    );
+    let o4 = check_select(&s4, &vars(&["g"]), &[]);
+    check(!compared(&o4), format!("4: {o4:?}"));
+    let o4b = check_select(&s4, &vars(&["g"]), &col(vec![Some(iri("urn:g1").into())]));
+    check(o4b.is_ok(), format!("4 allowed: {o4b:?}"));
+    assert!(failed.is_empty(), "{failed:#?}");
 }
 
 /// The reference evaluator's own cases: the choices that it notes, the scope of the

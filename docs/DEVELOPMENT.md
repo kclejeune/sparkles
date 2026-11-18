@@ -451,7 +451,7 @@ otherwise, which is none. The seeded queries of `tests/query_cursor.rs` take the
 evaluator as their oracle, and the optimizer, index-join and string-filter tests of
 `src/sparql` compare the engine with it as well as with `Optimizations::NONE`. Both go
 through `check.rs` beside the evaluator, which passes no answer that the specification
-forbids and reports a partial comparison where it cannot decide. A column of open values,
+forbids and reports a partial, unordered or skipped comparison where it cannot decide. A column of open values,
 such as a SAMPLE or a RAND, is compared only by its place in the rows. A number in a column
 that only computed values bind is compared by datatype and value, and every other term
 exactly. An ordered or sliced answer must be a slice of an order that ORDER BY allows,
@@ -460,7 +460,8 @@ is not compared. The evaluator follows Jena where Jena's reading differs from th
 specification's text and the engine follows Jena, and `with_spec_readings(true)` selects
 the text, which the W3C suites take. `SPARKLES_REFERENCE_KEEP_GOING=1` makes the seeded
 queries report every disagreement before they fail, and `SPARKLES_REFERENCE_SKIPS=1` makes
-the other tests print each query they do not compare with the evaluator.
+the seeded queries count their partial, unordered and skipped answers by reason and the
+other tests print each query they do not compare with the evaluator.
 
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.

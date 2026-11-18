@@ -39,7 +39,8 @@ use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Te
 use oxrdf::{Variable, vocab::xsd};
 use oxsdatatypes::DateTime;
 use spargebra::algebra::{
-    AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression, QueryDataset,
+    AggregateExpression, AggregateFunction, Expression, Function, GraphPattern, OrderExpression,
+    QueryDataset,
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::{Query, SparqlParser};
@@ -537,9 +538,13 @@ pub enum Provenance {
 
 /// The provenance of each variable that `p` binds. A variable is copied where a basic
 /// graph pattern, a path, VALUES or a GRAPH name binds it, or an expression whose
-/// outermost operator passes a term through: a variable, a constant, COALESCE, IF and
-/// the MIN, MAX and SAMPLE aggregates. It is computed where any other expression or
-/// aggregate binds it.
+/// outermost operator passes a term through or keeps the lexical form it is given: a
+/// variable, a constant, COALESCE, IF, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and
+/// SAMPLE aggregates. It is computed where arithmetic,
+/// a numeric function, a cast to a number or the COUNT, SUM and AVG aggregates bind it,
+/// whose numbers take the implementation's lexical form. Any other operator binds it
+/// both ways, so that its numbers compare exactly and a difference only in their
+/// lexical form makes the comparison partial.
 fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
     #[derive(Default)]
     struct Site {
@@ -556,7 +561,42 @@ fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
                 expr_site(a, site);
                 expr_site(b, site);
             }
-            _ => site.computed = true,
+            Expression::Add(..)
+            | Expression::Subtract(..)
+            | Expression::Multiply(..)
+            | Expression::Divide(..)
+            | Expression::UnaryPlus(_)
+            | Expression::UnaryMinus(_) => site.computed = true,
+            Expression::FunctionCall(f, _) => match f {
+                Function::Abs
+                | Function::Ceil
+                | Function::Floor
+                | Function::Round
+                | Function::Rand
+                | Function::StrLen
+                | Function::Year
+                | Function::Month
+                | Function::Day
+                | Function::Hours
+                | Function::Minutes
+                | Function::Seconds => site.computed = true,
+                Function::Custom(n)
+                    if [xsd::INTEGER, xsd::DECIMAL, xsd::FLOAT, xsd::DOUBLE]
+                        .iter()
+                        .any(|d| d.as_str() == n.as_str()) =>
+                {
+                    site.computed = true
+                }
+                Function::StrDt | Function::StrLang | Function::StrLangDir => site.copied = true,
+                _ => {
+                    site.copied = true;
+                    site.computed = true;
+                }
+            },
+            _ => {
+                site.copied = true;
+                site.computed = true;
+            }
         }
     }
     fn term_vars(t: &TermPattern, out: &mut Vec<Variable>) {
@@ -635,7 +675,18 @@ fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
                             expr,
                             ..
                         } => expr_site(expr, &mut site),
-                        _ => site.computed = true,
+                        AggregateExpression::CountSolutions { .. }
+                        | AggregateExpression::FunctionCall {
+                            name:
+                                AggregateFunction::Count
+                                | AggregateFunction::Sum
+                                | AggregateFunction::Avg,
+                            ..
+                        } => site.computed = true,
+                        _ => {
+                            site.copied = true;
+                            site.computed = true;
+                        }
                     }
                     sites.push((v.clone(), site));
                 }
@@ -704,6 +755,10 @@ pub struct TopOrder {
     /// Whether two different terms with equal values are unordered, as under Jena's
     /// reading, which [`strictly_before`] describes.
     pub term_ties: bool,
+    /// Whether a row's key ends before a condition that read an open value. The rows
+    /// that tie on the conditions before it may still be ordered by the ones after it,
+    /// so the keys tell only which orders are forbidden.
+    pub open_conditions: bool,
     pub offset: usize,
     pub limit: Option<usize>,
 }
@@ -717,6 +772,8 @@ struct Keyed {
     /// Whether DISTINCT kept a row whose copies have different keys, so that the order
     /// places it in one of several ranges, which the keys do not describe.
     unplaced: bool,
+    /// Whether a key ends before a condition that read an open value.
+    open_conditions: bool,
 }
 
 /// The values of the ORDER BY conditions for one solution, unbound where a condition is
@@ -1294,6 +1351,7 @@ impl<'a> Evaluator<'a> {
             solutions,
             keys,
             unplaced,
+            open_conditions,
         } = self.eval_keyed(inner, &cx)?;
         // A top slice's cuts are the comparison's to check, so they do not make the rows
         // open. A row that DISTINCT kept from copies with different keys has a place that
@@ -1325,6 +1383,7 @@ impl<'a> Evaluator<'a> {
                     .collect(),
                 descending,
                 term_ties: !self.data.spec_readings.get(),
+                open_conditions,
                 offset: slice.map_or(0, |s| s.0),
                 limit: slice.and_then(|s| s.1),
             })
@@ -1438,6 +1497,7 @@ impl<'a> Evaluator<'a> {
                     }
                     std::cmp::Ordering::Equal
                 });
+                let open_conditions = keyed.iter().any(|(_, fixed, _)| *fixed < expression.len());
                 let (keys, solutions) = keyed
                     .into_iter()
                     .map(|(mut k, fixed, s)| {
@@ -1449,6 +1509,7 @@ impl<'a> Evaluator<'a> {
                     solutions,
                     keys: Some((keys, descending)),
                     unplaced: false,
+                    open_conditions,
                 })
             }
             GraphPattern::Project { inner, variables } => {
@@ -1481,6 +1542,7 @@ impl<'a> Evaluator<'a> {
                     solutions,
                     keys,
                     unplaced: unplaced_any,
+                    open_conditions,
                 } = self.eval_keyed(inner, cx)?;
                 // open values may be equal or not in another answer
                 if self.binds_open(inner) {
@@ -1509,6 +1571,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Keyed {
                     unplaced: unplaced_any || !unplaced.is_empty(),
+                    open_conditions,
                     solutions: kept.iter().map(|&i| solutions[i].clone()).collect(),
                     keys: keys.map(|(k, d)| {
                         let k = kept
@@ -1539,6 +1602,7 @@ impl<'a> Evaluator<'a> {
                 solutions: self.eval(p, cx)?,
                 keys: None,
                 unplaced: false,
+                open_conditions: false,
             }),
         }
     }
@@ -1629,6 +1693,11 @@ impl<'a> Evaluator<'a> {
                         }
                         out.push(s);
                     }
+                }
+                // The graph's name joins the inner pattern's binding of the variable,
+                // so an open value there decides which solutions the join keeps.
+                if self.open_vars.borrow().contains(v) && in_scope(inner).contains(v) {
+                    self.chose.set(true);
                 }
             }
         }
