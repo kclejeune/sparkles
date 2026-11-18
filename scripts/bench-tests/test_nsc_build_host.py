@@ -489,28 +489,32 @@ class BuildHost(unittest.TestCase):
         self.assertIn("bh_entry_host_ok", (self.repo / "scripts/nsc-bench.sh").read_text())
 
     def test_a_boat_build_gets_the_cap_and_a_bounded_jobs_count(self):
-        """Five jobs, the count that the 12G cap alone implies, ran a cold Boat build out of memory."""
+        """The server's final rustc ran a 12G Boat build out of memory at 5 jobs and at 2, so the cap is 13G."""
         # bh_rx is stubbed, so the test sees the exact command that would reach the host.
         program = ('. "$1/scripts/nsc-build-host.sh"; die() { echo "die: $*" >&2; exit 9; }; '
                    'bh_rx() { echo "$3"; }; bh_start "$2" /scratch unit-x --locked')
-        def start(host, jobs=None):
+        def start(host, jobs=None, mem=None):
             env = dict(self.env)
             env.pop("SPARKLES_BOAT_BUILD_JOBS", None)
+            env.pop("SPARKLES_BOAT_BUILD_MEMORY_MAX", None)
             if jobs is not None:
                 env["SPARKLES_BOAT_BUILD_JOBS"] = jobs
+            if mem is not None:
+                env["SPARKLES_BOAT_BUILD_MEMORY_MAX"] = mem
             return subprocess.run(["bash", "-c", program, "bash", str(self.repo), host],
                                   env=env, capture_output=True, text=True)
         tail = "bash /scratch/bin/nsc-build-remote.sh /scratch unit-x "
         default = start("boat:bx_worker")
         self.assertEqual(default.returncode, 0, default.stderr)
-        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=12G CARGO_BUILD_JOBS=2 " + tail, default.stdout)
-        override = start("boat:bx_worker", "3")
+        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=13G CARGO_BUILD_JOBS=6 " + tail, default.stdout)
+        override = start("boat:bx_worker", "3", "12G")
         self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=12G CARGO_BUILD_JOBS=3 " + tail, override.stdout)
         # An ssh host derives its own cap and jobs, and the caller's override does not reach it.
-        ssh = start("h1", "3")
+        ssh = start("h1", "3", "12G")
         self.assertEqual(ssh.returncode, 0, ssh.stderr)
         self.assertIn("\n" + tail, ssh.stdout)
         self.assertNotIn("CARGO_BUILD_JOBS", ssh.stdout)
+        self.assertNotIn("SPARKLES_NSC_BUILD_MEMORY_MAX", ssh.stdout)
         # A bad value is refused by the argument check, before the Boat admission is validated
         # and before either entry point admits its executor.
         spy = self.root / "admission-calls"
@@ -522,6 +526,13 @@ class BuildHost(unittest.TestCase):
                                      env=env, capture_output=True, text=True)
             self.assertEqual(refused.returncode, 9, bad)
             self.assertIn("not a whole number from 2 to 8", refused.stderr)
+            self.assertFalse(spy.exists(), bad)
+        for bad in ("14G", "7G", "12", "12g", "013G", "12.5G"):
+            env = dict(self.env, SPARKLES_BOAT_BUILD_JOBS="2", SPARKLES_BOAT_BUILD_MEMORY_MAX=bad)
+            refused = subprocess.run(["bash", "-c", check, "bash", str(self.repo), "boat:bx_worker", str(spy)],
+                                     env=env, capture_output=True, text=True)
+            self.assertEqual(refused.returncode, 9, bad)
+            self.assertIn("not a whole number of G from 8G to 13G", refused.stderr)
             self.assertFalse(spy.exists(), bad)
         accepted = subprocess.run(["bash", "-c", check, "bash", str(self.repo), "boat:bx_worker", str(spy)],
                                   env=dict(self.env, SPARKLES_BOAT_BUILD_JOBS="2"), capture_output=True, text=True)

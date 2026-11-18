@@ -26,7 +26,7 @@
 # (default 20), and a lost reply never starts a second build. The scope must stop within
 # SPARKLES_NSC_BUILD_RUNTIME (default 14400) seconds, sooner when SPARKLES_NSC_BUILD_DEADLINE
 # or a Boat worker's admitted lifetime leaves less (bh_expiry), and the host enforces it. A
-# Boat build runs with a 12G cap and SPARKLES_BOAT_BUILD_JOBS compile jobs (bh_build_env). The binary and its build record come back over ssh and the SHA-256 is checked.
+# Boat build runs with the cap SPARKLES_BOAT_BUILD_MEMORY_MAX and SPARKLES_BOAT_BUILD_JOBS compile jobs (bh_build_env). The binary and its build record come back over ssh and the SHA-256 is checked.
 # The scope is stopped and the scratch directory removed when the build ends in any way:
 # after a failure, and from the caller's EXIT trap (bh_cleanup) after an interrupt or lost
 # contact. A Boat worker keeps the directory as evidence. Cleanup touches only the
@@ -80,7 +80,7 @@ bh_check_arg() {
   case $BH_ARG in
     '' | local | auto) ;;
     boat:bx_*)
-      bh_build_env "$BH_ARG" > /dev/null || die "SPARKLES_BOAT_BUILD_JOBS is not valid"
+      bh_build_env "$BH_ARG" > /dev/null || die "SPARKLES_BOAT_BUILD_MEMORY_MAX or SPARKLES_BOAT_BUILD_JOBS is not valid"
       python3 "$RX_DIR/remote-executor.py" validate "$BH_ARG" > /dev/null || die 'invalid or expired Boat admission'
       ;;
     -* | *[!A-Za-z0-9._@-]*) die "--build-host is local, auto or a host name, not $BH_ARG" ;;
@@ -341,24 +341,33 @@ bh_expiry() {
 }
 
 # bh_build_env HOST: the environment prefix of the remote build command, empty for an ssh
-# host, which derives its own cap and jobs. Qualification admits a Boat worker for a job of
-# BOAT_JOB_MEMORY_GIB in scripts/boat/metadata-probe.py, so a build there takes a 12G cap
-# with no swap. The jobs that nsc-build-remote.sh would derive from that cap, 5, ran a cold
-# server build out of memory, and the jobs also bound the codegen threads of the server's
-# final rustc through the jobserver. A Boat build therefore gets SPARKLES_BOAT_BUILD_JOBS
-# compile jobs, a whole number from 2 to 8 (default BH_BOAT_BUILD_JOBS). Any other value is
-# refused before the worker is admitted.
-BH_BOAT_BUILD_JOBS=2
+# host, which derives its own cap and jobs. A Boat build takes the cap
+# SPARKLES_BOAT_BUILD_MEMORY_MAX, a whole number of G from 8G to 13G (default
+# BH_BOAT_BUILD_MEMORY_MAX), with no swap. The server's final rustc peaks just above 12 GiB
+# whatever the job count, so 12G ran it out of memory at 5 jobs and at 2, and 13G is the
+# screen-build figure. It is 1 GiB above BOAT_JOB_MEMORY_GIB, the job that qualification
+# admits in scripts/boat/metadata-probe.py, so a worker that runs it needs its own job release
+# that checks the 14.5 GiB headroom. The build gets SPARKLES_BOAT_BUILD_JOBS compile jobs, a
+# whole number from 2 to 8 (default BH_BOAT_BUILD_JOBS, the count that passed at 13G). Any
+# other value of either is refused before the worker is admitted.
+BH_BOAT_BUILD_MEMORY_MAX=13G
+BH_BOAT_BUILD_JOBS=6
 bh_build_env() {
   case $1 in
     boat:*)
       local jobs=${SPARKLES_BOAT_BUILD_JOBS:-$BH_BOAT_BUILD_JOBS}
+      local mem=${SPARKLES_BOAT_BUILD_MEMORY_MAX:-$BH_BOAT_BUILD_MEMORY_MAX}
       case $jobs in [2-8]) ;; *)
         echo "SPARKLES_BOAT_BUILD_JOBS is $jobs, not a whole number from 2 to 8" >&2
         return 1
         ;;
       esac
-      echo "SPARKLES_NSC_BUILD_MEMORY_MAX=12G CARGO_BUILD_JOBS=$jobs "
+      case $mem in [89]G | 1[0-3]G) ;; *)
+        echo "SPARKLES_BOAT_BUILD_MEMORY_MAX is $mem, not a whole number of G from 8G to 13G" >&2
+        return 1
+        ;;
+      esac
+      echo "SPARKLES_NSC_BUILD_MEMORY_MAX=$mem CARGO_BUILD_JOBS=$jobs "
       ;;
   esac
 }

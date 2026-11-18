@@ -278,7 +278,7 @@ class MemoryAdmission(unittest.TestCase):
 
 
 class BoatJobMemory(unittest.TestCase):
-    """Qualification admits a job of BOAT_JOB_MEMORY_GIB, and every Boat job unit has that cap."""
+    """Qualification admits a job of BOAT_JOB_MEMORY_GIB, and every Boat job unit but a screen build has that cap."""
     def test_the_headroom_and_its_refusal_follow_the_job_figure(self):
         mp=metadata_probe();g=mp.BOAT_JOB_MEMORY_GIB
         self.assertEqual(g,12)
@@ -296,8 +296,10 @@ class BoatJobMemory(unittest.TestCase):
         self.assertEqual(set(re.findall(r'MemoryMax=(\S+)',screen)),{f'{g}G'})
         gate=(scripts/'gate/remote/gate-start.sh').read_text()
         self.assertEqual(re.findall(r'^boat_mem_g=(\S+)$',gate,re.M),[str(g)])
+        # A Boat screen build is the exception: its default cap is 1 GiB above the admitted
+        # job, so the worker that runs it carries its own job release for that figure.
         build=(scripts/'nsc-build-host.sh').read_text()
-        self.assertEqual(re.findall(r'SPARKLES_NSC_BUILD_MEMORY_MAX=(\S+?)\s',build),[f'{g}G'])
+        self.assertEqual(re.findall(r'^BH_BOAT_BUILD_MEMORY_MAX=(\S+)$',build,re.M),[f'{g+1}G'])
 
     def test_the_admission_edge(self):
         mp=metadata_probe();total=16768798720
