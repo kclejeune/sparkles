@@ -3397,6 +3397,15 @@ fn count_join_counts_a_streamed_join() {
             ),
             false,
         ),
+        // two matching rows before a tail that matches nothing, which a hash join reads
+        // after its last pair
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES ?s {{ <urn:s:1> <urn:s:2> {} }} ?s <urn:q> ?t }}",
+                (0..100).map(|i| format!("<urn:x:{i}>")).collect::<Vec<_>>().join(" ")
+            ),
+            false,
+        ),
         // a key that some rows leave unbound
         (
             format!(

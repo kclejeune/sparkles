@@ -3617,6 +3617,11 @@ impl Operator {
                 }
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
+                // The inputs' last rows count once the pairs are all out, as they
+                // counted before the eager count admitted the pairs.
+                if self.count_pairs == Some(true) {
+                    ctx.check_output_rows(self.rows)?;
+                }
                 self.done = true;
                 self.release_finished();
             }
@@ -3675,6 +3680,11 @@ impl Operator {
                 // a fallback counts the rows it emitted; `materializedRows` holds its table
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
+                // The inputs' last rows count once the pairs are all out, as they
+                // counted before the eager count admitted the pairs.
+                if self.count_pairs == Some(true) {
+                    ctx.check_output_rows(self.rows)?;
+                }
                 self.done = true;
                 self.release_finished();
             }

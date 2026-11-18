@@ -843,3 +843,51 @@ fn a_streamed_loop_admits_each_answer_before_the_next_request() {
     let sent = ep.take().len();
     assert!(sent < 40, "the loop sent {sent} requests past its budget");
 }
+
+/// A bulk request cut short is sent again one input at a time, and the streamed loop
+/// admits each of those answers before it sends the next (Sol review of item 829, round
+/// 3, finding 2).
+#[test]
+fn a_streamed_loop_admits_each_retried_answer() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(40));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p ?l {{ ?d a <urn:Department> SERVICE <loop:bulk+40:{}> {{ ?d <urn:hasEmployee> ?p . ?p <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}",
+        ep.url()
+    );
+    // Every response stops after 30 rows, so the bulk request lacks its end marker.
+    ep.limit.store(30, Ordering::SeqCst);
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let o = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: memory,
+            ..opts()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &opts, &o)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    assert!(streamed(None).unwrap() > 0);
+    assert_eq!(
+        ep.take().len(),
+        41,
+        "a bulk request and one retry per department"
+    );
+    let r = streamed(Some(48 << 10));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+    let sent = ep.take().len();
+    assert!(sent < 41, "the loop sent {sent} requests past its budget");
+}

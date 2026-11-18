@@ -1427,8 +1427,16 @@ impl RemoteRun {
                             stats.retried += 1;
                             let mut out = Vec::new();
                             let mut err = None;
+                            // Each answer is held before the next request goes out.
+                            let mut retried = held.saturating_add(kept);
                             for i in chunk {
-                                match ctx.check().and_then(|()| one(ctx, &inputs[*i], stats)) {
+                                match ctx
+                                    .check()
+                                    .and_then(|()| one(ctx, &inputs[*i], stats))
+                                    .and_then(|r| {
+                                        retried = retried.saturating_add(r.bytes());
+                                        admit(retried).map(|()| r)
+                                    }) {
                                     Ok(r) => out.push((*i, r, true)),
                                     Err(e) => {
                                         err = Some(e);
