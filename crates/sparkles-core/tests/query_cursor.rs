@@ -3348,9 +3348,10 @@ fn count_join_counts_a_streamed_join() {
             )
         })
         .collect::<String>()
-        // two pairs with `?s <urn:q> ?t` on both variables, then 60 rows that match
+        // four pairs with `?s <urn:q> ?t` on both variables, then 60 rows that match
         // nothing
         + "<urn:s:1> <urn:w> <urn:s:7> .\n<urn:s:2> <urn:w> <urn:s:14> .\n"
+        + "<urn:s:3> <urn:w> <urn:s:21> .\n<urn:s:4> <urn:w> <urn:s:28> .\n"
         + &(0..60)
             .map(|i| format!("<urn:z:{i}> <urn:w> <urn:z:{i}> .\n"))
             .collect::<String>();
@@ -3403,9 +3404,11 @@ fn count_join_counts_a_streamed_join() {
             ),
             false,
         ),
-        // a hash join on two variables that BIND leaves unsorted, whose two pairs come
+        // a hash join on two variables that BIND leaves unsorted, whose four pairs come
         // before rows that match nothing, so the join reads input after its last pair
-        // (a merge join would stop at the end of one input, which eager reads whole)
+        // (a merge join would stop at the end of one input, which eager reads whole);
+        // eager refuses it at a work limit equal to its own work, as item 1103 records,
+        // and so must the streamed count once it has read that input
         (
             "SELECT (COUNT(*) AS ?n) WHERE { { ?a <urn:q> ?b BIND(?a AS ?s) BIND(?b AS ?t) } ?s <urn:w> ?t }".to_string(),
             true,
@@ -3449,16 +3452,10 @@ fn count_join_counts_a_streamed_join() {
                 ..Default::default()
             }
         };
-        // A refusal compares by its kind. A streamed count refuses at the first batch
-        // that passes a limit, so the total it reports is in general below eager's. The
-        // hash join whose input goes on after its last pair also compares the total,
-        // since eager and the streamed count both refuse once the join has read all of
-        // its input, and not when a later operator counts its row.
-        let exact = q.contains("BIND");
-        type Outcome = Result<Vec<Vec<Option<Term>>>, Option<(BudgetKind, u64)>>;
+        type Outcome = Result<Vec<Vec<Option<Term>>>, Option<BudgetKind>>;
         let outcome = |r: Result<Vec<Vec<Option<Term>>>, Error>| -> Outcome {
             r.map_err(|e| match e {
-                Error::BudgetExceeded(b) => Some((b.kind, if exact { b.requested } else { 0 })),
+                Error::BudgetExceeded(b) => Some(b.kind),
                 _ => None,
             })
         };
