@@ -12,8 +12,8 @@ and that path decoded every vocabulary column an expression named once the table
 with one thread the query took 57 ms against 16 ms before item 826, and its EXISTS form
 53 ms against 14. The decode now covers only the columns whose values the expression
 reads, which also spares eager BIND and ORDER BY keys of the same shape. Arguments that
-read values, such as `STRLEN(?name)`, still decode their columns first, which measured
-13% faster than reading them row by row. This is roadmap item 1098.
+read values, such as `STRLEN(?name)`, still decode their columns first, since that was
+faster on one thread than reading them row by row. This is roadmap item 1098.
 
 ### Dependency security updates
 
