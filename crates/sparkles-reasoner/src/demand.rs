@@ -902,8 +902,9 @@ struct StageBuilder<'a> {
     derived_lists: bool,
     /// whether linear recursion is rewritten (see [`transform`])
     rewrite_linear: bool,
-    /// the rules are a lowered program's (see [`replays_lists`]), whose evaluation reads
-    /// a list again when its cells arrive
+    /// the rules are a lowered program's with an IR feature (item 839), which runs as
+    /// `engine::run_program` runs it and reads a list again when its cells arrive, so a
+    /// stage whose lists are not completed below asks for the cells it reads
     replay: bool,
 }
 
@@ -2169,6 +2170,10 @@ pub(crate) fn schema_roots(vocab: &Vocab, rdf_type: u64) -> Vec<(Key, [u64; 3])>
 /// With `linear` unset, linear recursion is not rewritten. Then every fact the program derives for a key has, among the facts derived, the
 /// premises of an instance of the original rule (spec F18 §3.1), since the rewriting
 /// derives the answers for the value asked for and not for the nodes it passes.
+///
+/// With `replay` set, the rules are a lowered program's with an IR feature (item 839),
+/// which runs as `engine::run_program` runs it and reads a list again when its cells
+/// arrive: a stage whose lists are not completed below asks for the list cells it reads.
 pub(crate) fn transform(
     rules: &[CRule],
     terms: &Terms,
@@ -2176,15 +2181,16 @@ pub(crate) fn transform(
     est: Estimate<'_>,
     pass: Pass<'_>,
     linear: bool,
+    replay: bool,
 ) -> Result<Program, TransformError> {
     // A lower stage of every derived list can depend on itself when a rule reads one
     // list to build another, which the keys cannot tell apart. The program is then made
     // again with lists read as the stage holds them (Codex re-review F17-P1 #3).
     // A program whose noValue lies on a cycle stays refused (second Codex re-review of
     // F17-P1, #2).
-    match transform_in(rules, terms, roots, est, pass, true, linear) {
+    match transform_in(rules, terms, roots, est, pass, true, linear, replay) {
         Err(TransformError::NotStratified) if !negation_on_a_cycle(rules, terms) => {
-            transform_in(rules, terms, roots, est, pass, false, linear)
+            transform_in(rules, terms, roots, est, pass, false, linear, replay)
         }
         r => r,
     }
@@ -2326,9 +2332,8 @@ fn transform_in(
     pass: Pass<'_>,
     list_stages: bool,
     linear: bool,
+    replay: bool,
 ) -> Result<Program, TransformError> {
-    // a property of the program as a whole, before the closed pass leaves rules out
-    let replay = replays_lists(rules);
     let closed = match pass {
         Pass::Closed(c) => Some(c),
         _ => None,
@@ -2512,24 +2517,6 @@ fn transform_in(
         magic_preds,
         dummy,
         _compact_allocation: None,
-    })
-}
-
-/// Whether `rules` are a lowered program of the IR with an IR feature (item 839): a
-/// relation's key or a lowered builtin. Such a program runs as `engine::run_program` runs
-/// it, which reads a list again when its cells arrive, so its demand program asks for the
-/// list cells that a stage reads when the lists are not completed below it, and its
-/// stages run with the replay too.
-pub(crate) fn replays_lists(rules: &[CRule]) -> bool {
-    rules.iter().any(|r| {
-        r.atoms.iter().any(|a| is_key(a.p))
-            || r.head.iter().any(|h| is_key(head_slots(h).1))
-            || r.builtins.iter().any(|b| {
-                matches!(
-                    b.kind,
-                    BuiltinKind::RelTail | BuiltinKind::RelTuple | BuiltinKind::RelAbsent
-                )
-            })
     })
 }
 

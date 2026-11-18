@@ -182,11 +182,12 @@ fn write_call(
     out: &mut impl std::fmt::Write,
     name: &str,
     args: &[Option<Term>],
+    sep: &str,
 ) -> std::fmt::Result {
     write!(out, "{name}(")?;
     for (i, arg) in args.iter().enumerate() {
         if i != 0 {
-            out.write_str(", ")?;
+            out.write_str(sep)?;
         }
         match arg {
             Some(term) => write!(out, "{term}")?,
@@ -203,6 +204,17 @@ fn blocker_call(
     args: &[Option<u64>],
     retained: &mut crate::budget::Held,
 ) -> anyhow::Result<String> {
+    blocker_call_sep(terms, name, args, ", ", retained)
+}
+
+/// [`blocker_call`] with `sep` between the arguments.
+fn blocker_call_sep(
+    terms: &Terms,
+    name: &str,
+    args: &[Option<u64>],
+    sep: &str,
+    retained: &mut crate::budget::Held,
+) -> anyhow::Result<String> {
     let mut temporary = crate::budget::Held::new(retained.budget());
     temporary.try_grow(args.len() * std::mem::size_of::<Option<Term>>())?;
     let mut decoded = Vec::with_capacity(args.len());
@@ -214,10 +226,10 @@ fn blocker_call(
         decoded.push(term);
     }
     let mut bytes = CallBytes(0);
-    write_call(&mut bytes, name, &decoded)?;
+    write_call(&mut bytes, name, &decoded, sep)?;
     retained.try_grow(bytes.0 + 2 * std::mem::size_of::<(String, Option<Triple>)>())?;
     let mut call = String::with_capacity(bytes.0);
-    write_call(&mut call, name, &decoded)?;
+    write_call(&mut call, name, &decoded, sep)?;
     Ok(call)
 }
 
@@ -239,25 +251,7 @@ fn negated_call(
         .and_then(|r| relations.and_then(|rs| rs.get(r)));
     let Some(rel) = rel else {
         // `not (s p o)`, as explanations write a negated triple
-        let mut temporary = crate::budget::Held::new(retained.budget());
-        let mut parts: Vec<String> = Vec::with_capacity(args.len());
-        for arg in args {
-            let part = match arg.and_then(|id| terms.term(id)) {
-                Some(t) => {
-                    temporary.try_grow(2 * sparkles_core::explain::term_bytes(&t))?;
-                    t.to_string()
-                }
-                None => "_".to_string(),
-            };
-            parts.push(part);
-        }
-        let bytes = 6 + parts.iter().map(|p| p.len() + 1).sum::<usize>();
-        retained.try_grow(bytes + 2 * std::mem::size_of::<(String, Option<Triple>)>())?;
-        let mut call = String::with_capacity(bytes);
-        call.push_str("not (");
-        call.push_str(&parts.join(" "));
-        call.push(')');
-        return Ok(call);
+        return blocker_call_sep(terms, "not ", args, " ", retained);
     };
     let cols: Vec<Option<u64>> = match rel.arity {
         0 => Vec::new(),

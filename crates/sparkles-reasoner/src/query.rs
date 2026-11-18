@@ -1144,12 +1144,23 @@ impl Session {
     fn transform(&self, rules: &[CRule], roots: &[Key], pass: Pass<'_>) -> Result<Program> {
         let g = self.graph.as_ref().expect("graph made");
         let est = |a: &Atom, bound: &[bool]| estimate(g, a, bound);
-        demand::transform(rules, &self.terms, roots, &est, pass, self.rewrite_linear).map_err(|e| {
-            match e {
-                TransformError::Memory(m) => memory_error(m, "the demand program"),
-                TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
-                TransformError::NotStratified => component(RULES_CODE, e.to_string()),
-            }
+        // whether the program reads lists again when their cells arrive is the source
+        // program's, since the schema pass and specialization may leave out the rules
+        // that hold its IR features (item 839)
+        let replay = self.compiled.replays_lists();
+        demand::transform(
+            rules,
+            &self.terms,
+            roots,
+            &est,
+            pass,
+            self.rewrite_linear,
+            replay,
+        )
+        .map_err(|e| match e {
+            TransformError::Memory(m) => memory_error(m, "the demand program"),
+            TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
+            TransformError::NotStratified => component(RULES_CODE, e.to_string()),
         })
     }
 

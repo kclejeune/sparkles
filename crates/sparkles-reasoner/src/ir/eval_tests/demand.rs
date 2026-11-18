@@ -549,7 +549,7 @@ fn magic_rules_intern_no_tail() {
         (v.props[4], true, false),
     ] {
         let root = Key::new(s, KeyP::Const(pred), o);
-        let prog = transform(&rules, &t, &[root], &est, Pass::Plain, true).unwrap();
+        let prog = transform(&rules, &t, &[root], &est, Pass::Plain, true, true).unwrap();
         let mut tuples = 0;
         for st in &prog.stages {
             for r in &st.rules {
@@ -847,4 +847,133 @@ fn the_relation_catalog_stays_charged() {
     terms.set_budget(&budget).unwrap();
     let used = Session::program_rules_for_tests(&source, &terms, &budget).unwrap();
     assert!(used >= 1 << 20, "{used} bytes charged");
+}
+
+/// The list pipeline beside a negated rule that gives schema facts: the schema pass
+/// completes that rule and specialization leaves it out, so the rules the query's program
+/// is made from hold no IR feature, and the program still asks for the copied list's
+/// cells and reads them when they arrive.
+#[test]
+fn replay_survives_specialization() {
+    let v = Arc::new(TV::new());
+    let ind = |i: usize| v.inds[i];
+    let rdf = |l: &str| v.iri[&format!("{RDF}{l}")];
+    let sub = v.iri["http://www.w3.org/2000/01/rdf-schema#subClassOf"];
+    let (first, rest, nil) = (rdf("first"), rdf("rest"), rdf("nil"));
+    let (l0, l1, l2) = (v.list_nodes[0], v.list_nodes[1], v.list_nodes[2]);
+    let (seed, blocked, p2, copy, uses) =
+        (v.props[1], v.props[3], v.props[2], v.props[0], v.props[4]);
+    let (c0, c1) = (v.classes[0], v.classes[1]);
+    let source: Source = Arc::new(move |_: &Terms| {
+        let rules = vec![
+            rule(
+                "copy",
+                vec![pos(tri(V(0), copy, V(1))), bi(B::ListMember, &[V(0), V(2)])],
+                vec![head(tri(V(1), first, V(2))), head(tri(V(1), rest, C(nil)))],
+            ),
+            rule(
+                "use",
+                vec![pos(tri(V(0), uses, V(1))), bi(B::ListMember, &[V(1), V(2)])],
+                vec![head(tri(V(2), p2, V(2)))],
+            ),
+            rule(
+                "schema",
+                vec![pos(tri(V(0), seed, V(1))), neg(tri(V(0), blocked, V(1)))],
+                vec![head(tri(V(0), sub, V(1)))],
+            ),
+        ];
+        (Relations::default(), rules)
+    });
+    let base: FxHashSet<Triple> = [
+        [l0, first, ind(0)],
+        [l0, rest, l2],
+        [l2, first, ind(1)],
+        [l2, rest, nil],
+        [l0, copy, l1],
+        [ind(5), uses, l1],
+        [c0, seed, c1],
+    ]
+    .into_iter()
+    .collect();
+    let want = full(&v, &source, &base);
+    assert!(want.contains(&(None, vec![ind(0), p2, ind(0)])), "{want:?}");
+    assert!(want.contains(&(None, vec![c0, sub, c1])));
+    // the query session, whose program is specialized to the schema
+    use sparkles_core::sparql::reasoning::{Demand, DemandTerm, ReasoningSession};
+    let snap = set_default_graph(&v, &base);
+    let qr = reasoner(&source);
+    let mut s: Session = qr.test_session(request(&snap), true).unwrap();
+    let t = Terms::new(v.store.snapshot());
+    let d = Demand {
+        s: DemandTerm::Var,
+        p: DemandTerm::Const(t.term(p2).unwrap()),
+        o: DemandTerm::Var,
+    };
+    s.prepare(&[d], false).unwrap();
+    let out = s.derive(vec![(0, Vec::new())]).unwrap();
+    assert!(out.facts.contains(&[ind(0), p2, ind(0)]), "{:?}", out.facts);
+    check(&v, &source, &base, &[tp(p2, None, None)], "pattern");
+}
+
+/// A negated triple's blocker over a large literal with escaped characters stays within
+/// a memory budget that admits the rest of the answer.
+#[test]
+fn a_large_negated_triple_blocker_is_charged() {
+    let v = Arc::new(TV::new());
+    let ind = |i: usize| v.inds[i];
+    let (p0, p1, p2) = (v.props[0], v.props[1], v.props[2]);
+    let text = "\"\n\\".repeat(1 << 16);
+    let lit = {
+        let key = sparkles_core::id::term_key(&oxrdf::Term::Literal(
+            oxrdf::Literal::new_simple_literal(text),
+        ));
+        let mut txn = v.store.write();
+        let id = txn.intern_key(&key).unwrap().0;
+        txn.commit().unwrap();
+        id
+    };
+    let source: Source = Arc::new(move |_: &Terms| {
+        let rules = vec![rule(
+            "q",
+            vec![pos(tri(V(0), p1, V(1))), neg(tri(V(0), p0, C(lit)))],
+            vec![head(tri(V(0), p2, V(1)))],
+        )];
+        (Relations::default(), rules)
+    });
+    let base: FxHashSet<Triple> = [[ind(0), p0, lit], [ind(0), p1, ind(1)]]
+        .into_iter()
+        .collect();
+    let snap = set_default_graph(&v, &base);
+    let qr = reasoner(&source);
+    let t = Terms::new(v.store.snapshot());
+    let triple = [
+        t.term(ind(0)).unwrap(),
+        t.term(p2).unwrap(),
+        t.term(ind(1)).unwrap(),
+    ];
+    let mut opts = crate::whynot::WhyNotOptions::default();
+    // too little for the rendered call with its escapes, enough without it
+    opts.explain.max_memory = Some(1 << 18);
+    let input = crate::explain::DemandInput {
+        reasoner: &qr,
+        snap,
+        readable: None,
+    };
+    match crate::whynot::why_not(&input, &triple, &opts) {
+        Err(e) => assert!(format!("{e:#}").contains("memory"), "{e:#}"),
+        Ok(crate::whynot::WhyNot::NotEntailed { rules, .. }) => {
+            let call = &rules
+                .iter()
+                .find(|c| c.rule.name == "q")
+                .unwrap()
+                .blocked_by[0]
+                .call;
+            assert!(
+                call.len() < 1 << 18,
+                "{} bytes rendered under the budget",
+                call.len()
+            );
+        }
+        Ok(w) => panic!("{w:?}"),
+    }
 }
