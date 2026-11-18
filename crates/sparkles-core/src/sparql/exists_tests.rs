@@ -564,6 +564,16 @@ fn explain_shows_decorrelation_and_why_not() {
     );
     assert_eq!(counter(nested.plan(), "existsProbed"), Some(3000));
     assert_eq!(counter(nested.plan(), "existsPerRow"), Some(0));
+    // a FOLD evaluates its value itself over its group's rows, from the key set as well,
+    // in the row accumulator that the cursor's grouping also runs
+    let q = "SELECT (FOLD(IF(EXISTS { ?y ex:q ?z }, 1, 0)) AS ?l) WHERE { ?x ex:p ?y }";
+    let folded = explain_of(&s, q, Optimizations::ALL);
+    assert_eq!(
+        rows(&folded, false),
+        rows(&explain_of(&s, q, without()), false)
+    );
+    assert_eq!(counter(folded.plan(), "existsProbed"), Some(3000));
+    assert_eq!(counter(folded.plan(), "existsPerRow"), Some(0));
     // rows that bind a risky variable are left to substitution, and are counted only
     // when the expression reaches the EXISTS: never here, every one of them here
     let skip = "SELECT ?x WHERE { ?x ex:p ?y OPTIONAL { ?x ex:t ?v } FILTER(IF(BOUND(?v), true, EXISTS { ?y ex:q ?z FILTER(!BOUND(?v)) })) }";
