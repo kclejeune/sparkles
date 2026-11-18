@@ -25,6 +25,18 @@ with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which
 their advisories. The SvelteKit advisories that only 3.x fixes concern features the
 static UI does not use, and roadmap item 1049 covers the migration.
 
+### Keys and the universal property in rooted classification runs
+
+With `Limits::rooted`, the disjunctive rules take keys over object properties and the
+universal object property, which completes roadmap item 805. A key becomes class axioms
+that mark the values of each named individual and make two named instances that share a
+named value for every key property equal, and the universal property becomes a symmetric
+transitive property that links every element to a fresh hub individual. The fresh names
+never reach an answer, and an ontology that names an entity with their prefix, a key
+whose rewriting passes its budget or a cardinality of the universal property keeps the
+default answer. On 392 generated ontologies, no rooted run reports a subsumption HermiT
+does not, and ore_ont_14924, which passes the run's bound, is item 1061.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,

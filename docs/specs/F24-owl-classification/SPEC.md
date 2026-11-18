@@ -102,8 +102,26 @@ default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rul
 ontologies with individuals and nominals take the case analysis through a root context,
 with four recorded departures from the journal's rules, a work bound past which the run
 gives its default answer, and 45 of the 50 `shoi` fixtures exact against HermiT. The five
-fixtures that pass the bound are item 822, the default is item 823, and keys and the
-universal property are item 805.
+fixtures that pass the bound are item 822, and the default is item 823.
+
+Item 805 delivers keys over object properties and the universal object property in rooted
+runs, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) describes.
+A key becomes class axioms that mark the values of each named individual with a universal
+restriction, in place of the fresh property per individual that the section first
+designed, which took most generated ontologies with keys past the work bound. The
+universal property becomes a symmetric transitive property with a hub individual. The
+fresh names carry a reserved prefix, an ontology that uses the prefix is not rewritten,
+and no fresh name reaches a taxonomy, a partial answer, a description or the report of
+the axioms left out. On 392 generated ontologies with four individuals and keys or the
+universal property, checked against HermiT 1.4.5 on one and on four threads with the same
+answers, no run reports a subsumption HermiT does not. 274 take the disjunctive rules and
+finish within the bound, and all agree with HermiT but one, a gap of the rooted run that
+the ontology shows without keys or the universal property too and item 823 records. 109
+pass the bound and give their default answer, and 9 take the default paths. ore_ont_14924 states the universal property only in a dropped tautology, so its
+run is rooted now. It passes the bound and gives the default answer, which is HermiT's,
+in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803 does the
+same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
+Item 1061 follows that cost.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
@@ -3414,7 +3432,7 @@ rules is not proved and five of the 50 `shoi` fixtures of the phase's gate pass 
 bound of a rooted run, which item 822 follows. Without the option the disjunctive rules
 refuse ontologies with individuals and nominals as the section above says, and every run
 takes the paths it took before these rules existed. The option changes nothing for an
-ontology without individuals. The measurements of the journal's rules are at the end of
+ontology without individuals, nominals or the universal object property. The measurements of the journal's rules are at the end of
 this section, and the departures of item 804 that follow them are the design the run
 follows where this section says so.
 
@@ -3517,15 +3535,32 @@ positive position is a disjunction of their proxies.
 
 A key `HasKey(C (r_1 … r_m) ())` over object properties holds only of named individuals, as
 the OWL 2 Direct Semantics says. The run reduces it to class axioms in the calculus's
-normal forms, so that the journal's theorems cover it. Each named individual b gets a fresh
-property `W_b` with `⊤ ⊑ ∃W_b.{b}`, which lets any element see b. For each pair of distinct
-named individuals a and b, each key property `r_j` and each named individual c, the axiom
-`{a} ⊓ ∃r_j.({c} ⊓ ∃W_b.({b} ⊓ ∃r_j.{c})) ⊑ M_jab` marks that a and b share the value c of
-`r_j`, and `{a} ⊓ C ⊓ ∃W_b.({b} ⊓ C) ⊓ M_1ab ⊓ … ⊓ M_mab ⊑ {b}` makes them equal. The fresh
-properties and classes make this a conservative extension, and the axioms hold exactly
-when the key's ground instances do. The reduction has m·n³ axioms for n named individuals,
-and a key whose reduction passes the memory budget is left out and reported. Keys over
-data properties wait on item 768.
+normal forms, so that the journal's theorems cover it. For each named individual b other
+than the first and each key property `r_j`, the axiom `{b} ⊓ C ⊑ ∀r_j.V_jb` marks the
+values of b when b is a C. For each pair of distinct named individuals a and b, each key
+property `r_j` and each named individual c, the axiom `{a} ⊓ ∃r_j.({c} ⊓ V_jb) ⊑ M_jab`
+marks that a has a named value of b, and `{a} ⊓ C ⊓ M_1ab ⊓ … ⊓ M_mab ⊑ {b}` makes them
+equal. A key whose class is not a name gets a fresh class equivalent to it, so that the
+axioms hold the name and not copies of the expression. The fresh classes make this a
+conservative extension. A model of the ontology
+extends to them, with `V_jb` the `r_j`-values of b when b is a C and empty otherwise, and
+`M_jab` the set `{a}` when a has a named `r_j`-value in `V_jb`. A model of the rewritten
+axioms satisfies the key, since two named instances of C that share a named value for each
+property make every marker hold. The reduction has about m·n³/2 axioms for n named
+individuals. When the keys' reductions pass the smaller of 131,072 axioms and one axiom
+per 2 KiB of the memory budget, the ontology is not rewritten at all and takes its default
+answer, which is about 60 individuals for a key with one property. Keys over data
+properties wait on item 768.
+
+The first reduction gave each named individual b a fresh property `W_b` with `⊤ ⊑
+∃W_b.{b}`, so that any element could see b, and marked shared values through
+`∃W_b.({b} ⊓ ∃r_j.{c})`. It is a conservative extension too, but it links every context
+to every named individual. On 96 generated ontologies with four individuals and keys or
+the universal property, the rooted run passed its bound on 53 with `W_b` and on 21 with
+the markers. The five of them with keys and no universal property passed it with `W_b`
+and finished with the markers. The markers keep the facts on the
+values, which the root shares, and need no inverse property, which would meet the Nom
+rule's refusal beside an at-most restriction.
 
 An occurrence of `owl:topObjectProperty` becomes a fresh property U′ that is symmetric and
 transitive, with `⊤ ⊑ ∃U′.{h}` for a fresh internal individual h. Every element then
@@ -3533,9 +3568,24 @@ reaches h and back, so U′ relates every pair of elements. An inclusion or chai
 superproperty is the universal property is a tautology and is dropped before the
 replacement, since OWL 2 exempts such axioms from the regularity conditions and U′ would
 otherwise make the hierarchy irregular. The replaced hierarchy is then checked for
-regularity, and an ontology that fails the check is refused. The transitive property goes
-through the automata of the rules above, and h is not a named individual for keys or for
-the taxonomy.
+regularity, and an ontology that fails the check takes its default answer. The transitive
+property goes through the automata of the rules above, and h is not a named individual for
+keys or for the taxonomy. A domain or range of the universal property becomes `⊤ ⊑ C`, a
+minimum of none over it is `⊤` and a minimum of one is an existential restriction over U′,
+and a property equivalent to it or its inverse gets U′ as a subproperty. A property above
+U′ is not simple, which OWL 2 DL forbids in a number restriction, a functionality, a
+disjointness or an irreflexivity, and the run either leaves such an axiom out and reports
+it or gives the default answer. A larger minimum, a maximum, an exact cardinality, a
+self restriction, functionality, asymmetry, irreflexivity or disjointness of the universal
+property itself has no replacement, and the ontology is then not rewritten. Neither is an
+ontology that names an entity with the prefix `urn:sparkles:internal:` of the fresh names,
+and a rewritten run that does not take the disjunctive rules starts again on the original
+axioms. Both cases give the default answer. The classes and individuals of an axiom that
+the rewriting drops stay in the signature, and the statistics count the original axioms
+outside OWL 2 EL. The universal property links every context
+to h, and on the generated ontologies above every run that passed the bound had the
+universal property, which item 1061 follows with the cost of ground reasoning in each
+context.
 
 The run relies on the journal's Theorem 1 for soundness, Theorem 2 with condition C2 for
 the completeness of each named class's context under the journal's rules, which item

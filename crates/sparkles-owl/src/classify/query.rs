@@ -37,6 +37,27 @@ impl Saturation {
     /// In an inconsistent ontology every class is unsatisfiable, so the answer is that
     /// of an unsatisfiable class, with every individual as an instance.
     pub fn describe(&self, c: &Class) -> Option<Description> {
+        let mut d = self.describe_all(c)?;
+        if self.reduced {
+            // the names that item 805's reductions made up, such as the hub individual and
+            // the classes of the keys, stay out of the answer
+            let ours = |s: &str| !s.starts_with(super::dl_reduce::PREFIX);
+            for v in [
+                &mut d.equivalents,
+                &mut d.superclasses,
+                &mut d.direct_superclasses,
+                &mut d.subclasses,
+                &mut d.direct_subclasses,
+            ] {
+                v.retain(|k| ours(k.as_str()));
+            }
+            d.instances.retain(|i| ours(i.as_str()));
+        }
+        Some(d)
+    }
+
+    /// [`Saturation::describe`] with every name of the run's axioms.
+    fn describe_all(&self, c: &Class) -> Option<Description> {
         if self.dirty || self.index.is_none() {
             return None;
         }
@@ -91,9 +112,16 @@ impl Saturation {
                 ..Default::default()
             });
         }
-        let (bottom, subsumers) = self
+        let (bottom, mut subsumers) = self
             .named_subsumers(q)
             .unwrap_or((q == BOTTOM, vec![q, TOP]));
+        if self.reduced {
+            // the made-up classes of item 805's reductions take no part in the answer,
+            // whose direct superclasses are those among the visible ones
+            subsumers.retain(|&e| {
+                class_of(e).is_none_or(|k| !k.as_str().starts_with(super::dl_reduce::PREFIX))
+            });
+        }
         if bottom {
             let mut eq: Vec<Class> = named
                 .iter()

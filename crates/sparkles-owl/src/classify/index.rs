@@ -639,6 +639,16 @@ impl Interner {
         self.met.iter_mut().for_each(|m| *m = false);
     }
 
+    /// Takes the classes whose IRIs start with `prefix` out of the signature, which the
+    /// run's reductions made up (item 805).
+    pub fn hide_prefix(&mut self, prefix: &str) {
+        for id in 0..self.met.len() {
+            if self.met[id] && self.classes[id].as_str().starts_with(prefix) {
+                self.met[id] = false;
+            }
+        }
+    }
+
     /// The expressions of the classes the run's normalization met, by class id.
     pub fn met_classes(&self) -> impl Iterator<Item = Ex> + '_ {
         self.met

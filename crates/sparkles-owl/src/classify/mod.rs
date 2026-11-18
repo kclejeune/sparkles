@@ -76,6 +76,7 @@ mod dl;
 mod dl_clause;
 mod dl_eq;
 mod dl_norm;
+mod dl_reduce;
 mod dl_root;
 mod dl_rules;
 mod horn;
@@ -252,9 +253,13 @@ pub struct Limits {
     /// OWL 2 EL as it does by default, with [`Stats::dl_rooted_over`] set. Every answer
     /// of a rooted run is entailed, and its completeness is not proved: F24 records the
     /// calculus's departures from the published rules and the fixtures it finishes.
-    /// A rooted run refuses an ontology with keys, a top property or a functional data
-    /// property, which take the default paths, and the option changes nothing for an
-    /// ontology without individuals.
+    /// A rooted run takes keys over object properties and the universal object property
+    /// by rewriting them into class axioms over fresh names, and a run of the rewritten
+    /// axioms always starts from nothing. It refuses an ontology with keys over data
+    /// properties, the top data property or a functional data property, and one whose keys
+    /// or universal property the rewriting declines, which take the default paths. The
+    /// option changes nothing for an ontology without individuals, nominals or the
+    /// universal object property.
     pub rooted: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
@@ -573,6 +578,15 @@ pub struct Saturation {
     /// set while a run classifies again without the rooted rules, past a rooted run's
     /// bound on derived conclusions, which leaves the axioms outside OWL 2 EL out
     no_rooted: bool,
+    /// set while a run classifies the axioms that item 805's reductions made, so that the
+    /// classes they made up stay out of the taxonomy
+    hide_internal: bool,
+    /// the chains outside OWL 2 EL for their ranges alone in a run of rewritten axioms,
+    /// which the statistics of the original axioms count
+    chain_ranged: Vec<AxiomKind>,
+    /// whether the last run classified rewritten axioms, which the next run's changes
+    /// do not describe and whose made-up names [`Saturation::describe`] leaves out
+    pub(crate) reduced: bool,
     /// whether the current run of Tier D is rooted and whether it counts, for the
     /// fallback its bound on derived conclusions takes
     dl_rooted: bool,
@@ -1077,6 +1091,9 @@ impl Saturation {
             skip_dl: false,
             no_counting: false,
             no_rooted: false,
+            hide_internal: false,
+            chain_ranged: Vec::new(),
+            reduced: false,
             dl_rooted: false,
             dl_counted: false,
             dl_attempt: false,
@@ -1609,6 +1626,9 @@ impl Saturation {
         // chain whose superproperty has a range its last property lacks is Horn
         let mut candidates: Vec<&AxiomKind> = outside.iter().map(|(i, _)| axioms[*i]).collect();
         candidates.extend(chain_ranges.iter().map(|(k, _)| *k));
+        if self.hide_internal {
+            self.chain_ranged = chain_ranges.iter().map(|(k, _)| (*k).clone()).collect();
+        }
         candidates.sort();
         candidates.dedup();
         let mut outside_el = OutsideEl::default();
@@ -1693,6 +1713,9 @@ impl Saturation {
         // that the decision reads would keep a later run over this interner from Tier D.
         // A run whose rules take it starts again anyway, as `entangled` says.
         self.stale_tier |= mark.passed(&self.interner);
+        if self.hide_internal {
+            self.interner.hide_prefix(dl_reduce::PREFIX);
+        }
         ax.classes.extend(self.interner.met_classes());
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
@@ -1738,9 +1761,9 @@ impl Saturation {
     }
 
     /// Whether a rooted run of Tier D may take axioms outside OWL 2 EL with individuals:
-    /// when the EL part has no keys, top properties or functional data roles. Keys wait on
-    /// their reduction to class axioms and the universal property on its replacement, as
-    /// F24 describes.
+    /// when the EL part has no keys, top properties or functional data roles. A key over
+    /// object properties and the universal object property reach this check only when
+    /// item 805's rewriting in [`Saturation::run`] declined them.
     fn rooted_allowed(&self, ax: &Axioms) -> bool {
         let it = &self.interner;
         ax.functional.is_empty()
@@ -1779,6 +1802,62 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        if limits.rooted
+            && !self.no_rooted
+            && !limits.el_only
+            && !self.skip_dl
+            && let Some(red) = dl_reduce::plan(axioms, limits.max_memory)
+        {
+            // item 805: keys over object properties and the universal property go through
+            // class axioms over fresh names, which a run that does not take Tier D leaves
+            // to the run without them
+            let all = red.all(axioms);
+            // the interner of an earlier run holds names and individuals that decide the
+            // tiers, so the rewritten axioms start from nothing
+            self.reset();
+            // the rewritten axioms are held beside the caller's for the run
+            let red_bytes: usize = red.axioms.iter().map(held_bytes_of).sum();
+            self.hide_internal = true;
+            let r = self.run_once(&all, None, held_bytes + red_bytes, limits, with_taxonomy);
+            self.hide_internal = false;
+            match r {
+                Ok(Some(mut r)) if self.dl_tried => {
+                    red.restore(axioms, &mut self.excluded);
+                    r.2.added = axioms.len();
+                    let tier = r.2.tier;
+                    let mut chains: Vec<Excluded> = std::mem::take(&mut self.chain_ranged)
+                        .into_iter()
+                        .map(|axiom| Excluded {
+                            axiom,
+                            gap: index::Gap::Partial("chain range"),
+                        })
+                        .collect();
+                    red.restore(axioms, &mut chains);
+                    let chains: Vec<&AxiomKind> = chains.iter().map(|e| &e.axiom).collect();
+                    r.2.outside_el = red.outside_el(axioms, &chains, &self.excluded);
+                    r.2.tier = tier;
+                    self.reduced = true;
+                    return Ok(r);
+                }
+                Err(e) => {
+                    // the report of a run that stopped still names the original axioms
+                    red.restore(axioms, &mut self.excluded);
+                    self.reduced = true;
+                    return Err(e);
+                }
+                _ => {
+                    red.restore(axioms, &mut self.excluded);
+                    self.reset();
+                }
+            }
+        }
+        // after a run of rewritten axioms, whose made-up names and hub individual the
+        // interner still holds, the run starts from nothing
+        let was = std::mem::take(&mut self.reduced);
+        if was {
+            self.reset();
+        }
+        let changes = changes.filter(|_| !was);
         if let Some(r) = self.run_once(axioms, changes, held_bytes, limits, with_taxonomy)? {
             return Ok(r);
         }
@@ -2704,6 +2783,7 @@ impl Saturation {
                     Node::Class(id) => Some(self.interner.classes[id as usize].clone()),
                     _ => None,
                 })
+                .filter(|k| !self.hide_internal || !k.as_str().starts_with(dl_reduce::PREFIX))
                 .collect();
             classes.sort();
             self.partial = Some((classes, consistency));
