@@ -318,6 +318,38 @@ fn the_result_cache_keys_on_the_reading() {
     }
 }
 
+/// The result cache keeps the readings apart for an aggregate inside a correlated
+/// LATERAL, whose right side is planned while the query runs, and when the dataset's
+/// setting changes without a commit.
+#[test]
+fn the_result_cache_keys_a_lateral_on_the_reading() {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    let text = "SELECT ?x ?m WHERE { VALUES ?x { 7 } LATERAL { \
+        SELECT ?x (MIN(?v) AS ?m) WHERE { VALUES ?v { 1 UNDEF } } GROUP BY ?x } }";
+    let m = |opts: &QueryOptions| {
+        let r = query(s.snapshot(), text, opts).unwrap().rows().unwrap();
+        r.iter()
+            .map(|row| tsv(&row.values()[1]))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(m(&under(AggregateErrors::Sparkles, None)), ["1"]);
+    assert_eq!(m(&under(AggregateErrors::Jena, None)), [""]);
+    // the same requests again are answered from the cache
+    let hits = s.result_cache().hits();
+    assert_eq!(m(&under(AggregateErrors::Sparkles, None)), ["1"]);
+    assert_eq!(m(&under(AggregateErrors::Jena, None)), [""]);
+    assert!(s.result_cache().hits() > hits, "the cache answered");
+    assert_eq!(m(&QueryOptions::default()), [""]);
+    s.set_aggregate_errors_setting(Some(AggregateErrors::Sparkles))
+        .unwrap();
+    assert_eq!(m(&QueryOptions::default()), ["1"]);
+    s.set_aggregate_errors_setting(None).unwrap();
+    assert_eq!(m(&QueryOptions::default()), [""]);
+}
+
 /// EXPLAIN names a reading other than the default on the aggregates it changes.
 #[test]
 fn the_plan_names_the_reading() {
