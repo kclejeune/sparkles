@@ -92,17 +92,15 @@ These read paths are tuned for queries over data that is not yet in memory
   insert and an RDF Patch. A write takes the bulk path when its size is above the store's
   bulk threshold, 250,000 quads by default. Files are sized at about 80 bytes per quad,
   and streams are read ahead up to 80 bytes per threshold quad, 20 MB by default, to
-  tell. A load or a replacement into an empty store takes the bulk path when its inputs
-  hold more than 8 MiB, or more than 80 bytes per threshold quad when the threshold is
-  lower, and a transaction otherwise, since a transaction costs less than the rebuild's
-  fixed cost of about 20 ms below that size. Such a small first write leaves its quads in
-  the delta, where an in-memory dataset admits them by the memory estimate of each quad. A
-  write limited to some graphs parses its inputs in a transaction, and batches that check
-  triple protections, managed graphs or control records stay transactional, as does a
-  patch once it has met a delete row. A large stream load into a dataset that holds data,
-  and a large load or replacement into an empty one, are bulk commits, so the change-log
-  limit of bulk commits under the limitations below applies to them. SPARQL `LOAD` always
-  inserts in a transaction. Roadmap item 846 tracks a bulk path for a large `LOAD`.
+  tell. A load into an empty store takes the bulk path whatever its size, unless all its
+  inputs are streams that end within 8 MiB, while a graph replacement into an empty store
+  follows the threshold, so a small first PUT goes in by a transaction. A write limited to
+  some graphs parses its inputs in a transaction, and batches that check triple
+  protections, managed graphs or control records stay transactional, as does a patch once
+  it has met a delete row. A large stream load into a dataset that holds data, and a load
+  into an empty one, are bulk commits, so the change-log limit of bulk commits under the
+  limitations below applies to them. SPARQL `LOAD` always inserts in a transaction.
+  Roadmap item 846 tracks a bulk path for a large `LOAD`.
 * CSV and TSV tables map to triples ([C05](../specs/C05-tabular-imports.md),
   [USAGE.md](../USAGE.md#loading-csv-and-tsv)). `sparkles load`, `sparkles csv`,
   `POST /{ds}/upload` and the web UI's upload form accept them. A table maps with a
@@ -402,10 +400,10 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   0.3% more instructions for the group's admission checks, and spatial readers at 1.05M
   under mixed load measured a p50 ratio of 1.028, both within their gates. Roadmap
   item 448.
-* A first Graph Store PUT of a small buffered body into an empty dataset rebuilds the
-  index, as a first POST does. The rebuild's fixed cost of about 20 to 27 ms makes a PUT
-  of 10 to 1,000 quads take 21 to 34 ms, where a transaction took 0.7 to 8.5 ms. Roadmap
-  item 1079.
+* A first load of a small file or buffered body into an empty dataset, from a Graph Store
+  POST or `sparkles load`, rebuilds the index. The rebuild's fixed cost of about 20 to
+  25 ms makes a first POST of 10 to 1,000 quads take 24 to 34 ms, where a first PUT of the
+  same body, which takes a transaction, takes 0.7 to 8.5 ms. Roadmap item 1097.
 * Branch stores share their dataset's quota, which counts the zeros preallocated after
   each store's log and delta vocabulary as those of the store written last. With several
   branches written, the zeros of the others count as data. Roadmap item 560.

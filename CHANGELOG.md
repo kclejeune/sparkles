@@ -8,29 +8,24 @@
 `Store::load_with`, `Store::replace_with`, `WriteTxn::insert_bulk` and RDF Patch, which
 each had a rule of their own, and a table test records the plan of each entry point at
 the boundaries. The threshold test is strict everywhere, so a batch or a patch of exactly
-the bulk threshold now commits in a transaction. A load or a graph replacement into an empty store
-takes a transaction when its inputs hold at most 8 MiB, or 80 bytes per threshold quad
-when that bound is lower, and the bulk path above that size. Files are sized by their
-length and streams are read ahead to tell. A load into an empty store used to rebuild
-whatever the size of a file or a buffered body, so a first small POST into a new dataset
-no longer pays the rebuild's fixed cost of about 20 ms, and its quads stay in the delta
-until a compaction. An in-memory dataset admits such a first write by the memory estimate
-of each quad it inserts, as it admits a write into a dataset with data, so a first POST
-that the size of a built generation admitted can now return 507. A load of an empty file
-into an empty store makes no commit, where it committed an empty generation. A stream load into a store
-that holds data reads its stream ahead up to 80 bytes per threshold quad, as a
-replacement did, and takes the bulk path past that bound. A bulk replacement returns the
-quads it parsed, duplicates included, as the transactional path and the documentation
-already did, where it used to return the quads the store held afterwards. Every stream
-of a load or a replacement now checks the write's deadline and cancellation beneath its
-decoder whichever plan runs, which a load into a store with data and a write limited to
-some graphs did not do before. A write limited to some graphs still parses its sources in
-a transaction, and a bulk insert or a patch under such a limit, whose graphs are checked
-as it is staged, may still take the bulk path. A dry run of a load or a replacement
-through a transaction is no longer refused by an in-memory dataset's memory limit while
-its sources are parsed. It returns a preview that reports the refusal, as a dry run on the
-bulk path does, which also corrects the dry run of a first PUT into an empty in-memory
-dataset. Durability, the write-ahead log and the on-disk formats are unchanged.
+the bulk threshold now commits in a transaction. A load into an empty store still takes
+the bulk path unless all its inputs are streams that end within 8 MiB, and a graph
+replacement still takes a transaction unless its estimate or its streams are above the
+threshold, whatever the store holds. A stream load into a store that holds data reads its
+stream ahead up to 80 bytes per threshold quad, as a replacement did, and takes the bulk
+path past that bound. A bulk replacement returns the quads it parsed, duplicates
+included, as the transactional path and the documentation already did, where it used to
+return the quads the store held afterwards. Every stream of a load or a replacement now
+checks the write's deadline and cancellation beneath its decoder whichever plan runs,
+which a load into a store with data and a write limited to some graphs did not do before.
+A write limited to some graphs still parses its sources in a transaction, and a bulk
+insert or a patch under such a limit, whose graphs are checked as it is staged, may still
+take the bulk path. A dry run of a load or a replacement through a transaction is no
+longer refused by an in-memory dataset's memory limit while its sources are parsed. It
+returns a preview that reports the refusal the write itself gets, as a dry run on the
+bulk path does, which corrects the dry run of a large first PUT into an empty in-memory
+dataset and of a large POST into one with data. Durability, the write-ahead log and the
+on-disk formats are unchanged.
 
 ### Dependency security updates
 

@@ -285,16 +285,16 @@ changes, and the second commit unifies the rules by the decisions it records.
 | `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed capability and no control records. | The length is at or above. | It has no size estimate and no small-reader case. |
 | `patch_apply` | The patch has met no delete row, whether or not the row deleted anything, and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
 
-The unified rule takes the strict test everywhere and gives `load_with` and
-`replace_with` one empty-head case. An unrestricted load or replacement into an empty
-store takes the bulk path when its inputs hold more than `SMALL_SOURCE_BYTES`, 8 MiB, or
-more than eighty bytes per threshold quad when that bound is lower, and a transaction
-otherwise. Files and buffered bodies are sized by their length, scaled by a codec's expansion
-factor when they are compressed, and streams are read ahead for the rest of the bound, so a threshold of 0 sends any source that holds
-a byte to a rebuild. The rule gives `load_with` the large-stream probe of `replace_with`
-for a store with data, and treats a triple protection, the capability to change managed
-graphs, control records and a delete row as reasons for the transactional path of a batch.
-A graph restriction keeps sources on the transactional path, since a rebuild from sources
+The unified rule takes the strict test everywhere, gives `load_with` the large-stream
+probe of `replace_with` for a store with data, and treats a triple protection, the
+capability to change managed graphs, control records and a delete row as reasons for the
+transactional path of a batch. A load into an empty store keeps the empty-head case of
+`load_with`, a rebuild unless every source is a stream that ends within
+`SMALL_STREAM_BYTES`. The rule as first written also gave `replace_with` that case and its
+small-stream exception. The maintainer kept a replacement into an empty store on its
+earlier rule instead, a transaction unless its estimate or its streams are above the
+threshold, because the rebuild's fixed cost made a first PUT of a few quads many times
+slower, as the outcome below records. A graph restriction keeps sources on the transactional path, since a rebuild from sources
 does not check each quad's graph. A batch from `insert_bulk` or a patch has its graphs
 checked as it is staged, so a restriction does not keep it out of a rebuild, as before the
 phase. The table test includes a patch whose delete row removes nothing and still takes
@@ -664,19 +664,26 @@ count. Every reader source of a load or a replacement gets its decoder and its
 `Controlled` stream before the plan is chosen, so a stream that never yields a quad stops
 at the write's deadline whichever plan runs. Before, a load into a store with data, a
 restricted write and a probe skipped at a saturated bound parsed such a stream without
-that check. A replacement into an empty store is a bulk commit, so a first PUT into an
-in-memory dataset is admitted by the size of the generation it builds, as a first POST
-was, and an empty body into an empty store commits an empty generation. On `atlas`, with
+that check. A dry run of a transactional load or replacement into an in-memory store is
+no longer refused by the memory limit while its sources are parsed. The first refusal is
+kept and reported in the preview, which then gives the error the write itself gets, with
+or without a net change. On `atlas`, with
 base `8baa5686` and the phase's load path at `2c08d2b0` interleaved, `sparkles load` of
 1.05M quads into an empty store took a median 0.558 s on the base and 0.557 s on the
 phase over seven rounds, and 10.5M quads took 4.448 s and 4.418 s over five, with peak
 RSS within 2%. Another lane's benchmark ran on the host during these rounds, so they
 show parity rather than a publishable time. The ignored `load_plan_timing` test at 1M
-quads, built at `2c08d2b0`, measured a stream load into a store with data at 1.57 s to 1.63 s on the bulk path
-against 2.01 s to 2.23 s transactional, persistent and in memory. A first PUT of 10 to
-1,000 quads into an empty dataset took 21 ms to 34 ms on the phase against 0.7 ms to
-8.5 ms on the base, the fixed cost of a rebuild that a first POST already paid on both,
-and item 1079 follows it. The gates were the table test, the entry-point tests, the
+quads, built at `2c08d2b0`, measured a stream load into a store with data at 1.57 s to
+1.63 s on the bulk path against 2.01 s to 2.23 s transactional, persistent and in memory.
+With the empty-head case given to `replace_with`, a first PUT of 10 to 1,000 quads into
+an empty dataset took 21 ms to 34 ms against 0.7 ms to 8.5 ms on the base. A second rule
+that sent every load or replacement of up to 8 MiB into an empty store to a transaction
+removed that cost, but about 150 tests across the workspace failed under it. They, and
+features such as characteristic sets, `sparkles vector create` and the spatial status,
+expect a small first load to build a base generation, while under that rule its quads
+stayed in the delta until a compaction. The phase therefore kept the earlier rule of a
+replacement into an empty store, and item 1097 follows the rebuild cost of a small first
+POST, which both builds pay. The gates were the table test, the entry-point tests, the
 deadline tests at the default and the saturated threshold, lane CI and three review
 rounds. Durability, the write-ahead log and the on-disk formats did not change.
 
