@@ -349,52 +349,87 @@ fn patch_plans() {
 
 /// Times a graph-restricted replace and a reader load into a store that holds data, each
 /// with the default threshold and with every batch kept transactional, to measure what
-/// the plan of a restricted batch and the probe of a large stream decide. Run it with
-/// `LOAD_PLAN_QUADS=1000000 mbx test --release -p sparkles-core --lib -- --ignored
-/// load_plan_timing --nocapture`.
+/// the plan of a restricted batch and the probe of a large stream decide. The stores are
+/// persistent, under `LOAD_PLAN_DIR` or a temporary directory, and in memory, and the
+/// arms alternate over `LOAD_PLAN_ROUNDS` rounds. Run it with `LOAD_PLAN_QUADS=1000000
+/// mbx test --release -p sparkles-core --lib -- --ignored load_plan_timing --nocapture`.
 #[test]
 #[ignore]
 fn load_plan_timing() {
-    let n: u64 = std::env::var("LOAD_PLAN_QUADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1_000_000);
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (n, rounds) = (
+        env("LOAD_PLAN_QUADS", 1_000_000),
+        env("LOAD_PLAN_ROUNDS", 3),
+    );
     let data = ntriples(0, n);
-    for (label, threshold) in [
-        ("default threshold", StoreOptions::default().bulk_threshold),
-        ("transactional", u64::MAX),
-    ] {
-        let open = || {
-            let s = Store::in_memory(StoreOptions {
-                bulk_threshold: threshold,
-                ..StoreOptions::default()
-            });
-            s.load(&[bytes(10 * n, 1000)]).unwrap();
-            s
-        };
-        let s = open();
-        let t = std::time::Instant::now();
-        s.replace_with(
-            ReplaceTarget::Default,
-            &[Source::from_bytes(data.clone(), RdfFormat::NTriples, None)],
-            CommitKind::GspPut,
-            &restricted_opts(),
-        )
-        .unwrap();
-        let replace = t.elapsed();
-        let s = open();
-        let t = std::time::Instant::now();
-        s.load_with(
-            &[Source::from_reader(
-                std::io::Cursor::new(data.clone()),
-                RdfFormat::NTriples,
-                None,
-            )],
-            CommitKind::GspPost,
-            &WriteOptions::default(),
-        )
-        .unwrap();
-        let load = t.elapsed();
-        println!("{label}: {n} quads, restricted replace {replace:?}, stream load {load:?}");
+    let parent = std::env::var_os("LOAD_PLAN_DIR").map(std::path::PathBuf::from);
+    for round in 0..rounds {
+        for persistent in [true, false] {
+            for (label, threshold) in [
+                ("default threshold", StoreOptions::default().bulk_threshold),
+                ("transactional", u64::MAX),
+            ] {
+                let mut dirs = Vec::new();
+                let mut open = || {
+                    let opts = StoreOptions {
+                        bulk_threshold: threshold,
+                        ..StoreOptions::default()
+                    };
+                    let s = if persistent {
+                        let d = match &parent {
+                            Some(p) => tempfile::tempdir_in(p).unwrap(),
+                            None => tempfile::tempdir().unwrap(),
+                        };
+                        let s = Store::open(&d.path().join("db"), opts).unwrap();
+                        dirs.push(d);
+                        s
+                    } else {
+                        Store::in_memory(opts)
+                    };
+                    s.load(&[bytes(10 * n, 1000)]).unwrap();
+                    s
+                };
+                let s = open();
+                let t = std::time::Instant::now();
+                s.replace_with(
+                    ReplaceTarget::Default,
+                    &[Source::from_bytes(data.clone(), RdfFormat::NTriples, None)],
+                    CommitKind::GspPut,
+                    &restricted_opts(),
+                )
+                .unwrap();
+                let replace = t.elapsed();
+                drop(s);
+                let s = open();
+                let t = std::time::Instant::now();
+                s.load_with(
+                    &[Source::from_reader(
+                        std::io::Cursor::new(data.clone()),
+                        RdfFormat::NTriples,
+                        None,
+                    )],
+                    CommitKind::GspPost,
+                    &WriteOptions::default(),
+                )
+                .unwrap();
+                let load = t.elapsed();
+                drop(s);
+                let kind = if persistent {
+                    "persistent"
+                } else {
+                    "in memory"
+                };
+                println!(
+                    "round {round}, {kind}, {label}: {n} quads, restricted replace {:.3} s, stream load {:.3} s",
+                    replace.as_secs_f64(),
+                    load.as_secs_f64()
+                );
+            }
+        }
     }
 }
