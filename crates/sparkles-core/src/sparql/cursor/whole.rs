@@ -2,7 +2,9 @@
 //! bounded: a vector or hybrid search that ranks the candidate subjects of its whole
 //! input against its global `k` or limit, a path search over its group under a limit,
 //! which takes its paths in one order across all of its sources, and an algorithm call
-//! over its group, which runs once from all of its sources.
+//! over its group, which runs once from all of its sources. A path search under a limit
+//! or an algorithm call whose edges come from a nested pattern reads that pattern whole
+//! in the same way, also when its sources are constants.
 //!
 //! The operator reads each input cursor's batches into a charged table, so a budget
 //! that cannot hold the input refuses the query as a sort without spill does. When the
@@ -18,7 +20,6 @@ use std::sync::Arc;
 
 /// Whether a plan node runs as a whole-input operator.
 pub(super) fn eligible(node: &Node) -> bool {
-    let reads = super::leaf::reads_group(node);
     match &node.kind {
         Kind::VectorSearch(spec) => {
             spec.candidates && !spec.order_fallback && node.children.len() == 1
@@ -26,10 +27,21 @@ pub(super) fn eligible(node: &Node) -> bool {
         Kind::HybridSearch(spec) => {
             spec.vector.as_ref().is_some_and(|v| v.candidates) && node.children.len() == 1
         }
-        Kind::PathSearch(spec) => reads && spec.limit.is_some(),
+        // A search or call whose edges come from a nested pattern reads that pattern
+        // whole too, as its last child, whether or not it also reads its group.
+        Kind::PathSearch(spec) => !node.children.is_empty() && spec.limit.is_some(),
         // Decision 2 of the X14 plan counts an algorithm call as bounded.
-        Kind::AlgoCall(_) => reads,
+        Kind::AlgoCall(_) => !node.children.is_empty(),
         _ => false,
+    }
+}
+
+/// What a whole-input operator reads before it answers, for its plan's reason: its
+/// group, or only the nested pattern of its edges.
+pub(super) fn reads(node: &Node) -> &'static str {
+    match super::leaf::reads_group(node) {
+        true => "all of its input",
+        false => "all of its edge pattern",
     }
 }
 
@@ -133,6 +145,9 @@ impl Whole {
     /// Run the kernel once over the charged input tables, which it takes.
     fn run(&mut self, ctx: &Arc<Ctx>, inputs: &mut [Buffer]) -> Result<Buffer> {
         let last = inputs.len().saturating_sub(1);
+        // The group is the first child when the kernel reads one, and the edge pattern
+        // the last.
+        let group = super::leaf::reads_group(&self.node);
         let mut take =
             |i: usize| -> Table { std::mem::replace(&mut inputs[i].table, Table::new(Vec::new())) };
         let vars = &self.node.vars;
@@ -150,12 +165,14 @@ impl Whole {
             }
             Kind::PathSearch(spec) => {
                 let edges = spec.edge_pattern.is_some().then(|| take(last));
-                let (t, c) = crate::sparql::pathsearch::run(ctx, spec, Some(take(0)), edges, vars)?;
+                let input = group.then(|| take(0));
+                let (t, c) = crate::sparql::pathsearch::run(ctx, spec, input, edges, vars)?;
                 (t, c, None)
             }
             Kind::AlgoCall(spec) => {
                 let edges = spec.proj.pattern.is_some().then(|| take(last));
-                let (t, c) = crate::sparql::algosvc::run(ctx, spec, Some(take(0)), edges, vars)?;
+                let input = group.then(|| take(0));
+                let (t, c) = crate::sparql::algosvc::run(ctx, spec, input, edges, vars)?;
                 (t.table, c, t.lease)
             }
             _ => unreachable!("{} is not a whole-input operator", self.node.operator()),

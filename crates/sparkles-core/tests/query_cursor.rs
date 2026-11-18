@@ -5059,3 +5059,90 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         assert_eq!(bag(eager.application_rows()), expected);
     }
 }
+
+/// A whole-input operator counts the rows it produces against the work limit as the
+/// eager kernel does: both modes count the same rows, a limit one row short of that
+/// count stops both, and the count itself passes both (item 829). The forms are a path
+/// search over its group, a path search and an algorithm call over a nested edge
+/// pattern, and an algorithm call over its group.
+#[test]
+fn whole_input_operators_count_their_rows_as_eager_does() {
+    use std::sync::atomic::AtomicU64;
+    let s = store(30);
+    let data = (0..30)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % 30))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let prefixes = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    fn reasons(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<String>) {
+        out.extend(plan.reason.clone());
+        for c in &plan.children {
+            reasons(c, out);
+        }
+    }
+    for (q, reads) in [
+        (
+            "SELECT ?s ?b WHERE { ?s <urn:p> ?o FILTER(?o < 5) SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 7 } }",
+            "all of its input",
+        ),
+        (
+            "SELECT ?b ?i WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 6 ; path:edgeIndex ?i ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+            "all of its edge pattern",
+        ),
+        (
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n ; algo:component ?c . ?a <urn:q> ?b } }",
+            "all of its edge pattern",
+        ),
+        (
+            "SELECT ?src ?n ?d WHERE { ?src <urn:p> ?o FILTER(?o < 3) SERVICE algo:bfs { [] algo:predicate <urn:q> ; algo:source ?src ; algo:node ?n ; algo:depth ?d } }",
+            "all of its input",
+        ),
+    ] {
+        let q = format!("{prefixes}{q}");
+        let opts = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+            no_cache: true,
+            max_rows_produced: limit,
+            work,
+            ..Default::default()
+        };
+        let eager = query(s.snapshot(), &q, &opts(None, None)).unwrap();
+        let produced = eager.rows_produced;
+        assert!(!eager.is_empty(), "{q}");
+        let streamed = |limit: Option<u64>, rows: usize| -> Result<u64, Error> {
+            let work = Arc::new(AtomicU64::new(0));
+            let mut c = select_cursor(
+                s.snapshot(),
+                &q,
+                &opts(limit, Some(work.clone())),
+                &options(rows),
+            )?;
+            let mut found = Vec::new();
+            reasons(c.plan(), &mut found);
+            assert!(
+                found
+                    .iter()
+                    .any(|r| r.contains(reads) && r.contains("runs once")),
+                "{q}: {found:?}"
+            );
+            while c.next_batch()?.is_some() {}
+            Ok(work.load(Ordering::Relaxed))
+        };
+        for rows in [1, 3, 4096] {
+            assert_eq!(streamed(None, rows).unwrap(), produced, "{q}; {rows}");
+            assert!(streamed(Some(produced), rows).is_ok(), "{q}; {rows}");
+            assert!(
+                matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+                "{q}; {rows}"
+            );
+        }
+        assert!(
+            matches!(query(s.snapshot(), &q, &opts(Some(produced - 1), None)), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+            "{q}"
+        );
+    }
+}

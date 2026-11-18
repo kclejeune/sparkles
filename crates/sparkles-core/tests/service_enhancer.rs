@@ -703,3 +703,51 @@ fn a_streamed_loop_sends_the_requests_of_an_eager_run() {
     assert_eq!(streamed(&silent, 1).0.len(), 9);
     assert_eq!(streamed(&silent, 1).0, rows(&data, &silent));
 }
+
+/// A streamed loop counts the rows it joins against the work limit as an eager run
+/// does: both count the same rows, and a limit one row short of that count stops both
+/// (item 829).
+#[test]
+fn a_streamed_loop_counts_its_rows_as_an_eager_run_does() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::sync::atomic::AtomicU64;
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let with = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+        no_cache: true,
+        max_rows_produced: limit,
+        work,
+        ..opts()
+    };
+    let eager = query(data.snapshot(), &q, &with(None, None)).unwrap();
+    let produced = eager.rows_produced;
+    assert!(eager.len() > 9, "{q}");
+    let streamed = |limit: Option<u64>, rows: usize| -> Result<u64, Error> {
+        let work = Arc::new(AtomicU64::new(0));
+        let o = CursorOptions {
+            batch_rows: rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &with(limit, Some(work.clone())), &o)?;
+        while c.next_batch()?.is_some() {}
+        Ok(work.load(Ordering::Relaxed))
+    };
+    for rows in [1, 3, 4096] {
+        assert_eq!(streamed(None, rows).unwrap(), produced, "{rows}");
+        assert!(streamed(Some(produced), rows).is_ok(), "{rows}");
+        assert!(
+            matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+            "{rows}"
+        );
+    }
+    assert!(matches!(
+        query(data.snapshot(), &q, &with(Some(produced - 1), None)),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced
+    ));
+}

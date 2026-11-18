@@ -662,3 +662,52 @@ fn vector_searches_run_as_cursor_operators() {
     assert_eq!(bag(c).len(), 1);
     assert_eq!(eager(&q).len(), 1);
 }
+
+/// Vector searches as cursor operators count the rows they produce against the work
+/// limit as eager runs do: both modes count the same rows, and a limit one row short of
+/// that count stops both (item 829).
+#[test]
+fn streamed_vector_searches_count_their_rows_as_eager_does() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let s = store(StoreOptions::default());
+    for q in [
+        "SELECT ?s ?score { VALUES ?s { ex:a ex:b ex:c ex:d } (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 2 \"candidates:join\") }",
+        "SELECT ?q ?s ?score { VALUES ?q { ex:a ex:c } (?s ?score) spk:vectorSearch (ex:emb ?q 2) }",
+    ] {
+        let q = format!("{P}{q}");
+        let with = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+            no_cache: true,
+            max_rows_produced: limit,
+            work,
+            ..Default::default()
+        };
+        let produced = query(s.snapshot(), &q, &with(None, None))
+            .unwrap()
+            .rows_produced;
+        let streamed = |limit: Option<u64>, rows: usize| -> sparkles_core::Result<u64> {
+            let work = Arc::new(AtomicU64::new(0));
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), &q, &with(limit, Some(work.clone())), &o)?;
+            while c.next_batch()?.is_some() {}
+            Ok(work.load(Ordering::Relaxed))
+        };
+        for rows in [1, 4096] {
+            assert_eq!(streamed(None, rows).unwrap(), produced, "{q}; {rows}");
+            assert!(
+                matches!(streamed(Some(produced - 1), rows), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+                "{q}; {rows}"
+            );
+        }
+        assert!(matches!(
+            query(s.snapshot(), &q, &with(Some(produced - 1), None)),
+            Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced
+        ));
+    }
+}

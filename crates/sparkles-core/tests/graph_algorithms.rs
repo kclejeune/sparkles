@@ -2808,3 +2808,81 @@ fn r12_conversion_precedes_minimum_and_preserves_applicability() {
         "unused default, duplicate and non-resource rows are not converted"
     );
 }
+
+/// An algorithm call over its group runs as a cursor operator that calls the kernel
+/// itself. It reads a pending transaction's view as the eager call does, and under an
+/// access mask its cursor plan carries no runtime counters, also after it has run
+/// (item 829).
+#[test]
+fn a_streamed_algorithm_call_reads_pending_views_and_redacts_masked_plans() {
+    use sparkles_core::sparql::{CursorOptions, CursorPlan, FallbackPolicy, select_cursor};
+    fn find_op<'a>(p: &'a CursorPlan, op: &str) -> Option<&'a CursorPlan> {
+        if p.operator.operator == op {
+            return Some(p);
+        }
+        p.children.iter().find_map(|c| find_op(c, op))
+    }
+    let q = format!(
+        "{PREFIXES}SELECT ?src ?n ?d WHERE {{ VALUES ?src {{ ex:a }} SERVICE algo:bfs {{ [] algo:predicate ex:p ; algo:source ?src ; algo:node ?n ; algo:depth ?d }} }}"
+    );
+    let streamed = |snap: Arc<sparkles_core::store::Snapshot>, opts: &QueryOptions| {
+        let mut c = select_cursor(
+            snap,
+            &q,
+            opts,
+            &CursorOptions {
+                batch_rows: 1,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut nodes = BTreeSet::new();
+        while let Some(batch) = c.next_batch().unwrap() {
+            for row in 0..batch.len() {
+                nodes.insert(short(&batch.row(row).unwrap().values()[1]));
+            }
+        }
+        let call = find_op(c.plan(), "AlgoCall")
+            .expect("algorithm call")
+            .clone();
+        assert!(
+            call.full_input_before_output && !call.materializes,
+            "{call:?}"
+        );
+        (nodes, call)
+    };
+    let eager = |snap: Arc<sparkles_core::store::Snapshot>, opts: &QueryOptions| {
+        query(snap, &q, opts)
+            .unwrap()
+            .rows()
+            .unwrap()
+            .iter()
+            .map(|r| short(&r.values()[1]))
+            .collect::<BTreeSet<_>>()
+    };
+    let s = projection_cache_store();
+    let opts = QueryOptions::default();
+    let (nodes, call) = streamed(s.snapshot(), &opts);
+    assert_eq!(nodes, eager(s.snapshot(), &opts));
+    assert_eq!(nodes.len(), 2);
+    assert!(call.operator.counters.is_some(), "{call:?}");
+    let mut t = projection_cache_txn(&s);
+    let bridge = projection_cache_bridge(&mut t);
+    t.insert(bridge).unwrap();
+    let pending = Arc::new(t.view());
+    let (nodes, _) = streamed(pending.clone(), &opts);
+    assert_eq!(nodes, eager(pending, &opts));
+    assert_eq!(nodes.len(), 4, "the pending bridge joins the components");
+    drop(t);
+    let (nodes, _) = streamed(s.snapshot(), &opts);
+    assert_eq!(nodes.len(), 2, "the rolled-back bridge is gone");
+    let masked = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(Graphs::All, Graphs::All))),
+        ..Default::default()
+    };
+    let (nodes, call) = streamed(s.snapshot(), &masked);
+    assert_eq!(nodes, eager(s.snapshot(), &masked));
+    assert!(call.operator.counters.is_none(), "{call:?}");
+    assert_eq!(call.operator.estimated_rows, -1.0, "{call:?}");
+}

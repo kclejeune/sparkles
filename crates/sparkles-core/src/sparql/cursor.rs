@@ -3117,13 +3117,14 @@ impl Operator {
                     node.operator()
                 )
             } else if whole_input {
+                let reads = whole::reads(&node);
                 match whole::bound(&node) {
                     Some(bound) => format!(
-                        "{} reads all of its input under the memory budget, runs once and serves its answer of {bound}",
+                        "{} reads {reads} under the memory budget, runs once and serves its answer of {bound}",
                         node.operator()
                     ),
                     None => format!(
-                        "{} reads all of its input under the memory budget, runs once and serves its charged answer",
+                        "{} reads {reads} under the memory budget, runs once and serves its charged answer",
                         node.operator()
                     ),
                 }
@@ -3775,6 +3776,10 @@ impl Operator {
                     if let Some(description) = whole.description() {
                         self.info.description = description;
                     }
+                    // A graph view's plan tells nothing a kernel saw of other graphs.
+                    if ctx.graphs.is_some() {
+                        self.info.redact();
+                    }
                     self.done = whole.done();
                     batch
                 }
@@ -3785,6 +3790,9 @@ impl Operator {
                     }
                     if let Some(description) = expand.description() {
                         self.info.description = description;
+                    }
+                    if ctx.graphs.is_some() {
+                        self.info.redact();
                     }
                     let input = self.children.last().is_none_or(|c| c.done);
                     self.done = expand.done(input);
