@@ -15,11 +15,14 @@ manual dispatch, whatever commit that run tested. It prints one line for each, w
 and exits 0 when none failed, 1 when one failed and 2 when `gh` cannot list the runs. A
 cancelled run is not a failure, and a run still in progress is left for the next report.
 
-It also follows failure streaks. When a workflow's two newest finished runs that were not
-cancelled both failed, the workflow is red on the branch, and the first report that sees
-the streak writes a roadmap row draft to DIR/drafts/ and prints its path. DIR/state.json
-remembers each open streak by its first failed run, so later reports of the same streak
-write no new draft, and the workflow's next passing run closes it. DIR defaults to
+It also follows failure streaks. DIR/state.json keeps, for each repository, branch and
+workflow, the newest run it has processed and the failed runs in a row since the last
+pass, so each run counts once and a report older than the state changes nothing. When the
+fetched runs do not reach back to the processed run, it fetches further back. When a
+streak reaches two failed runs that were not cancelled, the report writes a roadmap row
+draft to DIR/drafts/ and prints its path. A streak opens one draft, and the workflow's
+next passing run closes it. A streak that opened and closed between two reports opens
+none. DIR defaults to
 .artifacts/gates/github-streaks in the main checkout, which every worktree shares. The
 script never edits the roadmap, commits or pushes, and a streak does not change its exit
 status.
@@ -37,8 +40,10 @@ from pathlib import Path
 FAILED = {"failure", "timed_out", "startup_failure", "action_required"}
 # Runs that say nothing about the workflow's state, which a streak passes over.
 NEUTRAL = {"cancelled", "skipped", "neutral", "stale"}
-# Finished runs fetched for each workflow, enough to see two that were not cancelled.
-HISTORY = 6
+# Finished runs fetched for each workflow when following streaks, and the most fetched
+# when that does not reach back to the run the last report processed.
+HISTORY = 20
+HISTORY_MAX = 200
 STATE_VERSION = 1
 
 
@@ -75,35 +80,38 @@ def summarize(runs, failed_jobs):
     return lines, bad
 
 
-def streak(runs, workflow):
-    """The failed runs, newest first, at the head of WORKFLOW's finished history, passing
-    over cancelled runs. Empty when its newest such run did not fail."""
-    mine = sorted((r for r in runs if r["workflowName"] == workflow and r["status"] == "completed"
-                   and r["conclusion"] not in NEUTRAL), key=lambda r: r["createdAt"], reverse=True)
-    out = []
-    for r in mine:
-        if r["conclusion"] not in FAILED:
-            break
-        out.append(r)
-    return out
+def order(run):
+    return (run["createdAt"], run["databaseId"])
 
 
-def draft_row(workflow, failed, failed_jobs):
-    """A roadmap row draft for a workflow that failed twice or more in a row."""
-    first, newest = failed[-1], failed[0]
-    jobs = ", ".join(failed_jobs.get(newest["databaseId"], [])) or "see the run"
+def workflow_key(run):
+    """A workflow's stable identity: its database ID when gh reports one, else its name."""
+    wid = run.get("workflowDatabaseId")
+    return f"id:{wid}" if wid is not None else f"name:{run['workflowName']}"
+
+
+def draft_row(repo, branch, workflow, streak, jobs):
+    """A roadmap row draft for a workflow with STREAK's count of failed runs in a row."""
+    first, newest = streak["first"], streak["newest"]
     return (
-        f"| NNN | **The {workflow} workflow fails on main.** Its last {len(failed)} finished runs "
-        f"failed, from {first['headSha'][:8]} ({first['url']}) to {newest['headSha'][:8]} "
-        f"({newest['url']}), in {jobs}. The batch gate does not run this workflow. Find the change "
-        f"that broke it and fix it forward, or record why it can wait. "
-        f"| [DEVELOPMENT](DEVELOPMENT.md#nightly-gate) | S |"
+        f"| NNN | **The {workflow} workflow fails on {branch}.** Its last {streak['count']} finished runs "
+        f"in {repo} failed, from {first['headSha'][:8]} ({first['url']}) to {newest['headSha'][:8]} "
+        f"({newest['url']}), in {', '.join(jobs) or 'the jobs that the run lists'}. The batch gate does "
+        f"not run this workflow. Find the change that broke it and fix it forward, or record why it "
+        f"can wait. | [DEVELOPMENT](DEVELOPMENT.md#nightly-gate) | S |"
     )
 
 
-def follow_streaks(runs, failed_jobs, state_dir):
-    """Open a draft for each new streak of two or more failed runs and close the streaks
-    whose workflow passed. Returns the lines to print."""
+def follow_streaks(repo, branch, runs, state_dir, more=None, jobs=None):
+    """Advance each workflow's streak with the runs that the last report did not process,
+    open a draft for a streak that now has two or more failed runs and no draft, and close
+    a streak at a passing run. Returns the lines to print.
+
+    The state keeps, for each repository, branch and workflow, the newest run processed,
+    so a report that is older than the state changes nothing, and a run is counted once.
+    When the fetched runs do not reach back to that run, MORE(workflow name, limit)
+    fetches a longer history. JOBS(run ID) names a failed run's failed jobs for a draft.
+    Neither may raise into the report; their errors only shorten a line."""
     state_dir = Path(state_dir)
     (state_dir / "drafts").mkdir(parents=True, exist_ok=True)
     lines = []
@@ -113,38 +121,72 @@ def follow_streaks(runs, failed_jobs, state_dir):
         try:
             state = json.loads(path.read_text())
         except FileNotFoundError:
-            state = {"version": STATE_VERSION, "open": {}}
-        if state.get("version") != STATE_VERSION:
+            state = {"version": STATE_VERSION, "scopes": {}}
+        if state.get("version") != STATE_VERSION or "scopes" not in state:
             raise ValueError(f"{path} is version {state.get('version')!r}, and this script reads {STATE_VERSION}")
-        opened = state["open"]
-        for workflow in sorted({r["workflowName"] for r in runs}):
-            failed = streak(runs, workflow)
-            seen = sum(1 for r in runs if r["workflowName"] == workflow and r["status"] == "completed"
-                       and r["conclusion"] not in NEUTRAL)
-            known = opened.get(workflow)
-            # A passing run in view below the failures, or at their head, ends a streak.
-            ended = known is not None and seen > 0 and (
-                not failed or (len(failed) < seen and known["first"] not in {r["databaseId"] for r in failed}))
-            if ended:
-                lines.append(f"  {workflow}: passed again, streak from run {known['first']} closed")
-                del opened[workflow]
-                known = None
-            if not failed:
-                continue
-            if known is not None:
-                # The same streak, while its first run is still in view or its failures
-                # continue past the fetched history.
-                known["newest"] = failed[0]["databaseId"]
-                continue
-            if len(failed) < 2:
-                continue
-            slug = re.sub(r"[^a-z0-9]+", "-", workflow.lower()).strip("-")
-            draft = state_dir / "drafts" / f"{slug}-{failed[-1]['databaseId']}.md"
-            draft.write_text("Add this row to the roadmap's fix-forward items with the next free number:\n\n"
-                             + draft_row(workflow, failed, failed_jobs) + "\n")
-            opened[workflow] = {"first": failed[-1]["databaseId"], "newest": failed[0]["databaseId"],
-                                "draft": str(draft)}
-            lines.append(f"  {workflow}: failed {len(failed)} times in a row; roadmap row draft in {draft}")
+        scope = state["scopes"].setdefault(f"{repo}@{branch}", {})
+        by_workflow = {}
+        for r in runs:
+            if r["status"] == "completed":
+                by_workflow.setdefault(workflow_key(r), []).append(r)
+        for key in sorted(by_workflow):
+            mine = sorted(by_workflow[key], key=order)
+            name = mine[-1]["workflowName"]
+            st = scope.get(key)
+            seen = tuple(st["seen"]) if st else None
+            if seen is not None and order(mine[-1]) <= seen:
+                continue  # an older or equal report: nothing new
+            if seen is not None and order(mine[0]) > seen and more is not None:
+                # The window does not reach the last processed run, so runs may be missing
+                # between them. Fetch further back, up to HISTORY_MAX runs.
+                limit = len(mine)
+                while order(mine[0]) > seen and limit < HISTORY_MAX:
+                    limit = min(HISTORY_MAX, max(limit * 4, HISTORY))
+                    try:
+                        longer = [r for r in more(name, limit) if workflow_key(r) == key and r["status"] == "completed"]
+                    except Exception as e:  # noqa: BLE001 - the follower never fails the report
+                        lines.append(f"  {name}: could not fetch more runs ({e}); counting the window only")
+                        break
+                    if len(longer) <= len(mine):
+                        break
+                    mine = sorted(longer, key=order)
+            gap = seen is not None and order(mine[0]) > seen
+            if st is None or gap:
+                # No earlier report, or one that the history no longer reaches: count from
+                # the window alone, keeping an open streak's draft.
+                st = {"seen": None, "count": 0, "first": None, "newest": None,
+                      "draft": st.get("draft") if st and gap else None}
+                if gap:
+                    lines.append(f"  {name}: the runs since the last report exceed {HISTORY_MAX}; counting the window only")
+            new = [r for r in mine if st["seen"] is None or order(r) > tuple(st["seen"])]
+            for r in new:
+                if r["conclusion"] in NEUTRAL:
+                    continue
+                if r["conclusion"] in FAILED:
+                    brief = {k: r[k] for k in ("databaseId", "headSha", "url")}
+                    st["first"] = st["first"] or brief
+                    st["newest"] = brief
+                    st["count"] += 1
+                else:
+                    if st.get("draft"):
+                        since = st["first"]["databaseId"] if st.get("first") else "before the fetched runs"
+                        lines.append(f"  {name}: passed again, streak from run {since} closed")
+                    st.update(count=0, first=None, newest=None, draft=None)
+            st["seen"] = list(order(mine[-1]))
+            if st["count"] >= 2 and not st.get("draft"):
+                found = []
+                if jobs is not None:
+                    try:
+                        found = jobs(st["newest"]["databaseId"])
+                    except Exception:  # noqa: BLE001 - a draft without job names still helps
+                        found = []
+                slug = re.sub(r"[^a-z0-9]+", "-", f"{repo}-{branch}-{name}".lower()).strip("-")
+                draft = state_dir / "drafts" / f"{slug}-{st['first']['databaseId']}.md"
+                draft.write_text("Add this row to the roadmap's fix-forward items with the next free number:\n\n"
+                                 + draft_row(repo, branch, name, st, found) + "\n")
+                st["draft"] = str(draft)
+                lines.append(f"  {name}: failed {st['count']} times in a row; roadmap row draft in {draft}")
+            scope[key] = st
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
         os.replace(tmp, path)
@@ -165,6 +207,18 @@ def main():
     ap.add_argument("--streaks", help="the directory of the streak state and drafts")
     ap.add_argument("--no-streaks", action="store_true", help="do not follow failure streaks")
     args = ap.parse_args()
+    fields = "databaseId,workflowName,workflowDatabaseId,status,conclusion,createdAt,headSha,url"
+
+    def run_list(workflow, limit):
+        return json.loads(gh(
+            "run", "list", "--repo", args.repo, "--workflow", workflow, "--branch", args.branch,
+            "--status", "completed", "--limit", str(limit), "--json", fields,
+        ))
+
+    def failed_jobs_of(run_id):
+        view = json.loads(gh("run", "view", "--repo", args.repo, str(run_id), "--json", "jobs"))
+        return [j["name"] for j in view["jobs"] if j["conclusion"] in FAILED]
+
     try:
         # One query per workflow, so that a workflow that runs rarely is not crowded out
         # by the runs of the others. Pushes and manual dispatches on the branch both count.
@@ -173,19 +227,11 @@ def main():
         for wf in workflows:
             if wf["state"] != "active":
                 continue
-            runs += json.loads(gh(
-                "run", "list", "--repo", args.repo, "--workflow", wf["name"], "--branch", args.branch,
-                "--status", "completed", "--limit", str(HISTORY),
-                "--json", "databaseId,workflowName,status,conclusion,createdAt,headSha,url",
-            ))
+            runs += run_list(wf["name"], 1 if args.no_streaks else HISTORY)
         failed_jobs = {}
-        heads = [streak(runs, w)[:1] for w in {r["workflowName"] for r in runs}]
-        for run in latest_runs(runs) + [r for h in heads for r in h]:
-            if run["conclusion"] in FAILED and run["databaseId"] not in failed_jobs:
-                view = json.loads(gh("run", "view", "--repo", args.repo, str(run["databaseId"]), "--json", "jobs"))
-                failed_jobs[run["databaseId"]] = [
-                    j["name"] for j in view["jobs"] if j["conclusion"] in FAILED
-                ]
+        for run in latest_runs(runs):
+            if run["conclusion"] in FAILED:
+                failed_jobs[run["databaseId"]] = failed_jobs_of(run["databaseId"])
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as e:
         detail = getattr(e, "stderr", "") or str(e)
         print(f"github runs on {args.branch}: gh could not list them: {detail.strip()}")
@@ -198,8 +244,9 @@ def main():
     print("\n".join(lines))
     if not args.no_streaks:
         try:
-            notes = follow_streaks(runs, failed_jobs, args.streaks or default_streak_dir())
-        except (OSError, ValueError, subprocess.CalledProcessError) as e:
+            notes = follow_streaks(args.repo, args.branch, runs, args.streaks or default_streak_dir(),
+                                   more=run_list, jobs=lambda i: failed_jobs.get(i) or failed_jobs_of(i))
+        except Exception as e:  # noqa: BLE001 - the follower never changes the report's status
             notes = [f"  the failure streaks could not be followed: {e}"]
         if notes:
             print("failure streaks:")

@@ -1176,14 +1176,17 @@ failed run only warns and never changes either gate's exit status. A batch that 
 red run has to pass the gate while `main` is still red, so a blocking check would stop
 the fix from landing. Fix the run in the next batch, or say in the batch why it can wait.
 
-The script also follows failure streaks. When the two newest finished runs of a workflow
-that were not cancelled both failed, the first report that sees it writes a roadmap row
-draft to `.artifacts/gates/github-streaks/drafts/` in the main checkout and prints its
-path. `state.json` there records each open streak by its first failed run, so a streak
-opens one draft however many reports see it, and the workflow's next passing run closes
-it. Add the drafted row to the roadmap with the next free number. The
-script never edits the roadmap, commits or pushes, and `--no-streaks` turns the
-streaks off.
+The script also follows failure streaks. `state.json` in
+`.artifacts/gates/github-streaks/` of the main checkout keeps, for each repository,
+branch and workflow, the newest run it has processed and the failed runs in a row since
+the last pass. Each run counts once, a report older than the state changes nothing, and
+when the fetched runs do not reach back to the processed run the script fetches further
+back. When a streak reaches two failed runs that were not cancelled, the report writes a
+roadmap row draft to `drafts/` there and prints its path. A streak opens one draft, the
+workflow's next passing run closes it, and a streak that ended between two reports opens
+none. Add the drafted row to the roadmap with the next free number. The script never
+edits the roadmap, commits or pushes, an error in following the streaks only prints a
+line, and `--no-streaks` turns them off.
 
 ## Continuous integration
 
