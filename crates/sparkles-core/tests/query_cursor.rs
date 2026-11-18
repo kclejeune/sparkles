@@ -5321,13 +5321,40 @@ fn reference_evaluator_notes_open_choices_and_keeps_scopes() {
         run("SELECT (MIN(?x) AS ?n) (MAX(?x) AS ?m) WHERE { VALUES ?x { UNDEF 1 2 } }");
     assert_eq!(rows, vec![vec![None, int(2)]]);
     assert!(notes.min_max_error && !notes.chose);
-    let passing = reference::Reference::new(snapshot_quads(&snap)).passing_over_min_max_errors();
-    let (_, rows, _) = reference_select(
-        &passing,
-        "SELECT (MIN(?x) AS ?n) (MAX(?x) AS ?m) WHERE { VALUES ?x { UNDEF 1 2 } }",
-        "reference",
-    );
-    assert_eq!(rows, vec![vec![int(1), int(2)]]);
+    // the three readings of item 1064
+    use reference::AggregateErrors;
+    let q = "SELECT (MIN(?x) AS ?n) (MAX(?x) AS ?m) (AVG(?u) AS ?a) (GROUP_CONCAT(?x) AS ?g) \
+             WHERE { VALUES ?x { UNDEF 1 2 } }";
+    let reading = |r: AggregateErrors| {
+        let oracle = reference::Reference::new(snapshot_quads(&snap)).with_aggregate_errors(r);
+        reference_select(&oracle, q, "reference").1.remove(0)
+    };
+    let spec = reading(AggregateErrors::Spec);
+    assert_eq!(spec[..3], [None, int(2), int(0)]);
+    assert_eq!(spec[3], None, "GROUP_CONCAT over an error");
+    let jena = reading(AggregateErrors::Jena);
+    assert_eq!(jena[..3], [None, None, None]);
+    let sparkles = reading(AggregateErrors::Sparkles);
+    assert_eq!(sparkles[..3], [int(1), int(2), None]);
+    let concat = "SELECT (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES ?x { <urn:a> } }";
+    for (r, expected) in [
+        (AggregateErrors::Spec, None),
+        (
+            AggregateErrors::Jena,
+            Some(Term::Literal(oxrdf::Literal::new_simple_literal("urn:a"))),
+        ),
+        (
+            AggregateErrors::Sparkles,
+            Some(Term::Literal(oxrdf::Literal::new_simple_literal("urn:a"))),
+        ),
+    ] {
+        let oracle = reference::Reference::new(snapshot_quads(&snap)).with_aggregate_errors(r);
+        assert_eq!(
+            reference_select(&oracle, concat, "reference").1[0][0],
+            expected,
+            "{r:?}"
+        );
+    }
 
     // the middle of a path sequence arrives as a blank node, which COUNT(DISTINCT *)
     // cannot tell from one of a basic graph pattern

@@ -11,7 +11,12 @@
 //! themselves are open, because an open value decides which rows there are, is not
 //! compared.
 
-use super::{Error, Notes, Reference, Selected, value};
+use super::{AggregateErrors, Error, Notes, Reference, Selected, value};
+
+/// The engine's reading of the aggregates over errors and non-strings, which the
+/// comparisons take until the setting of roadmap item 1064 lands in the engine with
+/// Jena's reading as its default.
+pub const ENGINE_AGGREGATE_ERRORS: AggregateErrors = AggregateErrors::Sparkles;
 use oxrdf::Term;
 use std::collections::{BTreeSet, HashMap};
 
@@ -28,9 +33,9 @@ pub enum Expected {
 /// The reference's answer to `text` under the engine's readings of the open roadmap
 /// items, with the names of the readings it took. Where the query meets an item, it is
 /// evaluated again with the engine's reading, so that the comparison is exact under it:
-/// MIN and MAX passing over errors and AVG of errors only an error (item 1064), string arguments compatible whatever
-/// their base direction (item 1071), GROUP_CONCAT reading the lexical form of any value,
-/// and the default graph of several FROM clauses as the union of their graphs.
+/// the aggregates over errors and non-strings under [`ENGINE_AGGREGATE_ERRORS`] (item
+/// 1064), string arguments compatible whatever their base direction (item 1071), and the
+/// default graph of several FROM clauses as the union of their graphs.
 pub fn under_engine_readings(
     r: &Reference,
     text: &str,
@@ -51,17 +56,12 @@ pub fn under_engine_readings(
         Expected::Other => return Ok((first, Vec::new())),
     };
     let mut readings = Vec::new();
-    if notes.min_max_error {
-        readings.push("MIN and MAX pass over errors");
-    }
-    if notes.avg_of_errors {
-        readings.push("AVG of errors only is an error");
+    let aggregates = notes.min_max_error || notes.avg_of_errors || notes.group_concat_non_string;
+    if aggregates {
+        readings.push("the engine's aggregates over errors and non-strings");
     }
     if notes.direction_in_compatibility {
         readings.push("string arguments ignore the base direction");
-    }
-    if notes.group_concat_non_string {
-        readings.push("GROUP_CONCAT reads any lexical form");
     }
     if notes.from_shares_blank_nodes {
         readings.push("FROM graphs share their blank nodes");
@@ -70,10 +70,12 @@ pub fn under_engine_readings(
         return Ok((first, readings));
     }
     let set = |on: bool| {
-        r.set_passing_over_min_max_errors(on && notes.min_max_error);
-        r.set_avg_of_errors_unbound(on && notes.avg_of_errors);
+        r.set_aggregate_errors(if on && aggregates {
+            ENGINE_AGGREGATE_ERRORS
+        } else {
+            AggregateErrors::Spec
+        });
         r.set_ignoring_direction_in_compatibility(on && notes.direction_in_compatibility);
-        r.set_stringifying_group_concat(on && notes.group_concat_non_string);
         r.set_union_of_from_graphs(on && notes.from_shares_blank_nodes);
     };
     set(true);

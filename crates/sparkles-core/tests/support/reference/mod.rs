@@ -145,10 +145,8 @@ impl GraphData {
 pub struct Reference {
     quads: Vec<Quad>,
     union_default: bool,
-    pass_min_max_errors: Cell<bool>,
-    avg_of_errors_unbound: Cell<bool>,
+    aggregate_errors: Cell<AggregateErrors>,
     ignore_direction_in_compatibility: Cell<bool>,
-    stringify_group_concat: Cell<bool>,
     union_from: Cell<bool>,
     sparql11_ebv: Cell<bool>,
     /// The start of the labels of the blank nodes that the evaluation makes, which no
@@ -186,10 +184,8 @@ impl Reference {
         Reference {
             quads,
             union_default: false,
-            pass_min_max_errors: Cell::new(false),
-            avg_of_errors_unbound: Cell::new(false),
+            aggregate_errors: Cell::new(AggregateErrors::Spec),
             ignore_direction_in_compatibility: Cell::new(false),
-            stringify_group_concat: Cell::new(false),
             union_from: Cell::new(false),
             sparql11_ebv: Cell::new(false),
             fresh_prefix,
@@ -207,18 +203,17 @@ impl Reference {
         self
     }
 
-    /// Make MIN and MAX pass over the errors among their values, a reading other than
-    /// the specification's, which [`Notes::min_max_error`] describes. A test may compare
-    /// with it where the difference is tracked as an open question.
-    pub fn passing_over_min_max_errors(self) -> Reference {
-        self.pass_min_max_errors.set(true);
+    /// Evaluate MIN and MAX over errors, AVG over errors only and GROUP_CONCAT over
+    /// values that are not strings under `reading`, which [`AggregateErrors`] describes.
+    pub fn with_aggregate_errors(self, reading: AggregateErrors) -> Reference {
+        self.aggregate_errors.set(reading);
         self
     }
 
-    /// Set whether later evaluations pass over the errors in MIN and MAX, as
-    /// [`Self::passing_over_min_max_errors`] does, for an evaluator kept across queries.
-    pub fn set_passing_over_min_max_errors(&self, pass: bool) {
-        self.pass_min_max_errors.set(pass);
+    /// Set the reading of [`Self::with_aggregate_errors`] for later evaluations, for an
+    /// evaluator kept across queries.
+    pub fn set_aggregate_errors(&self, reading: AggregateErrors) {
+        self.aggregate_errors.set(reading);
     }
 
     /// Set whether later evaluations take two language-tagged string arguments of the same
@@ -226,20 +221,6 @@ impl Reference {
     /// 1.2's, which [`Notes::direction_in_compatibility`] describes.
     pub fn set_ignoring_direction_in_compatibility(&self, ignore: bool) {
         self.ignore_direction_in_compatibility.set(ignore);
-    }
-
-    /// Set whether later evaluations make AVG an error where all its values are errors, as
-    /// Jena does, where the specification's Avg is zero, which [`Notes::avg_of_errors`]
-    /// describes.
-    pub fn set_avg_of_errors_unbound(&self, unbound: bool) {
-        self.avg_of_errors_unbound.set(unbound);
-    }
-
-    /// Set whether later evaluations let GROUP_CONCAT read the lexical form of any value,
-    /// as Jena does, where the specification's CONCAT takes only strings, which
-    /// [`Notes::group_concat_non_string`] describes.
-    pub fn set_stringifying_group_concat(&self, stringify: bool) {
-        self.stringify_group_concat.set(stringify);
     }
 
     /// Set whether later evaluations take the default graph of several FROM clauses as
@@ -454,16 +435,33 @@ pub(crate) struct Evaluator<'a> {
     pub read_open: Cell<bool>,
 }
 
+/// The readings of the aggregates where SPARQL, Jena and the engine differ, roadmap item
+/// 1064: MIN and MAX over an error, AVG over values that are all errors and GROUP_CONCAT
+/// over a value that is not a string, such as an IRI or a number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AggregateErrors {
+    /// The specification's text. MIN and MAX sort the values in the order of ORDER BY,
+    /// where an error comes first, so MIN is an error and MAX passes over it. AVG is zero
+    /// where Count, which removes the errors, is zero. GROUP_CONCAT is CONCAT over the
+    /// values, which makes a value that is not a string an error.
+    #[default]
+    Spec,
+    /// Jena's reading. An error makes MIN, MAX and AVG errors, and GROUP_CONCAT reads
+    /// the lexical form of any value.
+    Jena,
+    /// The engine's reading before item 1064 makes it selectable. MIN and MAX pass over
+    /// errors, an error makes AVG an error, and GROUP_CONCAT reads the lexical form of any
+    /// value.
+    Sparkles,
+}
+
 /// What an evaluation noted about its answer beside the answer itself.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Notes {
     /// The specification allows other answers, because the evaluator made a choice
     /// that it leaves open.
     pub chose: bool,
-    /// MIN or MAX read an error. The evaluator follows the specification's definition,
-    /// which sorts the values in the order of ORDER BY, where an error sorts first, so
-    /// MIN is an error and MAX passes over it. Jena makes both an error, and other
-    /// readings pass over it in both.
+    /// MIN or MAX read an error, where the readings of [`AggregateErrors`] differ.
     pub min_max_error: bool,
     /// `COUNT(DISTINCT *)` counted solutions of a pattern with blank nodes. Section
     /// 18.2.2.4 joins the two halves of a path sequence on a fresh variable, which is in
@@ -481,12 +479,10 @@ pub struct Notes {
     /// an error. A test may compare with the reading that ignores the direction where the
     /// difference is tracked as an open defect.
     pub direction_in_compatibility: bool,
-    /// AVG read only errors. The specification's Avg is zero where Count, which removes
-    /// the errors, is zero, and Jena makes it an error.
+    /// AVG read only errors, where the readings of [`AggregateErrors`] differ.
     pub avg_of_errors: bool,
-    /// GROUP_CONCAT read a value that is not a string, such as an IRI or a number. The
-    /// specification defines GROUP_CONCAT through CONCAT, which makes such a value an
-    /// error, and Jena reads its lexical form.
+    /// GROUP_CONCAT read a value that is not a string, such as an IRI or a number, where
+    /// the readings of [`AggregateErrors`] differ.
     pub group_concat_non_string: bool,
     /// Two of the graphs of the FROM clauses share a blank node, which the RDF merge of
     /// section 13.2 keeps apart and a store's union of its graphs shares.
@@ -1705,7 +1701,7 @@ impl<'a> Evaluator<'a> {
                         let mut notes = self.notes.get();
                         notes.avg_of_errors = true;
                         self.notes.set(notes);
-                        if self.data.avg_of_errors_unbound.get() {
+                        if self.data.aggregate_errors.get() != AggregateErrors::Spec {
                             return Ok(None);
                         }
                     }
@@ -1735,16 +1731,18 @@ impl<'a> Evaluator<'a> {
                 // Min and Max sort the values in the order of ORDER BY, where an error
                 // sorts with the unbound values, first. So an error is the minimum, and
                 // the maximum passes over it.
-                if has_error && !self.data.pass_min_max_errors.get() {
+                if has_error {
                     let mut notes = self.notes.get();
                     notes.min_max_error = true;
                     self.notes.set(notes);
-                }
-                if has_error
-                    && !self.data.pass_min_max_errors.get()
-                    && matches!(name, AggregateFunction::Min)
-                {
-                    return Ok(None);
+                    let error = match self.data.aggregate_errors.get() {
+                        AggregateErrors::Spec => matches!(name, AggregateFunction::Min),
+                        AggregateErrors::Jena => true,
+                        AggregateErrors::Sparkles => false,
+                    };
+                    if error {
+                        return Ok(None);
+                    }
                 }
                 let mut best: Option<&Term> = None;
                 for t in &terms {
@@ -1799,7 +1797,7 @@ impl<'a> Evaluator<'a> {
                         let mut notes = self.notes.get();
                         notes.group_concat_non_string = true;
                         self.notes.set(notes);
-                        if !self.data.stringify_group_concat.get() {
+                        if self.data.aggregate_errors.get() == AggregateErrors::Spec {
                             return Ok(None);
                         }
                     }

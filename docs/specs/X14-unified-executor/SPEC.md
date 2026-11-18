@@ -255,8 +255,12 @@ error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
 `xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
 XSD permits and Jena does not do. Its string functions take a directional string and a
 language-tagged string of the same language as compatible arguments, which SPARQL 1.2
-and Jena do not. The evaluator notes where a query meets item 1064 or 1071, and the tests
-compare such a query exactly under the engine's reading until the item is decided. The
+and Jena do not. The evaluator evaluates the aggregates of item 1064 under the
+specification's, Jena's or the engine's reading, answers the W3C suites under the
+specification's, and compares the engine under the engine's current reading until the
+setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
+meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
+reading. The
 evaluator takes two well-formed values of different supported types, such as a string
 and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
 default, where Jena's strict mode and the section's main text make the comparison an

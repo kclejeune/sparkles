@@ -425,7 +425,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   MAX pass over it, and Jena makes both an error. AVG over values that are all errors is
   an error, as in Jena, where SPARQL makes it zero. GROUP_CONCAT reads the lexical form of
   an IRI or a number, as Jena does, where SPARQL's CONCAT makes such a value an error.
-  Roadmap item 1064.
+  Roadmap item 1064 makes the reading a setting with Jena's as its default.
 * An `xsd:integer` or `xsd:decimal` with more digits than the engine's decimal type
   holds, about 20 before the point, is not read as a number, so comparisons, arithmetic
   and range filters treat it as an unknown literal. XSD allows a limit of 16 digits, while
