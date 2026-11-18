@@ -796,10 +796,10 @@ useful authorized clauses for restricted views. Such isolated output has no impl
 reclassification continuation. Property and individual pages also read materialized frames and hierarchies from an
 existing fresh RDFS or OWL RL producer. These views require complete readable inputs
 matching the producer scope. They retain an exact source/revision pin, label actual
-inferred-graph provenance and distinguish facts also asserted. A materialized frame
-writes its rows in the clauses of the entity's frame, such as Types, Facts and
-SubPropertyOf, in Manchester syntax with an Inferred badge on each row and the names linked
-to their pages. Entailments that every entity of the profile has, such as a property's
+inferred-graph provenance and distinguish facts also asserted. The read-only materialized
+region below the asserted frame groups its rows under the frame's clause keywords, such as
+Types, Facts and SubPropertyOf, in Manchester syntax with an Inferred badge on each row and
+the names linked to their pages. Entailments that every entity of the profile has, such as a property's
 subproperty relation to itself or a type of `owl:Thing`, are counted instead of listed.
 Disabled or incomplete
 change logs and reverted input changes are conservatively refused when freshness cannot

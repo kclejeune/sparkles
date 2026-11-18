@@ -1073,8 +1073,9 @@ or OWL RL producer. The hierarchy reduces transitive closure edges between equiv
 groups. Regions at one displayed revision share a producer pin and refuse replacement,
 while source and entity changes abort and discard prior reads. Missing or stale sources
 remain visible failures and never start implicit computation. Actual inferred-graph
-provenance and duplicate asserted facts are shown. Item 622 writes the materialized frame
-rows in the frame's own clauses in Manchester syntax, with an Inferred badge per row and
+provenance and duplicate asserted facts are shown. Item 622 groups the rows of the separate
+read-only materialized region under the frame's clause keywords in Manchester syntax, with
+an Inferred badge per row and
 linked names whose labels come from the same pinned read, and characteristics in a
 Characteristics clause. Self-subsumptions, types and superclasses of `owl:Thing` or
 `rdfs:Resource` and subproperty relations to the top property of the same kind are counted

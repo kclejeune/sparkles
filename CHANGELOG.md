@@ -2,12 +2,12 @@
 
 ## Unreleased
 
-### Materialized inferences in the clauses of entity frames
+### Materialized inferences under the clause keywords of entity frames
 
-The materialized frame of a property or individual in Browse and the ontology editor
-writes its rows in the clauses of the entity's frame, such as Types, Facts and
+The read-only materialized region of a property or individual frame in Browse and the
+ontology editor groups its rows under the frame's clause keywords, such as Types, Facts and
 SubPropertyOf, in Manchester syntax with an Inferred badge on each row, in place of a list
-of functional-style axioms. Names link to their pages in Browse and select the entity in
+of functional-style axioms. The rows stay in their own region below the asserted frame. Names link to their pages in Browse and select the entity in
 the editor, and their labels come from the same pinned read as the rows. Entailments that
 every entity of the profile has, such as a property's subproperty relation to itself or a
 type of `owl:Thing` or `rdfs:Resource`, are counted instead of listed. This is part of
