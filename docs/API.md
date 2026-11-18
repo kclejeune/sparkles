@@ -2734,7 +2734,9 @@ Query parameters beyond the standard protocol:
   diffs and `/{ds}/explain` always run eagerly, because each of them returns one
   document built from the whole result.
 * `send=<n>` caps the number of rows serialized. The UI uses it so that a huge result does
-  not hang the browser, and asks for eager execution, because it shows the full count.
+  not hang the browser. Its result table leaves the mode to the server's default and
+  shows an unknown total for a streamed answer that `send` stopped, and its comparisons
+  ask for eager execution, because they compare exact counts.
   With eager execution, the native metadata reports the full count. With streaming,
   including a scan that `auto` streams, the query stops after the first n rows. `meta.status` is then
   `stopped`, and `meta.totalRows` is `null` unless the cursor had already reached the

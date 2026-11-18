@@ -629,8 +629,6 @@ workstream, and the spec that holds the design gives its gates. They run in Wave
 * An OPTIONAL whose condition is an EXISTS stays eager under automatic execution until
   item 570 makes the cursor's conditional OPTIONAL as fast as the eager one. An EXISTS
   nested more than four levels deep stays eager as well, which item 1081 covers.
-* The UI's result table still asks for eager execution until it can show a streamed
-  result's unknown total.
 * The parallel cursor filters and range top-k were measured on 8 vCPUs and still need a
   12-thread measurement on an Intel host. Decoding ahead under many concurrent queries is
   unmeasured.

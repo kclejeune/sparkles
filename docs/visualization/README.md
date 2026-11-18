@@ -129,6 +129,13 @@ The SvelteKit UI is embedded in the server binary.
 
   ![The query page's Options menu with Demand reasoning and the RDFS profile, over a result whose badge reports 322 derived facts](../images/query-reasoning.png)
 
+* The result table runs a query in the server's default execution mode, so a plan that is
+  faster as a cursor streams. When a streamed answer reaches the row limit, the table
+  shows the rows it received, the **Table** tab reads the count with a plus sign, such as
+  `1,000+`, and a notice says that there may be more rows and that the total is unknown.
+  Raising the row limit or downloading the result from **Raw** reads the rest. A
+  comparison on the history slider reads both states eagerly, so it can compare whole
+  results or their exact counts ([USAGE.md](../USAGE.md#incremental-query-execution)).
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.
