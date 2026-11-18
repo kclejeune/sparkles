@@ -410,15 +410,16 @@ these writers.
 
 ### The hand-off of a streamed response, item 534
 
-A phase trace of `count-all` on forge put the rest of the short queries' gap in the
+A phase trace of the nine short queries on forge put the rest of their gap in the
 hand-off between threads. An eager request for a text whose last run was quick runs on
-the worker that received it, without waking another thread, and had serialized its
-answer 65 µs after the handler started. A streamed request woke a blocking-pool thread to
-open its cursor, woke the handler again to receive the cursor, and woke a second pool
-thread to write the body, with median costs of 15, 12 and 59 µs on `count-all`. The cost
-of a wake is bimodal, as the open's hop took 15 µs on `count-all` and 80 µs on
-`predicate-counts`, so the plan predicts savings in wakes removed and judges them by
-per-request deltas. Three changes follow, and they differ in what they change for a
+the worker that received it, without waking another thread, and `count-all` had
+serialized its answer a median of 65 µs after the handler started. A streamed request
+woke a blocking-pool thread to open its cursor, woke the handler to receive the cursor
+and woke a second pool thread to write the body. Each pool wake took either about 10 µs
+or about 80 µs per request, so their means are the useful measure, 35 to 80 µs for the
+open's wake and 32 to 73 µs for the producer's across the nine queries, with 8 to 10 µs
+for the return to the handler. The plan therefore predicts savings in wakes removed and
+judges them by per-request deltas. Three changes follow, and they differ in what they change for a
 client.
 
 The first opens the cursor in the producer's task. `cursor::run` opens the cursor on the
@@ -438,8 +439,11 @@ unknown `at`, a budget refused at the open and a timeout at the open. The change
 when atlas's interleaved rounds under the [Intel rule](#the-intel-rule) show a saving
 per request on the queries under 1 ms and no query slower, and it stays under item 534.
 
-The second gives cursor executions the in-place route. A cursor takes it only on a
-text's first run, since a quick history sends the text to the eager executor. The merge
+The second gives the writing of a cursor's body the in-place route. A cursor opens in
+place on a text's first run and on a text whose quick history keeps automatic execution,
+as a quick cursor, a text that is settling its mode and a quick ASK do, and its body
+then still moves to the pool to be written. Every other quick history sends the text to
+the eager executor, and the route must cover both kinds of cursor. The merge
 keeps the in-place runner's choice between the receiving worker and the blocking pool
 for a collected cursor, so cursors need the route before the merge can hold a quick
 text to the eager time. A cursor run in place pulls batches and writes them until the
@@ -458,14 +462,14 @@ commits after its first batch or 64 KiB. Work in place cannot stop when its clie
 away, and only the query's timeout bounds it. The merge leaves the commit point as the
 only difference between the modes, which would carry explicit streaming onto the route,
 so whether it does is an open decision for the maintainer. The bound on the saving is
-the producer's wake, 59 µs on `count-all`, beside the first change's two.
+the open's wake, 35 to 80 µs on average, beside what the first change saves.
 
 Two candidates were measured and are not planned. A diagnostic build that answered a
 streamed request whole, without the early commit, removed the channel, the end-of-body
 handshake and the first-batch commit together and was no faster on forge, as the
-[Outcome](SPEC.md#the-streamed-response-cost) records. The cursor's open, 67 µs against
-the eager run's 45 µs on `count-all`, and its first batch with its write, 35 µs against
-the eager serialization's 8 µs, are executor costs that no change of route removes. Item
+[Outcome](SPEC.md#the-streamed-response-cost) records. The cursor's open, a median of 59 µs
+against the eager run's 45 µs on `count-all`, and its first batch with its write, 42 µs
+against the eager serialization's 8 µs, are executor costs that no change of route removes. Item
 828's decoding of a batch column at a time takes the write, and the merge owns the open,
 since it opens a cursor for every query.
 

@@ -1797,11 +1797,11 @@ claim follows from these correctness checks.
 The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
 through the engine's 8 KiB `Buffered` writer, as the eager writers do, and count the rows
 whose bytes reached the response, so a streamed body that stopped partway reports the
-rows the client received. A streamed body that the result-size budget stops after the
+rows the response writer accepted, as an eager body does. A streamed body that the result-size budget stops after the
 response committed sends what it had buffered before it aborts the transfer, which only
 eager bodies did before. That send waits under the body's idle limit, and when it fails
-the report leaves out its bytes. On the large answers at 1.05M triples a streamed
-request runs 0.46 to 0.69 times the instructions it ran before, at or below the eager
-request's count, and the
+the report leaves out its bytes but still counts its rows. On the large answers at 1.05M
+triples a streamed request runs 0.46 to 0.69 times the instructions it ran before, within
+2% of the eager request's count in native JSON or below it, and the
 [X14 Outcome](X14-unified-executor/SPEC.md#the-streamed-response-cost) gives the counts
 and where the short queries' remaining cost lies.

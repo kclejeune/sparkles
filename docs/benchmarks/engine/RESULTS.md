@@ -118,8 +118,8 @@ whose bytes the response writer took. That accounting costs 7% of the instructio
 a buffer that counts rows only when it is written out, and on forge `optional-chain` took
 150.8 ms of client time against 132.0 ms without it. Roadmap item 243 follows this up.
 
-Streamed answers write through the same buffer, with the same count of the rows the client
-received. The table gives `instructions:u` per request of a native JSON request with
+Streamed answers write through the same buffer, with the same count of the rows the
+response writer accepted. The table gives `instructions:u` per request of a native JSON request with
 `execution=streaming` at 1.05M triples, over two passes of 200 requests for the short
 queries and 10 for the large ones, for a build whose cursor writers wrote to the response
 writer a few bytes at a time and for the current one, with the eager request's count

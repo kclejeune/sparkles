@@ -1280,15 +1280,18 @@ On forge, with the server on CPUs 0 to 11 with 12 Rayon threads and curl on CPU 
 streamed answer took 0.13 to 0.23 ms more wall time than an eager one on the nine
 queries under 1 ms, 1.29 to 1.47 times as long. The large answers took 7.53 ms against
 5.00 ms on `star-join`, 22.4 against 20.1 ms on `optional-chain`, 49.4 against 40.2 ms
-on `order-by-full` and 284 against 213 ms on `export-500k`. A phase trace of `count-all`
-in a diagnostic build placed the short queries' gap in the hand-off between threads. The
-eager request ran in place on the worker that received it and had serialized its answer
-65 µs after the handler started. The streamed request took 15 µs to reach a blocking-pool
-thread, 67 µs to open its cursor against the eager run's 45 µs, 12 µs to return the
-cursor to the handler, 59 µs to start the producer on a second pool thread, 35 µs for the
-first batch and its write against the eager serialization's 8 µs, and about 43 µs to end
-the body. The wake costs were bimodal, 15 µs for the open's hop on `count-all` and 80 µs
-on `predicate-counts`. The same build answered a streamed request whole, without the
+on `order-by-full` and 284 against 213 ms on `export-500k`. A phase trace of
+the nine short queries in a diagnostic build placed their gap in the hand-off between
+threads, with each phase measured per request. An eager request ran in place on the
+worker that received it, and `count-all` had serialized its answer a median of 65 µs
+after the handler started. A streamed request woke a blocking-pool thread to open its
+cursor, woke the handler to receive the cursor and woke a second pool thread to write
+the body. Each pool wake took either about 10 µs or about 80 µs, and their means across
+the nine queries were 35 to 80 µs for the open's wake and 32 to 73 µs for the
+producer's, with 8 to 10 µs for the return to the handler. The end of the body, from the
+last write to the producer's finish, took 49 to 85 µs on average. On `count-all` the
+cursor's open took a median of 59 µs against the eager run's 45 µs, and the first batch
+with its write 42 µs against the eager serialization's 8 µs. The same build answered a streamed request whole, without the
 early commit at the first batch, which removes the channel, the end-of-body handshake and
 the early commit together, and it was no faster. Its streamed `count-all` took 0.729 ms
 against 0.546 ms with the early commit, and the other short queries took 0.58 to 0.89 ms
@@ -1302,10 +1305,10 @@ pieces of that size. Each writer counts the rows whose bytes reached the server'
 and the access log and the metrics report that count for a streamed body that stopped
 partway, as they do for an eager one. A streamed body that the result-size budget stops
 after its first bytes now sends what it had buffered before it aborts, as an eager body
-already did, so the rows reported are the rows the client received. That last send
-waits under the body's idle limit like any other, and when it fails the bytes reported
-leave out the unsent chunk while the row count still includes its rows, so the count is
-exact when the client keeps reading and otherwise within one chunk.
+already did, so the rows reported are the rows a client that keeps reading receives.
+That last send waits under the body's idle limit like any other, and when it fails the
+bytes reported leave out the unsent chunk while the row count still includes its rows,
+so the count is exact when the client keeps reading and otherwise within one chunk.
 
 Matched release builds of 8baa5686 and a016b7bd, both from wally, were counted on the
 laptop with the server on four performance cores, over two passes of 200 requests for
