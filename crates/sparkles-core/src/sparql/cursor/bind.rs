@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::id::{Id, Tag};
 use crate::index::{O, P, Perm, S};
 use crate::sparql::ctx::RetainedCharge;
-use crate::sparql::expr::{Expr, Row, eval};
+use crate::sparql::expr::Expr;
 use crate::sparql::plan::{Kind, Node};
 use crate::sparql::table::VarId;
 use crate::sparql::{Ctx, Table};
@@ -47,39 +47,9 @@ enum Mode {
     Off,
 }
 
-/// The experiment switch `SPARKLES_BIND_REUSE`: `observed` (the default), `legacy` (the
-/// one-shot pilot) or `off`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Policy {
-    Observed,
-    Legacy,
-    Off,
-}
-/// The experiment switches `SPARKLES_BIND_ADMIT=N`, admission at one repeated row in
-/// N (default 4) and release below one answered row in 2N, and `SPARKLES_BIND_HINT=0`,
-/// which ignores the snapshot hint.
-fn admit_divisor() -> u32 {
-    static ADMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *ADMIT.get_or_init(|| {
-        std::env::var("SPARKLES_BIND_ADMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(4)
-    })
-}
-fn hint_enabled() -> bool {
-    static HINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HINT.get_or_init(|| std::env::var("SPARKLES_BIND_HINT").as_deref() != Ok("0"))
-}
-fn policy() -> Policy {
-    static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("SPARKLES_BIND_REUSE").as_deref() {
-        Ok("legacy") => Policy::Legacy,
-        Ok("off") => Policy::Off,
-        _ => Policy::Observed,
-    })
-}
+/// Admission needs one repeated row in `ADMIT`, and an admitted map is released once
+/// it answers fewer than one row in `2 * ADMIT` without an evaluation.
+const ADMIT: u32 = 8;
 
 pub(super) struct Reuse {
     input: VarId,
@@ -102,19 +72,18 @@ pub(super) struct Reuse {
 }
 impl Reuse {
     pub(super) fn prepare(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Admission> {
-        if !ctx.opt.expr_cache || policy() == Policy::Off {
+        if !ctx.opt.expr_cache {
             return None;
         }
         let input = crate::sparql::exprcache::eligible(&[expr]).ok().flatten()?;
         Some(Admission {
             input,
-            expected_reuse: hint_enabled()
-                && source.is_some_and(|source| {
-                    source.est.is_finite()
-                        && source.est > 0.0
-                        && distinct_bound(ctx, source, input, &mut 64)
-                            .is_some_and(|distinct| distinct as f64 <= source.est * 0.8)
-                }),
+            expected_reuse: source.is_some_and(|source| {
+                source.est.is_finite()
+                    && source.est > 0.0
+                    && distinct_bound(ctx, source, input, &mut 64)
+                        .is_some_and(|distinct| distinct as f64 <= source.est * 0.8)
+            }),
         })
     }
     pub(super) fn new(ctx: &Ctx, admission: Admission) -> Option<Self> {
@@ -144,9 +113,8 @@ impl Reuse {
     /// sampled sketch can miss a few hot keys, so it admits the map for later batches.
     pub(super) fn counted(&mut self, rows: usize, distinct: usize) {
         if self.mode == Mode::Probe
-            && policy() == Policy::Observed
             && rows >= crate::sparql::exprcache::MIN_ROWS
-            && (rows - distinct) * admit_divisor() as usize >= rows
+            && (rows - distinct) * ADMIT as usize >= rows
         {
             self.admit();
         }
@@ -191,9 +159,6 @@ impl Reuse {
                 }
             }
         }
-        if policy() == Policy::Legacy {
-            return self.apply_rows(ctx, table, column, target, expr);
-        }
         self.apply_map(ctx, table, column, target, expr)
     }
 
@@ -216,7 +181,7 @@ impl Reuse {
 
     /// The first batch: substantial exact repetition, or a repeated key with the
     /// snapshot hint, admits the map at once. Otherwise the sampled keys of the batch
-    /// seed the sketch, or the legacy policy declines for the query.
+    /// seed the sketch.
     fn pilot(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<bool> {
         // Cheap, mostly distinct inputs do not repay per-row map work.
         // The estimate affects profit only, never physical budget admission.
@@ -235,14 +200,10 @@ impl Reuse {
                 repeats += 1;
             }
         }
-        if repeats > 0 && (repeats * admit_divisor() as usize >= sample || self.expected_reuse) {
+        if repeats > 0 && (repeats * ADMIT as usize >= sample || self.expected_reuse) {
             self.max_entries = MAP_ENTRIES;
             self.admit();
             return Ok(true);
-        }
-        if policy() == Policy::Legacy {
-            self.decline();
-            return Ok(false);
         }
         self.mode = Mode::Probe;
         self.max_entries = MAP_ENTRIES;
@@ -256,8 +217,8 @@ impl Reuse {
         Ok(false)
     }
 
-    /// Later batches: admit once a window of sampled rows repeats a quarter of the
-    /// time, and decline once the sketch is full without that.
+    /// Later batches: admit once a window of sampled rows repeats one time in
+    /// [`ADMIT`], and decline once the sketch is full without that.
     fn probe(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<bool> {
         self.observe(ctx, keys)?;
         let (rows, repeats) = self.window;
@@ -265,7 +226,7 @@ impl Reuse {
             return Ok(false);
         }
         self.window = (0, 0);
-        if repeats * admit_divisor() >= rows {
+        if repeats * ADMIT >= rows {
             self.admit();
             return Ok(true);
         }
@@ -382,67 +343,11 @@ impl Reuse {
             && (self.map_rows >= MAP_ENTRIES as u64 || self.values.len() >= self.max_entries)
         {
             let (rows, answered) = std::mem::take(&mut self.map_window);
-            // A map that answers fewer than an eighth of its rows costs more than it saves.
-            if answered * 2 * admit_divisor() < rows {
+            // A map that answers fewer than one row in `2 * ADMIT` costs more than it saves.
+            if answered * 2 * ADMIT < rows {
                 self.decline();
             }
         }
-        Ok(true)
-    }
-
-    /// The legacy evaluation of an admitted map: misses one row at a time.
-    fn apply_rows(
-        &mut self,
-        ctx: &Ctx,
-        table: &mut Table,
-        column: usize,
-        target: VarId,
-        expr: &Expr,
-    ) -> Result<bool> {
-        let map = table.var_map(ctx.nvars());
-        let mut output = Vec::with_capacity(table.len);
-        for row in 0..table.len {
-            if row.is_multiple_of(1024) {
-                ctx.check()?;
-            }
-            let key = table.cols[column][row];
-            let value = if let Some(value) = self.values.get(&key) {
-                self.hits += 1;
-                *value
-            } else {
-                #[cfg(test)]
-                {
-                    self.evaluations += 1;
-                }
-                self.misses += 1;
-                let value = eval(
-                    expr,
-                    &Row {
-                        table,
-                        i: row,
-                        map: &map,
-                        dec: None,
-                    },
-                    ctx,
-                )
-                .ok()
-                .map_or(Id::UNDEF, |value| value.into_id(ctx));
-                ctx.check()?;
-                if self.values.len() < self.max_entries
-                    && self.charge.as_mut().is_some_and(|charge| {
-                        charge
-                            .resize(512 + (self.values.len() as u64 + 1) * ENTRY_BYTES)
-                            .is_ok()
-                    })
-                {
-                    self.values.insert(key, value);
-                }
-                value
-            };
-            output.push(value);
-        }
-        table.vars.push(target);
-        table.cols.push(output);
         Ok(true)
     }
 }
