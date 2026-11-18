@@ -3107,7 +3107,7 @@ impl Operator {
                 info.description
             );
         }
-        if let Kind::LeftJoin { expr: None } = node.kind {
+        if let Kind::LeftJoin { .. } = node.kind {
             // the plan names the algorithm the merge_left_join switch selected, as the
             // eager plan does
             if let Some(merge) = &merge {

@@ -5139,7 +5139,17 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         None,
     )])
     .unwrap();
-    let q = "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }";
+    // The second query's condition reads both sides, and the third's is an EXISTS.
+    for q in [
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }",
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x FILTER(?o > 50 && ?x != \"77\") } }",
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x FILTER EXISTS { ?s <urn:p> ?v FILTER(?v < 120) } } }",
+    ] {
+        optional_merge_names_its_algorithm(&s, q);
+    }
+}
+
+fn optional_merge_names_its_algorithm(s: &Store, q: &str) {
     let expected = bag(query(s.snapshot(), q, &Default::default())
         .unwrap()
         .application_rows());
@@ -5165,8 +5175,8 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
             );
         }
         assert_eq!(plan.contains("[hash join]"), !merge, "{plan}");
-        assert_eq!(bag(all(c)), expected, "merge_left_join {merge}");
-        assert_eq!(bag(eager.application_rows()), expected);
+        assert_eq!(bag(all(c)), expected, "{q}: merge_left_join {merge}");
+        assert_eq!(bag(eager.application_rows()), expected, "{q}");
     }
 }
 
