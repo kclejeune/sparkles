@@ -124,7 +124,9 @@ export function materializedClauses(
     }
     const alsoAsserted = asserted.has(item.ofn);
     const characteristic = CHARACTERISTICS.get(a.type);
-    if (characteristic && a.property === iri) {
+    const propertyKind =
+      a.type === 'FunctionalDataProperty' ? kind === 'DataProperty' : kind === 'ObjectProperty';
+    if (characteristic && a.property === iri && propertyKind) {
       let clause = byId.get('characteristics');
       if (!clause)
         byId.set(

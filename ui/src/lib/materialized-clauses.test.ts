@@ -187,4 +187,20 @@ describe('materializedClauses', () => {
       ['Characteristics', ['Functional']],
     ]);
   });
+
+  it('leaves a characteristic in its functional form in a frame of another kind', () => {
+    const items = [item({ type: 'TransitiveObjectProperty', property: 'urn:p' }, 'T')];
+    const f = materializedClauses('NamedIndividual', 'urn:p', items, new Set(), name, {});
+    expect(f.clauses).toEqual([]);
+    expect(f.other.map((r) => r.ofn)).toEqual(['T']);
+    const data = materializedClauses(
+      'ObjectProperty',
+      'urn:d',
+      [item({ type: 'FunctionalDataProperty', property: 'urn:d' }, 'F')],
+      new Set(),
+      name,
+      {},
+    );
+    expect(data.other.map((r) => r.ofn)).toEqual(['F']);
+  });
 });
