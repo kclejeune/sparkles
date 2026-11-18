@@ -1,0 +1,29 @@
+total 938348
+region other: 936777
+region next_batch_at_most: 1571
+== leaves of next_batch_at_most
+    647 sparkles_core::sparql::exec::block_passes
+    151 __vdso_clock_gettime
+    147 mi_free
+     98 <sparkles_core::sparql::cursor::Operator>::next_shared
+     53 <sparkles_core::sparql::cursor::Scan>::next_shared::{closure#2}
+     52 <sparkles_core::index::Block>::key_range
+     39 <quick_cache::sync::Cache<(u64, u32, u32), sparkles_core::index::Col, sparkles_core::index::BlockWeighter>>::get::<(u64, u32, u32)>
+     38 <sparkles_core::sparql::cursor::QueryCursor>::next_batch_at_most
+     35 core::ptr::drop_glue::<sparkles_core::sparql::exec::PlanInfo>
+     24 <sparkles_core::index::PermIndex>::key_block_range
+     23 <sparkles_core::sparql::query_memory::QueryMemoryLedger>::new_owner
+     21 <sparkles_core::sparql::ctx::OwnedCharge>::new
+     20 <sparkles_core::sparql::cursor::QueryCursor>::publish_batch
+     17 <sparkles_core::sparql::query_memory::QueryMemoryLedger>::admit
+     16 mi_malloc
+     15 core::ptr::drop_glue::<sparkles_core::sparql::cursor::Operator>
+     14 <quick_cache::shard::CacheShard<(u64, u32, u32), sparkles_core::index::Col, sparkles_core::index::BlockWeighter, quick_cache::DefaultHashBuilder, quic
+     13 <sparkles_core::sparql::cursor::Operator>::update_plan
+     13 __memmove_avx_unaligned_erms
+     10 clock_gettime@@GLIBC_2.17
+      9 core::ptr::drop_glue::<core::option::Option<sparkles_core::index::WeakBlock>>
+      9 core::ptr::drop_glue::<sparkles_core::sparql::cursor::State>
+      9 core::ptr::drop_glue::<sparkles_core::sparql::plan::Kind>
+      8 <stacker::STACK_LIMIT::{K#0}::{closure#1} as core::ops::function::FnOnce<(core::option::Option<&mut core::option::Option<core::cell::Cell<core::option
+      7 <sparkles_core::sparql::query_regex::RegexCache>::clear

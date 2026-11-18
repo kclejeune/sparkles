@@ -22,6 +22,7 @@ that were measured and not kept, and [DEVELOPMENT.md](DEVELOPMENT.md) covers bui
 testing.
 
 * [Choosing a host](#choosing-a-host)
+  * [Instruction counts before timing](#instruction-counts-before-timing)
 * [Pinned comparison engines](#pinned-comparison-engines)
 * [Release build settings](#release-build-settings)
 * [Benchmark scripts](#benchmark-scripts)
@@ -78,6 +79,87 @@ Server ports belong below the kernel's range of ephemeral client ports, which is
 happened to use a server's port as its own local port stays in TIME-WAIT for 60 s after it
 closes, and until then the server cannot bind that port, even with `SO_REUSEADDR`. The
 scripts warn about a port base inside the range.
+
+### Instruction counts before timing
+
+A change to query code is first screened by counting instructions per request on a
+build host, and Intel timing is booked only when the counts or the kind of change call
+for it. `mise run bench:request-insn BASE_BIN TIP_BIN` runs `scripts/request-insn.py`, which
+serves both builds from one store in fresh processes, in rounds of A,B,B,A, with the server
+on one performance core, the client on another, one Rayon thread and idle-priority
+spinners on both cores. Performance counters opened on the server process before it starts
+cover every thread it starts. For each query and execution mode the script reports the
+user-space instructions per request of each build, the median over rounds of the per-round
+ratio of their medians with a 95% bootstrap interval, the spread of each build's counts
+over its processes, the ratio of CPU time and the context switches per request. It checks
+each build's answers, refuses windows whose counters were multiplexed or missed a thread,
+and counts an idle window of each process to show that the server's background work does
+not reach the per-request counts.
+
+The counts have a noise floor, which A-against-A runs measure on each host that screens.
+On `stanley`, an Intel Core Ultra X7 358H, two such runs of eight rounds of 50 requests on
+the 1.05M-triple store, one of a single binary and one of one source built on `wally` and
+on `stanley`, gave intervals within 0.49% of 1 for queries under 2 million instructions
+per request, except one at 1.07%, and within 0.17% for larger queries, most within 0.04%.
+The small queries' counts spread by up to 4.1% over processes. A query is therefore
+flagged when its interval does not lie within 1 ± 1% below 2 million instructions per
+request, or within 1 ± 0.25% at or above it, and a lone flag of a small query near the
+threshold is rerun with more rounds. Under automatic execution a query can run on a different executor in different
+processes, so its counts split into two groups. `str-filter-two` ran 225 or 272 million
+instructions per request in different processes of one binary, and other automatic
+queries spread by 20% to 90%. A flag on such a query is rerun under explicit modes before
+it counts.
+
+Counts are a one-sided screen. A flag sends the change to timing, and counts never size an
+effect. Item 678's slower string floors added 13% to the instructions of `str-pair-lt` and
+29% to `str-pair-names` against 25% and 33% in time on `atlas`, and under streaming the
+counts flagged both and no other query. Item 1039's charged scan added 9.8% to the
+execution time of a root scan and 8.8% to an export of 500,000 rows on `atlas`, and the
+counts of every query stayed within the noise floor, those of the two scans within 0.04%.
+Cycle profiles of its remaining cost on `root-limit` place about 1,300 cycles per block
+in the new build's shared-batch construction, weak block handle and scan checks, which
+retire a few hundred instructions, as the
+[results](benchmarks/engine/RESULTS.md#per-request-instruction-counts) show. The counts
+cover user space only, since `kernel.perf_event_paranoid` is 2 on the build hosts, so a
+change in system calls, futex waits or page faults does not show either.
+
+Counts also measure the whole request, and the response usually costs far more than the
+execution that the [Intel rule](specs/X14-unified-executor/PLAN.md#the-intel-rule)
+gates. The noise floor times the request's CPU time is the smallest change in
+instructions, expressed as time, that the counts can see. A query whose gate is smaller
+than that resolution cannot be cleared by counts at all. On `stanley` the resolution is
+1.4 to 5.4 µs for every query of the matrix under 0.3 ms, against the Intel rule's 0.5 µs,
+including a LIMIT of 1,000 rows over one scan at 2.2 µs under streaming. It is 135 µs for
+the root scan and 1 ms for the export of 500,000 rows, whose execution takes 0.1 ms and
+0.6 ms, and 59 µs for `optional-chain` under streaming against 2% of its execution, 48 µs.
+The other 49 of the 76 query and mode cells resolve within 2% of their execution time.
+A resolution within the gate is necessary for counts to clear a query, and it is not
+sufficient, since instructions do not bound cycles. A few dependent divisions or a new
+cache miss can add more than 2% to a query's time while adding almost no instructions.
+
+Counts are enough to skip Intel timing when the change only adds or removes computation
+on data the query already reads, reaches no query under 0.3 ms, stays within the floor on
+every query and mode it can reach, and every such query resolves within 2% of its
+execution time. A cost that such a change carries in cycles alone then reaches the batch
+screen, which catches 10%, and the checks on `forge` after the push, which catch smaller
+costs. Intel timing is required in every other case, which includes
+
+* any count flag, and a split query that a rerun under explicit modes still flags,
+* any reachable query under 0.3 ms, or one that does not resolve within its gate,
+* changes to memory charging and budgets, allocation, atomic reference counts, locks,
+  channels and the hand-off of work between threads, system calls and the response path,
+* changes to memory or cache layout, the data a query touches, code generation or
+  concurrency.
+
+The script exits with 0 when every query is within the floor, 2 when a query is flagged or
+split, and 1 when the run cannot clear anything, because a query lacks three rounds that
+hold both builds, a window was not fully counted or the answers differ. It copies both
+builds into the run directory before it starts, so a rebuild cannot change them between
+epochs. The [runs behind these numbers](benchmarks/engine/RESULTS.md#per-request-instruction-counts)
+keep every count, the builds' hashes and the queries.
+
+Both builds come from one host with the same compilers, as for timing, although the
+builds of one source on `wally` and on `stanley` counted the same within the floor.
 
 ## Pinned comparison engines
 

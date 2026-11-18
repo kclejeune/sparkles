@@ -1554,6 +1554,49 @@ python3 scripts/bench-gate.py metrics "${files[@]}" --gate insn-screen --suite i
 SPARKLES_TASK
 '''
 
+[tasks."bench:request-insn"]
+description = "Per-request instruction counts of two server builds (scripts/request-insn.py, Linux): user-space instructions, cycles and CPU time per request per query in rounds of A,B,B,A on one pinned CPU, with per-query ratios, intervals and spread"
+usage = '''
+arg "<a>" help="base server binary"
+arg "<b>" help="tip server binary, or the base again for an A-against-A run"
+flag "--store <dir>" help="an existing store both builds serve"
+flag "--data <file>" help="N-Triples that A loads (default: the 1.05M triples of scripts/gen-data.py 100000)"
+flag "--queries <dir>" help="directory of NAME.rq files (default: the queries of scripts/bench.sh)"
+flag "--execution <modes>" default="streaming,auto" help="comma-separated execution modes"
+flag "--rounds <n>" default="8" help="rounds of A,B,B,A"
+flag "--reps <n>" default="50" help="counted requests per query and process"
+flag "--threshold <pct>" default="1.0" help="flag threshold in percent below 2M instructions per request (0.25% above), from A-against-A runs on the host"
+flag "--server-cpu <n>" default="2"
+flag "--client-cpu <n>" default="3"
+flag "--out <dir>" help="results directory (default .artifacts/bench-request-insn/<UTC time>)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+out=$(realpath -m "${usage_out:-.artifacts/bench-request-insn/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+q=${usage_queries:-}
+if [ -z "$q" ]; then
+  q=$out/queries
+  mkdir -p "$q"
+  P=$(sed -n "s/^P='\(.*\)'$/\1/p" scripts/bench.sh)
+  while IFS=$'\t' read -r n body; do printf '%s%s' "$P" "$body" > "$q/$n.rq"; done \
+    < <(sed -n "s/^add \([a-z0-9-]*\) '\(.*\)'$/\1\t\2/p" scripts/bench.sh)
+fi
+src=()
+if [ -n "${usage_store:-}" ]; then src=(--store "$usage_store")
+elif [ -n "${usage_data:-}" ]; then src=(--data "$usage_data")
+else
+  mkdir -p .artifacts/bench-request-insn
+  d=.artifacts/bench-request-insn/people-100000.nt.zst
+  [ -f "$d" ] || python3 scripts/gen-data.py 100000 | zstd -q -T0 -10 -o "$d"
+  src=(--data "$d")
+fi
+exec python3 scripts/request-insn.py run --a "$usage_a" --b "$usage_b" "${src[@]}" --queries "$q" \
+  --execution "$usage_execution" --rounds "$usage_rounds" --reps "$usage_reps" --threshold "$usage_threshold" \
+  --server-cpu "$usage_server_cpu" --client-cpu "$usage_client_cpu" --out "$out"
+'''
+
 [tasks."bench:reasoning-latency"]
 description = "Derivation on demand and RDFS on read against materialized inferences (item 472): the 14 LUBM queries on LUBM-style data, interleaved rounds, into a gate record"
 usage = '''

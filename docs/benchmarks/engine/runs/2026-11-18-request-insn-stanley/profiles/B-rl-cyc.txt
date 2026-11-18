@@ -1,0 +1,29 @@
+total 753698
+region other: 748225
+region next_batch_at_most: 5473
+== leaves of next_batch_at_most
+    655 sparkles_core::sparql::exec::block_passes
+    551 mi_free
+    422 <sparkles_core::index::Block>::key_range
+    405 <sparkles_core::index::PermIndex>::key_block_range
+    341 __vdso_clock_gettime
+    331 <sparkles_core::sparql::cursor::Operator>::next_shared
+    280 <sparkles_core::sparql::cursor::Scan>::next_shared::{closure#2}
+    269 mi_malloc
+    180 <sparkles_core::index::BlockCache>::get_cols_cached
+    171 <quick_cache::sync::Cache<(u64, u32, u32), sparkles_core::index::Col, sparkles_core::index::BlockWeighter>>::get::<(u64, u32, u32)>
+    165 <sparkles_core::sparql::cursor::QueryCursor>::next_batch_at_most
+    112 <sparkles_core::sparql::ctx::OwnedCharge>::new
+    107 <sparkles_core::sparql::query_memory::QueryMemoryLedger>::new_owner
+    105 <quick_cache::shard::CacheShard<(u64, u32, u32), sparkles_core::index::Col, sparkles_core::index::BlockWeighter, quick_cache::DefaultHashBuilder, quic
+     98 core::ptr::drop_glue::<core::option::Option<sparkles_core::index::WeakBlock>>
+     90 <sparkles_core::index::Block>::downgrade
+     82 core::ptr::drop_glue::<sparkles_core::sparql::exec::PlanInfo>
+     73 <sparkles_core::sparql::cursor::QueryCursor>::terminate::stopped
+     71 core::ptr::drop_glue::<sparkles_core::sparql::cursor::State>
+     70 <sparkles_core::sparql::cursor::Scan>::reads_base
+     63 <sparkles_core::sparql::ctx::Ctx>::check
+     58 <sparkles_core::sparql::cursor::Operator>::update_plan
+     56 __memmove_avx_unaligned_erms
+     55 <stacker::STACK_LIMIT::{K#0}::{closure#1} as core::ops::function::FnOnce<(core::option::Option<&mut core::option::Option<core::cell::Cell<core::option
+     53 core::ptr::drop_glue::<sparkles_core::sparql::cursor::Operator>
