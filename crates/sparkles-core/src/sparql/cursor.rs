@@ -4013,7 +4013,13 @@ impl Operator {
                     let mut report = ExprReport::default();
                     let reused = match (&mut self.bind_reuse, &node.kind) {
                         (Some(reuse), Kind::Extend(target, expr)) => {
-                            reuse.apply(ctx, &mut b.table, *target, expr)?
+                            let reused = reuse.apply(ctx, &mut b.table, *target, expr)?;
+                            if reused && let Some((hits, misses)) = reuse.counters() {
+                                let counters = self.info.counters.get_or_insert_default();
+                                counters.insert("exprCacheHits".into(), hits.into());
+                                counters.insert("exprCacheMisses".into(), misses.into());
+                            }
+                            reused
                         }
                         _ => false,
                     };

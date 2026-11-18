@@ -16,19 +16,76 @@ pub(super) struct Admission {
     expected_reuse: bool,
 }
 
+/// Entries of a general map, and of the sampled-key sketch times [`SAMPLE`].
+const MAP_ENTRIES: usize = 1 << 16;
+/// Entries of a map admitted by dense inline integers.
+const INTEGER_ENTRIES: usize = 1 << 14;
+/// One key in `1 << SAMPLE_SHIFT` is observed by the sketch, chosen by its hash, so
+/// the sketch sees every occurrence of the keys it samples.
+const SAMPLE_SHIFT: u32 = 4;
+/// Most keys the sketch holds: it covers as many distinct keys as a full map.
+const SKETCH_KEYS: usize = MAP_ENTRIES >> SAMPLE_SHIFT;
+/// Sampled rows per admission decision, about 4,096 input rows.
+const WINDOW: u32 = 256;
+/// Rows per decision whether an admitted map still pays. The first decision waits
+/// until the map has seen [`MAP_ENTRIES`] rows or filled, since a map admitted late in a
+/// cyclic input misses until one period has passed.
+const MAP_WINDOW: u32 = 16384;
+/// Charged bytes per map entry and per sketch key, beside a fixed 512.
+const ENTRY_BYTES: u64 = 96;
+const SKETCH_BYTES: u64 = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Waiting for the first batch of at least [`exprcache::MIN_ROWS`] rows.
+    Pilot,
+    /// Observing sampled keys across batches.
+    Probe,
+    /// Answering from the map, evaluating misses once per distinct key.
+    Map,
+    /// Ordinary evaluation for the rest of the query.
+    Off,
+}
+
+/// The experiment switch `SPARKLES_BIND_REUSE`: `observed` (the default), `legacy` (the
+/// one-shot pilot) or `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Policy {
+    Observed,
+    Legacy,
+    Off,
+}
+fn policy() -> Policy {
+    static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("SPARKLES_BIND_REUSE").as_deref() {
+        Ok("legacy") => Policy::Legacy,
+        Ok("off") => Policy::Off,
+        _ => Policy::Observed,
+    })
+}
+
 pub(super) struct Reuse {
     input: VarId,
+    mode: Mode,
     values: FxHashMap<Id, Id>,
     charge: Option<RetainedCharge>,
-    general_declined: bool,
     expected_reuse: bool,
     max_entries: usize,
+    sketch: FxHashSet<Id>,
+    /// Sampled rows, and those whose key the sketch held, in the current window.
+    window: (u32, u32),
+    /// Rows, and those answered without an evaluation, since the map's last check.
+    map_window: (u32, u32),
+    /// Rows the map has seen since it was admitted.
+    map_rows: u64,
+    hits: u64,
+    misses: u64,
     #[cfg(test)]
     evaluations: usize,
 }
 impl Reuse {
     pub(super) fn prepare(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Admission> {
-        if !ctx.opt.expr_cache {
+        if !ctx.opt.expr_cache || policy() == Policy::Off {
             return None;
         }
         let input = crate::sparql::exprcache::eligible(&[expr]).ok().flatten()?;
@@ -48,15 +105,27 @@ impl Reuse {
         let charge = ctx.retained_charge(512).ok()?;
         Some(Self {
             input: admission.input,
+            mode: Mode::Pilot,
             values: Default::default(),
             charge,
-            general_declined: false,
             expected_reuse: admission.expected_reuse,
-            max_entries: 16384,
+            max_entries: INTEGER_ENTRIES,
+            sketch: Default::default(),
+            window: (0, 0),
+            map_window: (0, 0),
+            map_rows: 0,
+            hits: 0,
+            misses: 0,
             #[cfg(test)]
             evaluations: 0,
         })
     }
+
+    /// Rows answered from the map and evaluations made for it, for EXPLAIN.
+    pub(super) fn counters(&self) -> Option<(u64, u64)> {
+        (self.hits + self.misses > 0).then_some((self.hits, self.misses))
+    }
+
     pub(super) fn apply(
         &mut self,
         ctx: &Ctx,
@@ -67,54 +136,238 @@ impl Reuse {
         let Some(column) = table.col_of(self.input) else {
             return Ok(false);
         };
-        if self.values.is_empty() {
-            if self.general_declined || table.len < crate::sparql::exprcache::MIN_ROWS {
-                return Ok(false);
-            }
-            let (mut lo, mut hi) = (u64::MAX, 0);
-            let mut integers = true;
-            for (row, id) in table.cols[column].iter().enumerate() {
-                if row.is_multiple_of(1024) {
-                    ctx.check()?;
-                }
-                if id.tag() != Tag::Int {
-                    integers = false;
-                    break;
-                }
-                lo = lo.min(id.payload());
-                hi = hi.max(id.payload());
-            }
-            if integers {
-                if hi.saturating_sub(lo) >= (table.len / 2).min(65536) as u64 {
-                    return Ok(false);
-                }
-            } else {
-                // Cheap, mostly distinct inputs do not repay per-row map work.
-                // Require substantial observed reuse, or a repeated pilot key
-                // together with snapshot evidence of cross-morsel reuse. The
-                // estimate affects profit only, never physical budget admission.
-                let sample = table.len.min(4096);
-                let Ok(_pilot) = ctx.retained_charge(512 + sample as u64 * 32) else {
-                    self.general_declined = true;
-                    return Ok(false);
-                };
-                let mut seen = FxHashSet::with_capacity_and_hasher(sample, Default::default());
-                let mut repeats = 0;
-                for (row, id) in table.cols[column].iter().take(sample).enumerate() {
-                    if row.is_multiple_of(1024) {
-                        ctx.check()?;
+        match self.mode {
+            Mode::Off => return Ok(false),
+            Mode::Map => {}
+            Mode::Pilot | Mode::Probe => {
+                if table.len < crate::sparql::exprcache::MIN_ROWS {
+                    // Small batches only feed the sketch of a probing map.
+                    if self.mode == Mode::Pilot || !self.probe(ctx, &table.cols[column])? {
+                        return Ok(false);
                     }
-                    if !seen.insert(*id) {
-                        repeats += 1;
+                } else if let Some(dense) = dense_integers(ctx, &table.cols[column])? {
+                    if !dense {
+                        return Ok(false);
                     }
-                }
-                if repeats == 0 || (repeats * 4 < sample && !self.expected_reuse) {
-                    self.general_declined = true;
+                    self.max_entries = INTEGER_ENTRIES;
+                    self.admit();
+                } else if self.mode == Mode::Pilot {
+                    if !self.pilot(ctx, &table.cols[column])? {
+                        return Ok(false);
+                    }
+                } else if !self.probe(ctx, &table.cols[column])? {
                     return Ok(false);
                 }
-                self.max_entries = 65536;
             }
         }
+        if policy() == Policy::Legacy {
+            return self.apply_rows(ctx, table, column, target, expr);
+        }
+        self.apply_map(ctx, table, column, target, expr)
+    }
+
+    fn admit(&mut self) {
+        self.mode = Mode::Map;
+        self.sketch = Default::default();
+        self.map_window = (0, 0);
+        self.map_rows = 0;
+    }
+
+    fn decline(&mut self) {
+        self.mode = Mode::Off;
+        self.sketch = Default::default();
+        self.values = Default::default();
+        if let Some(charge) = &mut self.charge {
+            // A shrink only releases.
+            let _ = charge.resize(512);
+        }
+    }
+
+    /// The first batch: substantial exact repetition, or a repeated key with the
+    /// snapshot hint, admits the map at once. Otherwise the sampled keys of the batch
+    /// seed the sketch, or the legacy policy declines for the query.
+    fn pilot(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<bool> {
+        // Cheap, mostly distinct inputs do not repay per-row map work.
+        // The estimate affects profit only, never physical budget admission.
+        let sample = keys.len().min(4096);
+        let Ok(_pilot) = ctx.retained_charge(512 + sample as u64 * 32) else {
+            self.decline();
+            return Ok(false);
+        };
+        let mut seen = FxHashSet::with_capacity_and_hasher(sample, Default::default());
+        let mut repeats = 0;
+        for (row, id) in keys.iter().take(sample).enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            if !seen.insert(*id) {
+                repeats += 1;
+            }
+        }
+        if repeats > 0 && (repeats * 4 >= sample || self.expected_reuse) {
+            self.max_entries = MAP_ENTRIES;
+            self.admit();
+            return Ok(true);
+        }
+        if policy() == Policy::Legacy {
+            self.decline();
+            return Ok(false);
+        }
+        self.mode = Mode::Probe;
+        self.max_entries = MAP_ENTRIES;
+        drop(seen);
+        self.observe(ctx, &keys[sample..])?;
+        // The pilot's own rows enter the sketch without a window: their repetition was
+        // counted exactly above and did not admit.
+        let window = self.window;
+        self.observe(ctx, &keys[..sample])?;
+        self.window = window;
+        Ok(false)
+    }
+
+    /// Later batches: admit once a window of sampled rows repeats a quarter of the
+    /// time, and decline once the sketch is full without that.
+    fn probe(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<bool> {
+        self.observe(ctx, keys)?;
+        let (rows, repeats) = self.window;
+        if rows < WINDOW {
+            return Ok(false);
+        }
+        self.window = (0, 0);
+        if repeats * 4 >= rows {
+            self.admit();
+            return Ok(true);
+        }
+        if self.sketch.len() >= SKETCH_KEYS {
+            self.decline();
+        }
+        Ok(false)
+    }
+
+    fn observe(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<()> {
+        let (mut rows, mut repeats) = self.window;
+        for (row, id) in keys.iter().enumerate() {
+            if row.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SAMPLE_SHIFT) != 0 {
+                continue;
+            }
+            rows += 1;
+            if self.sketch.contains(id) {
+                repeats += 1;
+            } else if self.sketch.len() < SKETCH_KEYS
+                && self.charge.as_mut().is_some_and(|charge| {
+                    charge
+                        .cover(
+                            512 + (self.sketch.len() as u64 + 1) * SKETCH_BYTES,
+                            ctx.reservation_step(),
+                        )
+                        .is_ok()
+                })
+            {
+                self.sketch.insert(*id);
+            }
+        }
+        self.window = (rows, repeats);
+        Ok(())
+    }
+
+    /// Answer the batch from the map. Misses are evaluated once per distinct key, as one
+    /// column through the ordinary batch evaluation, and retained while the map has room.
+    fn apply_map(
+        &mut self,
+        ctx: &Ctx,
+        table: &mut Table,
+        column: usize,
+        target: VarId,
+        expr: &Expr,
+    ) -> Result<bool> {
+        let n = table.len;
+        // Output, miss rows, distinct miss keys and their slots, beside the input.
+        let Ok(_scratch) = ctx.charge(n as u64 * 40 + 256) else {
+            return Ok(false);
+        };
+        let keys = &table.cols[column];
+        let mut output = Vec::with_capacity(n);
+        let mut missed: Vec<u32> = Vec::new();
+        let mut slots: FxHashMap<Id, u32> = FxHashMap::default();
+        let mut distinct = Vec::new();
+        for (row, key) in keys.iter().enumerate() {
+            if row.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if let Some(value) = self.values.get(key) {
+                output.push(*value);
+            } else {
+                let next = distinct.len() as u32;
+                let slot = *slots.entry(*key).or_insert(next);
+                if slot == next {
+                    distinct.push(*key);
+                }
+                missed.push(row as u32);
+                // the slot until the values are known
+                output.push(Id(slot as u64));
+            }
+        }
+        if !distinct.is_empty() {
+            #[cfg(test)]
+            {
+                self.evaluations += distinct.len();
+            }
+            let mut misses = Table::new(vec![self.input]);
+            misses.len = distinct.len();
+            misses.cols[0] = distinct;
+            let values = crate::sparql::exec::column_rows(ctx, &misses, expr)?;
+            ctx.check()?;
+            for row in &missed {
+                let at = &mut output[*row as usize];
+                *at = values[at.0 as usize];
+            }
+            let step = ctx.reservation_step();
+            for (key, value) in misses.cols[0].iter().zip(&values) {
+                if self.values.len() >= self.max_entries
+                    || !self.charge.as_mut().is_some_and(|charge| {
+                        charge
+                            .cover(512 + (self.values.len() as u64 + 1) * ENTRY_BYTES, step)
+                            .is_ok()
+                    })
+                {
+                    break;
+                }
+                self.values.insert(*key, *value);
+            }
+            self.misses += misses.len as u64;
+        }
+        // Rows that needed no evaluation of their own.
+        let answered = n - slots.len();
+        self.hits += answered as u64;
+        table.vars.push(target);
+        table.cols.push(output);
+        self.map_window.0 += n as u32;
+        self.map_window.1 += answered as u32;
+        self.map_rows += n as u64;
+        if self.map_window.0 >= MAP_WINDOW
+            && (self.map_rows >= MAP_ENTRIES as u64 || self.values.len() >= self.max_entries)
+        {
+            let (rows, answered) = std::mem::take(&mut self.map_window);
+            // A map that answers fewer than an eighth of its rows costs more than it saves.
+            if answered * 8 < rows {
+                self.decline();
+            }
+        }
+        Ok(true)
+    }
+
+    /// The legacy evaluation of an admitted map: misses one row at a time.
+    fn apply_rows(
+        &mut self,
+        ctx: &Ctx,
+        table: &mut Table,
+        column: usize,
+        target: VarId,
+        expr: &Expr,
+    ) -> Result<bool> {
         let map = table.var_map(ctx.nvars());
         let mut output = Vec::with_capacity(table.len);
         for row in 0..table.len {
@@ -123,12 +376,14 @@ impl Reuse {
             }
             let key = table.cols[column][row];
             let value = if let Some(value) = self.values.get(&key) {
+                self.hits += 1;
                 *value
             } else {
                 #[cfg(test)]
                 {
                     self.evaluations += 1;
                 }
+                self.misses += 1;
                 let value = eval(
                     expr,
                     &Row {
@@ -145,7 +400,7 @@ impl Reuse {
                 if self.values.len() < self.max_entries
                     && self.charge.as_mut().is_some_and(|charge| {
                         charge
-                            .resize(512 + (self.values.len() as u64 + 1) * 96)
+                            .resize(512 + (self.values.len() as u64 + 1) * ENTRY_BYTES)
                             .is_ok()
                     })
                 {
@@ -159,6 +414,25 @@ impl Reuse {
         table.cols.push(output);
         Ok(true)
     }
+}
+
+/// Whether a batch of inline integers spans few enough values for the integer map, or
+/// `None` when the batch holds another kind of term.
+fn dense_integers(ctx: &Ctx, keys: &[Id]) -> Result<Option<bool>> {
+    let (mut lo, mut hi) = (u64::MAX, 0);
+    for (row, id) in keys.iter().enumerate() {
+        if row.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if id.tag() != Tag::Int {
+            return Ok(None);
+        }
+        lo = lo.min(id.payload());
+        hi = hi.max(id.payload());
+    }
+    Ok(Some(
+        hi.saturating_sub(lo) < (keys.len() / 2).min(65536) as u64,
+    ))
 }
 
 /// A bounded profitability hint, not a resource or uniqueness proof. Unknown
@@ -349,12 +623,116 @@ mod tests {
         let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         assert!(!reuse.apply(&ctx, &mut table, target, &expr).unwrap());
         assert!(reuse.values.is_empty());
-        // An all-distinct pilot declines the optional map for the query. Later
-        // skew still runs normally, without retaining every new term seen.
-        let first = table.cols[0][0];
+        assert_eq!(reuse.mode, Mode::Probe);
+        // An all-distinct pilot does not retain results, but later skew that the
+        // sketch observes admits the map for the rest of the query.
+        let first = *table.cols[0].iter().find(|id| sampled(**id)).unwrap();
         table.cols[0].fill(first);
-        assert!(!reuse.apply(&ctx, &mut table, target, &expr).unwrap());
+        assert!(reuse.apply(&ctx, &mut table, target, &expr).unwrap());
+        assert_eq!(reuse.evaluations, 1);
+        assert_eq!(reuse.values.len(), 1);
+    }
+
+    fn sampled(id: Id) -> bool {
+        id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SAMPLE_SHIFT) == 0
+    }
+
+    fn local_strings(ctx: &Ctx, keys: impl Iterator<Item = usize>) -> Vec<Id> {
+        keys.map(|i| {
+            ctx.intern_term(&Term::Literal(Literal::new_simple_literal(format!(
+                "value{i:09}"
+            ))))
+        })
+        .collect()
+    }
+
+    fn batch(input: VarId, keys: &[Id]) -> Table {
+        let mut table = Table::new(vec![input]);
+        table.cols[0] = keys.to_vec();
+        table.len = keys.len();
+        table
+    }
+
+    /// Runs `keys` through `reuse` in batches of 4,096 and checks every answer against
+    /// row-by-row evaluation of the same rows.
+    fn run(ctx: &Ctx, reuse: &mut Reuse, input: VarId, target: VarId, expr: &Expr, keys: &[Id]) {
+        for chunk in keys.chunks(4096) {
+            let mut table = batch(input, chunk);
+            let expected = crate::sparql::exec::column_rows(ctx, &table, expr).unwrap();
+            if reuse.apply(ctx, &mut table, target, expr).unwrap() {
+                assert_eq!(table.cols[1], expected);
+            }
+            ctx.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn sparse_reuse_across_batches_admits_after_observed_repetition() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        // Every key is distinct within the first eight batches and repeats after them,
+        // the global-repeat shape that a one-shot pilot declines.
+        let domain = local_strings(&ctx, 0..32768);
+        let keys = (0..131072usize)
+            .map(|i| domain[i.wrapping_mul(2654435761) % 32768])
+            .collect::<Vec<_>>();
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        run(&ctx, &mut reuse, input, target, &expr, &keys);
+        assert_eq!(reuse.mode, Mode::Map);
+        assert!(
+            reuse.evaluations <= 32768 + 8192,
+            "admitted soon after repetition starts: {} evaluations",
+            reuse.evaluations
+        );
+        // A map admitted after the first period fills during the second and then
+        // answers every row.
+        assert!(
+            reuse.hits >= 131072 - 2 * 32768 - 8192,
+            "{} rows answered",
+            reuse.hits
+        );
+    }
+
+    #[test]
+    fn unique_inputs_stop_probing_once_the_sketch_is_full() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let keys = local_strings(&ctx, 0..90000);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        run(&ctx, &mut reuse, input, target, &expr, &keys);
+        assert_eq!(reuse.mode, Mode::Off);
+        assert_eq!(reuse.evaluations, 0);
+        assert!(reuse.sketch.is_empty() && reuse.values.is_empty());
+        assert_eq!(reuse.charge.as_ref().unwrap().bytes(), 512);
+    }
+
+    #[test]
+    fn an_admitted_map_that_stops_answering_rows_is_released() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        // A dense first batch admits the map, and unique keys follow.
+        let mut keys = local_strings(&ctx, (0..4096).map(|i| i % 64));
+        keys.extend(local_strings(&ctx, 100..100_000));
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        run(&ctx, &mut reuse, input, target, &expr, &keys[..4096]);
+        assert_eq!(reuse.mode, Mode::Map);
+        run(&ctx, &mut reuse, input, target, &expr, &keys[4096..]);
+        assert_eq!(reuse.mode, Mode::Off);
         assert!(reuse.values.is_empty());
+        assert_eq!(reuse.charge.as_ref().unwrap().bytes(), 512);
+        assert!(
+            reuse.evaluations <= 64 + MAP_ENTRIES + MAP_WINDOW as usize,
+            "the map is judged once it has seen as many rows as it holds"
+        );
     }
 
     #[test]
