@@ -455,14 +455,15 @@ give, so the route lands with item 828 and is measured there. A cursor knows it 
 ended only when a pull returns no batch, so the loop pulls once more after the last
 batch, which costs a check of a finished cursor's state.
 
-The third would let a request with `execution=streaming` take the in-place route too.
-Such a request opens on the pool today, so its work stops when its client disconnects,
-as [X05](../X05-streaming-query-execution.md) specifies for streaming bodies, and it
-commits after its first batch or 64 KiB. Work in place cannot stop when its client goes
-away, and only the query's timeout bounds it. The merge leaves the commit point as the
-only difference between the modes, which would carry explicit streaming onto the route,
-so whether it does is an open decision for the maintainer. The bound on the saving is
-the open's wake, 35 to 80 µs on average, beside what the first change saves.
+The third would have let a request with `execution=streaming` take the in-place route
+too, and it is not taken. Such a request opens on the pool, so its work stops when its
+client disconnects, as [X05](../X05-streaming-query-execution.md) specifies for
+streaming bodies, and it commits after its first batch or 64 KiB. Work in place cannot
+stop when its client goes away, and only the query's timeout bounds it. An explicit
+`execution=streaming` therefore keeps the pool route and its cancellation on a client's
+disconnect, and only the automatic execution of a quick text takes the in-place route.
+The merge keeps that difference beside the commit point. The saving given up is the
+open's wake, 35 to 80 µs on average, beside what the first change saves.
 
 Two candidates were measured and are not planned. A diagnostic build that answered a
 streamed request whole, without the early commit, removed the channel, the end-of-body
