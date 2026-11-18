@@ -8,13 +8,12 @@
 //! in `load_plan_tests.rs` records the plan each one chooses at every boundary.
 //!
 //! One rule serves the four entry points. A size is above the threshold only when it is
-//! strictly greater. Sources go into an empty store by a rebuild when they hold more than
-//! [`SMALL_SOURCE_BYTES`], or more than [`BYTES_PER_QUAD`] bytes per threshold quad when
-//! that bound is lower, and into a store that holds data by a rebuild when their estimate
-//! is above the threshold or their streams hold more than [`BYTES_PER_QUAD`] bytes per
-//! threshold quad. Files are sized by their length, and streams are read ahead to tell,
-//! which holds up to the bound in memory before the parse starts and is the cost of the
-//! probe. A
+//! strictly greater. A load goes into an empty store by a rebuild unless its sources are
+//! all streams that end within [`SMALL_STREAM_BYTES`]. A replace, whatever the store
+//! holds, and a load into a store that holds data go by a rebuild when their estimate is
+//! above the threshold or their streams hold more than [`BYTES_PER_QUAD`] bytes per
+//! threshold quad, so a small replace into an empty store takes a transaction. Reading streams ahead to tell holds up to
+//! that many bytes in memory before the parse starts, which is the cost of the probe. A
 //! batch that a transaction stages, from a bulk insert or a patch, is rebuilt when it is
 //! above the threshold. A write limited to some graphs parses its sources in a
 //! transaction, since a rebuild from sources does not check each quad's graph, while its
@@ -29,14 +28,14 @@
 
 use crate::error::Result;
 
-/// Decompressed bytes of sources, about 100,000 quads, below which a load or a replace
-/// into an empty store takes a transaction instead of a rebuild. A rebuild has a fixed
-/// cost of about 20 ms, and it parses a source shorter than one parallel chunk of 8 MiB on
-/// one thread, so a transaction is faster up to about that size.
-pub(crate) const SMALL_SOURCE_BYTES: u64 = 8 << 20;
+/// Decompressed bytes of streams, about 100,000 quads, below which a load into an empty
+/// store takes a transaction instead of a rebuild. A rebuild has a fixed cost of about
+/// 20 ms, and it parses a stream shorter than one parallel chunk of 8 MiB on one thread,
+/// so a transaction is faster up to about that size.
+pub(crate) const SMALL_STREAM_BYTES: u64 = 8 << 20;
 
-/// Bytes of text per quad by which the plan turns the bytes of sources into quads, and a
-/// stream probe turns the quad threshold into a byte bound.
+/// Bytes of text per quad that [`estimated_quads`](super::estimated_quads) assumes, by
+/// which a stream probe turns the quad threshold into a byte bound.
 pub(crate) const BYTES_PER_QUAD: u64 = 80;
 
 /// The path a write takes.
@@ -115,7 +114,7 @@ impl LoadInputs {
 /// The sizes of the sources of a load or a replace, which [`LoadPlan::choose`] asks for
 /// only when they decide the plan, since finding them reads the sources.
 pub(crate) trait Sizes {
-    /// The decompressed bytes of the sources that are not streams, from their lengths.
+    /// The estimate in quads of the sources that are not streams, from their lengths.
     fn estimate(&mut self) -> u64;
     /// Read the streams among the sources ahead and say whether they hold more than
     /// `limit` decompressed bytes.
@@ -142,20 +141,19 @@ impl LoadPlan {
             // A rebuild from sources does not check each quad's graph, so a write limited
             // to some graphs parses them in a transaction.
             Entry::Load | Entry::Replace if i.restricted => false,
-            Entry::Load | Entry::Replace if i.empty_head => {
-                // Sources that end within the small bound, or within the threshold when
-                // it is lower, go into an empty store by a transaction, which costs less
-                // than the fixed cost of a rebuild. The sized sources take their share of
-                // the bound first, and the streams are read ahead for the rest, as only
-                // a read can tell their size.
-                let limit = SMALL_SOURCE_BYTES.min(i.threshold.saturating_mul(BYTES_PER_QUAD));
-                let sized = sizes.estimate();
-                sized > limit || (i.streams > 0 && sizes.exceeds(limit - sized)?)
+            Entry::Load if i.empty_head => {
+                // A stream that ends within a few thousand quads goes into an empty
+                // store by a transaction, which costs less than the fixed cost of a
+                // rebuild. Its bytes are read ahead to tell, as only a read can.
+                let small_streams = i.sources > 0
+                    && i.streams == i.sources
+                    && !sizes.exceeds(SMALL_STREAM_BYTES)?;
+                !small_streams
             }
             Entry::Load | Entry::Replace => {
                 // a bound past the largest byte count is one no stream exceeds
                 let bound = i.threshold.checked_mul(BYTES_PER_QUAD);
-                sizes.estimate() / BYTES_PER_QUAD > i.threshold
+                sizes.estimate() > i.threshold
                     || match bound {
                         Some(bound) if i.streams > 0 => sizes.exceeds(bound)?,
                         _ => false,

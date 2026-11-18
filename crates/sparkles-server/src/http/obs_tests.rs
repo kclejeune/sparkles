@@ -44,13 +44,9 @@ fn server() -> Server {
 
 /// A ready server with dataset `ds`; `configure` sets limits and flags first.
 fn server_with(configure: impl FnOnce(&mut AppState)) -> Server {
-    server_opts(StoreOptions::default(), configure)
-}
-
-/// [`server_with`] with store options of its own.
-fn server_opts(opts: StoreOptions, configure: impl FnOnce(&mut AppState)) -> Server {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(dir.path(), opts, Duration::from_secs(30)).unwrap();
+    let mut state =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
     configure(&mut state);
     let state = Arc::new(state);
     let ds = state.attach("ds", DbType::Mem, None).unwrap();
@@ -288,14 +284,8 @@ async fn metrics_count_requests_by_dataset_operation_and_outcome() {
 
 #[tokio::test]
 async fn metrics_count_work_memory_peaks_and_rebuilds() {
-    // a threshold of 0 makes the fixture's load into an empty dataset a bulk commit
-    let s = server_opts(
-        StoreOptions {
-            bulk_threshold: 0,
-            ..StoreOptions::default()
-        },
-        |_| {},
-    );
+    let s = server();
+    // the fixture's load into an empty dataset was a bulk commit
     let m = metrics(&s.app).await;
     for (series, v) in [
         (

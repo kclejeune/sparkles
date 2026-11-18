@@ -65,8 +65,6 @@ fn gens(root: &Path) -> Vec<String> {
 fn source(root: &Path) -> Store {
     let s = Store::open(root, StoreOptions::default()).unwrap();
     load(&s, TRIG);
-    // a small first load stays in the delta, which the compaction moves to the base
-    s.compact().unwrap();
     s.set_prefix("ex", "http://ex.org/").unwrap();
     assert!(s.snapshot().delta.is_empty());
     s

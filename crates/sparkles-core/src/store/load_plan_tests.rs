@@ -1,7 +1,7 @@
 //! The plan each entry point chooses, at every boundary of its rule. A change to the rule
 //! shows here as a changed row.
 
-use super::{BYTES_PER_QUAD, Entry, LoadInputs, LoadPlan, SMALL_SOURCE_BYTES};
+use super::{BYTES_PER_QUAD, Entry, LoadInputs, LoadPlan, SMALL_STREAM_BYTES};
 use crate::access::{GraphAccess, GraphRule, Graphs};
 use crate::commit::CommitKind;
 use crate::guard::WriteOptions;
@@ -54,15 +54,6 @@ fn empty(i: LoadInputs) -> LoadInputs {
     }
 }
 
-/// Inputs with a threshold past every bound, so that the small bound alone limits an
-/// empty head.
-fn unbounded(i: LoadInputs) -> LoadInputs {
-    LoadInputs {
-        threshold: u64::MAX,
-        ..i
-    }
-}
-
 fn restricted(i: LoadInputs) -> LoadInputs {
     LoadInputs {
         restricted: true,
@@ -88,7 +79,7 @@ fn protected(i: LoadInputs) -> LoadInputs {
     }
 }
 
-const SMALL: u64 = SMALL_SOURCE_BYTES;
+const SMALL: u64 = SMALL_STREAM_BYTES;
 const LARGE: u64 = T * BYTES_PER_QUAD;
 
 /// The table: a name, the inputs, the bytes of the streams, the plan and the probes.
@@ -97,21 +88,12 @@ fn rows() -> Vec<Row> {
     let row = |name, inputs, stream_bytes, plan, probes| Row { name, inputs, stream_bytes, plan, probes };
     vec![
         // load_with
-        row("load: empty head, a small file", empty(sized(Load, 1)), 0, Txn, &[]),
-        row("load: empty head, no sources", empty(LoadInputs::new(Load, T)), 0, Txn, &[]),
-        row("load: empty head, a file at the threshold", empty(sized(Load, T)), 0, Txn, &[]),
-        row("load: empty head, a file above the threshold", empty(sized(Load, T + 1)), 0, Bulk, &[]),
-        row("load: empty head, stream at the large bound", empty(stream(Load)), LARGE, Txn, &[LARGE]),
-        row("load: empty head, stream above the large bound", empty(stream(Load)), LARGE + 1, Bulk, &[LARGE]),
-        row("load: empty head, a file and a stream within the large bound", empty(mixed(Load)), LARGE - BYTES_PER_QUAD, Txn, &[LARGE - BYTES_PER_QUAD]),
-        row("load: empty head, a file and a stream above the large bound", empty(mixed(Load)), LARGE - BYTES_PER_QUAD + 1, Bulk, &[LARGE - BYTES_PER_QUAD]),
-        row("load: empty head, a large file and a stream", empty(LoadInputs { quads: T + 1, ..mixed(Load) }), 1, Bulk, &[]),
-        row("load: empty head, threshold 0, a small file", empty(LoadInputs { threshold: 0, ..sized(Load, 1) }), 0, Bulk, &[]),
-        row("load: empty head, threshold 0, an empty file", empty(LoadInputs { threshold: 0, ..sized(Load, 0) }), 0, Txn, &[]),
-        row("load: empty head, a file at the small bound", unbounded(empty(sized(Load, SMALL / BYTES_PER_QUAD))), 0, Txn, &[]),
-        row("load: empty head, a file above the small bound", unbounded(empty(sized(Load, SMALL / BYTES_PER_QUAD + 1))), 0, Bulk, &[]),
-        row("load: empty head, stream at the small bound", unbounded(empty(stream(Load))), SMALL, Txn, &[SMALL]),
-        row("load: empty head, stream above the small bound", unbounded(empty(stream(Load))), SMALL + 1, Bulk, &[SMALL]),
+        row("load: empty head, a small file", empty(sized(Load, 1)), 0, Bulk, &[]),
+        row("load: empty head, no sources", empty(LoadInputs::new(Load, T)), 0, Bulk, &[]),
+        row("load: empty head, stream at the small bound", empty(stream(Load)), SMALL, Txn, &[SMALL]),
+        row("load: empty head, stream above the small bound", empty(stream(Load)), SMALL + 1, Bulk, &[SMALL]),
+        row("load: empty head, stream above the large bound", empty(stream(Load)), LARGE + 1, Txn, &[SMALL]),
+        row("load: empty head, a file and a stream", empty(mixed(Load)), 1, Bulk, &[]),
         row("load: estimate at the threshold", sized(Load, T), 0, Txn, &[]),
         row("load: estimate above the threshold", sized(Load, T + 1), 0, Bulk, &[]),
         row("load: stream at the large bound", stream(Load), LARGE, Txn, &[LARGE]),
@@ -123,19 +105,9 @@ fn rows() -> Vec<Row> {
         // replace_with
         row("replace: empty head, a small file", empty(sized(Replace, 1)), 0, Txn, &[]),
         row("replace: empty head, no sources", empty(LoadInputs::new(Replace, T)), 0, Txn, &[]),
-        row("replace: empty head, a file at the threshold", empty(sized(Replace, T)), 0, Txn, &[]),
         row("replace: empty head, a file above the threshold", empty(sized(Replace, T + 1)), 0, Bulk, &[]),
         row("replace: empty head, stream at the large bound", empty(stream(Replace)), LARGE, Txn, &[LARGE]),
         row("replace: empty head, stream above the large bound", empty(stream(Replace)), LARGE + 1, Bulk, &[LARGE]),
-        row("replace: empty head, a file and a stream within the large bound", empty(mixed(Replace)), LARGE - BYTES_PER_QUAD, Txn, &[LARGE - BYTES_PER_QUAD]),
-        row("replace: empty head, a file and a stream above the large bound", empty(mixed(Replace)), LARGE - BYTES_PER_QUAD + 1, Bulk, &[LARGE - BYTES_PER_QUAD]),
-        row("replace: empty head, a large file and a stream", empty(LoadInputs { quads: T + 1, ..mixed(Replace) }), 1, Bulk, &[]),
-        row("replace: empty head, threshold 0, a small file", empty(LoadInputs { threshold: 0, ..sized(Replace, 1) }), 0, Bulk, &[]),
-        row("replace: empty head, threshold 0, an empty file", empty(LoadInputs { threshold: 0, ..sized(Replace, 0) }), 0, Txn, &[]),
-        row("replace: empty head, a file at the small bound", unbounded(empty(sized(Replace, SMALL / BYTES_PER_QUAD))), 0, Txn, &[]),
-        row("replace: empty head, a file above the small bound", unbounded(empty(sized(Replace, SMALL / BYTES_PER_QUAD + 1))), 0, Bulk, &[]),
-        row("replace: empty head, stream at the small bound", unbounded(empty(stream(Replace))), SMALL, Txn, &[SMALL]),
-        row("replace: empty head, stream above the small bound", unbounded(empty(stream(Replace))), SMALL + 1, Bulk, &[SMALL]),
         row("replace: estimate at the threshold", sized(Replace, T), 0, Txn, &[]),
         row("replace: estimate above the threshold", sized(Replace, T + 1), 0, Bulk, &[]),
         row("replace: stream at the large bound", stream(Replace), LARGE, Txn, &[LARGE]),
@@ -164,8 +136,7 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The sizes of a row: its quads at `BYTES_PER_QUAD` as the estimate, and its stream
-/// bytes.
+/// The sizes of a row: its quads as the estimate, and its stream bytes.
 struct Stub<'a> {
     quads: u64,
     stream_bytes: u64,
@@ -176,7 +147,7 @@ struct Stub<'a> {
 impl super::Sizes for Stub<'_> {
     fn estimate(&mut self) -> u64 {
         *self.estimated = true;
-        self.quads * BYTES_PER_QUAD
+        self.quads
     }
 
     fn exceeds(&mut self, limit: u64) -> crate::error::Result<bool> {
@@ -208,7 +179,8 @@ fn plan_table() {
         }
         // the estimate reads file sources, so a plan that it does not decide skips it
         let sources = matches!(r.inputs.entry, Load | Replace);
-        let needed = sources && !r.inputs.restricted;
+        let needed =
+            sources && !r.inputs.restricted && !(r.inputs.empty_head && r.inputs.entry == Load);
         if estimated != needed {
             failures.push(format!(
                 "{}: estimated {estimated}, expected {needed}",
@@ -322,20 +294,8 @@ fn restricted_opts() -> WriteOptions {
 fn load_with_plans() {
     let o = WriteOptions::default();
     let cases: Vec<(&str, Store, Source, LoadPlan)> = vec![
-        ("empty head, small bytes", store(), bytes(0, 1), Txn),
-        (
-            "empty head, bytes above the threshold",
-            store(),
-            bytes(0, E + 1),
-            Bulk,
-        ),
+        ("empty head, small bytes", store(), bytes(0, 1), Bulk),
         ("empty head, small stream", store(), reader(0, 3), Txn),
-        (
-            "empty head, stream above the threshold",
-            store(),
-            reader(0, E + 1),
-            Bulk,
-        ),
         ("at the threshold", seeded(2), bytes(100, E), Txn),
         ("above the threshold", seeded(2), bytes(100, E + 1), Bulk),
         ("large stream", seeded(2), reader(100, 5 * E), Bulk),
@@ -361,6 +321,7 @@ fn replace_with_plans() {
             bytes(0, E + 1),
             Bulk,
         ),
+        ("empty head, small stream", store(), reader(0, 3), Txn),
         ("at the threshold", seeded(2), bytes(100, E), Txn),
         ("above the threshold", seeded(2), bytes(100, E + 1), Bulk),
         ("stream at the large bound", seeded(2), reader(100, E), Txn),
@@ -588,39 +549,24 @@ fn replace_counts_parsed_quads_on_both_plans() {
     }
 }
 
-/// A threshold of 0 sends any source that holds a byte into an empty store to a rebuild,
-/// a file shorter than one quad's estimate as well as a stream, and an empty one to a
-/// transaction that commits nothing.
+/// An empty source written into an empty store. A replace takes a transaction and makes
+/// no commit. A load of a stream does the same, and a load of other sources takes the bulk
+/// plan, which commits an empty generation.
 #[test]
-fn threshold_zero_into_an_empty_store() {
+fn empty_sources_into_an_empty_store() {
     let o = WriteOptions::default();
-    let zero = || {
-        Store::in_memory(StoreOptions {
-            bulk_threshold: 0,
-            ..StoreOptions::default()
-        })
-    };
-    let short = b"<urn:s> <urn:p> \"1\" .\n".to_vec();
-    assert!(short.len() < BYTES_PER_QUAD as usize);
-    let sources = [
-        (
-            "bytes",
-            Source::from_bytes(short.clone(), RdfFormat::NTriples, None),
-        ),
-        (
-            "stream",
-            Source::from_reader(std::io::Cursor::new(short), RdfFormat::NTriples, None),
-        ),
-    ];
-    for (name, src) in sources {
-        let s = zero();
-        s.load_with(&[src], CommitKind::Load, &o).unwrap();
-        assert_eq!(s.snapshot().len(), 1, "{name}");
-        assert_eq!(plan_of(&s), Bulk, "{name}");
+    for (stream, committed) in [(false, true), (true, false)] {
+        let src = || if stream { reader(0, 0) } else { bytes(0, 0) };
+        let s = store();
+        let (count, r) = s
+            .replace_with(ReplaceTarget::Default, &[src()], CommitKind::GspPut, &o)
+            .unwrap();
+        assert_eq!((count, r.committed), (0, false), "replace, stream {stream}");
+        let s = store();
+        let r = s.load_with(&[src()], CommitKind::Load, &o).unwrap();
+        assert_eq!(r.committed, committed, "load, stream {stream}");
+        assert_eq!(s.snapshot().len(), 0);
     }
-    let s = zero();
-    let r = s.load_with(&[bytes(0, 0)], CommitKind::Load, &o).unwrap();
-    assert!(!r.committed);
 }
 
 /// A dry run of a transactional load or replace into an in-memory store over its limit is
@@ -689,99 +635,5 @@ fn a_dry_run_over_the_memory_limit_is_previewed() {
         assert_eq!(p.commit.as_ref().map(|c| c.inserted), inserted, "{name}");
         assert!(p.commit.as_ref().is_none_or(|c| !c.bulk), "{name}");
         assert_eq!(s.snapshot().len(), before, "{name}");
-    }
-}
-
-/// An empty source written into an empty store takes a transaction and makes no commit,
-/// whether it is a stream or bytes, for a replace as for a load.
-#[test]
-fn empty_sources_into_an_empty_store() {
-    let o = WriteOptions::default();
-    for stream in [false, true] {
-        let src = || if stream { reader(0, 0) } else { bytes(0, 0) };
-        let s = store();
-        let (count, r) = s
-            .replace_with(ReplaceTarget::Default, &[src()], CommitKind::GspPut, &o)
-            .unwrap();
-        assert_eq!((count, r.committed), (0, false), "replace, stream {stream}");
-        let s = store();
-        let r = s.load_with(&[src()], CommitKind::Load, &o).unwrap();
-        assert!(!r.committed, "load, stream {stream}");
-        assert_eq!(s.snapshot().len(), 0);
-    }
-}
-
-/// Times a first write of N-Triples bytes into an empty store on each plan, to find the
-/// size below which a transaction is faster than a rebuild. A write restricted to every
-/// graph stands for the transaction, since a restriction keeps sources out of a rebuild. Each of `LOAD_PLAN_SIZES` (quads of 80
-/// bytes, comma-separated) runs as a load and as a replace, persistent and in memory, and
-/// the arms alternate over `LOAD_PLAN_ROUNDS` rounds. Run it with `mbx test --release -p
-/// sparkles-core --lib -- --ignored empty_head_timing --nocapture`.
-#[test]
-#[ignore]
-fn empty_head_timing() {
-    let sizes: Vec<u64> = std::env::var("LOAD_PLAN_SIZES")
-        .unwrap_or_else(|_| "10,1000,50000,100000,150000,200000".into())
-        .split(',')
-        .map(|v| v.trim().parse().unwrap())
-        .collect();
-    let rounds: u64 = std::env::var("LOAD_PLAN_ROUNDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
-    let parent = std::env::var_os("LOAD_PLAN_DIR").map(std::path::PathBuf::from);
-    let o = WriteOptions::default();
-    // a restriction that allows every graph keeps the write in a transaction at any size
-    let every_graph = WriteOptions {
-        graphs: Some(Arc::new(GraphAccess::graphs(Graphs::All, Graphs::All))),
-        ..Default::default()
-    };
-    println!("round\tentry\ttype\tquads\toptions\tplan\tms");
-    for round in 0..rounds {
-        for &n in &sizes {
-            let data = ntriples(0, n);
-            for persistent in [true, false] {
-                for replace in [false, true] {
-                    let mut arms = [false, true];
-                    if round % 2 == 1 {
-                        arms.reverse();
-                    }
-                    for txn in arms {
-                        let dir = match &parent {
-                            Some(p) => tempfile::tempdir_in(p).unwrap(),
-                            None => tempfile::tempdir().unwrap(),
-                        };
-                        // a threshold of 0 sends every write that is not restricted to a rebuild
-                        let opts = StoreOptions {
-                            bulk_threshold: if txn { u64::MAX } else { 0 },
-                            ..StoreOptions::default()
-                        };
-                        let s = if persistent {
-                            Store::open(&dir.path().join("db"), opts).unwrap()
-                        } else {
-                            Store::in_memory(opts)
-                        };
-                        let src = Source::from_bytes(data.clone(), RdfFormat::NTriples, None);
-                        let o = if txn { &every_graph } else { &o };
-                        let t = std::time::Instant::now();
-                        if replace {
-                            s.replace_with(ReplaceTarget::Default, &[src], CommitKind::GspPut, o)
-                                .unwrap();
-                        } else {
-                            s.load_with(&[src], CommitKind::GspPost, o).unwrap();
-                        }
-                        let ms = t.elapsed().as_secs_f64() * 1e3;
-                        assert_eq!(s.snapshot().len(), n);
-                        println!(
-                            "{round}\t{}\t{}\t{n}\t{}\t{:?}\t{ms:.2}",
-                            if replace { "replace" } else { "load" },
-                            if persistent { "persistent" } else { "mem" },
-                            if txn { "restricted" } else { "plain" },
-                            plan_of(&s),
-                        );
-                    }
-                }
-            }
-        }
     }
 }

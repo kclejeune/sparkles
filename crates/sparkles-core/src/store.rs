@@ -103,7 +103,7 @@ pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
 use load_plan::LoadPlan;
 #[cfg(test)]
-use load_plan::SMALL_SOURCE_BYTES;
+use load_plan::SMALL_STREAM_BYTES;
 use publish::{Committed, Publication};
 use snapshot::{Shared, SnapshotBuilder};
 pub(crate) mod wal;
@@ -5489,7 +5489,7 @@ impl Store {
         struct SourceSizes<'a>(&'a [Source], &'a crate::guard::WriteOptions);
         impl load_plan::Sizes for SourceSizes<'_> {
             fn estimate(&mut self) -> u64 {
-                estimated_bytes(self.0)
+                estimated_quads(self.0)
             }
             fn exceeds(&mut self, limit: u64) -> Result<bool> {
                 streams_exceed(self.0, limit, self.1)
@@ -7558,8 +7558,6 @@ fn guard_required_by(root: &Path) -> bool {
     }
 }
 
-/// The decompressed bytes of the RDF sources that are not streams, from their lengths,
-/// with compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion).
 /// A dry run's preview with `refused`, the memory refusal its sources met while they were
 /// parsed, which the write itself gets before its commit checks the storage, so that the
 /// preview reports that refusal, with or without a net change.
@@ -7573,7 +7571,9 @@ fn with_early_refusal<T>(r: Result<T>, refused: Option<Error>) -> Result<T> {
     }
 }
 
-fn estimated_bytes(sources: &[Source]) -> u64 {
+/// A rough quad count of RDF sources from their size (~80 bytes per quad in text
+/// formats; compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion)).
+fn estimated_quads(sources: &[Source]) -> u64 {
     let mut bytes = 0u64;
     for s in sources {
         let b = match &s.data {
@@ -7585,7 +7585,7 @@ fn estimated_bytes(sources: &[Source]) -> u64 {
         .saturating_mul(s.codec().map_or(1, |c| c.expansion()));
         bytes = bytes.saturating_add(b);
     }
-    bytes
+    bytes / load_plan::BYTES_PER_QUAD
 }
 
 /// Give each stream among `sources` its decompressing reader (see
@@ -8578,10 +8578,10 @@ mod tests {
             RdfFormat::NTriples,
             None,
         );
-        assert!(streams_exceed(std::slice::from_ref(&gz), SMALL_SOURCE_BYTES, &o).unwrap());
+        assert!(streams_exceed(std::slice::from_ref(&gz), SMALL_STREAM_BYTES, &o).unwrap());
         assert_eq!(collect_len(&gz), 300_000);
         let gz = Source::from_reader(std::io::Cursor::new(packed(30)), RdfFormat::NTriples, None);
-        assert!(!streams_exceed(std::slice::from_ref(&gz), SMALL_SOURCE_BYTES, &o).unwrap());
+        assert!(!streams_exceed(std::slice::from_ref(&gz), SMALL_STREAM_BYTES, &o).unwrap());
         assert_eq!(collect_len(&gz), 30);
         for (src, n) in [(big, 1000u64), (small, 3)] {
             let store = Store::in_memory(StoreOptions {

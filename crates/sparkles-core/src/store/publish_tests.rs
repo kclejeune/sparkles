@@ -120,8 +120,6 @@ fn a_bulk_commit_tells_the_guard_before_it_is_published() {
             &dir.path().join("db"),
             StoreOptions {
                 group_commit: false,
-                // a small first load into an empty store rebuilds only at a threshold of 0
-                bulk_threshold: 0,
                 ..Default::default()
             },
         )
@@ -146,7 +144,7 @@ fn a_bulk_commit_tells_the_guard_before_it_is_published() {
     );
     let committer = {
         let s = s.clone();
-        // a load into an empty store at a threshold of 0 builds a generation: the bulk path
+        // a load into an empty store builds a generation: the bulk path
         thread::spawn(move || s.load(&[Source::from_path(&nt, None).unwrap()]).unwrap())
     };
     let mut commits = s.subscribe_commits();
@@ -168,6 +166,5 @@ fn a_bulk_commit_tells_the_guard_before_it_is_published() {
         head_when_told, 0,
         "the guard was told after the snapshot of the bulk commit was current"
     );
-    assert!(s.snapshot().delta.is_empty(), "the load took the bulk path");
     s.set_failpoint("commit-published", None);
 }

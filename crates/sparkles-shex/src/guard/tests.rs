@@ -365,15 +365,7 @@ fn warn_mode_and_bulk_loads() {
 #[test]
 fn reject_mode_rejects_bulk_loads() {
     let dir = tempfile::tempdir().unwrap();
-    // a small load into an empty store rebuilds only at a threshold of 0
-    let s = Store::open(
-        &dir.path().join("db"),
-        StoreOptions {
-            bulk_threshold: 0,
-            ..StoreOptions::default()
-        },
-    )
-    .unwrap();
+    let s = open(&dir.path().join("db"));
     installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
     let e = s.load(&[Source::from_bytes(
         b"<http://ex.org/fay> a <http://ex.org/Person> .".to_vec(),
