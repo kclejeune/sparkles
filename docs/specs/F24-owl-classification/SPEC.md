@@ -127,12 +127,12 @@ Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
 1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`
 fixtures are exact against HermiT in every configuration, and shoi-005, 027 and 032 finish
-with 21,740, 12,666 and 30,781 derived conclusions where they passed the bound before.
+with 21,485, 12,666 and 30,789 derived conclusions where they passed the bound before.
 The 45 fixtures that finished before derive about half as many conclusions as before at
 the median, with one, shoi-033, rising from 404 to 528. shoi-022 and 042 still pass the
 bound, and item 822 follows them with their new attribution. On the 392 generated
-ontologies of item 805, 336 now finish within the bound on one and on four threads with
-the same answers, where 274 did before, and 47 pass it where 109 did. All agree with
+ontologies of item 805, 339 now finish within the bound on one and on four threads with
+the same answers, where 274 did before, and 44 pass it where 109 did. All agree with
 HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not report,
 since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
 same values. The gap of `owl:Thing` that item 805 found is closed.
@@ -3965,7 +3965,7 @@ same as for the first departure, the lifting of the ground clauses that the cont
 holds over v, and it is not a proof. The rationale is the attribution below. In one second
 of shoi-005 the run derived 223,616 Eq conclusions on a processed equality, and the four
 most frequent rewriting equalities were successor terms of restrictions into singletons
-equal to their constant. With the departure, shoi-005 finishes with 21,740 conclusions
+equal to their constant. With the departure, shoi-005 finishes with 21,485 conclusions
 where it passed the bound and finished with 6.4 million under a larger one, and shoi-027
 and 032 finish too. The derivation trace now names an Eq conclusion by the kinds of terms
 of its rewriting equality, such as `eq:fx>c` for `f(x) ↦ u`.

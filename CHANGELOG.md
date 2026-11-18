@@ -34,7 +34,7 @@ rewriting of every clause over the successor by its equality to the individual, 
 shoi-005, 027 and 032 of the nominal fixtures now finish within the bound with HermiT's
 taxonomy, 48 of the 50 in all, and the fixtures that finished before derive about half as
 many conclusions at the median. On 392 generated ontologies with keys or the universal
-property, 336 rooted runs finish within the bound where 274 did. A run that counts keeps
+property, 339 rooted runs finish within the bound where 274 did. A run that counts keeps
 the successors. The context of `owl:Thing` is now a query context of the rooted run, so
 an axiom that makes every element one individual gives the subsumptions of `owl:Thing`
 it entails, which completes roadmap item 1070. shoi-022 and 042 still pass the bound and
