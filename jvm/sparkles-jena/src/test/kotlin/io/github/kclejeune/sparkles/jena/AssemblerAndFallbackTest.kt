@@ -49,6 +49,26 @@ class AssemblerAndFallbackTest {
             assertThrows(org.apache.jena.query.QueryExecException::class.java) { QueryExec.dataset(ds).query(query).context(never).build().use { it.select().hasNext() } }
         }
     }
+    @Test fun a_query_under_another_reading_of_aggregate_errors_does_not_fall_back_to_arq() {
+        SparklesDatasets.memory().use { ds ->
+            val context = Context().set(ARQ.stageGenerator, StageGenerator { pattern, input, exec ->
+                StageBuilder.standardGenerator().execute(pattern, input, exec)
+            })
+            val min = "SELECT (MIN(?v) AS ?m) { VALUES ?v { 1 UNDEF } }"
+            // Jena's reading is ARQ's, so the query falls back
+            QueryExec.dataset(ds).query(min).context(context).build().use { assertNull(it.select().next().get("m")) }
+            assertEquals(1, ds.stats().fallbackQueries)
+            // under another reading ARQ would answer as Jena does, so the query is refused
+            val sparkles = context.copy().set(Sparkles.AGGREGATE_ERRORS, AggregateErrors.SPARKLES)
+            assertThrows(org.apache.jena.query.QueryExecException::class.java) {
+                QueryExec.dataset(ds).query(min).context(sparkles).build().use { it.select().hasNext() }
+            }
+            // a query without those aggregates still falls back
+            QueryExec.dataset(ds).query("SELECT (COUNT(?v) AS ?n) { VALUES ?v { 1 UNDEF } }").context(sparkles).build().use {
+                assertEquals("1", it.select().next().get("n").literalLexicalForm)
+            }
+        }
+    }
     @Test fun known_function_override_executes_java_instead_of_native() {
         SparklesDatasets.memory().use { ds ->
             val iri = "http://jena.apache.org/ARQ/function#sqrt"

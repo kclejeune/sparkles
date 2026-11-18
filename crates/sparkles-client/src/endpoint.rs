@@ -46,6 +46,7 @@ pub struct QueryOptions {
     pub(crate) execution: Option<Execution>,
     pub(crate) server_timeout: Option<Duration>,
     pub(crate) reasoning: Option<bool>,
+    pub(crate) aggregate_errors: Option<AggregateErrors>,
     pub(crate) default_graphs: Vec<String>,
     pub(crate) named_graphs: Vec<String>,
     pub(crate) method: QueryMethod,
@@ -77,6 +78,12 @@ impl QueryOptions {
         self.reasoning = Some(on);
         self
     }
+    /// How the query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's
+    /// setting (Sparkles only, the `aggregate-errors` parameter).
+    pub fn aggregate_errors(mut self, reading: AggregateErrors) -> Self {
+        self.aggregate_errors = Some(reading);
+        self
+    }
     /// The protocol's `default-graph-uri` (repeatable).
     pub fn default_graph(mut self, iri: impl Into<String>) -> Self {
         self.default_graphs.push(iri.into());
@@ -105,6 +112,29 @@ pub enum Execution {
     Streaming,
     /// Stream the plans that measured faster and run the rest eagerly.
     Auto,
+}
+
+/// How a Sparkles query's aggregates treat errors, such as an unbound value. `Jena` is
+/// the server's default unless it was started otherwise. API.md describes the readings
+/// under "Aggregate errors".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggregateErrors {
+    /// MIN and MAX over an error are unbound, as in Apache Jena.
+    Jena,
+    /// MIN and MAX pass over errors.
+    Sparkles,
+    /// The text of SPARQL 1.1 and 1.2.
+    Spec,
+}
+
+impl AggregateErrors {
+    fn as_str(self) -> &'static str {
+        match self {
+            AggregateErrors::Jena => "jena",
+            AggregateErrors::Sparkles => "sparkles",
+            AggregateErrors::Spec => "spec",
+        }
+    }
 }
 
 impl Execution {
@@ -393,6 +423,10 @@ impl Endpoint {
         if let Some(mode) = opts.execution {
             self.sparkles_only("execution")?;
             extra.push(("execution", mode.as_str().to_string()));
+        }
+        if let Some(m) = opts.aggregate_errors {
+            self.sparkles_only("aggregate-errors")?;
+            extra.push(("aggregate-errors", m.as_str().to_string()));
         }
         if let Some(t) = opts.server_timeout {
             extra.push(("timeout", secs(t)));

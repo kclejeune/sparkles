@@ -49,7 +49,9 @@ public object Sparkles {
 
     /**
      * How the query's aggregates treat errors: an [AggregateErrors] or its name, over the
-     * dataset's setting. A query that falls back to ARQ reads errors as Jena does.
+     * dataset's setting. ARQ reads errors as Jena does, so under another reading a query
+     * with MIN, MAX, AVG or GROUP_CONCAT that would fall back to ARQ fails instead, unless
+     * the fallback mode is ALWAYS.
      */
     @JvmField
     public val AGGREGATE_ERRORS: Symbol = Symbol.create(NS + "aggregateErrors")

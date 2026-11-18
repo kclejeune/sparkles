@@ -96,15 +96,15 @@ pass over it.
 
 ```sparql
 SELECT ?person (MAX(?age) AS ?oldest)
-WHERE { ?person a :Parent . OPTIONAL { ?person :child/:age ?age } }
+WHERE { ?person :child ?c . OPTIONAL { ?c :age ?age } }
 GROUP BY ?person
 ```
 
-Under `jena` and `spec`, `?oldest` is the greatest age of a parent whose every child has
-an age. Under `sparkles` it is the greatest of the ages that are present, and under
-`jena` a parent with a child of unknown age gets no `?oldest`. A query that should pass
-over missing values can filter them, as in `MAX(?age)` over `FILTER(BOUND(?age))`, and
-then gives the same answer under every reading.
+For a parent with one child of unknown age, `?oldest` is unbound under `jena`, while
+`sparkles` and `spec` give the greatest age present. `MIN(?age)` would be unbound under
+`spec` too. A query that wants the values present can ask for the `sparkles` reading,
+or compute the aggregate in a subquery that matches `:age` outside OPTIONAL and join
+that subquery with OPTIONAL, which gives the same answer under every reading.
 
 A query chooses its reading with the `aggregate-errors` request parameter, the library's
 `QueryOptions::aggregate_errors`, the Python keyword `aggregate_errors`, the Node.js

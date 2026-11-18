@@ -117,6 +117,9 @@ public object QueryEngineSparkles {
             if (mode == SparklesFallback.NEVER) {
                 throw QueryExecException("the query needs ARQ, and the fallback mode is NEVER: $reason")
             }
+            if (mode == SparklesFallback.AUTO) {
+                arqCannotRead(query, dsg, context)?.let { throw QueryExecException("the query needs ARQ: $reason, but $it") }
+            }
             log.debug("query runs in ARQ: {}", reason)
             dsg.handle.fallbackQueries.incrementAndGet()
             return arqPlan(query, dsg, input, context)
@@ -335,6 +338,7 @@ internal class QueryIterSparkles(
         if (mode == SparklesFallback.NEVER) {
             throw QueryExecException("Sparkles cannot run the query, and the fallback mode is NEVER: $why")
         }
+        arqCannotRead(query, dsg, context)?.let { throw QueryExecException("Sparkles cannot run the query: $why, and $it") }
         LOG.debug("query runs in ARQ after Sparkles refused it: {}", why)
         dsg.handle.nativeQueries.decrementAndGet()
         dsg.handle.fallbackQueries.incrementAndGet()

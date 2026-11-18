@@ -9,6 +9,11 @@ import io.github.kclejeune.sparkles.jena.internal.encodeTerms
 import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
 import org.apache.jena.graph.Node
 import org.apache.jena.query.ARQ
+import org.apache.jena.query.Query
+import org.apache.jena.sparql.algebra.Algebra
+import org.apache.jena.sparql.algebra.OpVisitorBase
+import org.apache.jena.sparql.algebra.OpWalker
+import org.apache.jena.sparql.algebra.op.OpGroup
 import org.apache.jena.sparql.engine.binding.Binding
 import org.apache.jena.sparql.util.Context
 import org.apache.jena.sparql.util.Symbol
@@ -85,3 +90,25 @@ internal fun aggregateErrors(context: Context): AggregateErrors? = when (val v =
     else -> AggregateErrors.entries.firstOrNull { it.name.equals(v.toString().trim(), ignoreCase = true) }
         ?: throw IllegalArgumentException("aggregateErrors is jena, sparkles or spec, not $v")
 }
+
+/** The aggregates whose answer over an error depends on the reading. */
+private val READING_AGGREGATES = setOf("MIN", "MAX", "AVG", "GROUP_CONCAT")
+
+/**
+ * Why ARQ cannot answer `query` on `dsg` in `context`, or null when it can. ARQ reads
+ * errors in aggregates as Jena does, so a query with MIN, MAX, AVG or GROUP_CONCAT under
+ * another reading cannot fall back to it.
+ */
+internal fun arqCannotRead(query: Query, dsg: DatasetGraphSparkles, context: Context): String? {
+    var found = false
+    OpWalker.walk(Algebra.compile(query), object : OpVisitorBase() {
+        override fun visit(opGroup: OpGroup) {
+            if (opGroup.aggregators.any { it.aggregator.name.uppercase() in READING_AGGREGATES }) found = true
+        }
+    })
+    if (!found) return null
+    val reading = aggregateErrors(context) ?: dsg.settings().aggregateErrors().get()
+    return if (reading == AggregateErrors.JENA) null else
+        "ARQ reads errors in aggregates as Jena does, and the query asks for ${reading.name.lowercase()}"
+}
+

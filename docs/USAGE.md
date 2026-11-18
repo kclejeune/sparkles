@@ -6863,7 +6863,7 @@ in the dataset's `getContext()` or on one execution.
 | `Sparkles.INCLUDE_INFERRED` | The reasoner's `urn:x-sparkles:inferred` graph is part of the default graph. |
 | `Sparkles.MAX_ROWS`, `MAX_MEMORY_BYTES`, `MAX_ROWS_PRODUCED` | The request's budgets. |
 | `Sparkles.NO_CACHE` | The request neither reads nor fills the result cache. |
-| `Sparkles.AGGREGATE_ERRORS` | How the query's aggregates treat errors, as an `AggregateErrors` or its name. A query that falls back to ARQ reads them as Jena does. |
+| `Sparkles.AGGREGATE_ERRORS` | How the query's aggregates treat errors, as an `AggregateErrors` or its name. Under a reading other than `JENA`, a query with MIN, MAX, AVG or GROUP_CONCAT that would fall back to ARQ fails, since ARQ answers as Jena. The fallback mode `ALWAYS` runs it in ARQ. |
 | `Sparkles.AT` | A historical reference such as `snapshot:before-edit` or `commit:42`. |
 | `ARQ.httpServiceAllowed` | `false` refuses SERVICE. |
 

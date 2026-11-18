@@ -29,6 +29,7 @@ const QUERY_PARAMS: &[&str] = &[
     "reasoning",
     "at",
     "execution",
+    "aggregate-errors",
 ];
 const GSP_WRITE_PARAMS: &[&str] = &[
     "graph", "default", "timeout", "dryRun", "receipt", "validate",
@@ -69,7 +70,8 @@ op!(
         "timeout",
         "reasoning",
         "at",
-        "execution"
+        "execution",
+        "aggregate-errors"
     ]
 );
 op!(
