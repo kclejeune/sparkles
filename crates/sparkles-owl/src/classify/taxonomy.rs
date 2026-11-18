@@ -335,6 +335,25 @@ pub(super) fn build(
     if stopped.load(Ordering::Relaxed) {
         return Err(Halt::Stopped);
     }
+    // a class equivalent to a class that is unsatisfiable or equivalent to owl:Thing is
+    // so too, as the equivalence entails. A run that is not complete can derive the
+    // equivalence and not the subsumption by owl:Thing or owl:Nothing, so the class goes
+    // where its equivalence class's first class goes, which has no node of its own. The
+    // first class comes earlier, so one pass in order settles every class.
+    let mut at_bottom: Vec<bool> = subs.iter().map(|s| s.0).collect();
+    for i in 0..n {
+        let r = key[i] as usize;
+        if key[i] == NONE || r == i {
+            continue;
+        }
+        if at_bottom[r] {
+            at_bottom[i] = true;
+            key[i] = NONE;
+        } else if at_top[r] {
+            at_top[i] = true;
+            key[i] = NONE;
+        }
+    }
     // the nodes, in the order of their first classes: number them and place each class
     // in its node, after owl:Thing in the top node and owl:Nothing in the bottom node, on
     // one pass of integers, then copy the names into the nodes in parallel chunks
@@ -343,7 +362,7 @@ pub(super) fn build(
     let mut size: Vec<u32> = vec![1, 1];
     let mut reps: Vec<u32> = Vec::new();
     for i in 0..n {
-        let node = if subs[i].0 {
+        let node = if at_bottom[i] {
             BOTTOM_NODE as u32
         } else if at_top[i] {
             TOP_NODE as u32
@@ -927,6 +946,37 @@ mod tests {
         assert!(bad == bad1);
         assert_eq!(bad.node_of(&c("C000001")), Some(BOTTOM_NODE));
         assert_eq!(bad.node_of(&Class::thing()), Some(BOTTOM_NODE));
+    }
+
+    #[test]
+    fn a_class_goes_with_its_equivalence_class_when_the_run_missed_owl_thing_or_nothing() {
+        // A and B are equivalent and A comes first in IRI order. The rows are then
+        // changed as an incomplete run can leave them: owl:Thing below A but not B, or A
+        // unsatisfiable while B is not. B's equivalence class starts at A, which has no
+        // node of its own, and the build placed B through a node that does not exist.
+        let axioms = [
+            Axiom::equivalent_classes([c("A").into(), c("B").into()]),
+            Axiom::sub_class_of(c("B"), c("C")),
+        ];
+        let ex = |k: &Saturation, s: &str| k.interner.class_ex(&c(s)).unwrap();
+        let mut top = saturated(&axioms);
+        let a = ex(&top, "A");
+        top.worlds.insert(TOP, (false, vec![TOP, a]));
+        for threads in [1, 4] {
+            let (t, _) = build(&top, true, threads, false, &|| false, &|_| true).unwrap();
+            assert_eq!(t.node_of(&c("A")), Some(TOP_NODE));
+            assert_eq!(t.node_of(&c("B")), Some(TOP_NODE));
+            assert!(t.node_of(&c("C")).is_some());
+        }
+        let mut bottom = saturated(&axioms);
+        let (a, b, cc) = (ex(&bottom, "A"), ex(&bottom, "B"), ex(&bottom, "C"));
+        bottom.worlds.insert(a, (true, vec![a, b, cc]));
+        for threads in [1, 4] {
+            let (t, _) = build(&bottom, true, threads, false, &|| false, &|_| true).unwrap();
+            assert_eq!(t.node_of(&c("A")), Some(BOTTOM_NODE));
+            assert_eq!(t.node_of(&c("B")), Some(BOTTOM_NODE));
+            assert!(t.node_of(&c("C")).is_some());
+        }
     }
 
     #[test]
