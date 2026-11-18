@@ -979,6 +979,8 @@ fn partners_rf(ix: &Index, st: &State, t: Role) -> Vec<(Ex, Vec<Side>)> {
             }
             units.sort_unstable();
         }
+        // a unit into a singleton has its constant in place of a successor term (item 822)
+        units.retain(|&e| into_nominal(ix, e).is_none());
     }
     out.extend(units.iter().map(|&e| (e, vec![unit()])));
     if let Some(d) = dl(st) {
@@ -1041,6 +1043,33 @@ pub(super) fn no_xy(v: super::dl_clause::XLit) -> bool {
     ts[..n]
         .iter()
         .all(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
+}
+
+/// Whether an existential restriction into a singleton class names its constant in place of
+/// a successor term, item 822's departure (F24). `SPARKLES_ROOTED_NOMINAL_SUCC=0` turns it
+/// off, for measurement.
+pub fn nominal_succ() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_NOMINAL_SUCC").is_none_or(|v| v != "0"))
+}
+
+/// For an existential restriction `d = ∃r.N_v` into a singleton class, in a rooted run, its
+/// role and the constant v, so that `d(t)` gives `r(t, v)` and the successor's context
+/// over v in place of a successor term of t.
+pub(super) fn into_nominal(ix: &Index, d: Ex) -> Option<(Role, u32)> {
+    let dx = dix(ix);
+    // a maximum must still merge r(x, v) with the other r-successors, which the counting
+    // rules do over successor terms
+    if !nominal_succ() || dx.root.is_none() || dx.counting {
+        return None;
+    }
+    match ix.head(d).node {
+        Node::Exist(r, f) => match ix.head(f).node {
+            Node::Nominal(v) => Some((r, v)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Whether a hypothetical successor sends its conclusions with an empty body over constants
@@ -2402,6 +2431,21 @@ fn rooted_unit(ix: &Index, me: Ex, st: &State, d: Ex, found: &mut Found, lits: &
         query: query_of(ix, me),
     };
     q.on_unit(st, XLit::Atom(d, RTerm::X), found);
+    // an existential restriction into a singleton names the constant, and its EL
+    // successor's clauses do not come back over f(x) (item 822)
+    if let Some((r, v)) = into_nominal(ix, d) {
+        found.rule = "nomunit";
+        let inv = |s| dx.inv(ix, s);
+        for l in [
+            XLit::Role(r, RTerm::X, RTerm::C(v)),
+            XLit::Atom(ix.head(d).succ, RTerm::C(v)),
+        ] {
+            if let Made::Lit(l) = lits.lit(l.canon(inv), inv) {
+                found.push(with(&unit(), l));
+            }
+        }
+        return;
+    }
     if let Node::Exist(r, _) = ix.head(d).node {
         let f = RTerm::Fx(d);
         q.on_unit(
@@ -2700,6 +2744,9 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
         let mut es = Vec::new();
         reaching(dx, st, v, &mut es);
         for e in es {
+            if into_nominal(ix, e).is_some() {
+                continue;
+            }
             pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
         }
     }
@@ -3022,8 +3069,21 @@ fn process<S: Sink>(
                         found.push(with(&prem, Lit::x(b)));
                     }
                     Node::Exist(r, _) => {
-                        found.push(with(&prem, Lit::rl(d, r)));
-                        found.push(with(&prem, Lit::f(d, h.succ)));
+                        if let Some((r, v)) = into_nominal(ix, d) {
+                            let lits = &out.dl().lits;
+                            let inv = |r| dx.inv(ix, r);
+                            for l in [
+                                super::dl_clause::XLit::Role(r, RTerm::X, RTerm::C(v)),
+                                super::dl_clause::XLit::Atom(h.succ, RTerm::C(v)),
+                            ] {
+                                if let Made::Lit(l) = lits.lit(l.canon(inv), inv) {
+                                    found.push(with(&prem, l));
+                                }
+                            }
+                        } else {
+                            found.push(with(&prem, Lit::rl(d, r)));
+                            found.push(with(&prem, Lit::f(d, h.succ)));
+                        }
                     }
                     _ => {}
                 }

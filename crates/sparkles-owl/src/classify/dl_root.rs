@@ -512,7 +512,10 @@ fn hyper_at<S: Sink>(
             put(ix, out, found, with(prem, at(b)));
         }
         Node::Exist(r, _) => {
-            let f = RTerm::Fc(d, u);
+            let f = match super::dl_rules::into_nominal(ix, d) {
+                Some((_, v)) => RTerm::C(v),
+                None => RTerm::Fc(d, u),
+            };
             for l in [XLit::Role(r, RTerm::C(u), f), XLit::Atom(h.succ, f)] {
                 if let Made::Lit(l) = lit(ix, out, l) {
                     put(ix, out, found, with(prem, l));
