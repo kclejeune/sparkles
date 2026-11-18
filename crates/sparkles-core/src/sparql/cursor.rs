@@ -5232,7 +5232,7 @@ mod tests {
         use crate::index::{BLOCK_ROWS, BlockCache, Perm, PermIndex, PermWriter};
         use crate::store::{Store, StoreOptions};
         let rows = 2 * BLOCK_ROWS + 1_000;
-        let other = |i: usize| (5_000..5_003).contains(&i) || i == BLOCK_ROWS + 7_777;
+        let other = |i: usize| i == 1_001 || (5_000..5_003).contains(&i) || i == BLOCK_ROWS + 7_777;
         let dir = tempfile::tempdir().unwrap();
         let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
         for i in 0..rows as u64 {
@@ -5304,6 +5304,87 @@ mod tests {
             assert!(
                 seen == expected,
                 "fill {fill}, keep {keep}: rows out of order"
+            );
+        }
+    }
+
+    /// A shared read that declines right after a partial shared batch, before any owned
+    /// read made a weak handle, leaves its row unconsumed and the block in the scan, and
+    /// the owned read that follows returns the remaining rows once and in order, also when
+    /// the view keeps no blocks and the earlier batch was dropped (roadmap item 1063).
+    #[cfg(unix)]
+    #[test]
+    fn base_scan_declining_while_it_shares_a_block_resumes_at_its_row() {
+        use crate::index::{BLOCK_ROWS, BlockCache, Perm, PermIndex, PermWriter};
+        use crate::store::{Store, StoreOptions};
+        let rows = BLOCK_ROWS + 500;
+        let other = |i: usize| i == 1_005;
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for i in 0..rows as u64 {
+            let graph = if other(i as usize) { 9 } else { 0 };
+            writer.push([i, i * 3 + 1, 0, graph]).unwrap();
+        }
+        writer.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let expected = (0..rows)
+            .filter(|&i| !other(i))
+            .map(|i| i as u64 * 3 + 1)
+            .collect::<Vec<_>>();
+        for (fill, keep) in [(false, false), (false, true), (true, false)] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut snapshot = (*store.snapshot()).clone();
+            drop(store);
+            Arc::get_mut(&mut snapshot.generation)
+                .expect("owned fixture generation")
+                .perms[Perm::Spo.index()] = idx.clone();
+            let cache = BlockCache::new(64 << 20);
+            snapshot.cache = Arc::new(if fill { cache } else { cache.read_through() });
+            let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+            let var = ctx.var("o");
+            let spec = ScanSpec {
+                perm: Perm::Spo,
+                prefix: vec![],
+                cols: vec![(1, var)],
+                eqs: vec![],
+                graph: super::super::plan::GraphFilter::One(0),
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            };
+            let mut scan = Scan::new(spec, None);
+            let ids = |batch: &SharedBatch| {
+                batch.shared.block.cols[batch.columns[0]][batch.start..batch.end].to_vec()
+            };
+            let SharedAttempt::Ready(Some(first)) = scan.next_shared(&ctx, &[var], 1_000).unwrap()
+            else {
+                panic!("the first read shares its block");
+            };
+            let mut seen = ids(&first);
+            let held = keep.then_some(first);
+            let base = scan.base.as_ref().unwrap();
+            assert!(base.shared.is_some() && base.parked.is_none() && base.block.is_none());
+            assert_eq!(base.row, 1_000);
+            assert!(matches!(
+                scan.next_shared(&ctx, &[var], 10).unwrap(),
+                SharedAttempt::Unsupported
+            ));
+            let base = scan.base.as_ref().unwrap();
+            assert_eq!(base.row, 1_000, "the declined read consumed rows");
+            assert!(base.shared.is_none() && base.parked.is_some());
+            drop(held);
+            let owned = scan.next(&ctx, &[var], 2_000).unwrap().unwrap();
+            seen.extend(owned.table.cols[0].iter().map(|id| id.0));
+            while !scan.done() {
+                match scan.next_shared(&ctx, &[var], 4_096).unwrap() {
+                    SharedAttempt::Ready(Some(batch)) => seen.extend(ids(&batch)),
+                    SharedAttempt::Ready(None) => break,
+                    SharedAttempt::Unsupported => panic!("no other row declines"),
+                }
+            }
+            assert!(
+                seen == expected,
+                "fill {fill}, keep {keep}: rows lost or repeated"
             );
         }
     }
