@@ -1801,6 +1801,22 @@ impl Store {
                     Err(e) => return Err(e.into()),
                 }
             }
+        } else {
+            // an in-memory store keeps these settings in memory: the capture holds the
+            // files a persistent store would write for them
+            let describe = self.describe_settings();
+            if !describe.is_default() {
+                files.push(meta_file(
+                    super::describe::DESCRIBE_FILE,
+                    super::describe::settings_bytes(&describe),
+                ));
+            }
+            if let Some(m) = self.aggregate_errors_setting() {
+                files.push(meta_file(
+                    super::aggregates::AGGREGATE_ERRORS_FILE,
+                    super::aggregates::setting_bytes(m),
+                ));
+            }
         }
         report(1.0, "built");
         check_preparation()?;

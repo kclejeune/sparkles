@@ -38,17 +38,20 @@ impl Store {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 },
-                Some(m) => {
-                    let v = serde_json::json!({ "format": 1, "aggregateErrors": m.as_str() });
-                    let mut bytes = serde_json::to_vec_pretty(&v).expect("json serializes");
-                    bytes.push(b'\n');
-                    write_atomic(&path, &bytes)?;
-                }
+                Some(m) => write_atomic(&path, &setting_bytes(m))?,
             }
         }
         *cur = s;
         Ok(())
     }
+}
+
+/// The contents of `aggregate-errors.json` for reading `m`.
+pub(crate) fn setting_bytes(m: AggregateErrors) -> Vec<u8> {
+    let v = serde_json::json!({ "format": 1, "aggregateErrors": m.as_str() });
+    let mut bytes = serde_json::to_vec_pretty(&v).expect("json serializes");
+    bytes.push(b'\n');
+    bytes
 }
 
 /// Read a dataset's `aggregate-errors.json` (`None` without one).
