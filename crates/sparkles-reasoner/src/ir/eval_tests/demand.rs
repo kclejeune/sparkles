@@ -516,7 +516,22 @@ fn random_programs_on_demand_equal_their_full_runs() {
 fn magic_rules_intern_no_tail() {
     use crate::demand::{Key, KeyP, Pass, transform};
     let v = TV::new();
-    let (rels, rules) = chain_and_key_rules(&v);
+    let (mut rels, mut rules) = chain_and_key_rules(&v);
+    // a tuple head whose columns its first atom binds, before an atom that rules give
+    let r3 = rels.declare("r3", 3, false).unwrap();
+    rules.push(rule(
+        "early",
+        vec![
+            pos(tri(V(0), v.props[0], V(1))),
+            pos(tri(V(1), v.props[2], V(2))),
+        ],
+        vec![head(rel(r3, &[V(0), V(1), V(1)]))],
+    ));
+    rules.push(rule(
+        "r3-out",
+        vec![pos(rel(r3, &[V(0), V(1), V(2)]))],
+        vec![head(tri(V(0), v.props[4], V(2)))],
+    ));
     let t = Terms::new(v.store.snapshot());
     let p = Program::new(rels, rules, &Vocab::of(&t), &t.budget()).unwrap();
     let lowered = p.lower(&t.budget()).unwrap();
@@ -531,6 +546,7 @@ fn magic_rules_intern_no_tail() {
         (v.props[2], true, false),
         (v.props[2], false, true),
         (v.props[3], true, false),
+        (v.props[4], true, false),
     ] {
         let root = Key::new(s, KeyP::Const(pred), o);
         let prog = transform(&rules, &t, &[root], &est, Pass::Plain, true).unwrap();
@@ -550,6 +566,15 @@ fn magic_rules_intern_no_tail() {
             }
         }
         assert!(tuples > 0, "the adorned copies keep their tuples");
+        // the early tuple is placed before the derived atom of its copy
+        if pred == v.props[4] {
+            assert!(
+                prog.stages[0]
+                    .rules
+                    .iter()
+                    .any(|r| r.name == "early (demand)")
+            );
+        }
     }
 }
 
@@ -634,7 +659,34 @@ fn demand_cost_probe() {
         (rels, rules)
     });
     let (p0, p1, p2) = (v.props[0], v.props[1], v.props[2]);
-    let p = move |i: usize| if i % 2 == 0 { p0 } else { p1 };
+    let p = move |i: usize| if i.is_multiple_of(2) { p0 } else { p1 };
+    // the same chain with its subject as the first column: chain(x, list, i, y)
+    let list = v.inds[7];
+    let subject_first: Source = Arc::new(move |_: &Terms| {
+        let mut rels = Relations::default();
+        let chain = rels.declare("chain", 4, false).unwrap();
+        let mut rules = vec![rule(
+            "chain-0",
+            vec![pos(tri(V(0), p(0), V(1)))],
+            vec![head(rel(chain, &[V(0), C(list), C(n(1)), V(1)]))],
+        )];
+        for i in 1..6 {
+            rules.push(rule(
+                &format!("chain-{i}"),
+                vec![
+                    pos(rel(chain, &[V(0), C(list), C(n(i as i64)), V(1)])),
+                    pos(tri(V(1), p(i), V(2))),
+                ],
+                vec![head(rel(chain, &[V(0), C(list), C(n(i as i64 + 1)), V(2)]))],
+            ));
+        }
+        rules.push(rule(
+            "chain-end",
+            vec![pos(rel(chain, &[V(0), C(list), C(n(6)), V(1)]))],
+            vec![head(tri(V(0), p2, V(1)))],
+        ));
+        (rels, rules)
+    });
     let per_length: Source = Arc::new(move |_: &Terms| {
         let body = (0..6).map(|i| pos(tri(V(i), p(i), V(i + 1)))).collect();
         (
@@ -642,11 +694,28 @@ fn demand_cost_probe() {
             vec![rule("spo2-6", body, vec![head(tri(V(0), p2, V(6)))])],
         )
     });
-    let node = |k: usize, i: usize| n(1000 + 10 * k as i64 + i as i64);
+    // the paths' nodes, as IRIs of the store
+    let nodes: Vec<u64> = {
+        let mut txn = v.store.write();
+        let ids = (0..40 * 7)
+            .map(|j| {
+                txn.intern_key(&sparkles_core::id::iri_key(&format!("http://ex.org/n{j}")))
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        txn.commit().unwrap();
+        ids
+    };
+    let node = |k: usize, i: usize| nodes[7 * k + i];
     let base: FxHashSet<Triple> = (0..40)
         .flat_map(|k| (0..6).map(move |i| [node(k, i), p(i), node(k, i + 1)]))
         .collect();
-    for (what, source) in [("relation", &relation), ("per length", &per_length)] {
+    for (what, source) in [
+        ("relation", &relation),
+        ("subject first", &subject_first),
+        ("per length", &per_length),
+    ] {
         let want = full(&v, source, &base);
         assert!(want.contains(&(None, vec![node(0, 0), p2, node(0, 6)])));
         for (shape, pat) in [
