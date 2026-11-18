@@ -1185,7 +1185,8 @@ When there are two or more failed runs, the report writes a roadmap row draft to
 versioned record beside each draft names its repository, branch, workflow and failed
 runs, and each report extends it. A streak that shares a failed run with a record already
 has its draft, so a streak opens one draft, and a streak that ended between two reports
-opens none. Add the drafted row to the roadmap with the next free number. The script
+opens none. A record closes only when the fetched runs include the run that ended its
+streak. Add the drafted row to the roadmap with the next free number. The script
 never edits the roadmap, commits or pushes, an error in following the streaks only
 prints a line, and `--no-streaks` turns them off.
 

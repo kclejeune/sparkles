@@ -102,7 +102,8 @@ def draft_row(repo, branch, workflow, failed, jobs):
 
 def current_streak(mine):
     """The failed runs, oldest first, after the newest finished run of MINE that neither
-    failed nor was cancelled, and whether that boundary run is among MINE."""
+    failed nor was cancelled, and whether that boundary run is among MINE. Without it, the
+    failed runs may continue further back, and a streak cannot be known to have ended."""
     meaningful = [r for r in sorted(mine, key=order) if r["conclusion"] not in NEUTRAL]
     out = []
     for r in reversed(meaningful):
@@ -149,7 +150,9 @@ def follow_streaks(repo, branch, runs, state_dir, more=None, jobs=None):
             # A window shorter than the fetch limit holds the whole history.
             limit = len(mine)
             full = limit >= HISTORY
-            while failed and not bounded and full and limit < HISTORY_MAX and more is not None:
+            # A full window without a run that ended the streak, even one with no failure in
+            # it, says nothing about the runs before it, so fetch further back.
+            while not bounded and full and limit < HISTORY_MAX and more is not None:
                 limit = min(HISTORY_MAX, limit * 4)
                 try:
                     longer = [r for r in more(name, limit) if workflow_key(r) == key and r["status"] == "completed"]
@@ -165,9 +168,10 @@ def follow_streaks(repo, branch, runs, state_dir, more=None, jobs=None):
             mine_records = records.get(key, [])
             match = [(f, rec) for f, rec in mine_records if ids & set(rec["runs"])]
             for f, rec in mine_records:
-                if (f, rec) in match or rec.get("closed"):
+                if (f, rec) in match or rec.get("closed") or not bounded:
                     continue
-                # a record whose streak shares no run with the current one has ended
+                # a record whose streak shares no run with the current one ended at the
+                # run that bounds the current streak; without that run nothing has ended
                 rec["closed"] = True
                 f.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n")
                 lines.append(f"  {name}: passed again, streak of {Path(rec['draft']).name} closed")

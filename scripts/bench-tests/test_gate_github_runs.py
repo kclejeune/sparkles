@@ -114,11 +114,38 @@ class Streaks(unittest.TestCase):
             lines = self.follow(d, runs[-20:], more=boom)
             self.assertIn("could not fetch older runs", lines[0])
             # the window alone already shows a streak of 20 that shares no run with the
-            # first draft, so it opens its own draft, and the next report changes nothing
+            # first draft, so it opens its own draft, and without the pass in view the first
+            # streak stays open
+            self.assertEqual(len(lines), 2)
             self.assertIn("or more times in a row", lines[-1])
             self.assertEqual(self.drafts(d), ["o-r-main-ci-10.md", "o-r-main-ci-15.md"])
-            self.assertEqual(self.follow(d, runs[-20:], more=lambda name, limit: runs[-limit:]), [])
+            self.assertFalse(self.record(d, "o-r-main-ci-10.md")["closed"])
+            # the next report reaches the pass, closes the first streak and opens nothing
+            lines = self.follow(d, runs[-20:], more=lambda name, limit: runs[-limit:])
+            self.assertEqual(len(lines), 1)
+            self.assertIn("o-r-main-ci-10.md closed", lines[0])
             self.assertEqual(self.drafts(d), ["o-r-main-ci-10.md", "o-r-main-ci-15.md"])
+
+    def test_a_window_of_only_cancelled_runs_fetches_further_back(self):
+        runs = history("success", "failure", "failure", *["cancelled"] * 25)
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.follow(d, runs[-20:], more=lambda name, limit: runs[-limit:])
+            self.assertIn("failed 2 times in a row", lines[0])
+            self.assertEqual(self.drafts(d), ["o-r-main-ci-11.md"])
+
+    def test_cancelled_runs_past_the_window_do_not_close_a_streak(self):
+        runs = history("success", "failure", "failure", *["cancelled"] * 25)
+        with tempfile.TemporaryDirectory() as d:
+            self.follow(d, runs[:3])
+            self.assertEqual(self.follow(d, runs[-20:], more=lambda name, limit: runs[-limit:]), [])
+            self.assertFalse(self.record(d, "o-r-main-ci-11.md")["closed"])
+            # nor does a window that cannot reach back, when fetching fails
+            def boom(*a):
+                raise RuntimeError("gh down")
+            lines = self.follow(d, runs[-20:], more=boom)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("could not fetch older runs", lines[0])
+            self.assertFalse(self.record(d, "o-r-main-ci-11.md")["closed"])
 
     def test_a_late_completion_is_counted(self):
         # run 10 was still running when run 11 failed; then run 10 failed too
