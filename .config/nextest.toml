@@ -79,6 +79,7 @@ filter = """\
 (package(sparkles-fmt) & test(=lint::tests_embedded::many_holders_of_one_query_keep_to_the_deadline)) | \
 (package(sparkles-core) & test(=store::backup::tests::captures_are_consistent_under_concurrent_writes)) | \
 (package(sparkles-core) & test(=store::family_tests::cohort_waits_cover_earlier_permits_only)) | \
+(package(sparkles-core) & binary(query_cursor) & test(=a_cursor_deadline_excludes_time_its_consumer_paused)) | \
 (package(sparkles-backup) & test(=restore::tests::backups_under_concurrent_writes_restore_to_their_commits)) | \
 (package(sparkles) & binary(nesting) & test(=a_basic_graph_pattern_past_the_plan_limit_is_refused)) | \
 (package(sparkles-server) & test(=http::stream_idle_tests::cleanup_waits_for_the_real_producer_not_only_its_released_pool_grant))\

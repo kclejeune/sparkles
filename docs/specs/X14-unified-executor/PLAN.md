@@ -167,17 +167,17 @@ phases name are carried here as they stand at the base of this plan.
 | Join-kernel library, item 825 | Item 93. | Item 7's remaining work does not change joins, so item 825 does not wait for it. |
 | Grouping operator, item 826 | Item 93. | Item 7's grouping over key runs has shipped. Item 418 is outstanding, and the [schedule](#order-of-work) says how item 826 proceeds with and without it. |
 | Frontier kernel | Item 417. | Items 8 and 51. |
-| Expression memo | None. | Item 293. |
+| Expression memo, item 1095 | None. | Item 293, which has shipped. |
 | Columnar writers, item 828 | None. | Items 91, 240, 243 and 534. Item 828 follows items 534 and 240 and carries items 243 and 91 as its own gates. |
 | Mode-independent plans and pull-demand LIMIT and ASK, item 827 | None. | Item 7, for the EXISTS shapes that stay eager, which item 827 leaves to item 829. |
 | Native leaf cursors, item 829 | None. | Item 827 for the admission code, and item 825 for the operators that build over their input. |
-| The merge | Items 93, 469 to 473. | Items 7, 240, 243, 293, 534 and 512, and items 825 to 829. |
+| The merge | Items 93, 469 to 473. | Items 7, 240, 243, 534 and 512, and items 825 to 829. |
 | Demand seeding and one visitor | None. | Item 190. |
 
-Items 7, 240, 243, 293 and 534 are on the merge's critical path because the design puts
-them there, and this plan does not shorten that path. Item 243 lands inside item 828's
-work on the writers, and item 293 settles the memo's admission before the merge deletes
-the eager memo.
+Items 7, 240, 243 and 534 are on the merge's critical path because the design puts them
+there, and this plan does not shorten that path. Item 243 lands inside item 828's work on
+the writers. Item 293 has settled the memo's admission, which item 1095 takes from
+`cursor/bind.rs` when it replaces the eager memo.
 
 ## Order of work
 
@@ -194,8 +194,8 @@ ownership boundaries given below, and the rows are serial.
 | After 825 | Item 826 starts. Item 240 starts once item 534 says where the streamed time goes. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
 | After 240 | Item 828 starts. | The writers take the buffer that item 240 gives the cursor writers. |
-| After 293 | The expression memo phase is numbered and starts. | It takes the admission policy that item 293 settled. |
-| After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
+| After 293 | Item 1095 starts. | It takes the admission policy that item 293 settled. |
+| After 825 to 829, 512, 243, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
 
 Item 826 defines the trait's `retract` method and leaves the view operator of
@@ -416,13 +416,12 @@ and gets its number then. Item 417 has shipped, it depends on items 8 and 51 for
 path ranges and the graph-algorithm surface, and the cold-read rule of X07 applies to
 every copy once they are one.
 
-### The query-scoped expression memo
+### Item 1095: the query-scoped expression memo
 
 This phase replaces `exprcache`'s per-value reuse, the `Reuse` of `cursor/bind.rs` and the
 EXISTS memo of `expr.rs` with one charged memo keyed by expression and input value, with
-one admission policy fed by observed repetition. It waits for item 293, whose question is
-the admission policy for sparse reuse, and gets its number when item 293 settles it. The
-memo's charge is a retained charge of stage 4, its bound is the EXISTS memo's eighth of
+one admission policy fed by observed repetition. Item 293 settled that policy for sparse
+reuse. The memo's charge is a retained charge of stage 4, its bound is the EXISTS memo's eighth of
 the budget, and its oracle is the differential test of stage 4 that compares reuse with
 row-by-row evaluation on both sides of the 16,384-row threshold.
 
@@ -595,7 +594,7 @@ that it agrees with the engine on every W3C query test and on the seeded queries
 
 ### The merge
 
-The merge phase gets its number when items 825 to 829, 512, 243, 293 and 534 have landed
+The merge phase gets its number when items 825 to 829, 512, 243 and 534 have landed
 and the remaining work of item 7 is done or decided. It is the design's single
 morsel-driven executor, and it is judgment-sensitive throughout.
 
