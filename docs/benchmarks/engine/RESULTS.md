@@ -526,13 +526,18 @@ those, `bt-678` flagged the two string queries under automatic execution as well
 million instructions per request in three rounds. The execution times that the runs
 record on the busy `stanley` do not resolve these costs, since their per-round ratios in
 the A-against-A runs scatter by up to 50% on these queries. Both builds of row 1063 made the same system calls per request, 6 futex
-calls and 2.4 `writev` calls among them. A call-graph profile of 300,000 requests of
-`root-limit` found the same user-space cycles under `next_batch_at_most` within 5%, with
-cycles moved from `Block::key_range` and the old scan's drops to the shared batch's
-closure, `mi_malloc`, `Block::downgrade` and the drop of the weak block handle. The
-profile samples user space through stacks of at most 32 frames, so the gap in execution
-time lies in kernel time, in time off the CPU inside the timed read, or in samples whose
-stacks the profile truncates.
+calls and 2.4 `writev` calls among them. Three call-graph profiles of `root-limit`
+under streaming, of 100,000 and twice 300,000 requests, sampled cycles in one server
+process of each build. The totals under `Operator::next_shared`, the call that execution
+time covers, moved between profiles by more than the change, as other functions' cycles
+shift between processes. The functions that only the new build runs there were stable,
+however. Per request, the shared batch's construction in `Scan::next_shared` added 650
+to 690 cycles, `Block::downgrade` 200 to 270, `Scan::reads_base` 200, `BaseScan::unpark`
+160 and the allocation and the drop of the weak block handle about 100 each, against
+about 250 cycles of `Block::clone` and `Ctx::nvars` that the old build ran. That is about
+1,500 cycles, or 0.3 µs on `stanley`, for the one block that `root-limit` enters, and it
+retires only a few hundred instructions, a hundredth of the noise floor of a request of
+9.4 million.
 
 The resolution of the counts is the floor times the request's CPU time. It is 1.4 to
 5.4 µs for every query under 0.3 ms, 135 µs for `root-scan` and 1 ms for `export-500k`,

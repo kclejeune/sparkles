@@ -31,7 +31,7 @@ that the script requires. Every pair returned the same answers to every query.
 `analyze.py.txt` computes the per-query interval deviations and the per-round ratios of
 execution and wall time that the results page quotes. `profiles/` holds the call-graph
 profiles of row 1063, made by `prof.sh.txt` with `perf record --call-graph lbr
---user-callchains` over 100,000 or 300,000 requests of `root-limit` and classified by
+--user-callchains` over 100,000 or 300,000 requests of `root-limit`, `cyc4` with the timed call `Operator::next_shared` as its own region, and classified by
 `classify.py.txt` into the samples under `QueryCursor::next_batch_at_most`, the timed
 part of a shared-batch read, and the rest, and the `strace -c -f` counts of 50 and 1,050
 requests of each build.
