@@ -3178,11 +3178,12 @@ impl Ctx {
     /// ([`crate::vocab::Vocab::get_with_prev`]), with both reconstructions and decodings
     /// inside the envelope. A refusal records a failure and gives `None`.
     ///
-    /// A cursor's walk admits at most [`PAIR_WALK_BYTES`] of reconstruction. A longer key
-    /// on the way, such as a long string before a short language-tagged one that needs no
-    /// floor, sends the read to [`Ctx::with_vocab_key`] of `id` alone with `prev` `None`,
-    /// so the key before is reserved only when the caller reads it. An eager walk cannot
-    /// be refused, so it reads both keys in one walk whatever their length.
+    /// A cursor's walk admits at most [`PAIR_WALK_BYTES`] of reconstruction, and only what
+    /// the envelope grants. A longer key on the way, or one the envelope refuses, such as
+    /// a long string before a short language-tagged one that needs no floor, sends the
+    /// read to [`Ctx::with_vocab_key`] of `id` alone with `prev` `None`, so the key before
+    /// is reserved only when the caller reads it. An eager walk cannot be refused, so it
+    /// reads both keys in one walk whatever their length.
     fn with_vocab_key_prev<T>(
         &self,
         id: u64,
@@ -3204,30 +3205,25 @@ impl Ctx {
                 .get_with_prev(id, &mut decode)
                 .flatten();
         }
-        enum Walk {
-            Long,
-            Refused(Error),
-        }
+        // The walk is a shortcut, so a key on the way that is long or that the envelope
+        // refuses records nothing. The key alone is read instead, which records a refusal
+        // of its own reconstruction, and its caller reads the key before when it needs it.
         let walked = self.snap.generation.vocab.get_with_prev_checked(
             id,
             |need| {
                 if need > PAIR_WALK_BYTES {
-                    return Err(Walk::Long);
+                    return Err(());
                 }
-                self.reserve_decode_checked(need).map_err(Walk::Refused)
+                self.reserve_decode_checked(need).map_err(|_| ())
             },
             &mut decode,
         );
         match walked {
             Ok(found) => found.flatten(),
-            Err(Walk::Long) => {
+            Err(()) => {
                 let mut f = f.take();
                 self.with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
                     .flatten()
-            }
-            Err(Walk::Refused(error)) => {
-                self.fail_memory(&error);
-                None
             }
         }
     }

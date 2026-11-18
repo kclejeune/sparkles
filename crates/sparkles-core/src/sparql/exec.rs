@@ -10438,57 +10438,68 @@ mod string_order_tests {
         }
     }
 
-    /// A short language-tagged string after a string longer than the budget needs no
-    /// floor, so its key is read without the long key before it: the mask declines
-    /// without a refusal in both modes, and the generic filter compares the rows.
+    /// A short language-tagged string after a long string needs no floor, so its key is
+    /// read without the key before it, whether that key is longer than the walk's scratch
+    /// or than the room the query has left: the mask declines without a refusal in both
+    /// modes, and the generic filter then compares the rows.
     #[test]
     fn a_long_string_before_a_tagged_one_does_not_fail_the_mask() {
         use super::super::expr::CmpOp;
-        let long = "a".repeat(1 << 20);
-        let nt = format!(
-            "<urn:s:0> <urn:p> \"{long}\" .\n<urn:s:1> <urn:p> \"b\"@en .\n<urn:s:2> <urn:p> \"c\"@en .\n"
-        );
-        let s = Store::in_memory(StoreOptions::default());
-        s.load(&[Source::from_bytes(
-            nt.into_bytes(),
-            RdfFormat::NTriples,
-            None,
-        )])
-        .unwrap();
-        let snap = s.snapshot();
-        let tagged = |l: &str| {
-            snap.lookup_term(
-                &oxrdf::Literal::new_language_tagged_literal(l, "en")
-                    .unwrap()
-                    .into(),
-            )
-            .unwrap()
-        };
-        let (b, c) = (tagged("b"), tagged("c"));
-        let first = snap
-            .lookup_term(&oxrdf::Literal::new_simple_literal(&long).into())
+        // a key past the scratch of the walk, and one within it that the room refuses
+        for (len, room) in [(1usize << 20, None), (2048, Some(8u64 << 10))] {
+            let long = "a".repeat(len);
+            let nt = format!(
+                "<urn:s:0> <urn:p> \"{long}\" .\n<urn:s:1> <urn:p> \"b\"@en .\n<urn:s:2> <urn:p> \"c\"@en .\n"
+            );
+            let s = Store::in_memory(StoreOptions::default());
+            s.load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
             .unwrap();
-        // the long string is the key before "b"@en, in the same block
-        assert_eq!(first.payload() + 1, b.payload());
-        assert!(!(b.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
-        for cursor in [false, true] {
-            let mut ctx = Ctx::new(s.snapshot());
-            ctx.mem_limit = 4 << 20;
-            if cursor {
-                ctx.enable_cursor_accounting().unwrap();
+            let snap = s.snapshot();
+            let tagged = |l: &str| {
+                snap.lookup_term(
+                    &oxrdf::Literal::new_language_tagged_literal(l, "en")
+                        .unwrap()
+                        .into(),
+                )
+                .unwrap()
+            };
+            let (b, c) = (tagged("b"), tagged("c"));
+            let first = snap
+                .lookup_term(&oxrdf::Literal::new_simple_literal(&long).into())
+                .unwrap();
+            // the long string is the key before "b"@en, in the same block
+            assert_eq!(first.payload() + 1, b.payload());
+            assert!(!(b.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+            for cursor in [false, true] {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                for _ in 0..STRING_ORDER_ROWS {
+                    t.push_row(&[b, c]);
+                }
+                let held =
+                    room.map(|room| ctx.charge(ctx.mem_limit - ctx.live_bytes() - room).unwrap());
+                let e = cmp(x, y, CmpOp::Lt);
+                let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+                assert!(
+                    matches!(outcome, Ok(None)),
+                    "{len} cursor {cursor}: {outcome:?}"
+                );
+                assert!(ctx.check().is_ok(), "{len} cursor {cursor}");
+                // the generic filter decodes the values, which takes more than that room
+                drop(held);
+                let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                assert!(generic.iter().all(|&k| k), "{len} cursor {cursor}");
+                assert!(ctx.check().is_ok(), "{len} cursor {cursor}");
             }
-            let (x, y) = (ctx.var("x"), ctx.var("y"));
-            let mut t = Table::new(vec![x, y]);
-            for _ in 0..STRING_ORDER_ROWS {
-                t.push_row(&[b, c]);
-            }
-            let e = cmp(x, y, CmpOp::Lt);
-            let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
-            assert!(matches!(outcome, Ok(None)), "cursor {cursor}: {outcome:?}");
-            assert!(ctx.check().is_ok(), "cursor {cursor}");
-            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
-            assert!(generic.iter().all(|&k| k), "cursor {cursor}");
-            assert!(ctx.check().is_ok(), "cursor {cursor}");
         }
     }
 
