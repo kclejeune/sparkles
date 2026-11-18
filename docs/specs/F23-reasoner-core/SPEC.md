@@ -393,7 +393,8 @@ constants bound, apart from the constants of a tail, which narrow nothing. Magic
 out the builtin that interns a head's tail, and a program with relations or negated atoms
 reads a list again when its cells arrive, in every stage, as its full run does. A demand
 binds only the first column of a relation of arity three or more, so a demand whose bound
-values are in the tail asks for every fact of the relation. On 600 random programs over
+values are in the tail asks for every fact of the relation until roadmap item 1004 orders
+the tail columns. On about 390 random programs over
 relations of arities zero to five with negated atoms, sessions for random patterns give
 facts of the full run and every fact of the full run that the pattern matches, and the demand
 programs of the built-in profiles are unchanged rule for rule. Demand explanations show

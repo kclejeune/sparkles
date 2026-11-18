@@ -1022,3 +1022,43 @@ fn a_relation_beside_a_variable_predicate_stratifies_on_demand() {
     let root = Key::new(true, KeyP::Const(p2), false);
     transform(&rules, &t, &[root], &est, Pass::Plain, true, true).unwrap();
 }
+
+/// A relation beside a right-linear rule with a variable predicate,
+/// `(y ?p z), (x q y) → (x ?p z)`: the rewriting of linear recursion for a demand on the
+/// relation does not take that rule as one of the relation's, which would carry the
+/// relation's facts back along `q`.
+#[test]
+fn linear_recursion_on_a_relation_skips_variable_predicate_heads() {
+    let v = Arc::new(TV::new());
+    let ind = |i: usize| v.inds[i];
+    let q = v.props[1];
+    let (a, b) = (ind(1), ind(2));
+    let source: Source = Arc::new(move |_: &Terms| {
+        let (rels, ids) = rels(&[2, 2]);
+        let (s, r) = (ids[0], ids[1]);
+        let rules = vec![
+            rule("seed", vec![], vec![head(rel(s, &[C(a), C(b)]))]),
+            rule(
+                "r",
+                vec![pos(rel(s, &[V(0), V(1)]))],
+                vec![head(rel(r, &[V(0), V(1)]))],
+            ),
+            rule(
+                "carry",
+                vec![
+                    pos(IAtom::triple(V(1), V(2), V(3))),
+                    pos(tri(V(0), q, V(1))),
+                ],
+                vec![head(IAtom::triple(V(0), V(2), V(3)))],
+            ),
+        ];
+        (rels, rules)
+    });
+    let base: FxHashSet<Triple> = [[ind(0), q, a]].into_iter().collect();
+    let want = full(&v, &source, &base);
+    assert!(want.contains(&(Some(1), vec![a, b])));
+    assert!(!want.contains(&(Some(1), vec![ind(0), b])));
+    for s in [Some(ind(0)), Some(a), None] {
+        check(&v, &source, &base, &[rp(1, s, None)], "subject");
+    }
+}
