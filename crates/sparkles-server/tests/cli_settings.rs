@@ -23,12 +23,14 @@ impl Server {
 
     /// Start on the first free port of `ports`. The ports lie in the kernel's ephemeral
     /// range, so another process can take a port between the check and the server's bind.
-    /// A server that exits before it answers therefore moves on to the next free port.
+    /// A server that exits before it answers because its port is in use moves on to the
+    /// next free port. Any other early exit fails with the server's error output.
     fn start_in(data: &Path, extra: &[&str], ports: std::ops::Range<u16>) -> Server {
         for port in ports.clone() {
             if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
                 continue;
             }
+            let log = data.with_extension(format!("server-{port}.log"));
             let child = Command::new(BIN)
                 .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
                 .arg("--data")
@@ -36,7 +38,7 @@ impl Server {
                 .args(extra)
                 .env_remove("SPARKLES_BACKUP_CONFIG")
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap())
                 .spawn()
                 .unwrap();
             let mut s = Server { child, port };
@@ -57,6 +59,12 @@ impl Server {
             if !exited {
                 return s;
             }
+            let err = std::fs::read_to_string(&log).unwrap_or_default();
+            assert!(
+                err.to_lowercase().contains("in use")
+                    || err.contains(&format!("binding 127.0.0.1:{port}")),
+                "the server exited before it answered on port {port}: {err}"
+            );
         }
         panic!("no server started on a free port in {ports:?}")
     }
