@@ -1176,17 +1176,18 @@ failed run only warns and never changes either gate's exit status. A batch that 
 red run has to pass the gate while `main` is still red, so a blocking check would stop
 the fix from landing. Fix the run in the next batch, or say in the batch why it can wait.
 
-The script also follows failure streaks. `state.json` in
-`.artifacts/gates/github-streaks/` of the main checkout keeps, for each repository,
-branch and workflow, the newest run it has processed and the failed runs in a row since
-the last pass. Each run counts once, a report older than the state changes nothing, and
-when the fetched runs do not reach back to the processed run the script fetches further
-back. When a streak reaches two failed runs that were not cancelled, the report writes a
-roadmap row draft to `drafts/` there and prints its path. A streak opens one draft, the
-workflow's next passing run closes it, and a streak that ended between two reports opens
-none. Add the drafted row to the roadmap with the next free number. The script never
-edits the roadmap, commits or pushes, an error in following the streaks only prints a
-line, and `--no-streaks` turns them off.
+The script also follows failure streaks. Each report works out, from each workflow's
+history on the branch, the failed runs since its newest run that neither failed nor was
+cancelled, and fetches up to 200 runs when the newest 20 do not reach such a run. A run
+that finished late or a rerun that changed its result therefore counts as it now stands.
+When there are two or more failed runs, the report writes a roadmap row draft to
+`.artifacts/gates/github-streaks/drafts/` in the main checkout and prints its path. A
+versioned record beside each draft names its repository, branch, workflow and failed
+runs, and each report extends it. A streak that shares a failed run with a record already
+has its draft, so a streak opens one draft, and a streak that ended between two reports
+opens none. Add the drafted row to the roadmap with the next free number. The script
+never edits the roadmap, commits or pushes, an error in following the streaks only
+prints a line, and `--no-streaks` turns them off.
 
 ## Continuous integration
 

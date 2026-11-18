@@ -51,10 +51,10 @@ class Streaks(unittest.TestCase):
         return gr.follow_streaks(repo, branch, runs, d, more=more, jobs=jobs)
 
     def drafts(self, d):
-        return sorted(p.name for p in (gr.Path(d) / "drafts").iterdir())
+        return sorted(p.name for p in (gr.Path(d) / "drafts").glob("*.md"))
 
-    def scope(self, d, key="o/r@main"):
-        return json.loads((gr.Path(d) / "state.json").read_text())["scopes"][key]
+    def record(self, d, name):
+        return json.loads((gr.Path(d) / "drafts" / name).with_suffix(".json").read_text())
 
     def test_the_second_failure_in_a_row_opens_one_draft(self):
         all_runs = history("success", "failure", "cancelled", "failure", "failure")
@@ -71,53 +71,84 @@ class Streaks(unittest.TestCase):
             # the same streak, longer and later, writes no second draft
             self.assertEqual(self.follow(d, all_runs), [])
             self.assertEqual(self.drafts(d), ["o-r-main-ci-11.md"])
-            st = self.scope(d)["name:CI"]
-            self.assertEqual((st["count"], st["first"]["databaseId"], st["newest"]["databaseId"]), (3, 11, 14))
+            rec = self.record(d, "o-r-main-ci-11.md")
+            self.assertEqual((rec["version"], rec["runs"], rec["closed"]), (1, [11, 13, 14], False))
 
     def test_a_streak_longer_than_the_window_stays_one_streak(self):
-        runs = history("success", "failure", "failure", *["failure"] * 30)
+        runs = history("success", "failure", "failure", *["failure"] * 300)
         with tempfile.TemporaryDirectory() as d:
             self.follow(d, runs[:3])
-            more = lambda name, limit: runs[-limit:]
-            self.assertEqual(self.follow(d, runs[-6:], more=more), [])
+            for end in (40, 120, 250, len(runs)):
+                more = lambda name, limit, end=end: runs[:end][-limit:]
+                self.assertEqual(self.follow(d, runs[end - 20:end], more=more), [])
             self.assertEqual(self.drafts(d), ["o-r-main-ci-11.md"])
-            self.assertEqual(self.scope(d)["name:CI"]["count"], 32)
 
-    def test_a_pass_hidden_behind_the_window_is_found_by_fetching_further_back(self):
-        # F1 F2 opened a draft, then S3 and F4..F9 ran; the report fetches only F4..F9
-        runs = history("failure", "failure", "success", *["failure"] * 6)
+    def test_a_pass_behind_the_window_is_found_by_fetching_further_back(self):
+        # F1 F2 opened a draft, then S3 and F4..F25 ran; the report fetches only the newest 20
+        runs = history("failure", "failure", "success", *["failure"] * 22)
         with tempfile.TemporaryDirectory() as d:
             self.follow(d, runs[:2])
             calls = []
             def more(name, limit):
                 calls.append(limit)
                 return runs[-limit:]
-            lines = self.follow(d, runs[-6:], more=more)
-            self.assertTrue(calls)
+            lines = self.follow(d, runs[-20:], more=more)
+            self.assertEqual(calls, [80])
             self.assertIn("closed", lines[0])
-            self.assertIn("failed 6 times in a row", lines[1])
+            self.assertIn("failed 22 times in a row", lines[1])
             self.assertEqual(self.drafts(d), ["o-r-main-ci-10.md", "o-r-main-ci-13.md"])
 
-    def test_many_cancelled_runs_between_two_failures_still_count_them(self):
-        runs = history("failure", *["cancelled"] * 6, "failure")
+    def test_first_reports_dominated_by_cancelled_runs_fetch_further_back(self):
+        runs = history("success", "failure", *["cancelled"] * 25, "failure")
         with tempfile.TemporaryDirectory() as d:
-            self.follow(d, runs[:1])
-            lines = self.follow(d, runs[-6:], more=lambda name, limit: runs[-limit:])
+            lines = self.follow(d, runs[-20:], more=lambda name, limit: runs[-limit:])
             self.assertIn("failed 2 times in a row", lines[0])
+            self.assertEqual(self.drafts(d), ["o-r-main-ci-11.md"])
+
+    def test_a_failed_fetch_counts_the_window_and_the_next_report_recovers(self):
+        runs = history("failure", "failure", "success", *["failure"] * 22)
+        def boom(*a):
+            raise RuntimeError("gh down")
+        with tempfile.TemporaryDirectory() as d:
+            self.follow(d, runs[:2])
+            lines = self.follow(d, runs[-20:], more=boom)
+            self.assertIn("could not fetch older runs", lines[0])
+            # the window alone already shows a streak of 20 that shares no run with the
+            # first draft, so it opens its own draft, and the next report changes nothing
+            self.assertIn("or more times in a row", lines[-1])
+            self.assertEqual(self.drafts(d), ["o-r-main-ci-10.md", "o-r-main-ci-15.md"])
+            self.assertEqual(self.follow(d, runs[-20:], more=lambda name, limit: runs[-limit:]), [])
+            self.assertEqual(self.drafts(d), ["o-r-main-ci-10.md", "o-r-main-ci-15.md"])
+
+    def test_a_late_completion_is_counted(self):
+        # run 10 was still running when run 11 failed; then run 10 failed too
+        early = history("success", start=9) + history("failure", start=11)
+        late = early + history("failure", start=10)
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.follow(d, early), [])
+            self.assertIn("failed 2 times", self.follow(d, late)[0])
+            self.assertEqual(self.drafts(d), ["o-r-main-ci-10.md"])
+            # and a late older failure that extends a streak backwards opens no second draft
+            older = late + history("failure", start=8)
+            self.assertEqual(self.follow(d, [r for r in older if r["databaseId"] != 9]), [])
             self.assertEqual(self.drafts(d), ["o-r-main-ci-10.md"])
 
-    def test_an_older_report_changes_nothing(self):
-        runs = history("success", "failure", "failure", "failure")
+    def test_a_rerun_that_passes_closes_the_streak(self):
+        runs = history("success", "failure", "failure")
+        with tempfile.TemporaryDirectory() as d:
+            self.follow(d, runs)
+            rerun = runs[:2] + [dict(runs[2], conclusion="success")]
+            self.assertIn("closed", self.follow(d, rerun)[0])
+            self.assertTrue(self.record(d, "o-r-main-ci-11.md")["closed"])
+            self.assertEqual(self.follow(d, rerun), [])
+
+    def test_an_older_report_opens_no_second_draft(self):
+        runs = history("success", "failure", "failure", *["failure"] * 30)
         with tempfile.TemporaryDirectory() as d:
             self.follow(d, runs[:3])
+            self.follow(d, runs[:1])  # a stale snapshot of the pass
+            self.assertEqual(self.follow(d, runs[-20:], more=lambda name, limit: runs[-limit:]), [])
             self.assertEqual(self.drafts(d), ["o-r-main-ci-11.md"])
-            # a stale snapshot holding only the pass neither closes the streak
-            self.assertEqual(self.follow(d, runs[:1]), [])
-            self.assertEqual(self.scope(d)["name:CI"]["count"], 2)
-            # nor does the next report open a second draft
-            self.assertEqual(self.follow(d, runs[-2:], more=lambda name, limit: runs[-limit:]), [])
-            self.assertEqual(self.drafts(d), ["o-r-main-ci-11.md"])
-            self.assertEqual(self.scope(d)["name:CI"]["count"], 3)
 
     def test_a_streak_that_ended_between_reports_opens_no_draft(self):
         runs = history("success", "failure", "failure", "success")
@@ -125,7 +156,6 @@ class Streaks(unittest.TestCase):
             self.follow(d, runs[:1])
             self.assertEqual(self.follow(d, runs), [])
             self.assertEqual(self.drafts(d), [])
-            self.assertEqual(self.scope(d)["name:CI"]["count"], 0)
 
     def test_repositories_and_branches_keep_their_own_streaks(self):
         with tempfile.TemporaryDirectory() as d:
@@ -134,9 +164,9 @@ class Streaks(unittest.TestCase):
             self.assertEqual(len(self.follow(d, history("failure", "failure"), repo="o/other")), 1)
             self.assertEqual(self.drafts(d), ["o-other-main-ci-10.md", "o-r-dev-ci-10.md", "o-r-main-ci-10.md"])
             self.assertIn("fails on dev", (gr.Path(d) / "drafts" / "o-r-dev-ci-10.md").read_text())
-            self.follow(d, history("success", start=20), branch="dev")
-            self.assertEqual(self.scope(d)["name:CI"]["count"], 2)
-            self.assertEqual(self.scope(d, "o/r@dev")["name:CI"]["count"], 0)
+            self.follow(d, history("failure", "failure", "success"), branch="dev")
+            self.assertFalse(self.record(d, "o-r-main-ci-10.md")["closed"])
+            self.assertTrue(self.record(d, "o-r-dev-ci-10.md")["closed"])
 
     def test_a_workflow_id_keeps_a_renamed_workflow_one_streak(self):
         a = [dict(r, workflowDatabaseId=7) for r in history("failure")]
@@ -150,25 +180,18 @@ class Streaks(unittest.TestCase):
             self.follow(d, history("failure", "failure"))
             runs = history("failure", "failure", "cancelled", "cancelled") + history("success", workflow="Nix", start=50)
             self.assertEqual(self.follow(d, runs), [])
-            self.assertEqual(self.scope(d)["name:CI"]["count"], 2)
-            self.assertIsNotNone(self.scope(d)["name:CI"]["draft"])
+            self.assertFalse(self.record(d, "o-r-main-ci-10.md")["closed"])
 
-    def test_errors_in_the_follower_lookups_only_shorten_its_lines(self):
+    def test_a_failed_jobs_lookup_only_shortens_the_draft(self):
         def boom(*a):
             raise RuntimeError("gh down")
-        runs = history("success", "failure", "failure")
         with tempfile.TemporaryDirectory() as d:
-            self.follow(d, runs[:1])
-            lines = self.follow(d, runs, jobs=boom)
-            self.assertIn("failed 2 times", lines[0])
-        with tempfile.TemporaryDirectory() as d:
-            self.follow(d, history("failure"))
-            lines = self.follow(d, history("failure", start=40), more=boom)
-            self.assertIn("could not fetch more runs", lines[0])
+            self.assertIn("failed 2 times", self.follow(d, history("failure", "failure"), jobs=boom)[0])
 
-    def test_a_state_file_of_another_version_is_refused(self):
+    def test_a_record_of_another_version_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
-            (gr.Path(d) / "state.json").write_text(json.dumps({"version": 2, "scopes": {}}))
+            (gr.Path(d) / "drafts").mkdir()
+            (gr.Path(d) / "drafts" / "x.json").write_text(json.dumps({"version": 2}))
             with self.assertRaises(ValueError):
                 self.follow(d, history("failure", "failure"))
 
@@ -198,7 +221,7 @@ class ReportStatus(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(self.run_main(["--no-streaks"], runs, view_fails=True), 0)
             self.assertEqual(self.run_main(["--streaks", d], runs, view_fails=True), 0)
-            self.assertEqual(len(list((gr.Path(d) / "drafts").iterdir())), 1)
+            self.assertEqual(len(list((gr.Path(d) / "drafts").glob("*.md"))), 1)
             self.assertEqual(self.run_main(["--streaks", d], runs + history("failure", start=13), view_fails=False), 1)
 
 
