@@ -5678,13 +5678,10 @@ fn string_order_mask(
         };
         ebv(expr, &row, ctx).unwrap_or(false)
     };
-    let test = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> Result<bool> {
-        if i.is_multiple_of(1024) {
-            ctx.check()?;
-        }
+    let order_of = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> bool {
         let (a, b) = (xs[i], ys[i]);
         let (Some(fa), Some(fb)) = (floors.floor(a), floors.floor(b)) else {
-            return Ok(generic(i));
+            return generic(i);
         };
         let (pa, pb) = (a.payload(), b.payload());
         let order = match pa.cmp(&pb) {
@@ -5694,12 +5691,18 @@ fn string_order_mask(
             Ordering::Greater if pb < fa => Ordering::Greater,
             Ordering::Greater => Ordering::Less,
         };
-        Ok(match op {
+        match op {
             CmpOp::Lt => order == Ordering::Less,
             CmpOp::Le => order != Ordering::Greater,
             CmpOp::Gt => order == Ordering::Greater,
             CmpOp::Ge => order != Ordering::Less,
-        })
+        }
+    };
+    let test = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> Result<bool> {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        Ok(order_of(floors, i))
     };
     let keep = if par {
         (0..n)
@@ -5707,12 +5710,16 @@ fn string_order_mask(
             .with_min_len(n.div_ceil(workers))
             .map_init(|| ctx.floor_map(), |floors, i| test(floors, i))
             .collect::<Result<Vec<bool>>>()?
-    } else {
+    } else if threads > 1 && n <= PAR_THRESHOLD {
         // A table of at most `PAR_THRESHOLD` rows, such as a cursor's batch, spreads over
         // the pool as the generic filter's batch does, so that a cursor's comparison is
-        // not left on one thread where the generic filter would use them all.
-        map_batch_with(ctx, n, true, || ctx.floor_map(), test)?
-            .into_iter()
+        // not left on one thread where the generic filter would use them all. The batch
+        // checks the deadline itself and collects the rows' booleans.
+        map_batch_with(ctx, n, true, || ctx.floor_map(), &order_of)?
+    } else {
+        let mut floors = ctx.floor_map();
+        (0..n)
+            .map(|i| test(&mut floors, i))
             .collect::<Result<Vec<bool>>>()?
     };
     // A refused floor took its row to the generic test, so the mask must not stand.
@@ -10070,9 +10077,11 @@ mod string_order_tests {
     /// A cursor's batch of at most `PAR_THRESHOLD` rows spreads its floor comparison over
     /// the pool as the generic filter's batch does, instead of leaving it on the calling
     /// thread, with each worker's map returned to the query's cache. The calling thread
-    /// keeps the map of its timed sample, so a batch that ran its pieces on one thread
-    /// leaves two maps and one spread over the pool leaves more. Work stealing may leave
-    /// one attempt on one thread, so the test allows several.
+    /// keeps the map of its timed sample while the parallel pieces check out their own,
+    /// so a batch given to the pool leaves at least two maps and one kept on the calling
+    /// thread leaves one. The pool takes the batch when its timed sample projects at
+    /// least `BATCH_PAR_NANOS` for the rest, which the sample's floors exceed many times
+    /// over, and the test allows several attempts.
     #[test]
     fn a_cursor_batch_compares_floors_on_the_pool() {
         use super::super::expr::CmpOp;
@@ -10096,8 +10105,8 @@ mod string_order_tests {
             let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
             assert_eq!(mask, generic);
             assert!(ctx.check().is_ok());
-            // the calling thread's map and one for each task that ran beside another
-            if ctx.floor_cache().shards() > 2 {
+            // the calling thread keeps its sample's map while the pieces take their own
+            if ctx.floor_cache().shards() > 1 {
                 spread = true;
                 break;
             }
