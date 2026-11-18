@@ -291,27 +291,43 @@ def stop_session(proc, grace=None):
     proc.wait()
 
 
+def run_session(cmd, seconds, env=None, stdout=None, stderr=None):
+    """Run CMD in a new session for at most SECONDS. Returns the exit code, or None when
+    it ran out of time, after every process of its session is stopped. A signal that ends
+    this script stops the session too, and so does a command that ends with processes of
+    its session still running."""
+    proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+    try:
+        code = proc.wait(timeout=max(1, seconds))
+    except subprocess.TimeoutExpired:
+        stop_session(proc)
+        return None
+    except BaseException:
+        stop_session(proc)
+        raise
+    if session_pids(proc.pid):
+        stop_session(proc)
+    return code
+
+
 def run(cmd, log, seconds, env=None):
-    """Run CMD with its output in LOG, for at most SECONDS, in a new session. Returns the
-    exit code, or None when it ran out of time, after every process of its session is
-    stopped. A signal that ends this script stops the session too."""
+    """Run CMD with its output in LOG, for at most SECONDS, through run_session."""
     with open(log, "w") as f:
         f.write("$ " + " ".join(cmd) + "\n")
         f.flush()
-        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, start_new_session=True)
-        try:
-            code = proc.wait(timeout=max(1, seconds))
-        except subprocess.TimeoutExpired:
-            stop_session(proc)
+        code = run_session(cmd, seconds, env=env, stdout=f, stderr=subprocess.STDOUT)
+        if code is None:
             f.write(f"\nstopped after {seconds} s\n")
-            return None
-        except BaseException:
-            stop_session(proc)
-            raise
-        # The command ended, and anything it left in its session goes with it.
-        if session_pids(proc.pid):
-            stop_session(proc)
         return code
+
+
+def run_capture(cmd, seconds, env=None):
+    """Run CMD through run_session and return its exit code, or None when it ran out of
+    time, and its standard output. Its standard error is discarded."""
+    with tempfile.TemporaryFile("w+") as out:
+        code = run_session(cmd, seconds, env=env, stdout=out, stderr=subprocess.DEVNULL)
+        out.seek(0)
+        return code, out.read()
 
 
 def rebuilt(log_text):
@@ -339,7 +355,7 @@ def fresh_scratch(rdir, i, target_tmp):
 
 
 def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xml"),
-         target_tmp=Path("target/tmp"), check_worktree=worktree_clean):
+         target_tmp=Path("target/tmp"), check_worktree=worktree_clean, discover=run_capture):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--commit", required=True)
@@ -401,16 +417,12 @@ def main(argv=None, runner=run, junit_path=Path("target/nextest/default/junit.xm
     left = int(deadline - time.monotonic())
     if left <= 0:
         return finish(1, "not forgiven: no time left for the doctests")
-    try:
-        env_pkgs = subprocess.run(
-            ["python3", "scripts/changed-crates.py", "--cargo-args", "--doc"],
-            env=dict(os.environ, SPARKLES_CHANGED_PACKAGES=packages), capture_output=True, text=True,
-            timeout=max(1, min(left, 300)),
-        )
-    except subprocess.TimeoutExpired:
+    code, stdout = discover(["python3", "scripts/changed-crates.py", "--cargo-args", "--doc"],
+                            min(left, 300), env=dict(os.environ, SPARKLES_CHANGED_PACKAGES=packages))
+    if code is None:
         return finish(1, "not forgiven: choosing the doctest packages ran out of time")
-    pkgs = env_pkgs.stdout.split()
-    if env_pkgs.returncode != 0 or not pkgs:
+    pkgs = stdout.split()
+    if code != 0 or not pkgs:
         return finish(1, "not forgiven: cannot choose the doctest packages")
     left = int(deadline - time.monotonic())
     if left <= 0:

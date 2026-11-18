@@ -379,6 +379,64 @@ class Timeout(unittest.TestCase):
             self.assertEqual(beat.stat().st_size, size)
             self.assertIn("stopped after 2 s", (Path(d) / "log").read_text())
 
+    def discovery(self, d, signal_helper):
+        """Run main with passing reruns and a package discovery that leaves a child in
+        another process group and blocks. With SIGNAL_HELPER, SIGTERM reaches the helper
+        during discovery; otherwise discovery runs out of time."""
+        pidfile = Path(d) / "discovery-child.pid"
+        script = textwrap.dedent(f"""
+            import os, subprocess, sys, time
+            p = subprocess.Popen([sys.executable, "-c", "import os, signal, time; os.setpgid(0, 0); "
+                                  "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"])
+            open({str(pidfile)!r}, "w").write(str(p.pid))
+            time.sleep(120)
+        """)
+        out = gate_out(Path(d) / "out")
+        junit_path = Path(d) / "target-junit.xml"
+
+        def runner(cmd, log, seconds, env=None):
+            name = cmd[cmd.index("-E") + 1].split("test(=")[1].rstrip(")")
+            b = next(b for b, n in FAILED if n == name)
+            junit_path.write_text(junit([(b, name, "pass")]))
+            log.write_text("Summary\n")
+            return 0
+
+        def discover(cmd, seconds, env=None):
+            if signal_helper:
+                def later():
+                    while not pidfile.exists():
+                        time.sleep(0.05)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                import threading
+                threading.Thread(target=later, daemon=True).start()
+                seconds = 60
+            else:
+                seconds = 2
+            return tr.run_capture([sys.executable, "-c", script], seconds, env=env)
+
+        old_handler = signal.getsignal(signal.SIGTERM)
+        try:
+            with mock.patch.object(tr, "GRACE", 1):
+                try:
+                    code = tr.main(["--out", str(out), "--commit", COMMIT], runner=runner, junit_path=junit_path,
+                                   target_tmp=Path(d) / "target-tmp", check_worktree=clean, discover=discover)
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            signal.signal(signal.SIGTERM, old_handler)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pidfile.read_text()), 0)
+        self.assertFalse((out / "ci.forgiven").exists())
+        return code
+
+    def test_a_discovery_that_runs_out_of_time_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.discovery(d, signal_helper=False), 1)
+
+    def test_sigterm_during_discovery_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.discovery(d, signal_helper=True), 143)
+
     def test_a_command_that_ends_leaves_nothing_behind(self):
         with tempfile.TemporaryDirectory() as d:
             pidfile = Path(d) / "pid"
