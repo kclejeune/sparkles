@@ -139,8 +139,14 @@ impl Preview {
         if matches!(self.precondition, Some(Err(_))) {
             return Outcome::PreconditionFailed;
         }
+        // a write without a net change can still be refused, by an in-memory limit
+        // that its sources pass while they are parsed
         let Some(c) = &self.commit else {
-            return Outcome::NoChange;
+            return if self.storage.refused.is_some() {
+                Outcome::StorageRefused
+            } else {
+                Outcome::NoChange
+            };
         };
         let rejected = self.rejected();
         let refused = self.storage.refused.is_some();

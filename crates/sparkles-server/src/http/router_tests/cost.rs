@@ -567,12 +567,12 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
             "<http://example.org/s{i}> <http://example.org/p> \"{i}\" .\n"
         ));
     }
-    // A small body into an empty dataset takes a transaction, which admits each quad by
-    // its memory estimate, for a POST as for a PUT. A dry run writes nothing, so the limit
-    // does not refuse it outright, and its preview reports the refusal the write gets.
+    // A transaction admits each quad by its memory estimate, for a first PUT into an empty
+    // dataset and a POST into one with data. A dry run writes nothing, so the limit does
+    // not refuse it outright, and its preview reports the refusal the write gets.
     for (method, uri) in [
         ("PUT", "/fresh-put/data?default"),
-        ("POST", "/fresh-post/data?default"),
+        ("POST", "/mem/data?default"),
     ] {
         let req = |uri: &str| {
             let f = if method == "PUT" { put } else { post };
@@ -609,6 +609,8 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
         put("/disk/data?default", "application/n-triples", small),
         post("/disk/upload", "application/n-triples", small),
         put("/mem/data?default", "application/n-triples", &large),
+        // A small body into an empty dataset takes a transaction, for a POST as for a PUT.
+        post("/fresh-post/data?default", "application/n-triples", &large),
     ];
     for req in writes {
         let what = format!("{} {}", req.method(), req.uri());

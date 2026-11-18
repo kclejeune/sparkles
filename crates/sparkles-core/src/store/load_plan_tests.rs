@@ -623,98 +623,73 @@ fn threshold_zero_into_an_empty_store() {
     assert!(!r.committed);
 }
 
-/// A dry run of a transactional first write into an in-memory store over its limit is
-/// previewed as a storage refusal and not refused outright, for a load as for a replace,
-/// and it leaves the store as it was.
+/// A dry run of a transactional load or replace into an in-memory store over its limit is
+/// previewed as the storage refusal the write itself gets, not refused outright, and
+/// leaves the store as it was. Copies of one quad are refused while they are parsed though
+/// the commit would hold one quad, or none when the graph already holds it.
 #[test]
 fn a_dry_run_over_the_memory_limit_is_previewed() {
-    let limited = || {
-        Store::in_memory(StoreOptions {
+    use crate::preview::{Outcome, catch};
+    const HELD: &[u8] = b"<urn:s> <urn:p> <urn:o> .\n";
+    let limited = |seed: bool| {
+        let s = Store::in_memory(StoreOptions {
             bulk_threshold: 1_000,
             max_memory_bytes: Some(16 << 10),
             ..StoreOptions::default()
-        })
+        });
+        if seed {
+            let src = Source::from_bytes(HELD.to_vec(), RdfFormat::NTriples, None);
+            s.load(&[src]).unwrap();
+        }
+        s
     };
+    let copies = || Source::from_bytes(HELD.repeat(500), RdfFormat::NTriples, None);
     let dry = WriteOptions {
         dry_run: Some(Default::default()),
         ..Default::default()
     };
-    let s = limited();
-    let p = crate::preview::catch(s.load_with(&[bytes(0, 500)], CommitKind::Load, &dry)).unwrap();
-    assert_eq!(p.outcome(), crate::preview::Outcome::StorageRefused, "load");
-    assert_eq!(
-        p.commit.as_ref().map(|c| (c.inserted, c.bulk)),
-        Some((500, false))
-    );
-    assert!(s.snapshot().is_empty());
-    let p = crate::preview::catch(s.replace_with(
-        ReplaceTarget::Default,
-        &[bytes(0, 500)],
-        CommitKind::GspPut,
-        &dry,
-    ))
-    .unwrap();
-    assert_eq!(
-        p.outcome(),
-        crate::preview::Outcome::StorageRefused,
-        "replace"
-    );
-    assert!(s.snapshot().is_empty());
-    // the write itself is refused
-    let e = s
-        .load_with(&[bytes(0, 500)], CommitKind::Load, &WriteOptions::default())
-        .unwrap_err();
-    assert!(matches!(e, crate::error::Error::StorageFull(_)), "{e}");
-    assert!(s.snapshot().is_empty());
-    // Copies of one quad are refused while they are parsed, though the commit would hold
-    // one quad, and the preview reports the same refusal.
-    let copies = || {
-        Source::from_bytes(
-            b"<urn:s> <urn:p> <urn:o> .\n".repeat(500),
-            RdfFormat::NTriples,
-            None,
-        )
+    let real = WriteOptions::default();
+    let replace = |s: &Store, src: Source, o: &WriteOptions| {
+        s.replace_with(ReplaceTarget::Default, &[src], CommitKind::GspPut, o)
+            .map(|(_, r)| r)
     };
-    let real = s
-        .load_with(&[copies()], CommitKind::Load, &WriteOptions::default())
-        .unwrap_err()
-        .to_string();
-    let p = crate::preview::catch(s.load_with(&[copies()], CommitKind::Load, &dry)).unwrap();
-    assert_eq!(
-        p.outcome(),
-        crate::preview::Outcome::StorageRefused,
-        "copies"
-    );
-    assert_eq!(
-        p.storage.refused.as_ref().map(|e| e.to_string()),
-        Some(real)
-    );
-    let real = s
-        .replace_with(
-            ReplaceTarget::Default,
-            &[copies()],
-            CommitKind::GspPut,
-            &WriteOptions::default(),
-        )
-        .unwrap_err()
-        .to_string();
-    let p = crate::preview::catch(s.replace_with(
-        ReplaceTarget::Default,
-        &[copies()],
-        CommitKind::GspPut,
-        &dry,
-    ))
-    .unwrap();
-    assert_eq!(
-        p.outcome(),
-        crate::preview::Outcome::StorageRefused,
-        "replace copies"
-    );
-    assert_eq!(
-        p.storage.refused.as_ref().map(|e| e.to_string()),
-        Some(real)
-    );
-    assert!(s.snapshot().is_empty());
+    let load = |s: &Store, src: Source, o: &WriteOptions| s.load_with(&[src], CommitKind::Load, o);
+    type Write<'a> =
+        &'a dyn Fn(&Store, Source, &WriteOptions) -> crate::error::Result<crate::commit::Receipt>;
+    let cases: Vec<(&str, bool, Write, fn() -> Source, Option<u64>)> = vec![
+        (
+            "load into a store with data",
+            true,
+            &load,
+            || bytes(0, 500),
+            Some(500),
+        ),
+        (
+            "first replace",
+            false,
+            &replace,
+            || bytes(0, 500),
+            Some(500),
+        ),
+        ("copies loaded", true, &load, copies, None),
+        ("copies replaced", false, &replace, copies, Some(1)),
+        ("held copies replaced", true, &replace, copies, None),
+    ];
+    for (name, seed, write, src, inserted) in cases {
+        let s = limited(seed);
+        let before = s.snapshot().len();
+        let e = write(&s, src(), &real).unwrap_err();
+        assert!(
+            matches!(e, crate::error::Error::StorageFull(_)),
+            "{name}: {e}"
+        );
+        let p = catch(write(&s, src(), &dry)).unwrap();
+        assert_eq!(p.outcome(), Outcome::StorageRefused, "{name}");
+        assert_eq!(p.error(), Some(e.to_string()), "{name}");
+        assert_eq!(p.commit.as_ref().map(|c| c.inserted), inserted, "{name}");
+        assert!(p.commit.as_ref().is_none_or(|c| !c.bulk), "{name}");
+        assert_eq!(s.snapshot().len(), before, "{name}");
+    }
 }
 
 /// An empty source written into an empty store takes a transaction and makes no commit,

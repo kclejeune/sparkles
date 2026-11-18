@@ -7561,14 +7561,12 @@ fn guard_required_by(root: &Path) -> bool {
 /// The decompressed bytes of the RDF sources that are not streams, from their lengths,
 /// with compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion).
 /// A dry run's preview with `refused`, the memory refusal its sources met while they were
-/// parsed, when the commit's own storage check found none, so that the preview reports the
-/// refusal the write would get.
+/// parsed, which the write itself gets before its commit checks the storage, so that the
+/// preview reports that refusal, with or without a net change.
 fn with_early_refusal<T>(r: Result<T>, refused: Option<Error>) -> Result<T> {
     match (r, refused) {
         (Err(Error::DryRun(mut p)), Some(e)) => {
-            if p.storage.refused.is_none() {
-                p.storage.refused = Some(e);
-            }
+            p.storage.refused = Some(e);
             Err(Error::DryRun(p))
         }
         (r, _) => r,
