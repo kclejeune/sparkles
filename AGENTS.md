@@ -92,7 +92,9 @@ adds to this file and does not override it.
   interval reaches 1.0 or a median added time of at most 0.5 µs, and for other A/Bs a
   difference that is not above 1 in every round. Small real costs of one workstream go
   into that workstream's running small-costs item as one line per query, naming the host
-  and the commits compared, and are never combined across hosts.
+  and the commits compared, and are never combined across hosts. A small cost lands only
+  with a named recovery and a deadline, and a workstream's spec may cap the total that
+  one query carries.
 - An optimization that is built and measured but not kept, because it measured no faster
   or slower, gets an entry in
   [docs/PERFORMANCE-EXPERIMENTS.md](docs/PERFORMANCE-EXPERIMENTS.md) in the same change.

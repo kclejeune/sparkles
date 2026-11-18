@@ -190,15 +190,21 @@ The maintainer settled these questions for stage 4.
 * Stage 4 is measured on an Intel host, since its effects on short queries are small.
 * Query budgets, cancellation on disconnect and the results of every query stay as they
   are. A measured slowdown that a gate accepts gets its own roadmap item.
-* From stage 5 to the merge, a phase may land with a real cost on a query under 0.3 ms
-  of at most 2% or 0.5 µs, recorded as a line of the stage's small-costs item with the
-  host and the commits compared. A larger cost keeps its own roadmap item. The merge is
-  measured against cc94ac7f, the main branch before item 825 landed, and meets the first
-  gate above against it, so the costs that phases accept are recovered by the merge or
-  before it. A query whose recorded costs pass the merge gate is recovered before the
-  next phase that changes its path lands. Each cost names the phase that recovers it,
-  since a cost measured in the streaming or automatic path survives the merge unless a
-  phase removes it.
+* From stage 5 to the merge, a phase may land with a real cost on a query under 0.3 ms,
+  recorded as a line of the stage's small-costs item with the host, the commits compared
+  and its class. The costs recorded against one query add up to at most 2% or 0.5 µs
+  across the whole stage, and a query at that limit takes no further cost until one of
+  its lines is recovered. A larger cost keeps its own roadmap item.
+* Each recorded cost is classed by a profile that names the functions it lives in. A
+  coexistence cost lives only in code the merge deletes, such as the eager executor's
+  path or a check of the mode. A kept-path cost lives in code that survives the merge,
+  and a cost without a profile counts as one. A kept-path cost names the item that
+  recovers it and is recovered within two batches of the one that accepted it, and until
+  then no phase that changes that query's path lands.
+* The forge matrix after each push that changes the query path also compares every
+  query with cc94ac7f, the main branch before item 825 landed. A query whose drift from
+  cc94ac7f is larger than its recorded costs is bisected and fixed forward at once. The
+  merge meets the first gate above against cc94ac7f.
 
 ## Non-goals
 
