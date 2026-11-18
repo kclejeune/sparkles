@@ -449,10 +449,13 @@ literals by their exact form, numbers by value and ORDER BY results in order, an
 `crates/sparkles-core/tests/w3c-reference-known.txt` lists the tests it answers
 otherwise, which is none. The seeded queries of `tests/query_cursor.rs` take the
 evaluator as their oracle, and the optimizer, index-join and string-filter tests of
-`src/sparql` compare the engine with it as well as with `Optimizations::NONE`. It reports
-in its `Notes` where the specification leaves the answer open. The seeded queries then
-check only what the specification fixes, and the other tests leave the query to the
-comparison with `Optimizations::NONE`. `SPARKLES_REFERENCE_KEEP_GOING=1` makes the seeded
+`src/sparql` compare the engine with it as well as with `Optimizations::NONE`. Both go
+through `check.rs` beside the evaluator, which allows every answer that the specification
+allows. A column of open values, such as a SAMPLE or a RAND, is compared only by its place
+in the rows. A number the evaluator computed is compared by datatype and value, and every
+other term exactly. An ordered or sliced answer must be a slice of an order that ORDER BY
+allows, with the sort keys that the evaluator reports. An answer whose rows an open value
+decides is not compared. `SPARKLES_REFERENCE_KEEP_GOING=1` makes the seeded
 queries report every disagreement before they fail, and `SPARKLES_REFERENCE_SKIPS=1` makes
 the other tests print each query they do not compare with the evaluator.
 

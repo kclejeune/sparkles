@@ -10,6 +10,7 @@ use oxsdatatypes::{Boolean, DateTime, Decimal, Double, Float};
 use regex::RegexBuilder;
 use spargebra::algebra::{Expression, Function};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 fn type_error<T>() -> R<T> {
@@ -103,11 +104,15 @@ impl Evaluator<'_> {
         match e {
             E::NamedNode(n) => Ok(Term::NamedNode(n.clone())),
             E::Literal(l) => Ok(Term::Literal(l.clone())),
-            E::Variable(v) => s
-                .get(v)
-                .or_else(|| cx.env.get(v))
-                .cloned()
-                .ok_or(Fail::Type),
+            E::Variable(v) => {
+                if self.open_vars.borrow().contains(v) {
+                    self.read_open.set(true);
+                }
+                s.get(v)
+                    .or_else(|| cx.env.get(v))
+                    .cloned()
+                    .ok_or(Fail::Type)
+            }
             E::Or(a, b) => {
                 let x = self.soft(self.expr(a, cx, s))?.and_then(|t| ebv(&t));
                 let y = self.soft(self.expr(b, cx, s))?.and_then(|t| ebv(&t));
@@ -179,6 +184,10 @@ impl Evaluator<'_> {
             }
             E::Exists(p) => {
                 let env = merge(cx.env, s);
+                // the pattern may read the open values that the solution binds
+                if env.keys().any(|k| self.open_vars.borrow().contains(k)) {
+                    self.read_open.set(true);
+                }
                 let found = self.eval(
                     p,
                     &Cx {
@@ -206,6 +215,17 @@ impl Evaluator<'_> {
                 type_error()
             }
             E::FunctionCall(f, args) => {
+                // values that another evaluation makes otherwise
+                if matches!(
+                    f,
+                    Function::BNode
+                        | Function::Rand
+                        | Function::Uuid
+                        | Function::StrUuid
+                        | Function::Now
+                ) {
+                    self.read_open.set(true);
+                }
                 if matches!(f, Function::BNode) {
                     self.scope.set(match s.get(&row_variable()) {
                         Some(Term::Literal(l)) => l.value().parse().unwrap_or(0),
@@ -287,7 +307,10 @@ impl Evaluator<'_> {
             F::BNode => {
                 if a.is_empty() {
                     let n = self.fresh_id();
-                    return Ok(Term::BlankNode(BlankNode::new_unchecked(format!("rb{n}"))));
+                    return Ok(Term::BlankNode(BlankNode::new_unchecked(format!(
+                        "{}b{n}",
+                        self.data.fresh_prefix
+                    ))));
                 }
                 let label = simple_arg(arg(0)?)?.value().to_string();
                 let scope = self.scope.get();
@@ -296,7 +319,9 @@ impl Evaluator<'_> {
                     .bnodes
                     .borrow_mut()
                     .entry((scope, label))
-                    .or_insert_with(|| BlankNode::new_unchecked(format!("rl{n}")))
+                    .or_insert_with(|| {
+                        BlankNode::new_unchecked(format!("{}l{n}", self.data.fresh_prefix))
+                    })
                     .clone();
                 Ok(Term::BlankNode(b))
             }
@@ -371,7 +396,12 @@ impl Evaluator<'_> {
                 for caps in re.captures_iter(text) {
                     let m = caps.get(0).ok_or(Fail::Type)?;
                     out.push_str(&text[last..m.start()]);
-                    expand(replacement.value(), &caps, &mut out)?;
+                    if flags.contains('q') {
+                        // with the q flag the replacement is literal too
+                        out.push_str(replacement.value());
+                    } else {
+                        expand(replacement.value(), &caps, &mut out)?;
+                    }
                     last = m.end();
                 }
                 out.push_str(&text[last..]);
@@ -594,10 +624,7 @@ impl Evaluator<'_> {
             || date_time(l).is_some();
         if target == xsd::STRING.as_str() {
             return Ok(string_term(match (num, boolean_value) {
-                (Some(n), _) => match n.to_term() {
-                    Term::Literal(c) => c.value().to_string(),
-                    _ => lexical,
-                },
+                (Some(n), _) => n.xpath_string(),
                 (_, Some(b)) => b.to_string(),
                 _ => lexical,
             }));
@@ -694,6 +721,9 @@ fn parse_untyped_number(lex: &str, target: &str) -> R<Num> {
         }
         return Decimal::from_str(lex).map(Num::Dec).map_err(|_| Fail::Type);
     }
+    if !is_float_lexical(lex) {
+        return type_error();
+    }
     if target == xsd::FLOAT.as_str() {
         return Float::from_str(lex)
             .map(|f| Num::Flt(f32::from(f)))
@@ -706,37 +736,202 @@ fn parse_untyped_number(lex: &str, target: &str) -> R<Num> {
 
 /// Build the regular expression of the XPath flags `s`, `m`, `i`, `x` and `q`, once per
 /// thread for each pattern and flags, since a filter builds the same one for every row.
+/// An invalid pattern is a type error, and a valid one that the evaluator cannot build,
+/// such as one with a back-reference, is unsupported.
 fn build_regex(pattern: &str, flags: &str) -> R<regex::Regex> {
     thread_local! {
-        static BUILT: std::cell::RefCell<std::collections::HashMap<(String, String), Option<regex::Regex>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        static BUILT: std::cell::RefCell<HashMap<(String, String), R<regex::Regex>>> =
+            std::cell::RefCell::new(HashMap::new());
     }
     let key = (pattern.to_owned(), flags.to_owned());
     if let Some(built) = BUILT.with(|b| b.borrow().get(&key).cloned()) {
-        return built.ok_or(Fail::Type);
+        return built;
     }
-    let built = compile_regex(pattern, flags).ok();
+    let built = compile_regex(pattern, flags);
     BUILT.with(|b| b.borrow_mut().insert(key, built.clone()));
-    built.ok_or(Fail::Type)
+    built
 }
 
 fn compile_regex(pattern: &str, flags: &str) -> R<regex::Regex> {
-    let mut b;
-    if flags.contains('q') {
-        b = RegexBuilder::new(&regex::escape(pattern));
-    } else {
-        b = RegexBuilder::new(pattern);
-        b.ignore_whitespace(flags.contains('x'));
-    }
     for c in flags.chars() {
         if !"smixq".contains(c) {
             return type_error();
         }
     }
+    let translated = if flags.contains('q') {
+        regex::escape(pattern)
+    } else {
+        xpath_regex(pattern, flags.contains('s'), flags.contains('x'))?
+    };
+    let mut b = RegexBuilder::new(&translated);
     b.case_insensitive(flags.contains('i'))
-        .dot_matches_new_line(flags.contains('s'))
         .multi_line(flags.contains('m'));
-    b.build().map_err(|_| Fail::Type)
+    b.build()
+        .map_err(|e| Fail::Unsupported(format!("the regular expression {pattern:?}: {e}")))
+}
+
+/// The general categories that `\p{..}` names in XML Schema 1.1 regular expressions.
+const CATEGORIES: &[&str] = &[
+    "L", "Lu", "Ll", "Lt", "Lm", "Lo", "M", "Mn", "Mc", "Me", "N", "Nd", "Nl", "No", "P", "Pc",
+    "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Z", "Zs", "Zl", "Zp", "S", "Sm", "Sc", "Sk", "So", "C",
+    "Cc", "Cf", "Co", "Cn",
+];
+
+/// An XPath regular expression, XPath and XQuery Functions and Operators 3.1 section
+/// 5.6.1, written in the syntax of the `regex` crate with the same meaning. The two
+/// differ in `.`, which in XPath matches neither a newline nor a carriage return
+/// without the `s` flag, in `\s`, `\w` and `\d`, which XPath defines by its own
+/// character sets, in the escapes each accepts, in `&`, `~` and `[` inside a class, and
+/// in the `x` flag, which in XPath removes whitespace outside classes and has no comments.
+fn xpath_regex(pattern: &str, dot_all: bool, extended: bool) -> R<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut groups = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        match c {
+            c if extended && matches!(c, ' ' | '\t' | '\n' | '\r') => {}
+            '.' => out.push_str(if dot_all { "(?s:.)" } else { "[^\n\r]" }),
+            '\\' => {
+                let Some(&e) = chars.get(i) else {
+                    return type_error();
+                };
+                i += 1;
+                if e.is_ascii_digit() && e != '0' {
+                    if (e as usize - '0' as usize) > groups {
+                        return type_error();
+                    }
+                    return unsupported("a back-reference in a regular expression");
+                }
+                out.push_str(&escape(e, &chars, &mut i)?);
+            }
+            '(' => {
+                if chars.get(i) == Some(&'?') {
+                    if chars.get(i + 1) != Some(&':') {
+                        return type_error();
+                    }
+                    i += 2;
+                    out.push_str("(?:");
+                } else {
+                    groups += 1;
+                    out.push('(');
+                }
+            }
+            '[' => out.push_str(&class(&chars, &mut i)?),
+            ']' => return type_error(),
+            '{' => {
+                // a quantifier: {n}, {n,} or {n,m}
+                let start = i;
+                while i < chars.len() && chars[i] != '}' {
+                    i += 1;
+                }
+                if i == chars.len() {
+                    return type_error();
+                }
+                let body: String = chars[start..i].iter().collect();
+                i += 1;
+                let (n, m) = match body.split_once(',') {
+                    Some((n, m)) => (n, Some(m)),
+                    None => (body.as_str(), None),
+                };
+                let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+                if !number(n) || m.is_some_and(|m| !m.is_empty() && !number(m)) {
+                    return type_error();
+                }
+                out.push('{');
+                out.push_str(&body);
+                out.push('}');
+            }
+            '}' => return type_error(),
+            '&' | '~' | '-' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// A character class from just after its `[` to just after its `]`.
+fn class(chars: &[char], i: &mut usize) -> R<String> {
+    let mut out = String::from("[");
+    if chars.get(*i) == Some(&'^') {
+        out.push('^');
+        *i += 1;
+    }
+    let mut first = true;
+    while let Some(&c) = chars.get(*i) {
+        *i += 1;
+        match c {
+            ']' if first => return type_error(),
+            ']' => {
+                out.push(']');
+                return Ok(out);
+            }
+            '-' if chars.get(*i) == Some(&'[') => {
+                return unsupported("a character class subtraction in a regular expression");
+            }
+            '[' => return type_error(),
+            '\\' => {
+                let Some(&e) = chars.get(*i) else {
+                    return type_error();
+                };
+                *i += 1;
+                out.push_str(&escape(e, chars, i)?);
+            }
+            '&' | '~' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+        first = false;
+    }
+    type_error()
+}
+
+/// The escape `\e`, after which `i` is just past it. A set it names is a nested class,
+/// which the regex crate also takes inside a class.
+fn escape(e: char, chars: &[char], i: &mut usize) -> R<String> {
+    let set = |s: &str| format!("[{s}]");
+    Ok(match e {
+        'n' => "\\n".into(),
+        'r' => "\\r".into(),
+        't' => "\\t".into(),
+        '\\' | '|' | '.' | '?' | '*' | '+' | '(' | ')' | '{' | '}' | '-' | '[' | ']' | '^'
+        | '$' => format!("\\{e}"),
+        's' => set("\\x20\\t\\n\\r"),
+        'S' => set("^\\x20\\t\\n\\r"),
+        'd' => "\\p{Nd}".into(),
+        'D' => "\\P{Nd}".into(),
+        'w' => set("^\\p{P}\\p{Z}\\p{C}"),
+        'W' => set("\\p{P}\\p{Z}\\p{C}"),
+        'i' | 'I' | 'c' | 'C' => {
+            return unsupported("the XML name escapes \\i and \\c in a regular expression");
+        }
+        'p' | 'P' => {
+            if chars.get(*i) != Some(&'{') {
+                return type_error();
+            }
+            let start = *i + 1;
+            let Some(len) = chars[start..].iter().position(|&c| c == '}') else {
+                return type_error();
+            };
+            let name: String = chars[start..start + len].iter().collect();
+            *i = start + len + 1;
+            if name.starts_with("Is") {
+                return unsupported("a Unicode block escape in a regular expression");
+            }
+            if !CATEGORIES.contains(&name.as_str()) {
+                return type_error();
+            }
+            format!("\\{e}{{{name}}}")
+        }
+        _ => return type_error(),
+    })
 }
 
 /// The replacement string of `fn:replace`: `$N` is a group and `\$` and `\\` are escapes.
@@ -827,6 +1022,24 @@ pub(crate) fn rdf_equal(a: &Term, b: &Term) -> R<bool> {
             (Space::Other, _) | (_, Space::Other) => type_error(),
             _ => Ok(false),
         },
+        (Term::Triple(_), Term::Triple(_)) => same_value(a, b),
+        _ => Ok(a == b),
+    }
+}
+
+/// sameValue of SPARQL 1.2 section 17.4.2.2, which `=` applies to two triple terms and
+/// sameValue applies to their components in turn. Equal terms are the same value, an
+/// IRI or a blank node is no other value, and two triple terms are the same value where
+/// each pair of components is, with an error in a pair before a false one. Literals are
+/// an error where one is ill-typed, two NaN are the same value, and otherwise the value
+/// equality of `=` decides.
+fn same_value(a: &Term, b: &Term) -> R<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    match (a, b) {
+        (Term::NamedNode(_) | Term::BlankNode(_), _)
+        | (_, Term::NamedNode(_) | Term::BlankNode(_)) => Ok(false),
         (Term::Triple(x), Term::Triple(y)) => {
             let parts = [
                 (Term::from(x.subject.clone()), Term::from(y.subject.clone())),
@@ -837,18 +1050,38 @@ pub(crate) fn rdf_equal(a: &Term, b: &Term) -> R<bool> {
                 (x.object.clone(), y.object.clone()),
             ];
             let mut error = false;
+            let mut all = true;
             for (p, q) in &parts {
-                match rdf_equal(p, q) {
+                match same_value(p, q) {
                     Ok(true) => {}
-                    Ok(false) => return Ok(false),
+                    Ok(false) => all = false,
                     Err(Fail::Type) => error = true,
                     Err(f) => return Err(f),
                 }
             }
-            if error { type_error() } else { Ok(true) }
+            if error { type_error() } else { Ok(all) }
         }
-        _ => Ok(a == b),
+        (Term::Triple(_), _) | (_, Term::Triple(_)) => Ok(false),
+        (Term::Literal(x), Term::Literal(y)) => {
+            if ill_typed(x) || ill_typed(y) {
+                return type_error();
+            }
+            if numeric(x).is_some_and(Num::is_nan) && numeric(y).is_some_and(Num::is_nan) {
+                return Ok(true);
+            }
+            rdf_equal(a, b)
+        }
     }
+}
+
+/// Whether a literal has a datatype that the evaluator reads and a lexical form outside
+/// it.
+fn ill_typed(l: &Literal) -> bool {
+    let dt = l.datatype();
+    (is_numeric_datatype(dt.as_str()) && numeric(l).is_none())
+        || (dt == xsd::BOOLEAN && boolean(l).is_none())
+        || (dt == xsd::DATE_TIME && date_time(l).is_none())
+        || (dt == xsd::DATE && date(l).is_none())
 }
 
 /// The order of the operator mapping for `<`, `>`, `<=` and `>=`. `Ok(None)` is an

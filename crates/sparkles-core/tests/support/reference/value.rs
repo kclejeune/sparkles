@@ -57,6 +57,40 @@ fn parse_integer(lex: &str) -> Option<i128> {
 
 thread_local! {
     static BEYOND_MINIMUM_PRECISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SPARQL11_EBV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read the effective boolean value of an ill-formed literal as SPARQL 1.1 does, false,
+/// or as SPARQL 1.2 does, an error, in the evaluations that follow on this thread.
+pub fn set_sparql11_ebv(sparql11: bool) {
+    SPARQL11_EBV.with(|c| c.set(sparql11));
+}
+
+/// Whether `lex` is in the lexical space of `xsd:float` and `xsd:double`, which has
+/// decimal and exponent forms, `INF`, `+INF`, `-INF` and `NaN` and nothing else, where
+/// a Rust float parse also takes forms such as `inf` and `infinity`.
+pub fn is_float_lexical(lex: &str) -> bool {
+    if matches!(lex, "INF" | "+INF" | "-INF" | "NaN") {
+        return true;
+    }
+    let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(i) => (&body[..i], Some(&body[i + 1..])),
+        None => (body, None),
+    };
+    let (whole, fraction) = match mantissa.find('.') {
+        Some(i) => (&mantissa[..i], Some(&mantissa[i + 1..])),
+        None => (mantissa, None),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let mantissa_ok = digits(whole)
+        && fraction.is_none_or(digits)
+        && !(whole.is_empty() && fraction.is_none_or(str::is_empty));
+    let exponent_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && digits(e)
+    });
+    mantissa_ok && exponent_ok
 }
 
 /// Whether [`numeric`] read an integer or decimal with more than 16 digits since the last
@@ -97,11 +131,17 @@ pub fn numeric(l: &Literal) -> Option<Num> {
         return Decimal::from_str(lex).ok().map(Num::Dec);
     }
     if dt == xsd::FLOAT.as_str() {
+        if !is_float_lexical(l.value()) {
+            return None;
+        }
         return Float::from_str(l.value())
             .ok()
             .map(|f| Num::Flt(f32::from(f)));
     }
     if dt == xsd::DOUBLE.as_str() {
+        if !is_float_lexical(l.value()) {
+            return None;
+        }
         return Double::from_str(l.value())
             .ok()
             .map(|f| Num::Dbl(f64::from(f)));
@@ -169,6 +209,79 @@ impl Num {
 
     pub fn to_term(self) -> Term {
         Term::Literal(self.to_literal())
+    }
+
+    /// The canonical lexical form of the value in its own type.
+    pub fn canonical_lexical(self) -> String {
+        match self {
+            Num::Int(i) => i.to_string(),
+            Num::Dec(d) => d.to_string(),
+            Num::Flt(f) => Float::from(f).to_string(),
+            Num::Dbl(d) => Double::from(d).to_string(),
+        }
+    }
+
+    /// The value cast to `xsd:string`, by the rules of XPath and XQuery Functions and
+    /// Operators 3.1 section 19.1.2.1. An integer and a decimal with an integral value
+    /// print as an integer, a decimal otherwise without trailing zeros. A float or double
+    /// with an absolute value from one millionth to below one million prints as a
+    /// decimal, and any other as a mantissa with one digit before the point and at least
+    /// one after, `E` and the exponent, such as `1.0E6`.
+    pub fn xpath_string(self) -> String {
+        let float = |v: f64, shortest: String| -> String {
+            if v.is_nan() {
+                return "NaN".into();
+            }
+            if v.is_infinite() {
+                return if v > 0.0 { "INF" } else { "-INF" }.into();
+            }
+            if v == 0.0 {
+                return if v.is_sign_negative() { "-0" } else { "0" }.into();
+            }
+            let a = v.abs();
+            if (1e-6..1e6).contains(&a) {
+                // the shortest decimal that reads back as the value
+                return shortest;
+            }
+            // scientific notation from the shortest digits
+            let sci = format!("{v:e}");
+            let (mantissa, exponent) = sci.split_once('e').expect("an exponent");
+            let mantissa = if mantissa.contains('.') {
+                mantissa.to_string()
+            } else {
+                format!("{mantissa}.0")
+            };
+            format!("{mantissa}E{exponent}")
+        };
+        match self {
+            Num::Int(i) => i.to_string(),
+            Num::Dec(d) => {
+                let s = d.to_string();
+                if s.contains('.') {
+                    let t = s.trim_end_matches('0').trim_end_matches('.');
+                    t.to_string()
+                } else {
+                    s
+                }
+            }
+            Num::Flt(f) => {
+                let shortest = format!("{f}");
+                // the float's own shortest digits, not the double's
+                if (1e-6..1e6).contains(&(f.abs() as f64)) || !f.is_finite() || f == 0.0 {
+                    float(f as f64, shortest)
+                } else {
+                    let sci = format!("{f:e}");
+                    let (mantissa, exponent) = sci.split_once('e').expect("an exponent");
+                    let mantissa = if mantissa.contains('.') {
+                        mantissa.to_string()
+                    } else {
+                        format!("{mantissa}.0")
+                    };
+                    format!("{mantissa}E{exponent}")
+                }
+            }
+            Num::Dbl(d) => float(d, format!("{d}")),
+        }
     }
 
     /// The value comparison of the operator mapping: `None` when a NaN takes part.
@@ -356,19 +469,22 @@ pub fn int_term(i: i128) -> Term {
     Num::Int(i).to_term()
 }
 
-/// The effective boolean value of SPARQL 1.1 §17.2.2, `None` for a type error.
+/// The effective boolean value of SPARQL 1.2 §17.2.3, or of SPARQL 1.1 §17.2.2 where
+/// [`set_sparql11_ebv`] asks for it, `None` for a type error.
 pub fn ebv(t: &Term) -> Option<bool> {
     let Term::Literal(l) = t else { return None };
     let dt = l.datatype();
+    // An ill-formed boolean or number has no effective boolean value in SPARQL 1.2,
+    // and SPARQL 1.1 reads it as false.
+    let ill_formed = || SPARQL11_EBV.with(|c| c.get()).then_some(false);
     if dt == xsd::BOOLEAN {
-        // an ill-formed boolean has no value, so it has no effective boolean value either
-        return boolean(l);
+        return boolean(l).or_else(ill_formed);
     }
     if dt == xsd::STRING {
         return Some(!l.value().is_empty());
     }
     if is_numeric_datatype(dt.as_str()) {
-        return Some(numeric(l).is_some_and(Num::truthy));
+        return numeric(l).map(Num::truthy).or_else(ill_formed);
     }
     None
 }
@@ -397,24 +513,8 @@ pub fn spec_order(a: Option<&Term>, b: Option<&Term>) -> Option<Ordering> {
         // blank nodes have no order among themselves
         (Some(Term::BlankNode(_)), Some(Term::BlankNode(_))) => None,
         (Some(Term::NamedNode(x)), Some(Term::NamedNode(y))) => Some(x.as_str().cmp(y.as_str())),
-        (Some(Term::Triple(x)), Some(Term::Triple(y))) => {
-            // component by component, as SPARQL 1.2 orders triple terms
-            let parts = [
-                (Term::from(x.subject.clone()), Term::from(y.subject.clone())),
-                (
-                    Term::NamedNode(x.predicate.clone()),
-                    Term::NamedNode(y.predicate.clone()),
-                ),
-                (x.object.clone(), y.object.clone()),
-            ];
-            for (p, q) in &parts {
-                match spec_order(Some(p), Some(q))? {
-                    Ordering::Equal => {}
-                    o => return Some(o),
-                }
-            }
-            Some(Ordering::Equal)
-        }
+        // SPARQL 1.2 section 15.1 leaves two triple terms unordered
+        (Some(Term::Triple(x)), Some(Term::Triple(y))) => (x == y).then_some(Ordering::Equal),
         (Some(Term::Literal(x)), Some(Term::Literal(y))) => literal_order(x, y),
         _ => None,
     }

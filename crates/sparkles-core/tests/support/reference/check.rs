@@ -1,0 +1,365 @@
+//! The comparison of an engine's SELECT answer with the reference evaluator's, which the
+//! optimizer tests and the seeded cursor differential share.
+//!
+//! The comparison allows every answer that the specification allows and no other, as far
+//! as the reference can tell them apart. A column whose values the specification leaves
+//! open, such as a SAMPLE or a RAND, is compared only by its place in the rows, and a
+//! column that the reference computed compares numbers by datatype and value, since the
+//! lexical form of a computed number is the implementation's. Every other term must be
+//! the same term. Where the query orders or slices its answer, the engine's rows must be
+//! a slice, at the query's offset, of an order that ORDER BY allows. An answer whose rows
+//! themselves are open, because an open value decides which rows there are, is not
+//! compared.
+
+use super::{Error, Notes, Reference, Selected, value};
+use oxrdf::Term;
+use std::collections::{BTreeSet, HashMap};
+
+/// The reference's answer to a query that an engine answered.
+#[derive(Debug, Clone)]
+pub enum Expected {
+    Select(Selected),
+    /// An ASK answer, with its notes, whose `chose` is set where it is open.
+    Ask(bool, Notes),
+    /// A query form that the comparisons do not check.
+    Other,
+}
+
+/// The reference's answer to `text` under the engine's readings of the open roadmap
+/// items, with the names of the readings it took. Where the query meets an item, it is
+/// evaluated again with the engine's reading, so that the comparison is exact under it:
+/// MIN and MAX passing over errors and AVG of errors only an error (item 1064), string arguments compatible whatever
+/// their base direction (item 1071), GROUP_CONCAT reading the lexical form of any value,
+/// and the default graph of several FROM clauses as the union of their graphs.
+pub fn under_engine_readings(
+    r: &Reference,
+    text: &str,
+) -> Result<(Expected, Vec<&'static str>), Error> {
+    let run = || -> Result<Expected, Error> {
+        if let Some(s) = r.run_selected(text, None)? {
+            return Ok(Expected::Select(s));
+        }
+        Ok(match r.run_ask(text, None)? {
+            Some((b, notes)) => Expected::Ask(b, notes),
+            None => Expected::Other,
+        })
+    };
+    let first = run()?;
+    let notes = match &first {
+        Expected::Select(s) => s.notes,
+        Expected::Ask(_, n) => *n,
+        Expected::Other => return Ok((first, Vec::new())),
+    };
+    let mut readings = Vec::new();
+    if notes.min_max_error {
+        readings.push("MIN and MAX pass over errors");
+    }
+    if notes.avg_of_errors {
+        readings.push("AVG of errors only is an error");
+    }
+    if notes.direction_in_compatibility {
+        readings.push("string arguments ignore the base direction");
+    }
+    if notes.group_concat_non_string {
+        readings.push("GROUP_CONCAT reads any lexical form");
+    }
+    if notes.from_shares_blank_nodes {
+        readings.push("FROM graphs share their blank nodes");
+    }
+    if readings.is_empty() {
+        return Ok((first, readings));
+    }
+    let set = |on: bool| {
+        r.set_passing_over_min_max_errors(on && notes.min_max_error);
+        r.set_avg_of_errors_unbound(on && notes.avg_of_errors);
+        r.set_ignoring_direction_in_compatibility(on && notes.direction_in_compatibility);
+        r.set_stringifying_group_concat(on && notes.group_concat_non_string);
+        r.set_union_of_from_graphs(on && notes.from_shares_blank_nodes);
+    };
+    set(true);
+    let again = run();
+    set(false);
+    Ok((again?, readings))
+}
+
+/// How a comparison ended when it found no disagreement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The rows and their order were compared.
+    Compared,
+    /// The rows were compared, and their order was not, for the reason given.
+    OrderUnchecked(String),
+    /// Nothing was compared, for the reason given.
+    Skipped(String),
+}
+
+/// The most strict-order tests that one order check makes before it gives up.
+const ORDER_BUDGET: u64 = 50_000_000;
+
+/// Compare the engine's rows, under `engine_vars`, with the reference's answer.
+pub fn check_select(
+    expected: &Selected,
+    engine_vars: &[String],
+    engine_rows: &[Vec<Option<Term>>],
+) -> Result<Outcome, String> {
+    if expected.rows_open {
+        return Ok(Outcome::Skipped(
+            "an open value decides which rows there are".into(),
+        ));
+    }
+    if expected.notes.beyond_minimum_precision {
+        return Ok(Outcome::Skipped(
+            "the query reads a number of more than 16 digits".into(),
+        ));
+    }
+    if engine_vars.len() != expected.variables.len() {
+        return Err(format!(
+            "columns {engine_vars:?} against the reference's {:?}",
+            expected.variables
+        ));
+    }
+    let columns: Vec<usize> = expected
+        .variables
+        .iter()
+        .map(|v| {
+            engine_vars
+                .iter()
+                .position(|x| x == v)
+                .ok_or_else(|| format!("the engine lacks the column {v}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let mask = |row: &[Option<Term>]| -> String {
+        (0..row.len())
+            .map(|c| cell(&row[c], expected.open[c], expected.computed[c]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let got: Vec<String> = engine_rows
+        .iter()
+        .map(|row| {
+            let ordered: Vec<Option<Term>> = columns.iter().map(|&i| row[i].clone()).collect();
+            mask(&ordered)
+        })
+        .collect();
+    let Some(order) = &expected.order else {
+        let mut a = got;
+        let mut b: Vec<String> = expected.rows.iter().map(|r| mask(r)).collect();
+        a.sort();
+        b.sort();
+        return if a == b {
+            Ok(Outcome::Compared)
+        } else {
+            Err(bag_difference(&a, &b))
+        };
+    };
+    let items: Vec<String> = order.items.iter().map(|(r, _)| mask(r)).collect();
+    check_order(order, &items, &got)
+}
+
+/// One cell of a row as the comparison sees it.
+fn cell(t: &Option<Term>, open: bool, computed: bool) -> String {
+    if open {
+        return "*".into();
+    }
+    match t {
+        None => "UNDEF".into(),
+        Some(Term::Literal(l)) if computed => match value::numeric(l) {
+            Some(n) => format!("\"{}\"^^<{}>", n.canonical_lexical(), l.datatype().as_str()),
+            None => l.to_string(),
+        },
+        Some(t) => t.to_string(),
+    }
+}
+
+/// A short description of how two sorted bags differ.
+fn bag_difference(got: &[String], expected: &[String]) -> String {
+    let mut counts: HashMap<&str, i64> = HashMap::new();
+    for r in got {
+        *counts.entry(r).or_default() += 1;
+    }
+    for r in expected {
+        *counts.entry(r).or_default() -= 1;
+    }
+    let mut extra: Vec<&str> = counts
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(r, _)| *r)
+        .collect();
+    let mut missing: Vec<&str> = counts
+        .iter()
+        .filter(|(_, n)| **n < 0)
+        .map(|(r, _)| *r)
+        .collect();
+    extra.sort();
+    missing.sort();
+    extra.truncate(5);
+    missing.truncate(5);
+    format!(
+        "{} rows against the reference's {}; the engine's rows not in the reference's \
+         answer include {extra:?}, and the reference's rows that the engine lacks include \
+         {missing:?}",
+        got.len(),
+        expected.len()
+    )
+}
+
+/// Check that `got` is a slice, at the query's offset, of an order of the reference's
+/// rows that ORDER BY allows.
+///
+/// The reference's rows are in an order that extends the specification's, so a row can
+/// be strictly before another only when it comes earlier. Rows with the same sort key
+/// form a block, and the strict order is tested between blocks. The engine's rows are
+/// matched to the reference's rows, each to the first unused row with the same cells.
+/// The returned rows must be in an allowed order among themselves. The other rows that
+/// the order puts strictly before a returned row must all be cut by the offset, and those
+/// strictly after one must all follow the slice, so the two sets cannot meet, the first
+/// must fit in the offset and the second in the rows after the slice.
+fn check_order(
+    order: &super::TopOrder,
+    items: &[String],
+    got: &[String],
+) -> Result<Outcome, String> {
+    let n = items.len();
+    let from = order.offset.min(n);
+    let expected_len = order.limit.map_or(n - from, |l| l.min(n - from));
+    if got.len() != expected_len {
+        return Err(format!(
+            "{} rows against the reference's {expected_len}",
+            got.len()
+        ));
+    }
+    // blocks of equal keys, in the reference's order
+    let mut block = Vec::with_capacity(n);
+    let mut keys: Vec<Option<&super::SortKey>> = Vec::new();
+    for (i, (_, k)) in order.items.iter().enumerate() {
+        let same = i > 0 && k.is_some() && order.items[i - 1].1.as_ref() == k.as_ref();
+        if !same {
+            keys.push(k.as_ref());
+        }
+        block.push(keys.len() - 1);
+    }
+    let mut budget = ORDER_BUDGET;
+    let mut before = |a: usize, b: usize| -> Option<bool> {
+        budget = budget.checked_sub(1)?;
+        Some(match (keys[a], keys[b]) {
+            (Some(x), Some(y)) => super::strictly_before(x, y, &order.descending),
+            _ => false,
+        })
+    };
+    // match the engine's rows to the reference's
+    let mut by_row: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, r) in items.iter().enumerate().rev() {
+        by_row.entry(r.as_str()).or_default().push(i);
+    }
+    // the rows whose copies fall in different blocks, where the matching chooses
+    let spread: std::collections::HashSet<&str> = by_row
+        .iter()
+        .filter(|(_, is)| is.iter().any(|&k| block[k] != block[is[0]]))
+        .map(|(r, _)| *r)
+        .collect();
+    let mut ambiguous = false;
+    let mut chosen = Vec::with_capacity(got.len());
+    for (j, r) in got.iter().enumerate() {
+        let Some(free) = by_row.get_mut(r.as_str()) else {
+            return Err(format!("row {j} {r} is not in the reference's answer"));
+        };
+        let Some(i) = free.pop() else {
+            return Err(format!(
+                "row {j} {r} occurs more often than in the reference's answer"
+            ));
+        };
+        if spread.contains(r.as_str()) {
+            ambiguous = true;
+        }
+        chosen.push(i);
+    }
+    let fail = |message: String| -> Result<Outcome, String> {
+        if ambiguous {
+            Ok(Outcome::OrderUnchecked(format!(
+                "equal rows with different sort keys, and the first matching found {message}"
+            )))
+        } else {
+            Err(message)
+        }
+    };
+    let unchecked = || {
+        Ok(Outcome::OrderUnchecked(
+            "the order check's budget ran out".into(),
+        ))
+    };
+    // the returned rows among themselves: a row after one it belongs before
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    for (j, &i) in chosen.iter().enumerate() {
+        let b = block[i];
+        for &earlier in seen.range(b + 1..) {
+            match before(b, earlier) {
+                None => return unchecked(),
+                Some(true) => {
+                    return fail(format!("row {j} {} belongs before an earlier row", got[j]));
+                }
+                Some(false) => {}
+            }
+        }
+        seen.insert(b);
+    }
+    if got.len() == n {
+        return Ok(Outcome::Compared);
+    }
+    // the rows outside the slice that the order places before or after a returned row
+    let mut used = vec![false; n];
+    for &i in &chosen {
+        used[i] = true;
+    }
+    let returned: Vec<usize> = seen.iter().copied().collect();
+    let mut forced_before = 0usize;
+    let mut forced_after = 0usize;
+    let mut verdict: HashMap<usize, (bool, bool)> = HashMap::new();
+    for i in (0..n).filter(|&i| !used[i]) {
+        let b = block[i];
+        let (is_before, is_after) = match verdict.get(&b) {
+            Some(v) => *v,
+            None => {
+                let mut is_before = false;
+                let mut is_after = false;
+                // only a later block can be strictly after, and an earlier one before
+                for &r in &returned {
+                    if r > b && !is_before {
+                        match before(b, r) {
+                            None => return unchecked(),
+                            Some(x) => is_before = x,
+                        }
+                    }
+                    if r < b && !is_after {
+                        match before(r, b) {
+                            None => return unchecked(),
+                            Some(x) => is_after = x,
+                        }
+                    }
+                }
+                verdict.insert(b, (is_before, is_after));
+                (is_before, is_after)
+            }
+        };
+        if is_before && is_after {
+            return fail(format!(
+                "the reference's row {} belongs both before and after returned rows",
+                items[i]
+            ));
+        }
+        forced_before += usize::from(is_before);
+        forced_after += usize::from(is_after);
+    }
+    let rest = n - got.len();
+    if forced_before > from {
+        return fail(format!(
+            "{forced_before} rows belong before the returned rows, more than the offset {from}"
+        ));
+    }
+    if from + forced_after > rest {
+        return fail(format!(
+            "{forced_after} rows belong after the returned rows, more than the {} rows after the slice",
+            rest - from
+        ));
+    }
+    Ok(Outcome::Compared)
+}

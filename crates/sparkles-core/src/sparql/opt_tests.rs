@@ -65,53 +65,15 @@ pub(super) fn has_desc(p: &PlanInfo, needle: &str) -> bool {
     p.description.contains(needle) || p.children.iter().any(|c| has_desc(c, needle))
 }
 
-/// A term with a number in its canonical form, since SPARQL leaves the lexical form of a
-/// computed number to the implementation.
-fn canonical(t: &Option<oxrdf::Term>) -> String {
-    match t {
-        Some(oxrdf::Term::Literal(l)) => match reference::value::numeric(l) {
-            Some(n) => n.to_literal().to_string(),
-            None => l.to_string(),
-        },
-        Some(t) => t.to_string(),
-        None => "UNDEF".into(),
-    }
-}
-
-/// Rows of `r` with canonical numbers, in the columns of `vars`, sorted.
-fn canonical_rows(
-    variables: &[String],
-    rows: &[Vec<Option<oxrdf::Term>>],
-    vars: &[String],
-) -> Vec<String> {
-    let columns: Vec<usize> = vars
-        .iter()
-        .map(|v| variables.iter().position(|x| x == v).expect("same columns"))
-        .collect();
-    let mut out: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            columns
-                .iter()
-                .map(|&c| canonical(&row[c]))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect();
-    out.sort();
-    out
-}
-
 /// Compare `r`, an engine answer to `text`, with the reference evaluator's answer over
-/// the store's quads, where the reference evaluates the query and the specification
-/// fixes its rows. The reference reads no text, spatial or extension indexes, so a
-/// query that uses them is one it does not evaluate, and neither is a query whose nested
-/// loops pass the work limit. A query that reads a number of more than 16 digits is not
-/// compared, since XSD lets the engine limit those (roadmap item 1065). Where MIN or MAX
-/// reads an error, the engine passes over it, which roadmap item 1064 keeps open, and
-/// where a string function's arguments differ only in base direction, the engine takes
-/// them as compatible, which roadmap item 1071 records, so such a query compares with
-/// the engine's reading.
+/// the store's quads, through the comparison that allows every answer the specification
+/// allows. The reference reads no text, spatial or extension indexes, so a query that
+/// uses them is one it does not evaluate, and neither is a query whose nested loops pass
+/// the work limit. A query that reads a number of more than 16 digits is not compared,
+/// since XSD lets the engine limit those (roadmap item 1065). Where the query meets an
+/// open roadmap item, such as an error in MIN or MAX (item 1064) or string arguments
+/// that differ only in base direction (item 1071), it is compared exactly under the
+/// engine's reading.
 pub(super) fn same_as_reference(s: &Store, text: &str, r: &QueryResult) {
     same_as_reference_on(&s.snapshot(), &format!("{PREFIXES}{text}"), r);
 }
@@ -158,54 +120,42 @@ pub(super) fn same_as_reference_on(
     r: &QueryResult,
 ) {
     let oracle = reference_of(snapshot);
-    let mut answer = oracle.run_noting_choices(text, None);
-    // the readings of the open roadmap items, where the query met them
-    if let Ok((_, notes)) = &answer
-        && (notes.min_max_error || notes.direction_in_compatibility)
-    {
-        oracle.set_passing_over_min_max_errors(notes.min_max_error);
-        oracle.set_ignoring_direction_in_compatibility(notes.direction_in_compatibility);
-        answer = oracle.run_noting_choices(text, None);
-        oracle.set_passing_over_min_max_errors(false);
-        oracle.set_ignoring_direction_in_compatibility(false);
-    }
-    if let Err(reference::Error::Parse(e)) = &answer {
-        panic!("the reference does not parse a query the engine ran ({e}): {text}");
-    }
-    let (variables, rows) = match answer {
-        Ok((reference::Answer::Select { variables, rows }, notes))
-            if !notes.chose
-                && !notes.distinct_over_blank_nodes
-                && !notes.beyond_minimum_precision =>
-        {
-            (variables, rows)
-        }
-        Ok((reference::Answer::Ask(b), _)) => {
-            assert_eq!(
-                r.test_application_rows().is_empty(),
-                !b,
-                "ASK against the reference: {text}"
-            );
-            return;
-        }
-        // open, not a SELECT, or outside the reference
-        other => {
-            if std::env::var_os("SPARKLES_REFERENCE_SKIPS").is_some() {
-                let why = match other {
-                    Ok((_, notes)) => format!("{notes:?}"),
-                    Err(e) => e.to_string(),
-                };
-                eprintln!("reference skips ({why}): {text}");
-            }
-            return;
+    let skip = |why: String| {
+        if std::env::var_os("SPARKLES_REFERENCE_SKIPS").is_some() {
+            eprintln!("reference skips ({why}): {text}");
         }
     };
-    let engine_vars = r.variables().to_vec();
-    assert_eq!(
-        canonical_rows(&engine_vars, &r.test_application_rows(), &variables),
-        canonical_rows(&variables, &rows, &variables),
-        "against the reference: {text}"
-    );
+    let expected = match reference::check::under_engine_readings(&oracle, text) {
+        Err(reference::Error::Parse(e)) => {
+            panic!("the reference does not parse a query the engine ran ({e}): {text}")
+        }
+        Err(e) => return skip(e.to_string()),
+        Ok((expected, _)) => expected,
+    };
+    match expected {
+        reference::check::Expected::Ask(b, notes) => {
+            assert_eq!(r.kind, QueryKind::Ask, "an ASK answer: {text}");
+            if notes.chose {
+                return skip("an open value decides the answer".into());
+            }
+            assert_eq!(r.boolean, b, "ASK against the reference: {text}");
+        }
+        reference::check::Expected::Select(selected) => {
+            match reference::check::check_select(
+                &selected,
+                r.variables(),
+                &r.test_application_rows(),
+            ) {
+                Ok(reference::check::Outcome::Compared) => {}
+                Ok(
+                    reference::check::Outcome::Skipped(why)
+                    | reference::check::Outcome::OrderUnchecked(why),
+                ) => skip(why),
+                Err(m) => panic!("against the reference: {m}: {text}"),
+            }
+        }
+        reference::check::Expected::Other => skip("not a SELECT or ASK".into()),
+    }
 }
 
 /// Run `text` with every optimization and with none; the answers must be equal and the

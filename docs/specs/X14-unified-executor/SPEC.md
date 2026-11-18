@@ -226,32 +226,41 @@ that end, none of which changes an answer. It answers all 508 query evaluation t
 and all 63 of SPARQL 1.2 under a comparison that holds literals to their exact form,
 numbers to their value and ORDER BY results to their order. It reports the queries it
 does not evaluate, such as SERVICE, DESCRIBE and extension functions, rather than
-answer them approximately. Where the specification allows several answers, it notes the
-choice it made, for a slice through rows that ORDER BY does not order strictly, MIN, MAX,
-SAMPLE and GROUP_CONCAT over tied or unordered values, MIN or MAX over an error,
-`COUNT(DISTINCT *)` over solutions with blank nodes and numbers of more than the 16
-digits that XSD requires. The seeded queries of `tests/query_cursor.rs` compare the
-eager answer and the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a
-compacted base, a pending delta, several index blocks and a masked view, and the
-optimizer, index-join and string-filter tests compare `Optimizations::ALL` with it as
-well as with `Optimizations::NONE`. The cursor differential compares a query whose
-answer depends on such a choice only as far as the specification fixes it, and the
-optimizer tests leave such a query to the comparison with `Optimizations::NONE`. The
-parser writes the middle of a path sequence as a blank node,
-which the algebra treats as a variable, so the evaluator cannot count distinct solutions
-over such a middle and leaves those queries uncompared. A query whose nested loops pass
-the evaluator's work limit of 20 million intermediate solutions is also left uncompared.
-The comparison found three disagreements, which items 1064, 1065 and 1071 hold. The engine
-passes over an error in MIN and MAX, where the specification's order makes MIN an error
-and Jena makes both an error. It does not read an `xsd:integer` or `xsd:decimal` beyond
-the range of its decimal type as a number, which XSD permits and Jena does not do. Its
-string functions take a directional string and a language-tagged string of the same
-language as compatible arguments, which SPARQL 1.2 and Jena do not. The evaluator notes
-where a query meets item 1064 or 1071, and the tests compare such a query exactly under
-the engine's reading until the item is decided. The evaluator takes two well-formed
-values of different supported types, such as a string and an integer, as unequal, which
-the note to section 17.4.1.7 allows and Jena does by default, where Jena's strict mode
-and the section's main text make the comparison an error.
+answer them approximately. It follows SPARQL 1.2 where the two versions differ, so the
+effective boolean value of an ill-formed literal is an error, and it reads XPath regular
+expressions in their own syntax, reporting a back-reference as unsupported. Where the
+specification allows several answers, it says which. A value that it leaves open, such as
+a SAMPLE, a MIN or MAX among unordered values, a GROUP_CONCAT order, a RAND, a UUID, NOW
+or a new blank node, makes its column open, and an open value that decides which rows
+there are, in a FILTER, a join, a group key or DISTINCT, makes the rows open. For an
+ordered or sliced answer it reports each row's sort key, including keys the query does
+not project. The seeded queries of `tests/query_cursor.rs` compare the eager answer and
+the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a compacted base, a
+pending delta, several index blocks and a masked view, and the optimizer, index-join and
+string-filter tests compare `Optimizations::ALL` with it as well as with
+`Optimizations::NONE`. Both go through one comparison, which compares an open column
+only by its place in the rows, a number that the evaluator computed by datatype and
+value, and every other term exactly. An ordered or sliced answer must be a slice, at the
+query's offset, of an order that ORDER BY allows, and an answer with open rows is left
+uncompared. The order check gives up past 50 million key comparisons, and where equal
+rows with different keys make its matching ambiguous it reports the order unchecked
+rather than fail. The parser writes the middle of a path sequence as a blank node, which
+the algebra treats as a variable, so a `COUNT(DISTINCT *)` over such a middle is an open
+value. A query whose nested loops pass the evaluator's work limit of 20 million
+intermediate solutions is left uncompared, and so is one that reads a number of more than
+16 digits. The comparison found disagreements, which items 1064, 1065 and 1071 hold. The
+engine passes over an error in MIN and MAX, where the specification's order makes MIN an
+error and Jena makes both an error, and it follows Jena in making AVG over errors only an
+error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
+`xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
+XSD permits and Jena does not do. Its string functions take a directional string and a
+language-tagged string of the same language as compatible arguments, which SPARQL 1.2
+and Jena do not. The evaluator notes where a query meets item 1064 or 1071, and the tests
+compare such a query exactly under the engine's reading until the item is decided. The
+evaluator takes two well-formed values of different supported types, such as a string
+and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
+default, where Jena's strict mode and the section's main text make the comparison an
+error.
 
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its

@@ -10,9 +10,11 @@ completes roadmap item 512. It answers all 508 SPARQL 1.0 and 1.1 and all 63 SPA
 query evaluation tests under an exact comparison. It is the oracle of the seeded cursor
 differential in place of the eager executor, and the optimizer, index-join and
 string-filter tests compare the engine with it as well as with `Optimizations::NONE`. It
-notes the answers that the specification leaves open, which the cursor differential
-compares only as far as the specification fixes them. It found three engine
-disagreements. MIN and MAX pass over errors, roadmap item 1064, integers and decimals
+notes the values and rows that the specification leaves open and the sort key of each
+row, and one comparison in `check.rs` allows every answer that the specification allows,
+including every slice of an order that ORDER BY allows. It found three groups of engine
+disagreements. MIN and MAX pass over errors, AVG over errors only is an error and
+GROUP_CONCAT reads IRIs and numbers, roadmap item 1064, integers and decimals
 beyond the engine's decimal range are not numbers, roadmap item 1065, and the string
 functions ignore the base direction of their arguments, roadmap item 1071.
 

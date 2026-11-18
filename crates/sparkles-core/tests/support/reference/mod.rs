@@ -21,12 +21,15 @@
 //! the answer depended on such a choice. That happens when a slice cuts between rows that the
 //! specification does not order strictly, and when MIN, MAX, SAMPLE or GROUP_CONCAT pick
 //! among values that it does not order. A comparison with an engine must allow every
-//! answer that the specification allows.
+//! answer that the specification allows. [`Reference::run_selected`] says which columns
+//! and rows are open and reports the sort keys of an ordered answer, and
+//! [`check::check_select`] compares an engine's answer with it.
 //!
 //! The file is included by `#[path]` into each test crate that uses it, so it carries
 //! `allow(dead_code)`.
 #![allow(dead_code, unused_imports)]
 
+pub mod check;
 mod expr;
 mod path;
 pub mod value;
@@ -143,27 +146,53 @@ pub struct Reference {
     quads: Vec<Quad>,
     union_default: bool,
     pass_min_max_errors: Cell<bool>,
+    avg_of_errors_unbound: Cell<bool>,
     ignore_direction_in_compatibility: Cell<bool>,
+    stringify_group_concat: Cell<bool>,
+    union_from: Cell<bool>,
+    sparql11_ebv: Cell<bool>,
+    /// The start of the labels of the blank nodes that the evaluation makes, which no
+    /// blank node of the quads has, so a made blank node is fresh.
+    fresh_prefix: String,
     work_limit: Option<u64>,
     now: DateTime,
     /// The graphs that evaluations have read, by the names merged into each, which every
     /// evaluation of these quads shares.
-    graphs: RefCell<HashMap<Vec<GraphName>, Rc<GraphData>>>,
+    graphs: RefCell<HashMap<(Vec<GraphName>, bool), Rc<GraphData>>>,
 }
 
 impl Reference {
     /// A dataset of the quads, each once.
     pub fn new(quads: impl IntoIterator<Item = Quad>) -> Reference {
         let mut seen = HashSet::new();
-        let quads = quads
+        let quads: Vec<Quad> = quads
             .into_iter()
             .filter(|q| seen.insert(q.clone()))
             .collect();
+        let mut labels = HashSet::new();
+        for q in &quads {
+            if let NamedOrBlankNode::BlankNode(b) = &q.subject {
+                labels.insert(b.as_str().to_string());
+            }
+            blank_labels(&q.object, &mut labels);
+            if let GraphName::BlankNode(b) = &q.graph_name {
+                labels.insert(b.as_str().to_string());
+            }
+        }
+        let mut fresh_prefix = String::from("ref");
+        while labels.iter().any(|l| l.starts_with(&fresh_prefix)) {
+            fresh_prefix.push('x');
+        }
         Reference {
             quads,
             union_default: false,
             pass_min_max_errors: Cell::new(false),
+            avg_of_errors_unbound: Cell::new(false),
             ignore_direction_in_compatibility: Cell::new(false),
+            stringify_group_concat: Cell::new(false),
+            union_from: Cell::new(false),
+            sparql11_ebv: Cell::new(false),
+            fresh_prefix,
             work_limit: None,
             now: DateTime::now(),
             graphs: RefCell::new(HashMap::new()),
@@ -197,6 +226,36 @@ impl Reference {
     /// 1.2's, which [`Notes::direction_in_compatibility`] describes.
     pub fn set_ignoring_direction_in_compatibility(&self, ignore: bool) {
         self.ignore_direction_in_compatibility.set(ignore);
+    }
+
+    /// Set whether later evaluations make AVG an error where all its values are errors, as
+    /// Jena does, where the specification's Avg is zero, which [`Notes::avg_of_errors`]
+    /// describes.
+    pub fn set_avg_of_errors_unbound(&self, unbound: bool) {
+        self.avg_of_errors_unbound.set(unbound);
+    }
+
+    /// Set whether later evaluations let GROUP_CONCAT read the lexical form of any value,
+    /// as Jena does, where the specification's CONCAT takes only strings, which
+    /// [`Notes::group_concat_non_string`] describes.
+    pub fn set_stringifying_group_concat(&self, stringify: bool) {
+        self.stringify_group_concat.set(stringify);
+    }
+
+    /// Set whether later evaluations take the default graph of several FROM clauses as
+    /// the union of the graphs, sharing their blank nodes as a store does, where the
+    /// specification's RDF merge keeps them apart, which
+    /// [`Notes::from_shares_blank_nodes`] describes.
+    pub fn set_union_of_from_graphs(&self, union: bool) {
+        self.union_from.set(union);
+    }
+
+    /// Read the effective boolean value of an ill-formed boolean or numeric literal as
+    /// false, as SPARQL 1.1 section 17.2.2 does, where SPARQL 1.2 section 17.2.3, which
+    /// the evaluator follows otherwise, makes it an error.
+    pub fn with_sparql11_ebv(self, sparql11: bool) -> Reference {
+        self.sparql11_ebv.set(sparql11);
+        self
     }
 
     /// Refuse a query, as one the evaluator does not evaluate, once it has formed
@@ -241,8 +300,36 @@ impl Reference {
             .map(|(answer, _)| answer)
     }
 
-    /// Evaluate a parsed query, with the [`Notes`] on its answer.
+    /// Evaluate a parsed query, with the [`Notes`] on its answer. [`Notes::chose`] is set
+    /// where the answer depends on a choice that the specification leaves open.
     pub fn evaluate_noting_choices(&self, query: &Query) -> Result<(Answer, Notes), Error> {
+        let (answer, notes, selected) = self.evaluate_all(query)?;
+        let mut notes = notes;
+        if let Some(s) = &selected {
+            notes.chose |= s.rows_open || s.open.iter().any(|o| *o);
+        }
+        Ok((answer, notes))
+    }
+
+    /// Parse and evaluate a SELECT, with what a comparison needs to allow every answer
+    /// that the specification allows. Another query form gives `None`.
+    pub fn run_selected(&self, text: &str, base: Option<&str>) -> Result<Option<Selected>, Error> {
+        let query = parse(text, base)?;
+        Ok(self.evaluate_all(&query)?.2)
+    }
+
+    /// Parse and evaluate an ASK, with the [`Notes`] on its answer, whose `chose` is set
+    /// where an open value or choice decides it. Another query form gives `None`.
+    pub fn run_ask(&self, text: &str, base: Option<&str>) -> Result<Option<(bool, Notes)>, Error> {
+        let query = parse(text, base)?;
+        let (answer, notes, _) = self.evaluate_all(&query)?;
+        Ok(match answer {
+            Answer::Ask(b) => Some((b, notes)),
+            _ => None,
+        })
+    }
+
+    fn evaluate_all(&self, query: &Query) -> Result<(Answer, Notes, Option<Selected>), Error> {
         let (dataset, pattern, base) = match query {
             Query::Select {
                 dataset,
@@ -267,22 +354,20 @@ impl Reference {
             } => (dataset, pattern, base_iri),
         };
         value::take_beyond_minimum_precision();
+        value::set_sparql11_ebv(self.sparql11_ebv.get());
         let ev = Evaluator::new(self, dataset.as_ref(), base.clone());
-        let run = || -> R<Answer> {
-            let solutions = ev.eval_top(pattern)?;
+        let mut selected = None;
+        let run = || -> R<(Answer, Option<Selected>)> {
             match query {
                 Query::Select { .. } => {
-                    let variables = projected(pattern);
-                    let rows = solutions
-                        .iter()
-                        .map(|s| variables.iter().map(|v| s.get(v).cloned()).collect())
-                        .collect();
-                    Ok(Answer::Select {
-                        variables: variables.iter().map(|v| v.as_str().to_string()).collect(),
-                        rows,
-                    })
+                    let s = ev.eval_select(pattern)?;
+                    let answer = Answer::Select {
+                        variables: s.variables.clone(),
+                        rows: s.rows.clone(),
+                    };
+                    Ok((answer, Some(s)))
                 }
-                Query::Ask { .. } => Ok(Answer::Ask(!solutions.is_empty())),
+                Query::Ask { .. } => Ok((Answer::Ask(!ev.eval_top(pattern)?.is_empty()), None)),
                 Query::Construct {
                     template,
                     graph_templates,
@@ -291,20 +376,37 @@ impl Reference {
                     if !graph_templates.is_empty() {
                         return unsupported("CONSTRUCT with graph templates");
                     }
-                    Ok(Answer::Graph(ev.construct(template, &solutions)))
+                    let solutions = ev.eval_top(pattern)?;
+                    Ok((Answer::Graph(ev.construct(template, &solutions)), None))
                 }
                 Query::Describe { .. } => unsupported("DESCRIBE"),
             }
         };
-        let answer = run().map_err(|f| match f {
+        let (answer, sel) = run().map_err(|f| match f {
             Fail::Unsupported(m) => Error::Unsupported(m),
             Fail::Type => Error::Unsupported("an expression error outside any expression".into()),
         })?;
         let mut notes = ev.notes.get();
         notes.chose = ev.chose.get();
         notes.beyond_minimum_precision = value::take_beyond_minimum_precision();
-        Ok((answer, notes))
+        if let Some(mut s) = sel {
+            s.notes = notes;
+            selected = Some(s);
+        }
+        Ok((answer, notes, selected))
     }
+}
+
+fn parse(text: &str, base: Option<&str>) -> Result<Query, Error> {
+    let mut parser = SparqlParser::new();
+    if let Some(b) = base {
+        parser = parser
+            .with_base_iri(b)
+            .map_err(|e| Error::Parse(e.to_string()))?;
+    }
+    parser
+        .parse_query(text)
+        .map_err(|e| Error::Parse(e.to_string()))
 }
 
 /// The projected variables of a SELECT: those of the Project below its Slice, Distinct
@@ -332,6 +434,8 @@ pub(crate) struct Evaluator<'a> {
     pub base: Option<Iri<String>>,
     pub now: DateTime,
     default_names: Vec<GraphName>,
+    /// Whether the default graph is the RDF merge of the graphs of FROM clauses.
+    default_is_merge: bool,
     named_names: Vec<GraphName>,
     /// The solution that BNODE(label) is evaluated for.
     pub scope: Cell<u64>,
@@ -342,6 +446,12 @@ pub(crate) struct Evaluator<'a> {
     pub chose: Cell<bool>,
     pub notes: Cell<Notes>,
     work: Cell<u64>,
+    /// The variables that hold open values somewhere in the evaluation.
+    pub open_vars: RefCell<HashSet<Variable>>,
+    /// The variables that hold values the evaluation computed somewhere.
+    computed_vars: RefCell<HashSet<Variable>>,
+    /// Whether the expression being evaluated read an open value.
+    pub read_open: Cell<bool>,
 }
 
 /// What an evaluation noted about its answer beside the answer itself.
@@ -371,21 +481,64 @@ pub struct Notes {
     /// an error. A test may compare with the reading that ignores the direction where the
     /// difference is tracked as an open defect.
     pub direction_in_compatibility: bool,
+    /// AVG read only errors. The specification's Avg is zero where Count, which removes
+    /// the errors, is zero, and Jena makes it an error.
+    pub avg_of_errors: bool,
+    /// GROUP_CONCAT read a value that is not a string, such as an IRI or a number. The
+    /// specification defines GROUP_CONCAT through CONCAT, which makes such a value an
+    /// error, and Jena reads its lexical form.
+    pub group_concat_non_string: bool,
+    /// Two of the graphs of the FROM clauses share a blank node, which the RDF merge of
+    /// section 13.2 keeps apart and a store's union of its graphs shares.
+    pub from_shares_blank_nodes: bool,
+}
+
+/// A SELECT answer with what a comparison needs to allow every answer that the
+/// specification allows: which columns hold open values, which hold values that the
+/// evaluation computed, and the order and slice of the rows.
+#[derive(Debug, Clone)]
+pub struct Selected {
+    pub variables: Vec<String>,
+    /// The answer.
+    pub rows: Vec<Vec<Option<Term>>>,
+    pub notes: Notes,
+    /// An open value, or a choice that the specification leaves open, decides which rows
+    /// there are, so the rows cannot be compared.
+    pub rows_open: bool,
+    /// For each column, whether its values are open, such as a SAMPLE, a RAND or a new
+    /// blank node, so that only their place in the rows can be compared.
+    pub open: Vec<bool>,
+    /// For each column, whether the evaluation computed its values, where an
+    /// implementation chooses the lexical form of a number.
+    pub computed: Vec<bool>,
+    /// The order and slice of the answer, when the query orders or slices it.
+    pub order: Option<TopOrder>,
+}
+
+/// The rows of an ordered or sliced answer before its slice, in the order of ORDER BY,
+/// each with its sort key, `None` where the key does not constrain the row's place.
+#[derive(Debug, Clone)]
+pub struct TopOrder {
+    pub items: Vec<(Vec<Option<Term>>, Option<SortKey>)>,
+    pub descending: Vec<bool>,
+    pub offset: usize,
+    pub limit: Option<usize>,
 }
 
 /// Solutions in ORDER BY order, with the sort key of each and the direction of each
 /// key: what a slice needs to tell whether its cut is one the specification fixes.
 struct Keyed {
     solutions: Vec<Solution>,
-    keys: Option<(Vec<SortKey>, Vec<bool>)>,
+    /// The key of each solution, `None` where its place is open.
+    keys: Option<(Vec<Option<SortKey>>, Vec<bool>)>,
 }
 
 /// The values of the ORDER BY conditions for one solution, unbound where a condition is
 /// an error or unbound.
-type SortKey = Vec<Option<Term>>;
+pub type SortKey = Vec<Option<Term>>;
 
 /// Whether the specification puts the key `a` strictly before `b`.
-fn strictly_before(a: &[Option<Term>], b: &[Option<Term>], descending: &[bool]) -> bool {
+pub(crate) fn strictly_before(a: &[Option<Term>], b: &[Option<Term>], descending: &[bool]) -> bool {
     for ((x, y), desc) in a.iter().zip(b).zip(descending) {
         let mut o = value::spec_order(x.as_ref(), y.as_ref());
         if *desc {
@@ -479,16 +632,61 @@ impl Candidates {
 pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
     let mut out = a.clone();
     for (k, v) in b {
-        if out
-            .insert(k.clone(), v.clone())
-            .is_some_and(|old| old != *v)
+        out.insert(k.clone(), v.clone());
+    }
+    // The merge keeps the number that BNODE reads only where it is the numbered solution
+    // itself, the other side binding nothing new. Otherwise it is a new solution, which a
+    // later BNODE numbers again.
+    let row = row_variable();
+    let keeps = |numbered: &Solution, other: &Solution| {
+        numbered.contains_key(&row)
+            && !other.contains_key(&row)
+            && other
+                .keys()
+                .all(|k| is_hidden(k) || numbered.contains_key(k))
+    };
+    if !(keeps(a, b) || keeps(b, a)) {
+        out.remove(&row);
+        if let (Some(x), Some(y)) = (a.get(&row), b.get(&row))
+            && x == y
         {
-            // the merge of two numbered solutions is a new solution, which a later BNODE
-            // numbers again
-            out.remove(k);
+            out.insert(row, x.clone());
         }
     }
     out
+}
+
+/// `t` with the label of each blank node prefixed by `prefix`.
+fn rename_blank_nodes(t: &Triple, prefix: &str) -> Triple {
+    let term = |x: &Term| -> Term {
+        match x {
+            Term::BlankNode(b) => {
+                Term::BlankNode(BlankNode::new_unchecked(format!("{prefix}{}", b.as_str())))
+            }
+            Term::Triple(tr) => Term::Triple(Box::new(rename_blank_nodes(tr, prefix))),
+            other => other.clone(),
+        }
+    };
+    let subject = match term(&Term::from(t.subject.clone())) {
+        Term::NamedNode(n) => NamedOrBlankNode::from(n),
+        Term::BlankNode(b) => NamedOrBlankNode::from(b),
+        _ => unreachable!("a subject is an IRI or a blank node"),
+    };
+    Triple::new(subject, t.predicate.clone(), term(&t.object))
+}
+
+/// The labels of the blank nodes in `t`, in triple terms too.
+fn blank_labels(t: &Term, out: &mut HashSet<String>) {
+    match t {
+        Term::BlankNode(b) => {
+            out.insert(b.as_str().to_string());
+        }
+        Term::Triple(tr) => {
+            blank_labels(&Term::from(tr.subject.clone()), out);
+            blank_labels(&tr.object, out);
+        }
+        _ => {}
+    }
 }
 
 /// The hidden variable that numbers a solution for BNODE.
@@ -528,11 +726,13 @@ impl<'a> Evaluator<'a> {
                 (default, named)
             }
         };
+        let default_is_merge = dataset.is_some() && default_names.len() > 1;
         Evaluator {
             data,
             base,
             now: data.now,
             default_names,
+            default_is_merge,
             named_names,
             scope: Cell::new(0),
             bnodes: RefCell::new(HashMap::new()),
@@ -541,28 +741,66 @@ impl<'a> Evaluator<'a> {
             chose: Cell::new(false),
             notes: Cell::new(Notes::default()),
             work: Cell::new(0),
+            open_vars: RefCell::new(HashSet::new()),
+            computed_vars: RefCell::new(HashSet::new()),
+            read_open: Cell::new(false),
         }
     }
 
     fn graph_of(&self, names: &[GraphName]) -> Rc<GraphData> {
-        if let Some(g) = self.data.graphs.borrow().get(names) {
+        self.graph_of_merging(names, false)
+    }
+
+    /// The graph of the triples of the graphs `names`. Where `merge` asks for their RDF
+    /// merge and two of them share a blank node, the blank nodes of each graph are
+    /// renamed apart, as section 13.2 makes the default graph of several FROM clauses
+    /// the RDF merge of their graphs, which shares no blank nodes between them.
+    fn graph_of_merging(&self, names: &[GraphName], merge: bool) -> Rc<GraphData> {
+        let mut merge = merge && names.len() > 1;
+        if merge {
+            let mut owner: HashMap<String, usize> = HashMap::new();
+            let mut shared = false;
+            for q in &self.data.quads {
+                let Some(g) = names.iter().position(|n| *n == q.graph_name) else {
+                    continue;
+                };
+                let mut labels = HashSet::new();
+                blank_labels(&Term::from(q.subject.clone()), &mut labels);
+                blank_labels(&q.object, &mut labels);
+                for l in labels {
+                    if *owner.entry(l).or_insert(g) != g {
+                        shared = true;
+                    }
+                }
+            }
+            if shared {
+                let mut notes = self.notes.get();
+                notes.from_shares_blank_nodes = true;
+                self.notes.set(notes);
+            }
+            merge = shared && !self.data.union_from.get();
+        }
+        let key = (names.to_vec(), merge);
+        if let Some(g) = self.data.graphs.borrow().get(&key) {
             return g.clone();
         }
         let mut seen = HashSet::new();
         let mut triples = Vec::new();
         for q in &self.data.quads {
-            if names.contains(&q.graph_name) {
-                let t = Triple::new(q.subject.clone(), q.predicate.clone(), q.object.clone());
-                if seen.insert(t.clone()) {
-                    triples.push(t);
-                }
+            let Some(g) = names.iter().position(|n| *n == q.graph_name) else {
+                continue;
+            };
+            let mut t = Triple::new(q.subject.clone(), q.predicate.clone(), q.object.clone());
+            if merge {
+                let prefix = format!("{}m{g}x", self.data.fresh_prefix);
+                t = rename_blank_nodes(&t, &prefix);
+            }
+            if seen.insert(t.clone()) {
+                triples.push(t);
             }
         }
         let g = Rc::new(GraphData::new(triples));
-        self.data
-            .graphs
-            .borrow_mut()
-            .insert(names.to_vec(), g.clone());
+        self.data.graphs.borrow_mut().insert(key, g.clone());
         g
     }
 
@@ -573,7 +811,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn eval_top(&self, p: &GraphPattern) -> R<Vec<Solution>> {
-        let default = self.graph_of(&self.default_names.clone());
+        let default = self.graph_of_merging(&self.default_names.clone(), self.default_is_merge);
         let env = Solution::new();
         self.eval(
             p,
@@ -625,6 +863,9 @@ impl<'a> Evaluator<'a> {
             } => self.eval_path_pattern(subject, path, object, cx),
             GraphPattern::Join { left, right } => {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
+                if self.shares_open(&l, &r) {
+                    self.chose.set(true);
+                }
                 let candidates = Candidates::new(&l, &r);
                 let mut out = Vec::new();
                 for a in &l {
@@ -645,6 +886,9 @@ impl<'a> Evaluator<'a> {
                 expression,
             } => {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
+                if self.shares_open(&l, &r) {
+                    self.chose.set(true);
+                }
                 let candidates = Candidates::new(&l, &r);
                 let mut out = Vec::new();
                 for a in &l {
@@ -658,7 +902,13 @@ impl<'a> Evaluator<'a> {
                         let m = merge(a, b);
                         let keep = match expression {
                             None => true,
-                            Some(e) => self.truthy(e, cx, &m)?,
+                            Some(e) => {
+                                let (keep, open) = self.tracking(|| self.truthy(e, cx, &m));
+                                if open {
+                                    self.chose.set(true);
+                                }
+                                keep?
+                            }
                         };
                         if keep {
                             matched = true;
@@ -673,7 +923,12 @@ impl<'a> Evaluator<'a> {
             }
             GraphPattern::Lateral { left, right } => {
                 let mut out = Vec::new();
-                for a in self.eval(left, cx)? {
+                let l = self.eval(left, cx)?;
+                // the right side reads the left's values, open ones too
+                if self.binds_open(&l) {
+                    self.chose.set(true);
+                }
+                for a in l {
                     let env = merge(cx.env, &a);
                     let inner = Cx {
                         graph: cx.graph,
@@ -690,7 +945,11 @@ impl<'a> Evaluator<'a> {
             GraphPattern::Filter { expr, inner } => {
                 let mut out = Vec::new();
                 for s in self.eval(inner, cx)? {
-                    if self.truthy(expr, cx, &s)? {
+                    let (keep, open) = self.tracking(|| self.truthy(expr, cx, &s));
+                    if open {
+                        self.chose.set(true);
+                    }
+                    if keep? {
                         out.push(s);
                     }
                 }
@@ -708,16 +967,18 @@ impl<'a> Evaluator<'a> {
                 expression,
             } => {
                 let mut out = Vec::new();
+                let numbers = reads_bnode(expression);
+                let mut open = false;
                 for mut s in self.eval(inner, cx)? {
                     // BNODE(label) is the same blank node within one solution, so a solution
                     // that an expression with BNODE reads gets a number to key it by.
-                    if format!("{expression:?}").contains("BNode")
-                        && !s.contains_key(&row_variable())
-                    {
+                    if numbers && !s.contains_key(&row_variable()) {
                         let n = self.fresh_id();
                         s.insert(row_variable(), int_term(n as i128));
                     }
-                    if let Some(v) = self.soft(self.expr(expression, cx, &s))? {
+                    let (v, read_open) = self.tracking(|| self.soft(self.expr(expression, cx, &s)));
+                    open |= read_open;
+                    if let Some(v) = v? {
                         if s.get(variable).is_some_and(|old| *old != v) {
                             // a variable already in scope cannot be extended
                             return unsupported("BIND of a variable that is in scope");
@@ -726,10 +987,20 @@ impl<'a> Evaluator<'a> {
                     }
                     out.push(s);
                 }
+                if open {
+                    self.mark_open(variable);
+                }
+                match expression {
+                    Expression::Variable(x) if !self.is_computed(x) => {}
+                    _ => self.mark_computed(variable),
+                }
                 Ok(out)
             }
             GraphPattern::Minus { left, right } => {
                 let (l, r) = (self.eval(left, cx)?, self.eval(right, cx)?);
+                if self.shares_open(&l, &r) {
+                    self.chose.set(true);
+                }
                 let candidates = Candidates::new(&l, &r);
                 let mut out = Vec::new();
                 for a in &l {
@@ -755,6 +1026,11 @@ impl<'a> Evaluator<'a> {
                             s.insert(v.clone(), ground_term(t));
                         }
                     }
+                    if s.keys()
+                        .any(|k| cx.env.contains_key(k) && self.open_vars.borrow().contains(k))
+                    {
+                        self.chose.set(true);
+                    }
                     if compatible(&s, cx.env) {
                         out.push(s);
                     }
@@ -763,9 +1039,8 @@ impl<'a> Evaluator<'a> {
             }
             GraphPattern::OrderBy { .. }
             | GraphPattern::Project { .. }
-            | GraphPattern::Distinct { .. } => Ok(self.eval_keyed(p, cx)?.solutions),
-            // REDUCED may drop duplicates and need not, and this one keeps them
-            GraphPattern::Reduced { inner } => self.eval(inner, cx),
+            | GraphPattern::Distinct { .. }
+            | GraphPattern::Reduced { .. } => Ok(self.eval_keyed(p, cx)?.solutions),
             GraphPattern::Slice {
                 inner,
                 start,
@@ -775,25 +1050,7 @@ impl<'a> Evaluator<'a> {
                 let n = solutions.len();
                 let from = (*start).min(n);
                 let to = length.map_or(n, |l| from.saturating_add(l).min(n));
-                // A cut is fixed when every row before it either equals every row after
-                // it or comes strictly before it in the order.
-                let visible_rows: Vec<Solution> = solutions.iter().map(visible).collect();
-                for cut in [from, to] {
-                    if cut == 0 || cut == n {
-                        continue;
-                    }
-                    let fixed = (0..cut).all(|i| {
-                        (cut..n).all(|j| {
-                            visible_rows[i] == visible_rows[j]
-                                || keys
-                                    .as_ref()
-                                    .is_some_and(|(k, d)| strictly_before(&k[i], &k[j], d))
-                        })
-                    });
-                    if !fixed {
-                        self.chose.set(true);
-                    }
-                }
+                self.note_open_cuts(&solutions, keys.as_ref(), from, to);
                 Ok(solutions.into_iter().skip(from).take(to - from).collect())
             }
             GraphPattern::Group {
@@ -809,6 +1066,143 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Note a choice where a slice of `solutions` from `from` to `to` cuts between rows
+    /// that the specification does not order. A cut is fixed when every row before it
+    /// either equals every row after it or comes strictly before it in the order.
+    fn note_open_cuts(
+        &self,
+        solutions: &[Solution],
+        keys: Option<&(Vec<Option<SortKey>>, Vec<bool>)>,
+        from: usize,
+        to: usize,
+    ) {
+        let n = solutions.len();
+        let visible_rows: Vec<Solution> = solutions.iter().map(visible).collect();
+        for cut in [from, to] {
+            if cut == 0 || cut == n {
+                continue;
+            }
+            let fixed = (0..cut).all(|i| {
+                (cut..n).all(|j| {
+                    visible_rows[i] == visible_rows[j]
+                        || keys.is_some_and(|(k, d)| match (&k[i], &k[j]) {
+                            (Some(a), Some(b)) => strictly_before(a, b, d),
+                            _ => false,
+                        })
+                })
+            });
+            if !fixed {
+                self.chose.set(true);
+            }
+        }
+    }
+
+    /// Evaluate the pattern of a SELECT, keeping the order and the slice of its answer
+    /// and the columns that hold open or computed values.
+    fn eval_select(&self, p: &GraphPattern) -> R<Selected> {
+        let variables = projected(p);
+        let default = self.graph_of_merging(&self.default_names.clone(), self.default_is_merge);
+        let env = Solution::new();
+        let cx = Cx {
+            graph: &default,
+            env: &env,
+        };
+        let (inner, slice) = match p {
+            GraphPattern::Slice {
+                inner,
+                start,
+                length,
+            } => (inner.as_ref(), Some((*start, *length))),
+            other => (other, None),
+        };
+        let Keyed { solutions, keys } = self.eval_keyed(inner, &cx)?;
+        // a top slice's cuts are the comparison's to check, so they do not make the rows open
+        let rows_open = self.chose.get();
+        let n = solutions.len();
+        let (from, to) = match slice {
+            Some((start, length)) => {
+                let from = start.min(n);
+                (from, length.map_or(n, |l| from.saturating_add(l).min(n)))
+            }
+            None => (0, n),
+        };
+        if slice.is_some() {
+            self.note_open_cuts(&solutions, keys.as_ref(), from, to);
+        }
+        let row_of = |s: &Solution| -> Vec<Option<Term>> {
+            variables.iter().map(|v| s.get(v).cloned()).collect()
+        };
+        let order = if keys.is_some() || slice.is_some() {
+            let (ks, descending) = keys.unwrap_or_else(|| (vec![None; n], Vec::new()));
+            Some(TopOrder {
+                items: solutions
+                    .iter()
+                    .zip(ks)
+                    .map(|(s, k)| (row_of(s), k))
+                    .collect(),
+                descending,
+                offset: slice.map_or(0, |s| s.0),
+                limit: slice.and_then(|s| s.1),
+            })
+        } else {
+            None
+        };
+        let rows = solutions[from..to].iter().map(row_of).collect();
+        let open_vars = self.open_vars.borrow();
+        let computed_vars = self.computed_vars.borrow();
+        Ok(Selected {
+            variables: variables.iter().map(|v| v.as_str().to_string()).collect(),
+            rows,
+            notes: Notes::default(),
+            rows_open,
+            open: variables.iter().map(|v| open_vars.contains(v)).collect(),
+            computed: variables
+                .iter()
+                .map(|v| computed_vars.contains(v))
+                .collect(),
+            order,
+        })
+    }
+
+    /// Whether one of the open variables is bound in a solution of `left` and in one of
+    /// `right`, where it decides which solutions are compatible.
+    fn shares_open(&self, left: &[Solution], right: &[Solution]) -> bool {
+        let open = self.open_vars.borrow();
+        !open.is_empty()
+            && open.iter().any(|v| {
+                left.iter().any(|s| s.contains_key(v)) && right.iter().any(|s| s.contains_key(v))
+            })
+    }
+
+    /// Whether a solution binds one of the open variables.
+    fn binds_open(&self, solutions: &[Solution]) -> bool {
+        let open = self.open_vars.borrow();
+        !open.is_empty() && solutions.iter().any(|s| s.keys().any(|k| open.contains(k)))
+    }
+
+    /// Run `f` and tell whether the expressions it evaluated read an open value.
+    pub(crate) fn tracking<T>(&self, f: impl FnOnce() -> T) -> (T, bool) {
+        let outer = self.read_open.replace(false);
+        let r = f();
+        let open = self.read_open.get();
+        self.read_open.set(outer || open);
+        (r, open)
+    }
+
+    /// Note that `v` holds open values.
+    fn mark_open(&self, v: &Variable) {
+        self.open_vars.borrow_mut().insert(v.clone());
+    }
+
+    /// Note that `v` holds values the evaluation computed.
+    fn mark_computed(&self, v: &Variable) {
+        self.computed_vars.borrow_mut().insert(v.clone());
+    }
+
+    fn is_computed(&self, v: &Variable) -> bool {
+        self.computed_vars.borrow().contains(v)
+    }
+
     /// Evaluate ORDER BY, and the projection and DISTINCT above it, keeping the sort
     /// keys for a slice. Any other pattern has no keys.
     fn eval_keyed(&self, p: &GraphPattern, cx: &Cx) -> R<Keyed> {
@@ -818,17 +1212,22 @@ impl<'a> Evaluator<'a> {
                 let mut keyed = Vec::new();
                 for s in sols {
                     let mut keys = Vec::new();
-                    for o in expression {
-                        let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
-                        keys.push(self.soft(self.expr(e, cx, &s))?);
-                    }
-                    keyed.push((keys, s));
+                    // a key that reads an open value does not fix the row's place
+                    let (r, open) = self.tracking(|| -> R<()> {
+                        for o in expression {
+                            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                            keys.push(self.soft(self.expr(e, cx, &s))?);
+                        }
+                        Ok(())
+                    });
+                    r?;
+                    keyed.push((keys, open, s));
                 }
                 let descending: Vec<bool> = expression
                     .iter()
                     .map(|o| matches!(o, OrderExpression::Desc(_)))
                     .collect();
-                keyed.sort_by(|(a, _), (b, _)| {
+                keyed.sort_by(|(a, _, _), (b, _, _)| {
                     for (i, desc) in descending.iter().enumerate() {
                         let mut c = total_order(a[i].as_ref(), b[i].as_ref());
                         if *desc {
@@ -840,7 +1239,10 @@ impl<'a> Evaluator<'a> {
                     }
                     std::cmp::Ordering::Equal
                 });
-                let (keys, solutions) = keyed.into_iter().unzip();
+                let (keys, solutions) = keyed
+                    .into_iter()
+                    .map(|(k, open, s)| ((!open).then_some(k), s))
+                    .unzip();
                 Ok(Keyed {
                     solutions,
                     keys: Some((keys, descending)),
@@ -873,8 +1275,13 @@ impl<'a> Evaluator<'a> {
             }
             GraphPattern::Distinct { inner } => {
                 let Keyed { solutions, keys } = self.eval_keyed(inner, cx)?;
+                // open values may be equal or not in another answer
+                if self.binds_open(&solutions) {
+                    self.chose.set(true);
+                }
                 let mut first: HashMap<Solution, usize> = HashMap::new();
                 let mut kept = Vec::new();
+                let mut unplaced = HashSet::new();
                 for (i, s) in solutions.iter().enumerate() {
                     match first.get(&visible(s)) {
                         None => {
@@ -882,20 +1289,45 @@ impl<'a> Evaluator<'a> {
                             kept.push(i);
                         }
                         // Which copy DISTINCT keeps is open, and it places the row
-                        // differently when the copies have different keys.
+                        // differently when the copies have different keys, so the kept
+                        // row's key does not fix its place.
                         Some(&f) => {
                             if let Some((k, _)) = &keys
                                 && k[f] != k[i]
                             {
-                                self.chose.set(true);
+                                unplaced.insert(f);
                             }
                         }
                     }
                 }
                 Ok(Keyed {
                     solutions: kept.iter().map(|&i| solutions[i].clone()).collect(),
-                    keys: keys.map(|(k, d)| (kept.iter().map(|&i| k[i].clone()).collect(), d)),
+                    keys: keys.map(|(k, d)| {
+                        let k = kept
+                            .iter()
+                            .map(|&i| {
+                                if unplaced.contains(&i) {
+                                    None
+                                } else {
+                                    k[i].clone()
+                                }
+                            })
+                            .collect();
+                        (k, d)
+                    }),
                 })
+            }
+            // REDUCED may drop duplicates and need not, and this one keeps them, so an
+            // answer with duplicates is one of several
+            GraphPattern::Reduced { inner } => {
+                let k = self.eval_keyed(inner, cx)?;
+                let mut seen = HashSet::new();
+                if self.binds_open(&k.solutions)
+                    || !k.solutions.iter().all(|s| seen.insert(visible(s)))
+                {
+                    self.chose.set(true);
+                }
+                Ok(k)
             }
             _ => Ok(Keyed {
                 solutions: self.eval(p, cx)?,
@@ -1142,6 +1574,13 @@ impl<'a> Evaluator<'a> {
         cx: &Cx,
     ) -> R<Vec<Solution>> {
         let sols = self.eval(inner, cx)?;
+        // a group key with open values may group the solutions otherwise in another answer
+        if variables
+            .iter()
+            .any(|v| self.open_vars.borrow().contains(v))
+        {
+            self.chose.set(true);
+        }
         let mut keys: Vec<Vec<Option<Term>>> = Vec::new();
         let mut groups: HashMap<Vec<Option<Term>>, Vec<Solution>> = HashMap::new();
         for s in sols {
@@ -1166,7 +1605,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
             for (v, a) in aggregates {
-                if let Some(t) = self.aggregate(a, members, cx)? {
+                if let Some(t) = self.aggregate(v, a, members, cx)? {
                     row.insert(v.clone(), t);
                 }
             }
@@ -1175,9 +1614,16 @@ impl<'a> Evaluator<'a> {
         Ok(out)
     }
 
-    /// An aggregate over the solutions of one group: `None` where the aggregate is an
-    /// error.
-    fn aggregate(&self, a: &AggregateExpression, members: &[Solution], cx: &Cx) -> R<Option<Term>> {
+    /// An aggregate over the solutions of one group, into `out`: `None` where the
+    /// aggregate is an error. An aggregate that reads an open value, or picks a value that
+    /// the specification leaves open, makes `out` open.
+    fn aggregate(
+        &self,
+        out: &Variable,
+        a: &AggregateExpression,
+        members: &[Solution],
+        cx: &Cx,
+    ) -> R<Option<Term>> {
         use value::*;
         let (name, expr, distinct) = match a {
             AggregateExpression::CountSolutions { distinct } => {
@@ -1189,11 +1635,16 @@ impl<'a> Evaluator<'a> {
                         let mut notes = self.notes.get();
                         notes.distinct_over_blank_nodes = true;
                         self.notes.set(notes);
+                        self.mark_open(out);
+                    }
+                    if self.binds_open(members) {
+                        self.mark_open(out);
                     }
                     members.iter().map(visible).collect::<HashSet<_>>().len()
                 } else {
                     members.len()
                 };
+                self.mark_computed(out);
                 return Ok(Some(int_term(n as i128)));
             }
             AggregateExpression::FunctionCall {
@@ -1206,10 +1657,33 @@ impl<'a> Evaluator<'a> {
         if let AggregateFunction::Custom(n) = name {
             return unsupported(format!("aggregate {n}"));
         }
+        let copies = matches!(
+            name,
+            AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::Sample
+        ) && matches!(expr, Expression::Variable(v) if !self.is_computed(v));
+        if !copies {
+            self.mark_computed(out);
+        }
         // ListEval: the value of the expression for each solution, an error as `None`.
+        // BNODE(label) gives each solution its own blank node.
+        let numbers = reads_bnode(expr);
         let mut values: Vec<Option<Term>> = Vec::new();
-        for s in members {
-            values.push(self.soft(self.expr(expr, cx, s))?);
+        let (r, open) = self.tracking(|| -> R<()> {
+            for s in members {
+                let v = if numbers && !s.contains_key(&row_variable()) {
+                    let mut s = s.clone();
+                    s.insert(row_variable(), int_term(self.fresh_id() as i128));
+                    self.soft(self.expr(expr, cx, &s))?
+                } else {
+                    self.soft(self.expr(expr, cx, s))?
+                };
+                values.push(v);
+            }
+            Ok(())
+        });
+        r?;
+        if open {
+            self.mark_open(out);
         }
         if distinct {
             let mut seen = HashSet::new();
@@ -1221,8 +1695,22 @@ impl<'a> Evaluator<'a> {
         let has_error = values.iter().any(Option::is_none);
         let terms: Vec<Term> = values.iter().flatten().cloned().collect();
         Ok(match name {
+            // Count removes the errors
             AggregateFunction::Count => Some(int_term(terms.len() as i128)),
             AggregateFunction::Sum | AggregateFunction::Avg => {
+                // Avg is zero where Count, which removes the errors, is zero, and Sum
+                // adds every value, so an error makes it an error
+                if matches!(name, AggregateFunction::Avg) && terms.is_empty() {
+                    if has_error {
+                        let mut notes = self.notes.get();
+                        notes.avg_of_errors = true;
+                        self.notes.set(notes);
+                        if self.data.avg_of_errors_unbound.get() {
+                            return Ok(None);
+                        }
+                    }
+                    return Ok(Some(int_term(0)));
+                }
                 if has_error {
                     return Ok(None);
                 }
@@ -1238,8 +1726,6 @@ impl<'a> Evaluator<'a> {
                 }
                 if matches!(name, AggregateFunction::Sum) {
                     Some(sum.to_term())
-                } else if terms.is_empty() {
-                    Some(int_term(0))
                 } else {
                     sum.arith(Arith::Div, value::Num::Int(terms.len() as i128))
                         .map(Num::to_term)
@@ -1286,7 +1772,7 @@ impl<'a> Evaluator<'a> {
                         .iter()
                         .any(|t| t != b && value::spec_order(Some(t), Some(b)) != Some(worse))
                     {
-                        self.chose.set(true);
+                        self.mark_open(out);
                     }
                 }
                 best.cloned()
@@ -1295,7 +1781,7 @@ impl<'a> Evaluator<'a> {
                 // any element of the values, an error among them
                 if terms.iter().any(|t| Some(t) != terms.first()) || has_error && !terms.is_empty()
                 {
-                    self.chose.set(true);
+                    self.mark_open(out);
                 }
                 terms.first().cloned()
             }
@@ -1303,9 +1789,20 @@ impl<'a> Evaluator<'a> {
                 if has_error {
                     return Ok(None);
                 }
+                // GroupConcat is CONCAT over the values, which takes only strings. Jena
+                // reads the lexical form of any value.
                 let sep = separator.clone().unwrap_or_else(|| " ".to_string());
                 let mut parts = Vec::new();
                 for t in &terms {
+                    let string = matches!(t, Term::Literal(l) if is_string_literal(l));
+                    if !string {
+                        let mut notes = self.notes.get();
+                        notes.group_concat_non_string = true;
+                        self.notes.set(notes);
+                        if !self.data.stringify_group_concat.get() {
+                            return Ok(None);
+                        }
+                    }
                     parts.push(match t {
                         Term::Literal(l) => l.value().to_string(),
                         Term::NamedNode(n) => n.as_str().to_string(),
@@ -1314,9 +1811,10 @@ impl<'a> Evaluator<'a> {
                 }
                 // the order of the values is open
                 if terms.iter().any(|t| Some(t) != terms.first()) {
-                    self.chose.set(true);
+                    self.mark_open(out);
                 }
-                // the result is a plain string, whatever the languages of the values
+                // CONCAT with the separator, or with "" for one value, makes a simple
+                // string whatever the languages of the values
                 Some(string_term(parts.join(&sep)))
             }
             AggregateFunction::Custom(_) => unreachable!(),
@@ -1376,7 +1874,13 @@ impl<'a> Evaluator<'a> {
             TermPattern::BlankNode(b) => Some(Term::BlankNode(
                 fresh
                     .entry(b.as_str().to_string())
-                    .or_insert_with(|| BlankNode::new_unchecked(format!("c{n}x{}", b.as_str())))
+                    .or_insert_with(|| {
+                        BlankNode::new_unchecked(format!(
+                            "{}c{n}x{}",
+                            self.data.fresh_prefix,
+                            b.as_str()
+                        ))
+                    })
                     .clone(),
             )),
             TermPattern::Triple(tp) => {
@@ -1399,6 +1903,11 @@ impl<'a> Evaluator<'a> {
             }
         }
     }
+}
+
+/// Whether an expression calls BNODE, which needs each solution numbered.
+fn reads_bnode(e: &Expression) -> bool {
+    format!("{e:?}").contains("BNode")
 }
 
 pub(crate) fn ground_term(t: &GroundTerm) -> Term {

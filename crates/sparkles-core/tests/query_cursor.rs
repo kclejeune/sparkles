@@ -3124,18 +3124,6 @@ fn compare(shape: &Shape, vars: &[String], expected: &Rows, got: &Rows, unsliced
     }
 }
 
-/// A term with a number in its canonical form, since SPARQL leaves the lexical form of a
-/// computed number to the implementation.
-fn canonical(t: &Option<Term>) -> String {
-    match t {
-        Some(Term::Literal(l)) => match reference::value::numeric(l) {
-            Some(n) => format!("{:?}", n.to_literal()),
-            None => format!("{l:?}"),
-        },
-        t => format!("{t:?}"),
-    }
-}
-
 /// The quads of a snapshot, for the reference evaluator.
 fn snapshot_quads(snapshot: &Snapshot) -> Vec<oxrdf::Quad> {
     let mut out = Vec::new();
@@ -3148,26 +3136,6 @@ fn snapshot_quads(snapshot: &Snapshot) -> Vec<oxrdf::Quad> {
     out
 }
 
-/// The reference evaluator's answer to a differential query.
-struct Expected {
-    vars: Vec<String>,
-    rows: Rows,
-    notes: reference::Notes,
-    /// The answer without the query's LIMIT and OFFSET, when it has them.
-    unsliced: Option<(Rows, reference::Notes)>,
-}
-
-impl Expected {
-    /// Whether the reference's rows are the only answer that the specification allows
-    /// and that the reference evaluates exactly.
-    fn exact(notes: &reference::Notes) -> bool {
-        !notes.chose
-            && !notes.min_max_error
-            && !notes.distinct_over_blank_nodes
-            && !notes.beyond_minimum_precision
-    }
-}
-
 fn reference_select(
     oracle: &reference::Reference,
     q: &str,
@@ -3176,103 +3144,6 @@ fn reference_select(
     match oracle.run_noting_choices(q, None) {
         Ok((reference::Answer::Select { variables, rows }, notes)) => (variables, rows, notes),
         other => panic!("{context}, reference: {other:?}: {q}"),
-    }
-}
-
-fn canonical_bag(rows: &Rows) -> Vec<Vec<String>> {
-    let mut b: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| r.iter().map(canonical).collect())
-        .collect();
-    b.sort();
-    b
-}
-
-/// Compare an engine answer with the reference evaluator's. Where the reference's
-/// answer is exact, the rows must match as a bag. Where only the answer without the
-/// slice is exact, the rows must be as many and come from it. The order that ORDER BY
-/// fixes is checked in every case.
-fn compare_with_reference(
-    shape: &Shape,
-    vars: &[String],
-    got: &Rows,
-    expected: &Expected,
-    what: &str,
-) {
-    let q = &shape.query;
-    let ref_vars = &expected.vars;
-    let ref_rows = &expected.rows;
-    let columns: Vec<usize> = ref_vars
-        .iter()
-        .map(|v| {
-            vars.iter()
-                .position(|x| x == v)
-                .unwrap_or_else(|| panic!("{what} lacks {v}: {q}"))
-        })
-        .collect();
-    assert_eq!(vars.len(), ref_vars.len(), "{what} columns: {q}");
-    let got: Rows = got
-        .iter()
-        .map(|row| columns.iter().map(|&i| row[i].clone()).collect())
-        .collect();
-    if Expected::exact(&expected.notes) {
-        assert_eq!(
-            canonical_bag(&got),
-            canonical_bag(ref_rows),
-            "{what} against the reference: {q}"
-        );
-    } else if let Some((all, notes)) = &expected.unsliced
-        && Expected::exact(notes)
-        && !expected.notes.min_max_error
-        && !expected.notes.distinct_over_blank_nodes
-    {
-        assert_eq!(
-            got.len(),
-            ref_rows.len(),
-            "{what} row count against the reference: {q}"
-        );
-        let mut pool = canonical_bag(all);
-        for row in canonical_bag(&got) {
-            let i = pool.iter().position(|r| *r == row).unwrap_or_else(|| {
-                panic!("{what}: row {row:?} outside the reference's unsliced answer: {q}")
-            });
-            pool.remove(i);
-        }
-    }
-    if let Order::Vars(keys) = &shape.order {
-        // ORDER BY ?v or DESC(?v): no row may follow a row that the specification
-        // puts strictly after it
-        let keys: Vec<(usize, bool)> = keys
-            .iter()
-            .map(|k| {
-                let desc = k.starts_with("DESC(");
-                let name = k.trim_start_matches("DESC(").trim_end_matches(')');
-                let name = name.trim_start_matches('?');
-                (ref_vars.iter().position(|v| v == name).unwrap(), desc)
-            })
-            .collect();
-        let before = |a: &[Option<Term>], b: &[Option<Term>]| {
-            for &(k, desc) in &keys {
-                let mut o = reference::value::spec_order(a[k].as_ref(), b[k].as_ref());
-                if desc {
-                    o = o.map(std::cmp::Ordering::reverse);
-                }
-                match o {
-                    Some(std::cmp::Ordering::Less) => return true,
-                    Some(std::cmp::Ordering::Equal) => {}
-                    _ => return false,
-                }
-            }
-            false
-        };
-        for i in 0..got.len() {
-            for j in i + 1..got.len() {
-                assert!(
-                    !before(&got[j], &got[i]),
-                    "{what}: row {j} belongs before row {i}: {q}"
-                );
-            }
-        }
     }
 }
 
@@ -3291,65 +3162,37 @@ fn differential(
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(seeds);
-    let oracle =
-        reference::Reference::new(quads.clone()).with_union_default(snapshot.union_default_graph);
-    // Where MIN or MAX reads an error, the engine passes over it, which the roadmap item
-    // on aggregate errors keeps open against the specification's reading, so those
-    // queries compare with that reading.
-    let passing = reference::Reference::new(quads)
-        .with_union_default(snapshot.union_default_graph)
-        .passing_over_min_max_errors();
+    let oracle = reference::Reference::new(quads).with_union_default(snapshot.union_default_graph);
     // SPARKLES_REFERENCE_KEEP_GOING reports every disagreement with the reference
     // before failing, for triage.
     let keep_going = std::env::var_os("SPARKLES_REFERENCE_KEEP_GOING").is_some();
     let disagreements = std::cell::Cell::new(0);
-    let (mut open, mut sliced, mut min_max, mut blank) = (0, 0, 0, 0);
+    let (mut skipped, mut unordered, mut readings) = (0, 0, 0);
     for seed in 1..=seeds {
         let shape = Gen::new(seed).query();
         let q = &shape.query;
         let context = format!("{name} seed {seed}");
-        let (mut rvars, mut rrows, mut notes) = reference_select(&oracle, q, &context);
-        let mut unsliced = shape
-            .unsliced
-            .as_ref()
-            .map(|u| reference_select(&oracle, u, &context));
-        if notes.min_max_error || unsliced.as_ref().is_some_and(|u| u.2.min_max_error) {
-            min_max += 1;
-            (rvars, rrows, notes) = reference_select(&passing, q, &context);
-            unsliced = shape
-                .unsliced
-                .as_ref()
-                .map(|u| reference_select(&passing, u, &context));
-        }
-        let unsliced = unsliced.map(|(_, rows, notes)| (rows, notes));
-        if !Expected::exact(&notes) {
-            if notes.distinct_over_blank_nodes {
-                blank += 1;
-            } else if unsliced.as_ref().is_some_and(|(_, n)| Expected::exact(n)) {
-                sliced += 1;
-            } else {
-                open += 1;
+        let selected = match reference::check::under_engine_readings(&oracle, q) {
+            Ok((reference::check::Expected::Select(s), taken)) => {
+                readings += usize::from(!taken.is_empty());
+                s
             }
-        }
-        let reference = Expected {
-            vars: rvars,
-            rows: rrows,
-            notes,
-            unsliced,
+            other => panic!("{context}, reference: {other:?}: {q}"),
         };
         let (vars, expected) = eager(snapshot.clone(), q, opts);
-        let check = |got: &Rows, what: &str| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                compare_with_reference(&shape, &vars, got, &reference, what)
-            }));
-            if let Err(e) = result {
-                eprintln!("{name} seed {seed}, {what}");
-                disagreements.set(disagreements.get() + 1);
-                if !keep_going {
-                    std::panic::resume_unwind(e);
+        let mut check =
+            |got: &Rows, what: &str| match reference::check::check_select(&selected, &vars, got) {
+                Ok(reference::check::Outcome::Compared) => {}
+                Ok(reference::check::Outcome::Skipped(_)) => skipped += 1,
+                Ok(reference::check::Outcome::OrderUnchecked(_)) => unordered += 1,
+                Err(m) => {
+                    eprintln!("{name} seed {seed}, {what} against the reference: {m}: {q}");
+                    disagreements.set(disagreements.get() + 1);
+                    if !keep_going {
+                        panic!("{name} seed {seed}, {what} against the reference: {m}: {q}");
+                    }
                 }
-            }
-        };
+            };
         check(&expected, "eager");
         let unsliced = shape
             .unsliced
@@ -3369,10 +3212,9 @@ fn differential(
         }
     }
     eprintln!(
-        "{name}: of {seeds} queries, {sliced} are compared through their unsliced answer, \
-         {open} have rows that the specification leaves open, {blank} count distinct \
-         solutions with blank nodes, and {min_max} read an error in MIN or MAX and compare \
-         with the reading that passes over it"
+        "{name}: of {seeds} queries and their five answers each, {skipped} answers have rows \
+         that the specification leaves open, {unordered} were compared without their order, \
+         and {readings} queries compare under the engine's reading of an open roadmap item"
     );
     assert_eq!(
         disagreements.get(),
@@ -5245,6 +5087,200 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         assert_eq!(bag(all(c)), expected, "merge_left_join {merge}");
         assert_eq!(bag(eager.application_rows()), expected);
     }
+}
+
+/// The reference evaluator's answers to the cases of its first review, and the
+/// comparison's verdicts on answers that the specification allows and forbids.
+#[test]
+fn reference_evaluator_review_cases() {
+    use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
+    use reference::check::{Outcome, check_select};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let quad =
+        |s: oxrdf::NamedOrBlankNode, p: &str, o: Term, g: GraphName| Quad::new(s, iri(p), o, g);
+    let a = || oxrdf::NamedOrBlankNode::from(iri("urn:a"));
+    let shared = BlankNode::new_unchecked("rb0");
+    let quads = vec![
+        quad(a(), "urn:p", iri("urn:b").into(), GraphName::DefaultGraph),
+        quad(a(), "urn:q", iri("urn:b").into(), GraphName::DefaultGraph),
+        quad(
+            shared.clone().into(),
+            "urn:p",
+            iri("urn:x").into(),
+            iri("urn:g1").into(),
+        ),
+        quad(
+            shared.clone().into(),
+            "urn:q",
+            iri("urn:y").into(),
+            iri("urn:g2").into(),
+        ),
+    ];
+    let r = reference::Reference::new(quads);
+    let rows = |q: &str| reference_select(&r, q, "review").1;
+    let one = |q: &str| rows(q).remove(0).remove(0);
+    let int = |n: i32| Some(Term::Literal(Literal::from(n)));
+    let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
+
+    // 1: a negated property set gives a pair once
+    assert_eq!(rows("SELECT ?o WHERE { <urn:a> !<urn:z> ?o }").len(), 1);
+    // 2: BNODE(label) is a new blank node for each solution that an aggregate reads
+    assert_eq!(
+        one("SELECT (COUNT(DISTINCT BNODE(\"x\")) AS ?n) WHERE { VALUES ?v { 1 2 } }"),
+        int(2)
+    );
+    // 3: a made blank node is none of the dataset's
+    assert_eq!(
+        rows("SELECT ?s WHERE { GRAPH ?g { ?s <urn:p> <urn:x> } FILTER(sameTerm(?s, BNODE())) }")
+            .len(),
+        0
+    );
+    // 4: AVG of errors only is zero
+    assert_eq!(
+        one("SELECT (AVG(?x) AS ?a) WHERE { VALUES ?x { UNDEF } }"),
+        int(0)
+    );
+    // 5: GROUP_CONCAT is CONCAT, which takes no IRI, and notes it
+    let (_, g, notes) = reference_select(
+        &r,
+        "SELECT (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES ?x { <urn:a> } }",
+        "review",
+    );
+    assert_eq!(g, vec![vec![None]]);
+    assert!(notes.group_concat_non_string);
+    // 6: the effective boolean value of an ill-formed boolean is an error in SPARQL 1.2
+    let bad = "SELECT (!\"bad\"^^<http://www.w3.org/2001/XMLSchema#boolean> AS ?x) WHERE {}";
+    assert_eq!(one(bad), None);
+    let r11 = reference::Reference::new(Vec::new()).with_sparql11_ebv(true);
+    assert_eq!(
+        reference_select(&r11, bad, "review").1[0][0],
+        Some(Term::Literal(Literal::from(true)))
+    );
+    // 7: inf is not a double
+    assert_eq!(
+        one(
+            "SELECT (isNumeric(\"inf\"^^<http://www.w3.org/2001/XMLSchema#double>) AS ?n) WHERE {}"
+        ),
+        Some(Term::Literal(Literal::from(false)))
+    );
+    // 8: a double casts to a string by the XPath rules
+    let cast = |e: &str| {
+        one(&format!(
+            "SELECT (<http://www.w3.org/2001/XMLSchema#string>({e}) AS ?s) WHERE {{}}"
+        ))
+    };
+    assert_eq!(cast("1e6"), string("1.0E6"));
+    assert_eq!(cast("1.5e0"), string("1.5"));
+    assert_eq!(cast("1.0e-7"), string("1.0E-7"));
+    assert_eq!(cast("2.50"), string("2.5"));
+    // 9: a back-reference is unsupported, not an error, and \b is no XPath escape
+    assert!(matches!(
+        r.run("SELECT (REGEX(\"aa\", \"(a)\\\\1\") AS ?r) WHERE {}", None),
+        Err(reference::Error::Unsupported(_))
+    ));
+    assert_eq!(
+        one("SELECT (REGEX(\"a b\", \"a\\\\b\") AS ?r) WHERE {}"),
+        None
+    );
+    assert_eq!(
+        one("SELECT (REGEX(\"a\\rb\", \"a.b\") AS ?r) WHERE {}"),
+        Some(Term::Literal(Literal::from(false)))
+    );
+    // 10: the default graph of two FROM clauses keeps their blank nodes apart
+    let from = "SELECT ?s FROM <urn:g1> FROM <urn:g2> WHERE { ?s <urn:p> ?x ; <urn:q> ?y }";
+    let (_, merged, notes) = reference_select(&r, from, "review");
+    assert!(merged.is_empty() && notes.from_shares_blank_nodes);
+    r.set_union_of_from_graphs(true);
+    assert_eq!(reference_select(&r, from, "review").1.len(), 1);
+    r.set_union_of_from_graphs(false);
+    // 11: two triple terms are unordered
+    use reference::value::spec_order;
+    let triple = |s: &str| {
+        Term::Triple(Box::new(oxrdf::Triple::new(
+            iri(s),
+            iri("urn:p"),
+            iri("urn:o"),
+        )))
+    };
+    assert_eq!(
+        spec_order(Some(&triple("urn:a")), Some(&triple("urn:b"))),
+        None
+    );
+    // 12: identical triple terms with NaN are the same value
+    assert_eq!(
+        one(
+            "SELECT (<<( <urn:a> <urn:p> \"NaN\"^^<http://www.w3.org/2001/XMLSchema#double> )>> = <<( <urn:a> <urn:p> \"NaN\"^^<http://www.w3.org/2001/XMLSchema#double> )>> AS ?e) WHERE {}"
+        ),
+        Some(Term::Literal(Literal::from(true)))
+    );
+
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // 13: a RAND column is open, and the rows still count
+    let s13 = selected("SELECT ?v (RAND() AS ?r) WHERE { VALUES ?v { 1 2 } }");
+    let rand = |v: i32, x: f64| vec![int(v), Some(Term::Literal(Literal::from(x)))];
+    assert_eq!(
+        check_select(&s13, &vars(&["v", "r"]), &[rand(1, 0.25), rand(2, 0.5)]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_select(&s13, &vars(&["v", "r"]), &[rand(1, 0.25)]).is_err());
+    // 14: an open MIN keeps the COUNT beside it compared
+    let s14 = selected("SELECT (MIN(?x) AS ?m) (COUNT(*) AS ?n) WHERE { VALUES ?x { 1 \"a\" } }");
+    assert!(check_select(&s14, &vars(&["m", "n"]), &[]).is_err());
+    assert_eq!(
+        check_select(&s14, &vars(&["m", "n"]), &[vec![string("a"), int(2)]]),
+        Ok(Outcome::Compared)
+    );
+    // 16: a slice must be one of an order that ORDER BY allows
+    let s16 = selected(
+        "SELECT ?y WHERE { VALUES (?x ?y) { (1 \"a\") (2 \"b\") (2 \"c\") (3 \"d\") } } ORDER BY ?x LIMIT 2",
+    );
+    let col = |v: &[&str]| v.iter().map(|x| vec![string(x)]).collect::<Vec<_>>();
+    assert_eq!(
+        check_select(&s16, &vars(&["y"]), &col(&["a", "c"])),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_select(&s16, &vars(&["y"]), &col(&["b", "d"])).is_err());
+    assert!(check_select(&s16, &vars(&["y"]), &col(&["b", "a"])).is_err());
+    let s16b = selected(
+        "SELECT ?y WHERE { VALUES (?x ?y) { (1 \"a\") (2 \"b\") (2 \"c\") (3 \"d\") } } ORDER BY ?x OFFSET 1 LIMIT 1",
+    );
+    assert_eq!(
+        check_select(&s16b, &vars(&["y"]), &col(&["c"])),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_select(&s16b, &vars(&["y"]), &col(&["a"])).is_err());
+    // 17: an expression key orders the rows
+    let s17 = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY DESC(STR(?x))");
+    assert!(check_select(&s17, &vars(&["x"]), &[vec![int(1)], vec![int(2)]]).is_err());
+    assert_eq!(
+        check_select(&s17, &vars(&["x"]), &[vec![int(2)], vec![int(1)]]),
+        Ok(Outcome::Compared)
+    );
+    // 18: a term of the data keeps its datatype and lexical form
+    let s18 = selected(
+        "SELECT ?x WHERE { VALUES ?x { \"01\"^^<http://www.w3.org/2001/XMLSchema#byte> 1 } }",
+    );
+    assert!(check_select(&s18, &vars(&["x"]), &[vec![int(1)], vec![int(1)]]).is_err());
+    // a computed number keeps its datatype, and its lexical form is free
+    let s18b = selected("SELECT ((?x + 0.0) AS ?y) WHERE { VALUES ?x { 1 } }");
+    let dec = |l: &str| {
+        Some(Term::Literal(Literal::new_typed_literal(
+            l,
+            iri("http://www.w3.org/2001/XMLSchema#decimal"),
+        )))
+    };
+    assert_eq!(
+        check_select(&s18b, &vars(&["y"]), &[vec![dec("1.0")]]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_select(&s18b, &vars(&["y"]), &[vec![int(1)]]).is_err());
+    // an open value in a FILTER leaves the rows open
+    let open_rows = selected("SELECT ?v WHERE { VALUES ?v { 1 2 } FILTER(RAND() < 0.5) }");
+    assert!(matches!(
+        check_select(&open_rows, &vars(&["v"]), &[]),
+        Ok(Outcome::Skipped(_))
+    ));
 }
 
 /// The reference evaluator's own cases: the choices that it notes, the scope of the
