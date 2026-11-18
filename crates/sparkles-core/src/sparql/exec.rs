@@ -10051,7 +10051,7 @@ mod string_order_tests {
             let mut masks = Vec::new();
             let mut computed = Vec::new();
             for op in [CmpOp::Lt, CmpOp::Ge] {
-                let (t, x, y) = product(&ctx, &ids);
+                let (t, x, y) = product(&ctx, ids);
                 let e = cmp(x, y, op);
                 let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
                     .unwrap()
