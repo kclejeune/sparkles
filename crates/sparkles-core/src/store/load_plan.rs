@@ -7,6 +7,19 @@
 //! entry point that can take either path asks [`LoadPlan::choose`], and the table test
 //! in `load_plan_tests.rs` records the plan each one chooses at every boundary.
 //!
+//! One rule serves the four entry points. A size is above the threshold only when it is
+//! strictly greater. Sources go into an empty store by a rebuild unless they are all
+//! streams that end within [`SMALL_STREAM_BYTES`], and into a store that holds data by a
+//! rebuild when their estimate is above the threshold or their streams hold more than
+//! [`BYTES_PER_QUAD`] bytes per threshold quad. Reading streams ahead to tell holds up to
+//! that many bytes in memory before the parse starts, which is the cost of the probe. A
+//! batch that a transaction stages, from a bulk insert or a patch, is rebuilt when it is
+//! above the threshold. A write limited to some graphs parses its sources in a
+//! transaction, since a rebuild from sources does not check each quad's graph, while its
+//! batches, whose graphs are checked as they are staged, can still be rebuilt. Triple
+//! protections, managed graphs, control records and a patch's delete row keep a batch in
+//! the delta.
+//!
 //! SPARQL `LOAD` is not an entry point of the plan. It inserts per quad whatever its
 //! size, so that an update keeps one memory and lock profile (spec X16, decision 4).
 //!
@@ -62,7 +75,8 @@ pub(crate) struct LoadInputs {
     /// How many of those sources are streams.
     pub streams: usize,
     /// The write is limited to some graphs through
-    /// [`WriteOptions::graphs`](crate::guard::WriteOptions::graphs).
+    /// [`WriteOptions::graphs`](crate::guard::WriteOptions::graphs). It keeps sources
+    /// out of a rebuild and not a batch, whose graphs are checked as it is staged.
     pub restricted: bool,
     /// The transaction checks triple-level write protections on each quad it is asked
     /// to change.
@@ -106,38 +120,28 @@ impl LoadPlan {
         mut exceeds: impl FnMut(u64) -> Result<bool>,
     ) -> Result<LoadPlan> {
         let bulk = match i.entry {
-            Entry::Load => {
+            // A rebuild from sources does not check each quad's graph, so a write limited
+            // to some graphs parses them in a transaction.
+            Entry::Load | Entry::Replace if i.restricted => false,
+            Entry::Load | Entry::Replace if i.empty_head => {
                 // A stream that ends within a few thousand quads goes into an empty
                 // store by a transaction, which costs less than the fixed cost of a
                 // rebuild. Its bytes are read ahead to tell, as only a read can.
-                let small_streams = i.empty_head
-                    && i.sources > 0
-                    && i.streams == i.sources
-                    && !exceeds(SMALL_STREAM_BYTES)?;
-                // a write limited to some graphs checks each quad, which a rebuild does
-                // not
-                !i.restricted && !small_streams && (i.empty_head || i.quads > i.threshold)
+                let small_streams =
+                    i.sources > 0 && i.streams == i.sources && !exceeds(SMALL_STREAM_BYTES)?;
+                !small_streams
             }
-            Entry::Replace => {
-                !i.restricted
-                    && (i.quads > i.threshold
-                        || (i.streams > 0 && exceeds(i.threshold.saturating_mul(BYTES_PER_QUAD))?))
+            Entry::Load | Entry::Replace => {
+                i.quads > i.threshold
+                    || (i.streams > 0 && exceeds(i.threshold.saturating_mul(BYTES_PER_QUAD))?)
             }
-            Entry::InsertBulk => {
-                // a write whose quads protections check goes through the delta, so that
-                // the state it leaves can be checked before the commit
-                i.quads >= i.threshold && !i.triple_checks && !i.managed && !i.control
-            }
-            Entry::Patch => {
-                !i.deleted
-                    && i.quads >= i.threshold
-                    && LoadPlan::choose(
-                        &LoadInputs {
-                            entry: Entry::InsertBulk,
-                            ..*i
-                        },
-                        exceeds,
-                    )? == LoadPlan::Bulk
+            // A batch has checked each quad's graph already, so a restriction to some
+            // graphs does not keep it out of a rebuild. Triple protections, managed
+            // graphs and control records check the state the transaction leaves, which
+            // needs the quads in the delta, and a patch's rows apply in order once it
+            // has met a delete row.
+            Entry::InsertBulk | Entry::Patch => {
+                i.quads > i.threshold && !i.triple_checks && !i.managed && !i.control && !i.deleted
             }
         };
         Ok(if bulk {

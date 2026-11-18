@@ -1408,8 +1408,9 @@ pub struct StoreOptions {
     pub service_cache_bytes: u64,
     pub union_default_graph: bool,
     pub build: BuildOptions,
-    /// Loads smaller than this many quads go through the transactional delta; larger
-    /// loads trigger a rebuild (bulk path).
+    /// Writes of more than this many quads rebuild the index generation (the bulk path),
+    /// and smaller ones go through the transactional delta. `store/load_plan.rs` holds
+    /// the rule for loads, replaces, bulk inserts and patches.
     pub bulk_threshold: u64,
     /// In-memory stores keep the metadata of this many most recent commits.
     pub memory_commit_ring: usize,
@@ -6909,7 +6910,7 @@ impl WriteTxn<'_> {
         !self.log.is_empty() || !self.bulk.is_empty()
     }
 
-    /// Insert many quads. Batches at or above the store's `bulk_threshold` are not
+    /// Insert many quads. Batches above the store's `bulk_threshold` are not
     /// applied to the delta; on commit they are merged into a freshly built generation
     /// (QLever-style rebuild), which is much faster than per-quad delta inserts. Staged
     /// bulk quads are not visible through [`view`](Self::view) / [`contains`](Self::contains)

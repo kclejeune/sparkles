@@ -96,18 +96,18 @@ fn rows() -> Vec<Row> {
         row("load: empty head, a file and a stream", empty(mixed(Load)), 1, Bulk, &[]),
         row("load: estimate at the threshold", sized(Load, T), 0, Txn, &[]),
         row("load: estimate above the threshold", sized(Load, T + 1), 0, Bulk, &[]),
-        row("load: stream at the large bound", stream(Load), LARGE, Txn, &[]),
-        row("load: stream above the large bound", stream(Load), LARGE + 1, Txn, &[]),
-        row("load: a small file and a large stream", mixed(Load), LARGE + 1, Txn, &[]),
+        row("load: stream at the large bound", stream(Load), LARGE, Txn, &[LARGE]),
+        row("load: stream above the large bound", stream(Load), LARGE + 1, Bulk, &[LARGE]),
+        row("load: a small file and a large stream", mixed(Load), LARGE + 1, Bulk, &[LARGE]),
         row("load: restricted, empty head", restricted(empty(sized(Load, 1))), 0, Txn, &[]),
         row("load: restricted, above the threshold", restricted(sized(Load, T + 1)), 0, Txn, &[]),
-        row("load: restricted, empty head, large stream", restricted(empty(stream(Load))), SMALL + 1, Txn, &[SMALL]),
+        row("load: restricted, empty head, large stream", restricted(empty(stream(Load))), SMALL + 1, Txn, &[]),
         // replace_with
-        row("replace: empty head, a small file", empty(sized(Replace, 1)), 0, Txn, &[]),
-        row("replace: empty head, no sources", empty(LoadInputs::new(Replace, T)), 0, Txn, &[]),
-        row("replace: empty head, a small stream", empty(stream(Replace)), 1, Txn, &[LARGE]),
-        row("replace: empty head, stream above the large bound", empty(stream(Replace)), LARGE + 1, Bulk, &[LARGE]),
-        row("replace: empty head, stream above the small bound", empty(stream(Replace)), SMALL + 1, Bulk, &[LARGE]),
+        row("replace: empty head, a small file", empty(sized(Replace, 1)), 0, Bulk, &[]),
+        row("replace: empty head, no sources", empty(LoadInputs::new(Replace, T)), 0, Bulk, &[]),
+        row("replace: empty head, a small stream", empty(stream(Replace)), 1, Txn, &[SMALL]),
+        row("replace: empty head, stream above the large bound", empty(stream(Replace)), LARGE + 1, Txn, &[SMALL]),
+        row("replace: empty head, stream above the small bound", empty(stream(Replace)), SMALL + 1, Bulk, &[SMALL]),
         row("replace: estimate at the threshold", sized(Replace, T), 0, Txn, &[]),
         row("replace: estimate above the threshold", sized(Replace, T + 1), 0, Bulk, &[]),
         row("replace: stream at the large bound", stream(Replace), LARGE, Txn, &[LARGE]),
@@ -117,7 +117,7 @@ fn rows() -> Vec<Row> {
         row("replace: restricted, large stream", restricted(stream(Replace)), LARGE + 1, Txn, &[]),
         // insert_bulk
         row("insert_bulk: below the threshold", sized(InsertBulk, T - 1), 0, Txn, &[]),
-        row("insert_bulk: at the threshold", sized(InsertBulk, T), 0, Bulk, &[]),
+        row("insert_bulk: at the threshold", sized(InsertBulk, T), 0, Txn, &[]),
         row("insert_bulk: above the threshold", sized(InsertBulk, T + 1), 0, Bulk, &[]),
         row("insert_bulk: empty head, small batch", empty(sized(InsertBulk, 1)), 0, Txn, &[]),
         row("insert_bulk: restricted", restricted(sized(InsertBulk, T + 1)), 0, Bulk, &[]),
@@ -126,7 +126,7 @@ fn rows() -> Vec<Row> {
         row("insert_bulk: control records", LoadInputs { control: true, ..sized(InsertBulk, T + 1) }, 0, Txn, &[]),
         // patch_apply
         row("patch: below the threshold", sized(Patch, T - 1), 0, Txn, &[]),
-        row("patch: at the threshold", sized(Patch, T), 0, Bulk, &[]),
+        row("patch: at the threshold", sized(Patch, T), 0, Txn, &[]),
         row("patch: above the threshold", sized(Patch, T + 1), 0, Bulk, &[]),
         row("patch: a delete row, even one that removes nothing", LoadInputs { deleted: true, ..sized(Patch, T + 1) }, 0, Txn, &[]),
         row("patch: restricted", restricted(sized(Patch, T + 1)), 0, Bulk, &[]),
@@ -245,7 +245,7 @@ fn load_with_plans() {
         ("empty head, small stream", store(), reader(0, 3), Txn),
         ("at the threshold", seeded(2), bytes(100, E), Txn),
         ("above the threshold", seeded(2), bytes(100, E + 1), Bulk),
-        ("large stream", seeded(2), reader(100, 5 * E), Txn),
+        ("large stream", seeded(2), reader(100, 5 * E), Bulk),
     ];
     for (name, s, src, plan) in cases {
         s.load_with(&[src], CommitKind::Load, &o).unwrap();
@@ -261,19 +261,10 @@ fn load_with_plans() {
 fn replace_with_plans() {
     let o = WriteOptions::default();
     let cases: Vec<(&str, Store, Source, LoadPlan)> = vec![
-        ("empty head, small bytes", store(), bytes(0, 1), Txn),
-        ("below the threshold", seeded(2), bytes(100, E - 1), Txn),
-        // the transaction stages the parsed quads through insert_bulk, whose own
-        // rule takes a batch at the threshold
-        ("at the threshold", seeded(2), bytes(100, E), Bulk),
+        ("empty head, small bytes", store(), bytes(0, 1), Bulk),
+        ("at the threshold", seeded(2), bytes(100, E), Txn),
         ("above the threshold", seeded(2), bytes(100, E + 1), Bulk),
-        (
-            "stream below the large bound",
-            seeded(2),
-            reader(100, E - 1),
-            Txn,
-        ),
-        ("stream at the large bound", seeded(2), reader(100, E), Bulk),
+        ("stream at the large bound", seeded(2), reader(100, E), Txn),
         (
             "stream above the large bound",
             seeded(2),
@@ -287,7 +278,7 @@ fn replace_with_plans() {
         assert_eq!(plan_of(&s), plan, "{name}");
     }
     // a restricted replace parses its sources and stages them through insert_bulk
-    for (n, plan) in [(E - 1, Txn), (E, Bulk)] {
+    for (n, plan) in [(E, Txn), (E + 1, Bulk)] {
         let s = seeded(2);
         s.replace_with(
             ReplaceTarget::Default,
@@ -302,7 +293,7 @@ fn replace_with_plans() {
 
 #[test]
 fn insert_bulk_plans() {
-    for (n, plan) in [(E - 1, Txn), (E, Bulk), (E + 1, Bulk)] {
+    for (n, plan) in [(E - 1, Txn), (E, Txn), (E + 1, Bulk)] {
         let s = seeded(2);
         let mut t = s.write();
         let p = t
@@ -335,7 +326,7 @@ fn patch_plans() {
     };
     let cases = [
         ("below the threshold", adds(E - 1), Txn),
-        ("at the threshold", adds(E), Bulk),
+        ("at the threshold", adds(E), Txn),
         ("above the threshold", adds(E + 1), Bulk),
         (
             "a delete row that removes nothing",
