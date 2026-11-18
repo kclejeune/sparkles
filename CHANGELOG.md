@@ -8,13 +8,16 @@
 `Store::load_with`, `Store::replace_with`, `WriteTxn::insert_bulk` and RDF Patch, which
 each had a rule of their own, and a table test records the plan of each entry point at
 the boundaries. The threshold test is strict everywhere, so a batch or a patch of exactly
-the bulk threshold now commits in a transaction. A graph replacement into an empty store
-takes the bulk path, as a load did, unless all its inputs are streams that end within
-8 MiB. A first Graph Store PUT into an empty in-memory dataset is therefore admitted by
-the size of the generation it builds, as a POST was, and a replacement of an empty body
-into an empty store commits an empty generation, as a load did. A first PUT of 10 to
-1,000 quads into an empty dataset pays the rebuild's fixed cost of about 20 to 27 ms, as
-a first POST did, and roadmap item 1079 follows it. A stream load into a store
+the bulk threshold now commits in a transaction. A load or a graph replacement into an empty store
+takes a transaction when its inputs hold at most 8 MiB, or 80 bytes per threshold quad
+when that bound is lower, and the bulk path above that size. Files are sized by their
+length and streams are read ahead to tell. A load into an empty store used to rebuild
+whatever the size of a file or a buffered body, so a first small POST into a new dataset
+no longer pays the rebuild's fixed cost of about 20 ms, and its quads stay in the delta
+until a compaction. An in-memory dataset admits such a first write by the memory estimate
+of each quad it inserts, as it admits a write into a dataset with data, so a first POST
+that the size of a built generation admitted can now return 507. A load of an empty file
+into an empty store makes no commit, where it committed an empty generation. A stream load into a store
 that holds data reads its stream ahead up to 80 bytes per threshold quad, as a
 replacement did, and takes the bulk path past that bound. A bulk replacement returns the
 quads it parsed, duplicates included, as the transactional path and the documentation

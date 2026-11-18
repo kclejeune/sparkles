@@ -92,19 +92,17 @@ These read paths are tuned for queries over data that is not yet in memory
   insert and an RDF Patch. A write takes the bulk path when its size is above the store's
   bulk threshold, 250,000 quads by default. Files are sized at about 80 bytes per quad,
   and streams are read ahead up to 80 bytes per threshold quad, 20 MB by default, to
-  tell. A load or a replacement into an empty store also takes the bulk path, unless all
-  its inputs are streams that end within 8 MiB. A write limited to some graphs parses its
-  inputs in a transaction, and batches that check triple protections, managed graphs or
-  control records stay transactional, as does a patch once it has met a delete row. A
-  large stream load into a dataset that holds data is a bulk commit, so the change-log
-  limit of bulk commits under the limitations below applies to it. A graph replacement
-  into an empty store, such as a first Graph Store PUT into a new dataset, is a bulk
-  commit for the same reason as a load, so the change-log note on a crash right after a
-  bulk commit under the limitations below applies to it. An in-memory dataset therefore admits it by the
-  size of the generation it builds, as it admits a load, rather than by the memory
-  estimate of each inserted quad. A load or replacement of an empty body into an empty
-  store commits an empty generation. SPARQL `LOAD` always inserts in a transaction. Roadmap item 846 tracks a bulk path for a
-  large `LOAD`.
+  tell. A load or a replacement into an empty store takes the bulk path when its inputs
+  hold more than 8 MiB, or more than 80 bytes per threshold quad when the threshold is
+  lower, and a transaction otherwise, since a transaction costs less than the rebuild's
+  fixed cost of about 20 ms below that size. Such a small first write leaves its quads in
+  the delta, where an in-memory dataset admits them by the memory estimate of each quad. A
+  write limited to some graphs parses its inputs in a transaction, and batches that check
+  triple protections, managed graphs or control records stay transactional, as does a
+  patch once it has met a delete row. A large stream load into a dataset that holds data,
+  and a large load or replacement into an empty one, are bulk commits, so the change-log
+  limit of bulk commits under the limitations below applies to them. SPARQL `LOAD` always
+  inserts in a transaction. Roadmap item 846 tracks a bulk path for a large `LOAD`.
 * CSV and TSV tables map to triples ([C05](../specs/C05-tabular-imports.md),
   [USAGE.md](../USAGE.md#loading-csv-and-tsv)). `sparkles load`, `sparkles csv`,
   `POST /{ds}/upload` and the web UI's upload form accept them. A table maps with a
