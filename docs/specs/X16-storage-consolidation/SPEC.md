@@ -272,8 +272,9 @@ check.
 estimate from `estimated_quads`, a batch length or a stream probe against a byte bound,
 whether every source is a small reader, whether the write is restricted to some graphs
 through `WriteOptions::graphs`, whether the transaction checks triple-level write
-protections, which `requested` records, whether it carries a managed admission, whether
-the patch has met a delete row, and `bulk_threshold`. The table below is the current
+protections, which `requested` records, whether it carries the capability to change
+managed graphs or control records, whether the patch has met a delete row, and
+`bulk_threshold`. The table below is the current
 behaviour, which the first commit of the phase encodes as a table test before any rule
 changes, and the second commit unifies the rules by the decisions it records.
 
@@ -281,7 +282,7 @@ changes, and the second commit unifies the rules by the decisions it records.
 |---|---|---|---|
 | `load_with` | The write is unrestricted, the sources are not small streams, and the head is empty or the estimate is above the threshold. Small streams means an empty head, at least one source, every source a reader, and the readers holding at most `SMALL_STREAM_BYTES`, 8 MiB, of decompressed bytes in total when read ahead. | The estimate is strictly above. | It has no probe of large streams against the threshold. |
 | `replace_with` | The write is unrestricted and the estimate is above the threshold or the streams exceed eighty bytes per threshold quad. | The estimate is strictly above. | It has no empty-head case. |
-| `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed admission. | The length is at or above. | It has no size estimate and no small-reader case. |
+| `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed capability and no control records. | The length is at or above. | It has no size estimate and no small-reader case. |
 | `patch_apply` | The patch has met no delete row, whether or not the row deleted anything, and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
 
 The unified rule takes the strict test everywhere, gives `replace_with` the empty-head

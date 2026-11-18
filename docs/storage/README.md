@@ -88,6 +88,16 @@ These read paths are tuned for queries over data that is not yet in memory
 * Inputs larger than the memory budget are sorted externally.
 * Large updates and inference batches take a bulk write path that merges them into a
   rebuilt generation and publishes it by an atomic switch of `CURRENT`.
+* One rule picks the bulk path or a transaction for a load, a graph replacement, a bulk
+  insert and an RDF Patch. A write takes the bulk path when its size is above the store's
+  bulk threshold, 250,000 quads by default. Files are sized at about 80 bytes per quad,
+  and streams are read ahead up to 80 bytes per threshold quad, 20 MB by default, to
+  tell. A load or a replacement into an empty store also takes the bulk path, unless all
+  its inputs are streams that end within 8 MiB. A write limited to some graphs parses its
+  inputs in a transaction, and batches that check triple protections, managed graphs or
+  control records stay transactional, as does a patch once it has met a delete row.
+  SPARQL `LOAD` always inserts in a transaction. Roadmap item 846 tracks a bulk path for a
+  large `LOAD`.
 * CSV and TSV tables map to triples ([C05](../specs/C05-tabular-imports.md),
   [USAGE.md](../USAGE.md#loading-csv-and-tsv)). `sparkles load`, `sparkles csv`,
   `POST /{ds}/upload` and the web UI's upload form accept them. A table maps with a

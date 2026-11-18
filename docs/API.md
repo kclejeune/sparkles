@@ -3687,9 +3687,9 @@ successfully checked a pending head waits for its fence and propagates a failure
 | A body over `--max-upload-mb` | 413 | |
 | Write-time validation rejects the result | 422 | as for other writes |
 
-A failed patch applies nothing. A patch of adds alone with at least as many rows as the
-store's bulk threshold takes the bulk path of a large load, which rebuilds the index
-instead of growing the write-ahead log.
+A failed patch applies nothing. A patch of adds alone with more rows than the store's
+bulk threshold takes the bulk path of a large load, which rebuilds the index instead of
+growing the write-ahead log.
 
 ## Stored queries
 
