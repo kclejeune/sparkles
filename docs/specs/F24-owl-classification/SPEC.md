@@ -1103,7 +1103,8 @@ the laptop runs falls from 796 to 678 MiB and from 1,189 to 933 MiB. The taxonom
 equal at every level on one and eight threads. Tier D's own unfolding in its bounded
 attempt is not reduced. The first two reductions were tried there and not kept. On the
 96 disjunctive files of the development set the taxonomies were equal, the same three
-attempts ended over their bound, and the two Uberon files took the same time, as the
+attempts ended over their bound, and the times of the two Uberon files differed by no
+more than the spread of their runs, 52 to 125 s, as the
 [experiments log](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
 
 A differential check generated small Horn ontologies with chains, transitive properties,
