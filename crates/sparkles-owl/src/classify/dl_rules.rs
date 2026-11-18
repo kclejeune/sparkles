@@ -1063,13 +1063,32 @@ pub(super) fn into_nominal(ix: &Index, d: Ex) -> Option<(Role, u32)> {
     if !nominal_succ() || dx.root.is_none() || dx.counting {
         return None;
     }
-    match ix.head(d).node {
-        Node::Exist(r, f) => match ix.head(f).node {
-            Node::Nominal(v) => Some((r, v)),
-            _ => None,
-        },
-        _ => None,
+    let h = ix.head(d);
+    let Node::Exist(r, _) = h.node else {
+        return None;
+    };
+    singleton_of(ix, h.succ).map(|v| (r, v))
+}
+
+/// The constant v when the class `a` is below the singleton `N_v` through told subsumers
+/// and conjuncts alone, so that `a(t)` gives `t ≈ v` under no other premise.
+fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
+    let mut todo = vec![a];
+    let mut seen: Vec<Ex> = Vec::new();
+    while let Some(b) = todo.pop() {
+        if seen.contains(&b) || seen.len() > 64 {
+            continue;
+        }
+        seen.push(b);
+        let h = ix.head(b);
+        match h.node {
+            Node::Nominal(v) => return Some(v),
+            Node::Conj(p, q) => todo.extend([p, q]),
+            _ => {}
+        }
+        todo.extend_from_slice(ix.told_of(h));
     }
+    None
 }
 
 /// Whether a hypothetical successor sends its conclusions with an empty body over constants

@@ -480,7 +480,7 @@ fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
         .collect();
     cases.sort();
     assert_eq!(cases.len(), 50);
-    let past_bound = ["shoi-005", "shoi-022", "shoi-027", "shoi-032", "shoi-042"];
+    let past_bound = ["shoi-022", "shoi-042"];
     let mut exact = 0;
     let mut failures = Vec::new();
     for case in &cases {

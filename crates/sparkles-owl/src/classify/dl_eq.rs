@@ -40,6 +40,42 @@ pub fn eq_block() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_BLOCK").is_none_or(|v| v != "0"))
 }
 
+/// The rule's name in the derivation trace with the shape of its rewriting equality
+/// `s₁ ↦ t₁`, by the kinds of terms: x, a constant, `f(x)` and `f(u)`.
+fn shape(rule: &'static str, s1: RTerm, t1: RTerm) -> &'static str {
+    use RTerm::*;
+    let k = |t: RTerm| match t {
+        X | Y => 0,
+        C(_) => 1,
+        Fx(_) => 2,
+        Fc(..) => 3,
+    };
+    const EQ: [&str; 16] = [
+        "eq:x>x", "eq:x>c", "eq:x>fx", "eq:x>fc", "eq:c>x", "eq:c>c", "eq:c>fx", "eq:c>fc",
+        "eq:fx>x", "eq:fx>c", "eq:fx>fx", "eq:fx>fc", "eq:fc>x", "eq:fc>c", "eq:fc>fx", "eq:fc>fc",
+    ];
+    const INTO: [&str; 16] = [
+        "eqinto:x>x",
+        "eqinto:x>c",
+        "eqinto:x>fx",
+        "eqinto:x>fc",
+        "eqinto:c>x",
+        "eqinto:c>c",
+        "eqinto:c>fx",
+        "eqinto:c>fc",
+        "eqinto:fx>x",
+        "eqinto:fx>c",
+        "eqinto:fx>fx",
+        "eqinto:fx>fc",
+        "eqinto:fc>x",
+        "eqinto:fc>c",
+        "eqinto:fc>fx",
+        "eqinto:fc>fc",
+    ];
+    let i = k(s1) * 4 + k(t1);
+    if rule == "eq" { EQ[i] } else { INTO[i] }
+}
+
 /// What the equality rules read beside a context's state: the index, the run's literals,
 /// whether the context is the root, and the named class of a query context, which is its
 /// core atom.
@@ -224,6 +260,7 @@ impl Eqs<'_> {
                     }
                     made.clear();
                     self.rewrites(*v2, s1, t1, &mut made);
+                    found.rule = shape("eq", s1, t1);
                     self.push(found, prem, c2, &made, no_xy(v) && no_xy(*v2));
                 }
             }
@@ -283,6 +320,7 @@ impl Eqs<'_> {
                         }
                         made.clear();
                         self.rewrites(v, s1, t1, &mut made);
+                        found.rule = shape("eqinto", s1, t1);
                         self.push(found, &c1, prem, &made, no_xy(self.view(e)) && no_xy(v));
                     }
                 }
