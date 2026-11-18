@@ -525,6 +525,9 @@ fn explain_shows_decorrelation_and_why_not() {
     let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
     for i in 0..3000 {
         ttl.push_str(&format!("ex:s{i} ex:p ex:o{} .\n", i % 700));
+        if i % 3 == 0 {
+            ttl.push_str(&format!("ex:s{i} ex:t ex:v .\n"));
+        }
     }
     // 100 objects with a q (50 of them with two)
     for j in (0..700).step_by(7) {
@@ -561,6 +564,25 @@ fn explain_shows_decorrelation_and_why_not() {
     );
     assert_eq!(counter(nested.plan(), "existsProbed"), Some(3000));
     assert_eq!(counter(nested.plan(), "existsPerRow"), Some(0));
+    // rows that bind a risky variable are left to substitution, and are counted only
+    // when the expression reaches the EXISTS: never here, every one of them here
+    let skip = "SELECT ?x WHERE { ?x ex:p ?y OPTIONAL { ?x ex:t ?v } FILTER(IF(BOUND(?v), true, EXISTS { ?y ex:q ?z FILTER(!BOUND(?v)) })) }";
+    let reach = "SELECT ?x WHERE { ?x ex:p ?y OPTIONAL { ?x ex:t ?v } FILTER(IF(BOUND(?v), EXISTS { ?y ex:q ?z FILTER(!BOUND(?v)) }, true)) }";
+    for (q, per_row) in [(skip, 0), (reach, 1000)] {
+        let r = explain_of(&s, q, Optimizations::ALL);
+        assert_eq!(
+            rows(&r, false),
+            rows(&explain_of(&s, q, without()), false),
+            "{q}"
+        );
+        assert!(
+            has_desc(r.plan(), "[EXISTS decorrelated on ?y:"),
+            "{q}: {:#?}",
+            r.plan()
+        );
+        assert_eq!(counter(r.plan(), "existsProbed"), Some(2000), "{q}");
+        assert_eq!(counter(r.plan(), "existsPerRow"), Some(per_row), "{q}");
+    }
     // a filter over an outer variable the pattern does not bind: per row, and why
     let q = "SELECT ?x WHERE { ?x ex:p ?y FILTER EXISTS { ?y ex:q ?z FILTER(?z != ?x) } }";
     let r = explain_of(&s, q, Optimizations::ALL);

@@ -1411,7 +1411,9 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
 
 /// The estimated bytes of the key sets that answer the EXISTS patterns of `node`, with
 /// the cursor state of their plans. A pattern without a key set is evaluated once per
-/// distinct outer key, and its memo stops growing at an eighth of the memory budget.
+/// distinct outer key, and its memo holds one entry per key up to its entry cap and an
+/// eighth of the memory budget. A pattern that shares no variable with the rows it tests
+/// keeps one answer.
 fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
     let hashed = |n: &Node| {
         let est = n.est.max(0.0);
@@ -1428,11 +1430,33 @@ fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
     specs
         .into_iter()
         .map(|spec| {
-            keyed_exists(ctx, node, spec).map_or((ctx.mem_limit / 8) as f64, |planned| {
-                hashed(&planned) + cursor_state_bytes(ctx, &planned)
-            })
+            keyed_exists(ctx, node, spec).map_or_else(
+                || per_key_exists_bytes(ctx, node, spec),
+                |planned| hashed(&planned) + cursor_state_bytes(ctx, &planned),
+            )
         })
         .sum()
+}
+
+/// The estimated bytes of the memo of an EXISTS that `node` evaluates once per distinct
+/// outer key, which [`super::expr::ExistsSpec`] caps at an eighth of the memory budget
+/// and a fixed number of entries. The rows it tests bound the number of keys, and a
+/// pattern that none of their variables or constants reaches keeps one answer.
+fn per_key_exists_bytes(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> f64 {
+    let (vars, rows): (Vec<VarId>, f64) = match (&node.kind, node.children.as_slice()) {
+        (Kind::LeftJoin { .. }, [left, right]) => (
+            left.vars.iter().chain(&right.vars).copied().collect(),
+            node.est.max(0.0),
+        ),
+        (_, [input]) => (input.vars.clone(), input.est.max(0.0)),
+        _ => return (ctx.mem_limit / 8) as f64,
+    };
+    if spec.bound.is_empty() && !spec.vars.iter().any(|v| vars.contains(v)) {
+        return 1024.0;
+    }
+    let entry = (spec.vars.len() * 8 + 64) as f64;
+    (rows.min(super::expr::EXISTS_MEMO_ENTRIES as f64) * entry + 1024.0)
+        .min((ctx.mem_limit / 8) as f64)
 }
 
 /// The plan of the key set that answers the EXISTS of `spec` in an expression of `node`:
@@ -5666,6 +5690,15 @@ mod tests {
         };
         let counted = "SELECT ?f (COUNT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f";
         assert!(memory(counted));
+        // EXISTS patterns without a key set that share no variable with the rows keep
+        // one answer each, so four of them do not take the cursor's room
+        assert!(memory(
+            "SELECT ?f (COUNT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f \
+             FILTER EXISTS { { ?a <urn:q> ?b } UNION { ?a <urn:p> ?b } } \
+             FILTER EXISTS { { ?c <urn:q> ?d } UNION { ?c <urn:p> ?d } } \
+             FILTER EXISTS { { ?e <urn:q> ?g } UNION { ?e <urn:p> ?g } } \
+             FILTER EXISTS { { ?h <urn:q> ?i } UNION { ?h <urn:p> ?i } } } GROUP BY ?f"
+        ));
         assert!(!memory(
             "SELECT ?f (COUNT(DISTINCT ?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f"
         ));

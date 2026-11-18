@@ -410,7 +410,9 @@ fn answers(
     spec: &ExistsSpec,
     negated: bool,
 ) -> Result<Option<Vec<bool>>> {
-    let Some(found) = probe_rows(ctx, t, spec)? else {
+    // The probe's charge covers `found` and the answers, and it stays held while the
+    // rows the key set cannot answer are evaluated.
+    let Some((found, held)) = probe_rows(ctx, t, spec, t.len() as u64, true)? else {
         return Ok(None);
     };
     let map = t.var_map(ctx.nvars());
@@ -434,6 +436,7 @@ fn answers(
             }
         });
     }
+    drop(held);
     Ok(Some(keep))
 }
 
@@ -445,8 +448,19 @@ const FOUND: u8 = 1;
 const UNKNOWN: u8 = 2;
 
 /// Whether the pattern of `spec` has a solution that agrees with each row of `t`, from
-/// its key set, if it has (or gets) one, as [`ABSENT`], [`FOUND`] or [`UNKNOWN`].
-fn probe_rows(ctx: &Ctx, t: &Table, spec: &ExistsSpec) -> Result<Option<Vec<u8>>> {
+/// its key set, if it has (or gets) one, as [`ABSENT`], [`FOUND`] or [`UNKNOWN`], with
+/// the charge that covers the answers and `extra` bytes more for the caller's use of
+/// them. The caller holds it while it uses them. With
+/// `count_unknown`, the rows left to substitution are counted for EXPLAIN here, because
+/// the caller evaluates every one of them. Otherwise the evaluation counts those it
+/// reaches.
+fn probe_rows<'a>(
+    ctx: &'a Ctx,
+    t: &Table,
+    spec: &ExistsSpec,
+    extra: u64,
+    count_unknown: bool,
+) -> Result<Option<(Vec<u8>, Charge<'a>)>> {
     let Some(build) = prepare(ctx, spec, t)? else {
         return Ok(None);
     };
@@ -459,7 +473,7 @@ fn probe_rows(ctx: &Ctx, t: &Table, spec: &ExistsSpec) -> Result<Option<Vec<u8>>
     }
     // The probe vectors are transient. Retained key sets carry their own charges, and
     // those of a context that was never shared are held while the rows are probed.
-    let probe = t.len() as u64 + (build.keys.len() + build.risky.len()) as u64 * 64 + 1024;
+    let probe = t.len() as u64 + extra + (build.keys.len() + build.risky.len()) as u64 * 64 + 1024;
     let held = match ctx.charge(if build._charge.is_some() {
         probe
     } else {
@@ -487,11 +501,10 @@ fn probe_rows(ctx: &Ctx, t: &Table, spec: &ExistsSpec) -> Result<Option<Vec<u8>>
             .with_min_len(PAR_MIN_LEN)
             .map(|id| set.contains(id) as u8)
             .collect();
-        drop(held);
         decor
             .probed
             .fetch_add(found.len() as u64, Ordering::Relaxed);
-        return Ok(Some(found));
+        return Ok(Some((found, held)));
     }
     let width = keys.len();
     let all = if width == 64 {
@@ -544,10 +557,11 @@ fn probe_rows(ctx: &Ctx, t: &Table, spec: &ExistsSpec) -> Result<Option<Vec<u8>>
             None => per_row += 1,
         }
     }
-    drop(held);
     decor.probed.fetch_add(probed, Ordering::Relaxed);
-    decor.per_row.fetch_add(per_row, Ordering::Relaxed);
-    Ok(Some(found))
+    if count_unknown {
+        decor.per_row.fetch_add(per_row, Ordering::Relaxed);
+    }
+    Ok(Some((found, held)))
 }
 
 /// The answers of the EXISTS patterns inside larger expressions, such as IF or OR, an
@@ -563,15 +577,17 @@ pub struct Answers<'a> {
     specs: Vec<(usize, Vec<u8>)>,
 }
 
-/// [`Answers`] with the charge of their memory, which the caller holds while it
+/// [`Answers`] with the charges of their memory, which the caller holds while it
 /// evaluates the rows.
 pub struct Nested<'a> {
     pub answers: Answers<'a>,
-    _held: Charge<'a>,
+    _held: Vec<Charge<'a>>,
 }
 
 impl Answers<'_> {
-    /// The answer of `spec` for row `i` of `t`, when its key set gave one.
+    /// The answer of `spec` for row `i` of `t`, when its key set gave one. A row that
+    /// the key set of `spec` could not answer is counted as evaluated per row, since the
+    /// caller evaluates it by substitution next.
     #[inline]
     pub fn get(&self, spec: &ExistsSpec, t: &Table, i: usize) -> Option<bool> {
         if !std::ptr::eq(self.table, t) {
@@ -584,7 +600,10 @@ impl Answers<'_> {
         match found.get(i).copied()? {
             FOUND => Some(true),
             ABSENT => Some(false),
-            _ => None,
+            _ => {
+                spec.decor.per_row.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 }
@@ -609,17 +628,15 @@ pub(super) fn nested<'a>(
         e.exists_specs(&mut all);
     }
     let mut specs: Vec<(usize, Vec<u8>)> = Vec::new();
-    let held = ctx.charge(0)?;
+    let mut held = Vec::new();
     for spec in all {
         let ptr = Arc::as_ptr(spec) as usize;
         if specs.iter().any(|(s, _)| *s == ptr) {
             continue;
         }
-        if let Some(found) = probe_rows(ctx, t, spec)? {
-            if held.add(found.len() as u64 + 64).is_err() {
-                break;
-            }
+        if let Some((found, charge)) = probe_rows(ctx, t, spec, 0, false)? {
             specs.push((ptr, found));
+            held.push(charge);
         }
     }
     Ok((!specs.is_empty()).then_some(Nested {

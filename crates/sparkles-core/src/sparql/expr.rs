@@ -135,7 +135,7 @@ impl ExistsSpec {
 }
 
 /// The most entries the memo of one EXISTS keeps.
-const EXISTS_MEMO_ENTRIES: usize = 100_000;
+pub(super) const EXISTS_MEMO_ENTRIES: usize = 100_000;
 
 /// The deepest expression evaluated on rayon's threads (see [`Expr::parallel`]): their
 /// stack is 2 MiB unless the application sets another, and a debug build's evaluator
