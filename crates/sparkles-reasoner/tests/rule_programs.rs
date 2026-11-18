@@ -474,3 +474,158 @@ r(?x) :- (?x ex:p ?y), not r(?y).
     .unwrap_err();
     assert!(format!("{e:#}").contains("adv"), "{e:#}");
 }
+
+/// Wildcards in every column of relations of arity 3 and 4, in positive and negated atoms,
+/// against the same program with named variables and projections in their place: a full
+/// run, query-time answers and kept and cache-free updates agree, and C24 §6.2's
+/// `not cousin(ex:n10, ?d, ?_)` reads every value of the last column.
+const WILD: &str = "@prefix ex: <http://ex.org/> .
+.decl link(x, m, y)
+.decl quad(x, m, c, y)
+link(?x, ?m, ?y) :- (?x ex:p ?m), (?m ex:q ?y).
+quad(?x, ?m, ?c, ?y) :- link(?x, ?m, ?y), (?m ex:c ?c).
+(?x ex:hop ?y) :- link(?x, ?_, ?y).
+(?x ex:start ex:yes) :- link(?x, ?_, ?_).
+(?y ex:end ex:yes) :- link(?_, ?_, ?y).
+(?m ex:mid ?c) :- quad(?_, ?m, ?c, ?_).
+(?x ex:lonely ex:yes) :- (?x rdf:type ex:T), not link(?x, ?_, ?_).
+(?x ex:noMid ex:yes) :- (?x rdf:type ex:T), not link(?_, ?x, ?_).
+(?x ex:noEnd ?z) :- (?x rdf:type ex:T), (?z rdf:type ex:T), not link(?x, ?_, ?z).
+(?x ex:noC ?c) :- (?x rdf:type ex:T), (?c rdf:type ex:C), not quad(?x, ?_, ?c, ?_).
+(?x ex:noTail ?y) :- (?x rdf:type ex:T), (?y rdf:type ex:T), not quad(?_, ?x, ?_, ?y).
+";
+
+/// [`WILD`] with named variables for the positive wildcards and a projection relation for
+/// each negated atom.
+const NAMED: &str = "@prefix ex: <http://ex.org/> .
+.decl link(x, m, y)
+.decl quad(x, m, c, y)
+.decl lx(x)
+.decl lm(m)
+.decl lxy(x, y)
+.decl qxc(x, c)
+.decl qmy(m, y)
+link(?x, ?m, ?y) :- (?x ex:p ?m), (?m ex:q ?y).
+quad(?x, ?m, ?c, ?y) :- link(?x, ?m, ?y), (?m ex:c ?c).
+lx(?x) :- link(?x, ?a, ?b).
+lm(?m) :- link(?a, ?m, ?b).
+lxy(?x, ?y) :- link(?x, ?a, ?y).
+qxc(?x, ?c) :- quad(?x, ?a, ?c, ?b).
+qmy(?m, ?y) :- quad(?a, ?m, ?b, ?y).
+(?x ex:hop ?y) :- link(?x, ?w1, ?y).
+(?x ex:start ex:yes) :- link(?x, ?w1, ?w2).
+(?y ex:end ex:yes) :- link(?w1, ?w2, ?y).
+(?m ex:mid ?c) :- quad(?w1, ?m, ?c, ?w2).
+(?x ex:lonely ex:yes) :- (?x rdf:type ex:T), not lx(?x).
+(?x ex:noMid ex:yes) :- (?x rdf:type ex:T), not lm(?x).
+(?x ex:noEnd ?z) :- (?x rdf:type ex:T), (?z rdf:type ex:T), not lxy(?x, ?z).
+(?x ex:noC ?c) :- (?x rdf:type ex:T), (?c rdf:type ex:C), not qxc(?x, ?c).
+(?x ex:noTail ?y) :- (?x rdf:type ex:T), (?y rdf:type ex:T), not qmy(?x, ?y).
+";
+
+const WILD_DATA: &str = "ex:a ex:p ex:b . ex:b ex:q ex:c . ex:b ex:q ex:d .
+ex:c ex:p ex:d . ex:d ex:q ex:a . ex:b ex:c ex:k1 . ex:d ex:c ex:k2 . ex:d ex:c ex:k1 .
+ex:a a ex:T . ex:b a ex:T . ex:c a ex:T . ex:d a ex:T . ex:e a ex:T .
+ex:k1 a ex:C . ex:k2 a ex:C . ex:k3 a ex:C .";
+
+#[test]
+fn wildcards_in_later_columns() {
+    let full = |text: &str, ttl: &str| {
+        let s = store(ttl);
+        let r = reason(&s, &rules(text), None, None);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        inferred(&s)
+    };
+    let got = full(WILD, WILD_DATA);
+    assert_eq!(got, full(NAMED, WILD_DATA));
+    // a check of the reference itself on a few facts
+    let has = |s: &str, p: &str, o: &str| got.contains(&format!("<{EX}{s}> <{EX}{p}> <{EX}{o}>"));
+    assert!(has("a", "hop", "c") && has("a", "hop", "d") && has("c", "hop", "a"));
+    assert!(has("e", "lonely", "yes") && !has("a", "lonely", "yes"));
+    assert!(has("a", "noMid", "yes") && !has("b", "noMid", "yes"));
+    assert!(has("a", "noEnd", "a") && !has("a", "noEnd", "c"));
+    assert!(has("a", "noC", "k3") && !has("a", "noC", "k1") && !has("c", "noC", "k2"));
+    assert!(has("b", "noTail", "a") && !has("b", "noTail", "c") && !has("d", "noTail", "a"));
+    assert!(has("d", "mid", "k2") && has("b", "mid", "k1"));
+    // explanations through wildcard atoms, positive and negated
+    let es = store(WILD_DATA);
+    reason(&es, &rules(WILD), None, None);
+    for (s, p, o) in [
+        ("a", "hop", "c"),
+        ("d", "mid", "k2"),
+        ("e", "lonely", "yes"),
+        ("b", "noTail", "a"),
+    ] {
+        let d = tree(why(&es, &rules(WILD), [ex(s), ex(p), ex(o)]));
+        assert!(d.rule.is_some(), "{s} {p} {o}: {d:?}");
+    }
+    // query time, for a bound subject, a bound object and a free pattern of each property
+    let reasoner = QueryReasoner::new(rules(WILD), &Extras::default(), Inputs::default()).unwrap();
+    let s = store(WILD_DATA);
+    let m = store(WILD_DATA);
+    reason(&m, &rules(WILD), None, None);
+    let mat = QueryOptions {
+        prefixes: vec![("ex".into(), EX.into())],
+        default_graph_extra: vec![INFERRED_GRAPH.into()],
+        ..Default::default()
+    };
+    for p in [
+        "hop", "start", "end", "mid", "lonely", "noMid", "noEnd", "noC", "noTail",
+    ] {
+        for q in [
+            format!("SELECT ?x ?y WHERE {{ ?x ex:{p} ?y }}"),
+            format!("SELECT ?y WHERE {{ ex:a ex:{p} ?y }}"),
+            format!("SELECT ?y WHERE {{ ex:b ex:{p} ?y }}"),
+            format!("SELECT ?x WHERE {{ ?x ex:{p} ex:a }}"),
+            format!("SELECT ?x WHERE {{ ?x ex:{p} ex:k3 }}"),
+            format!("SELECT ?x WHERE {{ ?x ex:{p} ex:yes }}"),
+        ] {
+            let at_query = rows(&query(s.snapshot(), &q, &demand(&reasoner)).unwrap());
+            let want = rows(&query(m.snapshot(), &q, &mat).unwrap());
+            assert_eq!(at_query, want, "{q}");
+        }
+    }
+    // updates of the positive part, kept and from the store, equal full runs
+    let positive: String = WILD
+        .lines()
+        .filter(|l| !l.contains(" not "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for kept in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = if kept {
+            store(WILD_DATA)
+        } else {
+            let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+            s.load(&[Source::from_bytes(
+                format!("{PREFIXES}{WILD_DATA}").into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+            s
+        };
+        let cache = Cache::default();
+        let cache = kept.then_some(&cache);
+        let p = rules(&positive);
+        let since = commit(&reason(&s, &p, None, cache));
+        change(
+            &s,
+            &[t("e", "p", "b"), t("b", "c", "k3")],
+            &[t("b", "q", "c"), t("d", "c", "k2")],
+        );
+        let r = reason(&s, &p, Some(since), cache);
+        assert_eq!(
+            r.method,
+            Method::Incremental,
+            "kept {kept}: {:?}",
+            r.fallback
+        );
+        let mut ttl = WILD_DATA
+            .replace("ex:b ex:q ex:c . ", "")
+            .replace("ex:d ex:c ex:k2 . ", "");
+        ttl.push_str(" ex:e ex:p ex:b . ex:b ex:c ex:k3 .");
+        assert_ne!(ttl, WILD_DATA);
+        assert_eq!(inferred(&s), full(&positive, &ttl), "kept {kept}");
+    }
+}
