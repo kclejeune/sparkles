@@ -5852,39 +5852,73 @@ fn reference_evaluator_notes_open_choices_and_keeps_scopes() {
 
 /// A term that the memory budget refuses to decode in the middle of an answer fails the
 /// output with the budget's error, in every SELECT format of both executors, after the
-/// rows before it.
+/// rows before it, which are written whole and counted. The long literal sorts in the
+/// middle of the objects, and the query reads them in object order.
+///
+/// The cursor runs with batches of 1 and 64 rows, whose term caches fit the budget, so the
+/// batches before the long literal are written from the cache and the batch holding it
+/// falls back to decoding row by row. With 4,096 rows the one batch's cache needs 128 bytes
+/// a cell before any term, 256 KiB, which the 128 KiB budget refuses, so every row is
+/// decoded row by row. The unit test
+/// `the_refused_decode_cases_cover_cached_and_declined_batches` checks these cases, and a
+/// control without the long literal is written whole under the same budget.
 #[test]
 fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
     use sparkles_core::sparql::results::{
         self, Format, RowCount, SolutionsFormat, WriteOptions, write,
     };
-    let s = Store::in_memory(StoreOptions::default());
-    let data = (0..1000)
-        .map(|i| {
-            if i == 600 {
-                format!("<urn:s:{i}> <urn:p> \"{}\" .\n", "x".repeat(256 << 10))
-            } else {
-                format!("<urn:s:{i}> <urn:p> \"v{i}\" .\n")
-            }
-        })
-        .collect::<String>();
-    s.load(&[Source::from_bytes(
-        data.into_bytes(),
-        RdfFormat::NTriples,
-        None,
-    )])
-    .unwrap();
-    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let load = |long: bool| {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = (0..1000)
+            .map(|i| {
+                if i == 600 && long {
+                    format!(
+                        "<urn:s:{i}> <urn:p> \"v{i:04}{}\" .\n",
+                        "x".repeat(256 << 10)
+                    )
+                } else {
+                    format!("<urn:s:{i}> <urn:p> \"v{i:04}\" .\n")
+                }
+            })
+            .collect::<String>();
+        s.load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        s
+    };
+    let s = load(true);
+    let control = load(false);
+    let q = "SELECT ?o ?s WHERE { ?s <urn:p> ?o }";
     let opts = QueryOptions {
         max_memory_bytes: Some(128 << 10),
         ..Default::default()
     };
-    let refused = |name: &str, error: Error| {
+    // the rows whose object, the last thing a row holds of its own, was written
+    let complete = |out: &[u8]| -> u64 {
+        out.windows(6)
+            .filter(|w| w[0] == b'v' && w[1..5].iter().all(u8::is_ascii_digit) && w[5] != b'x')
+            .count() as u64
+    };
+    let refused = |name: &str, error: &Error| {
         assert!(
-            matches!(&error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+            matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
             "{name}: {error:?}"
         );
     };
+    for batch in [1, 64, 4096] {
+        let mut c = select_cursor(control.snapshot(), q, &opts, &options(batch)).unwrap();
+        let rows = RowCount::new();
+        write(
+            results::Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(SolutionsFormat::Tsv), &rows),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rows.get(), 1000, "control batch {batch}");
+    }
     for fmt in [
         SolutionsFormat::Json,
         SolutionsFormat::Xml,
@@ -5901,8 +5935,14 @@ fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
             &mut out,
         )
         .unwrap_err();
-        refused(&format!("eager {fmt:?}"), error);
-        assert!(rows.get() < 1000, "eager {fmt:?}: {}", rows.get());
+        let name = format!("eager {fmt:?}");
+        refused(&name, &error);
+        assert!(
+            rows.get() > 0 && rows.get() < 1000,
+            "{name}: {}",
+            rows.get()
+        );
+        assert_eq!(rows.get(), complete(&out), "{name}");
         for batch in [1, 64, 4096] {
             let mut c = select_cursor(s.snapshot(), q, &opts, &options(batch)).unwrap();
             let rows = RowCount::new();
@@ -5913,8 +5953,27 @@ fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
                 &mut out,
             )
             .unwrap_err();
-            refused(&format!("cursor {fmt:?} batch {batch}"), error);
-            assert!(rows.get() < 1000, "cursor {fmt:?}: {}", rows.get());
+            let name = format!("cursor {fmt:?} batch {batch}");
+            refused(&name, &error);
+            assert!(
+                rows.get() > 0 && rows.get() < 1000,
+                "{name}: {}",
+                rows.get()
+            );
+            assert_eq!(rows.get(), complete(&out), "{name}");
+            // a cursor still open fails with the output; the one batch of 4,096 rows
+            // completed the plan before the writer failed, and keeps the output's error
+            let status = if batch == 4096 {
+                CursorStatus::Complete
+            } else {
+                CursorStatus::Failed
+            };
+            assert_eq!(c.status(), status, "{name}");
+            assert!(c.stats().error.is_some(), "{name}");
+            assert!(
+                c.next_batch().unwrap().is_none(),
+                "{name}: the cursor is fused"
+            );
         }
     }
 }

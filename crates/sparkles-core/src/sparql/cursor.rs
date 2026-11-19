@@ -5977,6 +5977,80 @@ mod tests {
         assert_eq!(successor([u64::MAX; 4]), None);
     }
 
+    /// The cases of the integration test
+    /// `a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer`, on its data and
+    /// budget: with batches of 1 and 64 rows the batches before the long literal are written
+    /// from their term caches and the batch that holds it declines its cache, and the one
+    /// batch of 4,096 rows declines its cache.
+    #[test]
+    fn the_refused_decode_cases_cover_cached_and_declined_batches() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..1000)
+            .map(|i| {
+                if i == 600 {
+                    format!(
+                        "<urn:s:{i}> <urn:p> \"v{i:04}{}\" .\n",
+                        "x".repeat(256 << 10)
+                    )
+                } else {
+                    format!("<urn:s:{i}> <urn:p> \"v{i:04}\" .\n")
+                }
+            })
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let options = QueryOptions {
+            max_memory_bytes: Some(128 << 10),
+            ..Default::default()
+        };
+        for batch_rows in [1, 64, 4096] {
+            let mut cursor = select_cursor(
+                store.snapshot(),
+                "SELECT ?o ?s WHERE { ?s <urn:p> ?o }",
+                &options,
+                &CursorOptions {
+                    batch_rows,
+                    fallback: FallbackPolicy::RejectMaterialization,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // the rows before each batch whose cache was declined, and the cached rows
+            let mut declined = Vec::new();
+            let (mut rows, mut cached) = (0, 0);
+            cursor
+                .for_each_decoded(None, |_, batch, decoded| {
+                    if decoded.is_some() {
+                        cached += batch.len();
+                    } else {
+                        declined.push(rows);
+                    }
+                    rows += batch.len();
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(rows, 1000, "{batch_rows}");
+            if batch_rows == 4096 {
+                assert_eq!(declined, vec![0], "{batch_rows}");
+            } else {
+                // the long literal is row 558 in object order
+                assert_eq!(
+                    declined,
+                    vec![558 / batch_rows * batch_rows],
+                    "{batch_rows}"
+                );
+                assert_eq!(cached, 1000 - batch_rows, "{batch_rows}");
+            }
+        }
+    }
+
     /// A writer that decodes ahead pulls each batch after the first before it writes the
     /// one before, and it writes the first batch before it pulls the second, so that the
     /// first rows wait for one batch only. Its batches and term caches go back to the
