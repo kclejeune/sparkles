@@ -943,7 +943,7 @@ keeps its recorded intent for reconciliation.
 | `gate.sh --no-wait <rev>` | Pushes and starts the gate, then returns, for agents with bounded waits. |
 | `gate.sh --status <rev>` | Prints each half's progress, steps and last memory sample. The last line is `active` while either half runs. |
 | `gate.sh --fetch <rev>` | Copies and merges the results into `.artifacts/gates/main-gate-<name>-<host>/` of the main checkout. |
-| `gate.sh --hosts` | Prints each host's lock state, number of gate units and free disk. |
+| `gate.sh --hosts` | Prints each host's lock state, number of gate units and free GiB, and whether that meets the disk floor of a whole gate or of a conformance half. |
 | `gate.sh --host wally <rev>` | Runs ci on wally, with the conformance half on a free configured helper. |
 | `gate.sh --host wally --helper none <rev>` | Runs the whole gate on one host. |
 | `gate.sh --base origin/main~3 <rev>` | Selects the checks from the changes since the merge base of `origin/main~3` and the commit. The default base is `GATE_BASE` or `origin/main`. |
@@ -980,17 +980,25 @@ under `~/gate/bin/v-<hash>/`, named by the hash of their contents. A new version
 never rewrites a script that a queued or running gate is reading. The host also needs
 `~/gate/suites` with the conformance suites, `~/gate/conformance.env` and the pytest venv
 `~/gate/py-venv`. `scripts/gate/setup-host.sh <host>` creates them, copies the suites from
-wally through the laptop and checks linger, mbx and free disk. A ci half needs about
-30 GiB of free disk for its target and a conformance half about 15 GiB.
+wally through the laptop and checks linger, mbx and free disk.
 
-The driver checks the free disk under the home directory of each chosen host before it
-starts anything there. A whole gate needs what a ci half needs. When a host has less, the
-driver runs `mbx gc` on it, which collects idle managed targets and evicts cache objects to
-the cache's budgets, and checks again. A host that is still short makes the driver stop
-with a message that names the host, the free space and the space needed. The check runs
-before the start because a running build holds its target's lease, so the cache cannot
-give back that space until the gate ends. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change
-the two amounts, in the environment or in `~/.config/sparkles/gate.env`.
+A gate has a disk floor on every host, 110 GiB by default for a ci half, a whole gate, the
+link check and a conformance half alike. That is the floor of a Boat gate, which a cold
+workspace build needs. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change the floors of the
+ci and conformance parts, in the environment or in `~/.config/sparkles/gate.env`. The
+driver checks the free disk under the home directory of each chosen host before it starts
+anything there. When a host has less, the driver runs `mbx gc` on it with
+`gc.min_free_size` raised to the floor, which collects idle managed targets and evicts
+cache objects until that much is free, and checks again. A host that is still short makes
+the driver stop with a message that names the host, the free space and the space needed.
+The check runs before the start because a running build holds its target's lease, so the
+cache cannot give back that space until the gate ends. Another job can use the space while
+the gate waits for the host's heavy lock, so the gate checks again under the lock, with the
+same `mbx gc` on an ssh host and the disk cleanup on a Boat worker. A gate still short there
+ends with exit 4 and `disk-below-floor` in its `outcome` file, and the driver says that the
+host's disk was below its floor. `--auto` and the default helper choice count a host as
+having the disk for a whole gate at `GATE_MIN_FREE_GB` free and for a conformance half at
+`GATE_MIN_FREE_HALF_GB`, which default to the two floors.
 
 Each run sets `CARGO_BUILD_JOBS` from its host's gate memory cap, the cap in GiB less one,
 halved, between 2 and 8. That gives 5 jobs at a Boat worker's 12 GiB cap, 6 jobs on a host

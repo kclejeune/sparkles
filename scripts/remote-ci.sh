@@ -20,9 +20,16 @@
 # closure watch's 900-second lead finds it closed. The host computes the unit's runtime
 # from that end immediately before systemd-run and refuses to start with under
 # REMOTE_CI_MIN_SECONDS left, 600 by default. On an ssh host the job may run 6 hours.
-# Under the heavy lock, a job on a Boat worker first needs REMOTE_CI_MIN_FREE_GIB free after
-# the disk cleanup, 85 by default, and refuses with exit 4 otherwise. A cold workspace test
-# build of the lane CI grew the disk by 67.8 GiB on the large worker, and 85 adds 25%.
+# Under the heavy lock, a job on any host first needs REMOTE_CI_MIN_FREE_GIB free, 85 by
+# default, and refuses with exit 4 otherwise. A cold workspace test build of the lane CI grew
+# the disk by 67.8 GiB on the large Boat worker, about 60 GiB of it in the mbx cache, and 85
+# adds 25%. A Boat worker frees finished work with its disk cleanup first, and an ssh host
+# runs `mbx gc` with gc.min_free_size raised to the floor, which evicts cache objects and
+# managed targets until the floor is free. While the build and tests run, the job reads the
+# free space every REMOTE_CI_WATCH_SECONDS, 30 by default, and stops them with exit 5 when it
+# falls under REMOTE_CI_RUN_FLOOR_GIB, 4 by default, since the server's tests keep 1 GiB free.
+# Either refusal writes disk-below-floor to the job's outcome file, and this script then
+# says that the host's disk was below its floor.
 # Results land in .artifacts/remote-ci/NAME, with ci.exit, ci.log and the ci or premerge logs.
 # A Boat worker needs SPARKLES_BOAT_PROFILE and SPARKLES_BOAT_ADMISSION, as every Boat
 # command does. The host needs ~/gate from scripts/gate/setup-host.sh.
@@ -146,11 +153,13 @@ case $host in
     ;;
 esac
 min=${REMOTE_CI_MIN_SECONDS:-600}
-case ${REMOTE_CI_MIN_FREE_GIB:-85} in '' | *[!0-9]* | 0)
-  echo "remote-ci.sh: REMOTE_CI_MIN_FREE_GIB must be a positive number of GiB" >&2
-  exit 2
-  ;;
-esac
+for n in REMOTE_CI_MIN_FREE_GIB REMOTE_CI_RUN_FLOOR_GIB REMOTE_CI_WATCH_SECONDS; do
+  case ${!n:-1} in '' | *[!0-9]* | 0 | 0*)
+    echo "remote-ci.sh: $n must be a positive whole number" >&2
+    exit 2
+    ;;
+  esac
+done
 # The job's script travels on stdin. Under the host's start lock, so that two starts of one
 # name cannot both pass the check, the host checks that the unit of that name has fully
 # stopped, rather than only left the active state, stores the
@@ -178,7 +187,8 @@ systemd-run --user --unit gate-$name --collect -q \"\${forward[@]}\" \\
   -p MemoryMax=$memory_max -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p TimeoutStopSec=60 -p UMask=0022 \\
   --setenv=HOME=\"\$HOME\" --setenv=USER=\"\$USER\" --setenv=PATH=\"\$p\" --setenv=SPARKLES_REMOTE_EXECUTOR=$executor \\
   --setenv=CARGO_BUILD_JOBS=$cargo_jobs --setenv=CARGO_INCREMENTAL=0 \\
-  --setenv=NEED_GIB=${REMOTE_CI_MIN_FREE_GIB:-85} --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end \\
+  --setenv=NEED_GIB=${REMOTE_CI_MIN_FREE_GIB:-85} --setenv=RUN_FLOOR_GIB=${REMOTE_CI_RUN_FLOOR_GIB:-4} --setenv=WATCH_SECONDS=${REMOTE_CI_WATCH_SECONDS:-30} \\
+  --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end \\
   /bin/bash \"\$o/ci-job.sh\"
 echo \"started gate-$name, ending by \$(date -u -d @$end +%FT%TZ)\"" < "$here/gate/remote/ci-job.sh"
 [ "$wait" = 1 ] || {
@@ -206,6 +216,11 @@ done
 fetch "$name"
 code=$(cat "$root/.artifacts/remote-ci/$name/ci.exit")
 echo "gate-$name exit $code in $(($(date +%s) - start)) s"
+if [ "$(cat "$root/.artifacts/remote-ci/$name/outcome" 2> /dev/null)" = disk-below-floor ]; then
+  echo "remote-ci.sh: host disk below floor on $host, so the job did not finish; its result says nothing about $full" >&2
+  grep 'host disk below floor' "$root/.artifacts/remote-ci/$name/progress.log" >&2 || true
+  exit "$code"
+fi
 [ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 30 "$root/.artifacts/remote-ci/$name/ci.log"
 [ -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 5 "$root/.artifacts/remote-ci/$name/progress.log"
 exit "$code"

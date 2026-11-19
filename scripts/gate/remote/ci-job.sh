@@ -14,6 +14,16 @@
 # unit's TimeoutStopSec bounds the shutdown. The worktree is created under the cleanup's
 # lock ~/gate/.disk-clean.lock, so a cleanup whose list of active units predates this unit
 # has finished before the worktree exists, and a later one sees the unit.
+#
+# A job that ends for want of disk writes disk-below-floor to $out/outcome, and its exit is
+# 4 at admission and 5 during the run. Under the heavy lock the job needs NEED_GIB free. A
+# Boat worker frees finished work with scripts/boat/disk_clean.py first. An ssh host runs
+# `mbx gc` with gc.min_free_size raised to NEED_GIB, which evicts managed targets and
+# cache objects until that much is free, and removes nothing else. While ci.sh or
+# premerge.sh runs, a watch reads the free space every WATCH_SECONDS, 30 by default, and
+# stops the run when it falls under RUN_FLOOR_GIB, 4 by default, so tests do not fail
+# against the server's own free-disk reserve for a reason that is not theirs. The run's
+# TMPDIR is .artifacts/tmp in the job's worktree, so its temporary files go with it.
 set -uo pipefail
 umask 022
 G=$HOME/gate
@@ -29,10 +39,32 @@ finish() {
     timeout --kill-after=10s 120 rm -rf "$wt"
     timeout --kill-after=10s 60 git -C "$G/repo.git" worktree prune
   fi
+  [ -z "${dw:-}" ] || kill "$dw" 2> /dev/null
   [ -z "${wd:-}" ] || kill "$wd" 2> /dev/null
   exit "$1"
 }
 until_end() { echo $((END - $(date +%s) - $1)); }
+# free_kib prints the KiB free on the filesystem of the home, or nothing when df fails.
+free_kib() {
+  local f
+  f=$(df -Pk "$HOME" 2> /dev/null | awk 'NR == 2 { print $4 }')
+  case $f in '' | *[!0-9]*) ;; *) echo "$f" ;; esac
+}
+# ssh_admit NEED_GIB SECONDS: succeed when NEED_GIB are free, after an `mbx gc` bounded by
+# SECONDS that frees the shortfall when they are not. An unreadable disk counts as full.
+ssh_admit() {
+  local need=$1 f c
+  f=$(free_kib)
+  [ "${f:-0}" -lt $((need * 1048576)) ] || return 0
+  log "$((${f:-0} / 1048576)) GiB free and the job needs $need GiB, so mbx gc frees the shortfall"
+  MBX_GC_MIN_FREE_SIZE=${need}GiB timeout --kill-after=10s "$2" mbx gc > "$out/gc-admit.log" 2>&1
+  c=$?
+  [ "$c" = 0 ] || log "mbx gc exited $c"
+  f=$(free_kib)
+  [ "${f:-0}" -lt $((need * 1048576)) ] || return 0
+  log "host disk below floor: $((${f:-0} / 1048576)) GiB free after mbx gc, under the $need GiB floor; not starting"
+  return 1
+}
 mkdir -p "$out"
 log "queued $MODE $FULL base ${BASE:-none} host $(hostname)"
 # A job whose end has passed has created nothing yet, so it records its exit and stops.
@@ -70,14 +102,23 @@ log "lock acquired"
 # The admission check runs under the heavy lock, so no other job's build grows meanwhile. A
 # disk with under NEED_GIB free after the cleanup refuses the job rather than fill up.
 need=${NEED_GIB:-85}
-if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ] && [ ! -f "$G/bin/disk_clean.py" ]; then
-  log "no ~/gate/bin/disk_clean.py for the admission check; run scripts/gate/setup-host.sh"
-  finish 4
-fi
-if [ -f "$G/bin/disk_clean.py" ] &&
-  ! python3 -I "$G/bin/disk_clean.py" --need-free-gib "$need" --deadline-seconds 240 --log "$G/disk-clean.jsonl" > "$out/disk-clean-admit.json" 2>&1; then
-  log "under $need GiB free after the cleanup; not starting"
-  finish 4
+if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ]; then
+  if [ ! -f "$G/bin/disk_clean.py" ]; then
+    log "no ~/gate/bin/disk_clean.py for the admission check; run scripts/gate/setup-host.sh"
+    finish 4
+  fi
+  if ! python3 -I "$G/bin/disk_clean.py" --need-free-gib "$need" --deadline-seconds 240 --log "$G/disk-clean.jsonl" > "$out/disk-clean-admit.json" 2>&1; then
+    log "host disk below floor: under $need GiB free after the cleanup; not starting"
+    echo disk-below-floor > "$out/outcome"
+    finish 4
+  fi
+else
+  w=$(until_end 600)
+  [ "$w" -le 240 ] || w=240
+  if [ "$w" -le 0 ] || ! ssh_admit "$need" "$w"; then
+    echo disk-below-floor > "$out/outcome"
+    finish 4
+  fi
 fi
 date +%s > "$out/started_at"
 exec 7>> "$G/.disk-clean.lock"
@@ -97,10 +138,38 @@ left=$(until_end 60)
   finish 3
 }
 case $MODE in
-  ci) timeout --signal=TERM --kill-after=30s "$left" scripts/ci.sh --fast --changed "$BASE" > "$out/ci.log" 2>&1 ;;
-  premerge) timeout --signal=TERM --kill-after=30s "$left" scripts/premerge.sh > "$out/ci.log" 2>&1 ;;
+  ci) run=(scripts/ci.sh --fast --changed "$BASE") ;;
+  premerge) run=(scripts/premerge.sh) ;;
   *) finish 2 ;;
 esac
+export TMPDIR=$wt/.artifacts/tmp
+mkdir -p "$TMPDIR"
+# timeout runs the command in its own process group and passes a TERM to the whole group,
+# so the disk watch stops the run by signalling timeout.
+timeout --signal=TERM --kill-after=30s "$left" "${run[@]}" > "$out/ci.log" 2>&1 &
+cpid=$!
+floor_kib=$((${RUN_FLOOR_GIB:-4} * 1048576))
+(
+  trap 'kill "$ds" 2> /dev/null; exit 0' TERM
+  ds=
+  while kill -0 "$cpid" 2> /dev/null; do
+    f=$(free_kib)
+    if [ "${f:-0}" -lt "$floor_kib" ]; then
+      echo disk-below-floor > "$out/outcome"
+      log "host disk below floor: $((${f:-0} / 1024)) MiB free during the run, under the ${RUN_FLOOR_GIB:-4} GiB floor; stopping it"
+      kill -TERM "$cpid" 2> /dev/null
+      exit 0
+    fi
+    sleep "${WATCH_SECONDS:-30}" &
+    ds=$!
+    wait "$ds"
+  done
+) &
+dw=$!
+wait "$cpid"
 c=$?
+kill "$dw" 2> /dev/null
+dw=
+[ ! -f "$out/outcome" ] || c=5
 for d in ci premerge; do [ ! -d ".artifacts/$d" ] || cp -r ".artifacts/$d" "$out/$d"; done
 finish "$c"

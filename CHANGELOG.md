@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### A free-disk floor on ssh build hosts
+
+`scripts/remote-ci.sh` and the batch gate now refuse an ssh host whose disk is below the
+floor, as they refused a Boat worker, which completes roadmap item 1130. Under the host's
+heavy lock a lane CI job needs 85 GiB free and a gate part 110 GiB, and an ssh host that is
+short first runs `mbx gc` with `gc.min_free_size` raised to the floor. A lane CI job also
+watches the free space while its build and tests run and stops with exit 5 when less than
+4 GiB is left, so the server's tests no longer fail against their 1 GiB reserve when
+another job fills the disk, and its temporary files live in its worktree. The gate's
+default disk needs rise from 30 GiB for a ci half and 15 GiB for a conformance half to the
+110 GiB floor of a cold build, and `gate.sh --hosts` shows each host against the floors.
+
 ### Streamed answers through the engine buffer
 
 The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write

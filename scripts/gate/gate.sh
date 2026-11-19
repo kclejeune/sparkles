@@ -7,7 +7,8 @@
 #   gate.sh [--tag T] --status <rev>   print progress, steps and the last memory sample
 #   gate.sh [--tag T] --fetch <rev>    copy and merge the out directories into
 #                                      <main checkout>/.artifacts/gates/main-gate-<name>-<host>/
-#   gate.sh --hosts                    print each gate host's lock, queue and free disk
+#   gate.sh --hosts                    print each gate host's lock, queue, free GiB and
+#                                      whether that meets the disk floors (see below)
 #
 # Options:
 #   --host H        SSH host or admitted boat:bx_ID; run ci on H (default GATE_PRIMARY or the first gate host)
@@ -74,10 +75,17 @@
 # the host with the fewest gate units and splits only onto a helper whose queue is no
 # longer.
 #
-# Before it starts, the driver checks each chosen host's free disk: GATE_NEED_CI_GB
-# (default 30) for a ci half or a whole gate and GATE_NEED_CONF_GB (default 15) for a
-# conformance half. A host that is short runs `mbx gc` first, and the driver refuses to
-# start when it is still short.
+# Disk floors. A gate needs GATE_NEED_CI_GB free for a ci half, a whole gate or the link
+# check and GATE_NEED_CONF_GB for a conformance half, 110 each by default, the floor a cold
+# workspace build needs on a Boat worker. Before it starts, the driver checks each chosen
+# host. A host that is short runs `mbx gc` with gc.min_free_size raised to the floor, which
+# evicts cache objects and managed targets until that much is free, and the driver refuses
+# to start when the host is still short. The gate then checks again under the host's heavy
+# lock, since another job may have used the space while the gate queued, and a gate still
+# short there ends with exit 4 and disk-below-floor in its outcome file. --auto and the
+# default helper choice count a host as having the disk for a whole gate when
+# GATE_MIN_FREE_GB are free and for a conformance half when GATE_MIN_FREE_HALF_GB are free,
+# which default to the two floors.
 #
 # Before it starts, the driver also prints the newest finished run of each GitHub workflow
 # on main (scripts/gate/github-runs.py) and warns when one failed, since those workflows
@@ -185,6 +193,14 @@ pick_helper=0
 if [ $helper_set = 0 ] && [ -z "${GATE_HELPER+x}" ]; then pick_helper=1; fi
 [ "$helper" = "$primary" ] && helper=none
 
+need_ci=${GATE_NEED_CI_GB:-110}
+need_conf=${GATE_NEED_CONF_GB:-110}
+min_whole=${GATE_MIN_FREE_GB:-$need_ci}
+min_half=${GATE_MIN_FREE_HALF_GB:-$need_conf}
+for v in "GATE_NEED_CI_GB $need_ci" "GATE_NEED_CONF_GB $need_conf" "GATE_MIN_FREE_GB $min_whole" "GATE_MIN_FREE_HALF_GB $min_half"; do
+  case ${v#* } in '' | *[!0-9]* | 0 | 0?*) die "bad $v" ;; esac
+done
+
 root=$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd)
 statedir=$root/.artifacts/gates/state
 
@@ -201,7 +217,19 @@ probe() {
 
 if [ $mode = hosts ]; then
   echo "benchmark host: $bench (never runs gates)"
-  for h in "${gate_hosts[@]}"; do printf '%-6s %s\n' "$h" "$(probe "$h")"; done
+  echo "disk floors: $min_whole GiB for a whole gate, $min_half GiB for a conformance half"
+  for h in "${gate_hosts[@]}"; do
+    p=$(probe "$h")
+    read -r l u d <<< "$p" || true
+    room=
+    if [ "$l" != unreachable ]; then
+      case $d in '' | *[!0-9]*) room='unknown-disk' ;; *)
+        if [ "$d" -ge "$min_whole" ]; then room='room-for-whole'; elif [ "$d" -ge "$min_half" ]; then room='room-for-half'; else room='below-floor'; fi
+        ;;
+      esac
+    fi
+    printf '%-6s %s%s\n' "$h" "$p" "${room:+ $room}"
+  done
   exit 0
 fi
 
@@ -298,6 +326,7 @@ start_on() {
     runtime=$(rx_runtime "$statedir/admission-$n.json" --reserve "$((${GATE_BOAT_RESERVE:-1200} + prep))") || return
     args+=" --executor boat --runtime $runtime --min-free-gib ${GATE_BOAT_MIN_FREE_GIB:-110}"
     ;;
+  *) if [ "$p" = conformance ]; then args+=" --min-free-gib $need_conf"; else args+=" --min-free-gib $need_ci"; fi ;;
   esac
   cj=$(cargo_jobs_for "$h")
   case $cj in '' | *[!0-9]* | 0) ;; *) args+=" --cargo-jobs $cj" ;; esac
@@ -536,8 +565,8 @@ if [ $auto = 1 ]; then
     [ "$l" = unreachable ] && continue
     units[$h]=${u:-0}
     [ "$l" = free ] && [ "${u:-0}" = 0 ] && idle[$h]=1
-    [ "${d:-0}" -ge "${GATE_MIN_FREE_GB:-40}" ] && roomy[$h]=1
-    [ "${d:-0}" -ge "${GATE_MIN_FREE_HALF_GB:-20}" ] && half[$h]=1
+    [ "${d:-0}" -ge "$min_whole" ] && roomy[$h]=1
+    [ "${d:-0}" -ge "$min_half" ] && half[$h]=1
   done
   chosen=
   if [ "$helper" != none ] && [ "${idle[$primary]:-0}" = 1 ] && [ "${roomy[$primary]:-0}" = 1 ] &&
@@ -579,7 +608,7 @@ if [ $pick_helper = 1 ] && [ $auto = 0 ]; then
   for h in "${gate_hosts[@]}"; do
     [ "$h" != "$primary" ] || continue
     read -r l u d <<< "$(probe "$h")" || true
-    if [ "$l" = free ] && [ "${u:-1}" = 0 ] && [ "${d:-0}" -ge "${GATE_MIN_FREE_HALF_GB:-20}" ]; then
+    if [ "$l" = free ] && [ "${u:-1}" = 0 ] && [ "${d:-0}" -ge "$min_half" ]; then
       helper=$h
       break
     fi
@@ -625,16 +654,16 @@ free_gib() {
 }
 
 # ensure_disk HOST NEED_GIB WHAT: refuse to start WHAT on HOST unless the host has NEED_GIB
-# free. A host that is short first runs `mbx gc`, which collects idle managed targets and
-# evicts cache objects down to their budgets and to gc.min_free_size. A build holds its
-# target lease for the whole run, so space freed after the start comes too late.
+# free. A host that is short first runs `mbx gc` with gc.min_free_size raised to NEED_GIB,
+# which collects idle managed targets and evicts cache objects until that much is free. A
+# build holds its target lease for the whole run, so space freed after the start comes too late.
 ensure_disk() {
   local h=$1 need=$2 what=$3 d
   d=$(free_gib "$h")
   [ -n "$d" ] || return 0
   [ "$d" -ge "$need" ] && return 0
-  echo "gate.sh: $h has $d GiB free and the $what needs $need GiB, so mbx gc runs there first" >&2
-  rx_exec "$h" 'mbx gc' >&2 || echo "gate.sh: mbx gc on $h failed" >&2
+  echo "gate.sh: $h has $d GiB free and the $what needs $need GiB, so mbx gc frees the shortfall there first" >&2
+  rx_exec "$h" "MBX_GC_MIN_FREE_SIZE=${need}GiB mbx gc" >&2 || echo "gate.sh: mbx gc on $h failed" >&2
   d=$(free_gib "$h")
   if [ -z "$d" ] || [ "$d" -lt "$need" ]; then
     die "$h has ${d:-an unknown number of} GiB free after mbx gc and the $what needs $need GiB. Free space there, choose another host with --host or --helper, or lower GATE_NEED_CI_GB or GATE_NEED_CONF_GB."
@@ -642,10 +671,6 @@ ensure_disk() {
   echo "gate.sh: $h has $d GiB free after mbx gc" >&2
 }
 
-need_ci=${GATE_NEED_CI_GB:-30}
-need_conf=${GATE_NEED_CONF_GB:-15}
-case $need_ci in '' | *[!0-9]*) die "bad GATE_NEED_CI_GB $need_ci" ;; esac
-case $need_conf in '' | *[!0-9]*) die "bad GATE_NEED_CONF_GB $need_conf" ;; esac
 # A whole gate runs the suites in the ci half's worktree after it, so it needs what the ci
 # half needs. An unreachable helper is left to the fallback below.
 ensure_disk "$primary" "$need_ci" "ci half"
@@ -702,4 +727,7 @@ cat "$dest/steps.txt" 2> /dev/null || true
 cat "$dest/wall.txt" 2> /dev/null || true
 code=$(cat "$dest/gate.exit" 2> /dev/null || echo 99)
 echo "gate exit $code"
+if grep -qx disk-below-floor "$dest/outcome" 2> /dev/null; then
+  echo "gate.sh: host disk below floor, so the gate did not run; its exit says nothing about $short" >&2
+fi
 exit "$code"
