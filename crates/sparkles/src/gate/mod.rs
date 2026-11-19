@@ -46,15 +46,23 @@
 //! of which must hold data in the candidate. The shapes graph, the run records and, unless
 //! `chk:inferences true`, the materialized inferences are never data. A shapes graph is an
 //! ordinary named graph: `chk:shapesGraph` refuses the ARQ aliases and the reserved graphs,
-//! and shapes that target nothing are refused rather than validating nothing.
+//! and shapes with no active shape that has a target are refused rather than validating
+//! nothing. A shape that `sh:deactivated true` turns off is not active.
 //!
 //! An unsatisfiable-classes check classifies the terminology and leaves out assertions
-//! about individuals in every form the graphs hold them, so its cost does not grow with the
-//! data. A contradiction among assertions, such as an individual of two disjoint classes,
-//! is found by a `chk:DiagnosticsCheck` or a SHACL check. The check never reads the
-//! materialized inferences, also through an import, and an index error, a quad it cannot
-//! decode, an error of the OWL reader, a logical axiom the reader cannot map, an import
-//! that resolves to no graph and graphs with no terminology are errors. What the answer
+//! about individuals in every form the graphs hold them, so an assertion can neither fail
+//! the check nor change its answer, and the check avoids a full assertion scan. The
+//! structural triples it reads can still include those of assertion-only structures, whose
+//! number grows with the data. A contradiction among assertions, such as an individual of
+//! two disjoint classes, is found by a `chk:DiagnosticsCheck` when it matches a
+//! contradiction pattern the diagnostics support, or by a SHACL check whose shapes describe
+//! it. The check never reads the materialized inferences, also through an import. An index
+//! error, a quad it cannot decode, an error of the OWL reader, a terminology statement the
+//! reader cannot map to its axiom, an import that resolves to no graph and graphs with no
+//! terminology are errors. A terminology statement is the main triple of a terminology
+//! axiom, such as an `rdfs:subClassOf` triple or a named class's `owl:intersectionOf`, and
+//! one whose list is malformed, whose predicate is typed as an annotation property or whose
+//! operands collapse, as in `owl:members ( A A )`, is refused rather than left out. What the answer
 //! may depend on but the check leaves out, the axioms outside what the classifier reasons
 //! with and the assertions about individuals that the terminology names, is a note of
 //! severity `sh:Warning` in the result, and `chk:requireComplete true` makes it keep the

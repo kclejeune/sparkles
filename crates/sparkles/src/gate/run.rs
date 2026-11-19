@@ -300,10 +300,11 @@ fn shacl(
                 .map_err(|e| failure(&e))?
         }
     };
-    if shapes.targeted().next().is_none() {
+    // a shape that `sh:deactivated true` turns off selects no focus node
+    if !shapes.targeted().any(|shape| !shape.deactivated) {
         return Err((
             "input-invalid",
-            "the shapes have no shape with a target, so the check would validate nothing"
+            "the shapes have no active shape with a target, so the check would validate nothing"
                 .to_string(),
         ));
     }

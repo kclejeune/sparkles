@@ -787,45 +787,6 @@ pub(crate) struct Unsatisfiable {
     pub unresolved: Vec<String>,
 }
 
-/// The predicates whose triples are the roots of logical axioms of the terminology: a
-/// read that leaves such a triple unmapped has lost an axiom.
-const ROOT_PREDICATES: [&str; 12] = [
-    vocab::RDFS_SUB_CLASS_OF,
-    vocab::OWL_EQUIVALENT_CLASS,
-    vocab::OWL_DISJOINT_WITH,
-    vocab::OWL_DISJOINT_UNION_OF,
-    vocab::RDFS_SUB_PROPERTY_OF,
-    vocab::OWL_EQUIVALENT_PROPERTY,
-    vocab::OWL_PROPERTY_DISJOINT_WITH,
-    vocab::RDFS_DOMAIN,
-    vocab::RDFS_RANGE,
-    vocab::OWL_INVERSE_OF,
-    vocab::OWL_PROPERTY_CHAIN_AXIOM,
-    vocab::OWL_HAS_KEY,
-];
-
-/// The `rdf:type` objects whose class assertions are the roots of logical axioms.
-const ROOT_TYPES: [&str; 9] = [
-    vocab::OWL_ALL_DISJOINT_CLASSES,
-    vocab::OWL_ALL_DISJOINT_PROPERTIES,
-    vocab::OWL_FUNCTIONAL_PROPERTY,
-    vocab::OWL_INVERSE_FUNCTIONAL_PROPERTY,
-    vocab::OWL_TRANSITIVE_PROPERTY,
-    vocab::OWL_SYMMETRIC_PROPERTY,
-    vocab::OWL_ASYMMETRIC_PROPERTY,
-    vocab::OWL_REFLEXIVE_PROPERTY,
-    vocab::OWL_IRREFLEXIVE_PROPERTY,
-];
-
-/// Whether `t` is the root triple of a logical axiom of the terminology.
-fn axiom_root(t: &oxrdf::Triple) -> bool {
-    let p = t.predicate.as_str();
-    if p == vocab::RDF_TYPE {
-        return matches!(&t.object, Term::NamedNode(o) if ROOT_TYPES.contains(&o.as_str()));
-    }
-    ROOT_PREDICATES.contains(&p)
-}
-
 /// The unsatisfiable classes of the terminology that `graphs` of `snap` hold, with the
 /// imports that resolve to graphs of `snap` through `import_targets`, by one complete
 /// classification of its asserted logical axioms (spec C31, `chk:UnsatisfiableClassesCheck`).
@@ -833,11 +794,15 @@ fn axiom_root(t: &oxrdf::Triple) -> bool {
 /// under the deadline, cancellation and memory budget of `opts`. A run those stop fails,
 /// since a partial answer could miss an unsatisfiable class.
 ///
-/// It reads the terminology and leaves out assertions about individuals, in whatever form
-/// the graphs hold them, so its cost does not grow with the data. It never reads the
+/// It reads the terminology with [`Scope::Terminology`](sparkles_owl::read::Scope), which
+/// leaves out assertions about individuals in whatever form the graphs hold them, so an
+/// assertion can neither fail the check nor change its answer, and the check avoids a
+/// full assertion scan. The structural predicates it reads can still select triples of
+/// assertion-only structures, whose number grows with the data. It never reads the
 /// materialized inferences, also through an import, and it loses no input: an index
-/// error, a quad it cannot decode, an error of the OWL reader or a logical axiom the
-/// reader could not map is an error, not an axiom left out.
+/// error, a quad it cannot decode, an error of the OWL reader, and a root of a
+/// terminology axiom that the reader does not map to one are each an error, not an axiom
+/// left out.
 pub(crate) fn unsatisfiable_at(
     snap: &Arc<Snapshot>,
     graphs: Vec<GraphRef>,
@@ -895,8 +860,15 @@ pub(crate) fn unsatisfiable_at(
             }
         }
     }
-    let (ontology, _) =
-        super::read_store_with(snap, &graph_ids, req.graphs().len(), req.mode, opts, true)?;
+    let (ontology, _) = super::read_store_with(
+        snap,
+        &graph_ids,
+        req.graphs().len(),
+        req.mode,
+        opts,
+        true,
+        sparkles_owl::read::Scope::Terminology,
+    )?;
     check(opts)?;
     if ontology.error_count > 0 {
         let first = ontology
@@ -907,16 +879,6 @@ pub(crate) fn unsatisfiable_at(
         return Err(Error::invalid(format!(
             "the OWL reader could not read the ontology whole ({} errors): {first}",
             ontology.error_count
-        )));
-    }
-    if let Some(t) = ontology
-        .unmapped
-        .iter()
-        .map(|i| &ontology.triples[*i])
-        .find(|t| axiom_root(t))
-    {
-        return Err(Error::invalid(format!(
-            "the triple {t} of the ontology maps to no axiom, so an axiom would be left out"
         )));
     }
     let mut tbox: Vec<&AxiomKind> = Vec::new();

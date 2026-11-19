@@ -47,6 +47,179 @@ impl Mode {
     }
 }
 
+/// Which axioms a read maps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// Every axiom the mapping defines.
+    #[default]
+    All,
+    /// The axioms of the terminology, accounted for one by one, for a reader that must
+    /// not lose an axiom (a required check of the terminology).
+    ///
+    /// A triple whose [`Role`] makes it the main triple of a terminology axiom is a root.
+    /// Each root must map to a logical axiom that is not an assertion, or to an axiom
+    /// about annotation properties, or else the read reports an `unmapped` error: a list
+    /// that is not well formed, a cyclic or missing structure, a definition that
+    /// collapses to fewer operands than its axiom needs, and a root predicate typed as an
+    /// annotation property all fail the read rather than vanish. A root that only marks
+    /// its triple used, such as one read as an annotation, does not count.
+    ///
+    /// Assertions are not read: no class assertion has its class expression parsed and
+    /// no assertion is an axiom of the result, so an assertion can neither fail the read
+    /// nor be part of it. Lenient typing of undeclared entities reads only the roots and
+    /// the structures they reach through blank nodes, so a structure that only an
+    /// assertion uses (orphan support, which is not a root) does not change how the
+    /// terminology maps. Exact duplicates of a triple, such as a graph and its copy, are
+    /// read once.
+    ///
+    /// It composes with [`ReadOptions::terminology_only`], which says what the input
+    /// holds, and with either [`Mode`]: a strict read also reports the unmapped triples of
+    /// the structures the roots reach.
+    Terminology,
+}
+
+/// What a triple is to a read of the terminology, from its predicate or, for an
+/// `rdf:type` triple, its object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// the main triple of a terminology axiom, whatever its subject
+    Root,
+    /// the main triple of a terminology axiom when its subject is an IRI (an OWL 1 class
+    /// definition, inverse properties, or a structure on a named node, which maps to no
+    /// axiom and so fails the read), and part of a structure when it is a blank node
+    RootIfNamed,
+    /// a declaration of an IRI, or the type of a structure on a blank node
+    Declaration,
+    /// the ontology header
+    Header,
+    /// part of an assertion, which a terminology read leaves out
+    Assertion,
+}
+
+/// The [`Role`] of a triple with predicate `p` (not `rdf:type`), for each predicate of
+/// [`STRUCTURAL_PREDICATES`](v::STRUCTURAL_PREDICATES) and [`FACETS`](v::FACETS); `None`
+/// for another predicate, whose triples are assertions or annotations.
+pub fn predicate_role(p: &str) -> Option<Role> {
+    use Role::*;
+    Some(match p {
+        v::RDFS_SUB_CLASS_OF
+        | v::RDFS_SUB_PROPERTY_OF
+        | v::RDFS_DOMAIN
+        | v::RDFS_RANGE
+        | v::OWL_EQUIVALENT_CLASS
+        | v::OWL_DISJOINT_WITH
+        | v::OWL_DISJOINT_UNION_OF
+        | v::OWL_PROPERTY_CHAIN_AXIOM
+        | v::OWL_EQUIVALENT_PROPERTY
+        | v::OWL_PROPERTY_DISJOINT_WITH
+        | v::OWL_HAS_KEY => Root,
+        v::OWL_INTERSECTION_OF
+        | v::OWL_UNION_OF
+        | v::OWL_COMPLEMENT_OF
+        | v::OWL_ONE_OF
+        | v::OWL_INVERSE_OF
+        | v::RDF_FIRST
+        | v::RDF_REST
+        | v::OWL_DATATYPE_COMPLEMENT_OF
+        | v::OWL_ON_DATATYPE
+        | v::OWL_WITH_RESTRICTIONS
+        | v::OWL_ON_PROPERTY
+        | v::OWL_ON_PROPERTIES
+        | v::OWL_SOME_VALUES_FROM
+        | v::OWL_ALL_VALUES_FROM
+        | v::OWL_HAS_VALUE
+        | v::OWL_HAS_SELF
+        | v::OWL_MIN_CARDINALITY
+        | v::OWL_MAX_CARDINALITY
+        | v::OWL_CARDINALITY
+        | v::OWL_MIN_QUALIFIED_CARDINALITY
+        | v::OWL_MAX_QUALIFIED_CARDINALITY
+        | v::OWL_QUALIFIED_CARDINALITY
+        | v::OWL_ON_CLASS
+        | v::OWL_ON_DATA_RANGE
+        | v::OWL_MEMBERS
+        | v::OWL_ANNOTATED_SOURCE
+        | v::OWL_ANNOTATED_PROPERTY
+        | v::OWL_ANNOTATED_TARGET => RootIfNamed,
+        p if v::FACETS.contains(&p) => RootIfNamed,
+        v::OWL_IMPORTS | v::OWL_VERSION_IRI => Header,
+        v::OWL_DISTINCT_MEMBERS
+        | v::OWL_SOURCE_INDIVIDUAL
+        | v::OWL_ASSERTION_PROPERTY
+        | v::OWL_TARGET_INDIVIDUAL
+        | v::OWL_TARGET_VALUE => Assertion,
+        _ => return None,
+    })
+}
+
+/// The [`Role`] of an `rdf:type` triple with the class `ty`, for each class of
+/// [`STRUCTURAL_TYPES`](v::STRUCTURAL_TYPES); `None` for another class, whose triples are
+/// class assertions.
+pub fn type_role(ty: &str) -> Option<Role> {
+    use Role::*;
+    Some(match ty {
+        v::OWL_ALL_DISJOINT_CLASSES
+        | v::OWL_ALL_DISJOINT_PROPERTIES
+        | v::OWL_FUNCTIONAL_PROPERTY
+        | v::OWL_INVERSE_FUNCTIONAL_PROPERTY
+        | v::OWL_REFLEXIVE_PROPERTY
+        | v::OWL_IRREFLEXIVE_PROPERTY
+        | v::OWL_SYMMETRIC_PROPERTY
+        | v::OWL_ASYMMETRIC_PROPERTY
+        | v::OWL_TRANSITIVE_PROPERTY => Root,
+        v::OWL_RESTRICTION | v::OWL_AXIOM | v::OWL_ANNOTATION | v::RDF_LIST => RootIfNamed,
+        v::OWL_CLASS
+        | v::RDFS_DATATYPE
+        | v::OWL_OBJECT_PROPERTY
+        | v::OWL_DATATYPE_PROPERTY
+        | v::OWL_ANNOTATION_PROPERTY
+        | v::OWL_NAMED_INDIVIDUAL
+        | v::OWL_ONTOLOGY_PROPERTY
+        | v::OWL_DATA_RANGE
+        | v::OWL_DEPRECATED_CLASS
+        | v::OWL_DEPRECATED_PROPERTY
+        | v::RDFS_CLASS
+        | v::RDF_PROPERTY => Declaration,
+        v::OWL_ONTOLOGY => Header,
+        v::OWL_ALL_DIFFERENT | v::OWL_NEGATIVE_PROPERTY_ASSERTION => Assertion,
+        _ => return None,
+    })
+}
+
+/// Whether `t` is a root of a terminology read (see [`Scope::Terminology`]).
+pub fn is_terminology_root(t: &Triple) -> bool {
+    let role = if t.predicate.as_str() == v::RDF_TYPE {
+        match &t.object {
+            Term::NamedNode(o) => type_role(o.as_str()),
+            _ => None,
+        }
+    } else {
+        predicate_role(t.predicate.as_str())
+    };
+    match role {
+        Some(Role::Root) => true,
+        Some(Role::RootIfNamed) => matches!(t.subject, NamedOrBlankNode::NamedNode(_)),
+        _ => false,
+    }
+}
+
+/// Whether committing `kind` from a root accounts for it in a terminology read: a
+/// logical axiom that is not an assertion, with the operands its axiom needs, or an axiom
+/// about annotation properties.
+fn accounts_for_root(kind: &AxiomKind) -> bool {
+    if kind.axiom_type().is_assertion() {
+        return false;
+    }
+    match kind {
+        AxiomKind::Declaration(_) | AxiomKind::AnnotationAssertion(..) => false,
+        // a set that collapsed, as `owl:members ( A A )` does, has lost its meaning
+        AxiomKind::DisjointClasses(s) => s.len() >= 2,
+        AxiomKind::DisjointObjectProperties(s) => s.len() >= 2,
+        AxiomKind::DisjointDataProperties(s) => s.len() >= 2,
+        _ => true,
+    }
+}
+
 /// The options of a read.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReadOptions {
@@ -57,6 +230,8 @@ pub struct ReadOptions {
     pub terminology_only: bool,
     /// The most diagnostics kept; later ones are counted only (0: 1,000).
     pub max_diagnostics: usize,
+    /// Which axioms the read maps.
+    pub scope: Scope,
 }
 
 /// A note about the read: a repair made in lenient mode, or an error of a strict read.
@@ -497,6 +672,18 @@ pub fn read(
     opts: ReadOptions,
 ) -> Ontology {
     assert_eq!(triples.len(), graph_of.len());
+    let (triples, graph_of) = if opts.scope == Scope::Terminology {
+        // a triple and its copy in another graph are one statement of the terminology,
+        // and two copies of a structure's triple would make it unreadable
+        let mut seen: FxHashSet<Triple> = FxHashSet::default();
+        triples
+            .into_iter()
+            .zip(graph_of)
+            .filter(|(t, _)| seen.insert(t.clone()))
+            .unzip()
+    } else {
+        (triples, graph_of)
+    };
     let mut p = Parser::new(&triples, &graph_of, opts);
     p.run(primary);
     let Parser {
@@ -615,6 +802,13 @@ struct Parser<'a> {
     ann_nodes: FxHashMap<(Key, String, Term), Vec<BlankNode>>,
     /// annotation subjects whose annotations an axiom or a header took
     ann_taken: FxHashSet<Key>,
+    /// a read of the terminology ([`Scope::Terminology`])
+    terms: bool,
+    /// in a read of the terminology: the roots, the triples they reach through blank
+    /// nodes (the roots included), and the roots that an axiom accounts for
+    roots: Vec<bool>,
+    reach: Vec<bool>,
+    accounted: Vec<bool>,
 }
 
 impl<'a> Parser<'a> {
@@ -666,6 +860,10 @@ impl<'a> Parser<'a> {
             ann_triples: FxHashMap::default(),
             ann_nodes: FxHashMap::default(),
             ann_taken: FxHashSet::default(),
+            terms: opts.scope == Scope::Terminology,
+            roots: Vec::new(),
+            reach: Vec::new(),
+            accounted: Vec::new(),
         }
     }
 
@@ -813,6 +1011,9 @@ impl<'a> Parser<'a> {
     // ---------------------------------------------------------------- the run ------
 
     fn run(&mut self, primary: &[u32]) {
+        if self.terms {
+            self.find_roots();
+        }
         self.header(primary);
         self.compat();
         self.declarations();
@@ -826,12 +1027,80 @@ impl<'a> Parser<'a> {
         self.plain_axioms();
         self.annotation_assertions();
         self.header_annotations();
+        if self.terms {
+            let lost: Vec<usize> = (0..self.t.len())
+                .filter(|i| self.roots[*i] && !self.accounted[*i])
+                .collect();
+            for i in lost {
+                let msg = format!(
+                    "the triple {} of the terminology maps to no axiom, so an axiom would be left out",
+                    self.t[i]
+                );
+                self.diag(Severity::Error, "unmapped", msg, vec![i]);
+            }
+        }
         if self.strict {
-            let unmapped: Vec<usize> = (0..self.t.len()).filter(|i| !self.used[*i]).collect();
+            let unmapped: Vec<usize> = (0..self.t.len())
+                .filter(|i| !self.used[*i] && (!self.terms || (self.reach[*i] && !self.roots[*i])))
+                .collect();
             for i in unmapped {
                 let msg = format!("the triple {} maps to no axiom", self.t[i]);
                 self.diag(Severity::Error, "unmapped", msg, vec![i]);
             }
+        }
+    }
+
+    /// The roots of a read of the terminology and the triples they reach: from each root,
+    /// the triples about its blank subject and, through blank objects, the triples about
+    /// each blank node it reaches. A structure that no root reaches is orphan support.
+    fn find_roots(&mut self) {
+        let n = self.t.len();
+        self.roots = (0..n).map(|i| is_terminology_root(&self.t[i])).collect();
+        self.reach = self.roots.clone();
+        self.accounted = vec![false; n];
+        let mut seen: FxHashSet<BlankNode> = FxHashSet::default();
+        let mut queue: Vec<BlankNode> = Vec::new();
+        for i in (0..n).filter(|i| self.roots[*i]) {
+            let tr = &self.t[i];
+            if let NamedOrBlankNode::BlankNode(b) = &tr.subject {
+                queue.push(b.clone());
+            }
+            if let Term::BlankNode(b) = &tr.object {
+                queue.push(b.clone());
+            }
+        }
+        while let Some(b) = queue.pop() {
+            if !seen.insert(b.clone()) {
+                continue;
+            }
+            let k: Key = b.into();
+            let about = self.by_s.get(&k).cloned().unwrap_or_default();
+            for j in about {
+                self.reach[j] = true;
+                if let Term::BlankNode(o) = &self.t[j].object
+                    && !seen.contains(o)
+                {
+                    queue.push(o.clone());
+                }
+            }
+        }
+    }
+
+    /// In a read of the terminology, record that an axiom of `kind` was read from the
+    /// triple `root`. An axiom that accounts for a root from a triple that is not one
+    /// means the roots are not classified as the mapping reads them, and fails the read.
+    fn account(&mut self, root: usize, kind: &AxiomKind) {
+        if !self.terms || !accounts_for_root(kind) {
+            return;
+        }
+        if self.roots[root] {
+            self.accounted[root] = true;
+        } else {
+            let msg = format!(
+                "the triple {} maps to an axiom of the terminology but is not classified as its root",
+                self.t[root]
+            );
+            self.diag(Severity::Error, "unclassified", msg, vec![root]);
         }
     }
 
@@ -1035,12 +1304,18 @@ impl<'a> Parser<'a> {
             changed = false;
             rounds += 1;
             for i in 0..self.t.len() {
+                if self.terms && !self.reach[i] {
+                    continue;
+                }
                 changed |= self.infer_from(i);
             }
         }
         // undeclared predicates of the remaining triples
         let mut stats: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
         for i in 0..self.t.len() {
+            if self.terms && !self.reach[i] {
+                continue;
+            }
             let tr = &self.t[i];
             let p = tr.predicate.as_str();
             if v::is_reserved(p) || !self.typing.kinds(p).is_empty() {
@@ -2059,6 +2334,9 @@ impl<'a> Parser<'a> {
         triples: Vec<usize>,
         main: Option<usize>,
     ) {
+        if let Some(m) = main {
+            self.account(m, &kind);
+        }
         for i in &triples {
             self.used[*i] = true;
         }
@@ -2268,6 +2546,9 @@ impl<'a> Parser<'a> {
                 AxiomKind::HasKey(c.value, ops, dps)
             }
             v::OWL_SAME_AS | v::OWL_DIFFERENT_FROM => {
+                if self.terms {
+                    return None;
+                }
                 let a = self.individual(&s)?;
                 let b = self.individual(&o)?;
                 if p != v::OWL_SAME_AS && a == b {
@@ -2326,6 +2607,10 @@ impl<'a> Parser<'a> {
                 };
                 let cls = ClassExpression::Class(Class(c.clone()));
                 if cls == e {
+                    // `C owl:intersectionOf ( C )` says nothing, which loses nothing
+                    if self.terms {
+                        self.accounted[i] = true;
+                    }
                     return None;
                 }
                 AxiomKind::EquivalentClasses([cls, e].into_iter().collect())
@@ -2352,6 +2637,10 @@ impl<'a> Parser<'a> {
                         ),
                         ts,
                     ));
+                }
+                if self.terms {
+                    // a property assertion, which a read of the terminology leaves out
+                    return None;
                 }
                 if self.typing.is(p, EntityKind::ObjectProperty) {
                     if matches!(o, Term::Literal(_)) {
@@ -2478,7 +2767,11 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        // a class assertion; a structure node is not an individual
+        // a class assertion, whose expression a read of the terminology never parses
+        if self.terms {
+            return None;
+        }
+        // a structure node is not an individual
         if let Term::BlankNode(b) = &s
             && (self.rind.contains(b) || !self.sp(&b.clone().into(), v::RDF_FIRST).is_empty())
         {
@@ -2564,6 +2857,14 @@ impl<'a> Parser<'a> {
             if self.used[ti] {
                 continue;
             }
+            if self.terms
+                && matches!(
+                    ty.as_str(),
+                    v::OWL_ALL_DIFFERENT | v::OWL_NEGATIVE_PROPERTY_ASSERTION
+                )
+            {
+                continue;
+            }
             let xk: Key = x.clone().into();
             let parsed = if ty == v::OWL_NEGATIVE_PROPERTY_ASSERTION {
                 self.negative_assertion(&xk)
@@ -2576,6 +2877,8 @@ impl<'a> Parser<'a> {
             ts.push(ti);
             let (anns, ats) = self.take_annotations(&xk);
             ts.extend(ats);
+            // the node's type triple is the root of the axiom, which has no main triple
+            self.account(ti, &kind);
             self.commit(kind, anns, ts, None);
         }
     }

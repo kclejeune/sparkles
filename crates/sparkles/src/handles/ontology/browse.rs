@@ -1545,7 +1545,7 @@ impl Scope {
             ReadOptions {
                 mode: self.mode,
                 terminology_only: false,
-                max_diagnostics: 0,
+                ..Default::default()
             },
         );
         // An axiom belongs to the fragment when its main triple does, or one of its

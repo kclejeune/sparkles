@@ -682,7 +682,7 @@ fn from_triples(
         ReadOptions {
             mode,
             terminology_only: true,
-            max_diagnostics: 0,
+            ..Default::default()
         },
     );
     Some((o, assertions))

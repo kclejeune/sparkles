@@ -1062,3 +1062,322 @@ fn the_canonical_limit_counts_every_byte() {
     .expect_err("one byte past the limit");
     assert!(e.0.contains("N-Triples"), "{e}");
 }
+
+// ---- round 3 of the slice 1 review ---------------------------------------------------
+
+#[cfg(feature = "ontology")]
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+
+/// `A` and `B` declared disjoint classes and `C` a declared class, with `body`.
+#[cfg(feature = "ontology")]
+fn disjoint_ontology(body: &str) -> String {
+    format!(
+        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> PREFIX rdf: <{RDF}>
+         INSERT DATA {{ <urn:A> a owl:Class . <urn:B> a owl:Class . <urn:C> a owl:Class .
+           <urn:A> owl:disjointWith <urn:B> . {body} }}"
+    )
+}
+
+#[cfg(feature = "ontology")]
+fn assert_invalid(r: &CheckResult, what: &str) {
+    assert_eq!(r.status, Status::Error, "{what}: {r:?}");
+    assert_eq!(r.code, Some("input-invalid"), "{what}: {r:?}");
+    assert!(r.blocks(), "{what}: {r:?}");
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn a_named_class_definition_is_read_or_refused() {
+    let suites = [unsat_suite(""), unsat_suite("; chk:requireComplete true")];
+    // the well-formed definition makes C the intersection of two disjoint classes
+    let ok = disjoint_ontology("<urn:C> owl:intersectionOf ( <urn:A> <urn:B> ) .");
+    let r = unsat_after(&suites[0], &ok);
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
+    // the same list with its last rdf:rest missing loses the definition
+    let broken = |p: &str| {
+        disjoint_ontology(&format!(
+            "<urn:C> owl:{p} _:l1 . _:l1 rdf:first <urn:A> ; rdf:rest _:l2 .
+             _:l2 rdf:first <urn:B> ."
+        ))
+    };
+    for s in &suites {
+        for p in ["intersectionOf", "unionOf"] {
+            assert_invalid(&unsat_after(s, &broken(p)), p);
+        }
+        let r = unsat_after(
+            s,
+            &disjoint_ontology(
+                "<urn:C> owl:oneOf _:l1 . _:l1 rdf:first <urn:a> ; rdf:rest _:l2 .
+                 _:l2 rdf:first <urn:b> .",
+            ),
+        );
+        assert_invalid(&r, "oneOf");
+        // a complement of a restriction without its filler
+        let r = unsat_after(
+            s,
+            &disjoint_ontology(
+                "<urn:r> a owl:ObjectProperty .
+                 <urn:C> owl:complementOf [ a owl:Restriction ; owl:onProperty <urn:r> ] .",
+            ),
+        );
+        assert_invalid(&r, "complementOf");
+    }
+    // the well-formed forms of the other three are read
+    for body in [
+        "<urn:C> owl:unionOf ( <urn:A> <urn:B> ) .",
+        "<urn:C> owl:oneOf ( <urn:a> <urn:b> ) .",
+        "<urn:C> owl:complementOf <urn:A> .",
+    ] {
+        let r = unsat_after(&suites[0], &disjoint_ontology(body));
+        assert_ne!(r.status, Status::Error, "{body}: {r:?}");
+    }
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn a_structural_predicate_typed_as_an_annotation_property_is_refused() {
+    let s = unsat_suite("");
+    let axioms = "<urn:C> rdfs:subClassOf <urn:A>, <urn:B> .";
+    let r = unsat_after(&s, &disjoint_ontology(axioms));
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
+    // the subclass triples would become annotations and the disjointness alone would pass
+    let r = unsat_after(
+        &s,
+        &disjoint_ontology(&format!(
+            "rdfs:subClassOf a owl:AnnotationProperty . {axioms}"
+        )),
+    );
+    assert_invalid(&r, "rdfs:subClassOf typed as an annotation property");
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn a_class_disjoint_with_itself_is_not_dropped() {
+    let s = unsat_suite("");
+    for body in [
+        "<urn:C> owl:disjointWith <urn:C> .",
+        "[] a owl:AllDisjointClasses ; owl:members ( <urn:C> <urn:C> ) .",
+    ] {
+        let r = unsat_after(&s, &disjoint_ontology(body));
+        // C is unsatisfiable: the check either finds it or refuses the input
+        if r.status != Status::Failed {
+            assert_invalid(&r, body);
+        } else {
+            assert!(
+                r.messages.iter().any(|m| m.contains("urn:C")),
+                "{body}: {r:?}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn a_terminology_repeated_in_two_graphs_reads_once() {
+    let s = unsat_suite("; chk:graph <urn:g1>, <urn:g2>");
+    // one request, so _:e0 is the same blank node in both graphs, as a graph copy leaves it
+    let t = "<urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A>, _:e0 .
+             <urn:r> a owl:ObjectProperty .
+             _:e0 a owl:Restriction ; owl:onProperty <urn:r> ; owl:someValuesFrom <urn:B> .
+             <urn:r> rdfs:domain <urn:B> .";
+    let r = unsat_after(
+        &s,
+        &format!(
+            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
+             INSERT DATA {{ GRAPH <urn:g1> {{ {t} }} GRAPH <urn:g2> {{ {t} }} }}"
+        ),
+    );
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
+}
+
+/// The result of the check on the consistent terminology `A owl:disjointWith B` with a
+/// declared object property, and `abox` beside it.
+#[cfg(feature = "ontology")]
+fn with_abox(s: &Suite, abox: &str) -> CheckResult {
+    unsat_after(
+        s,
+        &format!(
+            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> PREFIX rdf: <{RDF}>
+             INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . <urn:r> a owl:ObjectProperty .
+               {abox} }}"
+        ),
+    )
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn an_assertion_outside_the_terminology_cannot_refuse_it() {
+    let s = unsat_suite("");
+    let alone = with_abox(&s, "");
+    assert_eq!(alone.status, Status::Passed, "{alone:?}");
+    let deep = existentials(sparkles_owl::read::MAX_NESTING + 2);
+    for abox in [
+        // a class assertion whose expression is past the reader's nesting limit
+        format!("<urn:x> a _:e0 . {deep}"),
+        // the same assertion annotated
+        format!(
+            "<urn:x> a _:e0 . {deep}
+             [] a owl:Axiom ; owl:annotatedSource <urn:x> ; owl:annotatedProperty rdf:type ;
+                owl:annotatedTarget _:e0 ; rdfs:comment \"c\" ."
+        ),
+    ] {
+        let r = with_abox(&s, &abox);
+        assert_eq!(r.status, alone.status, "{r:?}");
+        assert_eq!(r.findings, alone.findings, "{r:?}");
+        assert_eq!(r.notes, alone.notes, "{r:?}");
+    }
+    // a terminology axiom that shares the expression reads it, and so meets the error
+    for s in [unsat_suite(""), unsat_suite("; chk:requireComplete true")] {
+        let r = with_abox(
+            &s,
+            &format!("<urn:x> a _:e0 . <urn:C> rdfs:subClassOf _:e0 . {deep}"),
+        );
+        assert_invalid(&r, "shared expression");
+    }
+    // the readable control: a shared expression within the limit is read
+    let r = with_abox(
+        &s,
+        &format!(
+            "<urn:x> a _:e0 . <urn:C> rdfs:subClassOf _:e0 . {}",
+            existentials(1)
+        ),
+    );
+    assert_eq!(r.status, Status::Passed, "{r:?}");
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn assertions_do_not_type_the_terminology() {
+    let s = unsat_suite("");
+    // r and D are undeclared, so the range axiom maps only if something types them
+    let base = "<urn:r> rdfs:range <urn:D> .";
+    let alone = with_abox_untyped(&s, base);
+    for abox in [
+        "<urn:x> a <urn:D> .",
+        "<urn:x> a <urn:D> .
+         [] a owl:Axiom ; owl:annotatedSource <urn:x> ; owl:annotatedProperty rdf:type ;
+            owl:annotatedTarget <urn:D> ; rdfs:comment \"c\" .",
+        "<urn:x> a [ a owl:Restriction ; owl:onProperty <urn:r> ;
+            owl:someValuesFrom <urn:E> ] .",
+        "[] a owl:NegativePropertyAssertion ; owl:sourceIndividual <urn:x> ;
+            owl:assertionProperty <urn:r> ; owl:targetIndividual <urn:y> .",
+    ] {
+        let r = with_abox_untyped(&s, &format!("{base} {abox}"));
+        assert!(
+            r.status == alone.status && r.code == alone.code && r.findings == alone.findings,
+            "{abox}: {r:?} against {alone:?}"
+        );
+    }
+}
+
+/// [`with_abox`] without the declared object property.
+#[cfg(feature = "ontology")]
+fn with_abox_untyped(s: &Suite, abox: &str) -> CheckResult {
+    unsat_after(
+        s,
+        &format!(
+            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> PREFIX rdf: <{RDF}>
+             INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . {abox} }}"
+        ),
+    )
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn an_axiom_the_classifier_leaves_out_is_a_warning_note() {
+    // a has-value restriction with a literal of a datatype outside the classifier's map
+    let left_out = "<urn:d> a owl:DatatypeProperty .
+         <urn:A> rdfs:subClassOf [ a owl:Restriction ; owl:onProperty <urn:d> ;
+            owl:hasValue \"x\"^^<urn:unknown-datatype> ] .";
+    let u = |body: &str| {
+        format!(
+            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
+             INSERT DATA {{ <urn:A> a owl:Class . <urn:B> a owl:Class . {left_out} {body} }}"
+        )
+    };
+    let report = |s: &Suite, body: &str| {
+        let ds = Dataset::memory();
+        let (before, after) = states(&ds, "", &u(body));
+        run_on(s, &before, &after).to_json()
+    };
+    let result = |j: &serde_json::Value| j["results"][0].clone();
+    // no finding, completeness not required: a pass with the warning note
+    let j = report(&unsat_suite(""), "<urn:A> rdfs:subClassOf <urn:B> .");
+    let r = result(&j);
+    assert_eq!(r["status"], "passed", "{j}");
+    assert_eq!(j["passed"], true, "{j}");
+    assert_eq!(r["notes"][0]["code"], "axioms-left-out", "{j}");
+    assert_eq!(r["notes"][0]["severity"], "warning", "{j}");
+    assert_eq!(r["notes"][0]["count"], 1, "{j}");
+    // completeness required and no finding: the gap blocks
+    let j = report(
+        &unsat_suite("; chk:requireComplete true"),
+        "<urn:A> rdfs:subClassOf <urn:B> .",
+    );
+    let r = result(&j);
+    assert_eq!(r["status"], "error", "{j}");
+    assert_eq!(r["code"], "check-incomplete", "{j}");
+    assert_eq!(r["findings"], 0, "{j}");
+    assert_eq!(r["blocks"], true, "{j}");
+    // a known violation stands as a failure, with the same note
+    let j = report(
+        &unsat_suite("; chk:requireComplete true"),
+        "<urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A>, <urn:B> .",
+    );
+    let r = result(&j);
+    assert_eq!(r["status"], "failed", "{j}");
+    assert_eq!(r["findings"], 1, "{j}");
+    assert_eq!(r["notes"][0]["code"], "axioms-left-out", "{j}");
+    assert_eq!(r["notes"][0]["severity"], "warning", "{j}");
+    assert_eq!(r["notes"][0]["count"], 1, "{j}");
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn shapes_that_are_all_deactivated_are_refused() {
+    let ds = Dataset::memory();
+    let shapes = |deactivated: &str| {
+        format!(
+            "<urn:S> a <{SH_NS}NodeShape> ; <{SH_NS}targetNode> <urn:bob> ;
+               <{SH_NS}deactivated> {deactivated} ;
+               <{SH_NS}property> [ <{SH_NS}path> <urn:name> ; <{SH_NS}minCount> 1 ] ."
+        )
+    };
+    let inline = |extra: &str| {
+        suite(&format!(
+            "<urn:s> a chk:Suite ; chk:check <urn:c> .
+             <urn:c> a chk:ShaclCheck ; chk:shapes \"\"\"{extra}\"\"\" ."
+        ))
+        .unwrap()
+    };
+    let pinned = |text: &str| {
+        let (before, after) = states(
+            &ds,
+            &format!("INSERT DATA {{ GRAPH <urn:shapes> {{ {text} }} }}"),
+            "INSERT DATA { <urn:bob> a <urn:Person> }",
+        );
+        run_on(&shacl_suite("").unwrap(), &before, &after).results[0].clone()
+    };
+    let run_inline = |text: &str| {
+        let ds = Dataset::memory();
+        let (before, after) = states(&ds, "", "INSERT DATA { <urn:bob> a <urn:Person> }");
+        run_on(&inline(text), &before, &after).results[0].clone()
+    };
+    for r in [run_inline(&shapes("true")), pinned(&shapes("true"))] {
+        assert_eq!(r.code, Some("input-invalid"), "{r:?}");
+        assert!(r.blocks());
+    }
+    // the active shape finds that Bob has no name
+    let r = run_inline(&shapes("false"));
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+    // an active shape whose target matches nothing beside an inactive one is a valid pass
+    let r = run_inline(&format!(
+        "{} <urn:T> a <{SH_NS}NodeShape> ; <{SH_NS}targetClass> <urn:Nobody> ;
+           <{SH_NS}property> [ <{SH_NS}path> <urn:name> ; <{SH_NS}minCount> 1 ] .",
+        shapes("true")
+    ));
+    assert_eq!(r.status, Status::Passed, "{r:?}");
+}
