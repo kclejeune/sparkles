@@ -226,40 +226,167 @@ const FLOOR_CACHE_BYTES: u64 = 64 << 20;
 /// [`Ctx::with_vocab_key_prev`]).
 const PAIR_WALK_BYTES: usize = 4096;
 
-/// The entries a floor map makes room for when it first grows.
-const FLOOR_MAP_FIRST: usize = 1024;
+/// The slots of the floor table a query starts with, 512 KiB of words.
+const FLOOR_TABLE_FIRST: usize = 1 << 16;
+
+/// The fewest slots a floor table is worth allocating.
+const FLOOR_TABLE_FEWEST: usize = 1 << 10;
+
+/// A floor table that grows is replaced by one this many times larger.
+const FLOOR_TABLE_GROWTH: usize = 8;
+
+/// A floor table grows once the floors it evicted that had been read again number at
+/// least its slots divided by this.
+const FLOOR_TABLE_EVICTIONS: usize = 32;
 
 /// The query's cache of string floors ([`Ctx::string_floor`]). It lasts the query, so the
-/// batches of a cursor share it as the rows of an eager table do. A mask checks out one
-/// map for each of its workers ([`Ctx::floor_map`]) and returns it when the worker ends,
-/// so a lookup takes no lock. A map's growth is charged to the query before the map
-/// allocates, through a reservation that grows in steps as the value cache's does, and
-/// the query's room falls as the cache grows. A refused growth, or one past the cache's
-/// cap, leaves the map full. The floors it does not hold are then computed each time,
-/// which costs about what a direct comparison of the two keys costs. The reservation is
-/// kept until the context drops.
+/// batches of a cursor share it as the rows of an eager table do, and every worker of a
+/// mask reads and writes the same [`FloorTable`] without a lock.
+///
+/// The first table has [`FLOOR_TABLE_FIRST`] slots, or fewer when the vocabulary has
+/// fewer strings or the cap allows less. A mask asks before each part of its rows whether
+/// the table should grow ([`Ctx::grow_floor_cache`]), which it does when the floors it
+/// evicted that had been read again pass [`FLOOR_TABLE_EVICTIONS`]. A query whose strings
+/// rarely repeat, whose evictions cost nothing, therefore keeps its first table. The new
+/// table is [`FLOOR_TABLE_GROWTH`] times larger and takes the floors of the old one as
+/// they are read. Each table is charged to the query before it is allocated, through a
+/// reservation that grows in steps as the value cache's does, and the old tables stay
+/// charged, since a mask can still hold one. A refused charge, or one past the cache's
+/// cap, keeps the table the query has, or leaves it without one, and the floors it does
+/// not hold are computed each time, which costs about what a direct comparison of the
+/// two keys costs. The reservation is kept until the context drops.
 #[derive(Default)]
 pub(super) struct FloorCache {
-    /// the maps no worker has checked out
-    maps: parking_lot::Mutex<Vec<FloorShard>>,
-    /// the estimated bytes of the maps' tables, the old table of a growing map included
+    /// the table the masks write and the one before it, which they read
+    tables: parking_lot::Mutex<FloorTables>,
+    /// the bytes of every table allocated
     used: AtomicU64,
     /// the bytes charged for the cache, never fewer than `used`
     charge: StepReservation,
-    /// the floors computed for its maps (for tests that the cache lasts the query)
+    /// the floors computed (for tests that the cache lasts the query)
     #[cfg(test)]
     computed: std::sync::atomic::AtomicUsize,
+    /// the slots of the first table, when a test sets them
+    #[cfg(test)]
+    first_slots: std::sync::atomic::AtomicUsize,
+    /// the threads that looked up floors (for tests that a mask spreads over the pool)
+    #[cfg(test)]
+    threads: parking_lot::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
 }
 
-/// One map of the [`FloorCache`]: the floor of each id it holds, or `u64::MAX` for an id
-/// that is not a base-vocabulary simple literal.
 #[derive(Default)]
-struct FloorShard {
-    map: FxHashMap<Id, u64>,
-    /// the estimated bytes of `map`'s table
-    bytes: u64,
-    /// a growth was refused or would pass the cap, so the map takes no more entries
+struct FloorTables {
+    cur: Option<Arc<FloorTable>>,
+    prev: Option<Arc<FloorTable>>,
+    /// a table was refused, so the cache takes no other
     full: bool,
+}
+
+/// A direct-mapped table of string floors shared by the workers of a query. Slot
+/// `p & mask` holds one word for base id `p`: from the top, `(p >> bits) + 1`, which
+/// tells the ids of a slot apart and is never zero, so an empty slot holds none; then the
+/// distance from `p` down to its floor, all ones for an id that is not a simple literal;
+/// then a bit set once the floor is read again. A floor farther away than the distance
+/// bits can hold is not kept. Each word is written and read whole, so a reader sees a
+/// word some worker wrote for an id of that slot, or zero, and a word whose top part
+/// matches is the floor of that id, which does not change while the query reads one
+/// snapshot. Two workers that compute the same floor store the same word, and a store
+/// that replaces another id's word only loses that floor. The words therefore need no
+/// ordering with other memory.
+pub(super) struct FloorTable {
+    slots: Box<[AtomicU64]>,
+    /// log2 of the slots
+    bits: u32,
+    /// the shift of the top part, above the distance and the read bit
+    shift: u32,
+    /// the distance that marks an id that is not a simple literal
+    none: u64,
+    /// the floors evicted that had been read again, counted by the maps that end
+    evicted: std::sync::atomic::AtomicUsize,
+}
+
+impl FloorTable {
+    /// A table of `slots`, a power of two, for base ids below `first_triple`.
+    fn new(slots: usize, first_triple: u64) -> Self {
+        debug_assert!(slots.is_power_of_two());
+        let bits = slots.trailing_zeros();
+        // The top part reaches `(first_triple - 1 >> bits) + 1`, which needs one bit more
+        // than `first_triple >> bits` takes. Base ids have at most `PAYLOAD_BITS`, so the
+        // distance keeps at least two bits.
+        let top_bits = 64 - (first_triple >> bits).leading_zeros() + 1;
+        let delta_bits = 64 - 1 - top_bits;
+        debug_assert!(delta_bits >= 2);
+        FloorTable {
+            slots: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            bits,
+            shift: delta_bits + 1,
+            none: (1 << delta_bits) - 1,
+            evicted: Default::default(),
+        }
+    }
+
+    /// The bytes of a table of `slots`.
+    fn bytes(slots: usize) -> u64 {
+        (slots as u64).saturating_mul(8)
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    fn slot(&self, p: u64) -> &AtomicU64 {
+        &self.slots[(p as usize) & (self.slots.len() - 1)]
+    }
+
+    #[inline]
+    fn top(&self, p: u64) -> u64 {
+        (p >> self.bits) + 1
+    }
+
+    /// The floor of `p` in `word`, when the word is `p`'s: `Some(None)` for an id that is
+    /// not a simple literal.
+    #[inline]
+    fn decode(&self, p: u64, word: u64) -> Option<Option<u64>> {
+        if word >> self.shift != self.top(p) {
+            return None;
+        }
+        let delta = (word >> 1) & self.none;
+        Some((delta != self.none).then(|| p - delta))
+    }
+
+    /// The floor of `p`, when the table holds it.
+    #[inline]
+    fn get(&self, p: u64) -> Option<Option<u64>> {
+        self.decode(p, self.slot(p).load(Ordering::Relaxed))
+    }
+
+    /// The word of `p` with floor `floor`, unless the floor is too far to hold.
+    #[inline]
+    fn encode(&self, p: u64, floor: Option<u64>, read: bool) -> Option<u64> {
+        let delta = floor.map_or(self.none, |f| p - f);
+        (floor.is_none() || delta < self.none)
+            .then(|| (self.top(p) << self.shift) | (delta << 1) | u64::from(read))
+    }
+
+    /// Keep the floor of `p`, unless it is too far to hold. Whether it was kept.
+    #[inline]
+    fn put(&self, p: u64, floor: Option<u64>, read: bool) -> bool {
+        let Some(word) = self.encode(p, floor, read) else {
+            return false;
+        };
+        self.slot(p).store(word, Ordering::Relaxed);
+        true
+    }
+
+    /// The words that hold a floor (for tests).
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|w| w.load(Ordering::Relaxed) != 0)
+            .count()
+    }
 }
 
 impl FloorCache {
@@ -268,106 +395,117 @@ impl FloorCache {
         FLOOR_CACHE_BYTES.min(mem_limit / 16)
     }
 
-    /// The bytes of a map's table with room for `capacity` entries: a power of two of
-    /// buckets at most 7/8 full, each a 16-byte entry and a control byte.
-    fn table_bytes(capacity: usize) -> u64 {
-        if capacity == 0 {
-            return 0;
-        }
-        ((capacity as u64).saturating_mul(8) / 7)
-            .next_power_of_two()
-            .saturating_mul(17)
-            .saturating_add(16)
-    }
-
     /// The bytes charged for the cache.
     #[cfg(test)]
     pub(super) fn reserved(&self) -> u64 {
         self.charge.reserved()
     }
 
-    /// The floors computed for the cache's maps.
+    /// The floors computed for the cache, whether or not it kept them.
     #[cfg(test)]
     pub(super) fn computed(&self) -> usize {
         self.computed.load(Ordering::Relaxed)
     }
 
-    /// The entries its maps hold.
+    /// The floors its current table holds.
     #[cfg(test)]
     pub(super) fn entries(&self) -> usize {
-        self.maps.lock().iter().map(|s| s.map.len()).sum()
+        self.tables.lock().cur.as_ref().map_or(0, |t| t.entries())
     }
 
-    /// The maps no worker has checked out, one for each worker that has mapped rows.
+    /// The slots of its current table.
     #[cfg(test)]
-    pub(super) fn shards(&self) -> usize {
-        self.maps.lock().len()
+    pub(super) fn slots(&self) -> usize {
+        self.tables.lock().cur.as_ref().map_or(0, |t| t.len())
+    }
+
+    /// Start the cache with a table of `slots`.
+    #[cfg(test)]
+    pub(super) fn set_first_slots(&self, slots: usize) {
+        self.first_slots.store(slots, Ordering::Relaxed);
+    }
+
+    /// The threads that have looked up floors.
+    #[cfg(test)]
+    pub(super) fn threads(&self) -> usize {
+        self.threads.lock().len()
     }
 }
 
-/// A map of the query's [`FloorCache`] checked out by one worker, returned on drop.
+/// A worker's view of the query's [`FloorCache`]: the tables it reads and the counts it
+/// adds to the cache when it ends.
 pub(super) struct FloorMap<'a> {
     ctx: &'a Ctx,
-    shard: FloorShard,
+    cur: Option<Arc<FloorTable>>,
+    prev: Option<Arc<FloorTable>>,
+    /// the floors that had been read again that this map's stores evicted
+    evicted: usize,
+    #[cfg(test)]
+    computed: usize,
 }
 
 impl Drop for FloorMap<'_> {
     fn drop(&mut self) {
-        let shard = std::mem::take(&mut self.shard);
-        self.ctx.floors.maps.lock().push(shard);
+        if let Some(cur) = &self.cur
+            && self.evicted > 0
+        {
+            cur.evicted.fetch_add(self.evicted, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        {
+            let cache = &self.ctx.floors;
+            cache.computed.fetch_add(self.computed, Ordering::Relaxed);
+            cache.threads.lock().insert(std::thread::current().id());
+        }
     }
 }
 
 impl FloorMap<'_> {
-    /// [`Ctx::string_floor`] of `id`, computed once while the map has room for it.
+    /// [`Ctx::string_floor`] of `id`, computed once while the table holds it.
     #[inline]
     pub(super) fn floor(&mut self, id: Id) -> Option<u64> {
-        if let Some(&f) = self.shard.map.get(&id) {
-            return (f != u64::MAX).then_some(f);
+        let p = id.payload();
+        if id.tag() != Tag::Vocab || p >= self.ctx.snap.generation.vocab.first_triple() {
+            return None;
         }
-        let f = self.ctx.string_floor(id);
-        #[cfg(test)]
-        self.ctx.floors.computed.fetch_add(1, Ordering::Relaxed);
+        let Some(cur) = &self.cur else {
+            return self.compute(id);
+        };
+        let slot = cur.slot(p);
+        let word = slot.load(Ordering::Relaxed);
+        if let Some(floor) = cur.decode(p, word) {
+            if word & 1 == 0 {
+                slot.store(word | 1, Ordering::Relaxed);
+            }
+            return floor;
+        }
+        // The slot held another id's floor, which had been read again when its bit is set.
+        let evicts = usize::from(word & 1 == 1);
+        if let Some(floor) = self.prev.as_ref().and_then(|prev| prev.get(p)) {
+            if cur.put(p, floor, true) {
+                self.evicted += evicts;
+            }
+            return floor;
+        }
+        let floor = self.compute(id);
         // A refused floor recorded a failure that ends the query. It is not kept as the
         // floor of another kind of value.
-        if (f.is_some() || self.ctx.check_memory_failure().is_ok())
-            && (self.shard.map.len() < self.shard.map.capacity() || self.grow())
+        if (floor.is_some() || self.ctx.check_memory_failure().is_ok())
+            && let Some(cur) = &self.cur
+            && cur.put(p, floor, false)
         {
-            self.shard.map.insert(id, f.unwrap_or(u64::MAX));
+            self.evicted += evicts;
         }
-        f
+        floor
     }
 
-    /// Make room for twice the entries, charged first. `false` when the map is full.
-    #[cold]
-    #[inline(never)]
-    fn grow(&mut self) -> bool {
-        let shard = &mut self.shard;
-        if shard.full {
-            return false;
-        }
-        let ctx = self.ctx;
-        let cache = &ctx.floors;
-        let target = shard.map.capacity().saturating_mul(2).max(FLOOR_MAP_FIRST);
-        let bytes = FloorCache::table_bytes(target);
-        let cap = FloorCache::cap(ctx.mem_limit);
-        // The old table is freed once its entries have moved, so both are charged.
-        let used = cache.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
-        if used > cap
-            || (!cache.charge.covers(used)
-                && ctx
-                    .grow_reservation(&cache.charge, used, cap, false)
-                    .is_err())
+    #[inline]
+    fn compute(&mut self, id: Id) -> Option<u64> {
+        #[cfg(test)]
         {
-            cache.used.fetch_sub(bytes, Ordering::AcqRel);
-            shard.full = true;
-            return false;
+            self.computed += 1;
         }
-        shard.map.reserve(target - shard.map.len());
-        debug_assert!(FloorCache::table_bytes(shard.map.capacity()) <= bytes);
-        cache.used.fetch_sub(shard.bytes, Ordering::AcqRel);
-        shard.bytes = bytes;
-        true
+        self.ctx.string_floor(id)
     }
 }
 
@@ -3240,10 +3378,90 @@ impl Ctx {
         &self.floors
     }
 
-    /// A map of the query's floor cache for one worker of a mask (see [`FloorCache`]).
+    /// A map of the query's floor cache for one worker of a mask (see [`FloorCache`]),
+    /// which allocates the cache's first table when it has none.
     pub(super) fn floor_map(&self) -> FloorMap<'_> {
-        let shard = self.floors.maps.lock().pop().unwrap_or_default();
-        FloorMap { ctx: self, shard }
+        let mut tables = self.floors.tables.lock();
+        if tables.cur.is_none() && !tables.full {
+            #[cfg(test)]
+            let first = match self.floors.first_slots.load(Ordering::Relaxed) {
+                0 => FLOOR_TABLE_FIRST,
+                slots => slots,
+            };
+            #[cfg(not(test))]
+            let first = FLOOR_TABLE_FIRST;
+            self.install_floor_table(&mut tables, first);
+        }
+        FloorMap {
+            ctx: self,
+            cur: tables.cur.clone(),
+            prev: tables.prev.clone(),
+            evicted: 0,
+            #[cfg(test)]
+            computed: 0,
+        }
+    }
+
+    /// Replace the floor cache's table by a larger one when the floors it evicted that
+    /// had been read again pass [`FLOOR_TABLE_EVICTIONS`] (see [`FloorCache`]). A mask
+    /// asks before each part of its rows, so that the workers of one part share a table.
+    pub(super) fn grow_floor_cache(&self) {
+        let mut tables = self.floors.tables.lock();
+        let Some(cur) = &tables.cur else {
+            return;
+        };
+        if tables.full || cur.evicted.load(Ordering::Relaxed) < cur.len() / FLOOR_TABLE_EVICTIONS {
+            return;
+        }
+        let slots = cur.len().saturating_mul(FLOOR_TABLE_GROWTH);
+        self.install_floor_table(&mut tables, slots);
+    }
+
+    /// Make a table of at most `slots` the floor cache's current one, charged first, with
+    /// the current table kept for reading. The slots are no more than the vocabulary's
+    /// strings need, since past that no two ids share a slot, and no more than the cap
+    /// holds. A cap that allows fewer than [`FLOOR_TABLE_FEWEST`] slots, a refused charge
+    /// or one past the cap leaves the cache full.
+    #[cold]
+    #[inline(never)]
+    fn install_floor_table(&self, tables: &mut FloorTables, slots: usize) {
+        let cache = &self.floors;
+        let first_triple = self.snap.generation.vocab.first_triple();
+        let cap = FloorCache::cap(self.mem_limit);
+        let most = usize::try_from(first_triple)
+            .unwrap_or(usize::MAX)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX);
+        let room = usize::try_from(cap / 8).unwrap_or(usize::MAX);
+        // the largest power of two the cap's words allow
+        let room = if room == 0 { 0 } else { 1 << room.ilog2() };
+        let wanted = slots.min(most);
+        if room < wanted && room < FLOOR_TABLE_FEWEST {
+            tables.full = true;
+            return;
+        }
+        let slots = wanted.min(room);
+        if tables.cur.as_ref().is_some_and(|cur| slots <= cur.len()) {
+            // the table is as large as the strings or the cap allow
+            tables.full = true;
+            return;
+        }
+        let bytes = FloorTable::bytes(slots);
+        // Every table allocated stays charged, since a mask may still read an old one.
+        let used = cache.used.load(Ordering::Acquire).saturating_add(bytes);
+        if used > cap
+            || (!cache.charge.covers(used)
+                && self
+                    .grow_reservation(&cache.charge, used, cap, false)
+                    .is_err())
+        {
+            tables.full = true;
+            return;
+        }
+        cache.used.store(used, Ordering::Release);
+        tracing::debug!(target: "sparkles::sparql::exec", "string floor table of {slots} slots");
+        let table = Arc::new(FloorTable::new(slots, first_triple));
+        tables.prev = tables.cur.replace(table);
     }
 
     /// The first base id whose key is not below `key`, searched inside the decoding
@@ -4625,6 +4843,41 @@ mod charge_tests {
                 assert!(ctx.check().is_ok());
             }
             drop(held);
+        }
+    }
+
+    /// A floor table's words tell apart the ids that share a slot, mark an id that is not
+    /// a simple literal, hold a floor as far as their distance bits reach and no farther,
+    /// and keep the bit of a floor read again only for that floor.
+    #[test]
+    fn floor_table_words_hold_one_id_of_a_slot() {
+        // 16 slots below 2^59 leave the top part 57 bits and the distance 6, so a floor
+        // 62 ids down is the farthest kept
+        let first_triple = 1u64 << 59;
+        let t = FloorTable::new(16, first_triple);
+        assert_eq!(t.none, 63);
+        let p = first_triple - 1;
+        let q = p - 16;
+        assert_eq!(t.get(p), None);
+        assert!(t.put(p, Some(p - 62), false));
+        assert_eq!(t.get(p), Some(Some(p - 62)));
+        assert_eq!(t.get(q), None, "the other id of the slot");
+        assert!(!t.put(q, Some(q - 63), false), "too far to hold");
+        assert_eq!(t.get(p), Some(Some(p - 62)));
+        assert!(t.put(q, None, true));
+        assert_eq!(t.get(q), Some(None));
+        assert_eq!(t.get(p), None, "evicted");
+        let word = t.slot(q).load(Ordering::Relaxed);
+        assert_eq!(word & 1, 1, "read again");
+        assert!(t.put(q, Some(q), false));
+        assert_eq!(t.get(q), Some(Some(q)));
+        assert_eq!(t.entries(), 1);
+        // a small vocabulary leaves the top part one bit, as every id is below the slots
+        let t = FloorTable::new(1 << 10, 1000);
+        assert_eq!(t.none, (1 << 62) - 1);
+        for p in [0, 1, 999] {
+            assert!(t.put(p, Some(0), false));
+            assert_eq!(t.get(p), Some(Some(0)));
         }
     }
 

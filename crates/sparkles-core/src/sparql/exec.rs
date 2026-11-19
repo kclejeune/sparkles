@@ -5655,6 +5655,7 @@ fn string_order_mask(
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
     let sample = n.min(STRING_ORDER_SAMPLE);
+    ctx.grow_floor_cache();
     let strings = {
         let mut floors = ctx.floor_map();
         (0..sample).all(|i| floors.floor(xs[i]).is_some() && floors.floor(ys[i]).is_some())
@@ -5665,8 +5666,6 @@ fn string_order_mask(
         return Ok(None);
     }
     let threads = rayon::current_num_threads().max(1);
-    let par = n > PAR_THRESHOLD && threads > 1;
-    let workers = if par { threads } else { 1 };
     let map = t.var_map(ctx.nvars());
     let generic = |i: usize| {
         let row = Row {
@@ -5704,23 +5703,39 @@ fn string_order_mask(
         }
         Ok(order_of(floors, i))
     };
-    let keep = if par {
-        (0..n)
-            .into_par_iter()
-            .with_min_len(n.div_ceil(workers))
-            .map_init(|| ctx.floor_map(), |floors, i| test(floors, i))
-            .collect::<Result<Vec<bool>>>()?
-    } else if threads > 1 && n <= PAR_THRESHOLD {
+    let keep = if n <= PAR_THRESHOLD && threads > 1 {
         // A table of at most `PAR_THRESHOLD` rows, such as a cursor's batch, spreads over
         // the pool as the generic filter's batch does, so that a cursor's comparison is
         // not left on one thread where the generic filter would use them all. The batch
         // checks the deadline itself and collects the rows' booleans.
         map_batch_with(ctx, n, true, || ctx.floor_map(), order_of)?
     } else {
-        let mut floors = ctx.floor_map();
-        (0..n)
-            .map(|i| test(&mut floors, i))
-            .collect::<Result<Vec<bool>>>()?
+        // A larger table is compared in parts of `PAR_THRESHOLD` rows and then of the
+        // rows before them, so that the floor cache can grow after the first parts as it
+        // does between a cursor's batches.
+        let mut keep = Vec::with_capacity(n);
+        let mut lo = 0;
+        while lo < n {
+            if lo > 0 {
+                ctx.grow_floor_cache();
+            }
+            let hi = n.min(lo + lo.max(PAR_THRESHOLD));
+            if threads > 1 {
+                let part = (lo..hi)
+                    .into_par_iter()
+                    .with_min_len((hi - lo).div_ceil(threads))
+                    .map_init(|| ctx.floor_map(), |floors, i| test(floors, i))
+                    .collect::<Result<Vec<bool>>>()?;
+                keep.extend_from_slice(&part);
+            } else {
+                let mut floors = ctx.floor_map();
+                for i in lo..hi {
+                    keep.push(test(&mut floors, i)?);
+                }
+            }
+            lo = hi;
+        }
+        keep
     };
     // A refused floor took its row to the generic test, so the mask must not stand.
     ctx.check_memory_failure()?;
@@ -10027,17 +10042,18 @@ mod string_order_tests {
     }
 
     /// The floors a query computes for one table serve its later tables, as a cursor's
-    /// batches are, in both modes: a second mask over the same strings computes none. It
-    /// runs on one thread, since each parallel task of a mask learns the floors of its
-    /// own map.
+    /// batches are, in both modes and on one thread or several: a second mask over the
+    /// same strings computes none, since every worker reads and writes one table.
     #[test]
     fn the_floor_cache_lasts_the_query() {
         let (s, ids) = store("long");
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
-        pool.install(|| the_floor_cache_lasts_the_query_in(&s, &ids));
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| the_floor_cache_lasts_the_query_in(&s, &ids));
+        }
     }
 
     fn the_floor_cache_lasts_the_query_in(s: &Store, ids: &[Id]) {
@@ -10062,10 +10078,16 @@ mod string_order_tests {
                 computed.push(ctx.floor_cache().computed());
             }
             let cache = ctx.floor_cache();
-            // every id and the local string, at most once per worker's map
-            assert!(computed[0] > ids.len(), "cursor {cursor}: {computed:?}");
+            // every base literal at least once, twice when two workers compute it at once
+            let v = &ctx.snap.generation.vocab;
+            let literals = ids
+                .iter()
+                .filter(|id| id.tag() == Tag::Vocab && id.payload() < v.first_triple())
+                .count();
+            assert!(literals > 0, "cursor {cursor}");
+            assert!(computed[0] >= literals, "cursor {cursor}: {computed:?}");
             assert_eq!(computed[1], computed[0], "cursor {cursor}: no floor again");
-            assert!(cache.entries() > ids.len(), "cursor {cursor}");
+            assert!(cache.entries() >= literals, "cursor {cursor}");
             assert!(
                 cache.reserved() > 0,
                 "cursor {cursor}: the maps are charged"
@@ -10076,12 +10098,9 @@ mod string_order_tests {
 
     /// A cursor's batch of at most `PAR_THRESHOLD` rows spreads its floor comparison over
     /// the pool as the generic filter's batch does, instead of leaving it on the calling
-    /// thread, with each worker's map returned to the query's cache. The calling thread
-    /// keeps the map of its timed sample while the parallel pieces check out their own,
-    /// so a batch given to the pool leaves at least two maps and one kept on the calling
-    /// thread leaves one. The pool takes the batch when its timed sample projects at
-    /// least `BATCH_PAR_NANOS` for the rest, which the sample's floors exceed many times
-    /// over, and the test allows several attempts.
+    /// thread, so that more than one thread looks up floors. The pool takes the batch
+    /// when its timed sample projects at least `BATCH_PAR_NANOS` for the rest, which the
+    /// sample's floors exceed many times over, and the test allows several attempts.
     #[test]
     fn a_cursor_batch_compares_floors_on_the_pool() {
         use super::super::expr::CmpOp;
@@ -10105,8 +10124,7 @@ mod string_order_tests {
             let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
             assert_eq!(mask, generic);
             assert!(ctx.check().is_ok());
-            // the calling thread keeps its sample's map while the pieces take their own
-            if ctx.floor_cache().shards() > 1 {
+            if ctx.floor_cache().threads() > 1 {
                 spread = true;
                 break;
             }
@@ -10130,8 +10148,9 @@ mod string_order_tests {
             let (t, x, y) = product(&ctx, &ids);
             let e = cmp(x, y, CmpOp::Lt);
             let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
-            // room for the decoding of the short keys, not for a map's first table
-            let room = 24 << 10;
+            // room for the decoding of the short keys, not for the reservation step of
+            // 16 KiB that the first table's charge takes
+            let room = 12 << 10;
             let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - room).unwrap();
             let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
                 .unwrap()
@@ -10578,20 +10597,12 @@ mod string_order_tests {
         }
     }
 
-    /// Strings whose distinct ids grow every worker's map past its first table, in a pool
-    /// of several threads: the masks of two tables match the generic filter in both
-    /// modes, the maps' tables are charged and take the query's room, and a budget whose
-    /// cap refuses a later growth leaves the masks exact without a failure.
-    #[test]
-    fn parallel_masks_grow_their_floor_maps_within_the_charge() {
-        use super::super::expr::CmpOp;
-        let n = 6000usize;
+    /// The strings of the growth tests: `n` distinct words, each the object of one subject.
+    fn word_store(n: usize) -> (Store, Vec<Id>) {
+        let word = |i: usize| format!("w{}", i * 7919 % 100_003);
         let mut nt = String::new();
         for i in 0..n {
-            nt.push_str(&format!(
-                "<urn:s:{i}> <urn:p> \"w{}\" .\n",
-                i * 7919 % 100_003
-            ));
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"{}\" .\n", word(i)));
         }
         let s = Store::in_memory(StoreOptions::default());
         s.load(&[Source::from_bytes(
@@ -10603,25 +10614,37 @@ mod string_order_tests {
         let snap = s.snapshot();
         let ids: Vec<Id> = (0..n)
             .map(|i| {
-                snap.lookup_term(
-                    &oxrdf::Literal::new_simple_literal(format!("w{}", i * 7919 % 100_003)).into(),
-                )
-                .unwrap()
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(word(i)).into())
+                    .unwrap()
             })
             .collect();
         drop(snap);
+        (s, ids)
+    }
+
+    /// Strings whose floors are read again evict each other from a small first table, in
+    /// a pool of several threads, so the table grows between the parts of a mask and
+    /// between masks: the masks match the generic filter in both modes, the tables are
+    /// charged and take the query's room, and a cap that refuses a later table keeps the
+    /// one the query has and leaves the masks exact without a failure.
+    #[test]
+    fn parallel_masks_grow_the_floor_table_within_the_charge() {
+        use super::super::expr::CmpOp;
+        let n = 6000usize;
+        let (s, ids) = word_store(n);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap();
         pool.install(|| {
-            for (mem_limit, roomy) in [(256 << 20, true), (2 << 20, false)] {
+            for (mem_limit, roomy) in [(256 << 20, true), (1 << 20, false)] {
                 for cursor in [false, true] {
                     let mut ctx = Ctx::new(s.snapshot());
                     ctx.mem_limit = mem_limit;
                     if cursor {
                         ctx.enable_cursor_accounting().unwrap();
                     }
+                    ctx.floor_cache().set_first_slots(64);
                     let room = ctx.memory_room();
                     for (round, op) in [CmpOp::Lt, CmpOp::Ge].into_iter().enumerate() {
                         let (x, y) = (ctx.var("x"), ctx.var("y"));
@@ -10642,19 +10665,101 @@ mod string_order_tests {
                     let cache = ctx.floor_cache();
                     let cap = (64u64 << 20).min(mem_limit / 16);
                     assert!(cache.reserved() <= cap, "{mem_limit} cursor {cursor}");
+                    assert!(cache.reserved() > 0, "{mem_limit} cursor {cursor}");
+                    assert!(
+                        ctx.memory_room() + cache.reserved() <= room,
+                        "{mem_limit} cursor {cursor}: the cache takes the query's room"
+                    );
+                    // 64, 512 and 4096 slots fit under the smaller cap, 8192 more do not
+                    let slots = cache.slots();
                     if roomy {
-                        // more than one map, and at least one past its first table
-                        assert!(cache.entries() > 2 * 1792, "cursor {cursor}");
-                        assert!(cache.reserved() > 0, "cursor {cursor}");
-                        assert!(
-                            ctx.memory_room() + cache.reserved() <= room,
-                            "cursor {cursor}: the cache takes the query's room"
-                        );
+                        assert_eq!(slots, n.next_power_of_two(), "cursor {cursor}");
+                        assert!(cache.entries() > n / 2, "cursor {cursor}");
                     } else {
-                        assert!(cache.entries() < n, "cursor {cursor}: the cap refused");
+                        assert_eq!(slots, 4096, "cursor {cursor}: the cap refused");
+                        assert!(cache.entries() < n, "cursor {cursor}");
                     }
                 }
             }
         });
+    }
+
+    /// Strings that rarely repeat keep the first table: masks over pairs of words that no
+    /// other row holds evict floors that were never read again, which does not grow it.
+    /// Only the rows of a mask's sample are read twice, which stays under the threshold.
+    #[test]
+    fn floors_read_once_do_not_grow_the_table() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let (s, ids) = word_store(3 * 2 * rows);
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 256 << 20;
+        let first = 1 << 14;
+        ctx.floor_cache().set_first_slots(first);
+        for part in ids.chunks(2 * rows) {
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for pair in part.chunks(2) {
+                t.push_row(pair);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the floors apply");
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+        }
+        assert!(
+            ids.len().next_power_of_two() > first,
+            "the table could grow"
+        );
+        assert_eq!(ctx.floor_cache().slots(), first);
+    }
+
+    /// Workers that look up the floors of ids sharing the slots of a tiny table at once,
+    /// while the table grows under a map that still reads the old one, each get the floor
+    /// [`Ctx::string_floor`] computes, in both modes.
+    #[test]
+    fn concurrent_floor_lookups_match_the_computed_floors() {
+        use rayon::prelude::*;
+        let (s, ids) = store("long");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            ctx.floor_cache().set_first_slots(16);
+            let expected: Vec<Option<u64>> = ids.iter().map(|&id| ctx.string_floor(id)).collect();
+            assert!(expected.iter().any(Option::is_some));
+            assert!(ids.len() > 4 * 16, "ids share the slots");
+            pool.install(|| {
+                let held = ctx.floor_map();
+                for round in 0..8usize {
+                    (0..64usize).into_par_iter().for_each(|task| {
+                        let mut map = ctx.floor_map();
+                        for k in 0..4 * ids.len() {
+                            let j = (k * 31 + task * 17 + round) % ids.len();
+                            assert_eq!(map.floor(ids[j]), expected[j], "cursor {cursor}");
+                        }
+                    });
+                    ctx.grow_floor_cache();
+                }
+                // a map taken before the growth still reads its tables
+                let mut held = held;
+                for (j, &id) in ids.iter().enumerate() {
+                    assert_eq!(held.floor(id), expected[j], "cursor {cursor}");
+                }
+            });
+            assert!(
+                ctx.floor_cache().slots() > 16,
+                "cursor {cursor}: the table grew"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
     }
 }
