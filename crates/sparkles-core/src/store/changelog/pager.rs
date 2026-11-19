@@ -36,6 +36,15 @@ impl Drop for LogPin {
 }
 
 impl ChangeLog {
+    fn require_on(&self) -> Result<()> {
+        if !self.is_enabled() {
+            return Err(Error::HistoryUnsupported(
+                "the change log of this dataset is off; history queries need it".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Pin the commits from `at` on. `None` for a read-only log, which needs no pin.
     /// The caller checks that the log is on once the pin is held.
     fn pin(self: &Arc<Self>, at: u64) -> Option<LogPin> {
@@ -52,15 +61,17 @@ impl ChangeLog {
     /// Start reading `q` in pages over the commits up to `upto`. The checks, the flush
     /// and the resolution of the range are those of [`ChangeLog::query`], made once.
     pub(crate) fn pages(self: &Arc<Self>, q: HistoryQuery, upto: u64) -> Result<HistoryPages> {
-        self.pages_hooked(q, upto, &mut || Ok(()))
+        self.pages_hooked(q, upto, &mut || Ok(()), &mut || Ok(()))
     }
 
-    /// [`ChangeLog::pages`], calling `after_range` once the range is resolved and before
-    /// it is pinned, which a test uses to run retention there.
+    /// [`ChangeLog::pages`], calling `after_prepare` once the flush is done and before
+    /// the range is pinned, and `after_range` once the range is resolved and before it
+    /// is pinned, which tests use to run retention or a change of settings there.
     fn pages_hooked(
         self: &Arc<Self>,
         q: HistoryQuery,
         upto: u64,
+        after_prepare: &mut dyn FnMut() -> Result<()>,
         after_range: &mut dyn FnMut() -> Result<()>,
     ) -> Result<HistoryPages> {
         // The checks and the flush come first, unpinned, so the retention that the
@@ -71,20 +82,20 @@ impl ChangeLog {
         // pins and drops segments: a retention pass that read them before has
         // finished, and every later one sees the pin.
         let upto = self.prepare(&q, upto)?;
+        after_prepare()?;
         let hold = {
             let _inner = self.inner.lock();
             self.pin(0)
         };
+        // The log is on while the pin is held: turning it off swaps the switch with
+        // `pins` locked, so it either finished before the pin and is seen here, or sees
+        // the pin and is refused. The bounds are resolved only against a log that stays.
+        self.require_on()?;
         let (from, to) = self.bounds(&q, upto)?;
         after_range()?;
         // an empty range reads nothing and holds no pin
         let pin = (from <= to).then(|| self.pin(from)).flatten();
         drop(hold);
-        if !self.is_enabled() {
-            return Err(Error::HistoryUnsupported(
-                "the change log of this dataset is off; history queries need it".into(),
-            ));
-        }
         Ok(HistoryPages {
             log: self.clone(),
             filter: q.filter(),
@@ -669,7 +680,7 @@ mod tests {
             let oldest = || log.inner.lock().segs[0].first;
             let first = oldest();
             let mut pages = log
-                .pages_hooked(all.clone(), 36, &mut || {
+                .pages_hooked(all.clone(), 36, &mut || Ok(()), &mut || {
                     s.set_change_log_settings(ChangeLogSettings {
                         keep_commits: Some(2),
                         ..Default::default()
@@ -783,6 +794,68 @@ mod tests {
             got.extend(page.changes.iter().map(key));
         }
         assert_eq!(got, want);
+    }
+
+    /// A log turned off after the flush, whose removal is still to come when the range
+    /// would be resolved, fails the read before its range is resolved, though the log is
+    /// on again before the read would start.
+    #[test]
+    fn a_log_turned_off_before_the_pin_fails_the_read() {
+        let s = Store::in_memory(options());
+        fill(&s);
+        let log = s.change_log().unwrap().clone();
+        let mut resolved = false;
+        let r = log.pages_hooked(
+            HistoryQuery::default(),
+            36,
+            // as `set_settings` leaves it once it has swapped the switch off and released
+            // the pins, before it removes the log
+            &mut || {
+                log.enabled.store(false, Ordering::Release);
+                Ok(())
+            },
+            // on again before the reader's last check
+            &mut || {
+                resolved = true;
+                log.enabled.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(matches!(r, Err(Error::HistoryUnsupported(_))));
+        assert!(
+            !resolved,
+            "the range was resolved against a log being removed"
+        );
+        assert!(log.pins.lock().is_empty());
+    }
+
+    /// A page vector that grows admits its old and new buffers together, releases the
+    /// old one, and only then admits the change it grew for.
+    #[test]
+    fn a_growing_page_admits_its_change_after_the_old_buffer_goes() {
+        let s = Store::in_memory(options());
+        s.change_log().unwrap().set_background(false);
+        let body: String = (0..100)
+            .map(|j| format!("<urn:s> <urn:p> {j} . "))
+            .collect();
+        upd(&s, &format!("INSERT DATA {{ {body} }}"));
+        s.flush_change_log().unwrap();
+        let log = s.change_log().unwrap().clone();
+        let mut pages = log.pages(HistoryQuery::default(), 1).unwrap();
+        let mut seen: Vec<u64> = Vec::new();
+        let page = pages
+            .next(10_000, 65, &mut |b| {
+                seen.push(b);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(page.changes.len(), 65);
+        let old = 64 * std::mem::size_of::<HistoryChange>() as u64;
+        assert!(
+            seen.windows(3)
+                .any(|w| w[0].checked_sub(w[1]) == Some(old) && w[2] > w[1]),
+            "{seen:?}"
+        );
     }
 
     #[test]
