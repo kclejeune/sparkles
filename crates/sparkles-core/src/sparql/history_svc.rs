@@ -43,7 +43,7 @@ use super::plan::{Kind, Node, PT, Planner};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::store::{DiffOp, HistoryBound, HistoryQuery};
+use crate::store::{DiffOp, HistoryBound, HistoryChange, HistoryQuery};
 use oxrdf::vocab::xsd;
 use oxrdf::{GraphName, Literal, NamedNode, Term};
 use rustc_hash::FxHashMap;
@@ -534,11 +534,36 @@ fn bind(ctx: &Ctx, spec: &HistorySpec, key: &[Id]) -> Result<Option<HistorySpec>
 /// One lookup in the change log: the changes that match the call's constants, as rows
 /// of `vars`.
 fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
-    let Some(log) = ctx.snap.change_log.as_ref() else {
-        return Err(Error::HistoryUnsupported(
-            "history queries need a store with a change log".into(),
-        ));
-    };
+    let log = change_log(ctx)?;
+    let q = history_query(ctx, spec);
+    if spec.limit == Some(0) {
+        return Ok(Table::empty(vars.to_vec()));
+    }
+    let r = log.query(&q, ctx.snap.commit)?;
+    ctx.check_rows(r.changes.len())?;
+    let mut t = Table::new(vars.to_vec());
+    let rows = RowMaker::new(spec, vars);
+    let mut row = vec![Id::UNDEF; vars.len()];
+    for c in &r.changes {
+        ctx.check()?;
+        if rows.fill(ctx, c, &mut row) {
+            t.push_row(&row);
+        }
+    }
+    Ok(t)
+}
+
+/// The change log a history query reads.
+pub(super) fn change_log(ctx: &Ctx) -> Result<&std::sync::Arc<crate::store::ChangeLog>> {
+    ctx.snap.change_log.as_ref().ok_or_else(|| {
+        Error::HistoryUnsupported("history queries need a store with a change log".into())
+    })
+}
+
+/// The change log query of a call: its constants, its range of commits with `head`
+/// resolved to the state the query reads, and its limit, at most one more than the row
+/// budget so that passing the budget fails.
+pub(super) fn history_query(ctx: &Ctx, spec: &HistorySpec) -> HistoryQuery {
     let terms = |s: &Slot| match s {
         Slot::Const(t) => vec![t.clone()],
         _ => Vec::new(),
@@ -583,43 +608,56 @@ fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
         }),
         b => b.clone(),
     };
-    let q = HistoryQuery {
+    HistoryQuery {
         from: resolve(&q.from),
         to: resolve(&q.to),
         ..q
-    };
-    if spec.limit == Some(0) {
-        return Ok(Table::empty(vars.to_vec()));
     }
-    let r = log.query(&q, ctx.snap.commit)?;
-    ctx.check_rows(r.changes.len())?;
-    let mut t = Table::new(vars.to_vec());
-    let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
-    let slot_col = |s: &Slot| match s {
-        Slot::Var(v) => col(Some(*v)),
-        _ => None,
-    };
-    let (cs, cp, co, cg, cop) = (
-        slot_col(&spec.s),
-        slot_col(&spec.p),
-        slot_col(&spec.o),
-        slot_col(&spec.g),
-        slot_col(&spec.op),
-    );
-    let (ccommit, ctime, ckind, cauthor, cmessage) = (
-        col(spec.commit),
-        col(spec.time),
-        col(spec.kind),
-        col(spec.author),
-        col(spec.message),
-    );
-    let mut row = vec![Id::UNDEF; vars.len()];
-    let plain = |s: &str| ctx.intern_term(&Term::Literal(Literal::new_simple_literal(s)));
-    'rows: for c in &r.changes {
-        ctx.check()?;
+}
+
+/// Where each part of a recorded change goes in a row of the call's variables.
+pub(super) struct RowMaker {
+    cs: Option<usize>,
+    cp: Option<usize>,
+    co: Option<usize>,
+    cg: Option<usize>,
+    cop: Option<usize>,
+    ccommit: Option<usize>,
+    ctime: Option<usize>,
+    ckind: Option<usize>,
+    cauthor: Option<usize>,
+    cmessage: Option<usize>,
+}
+
+impl RowMaker {
+    pub(super) fn new(spec: &HistorySpec, vars: &[VarId]) -> Self {
+        let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
+        let slot_col = |s: &Slot| match s {
+            Slot::Var(v) => col(Some(*v)),
+            _ => None,
+        };
+        RowMaker {
+            cs: slot_col(&spec.s),
+            cp: slot_col(&spec.p),
+            co: slot_col(&spec.o),
+            cg: slot_col(&spec.g),
+            cop: slot_col(&spec.op),
+            ccommit: col(spec.commit),
+            ctime: col(spec.time),
+            ckind: col(spec.kind),
+            cauthor: col(spec.author),
+            cmessage: col(spec.message),
+        }
+    }
+
+    /// Fill `row` with the change, or return `false` when a variable used twice in the
+    /// call would get two terms. A term that cannot be interned within the memory budget
+    /// leaves its cell unbound and fails the query at its next check.
+    pub(super) fn fill(&self, ctx: &Ctx, c: &HistoryChange, row: &mut [Id]) -> bool {
+        let plain = |s: &str| ctx.intern_term(&Term::Literal(Literal::new_simple_literal(s)));
         row.fill(Id::UNDEF);
         // a variable used twice must get the same term
-        let put = |row: &mut Vec<Id>, c: Option<usize>, id: Id| -> bool {
+        let put = |row: &mut [Id], c: Option<usize>, id: Id| -> bool {
             match c {
                 Some(i) if row[i].is_undef() => {
                     row[i] = id;
@@ -635,23 +673,23 @@ fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
             GraphName::NamedNode(n) => Some(Term::NamedNode(n.clone())),
             GraphName::BlankNode(b) => Some(Term::BlankNode(b.clone())),
         };
-        let mut ok = put(&mut row, cs, ctx.intern_term(&s))
+        let mut ok = put(row, self.cs, ctx.intern_term(&s))
             && put(
-                &mut row,
-                cp,
+                row,
+                self.cp,
                 ctx.intern_term(&Term::NamedNode(c.quad.predicate.clone())),
             )
-            && put(&mut row, co, ctx.intern_term(&c.quad.object));
+            && put(row, self.co, ctx.intern_term(&c.quad.object));
         if let Some(g) = &g {
-            ok = ok && put(&mut row, cg, ctx.intern_term(g));
-        } else if let Some(i) = cg
+            ok = ok && put(row, self.cg, ctx.intern_term(g));
+        } else if let Some(i) = self.cg
             && !row[i].is_undef()
         {
             // the variable is bound to a term elsewhere in the call: no match
             ok = false;
         }
         if !ok {
-            continue 'rows;
+            return false;
         }
         let op = match c.op {
             DiffOp::Add => "add",
@@ -668,23 +706,19 @@ fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
             c.commit.timestamp(),
             xsd::DATE_TIME,
         )));
-        let ok = put(&mut row, cop, plain(op))
-            && put(&mut row, ccommit, commit_id)
-            && put(&mut row, ctime, time)
-            && put(&mut row, ckind, plain(c.commit.kind.name()))
+        put(row, self.cop, plain(op))
+            && put(row, self.ccommit, commit_id)
+            && put(row, self.ctime, time)
+            && put(row, self.ckind, plain(c.commit.kind.name()))
             && match &c.commit.author {
-                Some(a) => put(&mut row, cauthor, plain(a)),
+                Some(a) => put(row, self.cauthor, plain(a)),
                 None => true,
             }
             && match &c.commit.message {
-                Some(m) => put(&mut row, cmessage, plain(m)),
+                Some(m) => put(row, self.cmessage, plain(m)),
                 None => true,
-            };
-        if ok {
-            t.push_row(&row);
-        }
+            }
     }
-    Ok(t)
 }
 
 /// The IRI of the default graph in `hist:graph` (for documentation and tests).
