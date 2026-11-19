@@ -125,10 +125,11 @@ const NESTED: &[&str] = &[
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?o <urn:r> ?k } }",
 ];
 
-/// OPTIONALs whose condition holds an EXISTS, which the cursor merges and tests on each
-/// batch's pairs as eager execution does, so automatic execution streams them. The
-/// second and third read the condition's right variable nowhere else, and the third's
-/// condition also reads the left side.
+/// OPTIONALs whose condition holds an EXISTS. The cursor merges them and tests the
+/// condition on each batch's pairs, but automatic execution keeps them eager, because
+/// that merge is slower than eager execution's at higher fan-out. The second and third
+/// read the condition's right variable nowhere else, and the third's condition also
+/// reads the left side.
 const OPTIONAL_CONDITION: &[&str] = &[
     "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER NOT EXISTS { ?o <urn:r> ?k } } }",
@@ -181,10 +182,11 @@ fn large_groupings_with_exists_stream_and_match_eager() {
     }
 }
 
-/// An OPTIONAL whose condition holds an EXISTS streams and matches eager execution at
-/// several batch sizes, with the merge OPTIONAL on and with it off, when both modes hash.
+/// Automatic execution keeps an OPTIONAL whose condition holds an EXISTS eager, and a
+/// strict cursor over it matches eager execution at several batch sizes, with the merge
+/// OPTIONAL on and with it off, when both modes hash.
 #[test]
-fn optional_exists_streams_and_matches_eager() {
+fn optional_exists_stays_eager_and_a_strict_cursor_matches() {
     use sparkles_core::sparql::{FallbackPolicy, select_cursor};
     let s = store();
     for q in OPTIONAL_CONDITION {
@@ -204,15 +206,15 @@ fn optional_exists_streams_and_matches_eager() {
                 };
                 let (got, streamed) =
                     automatic(&s, q, &opts, &cursor).unwrap_or_else(|e| panic!("{q}: {e}"));
-                assert!(streamed, "{q}; merge {merge}: kept eager");
+                assert!(!streamed, "{q}; merge {merge}: streamed");
                 assert_eq!(
                     ordered(got),
                     ordered(expected.clone()),
                     "{q}; merge {merge}; {rows}"
                 );
             }
-            // Automatic execution admits no batches this small, so a strict cursor
-            // runs them.
+            // A strict cursor runs the conditional merge, at batches small enough
+            // that a left row's pairs span several of them.
             for batch_rows in [1, 3, 1000] {
                 let cursor = CursorOptions {
                     batch_rows,
