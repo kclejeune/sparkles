@@ -31,6 +31,9 @@ pub(in crate::sparql) const MARK_BYTES: u64 = std::mem::size_of::<(usize, u64)>(
 /// ledger charges for each of its own mark slots.
 pub(in crate::sparql) const LEDGER_MARK_BYTES: u64 = std::mem::size_of::<(u64, u64)>() as u64;
 
+/// [`RowOut`]'s open offset when no row or piece is open.
+const CLOSED: usize = usize::MAX;
+
 /// The rows of a result writer's output that reached the caller's writer whole, and
 /// optionally the transport's [`RowLedger`].
 #[derive(Default)]
@@ -222,15 +225,18 @@ pub(crate) struct RowOut<'a> {
     /// an error that a [`Write`] call could report only as an I/O error, such as a
     /// refused memory charge, returned in its place
     refused: Option<Error>,
-    /// explicit mode: the offset in `buf` at which the open row or header starts
-    open: Option<usize>,
+    /// explicit mode: the offset in `buf` at which the open row or header starts, or
+    /// [`CLOSED`] between pieces and in the staged mode. One word, so that opening and
+    /// closing a row each cost one store.
+    open: usize,
     /// explicit mode: the open row outgrew the buffer, and `buf` is the scratch that
-    /// collects it whole while the buffer waits in `spill`
+    /// collects it whole while the buffer waits in `spill`. It implies `moved`, so the end
+    /// of a row tests `moved` alone.
     growing: bool,
     /// explicit mode: the open piece moved to the front of the buffer because it did not
     /// fit where it started, or started before the buffer existed. Such a piece of exactly
     /// the buffer's size goes on in one write at its end, as a serializer's write of that
-    /// size would at once.
+    /// size would at once. Only the cold paths set it, and the end of the piece clears it.
     moved: bool,
     /// the scratch for a row longer than the buffer, or the buffer while one grows, charged
     /// with the buffer and kept for the next long row
@@ -259,7 +265,7 @@ impl<'a> RowOut<'a> {
             taken: 0,
             failed: false,
             refused: None,
-            open: None,
+            open: CLOSED,
             growing: false,
             moved: false,
             spill: Vec::new(),
@@ -379,8 +385,9 @@ impl<'a> RowOut<'a> {
     /// fails.
     #[inline]
     pub(crate) fn end_row(&mut self, n: u64) -> std::io::Result<()> {
-        self.open = None;
-        if self.growing | self.moved {
+        self.open = CLOSED;
+        debug_assert!(self.moved || !self.growing);
+        if self.moved {
             return self.end_whole(Some(n));
         }
         self.push_mark(n);
@@ -391,14 +398,18 @@ impl<'a> RowOut<'a> {
     /// the caller's writer whole like a row but ends none.
     #[inline]
     pub(crate) fn begin_piece(&mut self) {
-        self.open = Some(self.buf.len());
-        self.moved = self.buf.capacity() == 0;
+        debug_assert!(
+            !self.moved && !self.growing,
+            "a piece begins inside another"
+        );
+        self.open = self.buf.len();
     }
 
     /// Explicit mode: close the piece [`RowOut::begin_piece`] opened.
     pub(crate) fn end_piece(&mut self) -> std::io::Result<()> {
-        self.open = None;
-        if self.growing | self.moved {
+        self.open = CLOSED;
+        debug_assert!(self.moved || !self.growing);
+        if self.moved {
             return self.end_whole(None);
         }
         Ok(())
@@ -471,10 +482,10 @@ impl<'a> RowOut<'a> {
             self.growing = false;
             std::mem::swap(&mut self.buf, &mut self.spill);
             self.spill.clear();
-        } else if let Some(start) = self.open {
-            self.buf.truncate(start);
+        } else if self.open != CLOSED {
+            self.buf.truncate(self.open);
         }
-        self.open = None;
+        self.open = CLOSED;
         self.moved = false;
     }
 
@@ -539,13 +550,16 @@ impl<'a> RowOut<'a> {
         // before the bytes go anywhere
         if self.buf.capacity() == 0 {
             self.start()?;
+            // a piece open before the buffer existed counts as moved, so that one of
+            // exactly the buffer's size goes on at its end
+            self.moved = self.open != CLOSED;
             if b.len() < OUTPUT_BUFFER {
                 self.buf.extend_from_slice(b);
                 return Ok(b.len());
             }
         }
-        if let Some(start) = self.open {
-            return self.write_open(start, b);
+        if self.open != CLOSED {
+            return self.write_open(self.open, b);
         }
         self.drain()?;
         if b.len() >= OUTPUT_BUFFER {
@@ -569,7 +583,7 @@ impl<'a> RowOut<'a> {
     #[inline(never)]
     fn write_open(&mut self, start: usize, b: &[u8]) -> std::io::Result<usize> {
         self.drain_to(start)?;
-        self.open = Some(0);
+        self.open = 0;
         self.moved = true;
         if self.buf.len() + b.len() <= OUTPUT_BUFFER {
             self.buf.extend_from_slice(b);
@@ -751,7 +765,7 @@ impl Write for Explicit<'_, '_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        debug_assert!(self.0.open.is_none(), "a flush inside an open row");
+        debug_assert!(self.0.open == CLOSED, "a flush inside an open row");
         self.0.drain()?;
         self.0.inner.flush()
     }
