@@ -1041,3 +1041,46 @@ fn validation_without_a_log_still_refuses_an_unknown_vocabulary() {
     std::fs::remove_file(generation.join("wal.log")).unwrap();
     assert!(validate_copy(dir.path(), false, &preparation()).is_err());
 }
+
+/// A compaction trims the old log's preallocated tail to its last commit once it
+/// switches `CURRENT` (`trim_wal`). A trim after the validation took the log's length
+/// ends the bound at the trimmed end, which still holds every commit record.
+#[test]
+fn validation_reads_a_log_trimmed_after_its_length_was_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        update(&store, "trimmed-0");
+        update(&store, "trimmed-1");
+    }
+    let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let log = dir.path().join(current.trim()).join("wal.log");
+    let bytes = std::fs::read(&log).unwrap();
+    let records = bytes.len() / crate::store::WAL_REC;
+    let end = (0..records)
+        .rev()
+        .find(|&i| bytes[i * crate::store::WAL_REC] == crate::store::WAL_COMMIT)
+        .map(|i| (i + 1) * crate::store::WAL_REC)
+        .unwrap();
+    // grow the preallocated zeros, as an open writer's log has them
+    let file = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+    file.set_len((end + 64 * crate::store::WAL_REC) as u64)
+        .unwrap();
+    let mut fired = false;
+    validation::INSPECTION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |at: &str| {
+            if at == "extent" && !fired {
+                fired = true;
+                file.set_len(end as u64).unwrap();
+            }
+        }))
+    });
+    let result = validate_copy(dir.path(), false, &preparation());
+    validation::INSPECTION_HOOK.with(|hook| hook.borrow_mut().take());
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().len(),
+        end as u64,
+        "{result:?}"
+    );
+    result.unwrap();
+}

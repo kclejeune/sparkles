@@ -2221,10 +2221,10 @@ and 2 when there are warnings only.
 Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
 that queries would read wrongly. Warnings are states that open handles by itself. A
 server that writes during the check can cause transient warnings, because an in-flight
-transaction looks like a torn tail, but never errors. A compaction that runs during the
-check is different. The configuration-history check can then report the old generation's
-trimmed log or vanished files as an error, which a second check does not repeat once the
-compaction is done ([roadmap item 1178](ROADMAP.md)).
+transaction looks like a torn tail, but never errors. A compaction or history upkeep that
+retires a generation during the check is different. The configuration-history check can
+then report the retired generation's vanished files as an error. A check made while no
+compaction or upkeep runs does not report it ([roadmap item 1178](ROADMAP.md)).
 
 If full-text commits or merges keep replacing files during inspection, the text check
 warns that the index changed and asks for another run. It inspects up to three metadata

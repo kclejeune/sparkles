@@ -625,7 +625,8 @@ pub(crate) struct ProvenWal {
 /// them, cannot then turn the writer's in-flight group into damage. A closed log loses
 /// nothing to the bound, since only a commit record proves an earlier commit durable. A
 /// log whose first record is not a header keeps its whole extent, so the refusals of a
-/// headerless or torn-header log still see every byte.
+/// headerless or torn-header log still see every byte. A log that a compaction trims
+/// while this reads it ends the bound at the trimmed end.
 pub(crate) fn committed_bound<R: Read + Seek>(
     reader: &mut BufReader<R>,
     extent: u64,
@@ -646,7 +647,14 @@ pub(crate) fn committed_bound<R: Read + Seek>(
     let mut end = WAL_REC as u64;
     for index in 1..records {
         budget.key_step("WAL bound record", index)?;
-        reader.read_exact(&mut record)?;
+        match reader.read_exact(&mut record) {
+            Ok(()) => {}
+            // A compaction that switched away from this log trims its preallocated
+            // zeros to the last commit (`trim_wal`), so a log shorter than its length
+            // was taken ends after every commit record it still holds.
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        }
         if record[0] == WAL_COMMIT {
             end = (index as u64 + 1) * WAL_REC as u64;
         }
