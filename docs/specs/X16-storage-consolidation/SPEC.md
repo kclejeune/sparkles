@@ -766,12 +766,13 @@ delta varints of an index column frame and of a run block's column, and
 `index::decode_varints_into`, the index's decoder with its eight-byte fast path, reads
 both. The run reader decodes a column into a scratch vector of up to 32,768 values and
 copies it into the keys, which costs each open run reader 256 KiB more memory beside the
-four 1 MiB blocks it already holds. Tests pin the varint bytes of a column frame and of
-a run block, so the change provably writes the same bytes. An instruction count of the
+four 1 MiB blocks it already holds. Tests pin the varint bytes of a sample column in a column frame and in a
+run block, which the shared coder writes unchanged. An instruction count of the
 new `delta_coder_bench` harness on one P core of the laptop, over 2^20 sorted keys in
 three interleaved rounds, found the index's column encode and decode and the run encode
 unchanged to within 0.001%, and the run decode 4.4% fewer instructions. The timing on
-`atlas` is pending. `bench:insn` reaches neither coder, so the harness stands in for it.
+`atlas` is pending. `bench:insn` reaches neither coder, so the harness stands in for it. It ran with the
+default features, whose run blocks use LZ4, while the server's builder uses zstd.
 The ungated test hooks `set_clock`, `wal_direct_active`, `vocab_direct_active`, the
 vector pause and sequential-build hooks, the full-text failure, checkpoint and tick hooks,
 `Spill::inject_fault` and `io::parse_lines_in_blocks` build only for tests or with the
