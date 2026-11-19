@@ -4,13 +4,27 @@ This is a manual record of eleven interleaved A/B pairs that forge ran alone on 
 under its benchmark and build locks. The
 [synthetic results](../../RESULTS.md#pinned-checks-and-drift-at-batch-37) discuss them.
 
-- `validation.json` names the host, builds, data, settings, lock, verdict rule and answer
-  check, and `binaries.sha256` and `binaries-zst.sha256` hold the binary hashes.
-- `stage3.sh` ran the pairs through `ab3.sh`, which ran `nsc-bench-remote.sh` in each pair
-  directory with that directory's `run.env`.
-- Each pair directory holds `revs.txt`, the query files, the samples, the answer checksums,
-  the load and progress logs and the uptime before and after.
-- `analyze.py` wrote `pinned-summary.json` and `pinned-summary.txt`, and `verdict.py` wrote
-  the combined verdicts in `verdict.txt`.
-- `attribution/` holds instruction counts and profiles from the laptop, which locate
-  changes and do not size them.
+- The [validation record](validation.json) names the host, builds, data, settings, lock,
+  verdict rule and answer check. The [binary hashes](binaries.sha256) and
+  [compressed binary hashes](binaries-zst.sha256) identify both forms of the builds.
+- [stage3.sh](stage3.sh) ran the pairs through [ab3.sh](ab3.sh), which invoked
+  [nsc-bench-remote.sh](nsc-bench-remote.sh) with the pair's `run.env`.
+- [analyze.py](analyze.py) wrote the [summary data](pinned-summary.json) and
+  [summary table](pinned-summary.txt). [verdict.py](verdict.py) wrote the [verdicts](verdict.txt).
+- The [attribution record](attribution/README.md) holds the laptop instruction counts and
+  profiles used to locate changes.
+
+Each pair directory holds its revisions, query files, samples, answer checksums, load
+and progress logs, and uptime before and after.
+
+- [big-b32-10m-12t-eager](big-b32-10m-12t-eager/)
+- [big-b32-10m-12t-stream](big-b32-10m-12t-stream/)
+- [big-b32-12t-eager](big-b32-12t-eager/)
+- [big-b32-12t-stream](big-b32-12t-stream/)
+- [big-b32-1t-stream](big-b32-1t-stream/)
+- [drift-cc94-1t-stream](drift-cc94-1t-stream/)
+- [sqa-b35-auto](sqa-b35-auto/)
+- [sqa-b35-stream](sqa-b35-stream/)
+- [tg-b33-auto](tg-b33-auto/)
+- [tg-b33-eager](tg-b33-eager/)
+- [tg-b33-stream](tg-b33-stream/)

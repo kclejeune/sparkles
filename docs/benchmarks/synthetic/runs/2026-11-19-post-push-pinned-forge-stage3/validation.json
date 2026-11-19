@@ -114,5 +114,5 @@
     "cc94ac7f": "d8679c5b9e5b973da3a3f6be0fe0e943127bfaee37e9931baa2711e0b39b1c34",
     "71c277b0": "6c2b4188d2999b3047035f13b35b8cdd9dd77e3d01f4dbcd4357c9558d7fe776"
   },
-  "answer_check": "answers.tsv holds, for each arm and query, the row count and a hash of the sorted TSV answer of one untimed request, and a fifth column from bench-gate.py order-digest. For a query with ORDER BY that column is a digest of the sort keys in the returned order, and for other queries it holds checks such as the count of distinct rows, a schema hash and missing values. Every entry matches across the two arms of every pair. WARM_DIGEST was not set, so the timed native JSON responses were not checked."
+  "answer_check": "answers.tsv holds, for each arm and query, the row count and a hash of the sorted TSV answer of one untimed request, and a fifth column from bench-gate.py order-digest. For ORDER BY, keys: hashes the projected sort keys in returned order, and rows: hashes the entire rows in returned order when those keys are unavailable. The unordered checks record distinct: for the distinct-row count and schema: for the schema hash. For triple exports checked with --data, missing: counts returned triples absent from the input dataset. Every entry matches across the two arms of every pair. WARM_DIGEST was not set, so the timed native JSON responses were not checked."
 }

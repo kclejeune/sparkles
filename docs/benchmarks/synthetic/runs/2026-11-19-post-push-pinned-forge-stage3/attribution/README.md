@@ -2,11 +2,14 @@
 
 These files were made on the laptop, an Intel Core Ultra X7 358H whose performance cores are
 CPUs 0 to 3, while it carried other work. They locate and name costs and do not size them.
-Each script set its variable `L` to the absolute path of the lane's scratch directory,
-`.artifacts/lanes/forge-backlog` under the main checkout, which held the binaries, the data
-and the outputs, and the record shortens that path to the relative form. To rerun a script,
-set `L` to that absolute path again. The count ladders change to the lane worktree to run
-`scripts/request-insn.py` and use `L` for every input and output.
+For a rerun, restore the absolute paths in copies of the archived scripts. In the three
+count ladders, set `L` to the absolute `.artifacts/lanes/forge-backlog` directory under the
+main checkout and `W` to the absolute `.artifacts/worktrees/forge-backlog` directory. The
+ladders run `scripts/request-insn.py` from `W`, with query files, data and outputs under
+`$L/insn`. The first ladder reads matrix binaries from `$L/bin`. The other two use
+`~/.cache/sparkles-nsc/bin/<full-revision>/sparkles`. In the perf wrapper set `cd` to the
+absolute `$L/perf` path with `profile.sh` and `drive.py` there, and restore the absolute
+`L` assignment in `profile.sh` itself.
 
 `request-insn/` holds per-request instruction counts from `scripts/request-insn.py` at
 1.05M triples, streaming, one Rayon thread, the server on CPU 2 and the client on CPU 3, in

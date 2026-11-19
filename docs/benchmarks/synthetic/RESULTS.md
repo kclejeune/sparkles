@@ -750,8 +750,9 @@ Eager `expr-bind-group` read 0.839 of the base, 0.50 ms against 0.60 ms, `expr-a
 and EXPLAIN marks it `[incremental]`. `group-avg` and `expr-bind-group` kept running state
 in the base as well. Streamed, the same queries read 0.975, 1.004 and 0.980. `types-grouped`,
 `predicate-counts` and `subquery-agg` keep their count plans and read 0.955 to 1.021 in
-both modes, within the spread of the base. Eager `types-grouped` read 1.003, a median of
-0.02 µs more in this one order of the A/B, under the 0.5 µs bound of the Intel rule. The
+both modes, within the spread of the base. Eager `subquery-agg` read 1.009 and streamed
+`predicate-counts` read 1.021. Eager `types-grouped` read 1.003, a median of 0.02 µs more
+in this order of the A/B, under the 0.5 µs bound of the Intel rule. The
 12-thread cells of these queries come from the forge matrix. Roadmap item 1067 follows
 these small deltas.
 
@@ -780,8 +781,11 @@ BIND form take about 13.5 ms in most server processes and 17 to 22 ms in some, i
 three builds, so the second pair's streamed ratios of 1.35 and 1.32 are noise that a round
 below 1.0 shows. Against the build before item 826, eager `SUM(STRLEN(?n))` grouped by
 employer reads 0.784, and eager `SUM(?s * 2)` reads 1.163, 57.9 ms against 49.7 ms, which
-roadmap item 1099 follows. Item 1067 holds the streamed costs of 1% to 7% that the same
-pair shows.
+roadmap item 1099 follows. With one thread at 10.5M triples, the same pair reads 1.039 for
+streamed `SUM(STRLEN(STR(?o)))`, 1.074 for streamed `expr-agg-arg`, 1.013 for streamed
+`SUM(?s * 2)` and 1.008 for streamed `SUM(STRLEN(?n))`. The fix is slower in all three
+rounds for each query. Item 1067 holds these costs and the 12-thread `group-avg` follow-up
+from the [pinned forge comparison](#pinned-checks-and-drift-at-batch-37).
 
 ### Forge record at batch 30 against cc94ac7f
 
@@ -944,8 +948,9 @@ ratio is below 1.05, and two are confirmed costs.
 | `order-by-full` | eager | 1.05M, 12 threads | 1.003 | 6 of 12 |
 | `class-predicates` | streaming | 1.05M, 12 threads | 1.006 | 9 of 12 |
 
-Row 1063 holds the `export-500k` cost and row 1067 the `group-avg` cost. Batch 32 merged
-items 826, 678 and 1039, so the cause of the `group-avg` cost is open. Streamed
+Row 1063 holds the `export-500k` cost and row 1067 the `group-avg` cost. The pairs
+span batches 32 and 33. Batch 32 merged items 826, 678 and 1039, which are
+starting points for investigating `group-avg`. Streamed
 `expr-order-key` has an interval from 1.010 to 1.031 but is faster in one of eight rounds,
 which the rule above counts as noise. Eager `order-by-full` at 10.5M triples, which the
 separate matrix runs read at 1.20, reads 1.001 here with an interval from 0.994 to 1.007.
@@ -961,9 +966,10 @@ queries since the fixed baseline with one thread at 1.05M triples.
 | `lang-filter` | 1.632 | 1.679 | 1.029 | 1.027 to 1.031 | 12 of 12 | 1204 |
 | `export-500k` | 0.417 | 0.398 | 0.956 | 0.952 to 0.959 | 0 of 12 | none |
 
-Each ratio is the whole drift since cc94ac7f. Row 1072 holds a timed cost of item 678 on
-`lang-filter` against item 678's own base, and how the 1.029 here divides between that cost
-and others is not measured. The separate matrix runs of 8baa5686 and bccc5f7b read
+Each ratio is the whole drift since cc94ac7f. The
+[separate timing of item 678](../../specs/X14-unified-executor/SPEC.md#charged-query-state-and-chunked-live-reservations)
+compares `lang-filter` against that item's own base. The two comparisons leave the share of
+the 1.029 endpoint ratio attributable to item 678 unresolved. The separate matrix runs of 8baa5686 and bccc5f7b read
 `lang-filter` and `regex-iri` at 1.08 to 1.12 of the cc94ac7f run in the same cells, against
 1.03 here. Their instruction counts are nearly flat from 8baa5686 to 71c277b0, so the gap
 between the two methods is not explained. The 10.5M and 12-thread cells of these four
