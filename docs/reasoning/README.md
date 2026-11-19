@@ -964,10 +964,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * In an ontology with individuals, the Horn rules leave out an at-least restriction
   above one and report it, since the unfolding they use elsewhere is argued for
   tree-shaped models. Roadmap item 867.
-* On an ontology with many property assertions, the Horn rules take 1.8 to 2.0 times the
-  EL rules' time on one thread and derive about 2.2 times the conclusions. Every context
-  takes the subsumers of `owl:Thing`, a successor is told twice that it has an instance,
-  and the states of the automata and existential restrictions repeat. Roadmap item 1025.
+* On four assertion-heavy ORE 2015 DL files on `atlas`, the Horn rules take
+  1.63 to 1.68 times the EL-only time on one thread. These rules skip R7
+  searches for irrelevant predecessors and omit Horn links covered by an
+  existing subrole link to the same successor. Every context still takes the
+  subsumers of `owl:Thing`, and successors receive two conclusions about
+  realness. Roadmap item 1025 and the
+  [classification report](../benchmarks/el-classification/RESULTS.md#guarded-horn-rules-with-individuals)
+  track the remaining work.
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
   rules on one thread and raise its peak resident set from 196 to 223 MiB. On two
   Uberon-based ontologies of the ORE 2015 DL sample the Horn rules take about five times

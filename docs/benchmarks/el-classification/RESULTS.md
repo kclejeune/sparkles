@@ -1675,7 +1675,118 @@ and not to the reductions. It lies within the base's own rounds, which range fro
 to 10.17 s. Roadmap item 1090 follows it with the Uberon files' time outside the
 saturation. The peak resident set of `ore_ont_14375` on one thread is 95 against 87 MiB.
 
+### Guarded Horn rules with individuals
+
+Six Atlas rounds compare commit `8b311a59` with `48344bca`. Stanley built both
+release binaries from clean source with Rust 1.99.1, and Atlas ran them under
+its shared benchmark lock. Each round ran one process per file, thread count
+and arm and reversed arm order from the preceding round. The default of
+`SPARKLES_HORN_RULES` is level 2. Level 0 runs the previous Horn rule bodies
+in the new binary. Level 1 adds the guarded R7 search and reads the at-most
+restrictions without copying the list. The four assertion-heavy files also ran
+with `--el-only` on each binary. The two Uberon files used `--dl-attempt-work 1`.
+All 912 processes finished and each file and mode gave the same sorted taxonomy
+hash across every arm, thread count and round.
+
+Each process contributes its median classification time. The ratios below
+use the median of the six paired round ratios. Horn/EL divides the median
+Horn time by the median EL-only time for the same build.
+
+| Ontology | Threads | Base ms | Level 2 ms | Level 2 / base | Range of round ratios | Base Horn/EL | New Horn/EL |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `ore_ont_10951` | 1 | 14.89 | 13.49 | 0.907 | 0.900–0.909 | 1.865 | 1.678 |
+| `ore_ont_10951` | 4 | 13.22 | 11.08 | 0.819 | 0.750–0.996 | 1.853 | 1.522 |
+| `ore_ont_12901` | 1 | 175.14 | 154.79 | 0.887 | 0.837–0.912 | 1.881 | 1.654 |
+| `ore_ont_12901` | 4 | 122.45 | 94.05 | 0.769 | 0.736–0.906 | 2.007 | 1.537 |
+| `ore_ont_14375` | 1 | 30.82 | 28.20 | 0.914 | 0.910–0.919 | 1.793 | 1.628 |
+| `ore_ont_14375` | 4 | 24.31 | 19.67 | 0.797 | 0.693–0.983 | 1.861 | 1.524 |
+| `ore_ont_4510` | 1 | 235.33 | 207.50 | 0.883 | 0.877–0.888 | 1.914 | 1.682 |
+| `ore_ont_4510` | 4 | 151.60 | 120.49 | 0.797 | 0.760–0.949 | 1.948 | 1.544 |
+
+Level 2 against the same binary at level 0 takes 0.876 to 0.904 times the time
+on one thread and 0.769 to 0.875 times on four for the four files. On one
+thread `ore_ont_4510` derives 2,357,244 conclusions at levels 0 and 1 and
+2,214,952 at level 2. `ore_ont_9654` also gains, with paired ratios of 0.892
+on one thread and 0.755 on four. The two capped Uberon runs at level 2 have
+paired medians of 0.997 and 0.991 on one thread and 0.993 and 1.000 on four.
+
+Two shipped-mode comparisons take longer in all six rounds. Both also meet
+the Intel significance rule. Their percentile interval excludes 1 and their
+median paired time increase exceeds 0.5 µs. The two-sided 95% percentile
+interval resamples the six paired ratios with replacement and enumerates
+all 46,656 resamples.
+
+| Ontology and mode | Threads | Median ratio | Round ratios in order | 95% interval | Added ms |
+|---|---:|---:|---|---:|---:|
+| GO, default Horn | 1 | 1.01473 | 1.01000, 1.01678, 1.01409, 1.00710, 1.01863, 1.01536 | 1.00855–1.01770 | 4.612 |
+| `ore_ont_10951`, EL only | 1 | 1.00706 | 1.00901, 1.01517, 1.00103, 1.00301, 1.00554, 1.00859 | 1.00202–1.01209 | 0.056 |
+
+GO derives 2,947,343 conclusions on both builds and its saturation accounts
+for a paired median increase of 2.747 ms. Level 2 is slower than level 0 in
+five of six GO rounds. The same-binary result leaves the contribution of the
+rule changes unresolved. The EL-only file adds a paired median 0.032 ms in
+the index and 0.021 ms in saturation and still derives 85,225 conclusions.
+[Roadmap item 1028](../../ROADMAP.md#classification-costs-in-item-1028) follows
+both costs.
+
+The within-candidate comparisons below measure the cost of level 2 against
+level 1. The three ORE rows still improve over the old binary by their
+median paired ratio. GO's cost against the old binary is recorded above.
+
+| Ontology | Threads | Level 2 / level 1 | Slower rounds | Range of round ratios | 95% interval | Added ms | Level 2 / base |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GO | 1 | 1.00153 | 5 of 6 | 0.99984–1.00814 | 1.00053–1.00576 | 0.485 | 1.01473 |
+| `ore_ont_10951` | 4 | 1.13814 | 6 of 6 | 1.05769–1.27575 | 1.06925–1.22361 | 1.339 | 0.81871 |
+| `ore_ont_14817`, capped | 1 | 1.00150 | 5 of 6 | 0.99981–1.02215 | 1.00018–1.01270 | 2.986 | 0.99697 |
+| `ore_ont_14817`, capped | 4 | 1.02115 | 6 of 6 | 1.01366–1.13407 | 1.01391–1.08731 | 16.508 | 0.99301 |
+
+A separate correctness run compiled the same Horn rule changes at
+`c1619c37`. HermiT agrees on the named-class taxonomy of 906 ontologies
+tested at levels 0, 1 and 2 on one thread and level 2 on eight, and of 369
+witness cases tested at all three levels on one and eight threads.
+
+A same-snapshot diagnostic built from `c1619c37` on Stanley runs the witness
+predicate with and without covered-successor recognition, then compares the
+IRIs of the named classes that reach each result before running any world.
+Each comparison uses one saturated state. All 2,674 processes succeeded.
+
+| Corpus | Inputs per thread count | Threads | Changed witness sets | Changed named-class sets |
+|---|---:|---:|---:|---:|
+| HermiT-checked hand and generated cases | 369 | 1 | 39 | 0 |
+| HermiT-checked hand and generated cases | 369 | 8 | 36 | 0 |
+| Full generated corpus | 968 | 1 | 18 | 0 |
+| Full generated corpus | 968 | 8 | 16 | 0 |
+
+The full corpus includes 348 of the HermiT-checked cases. The
+`covered_successor_witness.ofn` integration fixture preserves the exact input
+of a checked hand case. With the clause it has one witness and without it
+two, and the world for the same named class is selected in both paths on
+both thread counts. The [witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) retains
+the class sets and the diagnostic patch.
+
+### The default Uberon attempt with unchanged automata
+
+A separate four-round Atlas comparison of `eda22fce` against `48344bca`
+ran both binaries with the default disjunctive attempt. The release binaries
+were built on Wally. The candidate also ran at level 0 of
+`SPARKLES_HORN_AUTOMATA`, which keeps the previous automata.
+
+| Ontology | Threads | Base s | Level 0 s | Level 0 / base | Range of round ratios | Level 3 s |
+|---|---:|---:|---:|---:|---:|---:|
+| `ore_ont_14817` | 1 | 59.11 | 60.20 | 1.016 | 0.988–1.022 | 59.60 |
+| `ore_ont_9663` | 1 | 75.63 | 77.51 | 1.024 | 1.022–1.032 | 76.51 |
+
+Level 0 keeps the base's one-thread conclusion counts. On
+`ore_ont_9663`, the full classification takes longer in all four level 0
+rounds while the median final saturation takes 3.51 against 3.55 s. This build
+incurs the extra time outside the final saturation even with unchanged
+automata. Item 1090 follows the disjunctive attempt. The four Atlas rounds
+qualify this build separately from the six forge rounds of the reduced
+automata.
+
 ## Records
+
+The [record of the guarded Horn rules](runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json) holds the Atlas process reports and taxonomy hashes, the HermiT comparison summary, the original count-only witness diagnostics and the separate four-round Atlas control of the default Uberon attempt. The [same-snapshot witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) holds the later correctness comparison of the named-class sets.
 
 The [record of item 693's reduced automata](runs/2026-11-17-horn-automata-forge-7d064abd/record.json)
 holds every classification of the six rounds on forge of the base and of the build at

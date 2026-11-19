@@ -1,0 +1,34 @@
+base2          ore_ont_4510.owl                  instr/classify  2345.4M  conclusions 2357244 conj 116 contexts 60363
+fix            ore_ont_4510.owl                  instr/classify  2353.2M  conclusions 2357244 conj 116 contexts 60363
+fix            ore_ont_4510.owl                  instr/classify  2193.6M  conclusions 2357244 conj 116 contexts 60363
+fix            ore_ont_4510.owl                  instr/classify  2110.2M  conclusions 2214952 conj 116 contexts 60363
+base2          ore_ont_4510.owl       --el-only  instr/classify  1343.7M  conclusions 1145939 conj 0 contexts 60247
+fix            ore_ont_4510.owl       --el-only  instr/classify  1337.4M  conclusions 1145939 conj 0 contexts 60247
+base2          ore_ont_12901.owl                 instr/classify  1837.9M  conclusions 1816166 conj 44 contexts 49359
+fix            ore_ont_12901.owl                 instr/classify  1844.0M  conclusions 1816166 conj 44 contexts 49359
+fix            ore_ont_12901.owl                 instr/classify  1717.8M  conclusions 1816166 conj 44 contexts 49359
+fix            ore_ont_12901.owl                 instr/classify  1645.9M  conclusions 1697174 conj 44 contexts 49359
+base2          ore_ont_12901.owl      --el-only  instr/classify  1065.9M  conclusions 889182 conj 0 contexts 49315
+fix            ore_ont_12901.owl      --el-only  instr/classify  1061.0M  conclusions 889182 conj 0 contexts 49315
+base2          ore_ont_14375.owl                 instr/classify   352.6M  conclusions 363547 conj 109 contexts 9260
+fix            ore_ont_14375.owl                 instr/classify   354.0M  conclusions 363547 conj 109 contexts 9260
+fix            ore_ont_14375.owl                 instr/classify   331.5M  conclusions 363547 conj 109 contexts 9260
+fix            ore_ont_14375.owl                 instr/classify   319.7M  conclusions 344435 conj 109 contexts 9260
+base2          ore_ont_14375.owl      --el-only  instr/classify   203.8M  conclusions 186103 conj 0 contexts 9151
+fix            ore_ont_14375.owl      --el-only  instr/classify   203.0M  conclusions 186103 conj 0 contexts 9151
+base2          ore_ont_10951.owl                 instr/classify   175.0M  conclusions 180785 conj 74 contexts 4867
+fix            ore_ont_10951.owl                 instr/classify   175.6M  conclusions 180785 conj 74 contexts 4867
+fix            ore_ont_10951.owl                 instr/classify   164.5M  conclusions 180785 conj 74 contexts 4867
+fix            ore_ont_10951.owl                 instr/classify   158.5M  conclusions 170327 conj 74 contexts 4867
+base2          ore_ont_10951.owl      --el-only  instr/classify    97.6M  conclusions 85225 conj 0 contexts 4793
+fix            ore_ont_10951.owl      --el-only  instr/classify    97.1M  conclusions 85225 conj 0 contexts 4793
+base2          ore_ont_14817.owl      --dl-attempt-work 1 instr/classify 19430.7M  conclusions 22090247 conj 70689 contexts 129295
+fix            ore_ont_14817.owl      --dl-attempt-work 1 instr/classify 19310.8M  conclusions 22090247 conj 70689 contexts 129295
+fix            ore_ont_14817.owl      --dl-attempt-work 1 instr/classify 19326.7M  conclusions 22090247 conj 70689 contexts 129295
+base2          ore_ont_9663.owl       --dl-attempt-work 1 instr/classify 25898.9M  conclusions 35611566 conj 97224 contexts 157888
+fix            ore_ont_9663.owl       --dl-attempt-work 1 instr/classify 25772.4M  conclusions 35611566 conj 97224 contexts 157888
+fix            ore_ont_9663.owl       --dl-attempt-work 1 instr/classify 25593.6M  conclusions 35611566 conj 97224 contexts 157888
+base2          go.ofn                            instr/classify  5341.1M  conclusions 2947343 conj 2609 contexts 54596
+fix            go.ofn                            instr/classify  5262.4M  conclusions 2947343 conj 2609 contexts 54596
+fix            go.ofn                            instr/classify  5263.9M  conclusions 2947343 conj 2609 contexts 54596
+INSTR-DONE

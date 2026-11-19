@@ -234,6 +234,13 @@ ordering.
 
 ### OWL classification
 
+The Horn classifier skips R7 predecessor searches when the trigger cannot
+contribute a pair and checks the run's bounds during growing scans. It also
+omits a link covered by a retained subrole link to the same successor and a
+repeated core at the successor itself. Four assertion-heavy ORE 2015 DL files
+classify 9 to 12% faster on one thread and 18 to 23% faster on four by the
+median of paired Atlas rounds, with unchanged taxonomies.
+
 A property assertion `r(a, b)` over a property with a range links `a` to `b`'s own
 context, and the index tells `b` the range. Before, the index made a context of `b` with
 the range for each such assertion, which derived `b` and repeated what `b` holds, under
