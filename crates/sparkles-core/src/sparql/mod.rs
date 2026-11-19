@@ -68,6 +68,7 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::ioacct;
 use crate::store::Snapshot;
+use crate::validation::GraphSel;
 pub use aggerrors::AggregateErrors;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use cursor::{
@@ -693,7 +694,7 @@ fn make_ctx_input(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<Ctx> {
-    make_ctx_input_policy(snap, opts, dataset, base, source, None)
+    make_ctx_input_policy(snap, opts, dataset, base, source, None, None)
 }
 
 // Only the application root which just prepared this policy supplies the override.
@@ -705,6 +706,7 @@ fn make_ctx_input_policy(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    selector_graphs: Option<&GraphSel>,
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
@@ -764,7 +766,7 @@ fn make_ctx_input_policy(
         Some(r) => Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?),
         None => None,
     };
-    ctx.use_cache = !opts.no_cache;
+    ctx.use_cache = !opts.no_cache && selector_graphs.is_none();
     ctx.plan_patterns = !opts.no_plan_patterns;
     ctx.algo_projections = opts.algo_projections.clone();
     ctx.views = opts.views.clone();
@@ -780,7 +782,11 @@ fn make_ctx_input_policy(
     ctx.aggregate_errors = opts.aggregate_errors.unwrap_or(ctx.snap.aggregate_errors);
     ctx.base_iri = base.cloned();
     let mut ds = DatasetSpec::default();
-    if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
+    if let Some(graphs) = selector_graphs {
+        ds.default = Some(resolve_selector_graphs(&mut ctx, graphs)?);
+        ds.named = Some(Vec::new());
+        ctx.selector_default_only = true;
+    } else if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
         if opts
             .default_graph_uris
             .iter()
@@ -1010,6 +1016,34 @@ fn resolve_graphs<'a>(
     Ok(ids)
 }
 
+fn resolve_selector_graphs(ctx: &mut Ctx, graphs: &GraphSel) -> Result<Vec<Id>> {
+    let preparation = ctx.source_preparation.as_ref().expect("source controls");
+    let mut selected = crate::access::PreparationBuffer::new(preparation)?;
+    match graphs {
+        GraphSel::Set(ids) => {
+            for &id in ids {
+                selected.push(Id(id))?;
+            }
+        }
+        GraphSel::All | GraphSel::AllExcept(_) => {
+            let mut add = |id: Id| {
+                if graphs.accepts(id.0) {
+                    selected.push(id)?;
+                }
+                Ok(())
+            };
+            add(Id::DEFAULT_GRAPH)?;
+            ctx.snap.for_each_graph_id_checked(|| ctx.check(), add)?;
+        }
+    }
+    let (ids, held) = selected.into_parts();
+    ctx.source_setup
+        .as_mut()
+        .expect("source setup owner")
+        .merge(held);
+    Ok(ids)
+}
+
 fn restrict_source_ctx(
     ctx: &mut Ctx,
     access: Option<&Arc<crate::access::GraphAccess>>,
@@ -1218,7 +1252,7 @@ pub fn query_source(
     let started = Instant::now();
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut result = execute_retained_source(source, &parsed, opts, parse_ms)?;
+    let mut result = execute_retained_source(source, &parsed, opts, parse_ms, None)?;
     if result.kind == QueryKind::Select {
         select_star_order(q, &mut result)?;
     }
@@ -1235,7 +1269,7 @@ pub(crate) fn query_prepared_source(
 ) -> Result<QueryResult> {
     source.query_input().2.check()?;
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
-    execute_retained_source(source, &parsed, opts, 0.0)
+    execute_retained_source(source, &parsed, opts, 0.0, None)
 }
 
 /// Execute an already parsed query using a genuine physical source and the
@@ -1250,7 +1284,7 @@ pub fn execute_source(
 ) -> Result<QueryResult> {
     source.validate_query_instance(store)?;
     source.query_input().2.check()?;
-    execute_retained_source(source, parsed, opts, parse_ms)
+    execute_retained_source(source, parsed, opts, parse_ms, None)
 }
 
 fn execute_retained_source(
@@ -1258,13 +1292,23 @@ fn execute_retained_source(
     parsed: &Query,
     opts: &QueryOptions,
     parse_ms: f64,
+    selector_graphs: Option<&GraphSel>,
 ) -> Result<QueryResult> {
     source.query_input().2.check()?;
     let stack = depth::check_query(parsed)?;
     depth::with_stack(stack, || {
         let snapshot = source.query_input().0.clone();
         let start = Instant::now();
-        let prepared = prepare_query_input(snapshot, parsed, opts, None, None, Some(source))?;
+        let prepared = prepare_query_input_policy(
+            snapshot,
+            parsed,
+            opts,
+            None,
+            None,
+            Some(source),
+            None,
+            selector_graphs,
+        )?;
         let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
         depth::with_stack(prepared.plan_depth, || {
             execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
@@ -1503,7 +1547,16 @@ fn prepare_query_input(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<PreparedQuery> {
-    prepare_query_input_policy(snap, parsed, opts, cursor_started, automatic, source, None)
+    prepare_query_input_policy(
+        snap,
+        parsed,
+        opts,
+        cursor_started,
+        automatic,
+        source,
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1515,6 +1568,7 @@ fn prepare_query_input_policy(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    selector_graphs: Option<&GraphSel>,
 ) -> Result<PreparedQuery> {
     let (_, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
@@ -1526,6 +1580,7 @@ fn prepare_query_input_policy(
         base,
         source,
         prepared_policy,
+        selector_graphs,
     )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;

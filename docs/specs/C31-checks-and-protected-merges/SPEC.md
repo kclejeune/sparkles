@@ -86,10 +86,12 @@ request.
 The Rust gate runner evaluates standalone queries and supported SHACL and ShEx checks
 against the candidate. These checks refuse `SERVICE` even inside an expression. SHACL
 queries read the selected candidate data and refuse explicit `GRAPH`, `FROM` and
-`FROM NAMED` clauses. The SHACL profile also refuses unsupported and malformed targets.
-ShEx refuses semantic actions and fixed blank-node data selectors. The [reasoning and
-validation guide](../../reasoning/README.md#gate-suite-validation) describes the supported
-profiles.
+`FROM NAMED` clauses. The SHACL profile also refuses unsupported and malformed targets,
+conflicting node-expression forms and malformed SPARQL constraint deactivation flags.
+ShEx refuses semantic actions and fixed blank-node data selectors. Its SPARQL selectors
+read the full validation data as their default graph and have no named graphs. The
+[reasoning and validation guide](../../reasoning/README.md#gate-suite-validation)
+describes the supported profiles.
 
 A suite can name a `chk:UnsatisfiableClassesCheck`, which parses and counts in the suite's
 revision, but no build runs it. Its result is an error with the code `check-unavailable`,

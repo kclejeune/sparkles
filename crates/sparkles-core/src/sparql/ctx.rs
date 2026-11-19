@@ -928,6 +928,8 @@ pub struct Ctx {
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
+    /// A validation selector has only its selected default data, even for ARQ graph aliases.
+    pub(super) selector_default_only: bool,
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
@@ -1481,6 +1483,7 @@ impl Ctx {
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),
+            selector_default_only: false,
             graphs: None,
             now: std::sync::OnceLock::new(),
             base_iri: None,

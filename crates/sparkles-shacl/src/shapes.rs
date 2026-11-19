@@ -801,7 +801,7 @@ const SHAPE_PARAMS: &[NamedNodeRef<'static>] = &[
 pub(crate) struct Parser<'g> {
     pub(crate) g: G<'g>,
     pub(crate) out: Shapes,
-    gate: bool,
+    pub(crate) gate: bool,
     components: Vec<std::sync::Arc<SparqlComponent>>,
     pub(crate) fns: FnIndex,
     pub(crate) expr_memo: FxHashMap<Term, ExprId>,
@@ -1355,7 +1355,9 @@ impl<'g> Parser<'g> {
         }
         for t in g.objects(node, sh::SPARQL) {
             let path = self.out.shapes[id].path.clone();
-            if let Some(c) = crate::sparql::parse_sparql_constraint(&g, &t, path.as_ref())? {
+            if let Some(c) =
+                crate::sparql::parse_sparql_constraint(&g, &t, path.as_ref(), self.gate)?
+            {
                 cs.push(Constraint::Sparql(Box::new(c)));
             }
         }

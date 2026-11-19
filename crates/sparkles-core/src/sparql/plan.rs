@@ -945,6 +945,9 @@ impl<'a> Planner<'a> {
                 // the named graphs a table moving into `GRAPH ?g` is copied into, one
                 // plan of the inner pattern for each
                 let graphs = || {
+                    if self.ctx.selector_default_only {
+                        return 0;
+                    }
                     self.ctx.snap.graph_ids().map_or(usize::MAX, |ids| {
                         ids.iter()
                             .filter(|gid| {
@@ -1642,6 +1645,19 @@ impl<'a> Planner<'a> {
                 self.collect(left, g, items)?;
                 self.collect(right, g, items)?;
             }
+            GP::Graph { .. } if self.ctx.selector_default_only => {
+                // The selector has no named graphs, including the ARQ aliases.
+                // Preserve the algebra's variable scope without planning the inner group.
+                let mut vars = Vec::new();
+                gp.on_in_scope_variable(|variable| {
+                    if let PT::V(var) = self.var(variable.as_str()) {
+                        vars.push(var);
+                    }
+                });
+                vars.sort_unstable();
+                vars.dedup();
+                items.push(Item::Node(Node::empty(vars)));
+            }
             GP::Graph { name, inner } if !self.simple_graph_group(name, inner) => {
                 // Per-graph evaluation (Jena OpGraph semantics): evaluate the inner pattern
                 // against each named graph with the graph variable unbound, then join
@@ -2245,6 +2261,9 @@ impl<'a> Planner<'a> {
                 name: NamedNodePattern::NamedNode(n),
                 inner,
             } if n.as_str() == super::ctx::UNION_GRAPH_IRI => {
+                if self.ctx.selector_default_only {
+                    return Ok(None);
+                }
                 union = ActiveGraph::Union;
                 (&**inner, &union)
             }

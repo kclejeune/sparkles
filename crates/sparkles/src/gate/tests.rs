@@ -988,7 +988,10 @@ fn gate_shacl_profile_refuses_access_to_the_candidate_copy_of_pinned_shapes() {
         "DELETE DATA { GRAPH <urn:shapes> { <urn:ref> <urn:flag> true } }",
     );
     let suite = shacl_suite("").unwrap();
-    profile_refusal(&run_on(&suite, &before, &after).results[0], "GRAPH");
+    profile_refusal(
+        &run_on(&suite, &before, &after).results[0],
+        "GRAPH is not allowed in the gate's SHACL profile",
+    );
 }
 
 #[cfg(feature = "shacl")]
@@ -1017,7 +1020,10 @@ fn gate_shacl_profile_checks_all_embedded_query_forms() {
             "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select
               'SELECT $this WHERE {{ GRAPH {graph} {{ <urn:x> <urn:flag> true }} }}' ] ."
         );
-        profile_refusal(&run_shapes(&shapes), "GRAPH");
+        profile_refusal(
+            &run_shapes(&shapes),
+            "GRAPH is not allowed in the gate's SHACL profile",
+        );
     }
     let shapes = [
         "<urn:S> sh:targetNode <urn:x>,
@@ -1038,7 +1044,10 @@ fn gate_shacl_profile_checks_all_embedded_query_forms() {
          <urn:S> sh:targetNode <urn:x> .",
     ];
     for shapes in shapes {
-        profile_refusal(&run_shapes(shapes), "GRAPH");
+        profile_refusal(
+            &run_shapes(shapes),
+            "GRAPH is not allowed in the gate's SHACL profile",
+        );
     }
     for from in ["FROM <urn:other>", "FROM NAMED <urn:other>"] {
         for shapes in [
@@ -1057,7 +1066,10 @@ fn gate_shacl_profile_checks_all_embedded_query_forms() {
                     sh:class <urn:Required> ."
             ),
         ] {
-            profile_refusal(&run_shapes(&shapes), "FROM");
+            profile_refusal(
+                &run_shapes(&shapes),
+                "FROM and FROM NAMED are not allowed in the gate's SHACL profile",
+            );
         }
     }
     let supported = [
@@ -1085,6 +1097,117 @@ fn gate_shacl_profile_checks_all_embedded_query_forms() {
         ));
         assert_eq!(result.status, Status::Passed, "{result:?}");
     }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_refuses_conflicting_node_expression_forms() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:ok> a <urn:Allowed> }");
+    let run_target = |target: &str, class: &str| {
+        let suite = inline_shacl(
+            &format!(
+                "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+                 @prefix sparql: <http://www.w3.org/ns/sparql#> .
+                 <urn:S> sh:targetNode {target} ; sh:class <urn:{class}> ."
+            ),
+            "",
+        );
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    let list = "[ rdf:first <urn:ok> ; rdf:rest rdf:nil ; <urn:annotation> 'a list' ]";
+    assert_eq!(run_target(list, "Allowed").status, Status::Passed);
+    assert_eq!(run_target(list, "Required").status, Status::Failed);
+    for mixed in [
+        "[ rdf:first <urn:ok> ; rdf:rest rdf:nil ; sh:select
+           'SELECT ?result WHERE { GRAPH ?g { ?result ?p ?o } }' ]",
+        "[ sh:select 'SELECT ?result WHERE { BIND(<urn:ok> AS ?result) }' ;
+            sparql:STR ( <urn:ok> ) ]",
+    ] {
+        profile_refusal(
+            &run_target(mixed, "Allowed"),
+            "conflicting node expression forms",
+        );
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_requires_a_typed_constraint_deactivation_flag() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> <urn:flag> true }");
+    let run_constraint = |flag: &str| {
+        let suite = inline_shacl(
+            &format!(
+                "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:deactivated {flag} ;
+                    sh:select 'SELECT $this WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }}' ] ."
+            ),
+            "",
+        );
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    assert_eq!(run_constraint("true").status, Status::Passed);
+    profile_refusal(
+        &run_constraint("false"),
+        "GRAPH is not allowed in the gate's SHACL profile",
+    );
+    for invalid in [
+        "'true'",
+        "'yes'^^<http://www.w3.org/2001/XMLSchema#boolean>",
+        "true, false",
+    ] {
+        profile_refusal(
+            &run_constraint(invalid),
+            "sh:deactivated must be a single xsd:boolean literal",
+        );
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_preserves_path_variables_in_node_validators() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        "",
+        "INSERT DATA { <urn:x> <urn:flag> true ; <urn:edge> <urn:mid> .
+                       <urn:mid> <urn:leaf> true }",
+    );
+    for validator in ["nodeValidator", "validator"] {
+        let suite = inline_shacl(
+            &format!(
+                "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+                    sh:{validator} [ a sh:SPARQLSelectValidator ;
+                        sh:select 'SELECT $this $PATH WHERE {{ $this <urn:flag> $PATH }}' ] .
+                 <urn:S> sh:targetNode <urn:x> ; <urn:param> true ."
+            ),
+            "",
+        );
+        let result = run_on(&suite, &before, &after).results.remove(0);
+        assert_eq!(result.status, Status::Failed, "{validator}: {result:?}");
+        assert_eq!(result.findings, 1, "{validator}: {result:?}");
+    }
+    let suite = inline_shacl(
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+             sh:validator [ a sh:SPARQLSelectValidator ;
+                 sh:select 'SELECT $this WHERE { $this $PATH / <urn:leaf> $param }' ] .
+         <urn:S> sh:targetNode <urn:x> ;
+             sh:property [ sh:path <urn:edge> ; <urn:param> true ] .",
+        "",
+    );
+    let result = run_on(&suite, &before, &after).results.remove(0);
+    assert_eq!(result.status, Status::Failed, "{result:?}");
+    assert_eq!(result.findings, 1, "{result:?}");
+    let suite = inline_shacl(
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+             sh:validator [ a sh:SPARQLAskValidator ; sh:ask 'ASK FROM $PATH {}' ] .
+         <urn:S> sh:targetNode <urn:x> .",
+        "",
+    );
+    profile_refusal(
+        &run_on(&suite, &before, &after).results[0],
+        "FROM and FROM NAMED are not allowed in the gate's SHACL profile",
+    );
 }
 
 #[cfg(feature = "shacl")]
@@ -1122,17 +1245,46 @@ fn gate_shacl_profile_refuses_skipped_targets() {
 }
 
 #[cfg(feature = "shex")]
-fn run_shex_profile(schema: &str, map: &str) -> CheckResult {
-    let ds = Dataset::memory();
-    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> <urn:link> <urn:y> }");
+fn shex_profile_suite(schema: &str, map: &str) -> Suite {
     let schema = oxrdf::Literal::new_simple_literal(schema);
     let map = oxrdf::Literal::new_simple_literal(map);
-    let suite = suite(&format!(
+    suite(&format!(
         "<urn:s> a chk:Suite ; chk:check <urn:c> .
          <urn:c> a chk:ShexCheck ; chk:schema {schema} ; chk:shapeMap {map} ."
     ))
-    .unwrap();
+    .unwrap()
+}
+
+#[cfg(feature = "shex")]
+fn run_shex_profile(schema: &str, map: &str) -> CheckResult {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> <urn:link> <urn:y> }");
+    let suite = shex_profile_suite(schema, map);
     run_on(&suite, &before, &after).results.remove(0)
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_sparql_selects_from_blank_node_named_graphs() {
+    let ds = Dataset::from_store(crate::store::Store::in_memory(crate::store::StoreOptions {
+        union_default_graph: true,
+        ..Default::default()
+    }));
+    let before = ds.store().snapshot();
+    ds.load_str("_:g { <urn:x> <urn:link> <urn:y> }", RdfFormat::TriG)
+        .unwrap();
+    let after = ds.store().snapshot();
+    let schema = "<urn:S> { <urn:required> . }";
+    for map in [
+        "{FOCUS <urn:link> _}@<urn:S>",
+        "SPARQL 'SELECT ?focus WHERE { ?focus <urn:link> ?o }'@<urn:S>",
+    ] {
+        let suite = shex_profile_suite(schema, map);
+        let result = run_on(&suite, &before, &after).results.remove(0);
+        assert_eq!(result.status, Status::Failed, "{map}: {result:?}");
+        assert_eq!(result.findings, 1, "{map}: {result:?}");
+        assert!(result.messages[0].contains("<urn:x>"), "{map}: {result:?}");
+    }
 }
 
 #[cfg(feature = "shex")]
@@ -1148,10 +1300,9 @@ fn gate_shex_profile_refuses_nonportable_blank_data_selectors() {
     for selector in selectors {
         profile_refusal(&run_shex_profile("<urn:S> {}", &selector), "blank node");
     }
-    assert_eq!(
-        run_shex_profile("_:shape {}", "<urn:x>@_:shape").status,
-        Status::Passed
-    );
+    let blank_shape = run_shex_profile("_:shape { <urn:required> . }", "<urn:x>@_:shape");
+    assert_eq!(blank_shape.status, Status::Failed, "{blank_shape:?}");
+    assert_eq!(blank_shape.findings, 1, "{blank_shape:?}");
     assert_eq!(
         run_shex_profile("<urn:S> { <urn:req> . }", "{FOCUS <urn:absent> _}@<urn:S>").status,
         Status::Passed

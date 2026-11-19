@@ -951,6 +951,7 @@ fn open_pattern_cursor_input(
                 None,
                 source,
                 bound_policy.as_ref(),
+                None,
             )?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let levels = levels.max(prepared.plan_depth);

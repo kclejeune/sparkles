@@ -593,10 +593,22 @@ impl Parser<'_> {
         if preds.is_empty() {
             return Ok(self.push_expr(node, Expr::Empty));
         }
-        if preds
+        let rdf_list = preds
             .iter()
-            .any(|p| p.as_ref() == rdf::FIRST || p.as_ref() == rdf::REST)
-        {
+            .any(|p| p.as_ref() == rdf::FIRST || p.as_ref() == rdf::REST);
+        if self.gate {
+            let keyed = preds.iter().any(|p| self.is_expression_key(p));
+            let list_function = preds.iter().any(|p| self.is_list_function(p));
+            if [rdf_list, keyed, list_function]
+                .into_iter()
+                .filter(|present| *present)
+                .count()
+                > 1
+            {
+                bail!("conflicting node expression forms");
+            }
+        }
+        if rdf_list {
             let items = self.g.list(node)?;
             let mut ts = Vec::new();
             for i in items {

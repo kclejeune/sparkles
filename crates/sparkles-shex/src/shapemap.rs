@@ -19,7 +19,6 @@ use spargebra::Query;
 use spargebra::algebra::GraphPattern;
 use spargebra::term::Variable;
 use sparkles_core::id::{Id, Tag};
-use sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI;
 use sparkles_core::sparql::output::{OwnedTerm, SnapshotOutputRoot};
 use sparkles_core::store::parse_bnode_label;
 use sparkles_core::validation::DataGraph;
@@ -734,26 +733,6 @@ fn sparql_nodes(
 ) -> anyhow::Result<Vec<(OwnedTerm, Option<Id>)>> {
     let parsed = selector_query(q).map_err(SchemaError::new)?;
     let snap = &data.snap;
-    // the graphs of the data graph by name (the store's default graph included, which
-    // `urn:x-arq:UnionGraph` would leave out)
-    let default_graph_uris: Vec<String> = data
-        .sel
-        .ids(snap)?
-        .into_iter()
-        .filter_map(|g| {
-            if g == Id::DEFAULT_GRAPH {
-                return Some(DEFAULT_GRAPH_IRI.to_string());
-            }
-            match snap.term(g)? {
-                Term::NamedNode(n) => Some(n.into_string()),
-                _ => None,
-            }
-        })
-        .collect();
-    if default_graph_uris.is_empty() {
-        // no default graph given would be the store's
-        return Ok(Vec::new());
-    }
     let base = opts.selector_query.clone().unwrap_or_default();
     let qo = sparkles_core::sparql::QueryOptions {
         timeout: None,
@@ -768,9 +747,9 @@ fn sparql_nodes(
             (Some(a), Some(b)) => Some(a.combine(b)),
             (a, b) => a.clone().or_else(|| b.clone()),
         },
-        default_graph_uris,
-        // The root already owns the actual bound policy prepared from base.graphs.
+        // The root owns the policy, and execute_selector supplies the dataset.
         graphs: None,
+        default_graph_uris: Vec::new(),
         named_graph_uris: Vec::new(),
         default_graph_extra: Vec::new(),
         initial_bindings: Vec::new(),
@@ -789,7 +768,7 @@ fn sparql_nodes(
             e => SchemaError::new(format!("the SPARQL selector failed: {e}")).into(),
         }
     };
-    let mut r = root.execute(&parsed, &qo).map_err(failed)?;
+    let mut r = root.execute_selector(&parsed, &qo, data).map_err(failed)?;
     sparkles_core::sparql::select_star_order(q, &mut r).map_err(failed)?;
     let Some(col) = r
         .variables()
@@ -1503,6 +1482,17 @@ mod tests {
         assert_eq!(names(&ok(person, &all)), ["carol", "bob", "alice"]);
         let g1 = DataGraph::new(snap.clone(), Some(&ex("g1")), &[], &[]).unwrap();
         assert_eq!(names(&ok(person, &g1)), ["carol"]);
+        let empty = DataGraph::new(
+            snap.clone(),
+            None,
+            &[],
+            &[sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI.into()],
+        )
+        .unwrap();
+        assert!(ok(person, &empty).is_empty());
+        let constant =
+            "SPARQL 'SELECT ?focus { VALUES ?focus { <http://ex.org/alice> } }'@ex:Person";
+        assert_eq!(names(&ok(constant, &empty)), ["alice"]);
         // FROM and GRAPH do not reach past the data graph
         let fixed = ok(
             "SPARQL 'SELECT ?x FROM NAMED <http://ex.org/g1> { GRAPH ?g { ?x ?p ?o } }'@ex:Person",

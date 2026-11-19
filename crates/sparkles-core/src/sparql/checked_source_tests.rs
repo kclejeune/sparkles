@@ -1309,6 +1309,229 @@ fn parsed_checked_request_source_reuses_preparation_controls_policy_and_final_ow
 }
 
 #[test]
+fn snapshot_selector_uses_physical_default_graphs_and_has_no_named_graphs() {
+    use crate::validation::DataGraph;
+    let store = store();
+    store
+        .load(&[crate::io::Source::from_bytes(
+            format!(
+                "_:blank {{ <urn:blank> <urn:p> 4 . <urn:s> <urn:p> 1 }}
+                 <{}> {{ <urn:defaultAlias> <urn:p> 5 }}
+                 <{}> {{ <urn:unionAlias> <urn:p> 6 }}",
+                ctx::DEFAULT_GRAPH_IRI,
+                ctx::UNION_GRAPH_IRI
+            )
+            .into_bytes(),
+            crate::io::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let snapshot = store.snapshot();
+    let merged = DataGraph::new(
+        snapshot.clone(),
+        Some(ctx::UNION_GRAPH_IRI),
+        &[],
+        &["urn:hidden".into()],
+    )
+    .unwrap();
+    let empty = DataGraph::new(
+        snapshot.clone(),
+        None,
+        &[],
+        &[ctx::DEFAULT_GRAPH_IRI.into()],
+    )
+    .unwrap();
+    let options = QueryOptions {
+        default_graph_uris: vec!["urn:hidden".into()],
+        ..opts()
+    };
+    let root = output::SnapshotOutputRoot::new(snapshot, &options).unwrap();
+    let run = |query: &str, data: &DataGraph| {
+        let parsed = parse_query(query, None, &[]).unwrap();
+        root.execute_selector(&parsed, &options, data).unwrap()
+    };
+
+    let query = "SELECT ?s FROM <urn:hidden> WHERE { ?s <urn:p> ?o } ORDER BY ?s";
+    let result = run(query, &merged);
+    let subjects: Vec<_> = result
+        .test_application_rows()
+        .iter()
+        .map(|row| row[0].as_ref().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        subjects,
+        [
+            "<urn:a>",
+            "<urn:blank>",
+            "<urn:defaultAlias>",
+            "<urn:s>",
+            "<urn:unionAlias>"
+        ]
+    );
+    assert!(run(query, &empty).is_empty());
+    assert_eq!(
+        run(
+            "SELECT ?s FROM <urn:hidden> WHERE { BIND(<urn:s> AS ?s) }",
+            &empty
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        run("SELECT ?s WHERE { VALUES ?s { <urn:s> } }", &empty).len(),
+        1
+    );
+
+    for graph in [
+        "?g",
+        "<urn:allowed>",
+        "<urn:x-arq:DefaultGraph>",
+        "<urn:x-arq:DefaultGraphNode>",
+        "<urn:x-arq:UnionGraph>",
+    ] {
+        for pattern in [
+            format!("VALUES ?s {{ <urn:s> }} GRAPH {graph} {{}}"),
+            format!("GRAPH {graph} {{ ?s <urn:p>+ ?o }}"),
+            format!("VALUES ?s {{ <urn:s> }} FILTER(EXISTS {{ GRAPH {graph} {{}} }})"),
+        ] {
+            let query = format!("SELECT ?s FROM NAMED <urn:allowed> WHERE {{ {pattern} }}");
+            assert!(run(&query, &merged).is_empty(), "{query}");
+        }
+    }
+    assert!(
+        run(
+            "SELECT ?p (COUNT(?s) AS ?count) WHERE {
+                GRAPH <urn:x-arq:UnionGraph> { ?s ?p ?o }
+             } GROUP BY ?p",
+            &merged,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn snapshot_selector_retains_the_roots_snapshot_policy_and_controls() {
+    use crate::validation::DataGraph;
+    let store = store();
+    let snapshot = store.snapshot();
+    let all = DataGraph::new(snapshot.clone(), Some(ctx::UNION_GRAPH_IRI), &[], &[]).unwrap();
+    let foreign = DataGraph::new(Arc::new((*snapshot).clone()), None, &[], &[]).unwrap();
+    let pool = pool::QueryPool::new(16 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let options = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::Only(GraphRule::new(["urn:allowed"], &[])),
+            Graphs::none(),
+        ))),
+        grant: Some(grant.clone()),
+        max_memory_bytes: Some(4 << 20),
+        cancel: Some(cancel.clone()),
+        deadline: Some(deadline),
+        ..opts()
+    };
+    let root = output::SnapshotOutputRoot::new(snapshot, &options).unwrap();
+    let baseline = grant.used();
+    let parsed = parse_query("SELECT ?s WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+    assert!(root.execute_selector(&parsed, &opts(), &foreign).is_err());
+    assert_eq!(grant.used(), baseline);
+
+    let result = root.execute_selector(&parsed, &opts(), &all).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.row(0).unwrap().term(0).unwrap().unwrap().to_string(),
+        "<urn:a>"
+    );
+    let ctx = result.test_context();
+    assert!(Arc::ptr_eq(ctx.grant().unwrap(), &grant));
+    let preparation = ctx.source_preparation.as_ref().unwrap().clone();
+    assert_eq!(preparation.control().deadline, Some(deadline));
+    drop(result);
+    assert_eq!(grant.used(), baseline);
+
+    let pressure = preparation.reserve(preparation.room()).unwrap();
+    assert!(matches!(
+        root.execute_selector(&parsed, &opts(), &all),
+        Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+    ));
+    drop(pressure);
+    assert_eq!(grant.used(), baseline);
+    cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        root.execute_selector(&parsed, &opts(), &all),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(grant.used(), baseline);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let timed_root = output::SnapshotOutputRoot::new(
+        all.snap.clone(),
+        &QueryOptions {
+            deadline: Some(deadline),
+            ..opts()
+        },
+    )
+    .unwrap();
+    let result = timed_root.execute_selector(&parsed, &opts(), &all).unwrap();
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    assert!(matches!(result.test_context().check(), Err(Error::Timeout)));
+    assert!(matches!(
+        timed_root.execute_selector(&parsed, &opts(), &all),
+        Err(Error::Timeout)
+    ));
+}
+
+#[test]
+fn snapshot_selector_drops_partial_graph_ids_on_refusal() {
+    let _observe = Observe;
+    let store = store();
+    store
+        .load(&[crate::io::Source::from_bytes(
+            b"<urn:g1> { <urn:a> <urn:p> 1 }
+              <urn:g2> { <urn:a> <urn:p> 1 }
+              <urn:g3> { <urn:a> <urn:p> 1 }"
+                .to_vec(),
+            crate::io::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let control = Control::none();
+    let preparation = Preparation::new(control.clone(), 4 << 20).unwrap();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &preparation)
+        .unwrap();
+    let (mut ctx, _) = make_source_ctx(view.read_source(), &opts()).unwrap();
+    let baseline = preparation.inner_used();
+    let initial_bytes = (4 * std::mem::size_of::<Id>()) as u64;
+    let pressure = preparation
+        .reserve(preparation.room() - initial_bytes)
+        .unwrap();
+    assert!(matches!(
+        resolve_selector_graphs(&mut ctx, &GraphSel::All),
+        Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+    ));
+    assert_eq!(preparation.room(), initial_bytes);
+    drop(pressure);
+    assert_eq!(preparation.inner_used(), baseline);
+
+    // Trigger cancellation when the first allocated buffer grows and returns
+    // its credit. A partially filled replacement still has to be retired.
+    RELEASE_OBSERVER.with(|observer| {
+        *observer.borrow_mut() = Some(Box::new(move |_, bytes| {
+            if bytes == initial_bytes {
+                control.cancel.cancel();
+            }
+        }));
+    });
+    assert!(matches!(
+        resolve_selector_graphs(&mut ctx, &GraphSel::All),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(preparation.inner_used(), baseline);
+}
+
+#[test]
 fn parsed_historical_source_still_requires_actual_store_current_policy_and_parent() {
     let store = store();
     let preparation = Preparation::new(Control::none(), 8 << 20).unwrap();

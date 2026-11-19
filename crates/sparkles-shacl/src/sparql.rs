@@ -12,7 +12,8 @@ use crate::shapes::{Constraint, G, ShapeId, Shapes};
 use crate::validate::{Engine, Out, RPath};
 use crate::vocab::{owl, sh};
 use anyhow::{Context as _, Result, anyhow, bail};
-use oxrdf::{Literal, NamedNode, Term};
+use oxrdf::vocab::xsd;
+use oxrdf::{Literal, NamedNode, NamedNodeRef, Term};
 use rustc_hash::FxHashSet;
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;
@@ -272,6 +273,35 @@ fn check_gate_query(query: &Query) -> Result<()> {
     })
 }
 
+fn check_gate_validator(
+    text: &str,
+    prefixes: &[(String, String)],
+    predicate: NamedNodeRef<'_>,
+    property_path: &PropertyPath,
+) -> Result<()> {
+    let parse = |text: &str| parse_query(text, None, prefixes);
+    if predicate == sh::NODE_VALIDATOR {
+        return check_gate_query(&parse(text)?);
+    }
+    let property = substitute_path(text, Some(property_path));
+    if predicate == sh::PROPERTY_VALIDATOR {
+        return check_gate_query(&parse(&property)?);
+    }
+    if property == text {
+        return check_gate_query(&parse(text)?);
+    }
+    // A generic fallback can be used by either kind of shape. Check every
+    // available syntax here. The instance still has to parse in its actual context.
+    match (parse(text), parse(&property)) {
+        (Ok(node), Ok(property)) => {
+            check_gate_query(&node)?;
+            check_gate_query(&property)
+        }
+        (Ok(query), Err(_)) | (Err(_), Ok(query)) => check_gate_query(&query),
+        (Err(error), Err(_)) => Err(error.into()),
+    }
+}
+
 /// Check component validators even when no shape supplies their parameters, and
 /// SPARQL functions even when the shapes do not call them.
 pub(crate) fn check_gate_declarations(g: &G<'_>) -> Result<()> {
@@ -292,12 +322,8 @@ pub(crate) fn check_gate_declarations(g: &G<'_>) -> Result<()> {
                 let text = literal_text(&query)
                     .ok_or_else(|| anyhow!("the validator of {component} needs a query literal"))?;
                 let prefixes = prefixes(g, &validator);
-                check_gate_query(&parse_query(
-                    &substitute_path(text, Some(&path)),
-                    None,
-                    &prefixes,
-                )?)
-                .with_context(|| format!("validator of {component}"))?;
+                check_gate_validator(text, &prefixes, predicate, &path)
+                    .with_context(|| format!("validator of {component}"))?;
             }
         }
     }
@@ -358,11 +384,24 @@ pub(crate) fn parse_sparql_constraint(
     g: &G<'_>,
     node: &Term,
     path: Option<&PropertyPath>,
+    gate: bool,
 ) -> Result<Option<SparqlConstraint>> {
-    if g.objects(node, sh::DEACTIVATED)
-        .iter()
-        .any(|t| literal_text(t) == Some("true"))
-    {
+    let flags = g.objects(node, sh::DEACTIVATED);
+    let deactivated = if gate {
+        match flags.as_slice() {
+            [] => false,
+            [Term::Literal(l)]
+                if l.datatype() == xsd::BOOLEAN
+                    && matches!(l.value(), "true" | "false" | "1" | "0") =>
+            {
+                l.value() == "true"
+            }
+            _ => bail!("sh:deactivated must be a single xsd:boolean literal on {node}"),
+        }
+    } else {
+        flags.iter().any(|t| literal_text(t) == Some("true"))
+    };
+    if deactivated {
         return Ok(None);
     }
     let Some(sel) = g.object(node, sh::SELECT) else {
