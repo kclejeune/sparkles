@@ -1041,3 +1041,33 @@ fn validation_without_a_log_still_refuses_an_unknown_vocabulary() {
     std::fs::remove_file(generation.join("wal.log")).unwrap();
     assert!(validate_copy(dir.path(), false, &preparation()).is_err());
 }
+
+/// A compaction that switches `CURRENT` and trims the old log after the validation
+/// measured it is no error of `sparkles check`, which reads the new layout again.
+#[test]
+fn check_reads_again_after_a_compaction_trims_the_log_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(Store::open(dir.path(), StoreOptions::default()).unwrap());
+    update(&store, "trimmed-0");
+    update(&store, "trimmed-1");
+    let first = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let compactor = store.clone();
+    let mut fired = false;
+    validation::INSPECTION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |at: &str| {
+            if at == "extent" && !fired {
+                fired = true;
+                compactor.compact().unwrap();
+            }
+        }))
+    });
+    let report = crate::check::check(dir.path(), &crate::check::CheckOptions::default());
+    validation::INSPECTION_HOOK.with(|hook| hook.borrow_mut().take());
+    let report = report.unwrap();
+    assert_ne!(
+        std::fs::read_to_string(dir.path().join("CURRENT")).unwrap(),
+        first,
+        "the compaction switched CURRENT"
+    );
+    assert_eq!(report.errors, 0, "{}", report.to_text());
+}
