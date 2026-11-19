@@ -2204,19 +2204,12 @@ pub(crate) async fn run_query(
     let on_stream_end = move |end: stream::StreamEnd| {
         stream_end_log("query", &end);
         let (outcome, budget) = end.outcome();
-        // the rows whose ends the transport handed over, or for a writer that records
-        // none there, the rows it wrote whole. A body that failed before it was committed
-        // is an error response, which sent none of its rows.
-        let rows = if !end.committed {
-            None
-        } else if end.error.is_some() {
-            Some(
-                end.rows
-                    .unwrap_or_else(|| sent_rows.load(std::sync::atomic::Ordering::Relaxed)),
-            )
-        } else {
-            streamed_base.rows
-        };
+        // the same rule as the cursor route's, which a pre-commit failure never reaches
+        // here today, since its error response is logged from its own report
+        let rows = end.reported_rows(
+            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed)),
+            streamed_base.rows,
+        );
         stream_report.producer_done(RequestReport {
             outcome,
             budget,

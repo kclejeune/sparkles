@@ -90,6 +90,21 @@ impl StreamEnd {
             None => (None, None),
         }
     }
+
+    /// The rows that the access log and the metrics report for a body that ended this way.
+    /// A body that failed before it was committed is an error response, which sent none of
+    /// its rows. One that failed after reports the rows whose ends the transport handed
+    /// over, or for a writer that records none there the rows it `written` whole, and
+    /// otherwise the `complete` count. A complete body reports `complete`.
+    pub(crate) fn reported_rows(&self, written: Option<u64>, complete: Option<u64>) -> Option<u64> {
+        if !self.committed {
+            None
+        } else if self.error.is_some() {
+            self.rows.or(written).or(complete)
+        } else {
+            complete
+        }
+    }
 }
 
 enum Outcome {
@@ -947,6 +962,40 @@ impl futures_util::Stream for ChunkStream {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// Both query routes report a body's rows by one rule: none for a body that failed
+    /// before it was committed, whatever its writer counted, then the delivered rows, the
+    /// rows written whole and the complete count, in that order (items 828 and 243).
+    #[test]
+    fn the_reported_rows_follow_the_commit_and_the_error() {
+        let end = |committed, error: bool, rows| StreamEnd {
+            bytes: 0,
+            serialize_ms: 0.0,
+            error: error.then_some(Error::Cancelled),
+            disconnected: false,
+            rows,
+            committed,
+        };
+        // an error response sent no rows, also when the buffer had whole rows in it
+        assert_eq!(
+            end(false, true, Some(3)).reported_rows(Some(5), Some(9)),
+            None
+        );
+        assert_eq!(end(false, true, None).reported_rows(Some(5), Some(9)), None);
+        assert_eq!(
+            end(true, true, Some(3)).reported_rows(Some(5), Some(9)),
+            Some(3)
+        );
+        assert_eq!(
+            end(true, true, None).reported_rows(Some(5), Some(9)),
+            Some(5)
+        );
+        assert_eq!(end(true, true, None).reported_rows(None, Some(9)), Some(9));
+        assert_eq!(
+            end(true, false, Some(3)).reported_rows(Some(5), Some(9)),
+            Some(9)
+        );
+    }
 
     /// A send that enqueued and then failed its check counts the rows that end in its
     /// chunk, and its error comes back from the next write, flush or send, also when the
