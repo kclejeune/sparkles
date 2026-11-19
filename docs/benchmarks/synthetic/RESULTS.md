@@ -988,7 +988,7 @@ cc94ac7f and 8baa5686, cached screen builds of another toolchain. Counts locate 
 the code, and only the forge pair sizes a cost.
 
 - On `optional-count`, the screen builds 321508fe and 06ca04ef differ by 4.4%, and no
-  other step adds more than 0.3%. The range holds item 825 and the Horn classifier
+  other adjacent step in the screen ladder adds more than 0.3%. The range holds item 825 and the Horn classifier
   with individuals, which no synthetic query runs.
 - On `optional-chain`, the same range adds 0.5% while `export-500k` stays flat. The matrix
   step from ffb18866 to 1cbc23cd adds another 0.55% to `optional-chain` and 0.47% to
@@ -996,7 +996,7 @@ the code, and only the forge pair sizes a cost.
   instructions. Most of this request is the writer, so these totals do not show where the
   query's own instructions changed.
 - On `lang-filter` and `regex-iri`, adbe757c to 65c570db, which is batch 21, adds 1.8% and
-  1.6%, and no other step adds more than 0.06%. Item 948 changed the checked vocabulary
+  1.6%, and no other adjacent step in the screen ladder adds more than 0.06%. Item 948 changed the checked vocabulary
   decode in that batch and is a candidate that its own comparison would confirm.
 
 [Flat profiles](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/perf/) of
