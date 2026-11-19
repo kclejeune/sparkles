@@ -52,9 +52,20 @@ static BLOCKS: AtomicUsize = AtomicUsize::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static FULL: AtomicBool = AtomicBool::new(false);
-/// The meter's own test stops a counted `realloc` between the two halves of its
-/// accounting: 1 asks the next one to stop, which it reports with 2, and 3 lets it go on.
+/// The meter's own test stops a counted `realloc` beside its system call: 1 asks the
+/// next one to stop before the call and 4 after it, which it reports with 2, and 3
+/// lets it go on.
 static STEP: AtomicUsize = AtomicUsize::new(0);
+
+/// Stop here while the meter's test asked for a stop `at` this place.
+fn pause(at: usize) {
+    if STEP.load(Ordering::Relaxed) == at && counted() {
+        STEP.store(2, Ordering::Relaxed);
+        while STEP.load(Ordering::Relaxed) != 3 {
+            std::hint::spin_loop();
+        }
+    }
+}
 
 fn locked<T>(f: impl FnOnce() -> T) -> T {
     while LOCK
@@ -75,38 +86,32 @@ fn slot(address: usize) -> usize {
 /// Count a block that a counted thread allocated inside the window.
 fn insert(address: usize, size: usize) {
     if OPEN.load(Ordering::Relaxed) && counted() {
-        place(address, size, 0, false);
+        locked(|| {
+            let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+            PEAK.fetch_max(live, Ordering::Relaxed);
+            if !remember(address, size) {
+                LIVE.fetch_sub(size, Ordering::Relaxed);
+            }
+        });
     }
 }
 
-/// Put a block in the table. `held` is the bytes of the block that a `realloc` made
-/// this one from, which left the table and stayed in the live bytes. They leave the
-/// live bytes here, after the peak has read them with this block when the two were
-/// live `together`, and before it otherwise.
-fn place(address: usize, size: usize, held: usize, together: bool) {
-    locked(|| {
-        if !together {
-            LIVE.fetch_sub(held, Ordering::Relaxed);
-        }
-        let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
-        PEAK.fetch_max(live, Ordering::Relaxed);
-        if together {
-            LIVE.fetch_sub(held, Ordering::Relaxed);
-        }
-        if BLOCKS.load(Ordering::Relaxed) >= SLOTS / 2 {
-            // The block is not remembered, so its bytes are not counted either.
-            LIVE.fetch_sub(size, Ordering::Relaxed);
-            FULL.store(true, Ordering::Relaxed);
-            return;
-        }
-        let mut at = slot(address);
-        while ADDRESS[at].load(Ordering::Relaxed) != 0 {
-            at = (at + 1) % SLOTS;
-        }
-        ADDRESS[at].store(address, Ordering::Relaxed);
-        SIZE[at].store(size, Ordering::Relaxed);
-        BLOCKS.fetch_add(1, Ordering::Relaxed);
-    });
+/// Put a block in the table, under the lock. A full table does not take it, which
+/// voids the reading, and the caller then takes the block's bytes out of the live
+/// bytes.
+fn remember(address: usize, size: usize) -> bool {
+    if BLOCKS.load(Ordering::Relaxed) >= SLOTS / 2 {
+        FULL.store(true, Ordering::Relaxed);
+        return false;
+    }
+    let mut at = slot(address);
+    while ADDRESS[at].load(Ordering::Relaxed) != 0 {
+        at = (at + 1) % SLOTS;
+    }
+    ADDRESS[at].store(address, Ordering::Relaxed);
+    SIZE[at].store(size, Ordering::Relaxed);
+    BLOCKS.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// Take a block out of the table, and give its size, if the window counted it. Its
@@ -171,32 +176,45 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         // The address leaves the table before the system can free it, so a counted
-        // thread that is given the address meanwhile keeps its own block. The bytes
-        // stay in the live bytes until the system has answered, so that what another
-        // counted thread allocates meanwhile is read beside them: the interval reads
-        // high when the block shrinks, and never low.
+        // thread that is given the address meanwhile keeps its own block. From here
+        // until the outcome is recorded the live bytes hold the old block and, when
+        // the new one will count, the new block as well. The system holds at most
+        // those bytes for the block at any moment in between, so what another counted
+        // thread allocates meanwhile is read beside them: the interval reads high for a
+        // block that stays in place, by its smaller size, and never low. This thread
+        // raises the peak only once it knows the outcome.
         let old = remove(p as usize, true);
-        if STEP.load(Ordering::Relaxed) == 1 && counted() {
-            STEP.store(2, Ordering::Relaxed);
-            while STEP.load(Ordering::Relaxed) != 3 {
-                std::hint::spin_loop();
-            }
-        }
-        let q = unsafe { System.realloc(p, l, new) };
         let held = old.unwrap_or(0);
-        if q.is_null() {
-            // The block is still live at its address, with the bytes it had.
-            if let Some(size) = old {
-                place(p as usize, size, held, false);
+        let counts = OPEN.load(Ordering::Relaxed) && counted();
+        let ahead = if counts { new } else { 0 };
+        if ahead > 0 {
+            locked(|| LIVE.fetch_add(ahead, Ordering::Relaxed));
+        }
+        pause(1);
+        let q = unsafe { System.realloc(p, l, new) };
+        pause(4);
+        locked(|| {
+            if q.is_null() {
+                // The block is still live at its address, with the bytes it had.
+                LIVE.fetch_sub(ahead, Ordering::Relaxed);
+                if old.is_some_and(|size| !remember(p as usize, size)) {
+                    LIVE.fetch_sub(held, Ordering::Relaxed);
+                }
+                return;
             }
-        } else if OPEN.load(Ordering::Relaxed) && counted() {
             // A block that moved was live beside its copy while the bytes moved, and one
             // that stayed never held more than its larger size.
-            place(q as usize, new, held, q != p);
-        } else if held > 0 {
-            // The new block is not counted, and the old one is gone.
-            locked(|| LIVE.fetch_sub(held, Ordering::Relaxed));
-        }
+            if q != p {
+                PEAK.fetch_max(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            let live = LIVE.fetch_sub(held, Ordering::Relaxed) - held;
+            if counts {
+                PEAK.fetch_max(live, Ordering::Relaxed);
+                if !remember(q as usize, new) {
+                    LIVE.fetch_sub(new, Ordering::Relaxed);
+                }
+            }
+        });
         q
     }
 }
@@ -291,28 +309,35 @@ fn the_meter_counts_the_window_of_the_counted_thread_alone() {
         );
     }
     // What another counted thread allocates while a block is reallocated is read beside
-    // that block, whether the block then moves, stays or shrinks.
-    let (_, heap) = peak(|| {
-        let other = std::thread::spawn(|| {
-            COUNTED.set(true);
-            while STEP.load(Ordering::Relaxed) != 2 {
-                std::hint::spin_loop();
+    // that block, whether the other thread runs before the system call, when the old
+    // block is live, or after it, when the new one is. A stop after the call reads the
+    // old block's bytes as well, since the meter does not know the outcome yet.
+    for (from, to, at, most) in [(4 * MIB, 64, 1, 8 * MIB), (MIB, 4 * MIB, 4, 9 * MIB)] {
+        let (_, heap) = peak(|| {
+            let other = std::thread::spawn(|| {
+                COUNTED.set(true);
+                while STEP.load(Ordering::Relaxed) != 2 {
+                    std::hint::spin_loop();
+                }
+                drop(std::hint::black_box(Vec::<u8>::with_capacity(4 * MIB)));
+                STEP.store(3, Ordering::Relaxed);
+            });
+            unsafe {
+                let layout = Layout::from_size_align(from, 8).unwrap();
+                let p = std::alloc::alloc(layout);
+                STEP.store(at, Ordering::Relaxed);
+                let q = std::alloc::realloc(p, layout, to);
+                STEP.store(0, Ordering::Relaxed);
+                assert!(!q.is_null());
+                std::alloc::dealloc(q, Layout::from_size_align(to, 8).unwrap());
             }
-            drop(std::hint::black_box(Vec::<u8>::with_capacity(4 * MIB)));
-            STEP.store(3, Ordering::Relaxed);
+            other.join().unwrap();
         });
-        unsafe {
-            let layout = Layout::from_size_align(4 * MIB, 8).unwrap();
-            let p = std::alloc::alloc(layout);
-            STEP.store(1, Ordering::Relaxed);
-            let q = std::alloc::realloc(p, layout, 64);
-            STEP.store(0, Ordering::Relaxed);
-            assert!(!q.is_null());
-            std::alloc::dealloc(q, Layout::from_size_align(64, 8).unwrap());
-        }
-        other.join().unwrap();
-    });
-    assert!((8 * MIB..8 * MIB + MIB / 4).contains(&heap), "{heap}");
+        assert!(
+            (8 * MIB..most + MIB / 4).contains(&heap),
+            "{from} to {to}, stopped at {at}: {heap}"
+        );
+    }
     // A block that the window counted and another thread frees leaves the count.
     let (_, heap) = peak(|| {
         let block = Vec::<u8>::with_capacity(2 * MIB);
