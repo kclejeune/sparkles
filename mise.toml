@@ -1641,9 +1641,9 @@ SPARKLES_TASK
 '''
 
 [tasks."bench:remote"]
-description = "Interleaved query A/B on an explicit Namespace or admitted warm Boat worker; the mandatory full screen remains Namespace until Boat qualification"
+description = "Interleaved query A/B on an admitted warm Boat worker; this is the batch screen"
 usage = '''
-flag "--executor <selector>" default="nsc" help="nsc or boat:bx_ID with SPARKLES_BOAT_ADMISSION"
+flag "--executor <selector>" required=#true help="boat:bx_ID with SPARKLES_BOAT_ADMISSION; the Namespace executor is retired"
 arg "<a>" help="the baseline: a git revision (built here or on a build host, and cached) or a sparkles binary"
 arg "<b>" help="the candidate: a git revision or a sparkles binary"
 flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
@@ -1678,9 +1678,9 @@ SPARKLES_TASK
 '''
 
 [tasks."bench:remote-writes"]
-description = "Interleaved durable-write comparisons on an explicit Namespace or admitted warm Boat worker"
+description = "Interleaved durable-write comparisons on an admitted warm Boat worker"
 usage = '''
-flag "--executor <selector>" default="nsc" help="nsc or boat:bx_ID with SPARKLES_BOAT_ADMISSION"
+flag "--executor <selector>" required=#true help="boat:bx_ID with SPARKLES_BOAT_ADMISSION; the Namespace executor is retired"
 arg "<variants>" var=#true help="NAME=REF[:FLAGS]: a revision or sparkles binary, and optional global flags to run it with"
 flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
 flag "--scenarios <list>" default="serial-literal writers mixed" help="from serial-literal serial-iri serial-delete writers writers16 mixed serial-message writers-message writers16-message"
