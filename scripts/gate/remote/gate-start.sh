@@ -16,7 +16,9 @@
 #                 from the changed files (scripts/gate/select-checks.py)
 #   --full        every check with --force, with no selection, as the nightly gate runs
 #   --note        a line to record in progress.log before the run is queued
-#   --min-free-gib  on a Boat worker, the free space the run needs after the cleanup (default 110)
+#   --min-free-gib  the free space the run needs under the heavy lock (default 110). A Boat
+#                 worker also needs it at the start, after its cleanup, and an ssh host
+#                 runs `mbx gc` under the lock to free a shortfall (gate-inner.sh)
 #
 # The memory cap is the smaller of 24G and the host's RAM less 2G, with 2G of swap, and
 # GATE_MEMORY_MAX overrides it. On a Boat worker the cap is the 12G job that qualification

@@ -29,6 +29,28 @@ out=$G/out/$name
 host=$(hostname)
 mkdir -p "$out"
 log() { echo "$(date -u +%FT%TZ) $*" >> "$out/progress.log"; }
+# The same functions as in ci-job.sh, which a test keeps identical.
+# free_kib prints the KiB free on the filesystem of the home, or nothing when df fails.
+free_kib() {
+  local f
+  f=$(df -Pk "$HOME" 2> /dev/null | awk 'NR == 2 { print $4 }')
+  case $f in '' | *[!0-9]*) ;; *) echo "$f" ;; esac
+}
+# ssh_admit NEED_GIB SECONDS: succeed when NEED_GIB are free, after an `mbx gc` bounded by
+# SECONDS that frees the shortfall when they are not. An unreadable disk counts as full.
+ssh_admit() {
+  local need=$1 f c
+  f=$(free_kib)
+  [ "${f:-0}" -lt $((need * 1048576)) ] || return 0
+  log "$((${f:-0} / 1048576)) GiB free and the job needs $need GiB, so mbx gc frees the shortfall"
+  MBX_GC_MIN_FREE_SIZE=${need}GiB timeout --kill-after=10s "$2" mbx gc > "$out/gc-admit.log" 2>&1
+  c=$?
+  [ "$c" = 0 ] || log "mbx gc exited $c"
+  f=$(free_kib)
+  [ "${f:-0}" -lt $((need * 1048576)) ] || return 0
+  log "host disk below floor: $((${f:-0} / 1048576)) GiB free after mbx gc, under the $need GiB floor; not starting"
+  return 1
+}
 
 exec 9> "$G/.lock"
 log "waiting for lock $(readlink -f "$G/.lock")"
@@ -72,7 +94,14 @@ test "$(git rev-parse HEAD)" = "$full" || {
 # may have used it since, so the check runs again under the heavy lock before the build.
 if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ] &&
   ! python3 -I "$(dirname "$0")/disk_clean.py" --need-free-gib "${GATE_MIN_FREE_GIB:-110}" --deadline-seconds 240 --log "$G/disk-clean.jsonl" > "$out/disk-clean-admit.json" 2>&1; then
-  log "under ${GATE_MIN_FREE_GIB:-110} GiB free after the cleanup; not starting"
+  log "host disk below floor: under ${GATE_MIN_FREE_GIB:-110} GiB free after the cleanup; not starting"
+  echo disk-below-floor > "$out/outcome"
+  finish 4
+fi
+# An ssh host runs no disk cleanup, so under the heavy lock it runs `mbx gc` to free the
+# shortfall when it has less than the floor free, and refuses the gate when it stays short.
+if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = ssh ] && ! ssh_admit "${GATE_MIN_FREE_GIB:-110}" 240; then
+  echo disk-below-floor > "$out/outcome"
   finish 4
 fi
 
