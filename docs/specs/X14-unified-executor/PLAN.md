@@ -290,13 +290,12 @@ modes and EXPLAIN names the algorithm the switch selected in both. An OPTIONAL c
 is evaluated once over the gathered candidates of a chunk in both modes, as
 `Binary::condition` already does for the cursor and `left_join` for the eager table, and
 the phase measures the conditional OPTIONAL of item 570's record,
-`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. Item
-570 closes when that measurement puts the streamed query within the gate of the eager
-one and the admission of an OPTIONAL whose condition is an EXISTS with a key set, whose
-earlier admission and revert
-[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records,
-passes the same measurement. Until then item 570 stays open with the measurement
-recorded. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
+`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. The
+[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
+records that measurement, in which the cursor merges the query and streams it within
+the gate. Item 570 states the remaining acceptance rule, which adds OPTIONALs with
+several pairs per left row and the admission of an OPTIONAL whose condition holds an
+EXISTS. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
 for keys the hash cannot take.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
@@ -607,7 +606,8 @@ merge removes it with the eager executor. In both cases
 `mise run test:w3c:streaming` records no eager fallback for the W3C query suites, which
 hold no such shape. The EXISTS shapes that automatic execution keeps eager through
 `streams_natively` are an admission choice rather than a fallback, and the merge removes
-the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, an
+the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, since
+the cursor merges it but is slower than eager execution at higher fan-out, an
 EXISTS deeper than four levels is item 1081 and an EXISTS pattern that calls a SERVICE
 stays eager because a cursor cannot repeat its effects.
 

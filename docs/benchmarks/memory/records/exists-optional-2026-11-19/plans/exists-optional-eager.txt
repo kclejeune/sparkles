@@ -1,0 +1,8 @@
+parse 0.47 ms · plan 0.61 ms · exec 29.75 ms · total 30.83 ms
+Project ?c ?w  [1 rows (est 1), 29.74 ms]
+  Bind ?w := ?958782f7b31142f7e4b1c0ffb9e0a4b2  [1 rows (est 1), 29.73 ms]
+    Bind ?c := ?c2d19bebc3601298676a762ad135aa88  [1 rows (est 1), 29.72 ms]
+      GroupBy by  aggs ?c2d19bebc3601298676a762ad135aa88=Count ?958782f7b31142f7e4b1c0ffb9e0a4b2=Count [incremental]  [1 rows (est 1), 29.72 ms]
+        OptionalJoin filter EXISTS{…} [merge on ?p] [EXISTS decorrelated on ?o: 400110 keys from 400110 solutions, 300191 rows probed, 0 per row]  [300191 rows (est 300191), 28.83 ms]
+          IndexScan POS ?p rdf:type <http://example.org/Student> [decodes SG]  [300191 rows (est 300191), 2.77 ms]
+          IndexScan PSO ?p <http://example.org/advisor> ?o [decodes SOG]  [300191 rows (est 300191), 4.39 ms]

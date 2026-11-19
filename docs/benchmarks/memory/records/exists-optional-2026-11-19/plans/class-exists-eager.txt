@@ -1,0 +1,8 @@
+parse 0.16 ms · plan 0.18 ms · exec 39.14 ms · total 39.48 ms
+Project ?n ?w  [1 rows (est 1), 39.13 ms]
+  Bind ?w := ?e84006f1023cf091bd573d1a1403ad9b  [1 rows (est 1), 39.13 ms]
+    Bind ?n := ?9bb45d7ddd0ae25728144a92d3a67a05  [1 rows (est 1), 39.12 ms]
+      GroupBy by  aggs ?9bb45d7ddd0ae25728144a92d3a67a05=Count ?e84006f1023cf091bd573d1a1403ad9b=Count [incremental]  [1 rows (est 1), 39.12 ms]
+        OptionalJoin filter EXISTS{…} [flat hash table: 11 keys in 256 parts] [EXISTS decorrelated on ?x: 0 keys from 0 solutions, 1520000 rows probed, 0 per row]  [12 rows (est 1064012), 39.11 ms]
+          IndexScan PSO ?c rdfs:label ?l [decodes SOG]  [12 rows (est 12), 0.05 ms]
+          IndexScan PSO ?x rdf:type ?c [decodes SOG]  [1520017 rows (est 1520017), 10.01 ms]

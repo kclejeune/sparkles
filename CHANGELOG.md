@@ -249,6 +249,19 @@ EXISTS, so an IF branch that is never taken still builds the key set, which road
 eager are an EXISTS over a SERVICE, an EXISTS nested more than four levels deep, which item
 1081 covers, and an OPTIONAL whose condition holds an EXISTS, which item 570 covers.
 
+### Conditional merge OPTIONAL in the cursor
+
+The cursor merges an OPTIONAL with a condition over two inputs sorted on their shared
+variable, as eager execution does, and tests the condition on each batch's pairs. Both
+plans name the merge, and `merge_left_join` selects it in both modes. On an Intel host
+at 10.5M quads with one Rayon thread, the streamed `optional-filter` went from 46.6 to
+19.3 ms and `optional-cond` from 70.1 to 19.4 ms. At about 2.5 pairs per left row the cursor still takes 1.18 to 1.36 times
+the eager time, so an OPTIONAL whose condition holds an EXISTS stays eager under
+automatic execution, which item 570 keeps open. Item 1105 gives a future admission the
+build's merge order, and items 1106, 1137, 1143, 1144 and 1145 follow the EXISTS
+counters of the cursor's plan, the charge of the merge's variable map, a 0.9% cost of a
+hashed control, the reservation of a spooled frame and the eager memory retry.
+
 ### MCP tool profiles and semantic search
 
 `sparkles mcp --profile` and `--tools`, and `serve --mcp-profile` and `--mcp-tools`,
