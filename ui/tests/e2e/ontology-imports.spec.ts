@@ -124,8 +124,11 @@ open('the outbound policy refuses a fetch and nothing changes', async ({ request
   const head = (
     await (await request.get(`/$/ontology/${DS}?graph=${GRAPH}&branch=${BRANCH}`)).json()
   ).commit;
+  // The open server runs with --outbound-allow-private, so that a notification test reaches
+  // a receiver on 127.0.0.1, and a loopback location would be fetched. A link-local address
+  // needs --outbound-allow even then, so the policy refuses it before any connection.
   const r = await request.post(`/$/ontology/${DS}/imports/fetch?branch=${BRANCH}`, {
-    data: { iri: 'http://example.org/missing', location: 'http://127.0.0.1:9/missing.ttl' },
+    data: { iri: 'http://example.org/missing', location: 'http://169.254.0.9/missing.ttl' },
   });
   expect(r.status(), await r.text()).toBe(403);
   const after = await (

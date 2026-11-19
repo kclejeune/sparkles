@@ -230,10 +230,15 @@ cache = { enabled = false }
 description = "Rebuild the browser formatter if it was built before (`mise run ui:wasm`) and the formatter changed since"
 hide = true
 run = "if [ -e ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm ]; then mise run ui:wasm; fi"
+# after ui:wasm when one task graph, such as ui:e2e's, runs both, so that the graph builds the
+# module once (separate mise runs in one checkout are not serialized)
+wait_for = ["ui:wasm"]
 
 [tasks."ui:build"]
 description = "Build the SvelteKit UI (embedded into the server binary)"
 depends = ["ui:install", "ui:wasm:refresh"]
+# in a task graph that also runs ui:wasm, this build has the module
+wait_for = ["ui:wasm"]
 dir = "ui"
 run = "pnpm build"
 sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json", "pnpm-lock.yaml"]
@@ -287,7 +292,9 @@ pnpm exec playwright install chromium
 
 [tasks."ui:e2e"]
 description = "UI end-to-end tests (Playwright) against a real `sparkles serve` (debug build; SPARKLES_BIN=… for another); extra args go to `playwright test`"
-depends = ["ui:build", "ui:e2e:browsers"]
+# ui:wasm: the Pattern pane and the facets of a query have no server fallback, and the
+# flake's ui-e2e check runs against a UI built with the module
+depends = ["ui:wasm", "ui:build", "ui:e2e:browsers"]
 dir = "ui"
 # The server is built inside the lease that the tests run in, so collection cannot remove
 # the binary before they start it.

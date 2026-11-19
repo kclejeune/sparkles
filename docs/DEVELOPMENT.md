@@ -574,10 +574,18 @@ another port. The task is not part of `mise run ci`.
 
 ### Browser integration tests
 
-`mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
-port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
-configuration with one user and one API token. It then runs the Playwright tests in
-`ui/tests/e2e` in headless Chromium and stops the server.
+`mise run ui:e2e` builds the formatter's WebAssembly module, the UI with the module and a
+debug server. It starts two `sparkles serve` processes on free ports of 127.0.0.1, each
+with a temporary data directory. The first has a small dataset and an auth configuration
+with users and API tokens. The second runs without auth and allows private outbound
+addresses. The task then runs the Playwright tests in `ui/tests/e2e` in headless Chromium
+and stops the servers. The Pattern pane, the plan's pattern and **Apply to query** in the
+facets of a query have no server fallback, so their tests need the module. Before the
+servers start, the setup looks for the module in the directory that `SPARKLES_UI_DIR`
+names. Without that setting it looks in `ui/build` when the binary is the default debug
+build, and it skips the check for another binary, whose UI it cannot see. It stops with a
+message when the module is missing. `SPARKLES_E2E_NO_WASM=1` skips the check, and the
+tests that need the module still fail without it.
 
 To test another binary, set `SPARKLES_BIN=path/to/sparkles`. Extra arguments go to
 `playwright test`, as in `mise run ui:e2e -- -g Similar`. The flake's dev shell provides
