@@ -24,6 +24,11 @@ def blank_tokens(query):
     out, i, n = [], 0, len(query)
     while i < n:
         c = query[i]
+        if c == "\\":
+            # an escape outside a string, such as a prefixed name's \#, is no comment
+            out.append(query[i:i + 2])
+            i += 2
+            continue
         if c == "#":
             j = query.find("\n", i)
             j = n if j < 0 else j

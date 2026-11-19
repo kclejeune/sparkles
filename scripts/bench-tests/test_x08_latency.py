@@ -80,7 +80,9 @@ class AnswersTests(unittest.TestCase):
                     ("SELECT ?s WHERE { ?s <urn:limit> ?o }", False),
                     ('SELECT ("""alpha " LIMIT 1 " omega""" AS ?x) WHERE {}', False),
                     ('SELECT ?s ("""a " ORDER BY ?s " b""" AS ?x) WHERE { ?s ?p ?o } LIMIT 1', True),
-                    ("SELECT ?s ('''it's LIMIT 2''' AS ?x) WHERE { ?s ?p ?o }", False))):
+                    ("SELECT ?s ('''it's LIMIT 2''' AS ?x) WHERE { ?s ?p ?o }", False),
+                    ("PREFIX ex: <urn:ex:> SELECT ?x (ex:a\\#b AS ?v) WHERE { ?x ?p ?o } ORDER BY ?x\nLIMIT 1",
+                     False))):
                 run = self.run_dir(d, f"r{i}", query, {"A": "x", "B": "y"})
                 self.assertEqual(answers("--queries", "q", run).returncode, 0 if ok else 1, query)
 
