@@ -43,7 +43,7 @@ upper end of its 95% interval is at most 1.02 or its median added time is at mos
 The combined tables keep that script's column names, so "pool off ms" is the time of the
 base arm and "on/off" is the ratio of `fix` to that base.
 
-Every run returned the same answers from both arms, which each summary states. Another job
+Every run returned the same answers from both arms, which each summary states. The summaries carry the fixed title of the script that writes them, which names Namespace, but every run in this record ran on atlas. Another job
 copied files to atlas and ran a 0.1 s test outside the lock during rounds 3 and 4 of
 `summary-pre-small-streaming-ab.md`. Without those two rounds, `root-scan` reads 1.0240,
 1.0208 to 1.0276, and `root-limit` 1.0314, 1.0026 to 1.0674, so they change no verdict.
@@ -76,8 +76,8 @@ That reads like a cost per request rather than per block, but two queries do not
 Among the controls, `distinct-obj` and `predicate-counts` read 1.062 and 1.050 against
 `main` under streaming, 0.30 and 0.31 µs, and 0.976 and 0.986 under automatic execution.
 Their plans run an eager subplan under the cursor, and a profile of `distinct-obj` on
-stanley shows no sample in the scan code that the change touches, so the difference is
-not attributed to it. Against `pre`, `path-plus` under automatic execution reads 1.145,
+stanley lists no leaf of the scan code that the change touches among the 25 leaves it
+prints per region, so the difference is not attributed to it. Against `pre`, `path-plus` under automatic execution reads 1.145,
 1.43 µs, and `subquery-agg` 1.013, 2.41 µs, and 1.006, 1.14 µs, under streaming. All three
 are flat against `main`, so item 1063 does not cause them. Item 1039's own comparison on
 atlas, of `9acd6d74` with the tip of that item in six rounds of one arm order, read
