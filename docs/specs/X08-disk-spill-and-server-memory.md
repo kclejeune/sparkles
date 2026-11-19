@@ -344,7 +344,7 @@ keys hash the row's key ids once.
 ### 5.3 Gates
 
 The kernels land behind the existing `Optimizations` switch, one per kernel, and replace
-the old paths when the Boat query screen (`mise run bench:remote`, A/B/B/A, as in X05's
+the old paths when the Boat query screen (`mise run bench:remote --executor boat:bx_ID`, A/B/B/A, as in X05's
 Outcome) shows streaming within 10% of eager on `optional-chain`, `group-avg`, `minus`,
 `expr-bind-group` and `distinct-join` at 1.05M and 10.5M, with no other query slower by
 more than the tie threshold. X05's other follow-ups (LIMIT into the remaining fallbacks,
@@ -676,7 +676,7 @@ index.
 * The W3C SPARQL 1.1 query evaluation tests run with a 1 MiB budget and spill on, through
   cursors at batch sizes 1 and 4,096.
 * Performance: the Boat query screen for the kernels; a spill suite that runs the joins,
-  sorts and groups of `bench:remote` at budgets of 100%, 50%, 25% and 10% of their in-memory
+  sorts and groups of `bench:remote --executor boat:bx_ID` at budgets of 100%, 50%, 25% and 10% of their in-memory
   peak and reports time, bytes spilled and passes; the 10.5M memory probe of BENCHMARKS
   for the profiles; DBpedia warm and cold for the cache defaults.
 

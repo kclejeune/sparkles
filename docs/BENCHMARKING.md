@@ -986,8 +986,9 @@ A comparison against a baseline recorded on another day carries the host's run-t
 noise. A metric that a timing gate flags is therefore measured again in an interleaved
 A/B of the baseline build and the candidate on the same host, and it counts as a
 regression only if the A/B confirms it. For the matrix, `scripts/nsc-bench-remote.sh`
-runs that A/B with `EXECUTION` set to the flagged mode, and `bench:remote` with
-`--execution` does the same on a Boat worker for a first screen. A confirmed slowdown that a
+runs that A/B with `EXECUTION` set to the flagged mode, and
+`bench:remote --executor boat:bx_ID` with `--execution` does the same on a Boat worker
+for a first screen. A confirmed slowdown that a
 change accepts gets its own roadmap item, as for every gate. The W3C counts do not depend
 on the host, and the instruction counts are compared by their ranges over five
 processes, so their comparisons stand without an A/B.

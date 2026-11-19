@@ -99,7 +99,7 @@ the refresh protocol and the regression tracking.
 | `scripts/geosparql-benchmark.sh` | The GeoSPARQL Compliance Benchmark, fetched at a pinned commit when `SPARKLES_ALLOW_GPL_BENCHMARK=1` | Sparkles only | 187 of 206 |
 | `scripts/bench-writes.py` and the durable-commit harness | The synthetic data | Sparkles and Oxigraph, the churn on all five | Published |
 | `scripts/bench-regressions.py` | Store copies | One Sparkles binary against another | One record, `docs/benchmarks/2026-10-04-regressions.json` |
-| `scripts/nsc-bench.sh`, run by `bench:remote` | The synthetic data | Two Sparkles builds on a Boat worker | Not published; A/B only |
+| `scripts/nsc-bench.sh`, run by `bench:remote --executor boat:bx_ID` | The synthetic data | Two Sparkles builds on a Boat worker | Not published; A/B only |
 | `mise run bench:reasoner`, `bench:shacl`, `bench:bindings`, `bench:backup` | Generated | Sparkles; Jena, pyoxigraph and others in the bindings run | Published |
 
 Each harness writes its own result files (`results/*.json` from hyperfine and the
@@ -423,7 +423,7 @@ A *head* is the commit at which a refresh starts. A refresh has three levels.
 
 | Level | When | What | Where |
 |---|---|---|---|
-| A/B | A change that touches the executor, the store or the writer | `bench:remote` against the change's base, plus `bench-regressions.py` on forge for cold paths | A Boat worker, forge |
+| A/B | A change that touches the executor, the store or the writer | `bench:remote --executor boat:bx_ID` against the change's base, plus `bench-regressions.py` on forge for cold paths | A Boat worker, forge |
 | Standard | Every two weeks, and before BENCHMARKS.md is edited | The synthetic suite (all modes), WatDiv, full-text, BSBM, SP²Bench, LUBM(100), the GeoSPARQL comparison and vectors | forge |
 | Full | Every quarter, and when a roadmap item from Tier 2 or 3 lands | Everything, including DBpedia full, Wikidata, LDBC SF10, LUBM(1000), OWL2Bench and the four-hour write runs | forge and the large host |
 

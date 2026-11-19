@@ -409,7 +409,7 @@ Other gates:
    68.5 ms and `export-1m` at or below 1,239 ms, cold.
 3. No cold query that Sparkles wins today becomes more than 5% slower.
 4. Warm: the 28-query suite at 1.05M and 10.5M within 5% per query on the median
-   (`bench:remote` on a Boat worker for the screen, forge for the result).
+   (`bench:remote --executor boat:bx_ID` for the screen, forge for the result).
 5. Index size and load time within 5% at 10.5M and on DBpedia (Phase 3).
 
 A competitor's cold figures are re-measured in the same refresh (X06 §8), so the targets
