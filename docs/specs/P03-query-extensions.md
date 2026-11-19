@@ -415,7 +415,7 @@ still renames the query's blank nodes to variables whose prefix no SPARQL variab
 can have, so that one blank node keeps one binding across the algebra nodes of a group,
 and list extraction reads such a variable as the blank node it replaced. A review found
 that the OWL 2 QL rewrite reads the ontology without the registry in the same way, and
-roadmap item 1202 covers it. A reasoning seed set that would read through a call falls back to
+roadmap item 1205 covers it. A reasoning seed set that would read through a call falls back to
 the pattern's demand with constants. The configuration is still decided on the pattern
 as written, which the rewrite no longer extends, so the order of the two steps did not
 change. An error replaces the panic in `CallbackGuard::enter`, the planner refuses a

@@ -9231,7 +9231,7 @@ registered property function, which runs only in the query itself, so a pattern 
 seeds would need one is derived with its constants alone. The plan of the executed query
 names this fallback as `constants (a registered call binds the seeds)`. The OWL 2 QL
 rewrite does not tell registered properties apart from ontology properties, which
-roadmap item 1202 covers. The demand (magic sets)
+roadmap item 1205 covers. The demand (magic sets)
 transformation rewrites the rules for each demand, so that only the facts that can reach
 its answers are derived. LUBM query 1 at 100 universities under OWL 2 RL derives no facts
 beyond the schema, where a materialization derives 10.9 million.
