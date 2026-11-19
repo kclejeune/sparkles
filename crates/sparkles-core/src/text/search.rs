@@ -200,10 +200,8 @@ const PAGE: usize = 4096;
 /// a term's key is decoded into is Tantivy's, outside this count (row 1156).
 const PAGE_HIT_BYTES: u64 = 192;
 
-/// The literals a reader's highlighting remembers at most, and what that map holds.
+/// The literals a reader's highlighting remembers at most.
 const HIGHLIGHT_DONE: usize = PAGE;
-const HIGHLIGHT_DONE_BYTES: u64 = (HIGHLIGHT_DONE * 8 / 7).next_power_of_two() as u64
-    * (std::mem::size_of::<(Id, Id)>() as u64 + 1);
 
 /// The bytes a hit list keeps per hit, a score and a document address.
 const HIT_BYTES: u64 = std::mem::size_of::<(Score, DocAddress)>() as u64;
@@ -275,10 +273,14 @@ impl Reader {
         ctx.check_output_rows(total as usize)?;
         let mut page = (total as usize).min(PAGE) as u64 * PAGE_HIT_BYTES;
         if spec.highlight.is_some() {
-            page += HIGHLIGHT_DONE_BYTES;
+            // the map of the literals highlighted, which never holds more than the hits
+            page += map_bytes(
+                (total as usize).min(HIGHLIGHT_DONE),
+                std::mem::size_of::<(Id, Id)>(),
+            );
         }
         let seen = if spec.dedup {
-            seen_bytes(total as usize)
+            map_bytes(total as usize, std::mem::size_of::<(Id, Id, Id)>())
         } else {
             0
         };
@@ -399,8 +401,9 @@ impl Drop for Reader {
     }
 }
 
-/// The bytes of a set of `n` triples reserved at once, as `hashbrown` allocates it.
-fn seen_bytes(n: usize) -> u64 {
+/// The bytes of a hash table of `n` entries of `entry` bytes reserved at once, as
+/// `hashbrown` allocates it.
+fn map_bytes(n: usize, entry: usize) -> u64 {
     if n == 0 {
         return 0;
     }
@@ -411,8 +414,7 @@ fn seen_bytes(n: usize) -> u64 {
     } else {
         (n.saturating_mul(8) / 7).next_power_of_two()
     };
-    let entry = std::mem::size_of::<(Id, Id, Id)>() + 1;
-    (buckets * entry + 16) as u64
+    (buckets * (entry + 1) + 16) as u64
 }
 
 /// Counts the hits of each segment, without scoring them.
@@ -672,15 +674,21 @@ impl Collector for AllHits {
         &self,
         fruits: Vec<(SegmentOrdinal, u64, Vec<(Score, DocAddress)>)>,
     ) -> tantivy::Result<Self::Fruit> {
+        // a segment that one pass reports and the other does not has no hits
         let agreed = self.reserve.as_ref().is_none_or(|counts| {
-            let mut seen = vec![0u64; counts.len()];
-            fruits.iter().all(|(seg, n, _)| {
-                let at = *seg as usize;
-                at < counts.len() && {
-                    seen[at] += n;
-                    true
-                }
-            }) && seen == *counts
+            let len = fruits
+                .iter()
+                .map(|(seg, _, _)| *seg as usize + 1)
+                .max()
+                .unwrap_or(0)
+                .max(counts.len());
+            let mut seen = vec![0u64; len];
+            for (seg, n, _) in &fruits {
+                seen[*seg as usize] += n;
+            }
+            seen.iter()
+                .enumerate()
+                .all(|(i, &n)| n == counts.get(i).copied().unwrap_or(0))
         });
         let total = fruits.iter().map(|(_, n, _)| n).sum();
         let mut hits = Vec::with_capacity(fruits.iter().map(|(_, _, h)| h.len()).sum());
@@ -1264,6 +1272,19 @@ mod tests {
         assert!(!agreed(vec![fruit(0, 1), fruit(1, 1)]));
         assert!(!agreed(vec![fruit(0, 2)]));
         assert!(!agreed(vec![fruit(0, 2), fruit(1, 1), fruit(2, 1)]));
+        // segments in any order, and an empty segment only one pass reports
+        assert!(agreed(vec![fruit(1, 1), fruit(0, 2)]));
+        assert!(agreed(vec![fruit(0, 2), fruit(1, 1), fruit(2, 0)]));
+        let short = AllHits {
+            cap: 10,
+            reserve: Some(vec![2]),
+        };
+        assert!(
+            short
+                .merge_fruits(vec![fruit(1, 0), fruit(0, 2)])
+                .unwrap()
+                .2
+        );
         let plain = AllHits {
             cap: 10,
             reserve: None,

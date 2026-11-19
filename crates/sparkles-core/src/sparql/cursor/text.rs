@@ -80,8 +80,15 @@ impl Text {
         let Some((reader, _)) = &mut self.reader else {
             return Ok(None);
         };
-        // the hits left bound the batch, and none left ends the answer before a batch
-        let rows = cap.min(reader.remaining());
+        // the hits left bound the batch, and none left ends the answer before a batch;
+        // the batch, with its own overhead, fits in half of what the hit list leaves of
+        // the budget, so that an operator above may hold a copy of it
+        let width = self.node.vars.len().max(1);
+        let overhead = (width * 40 + 128).div_ceil(width * 8);
+        let fit = (ctx.rows_within_budget(width) / 2)
+            .saturating_sub(overhead)
+            .max(1);
+        let rows = cap.min(reader.remaining()).min(fit);
         if rows == 0 {
             self.reader = None;
             return Ok(None);

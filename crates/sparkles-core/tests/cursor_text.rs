@@ -332,3 +332,34 @@ fn a_search_that_matches_nothing_ends() {
     let (answer, sizes, _) = streamed(&snap, q, &opts(), &strict(3)).unwrap();
     assert!(answer.is_empty() && sizes.is_empty());
 }
+
+/// A highlighted search with no hits charges no map for highlighting.
+#[test]
+fn a_highlighted_search_without_hits_needs_no_map() {
+    let s = store(10, TextConfig::default());
+    let snap = s.snapshot();
+    let q = "SELECT ?s ?lit { (?s ?sc ?lit) text:query (rdfs:label \"wolf* AND fox\" \"highlight:s:<b> | e:</b>\") }";
+    let small = QueryOptions {
+        max_memory_bytes: Some(24 << 10),
+        ..opts()
+    };
+    assert!(eager(&snap, q, &small).unwrap().is_empty());
+    let (answer, sizes, _) = streamed(&snap, q, &small, &strict(4096)).unwrap();
+    assert!(answer.is_empty() && sizes.is_empty());
+}
+
+/// The first batch fits in what the charged hit list leaves of the budget, rather than
+/// in what the budget held before the search ran.
+#[test]
+fn the_first_batch_fits_beside_the_hit_list() {
+    let s = store(2500, TextConfig::default());
+    let snap = s.snapshot();
+    let q = "SELECT ?s ?sc ?lit { (?s ?sc ?lit) text:query (rdfs:label \"fox\") }";
+    let budget = QueryOptions {
+        max_memory_bytes: Some(1100 << 10),
+        ..opts()
+    };
+    let (answer, sizes, _) = streamed(&snap, q, &budget, &strict(4096)).unwrap();
+    assert_eq!(answer, eager(&snap, q, &opts()).unwrap());
+    assert!(sizes[0] < 2500, "{sizes:?}");
+}
