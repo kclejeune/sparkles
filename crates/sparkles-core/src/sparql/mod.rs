@@ -8,6 +8,7 @@ pub mod arqpf;
 pub mod cache;
 pub mod catalog;
 pub mod cdt;
+mod charged;
 pub mod charsets;
 mod constkeys;
 pub mod ctx;

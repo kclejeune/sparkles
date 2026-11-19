@@ -1,0 +1,477 @@
+//! Buffers whose memory charge is their allocation (item 1183).
+//!
+//! A [`Charged`] owns one growable collection and the charge for it. It grows in one
+//! place, [`Charged::grow`], which admits the old allocation and the new one together
+//! before it allocates, since both are live while the entries move, and then sets the
+//! charge to the size the collection reports. Its size is read from the collection, a
+//! vector's capacity or a hash table's allocation, and never from a formula. The charge
+//! is lowered only after the storage is freed, by [`Charged::shrink`] or [`Charged::clear_free`],
+//! and on drop, where the collection is declared before the charge and so freed first.
+//!
+//! The collection is reachable through `Deref` and through the mutators this module
+//! names, never through a `&mut` to the collection, so no caller has a second growth
+//! site. A mutator that adds entries asserts in debug builds that room was made for them
+//! first, and every growth checks in debug builds that the charge equals the size.
+//!
+//! A query without a budget or a grant pays for the charge only when a collection
+//! grows, which a doubling vector does a logarithmic number of times. Operators reserve
+//! the room for a batch at once, so the per-row path is a plain insert.
+
+// Operators move onto these buffers under item 1183, so some helpers have no caller yet.
+#![allow(dead_code)]
+
+use crate::error::{Error, Result};
+use crate::sparql::ctx::{OwnedCharge, RetainedCharge};
+use std::ops::Deref;
+
+/// The account a [`Charged`] holds its bytes on. An operator keeps the account type it
+/// already uses, so moving it onto charged buffers does not move it between accounts.
+pub(super) trait Account {
+    /// Set the account's bytes, admitting growth before the caller allocates it. A
+    /// refusal changes nothing.
+    fn resize(&mut self, bytes: u64) -> Result<()>;
+}
+
+impl Account for RetainedCharge {
+    fn resize(&mut self, bytes: u64) -> Result<()> {
+        RetainedCharge::resize(self, bytes)
+    }
+}
+
+impl Account for OwnedCharge {
+    fn resize(&mut self, bytes: u64) -> Result<()> {
+        OwnedCharge::resize(self, bytes)
+    }
+}
+
+/// An eager context with no cursor owner makes no retained charge, and a buffer on it
+/// is uncharged.
+impl Account for Option<RetainedCharge> {
+    fn resize(&mut self, bytes: u64) -> Result<()> {
+        match self {
+            Some(charge) => charge.resize(bytes),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A collection whose allocated bytes can be read from the collection itself.
+pub(super) trait Storage {
+    fn heap_bytes(&self) -> u64;
+}
+
+impl<T> Storage for Vec<T> {
+    #[inline]
+    fn heap_bytes(&self) -> u64 {
+        (self.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64)
+    }
+}
+
+impl<T> Storage for hashbrown::HashTable<T> {
+    #[inline]
+    fn heap_bytes(&self) -> u64 {
+        self.allocation_size() as u64
+    }
+}
+
+impl<T: Eq + std::hash::Hash, S: std::hash::BuildHasher> Storage for hashbrown::HashSet<T, S> {
+    #[inline]
+    fn heap_bytes(&self) -> u64 {
+        self.allocation_size() as u64
+    }
+}
+
+/// The fewest entries a charged vector allocates when it grows.
+const MIN: usize = 16;
+
+fn no_room() -> Error {
+    Error::invalid("a query operator could not allocate its state")
+}
+
+/// A collection and the charge for its allocation. See the module.
+pub(super) struct Charged<V: Storage, A: Account> {
+    /// Declared before the account, so that it is freed before the charge is released.
+    value: V,
+    /// The bytes this buffer has set on the account, which equal the collection's.
+    charged: u64,
+    account: A,
+}
+
+impl<V: Storage, A: Account> Deref for Charged<V, A> {
+    type Target = V;
+    #[inline]
+    fn deref(&self) -> &V {
+        &self.value
+    }
+}
+
+impl<V: Storage, A: Account> Charged<V, A> {
+    /// A buffer over `value` that charges `account`, which holds no bytes yet. The
+    /// value's existing allocation is admitted before it is kept.
+    pub(super) fn new(value: V, mut account: A) -> Result<Self> {
+        let charged = value.heap_bytes();
+        account.resize(charged)?;
+        Ok(Self {
+            value,
+            charged,
+            account,
+        })
+    }
+
+    /// The bytes the buffer charges, which are its collection's allocation.
+    #[inline]
+    pub(super) fn bytes(&self) -> u64 {
+        self.charged
+    }
+
+    #[inline]
+    fn check(&self) {
+        debug_assert_eq!(
+            self.charged,
+            self.value.heap_bytes(),
+            "a charged buffer's charge is its allocation"
+        );
+    }
+
+    /// The one growth site. `grown` is the size of the allocation that `f` makes, or an
+    /// upper bound on it, which is admitted beside the old allocation before `f` runs.
+    /// Afterwards the charge is set to what the collection reports, whether `f` failed
+    /// or not. A refused admission leaves the buffer as it was.
+    #[cold]
+    pub(super) fn grow<E>(
+        &mut self,
+        grown: u64,
+        f: impl FnOnce(&mut V) -> std::result::Result<(), E>,
+    ) -> Result<()> {
+        self.check();
+        let old = self.charged;
+        self.account.resize(old.saturating_add(grown))?;
+        let done = f(&mut self.value);
+        let now = self.value.heap_bytes();
+        debug_assert!(
+            now <= grown.max(old),
+            "a grown allocation of {now} bytes above the {grown} admitted"
+        );
+        self.settle(now)?;
+        done.map_err(|_| no_room())
+    }
+
+    /// Set the charge to the collection's size, after the collection freed or grew. A
+    /// size that rose past what was admitted is charged here, so a release build that
+    /// misses a debug assertion still charges what it holds.
+    fn settle(&mut self, now: u64) -> Result<()> {
+        let result = self.account.resize(now);
+        if result.is_ok() {
+            self.charged = now;
+        }
+        result
+    }
+
+    /// Run `f`, which frees storage and does not grow it, then lower the charge to what
+    /// the collection holds.
+    pub(super) fn shrink(&mut self, f: impl FnOnce(&mut V)) -> Result<()> {
+        f(&mut self.value);
+        let now = self.value.heap_bytes();
+        debug_assert!(now <= self.charged, "a shrink grew the allocation");
+        self.settle(now)
+    }
+
+    /// Run `f`, which neither grows nor frees the allocation, such as an in-place
+    /// edit of entries that are already there.
+    #[inline]
+    pub(super) fn edit<R>(&mut self, f: impl FnOnce(&mut V) -> R) -> R {
+        let r = f(&mut self.value);
+        self.check();
+        r
+    }
+
+    /// Free the allocation and release its charge.
+    pub(super) fn clear_free(&mut self) -> Result<()>
+    where
+        V: Default,
+    {
+        self.shrink(|v| *v = V::default())
+    }
+
+    /// The collection and the account with its charge, for a caller that moves the
+    /// allocation elsewhere, such as into an output batch, and takes over the charge.
+    pub(super) fn into_parts(self) -> (V, A, u64) {
+        (self.value, self.account, self.charged)
+    }
+}
+
+impl<T, A: Account> Charged<Vec<T>, A> {
+    /// Room for `more` entries beyond the length. The vector doubles where the budget
+    /// allows it and grows to exactly what it needs where it does not.
+    #[inline]
+    pub(super) fn reserve(&mut self, more: usize) -> Result<()> {
+        if self.value.capacity() - self.value.len() >= more {
+            return Ok(());
+        }
+        self.reserve_slow(more)
+    }
+
+    #[cold]
+    fn reserve_slow(&mut self, more: usize) -> Result<()> {
+        let len = self.value.len();
+        let need = len.checked_add(more).ok_or_else(no_room)?;
+        let size = |to: usize| (to as u64).saturating_mul(std::mem::size_of::<T>() as u64);
+        let doubled = need.max(self.value.capacity().saturating_mul(2)).max(MIN);
+        match self.grow(size(doubled), |v| v.try_reserve_exact(doubled - len)) {
+            Err(Error::BudgetExceeded(_)) if doubled > need => {
+                self.grow(size(need), |v| v.try_reserve_exact(need - len))
+            }
+            r => r,
+        }
+    }
+
+    /// Add an entry to room that [`Self::reserve`] made.
+    #[inline]
+    pub(super) fn push_reserved(&mut self, item: T) {
+        debug_assert!(
+            self.value.len() < self.value.capacity(),
+            "a push without room"
+        );
+        self.value.push(item);
+    }
+
+    /// Add an entry, growing the vector first when it is full.
+    #[inline]
+    pub(super) fn push(&mut self, item: T) -> Result<()> {
+        self.reserve(1)?;
+        self.value.push(item);
+        Ok(())
+    }
+
+    /// Add `items`, growing the vector first when they do not fit.
+    #[inline]
+    pub(super) fn extend_from_slice(&mut self, items: &[T]) -> Result<()>
+    where
+        T: Clone,
+    {
+        self.reserve(items.len())?;
+        self.value.extend_from_slice(items);
+        Ok(())
+    }
+
+    /// Drop the entries and keep the allocation.
+    #[inline]
+    pub(super) fn clear(&mut self) {
+        self.value.clear();
+    }
+
+    /// Keep the first `len` entries and the allocation.
+    #[inline]
+    pub(super) fn truncate(&mut self, len: usize) {
+        self.value.truncate(len);
+    }
+
+    #[inline]
+    pub(super) fn as_mut_slice(&mut self) -> &mut [T] {
+        self.value.as_mut_slice()
+    }
+}
+
+/// The bound on what a hashbrown table of `len` entries and room for `capacity` makes
+/// when it is asked for `more` entries: room for the larger of what it needs and one
+/// more than it has, which doubles its buckets.
+fn table_growth<T>(len: usize, capacity: usize, more: usize) -> u64 {
+    let target = len.saturating_add(more).max(capacity.saturating_add(1));
+    table_bound(target, std::mem::size_of::<T>())
+}
+
+impl<T, A: Account> Charged<hashbrown::HashTable<T>, A> {
+    /// Room for `more` entries beyond the length. The bound of the table's new
+    /// allocation is admitted before it allocates, since hashbrown reports its size only
+    /// after, and the charge is then set from that size.
+    #[inline]
+    pub(super) fn reserve(&mut self, more: usize, hasher: impl Fn(&T) -> u64) -> Result<()> {
+        if self.value.capacity() - self.value.len() >= more {
+            return Ok(());
+        }
+        let grown = table_growth::<T>(self.value.len(), self.value.capacity(), more);
+        self.grow(grown, |t| t.try_reserve(more, hasher))
+    }
+
+    /// Add an entry to room that [`Self::reserve`] made.
+    #[inline]
+    pub(super) fn insert_reserved(&mut self, hash: u64, value: T, hasher: impl Fn(&T) -> u64) {
+        debug_assert!(
+            self.value.len() < self.value.capacity(),
+            "an insert without room"
+        );
+        self.value.insert_unique(hash, value, hasher);
+    }
+
+    /// Drop the entries and keep the allocation.
+    #[inline]
+    pub(super) fn clear(&mut self) {
+        self.value.clear();
+    }
+}
+
+impl<T: Eq + std::hash::Hash, S: std::hash::BuildHasher, A: Account>
+    Charged<hashbrown::HashSet<T, S>, A>
+{
+    /// Room for `more` entries beyond the length, admitted as for a table.
+    #[inline]
+    pub(super) fn reserve(&mut self, more: usize) -> Result<()> {
+        if self.value.capacity() - self.value.len() >= more {
+            return Ok(());
+        }
+        let grown = table_growth::<T>(self.value.len(), self.value.capacity(), more);
+        self.grow(grown, |s| s.try_reserve(more))
+    }
+
+    /// Add an entry to room that [`Self::reserve`] made. Returns whether it was new.
+    #[inline]
+    pub(super) fn insert_reserved(&mut self, value: T) -> bool {
+        debug_assert!(
+            self.value.len() < self.value.capacity(),
+            "an insert without room"
+        );
+        self.value.insert(value)
+    }
+
+    /// Drop the entries and keep the allocation.
+    #[inline]
+    pub(super) fn clear(&mut self) {
+        self.value.clear();
+    }
+}
+
+/// The bytes a hashbrown table of entries of `entry` bytes allocates once it has room
+/// for `capacity` of them, or more. It is the bound a caller admits before the table
+/// grows, and the charge is then set from the table's own size.
+pub(super) fn table_bound(capacity: usize, entry: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 {
+        if capacity < 4 { 4 } else { 8 }
+    } else {
+        (capacity.saturating_mul(8) / 7).next_power_of_two()
+    };
+    // a bucket of `entry` bytes and one control byte, a control group of 16 bytes
+    // beyond the buckets, and the alignment of the entries before the control bytes
+    (buckets as u64)
+        .saturating_mul(entry as u64 + 1)
+        .saturating_add(16 + 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sparql::ctx::Ctx;
+    use crate::store::{Store, StoreOptions};
+    use std::sync::Arc;
+
+    fn context(limit: u64) -> Arc<Ctx> {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = limit;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        ctx
+    }
+
+    #[test]
+    fn a_vector_charges_its_capacity_and_releases_it_on_drop() {
+        let ctx = context(1 << 20);
+        let base = ctx.live_bytes();
+        let mut v = Charged::new(Vec::<u64>::new(), ctx.retained_charge(0).unwrap()).unwrap();
+        for i in 0..1000 {
+            v.push(i).unwrap();
+            assert_eq!(ctx.live_bytes() - base, v.capacity() as u64 * 8);
+            assert_eq!(v.bytes(), v.capacity() as u64 * 8);
+        }
+        // the old and the new storage were admitted together when it last doubled
+        assert!(ctx.mem_peak() - base >= (v.capacity() + v.capacity() / 2) as u64 * 8);
+        v.shrink(|v| v.shrink_to_fit()).unwrap();
+        assert_eq!(ctx.live_bytes() - base, v.capacity() as u64 * 8);
+        drop(v);
+        assert_eq!(ctx.live_bytes(), base);
+    }
+
+    #[test]
+    fn a_refused_growth_leaves_the_buffer_and_its_charge_as_they_were() {
+        let ctx = context(64 << 10);
+        let base = ctx.live_bytes();
+        let mut v = Charged::new(Vec::<u64>::new(), ctx.retained_charge(0).unwrap()).unwrap();
+        let mut refused = false;
+        for i in 0..100_000 {
+            let (len, cap) = (v.len(), v.capacity());
+            match v.push(i) {
+                Ok(()) => {}
+                Err(Error::BudgetExceeded(_)) => {
+                    assert_eq!((v.len(), v.capacity()), (len, cap));
+                    assert_eq!(ctx.live_bytes() - base, cap as u64 * 8);
+                    refused = true;
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(refused);
+        // a doubling that is refused falls back to the exact need, so the vector is
+        // full when the budget refuses it
+        assert_eq!(v.len(), v.capacity());
+        drop(v);
+        assert_eq!(ctx.live_bytes(), base);
+    }
+
+    #[test]
+    fn hash_tables_charge_their_allocation() {
+        let ctx = context(1 << 24);
+        let base = ctx.live_bytes();
+        let hash = |x: &u64| x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut t = Charged::new(
+            hashbrown::HashTable::<u64>::new(),
+            ctx.retained_charge(0).unwrap(),
+        )
+        .unwrap();
+        let mut s = Charged::new(
+            hashbrown::HashSet::<u64, rustc_hash::FxBuildHasher>::default(),
+            ctx.retained_charge(0).unwrap(),
+        )
+        .unwrap();
+        for batch in 0..40u64 {
+            t.reserve(100, hash).unwrap();
+            s.reserve(100).unwrap();
+            for i in batch * 100..batch * 100 + 100 {
+                t.insert_reserved(hash(&i), i, hash);
+                assert!(s.insert_reserved(i));
+            }
+            assert_eq!(
+                ctx.live_bytes() - base,
+                (t.allocation_size() + s.allocation_size()) as u64
+            );
+        }
+        t.clear();
+        s.clear_free().unwrap();
+        assert_eq!(ctx.live_bytes() - base, t.allocation_size() as u64);
+        drop(t);
+        drop(s);
+        assert_eq!(ctx.live_bytes(), base);
+    }
+
+    #[test]
+    fn the_bound_covers_every_table_size() {
+        for cap in 0..5000 {
+            let mut t = hashbrown::HashTable::<u32>::new();
+            t.reserve(cap, |&x| x as u64);
+            assert!(t.allocation_size() as u64 <= table_bound(cap, 4), "{cap}");
+            let mut t = hashbrown::HashTable::<[u64; 3]>::new();
+            t.reserve(cap, |x| x[0]);
+            assert!(t.allocation_size() as u64 <= table_bound(cap, 24), "{cap}");
+        }
+    }
+
+    #[test]
+    fn an_uncharged_buffer_grows_without_an_account() {
+        let mut v = Charged::new(Vec::<u8>::new(), None::<RetainedCharge>).unwrap();
+        v.extend_from_slice(&[1; 100]).unwrap();
+        assert_eq!(v.bytes(), v.capacity() as u64);
+    }
+}
