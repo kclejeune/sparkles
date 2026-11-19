@@ -29,6 +29,8 @@
 set -uo pipefail
 umask 022
 G=$HOME/gate
+# The run's TMPDIR, set only once this start has created it.
+tmpd=
 out=$G/out/$NAME
 wt=$G/wt-$NAME
 log() { echo "$(date -u +%FT%TZ) $*" >> "$out/progress.log"; }

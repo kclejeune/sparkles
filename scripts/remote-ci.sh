@@ -160,7 +160,7 @@ fetch() {
   # One publication of a name at a time, so two fetches never both migrate an older copy.
   # Without the lock the name keeps its earlier copy, and the new copy stays at res.
   local fd='' linked=0
-  if ! exec {fd}>> "$base/.lock-$1"; then
+  if ! command exec {fd}>> "$base/.lock-$1"; then
     fd=
     echo "remote-ci.sh: could not open the publication lock of $1" >&2
   elif ! flock -w 60 "$fd"; then

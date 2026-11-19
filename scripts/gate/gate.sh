@@ -227,19 +227,21 @@ if [ $mode = hosts ]; then
     room=
     if [ "$l" != unreachable ]; then
       case $d in '' | *[!0-9]*) room='unknown-disk' ;; *)
-        # Each role is compared with its own admission floor and selection threshold.
+        # Each role is compared with its own admission floor and selection threshold, and
+        # the conformance half is shown only when it differs from the whole gate.
         if [ "$d" -ge "$need_ci" ]; then
           room='room-for-whole'
-        elif [ "$d" -ge "$need_conf" ]; then
-          room='room-for-half'
-          [ "$d" -lt "$min_whole" ] || room="whole-after-gc $room"
         elif [ "$d" -ge "$min_whole" ]; then
           room='whole-after-gc'
-        elif [ "$d" -ge "$min_half" ]; then
-          room='half-after-gc'
         else
-          room='below-selection'
+          room=
         fi
+        if [ "$d" -ge "$need_conf" ]; then
+          [ "$room" = room-for-whole ] || room="${room:+$room }room-for-half"
+        elif [ "$d" -ge "$min_half" ]; then
+          [ "$room" = whole-after-gc ] || room="${room:+$room }half-after-gc"
+        fi
+        [ -n "$room" ] || room='below-selection'
         ;;
       esac
     fi

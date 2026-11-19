@@ -647,6 +647,11 @@ cat "$dest/gate.exit"
         self.assertIn('h1     free 0 150 room-for-whole', lines); self.assertIn('h2     held 1 60 whole-after-gc room-for-half', lines)
         self.assertIn('h3     free 0 20 half-after-gc', lines); self.assertIn('h4     unreachable', lines)
         self.assertIn('h5     free 0 30 room-for-half', lines)
+        # With the floors the other way round, the conformance half's need still shows.
+        r = subprocess.run(['bash', str(src / 'scripts/gate/gate.sh'), '--hosts'], cwd=src, capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, SPARKLES_GATE_CONFIG=str(self.t / 'none'), SPARKLES_BENCH_HOST='forge', GATE_HOSTS='h1',
+                                    GATE_NEED_CI_GB='25', GATE_NEED_CONF_GB='110', FAKE_PROBE_h1='free 0 60'))
+        self.assertIn('h1     free 0 60 room-for-whole half-after-gc', r.stdout.splitlines(), r.stdout + r.stderr)
         r = subprocess.run(['bash', str(src / 'scripts/gate/gate.sh'), '--hosts'], cwd=src, capture_output=True, text=True, timeout=60,
                            env=dict(self.env, SPARKLES_GATE_CONFIG=str(self.t / 'none'), GATE_NEED_CI_GB='x'))
         self.assertEqual(r.returncode, 2); self.assertIn('bad GATE_NEED_CI_GB', r.stderr)
