@@ -794,5 +794,43 @@ fn an_exists_over_an_in_process_call_keeps_the_strict_policy() {
             expected,
             "{filter}"
         );
+        assert_eq!(auto(&snap, &q, &o), expected, "{filter}");
+    }
+    // automatic admission under the default policy answers the nested form too
+    let nested = format!(
+        "SELECT ?x {{ SERVICE <http://local/sparql> {{ ?x <urn:p> ?o SERVICE SILENT <{}> {{ ?x ?q ?r }} }} }}",
+        failing.url
+    );
+    assert_eq!(auto(&snap, &nested, &o), eager(&snap, &nested, &o).unwrap());
+}
+
+/// The rows of a query under automatic admission and the default cursor policy.
+fn auto(snap: &Arc<Snapshot>, q: &str, o: &QueryOptions) -> Vec<Vec<Option<Term>>> {
+    match query_execution(
+        snap.clone(),
+        q,
+        o,
+        &CursorOptions::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap()
+    {
+        QueryExecution::Select(mut c) => {
+            let mut out = Vec::new();
+            while let Some(b) = c.next_batch().unwrap() {
+                for r in 0..b.len() {
+                    out.push(b.row(r).unwrap().values().to_vec());
+                }
+            }
+            out
+        }
+        QueryExecution::Eager(r) => r
+            .into_result()
+            .rows()
+            .unwrap()
+            .iter()
+            .map(|r| r.values().to_vec())
+            .collect(),
+        _ => unreachable!("a SELECT"),
     }
 }
