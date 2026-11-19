@@ -5,7 +5,8 @@
 # (scripts/boat/disk_clean.py) never takes its worktree while the unit is active.
 #
 # The unit's environment names the job: NAME, FULL (the commit), BASE (the base commit for
-# ci), MODE (ci or premerge) and END (Unix seconds by which the job has ended). It holds
+# ci), MODE (ci, premerge or cmd), CMD_B64 (the base64 of a cmd job's command) and END (Unix
+# seconds by which the job has ended). It holds
 # ~/gate/.lock, the host's heavy lock, while it builds, so one heavy job runs at a time and
 # others wait in their own units.
 #
@@ -140,6 +141,17 @@ left=$(until_end 60)
 case $MODE in
   ci) run=(scripts/ci.sh --fast --changed "$BASE") ;;
   premerge) run=(scripts/premerge.sh) ;;
+  cmd)
+    # A lane's command runs with the commit's pinned compiler and the tools of its
+    # mise.toml, and its log names both, so it matches a local run of the same command.
+    cmd=$(printf '%s' "${CMD_B64:-}" | base64 -d) || finish 2
+    [ -n "$cmd" ] || finish 2
+    tc=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml 2> /dev/null | head -n 1)
+    [ -z "$tc" ] || export RUSTUP_TOOLCHAIN=$tc
+    # shellcheck disable=SC2016
+    run=(mise exec -- bash -c 'echo "remote-ci: $1"; echo "remote-ci: RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-unset}"; echo "remote-ci: $(rustc --version 2>&1)"; echo "remote-ci: $(mbx --version 2>&1)"; exec bash -c "$1"' remote-ci "$cmd")
+    log "running $cmd with ${RUSTUP_TOOLCHAIN:-the default toolchain}"
+    ;;
   *) finish 2 ;;
 esac
 export TMPDIR=$wt/.artifacts/tmp

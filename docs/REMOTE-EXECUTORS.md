@@ -311,7 +311,10 @@ and the default adds 25% to that. The build cache does not help a second run on 
 worker, because the test build stores about 48 GiB, more than the store's 40 GiB budget, so
 a rerun of the same commit measured 3 hits in 343 lookups and grew the disk by 65.7 GiB. The worker's disk timer stops any running job at 95% use, which is a recovery rather
 than a guarantee, since it checks once a minute and a build can fill the disk sooner. A job on an ssh host may run 6
-hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
+hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. `--cmd`
+runs one command in place of `ci.sh` under the same bounds, with the commit's pinned
+compiler, and `--worktree` checks the working tree instead of a commit, which
+`mise run check:remote` combines. Results
 land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
 
 ## Source, results and cleanup

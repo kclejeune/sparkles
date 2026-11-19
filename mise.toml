@@ -573,6 +573,16 @@ run = 'scripts/ci.sh --jobs "$usage_jobs" ${usage_exhaustive_features:+--exhaust
 description = "The quick CI subset for iterating: formatting, cited doc paths, Clippy on the workspace and the Rust tests"
 run = "scripts/ci.sh --fast"
 
+[tasks."check:remote"]
+description = "Run one targeted command, such as `mbx check` or `mbx nextest run -p X --test Y`, on a remote host in a full copy of this working tree, and print its log and exit with its code (scripts/remote-ci.sh --cmd)"
+usage = '''
+flag "--host <host>" help="an ssh host such as wally, atlas or forge, or boat:bx_ID (default SPARKLES_REMOTE_CI_HOST)"
+flag "--commit" help="check HEAD as committed instead of the working tree"
+flag "--no-wait" help="start the job and return; scripts/remote-ci.sh --status and --fetch follow it"
+arg "<command>" help="the command, run with bash -c in the checkout"
+'''
+run = 'scripts/remote-ci.sh ${usage_host:+--host "$usage_host"} $([ "${usage_commit:-false}" = true ] || echo --worktree) ${usage_no_wait:+--no-wait} --cmd "$usage_command"'
+
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
 # in the root target directory, so it reuses the workspace's compiled dependencies.

@@ -49,6 +49,7 @@ echo "fake 2000000000 1 $k 1% /"
 
 # mbx gc records its gc.min_free_size and frees what ~/df-after-gc says.
 FAKE_MBX = r'''#!/bin/sh
+[ "$1" != --version ] || { echo "mbx 0.0.1"; exit 0; }
 echo "mbx $* min_free=${MBX_GC_MIN_FREE_SIZE:-unset}" >> "$FAKE_LOG"
 [ ! -f "$HOME/df-after-gc" ] || cp "$HOME/df-after-gc" "$HOME/df-kib"
 '''
@@ -76,6 +77,8 @@ class RemoteCI(unittest.TestCase):
         # With ~/ci-fills-disk the build leaves 1000 KiB free and keeps running.
         (src / 'scripts/ci.sh').write_text('#!/usr/bin/env bash\necho "ci $*"; echo "tmpdir $TMPDIR"; mkdir -p .artifacts/ci/logs; echo log > .artifacts/ci/logs/test.log\n'
                                            'if [ -f "$HOME/ci-fills-disk" ]; then echo 1000 > "$HOME/df-kib"; sleep 60; echo "survived the watch"; fi\nexit "${FAKE_CI_EXIT:-0}"\n')
+        (src / '.gitignore').write_text('.artifacts/\n')
+        (src / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.2.3"\n')
         (src / 'scripts/premerge.sh').write_text('#!/usr/bin/env bash\necho premerge; mkdir -p .artifacts/premerge; echo ok > .artifacts/premerge/doc-paths.log\n')
         for f in ['ci.sh', 'premerge.sh', 'remote-ci.sh']:
             (src / 'scripts' / f).chmod(0o755)
@@ -94,7 +97,9 @@ class RemoteCI(unittest.TestCase):
         fake = t / 'bin'; fake.mkdir()
         (fake / 'systemd-run').write_text(FAKE_SYSTEMD_RUN)
         (fake / 'systemctl').write_text('#!/bin/sh\necho "systemctl $*" >> "$FAKE_LOG"\n[ "$2" = is-active ] && { echo inactive; exit 3; }\n[ "$2" = show ] && echo "${FAKE_STATE-inactive}"\nexit 0\n')
-        (fake / 'mise').write_text('#!/bin/sh\nexit 0\n')
+        # mise exec runs its command, and every other mise command does nothing.
+        (fake / 'mise').write_text('#!/bin/sh\nif [ "$1" = exec ]; then shift; [ "$1" != -- ] || shift; exec "$@"; fi\nexit 0\n')
+        (fake / 'rustc').write_text('#!/bin/sh\necho "rustc ${RUSTUP_TOOLCHAIN:-default} (fake)"\n')
         (fake / 'df').write_text(FAKE_DF); (fake / 'mbx').write_text(FAKE_MBX)
         (fake / 'git').write_text(FAKE_GIT.replace('REAL_GIT', shutil.which('git')))
         (fake / 'flock').write_text('#!/bin/sh\necho "flock $*" >> "$FAKE_LOG"\n[ "$3" != "${FAKE_FLOCK_FAIL:-none}" ]\n')
@@ -302,6 +307,43 @@ class RemoteCI(unittest.TestCase):
 
     def test_a_disk_that_fills_during_the_run_on_a_boat_worker_stops_it(self):
         self.check_the_disk_watch(self.run_ci)
+
+    def run_cmd(self, cmd, *args, **env):
+        return self.run_ssh('--cmd', cmd, *args, **env)
+
+    def test_a_command_runs_with_the_pinned_toolchain_and_returns_its_exit(self):
+        r = self.run_cmd('echo "hello $RUSTUP_TOOLCHAIN"; test -f rust-toolchain.toml; exit 7')
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        name = 'cmd-%s-' % self.rev('HEAD')[:8]
+        self.assertIn('gate-' + name, r.stdout)
+        # The log comes back on stdout and names the compiler and the mbx it used.
+        for line in ['remote-ci: echo "hello $RUSTUP_TOOLCHAIN"; test -f rust-toolchain.toml; exit 7',
+                     'remote-ci: RUSTUP_TOOLCHAIN=1.2.3', 'remote-ci: rustc 1.2.3 (fake)', 'remote-ci: mbx 0.0.1', 'hello 1.2.3']:
+            self.assertIn(line, r.stdout.splitlines())
+        out = next((self.home / 'gate/out').glob(name + '*'))
+        self.assertEqual((out / 'ci.exit').read_text().strip(), '7')
+        self.assertFalse((self.home / 'gate' / ('wt-' + out.name)).exists())
+        # Another command of the same commit is another job.
+        r = self.run_cmd('true')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(list((self.home / 'gate/out').glob(name + '*'))), 2)
+
+    def test_a_command_on_the_working_tree_sees_uncommitted_files_and_changes_nothing(self):
+        (self.src / 'scripts/ci.sh').write_text('#!/bin/sh\necho edited\n')
+        (self.src / 'new-file.txt').write_text('untracked\n')
+        before = subprocess.run(['git', '-C', str(self.src), 'status', '--porcelain'], capture_output=True, text=True).stdout
+        head = self.rev('HEAD')
+        r = self.run_cmd('cat new-file.txt scripts/ci.sh', '--worktree')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('untracked', r.stdout.splitlines()); self.assertIn('echo edited', r.stdout.splitlines())
+        self.assertEqual(self.rev('HEAD'), head)
+        self.assertEqual(subprocess.run(['git', '-C', str(self.src), 'status', '--porcelain'], capture_output=True, text=True).stdout, before)
+        self.assertEqual(subprocess.run(['git', '-C', str(self.src), 'stash', 'list'], capture_output=True, text=True).stdout, '')
+
+    def test_a_command_job_keeps_the_disk_floor(self):
+        (self.home / 'df-kib').write_text(str(10 * GIB))
+        r = self.run_cmd('true')
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr); self.assertIn('host disk below floor', r.stderr)
 
     def test_the_disk_settings_must_be_positive_numbers(self):
         for n in ['REMOTE_CI_MIN_FREE_GIB', 'REMOTE_CI_RUN_FLOOR_GIB', 'REMOTE_CI_WATCH_SECONDS']:

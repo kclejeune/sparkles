@@ -343,6 +343,18 @@ lock, so jobs from several lanes queue rather than compete. `--no-wait` starts a
 returns, and `--status` and `--fetch` follow it later. The
 [remote CI section](REMOTE-EXECUTORS.md#remote-ci) describes the bounds on a Boat worker.
 
+`mise run check:remote --host <host> '<command>'` runs one targeted step the same way, such
+as `mbx check`, `mbx clippy --all-targets -- -D warnings` or `mbx nextest run -p <crate>
+--test <name>`, and prints the command's log and exits with its code. It checks the
+working tree as it is, with its uncommitted and untracked files, unless `--commit` asks for
+`HEAD`. The tree travels as a temporary commit object whose parent is `HEAD`, which a
+private index writes, so the branch, the index and the stash are left alone. The host
+checks out the whole commit, `rust-toolchain.toml` and `mise.toml` included, exports
+`RUSTUP_TOOLCHAIN` from `rust-toolchain.toml` and runs the command under `mise exec`, so the
+pinned compiler and the pinned mbx apply. The log starts with the `rustc --version` and
+`mbx --version` the command used. The step is a job of `scripts/remote-ci.sh --cmd`, so it
+waits for the host's heavy lock and needs the host's disk floor, as lane CI does.
+
 ### Remote executors
 
 Prefer available local resources before renting another worker. A 16 GiB Boat worker is

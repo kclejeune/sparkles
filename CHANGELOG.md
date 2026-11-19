@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Targeted checks on a remote host
+
+`mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
+`mbx nextest run -p <crate> --test <name>`, on an ssh build host or a Boat worker in a full
+copy of the working tree, with the pinned compiler and mbx, and prints its log and exits
+with its code. It is `scripts/remote-ci.sh --cmd`, so it waits for the host's heavy lock and
+keeps the host's disk floor.
+
 ### A free-disk floor on ssh build hosts
 
 `scripts/remote-ci.sh` and the batch gate now refuse an ssh host whose disk is below the

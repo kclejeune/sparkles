@@ -3,13 +3,26 @@
 # gate host or an admitted Boat worker instead of the laptop, and bring the results back.
 #
 # Usage: scripts/remote-ci.sh [--host H] [--base REV] [--premerge] [--no-wait] [REV]
+#        scripts/remote-ci.sh [--host H] [--worktree] [--no-wait] --cmd 'COMMAND' [REV]
 #        scripts/remote-ci.sh [--host H] --status NAME | --fetch NAME
 #   --host      boat:bx_ID or an ssh gate host such as wally (default SPARKLES_REMOTE_CI_HOST)
 #   --base      the base of --changed (default origin/main), of which the job uses the merge
-#               base with REV; ignored with --premerge
+#               base with REV; ignored with --premerge and --cmd
 #   --premerge  run scripts/premerge.sh instead of ci.sh
+#   --cmd       run COMMAND with bash -c in the checkout instead of ci.sh, such as
+#               'mbx check' or 'mbx nextest run -p sparkles-core --test csvw_conformance'
+#   --worktree  check the working tree as it is, with its uncommitted and untracked files,
+#               instead of REV
 #   --no-wait   start the job and return; --status and --fetch follow it
 #   REV         the commit to check (default HEAD); it must be committed
+#
+# With --cmd the job checks out the whole commit, rust-toolchain.toml and mise.toml
+# included, exports RUSTUP_TOOLCHAIN from rust-toolchain.toml, runs the command under
+# `mise exec` so the tools that mise.toml pins apply, and writes the `rustc --version` and
+# `mbx --version` it used at the top of its log, so its result matches a local run. The
+# job's name is cmd-<rev>-<hash of the command>, and the script prints the command's log
+# and exits with its code. With --worktree the commit is a temporary one whose parent is
+# HEAD, written from a private index, so neither the branch nor the index changes.
 #
 # The job runs in the systemd user unit gate-NAME on the host, NAME being ci-<rev>-<base> or
 # pm-<rev> with 8-digit hashes, from scripts/gate/remote/ci-job.sh. Everything it does,
@@ -44,6 +57,8 @@ wait=1
 action=start
 name=
 rev=HEAD
+cmd=
+worktree=0
 while [ $# -gt 0 ]; do
   case $1 in
     --host)
@@ -56,6 +71,15 @@ while [ $# -gt 0 ]; do
       ;;
     --premerge)
       mode=premerge
+      shift
+      ;;
+    --cmd)
+      mode=cmd
+      cmd=${2:?--cmd needs a command}
+      shift 2
+      ;;
+    --worktree)
+      worktree=1
       shift
       ;;
     --no-wait)
@@ -117,8 +141,22 @@ if [ "$action" = fetch ]; then
   exit 0
 fi
 
+if [ "$worktree" = 1 ]; then
+  # The working tree goes into a commit object of its own, through a private index, so the
+  # lane's branch, index and stash are left alone.
+  idx=$(mktemp)
+  trap 'rm -f "$idx"' EXIT
+  cp "$(git rev-parse --git-path index)" "$idx"
+  GIT_INDEX_FILE=$idx git add -A
+  tree=$(GIT_INDEX_FILE=$idx git write-tree)
+  rm -f "$idx"
+  rev=$(git commit-tree --no-gpg-sign -p HEAD -m "remote-ci working tree of $(git rev-parse --short HEAD)" "$tree")
+fi
 full=$(git rev-parse --verify "$rev^{commit}")
-if [ "$mode" = ci ]; then
+if [ "$mode" = cmd ]; then
+  bfull=$full
+  name=cmd-${full:0:8}-$(printf '%s' "$cmd" | sha256sum | cut -c1-8)
+elif [ "$mode" = ci ]; then
   # The changed set is taken from the merge base, which the tip's own history holds, so the
   # host has it whenever it has the tip, even when the base branch moved on.
   bfull=$(git merge-base "$full" "$(git rev-parse --verify "$base^{commit}")")
@@ -188,7 +226,7 @@ systemd-run --user --unit gate-$name --collect -q \"\${forward[@]}\" \\
   --setenv=HOME=\"\$HOME\" --setenv=USER=\"\$USER\" --setenv=PATH=\"\$p\" --setenv=SPARKLES_REMOTE_EXECUTOR=$executor \\
   --setenv=CARGO_BUILD_JOBS=$cargo_jobs --setenv=CARGO_INCREMENTAL=0 \\
   --setenv=NEED_GIB=${REMOTE_CI_MIN_FREE_GIB:-85} --setenv=RUN_FLOOR_GIB=${REMOTE_CI_RUN_FLOOR_GIB:-4} --setenv=WATCH_SECONDS=${REMOTE_CI_WATCH_SECONDS:-30} \\
-  --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end \\
+  --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end --setenv=CMD_B64=$(printf '%s' "$cmd" | base64 -w0) \\
   /bin/bash \"\$o/ci-job.sh\"
 echo \"started gate-$name, ending by \$(date -u -d @$end +%FT%TZ)\"" < "$here/gate/remote/ci-job.sh"
 [ "$wait" = 1 ] || {
@@ -221,6 +259,10 @@ if [ "$(cat "$root/.artifacts/remote-ci/$name/outcome" 2> /dev/null)" = disk-bel
   grep 'host disk below floor' "$root/.artifacts/remote-ci/$name/progress.log" >&2 || true
   exit "$code"
 fi
-[ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 30 "$root/.artifacts/remote-ci/$name/ci.log"
+if [ "$mode" = cmd ]; then
+  [ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n "${REMOTE_CI_LOG_LINES:-200}" "$root/.artifacts/remote-ci/$name/ci.log"
+else
+  [ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 30 "$root/.artifacts/remote-ci/$name/ci.log"
+fi
 [ -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 5 "$root/.artifacts/remote-ci/$name/progress.log"
 exit "$code"
