@@ -176,6 +176,11 @@ const TIMED_OUT: (&str, &str) = ("check-timeout", "the check did not finish with
 
 fn run_check(c: &Check, inputs: &Inputs<'_>) -> CheckResult {
     let t0 = Instant::now();
+    // the deferral comes before the bound, so no timeout can replace its code
+    if matches!(c.kind, CheckKind::UnsatisfiableClasses { .. }) {
+        let deferred = Err(("check-unavailable", UNSATISFIABLE_DEFERRED.to_string()));
+        return result(c, deferred, t0);
+    }
     let outcome = match inputs.timeout.map(|t| t0.checked_add(t)) {
         Some(None) => Err((
             "input-invalid",
@@ -198,6 +203,7 @@ fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
         return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
     }
     let outcome = match &c.kind {
+        // (run_check answers it before its bound; this keeps dispatch total)
         CheckKind::UnsatisfiableClasses { .. } => {
             Err(("check-unavailable", UNSATISFIABLE_DEFERRED.to_string()))
         }

@@ -640,6 +640,7 @@ fn the_unsatisfiable_classes_check_is_unavailable_in_every_build() {
         "",
         "; chk:requireComplete true",
         "; chk:requireComplete false",
+        "; chk:graph <urn:onto>",
     ] {
         for (severity, blocks) in [("sh:Violation", true), ("sh:Warning", false)] {
             let s = suite(&format!(
@@ -671,6 +672,23 @@ fn the_unsatisfiable_classes_check_is_unavailable_in_every_build() {
                 "{case}: {:?}",
                 r.results[1]
             );
+            // no bound replaces the deferral: a spent one, and one too large to add
+            for timeout in [std::time::Duration::ZERO, std::time::Duration::MAX] {
+                let r = run(
+                    &s,
+                    &Inputs {
+                        before: &before,
+                        after: &after,
+                        stored: None,
+                        timeout: Some(timeout),
+                    },
+                );
+                let u = &r.results[0];
+                let at = format!("{case} {timeout:?}");
+                assert_eq!(u.code, Some("check-unavailable"), "{at}: {u:?}");
+                assert!(u.messages[0].contains("deferred"), "{at}: {u:?}");
+                assert_eq!(u.blocks(), blocks, "{at}: {u:?}");
+            }
         }
     }
     refused(
