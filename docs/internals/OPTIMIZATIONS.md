@@ -411,6 +411,13 @@ implementation and always apply. EXPLAIN shows which ones ran.
   is kept alone. At 10.5M triples, `optional-count` runs in 6 ms instead of 15 ms on a
   warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
   puts the unmatched left rows last.
+* **Pair conditions in the streamed merge** (`merge_pair_conditions`). A streamed merge
+  OPTIONAL with a condition, whose key is the only shared variable, tests the condition on
+  the pairs of the left rows that the loaded right batch decides before it copies an
+  output row, as the eager merge does over the whole input. With the switch off it copies
+  every pair and an extension for every left row into the batch, copies the pairs again
+  for the test and then compacts the batch. Runs that cross a batch of the right input
+  keep that second path in both settings.
 * **Probed OPTIONAL** (`probed_optional`). An OPTIONAL whose right side is a triple
   pattern, with its FILTERs, sorted on a variable that every row of the evaluated left
   side binds reads the pattern only for the left side's distinct values. It uses the

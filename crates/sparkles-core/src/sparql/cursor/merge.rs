@@ -563,6 +563,88 @@ fn with_extensions(lrows: &[u32], rrows: &[u32]) -> (Vec<u32>, Vec<u32>) {
     (l, r)
 }
 
+/// What [`Merge::interior`] did with the loaded batches.
+enum Step {
+    /// It decided left rows or passed over right rows.
+    Advanced,
+    /// It decided nothing, and the general path takes the next run.
+    Stuck,
+    /// The next left row's pairs do not fit the rest of the batch, which ends here.
+    Full,
+}
+
+/// Test the condition of an OPTIONAL on the pairs `lrows` and `rrows` that the merge
+/// kernel gave for whole left rows, before any output row is copied: the pairs that pass
+/// stay, and a left row none of whose pairs passed stays once with no right row, as in
+/// the eager merge OPTIONAL. The pairs are rows of `left` and `right` from `li` and
+/// `ri`, and `vars` are the output variables that `columns` fill, without the marker.
+fn decide_pairs(
+    ctx: &Ctx,
+    condition: &Expr,
+    vars: &[VarId],
+    columns: &[(Option<usize>, Option<usize>)],
+    (left, right, li, ri): (&Table, &Table, usize, usize),
+    lrows: &mut Vec<u32>,
+    rrows: &mut Vec<u32>,
+) -> Result<()> {
+    let pairs = rrows.iter().filter(|j| **j != NO_ROW).count();
+    if pairs == 0 {
+        return Ok(());
+    }
+    let width = vars.len();
+    // the pairs with their column headers and variables, their verdicts and the variable
+    // map that evaluating the condition builds, charged once the number of pairs is known
+    let _scratch = ctx.charge(
+        pairs as u64 * (width as u64 * 8 + 1) + width as u64 * 28 + ctx.nvars() as u64 * 16 + 256,
+    )?;
+    let mut matched = Table::new(vars.to_vec());
+    for (to, &(l, r)) in matched.cols.iter_mut().zip(columns) {
+        to.reserve_exact(pairs);
+        match (l, r) {
+            (Some(c), _) => {
+                let source = &left.cols[c];
+                let rows = lrows
+                    .iter()
+                    .zip(rrows.iter())
+                    .filter(|(_, j)| **j != NO_ROW);
+                to.extend(rows.map(|(&i, _)| source[li + i as usize]));
+            }
+            (None, Some(c)) => {
+                let source = &right.cols[c];
+                let rows = rrows.iter().filter(|j| **j != NO_ROW);
+                to.extend(rows.map(|&j| source[ri + j as usize]));
+            }
+            (None, None) => to.resize(pairs, Id::UNDEF),
+        }
+    }
+    matched.len = pairs;
+    let pass = super::super::exec::condition_mask(ctx, &matched, condition)?;
+    drop(matched);
+    let mut verdicts = pass.into_iter();
+    // The rows kept are no more than the rows read, so they are written in place.
+    let (mut w, mut k) = (0, 0);
+    while k < lrows.len() {
+        let row = lrows[k];
+        let start = w;
+        while k < lrows.len() && lrows[k] == row {
+            if rrows[k] != NO_ROW && verdicts.next().unwrap_or(false) {
+                lrows[w] = row;
+                rrows[w] = rrows[k];
+                w += 1;
+            }
+            k += 1;
+        }
+        if w == start {
+            lrows[w] = row;
+            rrows[w] = NO_ROW;
+            w += 1;
+        }
+    }
+    lrows.truncate(w);
+    rrows.truncate(w);
+    Ok(())
+}
+
 /// Append the rows of `src` whose `keep` is set to `out`, writing every row and
 /// advancing by the flag, which costs no branch per row.
 pub(super) fn compact(out: &mut Vec<Id>, src: &[Id], keep: &[bool]) {
@@ -823,7 +905,7 @@ impl Merge {
         out: &mut Buffer,
         cap: usize,
         right_done: bool,
-    ) -> Result<bool> {
+    ) -> Result<Step> {
         let (left, right) = (self.inputs[0].table(), self.inputs[1].table());
         let (lk, rk) = (&left.cols[self.keys[0][0]], &right.cols[self.keys[1][0]]);
         let (li, ri) = (self.inputs[0].at, self.inputs[1].at);
@@ -833,15 +915,19 @@ impl Merge {
         } else {
             li + lk[li..].partition_point(|k| *k < last)
         };
-        // Under a condition every left row also takes its extension, which at most
-        // doubles its output.
         let extend = self.condition.is_some();
-        let room = (cap - out.table.len) >> usize::from(extend);
+        // The condition is tested on the pairs here, before any output row is copied,
+        // so a left row takes no more output rows than it has pairs. Otherwise every
+        // left row also takes its extension for [`Merge::test`] to choose from, which
+        // at most doubles its output.
+        let decide = extend && ctx.opt.merge_pair_conditions;
+        let room = (cap - out.table.len) >> usize::from(extend && !decide);
         let end = covered.min(li.saturating_add(room));
         let (mut next_li, mut next_ri) = (li, ri);
+        let mut full = false;
         if end > li && room > 0 {
-            // the bounds and the pairs, and under a condition the pairs with extensions
-            let pairs = if extend { 24 } else { 8 };
+            // the bounds and the pairs, and for [`Merge::test`] the pairs with extensions
+            let pairs = if extend && !decide { 24 } else { 8 };
             let _scratch = ctx.charge((end - li) as u64 * 4 + room as u64 * pairs + 128)?;
             let first = kernel::bounds(ctx, &lk[li..end], &rk[ri..])?;
             let mut lrows: Vec<u32> = Vec::with_capacity(room);
@@ -858,11 +944,44 @@ impl Merge {
                 &mut lrows,
                 &mut rrows,
             )?;
-            if extend && done > 0 {
+            if decide {
+                // A run that does not fit the rest of a batch that already has rows
+                // ends the batch, so that the next one takes it here and not through a
+                // pair of held runs, whose leftover would make the batch after it short.
+                full = done == 0 && out.table.len > 0;
+                if let Some(condition) = self.condition.as_deref()
+                    && done > 0
+                {
+                    let vars = &out.table.vars[..out.table.vars.len() - 1];
+                    let sides = (left, right, li, ri);
+                    decide_pairs(
+                        ctx,
+                        condition,
+                        vars,
+                        &self.columns,
+                        sides,
+                        &mut lrows,
+                        &mut rrows,
+                    )?;
+                }
+            } else if extend && done > 0 {
                 (lrows, rrows) = with_extensions(&lrows, &rrows);
             }
             if done > 0 {
-                for (column, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
+                let marker = if decide {
+                    self.columns.len() - 1
+                } else {
+                    usize::MAX
+                };
+                for (at, (column, &(l, r))) in
+                    out.table.cols.iter_mut().zip(&self.columns).enumerate()
+                {
+                    if at == marker {
+                        // Decided rows carry no marker, so the test keeps them as it
+                        // keeps the extension of a left row none of whose pairs passed.
+                        column.extend(std::iter::repeat_n(Id::UNDEF, lrows.len()));
+                        continue;
+                    }
                     match (l, r) {
                         (Some(c), _) => {
                             let source = &left.cols[c];
@@ -894,7 +1013,13 @@ impl Merge {
         }
         self.inputs[0].at = next_li;
         self.inputs[1].at = next_ri;
-        Ok((li, ri) != (next_li, next_ri))
+        Ok(if (li, ri) != (next_li, next_ri) {
+            Step::Advanced
+        } else if full {
+            Step::Full
+        } else {
+            Step::Stuck
+        })
     }
 
     /// Count compatible run multiplicities without constructing join output.
@@ -1103,6 +1228,12 @@ impl Merge {
         let marker = out.table.cols.pop().expect("a marker column");
         out.table.vars.pop();
         let pairs = marker.iter().filter(|id| !id.is_undef()).count();
+        if pairs == 0 && !self.passed {
+            // Every row is the extension of a left row with no pair to test, or a row
+            // that [`Merge::interior`] decided, and no left row is open with a pair
+            // that passed, so every row stays.
+            return out.reconcile();
+        }
         // the merged pairs with their column headers and variables, their verdicts, the
         // rows kept and the variable map that evaluating the condition builds
         let _scratch = ctx.charge(
@@ -1255,8 +1386,12 @@ impl Merge {
                     self.unmatched(&mut out, cap, ctx)?;
                     continue;
                 }
-                if self.key_only() && self.interior(ctx, &mut out, cap, children[1].done)? {
-                    continue;
+                if self.key_only() {
+                    match self.interior(ctx, &mut out, cap, children[1].done)? {
+                        Step::Advanced => continue,
+                        Step::Full => break,
+                        Step::Stuck => {}
+                    }
                 }
                 let cmp = self.keys[0]
                     .iter()
@@ -1441,8 +1576,15 @@ mod tests {
     }
 
     fn context_with_spill(limit: u64, spill: Option<&Arc<crate::spill::Spill>>) -> Arc<Ctx> {
+        context_with(limit, spill, true)
+    }
+
+    /// A context whose merge tests an OPTIONAL condition on the pairs before it copies
+    /// output rows when `pairs` is set, and on each batch after it otherwise.
+    fn context_with(limit: u64, spill: Option<&Arc<crate::spill::Spill>>, pairs: bool) -> Arc<Ctx> {
         let store = Store::in_memory(StoreOptions::default());
         let mut ctx = Ctx::new(store.snapshot());
+        ctx.opt.merge_pair_conditions = pairs;
         for name in ["key", "shared", "left", "right"] {
             ctx.var(name);
         }
@@ -1979,6 +2121,131 @@ mod tests {
                 assert_eq!(op.count_input(&ctx, &options).unwrap(), None);
             }
         }
+    }
+
+    /// With the key as the only shared variable, the merge tests the condition on the
+    /// pairs before it copies output rows (`merge_pair_conditions`). The rows it decides
+    /// there share batches with the rows of held and spooled runs, which the test after
+    /// the merge decides, and the bag is the eager one at every batch size with the
+    /// switch on and off. With the switch on, a batch ends only when the next left
+    /// row's pairs do not fit it, so no batch but the last is short.
+    #[test]
+    fn pair_conditions_match_the_staged_test_beside_held_and_spooled_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 34,
+            query_bytes: 1 << 34,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let (left, right) = (2, 3);
+        // The condition passes a pair whose right value is above its left value.
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(right)),
+            Box::new(Expr::Var(left)),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        let mut l: Vec<Vec<i64>> = Vec::new();
+        let mut r: Vec<Vec<i64>> = Vec::new();
+        for key in 0..600i64 {
+            // One to three left rows, some of them equal, and no to five right rows.
+            for i in 0..(1 + key % 3) {
+                l.push(vec![key, (key * 7 + i / 2 * 13) % 50]);
+            }
+            for j in 0..(key % 6) {
+                r.push(vec![key, (key * 11 + j * 17) % 60]);
+            }
+        }
+        let fan = l.len();
+        // A run that every pair of fails, one that every pair of passes, and a run of
+        // left rows, each long enough to be held across batches and to spool.
+        for j in 0..1500 {
+            r.push(vec![700, j % 40]);
+            r.push(vec![701, 100 + j]);
+        }
+        l.push(vec![700, 45]);
+        l.push(vec![700, 20]);
+        l.push(vec![701, 3]);
+        for i in 0..1500 {
+            l.push(vec![702, i % 50]);
+        }
+        r.sort_by_key(|row| row[0]);
+        for j in 0..3 {
+            r.push(vec![702, 20 + j]);
+        }
+        l.push(vec![703, 1]);
+        let mut spooled = 0;
+        for with_long in [false, true] {
+            let lr = if with_long { &l[..] } else { &l[..fan] };
+            let rr: Vec<Vec<i64>> = r
+                .iter()
+                .filter(|row| with_long || row[0] < 700)
+                .cloned()
+                .collect();
+            let mut node = join(values(vec![0, left], lr), values(vec![0, right], &rr));
+            node.kind = Kind::LeftJoin {
+                expr: Some(condition.clone()),
+            };
+            let expected = rows(
+                &exec::execute_materialized(&context(u64::MAX), &node)
+                    .unwrap()
+                    .0
+                    .table,
+            );
+            let unextended = expected.iter().filter(|row| !row[row.len() - 1].is_undef());
+            assert!(unextended.count() > lr.len() / 4 && expected.len() > lr.len());
+            for (pairs, spills) in [(true, false), (false, false), (true, true), (false, true)] {
+                for cap in [1, 2, 3, 4, 7, 64, 4096] {
+                    if spills && cap > 64 {
+                        // Two input batches of this size outgrow the small budget.
+                        continue;
+                    }
+                    let ctx = if spills {
+                        context_with(128 << 10, Some(&spill), pairs)
+                    } else {
+                        context_with(8 << 20, None, pairs)
+                    };
+                    let mut op =
+                        Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                            .unwrap();
+                    assert!(matches!(op.state, super::super::State::Merge(_)));
+                    let options = CursorOptions {
+                        batch_rows: cap,
+                        ..Default::default()
+                    };
+                    let mut result = Vec::new();
+                    let mut sizes = Vec::new();
+                    while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
+                        assert!(batch.table.len <= cap && batch.table.len > 0);
+                        assert_eq!(batch.table.width(), node.vars.len());
+                        assert!(batch.charge.bytes() >= capacity_bytes(&batch.table));
+                        sizes.push(batch.table.len);
+                        result.extend(rows(&batch.table));
+                    }
+                    if let super::super::State::Merge(merge) = &op.state {
+                        spooled += merge.spooled_runs;
+                    }
+                    // The merge keeps the left order, so only rows of one key reorder.
+                    let keys: Vec<Id> = result.iter().map(|row| row[0]).collect();
+                    assert!(keys.is_sorted());
+                    result.sort();
+                    let case = format!("long {with_long} pairs {pairs} spills {spills} cap {cap}");
+                    assert_eq!(result.len(), expected.len(), "{case}");
+                    assert_eq!(result, expected, "{case}");
+                    if pairs && !with_long && cap >= 64 {
+                        // A left row has at most five pairs. Only a run that crosses
+                        // a batch of the right input, which the test after the merge
+                        // decides, can leave a batch shorter than that.
+                        let short = sizes[..sizes.len() - 1].iter().filter(|n| **n + 12 <= cap);
+                        assert!(short.count() * 4 <= sizes.len(), "{case}: {sizes:?}");
+                    }
+                }
+            }
+        }
+        assert!(spooled > 0, "{spooled} runs spooled");
+        assert_eq!(spill.reserved_bytes(), 0);
     }
 
     /// A conditional OPTIONAL whose left rows each meet a long right run of failing pairs,
