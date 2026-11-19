@@ -995,3 +995,51 @@ fn an_in_process_call_charges_its_callers_query() {
     let peak = cursor.stats().mem_peak_bytes;
     assert!(peak >= alone / 2, "caller {peak}, callee alone {alone}");
 }
+
+/// A cached SERVICE whose copy of the answer the budget cannot hold drops the copy and
+/// streams the answer on uncached, as the same query does without the cache.
+#[test]
+fn a_copy_the_budget_cannot_hold_is_dropped() {
+    let s = store();
+    let snap = s.snapshot();
+    let vars: Vec<String> = (0..100).map(|i| format!("\"v{i}\"")).collect();
+    let head = format!(
+        r#"{{"head":{{"vars":["s",{}]}},"results":{{"bindings":["#,
+        vars.join(",")
+    );
+    let n = 2_000;
+    let body = format!(
+        "{head}{}{TAIL}",
+        (0..n)
+            .map(|i| format!(r#"{{"s":{{"type":"uri","value":"urn:s:{i}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let ep = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(body.clone().into_bytes())])
+    }));
+    let plain = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
+    let cached = plain.replace("SERVICE <", "SERVICE <cache:");
+    let tight = QueryOptions {
+        no_cache: false,
+        max_memory_bytes: Some(4 << 20),
+        ..opts()
+    };
+    let expected = streamed(&snap, &plain, &tight, &strict(256)).unwrap().0;
+    assert_eq!(expected.len(), n);
+    assert_eq!(
+        streamed(&snap, &cached, &tight, &strict(256)).unwrap().0,
+        expected
+    );
+    assert_eq!(s.result_cache().service.entries(), 0);
+    // with room for the copy, the answer is cached
+    let roomy = QueryOptions {
+        max_memory_bytes: Some(256 << 20),
+        ..tight.clone()
+    };
+    assert_eq!(
+        streamed(&snap, &cached, &roomy, &strict(256)).unwrap().0,
+        expected
+    );
+    assert_eq!(s.result_cache().service.entries(), 1);
+}

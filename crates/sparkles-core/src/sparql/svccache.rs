@@ -30,7 +30,7 @@ impl Rows {
     }
 
     /// What one row adds to [`Rows::bytes`].
-    pub fn row_bytes(row: &[Option<Term>]) -> u64 {
+    pub(crate) fn row_bytes(row: &[Option<Term>]) -> u64 {
         let terms: usize = row
             .iter()
             .map(|t| t.as_ref().map_or(0, term_bytes) + 16)
@@ -42,7 +42,7 @@ impl Rows {
     /// header and its terms' text. [`Rows::bytes`] is the cache's weight, an estimate
     /// that this exceeds for wide rows of mostly unbound slots.
     #[allow(clippy::ptr_arg, reason = "the capacity of the row is what it keeps")]
-    pub fn retained_row_bytes(row: &Vec<Option<Term>>) -> u64 {
+    pub(crate) fn retained_row_bytes(row: &Vec<Option<Term>>) -> u64 {
         let slots = row.capacity() * std::mem::size_of::<Option<Term>>();
         let terms: usize = row.iter().flatten().map(term_bytes).sum();
         (slots + std::mem::size_of::<Vec<Option<Term>>>() + terms) as u64
@@ -50,7 +50,7 @@ impl Rows {
 
     /// The bytes the entry keeps allocated, by [`Rows::retained_row_bytes`] and the
     /// capacities of its vectors.
-    pub fn retained_bytes(&self) -> u64 {
+    pub(crate) fn retained_bytes(&self) -> u64 {
         let rows: u64 = self.rows.iter().map(Self::retained_row_bytes).sum();
         let spare =
             (self.rows.capacity() - self.rows.len()) * std::mem::size_of::<Vec<Option<Term>>>();
@@ -60,7 +60,7 @@ impl Rows {
     }
 
     /// What the variable names add to [`Rows::bytes`].
-    pub fn vars_bytes(vars: &[String]) -> u64 {
+    pub(crate) fn vars_bytes(vars: &[String]) -> u64 {
         vars.iter().map(|v| v.len() as u64 + 24).sum()
     }
 }
@@ -258,7 +258,7 @@ impl ServiceCache {
     }
 
     /// The largest entry, with its key, that [`ServiceCache::put`] keeps.
-    pub fn max_entry_bytes(&self) -> u64 {
+    pub(crate) fn max_entry_bytes(&self) -> u64 {
         self.store.max_entry_bytes
     }
 

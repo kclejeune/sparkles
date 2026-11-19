@@ -17,7 +17,8 @@
 //! Three things differ from an eager run. A failure after rows were emitted fails the
 //! cursor, as any streamed failure does. A response is cached only when it has been read
 //! to its end, so a consumer that stops early leaves nothing in the cache, and a copy
-//! that grows past the largest entry the cache keeps is dropped as it grows. And the
+//! that grows past the largest entry the cache keeps, or past what the query's budget
+//! holds beside the answer, is dropped as it grows. And the
 //! outbound timeout counts from the start of the request, while the query's deadline
 //! leaves out the time a consumer keeps the cursor waiting, so a slow consumer can expire
 //! a remote transfer that an eager run would finish.
@@ -153,11 +154,19 @@ impl Tee {
         } else {
             capacity
         };
-        self.charge.resize(
-            self.retained
-                .saturating_add((grown * slot) as u64)
-                .saturating_add(self.key.capacity() as u64),
-        )?;
+        // The cache is an optimisation: a copy the budget cannot hold is dropped, and
+        // the answer streams on uncached, as it does without the cache.
+        if self
+            .charge
+            .resize(
+                self.retained
+                    .saturating_add((grown * slot) as u64)
+                    .saturating_add(self.key.capacity() as u64),
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
         self.rows.rows.reserve_exact(grown - len);
         self.rows.rows.push(row);
         Ok(Some(self))
@@ -276,7 +285,8 @@ impl Service {
                 });
                 return Ok(());
             }
-            tee = Some(Tee::new(ctx, key, store.max_entry_bytes())?);
+            // a copy the budget cannot hold is not made
+            tee = Tee::new(ctx, key, store.max_entry_bytes()).ok();
         }
         let meter = crate::sparql::exec::Meter {
             ctx,
