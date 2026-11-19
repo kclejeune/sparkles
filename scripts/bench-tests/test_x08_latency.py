@@ -102,9 +102,21 @@ class AnswersTests(unittest.TestCase):
             self.assertEqual(digest(q, ['"a"']), digest(q, ['"b"']))
             # a real ORDER BY after an escaped hash or a hash in a long literal keeps its order
             for q in ('PREFIX ex: <urn:ex:> SELECT ?x (ex:a\\#b AS ?v) WHERE { VALUES ?x { "a" "b" } } ORDER BY ?x\nLIMIT 2',
-                      'SELECT ?x ("""alpha " # text " omega""" AS ?v) WHERE { VALUES ?x { "a" "b" } } ORDER BY ?x LIMIT 2'):
+                      'SELECT ?x ("""alpha " # text " omega""" AS ?v) WHERE { VALUES ?x { "a" "b" } } ORDER BY ?x LIMIT 2',
+                      'SELECT ?x (<urn:u\\u0061#frag> AS ?v) WHERE { VALUES ?x { "a" "b" } } ORDER BY ?x\nLIMIT 2'):
                 self.assertTrue(digest(q, ['"a"', '"b"']).startswith("keys:"), q)
                 self.assertNotEqual(digest(q, ['"a"', '"b"']), digest(q, ['"b"', '"a"']), q)
+
+    def test_an_escaped_iri_keeps_the_slice_that_probes_rewrite(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("bench_answers_t", SCRIPTS / "bench-answers.py")
+        ba = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ba)
+        q = 'SELECT ?x (<urn:u\\u0061#frag> AS ?v) WHERE { VALUES ?x { "a" "b" } } ORDER BY ?x\nLIMIT 2'
+        self.assertEqual(len(ba.blank_tokens(q)), len(q))
+        self.assertEqual(ba.order_keys(q, {"x", "v"}), ["x"])
+        self.assertEqual(ba.slice_of(q), (2, 0))
+        self.assertTrue(ba.probe_query(q, 1, 1).startswith('SELECT ?x (<urn:u\\u0061#frag> AS ?v)'))
 
     def test_a_staged_query_missing_from_every_run_fails(self):
         with tempfile.TemporaryDirectory() as d:

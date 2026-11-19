@@ -456,6 +456,10 @@ def _blank(m):
     return " " * len(t)
 
 
+# an IRI reference, with the \\u and \\U escapes SPARQL allows in it
+_IRIREF = re.compile(r"<(?:[^<>\"{}|^`\\\s]|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})*>")
+
+
 def blank_tokens(query):
     """The query with every comment, IRI and string literal, long or short, blanked to the
     same length as `_blank` blanks one, so that words inside them are not read as syntax and
@@ -472,8 +476,8 @@ def blank_tokens(query):
             j = query.find("\n", i)
             j = n if j < 0 else j
             out.append(" " * (j - i))
-        elif c == "<" and (m := re.match(r"<[^<>\"{}|^`\\\s]*>", query[i:])):
-            j = i + m.end()
+        elif c == "<" and (m := _IRIREF.match(query, i)):
+            j = m.end()
             out.append("<" + " " * (j - i - 2) + ">")
         elif query.startswith(c * 3, i) and c in "\"'":
             j = i + 3
