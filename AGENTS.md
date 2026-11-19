@@ -34,8 +34,8 @@ adds to this file and does not override it.
 - Prefer available local implementation and build hosts. Use Boat sandboxes for overflow,
   isolation or additional parallel capacity, after checking the worker's tools, memory,
   disk and competing work. Reuse a warm worker for ordinary fix and test iterations.
-  Namespace remains a fallback for a measured resource need or a workflow without a
-  qualified Boat replacement. Provider-neutral commands accept an admitted `boat:bx_ID`
+  Namespace is not used. A workflow that only Namespace supported waits for a Boat or
+  local equivalent, which gets a roadmap item. Provider-neutral commands accept an admitted `boat:bx_ID`
   worker and never create or stop it. The tracked `boat:qualify`, `boat:job-env` and
   `boat:finish` commands preserve explicit profile/release and verified closure. See [remote executors](docs/REMOTE-EXECUTORS.md).
 - The benchmark host, which `SPARKLES_BENCH_HOST` names, runs no builds or gates. Keep
@@ -79,8 +79,8 @@ adds to this file and does not override it.
 - Features inspired by Fluree are built clean-room. Work from the W3C standards and
   Fluree's public documentation only, and never read Fluree's source code.
 - Performance claims need measurements. `mise run bench:remote --executor boat:bx_ID A B`
-  gives a quick A/B on a Boat worker, and `mise run bench:nsc A B` on Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
-  need an Intel host, and published numbers come from the benchmark host. See
+  gives a quick A/B on a Boat worker. Effects under about 5%, queries under 0.3 ms and
+  codegen-sensitive changes need an Intel host, and published numbers come from the benchmark host. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 - Count instructions per request with `mise run bench:request-insn BASE_BIN TIP_BIN` before
   booking an Intel host. A count flag books the timing run, and counts never size an
@@ -323,15 +323,15 @@ full gates of their own.
 Finished lanes merge into local `main` as they land, and several lanes may share one
 batch. One gate runs on the batch, with a query screen on an admitted
 Boat worker (`mise run bench:remote --executor boat:bx_ID --build-host boat:bx_ID
-origin/main HEAD`). The Namespace screen (`mise run bench:nsc origin/main HEAD`) remains
-the fallback when no Boat worker can take the screen, with the same acceptance criteria. `scripts/gate/gate.sh <rev>` runs the gate on the
-configured gate hosts and selects its checks from the batch's diff against `origin/main`.
+origin/main HEAD`), which is the only screen of record. A small or contested effect is
+checked on an Intel host, and timings from different providers are never compared.
+`scripts/gate/gate.sh <rev>` runs the gate on the configured gate hosts and selects its checks from the batch's diff against `origin/main`.
 It runs the `scripts/ci.sh` tasks, conformance suites and spill matrices that the changed
 files call for, with Clippy and the Rust tests for the packages they can affect, as the
 [batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Build configuration, the CI
 scripts and files that no rule covers run everything. Push when the tests pass and the
 screen shows no query 10% or more slower after the rerun of the flagged queries with more
-rounds, which the screen runs on the same worker or instance and reports beside the first pass.
+rounds, which the screen runs on the same worker and reports beside the first pass.
 The screen is skipped when `gate.sh` prints `skip screen (reason)`, which it does only
 when every changed file is one that cannot reach the server's query path or the screen,
 such as documentation, the CI scripts, tests or the OWL and validation crates. Any change

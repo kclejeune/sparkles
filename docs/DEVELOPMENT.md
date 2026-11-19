@@ -119,7 +119,7 @@ no compiler produces, such as logs, downloaded suites, test binaries built with 
 that runs a built binary after the build command has exited either runs inside
 `mbx sparkles-task` or copies the binary out of the target first. The benchmark and probe
 scripts do the second through `stage_binary` in `scripts/bench-tools.sh`, which copies a
-binary that lies in the managed target to the run's work directory, as the Namespace
+binary that lies in the managed target to the run's work directory, as the query
 screens stage theirs. A collection can also leave `target` as a link to a directory that
 no longer exists, and a command that writes there then fails with "File exists" or "Not a
 directory". Any `mbx` build places a fresh target, and so does `mbx sparkles-task -- true`.
@@ -190,7 +190,7 @@ mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs Q
 mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
-mise run bench:nsc main HEAD        # interleaved A/B of two revisions on a Namespace instance (needs nsc)
+mise run bench:remote --executor boat:bx_ID main HEAD   # interleaved A/B of two revisions on an admitted Boat worker
 mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
 ```
 
@@ -350,8 +350,8 @@ the normal starting point for overflow builds and tests. Check aggregate memory,
 disk and competing work before admitting a heavy job, and cap it where systemd is
 available. Boxington schedules builds but does not isolate other memory consumers.
 Start with one heavy job per worker, and use measurements to justify more concurrency or
-a larger machine. Namespace remains available for demonstrated resource needs and
-workflows without a qualified Boat replacement.
+a larger machine. Namespace is not used, and a workflow that only Namespace supported
+waits for a Boat or local equivalent.
 
 Keep ordinary implementation and test iterations on a warm worker within its assigned
 lifetime. Record its explicit sandbox ID, environment version, source and branch,
@@ -378,9 +378,9 @@ The provider-neutral `bench:remote`, `bench:remote-writes` and `bench:jena-remot
 commands accept an explicit admitted `boat:bx_ID` worker. Build hosts, partitioned test
 shares and gate hosts accept the same selector. The [remote executor commands](REMOTE-EXECUTORS.md)
 describe the tracked qualification/environment/finish commands, explicit private
-profile and admission inputs, warm reuse, artifact transport and cleanup. These adapters require
-real workload qualification before they replace the mandatory `bench:nsc` screen.
-Changing placement preserves the tests, benchmark comparability and acceptance criteria.
+profile and admission inputs, warm reuse, artifact transport and cleanup. The batch query
+screen runs through `bench:remote` on a Boat worker, and the retired `bench:nsc` tasks are
+unsupported. Changing placement preserves the tests, benchmark comparability and acceptance criteria.
 
 ### Known flaky tests
 
@@ -399,9 +399,9 @@ retries no other test.
 runs one share of the tests on this machine and sends the archive to the other machines,
 where nextest runs the other shares with `--partition slice:K/N`. The machines come from
 `--hosts`, `TEST_PARTITION_HOSTS` or a `TEST_PARTITION_HOSTS=` line in
-`~/.config/sparkles/test-partition.env`. An entry is an ssh host, or `nsc` or
-`nsc:MACHINE` for an ephemeral Namespace instance that the run creates and destroys,
-or `boat:bx_ID` for an admitted warm worker. An ssh host that is busy is left out, which means that another process holds its
+`~/.config/sparkles/test-partition.env`. An entry is an ssh host or `boat:bx_ID` for an
+admitted warm worker. The `nsc` and `nsc:MACHINE` selectors are retired and unsupported.
+An ssh host that is busy is left out, which means that another process holds its
 `~/lanes/.heavy.lock`, a gate unit runs there, its load exceeds half its processors or it
 has less than `TEST_PARTITION_MIN_FREE_GB` (default 40) GiB free. `--transport hc` starts
 each ssh host's share as a named terminal of the maintainer's terminal service, and the
@@ -410,8 +410,7 @@ connection.
 
 A Boat share checks its admission and remaining lifetime, uses the qualified installed
 tools and retains the existing archive and coverage checks. It never installs or
-refreshes toolchain pins during a job. The Namespace selector remains an explicit
-fallback while real Boat workload acceptance is outstanding under item 762.
+refreshes toolchain pins during a job. Item 762 tracks real Boat workload acceptance.
 
 The test binaries hold the absolute paths of the checkout that built them, from
 `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*` and `CARGO_TARGET_TMPDIR`. Each share therefore
@@ -419,9 +418,7 @@ runs at the same absolute path as the building checkout. The run creates that di
 on each machine, marks it as a share directory and refuses a machine where the path exists
 without the mark. It copies the tracked files, `ui/build` and the conformance suite
 directories the local tests read, and it extracts the archive there as it arrives. A
-Namespace instance also gets a C compiler, Python, Node.js, patchelf and the pinned
-rustfmt, and its share runs as an unprivileged user, since tests of permission checks
-fail as root. A binary whose loader the machine lacks, such as one built against a Nix
+binary whose loader the machine lacks, such as one built against a Nix
 store, gets the machine's own loader.
 Each share's JUnit report, log and exit code land in
 `.artifacts/test-partitioned/<time>/share-K/`, and the run fails unless every share passed
@@ -747,10 +744,10 @@ reasoner, small SPARQL queries, parameterized queries, small updates and Model w
 bulk load and queries through Fuseki. Every arm runs in fresh JVMs in A/B/B/A order, the
 answers are checked first, and the results go to `.artifacts/bench-jena/results` as
 `summary.md` and `raw.json`. An arm is an engine with JVM options, so a system property
-that turns a feature off gives a before arm. `scripts/nsc-jena.sh` (`mise run
-bench:jena-nsc`) runs the same comparison on an ephemeral Namespace instance. It builds
-the bindings here, ships them with a Temurin JDK and a standalone CPython, and downloads
-the results to `.artifacts/nsc-jena/<time>`.
+that turns a feature off gives a before arm. `mise run bench:jena-remote --executor
+boat:bx_ID` runs the same comparison on an admitted Boat worker. It builds the bindings
+here, ships them with a Temurin JDK and a standalone CPython, and downloads the results
+to `.artifacts/nsc-jena/<time>`.
 
 `./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv`, run in `jvm/`,
 times queries through Jena on Sparkles, through the native library alone and on an
@@ -1324,9 +1321,9 @@ container keeps its process limit and drops its 4 CPU and 14 GB limits, and Carg
 compiler job for each CPU instead of two in total.
 
 No workflow uses a remote build cache, so a build job needs no OIDC token. Every job keeps
-its caches in GitHub Actions, which serves self-hosted runners as it serves its own. Both
-providers below bill per second of runner time, while GitHub's standard runners are free for
-this public repository.
+its caches in GitHub Actions, which serves self-hosted runners as it serves its own. Boat
+bills per second of runner time, while GitHub's standard runners are free for this public
+repository.
 
 Boat runs each job in a fresh Ubuntu 24.04 virtual machine with Docker, passwordless
 `sudo` and 4 GB of swap. Its machines are in Germany, Finland and France, so a job may wait longer for
@@ -1345,20 +1342,7 @@ day limit fails. To set it up, the owner of the repository runs these steps.
    `SPARKLES_RUNNER` at `boat-large`, `SPARKLES_TEST_SLICES` at 2 gives about the same
    shard times as four 4-vCPU shards with two fewer jobs.
 
-Namespace registers its runners through a GitHub app and selects them by profile, with the
-label `namespace-profile-<name>`. A profile can attach a cache volume, mounted at `/cache`,
-and configure swap, which its runners lack by default and which a swap file on their
-overlay file system cannot replace. The workflows do not use cache volumes. To set it up,
-the owner runs these steps.
-
-1. Install the Namespace GitHub app on the account from the dashboard's GitHub runners
-   page and grant it this repository.
-2. Create a Linux AMD64 profile named `sparkles-large` with the 16x32 shape and 8 GB of
-   swap, and optionally a profile named `sparkles` with the 8x16 shape.
-3. Set `SPARKLES_RUNNER_LARGE` to `namespace-profile-sparkles-large`, and optionally
-   `SPARKLES_RUNNER` to `namespace-profile-sparkles`.
-
-Fork pull requests never reach either provider, because every label expression falls back
+Fork pull requests never reach Boat, because every label expression falls back
 to `ubuntu-24.04` unless the pull request's head repository is this one.
 
 ### Caches
