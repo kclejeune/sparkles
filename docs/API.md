@@ -9228,9 +9228,10 @@ Each triple pattern that rules can give facts for becomes a demand, with the pat
 constants bound. A pattern whose subject or object an earlier pattern of its group binds
 is seeded with that pattern's values, up to 10,000 of them. Seeds are not read through a
 registered property function, which runs only in the query itself, so a pattern whose
-seeds would need one is derived with its constants alone, and EXPLAIN shows `constants (a
-registered call binds the seeds)`. The OWL 2 QL rewrite does not yet tell registered
-properties apart from ontology properties. Roadmap item 1202. The demand (magic sets)
+seeds would need one is derived with its constants alone. The plan of the executed query
+names this fallback as `constants (a registered call binds the seeds)`. The OWL 2 QL
+rewrite does not tell registered properties apart from ontology properties, which
+roadmap item 1202 covers. The demand (magic sets)
 transformation rewrites the rules for each demand, so that only the facts that can reach
 its answers are derived. LUBM query 1 at 100 universities under OWL 2 RL derives no facts
 beyond the schema, where a materialization derives 10.9 million.

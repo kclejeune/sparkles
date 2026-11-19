@@ -389,23 +389,32 @@ pub(super) fn has_calls(ctx: &Ctx, patterns: &[TriplePattern]) -> bool {
 
 // Query-written collection extraction is local to the registered contract. The
 // built-in text/property parser's 64-cell limit remains unchanged.
+// Under RDFS on read the query's blank nodes are variables with a reserved prefix
+// (`renamed`), which still name the cells the query wrote.
 fn take_list(
     patterns: &[TriplePattern],
     head: &TermPattern,
+    renamed: bool,
 ) -> Result<(Vec<TermPattern>, Vec<usize>)> {
     use oxrdf::vocab::rdf;
-    let TermPattern::BlankNode(head) = head else {
+    let node = |t: &TermPattern| -> Option<String> {
+        match t {
+            TermPattern::BlankNode(b) => Some(b.as_str().to_owned()),
+            TermPattern::Variable(_) if renamed => super::rdfs::list_node(t).map(str::to_owned),
+            _ => None,
+        }
+    };
+    let Some(mut cell) = node(head) else {
         return Err(Error::invalid(
             "property argument must be a query-written RDF list",
         ));
     };
-    let mut cell = head.clone();
     let mut used = FxHashSet::default();
     let mut elements = Vec::new();
     loop {
         let link = |predicate: oxrdf::NamedNodeRef<'_>| -> Result<usize> {
             let mut matches = patterns.iter().enumerate().filter(|(_, t)| {
-                matches!(&t.subject, TermPattern::BlankNode(b) if b == &cell)
+                node(&t.subject).as_ref() == Some(&cell)
                     && matches!(&t.predicate, NamedNodePattern::NamedNode(n) if *n == predicate)
             });
             let (Some((i, _)), None) = (matches.next(), matches.next()) else {
@@ -424,8 +433,10 @@ fn take_list(
         elements.push(patterns[first].object.clone());
         match &patterns[rest].object {
             TermPattern::NamedNode(n) if *n == rdf::NIL => break,
-            TermPattern::BlankNode(next) => cell = next.clone(),
-            _ => return Err(Error::invalid("malformed property argument list")),
+            next => match node(next) {
+                Some(next) => cell = next,
+                None => return Err(Error::invalid("malformed property argument list")),
+            },
         }
     }
     Ok((elements, used.into_iter().collect()))
@@ -455,7 +466,7 @@ pub(super) fn take_calls(
                     Vec::new()
                 }
                 ArgumentShape::List(_) => {
-                    let (elements, cells) = take_list(patterns, head)?;
+                    let (elements, cells) = take_list(patterns, head, ctx.rdfs.is_some())?;
                     used.extend(cells);
                     elements
                 }

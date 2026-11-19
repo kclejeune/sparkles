@@ -407,10 +407,13 @@ in the same way.
 
 The RDFS rewrite now treats a registered property as a call through which the schema
 derives nothing. It leaves a triple pattern that names one as written, with the list
-cells of its arguments, and joins it after the rewritten patterns of its group so that
+cells of its list-shaped arguments, and joins it after the rewritten patterns of its group so that
 it still reads their bindings. It adds none as a subproperty branch, a domain or range
 branch or a superproperty pair, gives a variable predicate no type branches when
-`rdf:type` is registered, and keeps a path link of one as a stored read. A review found
+`rdf:type` is registered, and keeps a path link of one as a stored read. The rewrite
+still renames the query's blank nodes to variables with a reserved prefix, so that one
+blank node keeps one binding across the algebra nodes of a group, and list extraction
+reads such a variable as the blank node it replaced. A review found
 that the OWL 2 QL rewrite reads the ontology without the registry in the same way, and
 roadmap item 1202 covers it. A reasoning seed set that would read through a call falls back to
 the pattern's demand with constants. The configuration is still decided on the pattern

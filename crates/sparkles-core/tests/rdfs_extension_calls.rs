@@ -11,7 +11,8 @@ use sparkles_core::sparql::extensions::{
 };
 use sparkles_core::sparql::rdfs::{RdfsOnRead, RdfsSchema};
 use sparkles_core::sparql::reasoning::{
-    Demand, DemandInfo, Derived, ReasoningProvider, ReasoningSession, Report, SessionRequest,
+    Demand, DemandInfo, DemandTerm, Derived, ReasoningProvider, ReasoningSession, Report,
+    SessionRequest,
 };
 use sparkles_core::sparql::{
     CursorOptions, FallbackPolicy, QueryOptions, query, select_cursor, update::update,
@@ -250,12 +251,15 @@ impl ReasoningProvider for Deriving {
         Ok(Box::new(DerivingSession {
             seeds: self.seeds.clone(),
             plain: self.plain.clone(),
+            unseeded: Vec::new(),
         }))
     }
 }
 struct DerivingSession {
     seeds: Arc<AtomicUsize>,
     plain: Arc<AtomicUsize>,
+    /// the demands with no seeded position, from `prepare`
+    unseeded: Vec<usize>,
 }
 impl ReasoningSession for DerivingSession {
     fn intensional(
@@ -267,13 +271,20 @@ impl ReasoningSession for DerivingSession {
         Ok(matches!(p, Some(Term::NamedNode(n)) if n.as_str() == "urn:derived"))
     }
     fn prepare(&mut self, d: &[Demand], _: bool) -> sparkles_core::Result<Vec<DemandInfo>> {
+        self.unseeded = (0..d.len())
+            .filter(|&i| ![&d[i].s, &d[i].o].contains(&&DemandTerm::Seeded))
+            .collect();
         Ok(vec![DemandInfo::default(); d.len()])
     }
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> sparkles_core::Result<Derived> {
         self.seeds
             .fetch_add(seeds.iter().map(|(_, s)| s.len()).sum(), Ordering::SeqCst);
+        // a demand with constants alone, not a seeded one given no seeds
         self.plain.fetch_add(
-            seeds.iter().filter(|(_, s)| s.is_empty()).count(),
+            seeds
+                .iter()
+                .filter(|(d, s)| s.is_empty() && self.unseeded.contains(d))
+                .count(),
             Ordering::SeqCst,
         );
         Ok(Derived::default())
@@ -403,5 +414,83 @@ fn a_registered_type_gets_no_type_branch() {
     ] {
         eager(&s, q, &o).unwrap_or_else(|e| panic!("{q}: {e}"));
         assert_eq!(opens.load(Ordering::SeqCst), 0, "{q}");
+    }
+}
+
+/// Blank nodes keep one binding across the algebra nodes of a group, a list head shared
+/// with an ordinary pattern is still the call's list, and a cell-like pattern of a
+/// term-shaped argument is rewritten as any other pattern is.
+#[test]
+fn blank_nodes_and_list_cells_under_the_rewrite() {
+    type Make<'a> = dyn Fn(&Arc<AtomicUsize>) -> QueryOptions + 'a;
+    let s = store();
+    update(
+        &s,
+        "INSERT DATA { <urn:s:1> <urn:tag> 9 . <urn:s:1> <urn:firstChild> <urn:a> }",
+        &Default::default(),
+    )
+    .unwrap();
+    let n = |x: &str| NamedNode::new(x).unwrap();
+    let schema = RdfsSchema::from_triples(&[
+        Triple::new(
+            n("urn:firstChild"),
+            n(&format!("{RDFS}subPropertyOf")),
+            n("http://www.w3.org/1999/02/22-rdf-syntax-ns#first"),
+        ),
+        Triple::new(n("urn:q"), n(&format!("{RDFS}subPropertyOf")), n("urn:r")),
+    ]);
+    let rdfs = Some(Arc::new(RdfsOnRead::fixed(schema)));
+    let term = |opens: &Arc<AtomicUsize>| QueryOptions {
+        rdfs: rdfs.clone(),
+        ..options(opens, false)
+    };
+    let list = |opens: &Arc<AtomicUsize>| QueryOptions {
+        extensions: Some(registry_of(CALLBACK, ArgumentShape::List(1..=4), opens)),
+        rdfs: rdfs.clone(),
+        ..options(opens, false)
+    };
+    // each case answers as it does without RDFS, except the last, whose answer the
+    // schema entails
+    let cases: [(&str, &Make<'_>, Option<usize>); 3] = [
+        (
+            "SELECT ?x { <urn:s:1> <urn:p>+ _:b . _:b <urn:callback> ?x }",
+            &term,
+            None,
+        ),
+        (
+            "SELECT * { ?s <urn:p> ?v . _:args rdf:first ?s ; rdf:rest rdf:nil ;
+                        <urn:tag> ?tag ; <urn:callback> ?x }",
+            &list,
+            None,
+        ),
+        (
+            "SELECT ?x { _:s rdf:first ?v . _:s <urn:callback> ?x }",
+            &term,
+            Some(1),
+        ),
+    ];
+    for (q, make, entailed) in cases {
+        let q = format!("PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> {q}");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let without = QueryOptions {
+            rdfs: None,
+            ..make(&opens)
+        };
+        let plain = eager(&s, &q, &without).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let plain_calls = opens.swap(0, Ordering::SeqCst);
+        let got = eager(&s, &q, &make(&opens)).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let calls = opens.swap(0, Ordering::SeqCst);
+        match entailed {
+            None => {
+                assert!(!plain.is_empty(), "{q}");
+                assert_eq!(got, plain, "{q}");
+                assert_eq!(calls, plain_calls, "{q}");
+            }
+            Some(n) => {
+                assert_eq!(got.len(), n, "{q}");
+                assert_eq!(calls, n, "{q}");
+            }
+        }
+        assert_eq!(streamed(&s, &q, &make(&opens)).unwrap(), got, "{q}");
     }
 }

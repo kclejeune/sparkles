@@ -411,7 +411,7 @@ fn rewrite_calls(
     // Blank nodes of the patterns become variables, so that the parts a pattern is split
     // into still share them. Labels are scoped to one basic graph pattern, and the
     // projection of the query was fixed when it was parsed, so none becomes visible.
-    blank_to_var(&mut g, rw.calls);
+    blank_to_var(&mut g);
     rw.walk(&mut g);
     g
 }
@@ -1226,13 +1226,13 @@ fn dedup(mut v: Vec<Variable>) -> Vec<Variable> {
 }
 
 /// Turn the blank nodes of every pattern into variables (`__rdfsb_<label>`).
-fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::ExtensionRegistry>) {
+fn blank_to_var(gp: &mut GraphPattern) {
     use GraphPattern as G;
     fn term(t: &mut TermPattern) {
         match t {
             TermPattern::BlankNode(b) => {
                 *t = TermPattern::Variable(Variable::new_unchecked(format!(
-                    "__rdfsb_{}",
+                    "{BLANK_PREFIX}{}",
                     b.as_str()
                 )));
             }
@@ -1243,11 +1243,10 @@ fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::Extensi
             _ => {}
         }
     }
-    fn expr(e: &mut Expression, calls: Option<&super::extensions::ExtensionRegistry>) {
+    fn expr(e: &mut Expression) {
         use Expression as E;
-        let expr = |e: &mut Expression| expr(e, calls);
         match e {
-            E::Exists(p) => blank_to_var(p, calls),
+            E::Exists(p) => blank_to_var(p),
             E::Or(a, b)
             | E::And(a, b)
             | E::Equal(a, b)
@@ -1265,7 +1264,7 @@ fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::Extensi
             }
             E::In(a, l) => {
                 expr(a);
-                l.iter_mut().for_each(&expr);
+                l.iter_mut().for_each(expr);
             }
             E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr(a),
             E::If(a, b, c) => {
@@ -1273,35 +1272,15 @@ fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::Extensi
                 expr(b);
                 expr(c);
             }
-            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter_mut().for_each(&expr),
+            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter_mut().for_each(expr),
             E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => {}
         }
     }
     match gp {
         G::Bgp { patterns } => {
-            // A call's list arguments must stay blank nodes written in its pattern, so the
-            // blank nodes that occur only in its call group keep their labels.
-            let group = call_group(calls, patterns);
-            let mut keep: Vec<oxrdf::BlankNode> = Vec::new();
-            let mut shared: Vec<oxrdf::BlankNode> = Vec::new();
-            for (t, in_group) in patterns.iter().zip(&group) {
-                for x in [&t.subject, &t.object] {
-                    if let TermPattern::BlankNode(b) = x {
-                        if *in_group {
-                            keep.push(b.clone())
-                        } else {
-                            shared.push(b.clone())
-                        }
-                    }
-                }
-            }
-            keep.retain(|b| !shared.contains(b));
             for t in patterns {
-                for x in [&mut t.subject, &mut t.object] {
-                    if !matches!(x, TermPattern::BlankNode(b) if keep.contains(b)) {
-                        term(x);
-                    }
-                }
+                term(&mut t.subject);
+                term(&mut t.object);
             }
         }
         G::Path {
@@ -1316,23 +1295,23 @@ fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::Extensi
         | G::Minus { left, right }
         | G::SemiJoin { left, right }
         | G::AntiJoin { left, right } => {
-            blank_to_var(left, calls);
-            blank_to_var(right, calls);
+            blank_to_var(left);
+            blank_to_var(right);
         }
         G::LeftJoin {
             left,
             right,
             expression,
         } => {
-            blank_to_var(left, calls);
-            blank_to_var(right, calls);
+            blank_to_var(left);
+            blank_to_var(right);
             if let Some(e) = expression {
-                expr(e, calls);
+                expr(e);
             }
         }
         G::Filter { expr: e, inner } => {
-            expr(e, calls);
-            blank_to_var(inner, calls);
+            expr(e);
+            blank_to_var(inner);
         }
         G::Extend {
             inner, expression, ..
@@ -1343,8 +1322,8 @@ fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::Extensi
         | G::Unfold {
             inner, expression, ..
         } => {
-            expr(expression, calls);
-            blank_to_var(inner, calls);
+            expr(expression);
+            blank_to_var(inner);
         }
         G::Graph { inner, .. }
         | G::Project { inner, .. }
@@ -1352,32 +1331,50 @@ fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::Extensi
         | G::Reduced { inner }
         | G::Slice { inner, .. }
         | G::OrderBy { inner, .. }
-        | G::Group { inner, .. } => blank_to_var(inner, calls),
+        | G::Group { inner, .. } => blank_to_var(inner),
         G::Service { .. } | G::Values { .. } => {}
     }
 }
 
+/// The prefix of the variables that stand for the query's blank nodes after the rewrite.
+const BLANK_PREFIX: &str = "__rdfsb_";
+
+/// The label of a blank node of the query, written or renamed by the rewrite, so that a
+/// registered call's list argument is still read as the list the query wrote.
+pub(crate) fn list_node(t: &TermPattern) -> Option<&str> {
+    match t {
+        TermPattern::BlankNode(b) => Some(b.as_str()),
+        TermPattern::Variable(v) => v.as_str().strip_prefix(BLANK_PREFIX),
+        _ => None,
+    }
+}
+
 /// Which patterns of a basic graph pattern are registered calls or the cells of their
-/// list arguments: the `rdf:first` and `rdf:rest` patterns reached from a call's blank
-/// node argument through blank nodes.
+/// list arguments: the `rdf:first` and `rdf:rest` patterns of the blank nodes reached
+/// from a list-shaped argument through `rdf:rest`.
 fn call_group(
     calls: Option<&super::extensions::ExtensionRegistry>,
     patterns: &[TriplePattern],
 ) -> Vec<bool> {
+    use super::extensions::ArgumentShape;
     let mut group = vec![false; patterns.len()];
     let Some(r) = calls else {
         return group;
     };
-    let mut heads: Vec<&spargebra::term::BlankNode> = Vec::new();
+    let mut heads: Vec<&str> = Vec::new();
     for (t, g) in patterns.iter().zip(group.iter_mut()) {
-        if let NamedNodePattern::NamedNode(p) = &t.predicate
-            && r.property(p.as_str()).is_some()
-        {
-            *g = true;
-            for x in [&t.subject, &t.object] {
-                if let TermPattern::BlankNode(b) = x {
-                    heads.push(b);
-                }
+        let NamedNodePattern::NamedNode(p) = &t.predicate else {
+            continue;
+        };
+        let Some(d) = r.property(p.as_str()) else {
+            continue;
+        };
+        *g = true;
+        for (x, shape) in [(&t.subject, &d.subject), (&t.object, &d.object)] {
+            if matches!(shape, ArgumentShape::List(_))
+                && let Some(head) = list_node(x)
+            {
+                heads.push(head);
             }
         }
     }
@@ -1387,17 +1384,17 @@ fn call_group(
     loop {
         let mut grew = false;
         for (t, g) in patterns.iter().zip(group.iter_mut()) {
-            let cell = matches!(&t.predicate, NamedNodePattern::NamedNode(p)
-                if p.as_ref() == rdf::FIRST || p.as_ref() == rdf::REST);
-            if *g || !cell {
+            let NamedNodePattern::NamedNode(p) = &t.predicate else {
+                continue;
+            };
+            let (first, rest) = (p.as_ref() == rdf::FIRST, p.as_ref() == rdf::REST);
+            if *g || !(first || rest) {
                 continue;
             }
-            if let TermPattern::BlankNode(b) = &t.subject
-                && heads.contains(&b)
-            {
+            if list_node(&t.subject).is_some_and(|b| heads.contains(&b)) {
                 *g = true;
                 grew = true;
-                if let TermPattern::BlankNode(next) = &t.object {
+                if rest && let Some(next) = list_node(&t.object) {
                     heads.push(next);
                 }
             }
