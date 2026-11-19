@@ -118,6 +118,49 @@ whose bytes the response writer took. That accounting costs 7% of the instructio
 a buffer that counts rows only when it is written out, and on forge `optional-chain` took
 150.8 ms of client time against 132.0 ms without it. Roadmap item 243 follows this up.
 
+Streamed answers write through the same buffer, with the same count of the rows the
+response writer accepted. The table gives `instructions:u` per request of a native JSON request with
+`execution=streaming` at 1.05M triples, over two passes of 200 requests for the short
+queries and 10 for the large ones, for a build whose cursor writers wrote to the response
+writer a few bytes at a time and for the current one, with the eager request's count
+beside them. The eager counts of the two builds agree within 0.5%.
+
+| Query | Writing to the response writer | Writing to the buffer | Eager |
+|---|--:|--:|--:|
+| `count-all` | 453.2 thousand | 390.9 thousand | 306.8 thousand |
+| `predicate-counts` | 670.3 thousand | 509.7 thousand | 422.3 thousand |
+| `star-lookup` | 1,760.0 thousand | 1,327.1 thousand | 1,188.7 thousand |
+| `star-join` | 67.6 million | 40.4 million | 39.6 million |
+| `optional-chain` | 315.1 million | 157.6 million | 182.4 million |
+| `order-by-full` | 1,407.3 million | 970.5 million | 975.8 million |
+| `export-500k` | 6,132.2 million | 2,816.6 million | 3,537.1 million |
+
+*Instructions were counted on an Intel Core Ultra X7 358H laptop with the server on four
+performance cores, for release builds of 8baa5686 and a016b7bd made on the same host. The
+laptop ran other builds at the time, so cycles and wall times are not reported.*
+
+The wall times of the same two builds come from atlas, which has forge's hardware. The
+table gives the median wall time of a native JSON request at 1.05M triples with 12 Rayon
+threads, the server on CPUs 0 to 11 and the client on CPU 12, over eight rounds of A,B,B,A
+with 10 requests per variant in each position, from a run with the earlier build second
+that had the host to itself.
+
+| Query | Streamed, writing to the response writer | Streamed, writing to the buffer | Eager |
+|---|--:|--:|--:|
+| `star-join` | 5.88 ms | 4.55 ms | 4.89 ms |
+| `optional-chain` | 18.4 ms | 10.4 ms | 14.1 ms |
+| `order-by-full` | 50.6 ms | 31.7 ms | 42.7 ms |
+| `export-500k` | 289 ms | 121 ms | 220 ms |
+
+*Wall times were measured on atlas for release builds of 8baa5686 and a016b7bd made on
+wally. They are not comparable with forge's figures.*
+
+Over both orders, a streamed request with 12 threads took 0.42 to 0.77 times the earlier
+build's wall time on these four queries, and with one thread 0.53 to 0.78 times. On the
+seven queries under 1 ms, a pinned atlas check with 12 rounds in each order found the two builds' streamed wall times within 4% of each other, with every
+95% interval including 1.0. A streamed answer there still takes 0.21 to 0.29 ms more wall
+time than an eager one, which roadmap item 534 follows up.
+
 A pinned forge comparison of the combined feature changes, with 16 A,B,B,A rounds and
 100 requests per server process, found `count-all` server time 12.5% higher at 6.0 µs
 against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Every round was slower for both

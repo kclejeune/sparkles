@@ -118,11 +118,11 @@ The maintainer settled these questions for stage 4.
 
 **One query-scoped expression memo.** Replace exprcache, cursor BIND reuse and the EXISTS memo with one charged memo keyed by expression and input value with one admission policy fed by observed repetition. Three memos each have their own admission and charging. It depends on item 293.
 
-**One columnar writer per format over batch sources.** Write each result format once over a batch source, with an eager QueryResult as a one-batch source, vectorized term decoding, per-column writes into prebuilt buffers, and the Thrift writer moved into core. Two serializer stacks exist, Thrift forces eager execution, cursor writers write a few bytes at a time (item 240), and large answers such as SP2Bench q4 at 1.96 GB need a raised limit. It depends on items 91, 240, 243 and 534.
+**One columnar writer per format over batch sources.** Write each result format once over a batch source, with an eager QueryResult as a one-batch source, vectorized term decoding, per-column writes into prebuilt buffers, and the Thrift writer moved into core. Two serializer stacks exist, Thrift forces eager execution, and large answers such as SP2Bench q4 at 1.96 GB need a raised limit. It depends on items 91, 243 and 534, and item 240 has shipped.
 
 ### Stage 6: the executor merge
 
-**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 240, 243, 293 and 534. Items 93 and 512 have shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator remains their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
+**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 243, 293 and 534. Items 93, 240 and 512 have shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator remains their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
 
 **Eager LIMIT and ASK through pull demand.** Route every ASK and unordered LIMIT through the cursor's pull demand, move UNION branch ordering for ASK into the planner's cost model, and delete `run_limited`'s geometric prefix replay and the unionpush first-work estimator. Eager LIMIT replays growing prefixes and unionpush keeps a duplicate cost model. `ask_streaming` exists, so this can land before the executor merge. It depends on item 7.
 
@@ -156,7 +156,7 @@ The maintainer settled these questions for stage 4.
 * Items 7 and 93 land before the executor merge, because they settle the spill default and
   the remaining eager fallbacks that the merge must absorb. Item 93 has shipped.
 * Items 240, 243, 293 and 534 settle the cursor writers, row accounting, BIND reuse and
-  the streamed response cost that stage 6 relies on.
+  the streamed response cost that stage 6 relies on. Item 240 has shipped.
 * Item 512's test-only reference evaluator is the oracle of the differential tests, as it
   must be before the eager executor is deleted.
 * The join-algorithm work of [X15](../X15-join-algorithms-and-estimation/README.md),
@@ -1296,3 +1296,100 @@ second's final form, 0acba641, ran 1.3% more instructions than 6fba19d6 on
 c2b5d7cf over the two runs, longer in every round. The checked writer also had 44% more
 branch misses than 6fba19d6 on `optional-chain`, and none of the builds changed that
 count, so item 763 looks there next.
+
+### The streamed response cost
+
+Roadmap item 534 measured where a streamed response spends the time that an eager one
+does not, at 1.05M triples in native JSON. On the laptop, an Intel Core Ultra X7 358H
+with the server on four performance cores, `perf stat` counted 472 thousand user-space
+instructions per request of a streamed `count-all` against 311 thousand eager, 1.78
+million against 1.19 million on `star-lookup`, and 263 thousand more on
+`predicate-counts`. The user-space cycles of `count-all` were nearly equal, 410 thousand
+streamed against 396 thousand eager per request, so the gap of the short queries is not
+work in the server's code. On the large answers the streamed requests ran 6.13 billion
+instructions against 3.54 billion on `export-500k`, 315 million against 183 million on
+`optional-chain`, 68 million against 39 million on `star-join` and 1.41 billion against
+976 million on `order-by-full`. LBR call stacks showed that the cursor writers' chain of
+calls through the server's size-limited switch writer, which serde's escaping wrote
+through a few bytes at a time and which was not inlined, cost more than the whole
+difference on `export-500k` and about 90 thousand of the 160 thousand instructions on
+`count-all`, while the streamed decoding was cheaper than the eager one.
+
+On forge, with the server on CPUs 0 to 11 with 12 Rayon threads and curl on CPU 12, a
+streamed answer took 0.13 to 0.23 ms more wall time than an eager one on the nine
+queries under 1 ms, 1.29 to 1.47 times as long. The large answers took 7.53 ms against
+5.00 ms on `star-join`, 22.4 against 20.1 ms on `optional-chain`, 49.4 against 40.2 ms
+on `order-by-full` and 284 against 213 ms on `export-500k`. A phase trace of
+the nine short queries in a diagnostic build placed their gap in the hand-off between
+threads, with each phase measured per request. An eager request ran in place on the
+worker that received it, and `count-all` had serialized its answer a median of 65 µs
+after the handler started. A streamed request woke a blocking-pool thread to open its
+cursor, woke the handler to receive the cursor and woke a second pool thread to write
+the body. Each pool wake took either about 10 µs or about 80 µs, and their means across
+the nine queries were 35 to 80 µs for the open's wake and 32 to 73 µs for the
+producer's, with medians of 8 to 10 µs for the return to the handler. The end of the body, from the
+last write to the producer's finish, took 49 to 85 µs on average. On `count-all` the
+cursor's open took a median of 59 µs against the eager run's 45 µs, and the first batch
+with its write 42 µs against the eager serialization's 8 µs. The same build answered a streamed request whole, without the
+early commit at the first batch, which removes the channel, the end-of-body handshake and
+the early commit together, and it was no faster. Its streamed `count-all` took 0.729 ms
+against 0.546 ms with the early commit, and the other short queries took 0.58 to 0.89 ms
+against 0.53 to 0.82 ms. The Python client bounded the large answers' wall times in the
+laptop's runs, so their wall times come from curl.
+
+Roadmap item 240 then gave the cursor writers of SELECT, native JSON, RDF and Jena graph
+answers the 8 KiB `Buffered` writer of the eager writers through `write_buffered`, which
+is compiled in `sparkles-core`, so a streamed answer reaches the server's writer in
+pieces of that size. Each writer counts the rows whose bytes reached the server's writer,
+and the access log and the metrics report that count for a streamed body that stopped
+partway, as they do for an eager one. A streamed body that the result-size budget stops
+after its first bytes now sends what it had buffered before it aborts, as an eager body
+already did, so the rows reported are the rows a client that keeps reading receives.
+That last send waits under the body's idle limit like any other, and when it fails the
+bytes reported leave out the unsent chunk while the row count still includes its rows,
+so the count is exact when the client keeps reading and otherwise within one chunk.
+
+Matched release builds of 8baa5686 and a016b7bd, both from wally, were counted on the
+laptop with the server on four performance cores, over two passes of 200 requests for
+the short queries and 10 for the large ones, at 1.05M triples. The eager requests ran
+the same instructions within 0.5% in native JSON and in SPARQL JSON. In native JSON the
+streamed requests ran 0.46 times the base's instructions on `export-500k`, 2.82 billion
+against 6.13 billion, and below the eager requests' 3.54 billion. They ran 0.50 times on
+`optional-chain`, 158 million against 315 million with 182 million eager, 0.60 times on
+`star-join`, 40.4 million against 67.6 million with 39.6 million eager, and 0.69 times
+on `order-by-full`, 970 million against 1.41 billion with 976 million eager. The short
+queries kept part of their gap, as the hand-off is outside the writer. A streamed
+`count-all` ran 391 thousand instructions against 453 thousand with 307 thousand eager,
+`predicate-counts` 510 thousand against 670 thousand with 422 thousand eager, and
+`star-lookup` 1.33 million against 1.76 million with 1.19 million eager. In SPARQL JSON
+the streamed requests ran 0.44 to 0.50 times the base's instructions on `export-500k`,
+`optional-chain` and `star-join`, 7.64 billion against 7.69 billion eager on
+`export-500k` and 78.8 million against 73.3 million eager on `star-join`. The laptop ran
+other builds at the time, so only the instruction counts are reported here.
+
+The wall times of the same two builds come from atlas, an Intel host with forge's
+hardware. The server ran on CPUs 0 to 11 and the client on CPU 12, at 1.05M triples in
+native JSON, in rounds of A,B,B,A with 10 requests per variant in each position, and each
+cell ran once with the base first and once with the base second. The ratios below are
+the geometric means of the two orders, over the 31 queries of the matrix with eight
+rounds in each order, from runs that had the host to themselves. With 12 Rayon threads a
+streamed request took 0.42 times the base's wall time on `export-500k`, 0.56 times on
+`optional-chain`, 0.63 times on `order-by-full` and 0.77 times on `star-join`. In the run
+with the base second, these streamed requests took 121 ms against 289 ms, 10.4 against
+18.4 ms, 31.7 against 50.6 ms and 4.55 against 5.88 ms, and they finished before the
+eager requests of the same build, which took 220, 14.1, 42.7 and 4.89 ms. With one thread
+the four queries took 0.53, 0.65, 0.78 and 0.73 times the base's wall time, and the
+streamed `star-join` and `order-by-full` took about as long as the eager ones. The
+geometric mean of the streamed ratios over the 31 queries was 0.935 with 12 threads. The
+eager requests of the two builds took 0.984 to 1.023 times each other's wall time with 12
+threads, in the order with the base second, since the other order's eager run may have
+overlapped a build, and 0.983 to 1.018 with one thread over both orders.
+
+The seven queries under 1 ms ran again on atlas with 12 rounds in each order and 12
+threads, as a pinned check of the streamed `count-all` and `distinct-obj`, which one
+order of the matrix had shown about 7% slower. The streamed wall-time ratios of the two
+builds were 0.96 to 1.02 on all seven queries, and the 95% interval of every ratio
+included 1.0, as did the eager control's. A streamed answer still took 0.21 to 0.29 ms
+more wall time than an eager one on those queries, against 0.23 to 0.31 ms in the base,
+because the hand-off between threads that the phase trace measured lies outside the
+writer.

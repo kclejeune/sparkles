@@ -84,9 +84,11 @@ eighth of the budget. The decorrelated EXISTS key sets of `exists.rs` are shared
 
 The result writers exist twice, and the design's two gaps have narrowed. The eager
 writers of `sparql/results.rs` write a whole `QueryResult` through `Buffered`, which marks
-row ends and counts the rows the client received. The cursor writers write through the
-`Shared` adapter without that count, and SELECT, graph, Jena graph and native JSON each
-have a cursor writer of their own. An ASK that a streaming request runs is pulled through
+row ends and counts the rows the client received. The cursor writers run on the same
+`Buffered` writer through `write_buffered`, compiled in `sparkles-core`, and count the
+rows the client received the same way, but SELECT, graph, Jena graph and native JSON each
+still have a cursor writer of their own, whose serializer reaches the buffer through the
+`Shared` adapter. An ASK that a streaming request runs is pulled through
 the cursor by `finish_ask`, and its boolean is then written by the eager writers, since
 one value needs no streamed writer. The SPARQL Results Thrift encoder `ThriftResults` is
 already in `sparkles-core`'s `jena_formats.rs`, and only its writer
@@ -170,13 +172,13 @@ phases name are carried here as they stand at the base of this plan.
 | Grouping operator, item 826 | Item 93. | Item 7's grouping over key runs has shipped. Item 418 is outstanding, and the [schedule](#order-of-work) says how item 826 proceeds with and without it. |
 | Frontier kernel | Item 417. | Items 8 and 51. |
 | Expression memo | None. | Item 293. |
-| Columnar writers, item 828 | None. | Items 91, 240, 243 and 534. Item 828 follows items 534 and 240 and carries items 243 and 91 as its own gates. |
+| Columnar writers, item 828 | Item 240. | Items 91, 243 and 534. Item 828 carries items 243 and 91 as its own gates and the in-place route of item 534's hand-off plan. |
 | Mode-independent plans and pull-demand LIMIT and ASK, item 827 | None. | Item 7, for the EXISTS shapes that stay eager, which item 827 leaves to item 829. |
 | Native leaf cursors, item 829 | None. | Item 827 for the admission code, and item 825 for the operators that build over their input. |
-| The merge | Items 93, 469 to 473. | Items 7, 240, 243, 293, 534 and 512, and items 825 to 829. |
+| The merge | Items 93, 240, 469 to 473. | Items 7, 243, 293, 534 and 512, and items 825 to 829. |
 | Demand seeding and one visitor | None. | Item 190. |
 
-Items 7, 240, 243, 293 and 534 are on the merge's critical path because the design puts
+Items 7, 243, 293 and 534 are on the merge's critical path because the design puts
 them there, and this plan does not shorten that path. Item 243 lands inside item 828's
 work on the writers, and item 293 settles the memo's admission before the merge deletes
 the eager memo.
@@ -193,9 +195,9 @@ ownership boundaries given below, and the rows are serial.
 | Step | Phases | Why they wait |
 |---|---|---|
 | Now | Item 675 lands. Items 678, 512 and 534 start. Item 825 starts. Item 827 starts. | Each owns its own functions, as the boundaries below say. Item 534 is measurement work that items 240 and 828 build on. |
-| After 825 | Item 826 starts. Item 240 starts once item 534 says where the streamed time goes. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
+| After 825 | Item 826 starts. Item 240 has shipped on item 534's measurement. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
-| After 240 | Item 828 starts. | The writers take the buffer that item 240 gives the cursor writers. |
+| After 240 | Item 828 can start, and item 534 opens the cursor in the producer's task. | The writers take the buffer that item 240 gave the cursor writers. |
 | After 293 | The expression memo phase is numbered and starts. | Its admission policy is item 293's open question. |
 | After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
@@ -363,17 +365,19 @@ phase records their change.
 
 ### Item 828: one columnar writer per format over batch sources
 
-The phase follows item 240, which follows the measurement of item 534. Once the design is
-written down it is routine work, apart from item 534's profiling.
+The phase follows item 240, which followed the measurement of item 534. Once the design
+is written down it is routine work.
 
-Item 534 first finds where a streamed response spends about 0.27 ms more than an eager
-one on queries under 1 ms, between `QueryCursor::next_batch` and the response writer. It
-counts user-space instructions per request with `perf stat` on atlas and profiles with
-LBR call stacks, as stage 4's per-query costs were traced, since the instruction harness
-of `bench:insn` covers vocabulary scans and WAL replay and not response writing. Item 240
-then gives the cursor writers the `Buffered` writer of the eager path, so that every
-writer counts the rows the client received the same way, and item 243 finds a row-end
-record that costs nothing per write, measured on `optional-chain`.
+Item 534 counted user-space instructions per request with `perf stat` and profiled with
+LBR call stacks, as the [Outcome](SPEC.md#the-streamed-response-cost) records. The cursor
+writers wrote a few bytes at a time through the server's size-limited switch writer, and
+that chain of calls was more than the whole difference in instructions on `export-500k`
+and about half of it on `count-all`. Item 240 gave the cursor writers the `Buffered`
+writer of the eager path, so that every writer counts the rows the client received the
+same way. Item 243 then finds a row-end record that costs nothing per write, measured on
+`optional-chain`. The wall-time gap of the short queries lies mostly outside the writer,
+in the hand-off between threads that the
+[next section](#the-hand-off-of-a-streamed-response-item-534) plans.
 
 Item 828 then defines a batch source trait in `sparql/results` with `next_batch` and the
 variables, implemented by `QueryCursor`, by `GraphCursor` and by an eager `QueryResult`
@@ -389,11 +393,9 @@ source's decode buffer. The `_counted` eager writers and the `Shared` adapter ar
 deleted.
 
 The regression tests that fail before the change are a server test that a streaming
-request for a SELECT in Thrift streams rather than being refused, a test in
-`results/output_boundary_tests.rs` that a streamed answer cut by the byte budget reports
-the rows the client received as the eager one does, and a differential test that every
-format's bytes for a result are equal whether written from the eager result or from a
-cursor at a batch size of one. The edge cases are an answer of zero rows in each format,
+request for a SELECT in Thrift streams rather than being refused and a differential test
+that every format's bytes for a result are equal whether written from the eager result or
+from a cursor at a batch size of one. The edge cases are an answer of zero rows in each format,
 a literal larger than the buffer, a graph answer whose last batch holds only labels, a
 decode refusal in the middle of a batch, which keeps its original error and the earlier
 complete rows as stage 4 decided, and a client that disconnects between batches.
@@ -405,6 +407,72 @@ slower today and the merge needs it within the gate, and SP²Bench `q4` through
 `scripts/bench-sp2b.sh` on atlas for item 91, with its forge record after the push. The
 bindings run `bench:bindings`, since the Node, Python and FFI bindings serialize through
 these writers.
+
+### The hand-off of a streamed response, item 534
+
+A phase trace of the nine short queries on forge put the rest of their gap in the
+hand-off between threads. An eager request for a text whose last run was quick runs on
+the worker that received it, without waking another thread, and `count-all` had
+serialized its answer a median of 65 µs after the handler started. A streamed request
+woke a blocking-pool thread to open its cursor, woke the handler to receive the cursor
+and woke a second pool thread to write the body. Each pool wake took either about 10 µs
+or about 80 µs per request, so their means are the useful measure, 35 to 80 µs for the
+open's wake and 32 to 73 µs for the producer's across the nine queries, with medians of 8 to 10 µs
+for the return to the handler. The plan therefore predicts savings in wakes removed and
+judges them by per-request deltas. Three changes follow, and they differ in what they change for a
+client.
+
+The first opens the cursor in the producer's task. `cursor::run` opens the cursor on the
+pool, hands it back to the handler and then starts the producer on the pool, and the
+automatic route that opens a cursor through `blocking(run)` and reaches `cursor::serve`
+through `Ran::Cursor` takes the same two wakes. Opening the cursor in the task that then
+writes its body removes both on both routes and changes no response. The refusal of a
+streamed SELECT in Thrift is decided from the parsed query's kind before the task starts.
+The task builds `StreamControl` from the opened cursor, and the commit, the resolved
+state, the content type and the `Sparkles-Reasoning` header come back with the
+producer's first outcome. An error of the open is the response error with the status
+`with_timeout` gives it today and never reaches the report of a stream's end, which the
+outcome of a body with a control otherwise calls. The permit is held from the open on,
+and the report's split between execution and serialization time stays as it is.
+Characterization tests that pass before and after the change cover a parse error, an
+unknown `at`, a budget refused at the open and a timeout at the open. The change is kept
+when atlas's interleaved rounds under the [Intel rule](#the-intel-rule) show a saving
+per request on the queries under 1 ms and no query slower, and it stays under item 534.
+
+The second gives the writing of a cursor's body the in-place route. A cursor opens in
+place on a text's first run and on a text whose quick history keeps automatic execution,
+as a quick cursor, a text that is settling its mode and a quick ASK do, and its body
+then still moves to the pool to be written. Every other quick history sends the text to
+the eager executor, and the route must cover both kinds of cursor. The merge
+keeps the in-place runner's choice between the receiving worker and the blocking pool
+for a collected cursor, so cursors need the route before the merge can hold a quick
+text to the eager time. A cursor run in place pulls batches and writes them until the
+cursor ends or the body passes the switch threshold, and it answers whole when the
+cursor ends first, as an eager answer does. Otherwise it hands the cursor and the bytes
+written so far to the producer on the pool. The hand-off needs a writer whose state can
+move to another thread between batches, which item 828's writers over a batch source
+give, so the route lands with item 828 and is measured there. A cursor knows it has
+ended only when a pull returns no batch, so the loop pulls once more after the last
+batch, which costs a check of a finished cursor's state.
+
+The third would have let a request with `execution=streaming` take the in-place route
+too, and it is not taken. Such a request opens on the pool, so its work stops when its
+client disconnects, as [X05](../X05-streaming-query-execution.md) specifies for
+streaming bodies, and it commits after its first batch or 64 KiB. Work in place cannot
+stop when its client goes away, and only the query's timeout bounds it. An explicit
+`execution=streaming` therefore keeps the pool route and its cancellation on a client's
+disconnect, and only the automatic execution of a quick text takes the in-place route.
+The merge keeps that difference beside the commit point. The saving given up is the
+open's wake, 35 to 80 µs on average, beside what the first change saves.
+
+Two candidates were measured and are not planned. A diagnostic build that answered a
+streamed request whole, without the early commit, removed the channel, the end-of-body
+handshake and the first-batch commit together and was no faster on forge, as the
+[Outcome](SPEC.md#the-streamed-response-cost) records. The cursor's open, a median of 59 µs
+against the eager run's 45 µs on `count-all`, and its first batch with its write, 42 µs
+against the eager serialization's 8 µs, are executor costs that no change of route removes. Item
+828's decoding of a batch column at a time takes the write, and the merge owns the open,
+since it opens a cursor for every query.
 
 ### The frontier-expansion kernel
 
@@ -746,7 +814,7 @@ they change planner and executor cost decisions, and their validating planner im
 them. Item 678, item 512, the expanding operators of item 829 for forms whose eager
 kernel already runs per batch, and the visitor half of the demand phase are routine work
 with this plan and the design as their specification, with the planner validating item
-512's semantics. Item 828 is routine once items 534 and 240 have written down where the
+512's semantics. Item 828 is routine now that items 534 and 240 have written down where the
 time goes, and item 534 itself is performance work for a capable implementer on atlas.
 
 Items 678, 512, 534 and 825 run at the same time with item 827 within the ownership

@@ -369,6 +369,12 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   Expiry aborts the transfer and requests cancellation. Actual producer owners remain
   until work stops, and only a successful transfer is a complete answer. The settings
   also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
+* A response that the result-size budget stops after its first bytes, eager or streamed,
+  first sends what its writer had buffered and then aborts the transfer. The access log
+  and the metrics count the rows whose bytes the response writer accepted, which are the
+  rows a client that keeps reading receives. When the client has stopped reading, that
+  last send waits only as long as the idle limit, and if it fails the report leaves out
+  its bytes but still counts the rows of that last chunk.
 * A query that a budget or its timeout stopped keeps its plan in the error body of the
   `application/x-sparkles+json` format.
 * `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Streamed answers through the engine buffer
+
+The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
+through the engine's 8 KiB buffer, as eager answers do, which completes roadmap item 240.
+A streamed request on the large answers of the synthetic benchmark at 1.05M triples runs
+0.46 to 0.69 times the instructions it ran before, and on atlas with 12 threads it takes 0.42 to 0.77 times its former wall time, which puts it ahead of the eager request on those answers. The access log and the metrics report
+the rows whose bytes the response writer accepted for a streamed body that stopped
+partway, as they do for an eager one. A streamed body
+that the result-size budget stops after its first bytes now sends what it had buffered
+before it aborts the transfer, as an eager body did, so a client receives up to one more
+chunk of complete rows before the abort.
+
 ### Instruction counts per request before timing
 
 `mise run bench:request-insn` counts the user-space instructions, cycles and CPU time per

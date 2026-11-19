@@ -16,6 +16,7 @@ use oxrdf::{GraphName, Quad};
 use rustc_hash::FxHashSet;
 use spargebra::GraphTemplate;
 use spargebra::term::TriplePattern;
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -463,7 +464,42 @@ pub fn write_cursor_graph(
     send: Option<usize>,
     prefixes: &[(String, String)],
 ) -> Result<CursorStats> {
-    let result: Result<()> = depth::with_stack(cursor.where_cursor.depth, || {
+    write_cursor_graph_counted(cursor, format, output, send, prefixes, &Cell::new(0))
+}
+
+/// [`write_cursor_graph`], counting in `sent` the triples and quads that reached `output`
+/// whole, as the eager graph writers count them. The statements go out through the
+/// buffer of the eager writers.
+pub fn write_cursor_graph_counted(
+    cursor: &mut GraphCursor,
+    format: oxrdfio::RdfFormat,
+    output: &mut dyn std::io::Write,
+    send: Option<usize>,
+    prefixes: &[(String, String)],
+    sent: &Cell<u64>,
+) -> Result<CursorStats> {
+    let result = crate::sparql::results::write_buffered(output, sent, &mut |w, staged| {
+        graph_to(cursor, format, w, send, prefixes, staged)
+    });
+    if let Err(error) = result {
+        cursor.failure = Some(error.to_string());
+        cursor.finish(CursorStatus::Failed);
+        return Err(error);
+    }
+    Ok(cursor.stats())
+}
+
+/// [`write_cursor_graph_counted`] into the buffer of the eager writers.
+fn graph_to(
+    cursor: &mut GraphCursor,
+    format: oxrdfio::RdfFormat,
+    output: &mut crate::sparql::results::Buffered<'_>,
+    send: Option<usize>,
+    prefixes: &[(String, String)],
+    staged: &Cell<u64>,
+) -> Result<()> {
+    use std::io::Write as _;
+    depth::with_stack(cursor.where_cursor.depth, || {
         let _serializer_charge = OwnedCharge::new(
             &cursor.where_cursor.ctx,
             (128 << 10)
@@ -497,6 +533,7 @@ pub fn write_cursor_graph(
                     writer
                         .serialize_quad(quad)
                         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                    staged.set(staged.get() + 1);
                 }
                 sent += 1;
             }
@@ -513,11 +550,5 @@ pub fn write_cursor_graph(
             .finish()
             .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
         Ok(())
-    });
-    if let Err(error) = result {
-        cursor.failure = Some(error.to_string());
-        cursor.finish(CursorStatus::Failed);
-        return Err(error);
-    }
-    Ok(cursor.stats())
+    })
 }
