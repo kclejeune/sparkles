@@ -15,7 +15,8 @@ log and `sha256sum` of the two binaries as taken on `atlas` after the run.
 Both builds are release builds made on `atlas` with `mbx build --release -p
 sparkles-server` and rustc 1.99.1. A is bc647108, which streams EXISTS inside larger
 expressions and hashes every conditional OPTIONAL in the cursor, and B is ca1532ba,
-which merges a conditional OPTIONAL in the cursor. Their sha256 hashes are
+which merges a conditional OPTIONAL in the cursor and which became 426e8630 when the
+change was rebased onto a later main before it landed. Their sha256 hashes are
 `fa5dfcac483004a9c673af6e9e09348e9eb002de8c73db5aa5d633e234c7e74f` for A and
 `8c43879e2f6100cfa22f08669bedae30f5fbe4c505efc414f9eeeadc676b1ad3` for B. The commits
 after ca1532ba change only the merge's charges, where its condition is held and the
