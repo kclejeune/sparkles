@@ -7,9 +7,9 @@
 `mise run ui:e2e` now builds the formatter's WebAssembly module before the UI, as
 `ui:e2e:mock` does. The tests of the Pattern pane, the plan's pattern and **Apply to
 query** in the facets of a query need the module, and they now pass against a local debug
-server. When the debug server's UI or the one `SPARKLES_UI_DIR` names lacks the module, the
-setup stops with a message before the servers start, unless `SPARKLES_E2E_NO_WASM=1` is
-set. The lens tests now look for unlabelled nodes under the full IRIs that the rendering
+server. Before the servers start, the setup looks for the module in the directory that
+`SPARKLES_UI_DIR` names, or else in `ui/build` for the default debug binary, and stops with
+a message when it is missing. `SPARKLES_E2E_NO_WASM=1` skips that check. The lens tests now look for unlabelled nodes under the full IRIs that the rendering
 preferences draw. The outbound-policy test of ontology imports asks for a link-local
 address, which the test server's policy refuses before it connects, although it allows
 private addresses. This completes roadmap item 1131.

@@ -557,9 +557,10 @@ with users and API tokens. The second runs without auth and allows private outbo
 addresses. The task then runs the Playwright tests in `ui/tests/e2e` in headless Chromium
 and stops the servers. The Pattern pane, the plan's pattern and **Apply to query** in the
 facets of a query have no server fallback, so their tests need the module. Before the
-servers start, the setup looks for the module in the UI that the debug server or
-`SPARKLES_UI_DIR` serves, and it stops with a message when the module is missing. It
-cannot see the UI of another binary. `SPARKLES_E2E_NO_WASM=1` skips the check, and the
+servers start, the setup looks for the module in the directory that `SPARKLES_UI_DIR`
+names. Without that setting it looks in `ui/build` when the binary is the default debug
+build, and it skips the check for another binary, whose UI it cannot see. It stops with a
+message when the module is missing. `SPARKLES_E2E_NO_WASM=1` skips the check, and the
 tests that need the module still fail without it.
 
 To test another binary, set `SPARKLES_BIN=path/to/sparkles`. Extra arguments go to
