@@ -166,7 +166,7 @@ at 64 MiB or a sixteenth of the budget, so a cursor's batches share them. On for
 triples with one thread, streaming `str-pair-names` takes 0.517 of its earlier time and
 `str-pair-lt` 0.815, while `str-pair-colleague`, whose names rarely repeat, takes 1.042,
 and 1.065 with 12 threads, which item 1088 follows. Every worker of a comparison reads and
-writes one lock-free table of floors, which replaced an earlier map per worker that
+writes the slots of one table of floors without a lock, which replaced an earlier map per worker that
 computed a repeated string's floor once per worker.
 
 ### Fewer rooted classification runs past their bound

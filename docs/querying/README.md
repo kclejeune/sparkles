@@ -321,9 +321,11 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   lasts the query and grows when repeated strings evict each other, charged to its
   budget and capped at 64 MiB or a sixteenth of the budget, which trades that memory for
   not computing a repeated string's floor again. Once the cache is full, the floors it
-  lacks are computed each time. In streaming execution, pairs whose strings rarely
-  repeat run up to about 7% slower than a direct comparison of the keys, which
-  [roadmap item 1088](../ROADMAP.md) recovers.
+  lacks are computed each time. The comparison covers simple literals of the base
+  vocabulary, and other rows of the table take the generic comparison. In streaming
+  execution, a pair whose strings rarely repeat, such as the measured
+  `str-pair-colleague`, runs up to about 7% slower than a direct comparison of the keys,
+  which [roadmap item 1088](../ROADMAP.md) recovers.
 * Property path closures run within the query's memory budget and timeout in both
   executors. A closure counts its visited set, its frontier and the edge relation of a
   sequence or alternative path against the budget, and the walk checks the deadline while

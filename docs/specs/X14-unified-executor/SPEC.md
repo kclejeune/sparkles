@@ -280,7 +280,7 @@ that build with one thread, the shared table reads 0.952 on `str-pair-colleague`
 while `str-pair-names` takes 5.3% longer in streaming and 9.7% longer in eager execution.
 The names query's table grows from its first 2^16 slots during the query. On wally, a
 first table as large as the vocabulary's clamp closed that gap but made `str-pair-lt`,
-whose table never grows, 1.5% slower, and item 1140 follows the cost of the growth.
+whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
 
 `str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
 floors are nearly all computed once, and in streaming execution their reads of a key and
@@ -293,8 +293,8 @@ names query's 2x. A profile of the per-worker maps put most of the floors' time 
 predecessor, and item 1088 recovers the streaming cost.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
-holds these costs. The 37-query screens and the layout pair ran on 174de1f8, before the
-shared table, whose changes lie in code that only the floor comparison runs. Over three rounds the screens
+holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
+c0948014, and the shared table's changes lie in code that only the floor comparison runs. Over three rounds the screens
 had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no query
 was 10% slower. With one thread, 174de1f8 made streaming `str-filter-two` 2.8% slower over
 five rounds, which 3a8b7adb reads at 1.000 with rounds on both sides, and with 12 threads

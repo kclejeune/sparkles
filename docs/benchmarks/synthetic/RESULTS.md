@@ -738,8 +738,8 @@ keys on that base, and with 174de1f8, an earlier build of the item that gave eac
 a map of its own. The cells were interleaved A/Bs of release builds that forge made with
 the same compilers, at 1.05M triples in five A,B,B,A rounds of ten timed requests per
 query and server. The
-[run record](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g1-streaming/summary.md) keeps the samples, answers and summary of each
-of the six cells with their [commands](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/run.sh.txt). Every cell returned the same
+[run record](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g1-streaming/summary.md), whose
+first cell this links, keeps the samples, answers and summary of each of the six cells with their [commands](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/run.sh.txt). Every cell returned the same
 answers from both builds, and steal was zero. The table gives server execution time as a
 ratio of 3a8b7adb to the other build.
 
@@ -759,15 +759,18 @@ took 29.8 ms against the base's 57.7 ms with one thread and 24.5 ms against 31.6
 in all five rounds. `bind-two` and `order-lcase` at 12 threads read 0.992 to 1.037 with
 rounds on both sides of 1 and spreads of 8% to 94%.
 
-The 37-query screens and item 678's layout pair ran on 174de1f8, whose
-[run record](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f1-streaming/summary.md) keeps
-them with their [commands](runs/2026-11-18-floor-cache-ab-forge-174de1f8/run.sh.txt).
+The 37-query screens compared 174de1f8 with c0948014, and item 678's pair compared
+75a70587 with 7e272f4d. The earlier
+[run record](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f5-screen-streaming/summary.md),
+whose first screen this links, keeps both with their
+[commands](runs/2026-11-18-floor-cache-ab-forge-174de1f8/run.sh.txt).
 The screens against the base ran three rounds and read a geometric mean of 0.980 in
 streaming and 0.970 in automatic execution, with no query 10% slower, and automatic
 `str-pair-colleague` read 0.777. Roadmap item 1088 follows the streaming cost of
 `str-pair-colleague`, whose names rarely repeat, item 1140 the cost of the table's growth
-on `str-pair-names` against the per-worker maps, and item 1089 the costs of 0.2% to 2.8%
-that the screens found in queries the floors do not reach, together with item 678's costs
+on `str-pair-names` against the per-worker maps, and item 1089 the 12-thread cost of
+`str-filter-two` and the costs of 0.2% to 2.8% that the screens found in queries the
+floors do not reach, together with item 678's costs
 on `lang-filter`, `str-filter-two` and `distinct-join` of 1.8% to 2.9%. Automatic
 `str-filter-two` spread by 22% to 23% between server processes of one build, which item
 1087 follows.
