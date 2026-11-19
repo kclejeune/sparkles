@@ -56,6 +56,9 @@ name = "auto_latency"
 required-features = ["reasoning"]
 
 [dev-dependencies]
+# The tests use the test hooks of the `failpoints` feature, such as `Store::set_clock`,
+# whichever packages a test run selects.
+sparkles = { workspace = true, features = ["failpoints"] }
 toml = "1"
 oxrdfio.workspace = true
 spargebra.workspace = true

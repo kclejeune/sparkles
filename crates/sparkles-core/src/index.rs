@@ -746,14 +746,22 @@ impl BlockMeta {
     }
 }
 
-pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
-    scratch.clear();
+/// Append the differences of `values`, from 0, to `out` as zig-zag varints. The column
+/// frames of the index and the run blocks of the builder share this step and
+/// [`decode_varints_into`], and each adds its own compression framing.
+#[inline]
+pub(crate) fn encode_deltas(values: impl IntoIterator<Item = u64>, out: &mut Vec<u8>) {
     let mut prev = 0u64;
-    for &v in col {
+    for v in values {
         let d = v.wrapping_sub(prev) as i64;
-        write_varint(scratch, ((d << 1) ^ (d >> 63)) as u64);
+        write_varint(out, ((d << 1) ^ (d >> 63)) as u64);
         prev = v;
     }
+}
+
+pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
+    scratch.clear();
+    encode_deltas(col.iter().copied(), scratch);
     lz4_flex::compress_prepend_size(scratch)
 }
 
@@ -885,23 +893,47 @@ fn decode_point_column_limited(
     Ok(Col::from(values))
 }
 
-/// The `out.len()` zigzag-delta varints that make up all of `raw`, written to `out`.
-fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
-    let rows = out.len();
+/// The `out.len()` zigzag-delta varints that make up all of `raw`, written to `out`, as
+/// [`encode_deltas`] writes them.
+pub(crate) fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
+    decode_varints_strided::<1>(raw, out, out.len())
+}
+
+/// The `rows` zigzag-delta varints that make up all of `raw`, written to every `S`th
+/// element of `out` from its first, so that `S = 4` fills one column of a slice of
+/// [`Key`]s in place. `out` must reach the last of those elements. A stride outside 1 to
+/// 16 does not compile, which keeps the window arithmetic below from overflowing: the
+/// window starts at most at the last element, so it ends below `out.len() + 7 * S + 1`.
+#[inline(always)]
+pub(crate) fn decode_varints_strided<const S: usize>(
+    raw: &[u8],
+    out: &mut [u64],
+    rows: usize,
+) -> Result<()> {
+    const { assert!(S >= 1 && S <= 16, "a stride of 1 to 16") };
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
+    // the elements the values go to end at (rows - 1) * S, so the eight-value step below
+    // takes a window of 7 * S + 1 elements only while eight values remain
+    let out = match rows.checked_sub(1).map(|last| last.checked_mul(S)) {
+        None => &mut out[..0],
+        Some(Some(last)) if last < out.len() => &mut out[..=last],
+        Some(_) => return Err(bad(&format!("{rows} values do not fit the output"))),
+    };
     let mut pos = 0;
     let mut prev = 0u64;
     let mut i = 0;
     while i < rows {
         // Sorted key columns mostly hold deltas below 64, one byte each. Eight such
         // bytes in a row are decoded together, without a branch per value.
-        if let (Some(dst), Some(s)) = (out.get_mut(i..i + 8), raw.get(pos..pos + 8)) {
+        if let (Some(dst), Some(s)) = (out.get_mut(i * S..i * S + 7 * S + 1), raw.get(pos..pos + 8))
+        {
             let w = u64::from_le_bytes(s.try_into().unwrap());
             if w & 0x8080_8080_8080_8080 == 0 {
-                for (o, z) in dst.iter_mut().zip(w.to_le_bytes()) {
+                // the window holds every Sth element, so chunks of S start at the values
+                for (o, z) in dst.chunks_mut(S).zip(w.to_le_bytes()) {
                     let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
                     prev = prev.wrapping_add(d as u64);
-                    *o = prev;
+                    o[0] = prev;
                 }
                 pos += 8;
                 i += 8;
@@ -917,7 +949,7 @@ fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
         .ok_or_else(|| bad(&format!("holds fewer than {rows} values")))?;
         let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
         prev = prev.wrapping_add(d as u64);
-        out[i] = prev;
+        out[i * S] = prev;
         i += 1;
     }
     if pos != raw.len() {
@@ -4491,6 +4523,83 @@ mod tests {
         // a varint that runs past 10 bytes is damage
         assert!(decode_varints_into(&[0xff; 11], &mut [0]).is_err());
         assert!(decode_varints_into(&[0xff; 20], &mut [0]).is_err());
+    }
+
+    #[test]
+    fn strided_decode_matches_contiguous_decode() {
+        // runs of one-byte deltas broken by multi-byte ones, so both paths and their
+        // switches are taken
+        let mut col = Vec::new();
+        let mut v = 0u64;
+        for i in 0..203u64 {
+            v = v.wrapping_add(match i % 23 {
+                0 => 1 << 40,
+                5 => u64::MAX - 70,
+                _ => i % 31,
+            });
+            col.push(v);
+        }
+        let mut raw = Vec::new();
+        for n in [0, 1, 7, 8, 9, 15, 16, 17, 100, col.len()] {
+            for vals in [&col[..n], &col[col.len() - n..]] {
+                raw.clear();
+                encode_deltas(vals.iter().copied(), &mut raw);
+                let mut flat = vec![0u64; vals.len()];
+                decode_varints_into(&raw, &mut flat).unwrap();
+                assert_eq!(flat, vals);
+                for c in 0..4 {
+                    let mut keys = vec![[7u64; 4]; n];
+                    let out = keys.as_flattened_mut().get_mut(c..).unwrap_or_default();
+                    decode_varints_strided::<4>(&raw, out, n).unwrap();
+                    for (k, &want) in keys.iter().zip(vals) {
+                        for (j, &got) in k.iter().enumerate() {
+                            assert_eq!(got, if j == c { want } else { 7 }, "n {n} c {c}");
+                        }
+                    }
+                    // a value missing, a byte left over, a truncated last varint
+                    let mut keys = vec![[0u64; 4]; n + 1];
+                    let out = &mut keys.as_flattened_mut()[c..];
+                    assert!(decode_varints_strided::<4>(&raw, out, n + 1).is_err());
+                    if n > 0 {
+                        let out = &mut keys.as_flattened_mut()[c..];
+                        assert!(decode_varints_strided::<4>(&raw, out, n - 1).is_err());
+                        let cut = &raw[..raw.len() - 1];
+                        let out = &mut keys.as_flattened_mut()[c..];
+                        assert!(decode_varints_strided::<4>(cut, out, n).is_err());
+                    }
+                }
+            }
+        }
+        // no rows with bytes left, and an output too short for the rows
+        assert!(decode_varints_strided::<4>(&[0], &mut [], 0).is_err());
+        assert!(decode_varints_strided::<4>(&[], &mut [], 0).is_ok());
+        assert!(decode_varints_strided::<4>(&[0, 0], &mut [0; 4], 2).is_err());
+        assert!(decode_varints_strided::<4>(&[0, 0], &mut [0; 5], 2).is_ok());
+        assert!(decode_varints_strided::<4>(&[0; 3], &mut [0; 9], usize::MAX).is_err());
+        // eight one-byte values for seven rows, with room for an eighth: the byte left over
+        // is damage and the slots past the seventh row stay as they were
+        for s in [&[0u8; 8][..], &[2u8; 8][..]] {
+            let mut out = [9u64; 40];
+            assert!(decode_varints_strided::<4>(s, &mut out, 7).is_err());
+            assert!(out[25..].iter().all(|&v| v == 9));
+            assert!(out.iter().enumerate().all(|(i, &v)| i % 4 == 0 || v == 9));
+            let mut out = [9u64; 9];
+            assert!(decode_varints_strided::<1>(s, &mut out, 7).is_err());
+            assert_eq!(out[7..], [9, 9]);
+        }
+    }
+
+    #[test]
+    fn column_frame_bytes_are_pinned() {
+        // the column and its varints that the run blocks of the builder pin as well
+        const PINNED: [u64; 6] = [5, 3, 3, 200, 0, u64::MAX];
+        const PINNED_VARINTS: [u8; 8] = [0x0a, 0x03, 0x00, 0x8a, 0x03, 0x8f, 0x03, 0x01];
+        let mut scratch = Vec::new();
+        let frame = encode_column(&PINNED, &mut scratch);
+        assert_eq!(&frame[..4], &(PINNED_VARINTS.len() as u32).to_le_bytes());
+        let raw = lz4_flex::block::decompress(&frame[4..], PINNED_VARINTS.len()).unwrap();
+        assert_eq!(raw, PINNED_VARINTS);
+        assert_eq!(&decode_column(&frame, PINNED.len()).unwrap()[..], &PINNED);
     }
 
     #[test]
