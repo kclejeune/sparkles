@@ -2,6 +2,7 @@
 import hashlib
 from pathlib import Path
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -97,10 +98,10 @@ class RemoteCI(unittest.TestCase):
             (src / 'scripts' / f).chmod(0o755)
         g = ['git', '-C', str(src)]
         subprocess.run(['git', 'init', '-q', str(src)], check=True)
-        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base'], check=True)
+        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--no-gpg-sign', '-q', '--allow-empty', '-m', 'base'], check=True)
         subprocess.run(g + ['update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
         subprocess.run(g + ['add', '-A'], check=True)
-        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'tip'], check=True)
+        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--no-gpg-sign', '-q', '-m', 'tip'], check=True)
         self.src = src
         home = t / 'home'; (home / 'gate/bin').mkdir(parents=True); (home / 'gate/out').mkdir()
         subprocess.run(['git', 'init', '-q', '--bare', str(home / 'gate/repo.git')], check=True)
@@ -115,6 +116,8 @@ class RemoteCI(unittest.TestCase):
                                         '[ "$2" = is-active ] && { echo inactive; exit 3; }\n[ "$2" = show ] && echo "${FAKE_STATE-inactive}"\nexit 0\n')
         # mise exec runs its command, and every other mise command does nothing.
         (fake / 'mise').write_text('#!/bin/sh\nif [ "$1" = exec ]; then shift; [ "$1" != -- ] || shift; exec "$@"; fi\nexit 0\n')
+        # Some Bash builds load system profiles for noninteractive shells and reset PATH.
+        (fake / 'bash').write_text('#!/bin/sh\nexec %s --noprofile --norc "$@"\n' % shlex.quote(shutil.which('bash')))
         (fake / 'rustc').write_text('#!/bin/sh\necho "rustc ${RUSTUP_TOOLCHAIN:-default} (fake)"\n')
         (fake / 'df').write_text(FAKE_DF); (fake / 'mbx').write_text(FAKE_MBX)
         (fake / 'git').write_text(FAKE_GIT.replace('REAL_GIT', shutil.which('git')))
@@ -188,7 +191,7 @@ class RemoteCI(unittest.TestCase):
         g = ['git', '-C', str(self.src), '-c', 'user.name=t', '-c', 'user.email=t@t']
         mb = self.rev('origin/main')
         subprocess.run(g + ['checkout', '-q', '-b', 'side', 'origin/main'], check=True)
-        subprocess.run(g + ['commit', '-q', '--allow-empty', '-m', 'main moved'], check=True)
+        subprocess.run(g + ['commit', '--no-gpg-sign', '-q', '--allow-empty', '-m', 'main moved'], check=True)
         subprocess.run(g + ['update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
         subprocess.run(g + ['checkout', '-q', '-'], check=True)
         r = self.run_ci('--base', 'origin/main')
@@ -364,13 +367,45 @@ class RemoteCI(unittest.TestCase):
         self.assertIn('host disk below floor', r.stderr)
 
     def test_the_wait_takes_only_the_exit_record_and_fetches_a_fresh_copy(self):
-        stale = self.src / '.artifacts/remote-ci' / self.name()
-        stale.mkdir(parents=True); (stale / 'outcome').write_text('disk-below-floor\n'); (stale / 'ci.exit').write_text('4\n')
+        name = self.name()
+        res = self.src / '.artifacts/remote-ci' / name
+        stale = res.with_name(name + '.earlier')
+        stale.mkdir(parents=True)
+        (stale / 'outcome').write_text('disk-below-floor\n')
+        (stale / 'ci.exit').write_text('4\n')
+        res.symlink_to(stale.name)
         (self.home / 'ci-says-exit').touch()
         r = self.run_ssh(FAKE_ASYNC='1', REMOTE_CI_POLL_SECONDS='1')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn('host disk below floor', r.stderr)
-        self.assertEqual((stale / 'ci.exit').read_text().strip(), '0'); self.assertFalse((stale / 'outcome').exists())
+        self.assertEqual((res / 'ci.exit').read_text().strip(), '0')
+        self.assertFalse((res / 'outcome').exists())
+        self.assertEqual((stale / 'ci.exit').read_text().strip(), '4')
+
+    def test_a_legacy_result_stays_in_place_when_mv_cannot_exchange_it(self):
+        name = self.name()
+        base = self.src / '.artifacts/remote-ci'
+        earlier = base / name
+        earlier.mkdir(parents=True)
+        (earlier / 'ci.exit').write_text('0\n')
+        (earlier / 'ci.log').write_text('earlier result\n')
+        mv = self.t / 'bin/mv'
+        mv.write_text('#!/bin/sh\n[ "$1" != --exchange ] || exit 1\nexec %s "$@"\n' % shlex.quote(shutil.which('mv')))
+        mv.chmod(0o755)
+
+        r = self.run_ssh(FAKE_CI_EXIT='7')
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        self.assertIn('could not point to the new copy', r.stderr)
+        run_id = (self.home / 'gate/out' / name / 'run-id').read_text().strip()
+        fresh = base / (name + '.' + run_id)
+        self.assertEqual((fresh / 'ci.exit').read_text().strip(), '7')
+
+        r = self.run_ssh('--fetch', name)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('could not point to the new copy', r.stderr)
+        self.assertFalse(earlier.is_symlink())
+        self.assertEqual((earlier / 'ci.exit').read_text(), '0\n')
+        self.assertEqual((earlier / 'ci.log').read_text(), 'earlier result\n')
 
     def run_cmd(self, cmd, *args, **env):
         return self.run_ssh('--cmd', cmd, *args, **env)
@@ -397,7 +432,9 @@ class RemoteCI(unittest.TestCase):
         (self.src / 'new-file.txt').write_text('untracked\n')
         before = subprocess.run(['git', '-C', str(self.src), 'status', '--porcelain'], capture_output=True, text=True).stdout
         head = self.rev('HEAD')
-        r = self.run_cmd('cat new-file.txt scripts/ci.sh', '--worktree')
+        r = self.run_cmd('cat new-file.txt scripts/ci.sh', '--worktree',
+                         GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t',
+                         GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('untracked', r.stdout.splitlines()); self.assertIn('echo edited', r.stdout.splitlines())
         self.assertEqual(self.rev('HEAD'), head)
