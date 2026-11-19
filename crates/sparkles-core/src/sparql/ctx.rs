@@ -1945,7 +1945,7 @@ impl Ctx {
         self.memory().check_output(&owner, self.mem_limit, bytes)
     }
 
-    pub(super) fn check_output_rows(&self, rows: usize) -> Result<()> {
+    pub(crate) fn check_output_rows(&self, rows: usize) -> Result<()> {
         self.check_rows(rows)?;
         if self.max_rows_produced != u64::MAX {
             let total = self

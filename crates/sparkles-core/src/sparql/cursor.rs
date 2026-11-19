@@ -34,6 +34,7 @@ pub(super) use joinspill::row_hash;
 mod merge;
 mod ripple;
 mod service;
+mod text;
 mod topk;
 mod walk;
 mod whole;
@@ -2582,6 +2583,8 @@ enum State {
     IndexTopK(Box<topk::IndexTopK>),
     /// A SERVICE without SILENT, read from its endpoint a batch at a time.
     Service(Box<service::Service>),
+    /// A text search without a limit, which holds its hits and decodes rows from them.
+    Text(Box<text::Text>),
 }
 
 /// An eager kernel's node, its answer once it has run, and how far its consumer has
@@ -3020,6 +3023,8 @@ impl Operator {
         let index_topk = matches!(node.kind, Kind::OrderedTopK(_)) && exec::heap_eligible(ctx);
         // A SERVICE without SILENT reads its endpoint's answer as it arrives.
         let service_reader = service::eligible(&node);
+        // A text search without a limit holds its hits and decodes rows as they are read.
+        let text_reader = text::eligible(&node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -3031,6 +3036,7 @@ impl Operator {
             && !whole_input
             && !index_topk
             && !service_reader
+            && !text_reader
             && !pattern_counts
             && (!native_blocking || !exists_streams);
         // A kernel that answers whole tables runs as a native operator when its form is
@@ -3259,8 +3265,13 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input).then(|| {
-            if let Kind::OrderedTopK(spec) = &node.kind {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input || text_reader).then(|| {
+            if text_reader {
+                format!(
+                    "{} counts its hits, at most maxHits, holds them under the memory budget and decodes their rows a page at a time",
+                    node.operator()
+                )
+            } else if let Kind::OrderedTopK(spec) = &node.kind {
                 format!(
                     "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
                     node.operator(),
@@ -3326,6 +3337,8 @@ impl Operator {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if service_reader {
             State::Service(Box::new(service::Service::new(ctx, &node, fallback)))
+        } else if text_reader {
+            State::Text(Box::new(text::Text::new(node)))
         } else if index_topk {
             State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
@@ -3500,6 +3513,7 @@ impl Operator {
             State::Binary(binary) => binary.release_working_sets(),
             State::Ripple(ripple) => ripple.release_working_sets(),
             State::Service(service) => service.release(),
+            State::Text(text) => text.release(),
             _ => {}
         }
         if let Some(ahead) = &mut self.ahead {
@@ -3608,6 +3622,7 @@ impl Operator {
                         | State::Whole(_)
                         | State::TopK(_)
                         | State::IndexTopK(_)
+                        | State::Text(_)
                 ),
             growing_state: self.growing,
             complete: false,
@@ -4094,6 +4109,11 @@ impl Operator {
                 State::Service(service) => {
                     let b = service.next(ctx, options, cap)?;
                     self.done = service.done();
+                    b
+                }
+                State::Text(text) => {
+                    let b = text.next(ctx, cap)?;
+                    self.done = text.done();
                     b
                 }
                 State::TopK(topk) => {

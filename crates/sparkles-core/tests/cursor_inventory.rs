@@ -557,7 +557,15 @@ fn text_forms() -> Vec<(String, Why)> {
                 "text search without maxHits",
                 "TextSearch",
                 "SELECT ?s { ?s text:query \"fox\" }",
-                Refused(Why::Pending("text group")),
+                Native,
+            ),
+            // A limit above maxHits returns every hit, at most maxHits, and keeps the
+            // bounded leaf: the planner cannot see maxHits, which is the index's.
+            form(
+                "text search with a limit above maxHits",
+                "TextSearch",
+                "SELECT ?s { (?s) text:query (\"fox\" 5000000) }",
+                Native,
             ),
             form(
                 "text search over its group",

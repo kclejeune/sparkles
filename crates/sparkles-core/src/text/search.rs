@@ -40,44 +40,14 @@ pub fn search_in(
     lenient: bool,
 ) -> Result<Table> {
     let snap = &ctx.snap;
-    if snap.historical {
-        return Err(Error::HistoryUnsupported(format!(
-            "full-text search is only available at the head; this query reads commit {}",
-            snap.commit
-        )));
-    }
-    let Some(view) = &snap.text else {
-        return Err(Error::invalid(
-            "dataset has no full-text index; enable it with `sparkles text-index` or --text",
-        ));
-    };
-    if view.uncommitted {
-        return Err(super::uncommitted_changes());
-    }
-    let ready = view.ready(snap.commit)?;
-    if view.seq != snap.commit {
-        return Err(unavailable("dataset", "stale", view.seq, snap.commit));
-    }
-    let sh = &ready.index;
-    for p in &spec.predicates {
-        if !sh.config.predicates.contains(p) {
-            return Err(Error::invalid(format!(
-                "text:query: <{p}> is not text-indexed"
-            )));
-        }
-    }
-    ctx.check()?;
-    let resolved = view.resolved()?;
-    // a language with an analyzer searches its stemmed text; fuzzy terms expand against
-    // the searcher's terms of that field
-    let (field, analyzer) = sh.fields.text_for(spec.lang.as_deref());
-    let parsed = match super::lucene::parse(&spec.query, &resolved.searcher, field, analyzer) {
-        Ok(p) => p,
-        Err(_) if lenient => return Ok(Table::empty(vars.to_vec())),
-        Err(e) => return Err(Error::invalid(format!("text:query: {e}"))),
-    };
-    let matchers = parsed.matchers;
-    let Some(query) = scoped(snap, spec, &sh.fields, parsed.query, subjects) else {
+    let Some(Prepared {
+        sh,
+        resolved,
+        field,
+        matchers,
+        query,
+    }) = prepare(ctx, spec, subjects, lenient)?
+    else {
         return Ok(Table::empty(vars.to_vec()));
     };
     let out = Outputs::new(spec, vars, resolved, &sh.ids, snap.mask.is_some());
@@ -111,7 +81,13 @@ pub fn search_in(
         None => {
             let (total, mut hits) = resolved
                 .searcher
-                .search(&query, &AllHits { cap: max })
+                .search(
+                    &query,
+                    &AllHits {
+                        cap: max,
+                        reserve: None,
+                    },
+                )
                 .map_err(text_err)?;
             ctx.check()?;
             if total > max as u64 {
@@ -137,6 +113,317 @@ pub fn search_in(
         highlight(ctx, resolved, field, opts, &matchers, &mut t.cols[c])?;
     }
     Ok(t)
+}
+
+/// What a search needs once its call is checked against the view and its query parsed.
+struct Prepared<'a> {
+    sh: &'a std::sync::Arc<super::imp::Shared>,
+    resolved: &'a Resolved,
+    field: Field,
+    matchers: super::lucene::Matchers,
+    query: Box<dyn Query>,
+}
+
+/// Check a call against the snapshot's text view and parse its query, or `None` when
+/// nothing can match (a query string that does not parse, with `lenient`).
+fn prepare<'a>(
+    ctx: &'a Ctx,
+    spec: &TextSpec,
+    subjects: Option<&[Id]>,
+    lenient: bool,
+) -> Result<Option<Prepared<'a>>> {
+    let snap = &ctx.snap;
+    if snap.historical {
+        return Err(Error::HistoryUnsupported(format!(
+            "full-text search is only available at the head; this query reads commit {}",
+            snap.commit
+        )));
+    }
+    let Some(view) = &snap.text else {
+        return Err(Error::invalid(
+            "dataset has no full-text index; enable it with `sparkles text-index` or --text",
+        ));
+    };
+    if view.uncommitted {
+        return Err(super::uncommitted_changes());
+    }
+    let ready = view.ready(snap.commit)?;
+    if view.seq != snap.commit {
+        return Err(unavailable("dataset", "stale", view.seq, snap.commit));
+    }
+    let sh = &ready.index;
+    for p in &spec.predicates {
+        if !sh.config.predicates.contains(p) {
+            return Err(Error::invalid(format!(
+                "text:query: <{p}> is not text-indexed"
+            )));
+        }
+    }
+    ctx.check()?;
+    let resolved = view.resolved()?;
+    // a language with an analyzer searches its stemmed text; fuzzy terms expand against
+    // the searcher's terms of that field
+    let (field, analyzer) = sh.fields.text_for(spec.lang.as_deref());
+    let parsed = match super::lucene::parse(&spec.query, &resolved.searcher, field, analyzer) {
+        Ok(p) => p,
+        Err(_) if lenient => return Ok(None),
+        Err(e) => return Err(Error::invalid(format!("text:query: {e}"))),
+    };
+    let Some(query) = scoped(snap, spec, &sh.fields, parsed.query, subjects) else {
+        return Ok(None);
+    };
+    Ok(Some(Prepared {
+        sh,
+        resolved,
+        field,
+        matchers: parsed.matchers,
+        query,
+    }))
+}
+
+/// The hits a reader decodes at a time.
+const PAGE: usize = 4096;
+
+/// What decoding a page holds per hit: its terms and hash, the order of the page's
+/// hits by document, and the ordinals of a column.
+const PAGE_HIT_BYTES: u64 = 96;
+
+/// The bytes a hit list keeps per hit, a score and a document address.
+const HIT_BYTES: u64 = std::mem::size_of::<(Score, DocAddress)>() as u64;
+
+/// A text search without a limit, read a page of hits at a time (item 829).
+///
+/// Its hits are bounded by the index's `maxHits`, as an eager search's are, so it is a
+/// leaf under decision 2 of the X14 plan. The reader counts the hits first, without
+/// scoring them, and refuses more than `maxHits` before it collects any, with the
+/// error an eager search gives. It then holds the scored hit list, best first, under a
+/// charge, and decodes the terms of one page of hits at a time into rows, so what it
+/// holds between pulls does not grow with the width of a row. The triples a merged
+/// default graph has seen are kept across pages, in a set reserved and charged for the
+/// whole hit list at the start.
+pub(crate) struct Reader {
+    spec: TextSpec,
+    vars: Vec<VarId>,
+    /// The searcher that the hits' document addresses belong to.
+    resolved: Resolved,
+    sh: std::sync::Arc<super::imp::Shared>,
+    field: Field,
+    matchers: super::lucene::Matchers,
+    hits: Vec<(Score, DocAddress)>,
+    /// the first hit of the decoded page, and its terms
+    page: Option<(usize, HitTerms)>,
+    /// the next hit to read
+    at: usize,
+    st: RowState,
+}
+
+impl Reader {
+    /// Run the search of a call without a limit and keep its hits, or `None` when nothing
+    /// can match. `charge` sets the bytes the reader holds, before it allocates them.
+    pub(crate) fn open(
+        ctx: &Ctx,
+        spec: &TextSpec,
+        vars: &[VarId],
+        charge: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Reader>> {
+        debug_assert!(
+            spec.limit.is_none(),
+            "a reader serves a search without a limit"
+        );
+        let Some(Prepared {
+            sh,
+            resolved,
+            field,
+            matchers,
+            query,
+        }) = prepare(ctx, spec, None, false)?
+        else {
+            return Ok(None);
+        };
+        let max = sh.config.max_hits;
+        let counts = resolved
+            .searcher
+            .search(&query, &SegmentCounts)
+            .map_err(text_err)?;
+        ctx.check()?;
+        let total: u64 = counts.iter().sum();
+        if total > max as u64 {
+            return Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Rows,
+                limit: max as u64,
+                requested: total,
+            }));
+        }
+        // the row limits an eager search checks; the reader holds no table of the rows
+        ctx.check_output_rows(total as usize)?;
+        let page = (total as usize).min(PAGE) as u64 * PAGE_HIT_BYTES;
+        let seen = if spec.dedup {
+            seen_bytes(total as usize)
+        } else {
+            0
+        };
+        // the segments' lists and the merged one, until the merge ends
+        charge(
+            (2 * total * HIT_BYTES)
+                .saturating_add(page)
+                .saturating_add(seen),
+        )?;
+        let (_, mut hits) = resolved
+            .searcher
+            .search(
+                &query,
+                &AllHits {
+                    cap: max,
+                    reserve: Some(counts),
+                },
+            )
+            .map_err(text_err)?;
+        ctx.check()?;
+        charge(
+            (hits.capacity() as u64 * HIT_BYTES)
+                .saturating_add(page)
+                .saturating_add(seen),
+        )?;
+        sort_hits(&mut hits);
+        let mut st = RowState::default();
+        if spec.dedup {
+            st.seen.reserve(hits.len());
+        }
+        Ok(Some(Reader {
+            spec: spec.clone(),
+            vars: vars.to_vec(),
+            resolved: resolved.clone(),
+            sh: sh.clone(),
+            field,
+            matchers,
+            hits,
+            page: None,
+            at: 0,
+            st,
+        }))
+    }
+
+    /// Append the next rows to `t` until it holds `cap` of them, and return whether the
+    /// hits have ended.
+    pub(crate) fn next(&mut self, ctx: &Ctx, cap: usize, t: &mut Table) -> Result<bool> {
+        let out = Outputs::new(
+            &self.spec,
+            &self.vars,
+            &self.resolved,
+            &self.sh.ids,
+            ctx.snap.mask.is_some(),
+        );
+        let first = t.len();
+        let ended = loop {
+            if t.len() >= cap {
+                break false;
+            }
+            if self.at >= self.hits.len() {
+                break true;
+            }
+            let start = match &self.page {
+                Some((start, terms)) if self.at < start + terms.len() => *start,
+                _ => {
+                    self.page = None;
+                    let end = self.hits.len().min(self.at + PAGE);
+                    let terms = out.terms(ctx, &self.resolved, &self.hits[self.at..end])?;
+                    self.page = Some((self.at, terms));
+                    self.at
+                }
+            };
+            let (_, terms) = self.page.as_ref().expect("a decoded page");
+            let hits = &self.hits[start..start + terms.len()];
+            let next = out.rows(
+                ctx,
+                &self.resolved,
+                hits,
+                terms,
+                self.at - start,
+                cap - t.len(),
+                t,
+                &mut self.st,
+            )?;
+            self.at = start + next;
+        };
+        if let (Some(opts), Some(c)) = (&self.spec.highlight, out.clit) {
+            highlight(
+                ctx,
+                &self.resolved,
+                self.field,
+                opts,
+                &self.matchers,
+                &mut t.cols[c][first..],
+            )?;
+        }
+        if ended {
+            self.st.finish();
+            self.page = None;
+        }
+        Ok(ended)
+    }
+}
+
+/// The bytes of a set of `n` triples reserved at once, as `hashbrown` allocates it.
+fn seen_bytes(n: usize) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let buckets = if n < 4 {
+        4
+    } else if n < 8 {
+        8
+    } else {
+        (n.saturating_mul(8) / 7).next_power_of_two()
+    };
+    let entry = std::mem::size_of::<(Id, Id, Id)>() + 1;
+    (buckets * entry + 16) as u64
+}
+
+/// Counts the hits of each segment, without scoring them.
+struct SegmentCounts;
+
+struct SegmentCount {
+    seg: SegmentOrdinal,
+    n: u64,
+}
+
+impl Collector for SegmentCounts {
+    /// the hits of each segment, by segment ordinal
+    type Fruit = Vec<u64>;
+    type Child = SegmentCount;
+
+    fn for_segment(&self, seg: SegmentOrdinal, _: &SegmentReader) -> tantivy::Result<SegmentCount> {
+        Ok(SegmentCount { seg, n: 0 })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, fruits: Vec<(SegmentOrdinal, u64)>) -> tantivy::Result<Vec<u64>> {
+        let len = fruits
+            .iter()
+            .map(|(s, _)| *s as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut counts = vec![0; len];
+        for (s, n) in fruits {
+            counts[s as usize] += n;
+        }
+        Ok(counts)
+    }
+}
+
+impl SegmentCollector for SegmentCount {
+    type Fruit = (SegmentOrdinal, u64);
+
+    fn collect(&mut self, _: DocId, _: Score) {
+        self.n += 1;
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        (self.seg, self.n)
+    }
 }
 
 /// Order hits best first, as Tantivy's top-k orders them.
@@ -294,6 +581,9 @@ fn scoped(
 /// each hit is one push.
 struct AllHits {
     cap: usize,
+    /// the hits of each segment, when they were counted first: a segment's list is
+    /// allocated at its count and never holds more
+    reserve: Option<Vec<u64>>,
 }
 
 struct SegmentHits {
@@ -308,11 +598,26 @@ impl Collector for AllHits {
     type Child = SegmentHits;
 
     fn for_segment(&self, seg: SegmentOrdinal, _: &SegmentReader) -> tantivy::Result<SegmentHits> {
-        Ok(SegmentHits {
-            seg,
-            keep: self.cap.saturating_add(1),
-            total: 0,
-            hits: Vec::new(),
+        let keep = self.cap.saturating_add(1);
+        Ok(match &self.reserve {
+            Some(counts) => {
+                let n = counts
+                    .get(seg as usize)
+                    .map_or(0, |&n| n as usize)
+                    .min(keep);
+                SegmentHits {
+                    seg,
+                    keep: n,
+                    total: 0,
+                    hits: Vec::with_capacity(n),
+                }
+            }
+            None => SegmentHits {
+                seg,
+                keep,
+                total: 0,
+                hits: Vec::new(),
+            },
         })
     }
 
@@ -386,6 +691,13 @@ struct HitTerms {
     g: Vec<Id>,
     /// see [`super::imp::doc_hash`] (only with `Need::hash`)
     hash: Vec<u64>,
+}
+
+impl HitTerms {
+    /// The hits whose terms these are.
+    fn len(&self) -> usize {
+        self.s.len()
+    }
 }
 
 impl<'a> Outputs<'a> {
@@ -498,7 +810,7 @@ impl<'a> Outputs<'a> {
             {
                 continue;
             }
-            if self.spec.dedup && !st.dedup(s, p, o)? {
+            if self.spec.dedup && !st.dedup(s, p, o) {
                 continue;
             }
             row.fill(Id::UNDEF);
@@ -547,8 +859,6 @@ impl<'a> Outputs<'a> {
 #[derive(Default)]
 struct RowState {
     seen: FxHashSet<(Id, Id, Id)>,
-    /// admits the growth of `seen` before it grows, when set
-    grow: Option<Box<dyn FnMut(usize) -> Result<()> + Send>>,
     default_graph: Option<Id>,
     stale_hits: usize,
     /// the rank of the rows with the last score: tied rows share the first one's
@@ -558,16 +868,8 @@ struct RowState {
 
 impl RowState {
     /// Whether the triple is new.
-    fn dedup(&mut self, s: Id, p: Id, o: Id) -> Result<bool> {
-        if self.seen.len() == self.seen.capacity()
-            && let Some(grow) = &mut self.grow
-        {
-            // a rehash holds the old table and the new one at once
-            let next = (self.seen.capacity() * 2).max(4);
-            grow(next)?;
-            self.seen.reserve(next - self.seen.len());
-        }
-        Ok(self.seen.insert((s, p, o)))
+    fn dedup(&mut self, s: Id, p: Id, o: Id) -> bool {
+        self.seen.insert((s, p, o))
     }
 
     /// Report the hits skipped because their terms are not in the snapshot.
