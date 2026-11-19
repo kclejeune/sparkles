@@ -761,7 +761,8 @@ took 29.8 ms against the base's 57.7 ms with one thread and 24.5 ms against 31.6
 in all five rounds. `bind-two` and `order-lcase` at 12 threads read 0.992 to 1.037 with
 rounds on both sides of 1 and spreads of 8% to 94%.
 
-The 37-query screens compared 174de1f8 with c0948014, and item 678's pair compared
+The 37-query screens compared 174de1f8 with c0948014 and have not been run on 3a8b7adb,
+and item 678's pair compared
 75a70587 with 7e272f4d. The earlier run record keeps the
 [streaming](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f5-screen-streaming/summary.md) and
 [automatic](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f6-screen-auto/summary.md) screens and the pair's

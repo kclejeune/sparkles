@@ -298,7 +298,7 @@ its fallback.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
-c0948014, and the shared table's changes lie in code that only the floor comparison runs. Over three rounds the screens
+c0948014, and these lines have not been measured on 3a8b7adb. Over three rounds the screens
 had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no query
 was 10% slower. With one thread, 174de1f8 made streaming `str-filter-two` 2.8% slower over
 five rounds, which 3a8b7adb reads at 1.000 with rounds on both sides, and with 12 threads

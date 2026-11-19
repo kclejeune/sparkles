@@ -325,8 +325,8 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   vocabulary. When one of the first 64 rows holds another value, the whole table or
   batch takes the generic comparison, and a later row with another value takes it alone.
   In streaming execution, the measured `str-pair-colleague`, whose strings rarely
-  repeat, runs 4.2% slower than a direct comparison of the keys with one thread and 6.5%
-  slower with 12, which [roadmap item 1088](../ROADMAP.md) recovers.
+  repeat, runs 4.2% slower than before roadmap item 1069 with one thread and 6.5% slower
+  with 12, which [roadmap item 1088](../ROADMAP.md) recovers.
 * Property path closures run within the query's memory budget and timeout in both
   executors. A closure counts its visited set, its frontier and the edge relation of a
   sequence or alternative path against the budget, and the walk checks the deadline while
