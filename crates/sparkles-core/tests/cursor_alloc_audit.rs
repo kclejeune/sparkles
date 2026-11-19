@@ -71,9 +71,14 @@ fn slot(address: usize) -> usize {
 
 /// Count a block that a counted thread allocated inside the window.
 fn insert(address: usize, size: usize) {
-    if !OPEN.load(Ordering::Relaxed) || !counted() {
-        return;
+    if OPEN.load(Ordering::Relaxed) && counted() {
+        place(address, size, 0);
     }
+}
+
+/// Put a block in the table. The peak reads the live bytes with `beside`, the bytes of
+/// a block that left the table and was live while this one was filled.
+fn place(address: usize, size: usize, beside: usize) {
     locked(|| {
         if BLOCKS.load(Ordering::Relaxed) >= SLOTS / 2 {
             FULL.store(true, Ordering::Relaxed);
@@ -87,26 +92,27 @@ fn insert(address: usize, size: usize) {
         SIZE[at].store(size, Ordering::Relaxed);
         BLOCKS.fetch_add(1, Ordering::Relaxed);
         let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
-        PEAK.fetch_max(live, Ordering::Relaxed);
+        PEAK.fetch_max(live + beside, Ordering::Relaxed);
     });
 }
 
-/// Stop counting a block, if the window counted it. Later blocks of its probe run move
-/// back over the gap, so a search still ends at the first empty slot.
-fn remove(address: usize) {
+/// Stop counting a block, and give its size, if the window counted it. Later blocks of
+/// its probe run move back over the gap, so a search still ends at the first empty slot.
+fn remove(address: usize) -> Option<usize> {
     if BLOCKS.load(Ordering::Relaxed) == 0 {
-        return;
+        return None;
     }
     locked(|| {
         let mut at = slot(address);
         loop {
             match ADDRESS[at].load(Ordering::Relaxed) {
-                0 => return,
+                0 => return None,
                 a if a == address => break,
                 _ => at = (at + 1) % SLOTS,
             }
         }
-        LIVE.fetch_sub(SIZE[at].load(Ordering::Relaxed), Ordering::Relaxed);
+        let size = SIZE[at].load(Ordering::Relaxed);
+        LIVE.fetch_sub(size, Ordering::Relaxed);
         BLOCKS.fetch_sub(1, Ordering::Relaxed);
         let mut gap = at;
         let mut next = (at + 1) % SLOTS;
@@ -130,7 +136,8 @@ fn remove(address: usize) {
             next = (next + 1) % SLOTS;
         }
         ADDRESS[gap].store(0, Ordering::Relaxed);
-    });
+        Some(size)
+    })
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -146,17 +153,20 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        // The old and the new block can be live together while the bytes move, so the
-        // new size is counted in full before the old block leaves the count.
-        let old = locked(|| LIVE.load(Ordering::Relaxed));
-        let grows = OPEN.load(Ordering::Relaxed) && counted();
-        if grows {
-            PEAK.fetch_max(old + new, Ordering::Relaxed);
-        }
+        // The block leaves the table before the system can free its address, so a
+        // counted thread that is given the address meanwhile keeps its own block.
+        let old = remove(p as usize);
         let q = unsafe { System.realloc(p, l, new) };
-        if !q.is_null() {
-            remove(p as usize);
-            insert(q as usize, new);
+        if q.is_null() {
+            // The block is still live at its address.
+            if let Some(size) = old {
+                place(p as usize, size, 0);
+            }
+        } else if OPEN.load(Ordering::Relaxed) && counted() {
+            // A block that moved was live beside its copy while the bytes moved, and one
+            // that stayed never held more than its larger size.
+            let beside = if q == p { 0 } else { old.unwrap_or(0) };
+            place(q as usize, new, beside);
         }
         q
     }
@@ -229,12 +239,31 @@ fn the_meter_counts_the_window_of_the_counted_thread_alone() {
         std::thread::spawn(|| drop(std::hint::black_box(Vec::<u8>::with_capacity(8 * MIB))))
             .join()
             .unwrap();
-        let mut grown = Vec::<u8>::with_capacity(MIB);
-        grown.reserve_exact(2 * MIB);
-        drop((held, grown));
+        drop(held);
     });
-    // The held block, and the old and the new block of the one that grew.
-    assert!((4 * MIB..5 * MIB).contains(&heap), "{heap}");
+    assert!((MIB..2 * MIB).contains(&heap), "{heap}");
+    // A block that is reallocated counts its old and its new bytes together when it
+    // moves, and its larger size when it stays where it is. A block of 64 bytes cannot
+    // grow to 2 MiB in place, and one that keeps its size has no reason to move.
+    let mut seen = [false; 2];
+    for (from, to) in [(MIB, MIB), (64, 2 * MIB)] {
+        let (moved, heap) = peak(|| unsafe {
+            let layout = Layout::from_size_align(from, 8).unwrap();
+            let p = std::alloc::alloc(layout);
+            let old = p as usize;
+            let q = std::alloc::realloc(p, layout, to);
+            assert!(!q.is_null());
+            std::alloc::dealloc(q, Layout::from_size_align(to, 8).unwrap());
+            q as usize != old
+        });
+        let expected = if moved { from + to } else { from.max(to) };
+        assert!(
+            (expected..expected + MIB / 4).contains(&heap),
+            "{from} to {to}: {heap}"
+        );
+        seen[usize::from(moved)] = true;
+    }
+    assert_eq!(seen, [true, true], "a block that stayed and one that moved");
     // A block that the window counted and another thread frees leaves the count.
     let (_, heap) = peak(|| {
         let block = Vec::<u8>::with_capacity(2 * MIB);
