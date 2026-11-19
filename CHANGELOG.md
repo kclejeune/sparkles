@@ -221,6 +221,16 @@ and roadmap item 1075 follows the disjunctive equalities of constants in shoi-04
 equivalent and only one of them equivalent to `owl:Thing` or unsatisfiable, and places
 both where the equivalence puts them.
 
+### Root scans read a shared block in place
+
+A cursor scan that shares its block with the batches it hands out keeps no weak handle on
+the block and reads it in place, and it takes the block back from the shared batch only
+when it switches to owned rows inside the block or a batch declines the shared path. This removes most of the cost that the
+uncharged scan of item 1039 added. On 100,000 people on atlas with one thread, `root-scan`,
+`export-500k` and `root-limit` are 1.6% to 3.5% faster in server time. Against the build
+before item 1039, `root-scan` still takes 2.4% longer under streaming and 1.1% under
+automatic execution, about 2 and 1 µs, and roadmap item 1063 stays open for that remainder.
+
 ### Keys and the universal property in rooted classification runs
 
 With `Limits::rooted`, the disjunctive rules take keys over object properties and the
