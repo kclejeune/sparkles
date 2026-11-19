@@ -1,4 +1,5 @@
-total cycles/request A 64903.1k B 63993.6k ratio 0.986
+# events ['cpu_atom/cycles/u', 'cpu_core/cycles/u'], sample period 200003, columns: A per request, B per request, B minus A
+total events/request A 64903.1k B 63993.6k ratio 0.986
    1514.2k       2.3k   -1511.9k  cpu_core <sparkles_core::sparql::cursor::binary::Binary>::pairs
       0.0k    1308.4k   +1308.4k  cpu_core <sparkles_core::sparql::join::hash::HashIndex>::keyed
       0.0k    1130.7k   +1130.7k  cpu_core sparkles_core::sparql::join::hash::gather
@@ -24,8 +25,8 @@ total cycles/request A 64903.1k B 63993.6k ratio 0.986
    1319.8k    1373.8k     +54.0k  cpu_core <sparkles_core::sparql::cursor::QueryBatch>::term_cache
      56.5k     107.9k     +51.3k  cpu_core <sparkles_core::sparql::ctx::Ctx>::decoded_bytes
      98.9k      53.3k     -45.6k  cpu_core <sparkles_core::vocab::Ahead>::at
-   1025.6k     983.7k     -41.9k  cpu_core core::slice::sort::shared::smallsort::small_sort_general_with_scratch::<(u64, u32), <(u64, u32) as core::cmp::P
     946.9k     905.1k     -41.9k  cpu_core _mi_theap_malloc_zero
+   1025.6k     983.7k     -41.9k  cpu_core core::slice::sort::shared::smallsort::small_sort_general_with_scratch::<(u64, u32), <(u64, u32) as core::cmp::P
      71.7k     108.1k     +36.4k  cpu_core [unknown]
    1005.2k     970.3k     -34.9k  cpu_core <sparkles_core::sparql::results::NativeTerm as serde_core::ser::Serialize>::serialize::<&mut serde_json::ser::S
    1945.6k    1910.8k     -34.8k  cpu_core <sparkles_core::sparql::results::RowCharge>::term

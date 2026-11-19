@@ -84,7 +84,7 @@
     "cc94ac7f": "9efa1cd4655ff0d75af758bf0bb0f54ff5950f152b61b3e0afb765ff63e0fcba",
     "71c277b0": "4fde46bc9f96cbb459cc1ca37cc284c1f8b220f6970f5cc2222110f373d6de69"
   },
-  "compiler_provenance": "Every binary is a release build of the matrix recipe made on stanley with GCC 15.3.0, clang 23.1.0git, LLD 23.1.1 and rustc 1.99.1, and every build-config.json equals build-config.json here. The binaries were copied to forge as zstd files whose sha256 matched on both hosts, and forge built nothing.",
+  "compiler_provenance": "Every binary is a release build of the matrix recipe made on stanley with GCC 15.3.0, clang 23.1.0git, LLD 23.1.1 and rustc 1.99.1, and every build-config.json equals build-config.json here. The binaries were copied to forge as zstd files whose sha256 matched on both hosts, and forge built nothing. binaries-zst.sha256 holds the hashes of the compressed files, which equal those of every pair's bin-A.zst and bin-B.zst on forge, and forge's decompressed cc94ac7f and 71c277b0 hashes equal binaries.sha256.",
   "data": {
     "1.05M": {
       "generator": "scripts/gen-data.py 100000",
@@ -101,8 +101,18 @@
   },
   "settings": "Each pair directory's run.env holds its rounds, requests per round, warm-up, Rayon threads, server and client CPUs, idle spinners and execution mode. Pairs at one thread pin the server to CPU 2 and the client to CPU 4 with idle spinners. Pairs at 12 threads give the server CPUs 0 to 11 and the client CPU 12 without spinners.",
   "lock": "forge-backlog-stage3.service held ~/lanes/.bench.lock and ~/lanes/.heavy.lock for all eleven pairs, from 08:25 to 15:26 UTC on 2026-11-19, and refused to start while rustc, cargo, sparkles or another engine ran.",
-  "verdict_rule": "X14 SPEC D4 for a query under 0.3 ms: it passes when the upper end of the 95% t interval of the mean log round ratio is at most 1.02, or its median added server time is at most 0.5 us. A query above 0.3 ms passes when its ratio is below 1.05 and it is not slower in every round. analyze.py prints only the ratio test above 0.3 ms, so the rounds_slower field decides the second clause.",
+  "verdict_rule": "X14 SPEC D4 when both arm medians are under 0.3 ms: the query passes when the upper end of the 95% t interval of the mean log round ratio is at most 1.02, or its median added server time is at most 0.5 us. Otherwise a ratio of 1.05 or more fails, and a ratio below 1.05 that is slower in every round is a confirmed cost that needs a roadmap row. analyze.py's d4 field holds only the ratio test above 0.3 ms, so verdict.py derives the combined verdict in verdict.txt from pinned-summary.json.",
   "statistics": "ratio is the median of all B exec samples over the median of all A exec samples, computed by analyze.py, whose output is pinned-summary.json and pinned-summary.txt.",
   "answer_equality": true,
-  "attribution": "attribution/ holds per-request instruction counts on stanley (scripts/request-insn.py, streaming, one thread, 1.05M) across the matrix builds and across cached screen builds of another toolchain, and user-space perf profiles of the matrix builds on stanley's performance cores. Counts locate a cost and profiles name the code, and neither sizes it. Stanley carried other work during both, so its cycle and time ratios are not measurements."
+  "attribution": "attribution/ holds per-request instruction counts on stanley (scripts/request-insn.py, streaming, one thread, 1.05M) across the matrix builds and across cached screen builds of another toolchain, and user-space perf profiles of the matrix builds on stanley's performance cores. Counts locate a cost and profiles name the code, and neither sizes it. Stanley carried other work during both, so its cycle and time ratios are not measurements.",
+  "harness": "ab3.sh copies nsc-bench-remote.sh into each pair directory and runs it. The copy here is that file, byte-identical to scripts/nsc-bench-remote.sh at 8baa5686.",
+  "binary_zst_sha256": {
+    "ffb18866": "a886196e98f3e97f8973b21e82f8f186ce00405c773288669e3d8f3326628772",
+    "1cbc23cd": "0008c4414bed369e0d7e276917b055aac62239d7d21325af9b43b0d94743be83",
+    "eda22fce": "3593be7d131f40bb3baf7aabdf23fd694f18a13f1260c5ac71483d9d28c4d64e",
+    "bccc5f7b": "fbe097ee8a0eefdbf2ea16c27f16acbf0d59f35886d63f28eb4f4cb4064e8470",
+    "cc94ac7f": "d8679c5b9e5b973da3a3f6be0fe0e943127bfaee37e9931baa2711e0b39b1c34",
+    "71c277b0": "6c2b4188d2999b3047035f13b35b8cdd9dd77e3d01f4dbcd4357c9558d7fe776"
+  },
+  "answer_check": "answers.tsv holds, for each arm and query, the row count and a hash of the sorted TSV answer of one untimed request, with the ORDER BY digest of bench-gate.py order-digest in its last column, and every entry matches across the two arms of every pair. WARM_DIGEST was not set, so the timed native JSON responses were not checked."
 }

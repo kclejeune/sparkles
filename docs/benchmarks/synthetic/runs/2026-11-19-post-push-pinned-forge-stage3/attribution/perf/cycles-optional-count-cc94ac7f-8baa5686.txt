@@ -1,4 +1,5 @@
-total cycles/request A 2627.3k B 2294.1k ratio 0.873
+# events ['cpu_atom/cycles/u', 'cpu_core/cycles/u'], sample period 200003, columns: A per request, B per request, B minus A
+total events/request A 2627.3k B 2294.1k ratio 0.873
     847.3k       4.8k    -842.5k  cpu_core <sparkles_core::sparql::cursor::group::Group>::load
       0.0k     791.2k    +791.2k  cpu_core sparkles_core::sparql::join::merge::count
     414.5k       0.0k    -414.5k  cpu_core sparkles_core::sparql::zipper::lower_bounds

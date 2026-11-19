@@ -1,4 +1,5 @@
-total cycles/request A 152123.9k B 102334.2k ratio 0.673
+# events ['cpu_atom/instructions/u', 'cpu_core/instructions/u'], sample period 200003, columns: A per request, B per request, B minus A
+total events/request A 152123.9k B 102334.2k ratio 0.673
   42889.2k      11.2k  -42878.0k  cpu_core <sparkles::http::stream::SwitchWriter as core::io::write::Write>::write
   27503.6k       0.0k  -27503.6k  cpu_core <sparkles_core::sparql::results::LimitedWriter<sparkles::http::stream::SwitchWriter> as core::io::write::Write>
       0.0k   27354.8k  +27354.8k  cpu_core <&mut serde_json::ser::Serializer<&mut &mut sparkles_core::sparql::results::Buffered> as serde_core::ser::Seria
