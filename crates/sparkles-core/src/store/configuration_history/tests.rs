@@ -953,3 +953,38 @@ fn a_clone_racing_memory_activation_refuses_under_the_writer() {
     assert_eq!(error.code(), "unsupported", "{error}");
     update(&store, "after");
 }
+
+/// `sparkles check` runs this validation on a live root. Commits that land while it
+/// reads, after it counts the vocabulary or after it has buffered the log, must not
+/// read as a damaged committed prefix.
+#[test]
+fn validation_beside_a_live_writer_reads_one_consistent_prefix() {
+    let mut failures = Vec::new();
+    for point in ["bound", "vocabulary", "observation"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(dir.path(), StoreOptions::default()).unwrap());
+        update(&store, "seed");
+        let seeded = store.head_commit().seq;
+        let writer = store.clone();
+        let mut fired = false;
+        validation::INSPECTION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at: &str| {
+                if at == point && !fired {
+                    fired = true;
+                    for i in 0..3 {
+                        update(&writer, &format!("live-{point}-{i}"));
+                    }
+                }
+            }))
+        });
+        let result = validate_copy(dir.path(), false, &preparation());
+        validation::INSPECTION_HOOK.with(|hook| hook.borrow_mut().take());
+        if let Err(error) = result {
+            failures.push(format!("commits after {point}: {error}"));
+        }
+        // the commits landed and a later validation still proves all of them
+        assert_eq!(store.head_commit().seq, seeded + 3, "{point}");
+        validate_copy(dir.path(), false, &preparation()).unwrap();
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

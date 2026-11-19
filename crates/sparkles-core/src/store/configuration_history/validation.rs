@@ -3,6 +3,23 @@
 use super::*;
 use crate::store::cold::ColdBudget;
 
+#[cfg(test)]
+thread_local! {
+    /// Runs at a named point of a generation's inspection, so a test can commit
+    /// beside it at the moment a live writer could.
+    pub(super) static INSPECTION_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn inspection_point(_point: &str) {
+    #[cfg(test)]
+    INSPECTION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(_point);
+        }
+    });
+}
+
 pub(super) fn validate(root: &Path, required: bool, preparation: &Preparation) -> Result<()> {
     preparation.check()?;
     let published = match primary::recorded_root(root, preparation) {
@@ -294,15 +311,10 @@ fn inspect_generation(
             }
             None => None,
         };
-        let vocabulary = cold::head_vocabulary_controlled(directory, root, budget)?;
-        let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
-        let annotations = match branch {
-            None => cold::Loaded {
-                value: None,
-                charge: 0,
-            },
-            Some(branch) => crate::annotations::seqs_controlled(root, branch, budget)?,
-        };
+        // `sparkles check` runs this beside a live writer, so the log is bounded
+        // first and the vocabulary and annotations are counted after it, as the
+        // writer writes a group's terms and annotations before the next group's
+        // records (see `committed_bound`).
         let path = directory.join("wal.log");
         let loaded = match budget.buffered(&path) {
             Ok(loaded) => loaded,
@@ -313,6 +325,18 @@ fn inspect_generation(
         };
         let mut reader = loaded.value;
         let extent = reader.get_ref().metadata()?.len();
+        let extent = wal::probe::committed_bound(&mut reader, extent, budget)?;
+        inspection_point("bound");
+        let vocabulary = cold::head_vocabulary_controlled(directory, root, budget)?;
+        let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
+        inspection_point("vocabulary");
+        let annotations = match branch {
+            None => cold::Loaded {
+                value: None,
+                charge: 0,
+            },
+            Some(branch) => crate::annotations::seqs_controlled(root, branch, budget)?,
+        };
         let mut configuration_error = None;
         wal::probe::prove_prefix_with(
             &mut reader,
@@ -324,6 +348,7 @@ fn inspect_generation(
             &path,
             budget,
             &mut |observation| {
+                inspection_point("observation");
                 if configuration_error.is_none() {
                     let Some(primary) = primary.as_mut() else {
                         if observation.configuration.is_some() {
