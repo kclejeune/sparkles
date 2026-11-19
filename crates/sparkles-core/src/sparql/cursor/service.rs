@@ -217,7 +217,7 @@ impl Service {
             let call = LocalCall::new(ctx, target, ctx.current_deadline())?;
             ctx.check()?;
             let cursor = CursorOptions {
-                fallback: self.fallback,
+                fallback: self.fallback.at_pull(ctx),
                 ..options.clone()
             };
             let execution = super::query_cursor(call.snap, &self.query, &call.options, &cursor)?;

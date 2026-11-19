@@ -47,6 +47,24 @@ pub enum FallbackPolicy {
     RejectMaterialization,
 }
 
+/// How the strict policy's refusal of an eager fallback begins, so that code that turns
+/// other errors into values, as an EXISTS in an expression does, can tell it apart.
+pub(crate) const REFUSAL: &str = "cursor requires materialization at ";
+
+impl FallbackPolicy {
+    /// The policy for work an operator decides on at its first pull: the strict one when
+    /// either the operator's or its query's cursor is strict. An EXISTS pattern's
+    /// operators are built under the permissive policy, so their own may not be the
+    /// query's.
+    pub(crate) fn at_pull(self, ctx: &Ctx) -> Self {
+        if ctx.strict_cursor.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::RejectMaterialization
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CursorOptions {
     pub batch_rows: usize,
@@ -984,6 +1002,10 @@ fn from_prepared(
     let charge = OwnedCharge::new(&ctx, bytes)?;
     let variables = Variables::new(&ctx, &prepared.pattern, &prepared.node.vars, query)?;
     let spec = graph::Spec::from_parsed(parsed, options)?;
+    if cursor.fallback == FallbackPolicy::RejectMaterialization {
+        ctx.strict_cursor
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
     let plan = root.describe(&ctx);
     ctx.check()?;
@@ -2992,7 +3014,7 @@ impl Operator {
             });
         if materializes && !native && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
-                "cursor requires materialization at {}; use AllowMaterialization or eager execution",
+                "{REFUSAL}{}; use AllowMaterialization or eager execution",
                 node.operator()
             )));
         }

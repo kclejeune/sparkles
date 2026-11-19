@@ -618,6 +618,11 @@ pub struct Ctx {
     /// wait that is still in progress. A background reader of the deadline would need to
     /// credit a wait before it starts.
     pub deadline_pause: Arc<AtomicU64>,
+    /// Whether the query runs as a cursor under the strict policy. An operator that
+    /// decides at its first pull how to run, such as an in-process SERVICE call, reads
+    /// it, since the operators of an EXISTS pattern are built under the permissive
+    /// policy once their strict build has passed.
+    pub(crate) strict_cursor: AtomicBool,
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
@@ -844,6 +849,10 @@ enum ResourceRefusal {
     },
     Cancelled,
     Timeout,
+    /// The strict cursor policy's refusal of an eager fallback, met where the operator
+    /// decides how to run at its first pull, such as an in-process SERVICE call inside
+    /// an EXISTS. It fails the query, as the same refusal does outside an expression.
+    Refused(String),
 }
 
 impl ResourceRefusal {
@@ -852,6 +861,9 @@ impl ResourceRefusal {
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
             Error::Cancelled => Some(Self::Cancelled),
             Error::Timeout => Some(Self::Timeout),
+            Error::Unsupported(message) if message.starts_with(super::cursor::REFUSAL) => {
+                Some(Self::Refused(message.clone()))
+            }
             Error::Component(component) => component
                 .source
                 .as_ref()
@@ -871,6 +883,7 @@ impl ResourceRefusal {
             Self::Budget(budget) => Error::BudgetExceeded(budget),
             Self::Cancelled => Error::Cancelled,
             Self::Timeout => Error::Timeout,
+            Self::Refused(message) => Error::Unsupported(message),
             Self::Parent {
                 component,
                 code,
@@ -1166,6 +1179,7 @@ impl Ctx {
             literal_bnodes: Default::default(),
             deadline: None,
             deadline_pause: Arc::new(AtomicU64::new(0)),
+            strict_cursor: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),

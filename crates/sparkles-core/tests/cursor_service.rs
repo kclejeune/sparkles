@@ -752,3 +752,47 @@ fn a_cache_hit_is_charged_what_its_entry_keeps() {
     );
     assert_eq!(ep.calls(), calls, "the cache answered");
 }
+
+/// An EXISTS pattern runs an in-process call under the policy of the cursor that holds
+/// the filter, not a permissive one of its own. A strict caller refuses a callee form
+/// that the strict policy refuses, inside FILTER EXISTS as at the top of the query.
+#[test]
+fn an_exists_over_an_in_process_call_keeps_the_strict_policy() {
+    let s = store();
+    let remote = Store::in_memory(StoreOptions::default());
+    remote
+        .load(&[Source::from_bytes(
+            b"<urn:x> <urn:p> 1 .\n".to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let snap = s.snapshot();
+    let o = QueryOptions {
+        local_endpoints: Some(Arc::new(Local(remote.snapshot(), Arc::new(())))),
+        ..opts()
+    };
+    let failing = Endpoint::start(Arc::new(|| (500, vec![Part::Bytes(b"no".to_vec())])));
+    for filter in ["EXISTS", "NOT EXISTS"] {
+        let q = format!(
+            "SELECT ?a {{ ?a <urn:b> ?v FILTER {filter} {{ SERVICE <http://local/sparql> {{ ?x <urn:p> ?o SERVICE SILENT <{}> {{ ?x ?q ?r }} }} }} }}",
+            failing.url
+        );
+        let expected = eager(&snap, &q, &o).unwrap();
+        let r = streamed(&snap, &q, &o, &strict(4));
+        assert!(
+            matches!(&r, Err(Error::Unsupported(m)) if m.contains("materialization at Service")),
+            "{filter}: {:?}",
+            r.map(|(rows, _)| rows)
+        );
+        let allow = CursorOptions {
+            fallback: FallbackPolicy::AllowMaterialization,
+            ..strict(4)
+        };
+        assert_eq!(
+            streamed(&snap, &q, &o, &allow).unwrap().0,
+            expected,
+            "{filter}"
+        );
+    }
+}
