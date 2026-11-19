@@ -17,9 +17,6 @@
 //! grows, which a doubling vector does a logarithmic number of times. Operators reserve
 //! the room for a batch at once, so the per-row path is a plain insert.
 
-// Operators move onto these buffers under item 1183, so some helpers have no caller yet.
-#![allow(dead_code)]
-
 use crate::error::{Error, Result};
 use crate::sparql::ctx::{OwnedCharge, RetainedCharge};
 use std::ops::Deref;
@@ -169,6 +166,7 @@ impl<V: Storage, A: Account> Charged<V, A> {
 
     /// Run `f`, which frees storage and does not grow it, then lower the charge to what
     /// the collection holds.
+    #[allow(dead_code, reason = "the operators of item 1192 use it")]
     pub(super) fn shrink(&mut self, f: impl FnOnce(&mut V)) -> Result<()> {
         f(&mut self.value);
         let now = self.value.heap_bytes();
@@ -176,27 +174,13 @@ impl<V: Storage, A: Account> Charged<V, A> {
         self.settle(now)
     }
 
-    /// Run `f`, which neither grows nor frees the allocation, such as an in-place
-    /// edit of entries that are already there.
-    #[inline]
-    pub(super) fn edit<R>(&mut self, f: impl FnOnce(&mut V) -> R) -> R {
-        let r = f(&mut self.value);
-        self.check();
-        r
-    }
-
     /// Free the allocation and release its charge.
+    #[allow(dead_code, reason = "the operators of item 1192 use it")]
     pub(super) fn clear_free(&mut self) -> Result<()>
     where
         V: Default,
     {
         self.shrink(|v| *v = V::default())
-    }
-
-    /// The collection and the account with its charge, for a caller that moves the
-    /// allocation elsewhere, such as into an output batch, and takes over the charge.
-    pub(super) fn into_parts(self) -> (V, A, u64) {
-        (self.value, self.account, self.charged)
     }
 }
 
@@ -205,18 +189,51 @@ impl<T, A: Account> Charged<Vec<T>, A> {
     /// allows it and grows to exactly what it needs where it does not.
     #[inline]
     pub(super) fn reserve(&mut self, more: usize) -> Result<()> {
+        self.reserve_toward(more, 0)
+    }
+
+    /// Room for `more` entries beyond the length, growing to `toward` entries or to
+    /// double the capacity when `toward` is zero, where the budget allows it, and to
+    /// exactly what it needs where it does not. A buffer that keeps one entry for each
+    /// entry of a table grows toward the table's capacity.
+    #[inline]
+    pub(super) fn reserve_toward(&mut self, more: usize, toward: usize) -> Result<()> {
         if self.value.capacity() - self.value.len() >= more {
             return Ok(());
         }
-        self.reserve_slow(more)
+        self.reserve_slow(more, toward)
+    }
+
+    /// The bytes [`Self::reserve_toward`] would allocate for `more` entries where the
+    /// budget allows its target, or zero when the vector has room.
+    #[inline]
+    pub(super) fn growth(&self, more: usize, toward: usize) -> u64 {
+        if self.value.capacity() - self.value.len() >= more {
+            return 0;
+        }
+        let need = self.value.len().saturating_add(more);
+        Self::size(self.target(need, toward))
+    }
+
+    /// The entries a growth to `need` aims for.
+    fn target(&self, need: usize, toward: usize) -> usize {
+        if toward > 0 {
+            need.max(toward)
+        } else {
+            need.max(self.value.capacity().saturating_mul(2)).max(MIN)
+        }
+    }
+
+    fn size(to: usize) -> u64 {
+        (to as u64).saturating_mul(std::mem::size_of::<T>() as u64)
     }
 
     #[cold]
-    fn reserve_slow(&mut self, more: usize) -> Result<()> {
+    fn reserve_slow(&mut self, more: usize, toward: usize) -> Result<()> {
         let len = self.value.len();
         let need = len.checked_add(more).ok_or_else(no_room)?;
-        let size = |to: usize| (to as u64).saturating_mul(std::mem::size_of::<T>() as u64);
-        let doubled = need.max(self.value.capacity().saturating_mul(2)).max(MIN);
+        let size = Self::size;
+        let doubled = self.target(need, toward);
         match self.grow(size(doubled), |v| v.try_reserve_exact(doubled - len)) {
             Err(Error::BudgetExceeded(_)) if doubled > need => {
                 self.grow(size(need), |v| v.try_reserve_exact(need - len))
@@ -225,18 +242,22 @@ impl<T, A: Account> Charged<Vec<T>, A> {
         }
     }
 
-    /// Add an entry to room that [`Self::reserve`] made.
+    /// Add `items` to room that [`Self::reserve`] made.
     #[inline]
-    pub(super) fn push_reserved(&mut self, item: T) {
+    pub(super) fn extend_reserved(&mut self, items: &[T])
+    where
+        T: Clone,
+    {
         debug_assert!(
-            self.value.len() < self.value.capacity(),
-            "a push without room"
+            self.value.capacity() - self.value.len() >= items.len(),
+            "an extend without room"
         );
-        self.value.push(item);
+        self.value.extend_from_slice(items);
     }
 
     /// Add an entry, growing the vector first when it is full.
     #[inline]
+    #[allow(dead_code, reason = "the operators of item 1192 use it")]
     pub(super) fn push(&mut self, item: T) -> Result<()> {
         self.reserve(1)?;
         self.value.push(item);
@@ -245,6 +266,7 @@ impl<T, A: Account> Charged<Vec<T>, A> {
 
     /// Add `items`, growing the vector first when they do not fit.
     #[inline]
+    #[allow(dead_code, reason = "the operators of item 1192 use it")]
     pub(super) fn extend_from_slice(&mut self, items: &[T]) -> Result<()>
     where
         T: Clone,
@@ -259,17 +281,6 @@ impl<T, A: Account> Charged<Vec<T>, A> {
     pub(super) fn clear(&mut self) {
         self.value.clear();
     }
-
-    /// Keep the first `len` entries and the allocation.
-    #[inline]
-    pub(super) fn truncate(&mut self, len: usize) {
-        self.value.truncate(len);
-    }
-
-    #[inline]
-    pub(super) fn as_mut_slice(&mut self) -> &mut [T] {
-        self.value.as_mut_slice()
-    }
 }
 
 /// The bound on what a hashbrown table of `len` entries and room for `capacity` makes
@@ -280,7 +291,43 @@ fn table_growth<T>(len: usize, capacity: usize, more: usize) -> u64 {
     table_bound(target, std::mem::size_of::<T>())
 }
 
+/// The buckets a hashbrown table allocates for room for `capacity` entries, which are
+/// a power of two at most seven eighths full, and at least four.
+fn buckets(capacity: usize) -> usize {
+    if capacity < 8 {
+        if capacity < 4 { 4 } else { 8 }
+    } else {
+        (capacity.saturating_mul(8) / 7).next_power_of_two()
+    }
+}
+
 impl<T, A: Account> Charged<hashbrown::HashTable<T>, A> {
+    /// The room for entries the table has once [`Self::reserve`] makes room for `more`.
+    /// A caller that sizes a buffer beside the table from it reads it before the table
+    /// grows, to predict the pair's size.
+    pub(super) fn capacity_after(&self, more: usize) -> usize {
+        let (len, capacity) = (self.value.len(), self.value.capacity());
+        if capacity - len >= more {
+            return capacity;
+        }
+        let buckets = buckets(len.saturating_add(more).max(capacity.saturating_add(1)));
+        if buckets <= 8 {
+            buckets - 1
+        } else {
+            buckets / 8 * 7
+        }
+    }
+
+    /// The bound on what [`Self::reserve`] allocates for `more` entries, or zero when
+    /// the table has room.
+    #[inline]
+    pub(super) fn growth(&self, more: usize) -> u64 {
+        if self.value.capacity() - self.value.len() >= more {
+            return 0;
+        }
+        table_growth::<T>(self.value.len(), self.value.capacity(), more)
+    }
+
     /// Room for `more` entries beyond the length. The bound of the table's new
     /// allocation is admitted before it allocates, since hashbrown reports its size only
     /// after, and the charge is then set from that size.
@@ -313,6 +360,16 @@ impl<T, A: Account> Charged<hashbrown::HashTable<T>, A> {
 impl<T: Eq + std::hash::Hash, S: std::hash::BuildHasher, A: Account>
     Charged<hashbrown::HashSet<T, S>, A>
 {
+    /// The bound on what [`Self::reserve`] allocates for `more` entries, or zero when
+    /// the set has room.
+    #[inline]
+    pub(super) fn growth(&self, more: usize) -> u64 {
+        if self.value.capacity() - self.value.len() >= more {
+            return 0;
+        }
+        table_growth::<T>(self.value.len(), self.value.capacity(), more)
+    }
+
     /// Room for `more` entries beyond the length, admitted as for a table.
     #[inline]
     pub(super) fn reserve(&mut self, more: usize) -> Result<()> {
@@ -347,11 +404,7 @@ pub(super) fn table_bound(capacity: usize, entry: usize) -> u64 {
     if capacity == 0 {
         return 0;
     }
-    let buckets = if capacity < 8 {
-        if capacity < 4 { 4 } else { 8 }
-    } else {
-        (capacity.saturating_mul(8) / 7).next_power_of_two()
-    };
+    let buckets = buckets(capacity);
     // a bucket of `entry` bytes and one control byte, a control group of 16 bytes
     // beyond the buckets, and the alignment of the entries before the control bytes
     (buckets as u64)
@@ -454,6 +507,26 @@ mod tests {
         drop(t);
         drop(s);
         assert_eq!(ctx.live_bytes(), base);
+    }
+
+    #[test]
+    fn the_predicted_capacity_is_the_tables() {
+        let ctx = context(1 << 30);
+        let hash = |x: &u32| *x as u64;
+        let mut t = Charged::new(
+            hashbrown::HashTable::<u32>::new(),
+            ctx.retained_charge(0).unwrap(),
+        )
+        .unwrap();
+        for batch in [1, 3, 7, 1, 50, 200, 1, 1000, 5000, 1] {
+            let predicted = t.capacity_after(batch);
+            t.reserve(batch, hash).unwrap();
+            assert_eq!(t.capacity(), predicted, "{} + {batch}", t.len());
+            for _ in 0..batch {
+                let x = t.len() as u32;
+                t.insert_reserved(hash(&x), x, hash);
+            }
+        }
     }
 
     #[test]
