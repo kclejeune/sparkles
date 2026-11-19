@@ -1473,7 +1473,7 @@ python3 scripts/bench-gate.py w3c "$out/output.log" --out "$out/record.json" \
 '''
 
 [tasks."bench:executors"]
-description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; writes a gate record"
+description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; with --base, a four-arm A/B of a base and a tip binary; writes a gate record"
 usage = '''
 arg "[binary]" help="a built sparkles binary (default: build this checkout's release binary)"
 flag "--out <dir>" help="results directory (default .artifacts/bench-executors/<UTC time>)"
@@ -1484,6 +1484,11 @@ flag "--reps <n>" default="10" help="timed requests per query and server process
 flag "--queries <list>" help="only these queries (default: all 31)"
 flag "--commit <rev>" help="the commit the binary was built from, for the record"
 flag "--build-config <json>" help="a prebuilt binary's build configuration, from scripts/bench-gate.py build-config --cargo '<its cargo arguments>' in its build environment; compare refuses a record without one"
+flag "--modes <list>" help="the binary's execution modes, or the tip's with --base (default 'eager streaming', or 'default streaming' with --base, where default sends no execution field)"
+flag "--base <binary>" help="a prebuilt base binary: the run interleaves its --base-modes with the tip's --modes, and needs an even --rounds"
+flag "--base-modes <list>" help="the base binary's execution modes (default 'eager streaming')"
+flag "--base-commit <rev>" help="the commit the base binary was built from, for the record"
+flag "--base-build-config <json>" help="the base binary's build configuration, as --build-config gives the tip's"
 '''
 run = '''
 mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
@@ -1499,7 +1504,10 @@ if [ -z "$bin" ]; then
 fi
 scripts/bench-executors.sh --scales "$usage_scales" --threads "$usage_threads" \
   --rounds "$usage_rounds" --reps "$usage_reps" ${usage_queries:+--queries "$usage_queries"} \
-  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} ${config:+--build-config "$config"} "$bin"
+  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} ${config:+--build-config "$config"} \
+  ${usage_modes:+--modes "$usage_modes"} ${usage_base:+--base "$usage_base"} \
+  ${usage_base_modes:+--base-modes "$usage_base_modes"} ${usage_base_commit:+--base-commit "$usage_base_commit"} \
+  ${usage_base_build_config:+--base-build-config "$usage_base_build_config"} "$bin"
 SPARKLES_TASK
 '''
 
