@@ -1723,6 +1723,90 @@ mod tests {
         w.finish().unwrap()
     }
 
+    /// The quads, the prefixes and the number of sinks of both entry points for every
+    /// combination of syntax, parse mode, codec and kind of data agree.
+    #[test]
+    fn entry_points_agree_on_every_rung() {
+        let ttl = "@prefix e: <http://e/> .\ne:s e:p e:o , e:o2 .\n_:b e:q \"x\" .\n";
+        let nt = "<http://e/s> <http://e/p> <http://e/o> .\n_:b <http://e/q> \"x\" .\n";
+        let dir = tempfile::tempdir().unwrap();
+        let mut sinks_seen = Vec::new();
+        for (format, doc, ext) in [
+            (RdfFormat::Turtle, ttl, "ttl"),
+            (RdfFormat::NTriples, nt, "nt"),
+        ] {
+            let mut want: Vec<String> = RdfParser::from_format(format)
+                .for_slice(doc.as_bytes())
+                .map(|q| q.unwrap().to_string())
+                .collect();
+            want.sort();
+            // a blank node's label differs between parses, so compare without them
+            let strip = |v: &mut Vec<String>| {
+                for q in v.iter_mut() {
+                    *q = q
+                        .split_whitespace()
+                        .filter(|t| !t.starts_with("_:"))
+                        .collect();
+                }
+                v.sort();
+            };
+            strip(&mut want);
+            for mode in [ParseMode::Auto, ParseMode::Streaming, ParseMode::Buffered] {
+                for gz in [false, true] {
+                    for data in ["bytes", "file", "reader"] {
+                        let body = if gz {
+                            gzip(doc.as_bytes())
+                        } else {
+                            doc.as_bytes().to_vec()
+                        };
+                        let make = || match data {
+                            "bytes" => Source::from_bytes(body.clone(), format, None),
+                            "file" => {
+                                let p = dir.path().join(format!("d{gz}.{ext}"));
+                                std::fs::write(&p, &body).unwrap();
+                                let mut s = Source::from_path(&p, None).unwrap();
+                                s.base = None;
+                                s
+                            }
+                            _ => Source::from_reader(
+                                std::io::Cursor::new(body.clone()),
+                                format,
+                                None,
+                            ),
+                        };
+                        let case = format!("{format} {mode:?} gz={gz} {data}");
+                        let mut src = make();
+                        src.parse_mode = mode;
+                        let (all, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+                        let prefixes =
+                            parse_source(&src, 3, || Collect(&all, Vec::new(), &finished)).unwrap();
+                        let mut got = all.into_inner();
+                        strip(&mut got);
+                        assert_eq!(got, want, "{case}");
+                        let mut src = make();
+                        src.parse_mode = mode;
+                        let mut into = Vec::new();
+                        let into_prefixes = parse_source_into(&src, |q| {
+                            into.push(q.to_string());
+                            Ok(())
+                        })
+                        .unwrap();
+                        strip(&mut into);
+                        assert_eq!(into, want, "{case}");
+                        assert_eq!(into_prefixes, prefixes, "{case}");
+                        sinks_seen.push((case, prefixes.len(), finished.into_inner()));
+                    }
+                }
+            }
+        }
+        // a document this small takes one sink on every rung, and the Turtle document
+        // declares one prefix
+        for (case, prefixes, sinks) in sinks_seen {
+            assert_eq!(prefixes, usize::from(case.starts_with("Turtle")), "{case}");
+            assert_eq!(sinks, 1, "{case}");
+        }
+    }
+
     #[test]
     fn compressed_line_formats_parse_in_blocks() {
         let mut nt = String::new();
