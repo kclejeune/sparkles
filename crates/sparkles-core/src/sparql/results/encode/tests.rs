@@ -111,7 +111,7 @@ fn encode(
                 enc.row(&mut out, RowView::Dense(row), vars.len())
             };
             written.map_err(io)?;
-            out.end_row(1);
+            out.end_row(1).map_err(io)?;
         }
         Ok(())
     });
@@ -162,7 +162,7 @@ fn check(
 }
 
 /// The rows counted when the caller's writer fails after `limit` bytes are the rows
-/// whose ends lie within those bytes.
+/// whose ends lie within the bytes it took, and it takes every byte up to the limit.
 fn check_failing(
     enc: Enc,
     vars: &[String],
@@ -171,14 +171,78 @@ fn check_failing(
 ) -> std::result::Result<(), TestCaseError> {
     let (want, ends) = oracle(enc, vars, rows);
     let limit = limit.min(want.len());
-    let complete = ends.iter().filter(|&&e| e <= limit).count() as u64;
     for sparse in [false, true] {
         let mut w = Failing { limit, taken: 0 };
         let (r, n) = encode(enc, vars, rows, sparse, &mut w);
+        prop_assert_eq!(w.taken, limit, "{:?} sparse {}: bytes taken", enc, sparse);
         if limit < want.len() {
             prop_assert!(r.is_err(), "{enc:?}: a failed writer must fail the output");
+        } else {
+            prop_assert!(r.is_ok(), "{enc:?}: a writer that takes it all: {r:?}");
         }
+        let complete = ends.iter().filter(|&&e| e <= w.taken).count() as u64;
         prop_assert_eq!(n, complete, "{:?} sparse {} limit {}", enc, sparse, limit);
+    }
+    Ok(())
+}
+
+/// Records the length of each write it takes.
+#[derive(Default)]
+struct Pieces(Vec<usize>);
+
+impl Write for Pieces {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.push(b.len());
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The lengths of the writes the caller's writer takes when sparesults writes through the
+/// staged mode, one write per row, as the formats it serializes did before the engine
+/// encoded them.
+fn oracle_pieces(enc: Enc, vars: &[String], rows: &[Vec<Option<Term>>]) -> Vec<usize> {
+    let mut w = Pieces::default();
+    let count = RowCount::new();
+    let variables: Vec<Variable> = vars.iter().map(Variable::new_unchecked).collect();
+    write_buffered(&mut w, &count, None, &mut |out, staged| {
+        let mut s = QueryResultsSerializer::from_format(enc.oracle())
+            .serialize_solutions_to_writer(&mut *out, variables.clone())
+            .map_err(io)?;
+        for row in rows {
+            s.serialize(
+                row.iter()
+                    .enumerate()
+                    .filter_map(|(c, t)| t.as_ref().map(|t| (variables[c].as_ref(), t.as_ref()))),
+            )
+            .map_err(io)?;
+            staged.set(staged.get() + 1);
+        }
+        let _ = s.finish();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count.get(), rows.len() as u64);
+    w.0
+}
+
+/// The encoder hands the caller's writer the same pieces as sparesults' row writes did,
+/// so each piece ends where a row ends and a row longer than the buffer goes in one
+/// write, which a size limit refuses whole.
+fn check_pieces(
+    enc: Enc,
+    vars: &[String],
+    rows: &[Vec<Option<Term>>],
+) -> std::result::Result<(), TestCaseError> {
+    let want = oracle_pieces(enc, vars, rows);
+    for sparse in [false, true] {
+        let mut w = Pieces::default();
+        let (r, n) = encode(enc, vars, rows, sparse, &mut w);
+        prop_assert!(r.is_ok(), "{enc:?} sparse {sparse}: {r:?}");
+        prop_assert_eq!(n, rows.len() as u64);
+        prop_assert_eq!(&w.0, &want, "{:?} sparse {}: write lengths", enc, sparse);
     }
     Ok(())
 }
@@ -307,6 +371,28 @@ fn solutions() -> impl Strategy<Value = (Vec<String>, Vec<Vec<Option<Term>>>)> {
     })
 }
 
+/// Answers whose rows span several drains of the buffer: many rows, some of them near or
+/// past the buffer's size and full of escaped bytes.
+fn long_solutions() -> impl Strategy<Value = (Vec<String>, Vec<Vec<Option<Term>>>)> {
+    let value = prop_oneof![
+        6 => text(),
+        1 => (1usize..12_000).prop_map(|n| "x".repeat(n)),
+        1 => (1usize..6_000).prop_map(|n| "x\t".repeat(n)),
+        1 => (8_180usize..8_200).prop_map(|n| "y".repeat(n)),
+    ];
+    let cell = prop_oneof![
+        1 => Just(None),
+        2 => term().prop_map(Some),
+        2 => value.prop_map(|v| Some(Literal::new_simple_literal(v).into())),
+    ]
+    .boxed();
+    (1usize..4).prop_flat_map(move |width| {
+        let vars = (0..width).map(|i| format!("v{i}")).collect::<Vec<_>>();
+        let row = prop::collection::vec(cell.clone(), width);
+        (Just(vars), prop::collection::vec(row, 0..40))
+    })
+}
+
 /// The cases each property test runs, 100,000 unless `SPARKLES_ENCODE_CASES` says
 /// otherwise.
 fn cases() -> u32 {
@@ -327,6 +413,25 @@ proptest! {
     #[test]
     fn tsv_counts_the_rows_a_failed_writer_took((vars, rows) in solutions(), limit in 0usize..400) {
         check_failing(Enc::Tsv, &vars, &rows, limit)?;
+    }
+}
+
+proptest! {
+    // each case writes up to a few hundred kilobytes
+    #![proptest_config(ProptestConfig { cases: cases() / 50, ..ProptestConfig::default() })]
+
+    #[test]
+    fn tsv_pieces_equal_sparesults_row_writes((vars, rows) in long_solutions()) {
+        check_pieces(Enc::Tsv, &vars, &rows)?;
+    }
+
+    #[test]
+    fn tsv_counts_the_rows_a_failed_writer_took_over_drains(
+        (vars, rows) in long_solutions(),
+        at in 0.0f64..=1.0,
+    ) {
+        let total = oracle(Enc::Tsv, &vars, &rows).0.len();
+        check_failing(Enc::Tsv, &vars, &rows, (total as f64 * at) as usize)?;
     }
 }
 
@@ -445,4 +550,62 @@ fn tsv_writes_deeply_nested_triple_terms() {
         )));
     }
     tsv(&["t"], &[vec![Some(t)]]);
+}
+
+fn simple(v: &str) -> Option<Term> {
+    Some(Literal::new_simple_literal(v).into())
+}
+
+/// Rows of 8,191, 8,192 and 8,193 bytes after a short row and after an empty buffer, and a
+/// first row longer than the buffer, reach the caller's writer in the pieces sparesults'
+/// row writes did.
+#[test]
+fn tsv_pieces_at_the_buffer_size() {
+    let vars = vec!["v".to_string()];
+    // a row is the value, two quotes and a line feed
+    let row = |n: usize| vec![simple(&"z".repeat(n - 3))];
+    let mut rows = vec![vec![simple("a")]];
+    for n in [8_191, 8_192, 8_193, 8_192, 8_191] {
+        rows.push(row(n));
+        rows.push(vec![simple("b")]);
+    }
+    rows.extend([row(8_192), row(8_193), row(8_191), row(20_000)]);
+    check_pieces(Enc::Tsv, &vars, &rows).unwrap();
+    check_pieces(Enc::Tsv, &vars, &[row(20_000), vec![simple("a")]]).unwrap();
+    check_pieces(Enc::Tsv, &vars, &[vec![simple(&"x\t".repeat(35_000))]]).unwrap();
+    for limit in [0, 3, 4, 100, 8_000, 9_000, 40_000, 60_000, 90_000] {
+        check_failing(Enc::Tsv, &vars, &rows, limit).unwrap();
+    }
+}
+
+/// A sparse row of 70 columns with runs of more than 32 empty cells at its start, inside
+/// and at its end, and an answer of many short rows that spans several drains.
+#[test]
+fn tsv_writes_long_tab_runs_and_many_short_rows() {
+    let vars: Vec<String> = (0..70).map(|i| format!("c{i}")).collect();
+    let mut row = vec![None; 70];
+    row[33] = simple("m");
+    row[35] = simple("n");
+    let mut empty_but_one = vec![None; 70];
+    empty_but_one[69] = simple("last");
+    let rows = vec![row, vec![None; 70], empty_but_one];
+    let refs: Vec<&str> = vars.iter().map(String::as_str).collect();
+    let s = tsv(&refs, &rows);
+    assert!(s.ends_with(&format!("{}\"last\"\n", "\t".repeat(69))));
+    check_pieces(Enc::Tsv, &vars, &rows).unwrap();
+
+    let vars = vec!["a".to_string(), "b".to_string()];
+    let rows: Vec<Vec<Option<Term>>> = (0..5_000)
+        .map(|i| {
+            vec![
+                simple(&format!("r{i}")),
+                (i % 3 != 0).then(|| simple("q\"t")).flatten(),
+            ]
+        })
+        .collect();
+    tsv(&["a", "b"], &rows);
+    check_pieces(Enc::Tsv, &vars, &rows).unwrap();
+    for limit in [8_191, 8_192, 20_000, 50_000] {
+        check_failing(Enc::Tsv, &vars, &rows, limit).unwrap();
+    }
 }

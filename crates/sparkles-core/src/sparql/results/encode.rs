@@ -18,6 +18,7 @@ pub(super) struct Tsv;
 impl Tsv {
     /// The header line, `?` and each name separated by tabs.
     pub(super) fn header(out: &mut Explicit<'_, '_>, variables: &[String]) -> Result<()> {
+        out.begin_piece();
         for (i, v) in variables.iter().enumerate() {
             if i > 0 {
                 out.put(b"\t")?;
@@ -25,7 +26,8 @@ impl Tsv {
             out.put(b"?")?;
             out.put(v.as_bytes())?;
         }
-        out.put(b"\n")
+        out.put(b"\n")?;
+        out.end_piece()
     }
 
     /// One row of `width` cells, an unbound cell empty. The row's start and end are the

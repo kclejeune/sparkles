@@ -300,7 +300,7 @@ where
             let row = batch.row(i)?;
             self.out.begin_row()?;
             (self.row)(&mut self.out, row, self.width).map_err(io)?;
-            self.out.end_row(1);
+            self.out.end_row(1).map_err(io)?;
         }
         if std::mem::take(&mut self.flush) {
             self.out.flush().map_err(io)?;

@@ -2725,8 +2725,12 @@ Query parameters beyond the standard protocol:
   response starts gets the normal status and JSON error. An error after it has started,
   such as a timeout or an exhausted budget, aborts the body transfer. The client then sees a truncated
   response with a `200` status, and in TSV, CSV or N-Triples the rows before
-  the cut are well formed, so only a transfer that completes is a complete answer. Treat
-  a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
+  the cut are well formed, so only a transfer that completes is a complete answer. The
+  result-size budget follows the same rule. An answer that passes `max-result-mb` before
+  its response starts gets `507`, and one that passes it later is cut. The exact byte at
+  which a response starts depends on how the format's writer hands its bytes on and is
+  not part of the interface, so an answer that passes the budget near that point can get
+  either outcome. Treat a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
   the native metadata reports `stopped` and an unknown total instead of the full count.
   Rows come in the same order as eagerly. Streamed answers skip the full-result cache,
   and the access log entry and the metrics are recorded once both the query and the

@@ -222,6 +222,14 @@ pub(crate) struct RowOut<'a> {
     /// an error that a [`Write`] call could report only as an I/O error, such as a
     /// refused memory charge, returned in its place
     refused: Option<Error>,
+    /// explicit mode: the offset in `buf` at which the open row or header starts
+    open: Option<usize>,
+    /// explicit mode: the open row outgrew the buffer, and `buf` is the scratch that
+    /// collects it whole while the buffer waits in `spill`
+    growing: bool,
+    /// the scratch for a row longer than the buffer, or the buffer while one grows. It is
+    /// not charged, as the row string of a serializer that writes a row at once is not.
+    spill: Vec<u8>,
     ctx: Option<&'a Ctx>,
     /// the reservation for `buf` and `marks`, declared after them so that they drop first
     charge: Option<Charge<'a>>,
@@ -246,6 +254,9 @@ impl<'a> RowOut<'a> {
             taken: 0,
             failed: false,
             refused: None,
+            open: None,
+            growing: false,
+            spill: Vec::new(),
             ctx,
             charge: None,
         }
@@ -346,20 +357,78 @@ impl<'a> RowOut<'a> {
     }
 
     /// Explicit mode: make room for the next row's mark, before any of its bytes, so that
-    /// a refused growth fails before the row starts and [`RowOut::end_row`] cannot fail.
+    /// a refused growth fails before the row starts, and open the row.
     pub(crate) fn begin_row(&mut self) -> Result<()> {
-        if self.marks.len() < self.marks.capacity() {
-            return Ok(());
+        if self.marks.len() == self.marks.capacity() {
+            self.grow_marks()
+                .map_err(|e| self.refused.take().unwrap_or(Error::Io(e)))?;
         }
-        self.grow_marks()
-            .map_err(|e| self.refused.take().unwrap_or(Error::Io(e)))
+        self.open = Some(self.buf.len());
+        Ok(())
     }
 
     /// Explicit mode: `n` rows end here, `n` greater than one for a writer that counts
-    /// several statements at once. It never allocates or fails.
+    /// several statements at once. A row that outgrew the buffer goes on here in one
+    /// write, which can fail. Nothing else allocates or fails.
     #[inline]
-    pub(crate) fn end_row(&mut self, n: u64) {
+    pub(crate) fn end_row(&mut self, n: u64) -> std::io::Result<()> {
+        self.open = None;
+        if self.growing {
+            return self.write_grown(Some(n));
+        }
         self.push_mark(n);
+        Ok(())
+    }
+
+    /// Explicit mode: open a piece that is not a row, such as a header, which goes to
+    /// the caller's writer whole like a row but ends none.
+    pub(crate) fn begin_piece(&mut self) {
+        self.open = Some(self.buf.len());
+    }
+
+    /// Explicit mode: close the piece [`RowOut::begin_piece`] opened.
+    pub(crate) fn end_piece(&mut self) -> std::io::Result<()> {
+        self.open = None;
+        if self.growing {
+            return self.write_grown(None);
+        }
+        Ok(())
+    }
+
+    /// Explicit mode: forget the bytes of an open row or piece, which will not end.
+    #[cold]
+    fn drop_open(&mut self) {
+        if self.growing {
+            self.growing = false;
+            std::mem::swap(&mut self.buf, &mut self.spill);
+            self.spill.clear();
+        } else if let Some(start) = self.open {
+            self.buf.truncate(start);
+        }
+        self.open = None;
+    }
+
+    /// Write on the row or piece collected whole in the scratch, as one write, as a
+    /// serializer's write of at least the buffer's size goes, and put the buffer back.
+    /// Its mark, if it ends a row, lies at the start of the empty buffer, as after such a
+    /// write in the staged mode.
+    #[cold]
+    #[inline(never)]
+    fn write_grown(&mut self, rows: Option<u64>) -> std::io::Result<()> {
+        self.growing = false;
+        std::mem::swap(&mut self.buf, &mut self.spill);
+        debug_assert!(self.buf.is_empty() && self.marks.is_empty());
+        let r = self.inner.write_all(&self.spill);
+        self.failed |= r.is_err();
+        if r.is_ok() {
+            self.taken += self.spill.len() as u64;
+        }
+        self.spill.clear();
+        r?;
+        if let Some(n) = rows {
+            self.push_mark(n);
+        }
+        Ok(())
     }
 
     /// Staged mode: note the rows counted since the last look, which end where `buf`
@@ -391,6 +460,10 @@ impl<'a> RowOut<'a> {
     /// [`Write::write`] of `b` when it does not fit in what is left of `buf`.
     #[inline(never)]
     fn write_full(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.growing {
+            self.buf.extend_from_slice(b);
+            return Ok(b.len());
+        }
         // the buffer and the slot for the mark of the row these bytes belong to exist
         // before the bytes go anywhere
         if self.buf.capacity() == 0 {
@@ -399,6 +472,9 @@ impl<'a> RowOut<'a> {
                 self.buf.extend_from_slice(b);
                 return Ok(b.len());
             }
+        }
+        if let Some(start) = self.open {
+            return self.write_open(start, b);
         }
         self.drain()?;
         if b.len() >= OUTPUT_BUFFER {
@@ -410,6 +486,29 @@ impl<'a> RowOut<'a> {
         } else {
             self.buf.extend_from_slice(b);
         }
+        Ok(b.len())
+    }
+
+    /// Explicit mode: `b` does not fit, and a row or piece is open at `start`. The bytes
+    /// before it go on and the open part moves to the front, so that every piece the
+    /// caller's writer takes ends where a row ends, as with a serializer that writes each
+    /// row at once. Then a row longer than the buffer is collected whole and goes on at
+    /// its end in one write, so that a size limit refuses it whole.
+    #[cold]
+    #[inline(never)]
+    fn write_open(&mut self, start: usize, b: &[u8]) -> std::io::Result<usize> {
+        self.drain_to(start)?;
+        self.open = Some(0);
+        if self.buf.len() + b.len() <= OUTPUT_BUFFER {
+            self.buf.extend_from_slice(b);
+            return Ok(b.len());
+        }
+        self.spill.clear();
+        self.spill.extend_from_slice(&self.buf);
+        self.spill.extend_from_slice(b);
+        self.buf.clear();
+        std::mem::swap(&mut self.buf, &mut self.spill);
+        self.growing = true;
         Ok(b.len())
     }
 
@@ -433,23 +532,34 @@ impl<'a> RowOut<'a> {
     /// taken the bytes up to its end, also when it takes them in parts and fails before
     /// the last.
     fn drain(&mut self) -> std::io::Result<()> {
+        debug_assert!(
+            !self.growing,
+            "a drain inside a row that outgrew the buffer"
+        );
+        self.drain_to(self.buf.len())
+    }
+
+    /// Write the first `end` collected bytes on and move the rest, part of a row with no
+    /// mark yet, to the front.
+    fn drain_to(&mut self, end: usize) -> std::io::Result<()> {
         if self.failed {
             return Err(std::io::Error::other("the output already failed"));
         }
+        debug_assert!(self.marks.last().is_none_or(|&(offset, _)| offset <= end));
         self.register();
         let mut done = 0;
         let mut mark = 0;
         loop {
-            while let Some(&(end, n)) = self.marks.get(mark)
-                && end <= done
+            while let Some(&(at, n)) = self.marks.get(mark)
+                && at <= done
             {
                 self.count.add(n);
                 mark += 1;
             }
-            if done == self.buf.len() {
+            if done == end {
                 break;
             }
-            match self.inner.write(&self.buf[done..]) {
+            match self.inner.write(&self.buf[done..end]) {
                 Ok(0) => {
                     // the marks are registered and the rows taken are counted
                     self.failed = true;
@@ -468,7 +578,8 @@ impl<'a> RowOut<'a> {
                 }
             }
         }
-        self.buf.clear();
+        self.buf.copy_within(end.., 0);
+        self.buf.truncate(self.buf.len() - end);
         self.marks.clear();
         Ok(())
     }
@@ -534,8 +645,18 @@ impl<'o, 'a> Explicit<'o, 'a> {
 
     /// See [`RowOut::end_row`].
     #[inline]
-    pub(crate) fn end_row(&mut self, n: u64) {
+    pub(crate) fn end_row(&mut self, n: u64) -> std::io::Result<()> {
         self.0.end_row(n)
+    }
+
+    /// See [`RowOut::begin_piece`].
+    pub(crate) fn begin_piece(&mut self) {
+        self.0.begin_piece()
+    }
+
+    /// See [`RowOut::end_piece`].
+    pub(crate) fn end_piece(&mut self) -> std::io::Result<()> {
+        self.0.end_piece()
     }
 
     #[inline(always)]
@@ -557,6 +678,7 @@ impl Write for Explicit<'_, '_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        debug_assert!(self.0.open.is_none(), "a flush inside an open row");
         self.0.drain()?;
         self.0.inner.flush()
     }
@@ -600,7 +722,8 @@ pub(in crate::sparql) fn write_buffered(
         }
         Err(e) => {
             // the output stops here, with the bytes before the error written on and the
-            // rows that ended in them counted
+            // rows that ended in them counted, but no part of a row that did not end
+            out.drop_open();
             let _ = out.note();
             if !out.failed {
                 let _ = out.drain();

@@ -36,6 +36,11 @@ struct Server {
 }
 
 fn server(limit: Option<u64>) -> Server {
+    server_with(limit, "")
+}
+
+/// A server over [`DATA`] with `extra` statements added.
+fn server_with(limit: Option<u64>, extra: &str) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let mut state =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
@@ -48,6 +53,7 @@ fn server(limit: Option<u64>) -> Server {
         "ex:s2 ex:p \"{}\" .\n",
         "abc\\\"<&>é".repeat(10_000)
     ));
+    data.push_str(extra);
     ds.store
         .load(&[Source::from_bytes(
             data.into_bytes(),
@@ -274,4 +280,35 @@ async fn budget_cut_bodies_keep_their_status_and_error() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A row larger than the result-size budget that the response meets before it commits is
+/// refused with 507 in every execution, whatever pieces its encoder writes it in. Its
+/// 135,003 bytes of TSV and 90,002 of CSV would pass the 64 KiB at which a streamed
+/// response commits if they went on in pieces. The formats listed hand each row on whole.
+/// On the SPARQL writers of sparesults, SPARQL JSON and native JSON in streaming answer
+/// 200 with a cut body here, since they reach the response in pieces of 8 KiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_past_the_budget_before_the_commit_is_refused() {
+    let big = format!("<urn:ex:big> <urn:ex:p> \"{}\" .\n", "x\\t".repeat(45_000));
+    let s = server_with(Some(80 << 10), &big);
+    let mut failures = Vec::new();
+    for &(fname, accept) in SOLUTIONS {
+        if !["tsv", "csv"].contains(&fname) {
+            continue;
+        }
+        for mode in MODES {
+            let (status, _, body) = post(
+                &s.app,
+                &format!("/ds/sparql?execution={mode}"),
+                "SELECT ?v WHERE { <urn:ex:big> <urn:ex:p> ?v }",
+                accept,
+            )
+            .await;
+            if status != 507 {
+                failures.push(format!("{fname} {mode}: {status}, {} bytes", body.len()));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

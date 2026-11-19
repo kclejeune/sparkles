@@ -104,7 +104,7 @@ fn rows(
                 w.write_all(p).map_err(Error::Io)?;
             }
             if explicit {
-                w.end_row(1);
+                w.end_row(1).map_err(Error::Io)?;
             } else {
                 staged.set(staged.get() + 1);
             }
@@ -208,9 +208,9 @@ fn explicit_and_staged_marks_merge_at_one_offset() {
         w.begin_row()?;
         w.write_all(b"subject").map_err(Error::Io)?;
         // two rows ending at one offset, and a grouped count
-        w.end_row(1);
+        w.end_row(1).map_err(Error::Io)?;
         w.begin_row()?;
-        w.end_row(3);
+        w.end_row(3).map_err(Error::Io)?;
         assert_eq!(w.marks, vec![(7, 4)]);
         staged.set(2);
         w.write_all(b"x").map_err(Error::Io)?;
