@@ -227,9 +227,19 @@ if [ $mode = hosts ]; then
     room=
     if [ "$l" != unreachable ]; then
       case $d in '' | *[!0-9]*) room='unknown-disk' ;; *)
+        # Each role is compared with its own admission floor and selection threshold.
         if [ "$d" -ge "$need_ci" ]; then
           room='room-for-whole'
-        elif [ "$d" -ge "$min_whole" ]; then room='whole-after-gc'; elif [ "$d" -ge "$min_half" ]; then room='half-after-gc'; else room='below-selection'; fi
+        elif [ "$d" -ge "$need_conf" ]; then
+          room='room-for-half'
+          [ "$d" -lt "$min_whole" ] || room="whole-after-gc $room"
+        elif [ "$d" -ge "$min_whole" ]; then
+          room='whole-after-gc'
+        elif [ "$d" -ge "$min_half" ]; then
+          room='half-after-gc'
+        else
+          room='below-selection'
+        fi
         ;;
       esac
     fi

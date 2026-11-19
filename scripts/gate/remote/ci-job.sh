@@ -24,8 +24,8 @@
 # reads the free space every WATCH_SECONDS while the run goes, 30 by default, and once more
 # when a failed run ends, and stops or marks the run when it is under RUN_FLOOR_GIB, 4 by
 # default, so tests do not fail against the server's own free-disk reserve for a reason
-# that is not theirs. The run's TMPDIR there is ~/gate/tmp-NAME beside the job's worktree, so
-# its temporary files go with it.
+# that is not theirs. The run's TMPDIR there is a new ~/gate/tmp-NAME.XXXXXX beside the job's
+# worktree, which the job creates and removes, so its temporary files go with it.
 set -uo pipefail
 umask 022
 G=$HOME/gate
@@ -48,7 +48,9 @@ finish() {
   date +%s > "$out/done_at"
   log "end exit=$code"
   if [ "$keep" = 0 ] && cd "$G"; then
-    timeout --kill-after=10s 120 rm -rf "$wt" "$G/tmp-$NAME"
+    timeout --kill-after=10s 120 rm -rf "$wt"
+    # Only the TMPDIR that this start created goes, so a refused or Boat job removes none.
+    [ -z "${tmpd:-}" ] || timeout --kill-after=10s 120 rm -rf "$tmpd"
     timeout --kill-after=10s 60 git -C "$G/repo.git" worktree prune
   fi
   [ -z "${dw:-}" ] || kill "$dw" 2> /dev/null
@@ -177,9 +179,12 @@ esac
 watch=0
 if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = ssh ]; then
   watch=1
-  export TMPDIR=$G/tmp-$NAME
-  rm -rf "$TMPDIR"
-  mkdir -p "$TMPDIR"
+  tmpd=$(mktemp -d "$G/tmp-$NAME.XXXXXX") || {
+    tmpd=
+    log "could not create the run's temporary directory; not starting"
+    finish 2
+  }
+  export TMPDIR=$tmpd
 fi
 floor_kib=$((${RUN_FLOOR_GIB:-4} * 1048576))
 # is_below: 0 when the disk is under the run floor or its free space cannot be read.

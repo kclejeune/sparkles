@@ -158,11 +158,18 @@ fetch() {
   fi
   res=$base/$1.$id
   # One publication of a name at a time, so two fetches never both migrate an older copy.
-  local fd linked=0
-  exec {fd}>> "$base/.lock-$1"
-  flock -w 60 "$fd" || echo "remote-ci.sh: another fetch of $1 held its lock for 60 s" >&2
+  # Without the lock the name keeps its earlier copy, and the new copy stays at res.
+  local fd='' linked=0
+  if ! exec {fd}>> "$base/.lock-$1"; then
+    fd=
+    echo "remote-ci.sh: could not open the publication lock of $1" >&2
+  elif ! flock -w 60 "$fd"; then
+    exec {fd}>&-
+    fd=
+    echo "remote-ci.sh: another fetch of $1 held its lock for 60 s" >&2
+  fi
   link=$(mktemp -u "$base/.link-$1.XXXXXX")
-  if ! ln -s "$1.$id" "$link"; then
+  if [ -z "$fd" ] || ! ln -s "$1.$id" "$link"; then
     :
   elif [ -d "$base/$1" ] && [ ! -L "$base/$1" ]; then
     if mv --exchange -T "$link" "$base/$1" 2> /dev/null; then
@@ -176,7 +183,7 @@ fetch() {
   else
     rm -f "$link"
   fi
-  exec {fd}>&-
+  [ -z "$fd" ] || exec {fd}>&-
   echo "results in $res"
   if [ "$linked" = 0 ]; then
     echo "remote-ci.sh: $base/$1 could not point to the new copy and still holds the earlier one" >&2
@@ -193,7 +200,7 @@ if [ "$action" = status ]; then
   exit 0
 fi
 if [ "$action" = fetch ]; then
-  fetch "$name"
+  fetch "$name" || exit 1
   exit 0
 fi
 

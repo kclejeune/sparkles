@@ -1,4 +1,5 @@
 """scripts/remote-ci.sh and its job script against a fake host; no ssh or provider call runs."""
+import hashlib
 from pathlib import Path
 import os
 import shutil
@@ -272,6 +273,8 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual(self.run_ci('--no-wait', REMOTE_CI_MIN_FREE_GIB='x').returncode, 2)
 
     def test_an_ssh_host_with_room_runs_the_job_without_collecting(self):
+        # A directory at the old fixed TMPDIR path is not this start's and stays.
+        other = self.home / 'gate' / ('tmp-' + self.name()); other.mkdir(parents=True); (other / 'keep').write_text('x')
         r = self.run_ssh()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         log = self.log.read_text(); out = self.home / 'gate/out' / self.name()
@@ -279,8 +282,8 @@ class RemoteCI(unittest.TestCase):
         self.assertIn('prop MemoryMax=13G', log); self.assertIn('sync wally:gate/out/', log)
         self.assertFalse((out / 'outcome').exists())
         # The run's temporary files live beside its worktree, and the job removes both.
-        self.assertIn('tmpdir %s/gate/tmp-%s' % (self.home, self.name()), (out / 'ci.log').read_text())
-        self.assertFalse((self.home / 'gate' / ('tmp-' + self.name())).exists())
+        self.assertIn('tmpdir %s/gate/tmp-%s.' % (self.home, self.name()), (out / 'ci.log').read_text())
+        self.assertEqual(list((self.home / 'gate').glob('tmp-*.*')), []); self.assertTrue((other / 'keep').exists())
 
     def test_an_ssh_host_short_of_the_floor_collects_the_shortfall_and_runs(self):
         (self.home / 'df-kib').write_text(str(40 * GIB)); (self.home / 'df-after-gc').write_text(str(90 * GIB))
@@ -291,8 +294,10 @@ class RemoteCI(unittest.TestCase):
 
     def test_an_ssh_host_that_stays_short_of_the_floor_refuses_the_job(self):
         (self.home / 'df-kib').write_text(str(100 * GIB)); (self.home / 'df-after-gc').write_text(str(110 * GIB))
+        other = self.home / 'gate' / ('tmp-' + self.name()); other.mkdir(parents=True); (other / 'keep').write_text('x')
         r = self.run_ssh(REMOTE_CI_MIN_FREE_GIB='120')
         self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertTrue((other / 'keep').exists())
         self.assertIn('host disk below floor', r.stderr)
         out = self.home / 'gate/out' / self.name()
         self.assertIn('mbx gc min_free=120GiB', self.log.read_text())
@@ -451,6 +456,22 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(res.is_symlink()); self.assertIn('.fetch-', res.resolve().name)
         self.assertTrue(before.exists())
+
+    def test_a_publication_lock_that_cannot_be_opened_keeps_the_exit_and_the_earlier_copy(self):
+        base = self.src / '.artifacts/remote-ci'
+        name = 'cmd-%s-%s' % (self.rev('HEAD')[:8], hashlib.sha256(b'exit 3').hexdigest()[:8])
+        (base / ('.lock-' + name)).mkdir(parents=True)
+        # The waiter still returns the job's own exit status, read from its own copy.
+        r = self.run_cmd('exit 3')
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn('could not open the publication lock', r.stderr)
+        self.assertFalse((base / name).exists())
+        self.assertEqual(len(list(base.glob(name + '.*'))), 1)
+        # A fetch by name fails, since the name could not follow its new copy.
+        r = subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'wally', '--fetch', name],
+                           cwd=self.src, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertFalse((base / name).exists())
 
     def test_the_disk_settings_must_be_positive_numbers(self):
         for n in ['REMOTE_CI_MIN_FREE_GIB', 'REMOTE_CI_RUN_FLOOR_GIB', 'REMOTE_CI_WATCH_SECONDS']:
@@ -617,13 +638,15 @@ cat "$dest/gate.exit"
         (src / 'scripts/remote-executor.sh').write_text('rx_exec() { local v="FAKE_PROBE_$1"; [ -n "${!v:-}" ] || return 255; echo "${!v}"; }\n')
         subprocess.run(['git', 'init', '-q', str(src)], check=True)
         r = subprocess.run(['bash', str(src / 'scripts/gate/gate.sh'), '--hosts'], cwd=src, capture_output=True, text=True, timeout=60,
-                           env=dict(self.env, SPARKLES_GATE_CONFIG=str(self.t / 'none'), SPARKLES_BENCH_HOST='forge', GATE_HOSTS='h1 h2 h3 h4',
-                                    GATE_NEED_CONF_GB='40', FAKE_PROBE_h1='free 0 150', FAKE_PROBE_h2='held 1 60', FAKE_PROBE_h3='free 0 20'))
+                           env=dict(self.env, SPARKLES_GATE_CONFIG=str(self.t / 'none'), SPARKLES_BENCH_HOST='forge', GATE_HOSTS='h1 h2 h3 h4 h5',
+                                    GATE_NEED_CONF_GB='25', FAKE_PROBE_h1='free 0 150', FAKE_PROBE_h2='held 1 60', FAKE_PROBE_h3='free 0 20',
+                                    FAKE_PROBE_h5='free 0 30'))
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = r.stdout.splitlines()
-        self.assertIn('disk floors: 110 GiB for a ci half or a whole gate and 40 GiB for a conformance half, met under the heavy lock; selection from 40 and 20 GiB free', lines)
-        self.assertIn('h1     free 0 150 room-for-whole', lines); self.assertIn('h2     held 1 60 whole-after-gc', lines)
+        self.assertIn('disk floors: 110 GiB for a ci half or a whole gate and 25 GiB for a conformance half, met under the heavy lock; selection from 40 and 20 GiB free', lines)
+        self.assertIn('h1     free 0 150 room-for-whole', lines); self.assertIn('h2     held 1 60 whole-after-gc room-for-half', lines)
         self.assertIn('h3     free 0 20 half-after-gc', lines); self.assertIn('h4     unreachable', lines)
+        self.assertIn('h5     free 0 30 room-for-half', lines)
         r = subprocess.run(['bash', str(src / 'scripts/gate/gate.sh'), '--hosts'], cwd=src, capture_output=True, text=True, timeout=60,
                            env=dict(self.env, SPARKLES_GATE_CONFIG=str(self.t / 'none'), GATE_NEED_CI_GB='x'))
         self.assertEqual(r.returncode, 2); self.assertIn('bad GATE_NEED_CI_GB', r.stderr)

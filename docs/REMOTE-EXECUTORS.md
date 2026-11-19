@@ -316,8 +316,8 @@ when another start of the same name replaced them on the host. Its local copy go
 `.artifacts/remote-ci/NAME.ID`, which no later fetch replaces, and `NAME` links to the
 newest. Either refusal writes `disk-below-floor` to the job's `outcome` file,
 and `remote-ci.sh` then says that the host's disk was below its floor. The check's `TMPDIR`
-on an ssh host is `~/gate/tmp-NAME` beside its worktree, which the job removes with the
-worktree, so its temporary files do not fill the host's `/tmp`. A Boat worker keeps its disk timer's hard limit
+on an ssh host is a new `~/gate/tmp-NAME.XXXXXX` directory beside its worktree, which the job
+creates and removes with the worktree, so its temporary files do not fill the host's `/tmp`. A Boat worker keeps its disk timer's hard limit
 and its own temporary directory. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
 and the default adds 25% to that. The build cache does not help a second run on the large
 worker, because the test build stores about 48 GiB, more than the store's 40 GiB budget, so

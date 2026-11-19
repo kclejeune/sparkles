@@ -890,12 +890,27 @@ class BuildHost(unittest.TestCase):
              self.sha, self.sha], env=dict(self.env, FAKE_BUILD_DELAY="60"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         # A failed wait below still ends and reaps the run, so no process outlives the test.
+        # The cleanup runs after tearDown, so it cancels the run as an interrupt does, which
+        # stops its scope, and ends the recorded scope only when the run does not cancel.
         def reap():
             if process.poll() is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, signal.SIGINT)
                 except ProcessLookupError:
                     pass
+                try:
+                    process.communicate(timeout=20)
+                except subprocess.TimeoutExpired:
+                    # The run did not cancel, so its live scope cannot have been stopped.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    for record in (self.hosts / "units").glob("*"):
+                        try:
+                            os.killpg(int(record.read_text().split()[0]), signal.SIGKILL)
+                        except (OSError, ValueError, IndexError):
+                            pass
             process.communicate()
         self.addCleanup(reap)
         deadline = time.monotonic() + 20

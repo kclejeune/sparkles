@@ -1014,8 +1014,9 @@ disk record, the merge exits 4, writes `gate-outcome` and names the refusing hal
 worktree before it takes the heavy lock, which roadmap item 1169 tracks. `--auto` and the default helper choice read the disk without collecting, and a host's cache
 keeps it near its own `gc.min_free_size`, so they count a host as having the disk for a
 whole gate at `GATE_MIN_FREE_GB` free, 40 by default, and for a conformance half at
-`GATE_MIN_FREE_HALF_GB`, 20 by default. `gate.sh --hosts` marks a host that needs a
-collection before the floor as `whole-after-gc` or `half-after-gc`. Each ssh gate start on
+`GATE_MIN_FREE_HALF_GB`, 20 by default. `gate.sh --hosts` marks a host that meets a floor
+as `room-for-whole` or `room-for-half`, and one that needs a collection before the floor as
+`whole-after-gc` or `half-after-gc`. Each ssh gate start on
 such a host evicts cache down to the floor, so a host whose cache budget and other data
 leave less than the floor free rebuilds more of the cache on each gate.
 
