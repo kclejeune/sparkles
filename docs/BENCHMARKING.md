@@ -1047,7 +1047,49 @@ scripts/bench-gate.py compare BASELINE .artifacts/bench-executors/<time>/record.
 The X14 decision gate allows no query 5% or more slower at 12 threads. For the executor
 merge, the oracle of each query is the faster of the baseline's two modes, since one
 merged executor replaces both. A cell's summary lists streaming over eager for every
-query.
+query. `scripts/bench-gate.py compare BASELINE CANDIDATE --best-of eager,streaming`
+scores every candidate key against the faster of the baseline's two modes for its cell,
+query and metric, and a baseline that lacks either mode for a key fails the comparison.
+
+`--modes` gives the binary other execution modes, such as `--modes "eager collect"` for a
+diagnostic mode of a test build. Two modes run in rounds of A, B, B and A, and any other
+number runs every mode in order and then in reverse. The record's keys name each mode.
+
+With `--base BASE_BINARY`, the run is an interleaved A/B of two binaries in four arms.
+The base binary runs with `execution=eager` and with `execution=streaming`, and the tip
+binary runs with no execution field, as clients send by default, and with
+`execution=streaming`. `--base-modes` and `--modes` change those lists, where `default`
+stands for no field. Each binary loads its own store, which its own arms share, since the
+two binaries may differ in their store format. A round alternates the binaries as
+base-eager, tip-default, base-streaming and tip-streaming, then runs the four in reverse,
+and the next round starts with the tip, so each binary takes each position equally often.
+The round count must be even. Every arm's answer to every query must agree, and the
+record holds both binaries' hashes, commits, compilers and build configurations. The
+script refuses two binaries from different compilers or build configurations unless
+`--force` is given. Scoring the run compares the tip arms of the one record with its base
+arms, and comparing the arms of two binaries requires both to have a known and equal
+toolchain.
+
+```sh
+flock ~/lanes/.heavy.lock mise run bench:executors --base BASE_BIN --base-commit BASE_REV \
+  --base-build-config "$BASE_CONFIG" --commit TIP_REV --build-config "$TIP_CONFIG" TIP_BIN
+scripts/bench-gate.py compare .artifacts/bench-executors/<time>/record.json \
+  --best-of base-eager,base-streaming --keys '/exec$'
+```
+
+A run of four arms takes about twice as long as a run of two. The four-arm form decides
+between two builds on one host only, and its records are not compared with records of
+another host.
+
+For queries under 0.3 ms, `scripts/x08-gates/latency.sh --base BASE_BIN --tip TIP_BIN
+WORK` applies the Intel rule after `scripts/x08-gates/prepare.sh WORK`. It runs the base
+against the tip, the tip against the base and the tip against itself, one Rayon thread
+each, with at least ten rounds of A, B, B and A and 300 timed requests per query and
+server by default. `--base-execution` and `--tip-execution` set each binary's execution
+field, and `--queries` takes names from `WORK/queries` or paths to other query files,
+such as ASK shapes. `combine.py --labels base,tip` estimates the tip's time over the
+base's with the position bias cancelled. A query passes when the upper end of the ratio's
+95% interval is at most 1.02 or its median added time is at most 0.5 µs.
 
 #### W3C suites under streaming execution
 
