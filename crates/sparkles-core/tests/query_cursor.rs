@@ -5130,6 +5130,10 @@ fn graph_writers_flush_after_their_first_batch() {
         results::write_cursor_jena_graph(&mut c, format, &mut probe, None).unwrap();
         check(&format!("{format:?}"), probe);
     }
+    let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
+    let mut probe = Probe::default();
+    results::write_cursor_graph_native_json(&mut c, &mut probe, None, None).unwrap();
+    check("native", probe);
 }
 
 /// An OPTIONAL over two inputs sorted on their shared variable merges when the
@@ -5833,4 +5837,73 @@ fn reference_evaluator_notes_open_choices_and_keeps_scopes() {
     }
     // NaN is unordered against a number
     assert_eq!(spec_order(terms[3].as_ref(), terms[0].as_ref()), None);
+}
+
+/// A term that the memory budget refuses to decode in the middle of an answer fails the
+/// output with the budget's error, in every SELECT format of both executors, after the
+/// rows before it.
+#[test]
+fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
+    use sparkles_core::sparql::results::{
+        self, Format, RowCount, SolutionsFormat, WriteOptions, write,
+    };
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..1000)
+        .map(|i| {
+            if i == 600 {
+                format!("<urn:s:{i}> <urn:p> \"{}\" .\n", "x".repeat(256 << 10))
+            } else {
+                format!("<urn:s:{i}> <urn:p> \"v{i}\" .\n")
+            }
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..Default::default()
+    };
+    let refused = |name: &str, error: Error| {
+        assert!(
+            matches!(&error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+            "{name}: {error:?}"
+        );
+    };
+    for fmt in [
+        SolutionsFormat::Json,
+        SolutionsFormat::Xml,
+        SolutionsFormat::Csv,
+        SolutionsFormat::Tsv,
+        SolutionsFormat::Sparkles,
+    ] {
+        let r = query(s.snapshot(), q, &opts).unwrap();
+        let rows = RowCount::new();
+        let mut out = Vec::new();
+        let error = write(
+            results::Source::Result(&r),
+            WriteOptions::new(Format::Solutions(fmt), &rows),
+            &mut out,
+        )
+        .unwrap_err();
+        refused(&format!("eager {fmt:?}"), error);
+        assert!(rows.get() < 1000, "eager {fmt:?}: {}", rows.get());
+        for batch in [1, 64, 4096] {
+            let mut c = select_cursor(s.snapshot(), q, &opts, &options(batch)).unwrap();
+            let rows = RowCount::new();
+            let mut out = Vec::new();
+            let error = write(
+                results::Source::Select(&mut c),
+                WriteOptions::new(Format::Solutions(fmt), &rows),
+                &mut out,
+            )
+            .unwrap_err();
+            refused(&format!("cursor {fmt:?} batch {batch}"), error);
+            assert!(rows.get() < 1000, "cursor {fmt:?}: {}", rows.get());
+        }
+    }
 }
