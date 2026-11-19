@@ -394,7 +394,8 @@ fn long_rows(lens: &'static [usize]) -> impl FnMut(&mut RowOut<'_>, &Cell<u64>) 
 }
 
 /// The scratch that collects a row longer than the buffer is charged before it grows,
-/// when it takes the row and at a later growth. A refusal keeps its type, and the rows
+/// when it takes the row and at a later growth, with the old allocation during the
+/// growth. A refusal keeps its type, and the rows
 /// before the long one are written on and counted. With room, the scratch is reused for
 /// the next long row and released with the writer.
 #[test]
@@ -416,6 +417,21 @@ fn the_scratch_for_a_long_row_is_charged() {
         assert_eq!(out.len(), 30, "{left}");
         assert_eq!(count.get(), 3, "{left}");
     }
+    // a row of 30,000 bytes takes the scratch to 36,000 bytes by doubling from 9,000,
+    // and the last doubling holds the old 18,000 bytes beside the new ones, so a budget
+    // of 40,000 bytes past the buffer fits every new capacity alone but not that overlap
+    let r = small_answer();
+    let _held = leave(&r, first + 40_000);
+    let count = RowCount::new();
+    let mut out = Vec::new();
+    memory_refusal(write_buffered(
+        &mut out,
+        &count,
+        Some(r.test_context().clone()),
+        &mut long_rows(&[10, 10, 10, 30_000, 10]),
+    ));
+    assert_eq!(out.len(), 30);
+    assert_eq!(count.get(), 3);
     let r = small_answer();
     let ctx = r.test_context().clone();
     let before = room(&ctx);

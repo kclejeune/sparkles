@@ -429,7 +429,9 @@ impl<'a> RowOut<'a> {
     }
 
     /// Make room for `len` bytes in the scratch, which is `buf` while a row grows and
-    /// `spill` otherwise, under the charge and before it grows.
+    /// `spill` otherwise, under the charge and before it grows. The growth is admitted
+    /// with the old allocation too, which a moving reallocation holds until it has copied
+    /// the bytes, and the charge falls back to the new capacity after it.
     #[cold]
     #[inline(never)]
     fn reserve_scratch(&mut self, len: usize) -> std::io::Result<()> {
@@ -442,7 +444,8 @@ impl<'a> RowOut<'a> {
             return Ok(());
         }
         let cap = len.max(scratch * 2);
-        if let Err(e) = self.cover(self.held(buffer + cap, self.marks.capacity())) {
+        let marks = self.marks.capacity();
+        if let Err(e) = self.cover(self.held(buffer + scratch + cap, marks)) {
             return Err(self.refuse(e));
         }
         let scratch = if self.growing {
@@ -451,6 +454,13 @@ impl<'a> RowOut<'a> {
             &mut self.spill
         };
         scratch.reserve_exact(cap - scratch.len());
+        let grown = scratch.capacity();
+        let after = self.held(buffer + grown, marks);
+        if let Some(charge) = &self.charge
+            && let Err(e) = charge.resize(after)
+        {
+            return Err(self.refuse(e));
+        }
         Ok(())
     }
 
