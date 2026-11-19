@@ -24,6 +24,11 @@ pub(super) fn eligible(node: &Node) -> bool {
         && node.children.is_empty()
 }
 
+/// What handing out a batch charges for its header, with room to spare (192 bytes on a
+/// 64-bit target).
+#[cfg_attr(not(feature = "text"), allow(dead_code))]
+const PUBLISH: usize = 256;
+
 pub(super) struct Text {
     #[cfg_attr(not(feature = "text"), allow(dead_code))]
     node: Node,
@@ -81,18 +86,26 @@ impl Text {
             return Ok(None);
         };
         // The hits left bound the batch, and none left ends the answer before a batch.
-        // A batch that fits, with its own overhead, in what the hit list leaves of the
-        // budget is not cut, so a last batch takes every hit left and releases the hit
-        // list with it. A larger one is cut to half of that, so that an operator above
-        // may hold a copy of it.
-        let width = self.node.vars.len().max(1);
-        let overhead = (width * 40 + 128).div_ceil(width * 8);
-        let fit = ctx.rows_within_budget(width).saturating_sub(overhead);
-        let left = cap.min(reader.remaining());
-        let rows = if left <= fit {
-            left
+        // Every hit left goes in a last batch when its buffer fits in what the hit list
+        // leaves of the budget, since the hit list is released before the batch is
+        // handed out. Any other batch also leaves room for the header it is handed out
+        // in, and is not cut when it fits; a larger one is cut to half of what fits, so
+        // that an operator above may hold a copy of it.
+        let row = self.node.vars.len().max(1) * 8;
+        // what `Buffer::new` charges beside its rows
+        let buffer = self.node.vars.len() * 40 + 128;
+        let within = ctx.rows_within_budget(self.node.vars.len());
+        let remaining = reader.remaining();
+        let rows = if remaining <= cap && remaining <= within.saturating_sub(buffer.div_ceil(row)) {
+            remaining
         } else {
-            left.min((fit / 2).max(1))
+            let fit = within.saturating_sub((buffer + PUBLISH).div_ceil(row));
+            let want = cap.min(remaining);
+            if want <= fit {
+                want
+            } else {
+                want.min((fit / 2).max(1))
+            }
         };
         if rows == 0 {
             self.reader = None;
