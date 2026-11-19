@@ -965,14 +965,20 @@ pub(crate) fn decode_varints_strided<const S: usize>(
 #[inline(always)]
 fn read_varint10(s: &[u8; 10], pos: &mut usize) -> Option<u64> {
     let mut v = 0u64;
-    for (i, &b) in s.iter().enumerate() {
+    for (i, &b) in s[..9].iter().enumerate() {
         v |= ((b & 0x7F) as u64) << (7 * i);
         if b < 0x80 {
             *pos += i + 1;
             return Some(v);
         }
     }
-    None
+    // The tenth byte can supply only bit 63 and must terminate the value.
+    let high = s[9];
+    if high > 1 {
+        return None;
+    }
+    *pos += 10;
+    Some(v | (u64::from(high) << 63))
 }
 
 /// [`read_varint`](crate::vocab::read_varint) that returns `None` at the end of `buf` or
@@ -984,7 +990,7 @@ pub(crate) fn read_varint_checked(buf: &[u8], pos: &mut usize) -> Option<u64> {
     loop {
         let b = *buf.get(*pos)?;
         *pos += 1;
-        if shift > 63 {
+        if shift == 63 && b > 1 {
             return None;
         }
         v |= ((b & 0x7F) as u64) << shift;
@@ -3251,6 +3257,93 @@ mod tests {
                 decode_point_column_limited(damaged, values.len(), &mut scratch, &limit, 1 << 20)
                     .is_err()
             );
+        }
+    }
+
+    fn ten_byte_delta_frame(terminal: u8) -> Vec<u8> {
+        let mut raw = [0xff; 10];
+        raw[9] = terminal;
+        lz4_flex::compress_prepend_size(&raw)
+    }
+
+    #[test]
+    fn index_column_rejects_overflowing_delta_varints() {
+        let mut scratch = Vec::new();
+        let encoded_max_delta = encode_column(&[1 << 63], &mut scratch);
+        assert_eq!(encoded_max_delta, ten_byte_delta_frame(1));
+        assert_eq!(&*decode_column(&encoded_max_delta, 1).unwrap(), &[1 << 63]);
+
+        let round_trip = [0u64, 1 << 63, u64::MAX];
+        let encoded_round_trip = encode_column(&round_trip, &mut scratch);
+        assert_eq!(
+            &*decode_column(&encoded_round_trip, round_trip.len()).unwrap(),
+            &round_trip
+        );
+
+        let padded_zero_msb = decode_column(&ten_byte_delta_frame(0), 1).unwrap();
+        assert_eq!(&*padded_zero_msb, &[3u64 << 62]);
+
+        for byte in (2u8..=0x7f).chain([0x80, 0xff]) {
+            let result = decode_column(&ten_byte_delta_frame(byte), 1);
+            assert!(matches!(result, Err(Error::Corrupt(_))), "byte {byte:#x}");
+        }
+
+        let mut encoded_u64_max = Vec::new();
+        write_varint(&mut encoded_u64_max, u64::MAX);
+        assert_eq!(
+            encoded_u64_max,
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+        );
+        let mut pos = 0;
+        assert_eq!(
+            read_varint_checked(&encoded_u64_max, &mut pos),
+            Some(u64::MAX)
+        );
+        assert_eq!(pos, 10);
+        for byte in (2u8..=0x7f).chain([0x80, 0xff]) {
+            let mut raw = [0xff; 10];
+            raw[9] = byte;
+            let mut pos = 0;
+            assert_eq!(read_varint_checked(&raw, &mut pos), None, "byte {byte:#x}");
+        }
+    }
+
+    #[test]
+    fn bounded_index_column_rejects_overflowing_delta_varints() {
+        let options = crate::history::HistoryOptions::default();
+        let limit = crate::history::ReadLimit {
+            options: &options,
+            memory: Some(8 << 20),
+            held: 0,
+        };
+        let mut scratch = Vec::new();
+        let mut encode_scratch = Vec::new();
+        let encoded_max_delta = encode_column(&[1 << 63], &mut encode_scratch);
+        let maximum =
+            decode_point_column_limited(&encoded_max_delta, 1, &mut scratch, &limit, 0).unwrap();
+        assert_eq!(&*maximum, &[1 << 63]);
+
+        let round_trip = [0u64, 1 << 63, u64::MAX];
+        let encoded_round_trip = encode_column(&round_trip, &mut encode_scratch);
+        let decoded_round_trip = decode_point_column_limited(
+            &encoded_round_trip,
+            round_trip.len(),
+            &mut scratch,
+            &limit,
+            0,
+        )
+        .unwrap();
+        assert_eq!(&*decoded_round_trip, &round_trip);
+
+        for byte in (2u8..=0x7f).chain([0x80, 0xff]) {
+            let result = decode_point_column_limited(
+                &ten_byte_delta_frame(byte),
+                1,
+                &mut scratch,
+                &limit,
+                0,
+            );
+            assert!(matches!(result, Err(Error::Corrupt(_))), "byte {byte:#x}");
         }
     }
 

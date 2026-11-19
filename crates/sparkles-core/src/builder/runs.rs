@@ -534,6 +534,42 @@ mod tests {
         assert!(decode(&big).is_err());
     }
 
+    #[test]
+    fn run_column_rejects_overflowing_delta_varints() {
+        let frame = |terminal| {
+            let mut raw = [0xff; 10];
+            raw[9] = terminal;
+            let mut frame = 10u32.to_le_bytes().to_vec();
+            frame.extend(codec::compress(&raw).unwrap());
+            frame
+        };
+        let rows = [[0, 0, 1 << 63, u64::MAX]];
+        let block = encode_block(&rows).unwrap();
+        let u32_at = |i: usize| u32::from_le_bytes(block[i..i + 4].try_into().unwrap()) as usize;
+        let mut decoded = [[0u64; 4]];
+        let mut raw = Vec::new();
+        let mut at = HEADER;
+        for c in 0..4 {
+            let len = u32_at(4 + 4 * c);
+            if c == 2 {
+                assert_eq!(&block[at..at + len], frame(1).as_slice());
+            }
+            decode_column(&block[at..at + len], c, &mut decoded, &mut raw).unwrap();
+            at += len;
+        }
+        assert_eq!(decoded, rows);
+
+        let mut keys = [[0u64; 4]];
+        decode_column(&frame(1), 2, &mut keys, &mut raw).unwrap();
+        assert_eq!(keys, [[0, 0, 1 << 63, 0]]);
+        decode_column(&frame(0), 2, &mut keys, &mut raw).unwrap();
+        assert_eq!(keys, [[0, 0, 3u64 << 62, 0]]);
+        for byte in (2u8..=0x7f).chain([0x80, 0xff]) {
+            let result = decode_column(&frame(byte), 2, &mut keys, &mut raw);
+            assert!(matches!(result, Err(Error::Corrupt(_))), "byte {byte:#x}");
+        }
+    }
+
     /// A measurement of the delta coding of run blocks and index columns, not a check.
     /// `DELTA_BENCH_CASE` picks `run-encode`, `run-decode`, `index-encode` or
     /// `index-decode`, and `DELTA_BENCH_REPS` (default 20) the counted passes over 2^20
