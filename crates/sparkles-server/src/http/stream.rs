@@ -1349,10 +1349,32 @@ mod tests {
 
     /// A cursor graph written in Turtle or N-Triples keeps the kind of the I/O error that
     /// stops it, so a deadline that passes mid-stream is reported as a timeout and a
-    /// cancellation as a cancellation, as in the other graph writers.
+    /// cancellation as a cancellation, as in the other graph writers. The failure comes
+    /// after the first batch's flush, at the first write after it, which the serializer
+    /// makes while it writes a later statement.
     #[tokio::test]
     async fn a_cursor_graph_stream_is_classified_by_the_error_that_stops_it() {
         use sparkles::sparql::results as res;
+        /// Trips the failure at its first write after a flush.
+        struct Trip<'w> {
+            inner: &'w mut LimitedWriter<SwitchWriter>,
+            flushed: bool,
+            trip: Option<Box<dyn FnOnce() + 'w>>,
+        }
+        impl Write for Trip<'_> {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                if self.flushed
+                    && let Some(trip) = self.trip.take()
+                {
+                    trip();
+                }
+                self.inner.write(b)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed = true;
+                self.inner.flush()
+            }
+        }
         let store = sparkles::store::Store::in_memory(Default::default());
         let data = (0..5000)
             .map(|i| format!("<urn:s:{i}> <urn:p> \"value {i}\" .\n"))
@@ -1368,11 +1390,13 @@ mod tests {
             for timeout in [true, false] {
                 let (seen, on_end) = ends();
                 let cancel = Arc::new(AtomicBool::new(false));
-                let deadline = Instant::now() + Duration::from_millis(30);
+                // the deadline has passed, and a pause too long to represent holds it off
+                // until the trip clears the pause
+                let pause = Arc::new(AtomicU64::new(u64::MAX));
                 let control = StreamControl::new(
                     cancel.clone(),
-                    timeout.then_some(deadline),
-                    Default::default(),
+                    timeout.then(Instant::now),
+                    pause.clone(),
                     None,
                 );
                 let mut cursor = sparkles::sparql::graph_cursor(
@@ -1385,23 +1409,33 @@ mod tests {
                     },
                 )
                 .unwrap();
+                let taken = Arc::new(AtomicU64::new(0));
+                let tripped = Arc::new(AtomicBool::new(false));
+                let (taken_in, tripped_in) = (taken.clone(), tripped.clone());
                 let write = move |w: &mut LimitedWriter<SwitchWriter>| {
-                    // the response switches to streaming, and then the deadline passes or
-                    // the query is cancelled before the graph is written
+                    // the response switches to streaming before the graph is written
                     w.write_all(&[b'#'; 200])?;
                     w.write_all(b"\n")?;
-                    if timeout {
-                        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-                    } else {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
                     let rows = res::RowCount::with_ledger(w.get_ref().ledger());
-                    res::write(
+                    let mut trip = Trip {
+                        inner: w,
+                        flushed: false,
+                        trip: Some(Box::new(move || {
+                            tripped_in.store(true, Ordering::Relaxed);
+                            if timeout {
+                                pause.store(0, Ordering::Relaxed);
+                            } else {
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                        })),
+                    };
+                    let written = res::write(
                         res::Source::Graph(&mut cursor),
                         res::WriteOptions::new(res::Format::Rdf(format), &rows),
-                        w,
-                    )
-                    .map(|_| ())
+                        &mut trip,
+                    );
+                    taken_in.store(rows.get(), Ordering::Relaxed);
+                    written.map(|_| ())
                 };
                 let Ok(Serialized::Streamed(body)) =
                     serialize_inner(100, false, None, Some(control), write, on_end).await
@@ -1423,6 +1457,13 @@ mod tests {
                         "{format:?}: {error:?}"
                     );
                 }
+                // the first batch was written and flushed, and the failure came later
+                assert!(tripped.load(Ordering::Relaxed), "{format:?} {timeout}");
+                let taken = taken.load(Ordering::Relaxed);
+                assert!(
+                    (100..5000).contains(&taken),
+                    "{format:?} {timeout}: {taken}"
+                );
             }
         }
     }
