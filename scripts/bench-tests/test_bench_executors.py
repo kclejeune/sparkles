@@ -72,7 +72,9 @@ class ExecutorsTests(unittest.TestCase):
                                     ("stores/B", "tip", "tip", "-"),
                                     ("stores/C", "base", "base", "streaming"),
                                     ("stores/D", "tip", "tip", "streaming")})
-            self.assertEqual(sorted(p.name for p in (cell / "stores").iterdir()) if (cell / "stores").exists() else [], [])
+            # only the two binaries loaded a store
+            loads = (cell / "results" / "load.tsv").read_text().splitlines()
+            self.assertEqual([l.split("\t")[0] for l in loads], ["A", "B"])
             rec = json.loads((out / "record.json").read_text())
             keys = {m["key"] for m in rec["metrics"]}
             for arm in ("base-eager", "base-streaming", "tip-default", "tip-streaming"):
@@ -129,9 +131,30 @@ class ExecutorsTests(unittest.TestCase):
             c = gate("compare", out / "record.json", "--best-of", "eager", "--arms", "collect", "--keys", "/exec$")
             self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
 
+    def test_a_default_mode_first_keeps_its_empty_field(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, tip = stub(d, "base"), stub(d, "tip")
+            out = Path(d) / "out"
+            r = executors(d, "--out", out, "--rounds", "2", "--base-modes", "default streaming", "--base", base, tip,
+                          port=4299)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            cell = out / "people-10-threads-2"
+            self.assertIn("EXECUTION=,,streaming,streaming\n", (cell / "run.env").read_text())
+            modes = {(l.split("\t")[2], l.split("\t")[3]) for l in (cell / "requests.tsv").read_text().splitlines()}
+            self.assertEqual(modes, {("stores/A", "-"), ("stores/B", "-"), ("stores/C", "streaming"),
+                                     ("stores/D", "streaming")})
+            out = Path(d) / "out2"
+            r = executors(d, "--out", out, "--rounds", "1", "--modes", "default streaming", tip, port=4299)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            cell = out / "people-10-threads-2"
+            modes = {(l.split("\t")[2], l.split("\t")[3]) for l in (cell / "requests.tsv").read_text().splitlines()}
+            self.assertEqual(modes, {("stores/A", "-"), ("stores/B", "streaming")})
+
     def test_refusals(self):
         with tempfile.TemporaryDirectory() as d:
             base, tip = stub(d, "base"), stub(d, "tip")
+            r = executors(d, "--out", Path(d) / "o0", "--base-modes", "eager", "--base", base, tip, port=4297)
+            self.assertIn("as many modes", r.stderr)
             r = executors(d, "--out", Path(d) / "o1", "--rounds", "1", "--base", base, tip, port=4297)
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("must be even", r.stderr)
@@ -161,13 +184,31 @@ class RemoteRunnerTests(unittest.TestCase):
                       self.runner('VARIANTS="A B C"\nBINARY_OF_B=C\nBINARY_OF_C=A\n'))
         self.assertIn("ORDERS names Z", self.runner('ORDERS="A B Z"\n'))
 
+    def test_three_variants_with_their_own_stores_load_each(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        shutil.copy(SCRIPTS / "nsc-bench-remote.sh", d)
+        (d / "queries").mkdir()
+        (d / "queries" / "q.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+        (d / "run.env").write_text('SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\nDYNAMIC_C=0\n'
+                                   'VARIANTS="A B C"\nORDERS="A B C C B A"\nROUNDS=1\nREPS=1\nWARMUP=0\nPORT=4307\n')
+        for v in "ABC":
+            (d / f"bin-{v}").write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{v}"'))
+        subprocess.run(["zstd", "-q", "-o", str(d / "data.nt.zst")], input=b"", check=True)
+        subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True, timeout=120)
+        self.assertEqual((d / "results" / "done").read_text().strip(), "ok")
+        loads = [l.split("\t")[0] for l in (d / "results" / "load.tsv").read_text().splitlines()]
+        self.assertEqual(loads, ["A", "B", "C"])
+
 
 class BestOfTests(unittest.TestCase):
     def record(self, d, name, metrics, manifest=None):
+        manifest = dict(manifest or {"compilers": "rustc 1", "build_config": "{}", "base_compilers": "rustc 1",
+                                     "base_build_config": "{}", "base_binary": "base/sparkles"})
+        manifest.setdefault("arms", sorted({k.split("/")[1] for k in metrics}))
         rec = {"gate_record": 1, "gate": "executors", "kind": "gate-record", "suite": "synthetic", "scale": "s",
                "host": {"name": "atlas"},
-               "manifest": manifest or {"compilers": "rustc 1", "build_config": "{}", "base_compilers": "rustc 1",
-                                        "base_build_config": "{}"},
+               "manifest": manifest,
                "settings": {"threshold": 0.05, "short_below": 0.3, "short_threshold": 0.0},
                "metrics": [{"key": k, "value": v, "unit": "ms", "better": "lower"} for k, v in metrics.items()],
                "checks": []}
@@ -198,8 +239,63 @@ class BestOfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             rec = self.record(d, "r", {"c/base-eager/q/exec": 1.0, "c/tip-default/q/exec": 1.0})
             r = gate("compare", rec, "--best-of", "base-eager,base-streaming")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("no arm base-streaming", r.stderr)
+            # an arm the run had but whose metric for a query is gone
+            rec = self.record(d, "r", {"c/base-eager/q/exec": 1.0, "c/tip-default/q/exec": 1.0},
+                              {"compilers": "rustc 1", "build_config": "{}", "base_compilers": "rustc 1",
+                               "base_build_config": "{}", "base_binary": "b",
+                               "arms": ["base-eager", "base-streaming", "tip-default"]})
+            r = gate("compare", rec, "--best-of", "base-eager,base-streaming")
             self.assertEqual(r.returncode, 1)
             self.assertIn("baseline lacks base-streaming", r.stdout)
+
+    def test_coverage_holes_and_empty_selections_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = {"compilers": "rustc 1", "build_config": "{}", "base_compilers": "rustc 1",
+                 "base_build_config": "{}", "base_binary": "b",
+                 "arms": ["base-eager", "base-streaming", "tip-default", "tip-streaming"]}
+            full = {"c/base-eager/q/exec": 1.0, "c/base-streaming/q/exec": 1.0,
+                    "c/tip-default/q/exec": 1.0, "c/tip-streaming/q/exec": 1.0}
+            # a tip query that no base arm measured
+            rec = self.record(d, "r", full | {"c/tip-default/extra/exec": 1.0}, m)
+            r = gate("compare", rec, "--best-of", "base-eager,base-streaming")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("c/tip-default/extra/exec", r.stdout)
+            # a whole tip arm gone
+            rec = self.record(d, "r", {k: v for k, v in full.items() if "tip-streaming" not in k}, m)
+            r = gate("compare", rec, "--best-of", "base-eager,base-streaming")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("| c/tip-streaming/q/exec | 1 |  |  | missing |", r.stdout)
+            rec = self.record(d, "r", full, m)
+            r = gate("compare", rec, "--best-of", "base-eager,base-streaming", "--keys", "/nothing$")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("No metric was scored", r.stdout)
+            self.assertEqual(gate("compare", rec, "--best-of", ",").returncode, 2)
+            self.assertEqual(gate("compare", rec, "--best-of", "base-eager", "--arms", ",").returncode, 2)
+            self.assertEqual(gate("compare", rec, "--best-of", "base-eager,base-streaming").returncode, 0)
+
+    def test_a_mapped_metric_of_another_unit_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = {"compilers": "rustc 1", "build_config": "{}"}
+            old = self.record(d, "old", {"c/eager/q/exec": 1.0, "c/streaming/q/exec": 1.0}, m)
+            new = Path(d) / "new.json"
+            rec = json.loads(self.record(d, "new", {"c/eager/q/exec": 1.0}, m).read_text())
+            rec["metrics"][0]["unit"] = "s"
+            new.write_text(json.dumps(rec))
+            r = gate("compare", old, new, "--best-of", "eager,streaming", "--allow-different")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("against the baseline's ms/lower", r.stderr)
+
+    def test_across_records_the_base_arms_toolchain_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            four = self.record(d, "four", {"c/base-eager/q/exec": 1.0, "c/base-streaming/q/exec": 1.0},
+                               {"compilers": "rustc 1", "build_config": "{}", "base_compilers": "rustc 2",
+                                "base_build_config": "{}", "base_binary": "b"})
+            later = self.record(d, "later", {"c/eager/q/exec": 1.0}, {"compilers": "rustc 1", "build_config": "{}"})
+            r = gate("compare", four, later, "--best-of", "base-eager,base-streaming")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("the arms differ", r.stderr)
 
     def test_a_missing_tip_metric_fails(self):
         with tempfile.TemporaryDirectory() as d:
@@ -214,7 +310,7 @@ class BestOfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             rec = self.record(d, "r", {"c/base-eager/q/exec": 1.0, "c/tip-default/q/exec": 1.0},
                               {"compilers": "rustc 2", "build_config": "{}", "base_compilers": "rustc 1",
-                               "base_build_config": "{}"})
+                               "base_build_config": "{}", "base_binary": "base/sparkles"})
             r = gate("compare", rec, "--best-of", "base-eager")
             self.assertEqual(r.returncode, 2)
             self.assertIn("manifest compilers", r.stderr)

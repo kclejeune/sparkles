@@ -1059,12 +1059,13 @@ With `--base BASE_BINARY`, the run is an interleaved A/B of two binaries in four
 The base binary runs with `execution=eager` and with `execution=streaming`, and the tip
 binary runs with no execution field, as clients send by default, and with
 `execution=streaming`. `--base-modes` and `--modes` change those lists, where `default`
-stands for no field. Each binary loads its own store, which its own arms share, since the
+stands for no field, and the two lists must be of one length so that each base arm pairs
+with a tip arm. Each binary loads its own store, which its own arms share, since the
 two binaries may differ in their store format. A round alternates the binaries as
 base-eager, tip-default, base-streaming and tip-streaming, then runs the four in reverse,
 and the next round starts with the tip, so each binary takes each position equally often.
-The round count must be even. Every arm's answer to every query must agree, and the
-record holds both binaries' hashes, commits, compilers and build configurations. The
+The round count must be even. Every arm's answer to every query must agree, every timed
+request of every arm must have one digest of its native answer, and the record holds both binaries' hashes, commits, compilers and build configurations. The
 script refuses two binaries from different compilers or build configurations unless
 `--force` is given. Scoring the run compares the tip arms of the one record with its base
 arms, and comparing the arms of two binaries requires both to have a known and equal
@@ -1087,7 +1088,12 @@ against the tip, the tip against the base and the tip against itself, one Rayon 
 each, with at least ten rounds of A, B, B and A and 300 timed requests per query and
 server by default. `--base-execution` and `--tip-execution` set each binary's execution
 field, and `--queries` takes names from `WORK/queries` or paths to other query files,
-such as ASK shapes. `combine.py --labels base,tip` estimates the tip's time over the
+such as ASK shapes, whose file names must differ. Each run checks the untimed TSV answer
+of each binary and a digest of every timed native answer, and `answers.py` fails the gate
+when they disagree. The script refuses two binaries of different compilers or build
+configurations, given with `--base-build-config` and `--tip-build-config`, unless
+`--force` is given, and each run starts the servers from a cleared environment.
+`combine.py --labels base,tip` estimates the tip's time over the
 base's with the position bias cancelled. A query passes when the upper end of the ratio's
 95% interval is at most 1.02 or its median added time is at most 0.5 µs.
 

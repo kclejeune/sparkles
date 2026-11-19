@@ -32,7 +32,7 @@
 # and their hyperthreads, and CPU 12 is an efficiency core.
 #
 # OUT/<cell>/summary.md is the per-cell A/B summary of scripts/nsc-bench-summary.py, where
-# B/A is streaming over eager. OUT/record.json is the gate record of
+# B/A is streaming over eager, for a run of two arms. OUT/record.json is the gate record of
 # scripts/bench-gate.py, and `scripts/bench-gate.py compare BASELINE OUT/record.json`
 # checks a later build against a recorded baseline.
 #
@@ -145,7 +145,10 @@ read -r -a tip_modes <<< "$MODES"
 if [ -n "$BASE" ]; then
   read -r -a base_modes <<< "$BASE_MODES"
   [ ${#base_modes[@]} -gt 0 ] || die "--base-modes is empty"
-  n=$((${#base_modes[@]} > ${#tip_modes[@]} ? ${#base_modes[@]} : ${#tip_modes[@]}))
+  # each base arm is paired with a tip arm, so that both binaries take each position
+  [ ${#base_modes[@]} = ${#tip_modes[@]} ] ||
+    die "--base-modes and --modes must name as many modes, so the binaries alternate"
+  n=${#base_modes[@]}
   for i in $(seq 0 $((n - 1))); do
     [ -z "${base_modes[$i]:-}" ] || add_arm "base-${base_modes[$i]}" A "${base_modes[$i]}"
     [ -z "${tip_modes[$i]:-}" ] || add_arm "tip-${tip_modes[$i]}" B "${tip_modes[$i]}"
@@ -157,15 +160,21 @@ names=$(printf '%s\n' "${ARMS[@]}" | cut -d' ' -f2 | sort | uniq -d)
 [ -z "$names" ] || die "an arm is named twice: $names"
 LEGACY=
 [ -z "$BASE" ] && [ "$MODES" = "eager streaming" ] && LEGACY=1
-VARIANTS="" EXEC="" ARM_MAP="" FIRST="" REVERSE=""
+VARIANTS="" ARM_MAP="" FIRST="" REVERSE=""
+exec_fields=()
 for a in "${ARMS[@]}"; do
   read -r v name b m <<< "$a"
   VARIANTS+="${VARIANTS:+ }$v"
-  EXEC+="${EXEC:+,}$([ "$m" = default ] || echo "$m")"
+  # the default mode sends no execution field, an empty field of EXECUTION
+  if [ "$m" = default ]; then exec_fields+=(""); else exec_fields+=("$m"); fi
   ARM_MAP+="${ARM_MAP:+ }$v=$name"
   FIRST+="${FIRST:+ }$v"
   REVERSE="$v${REVERSE:+ }$REVERSE"
 done
+EXEC=$(
+  IFS=,
+  echo "${exec_fields[*]}"
+)
 # the tip-first order: each base arm swapped with the tip arm beside it
 SWAPPED=
 if [ -n "$BASE" ]; then
@@ -191,8 +200,9 @@ ROUND_TEXT=${ROUND_TEXT// /,}
 ROUND_TEXT=${ROUND_TEXT//,then,/ then }
 [ -z "$LEGACY" ] || ROUND_TEXT=A,B,B,A
 if [ -n "$BASE" ] && [ -z "$FORCE" ]; then
-  bc=$(python3 "$ROOT/scripts/bench-gate.py" compilers "$BASE")
-  tc=$(python3 "$ROOT/scripts/bench-gate.py" compilers "$BIN")
+  bc=$(python3 "$ROOT/scripts/bench-gate.py" compilers "$BASE" 2> /dev/null || true)
+  tc=$(python3 "$ROOT/scripts/bench-gate.py" compilers "$BIN" 2> /dev/null || true)
+  [ -n "$bc" ] && [ -n "$tc" ] || die "a binary names no compilers in its .comment section; pass --force to run anyway"
   [ "$bc" = "$tc" ] || die "the base was built by $bc and the tip by $tc; pass --force to run anyway"
   [ -z "$BASE_BUILD_CONFIG" ] || [ -z "$BUILD_CONFIG" ] || [ "$BASE_BUILD_CONFIG" = "$BUILD_CONFIG" ] ||
     die "the base and the tip have different build configurations; pass --force to run anyway"
@@ -348,7 +358,9 @@ ENV
       bash "$d/nsc-bench-remote.sh" > "$d/remote.log" 2>&1 || die "$cell failed, see $d/results/progress.log"
     grep -q '^ok' "$d/results/done" || die "$cell did not finish: $(cat "$d/results/done")"
     rm -rf "$d/stores" "$d/srv" "$d/data.nt" "$d"/bin-*.zst "$d/A" "$d/B" "$d/resp.json" "$d/ans.tsv"
-    python3 "$ROOT/scripts/nsc-bench-summary.py" "$d" > "$d/summary.md"
+    # the two-variant summary describes A against B, which is the whole cell only for two
+    # arms; the record's summary covers every arm
+    if [ ${#ARMS[@]} = 2 ]; then python3 "$ROOT/scripts/nsc-bench-summary.py" "$d" > "$d/summary.md"; fi
     log "$cell: done"
   done
 done

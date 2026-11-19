@@ -171,7 +171,7 @@ for v in "${VARIANT_LIST[@]}"; do [ "${STORE_OF[$v]}" = "$v" ] && PREPARED+=("$v
 for v in "${PREPARED[@]}"; do
   p=PREPARE_$v
   # shellcheck disable=SC2086 # the commands are word lists
-  [ -z "${!p}" ] || prepare "$v" ${!p}
+  [ -z "${!p:-}" ] || prepare "$v" ${!p:-}
 done
 # the repeated runs alternate A, B and B, A
 if [ -n "$PREPARE_REPEAT" ]; then

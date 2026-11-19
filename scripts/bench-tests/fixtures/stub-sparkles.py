@@ -49,12 +49,20 @@ def main():
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
-            form = urllib.parse.parse_qs(body)
+            # blank values are kept, so that an empty execution field differs from none
+            form = urllib.parse.parse_qs(body, keep_blank_values=True)
             accept = self.headers.get("Accept", "")
             mode = form.get("execution", ["-"])[0]
             with open(log, "a") as f:
                 f.write(f"{IDENTITY}\t{owner}\t{store}\t{mode}\t{accept}\n")
-            if "tab-separated" in accept:
+            ask = "ASK" in form.get("query", [""])[0].upper().split("{")[0]
+            if ask and "tab-separated" in accept:
+                out = b"?_askResult\ntrue\n"
+            elif ask:
+                out = json.dumps({"queryType": "ASK", "boolean": True,
+                                  "meta": {"sentRows": 1, "totalRows": 1, "execMs": EXEC_MS}},
+                                 separators=(",", ":")).encode()
+            elif "tab-separated" in accept:
                 out = b"?c\n1\n"
             else:
                 out = json.dumps({"queryType": "SELECT", "vars": ["c"],

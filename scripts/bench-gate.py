@@ -259,6 +259,7 @@ def executors(args):
         samples = defaultdict(lambda: defaultdict(list))
         errors = defaultdict(int)
         order = []
+        timed = defaultdict(set)
         for r in rows[1:]:
             q, v = r[col["query"]], r[col["variant"]]
             if q not in order:
@@ -267,6 +268,8 @@ def executors(args):
                 errors[(q, v)] += 1
                 continue
             samples[q][v].append((float(r[col["wall_ms"]]), float(r[col["exec_ms"]])))
+            # every timed request, by its server process, variant and repetition
+            timed[q].add((r[col["epoch"]], v, r[col["rep"]]))
         answers = defaultdict(dict)
         for row in read_tsv(d / "results" / "answers.tsv"):
             # variant, query, rows, digest of the sorted rows and, when the run had
@@ -278,12 +281,20 @@ def executors(args):
                 answers[q][v] = (n,) + tuple(o for o in row[4:5] if o.startswith("distinct:"))
         # the timed format's answer after each server process's timed requests
         warm = defaultdict(set)
-        for row in read_tsv(d / "results" / "warm-answers.tsv"):
+        # the timed requests each query's digests cover, and those covered twice
+        covered, twice = defaultdict(set), defaultdict(set)
+        warm_rows = read_tsv(d / "results" / "warm-answers.tsv")
+        for row in warm_rows:
             # epoch, variant, query, [timed repetition,] digest
             v, q, digest = row[1], row[2], row[-1]
             # unordered LIMIT answers may hold other rows, but not another count, schema or
             # number of distinct rows
             warm[q].add(",".join(digest.split(",")[:3]) if q in unordered else digest)
+            key = (row[0], v, row[3]) if len(row) >= 5 else (row[0], v)
+            (twice if key in covered[q] else covered[q]).add(key)
+        # a run of other arms than eager and streaming has a digest of every timed answer,
+        # and so does any run whose digests name their repetition
+        per_request = (not legacy) or any(len(row) >= 5 for row in warm_rows)
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the
@@ -298,15 +309,27 @@ def executors(args):
                 [f"{eager[0]} rows", eager[1]] + [o if o.startswith("distinct:") else f"order {o}" for o in eager[2:]])
             checks.append({"name": f"{cell}/{q}/answers", "ok": agree, "fingerprint": fingerprint,
                            "detail": {arms.get(v, v): list(a) for v, a in sorted(answers[q].items())}})
-            if warm:
+            if warm or per_request:
                 digests = warm.get(q, set())
                 rows = answers[q].get("A", ("error",))[0]
                 one = next(iter(digests)) if len(digests) == 1 else ""
                 ok = len(digests) == 1 and (one.startswith("ask ") or one.split(" ")[0] == rows) \
                     and not re.search(r"missing (?!0\b)\d+", one)
+                detail = sorted(digests)
+                if per_request:
+                    # one digest for each timed request of every arm, and none of another
+                    want = timed[q] if all(len(k) == 3 for k in covered[q]) or not covered[q] \
+                        else {k[:2] for k in timed[q]}
+                    missing, extra = want - covered[q], covered[q] - want
+                    lacking = sorted(arms[v] for v in arms if not any(k[1] == v for k in covered[q]))
+                    if missing or extra or twice[q] or lacking:
+                        ok = False
+                        detail = {"digests": detail, "requests without a digest": len(missing),
+                                  "digests of no timed request": len(extra), "repeated digests": len(twice[q]),
+                                  "arms without a digest": lacking}
                 checks.append({"name": f"{cell}/{q}/timed-answers", "ok": ok,
                                "fingerprint": next(iter(digests)) if len(digests) == 1 else None,
-                               "detail": sorted(digests)})
+                               "detail": detail})
             for v in sorted(set(arms) | {v for (eq, v) in errors if eq == q}):
                 if errors[(q, v)]:
                     checks.append({"name": f"{cell}/{q}/{arms.get(v, v)}/errors", "ok": False,
@@ -357,7 +380,7 @@ def executors(args):
                      "scripts_dirty_files": manifest.get("scripts dirty"),
                      "started": manifest.get("started"), "ended": manifest.get("ended"),
                      "load_before": manifest.get("load before"), "load_after": manifest.get("load after"),
-                     "cells": env} | base,
+                     "cells": env, "arms": [arms[v] for v in sorted(arms)]} | base,
         "settings": {"threshold": 0.05, "short_below": 0.3, "short_threshold": 0.0,
                      "queries_sha256": corpus_digest(root / "queries"),
                      "generator_sha256": manifest.get("generator sha256"),
@@ -638,29 +661,60 @@ def split_arm_key(key):
     return tuple(parts) if len(parts) == 4 else None
 
 
-def best_of_metrics(base, cand, best_of, arms, within):
-    """The baseline metrics that `compare --best-of` scores the candidate against: for each
-    candidate arm, cell, query and metric, the best value of the named baseline arms under
-    the candidate's key, or a missing marker when a baseline arm lacks it."""
-    by = {}
-    for m in base["metrics"]:
-        k = split_arm_key(m["key"])
-        if k:
-            by[k] = m
-    groups = sorted({(c, q, n) for (c, a, q, n) in by if a in best_of})
-    if not groups:
-        fail(f"the baseline has no metrics of the arms {', '.join(best_of)}")
-    cand_arms = set()
-    for m in cand["metrics"]:
-        k = split_arm_key(m["key"])
-        if k:
-            cand_arms.add(k[1])
+def arm_inventory(record):
+    """The arms a matrix record ran: its manifest's list, or eager and streaming for an
+    executors record that predates the list, or else the arms its keys name."""
+    mf = record.get("manifest", {})
+    if isinstance(mf.get("arms"), list):
+        return list(mf["arms"])
+    if record.get("gate") == "executors":
+        return list(MODES.values())
+    return sorted({k[1] for m in record["metrics"] if (k := split_arm_key(m["key"]))})
+
+
+def arm_toolchain(record, arm, k):
+    """The toolchain field `k` of the binary that ran `arm`: the base binary's for a
+    base arm of a four-arm record, and otherwise the record's own."""
+    mf = record.get("manifest", {})
+    if arm.startswith("base-") and mf.get("base_binary"):
+        return mf.get(f"base_{k}")
+    return mf.get(k)
+
+
+def resolve_arms(base, cand, best_of, arms, within):
+    """The candidate arms that `compare --best-of` scores, checked against both records'
+    arm inventories."""
+    base_inv, cand_inv = arm_inventory(base), arm_inventory(cand)
+    for a in best_of:
+        if a not in base_inv:
+            fail(f"the baseline has no arm {a}; it ran {', '.join(base_inv)}")
     if arms is None:
-        arms = sorted(cand_arms - set(best_of)) if within else sorted(cand_arms)
+        arms = [a for a in cand_inv if a not in best_of] if within else list(cand_inv)
     if not arms:
         fail("no candidate arms to score; name them with --arms")
+    for a in arms:
+        if a not in cand_inv:
+            fail(f"the candidate has no arm {a}; it ran {', '.join(cand_inv)}")
     if within and set(arms) & set(best_of):
         fail("an arm cannot be scored against itself within one record")
+    return arms
+
+
+def best_of_metrics(base, cand, best_of, arms):
+    """The baseline metrics that `compare --best-of` scores the candidate against: for each
+    candidate arm and each cell, query and metric of either record, the best value of the
+    named baseline arms under the candidate's key, or a marker naming the baseline arms
+    that lack it. A candidate metric of another unit or direction is refused."""
+    by, cby = {}, {}
+    for record, into in ((base, by), (cand, cby)):
+        for m in record["metrics"]:
+            k = split_arm_key(m["key"])
+            if k:
+                into[k] = m
+    groups = sorted({(c, q, n) for (c, a, q, n) in by if a in best_of}
+                    | {(c, q, n) for (c, a, q, n) in cby if a in arms})
+    if not groups:
+        fail(f"neither record has metrics of the arms {', '.join(best_of + arms)}")
     out = []
     for cell, q, name in groups:
         have = [by.get((cell, a, q, name)) for a in best_of]
@@ -670,9 +724,12 @@ def best_of_metrics(base, cand, best_of, arms, within):
                 lacking = [a for a, m in zip(best_of, have) if not m]
                 out.append({"key": key, "missing_base": lacking})
                 continue
-            better = have[0]["better"]
-            if any(m["better"] != better or m["unit"] != have[0]["unit"] for m in have):
+            better, unit = have[0]["better"], have[0]["unit"]
+            if any(m["better"] != better or m["unit"] != unit for m in have):
                 fail(f"{cell}/{q}/{name}: the arms {', '.join(best_of)} differ in unit or direction")
+            c = cby.get((cell, arm, q, name))
+            if c and (c["unit"] != unit or c["better"] != better):
+                fail(f"{key}: {c['unit']}/{c['better']} against the baseline's {unit}/{better}")
             pick = min(have, key=lambda m: m["value"]) if better == "lower" else max(have, key=lambda m: m["value"])
             out.append(dict(pick, key=key, source=pick["key"]))
     return out
@@ -693,22 +750,29 @@ def compare(args):
     if failed_base and not within:
         fail(f"the baseline has failed checks and cannot be compared with: {', '.join(failed_base[:10])}")
     best_of = [a for a in (args.best_of or "").split(",") if a]
-    arms = [a for a in args.arms.split(",") if a] if args.arms else None
-    if args.arms and not best_of:
+    arms = [a for a in args.arms.split(",") if a] if args.arms is not None else None
+    if args.best_of is not None and not best_of:
+        fail("--best-of names no arms")
+    if arms is not None and not arms:
+        fail("--arms names no arms")
+    if arms is not None and not best_of:
         fail("--arms needs --best-of")
-    if within:
-        # the arms of one record ran in one interleaved run on one host, and the base and
-        # tip binaries must come from one toolchain
-        mf = base.get("manifest", {})
-        reasons = []
-        # the arms of one binary share its toolchain
-        for k in (TOOLCHAIN if any(key.startswith("base_") for key in mf) else ()):
-            if not mf.get(k) or not mf.get(f"base_{k}"):
-                reasons.append(f"manifest {k}: unknown for the base or the tip")
-            elif mf[k] != mf[f"base_{k}"]:
-                reasons.append(f"manifest {k}: base {mf[f'base_{k}']!r} against tip {mf[k]!r}")
-    else:
-        reasons = incompatibilities(base, cand)
+    if best_of:
+        arms = resolve_arms(base, cand, best_of, arms, within)
+    reasons = [] if within else incompatibilities(base, cand)
+    if best_of:
+        # every arm that takes part ran a binary of one known toolchain; the arms of one
+        # binary share its toolchain
+        one_binary = within and not base.get("manifest", {}).get("base_binary")
+        for k in (() if one_binary else TOOLCHAIN):
+            seen = {f"baseline {a}": arm_toolchain(base, a, k) for a in best_of}
+            seen |= {f"candidate {a}": arm_toolchain(cand, a, k) for a in arms}
+            unknown = [n for n, v in seen.items() if not v]
+            if unknown:
+                reasons.append(f"manifest {k}: unknown for " + ", ".join(unknown))
+            elif len(set(seen.values())) > 1:
+                reasons.append(f"manifest {k}: the arms differ: "
+                               + "; ".join(f"{n} {v!r}" for n, v in seen.items()))
     if reasons and not args.allow_different:
         fail("the records measure different workloads (--allow-different compares them anyway): "
              + "; ".join(reasons))
@@ -720,7 +784,7 @@ def compare(args):
     pattern = re.compile(args.keys) if args.keys else None
     cm = {m["key"]: m for m in cand["metrics"]}
     rows, bad = [], []
-    for m in (best_of_metrics(base, cand, best_of, arms, within) if best_of else base["metrics"]):
+    for m in (best_of_metrics(base, cand, best_of, arms) if best_of else base["metrics"]):
         key = m["key"]
         if pattern and not pattern.search(key):
             continue
@@ -780,7 +844,7 @@ def compare(args):
     for r in reasons:
         print(f"- compared although different: {r}")
     print()
-    sources = {m["key"]: m.get("source") for m in best_of_metrics(base, cand, best_of, arms, within)} if best_of else {}
+    sources = {m["key"]: m.get("source") for m in best_of_metrics(base, cand, best_of, arms)} if best_of else {}
     print("| metric | baseline | candidate | ratio | flag |" + (" best baseline arm |" if best_of else ""))
     print("|---|--:|--:|--:|---|" + ("---|" if best_of else ""))
     fmt = lambda v: "" if v is None else f"{v:.6g}"
@@ -797,7 +861,10 @@ def compare(args):
         print(f"Changed from the baseline: {name}, {b} against {c}.")
     print(f"{len(rows)} metrics compared, {len(bad)} flagged, {len(failed)} failed checks, "
           f"{len(missing)} missing checks, {len(changed)} changed fingerprints.")
-    sys.exit(1 if bad or failed or changed or missing else 0)
+    scored = sum(1 for r in rows if r[3] is not None)
+    if best_of and not scored:
+        print("No metric was scored, so the comparison decides nothing.")
+    sys.exit(1 if bad or failed or changed or missing or (best_of and not scored) else 0)
 
 
 # --------------------------------------------------------------------------- order-digest

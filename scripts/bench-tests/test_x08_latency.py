@@ -59,24 +59,28 @@ class CombineTests(unittest.TestCase):
 @unittest.skipUnless(all(shutil.which(t) for t in ("taskset", "chrt", "zstd", "curl")) and (os.cpu_count() or 1) >= 5,
                      "needs taskset, chrt, zstd, curl and five CPUs")
 class LatencyTests(unittest.TestCase):
+    def work(self, d):
+        w = Path(d) / "work"
+        (w / "queries").mkdir(parents=True)
+        (w / "queries" / "count-all.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+        (w / "data.nt.zst").write_bytes(subprocess.run(["zstd", "-q", "-c"], input=b"", capture_output=True).stdout)
+        shutil.copy(SCRIPTS / "nsc-bench-remote.sh", w)
+        bins = {}
+        for name in ("base", "tip"):
+            p = Path(d) / name / "sparkles"
+            p.parent.mkdir()
+            p.write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{name}"'))
+            p.chmod(0o755)
+            bins[name] = p
+        return w, bins
+
     def test_the_base_and_tip_form_runs_each_binary_in_both_positions(self):
         with tempfile.TemporaryDirectory() as d:
-            w = Path(d) / "work"
-            (w / "queries").mkdir(parents=True)
-            (w / "queries" / "count-all.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
-            (w / "data.nt.zst").write_bytes(subprocess.run(["zstd", "-q", "-c"], input=b"", capture_output=True).stdout)
-            shutil.copy(SCRIPTS / "nsc-bench-remote.sh", w)
+            w, bins = self.work(d)
             extra = Path(d) / "ask-shape.rq"
             extra.write_text("ASK { ?s ?p ?o }")
-            bins = {}
-            for name in ("base", "tip"):
-                p = Path(d) / name / "sparkles"
-                p.parent.mkdir()
-                p.write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{name}"'))
-                p.chmod(0o755)
-                bins[name] = p
             r = subprocess.run(
-                ["bash", str(GATES / "latency.sh"), "--base", bins["base"], "--tip", bins["tip"],
+                ["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"],
                  "--base-execution", "eager", "--queries", f"count-all {extra}", "--rounds", "10", "--reps", "2",
                  "--port", "4301", w], capture_output=True, text=True, timeout=600)
             # the stub answers in a fixed time, so the gate passes
@@ -92,6 +96,34 @@ class LatencyTests(unittest.TestCase):
             self.assertEqual(seen["tip-first"], {("stores/A", "tip", "tip", "-"), ("stores/B", "base", "base", "eager")})
             self.assertEqual(seen["same"], {("stores/A", "tip", "tip", "-"), ("stores/B", "tip", "tip", "-")})
             self.assertIn("execution eager", (w / "runs-manifest.txt").read_text())
+            self.assertIn("the answers agree", r.stdout)
+            # each binary loaded its own store, and the run against itself one
+            for run, stores in (("tip-second", ["A", "B"]), ("tip-first", ["A", "B"]), ("same", ["A"])):
+                loads = (w / "runs" / run / "results" / "load.tsv").read_text().splitlines()
+                self.assertEqual([l.split("\t")[0] for l in loads], stores)
+
+    def test_an_inherited_environment_cannot_change_the_arms(self):
+        with tempfile.TemporaryDirectory() as d:
+            w, bins = self.work(d)
+            env = dict(os.environ, BINARY_OF_B="A", SHARE_STORE="1", EXECUTION="streaming")
+            r = subprocess.run(
+                ["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"], "--queries",
+                 "count-all", "--rounds", "10", "--reps", "1", "--port", "4303", w],
+                capture_output=True, text=True, timeout=600, env=env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            ids = {tuple(l.split("\t")[:2]) for l in (w / "runs" / "tip-second" / "requests.tsv").read_text().splitlines()}
+            self.assertEqual(ids, {("base", "base"), ("tip", "tip")})
+
+    def test_disagreeing_answers_fail_the_gate(self):
+        with tempfile.TemporaryDirectory() as d:
+            w, bins = self.work(d)
+            bins["tip"].write_text(bins["tip"].read_text().replace('b"?c\\n1\\n"', 'b"?c\\n2\\n"'))
+            r = subprocess.run(
+                ["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"], "--queries",
+                 "count-all", "--rounds", "10", "--reps", "1", "--port", "4305", w],
+                capture_output=True, text=True, timeout=600)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("the untimed answers differ", r.stdout)
 
     def test_refusals(self):
         with tempfile.TemporaryDirectory() as d:
@@ -101,6 +133,15 @@ class LatencyTests(unittest.TestCase):
             r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", "/bin/true", "--tip", "/bin/true",
                                 "--rounds", "4", d], capture_output=True, text=True)
             self.assertIn("at least 10 rounds", r.stderr)
+            w, bins = self.work(d)
+            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", bins["base"], "--tip", bins["tip"], w],
+                               capture_output=True, text=True)
+            self.assertIn("names no compilers", r.stderr)
+            for q, message in (("/no/such.rq", "no query file"), (f"{bins['tip']}", "must end in .rq"),
+                               (f"count-all {w}/queries/count-all.rq", "two queries are named count-all")):
+                r = subprocess.run(["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"],
+                                    "--queries", q, w], capture_output=True, text=True)
+                self.assertIn(message, r.stderr)
 
 
 if __name__ == "__main__":
