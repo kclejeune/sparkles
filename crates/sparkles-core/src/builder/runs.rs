@@ -10,7 +10,7 @@
 
 use super::codec;
 use crate::error::{Error, Result};
-use crate::index::{Key, decode_varints_into, encode_deltas};
+use crate::index::{Key, decode_varints_strided, encode_deltas};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -112,15 +112,8 @@ fn encode_block(rows: &[Key]) -> Result<Vec<u8>> {
 }
 
 /// Decode one column of `rows` values from `bytes` into the column `c` of `keys`, with
-/// `raw` and `col` as buffers. The values are decoded into `col` by the index's decoder
-/// and then copied into the keys.
-fn decode_column(
-    bytes: &[u8],
-    c: usize,
-    keys: &mut [Key],
-    raw: &mut Vec<u8>,
-    col: &mut Vec<u64>,
-) -> Result<()> {
+/// `raw` as a buffer. The index's decoder writes the values into the keys in place.
+fn decode_column(bytes: &[u8], c: usize, keys: &mut [Key], raw: &mut Vec<u8>) -> Result<()> {
     let bad = || Error::Corrupt("run block column".into());
     let (len, comp) = bytes.split_first_chunk::<4>().ok_or_else(bad)?;
     let len = u32::from_le_bytes(*len) as usize;
@@ -129,13 +122,10 @@ fn decode_column(
         return Err(bad());
     }
     codec::decompress(comp, len, raw, "run")?;
-    col.resize(keys.len(), 0);
-    let col = &mut col[..keys.len()];
-    decode_varints_into(raw, col).map_err(|_| bad())?;
-    for (k, &v) in keys.iter_mut().zip(col.iter()) {
-        k[c] = v;
-    }
-    Ok(())
+    let rows = keys.len();
+    // the column's values sit 4 apart in the flattened keys, from position c
+    let out = keys.as_flattened_mut().get_mut(c..).ok_or_else(bad)?;
+    decode_varints_strided::<4>(raw, out, rows).map_err(|_| bad())
 }
 
 /// Reads a run file block by block.
@@ -144,8 +134,6 @@ pub(super) struct RunReader {
     buf: Vec<u8>,
     /// a decompressed column
     raw: Vec<u8>,
-    /// a decoded column, up to [`RUN_BLOCK`] values (256 KiB)
-    col: Vec<u64>,
 }
 
 impl RunReader {
@@ -154,7 +142,6 @@ impl RunReader {
             r: BufReader::with_capacity(1 << 20, File::open(path)?),
             buf: Vec::new(),
             raw: Vec::new(),
-            col: Vec::new(),
         })
     }
 
@@ -174,7 +161,7 @@ impl RunReader {
         for c in 0..4 {
             self.buf.resize(u32_at(4 + 4 * c), 0);
             self.r.read_exact(&mut self.buf)?;
-            decode_column(&self.buf, c, &mut keys, &mut self.raw, &mut self.col)?;
+            decode_column(&self.buf, c, &mut keys, &mut self.raw)?;
         }
         Ok(Some(keys))
     }
@@ -501,11 +488,11 @@ mod tests {
         }
         assert_eq!(at, block.len());
         let mut keys = vec![[0u64; 4]; rows.len()];
-        let (mut raw, mut col) = (Vec::new(), Vec::new());
+        let mut raw = Vec::new();
         let mut at = HEADER;
         for c in 0..4 {
             let len = u32_at(4 + 4 * c);
-            decode_column(&block[at..at + len], c, &mut keys, &mut raw, &mut col).unwrap();
+            decode_column(&block[at..at + len], c, &mut keys, &mut raw).unwrap();
             at += len;
         }
         assert_eq!(keys, rows);
@@ -521,8 +508,8 @@ mod tests {
         };
         let decode = |bytes: &[u8]| {
             let mut keys = vec![[0u64; 4]; rows.len()];
-            let (mut raw, mut col) = (Vec::new(), Vec::new());
-            decode_column(bytes, 0, &mut keys, &mut raw, &mut col).map(|()| keys)
+            let mut raw = Vec::new();
+            decode_column(bytes, 0, &mut keys, &mut raw).map(|()| keys)
         };
         let whole = decode(&column(&PINNED_VARINTS)).unwrap();
         assert!(whole.iter().zip(&rows).all(|(k, r)| k[0] == r[0]));
@@ -588,7 +575,7 @@ mod tests {
             .collect();
         let mut keys = vec![[0u64; 4]; RUN_BLOCK];
         let mut out = vec![0u64; RUN_BLOCK];
-        let (mut raw, mut col) = (Vec::new(), Vec::new());
+        let mut raw = Vec::new();
         let mut sum = 0u64;
         for rep in 0..reps {
             let t = std::time::Instant::now();
@@ -606,7 +593,7 @@ mod tests {
                             let len =
                                 u32::from_le_bytes(enc[4 + 4 * c..8 + 4 * c].try_into().unwrap())
                                     as usize;
-                            decode_column(&enc[at..at + len], c, keys, &mut raw, &mut col).unwrap();
+                            decode_column(&enc[at..at + len], c, keys, &mut raw).unwrap();
                             at += len;
                         }
                         sum = sum.wrapping_add(keys[keys.len() - 1][2]);
