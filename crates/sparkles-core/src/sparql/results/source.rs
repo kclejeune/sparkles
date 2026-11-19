@@ -95,13 +95,13 @@ pub(super) enum EagerMode {
     /// Native JSON. Every row is decoded into one scratch row after the prefetch.
     Scratch,
     /// SPARQL Results Thrift. Every row is decoded into one scratch row with no
-    /// prefetch, and each row checks the query's controls first, as the server's own
-    /// row loop did.
+    /// prefetch, and each row checks the query's controls before and after its decode,
+    /// as the server's own row loop did.
     Rows,
 }
 
 /// Every row of an eager answer decoded into one scratch row. `CONTROLS` checks the
-/// query's cancellation and deadline before each row.
+/// query's cancellation and deadline before and after each row's decode.
 struct ScratchRows<'r, const CONTROLS: bool> {
     row: output::ScratchRow<'r>,
     r: &'r QueryResult,
@@ -115,11 +115,18 @@ impl<const CONTROLS: bool> RowBatch for ScratchRows<'_, CONTROLS> {
 
     #[inline]
     fn row(&mut self, i: usize) -> Result<RowView<'_>> {
+        let ctx = &self.r.inner.ctx;
         if CONTROLS {
             // a recorded memory refusal is checked first, so the earlier error wins
-            self.r.inner.ctx.check()?;
+            ctx.check()?;
         }
-        Ok(RowView::Dense(self.row.load(i)?))
+        let terms = self.row.load(i)?;
+        if CONTROLS {
+            // and again after the decode, so a stop during the last row's decode fails
+            // the answer, as the owned row decoder does
+            ctx.check()?;
+        }
+        Ok(RowView::Dense(terms))
     }
 }
 

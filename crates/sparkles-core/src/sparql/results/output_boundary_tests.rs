@@ -673,3 +673,32 @@ fn an_eager_thrift_answer_takes_no_vocabulary_prefetch() {
     thrift.unwrap();
     assert_eq!(rows, 2);
 }
+
+#[test]
+fn an_eager_thrift_answer_checks_its_controls_after_the_last_rows_decode() {
+    use crate::algo::memory::probe;
+    let r = answer(false);
+    // cancel while the last row is decoded, after its pre-row check
+    let cancel = r.test_context().cancel.clone();
+    let _scope = probe::install(
+        move |point| {
+            if let probe::Point::Allocation("scratch-row-decoded", 1) = point {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        },
+        None,
+    );
+    let sent = RowCount::new();
+    let mut out = Vec::new();
+    let error = write(
+        Source::Result(&r),
+        WriteOptions::new(super::Format::ResultsThrift, &sent),
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
+    // the first row was whole before the second was decoded
+    assert_eq!(sent.get(), 1);
+    assert!(!String::from_utf8_lossy(&out).contains("tail"));
+    r.test_context().cancel.store(false, Ordering::Relaxed);
+}

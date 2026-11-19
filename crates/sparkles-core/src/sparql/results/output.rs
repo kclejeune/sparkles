@@ -58,6 +58,11 @@ impl<'a> ScratchRow<'a> {
                 &mut self.terms,
             )?;
         }
+        #[cfg(test)]
+        crate::algo::memory::probe::at(crate::algo::memory::probe::Point::Allocation(
+            "scratch-row-decoded",
+            index,
+        ));
         r.inner.ctx.check_memory_failure()?;
         Ok(&self.terms)
     }

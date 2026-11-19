@@ -678,6 +678,8 @@ where
         });
         let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if let Some(mut producer) = sw.timed.take() {
+            // the producer is installed before the handoff, which can fail
+            let committed = sw.tx.is_some();
             drop(sw.tx.take());
             let result = producer.finish(result);
             let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -689,7 +691,7 @@ where
                 error: result.err(),
                 disconnected,
                 rows: sw.ledger.delivered(),
-                committed: true,
+                committed,
             });
             drop(span);
             producer.publish();
