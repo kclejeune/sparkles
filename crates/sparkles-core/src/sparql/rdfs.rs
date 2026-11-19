@@ -411,7 +411,7 @@ fn rewrite_calls(
     // Blank nodes of the patterns become variables, so that the parts a pattern is split
     // into still share them. Labels are scoped to one basic graph pattern, and the
     // projection of the query was fixed when it was parsed, so none becomes visible.
-    blank_to_var(&mut g);
+    blank_to_var(&mut g, rw.calls);
     rw.walk(&mut g);
     g
 }
@@ -442,6 +442,12 @@ impl Rewriter<'_> {
     /// Whether `p` is a registered property function, a call rather than stored data.
     fn call(&self, p: &NamedNode) -> bool {
         self.calls.is_some_and(|r| r.property(p.as_str()).is_some())
+    }
+
+    /// Whether `p` has a subproperty that is not a registered property.
+    fn has_subproperties(&self, p: &NamedNode) -> bool {
+        RdfsSchema::get(&self.s.sub_prop, p.as_ref())
+            .is_some_and(|subs| subs.iter().any(|q| !self.call(q)))
     }
 
     /// The pairs of a property and a superproperty, without registered properties.
@@ -591,9 +597,15 @@ impl Rewriter<'_> {
     /// A basic graph pattern with its changed patterns replaced, or `None` when none
     /// changes.
     fn bgp(&self, patterns: &[TriplePattern]) -> Option<GraphPattern> {
+        let group = call_group(self.calls, patterns);
         let mut kept = Vec::new();
         let mut parts = Vec::new();
-        for t in patterns {
+        let mut called = Vec::new();
+        for (t, in_group) in patterns.iter().zip(group) {
+            if in_group {
+                called.push(t.clone());
+                continue;
+            }
             match self.triple(&t.subject, &t.predicate, &t.object) {
                 Some(p) => parts.push(p),
                 None => kept.push(t.clone()),
@@ -603,7 +615,10 @@ impl Rewriter<'_> {
             return None;
         }
         let mut out = (!kept.is_empty()).then_some(GraphPattern::Bgp { patterns: kept });
-        for p in parts {
+        // the calls and their list cells, as written, after the patterns that bind
+        // their inputs
+        let called = (!called.is_empty()).then_some(GraphPattern::Bgp { patterns: called });
+        for p in parts.into_iter().chain(called) {
             out = Some(match out {
                 None => p,
                 Some(l) => join(l, p),
@@ -628,9 +643,7 @@ impl Rewriter<'_> {
             {
                 false
             }
-            NamedNodePattern::NamedNode(p) => {
-                RdfsSchema::get(&self.s.sub_prop, p.as_ref()).is_some()
-            }
+            NamedNodePattern::NamedNode(p) => self.has_subproperties(p),
             NamedNodePattern::Variable(_) => true,
         };
         if !changes {
@@ -846,7 +859,12 @@ impl Rewriter<'_> {
         } else {
             (true, false)
         };
-        let types = self.types(s, o, false, literal_range, subproperties);
+        // a registered `rdf:type` is a call, which no type branch may add
+        let types = if self.call(&TYPE.into_owned()) {
+            Vec::new()
+        } else {
+            self.types(s, o, false, literal_range, subproperties)
+        };
         let mut preds = vec![TYPE.into_owned()];
         if !subject_bound {
             preds.extend(
@@ -889,7 +907,7 @@ impl Rewriter<'_> {
                 } else if p.as_ref() == TYPE {
                     top && !self.s.only_properties()
                 } else {
-                    RdfsSchema::get(&self.s.sub_prop, p.as_ref()).is_some()
+                    self.has_subproperties(p)
                 }
             }
             P::NegatedPropertySet(_) => top,
@@ -1208,7 +1226,7 @@ fn dedup(mut v: Vec<Variable>) -> Vec<Variable> {
 }
 
 /// Turn the blank nodes of every pattern into variables (`__rdfsb_<label>`).
-fn blank_to_var(gp: &mut GraphPattern) {
+fn blank_to_var(gp: &mut GraphPattern, calls: Option<&super::extensions::ExtensionRegistry>) {
     use GraphPattern as G;
     fn term(t: &mut TermPattern) {
         match t {
@@ -1225,10 +1243,11 @@ fn blank_to_var(gp: &mut GraphPattern) {
             _ => {}
         }
     }
-    fn expr(e: &mut Expression) {
+    fn expr(e: &mut Expression, calls: Option<&super::extensions::ExtensionRegistry>) {
         use Expression as E;
+        let expr = |e: &mut Expression| expr(e, calls);
         match e {
-            E::Exists(p) => blank_to_var(p),
+            E::Exists(p) => blank_to_var(p, calls),
             E::Or(a, b)
             | E::And(a, b)
             | E::Equal(a, b)
@@ -1246,7 +1265,7 @@ fn blank_to_var(gp: &mut GraphPattern) {
             }
             E::In(a, l) => {
                 expr(a);
-                l.iter_mut().for_each(expr);
+                l.iter_mut().for_each(&expr);
             }
             E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr(a),
             E::If(a, b, c) => {
@@ -1254,15 +1273,35 @@ fn blank_to_var(gp: &mut GraphPattern) {
                 expr(b);
                 expr(c);
             }
-            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter_mut().for_each(expr),
+            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter_mut().for_each(&expr),
             E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => {}
         }
     }
     match gp {
         G::Bgp { patterns } => {
+            // A call's list arguments must stay blank nodes written in its pattern, so the
+            // blank nodes that occur only in its call group keep their labels.
+            let group = call_group(calls, patterns);
+            let mut keep: Vec<oxrdf::BlankNode> = Vec::new();
+            let mut shared: Vec<oxrdf::BlankNode> = Vec::new();
+            for (t, in_group) in patterns.iter().zip(&group) {
+                for x in [&t.subject, &t.object] {
+                    if let TermPattern::BlankNode(b) = x {
+                        if *in_group {
+                            keep.push(b.clone())
+                        } else {
+                            shared.push(b.clone())
+                        }
+                    }
+                }
+            }
+            keep.retain(|b| !shared.contains(b));
             for t in patterns {
-                term(&mut t.subject);
-                term(&mut t.object);
+                for x in [&mut t.subject, &mut t.object] {
+                    if !matches!(x, TermPattern::BlankNode(b) if keep.contains(b)) {
+                        term(x);
+                    }
+                }
             }
         }
         G::Path {
@@ -1277,23 +1316,23 @@ fn blank_to_var(gp: &mut GraphPattern) {
         | G::Minus { left, right }
         | G::SemiJoin { left, right }
         | G::AntiJoin { left, right } => {
-            blank_to_var(left);
-            blank_to_var(right);
+            blank_to_var(left, calls);
+            blank_to_var(right, calls);
         }
         G::LeftJoin {
             left,
             right,
             expression,
         } => {
-            blank_to_var(left);
-            blank_to_var(right);
+            blank_to_var(left, calls);
+            blank_to_var(right, calls);
             if let Some(e) = expression {
-                expr(e);
+                expr(e, calls);
             }
         }
         G::Filter { expr: e, inner } => {
-            expr(e);
-            blank_to_var(inner);
+            expr(e, calls);
+            blank_to_var(inner, calls);
         }
         G::Extend {
             inner, expression, ..
@@ -1304,8 +1343,8 @@ fn blank_to_var(gp: &mut GraphPattern) {
         | G::Unfold {
             inner, expression, ..
         } => {
-            expr(expression);
-            blank_to_var(inner);
+            expr(expression, calls);
+            blank_to_var(inner, calls);
         }
         G::Graph { inner, .. }
         | G::Project { inner, .. }
@@ -1313,8 +1352,59 @@ fn blank_to_var(gp: &mut GraphPattern) {
         | G::Reduced { inner }
         | G::Slice { inner, .. }
         | G::OrderBy { inner, .. }
-        | G::Group { inner, .. } => blank_to_var(inner),
+        | G::Group { inner, .. } => blank_to_var(inner, calls),
         G::Service { .. } | G::Values { .. } => {}
+    }
+}
+
+/// Which patterns of a basic graph pattern are registered calls or the cells of their
+/// list arguments: the `rdf:first` and `rdf:rest` patterns reached from a call's blank
+/// node argument through blank nodes.
+fn call_group(
+    calls: Option<&super::extensions::ExtensionRegistry>,
+    patterns: &[TriplePattern],
+) -> Vec<bool> {
+    let mut group = vec![false; patterns.len()];
+    let Some(r) = calls else {
+        return group;
+    };
+    let mut heads: Vec<&spargebra::term::BlankNode> = Vec::new();
+    for (t, g) in patterns.iter().zip(group.iter_mut()) {
+        if let NamedNodePattern::NamedNode(p) = &t.predicate
+            && r.property(p.as_str()).is_some()
+        {
+            *g = true;
+            for x in [&t.subject, &t.object] {
+                if let TermPattern::BlankNode(b) = x {
+                    heads.push(b);
+                }
+            }
+        }
+    }
+    if heads.is_empty() {
+        return group;
+    }
+    loop {
+        let mut grew = false;
+        for (t, g) in patterns.iter().zip(group.iter_mut()) {
+            let cell = matches!(&t.predicate, NamedNodePattern::NamedNode(p)
+                if p.as_ref() == rdf::FIRST || p.as_ref() == rdf::REST);
+            if *g || !cell {
+                continue;
+            }
+            if let TermPattern::BlankNode(b) = &t.subject
+                && heads.contains(&b)
+            {
+                *g = true;
+                grew = true;
+                if let TermPattern::BlankNode(next) = &t.object {
+                    heads.push(next);
+                }
+            }
+        }
+        if !grew {
+            return group;
+        }
     }
 }
 

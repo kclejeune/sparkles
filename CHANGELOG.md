@@ -10,9 +10,11 @@ rewrite added a call that the query had not been prepared for, the call panicked
 the stream's destructor panicked again while unwinding. A schema that gave the function
 a domain or range, or put a subproperty below it, could also add or change a call, and
 the seed queries of query-time reasoning ran a written call in the same unprepared way.
-The RDFS rewrite now treats a registered property as a call without stored triples. It
-keeps the query's own call as written and adds none, and a reasoning seed set that would
-need a call is derived from constants instead. A callback reached from an unprepared
+The RDFS rewrite now derives nothing through a registered property. It keeps the
+query's own call and its list arguments as written, after the patterns that bind its
+inputs, and adds none, and a reasoning seed set that would need a call is derived from
+constants instead. RDFS on read had also refused a written call with a list argument,
+or one whose input came from a rewritten pattern, and both now run. A callback reached from an unprepared
 query now fails that query with an error, and the stream and accumulator destructors no
 longer panic. This completes roadmap item 1198.
 

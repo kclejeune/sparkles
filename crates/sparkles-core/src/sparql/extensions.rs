@@ -217,14 +217,19 @@ impl CallbackGuard {
     }
 
     /// Drops `inner`, an application value, under the guard of `ctx` and without letting
-    /// its destructor unwind. A panic in the destructor is reported through `failed`.
+    /// its destructor unwind. A panic in the destructor is reported through `failed`, and
+    /// its payload is leaked rather than dropped.
     /// Without a configured context, which no opened value has, it is dropped unguarded.
     pub(crate) fn drop_owned<T>(ctx: &Ctx, inner: Option<T>, failed: &str) {
         let Some(inner) = inner else {
             return;
         };
         let _owner = Self::enter(ctx).ok();
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inner))).is_err() {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inner)))
+        {
+            // The payload's own destructor is application code too, and a panic from it
+            // here could unwind out of a destructor, so it is leaked.
+            std::mem::forget(payload);
             ctx.fail_extension(ScalarError::Execution(failed.into()));
         }
     }

@@ -74,6 +74,26 @@ fn an_owned_value_drops_without_a_guard_or_an_unwind() {
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
+/// A destructor that panics with a payload whose own destructor panics: the payload is
+/// leaked, so neither panic leaves `drop_owned`.
+#[test]
+fn a_panicking_payload_does_not_escape_the_drop() {
+    struct Payload;
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            panic!("payload destructor")
+        }
+    }
+    struct PanicsWithPayload;
+    impl Drop for PanicsWithPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(Payload)
+        }
+    }
+    let ctx = unconfigured();
+    CallbackGuard::drop_owned(&ctx, Some(PanicsWithPayload), "destructor panicked");
+}
+
 #[test]
 fn the_planner_refuses_a_call_its_context_was_not_configured_for() {
     let ctx = unconfigured();

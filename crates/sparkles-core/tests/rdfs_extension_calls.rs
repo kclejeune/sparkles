@@ -39,7 +39,7 @@ impl PropertyFunction for Echo {
     ) -> Result<Box<dyn PropertyStream + 'q>, ScalarError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(Once(Some(PropertyRow {
-            subject: vec![None],
+            subject: vec![None; input.subject.len()],
             object: vec![input.subject[0].clone()],
         }))))
     }
@@ -58,10 +58,18 @@ fn store() -> Store {
 }
 
 fn registry(opens: &Arc<AtomicUsize>) -> Arc<ExtensionRegistry> {
+    registry_of(CALLBACK, ArgumentShape::Term, opens)
+}
+
+fn registry_of(
+    iri: &str,
+    subject: ArgumentShape,
+    opens: &Arc<AtomicUsize>,
+) -> Arc<ExtensionRegistry> {
     let mut r = ExtensionRegistry::builder();
     let mut d = PropertyDescriptor::new(
-        CALLBACK,
-        ArgumentShape::Term,
+        iri,
+        subject,
         ArgumentShape::Term,
         vec![PropertyPosition::Subject(0)],
         vec![PropertyPosition::Object(0)],
@@ -137,14 +145,17 @@ const UNNAMED: &[&str] = &[
     "SELECT * { ?s <urn:p> ?v . ?s ?q ?x }",
     "SELECT * { ?s <urn:p> ?v . ?s <urn:parent>+ ?x }",
     "SELECT * { ?s <urn:p> ?v . ?s <urn:parent>{1,2} ?x }",
+    "SELECT * { ?s <urn:p> ?v . ?s (<urn:callback>|<urn:parent>) ?x }",
+    "SELECT * { ?s <urn:p> ?v . ?s (<urn:parent>|<urn:q>)/<urn:p> ?x }",
     "SELECT * { ?s a <urn:R> }",
 ];
 
 /// Each shape calls nothing, fails with no error, and answers as RDFS on read answers
 /// when the property is not registered and has no stored triples. The subproperty
 /// below the registered property still entails the parent through it, since the
-/// closure of the schema is unchanged. Only a variable predicate can tell the two
-/// apart, since it would bind the registered property to the entailed triple.
+/// closure of the schema is unchanged. A variable predicate can tell the two
+/// apart, binding the registered property to an entailed triple, and so can a path that
+/// names it, which no longer matches what the schema derives through it.
 fn same_as_unregistered(read: fn(&Store, &str, &QueryOptions) -> sparkles_core::Result<Rows>) {
     let s = store();
     for q in UNNAMED {
@@ -157,10 +168,12 @@ fn same_as_unregistered(read: fn(&Store, &str, &QueryOptions) -> sparkles_core::
             ..options(&opens, true)
         };
         let expected = read(&s, q, &unregistered).unwrap();
-        if !q.contains("?q") {
-            assert_eq!(with, expected, "{q}");
-        } else {
+        if q.contains("?q") || q.contains("<urn:callback>") {
+            // these name the registered property itself, which then binds or matches
+            // nothing that the schema derives through it
             assert!(with.len() < expected.len(), "{q}");
+        } else {
+            assert_eq!(with, expected, "{q}");
         }
     }
 }
@@ -227,6 +240,7 @@ fn update_where_rdfs_adds_no_registered_call() {
 /// every demand.
 struct Deriving {
     seeds: Arc<AtomicUsize>,
+    plain: Arc<AtomicUsize>,
 }
 impl ReasoningProvider for Deriving {
     fn label(&self) -> String {
@@ -235,11 +249,13 @@ impl ReasoningProvider for Deriving {
     fn start(&self, _: SessionRequest) -> sparkles_core::Result<Box<dyn ReasoningSession>> {
         Ok(Box::new(DerivingSession {
             seeds: self.seeds.clone(),
+            plain: self.plain.clone(),
         }))
     }
 }
 struct DerivingSession {
     seeds: Arc<AtomicUsize>,
+    plain: Arc<AtomicUsize>,
 }
 impl ReasoningSession for DerivingSession {
     fn intensional(
@@ -256,6 +272,10 @@ impl ReasoningSession for DerivingSession {
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> sparkles_core::Result<Derived> {
         self.seeds
             .fetch_add(seeds.iter().map(|(_, s)| s.len()).sum(), Ordering::SeqCst);
+        self.plain.fetch_add(
+            seeds.iter().filter(|(_, s)| s.is_empty()).count(),
+            Ordering::SeqCst,
+        );
         Ok(Derived::default())
     }
     fn report(&self) -> Report {
@@ -274,17 +294,114 @@ fn reasoning_seeds_run_no_registered_call() {
     let plain = eager(&s, q, &options(&opens, false)).unwrap();
     let without = opens.swap(0, Ordering::SeqCst);
     let seeds = Arc::new(AtomicUsize::new(0));
+    let plain_demands = Arc::new(AtomicUsize::new(0));
     let o = QueryOptions {
         reasoning: Some(Arc::new(Deriving {
             seeds: seeds.clone(),
+            plain: plain_demands.clone(),
         })),
         ..options(&opens, false)
     };
     let with = eager(&s, q, &o).unwrap();
     assert_eq!(opens.swap(0, Ordering::SeqCst), without);
     assert_eq!(with, plain);
+    // no seed is read through the call, and the derived pattern is derived with its
+    // constants alone instead
     assert_eq!(seeds.load(Ordering::SeqCst), 0);
+    assert_eq!(plain_demands.swap(0, Ordering::SeqCst), 1);
     let streamed_rows = streamed(&s, q, &o).unwrap();
     assert_eq!(opens.load(Ordering::SeqCst), without);
     assert_eq!(streamed_rows, plain);
+}
+
+/// A written call keeps its inputs when a pattern that binds them is rewritten, whether
+/// the rewritten pattern's only subproperty is the registered property or a stored one.
+#[test]
+fn a_written_call_reads_inputs_from_rewritten_patterns() {
+    let s = store();
+    update(
+        &s,
+        "INSERT DATA { <urn:s:1> <urn:parent> 1 . <urn:s:2> <urn:p2> 7 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let n = |x: &str| NamedNode::new(x).unwrap();
+    let sub = n(&format!("{RDFS}subPropertyOf"));
+    for (schema, q, calls) in [
+        (
+            vec![Triple::new(n(CALLBACK), sub.clone(), n("urn:parent"))],
+            "SELECT * { ?s <urn:parent> ?v . ?s <urn:callback> ?x }",
+            1,
+        ),
+        (
+            vec![Triple::new(n("urn:p2"), sub.clone(), n("urn:p"))],
+            "SELECT * { ?s <urn:p> ?v . ?s <urn:callback> ?x }",
+            4,
+        ),
+    ] {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let o = QueryOptions {
+            rdfs: Some(Arc::new(RdfsOnRead::fixed(RdfsSchema::from_triples(
+                &schema,
+            )))),
+            ..options(&opens, false)
+        };
+        let rows = eager(&s, q, &o).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(rows.len(), calls, "{q}");
+        assert_eq!(opens.swap(0, Ordering::SeqCst), calls, "{q}");
+        assert_eq!(streamed(&s, q, &o).unwrap(), rows, "{q}");
+        assert_eq!(opens.load(Ordering::SeqCst), calls, "{q}");
+    }
+}
+
+/// A call with a list argument keeps the list written in its pattern under RDFS on read.
+#[test]
+fn a_written_list_argument_survives_the_rewrite() {
+    let s = store();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let o = QueryOptions {
+        extensions: Some(registry_of(CALLBACK, ArgumentShape::List(1..=4), &opens)),
+        ..options(&opens, true)
+    };
+    let q = "SELECT * { ?s <urn:p> ?v . (?s ?v) <urn:callback> ?x }";
+    let without = QueryOptions {
+        rdfs: None,
+        ..o.clone()
+    };
+    let plain = eager(&s, q, &without).unwrap();
+    assert_eq!(opens.swap(0, Ordering::SeqCst), 3);
+    let with = eager(&s, q, &o).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(opens.swap(0, Ordering::SeqCst), 3);
+    assert_eq!(with, plain);
+}
+
+/// A registered `rdf:type` gets no type branches from a variable predicate.
+#[test]
+fn a_registered_type_gets_no_type_branch() {
+    let s = store();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let n = |x: &str| NamedNode::new(x).unwrap();
+    let schema = RdfsSchema::from_triples(&[Triple::new(
+        n("urn:C"),
+        n(&format!("{RDFS}subClassOf")),
+        n("urn:D"),
+    )]);
+    let o = QueryOptions {
+        extensions: Some(registry_of(
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            ArgumentShape::Term,
+            &opens,
+        )),
+        rdfs: Some(Arc::new(RdfsOnRead::fixed(schema))),
+        no_cache: true,
+        ..Default::default()
+    };
+    for q in [
+        "SELECT * { <urn:s:1> ?p ?o }",
+        "SELECT * { ?s ?p <urn:D> }",
+        "SELECT * { ?s ?p ?o }",
+    ] {
+        eager(&s, q, &o).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(opens.load(Ordering::SeqCst), 0, "{q}");
+    }
 }
