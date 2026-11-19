@@ -174,7 +174,8 @@ case $MODE in
   *) finish 2 ;;
 esac
 # On an ssh host, where other lanes' jobs share the disk, the run's temporary files live in
-# its worktree and a watch stops the run when the disk falls under the run floor. A Boat
+# a directory of this start's own beside its worktree, and a watch stops the run when the
+# disk falls under the run floor. A Boat
 # worker keeps its own timer's hard limit instead.
 watch=0
 if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = ssh ]; then
