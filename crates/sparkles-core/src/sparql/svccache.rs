@@ -38,6 +38,27 @@ impl Rows {
         (terms + 24) as u64
     }
 
+    /// The bytes one row keeps allocated: its slots at their capacity, its vector's
+    /// header and its terms' text. [`Rows::bytes`] is the cache's weight, an estimate
+    /// that this exceeds for wide rows of mostly unbound slots.
+    #[allow(clippy::ptr_arg, reason = "the capacity of the row is what it keeps")]
+    pub fn retained_row_bytes(row: &Vec<Option<Term>>) -> u64 {
+        let slots = row.capacity() * std::mem::size_of::<Option<Term>>();
+        let terms: usize = row.iter().flatten().map(term_bytes).sum();
+        (slots + std::mem::size_of::<Vec<Option<Term>>>() + terms) as u64
+    }
+
+    /// The bytes the entry keeps allocated, by [`Rows::retained_row_bytes`] and the
+    /// capacities of its vectors.
+    pub fn retained_bytes(&self) -> u64 {
+        let rows: u64 = self.rows.iter().map(Self::retained_row_bytes).sum();
+        let spare =
+            (self.rows.capacity() - self.rows.len()) * std::mem::size_of::<Vec<Option<Term>>>();
+        let vars = self.vars.capacity() * std::mem::size_of::<String>()
+            + self.vars.iter().map(String::capacity).sum::<usize>();
+        rows + (spare + vars + std::mem::size_of::<Self>()) as u64
+    }
+
     /// What the variable names add to [`Rows::bytes`].
     pub fn vars_bytes(vars: &[String]) -> u64 {
         vars.iter().map(|v| v.len() as u64 + 24).sum()

@@ -70,6 +70,8 @@ enum Source {
         cursor: Box<QueryCursor>,
         /// the callee's batch being read, and the next row of it
         batch: Option<(super::QueryBatch, usize)>,
+        /// the caller's pauses when the call opened, which its deadline counts
+        paused: u64,
         _hold: Option<Box<dyn std::any::Any + Send + Sync>>,
     },
     Cached {
@@ -86,24 +88,48 @@ enum Source {
 struct Tee {
     key: String,
     rows: Rows,
-    /// `rows.bytes()`, kept as rows arrive
+    /// `rows.bytes()`, the cache's weight of the copy, kept as rows arrive
     bytes: u64,
     /// the largest entry the cache keeps, with its key
     limit: u64,
+    /// what the copy's rows and names keep allocated, by `Rows::retained_row_bytes`
+    retained: u64,
     charge: OwnedCharge,
 }
 
 impl Tee {
+    fn new(ctx: &Arc<Ctx>, key: String, limit: u64) -> Result<Self> {
+        let rows = Rows {
+            vars: Vec::new(),
+            rows: Vec::new(),
+        };
+        let retained = rows.retained_bytes();
+        let charge = OwnedCharge::new(ctx, retained.saturating_add(key.capacity() as u64))?;
+        Ok(Self {
+            key,
+            rows,
+            bytes: 64,
+            limit,
+            retained,
+            charge,
+        })
+    }
+
     /// Copy one solution, or give up the copy once it is larger than the cache keeps.
+    /// What the copy will hold is charged before it grows.
     fn push(mut self, solution: &sparesults::QuerySolution) -> Result<Option<Self>> {
         // the variables of the first solution that binds any, as `fetch_rows` takes them
         if self.rows.vars.is_empty() && !solution.variables().is_empty() {
-            self.rows.vars = solution
+            let vars: Vec<String> = solution
                 .variables()
                 .iter()
                 .map(|v| v.as_str().to_owned())
                 .collect();
-            self.bytes += Rows::vars_bytes(&self.rows.vars);
+            self.bytes += Rows::vars_bytes(&vars);
+            let names = vars.capacity() * std::mem::size_of::<String>()
+                + vars.iter().map(String::capacity).sum::<usize>();
+            self.retained += names as u64;
+            self.rows.vars = vars;
         }
         let row: Vec<_> = self
             .rows
@@ -115,10 +141,21 @@ impl Tee {
         if self.bytes.saturating_add(self.key.len() as u64) > self.limit {
             return Ok(None);
         }
+        self.retained += Rows::retained_row_bytes(&row);
+        let slot = std::mem::size_of::<Vec<Option<oxrdf::Term>>>();
+        let (len, capacity) = (self.rows.rows.len(), self.rows.rows.capacity());
+        let grown = if len == capacity {
+            (capacity * 2).max(4)
+        } else {
+            capacity
+        };
+        self.charge.resize(
+            self.retained
+                .saturating_add((grown * slot) as u64)
+                .saturating_add(self.key.capacity() as u64),
+        )?;
+        self.rows.rows.reserve_exact(grown - len);
         self.rows.rows.push(row);
-        // the spare capacity of the row vector is live too
-        let spare = (self.rows.rows.capacity() - self.rows.rows.len()) as u64 * 24;
-        self.charge.resize(self.bytes.saturating_add(spare))?;
         Ok(Some(self))
     }
 }
@@ -147,6 +184,13 @@ impl Service {
         }
     }
 
+    /// Close the answer, its response, copy, entry or in-process call, once nothing
+    /// reads it any more.
+    pub(super) fn release(&mut self) {
+        self.opened = true;
+        self.source = None;
+    }
+
     /// Whether the answer has been read to its end.
     pub(super) fn done(&self) -> bool {
         self.opened && self.source.is_none()
@@ -166,9 +210,11 @@ impl Service {
             .as_ref()
             .and_then(|l| l.resolve(url.as_str()))
         {
-            // The callee's deadline is the caller's without its pauses, and each pull
-            // gives it the caller's pauses so far, so the call ends when its caller does.
-            let call = LocalCall::new(ctx, target, ctx.deadline)?;
+            // The callee's deadline is the caller's as it stands now, and each pull gives
+            // it the pauses its caller's consumer has taken since, so the call ends when
+            // its caller does.
+            let paused = ctx.deadline_pause.load(Ordering::Relaxed);
+            let call = LocalCall::new(ctx, target, ctx.current_deadline())?;
             ctx.check()?;
             let cursor = CursorOptions {
                 fallback: self.fallback,
@@ -184,6 +230,7 @@ impl Service {
             self.source = Some(Source::Local {
                 cursor,
                 batch: None,
+                paused,
                 _hold: call.hold,
             });
             return Ok(());
@@ -205,7 +252,7 @@ impl Service {
                 None
             };
             if let Some(rows) = hit {
-                let charge = OwnedCharge::new(ctx, rows.bytes())?;
+                let charge = OwnedCharge::new(ctx, rows.retained_bytes())?;
                 let cols = self
                     .names
                     .iter()
@@ -219,16 +266,7 @@ impl Service {
                 });
                 return Ok(());
             }
-            tee = Some(Tee {
-                key,
-                rows: Rows {
-                    vars: Vec::new(),
-                    rows: Vec::new(),
-                },
-                bytes: 64,
-                limit: store.max_entry_bytes(),
-                charge: OwnedCharge::new(ctx, 64)?,
-            });
+            tee = Some(Tee::new(ctx, key, store.max_entry_bytes())?);
         }
         let answer = RemoteAnswer::open(ctx, &url, &self.query)?;
         self.source = Some(Source::Remote {
@@ -293,14 +331,21 @@ impl Service {
                     push(&mut b, bnodes, &ServiceSolution::Remote(&solution));
                 }
             }
-            Source::Local { cursor, batch, .. } => loop {
+            Source::Local {
+                cursor,
+                batch,
+                paused,
+                ..
+            } => loop {
                 if b.table.len >= cap {
                     break false;
                 }
                 if batch.as_ref().is_none_or(|(rows, at)| *at >= rows.len()) {
                     *batch = None;
                     cursor.deadline_pause().store(
-                        ctx.deadline_pause.load(Ordering::Relaxed),
+                        ctx.deadline_pause
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(*paused),
                         Ordering::Relaxed,
                     );
                     match cursor.next_batch_at_most(cap - b.table.len)? {

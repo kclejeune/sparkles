@@ -3447,6 +3447,7 @@ impl Operator {
             State::Scan(scan) => scan.base = None,
             State::Binary(binary) => binary.release_working_sets(),
             State::Ripple(ripple) => ripple.release_working_sets(),
+            State::Service(service) => service.release(),
             _ => {}
         }
         if let Some(ahead) = &mut self.ahead {
@@ -3717,6 +3718,11 @@ impl Operator {
                         *remaining -= batch.end - batch.start;
                     }
                     self.done = *remaining == Some(0) || self.children[0].done;
+                    // A slice that has all of its rows reads no more, so its input lets go
+                    // of what it holds now, not when the query ends.
+                    if *remaining == Some(0) {
+                        self.children[0].release_finished();
+                    }
                     result
                 }
             }
@@ -4301,6 +4307,11 @@ impl Operator {
                         *r -= n;
                     }
                     self.done = *remaining == Some(0) || self.children[0].done;
+                    // A slice that has all of its rows reads no more, so its input lets go
+                    // of what it holds now, not when the query ends.
+                    if *remaining == Some(0) {
+                        self.children[0].release_finished();
+                    }
                     Some(b)
                 }
                 State::Union { at } => {

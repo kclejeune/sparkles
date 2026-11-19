@@ -512,20 +512,20 @@ fn a_service_is_cached_only_when_drained() {
 fn a_slow_consumer_can_expire_a_remote_transfer() {
     let s = store();
     let snap = s.snapshot();
-    let ep = Endpoint::start(answer(20_000));
+    let ep = Endpoint::start(answer(5_000));
     let q = format!("SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
     let short = QueryOptions {
         outbound: OutboundPolicy {
             allow_private: true,
-            timeout: Duration::from_millis(500),
+            timeout: Duration::from_secs(3),
             ..Default::default()
         },
         ..opts()
     };
-    assert_eq!(eager(&snap, &q, &short).unwrap().len(), 20_000);
+    assert_eq!(eager(&snap, &q, &short).unwrap().len(), 5_000);
     let mut cursor = select_cursor(snap.clone(), &q, &short, &strict(1)).unwrap();
     assert!(cursor.next_batch().unwrap().is_some());
-    std::thread::sleep(Duration::from_millis(800));
+    std::thread::sleep(Duration::from_millis(3500));
     let failure = loop {
         match cursor.next_batch() {
             Ok(Some(_)) => {}
@@ -585,7 +585,7 @@ fn an_exists_over_a_streamed_service_sends_eagers_requests() {
 
 /// The in-process endpoint `http://local/sparql`, which reads `snap` and may call
 /// services itself.
-struct Local(Arc<Snapshot>);
+struct Local(Arc<Snapshot>, Arc<()>);
 
 impl std::fmt::Debug for Local {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -607,7 +607,7 @@ impl LocalEndpoints for Local {
                     },
                     ..Default::default()
                 },
-                hold: None,
+                hold: Some(Box::new(self.1.clone())),
             })
         })
     }
@@ -629,8 +629,9 @@ fn an_in_process_call_runs_under_the_callers_policy_and_deadline() {
         .load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::Turtle, None)])
         .unwrap();
     let snap = s.snapshot();
+    let hold = Arc::new(());
     let o = QueryOptions {
-        local_endpoints: Some(Arc::new(Local(remote.snapshot()))),
+        local_endpoints: Some(Arc::new(Local(remote.snapshot(), hold.clone()))),
         ..opts()
     };
     let plain = "SELECT ?s ?o { SERVICE <http://local/sparql> { ?s <urn:p> ?o } }";
@@ -661,19 +662,93 @@ fn an_in_process_call_runs_under_the_callers_policy_and_deadline() {
         ..strict(4)
     };
     assert_eq!(streamed(&snap, &nested, &o, &allow).unwrap().0, expected);
-    // a pause of the caller's consumer past the deadline
+    // a pause of the caller's consumer past the deadline, after the call opened and
+    // before it opened
     let timed = QueryOptions {
-        timeout: Some(Duration::from_millis(300)),
+        timeout: Some(Duration::from_secs(2)),
         ..o.clone()
     };
+    let hour = 3_600_000_000_000;
     let mut cursor = select_cursor(snap.clone(), plain, &timed, &strict(1)).unwrap();
     let mut n = cursor.next_batch().unwrap().unwrap().len();
-    cursor
-        .deadline_pause()
-        .store(3_600_000_000_000, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(500));
+    cursor.deadline_pause().store(hour, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(2500));
     while let Some(b) = cursor.next_batch().unwrap() {
         n += b.len();
     }
     assert_eq!(n, 100);
+    let mut cursor = select_cursor(snap.clone(), plain, &timed, &strict(1)).unwrap();
+    cursor.deadline_pause().store(hour, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(2500));
+    let mut n = 0;
+    while let Some(b) = cursor.next_batch().unwrap() {
+        n += b.len();
+    }
+    assert_eq!(n, 100);
+    // a slice that has its rows lets go of the call before the next UNION branch runs
+    let sliced = "SELECT ?s ?a { { SELECT ?s { SERVICE <http://local/sparql> { ?s <urn:p> ?o } } LIMIT 1 } UNION { ?a <urn:b> ?v } }";
+    let mut cursor = select_cursor(snap.clone(), sliced, &o, &strict(1)).unwrap();
+    assert_eq!(cursor.next_batch().unwrap().unwrap().len(), 1);
+    assert_eq!(
+        Arc::strong_count(&hold),
+        2,
+        "the fixture and the endpoints only"
+    );
+    let mut n = 1;
+    while let Some(b) = cursor.next_batch().unwrap() {
+        n += b.len();
+    }
+    assert_eq!(n, 2);
+}
+
+/// A cache hit is charged what its entry keeps allocated, every slot of a wide row of
+/// mostly unbound values included, which the cache's own weight of the entry leaves
+/// out. A budget between the two refuses the streamed hit.
+#[test]
+fn a_cache_hit_is_charged_what_its_entry_keeps() {
+    let s = store();
+    let snap = s.snapshot();
+    let width = 100;
+    let vars: Vec<String> = (0..width).map(|i| format!("\"v{i}\"")).collect();
+    let head = format!(
+        r#"{{"head":{{"vars":["s",{}]}},"results":{{"bindings":["#,
+        vars.join(",")
+    );
+    let n = 2_000;
+    let body = format!(
+        "{head}{}{TAIL}",
+        (0..n)
+            .map(|i| format!(r#"{{"s":{{"type":"uri","value":"urn:s:{i}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let ep = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(body.clone().into_bytes())])
+    }));
+    let q = format!("SELECT ?s {{ SERVICE <cache:{}> {{ ?s ?p ?o }} }}", ep.url);
+    let cached = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    assert_eq!(
+        streamed(&snap, &q, &cached, &strict(256)).unwrap().0.len(),
+        n
+    );
+    assert_eq!(s.result_cache().service.entries(), 1);
+    let calls = ep.calls();
+    // the weight counts 16 bytes an unbound slot, and a slot is larger than that
+    let slot = std::mem::size_of::<Option<Term>>() as u64;
+    assert!(slot > 16);
+    let weight = s.result_cache().service.bytes();
+    let tight = QueryOptions {
+        max_memory_bytes: Some(weight + (n as u64 * width * (slot - 16)) / 2),
+        ..cached.clone()
+    };
+    let r = streamed(&snap, &q, &tight, &strict(256));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{:?}",
+        r.map(|r| r.0.len())
+    );
+    assert_eq!(ep.calls(), calls, "the cache answered");
 }
