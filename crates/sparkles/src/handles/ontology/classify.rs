@@ -767,3 +767,58 @@ fn bounded<T>(
         }
     })
 }
+
+/// What [`unsatisfiable_at`] found.
+pub(crate) struct Unsatisfiable {
+    /// the unsatisfiable named classes, sorted, without `owl:Nothing`
+    pub classes: Vec<String>,
+    /// false when the ontology has no model, so that every class is unsatisfiable
+    pub consistent: bool,
+    /// how many axioms the classifier left out or used in part, since they are outside
+    /// what it reasons with
+    pub excluded: usize,
+    /// why some of the ontology could not be read, such as an `owl:imports` that resolves
+    /// to no graph of the snapshot
+    pub unresolved: Vec<String>,
+}
+
+/// The unsatisfiable classes of the ontology that `graphs` of `snap` hold, with the
+/// imports that resolve to graphs of `snap` through `import_targets`, by one complete
+/// classification of its asserted logical axioms (spec C31, `chk:UnsatisfiableClassesCheck`).
+/// It reads the snapshot alone, with no dataset handle or kept classification, and runs
+/// under the deadline, cancellation and memory budget of `opts`. A run those stop fails,
+/// since a partial answer could miss an unsatisfiable class.
+pub(crate) fn unsatisfiable_at(
+    snap: &Arc<Snapshot>,
+    graphs: Vec<GraphRef>,
+    import_targets: sparkles_reasoner::inputs::ImportTargets,
+    opts: &QueryOptions,
+) -> Result<Unsatisfiable> {
+    let req = OntologyRequest {
+        graphs,
+        import_targets,
+        ..Default::default()
+    };
+    req.validate()?;
+    let (resolved, _) = req.resolve(snap, &|_| true);
+    let unresolved = resolved.warnings.clone();
+    let graph_ids: Vec<Option<crate::id::Id>> =
+        resolved.graphs.iter().map(|g| g.id(snap)).collect();
+    let (ontology, _) = super::read_store(snap, &graph_ids, req.graphs().len(), req.mode, opts)?;
+    check(opts)?;
+    let axioms = logical_axioms(&ontology);
+    let (out, excluded) = classify_once(&axioms, &ClassifyRequest::default(), opts)?;
+    if !out.complete {
+        return Err(Error::Timeout);
+    }
+    Ok(Unsatisfiable {
+        classes: out
+            .taxonomy
+            .unsatisfiable()
+            .map(|c| c.as_str().to_string())
+            .collect(),
+        consistent: out.consistent,
+        excluded: excluded.len(),
+        unresolved,
+    })
+}

@@ -25,12 +25,12 @@ fn a_suite_parses_with_its_checks_in_iri_order() {
          <urn:s#b> a chk:ShaclCheck ; chk:shapesGraph <urn:shapes> .",
     )
     .unwrap();
-    assert_eq!(s.iri.as_str(), "urn:s");
-    assert_eq!(s.label.as_deref(), Some("Gate"));
-    let iris: Vec<_> = s.checks.iter().map(|c| c.iri.as_str()).collect();
+    assert_eq!(s.iri().as_str(), "urn:s");
+    assert_eq!(s.label(), Some("Gate"));
+    let iris: Vec<_> = s.checks().iter().map(|c| c.iri.as_str()).collect();
     assert_eq!(iris, ["urn:s#a", "urn:s#b"]);
-    assert_eq!(s.checks[0].severity, Severity::Warning);
-    assert_eq!(s.checks[1].severity, Severity::Violation);
+    assert_eq!(s.checks()[0].severity, Severity::Warning);
+    assert_eq!(s.checks()[1].severity, Severity::Violation);
     assert!(s.revision().starts_with("sha256:"));
     // the same triples in another order and syntax have the same revision
     let nt = Suite::parse(s.canonical(), RdfFormat::NTriples).unwrap();
@@ -183,9 +183,11 @@ fn a_stored_query_check_runs_the_pinned_version_only() {
         "<urn:s> a chk:Suite ; chk:check <urn:c>, <urn:d>, <urn:e> .
          <urn:c> a chk:QueryCheck ; chk:storedQuery \"orphans\" ; chk:storedQueryVersion 1 ;
             chk:storedQueryDigest \"{digest}\" .
-         <urn:d> a chk:QueryCheck ; chk:storedQuery \"orphans\" ; chk:storedQueryVersion 2 .
+         <urn:d> a chk:QueryCheck ; chk:storedQuery \"orphans\" ; chk:storedQueryVersion 2 ;
+            chk:storedQueryDigest \"{digest}\" .
          <urn:e> a chk:QueryCheck ; chk:storedQuery \"orphans\" ; chk:storedQueryVersion 1 ;
-            chk:storedQueryDigest \"sha256:00\" ."
+            chk:storedQueryDigest \"sha256:{zeros}\" .",
+        zeros = "0".repeat(64)
     ))
     .unwrap();
     let r = run(
@@ -272,14 +274,12 @@ fn diagnostics_checks_fail_on_findings() {
               <http://www.w3.org/2002/07/owl#Nothing> }",
     );
     let s = suite(
-        "<urn:s> a chk:Suite ; chk:check <urn:d>, <urn:u> .
-         <urn:d> a chk:DiagnosticsCheck ; chk:diagnostic \"disjoint-classes\" .
-         <urn:u> a chk:UnsatisfiableClassesCheck .",
+        "<urn:s> a chk:Suite ; chk:check <urn:d> .
+         <urn:d> a chk:DiagnosticsCheck ; chk:diagnostic \"disjoint-classes\" .",
     )
     .unwrap();
     let r = run_on(&s, &before, &after);
     assert_eq!(r.results[0].status, Status::Failed, "{:?}", r.results[0]);
-    assert_eq!(r.results[1].status, Status::Failed, "{:?}", r.results[1]);
     assert!(run_on(&s, &before, &before).passed());
 }
 
@@ -292,6 +292,393 @@ fn a_check_the_build_cannot_run_blocks() {
     .unwrap();
     assert_eq!(s.unavailable().is_empty(), cfg!(feature = "shex"));
     if !cfg!(feature = "shex") {
+        let ds = Dataset::memory();
+        let snap = ds.store().snapshot();
+        let r = run_on(&s, &snap, &snap);
+        assert_eq!(r.results[0].code, Some("check-unavailable"));
+        assert!(!r.passed());
+    }
+}
+
+#[test]
+fn independently_ordered_documents_have_one_canonical_form() {
+    let a = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:s#a>, <urn:s#b> .
+         <urn:s#a> a chk:QueryCheck ; chk:query \"ASK {}\" .
+         <urn:s#b> a chk:QueryCheck ; chk:severity sh:Info ; chk:query \"ASK { ?s ?p ?o }\" .",
+    )
+    .unwrap();
+    let b = suite(
+        "<urn:s#b> chk:query \"ASK { ?s ?p ?o }\" ; chk:severity sh:Info ; a chk:QueryCheck .
+         <urn:s#a> chk:query \"ASK {}\" ; a chk:QueryCheck .
+         <urn:s> chk:check <urn:s#b>, <urn:s#a> ; a chk:Suite .",
+    )
+    .unwrap();
+    assert_eq!(a.canonical(), b.canonical());
+    assert_eq!(a.revision(), b.revision());
+    let order = |s: &Suite| -> Vec<String> {
+        s.checks()
+            .iter()
+            .map(|c| c.iri.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(order(&a), order(&b));
+    let lines: Vec<&str> = a.canonical().lines().collect();
+    let mut sorted = lines.clone();
+    sorted.sort_unstable();
+    assert_eq!(lines, sorted);
+}
+
+#[test]
+fn the_suite_node_has_one_type_of_the_vocabulary() {
+    refused(
+        "<urn:s> a chk:Suite, chk:FutureType ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query \"ASK {}\" .",
+        "chk:Suite",
+    );
+    refused(
+        "<urn:s> a chk:Suite, chk:QueryCheck ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query \"ASK {}\" .",
+        "chk:Suite",
+    );
+    // a type of another vocabulary is metadata, and a repeated triple is one triple
+    suite(
+        "<urn:s> a chk:Suite, <urn:other#Policy> ; chk:check <urn:c> .
+         <urn:s> a chk:Suite .
+         <urn:c> a chk:QueryCheck ; chk:query \"ASK {}\" .",
+    )
+    .unwrap();
+}
+
+#[test]
+fn blank_nodes_inside_triple_terms_are_refused() {
+    let nested = "<urn:s> a chk:Suite ; rdfs:comment <<( _:a <urn:p> <urn:o> )>> .";
+    let deep =
+        "<urn:s> a chk:Suite ; rdfs:comment <<( <urn:x> <urn:p> <<( <urn:y> <urn:q> _:b )>> )>> .";
+    for doc in [nested, deep] {
+        let text = format!("{PREFIXES}{doc}");
+        // the RDF parser accepts the triple term, and the suite refuses it
+        let parsed: Result<Vec<_>, _> = oxrdfio::RdfParser::from_format(RdfFormat::Turtle)
+            .for_slice(text.as_bytes())
+            .collect();
+        assert!(parsed.is_ok(), "{parsed:?}");
+        refused(doc, "blank nodes");
+    }
+    let ground =
+        suite("<urn:s> a chk:Suite ; rdfs:comment <<( <urn:x> <urn:p> <urn:o> )>> .").unwrap();
+    let again = Suite::parse(ground.canonical(), RdfFormat::NTriples).unwrap();
+    assert_eq!(again.revision(), ground.revision());
+}
+
+#[test]
+fn repeated_triples_count_once() {
+    let one = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query \"ASK {}\" .",
+    )
+    .unwrap();
+    let twice = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c>, <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query \"ASK {}\" .
+         <urn:c> chk:query \"ASK {}\" .",
+    )
+    .unwrap();
+    assert_eq!(one, twice);
+    refused(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query \"ASK {}\", \"ASK { ?s ?p ?o }\" .",
+        "has one value",
+    );
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn a_repeated_diagnostic_is_one_diagnostic() {
+    let s = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:DiagnosticsCheck ; chk:diagnostic \"disjoint-classes\" .
+         <urn:c> chk:diagnostic \"disjoint-classes\" .",
+    )
+    .unwrap();
+    let again = Suite::parse(s.canonical(), RdfFormat::NTriples).unwrap();
+    assert_eq!(s, again);
+    match &s.checks()[0].kind {
+        CheckKind::Diagnostics { diagnostics, .. } => assert_eq!(diagnostics.len(), 1),
+        k => panic!("{k:?}"),
+    }
+}
+
+/// A compact suite whose labels expand to about `n` times a 2 KiB IRI.
+fn long_iris(n: usize) -> String {
+    let base = format!("urn:x:{}", "a".repeat(2048));
+    let mut doc = format!("@prefix l: <{base}> .\n{PREFIXES}<urn:s> a chk:Suite ; rdfs:seeAlso ");
+    let objects: Vec<String> = (0..n).map(|i| format!("l:{i}")).collect();
+    doc.push_str(&objects.join(", "));
+    doc.push_str(" .\n");
+    doc
+}
+
+#[test]
+fn the_canonical_form_is_bounded_too() {
+    let big = long_iris(600);
+    assert!(big.len() < MAX_SUITE_BYTES);
+    let e = Suite::parse(&big, RdfFormat::Turtle).expect_err("too large once expanded");
+    assert!(e.0.contains("N-Triples"), "{e}");
+    let small = Suite::parse(&long_iris(300), RdfFormat::Turtle).unwrap();
+    assert!(small.canonical().len() <= MAX_SUITE_BYTES);
+    let again = Suite::parse(small.canonical(), RdfFormat::NTriples).unwrap();
+    assert_eq!(again.revision(), small.revision());
+}
+
+#[test]
+fn stored_query_digests_have_the_digest_form() {
+    refused(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:storedQuery \"q\" ; chk:storedQueryVersion 1 ;
+            chk:storedQueryDigest \"sha256:00\" .",
+        "chk:storedQueryDigest",
+    );
+}
+
+#[test]
+fn a_stored_query_without_a_digest_does_not_run() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> <urn:p> 1 }");
+    let catalog = crate::stored::Catalog::open(None).unwrap();
+    let def = |q: &str| -> crate::stored::Definition {
+        serde_json::from_value(serde_json::json!({ "query": q })).unwrap()
+    };
+    catalog
+        .put(
+            "q",
+            def("SELECT ?s { ?s a <urn:None> }"),
+            Default::default(),
+        )
+        .unwrap();
+    let s = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:storedQuery \"q\" ; chk:storedQueryVersion 1 .",
+    )
+    .unwrap();
+    let inputs = Inputs {
+        before: &before,
+        after: &after,
+        stored: Some(&catalog),
+        timeout: None,
+    };
+    let r = run(&s, &inputs);
+    assert_eq!(
+        r.results[0].code,
+        Some("input-invalid"),
+        "{:?}",
+        r.results[0]
+    );
+    assert!(!r.passed());
+
+    // a query deleted and created again restarts at version 1, and the digest tells them apart
+    let a = "SELECT ?s { ?s <urn:p> ?o }";
+    let b = "SELECT ?s { ?s a <urn:None> }";
+    catalog.delete("q", None).unwrap();
+    catalog.put("q", def(a), Default::default()).unwrap();
+    let pinned = |text: &str| {
+        let digest = sparkles_core::managed::settings_digest(text.as_bytes());
+        suite(&format!(
+            "<urn:s> a chk:Suite ; chk:check <urn:c> .
+             <urn:c> a chk:QueryCheck ; chk:storedQuery \"q\" ; chk:storedQueryVersion 1 ;
+                chk:storedQueryDigest \"{digest}\" ."
+        ))
+        .unwrap()
+    };
+    let (sa, sb) = (pinned(a), pinned(b));
+    assert_ne!(sa.revision(), sb.revision());
+    assert_eq!(run(&sa, &inputs).results[0].status, Status::Failed);
+    catalog.delete("q", None).unwrap();
+    catalog.put("q", def(b), Default::default()).unwrap();
+    assert_eq!(run(&sa, &inputs).results[0].code, Some("input-invalid"));
+    assert!(run(&sb, &inputs).passed());
+}
+
+#[cfg(feature = "shacl")]
+const SH_NS: &str = "http://www.w3.org/ns/shacl#";
+
+/// Shapes that need every `urn:Person` to have a `urn:name`.
+#[cfg(feature = "shacl")]
+fn person_shapes() -> String {
+    format!(
+        "INSERT DATA {{ GRAPH <urn:shapes> {{
+            <urn:PersonShape> a <{SH_NS}NodeShape> ; <{SH_NS}targetClass> <urn:Person> ;
+              <{SH_NS}property> <urn:NameShape> .
+            <urn:NameShape> <{SH_NS}path> <urn:name> ; <{SH_NS}minCount> 1 }} }}"
+    )
+}
+
+fn shacl_suite(data_graph: &str) -> Result<Suite, SuiteError> {
+    suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShaclCheck ; chk:shapesGraph <urn:shapes> {data_graph} ."
+    ))
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn a_shacl_check_selects_named_graphs_as_the_write_guard_does() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        &person_shapes(),
+        "INSERT DATA { GRAPH <urn:g> { <urn:bob> a <urn:Person> } }",
+    );
+    let status = |s: &Suite| run_on(s, &before, &after).results[0].clone();
+    // the named graph, and every graph, see the nameless person
+    for sel in [
+        "; chk:dataGraph <urn:g>",
+        "; chk:dataGraph chk:UnionGraph",
+        "; chk:dataGraph <urn:g>, chk:DefaultGraph",
+    ] {
+        let r = status(&shacl_suite(sel).unwrap());
+        assert_eq!(r.status, Status::Failed, "{sel}: {r:?}");
+    }
+    // without a selection the check reads the store's default graph, as the guard does
+    assert_eq!(status(&shacl_suite("").unwrap()).status, Status::Passed);
+    // a selected graph that holds no data in the candidate fails closed
+    let r = status(&shacl_suite("; chk:dataGraph <urn:g>, <urn:absent>").unwrap());
+    assert_eq!(r.code, Some("input-missing"), "{r:?}");
+    assert!(r.blocks());
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn a_shacl_check_leaves_out_the_inferred_graph_unless_asked() {
+    let ds = Dataset::memory();
+    let inferred = sparkles_core::INFERRED_GRAPH;
+    let (before, after) = states(
+        &ds,
+        &person_shapes(),
+        &format!("INSERT DATA {{ GRAPH <{inferred}> {{ <urn:bob> a <urn:Person> }} }}"),
+    );
+    let union = shacl_suite("; chk:dataGraph chk:UnionGraph").unwrap();
+    assert_eq!(
+        run_on(&union, &before, &after).results[0].status,
+        Status::Passed
+    );
+    let with = shacl_suite("; chk:dataGraph chk:UnionGraph ; chk:inferences true").unwrap();
+    assert_eq!(
+        run_on(&with, &before, &after).results[0].status,
+        Status::Failed
+    );
+}
+
+#[test]
+fn shacl_data_graph_selections_that_hide_data_are_refused() {
+    let refused_sel = |sel: &str, needle: &str| {
+        let e = shacl_suite(sel).expect_err(sel);
+        assert!(e.0.contains(needle), "{e} should mention {needle:?}");
+    };
+    refused_sel("; chk:dataGraph <urn:shapes>", "shapes graph");
+    refused_sel("; chk:dataGraph <urn:g>, <urn:shapes>", "shapes graph");
+    refused_sel(
+        &format!("; chk:dataGraph <{}>", sparkles_core::INFERRED_GRAPH),
+        "chk:inferences",
+    );
+    refused_sel("; chk:dataGraph <urn:x-arq:UnionGraph>", "chk:UnionGraph");
+    refused_sel(
+        "; chk:dataGraph <urn:x-sparkles:checks:runs>",
+        "does not take",
+    );
+    refused_sel("; chk:dataGraph chk:UnionGraph, <urn:g>", "no other");
+    let s = shacl_suite("; chk:dataGraph <urn:b>, <urn:a>").unwrap();
+    match &s.checks()[0].kind {
+        CheckKind::Shacl { data_graph, .. } => assert_eq!(
+            *data_graph,
+            DataGraph::Graphs(vec!["urn:a".into(), "urn:b".into()])
+        ),
+        k => panic!("{k:?}"),
+    }
+}
+
+#[test]
+fn a_check_past_its_bound_never_passes() {
+    let ds = Dataset::memory();
+    let snap = ds.store().snapshot();
+    let s = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query \"ASK { <urn:none> ?p ?o }\" .",
+    )
+    .unwrap();
+    let r = run(
+        &s,
+        &Inputs {
+            before: &snap,
+            after: &snap,
+            stored: None,
+            timeout: Some(std::time::Duration::ZERO),
+        },
+    );
+    assert_eq!(
+        r.results[0].code,
+        Some("check-timeout"),
+        "{:?}",
+        r.results[0]
+    );
+    assert!(!r.passed());
+}
+
+#[cfg(feature = "ontology")]
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
+#[cfg(feature = "ontology")]
+const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
+
+#[cfg(feature = "ontology")]
+#[test]
+fn the_el_classifier_finds_a_class_under_two_disjoint_classes() {
+    let ds = Dataset::memory();
+    // no asserted path leads to owl:Nothing, so the OWL RL diagnostic does not see it
+    let (before, after) = states(
+        &ds,
+        &format!("INSERT DATA {{ <urn:A> <{OWL}disjointWith> <urn:B> }}"),
+        &format!(
+            "INSERT DATA {{ <urn:C> <{RDFS}subClassOf> <urn:A>, <urn:B> .
+               GRAPH <urn:onto> {{ <urn:D> <{RDFS}subClassOf> <urn:E> }} }}"
+        ),
+    );
+    let s = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:u>, <urn:v>, <urn:w> .
+         <urn:u> a chk:UnsatisfiableClassesCheck .
+         <urn:v> a chk:UnsatisfiableClassesCheck ; chk:graph <urn:onto> .
+         <urn:w> a chk:UnsatisfiableClassesCheck ; chk:graph <urn:absent> .",
+    )
+    .unwrap();
+    let r = run_on(&s, &before, &after);
+    assert_eq!(r.results[0].status, Status::Failed, "{:?}", r.results[0]);
+    assert_eq!(r.results[0].findings, 1);
+    assert!(
+        r.results[0].messages[0].contains("urn:C"),
+        "{:?}",
+        r.results[0]
+    );
+    assert_eq!(r.results[1].status, Status::Passed, "{:?}", r.results[1]);
+    assert_eq!(
+        r.results[2].code,
+        Some("input-missing"),
+        "{:?}",
+        r.results[2]
+    );
+    assert!(run_on(&s, &before, &before).results[0].status == Status::Passed);
+}
+
+#[test]
+fn the_unsatisfiable_classes_check_needs_the_ontology_feature() {
+    let s = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:u> . <urn:u> a chk:UnsatisfiableClassesCheck .",
+    )
+    .unwrap();
+    assert_eq!(s.unavailable().is_empty(), cfg!(feature = "ontology"));
+    refused(
+        "<urn:s> a chk:Suite ; chk:check <urn:u> .
+         <urn:u> a chk:UnsatisfiableClassesCheck ; chk:inferences true .",
+        "does not take chk:inferences",
+    );
+    if !cfg!(feature = "ontology") {
         let ds = Dataset::memory();
         let snap = ds.store().snapshot();
         let r = run_on(&s, &snap, &snap);

@@ -1,7 +1,7 @@
 //! The runner: each check of a suite on a candidate state, with inputs from the state the
 //! change starts from.
 
-use super::{Check, CheckKind, Query, Severity, Shapes, Suite};
+use super::{Check, CheckKind, DataGraph, Query, Severity, Shapes, Suite};
 use crate::store::Snapshot;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,7 +106,9 @@ pub struct Inputs<'a> {
     pub after: &'a Arc<Snapshot>,
     /// the dataset's stored queries (`None`: a stored-query check cannot run)
     pub stored: Option<&'a crate::stored::Catalog>,
-    /// the bound on each check (`None`: none)
+    /// the bound on each check, from its start (`None`: none). It is cooperative: a check
+    /// that is still running when it passes ends at its next check of the deadline, and a
+    /// check that ends after it never passes.
     pub timeout: Option<Duration>,
 }
 
@@ -114,29 +116,76 @@ pub struct Inputs<'a> {
 /// [`Status::Error`] result, never skipped.
 pub fn run(suite: &Suite, inputs: &Inputs<'_>) -> SuiteReport {
     SuiteReport {
-        suite: suite.iri.clone(),
+        suite: suite.iri().clone(),
         revision: suite.revision(),
-        results: suite.checks.iter().map(|c| run_check(c, inputs)).collect(),
+        results: suite
+            .checks()
+            .iter()
+            .map(|c| run_check(c, inputs))
+            .collect(),
     }
 }
 
 /// What a checker answers: the findings and their messages, or why it could not run.
 type Outcome = Result<(u64, Vec<String>), (&'static str, String)>;
 
+/// One check's bound: its deadline, and what remains of it for the checkers that take a
+/// relative timeout.
+#[derive(Clone, Copy)]
+pub(super) struct Bound {
+    deadline: Option<Instant>,
+}
+
+impl Bound {
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    fn passed(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+const TIMED_OUT: (&str, &str) = ("check-timeout", "the check did not finish within its bound");
+
 fn run_check(c: &Check, inputs: &Inputs<'_>) -> CheckResult {
     let t0 = Instant::now();
+    let outcome = match inputs.timeout.map(|t| t0.checked_add(t)) {
+        Some(None) => Err((
+            "input-invalid",
+            "the check's bound is too large".to_string(),
+        )),
+        Some(Some(deadline)) => dispatch(
+            c,
+            inputs,
+            Bound {
+                deadline: Some(deadline),
+            },
+        ),
+        None => dispatch(c, inputs, Bound { deadline: None }),
+    };
+    result(c, outcome, t0)
+}
+
+fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
+    if bound.passed() {
+        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
+    }
     let outcome = if c.kind.available() {
         match &c.kind {
-            CheckKind::Shacl { shapes, data_graph } => shacl(shapes, data_graph.as_ref(), inputs),
-            CheckKind::Shex { schema, shape_map } => shex(schema, shape_map, inputs),
+            CheckKind::Shacl {
+                shapes,
+                data_graph,
+                inferences,
+            } => shacl(shapes, data_graph, *inferences, inputs, bound),
+            CheckKind::Shex { schema, shape_map } => shex(schema, shape_map, inputs, bound),
             CheckKind::Diagnostics {
                 diagnostics,
                 inferences,
-            } => diagnostics_check(diagnostics.clone(), *inferences, inputs),
-            CheckKind::UnsatisfiableClasses { inferences } => {
-                diagnostics_check(vec!["unsatisfiable-class".into()], *inferences, inputs)
-            }
-            CheckKind::Query(q) => query(q, inputs),
+            } => diagnostics_check(diagnostics.clone(), *inferences, inputs, bound),
+            CheckKind::UnsatisfiableClasses { graphs } => unsatisfiable(graphs, inputs, bound),
+            CheckKind::Query(q) => query(q, inputs, bound),
         }
     } else {
         Err((
@@ -147,6 +196,14 @@ fn run_check(c: &Check, inputs: &Inputs<'_>) -> CheckResult {
             ),
         ))
     };
+    // a check that ends after its deadline never passes, and its error is the timeout
+    if bound.passed() && !matches!(outcome, Ok((n, _)) if n > 0) {
+        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
+    }
+    outcome
+}
+
+fn result(c: &Check, outcome: Outcome, t0: Instant) -> CheckResult {
     let (status, findings, code, mut messages) = match outcome {
         Ok((0, m)) => (Status::Passed, 0, None, m),
         Ok((n, m)) => (Status::Failed, n, None, m),
@@ -173,8 +230,16 @@ fn failure(e: &anyhow::Error) -> (&'static str, String) {
             Some(crate::error::Error::Timeout)
         )
     });
+    let budget = e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<crate::error::Error>(),
+            Some(crate::error::Error::BudgetExceeded(_))
+        )
+    });
     let code = if timeout {
         "check-timeout"
+    } else if budget {
+        "budget-exceeded"
     } else {
         "input-invalid"
     };
@@ -182,12 +247,18 @@ fn failure(e: &anyhow::Error) -> (&'static str, String) {
 }
 
 #[cfg(feature = "shacl")]
-fn shacl(shapes: &Shapes, data_graph: Option<&oxrdf::NamedNode>, inputs: &Inputs<'_>) -> Outcome {
+fn shacl(
+    shapes: &Shapes,
+    data_graph: &DataGraph,
+    inferences: bool,
+    inputs: &Inputs<'_>,
+    bound: Bound,
+) -> Outcome {
     use sparkles_shacl::{ShapesSyntax, ValidateOptions};
-    let mut exclude = Vec::new();
+    let mut exclude = vec![super::RUNS_GRAPH.to_string()];
     let shapes = match shapes {
         Shapes::Graph(g) => {
-            if !graph_exists(inputs.before, g.as_str()) {
+            if !holds_data(inputs.before, g.as_str()).map_err(|e| failure(&e.into()))? {
                 return Err((
                     "input-missing",
                     format!(
@@ -205,10 +276,36 @@ fn shacl(shapes: &Shapes, data_graph: Option<&oxrdf::NamedNode>, inputs: &Inputs
                 .map_err(|e| failure(&e))?
         }
     };
+    if let DataGraph::Graphs(gs) = data_graph {
+        for g in gs {
+            if g != "urn:x-arq:DefaultGraph"
+                && !holds_data(inputs.after, g).map_err(|e| failure(&e.into()))?
+            {
+                return Err((
+                    "input-missing",
+                    format!("the data graph <{g}> holds no data in the candidate"),
+                ));
+            }
+        }
+    }
+    let Some(graphs) = data_graph
+        .selection()
+        .graphs(inputs.after, inferences, &exclude)
+    else {
+        return Err((
+            "input-missing",
+            "no data graph of the check holds data in the candidate".to_string(),
+        ));
+    };
+    if bound.passed() {
+        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
+    }
     let opts = ValidateOptions {
-        data_graph: data_graph.map(|g| g.as_str().to_string()),
-        exclude_graphs: exclude,
-        timeout: inputs.timeout,
+        data_graph: graphs.data_graph,
+        extra_graphs: graphs.extra_graphs,
+        exclude_graphs: graphs.exclude_graphs,
+        timeout: bound.remaining(),
+        deadline: bound.deadline,
         ..Default::default()
     };
     let report = sparkles_shacl::validate(inputs.after, &shapes, &opts).map_err(|e| failure(&e))?;
@@ -235,12 +332,12 @@ fn shacl(shapes: &Shapes, data_graph: Option<&oxrdf::NamedNode>, inputs: &Inputs
 }
 
 #[cfg(not(feature = "shacl"))]
-fn shacl(_: &Shapes, _: Option<&oxrdf::NamedNode>, _: &Inputs<'_>) -> Outcome {
+fn shacl(_: &Shapes, _: &DataGraph, _: bool, _: &Inputs<'_>, _: Bound) -> Outcome {
     unreachable!("an unavailable check does not run")
 }
 
 #[cfg(feature = "shex")]
-fn shex(schema: &str, map: &str, inputs: &Inputs<'_>) -> Outcome {
+fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
     let invalid = |what: &str, e: &dyn std::fmt::Display| ("input-invalid", format!("{what}: {e}"));
     let parsed =
         sparkles_shex::Schema::parse_shexc(schema, None).map_err(|e| invalid("the schema", &e))?;
@@ -248,8 +345,11 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>) -> Outcome {
         .map_err(|e| invalid("the schema", &e))?;
     let map = sparkles_shex::ShapeMap::parse(map, compiled.prefixes(), compiled.base())
         .map_err(|e| invalid("the shape map", &e))?;
+    if bound.passed() {
+        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
+    }
     let opts = sparkles_shex::ValidateOptions {
-        timeout: inputs.timeout,
+        timeout: bound.remaining(),
         ..Default::default()
     };
     let results =
@@ -275,17 +375,22 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>) -> Outcome {
 }
 
 #[cfg(not(feature = "shex"))]
-fn shex(_: &str, _: &str, _: &Inputs<'_>) -> Outcome {
+fn shex(_: &str, _: &str, _: &Inputs<'_>, _: Bound) -> Outcome {
     unreachable!("an unavailable check does not run")
 }
 
 #[cfg(feature = "reasoning")]
-fn diagnostics_check(checks: Vec<String>, inferences: bool, inputs: &Inputs<'_>) -> Outcome {
+fn diagnostics_check(
+    checks: Vec<String>,
+    inferences: bool,
+    inputs: &Inputs<'_>,
+    bound: Bound,
+) -> Outcome {
     use sparkles_reasoner::diagnostics::{CheckStatus, DiagnoseOptions, diagnose};
     let opts = DiagnoseOptions {
         checks,
         inferences,
-        timeout: inputs.timeout,
+        timeout: bound.remaining(),
         ..Default::default()
     };
     let report = diagnose(inputs.after.clone(), &opts).map_err(|e| failure(&e))?;
@@ -322,11 +427,11 @@ fn diagnostics_check(checks: Vec<String>, inferences: bool, inputs: &Inputs<'_>)
 }
 
 #[cfg(not(feature = "reasoning"))]
-fn diagnostics_check(_: Vec<String>, _: bool, _: &Inputs<'_>) -> Outcome {
+fn diagnostics_check(_: Vec<String>, _: bool, _: &Inputs<'_>, _: Bound) -> Outcome {
     unreachable!("an unavailable check does not run")
 }
 
-fn query(q: &Query, inputs: &Inputs<'_>) -> Outcome {
+fn query(q: &Query, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
     let text = match q {
         Query::Inline(t) => t.clone(),
         Query::Stored {
@@ -334,6 +439,14 @@ fn query(q: &Query, inputs: &Inputs<'_>) -> Outcome {
             version,
             digest,
         } => {
+            let Some(digest) = digest else {
+                return Err((
+                    "input-invalid",
+                    format!(
+                        "the stored query {name:?} is not pinned by chk:storedQueryDigest, so its text could change under the same version"
+                    ),
+                ));
+            };
             let catalog = inputs.stored.ok_or_else(|| {
                 (
                     "input-missing",
@@ -355,7 +468,7 @@ fn query(q: &Query, inputs: &Inputs<'_>) -> Outcome {
                 ));
             }
             let found = sparkles_core::managed::settings_digest(s.definition.query.as_bytes());
-            if digest.as_ref().is_some_and(|d| *d != found) {
+            if *digest != found {
                 return Err((
                     "input-invalid",
                     format!(
@@ -367,7 +480,8 @@ fn query(q: &Query, inputs: &Inputs<'_>) -> Outcome {
         }
     };
     let opts = crate::sparql::QueryOptions {
-        timeout: inputs.timeout,
+        timeout: bound.remaining(),
+        deadline: bound.deadline,
         ..Default::default()
     };
     let r = crate::sparql::query(inputs.after.clone(), &text, &opts)
@@ -386,10 +500,70 @@ fn query(q: &Query, inputs: &Inputs<'_>) -> Outcome {
     Ok((n, messages))
 }
 
-#[cfg(feature = "shacl")]
-fn graph_exists(snap: &Arc<Snapshot>, iri: &str) -> bool {
-    let q = format!("ASK {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}");
-    crate::sparql::query(snap.clone(), &q, &Default::default())
-        .map(|r| r.boolean)
-        .unwrap_or(false)
+/// Whether the named graph `iri` holds a quad in `snap`.
+#[cfg(any(feature = "shacl", feature = "ontology"))]
+fn holds_data(snap: &Arc<Snapshot>, iri: &str) -> sparkles_core::Result<bool> {
+    let Some(id) = snap.lookup_iri(iri) else {
+        return Ok(false);
+    };
+    Ok(snap.count(crate::index::Perm::Gspo, &[id.0])? > 0)
+}
+
+#[cfg(feature = "ontology")]
+fn unsatisfiable(graphs: &[oxrdf::NamedNode], inputs: &Inputs<'_>, bound: Bound) -> Outcome {
+    use sparkles_reasoner::inputs::GraphRef;
+    let mut refs = Vec::new();
+    for g in graphs {
+        if !holds_data(inputs.after, g.as_str()).map_err(|e| failure(&e.into()))? {
+            return Err((
+                "input-missing",
+                format!(
+                    "the ontology graph <{}> holds no data in the candidate",
+                    g.as_str()
+                ),
+            ));
+        }
+        refs.push(GraphRef::Named(g.as_str().to_string()));
+    }
+    if refs.is_empty() {
+        refs.push(GraphRef::Default);
+    }
+    let opts = crate::sparql::QueryOptions {
+        timeout: bound.remaining(),
+        deadline: bound.deadline,
+        ..Default::default()
+    };
+    let u = crate::handles::ontology::classify::unsatisfiable_at(
+        inputs.after,
+        refs,
+        Default::default(),
+        &opts,
+    )
+    .map_err(|e| failure(&anyhow::Error::new(e)))?;
+    if let Some(w) = u.unresolved.first() {
+        return Err(("input-missing", w.clone()));
+    }
+    let mut messages = Vec::new();
+    if !u.consistent {
+        messages.push("the ontology is inconsistent, so every class is unsatisfiable".to_string());
+    }
+    messages.extend(
+        u.classes
+            .iter()
+            .take(MAX_MESSAGES)
+            .map(|c| format!("<{c}> is unsatisfiable")),
+    );
+    if u.excluded > 0 {
+        messages.push(format!(
+            "{} axioms are outside what the classifier reasons with and were left out",
+            u.excluded
+        ));
+    }
+    let findings = u.classes.len() as u64 + u64::from(!u.consistent);
+    Ok((findings, messages))
+}
+
+#[cfg(not(feature = "ontology"))]
+fn unsatisfiable(_: &[oxrdf::NamedNode], _: &Inputs<'_>, _: Bound) -> Outcome {
+    unreachable!("an unavailable check does not run")
 }

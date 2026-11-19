@@ -18,18 +18,31 @@
 //! ```
 //!
 //! The check types are `chk:ShaclCheck` (`chk:shapesGraph` or inline `chk:shapes` Turtle,
-//! and an optional `chk:dataGraph`), `chk:ShexCheck` (`chk:schema` ShExC and
+//! `chk:dataGraph` and `chk:inferences`), `chk:ShexCheck` (`chk:schema` ShExC and
 //! `chk:shapeMap`), `chk:DiagnosticsCheck` (OWL RL diagnostics, `chk:diagnostic` ids, none
-//! for all), `chk:UnsatisfiableClassesCheck` (the `unsatisfiable-class` diagnostic) and
+//! for all), `chk:UnsatisfiableClassesCheck` (the OWL 2 EL classifier on the asserted axioms
+//! of the `chk:graph` graphs, the default graph without one, and their imports) and
 //! `chk:QueryCheck`, a query that must return nothing (`chk:query` text, or
-//! `chk:storedQuery` with `chk:storedQueryVersion` and optionally `chk:storedQueryDigest`,
-//! the `sha256:` digest of its text). The diagnostics checks take
+//! `chk:storedQuery` with `chk:storedQueryVersion` and `chk:storedQueryDigest`, the
+//! `sha256:` digest of its text). A stored query without its digest parses, so that a store
+//! of suites can fill it in, but it does not run: its versions restart when it is deleted and
+//! created again, and only the digest pins its text. The SHACL and diagnostics checks take
 //! `chk:inferences true` to read the inferred graph too.
 //!
-//! A suite has no blank nodes, so that its checks can be named in results and overrides
-//! and its canonical N-Triples, whose digest is its revision, are deterministic. An unknown
+//! A suite has no blank nodes, not even inside triple terms, so that its checks can be named
+//! in results and overrides and its canonical N-Triples, whose digest is its revision, are
+//! deterministic. A repeated triple counts once, and both the document and its canonical
+//! N-Triples are at most [`MAX_SUITE_BYTES`]. An unknown
 //! check type, an unknown term of the vocabulary, a missing or repeated value, or a check
 //! the suite does not link is refused, never ignored.
+//!
+//! A SHACL check selects its data graph as the SHACL write guard does. Without
+//! `chk:dataGraph` it reads the store's default graph, which is the union of all graphs only
+//! when the store uses a union default graph, so on another store it does not see data in
+//! named graphs. `chk:dataGraph chk:UnionGraph` reads every graph, and graph IRIs, with
+//! `chk:DefaultGraph` for the default graph, read those graphs, each of which must hold data
+//! in the candidate. The shapes graph, the run records and, unless `chk:inferences true`, the
+//! materialized inferences are never data.
 //!
 //! [`run`] reads the inputs of a check, a shapes graph or a stored query, from the state
 //! the merge starts from and never from the candidate, so a merge cannot weaken the checks
@@ -105,6 +118,35 @@ pub enum Shapes {
     Inline(String),
 }
 
+/// The data graph of a SHACL check, selected as the SHACL write guard selects it
+/// ([`sparkles_core::guard::config::DataGraphSel`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DataGraph {
+    /// no `chk:dataGraph`: the store's default graph, which is the union of all graphs when
+    /// the store uses a union default graph, as for the write guard's `"default"`
+    Default,
+    /// `chk:dataGraph chk:UnionGraph`: every graph
+    Union,
+    /// the listed graphs, sorted, `chk:DefaultGraph` among them as
+    /// `urn:x-arq:DefaultGraph`. Each must hold data in the candidate.
+    Graphs(Vec<String>),
+}
+
+impl DataGraph {
+    /// The write guard's selection of the same graphs.
+    pub fn selection(&self) -> sparkles_core::guard::config::DataGraphSel {
+        use sparkles_core::guard::config::DataGraphSel;
+        match self {
+            DataGraph::Default => DataGraphSel::Named("default".into()),
+            DataGraph::Union => DataGraphSel::Named("union".into()),
+            DataGraph::Graphs(gs) => DataGraphSel::Graphs(gs.clone()),
+        }
+    }
+}
+
+/// The graph that will hold the gate's run records, which no check reads.
+pub const RUNS_GRAPH: &str = "urn:x-sparkles:checks:runs";
+
 /// The query of a must-be-empty check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Query {
@@ -125,8 +167,10 @@ pub enum Query {
 pub enum CheckKind {
     Shacl {
         shapes: Shapes,
-        /// the data graph (`None`: the store's default graph)
-        data_graph: Option<NamedNode>,
+        data_graph: DataGraph,
+        /// also read the materialized inferences (`urn:x-sparkles:inferred`), which the data
+        /// graph leaves out otherwise
+        inferences: bool,
     },
     Shex {
         schema: String,
@@ -137,8 +181,10 @@ pub enum CheckKind {
         diagnostics: Vec<String>,
         inferences: bool,
     },
+    /// the classes the OWL 2 EL classifier finds unsatisfiable in the asserted axioms of
+    /// `graphs` (empty: the default graph) and their imports
     UnsatisfiableClasses {
-        inferences: bool,
+        graphs: Vec<NamedNode>,
     },
     /// a query that must return no solutions, `false` or no triples
     Query(Query),
@@ -161,9 +207,8 @@ impl CheckKind {
         match self {
             CheckKind::Shacl { .. } => cfg!(feature = "shacl"),
             CheckKind::Shex { .. } => cfg!(feature = "shex"),
-            CheckKind::Diagnostics { .. } | CheckKind::UnsatisfiableClasses { .. } => {
-                cfg!(feature = "reasoning")
-            }
+            CheckKind::Diagnostics { .. } => cfg!(feature = "reasoning"),
+            CheckKind::UnsatisfiableClasses { .. } => cfg!(feature = "ontology"),
             CheckKind::Query(_) => true,
         }
     }
@@ -180,10 +225,19 @@ pub struct Check {
 
 /// A gate suite: its checks in IRI order, and its canonical N-Triples.
 #[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its fields are private, so the checks that run are always the ones its revision names.
+/// A changed suite is parsed again.
+///
+/// ```compile_fail
+/// fn weaken(s: &mut sparkles::gate::Suite) {
+///     s.checks.clear();
+/// }
+/// ```
 pub struct Suite {
-    pub iri: NamedNode,
-    pub label: Option<String>,
-    pub checks: Vec<Check>,
+    iri: NamedNode,
+    label: Option<String>,
+    checks: Vec<Check>,
     canonical: String,
 }
 
@@ -211,10 +265,10 @@ fn bad(msg: impl Into<String>) -> SuiteError {
 /// The properties each check type takes, besides `rdf:type`, `chk:severity` and labels.
 fn allowed(kind: &str) -> &'static [&'static str] {
     match kind {
-        "ShaclCheck" => &["shapesGraph", "shapes", "dataGraph"],
+        "ShaclCheck" => &["shapesGraph", "shapes", "dataGraph", "inferences"],
         "ShexCheck" => &["schema", "shapeMap"],
         "DiagnosticsCheck" => &["diagnostic", "inferences"],
-        "UnsatisfiableClassesCheck" => &["inferences"],
+        "UnsatisfiableClassesCheck" => &["graph"],
         "QueryCheck" => &[
             "query",
             "storedQuery",
@@ -268,6 +322,7 @@ impl Suite {
     pub fn from_triples(triples: impl IntoIterator<Item = Triple>) -> Result<Suite, SuiteError> {
         let mut subjects: BTreeMap<String, Props> = BTreeMap::new();
         let mut lines = BTreeSet::new();
+        let mut canonical_bytes = 0usize;
         for t in triples {
             let s = match &t.subject {
                 oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().to_string(),
@@ -277,7 +332,7 @@ impl Suite {
                     ));
                 }
             };
-            if matches!(t.object, Term::BlankNode(_)) {
+            if has_blank_node(&t.object) {
                 return Err(bad(
                     "a suite has no blank nodes; name every node with an IRI",
                 ));
@@ -291,7 +346,18 @@ impl Suite {
                     t.predicate.as_str()
                 )));
             }
-            lines.insert(format!("{t} ."));
+            let line = format!("{t} .");
+            let len = line.len() + 1;
+            if !lines.insert(line) {
+                // a repeated triple is the same triple
+                continue;
+            }
+            canonical_bytes = canonical_bytes.saturating_add(len);
+            if canonical_bytes > MAX_SUITE_BYTES {
+                return Err(bad(format!(
+                    "the suite is larger than {MAX_SUITE_BYTES} bytes as N-Triples"
+                )));
+            }
             subjects
                 .entry(s)
                 .or_default()
@@ -315,6 +381,18 @@ impl Suite {
             _ => return Err(bad("the document has more than one chk:Suite")),
         };
         let suite_props = &subjects[&suite_iri];
+        let vocab_types = suite_props
+            .get(RDF_TYPE)
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| matches!(t, Term::NamedNode(n) if n.as_str().starts_with(NS)))
+            .count();
+        if vocab_types != 1 {
+            return Err(bad(format!(
+                "<{suite_iri}>: a suite has no type of the vocabulary besides chk:Suite"
+            )));
+        }
         for p in suite_props.keys() {
             if p.starts_with(NS) && p != &format!("{NS}check") {
                 return Err(bad(format!("<{suite_iri}>: a suite does not take <{p}>")));
@@ -384,6 +462,21 @@ impl Suite {
         })
     }
 
+    /// The suite's IRI.
+    pub fn iri(&self) -> &NamedNode {
+        &self.iri
+    }
+
+    /// The suite's `rdfs:label`.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// The checks, in IRI order.
+    pub fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+
     /// The suite as sorted N-Triples, one triple per line.
     pub fn canonical(&self) -> &str {
         &self.canonical
@@ -398,6 +491,34 @@ impl Suite {
     pub fn unavailable(&self) -> Vec<&Check> {
         self.checks.iter().filter(|c| !c.kind.available()).collect()
     }
+}
+
+/// Whether `t` is a blank node or a triple term with one at any depth.
+fn has_blank_node(t: &Term) -> bool {
+    let mut stack = vec![t];
+    while let Some(t) = stack.pop() {
+        match t {
+            Term::BlankNode(_) => return true,
+            Term::Triple(tt) => {
+                if matches!(tt.subject, oxrdf::NamedOrBlankNode::BlankNode(_)) {
+                    return true;
+                }
+                stack.push(&tt.object);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `d` has the form of [`sparkles_core::managed::settings_digest`]: `sha256:` and
+/// 64 lowercase hexadecimal digits.
+fn is_digest(d: &str) -> bool {
+    d.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 fn is_iri(t: &Term, iri: &str) -> bool {
@@ -419,6 +540,60 @@ fn text_value(props: &Props, p: &str, s: &str) -> Result<Option<String>, SuiteEr
             Ok(Some(l.value().to_string()))
         }
         Some(_) => Err(bad(format!("<{s}>: <{p}> takes a string"))),
+    }
+}
+
+/// Graph IRIs that are not data a check may select: the ARQ aliases, which the vocabulary
+/// names as `chk:DefaultGraph` and `chk:UnionGraph`, the materialized inferences, which
+/// `chk:inferences` selects, and the run records.
+fn reserved_graph(iri: &str) -> bool {
+    matches!(
+        iri,
+        "urn:x-arq:DefaultGraph" | "urn:x-arq:UnionGraph" | RUNS_GRAPH
+    ) || iri == sparkles_core::INFERRED_GRAPH
+        || iri.starts_with(NS)
+}
+
+/// The `chk:dataGraph` selection of a SHACL check.
+fn data_graph(props: &Props, s: &str, shapes: &Shapes) -> Result<DataGraph, SuiteError> {
+    let values = props
+        .get(&format!("{NS}dataGraph"))
+        .map(|v| v.as_slice())
+        .unwrap_or_default();
+    let union = format!("{NS}UnionGraph");
+    let default = format!("{NS}DefaultGraph");
+    let mut graphs = Vec::new();
+    let mut has_union = false;
+    for t in values {
+        let Term::NamedNode(n) = t else {
+            return Err(bad(format!("<{s}>: chk:dataGraph takes IRIs")));
+        };
+        let iri = n.as_str();
+        if iri == union {
+            has_union = true;
+        } else if iri == default {
+            graphs.push("urn:x-arq:DefaultGraph".to_string());
+        } else if reserved_graph(iri) {
+            return Err(bad(format!(
+                "<{s}>: chk:dataGraph does not take <{iri}>; use chk:DefaultGraph, \
+                 chk:UnionGraph or chk:inferences"
+            )));
+        } else if matches!(shapes, Shapes::Graph(g) if g.as_str() == iri) {
+            return Err(bad(format!(
+                "<{s}>: the shapes graph <{iri}> is not data of the same check"
+            )));
+        } else {
+            graphs.push(iri.to_string());
+        }
+    }
+    graphs.sort();
+    match (has_union, graphs.is_empty()) {
+        (true, true) => Ok(DataGraph::Union),
+        (true, false) => Err(bad(format!(
+            "<{s}>: chk:UnionGraph is every graph, so it takes no other chk:dataGraph"
+        ))),
+        (false, true) => Ok(DataGraph::Default),
+        (false, false) => Ok(DataGraph::Graphs(graphs)),
     }
 }
 
@@ -485,9 +660,12 @@ fn check(s: &str, kind: &str, props: &Props) -> Result<Check, SuiteError> {
                     )));
                 }
             };
+            let data_graph = data_graph(props, s, &shapes)?;
+            let inferences = inferences()?;
             CheckKind::Shacl {
                 shapes,
-                data_graph: iri("dataGraph")?,
+                data_graph,
+                inferences,
             }
         }
         "ShexCheck" => CheckKind::Shex {
@@ -522,9 +700,27 @@ fn check(s: &str, kind: &str, props: &Props) -> Result<Check, SuiteError> {
                 inferences: inferences()?,
             }
         }
-        "UnsatisfiableClassesCheck" => CheckKind::UnsatisfiableClasses {
-            inferences: inferences()?,
-        },
+        "UnsatisfiableClassesCheck" => {
+            let mut graphs = Vec::new();
+            for t in props
+                .get(&ns("graph"))
+                .map(|v| v.as_slice())
+                .unwrap_or_default()
+            {
+                match t {
+                    Term::NamedNode(n) if reserved_graph(n.as_str()) => {
+                        return Err(bad(format!(
+                            "<{s}>: chk:graph names an ontology graph, not <{}>",
+                            n.as_str()
+                        )));
+                    }
+                    Term::NamedNode(n) => graphs.push(n.clone()),
+                    _ => return Err(bad(format!("<{s}>: chk:graph takes IRIs"))),
+                }
+            }
+            graphs.sort();
+            CheckKind::UnsatisfiableClasses { graphs }
+        }
         "QueryCheck" => {
             let version = match one(props, &ns("storedQueryVersion"), s)? {
                 None => None,
@@ -548,6 +744,13 @@ fn check(s: &str, kind: &str, props: &Props) -> Result<Check, SuiteError> {
             if string("query")?.is_some() && string("storedQueryDigest")?.is_some() {
                 return Err(bad(format!(
                     "<{s}>: chk:storedQueryDigest pins a chk:storedQuery"
+                )));
+            }
+            if let Some(d) = string("storedQueryDigest")?
+                && !is_digest(&d)
+            {
+                return Err(bad(format!(
+                    "<{s}>: chk:storedQueryDigest takes \"sha256:\" and 64 lowercase hexadecimal digits"
                 )));
             }
             match (string("query")?, string("storedQuery")?, version) {
