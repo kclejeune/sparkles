@@ -449,6 +449,7 @@ impl Store {
 
     /// Test hook: hold (or release) background builds of vector indexes before they
     /// publish their result.
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn pause_vector_builds(&self, on: bool) {
         self.vector.paused.store(on, Ordering::SeqCst);
@@ -456,6 +457,7 @@ impl Store {
 
     /// Test hook: hold (or release) the background insertion of new rows into the
     /// graphs. While held, searches score the rows that commits added exactly.
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn pause_vector_catch_up(&self, on: bool) {
         self.vector.catch_up_paused.store(on, Ordering::SeqCst);

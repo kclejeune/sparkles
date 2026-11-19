@@ -1510,6 +1510,7 @@ fn read_blocks(
 
 /// Parse the N-Triples or N-Quads of `src` in blocks of `block` bytes as automatic mode
 /// parses a stream, with one parser per block. For tests of the block reader's memory.
+#[cfg(any(test, feature = "failpoints"))]
 #[doc(hidden)]
 pub fn parse_lines_in_blocks<S: QuadSink, F: Fn() -> S + Sync>(
     src: &Source,
