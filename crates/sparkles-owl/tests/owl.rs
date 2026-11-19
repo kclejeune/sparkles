@@ -1815,8 +1815,34 @@ fn a_terminology_read_reports_each_root_it_cannot_map() {
             "a disjointness that collapses to one class",
         ),
         (
-            "_:x a owl:Restriction ; rdfs:subClassOf :A . _:x owl:onProperty _:x .",
-            "a cyclic structure",
+            ":C rdfs:subClassOf _:a . _:a owl:intersectionOf ( :A _:a ) .",
+            "an expression that contains itself",
+        ),
+        (
+            ":C rdfs:subClassOf [ owl:intersectionOf _:l ] . _:l rdf:first :A ; rdf:rest _:l .",
+            "a list whose rest loops",
+        ),
+        (
+            ":r a owl:ObjectProperty . :C rdfs:subClassOf [ a owl:Restriction ;
+               owl:onProperty :r ; owl:someValuesFrom :A ; owl:allValuesFrom :B ] .",
+            "a restriction with two fillers",
+        ),
+        (
+            ":C rdfs:subClassOf [ a owl:Class ; owl:intersectionOf ( :A :B ) ;
+               owl:unionOf ( :A :B ) ] .",
+            "an expression with two constructors",
+        ),
+        (
+            ":r a owl:ObjectProperty . :C rdfs:subClassOf [ a owl:Restriction ;
+               owl:onProperty :r ; owl:someValuesFrom :A ; owl:intersectionOf ( :A :B ) ] .",
+            "a restriction with a constructor beside it",
+        ),
+        (
+            ":d a owl:DatatypeProperty . :C rdfs:subClassOf [ a owl:Restriction ;
+               owl:onProperty :d ; owl:someValuesFrom [ a rdfs:Datatype ;
+                 owl:onDatatype xsd:integer ;
+                 owl:withRestrictions ( [ xsd:minInclusive 1 ; xsd:maxInclusive 5 ] ) ] ] .",
+            "a facet node with two facets",
         ),
         (
             ":N a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :A .",
@@ -1834,9 +1860,31 @@ fn a_terminology_read_reports_each_root_it_cannot_map() {
         let full = lenient(&format!("{base} {body}"));
         assert_eq!(full.error_count, 0, "{what}: {:?}", full.diagnostics);
     }
-    // a tautology loses nothing
-    let o = terminology(&format!("{base} :C owl:intersectionOf ( :C ) ."));
+    // a tautology, a typed rdf:nil and duplicate operands lose nothing
+    for body in [
+        ":C owl:intersectionOf ( :C ) .",
+        "rdf:nil a rdf:List .",
+        "[] a owl:AllDisjointClasses ; owl:members ( :A :A :C ) .",
+    ] {
+        let o = terminology(&format!("{base} {body}"));
+        assert_eq!(o.error_count, 0, "{body}: {:?}", o.diagnostics);
+    }
+    // a structure two roots share is read for each
+    let o = terminology(&format!(
+        "{base} :r a owl:ObjectProperty . :C rdfs:subClassOf _:s . :A rdfs:subClassOf _:s .
+         _:s a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ."
+    ));
     assert_eq!(o.error_count, 0, "{:?}", o.diagnostics);
+    let subs = tbox(&o)
+        .into_iter()
+        .filter(|a| {
+            matches!(
+                a.kind,
+                AxiomKind::SubClassOf(_, ClassExpression::ObjectSomeValuesFrom(..))
+            )
+        })
+        .count();
+    assert_eq!(subs, 2);
 }
 
 #[test]

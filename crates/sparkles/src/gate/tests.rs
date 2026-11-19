@@ -1175,6 +1175,23 @@ fn a_class_disjoint_with_itself_is_not_dropped() {
 
 #[cfg(feature = "ontology")]
 #[test]
+fn a_structure_read_in_part_is_not_an_axiom() {
+    // the restriction's node also states the intersection that makes C unsatisfiable
+    let r = unsat_after(
+        &unsat_suite(""),
+        &disjoint_ontology(
+            "<urn:r> a owl:ObjectProperty .
+             <urn:C> rdfs:subClassOf [ a owl:Restriction ; owl:onProperty <urn:r> ;
+               owl:someValuesFrom owl:Thing ; owl:intersectionOf ( <urn:A> <urn:B> ) ] .",
+        ),
+    );
+    if r.status != Status::Failed {
+        assert_invalid(&r, "a restriction with an intersection beside it");
+    }
+}
+
+#[cfg(feature = "ontology")]
+#[test]
 fn a_terminology_repeated_in_two_graphs_reads_once() {
     let s = unsat_suite("; chk:graph <urn:g1>, <urn:g2>");
     // one request, so _:e0 is the same blank node in both graphs, as a graph copy leaves it

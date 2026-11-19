@@ -62,7 +62,12 @@ pub enum Scope {
     /// that is not well formed, a cyclic or missing structure, a definition that
     /// collapses to fewer operands than its axiom needs, and a root predicate typed as an
     /// annotation property all fail the read rather than vanish. A root that only marks
-    /// its triple used, such as one read as an annotation, does not count.
+    /// its triple used, such as one read as an annotation, does not count. A structural
+    /// triple that a root reaches through blank nodes and that no axiom reads, such as an
+    /// `owl:intersectionOf` beside a restriction's property, is an error too, since the
+    /// axiom read would not be the one the graph states. Duplicate operands merge, as in
+    /// the structural specification's sets, and only a set left with fewer operands than
+    /// its axiom needs is refused.
     ///
     /// Assertions are not read: no class assertion has its class expression parsed and
     /// no assertion is an axiom of the result, so an assertion can neither fail the read
@@ -167,7 +172,7 @@ pub fn type_role(ty: &str) -> Option<Role> {
         | v::OWL_SYMMETRIC_PROPERTY
         | v::OWL_ASYMMETRIC_PROPERTY
         | v::OWL_TRANSITIVE_PROPERTY => Root,
-        v::OWL_RESTRICTION | v::OWL_AXIOM | v::OWL_ANNOTATION | v::RDF_LIST => RootIfNamed,
+        v::OWL_RESTRICTION | v::OWL_AXIOM | v::OWL_ANNOTATION => RootIfNamed,
         v::OWL_CLASS
         | v::RDFS_DATATYPE
         | v::OWL_OBJECT_PROPERTY
@@ -179,24 +184,31 @@ pub fn type_role(ty: &str) -> Option<Role> {
         | v::OWL_DEPRECATED_CLASS
         | v::OWL_DEPRECATED_PROPERTY
         | v::RDFS_CLASS
-        | v::RDF_PROPERTY => Declaration,
+        | v::RDF_PROPERTY
+        // the type of a list cell, or of `rdf:nil`; a named cell's `rdf:first` is a root
+        | v::RDF_LIST => Declaration,
         v::OWL_ONTOLOGY => Header,
         v::OWL_ALL_DIFFERENT | v::OWL_NEGATIVE_PROPERTY_ASSERTION => Assertion,
         _ => return None,
     })
 }
 
-/// Whether `t` is a root of a terminology read (see [`Scope::Terminology`]).
-pub fn is_terminology_root(t: &Triple) -> bool {
-    let role = if t.predicate.as_str() == v::RDF_TYPE {
+/// The [`Role`] of a triple: [`type_role`] for an `rdf:type` triple with an IRI object,
+/// [`predicate_role`] for another.
+fn role_of(t: &Triple) -> Option<Role> {
+    if t.predicate.as_str() == v::RDF_TYPE {
         match &t.object {
             Term::NamedNode(o) => type_role(o.as_str()),
             _ => None,
         }
     } else {
         predicate_role(t.predicate.as_str())
-    };
-    match role {
+    }
+}
+
+/// Whether `t` is a root of a terminology read (see [`Scope::Terminology`]).
+pub fn is_terminology_root(t: &Triple) -> bool {
+    match role_of(t) {
         Some(Role::Root) => true,
         Some(Role::RootIfNamed) => matches!(t.subject, NamedOrBlankNode::NamedNode(_)),
         _ => false,
@@ -1039,10 +1051,31 @@ impl<'a> Parser<'a> {
                 self.diag(Severity::Error, "unmapped", msg, vec![i]);
             }
         }
-        if self.strict {
-            let unmapped: Vec<usize> = (0..self.t.len())
-                .filter(|i| !self.used[*i] && (!self.terms || (self.reach[*i] && !self.roots[*i])))
+        if self.terms {
+            // a structure a root reaches but no axiom read whole, such as a restriction
+            // with an `owl:intersectionOf` beside its property: an axiom read from part of
+            // it would not be the axiom the graph states
+            let partial: Vec<usize> = (0..self.t.len())
+                .filter(|i| self.reach[*i] && !self.roots[*i] && !self.used[*i])
+                // a declaration or a type such as `owl:Class` on a structure says nothing
+                // the axiom needs, which a lenient read repairs
+                .filter(|i| {
+                    self.strict
+                        || matches!(
+                            role_of(&self.t[*i]),
+                            Some(Role::RootIfNamed | Role::Assertion)
+                        )
+                })
                 .collect();
+            for i in partial {
+                let msg = format!(
+                    "the triple {} of a terminology structure is not part of the axiom read from it",
+                    self.t[i]
+                );
+                self.diag(Severity::Error, "unmapped", msg, vec![i]);
+            }
+        } else if self.strict {
+            let unmapped: Vec<usize> = (0..self.t.len()).filter(|i| !self.used[*i]).collect();
             for i in unmapped {
                 let msg = format!("the triple {} maps to no axiom", self.t[i]);
                 self.diag(Severity::Error, "unmapped", msg, vec![i]);
@@ -2610,6 +2643,9 @@ impl<'a> Parser<'a> {
                     // `C owl:intersectionOf ( C )` says nothing, which loses nothing
                     if self.terms {
                         self.accounted[i] = true;
+                        for j in &ts {
+                            self.used[*j] = true;
+                        }
                     }
                     return None;
                 }
