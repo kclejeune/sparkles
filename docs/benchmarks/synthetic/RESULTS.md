@@ -588,9 +588,10 @@ about the execution modes. Streaming is also slower end to end on the large answ
 of the time goes to writing the rows. It is faster on the grouped aggregates
 `expr-agg-arg` and `group-avg` in every cell, on `expr-bind-group` in every cell with 12
 threads and at 10.5M triples on `minus` and `not-exists`. Item 534 covers the
-streamed response's fixed cost and its losses on large answers, which the merged executor
-must not inherit. Item 240 has since removed the losses on large answers, as the
-[engine results](../engine/RESULTS.md) record for atlas.
+streamed response's fixed cost, which the merged executor must not inherit. With item
+240's buffered writers, separate atlas measurements at 1.05M triples with 12 threads show
+streamed responses faster than eager ones on these four queries, as the
+[engine results](../engine/RESULTS.md) record.
 
 ### Forge record after stages 1 and 3
 

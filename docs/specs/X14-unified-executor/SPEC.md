@@ -1329,18 +1329,22 @@ the streamed requests ran 0.44 to 0.50 times the base's instructions on `export-
 other builds at the time, so only the instruction counts are reported here.
 
 The wall times of the same two builds come from atlas, an Intel host with forge's
-hardware, which ran nothing else during the runs. The server ran on CPUs 0 to 11 and the
-client on CPU 12, at 1.05M triples in native JSON, in rounds of A,B,B,A in both orders
-with 10 requests per variant in each position, and the two orders were combined by their
-geometric mean. Over the 31 queries of the matrix with eight rounds in each order and 12
-Rayon threads, a streamed request took 0.42 times the base's wall time on `export-500k`,
-121 ms against 289 ms, 0.56 times on `optional-chain`, 10.4 against 18.4 ms, 0.63 times
-on `order-by-full`, 31.7 against 50.6 ms, and 0.77 times on `star-join`, 4.55 against
-5.90 ms. These streamed answers now finish before the eager ones, which took 220, 14.1,
-42.7 and 4.89 ms. With one thread the four queries took 0.53, 0.65, 0.78 and 0.73 times
-the base's wall time. The geometric mean of the streamed ratios was 0.935 with 12 threads
-and 0.932 with one. The eager requests of the two builds stayed within 2.3% of each other
-on every query in both cells.
+hardware. The server ran on CPUs 0 to 11 and the client on CPU 12, at 1.05M triples in
+native JSON, in rounds of A,B,B,A with 10 requests per variant in each position, and each
+cell ran once with the base first and once with the base second. The ratios below are
+the geometric means of the two orders, over the 31 queries of the matrix with eight
+rounds in each order, from runs that had the host to themselves. With 12 Rayon threads a
+streamed request took 0.42 times the base's wall time on `export-500k`, 0.56 times on
+`optional-chain`, 0.63 times on `order-by-full` and 0.77 times on `star-join`. In the run
+with the base second, these streamed requests took 121 ms against 289 ms, 10.4 against
+18.4 ms, 31.7 against 50.6 ms and 4.55 against 5.88 ms, and they finished before the
+eager requests of the same build, which took 220, 14.1, 42.7 and 4.89 ms. With one thread
+the four queries took 0.53, 0.65, 0.78 and 0.73 times the base's wall time, and the
+streamed `star-join` and `order-by-full` took about as long as the eager ones. The
+geometric mean of the streamed ratios was 0.935 with 12 threads and 0.932 with one. The
+eager requests of the two builds took 0.984 to 1.023 times each other's wall time with 12
+threads, in the order with the base second, since the other order's eager run may have
+overlapped a build, and 0.983 to 1.018 with one thread over both orders.
 
 The seven queries under 1 ms ran again on atlas with 12 rounds in each order and 12
 threads, as a pinned check of the streamed `count-all` and `distinct-obj`, which one
