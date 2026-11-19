@@ -52,9 +52,10 @@ pub enum FallbackPolicy {
 pub(crate) const REFUSAL: &str = "cursor requires materialization at ";
 
 /// How the strict policy's refusal of a SERVICE response that gives its results before
-/// the variables of its head ends. The message begins with the endpoint's URL, so code
-/// that turns other errors into values tells it apart by this ending.
-pub(crate) const LATE_HEAD: &str = ": the response gives its results before the variables of its head, which a strict cursor cannot stream";
+/// the variables of its head begins. Every other SERVICE error begins with words of its
+/// own or with the endpoint's URL, which the query names, and puts what an endpoint sent
+/// after them, so an endpoint cannot make its failure read as this refusal.
+pub(crate) const LATE_HEAD: &str = "a strict cursor cannot stream a SERVICE response whose results come before the variables of its head: ";
 
 impl FallbackPolicy {
     /// The policy for work an operator decides on at its first pull: the strict one when

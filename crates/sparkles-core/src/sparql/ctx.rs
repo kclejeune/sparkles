@@ -860,12 +860,12 @@ enum ResourceRefusal {
 }
 
 impl ResourceRefusal {
-    /// The refusal `error` records, if any. A SERVICE refusal is recognised only under
-    /// a strict cursor, the only policy that makes it, so that an endpoint's own error
-    /// text cannot make an ordinary failure sticky elsewhere.
+    /// The refusal `error` records, if any. A SERVICE refusal is recognised by its fixed
+    /// beginning, which no endpoint controls (see [`super::cursor::LATE_HEAD`]), and only
+    /// under a strict cursor, the only policy that makes it.
     fn from_error(error: &Error, strict: bool) -> Option<Self> {
         match error {
-            Error::Service(message) if strict && message.ends_with(super::cursor::LATE_HEAD) => {
+            Error::Service(message) if strict && message.starts_with(super::cursor::LATE_HEAD) => {
                 Some(Self::ServiceRefused(message.clone()))
             }
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),

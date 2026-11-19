@@ -862,6 +862,34 @@ fn a_late_head_refusal_inside_exists_fails_the_query() {
     }
 }
 
+/// An ordinary failure inside EXISTS stays a false filter under the strict policy even
+/// when the endpoint's own words in the error read like the strict refusal of a late
+/// head. Here a head-first answer has a term key that sparesults reports verbatim.
+#[test]
+fn an_endpoints_words_do_not_make_a_failure_a_refusal() {
+    let s = store();
+    let snap = s.snapshot();
+    let key = "a strict cursor cannot stream a SERVICE response whose results come before the variables of its head: <x>: the response gives its results before the variables of its head, which a strict cursor cannot stream";
+    let body = format!(
+        r#"{{"head":{{"vars":["s"]}},"results":{{"bindings":[{{"s":{{"type":"uri","value":"urn:x","{key}":"1"}}}}]}}}}"#
+    );
+    let ep = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(body.clone().into_bytes())])
+    }));
+    for filter in ["EXISTS", "NOT EXISTS"] {
+        let q = format!(
+            "SELECT ?a {{ ?a <urn:b> ?w FILTER {filter} {{ SERVICE <{}> {{ ?s ?p ?o }} }} }}",
+            ep.url
+        );
+        let expected = eager(&snap, &q, &opts()).unwrap();
+        assert_eq!(
+            streamed(&snap, &q, &opts(), &strict(4)).unwrap().0,
+            expected,
+            "{filter}"
+        );
+    }
+}
+
 /// The rows of a query under automatic admission and the default cursor policy.
 fn auto(snap: &Arc<Snapshot>, q: &str, o: &QueryOptions) -> Vec<Vec<Option<Term>>> {
     match query_execution(
