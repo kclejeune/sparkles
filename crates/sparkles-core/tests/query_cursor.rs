@@ -5084,56 +5084,67 @@ fn arq_uuid_aliases_and_dynamic_calls_stay_volatile_across_cursor_morsels() {
     }
 }
 
-/// The graph writers flush once after their first batch, with that batch's statements
-/// written and later batches not yet, so a writer that commits on a flush starts the
-/// response then. RDF/JSON groups by subject and writes everything at the end.
+/// The graph writers flush once after their first batch, before they pull the second, so
+/// a writer that commits on a flush starts the response then. The probe cancels the query
+/// at its first flush, so the next pull fails, and the output holds exactly the first
+/// batch's statements, written and counted.
 #[test]
 fn graph_writers_flush_after_their_first_batch() {
     use sparkles_core::jena_formats::JenaFormat;
-    use sparkles_core::sparql::{cursor::graph::write_cursor_graph, graph_cursor, results};
-    #[derive(Default)]
+    use sparkles_core::sparql::graph_cursor;
+    use sparkles_core::sparql::results::{
+        self, Format, RowCount, SolutionsFormat, Source, WriteOptions,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     struct Probe {
-        written: usize,
-        first_flush: Option<usize>,
+        out: Vec<u8>,
+        flushes: usize,
+        cancel: Arc<AtomicBool>,
     }
     impl std::io::Write for Probe {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.written += b.len();
+            self.out.extend_from_slice(b);
             Ok(b.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            self.first_flush.get_or_insert(self.written);
+            self.flushes += 1;
+            self.cancel.store(true, Ordering::Relaxed);
             Ok(())
         }
     }
     let s = store(1000);
     let q = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }";
-    let check = |name: &str, probe: Probe| {
-        let at = probe
-            .first_flush
-            .unwrap_or_else(|| panic!("{name}: no flush"));
+    let formats = [
+        Format::Rdf(RdfFormat::NTriples),
+        Format::Rdf(RdfFormat::NQuads),
+        Format::Rdf(RdfFormat::Turtle),
+        Format::Jena(JenaFormat::Thrift),
+        Format::Jena(JenaFormat::Protobuf),
+        Format::Jena(JenaFormat::TriX),
+        Format::Solutions(SolutionsFormat::Sparkles),
+    ];
+    for format in formats {
+        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
+        let mut probe = Probe {
+            out: Vec::new(),
+            flushes: 0,
+            cancel: c.cancellation_token(),
+        };
+        let rows = RowCount::new();
+        let options = WriteOptions::new(format, &rows);
+        let r = results::write(Source::Graph(&mut c), options, &mut probe);
         assert!(
-            at > 0 && at * 10 < probe.written,
-            "{name}: flushed at {at} of {}",
-            probe.written
+            matches!(r, Err(sparkles_core::Error::Cancelled)),
+            "{format:?}: {r:?}"
         );
-    };
-    for format in [RdfFormat::NTriples, RdfFormat::NQuads] {
-        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
-        let mut probe = Probe::default();
-        write_cursor_graph(&mut c, format, &mut probe, None, &[]).unwrap();
-        check(&format!("{format:?}"), probe);
+        assert_eq!(probe.flushes, 1, "{format:?}");
+        assert_eq!(rows.get(), 10, "{format:?}");
+        if matches!(format, Format::Rdf(RdfFormat::NTriples | RdfFormat::NQuads)) {
+            let lines = probe.out.iter().filter(|&&b| b == b'\n').count();
+            assert_eq!(lines, 10, "{format:?}");
+        }
     }
-    for format in [JenaFormat::Thrift, JenaFormat::Protobuf, JenaFormat::TriX] {
-        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
-        let mut probe = Probe::default();
-        results::write_cursor_jena_graph(&mut c, format, &mut probe, None).unwrap();
-        check(&format!("{format:?}"), probe);
-    }
-    let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
-    let mut probe = Probe::default();
-    results::write_cursor_graph_native_json(&mut c, &mut probe, None, None).unwrap();
-    check("native", probe);
 }
 
 /// An OPTIONAL over two inputs sorted on their shared variable merges when the
