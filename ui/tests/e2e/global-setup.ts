@@ -27,6 +27,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -81,13 +82,22 @@ function binary(): string {
  */
 function checkModule(bin: string) {
   if (process.env.SPARKLES_E2E_NO_WASM === '1') return;
-  const debug = resolve(bin) === resolve(UI_DIR, '../target/debug/sparkles');
-  const ui = process.env.SPARKLES_UI_DIR || (debug ? join(UI_DIR, 'build') : null);
-  if (!ui) return;
-  const assets = join(ui, '_app', 'immutable', 'assets');
+  // real paths, as the operating system resolves them for the server: Node's join and
+  // resolve fold `..` before following a symbolic link such as Boxington's managed target
+  const real = (p: string) => {
+    try {
+      return realpathSync.native(p);
+    } catch {
+      return null;
+    }
+  };
+  const debug = real(bin) === real(resolve(UI_DIR, '../target/debug/sparkles'));
+  const configured = process.env.SPARKLES_UI_DIR || null;
+  if (!configured && !debug) return;
+  const ui = configured ?? join(UI_DIR, 'build');
+  const assets = real(ui) && real(`${ui}/_app/immutable/assets`);
   const built =
-    existsSync(assets) &&
-    readdirSync(assets).some((f) => /^sparkles_fmt_wasm_bg\..*\.wasm$/.test(f));
+    assets !== null && readdirSync(assets).some((f) => /^sparkles_fmt_wasm_bg\..*\.wasm$/.test(f));
   if (!built)
     throw new Error(
       `The UI build in ${ui} has no browser module of the formatter, which the Pattern pane ` +
