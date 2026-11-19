@@ -816,14 +816,7 @@ pub(in crate::sparql) fn write_buffered(
                     Err(e)
                 }
             };
-            written.map_err(|e| out.refused.take().unwrap_or(Error::Io(e)))?;
-            if out.taken >= super::CANCEL_CHECK_BYTES {
-                // A long piece can leave cancellation due with no more bytes to
-                // drain. An empty write_all lets LimitedWriter check without writing
-                // to the sink or flushing it.
-                out.inner.write_all(&[]).map_err(Error::Io)?;
-            }
-            Ok(())
+            written.map_err(|e| out.refused.take().unwrap_or(Error::Io(e)))
         }
         Err(e) => {
             // the output stops here, with the bytes before the error written on and the

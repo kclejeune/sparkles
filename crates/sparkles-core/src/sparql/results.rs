@@ -108,6 +108,8 @@ fn io(e: std::io::Error) -> Error {
 /// output past `limit` bytes fails, and the cancellation flag is checked every 64 KiB.
 /// After a write of at least 64 KiB, the next write or flush also checks the flag.
 /// [`LimitedWriter::classify`] turns the resulting I/O error back into the reason.
+/// Supply the adapter directly to enforce the budget on each piece the serializer
+/// emits. An outer buffering writer can change the pieces this adapter receives.
 pub struct LimitedWriter<W> {
     inner: W,
     limit: Option<u64>,
@@ -142,6 +144,19 @@ impl<W: Write> LimitedWriter<W> {
     /// Inspect the underlying writer without consuming it.
     pub fn get_ref(&self) -> &W {
         &self.inner
+    }
+
+    /// Check for cancellation if this writer has reached its next byte checkpoint.
+    ///
+    /// This uses the writer's cumulative byte count and records observed cancellation
+    /// as [`Error::Cancelled`]. It performs no I/O and leaves the byte count and
+    /// checkpoint unchanged. Use it with [`write_with_completion`] to observe a
+    /// check left due by the last write of a result.
+    pub fn check_completion(&mut self) -> Result<()> {
+        if self.written >= self.next_check {
+            self.check_cancel().map_err(|_| Error::Cancelled)?;
+        }
+        Ok(())
     }
 
     /// An error of a serializer writing through this adapter: caused by the limit ->
@@ -254,7 +269,7 @@ mod writers;
 use rowout::{MARK_BYTES, OUTPUT_BUFFER};
 pub use rowout::{RowCount, RowLedger};
 pub(in crate::sparql) use rowout::{RowOut, write_buffered};
-pub use writers::{Format, Source, WriteOptions, write};
+pub use writers::{Format, Source, WriteOptions, write, write_with_completion};
 
 /// The reservation for the cells of a streamed row that the batch's term cache does not
 /// hold, which are decoded or built for the row and dropped after it. It grows to the

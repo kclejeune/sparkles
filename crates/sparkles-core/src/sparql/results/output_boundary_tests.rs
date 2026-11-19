@@ -648,56 +648,249 @@ fn cancelling_during_a_grown_native_row_counts_it_and_stops_the_trailer() {
 #[test]
 fn cancelling_during_the_last_grown_csv_or_tsv_row_fails_on_completion() {
     use crate::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::io::BufWriter;
+
+    fn check<W: Write>(
+        source: Source<'_>,
+        format: SolutionsFormat,
+        mut writer: W,
+        limited: impl Fn(&mut W) -> &mut LimitedWriter<CancelAfter>,
+        flushes: usize,
+    ) {
+        let sent = RowCount::new();
+        let result = write_with_completion(
+            source,
+            WriteOptions::new(super::Format::Solutions(format), &sent),
+            &mut writer,
+            |out| {
+                assert_eq!(sent.get(), 2, "completion follows the final row credit");
+                limited(out).check_completion()
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "{format:?}: {result:?}"
+        );
+        let out = limited(&mut writer);
+        assert!(out.get_ref().cancel.load(Ordering::Relaxed));
+        assert_eq!(out.get_ref().flushes, flushes);
+        assert_eq!(out.written() as usize, out.get_ref().bytes.len());
+        assert!(out.written() >= 70 << 10);
+    }
 
     let store = Store::in_memory(StoreOptions::default());
     let literal = "x".repeat(70 << 10);
     let text = format!("SELECT ?o WHERE {{ VALUES ?o {{ \"first\" \"{literal}\" }} }}");
     let options = QueryOptions::default();
     let r = query(store.snapshot(), &text, &options).unwrap();
-    let mut outcomes = Vec::new();
     for format in [SolutionsFormat::Csv, SolutionsFormat::Tsv] {
-        let mut cursor = select_cursor(
-            store.snapshot(),
-            &text,
-            &options,
-            &CursorOptions {
-                batch_rows: 1,
-                fallback: FallbackPolicy::RejectMaterialization,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        for (mode, source, flushes) in [
-            ("eager", Source::Result(&r), 0),
-            ("cursor", Source::Select(&mut cursor), 1),
-        ] {
-            // Keep the sink's flag independent of the query and cursor controls.
-            let cancel = Arc::new(AtomicBool::new(false));
-            let sink = CancelAfter {
-                bytes: Vec::new(),
-                cancel: cancel.clone(),
-                after: CANCEL_CHECK_BYTES as usize,
-                flushes: 0,
-            };
-            let mut out = LimitedWriter::new(sink, None, Some(cancel.clone()));
-            let sent = RowCount::new();
-            let result = write(
-                source,
-                WriteOptions::new(super::Format::Solutions(format), &sent),
-                &mut out,
-            );
-            assert!(cancel.load(Ordering::Relaxed), "{format:?}, {mode}");
-            assert_eq!(sent.get(), 2, "{format:?}, {mode}");
-            assert_eq!(out.get_ref().flushes, flushes, "{format:?}, {mode}");
-            outcomes.push((format, mode, result.map_err(|e| out.classify(e))));
+        for buffered in [false, true] {
+            let mut cursor = select_cursor(
+                store.snapshot(),
+                &text,
+                &options,
+                &CursorOptions {
+                    batch_rows: 1,
+                    fallback: FallbackPolicy::RejectMaterialization,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for (source, flushes) in [(Source::Result(&r), 0), (Source::Select(&mut cursor), 1)] {
+                // Keep the sink's flag independent of the query and cursor controls.
+                let cancel = Arc::new(AtomicBool::new(false));
+                let sink = CancelAfter {
+                    bytes: Vec::new(),
+                    cancel: cancel.clone(),
+                    after: CANCEL_CHECK_BYTES as usize,
+                    flushes: 0,
+                };
+                let out = LimitedWriter::new(sink, None, Some(cancel));
+                if buffered {
+                    check(
+                        source,
+                        format,
+                        BufWriter::with_capacity(OUTPUT_BUFFER, out),
+                        BufWriter::get_mut,
+                        flushes,
+                    );
+                } else {
+                    check(source, format, out, |w| w, flushes);
+                }
+            }
+            let stats = cursor.stats();
+            assert_eq!(stats.status, crate::sparql::CursorStatus::Complete);
+            assert_eq!(stats.error, Some(Error::Cancelled.to_string()));
         }
     }
-    assert!(
-        outcomes
-            .iter()
-            .all(|(_, _, result)| matches!(result, Err(Error::Cancelled))),
-        "{outcomes:?}"
+}
+
+#[test]
+fn a_small_buffered_result_checks_the_reused_adapters_checkpoint() {
+    use std::io::BufWriter;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut limited = LimitedWriter::new(Vec::new(), None, Some(cancel.clone()));
+    limited
+        .write_all(&vec![b'a'; CANCEL_CHECK_BYTES as usize - 1])
+        .unwrap();
+    cancel.store(true, Ordering::Relaxed);
+    limited.check_completion().unwrap();
+    cancel.store(false, Ordering::Relaxed);
+    limited
+        .write_all(&vec![b'a'; CANCEL_CHECK_BYTES as usize])
+        .unwrap();
+    let written = limited.written();
+    let next_check = limited.next_check;
+    // A successful completion check leaves the pending checkpoint in place.
+    limited.check_completion().unwrap();
+    cancel.store(true, Ordering::Relaxed);
+
+    let mut out = BufWriter::new(limited);
+    let store = Store::in_memory(StoreOptions::default());
+    let r = query(
+        store.snapshot(),
+        "SELECT ?o WHERE { VALUES ?o { \"new\" } }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let sent = RowCount::new();
+    let result = write_with_completion(
+        Source::Result(&r),
+        WriteOptions::new(super::Format::Solutions(SolutionsFormat::Csv), &sent),
+        &mut out,
+        |w| w.get_mut().check_completion(),
     );
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    assert_eq!(sent.get(), 1);
+    assert_eq!(out.buffer(), b"o\r\nnew\r\n");
+    assert_eq!(out.get_ref().written(), written);
+    assert_eq!(out.get_ref().next_check, next_check);
+    assert!(out.get_ref().cancelled);
+
+    let mut unlimited = LimitedWriter::new(Vec::new(), None, None);
+    unlimited
+        .write_all(&vec![b'a'; CANCEL_CHECK_BYTES as usize])
+        .unwrap();
+    unlimited.check_completion().unwrap();
+}
+
+#[test]
+fn plain_writers_receive_only_result_bytes_and_their_existing_flushes() {
+    use std::io::{self, LineWriter};
+
+    #[derive(Default)]
+    struct Sink {
+        short_line: bool,
+        newline_retries: usize,
+        empty_pieces: usize,
+    }
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            match bytes {
+                b"tail\r\n" if self.short_line => Ok(bytes.len() - 1),
+                b"\n" if self.short_line => {
+                    self.newline_retries += 1;
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
+                _ => Ok(bytes.len()),
+            }
+        }
+        fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if bytes.is_empty() {
+                self.empty_pieces += 1;
+                return Err(io::Error::other("unexpected empty piece"));
+            }
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let store = Store::in_memory(StoreOptions::default());
+    let literal = "x".repeat(70 << 10);
+    let r = query(
+        store.snapshot(),
+        &format!("SELECT ?o WHERE {{ VALUES ?o {{ \"{literal}\" \"tail\" }} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let sent = RowCount::new();
+    let options = || WriteOptions::new(super::Format::Solutions(SolutionsFormat::Csv), &sent);
+    let mut out = LineWriter::new(Sink {
+        short_line: true,
+        ..Sink::default()
+    });
+    write(Source::Result(&r), options(), &mut out).unwrap();
+    assert_eq!(sent.get(), 2);
+    assert_eq!(out.get_ref().newline_retries, 0);
+    assert_eq!(out.flush().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(out.get_ref().newline_retries, 1);
+
+    let mut out = Sink::default();
+    let sent = RowCount::new();
+    write(
+        Source::Result(&r),
+        WriteOptions::new(super::Format::Solutions(SolutionsFormat::Csv), &sent),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out.empty_pieces, 0);
+    assert_eq!(sent.get(), 2);
+}
+
+#[test]
+fn a_partial_row_sink_failure_bypasses_completion() {
+    use std::io;
+
+    struct Sink {
+        cancel: Arc<AtomicBool>,
+        left: usize,
+    }
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.left == 0 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let n = bytes.len().min(self.left);
+            self.left -= n;
+            if self.left == 0 {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let store = Store::in_memory(StoreOptions::default());
+    let literal = "x".repeat(70 << 10);
+    let r = query(
+        store.snapshot(),
+        &format!("SELECT ?o WHERE {{ VALUES ?o {{ \"first\" \"{literal}\" }} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sink = Sink {
+        cancel: cancel.clone(),
+        left: 1024,
+    };
+    let mut out = LimitedWriter::new(sink, None, Some(cancel.clone()));
+    let sent = RowCount::new();
+    let error = write_with_completion(
+        Source::Result(&r),
+        WriteOptions::new(super::Format::Solutions(SolutionsFormat::Csv), &sent),
+        &mut out,
+        |_| panic!("the sink failed before completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(out.classify(error), Error::Io(e) if e.kind() == io::ErrorKind::BrokenPipe));
+    assert!(cancel.load(Ordering::Relaxed));
+    assert_eq!(out.written(), 1024);
+    assert_eq!(sent.get(), 1);
 }
 
 #[test]

@@ -2229,6 +2229,131 @@ fn native_graph_document_and_jena_writers_stream_and_fuse_failures() {
 }
 
 #[test]
+fn completion_runs_once_after_ask_empty_select_and_graph_output() {
+    use sparkles_core::sparql::graph_cursor;
+    use sparkles_core::sparql::results::{
+        Format, RowCount, SolutionsFormat, Source, WriteOptions, write, write_with_completion,
+    };
+
+    let s = store(1);
+    let construct = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }";
+    let tsv = Format::Solutions(SolutionsFormat::Tsv);
+    let ntriples = Format::Rdf(RdfFormat::NTriples);
+    for (text, format) in [
+        ("ASK {}", tsv),
+        ("SELECT ?s WHERE { ?s <urn:missing> ?o }", tsv),
+        (construct, ntriples),
+    ] {
+        let result = query(s.snapshot(), text, &Default::default()).unwrap();
+        let expected_rows = RowCount::new();
+        let mut expected = Vec::new();
+        write(
+            Source::Result(&result),
+            WriteOptions::new(format, &expected_rows),
+            &mut expected,
+        )
+        .unwrap();
+        let mut calls = 0;
+        let mut out = Vec::new();
+        let sent = RowCount::new();
+        let stats = write_with_completion(
+            Source::Result(&result),
+            WriteOptions {
+                format,
+                send: None,
+                prefixes: &[],
+                metadata: None,
+                rows: &sent,
+            },
+            &mut out,
+            |out| {
+                calls += 1;
+                assert_eq!(*out, expected);
+                assert_eq!(sent.get(), expected_rows.get());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(stats.is_none());
+        assert_eq!(calls, 1);
+    }
+
+    let mut graph =
+        graph_cursor(s.snapshot(), construct, &Default::default(), &options(1)).unwrap();
+    let sent = RowCount::new();
+    let error = write_with_completion(
+        Source::Graph(&mut graph),
+        WriteOptions::new(ntriples, &sent),
+        &mut Vec::new(),
+        |out| {
+            assert!(out.ends_with(b" .\n"));
+            assert_eq!(sent.get(), 1);
+            Err(Error::Cancelled)
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Cancelled));
+    let stats = graph.stats();
+    assert_eq!(stats.status, CursorStatus::Failed);
+    assert_eq!(stats.error, Some(error.to_string()));
+}
+
+#[test]
+fn completion_is_skipped_on_dispatch_drain_and_flush_failures() {
+    use sparkles_core::sparql::results::{
+        Format, LimitedWriter, RowCount, SolutionsFormat, Source, WriteOptions,
+        write_with_completion,
+    };
+    use std::io::{self, Write};
+
+    let s = store(1);
+    let ask = query(s.snapshot(), "ASK {}", &Default::default()).unwrap();
+    let sent = RowCount::new();
+    let error = write_with_completion(
+        Source::Result(&ask),
+        WriteOptions::new(Format::ResultsThrift, &sent),
+        &mut Vec::new(),
+        |_| panic!("invalid format must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)));
+
+    let mut limited = LimitedWriter::new(Vec::new(), Some(0), None);
+    let error = write_with_completion(
+        Source::Result(&ask),
+        WriteOptions::new(Format::Solutions(SolutionsFormat::Csv), &sent),
+        &mut limited,
+        |_| panic!("failed drain must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        limited.classify(error),
+        Error::BudgetExceeded(b) if b.kind == BudgetKind::ResultBytes
+    ));
+
+    struct BrokenFlush;
+    impl Write for BrokenFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let mut cursor = open(&s, "SELECT ?o WHERE { ?s <urn:p> ?o }", 1);
+    let error = write_with_completion(
+        Source::Select(&mut cursor),
+        WriteOptions::new(Format::Solutions(SolutionsFormat::Tsv), &sent),
+        &mut BrokenFlush,
+        |_| panic!("failed first-batch flush must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(&error, Error::Io(e) if e.kind() == io::ErrorKind::BrokenPipe));
+    assert_eq!(sent.get(), 1);
+    assert_eq!(cursor.stats().error, Some(error.to_string()));
+}
+
+#[test]
 fn ordered_optional_unique_and_duplicate_runs_resume_across_batch_boundaries() {
     let s = store(0);
     s.load(&[Source::from_bytes(

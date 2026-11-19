@@ -288,6 +288,14 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
   library pulls SELECT results. Result writers use bounded buffers with backpressure and
   stop when the client disconnects.
+* Rust callers can use `sparql::results::write_with_completion` to check a writer
+  after serialization finishes and the writer has accepted the final rows. With a
+  `LimitedWriter`, the callback can call `check_completion` to observe a pending
+  byte-based cancellation check. If the caller supplies a buffered wrapper, the
+  callback can reach the adapter through the wrapper. Row counts describe what
+  the supplied writer accepted, including rows it still holds in its buffer.
+  The completion check itself performs no I/O. An error during serialization
+  or writing skips the callback.
 * Native SELECT output and standard JSON, XML, CSV and TSV solution responses of at
   most 65,536 rows check a complete decoded row before writing its cells. Row storage
   and decoded terms retain query memory credit while they are written. A required

@@ -73,14 +73,72 @@ impl<'a> WriteOptions<'a> {
 }
 
 /// Write `source` to `writer` as `options` say. The output goes through the writers'
-/// buffer, so a writer that stops it partway, such as at the result-size budget, has
-/// `options.rows` hold the rows of the output it took. A cursor's statistics are
-/// returned after a whole output, and a cursor whose output fails is failed with the
-/// error.
+/// buffer, so `options.rows` counts the complete rows the supplied writer has
+/// accepted, even if that writer retains them in its own buffer. A cursor's
+/// statistics are returned after a whole output. An output error is recorded on
+/// the cursor. Use [`write_with_completion`] to run a check after the final drain.
 pub fn write(
     source: Source<'_>,
     options: WriteOptions<'_>,
     writer: &mut dyn Write,
+) -> Result<Option<CursorStats>> {
+    write_output(source, options, writer)
+}
+
+/// Write a result and run `complete` once on the supplied writer after successful
+/// serialization, including its final drain and row accounting. A completion error
+/// is returned in place of statistics and recorded on a cursor's output path.
+/// Serialization or sink errors skip the callback and are returned unchanged.
+///
+/// This adds no write or flush of its own. A callback can inspect a known writer
+/// layout, for example by invoking
+/// [`LimitedWriter::check_completion`](super::LimitedWriter::check_completion)
+/// directly or via a surrounding `BufWriter`'s `get_mut()`.
+pub fn write_with_completion<W: Write>(
+    source: Source<'_>,
+    options: WriteOptions<'_>,
+    writer: &mut W,
+    complete: impl FnOnce(&mut W) -> Result<()>,
+) -> Result<Option<CursorStats>> {
+    write_output(source, options, Completion { writer, complete })
+}
+
+// The policy stays at the driver boundary. Both paths give RowOut the same
+// erased byte writer, and the plain path has no completion state.
+trait Output {
+    fn writer(&mut self) -> &mut dyn Write;
+    fn complete(self) -> Result<()>;
+}
+
+impl Output for &mut dyn Write {
+    fn writer(&mut self) -> &mut dyn Write {
+        *self
+    }
+
+    fn complete(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct Completion<'a, W, F> {
+    writer: &'a mut W,
+    complete: F,
+}
+
+impl<W: Write, F: FnOnce(&mut W) -> Result<()>> Output for Completion<'_, W, F> {
+    fn writer(&mut self) -> &mut dyn Write {
+        self.writer
+    }
+
+    fn complete(self) -> Result<()> {
+        (self.complete)(self.writer)
+    }
+}
+
+fn write_output(
+    source: Source<'_>,
+    options: WriteOptions<'_>,
+    writer: impl Output,
 ) -> Result<Option<CursorStats>> {
     let WriteOptions {
         format,
@@ -184,14 +242,15 @@ pub fn write(
 /// Run `write` on `source` into the writers' buffer, failing the source with its error.
 fn solutions<S: SolutionSource>(
     source: &mut S,
-    writer: &mut dyn Write,
+    mut output: impl Output,
     rows: &RowCount,
     mut write: impl FnMut(&mut S, &mut RowOut<'_>, &Cell<u64>) -> Result<()>,
 ) -> Result<Option<CursorStats>> {
     let ctx = source.ctx();
-    let result = write_buffered(writer, rows, Some(ctx), &mut |out, staged| {
+    let result = write_buffered(output.writer(), rows, Some(ctx), &mut |out, staged| {
         write(source, out, staged)
-    });
+    })
+    .and_then(|()| output.complete());
     match result {
         Ok(()) => Ok(source.stats()),
         Err(error) => {
@@ -461,16 +520,22 @@ impl BatchVisitor for NativeRows<'_, '_> {
 /// the source with its error.
 fn graphs<S: GraphSource>(
     source: &mut S,
-    writer: &mut dyn Write,
+    mut output: impl Output,
     rows: &RowCount,
     mut write: impl FnMut(&mut S, &mut RowOut<'_>, &Cell<u64>) -> Result<()>,
 ) -> Result<Option<CursorStats>> {
     let ctx = source.ctx();
     let depth = source.stack_depth();
-    let result = write_buffered(writer, rows, Some(ctx), &mut |out, staged| match depth {
-        Some(depth) => crate::sparql::depth::with_stack(depth, || write(source, out, staged)),
-        None => write(source, out, staged),
-    });
+    let result = write_buffered(
+        output.writer(),
+        rows,
+        Some(ctx),
+        &mut |out, staged| match depth {
+            Some(depth) => crate::sparql::depth::with_stack(depth, || write(source, out, staged)),
+            None => write(source, out, staged),
+        },
+    )
+    .and_then(|()| output.complete());
     match result {
         Ok(()) => Ok(source.stats()),
         Err(error) => {

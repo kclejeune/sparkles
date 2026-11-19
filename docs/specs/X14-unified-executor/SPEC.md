@@ -1352,6 +1352,13 @@ Roadmap item 243 made it exact in that case too. The writer records where each r
 ends, and the transport counts a row once a send that enqueued has handed over the bytes
 up to its end.
 
+For Rust callers, `write_with_completion` runs a callback after the output
+buffer has drained and credited the accepted rows. The callback can check
+pending cancellation on a `LimitedWriter`, including one it reaches through
+a known wrapper, without writing or flushing the sink. A failed serialization
+keeps its original error and skips completion. A completion failure is
+recorded on a cursor before the writer can return successful statistics.
+
 Matched release builds of 8baa5686 and a016b7bd, both from wally, were counted on the
 laptop with the server on four performance cores, over two passes of 200 requests for
 the short queries and 10 for the large ones, at 1.05M triples. The eager requests ran

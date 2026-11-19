@@ -407,6 +407,12 @@ a literal larger than the buffer, a graph answer whose last batch holds only lab
 decode refusal in the middle of a batch, which keeps its original error and the earlier
 complete rows as stage 4 decided, and a client that disconnects between batches.
 
+For a caller-supplied Rust writer, the acceptance boundary is the last byte of
+each row the writer took. A caller can opt into a completion callback that
+runs after the final drain and before successful cursor statistics. A cancellable
+size adapter can check a due byte checkpoint there without writing or flushing
+its sink. HTTP keeps completion and transport delivery in its response producer.
+
 Its gates are the server's budget, limit and quota tests, `mise run test:w3c:streaming`,
 `scripts/ci.sh --fast`, the end-to-end wall times of `export-500k`, `optional-chain`,
 `star-join` and `order-by-full` in both modes on atlas, where streaming is 8% to 51%
