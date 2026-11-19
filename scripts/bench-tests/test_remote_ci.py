@@ -36,6 +36,7 @@ done
 printf 'prop %s\n' "${props[@]}" >> "$FAKE_LOG"
 # systemd-run itself succeeds once the unit has started, whatever the unit's exit. With
 # FAKE_ASYNC the unit runs on after the start returns, as a real unit does.
+[ -z "${FAKE_CGROUP:-}" ] || envs+=("CI_JOB_CGROUP=$FAKE_CGROUP")
 if [ -n "${FAKE_ASYNC:-}" ]; then
   env -i FAKE_LOG="$FAKE_LOG" FAKE_CI_EXIT="${FAKE_CI_EXIT:-0}" FAKE_CLEAN_EXIT="${FAKE_CLEAN_EXIT:-0}" "${envs[@]}" "$@" > /dev/null 2>&1 < /dev/null &
   exit 0
@@ -337,6 +338,19 @@ class RemoteCI(unittest.TestCase):
         self.assertFalse(Path('/proc/%d' % pid).exists() and Path('/proc/%d/stat' % pid).read_text().split(') ', 1)[1][0] != 'Z')
         self.assertIn('ended the processes the run left', (self.home / 'gate/out' / self.name() / 'progress.log').read_text())
 
+    def test_a_run_in_its_cgroup_that_ended_cleanly_exits_0(self):
+        # A stand-in cgroup whose run directory reads empty, and an rmdir that removes it as
+        # the kernel does, so that finish() must not look at it again.
+        cg = self.t / 'cg'; run = cg / 'run'; run.mkdir(parents=True)
+        for f, text in [('cgroup.procs', ''), ('cgroup.kill', ''), ('cgroup.events', 'populated 0\nfrozen 0\n')]:
+            (run / f).write_text(text)
+        fake = self.t / 'bin'
+        (fake / 'rmdir').write_text('#!/bin/sh\nrm -rf "$1"\n'); (fake / 'rmdir').chmod(0o755)
+        r = self.run_ssh(FAKE_CGROUP=str(cg))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(run.exists())
+        self.assertNotIn('could not be shown ended', (self.home / 'gate/out' / self.name() / 'progress.log').read_text())
+
     def test_a_disk_that_fills_just_before_a_failed_run_ends_marks_it(self):
         (self.home / 'ci-fills-disk').write_text('0')
         r = self.run_ssh(FAKE_CI_EXIT='1', REMOTE_CI_WATCH_SECONDS='600')
@@ -405,6 +419,20 @@ class RemoteCI(unittest.TestCase):
         # The name is a link to the start's own copy, which no later fetch replaces.
         self.assertTrue(res.is_symlink())
         self.assertEqual(res.resolve().name, '%s.%s' % (self.name(), (res / 'run-id').read_text().strip()))
+
+    def test_a_manual_fetch_that_cannot_publish_keeps_the_earlier_copy(self):
+        r = self.run_ssh()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = self.src / '.artifacts/remote-ci' / self.name()
+        # An mv that fails for the publication leaves the earlier copy where it was.
+        fake = self.t / 'bin'
+        (fake / 'mv').write_text('#!/usr/bin/env bash\nfor a in "$@"; do case $a in */.fetch-*) exit 1 ;; esac; done\nexec %s "$@"\n' % shutil.which('mv'))
+        (fake / 'mv').chmod(0o755)
+        r = subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'wally', '--fetch', self.name()],
+                           cwd=self.src, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual((res / 'ci.exit').read_text().strip(), '0')
+        self.assertEqual(list((self.src / '.artifacts/remote-ci').glob('.fetch-*')), [])
 
     def test_the_disk_settings_must_be_positive_numbers(self):
         for n in ['REMOTE_CI_MIN_FREE_GIB', 'REMOTE_CI_RUN_FLOOR_GIB', 'REMOTE_CI_WATCH_SECONDS']:

@@ -37,10 +37,10 @@ finish() {
   local code=$1 keep=0
   # A run still alive, as after a stop of the unit, is ended first. When its processes
   # cannot be shown gone, the worktree stays for a later cleanup and the job exits 6.
-  if [ -n "${cpid:-}" ] && ! settle_run; then
+  if [ -n "${cpid:-}" ] && [ "${settled:-0}" != 1 ] && ! settle_run; then
     log "the run's processes could not be shown ended; the worktree stays for a later cleanup" 2> /dev/null || true
     keep=1
-    [ "$code" != 0 ] || code=6
+    code=6
   fi
   # The exit's reserve goes first, so the records below fit on a disk the run filled.
   rm -f "$out/.reserve-exit"
@@ -194,14 +194,22 @@ note_below() {
 # Two reserves of a MiB each are set aside before the run. The job gives back the first just
 # before it writes the outcome and finish() the second just before the exit record, so both
 # fit on a disk the run filled and the copy of the run's logs between them uses neither.
-for r in outcome exit; do head -c 1048576 /dev/zero > "$out/.reserve-$r" 2> /dev/null || rm -f "$out/.reserve-$r"; done
+for r in outcome exit; do
+  head -c 1048576 /dev/zero > "$out/.reserve-$r" 2> /dev/null || {
+    rm -f "$out/.reserve-$r"
+    log "could not set aside the $r record's reserve"
+  }
+done
 # On an ssh host the unit is delegated, and the run goes into the child cgroup run, so that
 # a stop ends every process the run started, those in other process groups or sessions and
 # those reparented away included. A unit without a writable cgroup of its own, as in a
 # test, stops the run's process group instead.
+# CI_JOB_CGROUP, which only the tests set, names a stand-in for the unit's cgroup.
 runcg=
-cg=/sys/fs/cgroup$(cut -d: -f3 < /proc/self/cgroup 2> /dev/null)
-case $cg in */gate-"$NAME".service)
+cg=${CI_JOB_CGROUP:-/sys/fs/cgroup$(cut -d: -f3 < /proc/self/cgroup 2> /dev/null)}
+unitcg=$cg
+[ -z "${CI_JOB_CGROUP:-}" ] || unitcg=/gate-$NAME.service
+case $unitcg in */gate-"$NAME".service)
   if [ "$watch" = 1 ] && mkdir -p "$cg/run" 2> /dev/null && [ -w "$cg/run/cgroup.procs" ] && [ -e "$cg/run/cgroup.kill" ]; then runcg=$cg/run; fi
   ;;
 esac
@@ -284,6 +292,8 @@ dw=
 # the group, can still run. It is ended before the results are copied and the worktree goes,
 # and when it cannot be, finish() keeps the worktree and exits 6.
 settle_run || finish 6
+# finish() then knows that the run has ended, whatever becomes of its cgroup.
+settled=1
 [ -z "$runcg" ] || rmdir "$runcg" 2> /dev/null || true
 # A disk that fell under the floor between the last sample and the run's end still marks a
 # failed run.

@@ -157,16 +157,31 @@ fetch() {
       res=
       return 1
     fi
+    # An older copy that is a directory, not a link, is kept beside it under a dated name.
+    if [ -d "$base/$1" ] && [ ! -L "$base/$1" ]; then
+      mv -T "$base/$1" "$base/$1.kept-$(date +%s)" || echo "remote-ci.sh: could not move the older copy $base/$1 aside" >&2
+    fi
     link=$(mktemp -u "$base/.link-$1.XXXXXX")
-    if ! { ln -s "$1.$2" "$link" && { [ ! -d "$base/$1" ] || [ -L "$base/$1" ] || rm -rf "${base:?}/$1"; } && mv -Tf "$link" "$base/$1"; }; then
+    if ! { ln -s "$1.$2" "$link" && mv -Tf "$link" "$base/$1"; }; then
       rm -f "$link"
       echo "remote-ci.sh: results in $res, but $base/$1 could not point to them" >&2
     fi
   else
-    if ! { rm -rf "${base:?}/$1" && mv -T "$stage" "$base/$1"; }; then
+    # The earlier copy moves aside first and comes back when the new one cannot take its place.
+    local old=
+    if [ -e "$base/$1" ] || [ -L "$base/$1" ]; then
+      old=$base/.old-$1.$$
+      mv -T "$base/$1" "$old" || {
+        rm -rf "$stage"
+        return 1
+      }
+    fi
+    if ! mv -T "$stage" "$base/$1"; then
       rm -rf "$stage"
+      [ -z "$old" ] || mv -T "$old" "$base/$1"
       return 1
     fi
+    [ -z "$old" ] || rm -rf "$old"
     res=$base/$1
   fi
   echo "results in $res"
