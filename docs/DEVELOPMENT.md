@@ -1011,7 +1011,7 @@ below its floor. A split gate keeps each half's own record, the ci half's as `ou
 the conformance half's as `outcome-conf`. When every failed half exited 4 with its own
 disk record, the merge exits 4, writes `gate-outcome` and names the refusing halves in
 `outcome-host`. Any other failure makes the merge exit 1. An ssh gate still creates its
-worktree before it takes the heavy lock, which roadmap item 1136 tracks. `--auto` and the default helper choice read the disk without collecting, and a host's cache
+worktree before it takes the heavy lock, which roadmap item 1169 tracks. `--auto` and the default helper choice read the disk without collecting, and a host's cache
 keeps it near its own `gc.min_free_size`, so they count a host as having the disk for a
 whole gate at `GATE_MIN_FREE_GB` free, 40 by default, and for a conformance half at
 `GATE_MIN_FREE_HALF_GB`, 20 by default. `gate.sh --hosts` marks a host that needs a
