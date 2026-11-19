@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Item 829 part 1 forge results under the Intel rule.
+
+    analyze.py FORGE_RESULTS_DIR > summary.md
+
+Matrix cells (FORGE/matrix/<cell>/stage/results/samples.tsv, 8 rounds of A,B,B,A): per
+query, the ratio B/A of each round's median execMs, the median of those ratios, a 95%
+percentile bootstrap over rounds (20000 resamples, seed 829), the median added time
+(median of all B requests minus median of all A requests) in microseconds, and the
+same-binary spread (the largest per-server-process median over the smallest, minus one,
+for A and for B). A query is a real cost when the interval's lower end is above 1.0 and
+the added time is above 0.5 us; it is a real gain when the upper end is below 1.0 and the
+saved time is above 0.5 us.
+
+A/B scripts (FORGE/out/results/<script>-<arm>-<mode>-t<threads>, arms base,tip,tip2,base2):
+per query, the ratio of the median of the pooled tip requests over the pooled base
+requests, with a 95% bootstrap that resamples requests within each arm (which ignores the
+variance between server processes and so is only indicative), the added time, the ratio
+of each A,B,B,A pair (tip/base and tip2/base2), and the same-binary ratios base2/base and
+tip2/tip. The verdict follows the plan's rule for these scripts: a query slower in both
+pairs by 5% or more fails the gate, one slower in both pairs by less is a real difference
+below the gate, and one not slower in both pairs is noise.
+"""
+
+import json
+import random
+import statistics as st
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+B = 20000
+
+
+def pct(xs, p):
+    xs = sorted(xs)
+    k = (len(xs) - 1) * p
+    lo, hi = int(k), min(int(k) + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def verdict(lo, hi, added_us):
+    if lo > 1.0 and added_us > 0.5:
+        return "cost"
+    if hi < 1.0 and added_us < -0.5:
+        return "gain"
+    return "noise"
+
+
+def matrix(cell):
+    rnd = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    proc = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    allv = defaultdict(lambda: defaultdict(list))
+    with (cell / "stage/results/samples.tsv").open() as f:
+        hdr = f.readline().rstrip("\n").split("\t")
+        ix = {h: i for i, h in enumerate(hdr)}
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if p[ix["exec_ms"]] == "error":
+                print(f"ERROR sample {p}", file=sys.stderr)
+                continue
+            q, v, x = p[ix["query"]], p[ix["variant"]], float(p[ix["exec_ms"]])
+            rnd[q][int(p[ix["round"]])][v].append(x)
+            proc[q][v][int(p[ix["epoch"]])].append(x)
+            allv[q][v].append(x)
+    rng = random.Random(829)
+    print(f"\n### {cell.name}\n")
+    print("| query | A ms | B ms | B/A | 95% interval | added µs | A spread | B spread | verdict |")
+    print("|---|--:|--:|--:|---|--:|--:|--:|---|")
+    out = {}
+    for q in sorted(rnd):
+        ratios = [st.median(r["B"]) / st.median(r["A"]) for _, r in sorted(rnd[q].items())]
+        boots = [st.median(rng.choices(ratios, k=len(ratios))) for _ in range(B)]
+        lo, hi = pct(boots, 0.025), pct(boots, 0.975)
+        a, b = st.median(allv[q]["A"]), st.median(allv[q]["B"])
+        added = (b - a) * 1000
+        sp = {}
+        for v in ("A", "B"):
+            meds = [st.median(xs) for xs in proc[q][v].values()]
+            sp[v] = max(meds) / min(meds) - 1
+        vd = verdict(lo, hi, added)
+        out[q] = dict(a=a, b=b, ratio=st.median(ratios), lo=lo, hi=hi, added_us=added,
+                      spread_a=sp["A"], spread_b=sp["B"], verdict=vd, rounds=ratios)
+        print(f"| {q} | {a:.4f} | {b:.4f} | {st.median(ratios):.3f} | {lo:.3f}–{hi:.3f} | "
+              f"{added:+.2f} | {sp['A']*100:.1f}% | {sp['B']*100:.1f}% | {vd} |")
+    return out
+
+
+def ab_times(d, script):
+    """query -> list of seconds for one arm directory."""
+    t = {}
+    if script == "vector":
+        h = json.loads((d / "hyperfine.json").read_text())
+        for r in h["results"]:
+            t[r["name"]] = [m["time_wall_clock"]["value"] for m in r["measurements"]]
+        return t
+    for f in sorted(d.glob(f"{script}-*.json")):
+        if f.name in (f"{script}-answers.json", f"{script}-status.json", "text-hits.json"):
+            continue
+        j = json.loads(f.read_text())
+        rs = [r for r in j.get("results", []) if r.get("command") == "sparkles"]
+        if rs:
+            t[f.stem[len(script) + 1:]] = rs[0]["times"]
+    return t
+
+
+def ab(root):
+    rng = random.Random(829)
+    out = {}
+    for script in ("text", "geo", "vector"):
+        for threads in ("t12", "t1"):
+            for mode in ("eager", "streaming"):
+                arms = {a: ab_times(root / f"{script}-{a}-{mode}-{threads}", script)
+                        for a in ("base", "tip", "tip2", "base2")}
+                print(f"\n### {script} {mode} {threads}\n")
+                print("| query | base ms | tip ms | tip/base | 95% interval | added µs | pair 1 | pair 2 | base2/base | tip2/tip | verdict |")
+                print("|---|--:|--:|--:|---|--:|--:|--:|--:|--:|---|")
+                common = set.intersection(*(set(v) for v in arms.values()))
+                for q in sorted(arms["base"]):
+                    if q not in common:
+                        print(f"| {q} | missing in some arm | | | | | | | skipped |")
+                        continue
+                    xs = {a: arms[a][q] for a in arms}
+                    base = xs["base"] + xs["base2"]
+                    tip = xs["tip"] + xs["tip2"]
+                    r = st.median(tip) / st.median(base)
+                    boots = []
+                    for _ in range(B // 4):
+                        rb = [x for a in ("base", "base2") for x in rng.choices(xs[a], k=len(xs[a]))]
+                        rt = [x for a in ("tip", "tip2") for x in rng.choices(xs[a], k=len(xs[a]))]
+                        boots.append(st.median(rt) / st.median(rb))
+                    lo, hi = pct(boots, 0.025), pct(boots, 0.975)
+                    added = (st.median(tip) - st.median(base)) * 1e6
+                    sb = st.median(xs["base2"]) / st.median(xs["base"])
+                    stt = st.median(xs["tip2"]) / st.median(xs["tip"])
+                    p1 = st.median(xs["tip"]) / st.median(xs["base"])
+                    p2 = st.median(xs["tip2"]) / st.median(xs["base2"])
+                    # the plan's rule for these scripts: 5% on wall time, and a difference
+                    # not above 1 in both A,B,B,A pairs is noise
+                    if p1 > 1 and p2 > 1:
+                        vd = "gate fail" if min(p1, p2) >= 1.05 else "slower in both pairs"
+                    elif p1 < 1 and p2 < 1:
+                        vd = "faster in both pairs"
+                    else:
+                        vd = "noise"
+                    out[f"{script}/{mode}/{threads}/{q}"] = dict(
+                        base_ms=st.median(base) * 1e3, tip_ms=st.median(tip) * 1e3, ratio=r,
+                        lo=lo, hi=hi, added_us=added, base2_over_base=sb, tip2_over_tip=stt,
+                        n=[len(xs[a]) for a in ("base", "tip", "tip2", "base2")], pairs=[p1, p2], verdict=vd)
+                    print(f"| {q} | {st.median(base)*1e3:.2f} | {st.median(tip)*1e3:.2f} | {r:.3f} | "
+                          f"{lo:.3f}–{hi:.3f} | {added:+.1f} | {p1:.3f} | {p2:.3f} | {sb:.3f} | {stt:.3f} | {vd} |")
+    return out
+
+
+def main():
+    root = Path(sys.argv[1])
+    print("# Item 829 part 1 on forge, base bccc5f7b (A) against tip 9df856f3 (B)\n")
+    print("## 31-query matrix, server execMs, one thread")
+    m = {c: matrix(root / "matrix" / c) for c in ("streaming-t1", "eager-t1")}
+    print("\n## Text, geo and vector scripts, client wall time")
+    a = ab(root / "out" / "results")
+    (root / "analysis.json").write_text(json.dumps(dict(matrix=m, ab=a), indent=1))
+
+
+main()
