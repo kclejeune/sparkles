@@ -79,27 +79,46 @@ pub(super) trait SolutionSource {
     fn fail_output(&mut self, error: &Error);
 }
 
-/// An eager result. The terms of an answer of one chunk, and of every native JSON
-/// answer, are decoded row by row into one scratch row. Larger answers in the other
-/// formats decode a chunk of rows at a time, the next chunk on a scoped thread.
+/// An eager result, written in the way its [`EagerMode`] names.
 pub(super) struct EagerSolutions<'r> {
     pub(super) r: &'r QueryResult,
-    /// decode every row into the scratch row, as the native writer does
-    pub(super) scratch: bool,
+    pub(super) mode: EagerMode,
 }
 
-struct ScratchRows<'r> {
+/// How an eager answer's rows are decoded for its writer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum EagerMode {
+    /// The SPARQL formats. An answer of one chunk is decoded row by row into one
+    /// scratch row after a vocabulary prefetch, and a larger answer a chunk of rows at
+    /// a time, the next chunk on a scoped thread.
+    Chunks,
+    /// Native JSON. Every row is decoded into one scratch row after the prefetch.
+    Scratch,
+    /// SPARQL Results Thrift. Every row is decoded into one scratch row with no
+    /// prefetch, and each row checks the query's controls first, as the server's own
+    /// row loop did.
+    Rows,
+}
+
+/// Every row of an eager answer decoded into one scratch row. `CONTROLS` checks the
+/// query's cancellation and deadline before each row.
+struct ScratchRows<'r, const CONTROLS: bool> {
     row: output::ScratchRow<'r>,
+    r: &'r QueryResult,
     n: usize,
 }
 
-impl RowBatch for ScratchRows<'_> {
+impl<const CONTROLS: bool> RowBatch for ScratchRows<'_, CONTROLS> {
     fn len(&self) -> usize {
         self.n
     }
 
     #[inline]
     fn row(&mut self, i: usize) -> Result<RowView<'_>> {
+        if CONTROLS {
+            // a recorded memory refusal is checked first, so the earlier error wins
+            self.r.inner.ctx.check()?;
+        }
         Ok(RowView::Dense(self.row.load(i)?))
     }
 }
@@ -169,7 +188,17 @@ impl SolutionSource for EagerSolutions<'_> {
     fn drive<V: BatchVisitor>(&mut self, send: Option<usize>, visitor: &mut V) -> Result<()> {
         let r = self.r;
         let n = send.map_or(r.inner.table.len(), |s| s.min(r.inner.table.len()));
-        if self.scratch || n <= DECODE_ROWS {
+        if self.mode == EagerMode::Rows {
+            let mut rows = ScratchRows::<true> {
+                row: output::ScratchRow::new(r)?,
+                r,
+                n,
+            };
+            visitor.batch(&mut rows)?;
+            drop(rows);
+            return r.inner.ctx.check_memory_failure();
+        }
+        if self.mode == EagerMode::Scratch || n <= DECODE_ROWS {
             // a result of one chunk is decoded row by row: under concurrent load that
             // keeps less memory live per request than a chunk's table of terms, and in the
             // 10.5M benchmark it served 25% more requests a second
@@ -179,8 +208,9 @@ impl SolutionSource for EagerSolutions<'_> {
             if ahead >= 2 && crate::index::io_hints() {
                 prefetch_answer(r, ahead)?;
             }
-            let mut rows = ScratchRows {
+            let mut rows = ScratchRows::<false> {
                 row: output::ScratchRow::new(r)?,
+                r,
                 n,
             };
             visitor.batch(&mut rows)?;

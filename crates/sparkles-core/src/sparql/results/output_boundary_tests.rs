@@ -594,3 +594,82 @@ fn an_outlier_row_does_not_make_a_later_small_row_refuse() {
     assert_eq!(r.test_context().live_bytes(), live);
     r.test_context().check_memory_failure().unwrap();
 }
+
+/// A writer that cancels its query once `after` bytes have reached it.
+struct CancelAfter {
+    bytes: Vec<u8>,
+    cancel: Arc<AtomicBool>,
+    after: usize,
+}
+
+impl Write for CancelAfter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        if self.bytes.len() >= self.after {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn an_eager_thrift_answer_checks_its_controls_before_each_row() {
+    let r = answer(false);
+    // The first row's literal is longer than the output buffer, so it reaches the
+    // writer before the second row is decoded, and the writer cancels the query then.
+    let mut out = CancelAfter {
+        bytes: Vec::new(),
+        cancel: r.test_context().cancel.clone(),
+        after: LONG,
+    };
+    let sent = RowCount::new();
+    let error = write(
+        Source::Result(&r),
+        WriteOptions::new(super::Format::ResultsThrift, &sent),
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
+    assert_eq!(sent.get(), 1);
+    let text = String::from_utf8_lossy(&out.bytes);
+    assert!(text.contains(&"x".repeat(LONG)));
+    assert!(
+        !text.contains("tail"),
+        "the second row was written after the cancel"
+    );
+    r.test_context().cancel.store(false, Ordering::Relaxed);
+}
+
+#[test]
+fn an_eager_thrift_answer_takes_no_vocabulary_prefetch() {
+    use crate::algo::memory::probe;
+    if !crate::index::io_hints() {
+        return;
+    }
+    // Each arm has a fresh store, since a prefetch marks its vocabulary blocks as asked.
+    let arm = |format: super::Format| {
+        let (_directory, r) = stored(64);
+        let _scope = probe::install(|_| {}, Some("answer-prefetch-ids"));
+        let sent = RowCount::new();
+        let result = write(
+            Source::Result(&r),
+            WriteOptions::new(format, &sent),
+            &mut Vec::new(),
+        );
+        (result.map(drop), sent.get())
+    };
+    // The TSV writer prefetches the answer's vocabulary blocks, so the injected
+    // failure shows that the probe is reached at all.
+    let (tsv, _) = arm(super::Format::Solutions(SolutionsFormat::Tsv));
+    assert!(
+        matches!(&tsv, Err(Error::Invalid(m)) if m.contains("injected chunk storage")),
+        "{tsv:?}"
+    );
+    let (thrift, rows) = arm(super::Format::ResultsThrift);
+    thrift.unwrap();
+    assert_eq!(rows, 2);
+}

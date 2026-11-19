@@ -2,7 +2,7 @@
 //! entry that every caller writes a result through.
 
 use super::source::{
-    BatchVisitor, CursorGraph, CursorSolutions, EagerGraph, EagerSolutions, GraphSource,
+    BatchVisitor, CursorGraph, CursorSolutions, EagerGraph, EagerMode, EagerSolutions, GraphSource,
     NativeGraphLayout, RowBatch, RowView, SolutionSource, Statement, StatementVisitor,
 };
 use super::{
@@ -92,7 +92,10 @@ pub fn write(
         (Source::Result(r), Format::Solutions(SolutionsFormat::Sparkles))
             if matches!(r.kind, QueryKind::Select | QueryKind::Ask) =>
         {
-            let mut source = EagerSolutions { r, scratch: true };
+            let mut source = EagerSolutions {
+                r,
+                mode: EagerMode::Scratch,
+            };
             solutions(&mut source, writer, rows, |s, out, staged| {
                 native(s, out, staged, send, metadata)
             })
@@ -103,7 +106,10 @@ pub fn write(
             })
         }
         (Source::Result(r), Format::Solutions(fmt)) => {
-            let mut source = EagerSolutions { r, scratch: false };
+            let mut source = EagerSolutions {
+                r,
+                mode: EagerMode::Chunks,
+            };
             solutions(&mut source, writer, rows, |s, out, staged| {
                 select(s, fmt, out, staged, send)
             })
@@ -120,8 +126,12 @@ pub fn write(
             })
         }
         (Source::Result(r), Format::ResultsThrift) if r.kind == QueryKind::Select => {
-            // row by row into one scratch row, as the server wrote it before
-            let mut source = EagerSolutions { r, scratch: true };
+            // row by row into one scratch row with each row's control check and no
+            // prefetch, as the server wrote it before
+            let mut source = EagerSolutions {
+                r,
+                mode: EagerMode::Rows,
+            };
             solutions(&mut source, writer, rows, |s, out, staged| {
                 thrift(s, out, staged, send)
             })

@@ -5147,6 +5147,62 @@ fn graph_writers_flush_after_their_first_batch() {
     }
 }
 
+/// The cursor's SPARQL Results Thrift writer flushes once after its first batch, before it
+/// pulls the second, so a writer that commits on a flush starts the response then. The
+/// probe cancels the query at its first flush, and the output holds exactly the first
+/// batch's rows, written and counted.
+#[test]
+fn the_cursor_thrift_writer_flushes_after_its_first_batch() {
+    use sparkles_core::jena_formats::ThriftResults;
+    use sparkles_core::sparql::results::{self, Format, RowCount, Source, WriteOptions};
+    struct Probe {
+        out: Vec<u8>,
+        flushes: usize,
+        cancel: Arc<AtomicBool>,
+    }
+    impl std::io::Write for Probe {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.out.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            self.cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    let s = store(1000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let eager = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    let vars = ["s".to_string(), "o".to_string()];
+    let mut expected = ThriftResults::new(Vec::new(), &vars).unwrap();
+    for row in &eager[..10] {
+        expected.row(row).unwrap();
+    }
+    let mut c = open(&s, q, 10);
+    let mut probe = Probe {
+        out: Vec::new(),
+        flushes: 0,
+        cancel: c.cancellation_token(),
+    };
+    let rows = RowCount::new();
+    let r = results::write(
+        Source::Select(&mut c),
+        WriteOptions::new(Format::ResultsThrift, &rows),
+        &mut probe,
+    );
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert_eq!(probe.flushes, 1);
+    assert_eq!(rows.get(), 10);
+    assert_eq!(
+        &probe.out,
+        expected.get_mut(),
+        "the first batch's rows, whole"
+    );
+}
+
 /// An OPTIONAL over two inputs sorted on their shared variable merges when the
 /// `merge_left_join` switch is on and hashes when it is off, in the cursor as in eager
 /// execution, and both plans name the algorithm that ran. The first query fills the
