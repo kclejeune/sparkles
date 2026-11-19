@@ -317,8 +317,8 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
 * `FILTER(?x < ?y)` and the other order comparisons of two columns of stored simple
   literals, over a table or cursor batch of at least 4,096 rows, read the strings' order
   from their vocabulary ids and each string's floor in both modes, so neither column is
-  decoded. Each worker keeps the floors it computes in a map of a cache that lasts the
-  query, charged to its budget and capped at 64 MiB or a sixteenth of the budget, which
+  decoded. The workers keep the floors they compute in one shared table of a cache that
+  lasts the query and grows when repeated strings evict each other, charged to its budget and capped at 64 MiB or a sixteenth of the budget, which
   trades that memory for not computing a repeated string's floor again. Once the cache
   is full, the floors it lacks are computed each time. Pairs whose strings rarely repeat
   run up to 12% slower than a direct comparison of the keys, which

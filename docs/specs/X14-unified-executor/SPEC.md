@@ -247,12 +247,16 @@ The query's context keeps the floors in a cache that lasts the query, so cursor 
 compare two string columns through the floors as eager tables do. A floor cache that
 each batch built again had measured 24.8% slower on streaming `str-pair-lt` and 33.4% on
 `str-pair-names` on atlas, since names that repeat across batches had their floors
-computed in every batch. The cache holds one map for each worker of a mask, which the
-worker checks out and returns, so a lookup takes no lock. A map's growth is charged to
-the query before it allocates, inside the spill threshold, and the cache holds at most
-64 MiB or a sixteenth of the query's memory budget. This memory buys the speed below, and
-a growth that the budget refuses leaves the map full, so the floors it lacks are computed
-each time. A cursor reads a key and the key before it in one walk of their block when
+computed in every batch. Every worker of a mask reads and writes one direct-mapped table
+of atomic words without a lock, since maps of their own made each worker compute a
+recurring string's floor again. A word holds the id's slot tag, the distance down to its
+floor and a bit set when the floor is read again. The first table has 2^16 slots, and it
+grows eightfold before a mask or a part of a large eager table once the floors it evicted
+that had been read again reach a thirty-second of its slots, so inputs whose strings
+rarely repeat keep it. Each table is charged to the query before it is allocated, inside
+the spill threshold, and the cache holds at most 64 MiB or a sixteenth of the query's
+memory budget. This memory buys the speed below, and a table that the budget refuses
+leaves the floors the cache lacks to be computed each time. A cursor reads a key and the key before it in one walk of their block when
 that walk admits at most 4 KiB and the envelope grants it, and otherwise reads the key
 alone. A cursor batch spreads its floor comparison over the pool as the generic filter
 does. The bounded-reads test counts every read of the mode, seven in all.
