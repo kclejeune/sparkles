@@ -3,12 +3,47 @@
 //! restricted to them. A triple present in several graphs of the data graph is one
 //! triple, as in the RDF merge.
 
-use crate::error::{Error, Result};
+use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{Key, Perm};
 use crate::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
 use crate::store::{Chunk, Snapshot};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A byte allowance for retaining validation report entries. Workers can share one
+/// allowance and reserve estimated bytes before moving each entry into a report.
+#[derive(Debug)]
+pub struct ReportBytes {
+    limit: u64,
+    retained: AtomicU64,
+}
+
+impl ReportBytes {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            retained: AtomicU64::new(0),
+        }
+    }
+
+    pub fn admit(&self, bytes: u64) -> Result<()> {
+        self.retained
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |retained| {
+                retained
+                    .checked_add(bytes)
+                    .filter(|&total| total <= self.limit)
+            })
+            .map_err(|retained| {
+                Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::Memory,
+                    limit: self.limit,
+                    requested: retained.saturating_add(bytes),
+                })
+            })?;
+        Ok(())
+    }
+}
 
 /// Which graphs of the store form the data graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +186,10 @@ impl DataGraph {
         })
     }
 
+    fn next_distinct(last: &mut Option<Id>, id: Id) -> bool {
+        last.replace(id) != Some(id)
+    }
+
     /// Visit the distinct values of key column `col` under `prefix` (the column right
     /// after the prefix, so equal values are adjacent); `f` returns `false` to stop.
     fn scan_distinct(
@@ -162,12 +201,40 @@ impl DataGraph {
     ) -> Result<()> {
         let mut last = None;
         self.scan(perm, prefix, |k| {
-            if last == Some(k[col]) {
-                return true;
-            }
-            last = Some(k[col]);
-            f(Id(k[col]))
+            let id = Id(k[col]);
+            !Self::next_distinct(&mut last, id) || f(id)
         })
+    }
+
+    /// Stream a FOCUS pattern over the physical validation graph under its
+    /// original preparation. The scanner polls rows excluded here as well.
+    pub(crate) fn scan_focus<E: From<Error>>(
+        &self,
+        preparation: &crate::access::Preparation,
+        predicate: Id,
+        fixed: Option<Id>,
+        focus_is_subject: bool,
+        mut each: impl FnMut(Id) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if !Self::stored(predicate) || fixed.is_some_and(|id| !Self::stored(id)) {
+            return Ok(());
+        }
+        let (perm, prefix, len) = match (focus_is_subject, fixed) {
+            (true, Some(object)) => (Perm::Pos, [predicate.0, object.0], 2),
+            (false, Some(subject)) => (Perm::Spo, [subject.0, predicate.0], 2),
+            (true, None) => (Perm::Pso, [predicate.0, 0], 1),
+            (false, None) => (Perm::Pos, [predicate.0, 0], 1),
+        };
+        let column = perm.order()[len];
+        let mut last = None;
+        self.snap
+            .scan_prepared(perm, &prefix[..len], preparation, |quad| {
+                let id = quad[column];
+                if self.sel.accepts(quad[crate::index::G].0) && Self::next_distinct(&mut last, id) {
+                    each(id)?;
+                }
+                Ok(true)
+            })
     }
 
     /// Stream the distinct objects of `(s, p, ?)`; `f` returns `false` to stop.
@@ -382,6 +449,180 @@ ex:g2 { ex:a ex:p 4 . }
         assert_eq!(ex.sel.ids(&snap).unwrap().len(), 2);
         let err = DataGraph::new(snap.clone(), Some("http://ex.org/none"), &[], &[]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn controlled_focus_streams_the_same_distinct_physical_ids() {
+        let store = Store::in_memory(StoreOptions::default());
+        let trig = format!("{TRIG} _:g {{ <urn:blank-subject> <http://ex.org/p> 2 . }}");
+        store
+            .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+        let snap = store.snapshot();
+        let a = iri(&snap, "a");
+        let p = iri(&snap, "p");
+        let preparation =
+            crate::access::Preparation::new(crate::task::Control::none(), 4 << 20).unwrap();
+
+        for (graph, excluded) in [
+            (None, &[][..]),
+            (Some("http://ex.org/g1"), &[][..]),
+            (Some(UNION_GRAPH_IRI), &[][..]),
+            (Some(UNION_GRAPH_IRI), &["http://ex.org/g1".to_owned()][..]),
+        ] {
+            let d = DataGraph::new(snap.clone(), graph, &[], excluded).unwrap();
+            for (subject, fixed, expected) in [
+                (true, Some(int(2)), d.subjects(p, int(2)).unwrap()),
+                (false, Some(a), d.objects(a, p).unwrap()),
+                (true, None, d.subjects_of(p).unwrap()),
+                (false, None, d.objects_of(p).unwrap()),
+                (true, Some(Id::UNDEF), Vec::new()),
+            ] {
+                let baseline = preparation.inner_used();
+                let mut found = Vec::new();
+                d.scan_focus(&preparation, p, fixed, subject, |id| -> Result<()> {
+                    assert!(preparation.inner_used() > baseline);
+                    found.push(id);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(found, expected);
+                assert_eq!(preparation.inner_used(), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_focus_polls_rows_that_emit_no_association() {
+        use crate::task::{Control, Progress};
+        use std::fmt::Write;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut text = String::new();
+        for n in 0..2048 {
+            writeln!(text, "<urn:s> <urn:p> <urn:o{n:04}> <urn:excluded> .").unwrap();
+        }
+        store
+            .load(&[Source::from_bytes(
+                text.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let p = snap.lookup_iri("urn:p").unwrap();
+        for excluded in [Vec::new(), vec!["urn:excluded".to_owned()]] {
+            let d = DataGraph::new(snap.clone(), Some(UNION_GRAPH_IRI), &[], &excluded).unwrap();
+            let mut control = Control::none();
+            let cancel = control.cancel.clone();
+            control.progress = Progress::new(move |_, stage| {
+                if stage == "scanning permission rows" {
+                    cancel.cancel();
+                }
+            });
+            let preparation = crate::access::Preparation::new(control, 4 << 20).unwrap();
+            let mut called = 0;
+            assert!(matches!(
+                d.scan_focus(&preparation, p, None, true, |_| -> Result<()> {
+                    called += 1;
+                    Ok(())
+                }),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(called, usize::from(excluded.is_empty()));
+        }
+
+        let mut txn = store.write();
+        snap.for_each_quad(|quad| {
+            txn.delete(*quad)?;
+            Ok(())
+        })
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.snapshot().len(), 0);
+        let d = DataGraph::new(store.snapshot(), Some(UNION_GRAPH_IRI), &[], &[]).unwrap();
+        let mut control = Control::none();
+        let cancel = control.cancel.clone();
+        control.progress = Progress::new(move |_, stage| {
+            if stage == "scanning permission rows" {
+                cancel.cancel();
+            }
+        });
+        let preparation = crate::access::Preparation::new(control, 4 << 20).unwrap();
+        assert!(matches!(
+            d.scan_focus(&preparation, p, None, true, |_| -> Result<()> {
+                panic!("a deleted row reached the callback")
+            }),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn controlled_focus_stops_at_callback_refusal_and_returns_read_errors() {
+        use crate::task::{Control, Progress};
+        use std::fmt::Write;
+        use std::sync::atomic::AtomicUsize;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut text = String::new();
+        for n in 0..2048 {
+            writeln!(text, "<urn:s{n:04}> <urn:p> <urn:o> .").unwrap();
+        }
+        store
+            .load(&[Source::from_bytes(
+                text.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let mut snap = store.snapshot();
+        drop(store);
+        let p = snap.lookup_iri("urn:p").unwrap();
+
+        let checked = Arc::new(AtomicUsize::new(0));
+        let mut control = Control::none();
+        let count = checked.clone();
+        control.progress = Progress::new(move |_, stage| {
+            if stage == "scanning permission rows" {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let preparation = crate::access::Preparation::new(control, 4 << 20).unwrap();
+        let baseline = preparation.inner_used();
+        let d = DataGraph::new(snap.clone(), Some(UNION_GRAPH_IRI), &[], &[]).unwrap();
+        for stop_at in [1, 2] {
+            let mut visited = 0;
+            assert!(matches!(
+                d.scan_focus(&preparation, p, None, true, |_| -> Result<()> {
+                    visited += 1;
+                    if visited == stop_at {
+                        return Err(Error::invalid("callback refused"));
+                    }
+                    Ok(())
+                }),
+                Err(Error::Invalid(message)) if message == "callback refused"
+            ));
+            assert_eq!(visited, stop_at);
+            assert_eq!(checked.load(Ordering::Relaxed), 0);
+            assert_eq!(preparation.inner_used(), baseline);
+        }
+        drop(d);
+
+        let snapshot = Arc::get_mut(&mut snap).unwrap();
+        let generation = Arc::get_mut(&mut snapshot.generation).unwrap();
+        let index = &mut generation.perms[Perm::Pso.index()];
+        let block = &mut Arc::make_mut(&mut index.blocks)[0];
+        block.offset = u64::MAX;
+        // A cold cache ensures the invalid frame address is reached on this scan.
+        snapshot.cache = Arc::new(crate::index::BlockCache::new(0));
+        let d = DataGraph::new(snap, Some(UNION_GRAPH_IRI), &[], &[]).unwrap();
+        assert!(matches!(
+            d.scan_focus(&preparation, p, None, true, |_| -> Result<()> {
+                panic!("an unreadable block reached the callback")
+            }),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(preparation.inner_used(), baseline);
     }
 
     #[test]

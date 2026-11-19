@@ -838,6 +838,21 @@ default graph, including any selected blank-node-named graphs, and have no named
 A blank-node shape label is supported, and a supported selector that matches no node
 can pass. See [C31](../specs/C31-checks-and-protected-merges/SPEC.md#outcome) for the gate suite work.
 
+The controlled Rust runner uses the earliest of its parent deadline and each check's
+timeouts. The deadline is cooperative and includes loading, parsing and compiling
+inputs, evaluation and report collection. A completed violation still blocks if its
+checker returns late. A timed-out or incomplete check returns an error.
+
+The produced-row budget is shared by all queries of a check. Intermediate row and
+query memory limits apply to each query. ShEx also enforces the same memory limit across
+shared preparation, FOCUS scan workspace and retained selector output. Retaining the
+first selector's output can reduce the memory available to a later selector. The runner
+can separately limit the number and estimated bytes of retained validation results.
+These bounds include SHACL detail results, ShEx expanded associations and explanations,
+and diagnostic evidence and messages. An asserted-only diagnostic excludes materialized
+inferences even when the store uses a union default graph. Enabling inferences preserves
+the normal selection of asserted data.
+
 ### Schema discovery and drafted shapes
 
 * `GET /$/schema/{ds}`, `sparkles schema` and `sparkles::schema` list classes and

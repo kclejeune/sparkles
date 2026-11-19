@@ -2807,14 +2807,14 @@ impl PermIndex {
     /// A permission preparation reads one admitted segment at a time. Cache access
     /// is nonblocking; contention causes a controlled local decode, never a wait
     /// inside the shared cache. Dense-reader hints do not enlarge the segment.
-    pub(crate) fn for_each_prepared(
+    pub(crate) fn for_each_prepared<E: From<Error>>(
         &self,
         cache: &BlockCache,
         lo: &Key,
         hi: &Key,
         preparation: &crate::access::Preparation,
-        mut each: impl FnMut(&Block, usize, usize) -> Result<bool>,
-    ) -> Result<()> {
+        mut each: impl FnMut(&Block, usize, usize) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<(), E> {
         preparation.check()?;
         let (b0, b1) = self.key_block_range(lo, hi);
         for b in b0..b1 {
@@ -2875,7 +2875,8 @@ impl PermIndex {
                         if before.checked_add(frame).is_none_or(|end| end > length) {
                             return Err(Error::Corrupt(
                                 "prepared segment ends past its column".into(),
-                            ));
+                            )
+                            .into());
                         }
                         offset = offset.checked_add(before).ok_or_else(|| {
                             Error::Corrupt("prepared segment offset overflow".into())
@@ -2913,7 +2914,7 @@ impl PermIndex {
                 }
             }
         }
-        preparation.check()
+        preparation.check().map_err(E::from)
     }
 
     /// Bounded point lookup for historical replay. Fresh local scratch avoids the

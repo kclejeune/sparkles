@@ -806,17 +806,22 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
 }
 
 fn source_parser(src: &Source) -> Result<RdfParser> {
-    let mut parser = RdfParser::from_format(src.rdf_format()?);
-    if let Some(base) = &src.base {
-        parser = parser
-            .with_base_iri(base.clone())
-            .map_err(|e| Error::invalid(e.to_string()))?;
-    }
+    let mut parser = rdf_parser(src.rdf_format()?, src.base.as_deref())?;
     if let Some(g) = &src.graph {
         parser = parser.with_default_graph(GraphName::NamedNode(g.clone()));
     }
     if src.lenient {
         parser = parser.lenient();
+    }
+    Ok(parser)
+}
+
+fn rdf_parser(format: RdfFormat, base: Option<&str>) -> Result<RdfParser> {
+    let mut parser = RdfParser::from_format(format);
+    if let Some(base) = base {
+        parser = parser
+            .with_base_iri(base)
+            .map_err(|e| Error::invalid(e.to_string()))?;
     }
     Ok(parser)
 }
@@ -1286,21 +1291,39 @@ fn pipe_quads<S: QuadSink, F: Fn() -> S + Sync>(
     }
 }
 
+/// Parse a borrowed, already-decoded RDF stream with the strict reader and nesting
+/// guard used by the loader. Reader and sink errors keep their original types.
+pub fn parse_rdf_reader(
+    reader: impl Read,
+    format: RdfFormat,
+    base: Option<&str>,
+    name: &str,
+    sink: impl FnMut(Quad) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    parse_rdf_reader_with(reader, format, name, rdf_parser(format, base)?, sink)
+}
+
 fn parse_reader(
     src: &Source,
     parser: RdfParser,
     reader: impl Read,
+    sink: impl FnMut(Quad) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    parse_rdf_reader_with(reader, src.rdf_format()?, &src.name, parser, sink)
+}
+
+fn parse_rdf_reader_with(
+    reader: impl Read,
+    format: RdfFormat,
+    name: &str,
+    parser: RdfParser,
     mut sink: impl FnMut(Quad) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
-    let mut parsed = parser.for_reader(crate::nesting::Guarded::rdf(
-        reader,
-        src.rdf_format()?,
-        &src.name,
-    ));
+    let mut parsed = parser.for_reader(crate::nesting::Guarded::rdf(reader, format, name));
     for q in parsed.by_ref() {
         let q = q.map_err(|e| match e {
             oxrdfio::RdfParseError::Io(e) => crate::codec::io_error(e),
-            e => Error::RdfParse(format!("{}: {e}", src.name)),
+            e => Error::RdfParse(format!("{name}: {e}")),
         })?;
         sink(q)?;
     }

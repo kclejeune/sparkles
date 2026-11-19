@@ -1078,6 +1078,8 @@ fn restrict_source_ctx(
         } else {
             every = false;
         }
+        #[cfg(test)]
+        checked_source_tests::observe_union_graph(graph);
         Ok(true)
     })?;
     #[cfg(test)]
@@ -1256,6 +1258,38 @@ pub fn query_source(
     if result.kind == QueryKind::Select {
         select_star_order(q, &mut result)?;
     }
+    Ok(result)
+}
+
+/// Query a trusted application's physical snapshot under one preparation and its
+/// retained accounting. The caller supplies the actual snapshot and applicable
+/// current graph policy. This establishes no Store authority or history proof.
+pub fn query_snapshot_prepared(
+    snapshot: Arc<Snapshot>,
+    q: &str,
+    mut opts: QueryOptions,
+) -> Result<QueryResult> {
+    opts.deadline = opts.effective_deadline(Instant::now())?;
+    opts.timeout = None;
+    let preparation = crate::access::Preparation::for_request(&opts)?;
+    let policy = opts.graphs.take();
+    let all = crate::access::GraphAccess::all();
+    let prepared = policy
+        .as_deref()
+        .unwrap_or(&all)
+        .masked_controlled(&snapshot, &preparation)?;
+    // Execution uses exactly the policy bound to the retained source.
+    let source = prepared.read_source();
+    preparation.check()?;
+    let started = Instant::now();
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
+    preparation.check()?;
+    let mut result = execute_retained_source(source, &parsed, &opts, parse_ms, None)?;
+    if result.kind == QueryKind::Select {
+        select_star_order(q, &mut result)?;
+    }
+    preparation.check()?;
     Ok(result)
 }
 

@@ -79,7 +79,7 @@ mod run;
 #[cfg(test)]
 mod tests;
 
-pub use run::{CheckResult, Inputs, Note, Status, SuiteReport, run};
+pub use run::{CheckResult, GateControls, Inputs, Note, Status, SuiteReport, run, run_controlled};
 
 use oxrdf::{NamedNode, Term, Triple};
 use std::collections::{BTreeMap, BTreeSet};

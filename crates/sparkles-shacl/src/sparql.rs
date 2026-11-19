@@ -22,6 +22,7 @@ use sparkles_core::sparql::plan::{ActiveGraph, Planner};
 use sparkles_core::sparql::table::Table;
 use sparkles_core::sparql::{Ctx, depth, exec, parse_query};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Variables that may be pre-bound (and so must not be assigned by the query).
 const PREBOUND: &[&str] = &["this", "value", "currentShape", "shapesGraph"];
@@ -278,7 +279,9 @@ fn check_gate_validator(
     prefixes: &[(String, String)],
     predicate: NamedNodeRef<'_>,
     property_path: &PropertyPath,
+    deadline: Option<Instant>,
 ) -> Result<()> {
+    crate::data::check_deadline(deadline)?;
     let parse = |text: &str| parse_query(text, None, prefixes);
     if predicate == sh::NODE_VALIDATOR {
         return check_gate_query(&parse(text)?);
@@ -292,7 +295,11 @@ fn check_gate_validator(
     }
     // A generic fallback can be used by either kind of shape. Check every
     // available syntax here. The instance still has to parse in its actual context.
-    match (parse(text), parse(&property)) {
+    let node = parse(text);
+    crate::data::check_deadline(deadline)?;
+    let property = parse(&property);
+    crate::data::check_deadline(deadline)?;
+    match (node, property) {
         (Ok(node), Ok(property)) => {
             check_gate_query(&node)?;
             check_gate_query(&property)
@@ -304,14 +311,15 @@ fn check_gate_validator(
 
 /// Check component validators even when no shape supplies their parameters, and
 /// SPARQL functions even when the shapes do not call them.
-pub(crate) fn check_gate_declarations(g: &G<'_>) -> Result<()> {
+pub(crate) fn check_gate_declarations(g: &G<'_>, deadline: Option<Instant>) -> Result<()> {
     // A validator may be used by a property shape. Its path cannot introduce a
     // graph or a dataset clause, so one placeholder suffices for this preflight.
     let path = PropertyPath::Predicate(NamedNode::new_unchecked("urn:sparkles:shacl:path"));
     for predicate in [sh::VALIDATOR, sh::NODE_VALIDATOR, sh::PROPERTY_VALIDATOR] {
         for triple in g.g.triples_for_predicate(predicate) {
+            crate::data::check_deadline(deadline)?;
             let component = Term::from(triple.subject.into_owned());
-            if !g.is_instance(&component, sh::CONSTRAINT_COMPONENT) {
+            if !g.is_instance_until(&component, sh::CONSTRAINT_COMPONENT, deadline)? {
                 continue;
             }
             let validator = triple.object.into_owned();
@@ -322,15 +330,16 @@ pub(crate) fn check_gate_declarations(g: &G<'_>) -> Result<()> {
                 let text = literal_text(&query)
                     .ok_or_else(|| anyhow!("the validator of {component} needs a query literal"))?;
                 let prefixes = prefixes(g, &validator);
-                check_gate_validator(text, &prefixes, predicate, &path)
+                check_gate_validator(text, &prefixes, predicate, &path, deadline)
                     .with_context(|| format!("validator of {component}"))?;
             }
         }
     }
     for predicate in [sh::ASK, sh::SELECT] {
         for triple in g.g.triples_for_predicate(predicate) {
+            crate::data::check_deadline(deadline)?;
             let function = Term::from(triple.subject.into_owned());
-            if !g.is_instance(&function, sh::SPARQL_FUNCTION) {
+            if !g.is_instance_until(&function, sh::SPARQL_FUNCTION, deadline)? {
                 continue;
             }
             let query = triple.object.into_owned();
@@ -345,9 +354,10 @@ pub(crate) fn check_gate_declarations(g: &G<'_>) -> Result<()> {
 
 /// Check the actual queries after compilation, including substituted paths and
 /// expressions nested in targets, constraints or custom function bodies.
-pub(crate) fn check_gate_queries(shapes: &Shapes) -> Result<()> {
+pub(crate) fn check_gate_queries(shapes: &Shapes, deadline: Option<Instant>) -> Result<()> {
     for shape in &shapes.shapes {
         for constraint in &shape.constraints {
+            crate::data::check_deadline(deadline)?;
             let query = match constraint {
                 Constraint::Sparql(c) => &c.parsed,
                 Constraint::Component(c) => &c.parsed,
@@ -357,6 +367,7 @@ pub(crate) fn check_gate_queries(shapes: &Shapes) -> Result<()> {
         }
     }
     for (expr, node) in shapes.exprs.iter().zip(&shapes.expr_nodes) {
+        crate::data::check_deadline(deadline)?;
         let query = match expr {
             Expr::Select(q) | Expr::SparqlExpr(q) => &q.query,
             Expr::SparqlFn { query, .. } | Expr::SparqlCall { query, .. } => query.as_ref(),
@@ -442,24 +453,29 @@ fn parse_validator(g: &G<'_>, node: &Term) -> Option<Validator> {
 }
 
 /// All SPARQL-based constraint components declared in the shapes graph.
-pub(crate) fn parse_components(g: &G<'_>) -> Result<Vec<Arc<SparqlComponent>>> {
+pub(crate) fn parse_components(
+    g: &G<'_>,
+    deadline: Option<Instant>,
+) -> Result<Vec<Arc<SparqlComponent>>> {
     let mut out = Vec::new();
     let mut cands: Vec<Term> = Vec::new();
+    let mut seen = FxHashSet::default();
     for t in g.g.triples_for_predicate(sh::PARAMETER) {
-        let s = Term::from(t.subject.into_owned());
-        if !cands.contains(&s) {
-            cands.push(s);
+        crate::data::check_deadline(deadline)?;
+        if seen.insert(t.subject) {
+            cands.push(Term::from(t.subject.into_owned()));
         }
     }
     for c in cands {
+        crate::data::check_deadline(deadline)?;
         let Term::NamedNode(iri) = &c else { continue };
         if iri.as_str().starts_with(crate::vocab::SH_NS)
-            || !g.is_instance(&c, sh::CONSTRAINT_COMPONENT)
+            || !g.is_instance_until(&c, sh::CONSTRAINT_COMPONENT, deadline)?
         {
             continue;
         }
         let mut params = Vec::new();
-        for p in g.objects(&c, sh::PARAMETER) {
+        for p in g.objects_until(&c, sh::PARAMETER, deadline)? {
             let Some(Term::NamedNode(path)) = g.object(&p, sh::PATH) else {
                 bail!("parameter {p} of {c} has no IRI sh:path");
             };
@@ -486,6 +502,21 @@ pub(crate) fn parse_components(g: &G<'_>) -> Result<Vec<Arc<SparqlComponent>>> {
     Ok(out)
 }
 
+#[cfg(test)]
+thread_local! {
+    static INSTANCE_CONVERSIONS_LEFT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_instance_conversion() {
+    INSTANCE_CONVERSIONS_LEFT.with(|left| match left.get() {
+        Some(0) => crate::data::set_deadline_checks_left(Some(0)),
+        Some(n) => left.set(Some(n - 1)),
+        None => {}
+    });
+}
+
 impl SparqlComponent {
     /// Instances of this component in shape `node` (one per combination of parameter
     /// values).
@@ -494,26 +525,30 @@ impl SparqlComponent {
         g: &G<'_>,
         node: &Term,
         path: Option<&PropertyPath>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<ComponentConstraint>> {
         let mut combos: Vec<Vec<(String, Term)>> = vec![Vec::new()];
         for p in &self.params {
-            let vals = g.objects(node, p.path.as_ref());
+            crate::data::check_deadline(deadline)?;
+            let vals = g.objects_until(node, p.path.as_ref(), deadline)?;
             if vals.is_empty() {
                 if p.optional {
                     continue;
                 }
                 return Ok(Vec::new());
             }
-            combos = combos
-                .into_iter()
-                .flat_map(|c| {
-                    vals.iter().map(move |v| {
-                        let mut c = c.clone();
-                        c.push((p.var.clone(), v.clone()));
-                        c
-                    })
-                })
-                .collect();
+            let mut next = Vec::new();
+            for combo in combos {
+                for val in &vals {
+                    if next.len() % 256 == 0 {
+                        crate::data::check_deadline(deadline)?;
+                    }
+                    let mut combo = combo.clone();
+                    combo.push((p.var.clone(), val.clone()));
+                    next.push(combo);
+                }
+            }
+            combos = next;
         }
         let validator = if path.is_some() {
             self.property_validator.as_ref().or(self.validator.as_ref())
@@ -525,24 +560,35 @@ impl SparqlComponent {
         };
         let mut prebound: Vec<String> = PREBOUND.iter().map(|s| s.to_string()).collect();
         prebound.extend(self.params.iter().map(|p| p.var.clone()));
+        crate::data::check_deadline(deadline)?;
         let text = substitute_path(&validator.text, path);
         let parsed = parse(&text, &validator.prefixes, &prebound)
             .with_context(|| format!("validator of {}", self.iri))?;
+        crate::data::check_deadline(deadline)?;
         let messages = if validator.messages.is_empty() {
-            self.messages.clone()
+            &self.messages
         } else {
-            validator.messages.clone()
+            &validator.messages
         };
-        Ok(combos
-            .into_iter()
-            .map(|bindings| ComponentConstraint {
+        let mut instances = Vec::new();
+        for bindings in combos {
+            #[cfg(test)]
+            observe_instance_conversion();
+            crate::data::check_deadline(deadline)?;
+            let mut instance_messages = Vec::new();
+            for message in messages {
+                crate::data::check_deadline(deadline)?;
+                instance_messages.push(message.clone());
+            }
+            instances.push(ComponentConstraint {
                 component: self.clone(),
                 bindings,
                 parsed: parsed.clone(),
                 ask: validator.ask,
-                messages: messages.clone(),
-            })
-            .collect())
+                messages: instance_messages,
+            });
+        }
+        Ok(instances)
     }
 }
 
@@ -573,7 +619,7 @@ fn display(t: &Term) -> String {
 impl Engine<'_> {
     /// Execute a parsed query with pre-bound variables.
     pub(crate) fn run_query(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Arc<Ctx>)> {
-        let depth = depth::check_query(q).map_err(|e| anyhow!("{e}"))?;
+        let depth = depth::check_query(q)?;
         depth::with_stack(depth, || self.run_query_on(q, binds))
     }
 
@@ -585,6 +631,20 @@ impl Engine<'_> {
         ctx.deadline = self.deadline;
         if let Some(m) = self.query_memory {
             ctx.mem_limit = ctx.mem_limit.min(m);
+        }
+        if let Some(opts) = &self.query_limits {
+            if let Some(rows) = opts.max_rows {
+                ctx.max_rows = ctx.max_rows.min(rows);
+            }
+            if let Some(bytes) = opts.max_memory_bytes {
+                ctx.mem_limit = ctx.mem_limit.min(bytes);
+            }
+            if let Some(work) = opts.max_rows_produced {
+                ctx.max_rows_produced = ctx.max_rows_produced.min(work);
+            }
+            if let Some(work) = &opts.work {
+                ctx.rows_produced = work.clone();
+            }
         }
         ctx.cancellation = self.cancellation.clone();
         if let Some(c) = &self.cancel {
@@ -608,13 +668,11 @@ impl Engine<'_> {
                 };
                 planner.subst.insert(ctx.var(name), id);
             }
-            planner
-                .plan(&pattern, &ActiveGraph::Default, Vec::new())
-                .map_err(|e| anyhow!("{e}"))?
+            planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?
         };
         // A shared context pulls an ASK, a LIMIT and an EXISTS only to the rows they need.
         let ctx = ctx.into_shared();
-        let (table, _) = exec::execute(&ctx, &node).map_err(|e| anyhow!("{e}"))?;
+        let (table, _) = exec::execute(&ctx, &node)?;
         Ok((table, ctx))
     }
 
@@ -852,6 +910,50 @@ mod tests {
     use super::substitute_path;
     use crate::path::PropertyPath;
     use oxrdf::NamedNode;
+
+    #[test]
+    fn gate_component_conversion_polls_after_expansion() {
+        use super::{G, INSTANCE_CONVERSIONS_LEFT, Parameter, SparqlComponent, Validator};
+        use oxrdf::{Graph, Triple};
+        use sparkles_core::Error;
+        use std::sync::Arc;
+
+        let node = NamedNode::new_unchecked("urn:shape");
+        let parameter = NamedNode::new_unchecked("urn:value");
+        let mut graph = Graph::new();
+        for value in [1, 2, 3] {
+            graph.insert(&Triple::new(
+                node.clone(),
+                parameter.clone(),
+                oxrdf::Literal::from(value),
+            ));
+        }
+        let component = Arc::new(SparqlComponent {
+            iri: NamedNode::new_unchecked("urn:component"),
+            params: vec![Parameter {
+                path: parameter,
+                var: "value".into(),
+                optional: false,
+            }],
+            validator: Some(Validator {
+                ask: false,
+                text: "SELECT $this WHERE { FILTER(?value = 1) }".into(),
+                prefixes: Vec::new(),
+                messages: Vec::new(),
+            }),
+            node_validator: None,
+            property_validator: None,
+            messages: vec![oxrdf::Literal::new_simple_literal("message")],
+        });
+        INSTANCE_CONVERSIONS_LEFT.set(Some(1));
+        let result = component.instances(&G { g: &graph }, &node.into(), None, None);
+        INSTANCE_CONVERSIONS_LEFT.set(None);
+        crate::data::set_deadline_checks_left(None);
+        assert!(matches!(
+            result.err().and_then(|e| e.downcast::<Error>().ok()),
+            Some(Error::Timeout)
+        ));
+    }
 
     #[test]
     fn path_placeholder_is_replaced_only_as_a_token() {

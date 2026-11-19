@@ -93,6 +93,12 @@ read the full validation data as their default graph and have no named graphs. T
 [reasoning and validation guide](../../reasoning/README.md#gate-suite-validation)
 describes the supported profiles.
 
+The controlled Rust runner shares one deadline and produced-row allowance across each
+check's setup and queries, and bounds retained validation results including SHACL
+details. ShEx also shares its query memory ceiling across preparation, FOCUS scan
+workspace and retained selector output. Diagnostics with materialized inference reading
+turned off exclude the inferred graph even when the store's SPARQL default is a union.
+
 A suite can name a `chk:UnsatisfiableClassesCheck`, which parses and counts in the suite's
 revision, but no build runs it. Its result is an error with the code `check-unavailable`,
 so a required one fails the suite. The OWL reader cannot yet read a terminology with the

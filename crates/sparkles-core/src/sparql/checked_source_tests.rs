@@ -61,6 +61,64 @@ fn prepared_query_retains_genuine_source_credit_and_releases_on_final_result() {
 }
 
 #[test]
+fn snapshot_prepared_query_retains_controls_policy_and_output() {
+    let store = store();
+    let snap = store.snapshot();
+    let pool = pool::QueryPool::new(16 << 20);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let access = GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["urn:allowed"], &[])),
+        Graphs::none(),
+    );
+    let opts = QueryOptions {
+        graphs: Some(Arc::new(access)),
+        union_default_graph: Some(true),
+        base_iri: Some("https://example.com/".into()),
+        prefixes: vec![("ex".into(), "urn:".into())],
+        pool: Some(pool.clone()),
+        cancellation: Some(crate::task::Cancellation::from_flags([cancelled.clone()])),
+        max_memory_bytes: Some(8 << 20),
+        ..opts()
+    };
+    let query = "SELECT * WHERE { ?z ex:p ?o . BIND(<relative> AS ?a) }";
+    let result = query_snapshot_prepared(snap.clone(), query, opts.clone()).unwrap();
+    assert_eq!(result.variables(), ["z", "o", "a"]);
+    assert_eq!(result.len(), 1);
+    let term = result
+        .term(snap.lookup_iri("urn:a").unwrap())
+        .unwrap()
+        .unwrap();
+    let values = result.rows().unwrap();
+    assert_eq!(
+        values.row(0).unwrap().values()[2]
+            .as_ref()
+            .unwrap()
+            .to_string(),
+        "<https://example.com/relative>"
+    );
+    drop(values);
+    cancelled.store(true, Ordering::Relaxed);
+    assert!(matches!(result.rows(), Err(Error::Cancelled)));
+    drop(result);
+    assert!(pool.granted() > 0);
+    assert_eq!(term.to_string(), "<urn:a>");
+    drop(term);
+    assert_eq!(pool.granted(), 0);
+    assert!(matches!(
+        query_snapshot_prepared(snap.clone(), "invalid text", opts),
+        Err(Error::Cancelled)
+    ));
+    let timeout = QueryOptions {
+        timeout: Some(std::time::Duration::ZERO),
+        ..Default::default()
+    };
+    assert!(matches!(
+        query_snapshot_prepared(snap, "invalid text", timeout),
+        Err(Error::Timeout)
+    ));
+}
+
+#[test]
 fn two_source_queries_share_the_original_preparation_cap_without_credit_gap() {
     let store = store();
     let preparation = Preparation::new(Control::none(), 2 << 20).unwrap();
@@ -396,10 +454,13 @@ fn historical_source_requires_current_policy_and_real_runtime_instance() {
 // Observation hooks are thread-local and test-only. They never alter admission.
 type ReleaseObserver = Box<dyn Fn(&Preparation, u64)>;
 type UnionObserver = Box<dyn Fn(&Preparation, Option<(usize, u64)>)>;
+type UnionGraphObserver = Box<dyn Fn(Id)>;
 type ContextObserver = Box<dyn Fn(&Ctx)>;
 thread_local! {
     static RELEASE_OBSERVER: std::cell::RefCell<Option<ReleaseObserver>> = const { std::cell::RefCell::new(None) };
     static UNION_OBSERVER: std::cell::RefCell<Option<UnionObserver>> = const { std::cell::RefCell::new(None) };
+    static UNION_GRAPH_OBSERVER: std::cell::RefCell<Option<UnionGraphObserver>> =
+        const { std::cell::RefCell::new(None) };
     static CONTEXT_OBSERVER: std::cell::RefCell<Option<ContextObserver>> = const { std::cell::RefCell::new(None) };
 }
 // The crate test allocator records the watched allocation, the original
@@ -426,11 +487,19 @@ pub(super) fn observe_union(preparation: &Preparation, allocation: Option<(usize
         }
     });
 }
+pub(super) fn observe_union_graph(graph: Id) {
+    UNION_GRAPH_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow().as_ref() {
+            observer(graph);
+        }
+    });
+}
 struct Observe;
 impl Drop for Observe {
     fn drop(&mut self) {
         RELEASE_OBSERVER.with(|observer| *observer.borrow_mut() = None);
         UNION_OBSERVER.with(|observer| *observer.borrow_mut() = None);
+        UNION_GRAPH_OBSERVER.with(|observer| *observer.borrow_mut() = None);
         CONTEXT_OBSERVER.with(|observer| *observer.borrow_mut() = None);
         DEALLOCATION.with(|observer| observer.set((0, 0, 0, 0)));
     }
@@ -1042,6 +1111,38 @@ fn checked_source_union_cancel_retires_its_actual_partial_payload() {
         ctx.dataset.default.is_none() && ctx.dataset.named.is_none(),
         "no partial dataset is published"
     );
+}
+
+#[test]
+fn snapshot_prepared_query_cancels_inside_cold_union_restriction() {
+    let _observe = Observe;
+    let store = store();
+    let pool = pool::QueryPool::new(16 << 20);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let triggered = cancel.clone();
+    UNION_GRAPH_OBSERVER.with(|observer| {
+        *observer.borrow_mut() = Some(Box::new(move |_| triggered.store(true, Ordering::Relaxed)));
+    });
+    let access = GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["urn:allowed"], &[])),
+        Graphs::none(),
+    );
+    assert!(matches!(
+        query_snapshot_prepared(
+            store.snapshot(),
+            "SELECT ?x WHERE { BIND(1 AS ?x) }",
+            QueryOptions {
+                graphs: Some(Arc::new(access)),
+                union_default_graph: Some(true),
+                cancel: Some(cancel.clone()),
+                pool: Some(pool.clone()),
+                ..opts()
+            },
+        ),
+        Err(Error::Cancelled)
+    ));
+    assert!(cancel.load(Ordering::Relaxed));
+    assert_eq!(pool.granted(), 0);
 }
 
 #[test]

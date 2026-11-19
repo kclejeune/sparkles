@@ -16,6 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::io::Source;
 use sparkles_core::sparql::value::Value;
 use std::fmt;
+use std::time::Instant;
 
 /// The guard may repair invalid syntax, but cannot validate an unreadable schema.
 pub(crate) enum GraphShapesError {
@@ -366,9 +367,10 @@ impl Shapes {
         text: &str,
         syntax: impl Into<ShapesSyntax>,
         base: Option<&str>,
+        deadline: Option<Instant>,
     ) -> Result<Shapes> {
-        let doc = crate::syntax::read_document(text, syntax.into(), base)?;
-        Parser::new(&doc.graph).for_gate().parse(false)
+        let doc = crate::syntax::read_document_until(text, syntax.into(), base, deadline)?;
+        Parser::new(&doc.graph).for_gate(deadline).parse(false)
     }
 
     /// Read shapes text (RDF or SHACLC) into a graph for
@@ -444,31 +446,35 @@ impl Shapes {
         snap: &sparkles_core::store::Snapshot,
         graph: Option<&str>,
     ) -> Result<Shapes> {
-        Self::from_store_with_profile(snap, graph, false)
-    }
-
-    /// Compile the pinned shapes graph for a gate. Stored blank nodes retain their
-    /// identity, as in [`Shapes::from_store`].
-    pub fn from_store_for_gate(
-        snap: &sparkles_core::store::Snapshot,
-        graph: Option<&str>,
-    ) -> Result<Shapes> {
-        Self::from_store_with_profile(snap, graph, true)
-    }
-
-    fn from_store_with_profile(
-        snap: &sparkles_core::store::Snapshot,
-        graph: Option<&str>,
-        gate: bool,
-    ) -> Result<Shapes> {
         let g = crate::data::read_graph(snap, graph)?;
-        let mut parser = Parser::new(&g);
-        parser.gate = gate;
-        let mut shapes = parser.parse(true)?;
+        let mut shapes = Parser::new(&g).parse(true)?;
         shapes.source_graph = graph
             .filter(|g| *g != sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI)
             .map(str::to_string);
         Ok(shapes)
+    }
+
+    /// Compile the pinned shapes graph for a gate. Stored blank nodes retain their
+    /// identity, as in [`Shapes::from_store`]. An absent or empty graph returns
+    /// `None`. The absolute deadline covers reading and compilation.
+    pub fn from_store_for_gate(
+        snap: &sparkles_core::store::Snapshot,
+        graph: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Shapes>> {
+        crate::data::check_deadline(deadline)?;
+        let Some(id) = sparkles_core::validation::graph_id(snap, graph) else {
+            return Ok(None);
+        };
+        let g = crate::data::read_graph_by_id(snap, id, deadline)?;
+        if g.is_empty() {
+            return Ok(None);
+        }
+        let mut shapes = Parser::new(&g).for_gate(deadline).parse(true)?;
+        if graph != sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI {
+            shapes.source_graph = Some(graph.to_string());
+        }
+        Ok(Some(shapes))
     }
 
     /// Read and merge several graphs of the store into one shapes graph (a graph that
@@ -669,6 +675,22 @@ impl<'g> G<'g> {
         }
     }
 
+    pub fn objects_until(
+        &self,
+        s: &Term,
+        p: NamedNodeRef<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Term>> {
+        let mut values = Vec::new();
+        if let Some(subject) = as_subject(s) {
+            for value in self.g.objects_for_subject_predicate(subject, p) {
+                crate::data::check_deadline(deadline)?;
+                values.push(value.into_owned());
+            }
+        }
+        Ok(values)
+    }
+
     pub fn object(&self, s: &Term, p: NamedNodeRef<'_>) -> Option<Term> {
         let sub = as_subject(s)?;
         self.g
@@ -713,18 +735,50 @@ impl<'g> G<'g> {
 
     /// Is `t` a SHACL instance of `class` (rdf:type/rdfs:subClassOf*) in this graph?
     pub fn is_instance(&self, t: &Term, class: NamedNodeRef<'_>) -> bool {
+        self.is_instance_with(t, class, || Ok(()))
+            .expect("an unchecked instance lookup cannot time out")
+    }
+
+    pub fn is_instance_until(
+        &self,
+        t: &Term,
+        class: NamedNodeRef<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
+        self.is_instance_with(t, class, || {
+            crate::data::check_deadline(deadline)?;
+            Ok(())
+        })
+    }
+
+    fn is_instance_with(
+        &self,
+        t: &Term,
+        class: NamedNodeRef<'_>,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
         let class = Term::from(class.into_owned());
-        let mut stack = self.objects(t, rdf::TYPE);
+        let mut stack = Vec::new();
+        let mut queue = |node: &Term, predicate, stack: &mut Vec<Term>| {
+            if let Some(subject) = as_subject(node) {
+                for value in self.g.objects_for_subject_predicate(subject, predicate) {
+                    check()?;
+                    stack.push(value.into_owned());
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        queue(t, rdf::TYPE, &mut stack)?;
         let mut seen = FxHashSet::default();
         while let Some(c) = stack.pop() {
             if c == class {
-                return true;
+                return Ok(true);
             }
             if seen.insert(c.clone()) {
-                stack.extend(self.objects(&c, rdfs::SUB_CLASS_OF));
+                queue(&c, rdfs::SUB_CLASS_OF, &mut stack)?;
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -802,6 +856,7 @@ pub(crate) struct Parser<'g> {
     pub(crate) g: G<'g>,
     pub(crate) out: Shapes,
     pub(crate) gate: bool,
+    deadline: Option<Instant>,
     components: Vec<std::sync::Arc<SparqlComponent>>,
     pub(crate) fns: FnIndex,
     pub(crate) expr_memo: FxHashMap<Term, ExprId>,
@@ -816,6 +871,7 @@ impl<'g> Parser<'g> {
             g: G { g: graph },
             out: Shapes::default(),
             gate: false,
+            deadline: None,
             components: Vec::new(),
             fns: FnIndex::default(),
             expr_memo: FxHashMap::default(),
@@ -824,9 +880,14 @@ impl<'g> Parser<'g> {
         }
     }
 
-    fn for_gate(mut self) -> Self {
+    fn for_gate(mut self, deadline: Option<Instant>) -> Self {
         self.gate = true;
+        self.deadline = deadline;
         self
+    }
+
+    pub(crate) fn check_deadline(&self) -> Result<()> {
+        crate::data::check_deadline(self.deadline).map_err(Into::into)
     }
 
     pub(crate) fn parse(self, bnodes_in_store: bool) -> Result<Shapes> {
@@ -842,6 +903,7 @@ impl<'g> Parser<'g> {
     ) -> Result<(Shapes, Option<ExprId>)> {
         self.out.bnodes_in_store = bnodes_in_store;
         self.out.binds_shapes_graph = bnodes_in_store;
+        self.check_deadline()?;
         if self.gate {
             if let Some(t) = self.g.g.triples_for_predicate(sh::TARGET).next() {
                 bail!(
@@ -849,10 +911,12 @@ impl<'g> Parser<'g> {
                     t.subject
                 );
             }
-            crate::sparql::check_gate_declarations(&self.g)?;
+            crate::sparql::check_gate_declarations(&self.g, self.deadline)?;
         }
-        self.components = crate::sparql::parse_components(&self.g)?;
+        self.components = crate::sparql::parse_components(&self.g, self.deadline)?;
+        self.check_deadline()?;
         self.parse_functions()?;
+        self.check_deadline()?;
         // candidate shapes, in a deterministic order
         let mut roots: Vec<Term> = Vec::new();
         let mut seen = FxHashSet::default();
@@ -862,8 +926,9 @@ impl<'g> Parser<'g> {
             }
         };
         for class in [sh::NODE_SHAPE, sh::PROPERTY_SHAPE] {
-            for s in self.g.subjects(rdf::TYPE, &class.into_owned().into()) {
-                add(s, &mut roots);
+            for s in self.g.g.subjects_for_predicate_object(rdf::TYPE, class) {
+                self.check_deadline()?;
+                add(Term::from(s.into_owned()), &mut roots);
             }
         }
         for p in [
@@ -874,19 +939,27 @@ impl<'g> Parser<'g> {
             sh::TARGET_WHERE,
         ] {
             for t in self.g.g.triples_for_predicate(p) {
+                self.check_deadline()?;
                 add(Term::from(t.subject.into_owned()), &mut roots);
             }
         }
         // nodes declared as shapes through subclasses of sh:Shape classes
         for t in self.g.g.triples_for_predicate(rdf::TYPE) {
+            self.check_deadline()?;
             let s = Term::from(t.subject.into_owned());
-            if self.g.is_instance(&s, sh::NODE_SHAPE) || self.g.is_instance(&s, sh::PROPERTY_SHAPE)
+            if self
+                .g
+                .is_instance_until(&s, sh::NODE_SHAPE, self.deadline)?
+                || self
+                    .g
+                    .is_instance_until(&s, sh::PROPERTY_SHAPE, self.deadline)?
             {
                 add(s, &mut roots);
             }
         }
         for p in SHAPE_PARAMS {
             for t in self.g.g.triples_for_predicate(*p) {
+                self.check_deadline()?;
                 add(Term::from(t.subject.into_owned()), &mut roots);
             }
         }
@@ -905,12 +978,14 @@ impl<'g> Parser<'g> {
             None => None,
         };
         if self.gate {
-            crate::sparql::check_gate_queries(&self.out)?;
+            crate::sparql::check_gate_queries(&self.out, self.deadline)?;
         }
+        self.check_deadline()?;
         Ok((self.out, expr))
     }
 
     pub(crate) fn shape(&mut self, node: &Term) -> Result<ShapeId> {
+        self.check_deadline()?;
         if let Some(&i) = self.out.by_node.get(node) {
             return Ok(i);
         }
@@ -1080,9 +1155,13 @@ impl<'g> Parser<'g> {
         }
         // implicit class target: the shape is also an rdfs:Class
         if matches!(node, Term::NamedNode(_))
-            && self.g.is_instance(node, rdfs::CLASS)
-            && (self.g.is_instance(node, sh::NODE_SHAPE)
-                || self.g.is_instance(node, sh::PROPERTY_SHAPE))
+            && self.g.is_instance_until(node, rdfs::CLASS, self.deadline)?
+            && (self
+                .g
+                .is_instance_until(node, sh::NODE_SHAPE, self.deadline)?
+                || self
+                    .g
+                    .is_instance_until(node, sh::PROPERTY_SHAPE, self.deadline)?)
         {
             let t = self.out.intern(node.clone());
             if !out.contains(&Target::Class(t)) {
@@ -1354,6 +1433,7 @@ impl<'g> Parser<'g> {
             cs.push(Constraint::NodeByExpression(e));
         }
         for t in g.objects(node, sh::SPARQL) {
+            self.check_deadline()?;
             let path = self.out.shapes[id].path.clone();
             if let Some(c) =
                 crate::sparql::parse_sparql_constraint(&g, &t, path.as_ref(), self.gate)?
@@ -1363,7 +1443,8 @@ impl<'g> Parser<'g> {
         }
         let path = self.out.shapes[id].path.clone();
         for comp in self.components.clone() {
-            for inst in comp.instances(&g, node, path.as_ref())? {
+            self.check_deadline()?;
+            for inst in comp.instances(&g, node, path.as_ref(), self.deadline)? {
                 cs.push(Constraint::Component(Box::new(inst)));
             }
         }

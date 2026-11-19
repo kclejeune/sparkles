@@ -545,6 +545,36 @@ impl SnapshotOutputRoot {
         super::execute_retained_source(self.source.clone(), query, opts, 0.0, None)
     }
 
+    /// Stream a FOCUS selector over this validation's physical data graph.
+    /// Scanning and decoded output use this root's original controls and memory.
+    pub fn scan_focus<E: From<Error>>(
+        &self,
+        data: &crate::validation::DataGraph,
+        predicate: Id,
+        fixed: Option<Id>,
+        focus_is_subject: bool,
+        each: impl FnMut(Id) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.budget.check()?;
+        self.check_snapshot(data)?;
+        data.scan_focus(
+            self.source.query_input().2,
+            predicate,
+            fixed,
+            focus_is_subject,
+            each,
+        )
+    }
+
+    fn check_snapshot(&self, data: &crate::validation::DataGraph) -> Result<()> {
+        if !std::ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(&data.snap)) {
+            return Err(Error::invalid(
+                "the selector data graph belongs to a different snapshot",
+            ));
+        }
+        Ok(())
+    }
+
     /// Execute a SELECT over a validation data graph from the exact Snapshot used
     /// to construct this root. The selection replaces both dataset clauses and
     /// protocol graph options. The query has no named graphs and remains subject
@@ -556,11 +586,7 @@ impl SnapshotOutputRoot {
         data: &crate::validation::DataGraph,
     ) -> Result<super::QueryResult> {
         self.budget.check()?;
-        if !std::ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(&data.snap)) {
-            return Err(Error::invalid(
-                "the selector data graph belongs to a different snapshot",
-            ));
-        }
+        self.check_snapshot(data)?;
         if !matches!(query, spargebra::Query::Select { .. }) {
             return Err(Error::invalid(
                 "a validation selector requires a SELECT query",
@@ -881,9 +907,9 @@ pub(super) fn term_depth(mut term: &Term) -> usize {
     nesting
 }
 
-// Conservative owned string/box payload envelope. The outer Term slots are paid
-// by build; no allocation occurs while calculating this admission.
-pub(super) fn term_bytes(mut term: &Term) -> Option<u64> {
+/// A conservative estimate of a term's owned string and box payloads, including
+/// nested triple terms. The enclosing term slot is charged separately.
+pub fn term_bytes(mut term: &Term) -> Option<u64> {
     let mut bytes = 0u64;
     loop {
         let text = match term {

@@ -14,6 +14,7 @@ use sparkles_core::sparql::value::Value;
 use sparkles_core::store::{Chunk, Snapshot};
 use sparkles_core::validation::{self, graph_id};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 /// Terms with local ids.
 #[derive(Default)]
@@ -54,6 +55,18 @@ impl DataGraph {
         exclude: &[String],
         shapes: &Shapes,
     ) -> Result<(DataGraph, Vec<Id>)> {
+        Self::new_until(snap, data_graph, extra, exclude, shapes, None)
+    }
+
+    pub fn new_until(
+        snap: Arc<Snapshot>,
+        data_graph: Option<&str>,
+        extra: &[String],
+        exclude: &[String],
+        shapes: &Shapes,
+        deadline: Option<Instant>,
+    ) -> Result<(DataGraph, Vec<Id>)> {
+        check_deadline(deadline)?;
         let graph = validation::DataGraph::new(snap, data_graph, extra, exclude)?;
         let mut d = DataGraph {
             rdf_type: Id::UNDEF,
@@ -70,11 +83,14 @@ impl DataGraph {
         d.rdf_first = d.resolve(&rdf::FIRST.into_owned().into(), false);
         d.rdf_rest = d.resolve(&rdf::REST.into_owned().into(), false);
         d.rdf_nil = d.resolve(&rdf::NIL.into_owned().into(), false);
-        let ids = shapes
-            .terms
-            .iter()
-            .map(|t| d.resolve(t, shapes.bnodes_in_store))
-            .collect();
+        let mut ids = Vec::with_capacity(shapes.terms.len());
+        for (i, term) in shapes.terms.iter().enumerate() {
+            if i % 256 == 0 {
+                check_deadline(deadline)?;
+            }
+            ids.push(d.resolve(term, shapes.bnodes_in_store));
+        }
+        check_deadline(deadline)?;
         Ok((d, ids))
     }
 
@@ -183,26 +199,64 @@ pub(crate) fn read_graph(snap: &Snapshot, graph: Option<&str>) -> Result<Graph> 
             None => bail!("graph <{iri}> does not exist"),
         },
     };
+    read_graph_by_id(snap, g, None)
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEADLINE_CHECKS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_deadline_checks_left(checks: Option<usize>) {
+    DEADLINE_CHECKS_LEFT.set(checks);
+}
+
+pub(crate) fn check_deadline(deadline: Option<Instant>) -> sparkles_core::Result<()> {
+    #[cfg(test)]
+    if DEADLINE_CHECKS_LEFT.with(|left| match left.get() {
+        Some(0) => true,
+        Some(n) => {
+            left.set(Some(n - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err(sparkles_core::Error::Timeout);
+    }
+    if deadline.is_some_and(|limit| Instant::now() >= limit) {
+        return Err(sparkles_core::Error::Timeout);
+    }
+    Ok(())
+}
+
+/// Read the graph at a pinned physical id and preserve the store's blank-node labels.
+pub(crate) fn read_graph_by_id(snap: &Snapshot, g: Id, deadline: Option<Instant>) -> Result<Graph> {
+    check_deadline(deadline)?;
     let mut out = Graph::new();
-    let mut err = None;
     snap.scan(Perm::Gspo, &[g.0], |c| {
-        let mut add = |k: Key| {
+        check_deadline(deadline)?;
+        let mut add = |k: Key| -> sparkles_core::Result<()> {
             let q = Perm::Gspo.to_quad(&k);
-            match snap.quad_to_terms(&q) {
-                Some(q) => {
-                    out.insert(&Triple::new(q.subject, q.predicate, q.object));
-                }
-                None => err = Some(format!("cannot decode quad {q:?}")),
-            }
+            let q = snap.quad_to_terms(&q).ok_or_else(|| {
+                sparkles_core::Error::invalid(format!("cannot decode quad {q:?}"))
+            })?;
+            out.insert(&Triple::new(q.subject, q.predicate, q.object));
+            Ok(())
         };
         match c {
-            Chunk::Block(b, s, e) => (s..e).for_each(|i| add(b.key(i))),
-            Chunk::Row(k) => add(k),
+            Chunk::Block(b, s, e) => {
+                for i in s..e {
+                    if i % 256 == 0 {
+                        check_deadline(deadline)?;
+                    }
+                    add(b.key(i))?;
+                }
+            }
+            Chunk::Row(k) => add(k)?,
         }
         Ok(true)
     })?;
-    if let Some(e) = err {
-        bail!(e);
-    }
+    check_deadline(deadline)?;
     Ok(out)
 }

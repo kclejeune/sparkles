@@ -730,7 +730,8 @@ fn sparql_nodes(
     opts: &ValidateOptions,
     deadline: Option<Instant>,
     root: &SnapshotOutputRoot,
-) -> anyhow::Result<Vec<(OwnedTerm, Option<Id>)>> {
+    mut node: impl FnMut(OwnedTerm, Option<Id>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let parsed = selector_query(q).map_err(SchemaError::new)?;
     let snap = &data.snap;
     let base = opts.selector_query.clone().unwrap_or_default();
@@ -776,9 +777,8 @@ fn sparql_nodes(
         .position(|v| v == "focus")
         .or((!r.variables().is_empty()).then_some(0))
     else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    let mut out = Vec::new();
     for &id in r.table().column(col).expect("checked projected column") {
         let Some(t) = r.term(id).map_err(failed)? else {
             continue;
@@ -789,9 +789,9 @@ fn sparql_nodes(
         } else {
             Some(id)
         };
-        out.push((t, sid));
+        node(t, sid)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// The fixed map of a query map: each selector expanded over the data graph, the
@@ -807,7 +807,7 @@ pub fn expand(
     deadline: Option<Instant>,
 ) -> anyhow::Result<(Vec<FixedEntry>, Vec<String>)> {
     let root = output_root(&data.snap, opts, deadline)?;
-    expand_in(map, data, schema, opts, deadline, &root)
+    expand_in(map, data, schema, opts, deadline, &root, None)
 }
 
 // A single genuine original parent spans selectors, absent values and output nodes.
@@ -843,6 +843,7 @@ pub(crate) fn expand_in(
     opts: &ValidateOptions,
     deadline: Option<Instant>,
     root: &SnapshotOutputRoot,
+    report_bytes: Option<&sparkles_core::validation::ReportBytes>,
 ) -> anyhow::Result<(Vec<FixedEntry>, Vec<String>)> {
     root.budget().check()?;
     let snap = &data.snap;
@@ -853,12 +854,22 @@ pub(crate) fn expand_in(
         reason = "OwnedTerm hashes and compares its immutable term, not its owner"
     )]
     let mut seen: FxHashSet<(OwnedTerm, ShapeLabel)> = FxHashSet::default();
+    let limit = opts.max_results.filter(|_| !opts.only_nonconformant);
     let mut push = |out: &mut Vec<FixedEntry>,
                     node: OwnedTerm,
                     id: Option<Id>,
                     a: &Association,
-                    kind: PairKind| {
+                    kind: PairKind|
+     -> anyhow::Result<()> {
         if seen.insert((node.clone(), a.shape.clone())) {
+            if let Some(limit) = limit
+                && out.len() >= limit
+            {
+                return Err(crate::TooManyResults { limit }.into());
+            }
+            if let Some(report) = report_bytes {
+                report.admit(crate::engine::entry_bytes(&node, &a.shape))?;
+            }
             out.push(FixedEntry {
                 node,
                 id,
@@ -866,18 +877,20 @@ pub(crate) fn expand_in(
                 kind,
             });
         }
+        Ok(())
     };
     for a in &map.0 {
+        root.budget().check()?;
         let kind = label_kind(schema, &a.shape)?;
         match &a.node {
             NodeSelector::Term(Term::BlankNode(b)) => match parse_bnode_label(b.as_str()) {
-                Some(id) => push(&mut out, root.budget().copy_term(b.as_ref().into())?, Some(id), a, kind),
+                Some(id) => push(&mut out, root.budget().copy_term(b.as_ref().into())?, Some(id), a, kind)?,
                 None => warnings.push(format!(
                     "the blank node _:{} selects nothing: only labels of stored blank nodes (_:b…) name nodes",
                     b.as_str()
                 )),
             },
-            NodeSelector::Term(t) => push(&mut out, root.budget().copy_term(t.as_ref())?, snap.lookup_term(t), a, kind),
+            NodeSelector::Term(t) => push(&mut out, root.budget().copy_term(t.as_ref())?, snap.lookup_term(t), a, kind)?,
             NodeSelector::Focus {
                 subject,
                 predicate,
@@ -894,29 +907,20 @@ pub(crate) fn expand_in(
                         Some(t) => snap.lookup_term(t).map(Some),
                     }
                 };
-                let ids = if *focus_is_subject {
-                    match fixed(object) {
-                        None => continue,
-                        Some(Some(o)) => data.subjects(p, o)?,
-                        Some(None) => data.subjects_of(p)?,
-                    }
-                } else {
-                    match fixed(subject) {
-                        None => continue,
-                        Some(Some(s)) => data.objects(s, p)?,
-                        Some(None) => data.objects_of(p)?,
-                    }
+                let Some(fixed) = fixed(if *focus_is_subject { object } else { subject }) else {
+                    continue;
                 };
-                for id in ids {
+                root.scan_focus(data, p, fixed, *focus_is_subject, |id| -> anyhow::Result<()> {
                     if let Some(t) = root.term(id)? {
-                        push(&mut out, t, Some(id), a, kind);
+                        push(&mut out, t, Some(id), a, kind)?;
                     }
-                }
+                    Ok(())
+                })?;
             }
             NodeSelector::Sparql(q) => {
-                for (t, id) in sparql_nodes(q, data, opts, deadline, root)? {
-                    push(&mut out, t, id, a, kind);
-                }
+                sparql_nodes(q, data, opts, deadline, root, |t, id| {
+                    push(&mut out, t, id, a, kind)
+                })?;
             }
         }
     }
@@ -1245,6 +1249,86 @@ mod tests {
         )])
         .unwrap();
         s
+    }
+
+    #[test]
+    fn focus_scan_admits_base_workspace_before_the_first_association() {
+        use sparkles_core::Error;
+        use sparkles_core::error::BudgetKind;
+        use sparkles_core::sparql::QueryOptions;
+        use std::fmt::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path(), StoreOptions::default()).unwrap();
+        let mut text = String::new();
+        for id in 0..4096 {
+            writeln!(
+                text,
+                "<http://ex.org/n{id:04}> <http://ex.org/knows> <urn:o> ."
+            )
+            .unwrap();
+        }
+        store
+            .load(&[Source::from_bytes(
+                text.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        let data = DataGraph::new(snap, None, &[], &[]).unwrap();
+        let schema = schema(false);
+        let map = ShapeMap::parse(
+            "{ FOCUS ex:knows _ }@ex:Person",
+            schema.prefixes(),
+            schema.base(),
+        )
+        .unwrap();
+        let limit = 64 << 10;
+        let opts = ValidateOptions {
+            max_results: Some(0),
+            selector_query: Some(QueryOptions {
+                max_memory_bytes: Some(limit),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The root and a selected term fit. The scan's decode workspace must be
+        // refused before the first row could hit the association limit.
+        let root = output_root(&data.snap, &opts, None).unwrap();
+        let first = data.snap.lookup_iri("http://ex.org/n0000").unwrap();
+        assert!(root.term(first).unwrap().is_some());
+        let error = expand_in(&map, &data, &schema, &opts, None, &root, None).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<Error>(),
+                Some(Error::BudgetExceeded(budget)) if budget.kind == BudgetKind::Memory
+                    && budget.limit == limit && budget.requested == limit + 1
+            ),
+            "expected scan workspace refusal before the first association, got {error:?}"
+        );
+
+        let opts = ValidateOptions {
+            max_results: Some(1),
+            ..Default::default()
+        };
+        let limited = expand(&map, &data, &schema, &opts, None);
+        assert!(matches!(
+            limited
+                .err()
+                .and_then(|e| e.downcast::<crate::TooManyResults>().ok()),
+            Some(crate::TooManyResults { limit: 1 })
+        ));
+        let opts = ValidateOptions::default();
+        let root = output_root(&data.snap, &opts, None).unwrap();
+        let report = sparkles_core::validation::ReportBytes::new(0);
+        let limited = expand_in(&map, &data, &schema, &opts, None, &root, Some(&report));
+        assert!(matches!(
+            limited.err().and_then(|e| e.downcast::<Error>().ok()),
+            Some(Error::BudgetExceeded(budget)) if budget.kind == BudgetKind::Memory
+                && budget.limit == 0
+        ));
     }
 
     fn names(entries: &[FixedEntry]) -> Vec<String> {

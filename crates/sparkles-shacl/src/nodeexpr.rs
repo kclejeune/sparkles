@@ -21,6 +21,7 @@ use oxrdf::vocab::xsd;
 use oxrdf::{NamedNode, NamedNodeRef, Term};
 use rustc_hash::FxHashMap;
 use spargebra::Query;
+use std::collections::BTreeMap;
 
 /// Index of an expression in [`crate::Shapes`].
 pub type ExprId = usize;
@@ -247,14 +248,17 @@ impl Parser<'_> {
     /// Declare the custom node expression functions of the shapes graph and parse
     /// their bodies.
     pub(crate) fn parse_functions(&mut self) -> Result<()> {
-        let mut declared: Vec<Declared> = Vec::new();
+        let mut declared = BTreeMap::new();
         for (class, list) in [
             (sh::NAMED_PARAMETER_EXPRESSION_FUNCTION, false),
             (sh::LIST_PARAMETER_EXPRESSION_FUNCTION, true),
         ] {
-            let class_term: Term = class.into_owned().into();
-            for s in self.g.subjects(rdf::TYPE, &class_term) {
-                let Term::NamedNode(iri) = s else { continue };
+            for s in self.g.g.subjects_for_predicate_object(rdf::TYPE, class) {
+                self.check_deadline()?;
+                let oxrdf::NamedOrBlankNodeRef::NamedNode(iri) = s else {
+                    continue;
+                };
+                let iri = iri.into_owned();
                 let Some(body) = self
                     .g
                     .object(&Term::NamedNode(iri.clone()), sh::BODY_EXPRESSION)
@@ -265,7 +269,13 @@ impl Parser<'_> {
                     FnKind::List
                 } else {
                     let mut params = Vec::new();
-                    for p in self.g.objects(&Term::NamedNode(iri.clone()), sh::PARAMETER) {
+                    for p in self
+                        .g
+                        .g
+                        .objects_for_subject_predicate(iri.as_ref(), sh::PARAMETER)
+                    {
+                        self.check_deadline()?;
+                        let p = p.into_owned();
                         let Some(Term::NamedNode(path)) = self.g.object(&p, sh::PATH) else {
                             bail!("a parameter of {iri} has no IRI as its sh:path");
                         };
@@ -288,18 +298,23 @@ impl Parser<'_> {
                     }
                     FnKind::Named { params }
                 };
-                declared.push(Declared { iri, body, kind });
+                declared
+                    .entry(iri.clone())
+                    .or_insert(Declared { iri, body, kind });
             }
         }
-        declared.sort_by(|a, b| a.iri.cmp(&b.iri));
-        declared.dedup_by(|a, b| a.iri == b.iri);
-        for (i, d) in declared.iter().enumerate() {
+        for (i, d) in declared.values().enumerate() {
+            self.check_deadline()?;
             match &d.kind {
                 FnKind::List => {
                     self.fns.lists.insert(d.iri.clone(), i);
                 }
                 FnKind::Named { params } => {
-                    for p in params.iter().filter(|p| p.key) {
+                    for p in params {
+                        self.check_deadline()?;
+                        if !p.key {
+                            continue;
+                        }
                         if p.path.as_str().starts_with(SHNEX_NS)
                             && KEYS.iter().any(|k| k.as_str() == p.path.as_str())
                         {
@@ -322,7 +337,7 @@ impl Parser<'_> {
                 body: usize::MAX,
             });
         }
-        for (i, d) in declared.iter().enumerate() {
+        for (i, d) in declared.values().enumerate() {
             let body = self
                 .expr(&d.body)
                 .with_context(|| format!("the body of {}", d.iri))?;
@@ -340,6 +355,7 @@ impl Parser<'_> {
 
     /// Parse the node expression `node` (shared when it is a blank node used twice).
     pub(crate) fn expr(&mut self, node: &Term) -> Result<ExprId> {
+        self.check_deadline()?;
         if let Term::BlankNode(_) = node {
             if let Some(&id) = self.expr_memo.get(node) {
                 return Ok(id);
@@ -366,6 +382,7 @@ impl Parser<'_> {
     /// `sh:filterShape` with `sh:nodes`, `sh:intersection`, `sh:union` and calls of
     /// `sh:SPARQLFunction`s. Any other blank node is read as a SHACL 1.2 expression.
     pub(crate) fn af_expr(&mut self, node: &Term) -> Result<ExprId> {
+        self.check_deadline()?;
         match node {
             Term::NamedNode(n) if n.as_ref() == sh::THIS => {
                 return Ok(self.push_expr(node, Expr::Var("focusNode".into())));

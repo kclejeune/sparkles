@@ -101,14 +101,42 @@ pub fn validate(
     shapes: &Shapes,
     opts: &ValidateOptions,
 ) -> Result<ValidationReport> {
-    let (data, ids) = DataGraph::new(
+    validate_impl(snap, shapes, opts, None, None)
+}
+
+/// Validate with bounds on embedded SPARQL and estimated retained report memory.
+/// From `query`, use the intermediate rows, bytes, produced rows and shared work
+/// counter. The validation deadline and data selection are supplied by `opts`.
+pub fn validate_controlled(
+    snap: &Arc<Snapshot>,
+    shapes: &Shapes,
+    opts: &ValidateOptions,
+    query: &sparkles_core::sparql::QueryOptions,
+    max_report_bytes: Option<u64>,
+) -> Result<ValidationReport> {
+    validate_impl(snap, shapes, opts, Some(query), max_report_bytes)
+}
+
+fn validate_impl(
+    snap: &Arc<Snapshot>,
+    shapes: &Shapes,
+    opts: &ValidateOptions,
+    query: Option<&sparkles_core::sparql::QueryOptions>,
+    max_report_bytes: Option<u64>,
+) -> Result<ValidationReport> {
+    crate::data::check_deadline(opts.deadline)?;
+    let (data, ids) = DataGraph::new_until(
         snap.clone(),
         opts.data_graph.as_deref(),
         &opts.extra_graphs,
         &opts.exclude_graphs,
         shapes,
+        opts.deadline,
     )?;
-    let engine = Engine::new(shapes, &data, ids, opts)?;
+    let mut engine = Engine::new_until(shapes, &data, ids, opts, opts.deadline)?;
+    engine.query_limits = query.cloned();
+    engine.report_bytes = max_report_bytes.map(sparkles_core::validation::ReportBytes::new);
+    engine.check_limits()?;
     engine.run(None)
 }
 
@@ -357,6 +385,8 @@ pub(crate) struct Engine<'a> {
     pub max_expr_nodes: u64,
     /// the memory budget of each query ([`ValidateOptions::query_memory`])
     pub query_memory: Option<u64>,
+    pub query_limits: Option<sparkles_core::sparql::QueryOptions>,
+    report_bytes: Option<sparkles_core::validation::ReportBytes>,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
     /// the queries node expressions have run, which keep the new blank nodes of each
@@ -388,6 +418,16 @@ impl<'a> Engine<'a> {
         ids: Vec<Id>,
         opts: &ValidateOptions,
     ) -> Result<Engine<'a>> {
+        Self::new_until(shapes, data, ids, opts, None)
+    }
+
+    fn new_until(
+        shapes: &'a Shapes,
+        data: &'a DataGraph,
+        ids: Vec<Id>,
+        opts: &ValidateOptions,
+        setup_deadline: Option<Instant>,
+    ) -> Result<Engine<'a>> {
         let lookup = |n: &NamedNode| {
             data.snap
                 .lookup_iri(n.as_str())
@@ -396,26 +436,36 @@ impl<'a> Engine<'a> {
         let expr_paths = shapes
             .exprs
             .iter()
-            .map(|e| match e {
-                crate::nodeexpr::Expr::PathValues { path, .. } => {
-                    Some(CPath::compile(path, &mut |n| lookup(n)))
+            .enumerate()
+            .map(|(i, e)| {
+                if i % 256 == 0 {
+                    crate::data::check_deadline(setup_deadline)?;
                 }
-                _ => None,
+                Ok(match e {
+                    crate::nodeexpr::Expr::PathValues { path, .. } => {
+                        Some(CPath::compile(path, &mut |n| lookup(n)))
+                    }
+                    _ => None,
+                })
             })
-            .collect();
+            .collect::<sparkles_core::Result<Vec<_>>>()?;
         let paths = shapes
             .shapes
             .iter()
-            .map(|s| {
-                s.path.as_ref().map(|p| {
+            .enumerate()
+            .map(|(i, s)| {
+                if i % 256 == 0 {
+                    crate::data::check_deadline(setup_deadline)?;
+                }
+                Ok(s.path.as_ref().map(|p| {
                     CPath::compile(p, &mut |n| {
                         data.snap
                             .lookup_iri(n.as_str())
                             .unwrap_or(Id::local(u64::MAX >> 8))
                     })
-                })
+                }))
             })
-            .collect();
+            .collect::<sparkles_core::Result<Vec<_>>>()?;
         Ok(Engine {
             shapes,
             data,
@@ -434,6 +484,8 @@ impl<'a> Engine<'a> {
             max_results: opts.max_results,
             max_expr_nodes: opts.max_expr_nodes,
             query_memory: opts.query_memory,
+            query_limits: None,
+            report_bytes: None,
             collected: AtomicUsize::new(0),
             query_calls: Default::default(),
         })
@@ -448,22 +500,22 @@ impl<'a> Engine<'a> {
         if let Some(cancellation) = &self.cancellation {
             cancellation.check()?;
         }
-        if let Some(d) = self.deadline
-            && Instant::now() >= d
-        {
-            bail!("validation timed out");
-        }
-        Ok(())
+        crate::data::check_deadline(self.deadline).map_err(Into::into)
     }
 
-    /// Count `n` more results against `max_results`.
-    fn count_results(&self, n: usize) -> Result<()> {
+    /// Admit a report entry or a nested detail before retaining it.
+    fn admit_result(&self, result: &ValidationResult) -> Result<()> {
+        if let Some(bytes) = &self.report_bytes {
+            bytes.admit(result.retained_bytes())?;
+        }
         let Some(limit) = self.max_results else {
             return Ok(());
         };
-        if n > 0 && self.collected.fetch_add(n, AtomicOrdering::Relaxed) + n > limit {
-            return Err(TooManyResults { limit }.into());
-        }
+        self.collected
+            .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
+                (n < limit).then(|| n + 1)
+            })
+            .map_err(|_| TooManyResults { limit })?;
         Ok(())
     }
 
@@ -540,9 +592,7 @@ impl<'a> Engine<'a> {
                     if i % 256 == 0 {
                         self.check_limits()?;
                     }
-                    let before = out.results.len();
                     self.validate_focus(si, f, &mut out, &mut cx)?;
-                    self.count_results(out.results.len() - before)?;
                 }
                 Ok(out.results)
             };
@@ -806,7 +856,7 @@ impl<'a> Engine<'a> {
             let d = default();
             if d.is_empty() { Vec::new() } else { msg(d) }
         };
-        out.results.push(ValidationResult {
+        let result = ValidationResult {
             focus_node: focus,
             result_path,
             value,
@@ -816,7 +866,9 @@ impl<'a> Engine<'a> {
             severity: shape.severity.clone(),
             messages,
             details: Vec::new(),
-        });
+        };
+        self.admit_result(&result)?;
+        out.results.push(result);
         Ok(())
     }
 

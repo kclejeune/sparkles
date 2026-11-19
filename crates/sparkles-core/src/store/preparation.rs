@@ -3,13 +3,13 @@ use super::*;
 use crate::access::Preparation;
 
 impl Snapshot {
-    pub(crate) fn scan_prepared(
+    pub(crate) fn scan_prepared<E: From<Error>>(
         &self,
         perm: Perm,
         prefix: &[u64],
         preparation: &Preparation,
-        mut each: impl FnMut([Id; 4]) -> Result<bool>,
-    ) -> Result<()> {
+        mut each: impl FnMut([Id; 4]) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<(), E> {
         preparation.check()?;
         let lo = pad(prefix, 0);
         let hi = pad(prefix, u64::MAX);
@@ -23,7 +23,7 @@ impl Snapshot {
             &lo,
             &hi,
             preparation,
-            |block, start, end| {
+            |block, start, end| -> std::result::Result<bool, E> {
                 for row in start..end {
                     preparation.check()?;
                     work += 1;
@@ -66,6 +66,6 @@ impl Snapshot {
                 }
             }
         }
-        preparation.check()
+        preparation.check().map_err(E::from)
     }
 }

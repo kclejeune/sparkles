@@ -4,6 +4,7 @@
 use super::{Check, CheckKind, DataGraph, Query, Severity, Shapes, Suite};
 use crate::store::Snapshot;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 /// The most messages one result keeps.
@@ -131,16 +132,43 @@ pub struct Inputs<'a> {
     pub timeout: Option<Duration>,
 }
 
+/// Resource bounds for each check of a suite. An unset field keeps the checker default.
+#[derive(Clone, Debug, Default)]
+pub struct GateControls {
+    /// Timeout and query budgets. The produced-row allowance is shared across the
+    /// queries of one check. Intermediate row and memory bounds apply to each query.
+    /// ShEx also uses the memory bound for shared preparation, FOCUS scan workspace
+    /// and retained selector output.
+    pub budgets: crate::Budgets,
+    /// An enclosing operation's deadline. Each check uses the earliest bound.
+    pub deadline: Option<Instant>,
+    /// Retained validation results in one check, including SHACL result details.
+    /// ShEx counts its expanded associations. Diagnostics count findings across
+    /// the selected diagnostics and may report a proven violation if the cap is hit.
+    pub max_results: Option<usize>,
+    /// Estimated bytes of retained validation results of one check, including
+    /// result entries, terms, paths, labels, diagnostic evidence and messages.
+    /// This allowance covers the report. Nested query work uses `budgets`.
+    pub max_report_bytes: Option<u64>,
+}
+
 /// Run every check of `suite`, in its order. A check that cannot run is an
 /// [`Status::Error`] result, never skipped.
 pub fn run(suite: &Suite, inputs: &Inputs<'_>) -> SuiteReport {
+    run_controlled(suite, inputs, &GateControls::default())
+}
+
+/// Run a suite within the given per-check resource bounds. Time bounds are
+/// cooperative and include reading and compiling pinned inputs. A late check
+/// keeps an already-proven violation. An incomplete check returns an error.
+pub fn run_controlled(suite: &Suite, inputs: &Inputs<'_>, controls: &GateControls) -> SuiteReport {
     SuiteReport {
         suite: suite.iri().clone(),
         revision: suite.revision(),
         results: suite
             .checks()
             .iter()
-            .map(|c| run_check(c, inputs))
+            .map(|c| run_check(c, inputs, controls))
             .collect(),
     }
 }
@@ -149,21 +177,31 @@ pub fn run(suite: &Suite, inputs: &Inputs<'_>) -> SuiteReport {
 /// not run.
 type Outcome = Result<(u64, Vec<String>, Vec<Note>), (&'static str, String)>;
 
-/// One check's bound: its deadline, and what remains of it for the checkers that take a
-/// relative timeout.
-#[derive(Clone, Copy)]
-pub(super) struct Bound {
+/// One check's absolute deadline and query allowance.
+struct Bound<'a> {
     deadline: Option<Instant>,
+    controls: &'a GateControls,
+    work: Option<Arc<AtomicU64>>,
 }
 
-impl Bound {
-    fn remaining(&self) -> Option<Duration> {
-        self.deadline
-            .map(|d| d.saturating_duration_since(Instant::now()))
+impl Bound<'_> {
+    fn check(&self) -> Result<(), (&'static str, String)> {
+        if expired_at(self.deadline, Instant::now()) {
+            return Err(timed_out());
+        }
+        Ok(())
     }
 
-    fn passed(&self) -> bool {
-        self.deadline.is_some_and(|d| Instant::now() >= d)
+    fn query_options(&self) -> crate::sparql::QueryOptions {
+        let mut opts = crate::sparql::QueryOptions {
+            deadline: self.deadline,
+            no_cache: true,
+            forbid_service: true,
+            work: self.work.clone(),
+            ..Default::default()
+        };
+        self.controls.budgets.lower(&mut opts);
+        opts
     }
 }
 
@@ -172,37 +210,69 @@ pub(super) const UNSATISFIABLE_DEFERRED: &str = "chk:UnsatisfiableClassesCheck i
      so no build runs it: the OWL reader cannot yet read a terminology with the guarantee \
      that no axiom is lost";
 
-const TIMED_OUT: (&str, &str) = ("check-timeout", "the check did not finish within its bound");
+fn timed_out() -> (&'static str, String) {
+    (
+        "check-timeout",
+        "the check did not finish within its bound".to_string(),
+    )
+}
 
-fn run_check(c: &Check, inputs: &Inputs<'_>) -> CheckResult {
+fn expired_at(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
+}
+
+fn run_check(c: &Check, inputs: &Inputs<'_>, controls: &GateControls) -> CheckResult {
     let t0 = Instant::now();
     // the deferral comes before the bound, so no timeout can replace its code
     if matches!(c.kind, CheckKind::UnsatisfiableClasses { .. }) {
         let deferred = Err(("check-unavailable", UNSATISFIABLE_DEFERRED.to_string()));
         return result(c, deferred, t0);
     }
-    let outcome = match inputs.timeout.map(|t| t0.checked_add(t)) {
-        Some(None) => Err((
-            "input-invalid",
-            "the check's bound is too large".to_string(),
-        )),
-        Some(Some(deadline)) => dispatch(
-            c,
-            inputs,
-            Bound {
-                deadline: Some(deadline),
-            },
-        ),
-        None => dispatch(c, inputs, Bound { deadline: None }),
-    };
+    let outcome = (|| {
+        let mut deadline = controls.deadline;
+        for timeout in [inputs.timeout, controls.budgets.timeout]
+            .into_iter()
+            .flatten()
+        {
+            let limit = t0.checked_add(timeout).ok_or_else(|| {
+                (
+                    "input-invalid",
+                    "the check's bound is too large".to_string(),
+                )
+            })?;
+            deadline = deadline.into_iter().chain([limit]).min();
+        }
+        let bound = Bound {
+            deadline,
+            controls,
+            work: controls
+                .budgets
+                .max_rows_produced
+                .map(|_| Arc::new(AtomicU64::new(0))),
+        };
+        within_deadline(deadline, Instant::now, || dispatch(c, inputs, &bound))
+    })();
     result(c, outcome, t0)
 }
 
-fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
-    if bound.passed() {
-        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
+fn within_deadline(
+    deadline: Option<Instant>,
+    now: impl Fn() -> Instant,
+    check: impl FnOnce() -> Outcome,
+) -> Outcome {
+    if expired_at(deadline, now()) {
+        return Err(timed_out());
     }
-    let outcome = match &c.kind {
+    let outcome = check();
+    // Keep an already-proven violation even if the checker returns after the deadline.
+    if expired_at(deadline, now()) && !matches!(outcome, Ok((n, _, _)) if n > 0) {
+        return Err(timed_out());
+    }
+    outcome
+}
+
+fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: &Bound<'_>) -> Outcome {
+    match &c.kind {
         // (run_check answers it before its bound; this keeps dispatch total)
         CheckKind::UnsatisfiableClasses { .. } => {
             Err(("check-unavailable", UNSATISFIABLE_DEFERRED.to_string()))
@@ -225,12 +295,7 @@ fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
             inferences,
         } => diagnostics_check(diagnostics.clone(), *inferences, inputs, bound),
         CheckKind::Query(q) => query(q, inputs, bound),
-    };
-    // a check that ends after its deadline never passes, and its error is the timeout
-    if bound.passed() && !matches!(outcome, Ok((n, _, _)) if n > 0) {
-        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
     }
-    outcome
 }
 
 fn result(c: &Check, outcome: Outcome, t0: Instant) -> CheckResult {
@@ -283,13 +348,19 @@ fn shacl(
     data_graph: &DataGraph,
     inferences: bool,
     inputs: &Inputs<'_>,
-    bound: Bound,
+    bound: &Bound<'_>,
 ) -> Outcome {
     use sparkles_shacl::{ShapesSyntax, ValidateOptions};
     let mut exclude = vec![super::RUNS_GRAPH.to_string()];
     let shapes = match shapes {
         Shapes::Graph(g) => {
-            if !holds_data(inputs.before, g.as_str()).map_err(|e| failure(&e.into()))? {
+            let Some(shapes) = sparkles_shacl::Shapes::from_store_for_gate(
+                inputs.before,
+                g.as_str(),
+                bound.deadline,
+            )
+            .map_err(|e| failure(&e))?
+            else {
                 return Err((
                     "input-missing",
                     format!(
@@ -297,18 +368,19 @@ fn shacl(
                         g.as_str()
                     ),
                 ));
-            }
+            };
             exclude.push(g.as_str().to_string());
-            sparkles_shacl::Shapes::from_store_for_gate(inputs.before, Some(g.as_str()))
-                .map_err(|e| failure(&e))?
+            shapes
         }
         Shapes::Inline(text) => sparkles_shacl::Shapes::parse_for_gate(
             text,
             ShapesSyntax::Rdf(oxrdfio::RdfFormat::Turtle),
             None,
+            bound.deadline,
         )
         .map_err(|e| failure(&e))?,
     };
+    bound.check()?;
     // a shape that `sh:deactivated true` turns off selects no focus node
     if !shapes.targeted().any(|shape| !shape.deactivated) {
         return Err((
@@ -319,6 +391,7 @@ fn shacl(
     }
     if let DataGraph::Graphs(gs) = data_graph {
         for g in gs {
+            bound.check()?;
             if !holds_data(inputs.after, g).map_err(|e| failure(&e.into()))? {
                 return Err((
                     "input-missing",
@@ -336,18 +409,29 @@ fn shacl(
             "no data graph of the check holds data in the candidate".to_string(),
         ));
     };
-    if bound.passed() {
-        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
-    }
+    bound.check()?;
     let opts = ValidateOptions {
         data_graph: graphs.data_graph,
         extra_graphs: graphs.extra_graphs,
         exclude_graphs: graphs.exclude_graphs,
-        timeout: bound.remaining(),
         deadline: bound.deadline,
+        max_results: bound.controls.max_results,
         ..Default::default()
     };
-    let report = sparkles_shacl::validate(inputs.after, &shapes, &opts).map_err(|e| failure(&e))?;
+    let report = sparkles_shacl::validate_controlled(
+        inputs.after,
+        &shapes,
+        &opts,
+        &bound.query_options(),
+        bound.controls.max_report_bytes,
+    )
+    .map_err(|e| {
+        if e.downcast_ref::<sparkles_shacl::TooManyResults>().is_some() {
+            ("budget-exceeded", e.to_string())
+        } else {
+            failure(&e)
+        }
+    })?;
     if report.conforms {
         return Ok((0, Vec::new(), Vec::new()));
     }
@@ -371,17 +455,18 @@ fn shacl(
 }
 
 #[cfg(not(feature = "shacl"))]
-fn shacl(_: &Shapes, _: &DataGraph, _: bool, _: &Inputs<'_>, _: Bound) -> Outcome {
+fn shacl(_: &Shapes, _: &DataGraph, _: bool, _: &Inputs<'_>, _: &Bound<'_>) -> Outcome {
     unreachable!("an unavailable check does not run")
 }
 
 #[cfg(feature = "shex")]
-fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
+fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: &Bound<'_>) -> Outcome {
     use sparkles_shex::NodeSelector;
 
     let invalid = |what: &str, e: &dyn std::fmt::Display| ("input-invalid", format!("{what}: {e}"));
     let parsed =
         sparkles_shex::Schema::parse_shexc(schema, None).map_err(|e| invalid("the schema", &e))?;
+    bound.check()?;
     let compiled = sparkles_shex::compile(&parsed, &sparkles_shex::NoImports)
         .map_err(|e| invalid("the schema", &e))?;
     if compiled.has_semantic_actions() {
@@ -390,6 +475,7 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
             "the gate's ShEx profile does not support semantic actions".to_string(),
         ));
     }
+    bound.check()?;
     let map = sparkles_shex::ShapeMap::parse(map, compiled.prefixes(), compiled.base())
         .map_err(|e| invalid("the shape map", &e))?;
     let is_blank = |term: &oxrdf::Term| matches!(term, oxrdf::Term::BlankNode(_));
@@ -409,15 +495,27 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
             ));
         }
     }
-    if bound.passed() {
-        return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
-    }
+    bound.check()?;
     let opts = sparkles_shex::ValidateOptions {
-        timeout: bound.remaining(),
+        deadline: bound.deadline,
+        max_results: bound.controls.max_results,
+        selector_query: Some(bound.query_options()),
         ..Default::default()
     };
-    let results =
-        sparkles_shex::validate(inputs.after, &compiled, &map, &opts).map_err(|e| failure(&e))?;
+    let results = sparkles_shex::validate_controlled(
+        inputs.after,
+        &compiled,
+        &map,
+        &opts,
+        bound.controls.max_report_bytes,
+    )
+    .map_err(|e| {
+        if e.downcast_ref::<sparkles_shex::TooManyResults>().is_some() {
+            ("budget-exceeded", e.to_string())
+        } else {
+            failure(&e)
+        }
+    })?;
     if let Some(warning) = results.warnings.first() {
         return Err((
             "input-invalid",
@@ -445,7 +543,7 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
 }
 
 #[cfg(not(feature = "shex"))]
-fn shex(_: &str, _: &str, _: &Inputs<'_>, _: Bound) -> Outcome {
+fn shex(_: &str, _: &str, _: &Inputs<'_>, _: &Bound<'_>) -> Outcome {
     unreachable!("an unavailable check does not run")
 }
 
@@ -454,16 +552,22 @@ fn diagnostics_check(
     checks: Vec<String>,
     inferences: bool,
     inputs: &Inputs<'_>,
-    bound: Bound,
+    bound: &Bound<'_>,
 ) -> Outcome {
-    use sparkles_reasoner::diagnostics::{CheckStatus, DiagnoseOptions, diagnose};
+    use sparkles_reasoner::diagnostics::{CheckStatus, DiagnoseOptions, diagnose_for_gate};
     let opts = DiagnoseOptions {
         checks,
         inferences,
-        timeout: bound.remaining(),
         ..Default::default()
     };
-    let report = diagnose(inputs.after.clone(), &opts).map_err(|e| failure(&e))?;
+    let report = diagnose_for_gate(
+        inputs.after.clone(),
+        &opts,
+        &bound.query_options(),
+        bound.controls.max_results,
+        bound.controls.max_report_bytes,
+    )
+    .map_err(|e| failure(&e))?;
     for o in &report.checks {
         match o.status {
             CheckStatus::Timeout => {
@@ -487,25 +591,27 @@ fn diagnostics_check(
         .checks
         .iter()
         .any(|o| o.status == CheckStatus::Truncated);
+    if total == 0 && truncated {
+        return Err((
+            "budget-exceeded",
+            "diagnostics stopped before they could report a finding".to_string(),
+        ));
+    }
     let messages = report
         .findings
         .iter()
         .take(MAX_MESSAGES)
         .map(|f| format!("{}: {}", f.check, f.message))
         .collect();
-    Ok((
-        (total.max(usize::from(truncated))) as u64,
-        messages,
-        Vec::new(),
-    ))
+    Ok((total as u64, messages, Vec::new()))
 }
 
 #[cfg(not(feature = "reasoning"))]
-fn diagnostics_check(_: Vec<String>, _: bool, _: &Inputs<'_>, _: Bound) -> Outcome {
+fn diagnostics_check(_: Vec<String>, _: bool, _: &Inputs<'_>, _: &Bound<'_>) -> Outcome {
     unreachable!("an unavailable check does not run")
 }
 
-fn query(q: &Query, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
+fn query(q: &Query, inputs: &Inputs<'_>, bound: &Bound<'_>) -> Outcome {
     let text = match q {
         Query::Inline(t) => t.clone(),
         Query::Stored {
@@ -553,17 +659,13 @@ fn query(q: &Query, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
             s.definition.query
         }
     };
-    let opts = crate::sparql::QueryOptions {
-        timeout: bound.remaining(),
-        deadline: bound.deadline,
-        no_cache: true,
-        forbid_service: true,
-        ..Default::default()
-    };
+    bound.check()?;
+    let opts = bound.query_options();
     let started = Instant::now();
     let parsed = crate::sparql::parse_query(&text, None, &[])
         .map_err(|e| failure(&anyhow::Error::new(e)))?;
     crate::sparql::check_no_service(&parsed).map_err(|e| failure(&anyhow::Error::new(e)))?;
+    bound.check()?;
     let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
     let r = crate::sparql::execute_query(inputs.after.clone(), &parsed, &opts, parse_ms)
         .map_err(|e| failure(&anyhow::Error::new(e)))?;
@@ -594,4 +696,45 @@ fn holds_data(snap: &Arc<Snapshot>, iri: &str) -> sparkles_core::Result<bool> {
         }
     };
     Ok(snap.count(crate::index::Perm::Gspo, &[id.0])? > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn gate_deadline_is_checked_after_dispatch() {
+        let check = Check {
+            iri: oxrdf::NamedNode::new_unchecked("urn:check"),
+            severity: Severity::Violation,
+            label: None,
+            kind: CheckKind::Query(Query::Inline("ASK {}".into())),
+        };
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        for findings in [0, 1] {
+            let now = Cell::new(start);
+            let calls = Cell::new(0);
+            let outcome = within_deadline(
+                Some(deadline),
+                || now.get(),
+                || {
+                    calls.set(calls.get() + 1);
+                    now.set(deadline);
+                    Ok((findings, Vec::new(), Vec::new()))
+                },
+            );
+            assert_eq!(calls.get(), 1);
+            let result = result(&check, outcome, start);
+            assert!(result.blocks());
+            if findings == 0 {
+                assert_eq!(result.status, Status::Error);
+                assert_eq!(result.code, Some("check-timeout"));
+            } else {
+                assert_eq!(result.status, Status::Failed);
+                assert_eq!(result.findings, findings);
+            }
+        }
+    }
 }

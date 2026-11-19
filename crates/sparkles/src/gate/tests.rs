@@ -1244,6 +1244,26 @@ fn gate_shacl_profile_refuses_skipped_targets() {
     }
 }
 
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_preserves_a_described_pinned_blank_target() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        &format!(
+            "PREFIX sh: <{SH_NS}>
+             INSERT DATA {{ GRAPH <urn:shapes> {{
+                 <urn:S> sh:targetNode [ <urn:description> 'ordinary node' ] ;
+                     sh:nodeKind sh:IRI .
+             }} }}"
+        ),
+        "INSERT DATA { <urn:x> a <urn:Observed> }",
+    );
+    let r = run_on(&shacl_suite("").unwrap(), &before, &after);
+    assert_eq!(r.results[0].status, Status::Failed, "{:?}", r.results[0]);
+    assert_eq!(r.results[0].findings, 1);
+}
+
 #[cfg(feature = "shex")]
 fn shex_profile_suite(schema: &str, map: &str) -> Suite {
     let schema = oxrdf::Literal::new_simple_literal(schema);
@@ -1346,6 +1366,424 @@ fn gate_shex_profile_refuses_service_in_selector_expressions() {
         .status,
         Status::Passed
     );
+}
+
+fn run_with_controls(suite: &Suite, snap: &Arc<Snapshot>, controls: &GateControls) -> CheckResult {
+    run_controlled(
+        suite,
+        &Inputs {
+            before: snap,
+            after: snap,
+            stored: None,
+            timeout: None,
+        },
+        controls,
+    )
+    .results
+    .remove(0)
+}
+
+fn gate_budget_refusal(result: &CheckResult) {
+    assert_eq!(result.status, Status::Error, "{result:?}");
+    assert_eq!(result.code, Some("budget-exceeded"), "{result:?}");
+    assert!(result.blocks());
+}
+
+#[test]
+fn gate_query_obeys_the_work_cap_and_earliest_deadline() {
+    let ds = Dataset::memory();
+    let snap = ds.store().snapshot();
+    let check = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query 'SELECT ?x { VALUES ?x { 1 2 } }' .",
+    )
+    .unwrap();
+    gate_budget_refusal(&run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            budgets: crate::Budgets {
+                max_rows_produced: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ));
+    let expired = run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            deadline: Some(std::time::Instant::now()),
+            budgets: crate::Budgets {
+                timeout: Some(std::time::Duration::from_secs(10)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert_eq!(expired.code, Some("check-timeout"), "{expired:?}");
+    let overflow = run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            budgets: crate::Budgets {
+                timeout: Some(std::time::Duration::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert_eq!(overflow.code, Some("input-invalid"), "{overflow:?}");
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_covers_setup_and_embedded_query_resources() {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:x> <urn:p> 1, 2 }").unwrap();
+    let snap = ds.store().snapshot();
+    let inactive = inline_shacl("<urn:S> sh:targetNode <urn:x> ; sh:deactivated true .", "");
+    let timeout = run_with_controls(
+        &inactive,
+        &snap,
+        &GateControls {
+            budgets: crate::Budgets {
+                timeout: Some(std::time::Duration::ZERO),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert_eq!(timeout.code, Some("check-timeout"), "{timeout:?}");
+    let expired = sparkles_shacl::Shapes::from_store_for_gate(
+        &snap,
+        "urn:missing",
+        Some(std::time::Instant::now()),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        expired.downcast_ref::<crate::Error>(),
+        Some(crate::Error::Timeout)
+    ));
+
+    let nested = inline_shacl(
+        "<urn:S> sh:targetNode <urn:x> ; sh:sparql [
+            sh:select 'SELECT $this ?value { $this <urn:p> ?value }'
+         ] .",
+        "",
+    );
+    for budgets in [
+        crate::Budgets {
+            max_rows_produced: Some(1),
+            ..Default::default()
+        },
+        crate::Budgets {
+            max_rows: Some(1),
+            ..Default::default()
+        },
+        crate::Budgets {
+            max_memory_bytes: Some(0),
+            ..Default::default()
+        },
+    ] {
+        gate_budget_refusal(&run_with_controls(
+            &nested,
+            &snap,
+            &GateControls {
+                budgets,
+                ..Default::default()
+            },
+        ));
+    }
+    assert_eq!(
+        run_with_controls(&nested, &snap, &GateControls::default()).findings,
+        2,
+    );
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_bounds_nested_and_top_level_reports() {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:x> <urn:list> (1 2) }")
+        .unwrap();
+    let snap = ds.store().snapshot();
+    let capped = GateControls {
+        max_results: Some(1),
+        ..Default::default()
+    };
+    for shapes in [
+        "<urn:S> sh:targetNode <urn:x> ; sh:class <urn:A> ; sh:nodeKind sh:Literal .",
+        "<urn:S> sh:targetNode <urn:x> ;
+            sh:property [ sh:path <urn:list> ; sh:memberShape [ sh:nodeKind sh:IRI ] ] .",
+    ] {
+        let check = inline_shacl(shapes, "");
+        gate_budget_refusal(&run_with_controls(&check, &snap, &capped));
+        assert_eq!(
+            run_with_controls(&check, &snap, &GateControls::default()).status,
+            Status::Failed
+        );
+    }
+    let with_message = inline_shacl(
+        &format!(
+            "<urn:S> sh:targetNode <urn:x> ; sh:class <urn:Missing> ; sh:message '{}'.",
+            "m".repeat(8192)
+        ),
+        "",
+    );
+    gate_budget_refusal(&run_with_controls(
+        &with_message,
+        &snap,
+        &GateControls {
+            max_report_bytes: Some(4096),
+            ..Default::default()
+        },
+    ));
+    let empty = inline_shacl(
+        "<urn:S> sh:targetClass <urn:Missing> ; sh:closed true .",
+        "",
+    );
+    assert_eq!(
+        run_with_controls(
+            &empty,
+            &snap,
+            &GateControls {
+                max_results: Some(0),
+                max_report_bytes: Some(0),
+                ..Default::default()
+            },
+        )
+        .status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_bounds_selector_work_and_retained_results() {
+    let ds = Dataset::memory();
+    let snap = ds.store().snapshot();
+    let check = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShexCheck ; chk:schema '<urn:S> {}' ;
+             chk:shapeMap \"SPARQL 'SELECT ?focus { VALUES ?focus { <urn:x> <urn:y> } }'@<urn:S>\" .",
+    )
+    .unwrap();
+    for controls in [
+        GateControls {
+            budgets: crate::Budgets {
+                max_rows_produced: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        GateControls {
+            max_results: Some(1),
+            ..Default::default()
+        },
+        GateControls {
+            max_report_bytes: Some(0),
+            ..Default::default()
+        },
+    ] {
+        gate_budget_refusal(&run_with_controls(&check, &snap, &controls));
+    }
+    assert_eq!(
+        run_with_controls(&check, &snap, &GateControls::default()).status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_selectors_spend_one_check_work_allowance() {
+    let snap = Dataset::memory().store().snapshot();
+    let query = "SELECT ?focus { VALUES ?focus { <urn:x> } }";
+    let one = crate::sparql::query(snap.clone(), query, &Default::default()).unwrap();
+    assert!(one.rows_produced > 0);
+    let controls = GateControls {
+        budgets: crate::Budgets {
+            max_rows_produced: Some(one.rows_produced),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let check = |count: usize| {
+        let selector = |label| format!("SPARQL '{query}'@<urn:{label}>");
+        let selectors = ["A", "B"]
+            .into_iter()
+            .take(count)
+            .map(selector)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let map = oxrdf::Literal::new_simple_literal(selectors);
+        suite(&format!(
+            "<urn:s> a chk:Suite ; chk:check <urn:c> .
+             <urn:c> a chk:ShexCheck ; chk:schema '<urn:A> {{}} <urn:B> {{}}' ; chk:shapeMap {map} ."
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        run_with_controls(&check(1), &snap, &controls).status,
+        Status::Passed
+    );
+    gate_budget_refusal(&run_with_controls(&check(2), &snap, &controls));
+}
+
+#[cfg(feature = "reasoning")]
+fn gate_diagnostics_suite(inferences: bool) -> Suite {
+    suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:DiagnosticsCheck ; chk:diagnostic 'disjoint-classes' ;
+             chk:inferences {inferences} ."
+    ))
+    .unwrap()
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn gate_diagnostics_obeys_the_native_default_and_inference_flag() {
+    let store = |union_default_graph| {
+        Dataset::from_store(crate::store::Store::in_memory(crate::store::StoreOptions {
+            union_default_graph,
+            ..Default::default()
+        }))
+    };
+    let inferred = sparkles_core::INFERRED_GRAPH;
+    let asserted = "<urn:A> <http://www.w3.org/2002/07/owl#disjointWith> <urn:B> .
+                    <urn:x> a <urn:A> .";
+    let union = store(true);
+    union
+        .update(&format!(
+            "INSERT DATA {{
+                GRAPH <urn:asserted> {{ {asserted} }}
+                GRAPH <{inferred}> {{ <urn:x> a <urn:B> }}
+            }}"
+        ))
+        .unwrap();
+    let plain = store(false);
+    plain
+        .update(&format!(
+            "INSERT DATA {{ {asserted} GRAPH <{inferred}> {{ <urn:x> a <urn:B> }} }}"
+        ))
+        .unwrap();
+    for ds in [&union, &plain] {
+        let snap = ds.store().snapshot();
+        for (flag, status) in [(false, Status::Passed), (true, Status::Failed)] {
+            let check = gate_diagnostics_suite(flag);
+            let r = run_on(&check, &snap, &snap);
+            assert_eq!(r.results[0].status, status, "{:?}", r.results[0]);
+        }
+    }
+    use sparkles_reasoner::diagnostics::{Basis, DiagnoseOptions, diagnose_for_gate};
+    let evidence = diagnose_for_gate(
+        union.store().snapshot(),
+        &DiagnoseOptions {
+            checks: vec!["disjoint-classes".into()],
+            inferences: true,
+            ..Default::default()
+        },
+        &Default::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(evidence.findings[0].basis, Basis::UsesInferences);
+    union
+        .update("INSERT DATA { GRAPH <urn:asserted> { <urn:x> a <urn:B> } }")
+        .unwrap();
+    let snap = union.store().snapshot();
+    for flag in [false, true] {
+        let result = run_on(&gate_diagnostics_suite(flag), &snap, &snap)
+            .results
+            .remove(0);
+        assert_eq!(result.status, Status::Failed, "{result:?}");
+    }
+
+    let evidence = diagnose_for_gate(
+        snap,
+        &DiagnoseOptions {
+            checks: vec!["disjoint-classes".into()],
+            inferences: true,
+            ..Default::default()
+        },
+        &Default::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(evidence.findings[0].basis, Basis::Asserted);
+
+    let blank = store(true);
+    blank
+        .store()
+        .load(&[sparkles_core::io::Source::from_bytes(
+            format!("_:graph {{ {asserted} <urn:x> a <urn:B> . }}").into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let snap = blank.store().snapshot();
+    let result = run_on(&gate_diagnostics_suite(false), &snap, &snap)
+        .results
+        .remove(0);
+    assert_eq!(result.status, Status::Failed, "{result:?}");
+
+    let union_only_default = store(true);
+    union_only_default
+        .update(&format!(
+            "INSERT DATA {{ {asserted} <urn:x> a <urn:B> .
+                             GRAPH <urn:unrelated> {{ <urn:y> a <urn:C> }} }}"
+        ))
+        .unwrap();
+    let snap = union_only_default.store().snapshot();
+    for flag in [false, true] {
+        assert!(run_on(&gate_diagnostics_suite(flag), &snap, &snap).passed());
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn gate_diagnostics_bounds_queries_and_the_report() {
+    let ds = Dataset::memory();
+    ds.update(
+        "INSERT DATA {
+             <urn:A> <http://www.w3.org/2002/07/owl#disjointWith> <urn:B> .
+             <urn:x> a <urn:A>, <urn:B> . <urn:y> a <urn:A>, <urn:B> .
+         }",
+    )
+    .unwrap();
+    let snap = ds.store().snapshot();
+    let check = gate_diagnostics_suite(false);
+    for controls in [
+        GateControls {
+            budgets: crate::Budgets {
+                max_memory_bytes: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        GateControls {
+            max_results: Some(0),
+            ..Default::default()
+        },
+        GateControls {
+            max_report_bytes: Some(0),
+            ..Default::default()
+        },
+    ] {
+        gate_budget_refusal(&run_with_controls(&check, &snap, &controls));
+    }
+    let truncated = run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            max_results: Some(1),
+            ..Default::default()
+        },
+    );
+    assert_eq!(truncated.status, Status::Failed, "{truncated:?}");
+    assert_eq!(truncated.findings, 1);
 }
 
 #[test]

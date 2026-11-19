@@ -136,10 +136,17 @@ impl Engine<'_> {
 
     fn over_budget(&self, cx: &Cx) -> Result<()> {
         if cx.expr_work > self.max_expr_nodes {
-            return fail(format!(
-                "a node expression worked through more than {} units",
-                self.max_expr_nodes
-            ));
+            let budget = sparkles_core::Budget {
+                kind: sparkles_core::BudgetKind::ValidationWork,
+                limit: self.max_expr_nodes,
+                requested: cx.expr_work,
+            };
+            return Err(
+                anyhow::Error::new(sparkles_core::Error::BudgetExceeded(budget)).context(format!(
+                    "a node expression worked through more than {} units",
+                    self.max_expr_nodes
+                )),
+            );
         }
         Ok(())
     }
