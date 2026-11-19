@@ -363,3 +363,32 @@ fn the_first_batch_fits_beside_the_hit_list() {
     assert_eq!(answer, eager(&snap, q, &opts()).unwrap());
     assert!(sizes[0] < 2500, "{sizes:?}");
 }
+
+/// Highlighting holds no map whose size a batch would set, so a search of one row per
+/// pull runs under a budget that holds its hit list, a page and the highlighted
+/// literals it interns, about 1.37 MB, where a map for 4096 literals would not fit.
+#[test]
+fn highlighting_one_row_per_pull_needs_no_map() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..4096 {
+        data.push_str(&format!(
+            "<http://example.org/s{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"fox {i}\" .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_text(TextConfig::default()).unwrap();
+    let snap = s.snapshot();
+    let q = "SELECT ?lit { (?s ?sc ?lit) text:query (rdfs:label \"fox\" \"highlight:s:<b> | e:</b>\") }";
+    let budget = QueryOptions {
+        max_memory_bytes: Some(1400 << 10),
+        ..opts()
+    };
+    let (answer, _, _) = streamed(&snap, q, &budget, &strict(1)).unwrap();
+    assert_eq!(answer, eager(&snap, q, &opts()).unwrap());
+}

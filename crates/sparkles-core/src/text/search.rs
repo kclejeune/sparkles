@@ -200,9 +200,6 @@ const PAGE: usize = 4096;
 /// a term's key is decoded into is Tantivy's, outside this count (row 1156).
 const PAGE_HIT_BYTES: u64 = 192;
 
-/// The literals a reader's highlighting remembers at most.
-const HIGHLIGHT_DONE: usize = PAGE;
-
 /// The bytes a hit list keeps per hit, a score and a document address.
 const HIT_BYTES: u64 = std::mem::size_of::<(Score, DocAddress)>() as u64;
 
@@ -271,14 +268,7 @@ impl Reader {
         }
         // the row limits an eager search checks; the reader holds no table of the rows
         ctx.check_output_rows(total as usize)?;
-        let mut page = (total as usize).min(PAGE) as u64 * PAGE_HIT_BYTES;
-        if spec.highlight.is_some() {
-            // the map of the literals highlighted, which never holds more than the hits
-            page += map_bytes(
-                (total as usize).min(HIGHLIGHT_DONE),
-                std::mem::size_of::<(Id, Id)>(),
-            );
-        }
+        let page = (total as usize).min(PAGE) as u64 * PAGE_HIT_BYTES;
         let seen = if spec.dedup {
             map_bytes(total as usize, std::mem::size_of::<(Id, Id, Id)>())
         } else {
@@ -383,7 +373,8 @@ impl Reader {
                 opts,
                 &self.matchers,
                 &mut t.cols[c][first..],
-                HIGHLIGHT_DONE,
+                // no map of the literals highlighted, whose size a batch would set
+                0,
             )?;
         }
         if ended {
@@ -512,11 +503,13 @@ fn highlight(
             }
             _ => *id,
         };
-        if done.len() >= remember {
-            // a literal highlighted again interns to the same id
-            done.clear();
+        // a literal highlighted again interns to the same id
+        if remember > 0 {
+            if done.len() >= remember {
+                done.clear();
+            }
+            done.insert(*id, h);
         }
-        done.insert(*id, h);
         *id = h;
     }
     Ok(())
