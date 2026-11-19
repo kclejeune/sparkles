@@ -126,12 +126,14 @@ status() {
   rx_exec "$host" "o=\$HOME/gate/out/$1; cat \"\$o/progress.log\" 2> /dev/null; [ ! -f \"\$o/run-id\" ] || echo \"run-id=\$(cat \"\$o/run-id\")\"; [ ! -f \"\$o/ci.exit\" ] || echo \"ci.exit=\$(cat \"\$o/ci.exit\")\"; systemctl --user is-active gate-$1 || true"
 }
 # fetch NAME [RUN_ID]: copy the job's results into a staging directory, check the copy and,
-# with RUN_ID, that it is that start's own, and publish it, setting res to its path. With
-# RUN_ID the copy goes to NAME.RUN_ID, which nothing replaces, and NAME becomes a link to it.
-# Without one it replaces NAME. Every step checks its own result, since a caller may run fetch
-# where errexit is off, and a failure keeps the earlier copy.
+# with RUN_ID, that it is that start's own, and publish it, setting res to its path. Each copy
+# goes to a path of its own, NAME.RUN_ID or, for a fetch by name, NAME.fetch-TIME-PID, which
+# nothing replaces, and NAME becomes a link to it by an atomic rename. An older NAME that is a
+# directory is exchanged with the new link atomically, where mv can, and is otherwise left in
+# place, so NAME is never missing. Every step checks its own result, since a caller may run
+# fetch where errexit is off.
 fetch() {
-  local base=$root/.artifacts/remote-ci stage link
+  local base=$root/.artifacts/remote-ci stage link id=${2:-fetch-$(date +%s)-$$}
   res=
   mkdir -p "$base" || return 1
   stage=$(mktemp -d "$base/.fetch-$1.XXXXXX") || return 1
@@ -150,39 +152,24 @@ fetch() {
     echo "remote-ci.sh: another start of gate-$1 replaced this one's results on $host" >&2
     return 1
   fi
-  if [ -n "${2:-}" ]; then
-    res=$base/$1.$2
-    if ! mv -T "$stage" "$res"; then
-      rm -rf "$stage"
-      res=
-      return 1
-    fi
-    # An older copy that is a directory, not a link, is kept beside it under a dated name.
-    if [ -d "$base/$1" ] && [ ! -L "$base/$1" ]; then
-      mv -T "$base/$1" "$base/$1.kept-$(date +%s)" || echo "remote-ci.sh: could not move the older copy $base/$1 aside" >&2
-    fi
-    link=$(mktemp -u "$base/.link-$1.XXXXXX")
-    if ! { ln -s "$1.$2" "$link" && mv -Tf "$link" "$base/$1"; }; then
+  if ! mv -T "$stage" "$base/$1.$id"; then
+    rm -rf "$stage"
+    return 1
+  fi
+  res=$base/$1.$id
+  link=$(mktemp -u "$base/.link-$1.XXXXXX")
+  if ! ln -s "$1.$id" "$link"; then
+    echo "remote-ci.sh: results in $res, but $base/$1 could not point to them" >&2
+  elif [ -d "$base/$1" ] && [ ! -L "$base/$1" ]; then
+    if mv --exchange -T "$link" "$base/$1" 2> /dev/null; then
+      mv -T "$link" "$base/$1.kept-$(date +%s)" 2> /dev/null || echo "remote-ci.sh: the older copy of $1 is at $link" >&2
+    else
       rm -f "$link"
-      echo "remote-ci.sh: results in $res, but $base/$1 could not point to them" >&2
+      echo "remote-ci.sh: results in $res; the older directory $base/$1 stays in place" >&2
     fi
-  else
-    # The earlier copy moves aside first and comes back when the new one cannot take its place.
-    local old=
-    if [ -e "$base/$1" ] || [ -L "$base/$1" ]; then
-      old=$base/.old-$1.$$
-      mv -T "$base/$1" "$old" || {
-        rm -rf "$stage"
-        return 1
-      }
-    fi
-    if ! mv -T "$stage" "$base/$1"; then
-      rm -rf "$stage"
-      [ -z "$old" ] || mv -T "$old" "$base/$1"
-      return 1
-    fi
-    [ -z "$old" ] || rm -rf "$old"
-    res=$base/$1
+  elif ! mv -Tf "$link" "$base/$1"; then
+    rm -f "$link"
+    echo "remote-ci.sh: results in $res, but $base/$1 could not point to them" >&2
   fi
   echo "results in $res"
 }

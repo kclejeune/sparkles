@@ -433,6 +433,20 @@ class RemoteCI(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual((res / 'ci.exit').read_text().strip(), '0')
         self.assertEqual(list((self.src / '.artifacts/remote-ci').glob('.fetch-*')), [])
+        # A link swap that fails leaves the name pointing at the earlier copy.
+        (fake / 'mv').write_text('#!/usr/bin/env bash\nfor a in "$@"; do case $a in */.link-*) exit 1 ;; esac; done\nexec %s "$@"\n' % shutil.which('mv'))
+        before = res.resolve()
+        r = subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'wally', '--fetch', self.name()],
+                           cwd=self.src, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('could not point to them', r.stderr)
+        self.assertEqual(res.resolve(), before)
+        # Without the fault a fetch by name gets a copy of its own, and the name follows it.
+        (fake / 'mv').unlink()
+        r = subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'wally', '--fetch', self.name()],
+                           cwd=self.src, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(res.is_symlink()); self.assertIn('.fetch-', res.resolve().name)
+        self.assertTrue(before.exists())
 
     def test_the_disk_settings_must_be_positive_numbers(self):
         for n in ['REMOTE_CI_MIN_FREE_GIB', 'REMOTE_CI_RUN_FLOOR_GIB', 'REMOTE_CI_WATCH_SECONDS']:
