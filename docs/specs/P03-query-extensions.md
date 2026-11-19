@@ -424,7 +424,8 @@ and aggregate accumulators drop their value without a guard when none can be ent
 leak the payload of a panic from it, whose own destructor could otherwise unwind.
 When an evaluated `EXISTS` or a registered scalar call encounters this refusal, query
 execution preserves the original error even if an expression such as `COALESCE`
-handles the evaluation error.
+handles the evaluation error. Patterns containing registered callbacks use per-row
+`EXISTS` evaluation. Row-budget checks preserve a recorded unconfigured-call refusal.
 `tests/rdfs_extension_calls.rs` covers eager and streamed shapes, an update's `WHERE`
 clause, inputs from rewritten patterns, list arguments, a registered `rdf:type` and the
 reasoning seeds. Unit tests cover the guard, the planner, eager execution and cursor

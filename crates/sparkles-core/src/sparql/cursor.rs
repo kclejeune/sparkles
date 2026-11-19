@@ -4750,9 +4750,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn unconfigured_cursor(query: &str) -> (Result<QueryCursor>, Arc<AtomicUsize>) {
+    fn unconfigured_cursor(
+        query: &str,
+        max_rows_produced: Option<u64>,
+    ) -> (Result<QueryCursor>, Arc<AtomicUsize>) {
+        use super::super::callback_guard_tests::{prepare_unconfigured, unconfigured};
         let parsed = super::super::parse_query(query, None, &[]).unwrap();
-        let (prepared, opens) = super::super::callback_guard_tests::prepared(&parsed, true);
+        let (mut ctx, opens) = unconfigured();
+        if let Some(limit) = max_rows_produced {
+            ctx.max_rows_produced = limit;
+        }
+        let prepared = prepare_unconfigured(&parsed, ctx, true);
         let levels = prepared.plan_depth;
         let cursor = from_prepared(
             prepared,
@@ -4776,7 +4784,7 @@ mod tests {
     #[test]
     fn callback_guard_exists_fails_before_a_cursor_emits_rows() {
         use super::super::callback_guard_tests::{EXISTS_QUERY, assert_unconfigured};
-        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY);
+        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY, None);
         let mut cursor = cursor.unwrap();
         let result = cursor.next_batch();
         assert_eq!(opens.load(Ordering::Relaxed), 0);
@@ -4799,9 +4807,21 @@ mod tests {
     }
 
     #[test]
+    fn callback_guard_cursor_preserves_the_refusal_at_its_produced_row_limit() {
+        use super::super::callback_guard_tests::{EXISTS_QUERY, assert_unconfigured};
+        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY, Some(1));
+        let mut cursor = cursor.unwrap();
+        let error = cursor.next_batch().err().expect("a refusal on first pull");
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        assert_eq!(cursor.status(), CursorStatus::Failed);
+        assert_eq!(cursor.stats().emitted_rows, 0);
+        assert_unconfigured(error);
+    }
+
+    #[test]
     fn callback_guard_cursor_allows_untaken_exists_and_expression_fallback() {
         use super::super::callback_guard_tests::FALLBACK_QUERY;
-        let (cursor, opens) = unconfigured_cursor(FALLBACK_QUERY);
+        let (cursor, opens) = unconfigured_cursor(FALLBACK_QUERY, None);
         let mut cursor = cursor.unwrap();
         let batch = cursor.next_batch().unwrap().unwrap();
         assert_eq!(batch.len(), 1);
@@ -4825,6 +4845,7 @@ mod tests {
                     EXISTS { SERVICE <urn:remote> { ?s <urn:p> ?o } }
                 ) AS ?b)
             }",
+            None,
         );
         assert!(
             matches!(cursor, Err(Error::Unsupported(message)) if message.starts_with("cursor requires materialization at Bind"))

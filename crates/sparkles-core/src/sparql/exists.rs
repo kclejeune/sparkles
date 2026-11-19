@@ -958,6 +958,14 @@ fn build_streaming(
 
 /// Check the pattern against the admitted algebra and plan it unsubstituted.
 fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
+    // Evaluating a key set can reach a callback under an untaken expression arm.
+    if ctx
+        .extensions
+        .as_ref()
+        .is_some_and(|r| !r.is_empty() && r.references(&spec.pattern))
+    {
+        return Err("it calls a registered extension".into());
+    }
     // Count the algebra's printed size without constructing a temporary String.
     // This conservative reservation covers the newly planned tree and admission
     // sets in addition to the existing EXISTS algebra already owned by the plan.

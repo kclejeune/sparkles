@@ -1860,7 +1860,7 @@ impl Ctx {
     #[inline]
     pub fn check_rows(&self, n: usize) -> Result<()> {
         if n > self.max_rows {
-            return Err(Error::BudgetExceeded(Budget {
+            return Err(self.row_budget_error(Budget {
                 kind: BudgetKind::Rows,
                 limit: self.max_rows as u64,
                 requested: n as u64,
@@ -1895,11 +1895,24 @@ impl Ctx {
     }
 
     fn produced_exceeded(&self, requested: u64) -> Error {
-        Error::BudgetExceeded(Budget {
+        self.row_budget_error(Budget {
             kind: BudgetKind::RowsProduced,
             limit: self.max_rows_produced,
             requested,
         })
+    }
+
+    #[cold]
+    fn row_budget_error(&self, budget: Budget) -> Error {
+        // Row accounting can see a fallback row from a refused expression.
+        if matches!(
+            self.memory_failure.failure.lock().as_ref(),
+            Some(ResourceRefusal::UnconfiguredExtension)
+        ) {
+            super::extensions::unconfigured()
+        } else {
+            Error::BudgetExceeded(budget)
+        }
     }
 
     // --------------------------------------------------------------- memory ------

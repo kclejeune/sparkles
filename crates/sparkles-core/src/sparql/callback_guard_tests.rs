@@ -9,6 +9,7 @@ use super::extensions::{
 };
 use super::plan::Planner;
 use super::*;
+use crate::error::BudgetKind;
 use crate::store::{Store, StoreOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -40,7 +41,11 @@ impl ScalarFunction for Never {
 
 /// A context with the registry and without `configure_extensions`, as a rewrite that
 /// adds a call after configuration would leave it.
-fn unconfigured() -> (Ctx, Arc<AtomicUsize>) {
+pub(super) fn unconfigured() -> (Ctx, Arc<AtomicUsize>) {
+    unconfigured_on(&Store::in_memory(StoreOptions::default()))
+}
+
+fn unconfigured_on(store: &Store) -> (Ctx, Arc<AtomicUsize>) {
     let opens = Arc::new(AtomicUsize::new(0));
     let mut r = ExtensionRegistry::builder();
     r.register_property(
@@ -62,15 +67,18 @@ fn unconfigured() -> (Ctx, Arc<AtomicUsize>) {
         no_cache: true,
         ..Default::default()
     };
-    let store = Store::in_memory(StoreOptions::default());
     (
         make_ctx(store.snapshot(), &opts, None, None).unwrap(),
         opens,
     )
 }
 
-pub(super) fn prepared(parsed: &Query, cursor: bool) -> (PreparedQuery, Arc<AtomicUsize>) {
-    let (mut ctx, opens) = unconfigured();
+fn prepared(parsed: &Query) -> (PreparedQuery, Arc<AtomicUsize>) {
+    let (ctx, opens) = unconfigured();
+    (prepare_unconfigured(parsed, ctx, false), opens)
+}
+
+pub(super) fn prepare_unconfigured(parsed: &Query, mut ctx: Ctx, cursor: bool) -> PreparedQuery {
     if cursor {
         ctx.enable_cursor_accounting().unwrap();
     }
@@ -81,17 +89,14 @@ pub(super) fn prepared(parsed: &Query, cursor: bool) -> (PreparedQuery, Arc<Atom
         .plan(pattern, &ActiveGraph::Default, Vec::new())
         .unwrap();
     let plan_depth = depth::check_plan(node.depth()).unwrap();
-    (
-        PreparedQuery {
-            ctx,
-            node,
-            pattern: pattern.clone(),
-            bound: Vec::new(),
-            kind: QueryKind::Select,
-            plan_depth,
-        },
-        opens,
-    )
+    PreparedQuery {
+        ctx,
+        node,
+        pattern: pattern.clone(),
+        bound: Vec::new(),
+        kind: QueryKind::Select,
+        plan_depth,
+    }
 }
 
 pub(super) fn assert_unconfigured(error: Error) {
@@ -170,7 +175,7 @@ fn eager_scalar_fallback_cannot_hide_the_unconfigured_call() {
 
 fn assert_eager_unconfigured(query: &str) {
     let parsed = parse_query(query, None, &[]).unwrap();
-    let (prepared, opens) = prepared(&parsed, false);
+    let (prepared, opens) = prepared(&parsed);
     let result = execute_prepared(&parsed, &Default::default(), 0.0, 0.0, prepared);
     assert_eq!(opens.load(Ordering::Relaxed), 0);
     let error = match result {
@@ -186,7 +191,7 @@ fn assert_eager_unconfigured(query: &str) {
 #[test]
 fn eager_untaken_exists_and_expression_fallback_succeed() {
     let parsed = parse_query(FALLBACK_QUERY, None, &[]).unwrap();
-    let (prepared, opens) = prepared(&parsed, false);
+    let (prepared, opens) = prepared(&parsed);
     let result = execute_prepared(&parsed, &Default::default(), 0.0, 0.0, prepared).unwrap();
     assert_eq!(
         result.test_application_rows(),
@@ -196,4 +201,60 @@ fn eager_untaken_exists_and_expression_fallback_succeed() {
         ]]
     );
     assert_eq!(opens.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn eager_untaken_nested_exists_ignores_unconfigured_callback() {
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[crate::io::Source::from_bytes(
+            b"<urn:s> <urn:stored> <urn:present> .".to_vec(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let parsed = parse_query(
+        "SELECT ?b WHERE {
+            VALUES ?s { <urn:s> }
+            BIND(IF(false, EXISTS {
+                ?s <urn:stored> <urn:present>
+                FILTER(COALESCE(EXISTS { ?s <urn:callback> <urn:x> }, false))
+            }, true) AS ?b)
+        }",
+        None,
+        &[],
+    )
+    .unwrap();
+    let (ctx, opens) = unconfigured_on(&store);
+    assert!(ctx.opt.decorrelate_exists);
+    let prepared = prepare_unconfigured(&parsed, ctx, false);
+    let result = exists::FORCE.with(|force| {
+        let previous = force.replace(true);
+        let result = execute_prepared(&parsed, &Default::default(), 0.0, 0.0, prepared);
+        force.set(previous);
+        result
+    });
+    assert_eq!(opens.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        result.unwrap().test_application_rows(),
+        [vec![Some(oxrdf::Literal::from(true).into())]]
+    );
+}
+
+#[test]
+fn row_accounting_preserves_only_the_unconfigured_callback_refusal() {
+    let check = |failure: Error| {
+        let (mut ctx, _) = unconfigured();
+        ctx.max_rows = 0;
+        ctx.rows_produced.store(u64::MAX, Ordering::Relaxed);
+        ctx.fail_memory(&failure);
+        (ctx.check_rows(1).unwrap_err(), ctx.produced(1).unwrap_err())
+    };
+    let (rows, produced) = check(extensions::unconfigured());
+    assert_unconfigured(rows);
+    assert_unconfigured(produced);
+
+    let (rows, produced) = check(Error::Timeout);
+    assert!(matches!(rows, Error::BudgetExceeded(b) if b.kind == BudgetKind::Rows));
+    assert!(matches!(produced, Error::BudgetExceeded(b) if b.kind == BudgetKind::RowsProduced));
 }
