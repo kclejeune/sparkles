@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Browser tests on a local debug build
+
+`mise run ui:e2e` now builds the formatter's WebAssembly module before the UI, as
+`ui:e2e:mock` does, so the Pattern pane, the plan's pattern and the facets of a query pass
+against a local debug server. A run whose `ui/build` lacks the module stops with a message
+unless `SPARKLES_E2E_NO_WASM=1` is set. The lens tests now look for unlabelled nodes under
+the full IRIs that the rendering preferences draw, and the outbound-policy test of ontology
+imports fetches a link-local address, which the test server refuses although it allows
+private ones. This completes roadmap item 1131.
+
 ### Streamed answers through the engine buffer
 
 The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write

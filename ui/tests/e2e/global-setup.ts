@@ -12,7 +12,9 @@
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
 // from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log;
-// SPARKLES_E2E_PORT=N runs the servers on ports N and N + 1 instead of free ones.
+// SPARKLES_E2E_PORT=N runs the servers on ports N and N + 1 instead of free ones;
+// SPARKLES_E2E_NO_WASM=1 runs against a debug server whose ui/build lacks the formatter's
+// browser module.
 
 import { request, type FullConfig } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
@@ -23,6 +25,7 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -64,6 +67,27 @@ function binary(): string {
       `no Sparkles binary at ${bin}: run \`cargo build -p sparkles-server\` or set SPARKLES_BIN`,
     );
   return bin;
+}
+
+/**
+ * The debug server serves ui/build from disk. The Pattern pane, the plan's pattern and the
+ * facets of a query have no server fallback for the formatter's WebAssembly module, so
+ * without it in that build their tests fail on a pane that reports "unavailable", far from
+ * the cause. Another binary embeds its own UI, which this check cannot see.
+ * `SPARKLES_E2E_NO_WASM=1` runs the suite without the module anyway.
+ */
+function checkModule() {
+  if (process.env.SPARKLES_BIN || process.env.SPARKLES_E2E_NO_WASM === '1') return;
+  const assets = join(UI_DIR, 'build', '_app', 'immutable', 'assets');
+  const built =
+    existsSync(assets) &&
+    readdirSync(assets).some((f) => /^sparkles_fmt_wasm_bg\..*\.wasm$/.test(f));
+  if (!built)
+    throw new Error(
+      `The UI build in ${join(UI_DIR, 'build')} has no browser module of the formatter, which ` +
+        'the Pattern pane and the facets tests need. Run `mise run ui:e2e`, which builds it ' +
+        'with `mise run ui:wasm` before the UI, or set SPARKLES_E2E_NO_WASM=1.',
+    );
 }
 
 /** A port that was free a moment ago (the server is retried on another if it is taken). */
@@ -152,6 +176,7 @@ async function serve(bin: string, data: string, log: string, extra: string[], of
 
 export default async function globalSetup(_config: FullConfig) {
   const bin = binary();
+  checkModule();
   const dir = mkdtempSync(join(tmpdir(), 'sparkles-e2e-'));
   const log = join(dir, 'server.log');
 
