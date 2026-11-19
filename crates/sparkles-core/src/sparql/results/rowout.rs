@@ -227,8 +227,13 @@ pub(crate) struct RowOut<'a> {
     /// explicit mode: the open row outgrew the buffer, and `buf` is the scratch that
     /// collects it whole while the buffer waits in `spill`
     growing: bool,
-    /// the scratch for a row longer than the buffer, or the buffer while one grows. It is
-    /// not charged, as the row string of a serializer that writes a row at once is not.
+    /// explicit mode: the open piece moved to the front of the buffer because it did not
+    /// fit where it started, or started before the buffer existed. Such a piece of exactly
+    /// the buffer's size goes on in one write at its end, as a serializer's write of that
+    /// size would at once.
+    moved: bool,
+    /// the scratch for a row longer than the buffer, or the buffer while one grows, charged
+    /// with the buffer and kept for the next long row
     spill: Vec<u8>,
     ctx: Option<&'a Ctx>,
     /// the reservation for `buf` and `marks`, declared after them so that they drop first
@@ -256,6 +261,7 @@ impl<'a> RowOut<'a> {
             refused: None,
             open: None,
             growing: false,
+            moved: false,
             spill: Vec::new(),
             ctx,
             charge: None,
@@ -277,8 +283,8 @@ impl<'a> RowOut<'a> {
         }
     }
 
-    /// The bytes of a buffer of `buf` bytes and `marks` mark slots, with as many slots of
-    /// the ledger's queue when the count has a ledger.
+    /// The bytes of `buf` bytes of buffer and scratch and `marks` mark slots, with as many
+    /// slots of the ledger's queue when the count has a ledger.
     fn held(&self, buf: usize, marks: usize) -> u64 {
         let slot = if self.count.ledger.is_some() {
             MARK_BYTES + LEDGER_MARK_BYTES
@@ -308,7 +314,7 @@ impl<'a> RowOut<'a> {
     #[inline(never)]
     fn start(&mut self) -> std::io::Result<()> {
         let marks = self.marks.capacity().max(FIRST_MARKS);
-        if let Err(e) = self.cover(self.held(OUTPUT_BUFFER, marks)) {
+        if let Err(e) = self.cover(self.held(OUTPUT_BUFFER + self.spill.capacity(), marks)) {
             return Err(self.refuse(e));
         }
         self.buf.reserve_exact(OUTPUT_BUFFER);
@@ -330,7 +336,7 @@ impl<'a> RowOut<'a> {
     #[inline(never)]
     fn grow_marks(&mut self) -> std::io::Result<()> {
         let marks = (self.marks.capacity() * 2).max(FIRST_MARKS);
-        let buf = self.buf.capacity();
+        let buf = self.buf.capacity() + self.spill.capacity();
         if let Err(e) = self.cover(self.held(buf, marks)) {
             return Err(self.refuse(e));
         }
@@ -363,18 +369,19 @@ impl<'a> RowOut<'a> {
             self.grow_marks()
                 .map_err(|e| self.refused.take().unwrap_or(Error::Io(e)))?;
         }
-        self.open = Some(self.buf.len());
+        self.begin_piece();
         Ok(())
     }
 
     /// Explicit mode: `n` rows end here, `n` greater than one for a writer that counts
-    /// several statements at once. A row that outgrew the buffer goes on here in one
-    /// write, which can fail. Nothing else allocates or fails.
+    /// several statements at once. A row that outgrew the buffer, or that moved and fills
+    /// it exactly, goes on here in one write, which can fail. Nothing else allocates or
+    /// fails.
     #[inline]
     pub(crate) fn end_row(&mut self, n: u64) -> std::io::Result<()> {
         self.open = None;
-        if self.growing {
-            return self.write_grown(Some(n));
+        if self.growing | self.moved {
+            return self.end_whole(Some(n));
         }
         self.push_mark(n);
         Ok(())
@@ -382,16 +389,68 @@ impl<'a> RowOut<'a> {
 
     /// Explicit mode: open a piece that is not a row, such as a header, which goes to
     /// the caller's writer whole like a row but ends none.
+    #[inline]
     pub(crate) fn begin_piece(&mut self) {
         self.open = Some(self.buf.len());
+        self.moved = self.buf.capacity() == 0;
     }
 
     /// Explicit mode: close the piece [`RowOut::begin_piece`] opened.
     pub(crate) fn end_piece(&mut self) -> std::io::Result<()> {
         self.open = None;
-        if self.growing {
-            return self.write_grown(None);
+        if self.growing | self.moved {
+            return self.end_whole(None);
         }
+        Ok(())
+    }
+
+    /// The end of a piece that grew past the buffer or moved, with the mark of `rows` if
+    /// it ends rows. A moved piece of exactly the buffer's size, the whole buffer now, goes
+    /// on in one write as a serializer's write of that size does.
+    #[cold]
+    #[inline(never)]
+    fn end_whole(&mut self, rows: Option<u64>) -> std::io::Result<()> {
+        self.moved = false;
+        if self.growing {
+            return self.write_grown(rows);
+        }
+        if self.buf.len() == OUTPUT_BUFFER {
+            debug_assert!(self.marks.is_empty());
+            let r = self.inner.write_all(&self.buf);
+            self.failed |= r.is_err();
+            r?;
+            self.taken += self.buf.len() as u64;
+            self.buf.clear();
+        }
+        if let Some(n) = rows {
+            self.push_mark(n);
+        }
+        Ok(())
+    }
+
+    /// Make room for `len` bytes in the scratch, which is `buf` while a row grows and
+    /// `spill` otherwise, under the charge and before it grows.
+    #[cold]
+    #[inline(never)]
+    fn reserve_scratch(&mut self, len: usize) -> std::io::Result<()> {
+        let (scratch, buffer) = if self.growing {
+            (self.buf.capacity(), self.spill.capacity())
+        } else {
+            (self.spill.capacity(), self.buf.capacity())
+        };
+        if scratch >= len {
+            return Ok(());
+        }
+        let cap = len.max(scratch * 2);
+        if let Err(e) = self.cover(self.held(buffer + cap, self.marks.capacity())) {
+            return Err(self.refuse(e));
+        }
+        let scratch = if self.growing {
+            &mut self.buf
+        } else {
+            &mut self.spill
+        };
+        scratch.reserve_exact(cap - scratch.len());
         Ok(())
     }
 
@@ -406,6 +465,7 @@ impl<'a> RowOut<'a> {
             self.buf.truncate(start);
         }
         self.open = None;
+        self.moved = false;
     }
 
     /// Write on the row or piece collected whole in the scratch, as one write, as a
@@ -461,6 +521,7 @@ impl<'a> RowOut<'a> {
     #[inline(never)]
     fn write_full(&mut self, b: &[u8]) -> std::io::Result<usize> {
         if self.growing {
+            self.reserve_scratch(self.buf.len() + b.len())?;
             self.buf.extend_from_slice(b);
             return Ok(b.len());
         }
@@ -499,11 +560,13 @@ impl<'a> RowOut<'a> {
     fn write_open(&mut self, start: usize, b: &[u8]) -> std::io::Result<usize> {
         self.drain_to(start)?;
         self.open = Some(0);
+        self.moved = true;
         if self.buf.len() + b.len() <= OUTPUT_BUFFER {
             self.buf.extend_from_slice(b);
             return Ok(b.len());
         }
         self.spill.clear();
+        self.reserve_scratch(self.buf.len() + b.len())?;
         self.spill.extend_from_slice(&self.buf);
         self.spill.extend_from_slice(b);
         self.buf.clear();

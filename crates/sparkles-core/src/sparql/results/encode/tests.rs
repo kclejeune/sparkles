@@ -614,6 +614,106 @@ fn tsv_pieces_at_the_buffer_size() {
     }
 }
 
+/// Refuses a write whole when it would take the bytes past `cap`, as the result-size
+/// limit does.
+struct Capped {
+    cap: usize,
+    taken: usize,
+}
+
+impl Write for Capped {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.taken + b.len() > self.cap {
+            return Err(std::io::Error::other("result size budget exceeded"));
+        }
+        self.taken += b.len();
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+const SOURCE_ERROR: &str = "the source's error after the last row";
+
+/// The error of the encoder, and of sparesults through the staged mode, when the rows
+/// are followed by a source error and the caller's writer refuses writes past `cap`.
+fn errors_after(
+    enc: Enc,
+    vars: &[String],
+    rows: &[Vec<Option<Term>>],
+    cap: usize,
+) -> (crate::error::Error, crate::error::Error) {
+    let count = RowCount::new();
+    let explicit = write_buffered(
+        &mut Capped { cap, taken: 0 },
+        &count,
+        None,
+        &mut |out, _| {
+            let mut out = Explicit::new(out);
+            enc.header(&mut out, vars).map_err(io)?;
+            for row in rows {
+                out.begin_row()?;
+                enc.row(&mut out, RowView::Dense(row), vars.len())
+                    .map_err(io)?;
+                out.end_row(1).map_err(io)?;
+            }
+            Err(crate::error::Error::invalid(SOURCE_ERROR))
+        },
+    );
+    let variables: Vec<Variable> = vars.iter().map(Variable::new_unchecked).collect();
+    let staged =
+        write_buffered(
+            &mut Capped { cap, taken: 0 },
+            &RowCount::new(),
+            None,
+            &mut |out, staged| {
+                let mut s = QueryResultsSerializer::from_format(enc.oracle())
+                    .serialize_solutions_to_writer(&mut *out, variables.clone())
+                    .map_err(io)?;
+                for row in rows {
+                    s.serialize(row.iter().enumerate().filter_map(|(c, t)| {
+                        t.as_ref().map(|t| (variables[c].as_ref(), t.as_ref()))
+                    }))
+                    .map_err(io)?;
+                    staged.set(staged.get() + 1);
+                }
+                Err(crate::error::Error::invalid(SOURCE_ERROR))
+            },
+        );
+    (explicit.unwrap_err(), staged.unwrap_err())
+}
+
+/// A row or header of exactly the buffer's size that did not fit where it started goes on
+/// at once, as sparesults' write of it did, so a writer that refuses it fails the output
+/// before the source's next error, which would otherwise hide the refusal.
+#[test]
+fn a_refused_piece_of_the_buffer_size_fails_before_a_later_error() {
+    for enc in [Enc::Tsv, Enc::Csv] {
+        // TSV quotes a simple literal and ends a line with LF, CSV writes it bare and ends
+        // a line with CRLF, and both headers of one short name take 3 bytes
+        let (quotes, eol) = match enc {
+            Enc::Tsv => (2, 1),
+            Enc::Csv => (0, 2),
+        };
+        let vars = vec!["v".to_string()];
+        let rows = vec![vec![simple(&"z".repeat(8_192 - quotes - eol))]];
+        // a name of 8,190 bytes makes a header of exactly the buffer's size in both
+        let long = vec!["h".repeat(8_190)];
+        for (case, (explicit, staged)) in [
+            ("row", errors_after(enc, &vars, &rows, 3 + 8_191)),
+            ("header", errors_after(enc, &long, &[], 8_191)),
+        ] {
+            for (path, e) in [("explicit", &explicit), ("staged", &staged)] {
+                assert!(
+                    matches!(e, crate::error::Error::Io(_)),
+                    "{enc:?} {case} {path}: the refusal was hidden by {e:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A sparse row of 70 columns with runs of more than 32 empty cells at its start, inside
 /// and at its end, and an answer of many short rows that spans several drains.
 #[test]
@@ -699,4 +799,19 @@ fn csv_handles_long_rows_and_long_comma_runs() {
     let rows = vec![sparse, vec![None; 70]];
     check(Enc::Csv, &vars, &rows).unwrap();
     check_pieces(Enc::Csv, &vars, &rows).unwrap();
+}
+
+/// Runs of more than 32 empty cells before, between and after two bound cells, in both
+/// row views against the byte oracle.
+#[test]
+fn wide_gaps_in_both_views() {
+    let vars: Vec<String> = (0..120).map(|i| format!("c{i}")).collect();
+    let mut row = vec![None; 120];
+    row[40] = simple("a");
+    row[80] = simple("b");
+    let rows = vec![row, vec![None; 120]];
+    for enc in [Enc::Tsv, Enc::Csv] {
+        check(enc, &vars, &rows).unwrap();
+        check_pieces(enc, &vars, &rows).unwrap();
+    }
 }

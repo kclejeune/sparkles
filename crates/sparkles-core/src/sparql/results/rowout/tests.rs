@@ -376,6 +376,63 @@ fn a_refused_last_mark_after_a_whole_output_keeps_its_rows() {
     assert_eq!(count.get(), FIRST_MARKS as u64);
 }
 
+/// Explicit rows of these lengths, each a run of `x` and a line feed written in pieces of
+/// at most 3,000 bytes.
+fn long_rows(lens: &'static [usize]) -> impl FnMut(&mut RowOut<'_>, &Cell<u64>) -> Result<()> {
+    move |w, _| {
+        for &len in lens {
+            w.begin_row()?;
+            let mut line = vec![b'x'; len - 1];
+            line.push(b'\n');
+            for p in line.chunks(3000) {
+                w.write_all(p).map_err(Error::Io)?;
+            }
+            w.end_row(1).map_err(Error::Io)?;
+        }
+        Ok(())
+    }
+}
+
+/// The scratch that collects a row longer than the buffer is charged before it grows,
+/// when it takes the row and at a later growth. A refusal keeps its type, and the rows
+/// before the long one are written on and counted. With room, the scratch is reused for
+/// the next long row and released with the writer.
+#[test]
+fn the_scratch_for_a_long_row_is_charged() {
+    let first = OUTPUT_BUFFER as u64 + FIRST_MARKS as u64 * MARK_BYTES;
+    // the first budget refuses the scratch when the row moves into it, and the second
+    // its doubling past 16 KiB
+    for left in [first + 1_000, first + 12_000] {
+        let r = small_answer();
+        let _held = leave(&r, left);
+        let count = RowCount::new();
+        let mut out = Vec::new();
+        memory_refusal(write_buffered(
+            &mut out,
+            &count,
+            Some(r.test_context().clone()),
+            &mut long_rows(&[10, 10, 10, 40_000, 10]),
+        ));
+        assert_eq!(out.len(), 30, "{left}");
+        assert_eq!(count.get(), 3, "{left}");
+    }
+    let r = small_answer();
+    let ctx = r.test_context().clone();
+    let before = room(&ctx);
+    let count = RowCount::new();
+    let mut out = Vec::new();
+    write_buffered(
+        &mut out,
+        &count,
+        Some(ctx.clone()),
+        &mut long_rows(&[10, 40_000, 10, 30_000, 10]),
+    )
+    .unwrap();
+    assert_eq!(count.get(), 5);
+    assert_eq!(out.len(), 70_030);
+    assert_eq!(room(&ctx), before);
+}
+
 #[test]
 fn the_charge_is_released_with_the_writer() {
     let r = small_answer();
