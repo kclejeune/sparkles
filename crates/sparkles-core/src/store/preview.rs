@@ -131,6 +131,7 @@ impl Store {
                     limit: Some(limit),
                     used: Some(used),
                     projected: Some(projected),
+                    ..StorageCheck::default()
                 },
                 None => StorageCheck::default(),
             };
@@ -141,6 +142,7 @@ impl Store {
                 limit: Some(max),
                 used: None,
                 projected: Some(dir_size(new)),
+                ..StorageCheck::default()
             },
             None => StorageCheck::default(),
         }
@@ -250,6 +252,7 @@ impl WriteTxn<'_> {
                     limit: Some(limit),
                     used: Some(used),
                     projected: Some(projected),
+                    ..StorageCheck::default()
                 },
                 None => StorageCheck::default(),
             },
@@ -258,6 +261,7 @@ impl WriteTxn<'_> {
                 limit: Some(max),
                 used: None,
                 projected: Some(self.memory_size()),
+                ..StorageCheck::default()
             },
             (None, None) => StorageCheck::default(),
         };

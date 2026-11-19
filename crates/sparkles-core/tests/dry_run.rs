@@ -1147,3 +1147,69 @@ fn replay_preview_projects_a_wal_commit_marker_for_every_source_step() {
     .unwrap();
     assert_eq!(projected_append, main.wal_bytes() - before);
 }
+
+/// A dry run of a transactional load or replace into an in-memory store over its limit
+/// reports the first refusal the write itself meets. Both parse their sources before the
+/// guard validates, so the memory refusal comes before a rejection. A load opens its
+/// transaction, which checks the precondition, before it parses, and a replace parses
+/// before it opens one, so the precondition comes first for a load and second for a
+/// replace. The preview's sizes are those of the check that refused it.
+#[test]
+fn an_early_memory_refusal_comes_in_the_order_of_the_write() {
+    let limited = || {
+        let s = Store::in_memory(StoreOptions {
+            bulk_threshold: 1_000,
+            max_memory_bytes: Some(16 << 10),
+            ..StoreOptions::default()
+        });
+        seed(&s);
+        s.set_guard(Some(Arc::new(BadGuard::default())));
+        s
+    };
+    let bad: String = (0..500)
+        .map(|i| format!("<urn:s{i}> <urn:bad> \"{i}\" .\n"))
+        .collect();
+    let src = || Source::from_bytes(bad.clone().into_bytes(), RdfFormat::NTriples, None);
+    let stale = || {
+        Some(Precondition::new(|_| {
+            Err(Error::PreconditionFailed("stale".into()))
+        }))
+    };
+    for replace in [false, true] {
+        let write = |s: &Store, w: WriteOptions| {
+            if replace {
+                s.replace_with(ReplaceTarget::Default, &[src()], CommitKind::GspPut, &w)
+                    .map(|(_, r)| r)
+            } else {
+                s.load_with(&[src()], CommitKind::Load, &w)
+            }
+        };
+        for precondition in [false, true] {
+            let what = format!("replace {replace}, precondition {precondition}");
+            let opts = |dry_run: bool| WriteOptions {
+                precondition: if precondition { stale() } else { None },
+                dry_run: dry_run.then(Default::default),
+                ..Default::default()
+            };
+            let s = limited();
+            let before = s.snapshot().len();
+            let e = write(&s, opts(false)).unwrap_err();
+            let p = preview::catch(write(&s, opts(true))).unwrap();
+            assert_eq!(s.snapshot().len(), before, "{what}");
+            if precondition && !replace {
+                assert!(matches!(e, Error::PreconditionFailed(_)), "{what}: {e}");
+                assert_eq!(p.outcome(), Outcome::PreconditionFailed, "{what}");
+            } else {
+                assert!(matches!(e, Error::StorageFull(_)), "{what}: {e}");
+                assert_eq!(p.outcome(), Outcome::StorageRefused, "{what}");
+                assert_eq!(p.error(), Some(e.to_string()), "{what}");
+                assert!(p.rejected(), "{what}");
+                assert!(
+                    p.storage.projected.unwrap() > p.storage.limit.unwrap(),
+                    "{what}: {:?}",
+                    p.storage
+                );
+            }
+        }
+    }
+}

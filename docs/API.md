@@ -3597,7 +3597,7 @@ refuses it like any write.
 | `changes` | With `changes=N`. `total` counts every changed quad, and `quads` lists the first `N`, removals first, in the form of [diffs](#diffs-between-commits). |
 | `validation` | The write-time validation summary the write would get, in the guard's mode, including grandfather mode. Absent when no guard runs. |
 | `precondition` | With `If-Match` or `If-None-Match`, whether the condition holds, with the `error` the write would get when it does not. |
-| `storage` | Whether the write fits. With a [storage quota](#storage-quotas), `limit`, `used` and `projected` give the bytes before and after the write. A refusal has the `error` and its `budget` or `code`. |
+| `storage` | Whether the write fits. With a [storage quota](#storage-quotas), `limit`, `used` and `projected` give the bytes before and after the write, and an in-memory dataset gives `limit` and `projected`. A refusal has the `error` and its `budget` or `code`, with the sizes of the check that refused it. |
 
 The status is the one the write would get. A write that would succeed answers `200`. A
 write that a failed precondition would stop answers `412`, one the guard would reject
@@ -3605,7 +3605,11 @@ answers `422`, and one the quota would refuse answers `507`. Each of these still
 the whole preview, with every check evaluated, plus the `error`, `code`, `budget` and
 `validation` members of the real error. When several apply, the status is the one the
 write would meet first: the precondition, then the validation, then the storage, except
-that a bulk write measures its new generation before it validates it. Any other failure,
+that a bulk write measures its new generation before it validates it. A load or a
+replacement through a transaction checks an in-memory dataset's size limit while it
+parses its body, before the validation, and a PUT does so before its precondition too. A
+dry run builds the whole state the write would leave, so that limit does not bound the
+memory a preview takes, while its deadline and cancellation still apply. Any other failure,
 such as a syntax error, a missing permission or a timeout, is the write's own error.
 Responses carry `Sparkles-Dry-Run: true` and `Sparkles-Dry-Run-Outcome` with the
 outcome, and `Sparkles-Validation` when a guard ran.
@@ -3739,9 +3743,9 @@ successfully checked a pending head waits for its fence and propagates a failure
 | A body over `--max-upload-mb` | 413 | |
 | Write-time validation rejects the result | 422 | as for other writes |
 
-A failed patch applies nothing. A patch of adds alone with at least as many rows as the
-store's bulk threshold takes the bulk path of a large load, which rebuilds the index
-instead of growing the write-ahead log.
+A failed patch applies nothing. A patch of adds alone with more rows than the store's
+bulk threshold takes the bulk path of a large load, which rebuilds the index instead of
+growing the write-ahead log.
 
 ## Stored queries
 
@@ -10869,8 +10873,9 @@ describes when that happens, and `execution=eager` avoids it.
 **Large request bodies.** Graph Store PUT/POST bodies over 16 MiB, and upload files, are
 written to a temporary file as they arrive rather than held in memory. A large PUT,
 estimated above the bulk threshold, replaces its graphs in one index rebuild that parses
-the body as a stream. Like every write it is atomic, so a parse error leaves the data as
-it was.
+the body as a stream. A POST into an empty dataset also builds the index in one
+rebuild, whatever the size of its body, unless the caller may write only some graphs.
+Like every write it is atomic, so a parse error leaves the data as it was.
 
 ### Storage quotas
 
