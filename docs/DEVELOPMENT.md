@@ -355,6 +355,17 @@ pinned compiler and the pinned mbx apply. The log starts with the `rustc --versi
 `mbx --version` the command used. The step is a job of `scripts/remote-ci.sh --cmd`, so it
 waits for the host's heavy lock and needs the host's disk floor, as lane CI does.
 
+A job of `scripts/remote-ci.sh` exits with the code of its check, and with codes of its own
+when the check did not finish. Exit 2 means the job could not be set up and exit 3 that too
+little time was left before its end. Exit 4 means the host's disk was below its floor at
+admission, and exit 5 that it fell under `REMOTE_CI_RUN_FLOOR_GIB` during the run. In both
+cases the job writes `disk-below-floor` to its `outcome` file and `remote-ci.sh` says that
+the result says nothing about the commit. Exit 6 means the check was stopped and its
+processes could not be shown gone, so the worktree stays on the host for a later cleanup. A
+command that itself exits with one of these codes is told apart by the `outcome` file and
+the job's `progress.log`. The [remote CI section](REMOTE-EXECUTORS.md#remote-ci) gives the
+details.
+
 ### Remote executors
 
 Prefer available local resources before renting another worker. A 16 GiB Boat worker is
