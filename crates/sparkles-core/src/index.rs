@@ -901,13 +901,16 @@ pub(crate) fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
 
 /// The `rows` zigzag-delta varints that make up all of `raw`, written to every `S`th
 /// element of `out` from its first, so that `S = 4` fills one column of a slice of
-/// [`Key`]s in place. `out` must reach the last of those elements.
+/// [`Key`]s in place. `out` must reach the last of those elements. A stride outside 1 to
+/// 16 does not compile, which keeps the window arithmetic below from overflowing: the
+/// window starts at most at the last element, so it ends below `out.len() + 7 * S + 1`.
 #[inline(always)]
 pub(crate) fn decode_varints_strided<const S: usize>(
     raw: &[u8],
     out: &mut [u64],
     rows: usize,
 ) -> Result<()> {
+    const { assert!(S >= 1 && S <= 16, "a stride of 1 to 16") };
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
     // the elements the values go to end at (rows - 1) * S, so the eight-value step below
     // takes a window of 7 * S + 1 elements only while eight values remain
@@ -4573,6 +4576,17 @@ mod tests {
         assert!(decode_varints_strided::<4>(&[0, 0], &mut [0; 4], 2).is_err());
         assert!(decode_varints_strided::<4>(&[0, 0], &mut [0; 5], 2).is_ok());
         assert!(decode_varints_strided::<4>(&[0; 3], &mut [0; 9], usize::MAX).is_err());
+        // eight one-byte values for seven rows, with room for an eighth: the byte left over
+        // is damage and the slots past the seventh row stay as they were
+        for s in [&[0u8; 8][..], &[2u8; 8][..]] {
+            let mut out = [9u64; 40];
+            assert!(decode_varints_strided::<4>(s, &mut out, 7).is_err());
+            assert!(out[25..].iter().all(|&v| v == 9));
+            assert!(out.iter().enumerate().all(|(i, &v)| i % 4 == 0 || v == 9));
+            let mut out = [9u64; 9];
+            assert!(decode_varints_strided::<1>(s, &mut out, 7).is_err());
+            assert_eq!(out[7..], [9, 9]);
+        }
     }
 
     #[test]

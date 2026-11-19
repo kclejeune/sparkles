@@ -768,13 +768,14 @@ both. It writes every `S`th element of its output, so the run reader decodes a c
 straight into every fourth word of the flattened keys and the index's frames use a stride
 of one. Tests pin the varint bytes of a sample column in a column frame and in a run block,
 which the shared coder writes unchanged, and check the strided decode against the
-contiguous one for every column, tail length and kind of damage. The new
+contiguous one in each of the four columns, for row counts on both sides of the
+eight-value step and for missing values, values left over and a truncated last value. The new
 `delta_coder_bench` harness times the four cases over 2^20 sorted keys on one P core. The
 first shared version decoded a run column into a 256 KiB scratch vector and copied it into
 the keys. On `atlas`, in five interleaved A,B,B,A rounds, it left the run encode and the
-index's encode and decode within the spread of their rounds, and made the run decode 19%
-slower, 14.35 against 11.98 ns a key, in every round, although it ran 4.4% fewer
-instructions. A profile on the laptop put the extra cycles in that copy, whose stores
+index's encode and decode within the spread of their rounds, and made the run decode
+slower in every round, 14.35 against 11.98 ns a key in the medians, which is about 20%. An
+instruction count on the laptop had found that version's run decode 4.4% shorter. A profile on the laptop put the extra cycles in that copy, whose stores
 stride 32 bytes through a megabyte of keys. Decoding in place removed the copy. On a
 laptop P core over two interleaved rounds the run decode then took 41.3 million cycles a
 pass against 45.1 million before the sharing, and the index's decode 38.8 million against
