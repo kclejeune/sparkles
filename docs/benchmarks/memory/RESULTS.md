@@ -303,9 +303,9 @@ OPTIONAL whose condition holds an EXISTS eager, which item 570 covers. The eager
 differences between the builds are within the spread of their server processes, from
 18.9 to 24.0 ms for `exists-optional` and from 31.5 to 45.2 ms for `class-exists`,
 except eager `optional-cond`, which was faster on B in every round. With
-`merge_left_join` off both modes hash, and over two rounds the builds were within their
-spread except streamed `knows-fail`, 305.3 ms on B against 302.5 ms on A, which item
-1140 holds.
+`merge_left_join` off both builds hash. Over two rounds, resampling the medians of
+their server processes gave a 95% interval that reaches 1.0 on every query except
+streamed `knows-fail`, 305.3 ms on B against 302.5 ms on A, which item 1143 holds.
 
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M, with the spill directory on the instance's local disk.

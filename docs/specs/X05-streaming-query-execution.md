@@ -1721,8 +1721,9 @@ the evaluator reads the row's answer. A row that the key set cannot answer, and 
 without a key set, are evaluated by substitution with the memo per distinct key as
 before. The probe answers and the key sets stay charged to the query while the
 expression reads them, and a row evaluated by substitution is counted when the
-expression reaches it. EXPLAIN reports the probes and the rows evaluated per row on the
-filter, extension, grouping and ordering that hold the EXISTS.
+expression reaches it. Eager plans report the probes and the rows evaluated per row on
+the filter, extension, grouping and ordering that hold the EXISTS, and the cursor's
+plans report them on a filter.
 
 Automatic execution now streams every FILTER, BIND, ORDER BY and grouping whose EXISTS
 patterns have cursor plans, whether the pattern is answered from a key set or per key.
@@ -1799,7 +1800,8 @@ merge reports no count under a condition, holds the condition once for the opera
 and charges its variable map, its candidate table and the pair and extension of a
 one-row batch before the test. A spooled run drops a consumed frame before it decodes
 the next, but its reservation of eight bytes per encoded cell can fall short for wide,
-poorly compressible frames, which item 1141 covers. The variable map is sized before
+poorly compressible frames and for the capacity the reader's buffer keeps, which item
+1144 covers. The variable map is sized before
 planning a nested EXISTS interns more variables, which item 1137 covers.
 
 A quiet A/B on `atlas`, an Intel benchmark worker, compared bc647108, which hashed every
@@ -1815,13 +1817,14 @@ pair, `optional-filter`, `optional-cond` and `exists-optional`, B streamed in 0.
 in 1.32 times its eager time with a plain FILTER and in 1.18 and 1.36 times with an
 EXISTS. Eager execution tests the condition over all of the matched pairs at once,
 while the cursor emits every pair and a candidate extension for each left row and then
-tests the batch. With `merge_left_join` off both modes hash, and over two rounds the
-builds were within their spread on every query except streamed `knows-fail`, which took
-305.3 ms on B against 302.5 ms on A in code the change does not touch. Item 1140 holds
-that cost.
+tests the batch. With `merge_left_join` off both builds hash in both modes. Over two
+rounds, resampling the medians of their server processes gave a 95% interval that
+reaches 1.0 on every query except streamed `knows-fail`, which took 305.3 ms on B
+against 302.5 ms on A. Item 1143 holds that cost.
 
 B also streamed an OPTIONAL whose condition holds an EXISTS under automatic execution,
-which A kept eager, as the plans that B's automatic execution chose show. The A/B timed
+which A kept eager. B's recorded plans show its automatic execution choosing the
+cursor, and A's admission check refuses an EXISTS in an OPTIONAL condition. The A/B timed
 the forced modes, so the cost of that admission is read from the paths each build's
 automatic execution takes, A eager against B streamed. That is 132 against 181 ms for
 `knows-exists` and 549 against 647 ms for `knows-mixed`, so the change keeps such plans
@@ -1841,10 +1844,10 @@ caps over long runs of failing pairs.
 eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
 per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the
 conditional OPTIONAL honours `merge_left_join` and names its algorithm in both plans.
-The cursor's EXPLAIN reports EXISTS counters only on a FILTER, while eager plans report
-them on every operator that evaluates an EXISTS, which item 1106 covers. Without spill,
+The cursor's EXPLAIN reports EXISTS counters only on a FILTER, so its merge OPTIONAL
+shows none, which item 1106 covers. Without spill,
 the eager memory retry of automatic execution uses the admission check and so does not
-retry an OPTIONAL whose condition holds an EXISTS as a cursor, which item 1142 covers.
+retry an OPTIONAL whose condition holds an EXISTS as a cursor, which item 1145 covers.
 
 ### Finite HTTP body limits
 

@@ -213,8 +213,9 @@ fn optional_exists_stays_eager_and_a_strict_cursor_matches() {
                     "{q}; merge {merge}; {rows}"
                 );
             }
-            // A strict cursor runs the conditional merge at several batch sizes. The
-            // merge's unit tests cover a left row whose pairs span several batches.
+            // A strict cursor runs the merge or the hash OPTIONAL, as the switch
+            // selects, at several batch sizes. The merge's unit tests cover a left row
+            // whose pairs span several batches.
             for batch_rows in [1, 3, 1000] {
                 let cursor = CursorOptions {
                     batch_rows,
